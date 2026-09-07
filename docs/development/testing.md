@@ -26,7 +26,7 @@ The suite is split by cost:
   roughly current when their cost changes materially.
 
 Fast resolution-audit cycle: the overload-resolution unification work
-(`plans/resolution-unification-plan.md`) verifies a scorer slice with
+(`plans/resolution-unification-plan.md (git history)`) verifies a scorer slice with
 `scripts/resolve_audit_sweep.py --build`, not the ~18-minute ReleaseSafe
 canonical. It rebuilds the fast Debug `klio` (~2s incremental) and sweeps the
 whole stdlib commonTest corpus with `KLIO_RESOLVE_AUDIT=1`, reporting every
@@ -133,7 +133,7 @@ the external sweep's ad-hoc flags:
 The `src/itests/*_commontest.zig` suites drive these per library and
 ratchet the pass count. The migration from the per-file driver + the
 Python sweep to a single `klio test <project> --format=json` is
-tracked in `plans/project-manifest.md`.
+tracked in `plans/open-campaigns.md`.
 
 ## 5. Pack smoke tests
 
@@ -208,7 +208,7 @@ Two mechanisms keep the suite fast:
 ## The iteration playbook
 
 Match the check to the size of the change
-(`plans/verification-speed-plan.md` is the working record):
+(`docs/development/verification-playbook.md` is the working record):
 
 - **Edit-repro loop** (fixing one bug, running one program):
   `zig build klio-harness -Dharness-optimize=Debug` (~16 s per

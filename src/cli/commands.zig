@@ -344,7 +344,7 @@ pub fn runDumpIr(
 
 /// `klio transpile-dump <file>` — lower the file exactly as `run` does and
 /// print each function's decoded bytecode stream (the transpiler emitter's
-/// input tuples; plans/c-transpiler-plan.md stage 2). No execution.
+/// input tuples; plans/c-transpiler-plan.md (git history) stage 2). No execution.
 pub fn runTranspileDump(
     gpa: std.mem.Allocator,
     path: []const u8,
@@ -410,7 +410,7 @@ pub fn runTranspileDump(
 
 /// `klio transpile <file> [-o out.c]` — lower the file exactly as `run`
 /// does and emit every user-script function's bytecode stream as C over
-/// the klio_rt per-op helpers (plans/c-transpiler-plan.md stage 2), plus
+/// the klio_rt per-op helpers (plans/c-transpiler-plan.md (git history) stage 2), plus
 /// the per-fid registration hook and a `main` that drives the program
 /// through libklio_rt. The emitted file compiles with
 /// `zig cc out.c -I<include> -L<lib> -lklio_rt -lzstd`.
@@ -893,7 +893,7 @@ fn transpileEmit(
     // walk to the image's library bodies. The fids the emitter registers must
     // match the fids the running binary resolves, which the pinned image
     // guarantees.
-    // THE NATIVE FLOOR (plans/native-floor-and-tower-campaign.md): the
+    // THE NATIVE FLOOR (plans/native-floor-and-tower-campaign.md (git history)): the
     // per-op op-helper bodies pay one host-ABI crossing per instruction
     // and measured ~10x SLOWER than the runtime's own drivers on
     // object-heavy code, while never beating them elsewhere — so by

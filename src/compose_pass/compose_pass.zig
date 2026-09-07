@@ -21,7 +21,7 @@
 //! keys are derived from the call's source span (stable per call site), the same
 //! role the plugin's compile-time key constant plays.
 //!
-//! See plans/compose-plugin-lowering.md.
+//! See plans/compose-plugin-lowering.md (git history).
 
 const std = @import("std");
 const ast = @import("ast");

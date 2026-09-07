@@ -1,4 +1,4 @@
-//! The C ABI surface of the klio runtime (`plans/c-transpiler-plan.md`):
+//! The C ABI surface of the klio runtime (`plans/c-transpiler-plan.md (git history)`):
 //! program bootstrap plus the per-op helpers the transpiled C calls. The
 //! helpers are thin casts into the evaluator's own arm bodies
 //! (`ir.eval.nativeOp*`), so the emitted code shares interpreter

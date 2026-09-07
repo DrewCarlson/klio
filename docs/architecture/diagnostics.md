@@ -14,7 +14,7 @@ which renders to plain text, JSON, or SARIF.
 | `W00xx`| Typechecker warnings  |
 
 The full catalog (with the source spans that emit each code) lives
-at `plans/DIAGNOSTICS.md` in the repository.
+at `docs/design/DIAGNOSTICS.md` in the repository.
 
 ## Wording rules
 

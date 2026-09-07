@@ -1,6 +1,6 @@
 //! Stage-3 JIT: compile a hot natural loop to native x86-64 machine code.
 //!
-//! Additive tier over the IR interpreter (see plans/JIT-DESIGN.md). The loop's
+//! Additive tier over the IR interpreter (see docs/design/JIT-DESIGN.md). The loop's
 //! IR registers live as i64 slots in a scratch file; the emitted code uses
 //! rax/rcx/rdx/rsi scratch per op (no register allocator) and runs the loop
 //! natively, eliminating Value boxing, member dispatch, and per-instruction

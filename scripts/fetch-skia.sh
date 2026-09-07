@@ -4,7 +4,7 @@
 # Skiko/Compose-Multiplatform link: a single libskia + every dependency bundled
 # (freetype2, harfbuzz, icu, png, jpeg, webp, skparagraph, skshaper, skunicode)
 # and the full headers, so CPU raster + PNG encode + real text shaping work
-# offline. See plans/UI-RENDERING-PACKS.md.
+# offline. See plans/open-campaigns.md.
 #
 # Usage:
 #   scripts/fetch-skia.sh                 # host os/arch

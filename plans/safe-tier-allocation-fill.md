@@ -1,6 +1,6 @@
 # ReleaseSafe allocation fill — the verification tier's memset tax
 
-Profiles taken for `compute-floors-record.md` (2026-09-05) show `memset` as
+Profiles taken for the compute-floors record (2026-09-05, in git history) show `memset` as
 the largest single symbol on the ReleaseSafe harness: 11.5% of
 `validatePotentialDeadlock`, 21% of `JsonHugeDataSerializationTest`, and
 the dominant share of `fromEpochDays` before its memo fix. Caller
@@ -24,7 +24,7 @@ Parent plan: `conformance-backlog.md`.
    androidx) on `klio-harness` and `klio-harness-fast` back to back, same
    cores, nothing else running; record wall and pass counts. Exit: a table
    here with the ReleaseSafe/ReleaseFast ratio per suite.
-2. **What ReleaseSafe has caught.** From `ci-green.md`, the census memories,
+2. **What ReleaseSafe has caught.** From the CI campaign record (git history), the census memories,
    and `git log`, list the defects a safety check (bounds, overflow,
    unreachable, ubsan in C deps) surfaced that ReleaseFast would have run
    past. Exit: the list, with commit ids.

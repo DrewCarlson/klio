@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-2 gate of plans/c-transpiler-plan.md: `klio transpile` emits C over
+# Stage-2 gate of plans/c-transpiler-plan.md (git history): `klio transpile` emits C over
 # the klio_rt per-op helpers, the result compiles and links against
 # libklio_rt.a, its output matches the interpreter, and the native bodies
 # actually engage (KLIO_NATIVE_TRACE).

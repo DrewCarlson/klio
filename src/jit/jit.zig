@@ -1,4 +1,4 @@
-//! Tiered native-compiler foundation for KLIO. See `plans/JIT-DESIGN.md`.
+//! Tiered native-compiler foundation for KLIO. See `docs/design/JIT-DESIGN.md`.
 //!
 //! W^X executable memory plus a machine-code emitter selected per target:
 //! `X86Emitter` (System V) and the AArch64 backend in `arm64.zig`. Both expose

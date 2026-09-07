@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-4 gate of plans/c-transpiler-plan.md, parity half: every corpus
+# Stage-4 gate of plans/c-transpiler-plan.md (git history), parity half: every corpus
 # example transpiles, compiles against libklio_rt.a, and its output matches
 # the interpreter (rc + bytes). Runs JOBS examples in parallel (default 8).
 # Interactive/window examples (no deterministic output) and the known

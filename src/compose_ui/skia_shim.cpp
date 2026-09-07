@@ -1,7 +1,7 @@
 // Skia rendering shim — a thin extern-"C" surface over Skia's C++ API so the Zig
 // `compose_ui` module can drive a real GPU-class rasterizer without any C++ in Zig.
 // Built with system g++/libstdc++ (Skia's prebuilt libs use the old GNU string
-// ABI; zig cc/libc++ will not link them). See plans/UI-RENDERING-PACKS.md.
+// ABI; zig cc/libc++ will not link them). See plans/open-campaigns.md.
 //
 // The klio.compose.ui pack records a display list of draw ops during its draw
 // pass; this shim replays them onto a headless raster SkSurface and encodes PNG.

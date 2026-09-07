@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Standing gate for the compose-ui example family — the surface the
 # example corpus alone watched, which twice rotted unnoticed for weeks
-# (plans/leaf-production-campaign.md). The family is the set that was
+# (plans/leaf-production-campaign.md (git history)). The family is the set that was
 # bake-order-sensitive before the file-scope class-pick fix, so the
 # gate builds packs FRESH from source into the repo-local home with a
 # CLEARED image cache every run: stale installed packs or a poisoned

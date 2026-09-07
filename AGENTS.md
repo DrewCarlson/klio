@@ -52,7 +52,7 @@ When changing behavior, match Kotlin semantics exactly and fix the real root
 cause. Verify per-module in isolation with `python3 scripts/zigcheck.py <module>`.
 
 Verification speed — DEFAULT to the harness + sweep, NOT `zig build itest-*`.
-Full playbook in `plans/verification-speed-plan.md`. The path that must be used:
+Full playbook in `docs/development/verification-playbook.md`. The path that must be used:
 
 - **Commontest correctness (the default for any stdlib/library check):** build the
   ReleaseSafe harness ONCE (`zig build klio-harness`, installs

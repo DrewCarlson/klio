@@ -1,732 +1,111 @@
 # kotlinc box-test conformance corpus
 
-The Kotlin compiler's own `compiler/testData/codegen/box` suite is the widest
-executable oracle for a Kotlin implementation: 7,351 `.kt` programs at the
-pinned `kotlin` submodule revision (build-2.4.10-RC), each declaring
-`fun box(): String` that must return `"OK"`. klio runs none of them today: the
-`kotlin` submodule is a blobless sparse clone of `libraries/stdlib` and
-`libraries/kotlin.test` only (`scripts/init-kotlin-submodule.sh`, CI's
-"populate kotlin" step in `.github/workflows/ci.yml`).
+The upstream `compiler/testData/codegen/box` corpus (7,351 programs, 6,371
+selected by directive, 980 excluded) run through `klio`, each asserting
+`box() == "OK"`. Stage 2 of `conformance-backlog.md`; the runner, the
+ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
+git history under this file's name.
 
-Parent plan: `conformance-backlog.md`. Verification practice:
-`verification-speed-plan.md` (harness + sweep, census children, ratchets);
-gate wiring: `census-gates-and-red-mass.md`.
+## State (2026-09-07, eb4d1fcc)
 
-## Why this corpus
+Census 5751 passed / 609 failed / 11 did not complete. Ratchet
+`BASELINE = 5751`, `MAX_FAILED = 609` in `src/itests/box_support.zig`
+(pass floor and failure ceiling, no slack). The suite stands in
+`scripts/stack.sh` and in CI at shard weight 35.
 
-- Every program is small, deterministic, and self-checking; a failure is a
-  semantic gap, not a flaky wall.
-- It covers the language surface systematically (directories are features:
-  `when`, `ranges`, `inlineClasses`, `coroutines`, `delegatedProperty`,
-  `smartCasts`, `varargs`, `properties`, `sealed`, `contracts`, ...), so
-  failures cluster by mechanism and each root fix closes many at once.
-- It is the same oracle kotlinc gates itself on: matching it IS matching
-  Kotlin semantics.
+## How to work it
 
-## Corpus facts to design against
+- Runner: `src/itests/box_support.zig` (shared by the `box_conformance`
+  itest and `klio-census box`). One child `klio run` per test; sections
+  become numbered files under `/tmp/klio_itest_box_home/cases/<path>/`; a
+  synthesized `__box_main.kt` throws unless `box() == "OK"`; the
+  `WITH_COROUTINES` helpers are appended; `OPTIONAL_JVM_INLINE_ANNOTATION`
+  becomes `@JvmInline`.
+- One directory: `KLIO_ITEST_BIN=zig-out/bin/klio-harness
+  KLIO_BOX_FILTER=enum/ KLIO_BOX_JOBS=4 zig-out/bin/klio-census box`
+  (`KLIO_BOX_FILTER` is a path substring; `enum` also matches `enumEntries`).
+  Full census: drop the filter, `KLIO_BOX_JOBS=12`, about six minutes.
+  `KLIO_BOX_TIMEOUT_MS` defaults to 60 s (×4 on a Debug harness).
+- One test by hand: copy the file, append `fun main() { println(box()) }`,
+  run it through the harness with `KLIO_HOME=$PWD/.klio-local`.
+- Cluster a census by the first two path segments and count `[box-crash]`
+  lines with the `[box-fail]` lines; a crash is a panic in the interpreter
+  (`KLIO_ERR_TRACE=1` prints the frame chain).
+- Every fix ships an `examples/` program, its
+  `tests/corpus/expected/<name>.out`, and a README row; the corpus file
+  must pass unmodified (a renamed or simplified copy is for bisecting
+  only); kotlinc semantics exactly, oracle where in doubt.
+- Before the push: the whole battery (`scripts/stack.sh`) plus
+  `itest-e2e`, `itest-parity_corpus_pinned` and the CLI corpus check; the
+  stdlib sweep does not cover the coroutines census or the pinned parity
+  corpus, and both have caught lowering regressions the sweep passed.
 
-- Directives are `// NAME` or `// NAME: value` header comments. Seen in a
-  40-file sample of `box/ranges`: `WITH_STDLIB` (37), `FILE: name.kt` (18,
-  splits one test into several source files), `LANGUAGE: +Feature` (7),
-  `KJS_WITH_FULL_RUNTIME` (6). Others across the corpus: `TARGET_BACKEND`,
-  `DONT_TARGET_EXACT_BACKEND`, `IGNORE_BACKEND`, `MODULE: name(deps)`,
-  `WITH_COROUTINES` (pulls the framework's coroutine helpers),
-  `WITH_REFLECT`, `FULL_JDK`, `JVM_TARGET`, `ASSERTIONS_MODE`.
-- Multi-module tests (`MODULE:`) and JVM-only tests (`TARGET_BACKEND: JVM`,
-  `FULL_JDK`, `WITH_REFLECT`, anything importing `java.*`) are out of klio's
-  model; they are excluded BY DIRECTIVE, never by name.
-- The sparse checkout must add `compiler/testData/codegen/box` and the
-  helpers the directives reference (`WITH_COROUTINES` helpers live beside
-  the corpus under `compiler/testData/codegen/helpers`; confirm the path
-  when populating). Blobless clones fetch blobs lazily: the runner must
-  never read the corpus through `git show`; populate once.
+## Left: clusters of five or more (2026-09-07 census)
 
-## Tasks
+Fix each, or record a verdict here, until none remains; then write the
+residue list (every cluster under five) as the seed of the next campaign.
 
-1. **Populate.** Extend `scripts/init-kotlin-submodule.sh` and the CI
-   "populate kotlin" step with the two directories; `scripts/bootstrap.sh
-   --packs` stays the one-shot. Exit: `kotlin/compiler/testData/codegen/box`
-   present locally and on CI (the CI campaign's rule: populate every
-   `update = none` submodule a corpus reads).
-2. **Runner.** A census suite `box` (`src/itests/box_conformance.zig`,
-   registered in `src/itests/census_main.zig`, driven by
-   `zig-out/bin/klio-census box` with `KLIO_ITEST_BIN`) that: parses the
-   directives; splits `FILE:` sections into files; selects by directive
-   (an allowlist of directives klio honors, a denylist of JVM/JS/module
-   ones, every exclusion counted and printed by reason); synthesizes
-   `fun main() { val r = box(); if (r != "OK") throw AssertionError(r) }`
-   as a trailing file (never edits the test); batches one directory per
-   child like the sweep (`--no-batch` for isolation); per-file wall cap;
-   names every failure (`[box-fail] dir/file.kt: <first line>`) and every
-   exclusion reason. Exit: the suite runs end to end and prints
-   `passed / failed / excluded(by reason) / did-not-complete`.
-3. **Baseline.** Record the first full census (wall, pass count, exclusion
-   census) here; ratchet `BASELINE` to the measured pass count with
-   `MAX_FAILED 0`; add the suite to `scripts/stack.sh` and to a CI shard
-   with a measured weight (4-core ReleaseSafe seconds ÷ 10). Exit: green
-   battery and CI with the box suite standing.
-4. **Root-fix by cluster.** Group failures by the first diagnostic or miss
-   trace (`KLIO_ERR_TRACE`, `KLIO_MISS_TRACE`, `KLIO_BARE_TRACE`), take the
-   largest cluster, root-fix the mechanism (never the test), re-census,
-   ratchet up. Every fix ships an `examples/` program with its `.out` and
-   README row, as the resolution-residue work did. Exit for this plan:
-   every cluster of size ≥ 5 is either root-fixed or carries a verdict
-   here (unsupported-by-design with the directive that should exclude it,
-   or a named open mechanism with its repro); the residue list is the
-   seed of the next campaign.
+| Cluster | Fails | Dominant shape |
+| --- | --- | --- |
+| callableReference/adaptedReferences | 18 | `invoke_callable_with_this` on a `KClass` value; `startCoroutine` on the receiver of a suspend reference |
+| inlineClasses | 18 (+2 crash) | field read on an anonymous object standing for a value class; member extension on a value class; secondary constructors of generic value classes crash |
+| typealias | 13 | explicit type arguments on an alias call reaching the constructor as values; alias targets from a class body; an alias of a companion as a value; aliases in anonymous object types and super calls; alias-typed extensions |
+| coroutines | 13 | exception expected from a suspend path not thrown; intrinsic semantics and feature intersection |
+| callableReference/function | 12 (+1 crash) | `invoke_callable_with_this` on a `KClass`; a reference cast to `Function1` fails; an extension in a SAM interface recurses |
+| super | 12 (+1 crash) | `super` call resolving to the subclass override (`test1 B.bar`); a `super<Interface>` chain crashes |
+| casts/functions | 11 | `Function0` unresolved as a global (function-type `is`/`as` checks) |
+| localClasses | 11 | `this@C` unbound inside a local class; captured locals read null |
+| extensionFunctions | 11 | one recursion (SAM interface extension), the rest single-file mismatches |
+| enum | 11 | entry initialization order against companion and static init (`Foo.FOO;Foo.B…` order); lazy entry init |
+| properties/lateinit | 10 | `isInitialized` from another class; uninitialized access must throw; a Unit value where the property was expected |
+| fir | 10 | member call on an anonymous object; `Unit` rendered into a string |
+| diagnostics/functions | 10 | constant `ONE` read on a `KClass`; two recursions; constructor arity through a reference |
+| delegatedProperty | 10 | file initialization failure on a top-level delegate; `provideDelegate` inference cases |
+| properties | 9 | accessor shapes (see the file names) |
+| binaryOp | 9 | operator convention edges |
+| specialBuiltins | 8 | JVM builtin stubs (`extendJavaClasses`) |
+| objects/companionObjectAccess | 8 | companion members through the class value |
+| extensionProperties | 8 | extension property accessors |
+| callableReference | 8 | property, bound, equality subgroups (6, 5, 5) |
+| secondaryConstructors | 7 | delegation chains |
+| inline | 7 | inline function edges |
+| evaluate | 7 | unsigned constant operations (`plus1` unresolved), `kCallableName` |
+| collectionLiterals | 7 | array literals in annotations |
+| classes | 7 | class body shapes |
+| casts/mutableCollections | 7 | `as MutableList` checks on read-only collections |
+| operatorConventions | 6 | convention resolution edges |
+| increment | 6 | `++`/`--` on properties and indexed receivers |
+| functions/localFunctions | 6 | local function capture |
+| defaultArguments | 6 | default parameter evaluation |
+| controlStructures/breakContinueInExpressions | 6 | `break`/`continue` inside expressions |
+| closures | 6 | capture shapes |
+| builtinStubMethods/extendJavaClasses | 6 | JVM stub methods |
+| arrays | 6 | multi-index `get`/`set` (`collectionGetMultiIndex`) |
+| strings, intrinsics, finally | 5 each | single-file mismatches |
 
-## Traps (from the stdlib and library censuses)
+The `functions/nothisnoclosure.kt` crash is an RSS-cap abort (6.4 GB); it
+is a memory blow-up, not a semantic miss.
 
-- A per-file compile that loses its helper files fails for starvation, not
-  semantics (`klio-library-100-campaign` keeper): batch per directory.
-- The census names must always print; a bare count is undiagnosable.
-- Child timeouts must sit ≥ 1.5× the slowest healthy child on a 4-vCPU
-  runner; harness Debug builds run ~4× slower (`harnessSlowdown`).
-- A renamed or simplified copy of a failing test is for bisecting only;
-  the corpus file must pass unmodified.
+## Verdicts recorded (closed; reopen only with a new mechanism)
 
-## Runner facts (2026-09-05)
-
-- Populated: `scripts/init-kotlin-submodule.sh` now lists
-  `compiler/testData/codegen/box` and
-  `compiler/testData/diagnostics/helpers/coroutines` (the `WITH_COROUTINES`
-  helpers: CoroutineUtil, CoroutineHelpers, StateMachineChecker,
-  TailCallOptimizationChecker, all `package helpers`); 7,351 `.kt` files in
-  174 directories, 36 MB; CI's kotlin cache key carries `-codegen-box`.
-- Shape: one child `klio run` per selected test (a warm trivial run is
-  0.087 s, so the corpus is minutes on 4 cores), sections written as
-  numbered files under `/tmp/klio_itest_box_home/cases/<path>/`, a
-  synthesized `__box_main.kt` (`import <pkg>.box` when the box file has a
-  package) that throws unless `box() == "OK"` and prints `BOX-OK`; the
-  helpers appended for `WITH_COROUTINES`; `OPTIONAL_JVM_INLINE_ANNOTATION`
-  replaced by `@JvmInline` under `WORKS_WHEN_VALUE_CLASS`. Runner:
-  `src/itests/box_support.zig` (shared by the `box_conformance` itest and
-  `klio-census box`). Knobs: `KLIO_BOX_FILTER` (path substring),
-  `KLIO_ITEST_JOBS`, `KLIO_BOX_TIMEOUT_MS` (60 s, ×4 on a Debug harness).
-- Directive census over the corpus (files): WITH_STDLIB 3,582; LANGUAGE
-  1,708 (27 disable a feature → excluded); WORKS_WHEN_VALUE_CLASS 740;
-  WITH_COROUTINES 500; MODULE 491; TARGET_BACKEND 272; IGNORE_BACKEND 285;
-  WITH_REFLECT 109; CHECK_TYPE_WITH_EXACT 44 (framework helper → excluded);
-  Java sections 5; no `box()` 2. Header-only scan (directives before the
-  first code line) keeps body comments like `// TODO:` out of selection.
-- Ratchet semantics: `BASELINE` = measured pass count (floor),
-  `MAX_FAILED` = measured failure count (ceiling with no slack); a new
-  failure trips the ceiling even while old ones remain. "MAX_FAILED 0" in
-  the goal reads as zero slack, since the first census carries real
-  failures by construction.
-- Prototype sample (300 random files, before the Zig runner): 207 pass /
-  47 fail / 46 excluded; failure shapes: runtime misses (`call_member`,
-  `get_field`, unresolved globals), parser gaps (name-based destructuring,
-  `for` with destructuring in arrays), assertion mismatches (unsigned
-  stepped ranges, IEEE 754 equality, finally ordering).
-
-## Task 3 record — first full census (2026-09-05)
-
-ReleaseSafe harness, 12 workers, 147 s wall: **5,246 passed, 1,105 failed, 20 did
-not complete of 6,371 selected; 980 excluded of 7,351 files.** Ratchet:
-`BASELINE = 5246`, `MAX_FAILED = 1105` (`src/itests/box_support.zig`).
-
-Exclusion census (by directive): MODULE: 447; TARGET_BACKEND: 263; WITH_REFLECT: 88; CHECK_TYPE_WITH_EXACT: 44; LANGUAGE:-feature: 27; FREE_COMPILER_ARGS: 19; FULL_JDK: 18; IGNORE_BACKEND:ANY: 14; JVM_DEFAULT_MODE: 12; API_VERSION: 10; JVM_TARGET: 9; LAMBDAS: 7; IGNORE_BACKEND_K2:ANY: 6; STRING_CONCAT: 4; USE_OLD_INLINE_CLASSES_MANGLING_SCHEME: 4; ALLOW_KOTLIN_PACKAGE: 3; ASSERTIONS_MODE: 2; NATIVE_STANDALONE: 2; SAM_CONVERSIONS: 1.
-
-Failure shapes (first line of the child's stderr, normalized):
-
-| Count | Shape | Example |
-|-------|-------|---------|
-| 246 | `runtime error: uncaught kotlin.AssertionError: box() returned …` | `annotations/instances/annotationAnnotationParam.kt` |
-| 146 | `runtime error: IR eval: Vm::call_member `_` on `_`` | `associatedObjects/findAssociatedObject.kt` |
-| 113 | `<file> error: expected loop variable` | `arrays/forInUnsignedArray/forInUnsignedArrayWithIndex.kt` |
-| 92 | `runtime error: IR eval: Vm::get_field `_` on `_`` | `callableReference/adaptedReferences/adaptedVarargFunImportedFromObject.kt` |
-| 79 | `runtime error: IR eval: unresolved global `_`` | `callableReference/adaptedReferences/innerConstructorWithVararg.kt` |
-| 66 | `runtime error: uncaught kotlin.AssertionError: Expected …` | `annotations/instances/annotationWithTypeParameters.kt` |
-| 34 | `<file> error: expected `_`` | `argumentOrder/arguments.kt` |
-| 34 | `<file> error: expected property name` | `callableReference/function/genericCallableReferenceWithReifiedTypeParam.kt` |
-| 18 | `<file> error: expected expression` | `annotations/spreadOperatorInAnnotationArguments.kt` |
-| 17 | `<file> error: expected top-level declaration` | `bridges/propertyAccessorsWithoutBody.kt` |
-| 15 | `runtime error: IR eval: Vm::call_value on `_`` | `callableReference/function/local/constructorWithInitializer.kt` |
-| 12 | `runtime error: uncaught java.lang.StackOverflowError: Stack overflow: evaluation` | `builtinStubMethods/extendJavaClasses/arrayList.kt` |
-| 10 | `runtime error: uncaught kotlin.AssertionError` | `delegatedProperty/optimizedDelegatedProperties/mixedArgumentSizes.kt` |
-| 8 | `<file> error: expected newline or `_` between statements` | `contracts/lambdaParameter.kt` |
-| 7 | `<file> error: expecte` | `callableReference/adaptedReferences/suspendConversion/inlineWithContextParameterAsAPropertyType.kt` |
-| 6 | `<file> error: expected member name` | `extensionFunctions/executionOrder.kt` |
-
-Failures by corpus directory: callableReference 87, controlStructures 76, multiDecl 67, enum 54, ranges 52, delegatedProperty 48, coroutines 39, inlineClasses 37, contextParameters 28, diagnostics 28, annotations 26, casts 25, defaultArguments 25, arrays 23, closures 23, properties 22, evaluate 16, ieee754 16, objects 16, extensionFunctions 15, functions 15, localClasses 14, super 14, typealias 14.
-
-Did not complete: crashes `callableReference/function/innerConstructorFromClass.kt`, `callableReference/function/innerConstructorFromExtension.kt`, `callableReference/function/extensionFunctionWithExtensionInSAMInterface.kt`, `inlineClasses/defaultParameterValues/inlineClassSecondaryConstructorGeneric.kt`, `inlineClasses/secondaryConstructorsInsideInlineClassWithPrimitiveCarrierTypeGeneric.kt`, `functions/nothisnoclosure.kt`, `extensionFunctions/extensionFunctionWithExtensionInSAMInterface.kt`, `ranges/stepped/expression/downTo/maxValueToMinValueStepMaxValue.kt`, `ranges/stepped/expression/rangeTo/minValueToMaxValueStepMaxValue.kt`, `ranges/stepped/expression/until/minValueToMaxValueStepMaxValue.kt`, `ranges/stepped/literal/downTo/maxValueToMinValueStepMaxValue.kt`, `ranges/stepped/literal/rangeTo/minValueToMaxValueStepMaxValue.kt`, `ranges/stepped/literal/until/minValueToMaxValueStepMaxValue.kt`, `super/kt4173_2.kt`; timeouts `controlStructures/breakContinueInExpressions/continueInDoWhile.kt`, `controlStructures/breakContinueInExpressions/inlinedBreakContinue/withReturnValueDoWhileContinue.kt`, `controlStructures/breakContinueInExpressions/pathologicalDoWhile.kt`, `controlStructures/continueInWhen.kt`, `diagnostics/functions/tailRecursion/defaultArgsOverridden.kt`, `inline/loopWithInlinableCondition.kt`.
-
-Cluster reading (Task 4 order): (1) Kotlin 2.4 destructuring syntax —
-`[a, b]` positional short form and `(val a, val b = prop)` name-based full
-form in `val`, `for`, and lambda parameters (~150 files across
-`multiDecl`, `controlStructures`, `arrays`, `ranges`, `nameBasedDestructuring`,
-`coroutines`); (2) `box() returned …` assertion mismatches (237, heterogeneous:
-per-directory triage); (3) runtime dispatch misses — `call_member` (146),
-`get_field` (92), unresolved global (78), `call_value` (14) — mostly
-`callableReference`, `enum`, `delegatedProperty`, `contextParameters`;
-(4) parser gaps: immediately-invoked lambda arguments `f(b = { … }())` (34),
-extension properties on parenthesized function-type receivers
-`val (Int.() -> String).baz` (32), annotation spread arguments and empty
-`for (…);` bodies (30), accessor-only lines / `by` on its own line /
-`x!! infix y` (27), `receiver.(expr)(args)` (6), `label@for` without space,
-`context(String) () -> Unit` function types; (5) crashes: six
-`…StepMaxValue` progression tests segfault in libc (step arithmetic at
-`Long.MAX_VALUE`), four evaluation stack overflows (inline-class secondary
-constructors, SAM extension), one RSS-cap abort (`functions/nothisnoclosure.kt`),
-`super/kt4173_2.kt`; timeouts: `continue` inside `do-while` / `when` bodies
-(five) and `inline/loopWithInlinableCondition.kt`.
-
-## Task 4 record — root fixes by cluster
-
-1. **Kotlin 2.4 destructuring forms** (2026-09-05): the positional short
-   form `[a, b]` and the name-based full form `(val a, var n: T = prop)` in
-   declarations (the full form opens the statement with `(`), `for`
-   loops, and lambda parameters. Parser: one entry grammar
-   (`control.parseDestructEntries`) behind all three sites; AST: `by_name`
-   + `sources` on `DestructuringDecl` and `For`; lowering: name-based
-   entries read their property with `GetField`, positional ones keep
-   `componentN`; typeck skips the `componentN` operator check for the
-   name-based form. Root cause found alongside: a destructured `var` was
-   bound as a plain register, so `p += 1` dispatched `plusAssign` on an
-   Int — the old `var (p, q)` form failed the same way; destructured names
-   now bind like `var x = …` (home slot, `markMutable`, a shared cell when
-   captured). Census 5,246 → 5,409 passed, 1,105 → 942 failed, 20
-   incomplete unchanged (two stack-overflow crashes crossed the cap under
-   load and were counted as timeouts). Example
-   `examples/destructuring_forms.kt`. Not modeled yet: per-entry
-   mutability in the full form (one `var` entry makes the whole group
-   mutable).
-
-2. **Explicit primitive `rangeTo`** (2026-09-05): `0.rangeTo(2)` (and
-   `rangeUntil`) called by name on Int/Long/Char was deferred to the
-   extension fallback, which picked the generic `Comparable<T>.rangeTo`
-   and produced a `ComparableRange` with no `iterator` (17 tests, the
-   `multiDecl/forRange/explicitRangeTo*` families and the implicit-receiver
-   range tests). The builtin registry now serves `kotlin.Int|Long|Char.rangeTo`
-   and `rangeUntil` with the same range value the `..`/`..<` operators
-   build. Example `examples/explicit_range_to.kt`.
-3. **Invoked lambda arguments** (2026-09-05): a `{ … }` value argument was
-   parsed as a lambda literal and returned without its postfix tail, so
-   `f(b = { … }(), a = …)` ended the argument at `}` (the whole
-   `argumentOrder` directory, 15 tests, plus others: 27 "expected `,`").
-   `parsePostfix` is split so the postfix loop applies to an already-parsed
-   primary, and the argument lambda goes through it. Example
-   `examples/invoked_lambda_argument.kt`. Census after 2+3: 5,440 / 911 / 20.
-4. **Enum entries with bodies** (2026-09-05): the runtime kept only the
-   entry body's *functions* (an `anon_methods` side-table keyed by a
-   synthesized `X$B` name and an `__enum_entry_class__` tag on the
-   instance) and dropped properties, `init` blocks, inner classes, and
-   super calls (33 failing tests). The parser now synthesizes a real
-   nested class per entry body — `$B : X(entry args)` with the body as its
-   members, flagged `is_enum` so entry behaviors key off the instance's
-   own class — and VM start constructs it through the ordinary class path
-   (parent constructor arguments, property initializers, init blocks) and
-   makes it the entry's value; `name`/`ordinal` are preset before the
-   body's initializers run (`init { println(this.name) }` sees them), and
-   bare sibling-entry names on a body instance resolve through the parent
-   enum's entry table. The side-table lowering and the tag are gone.
-   `enum/` 54 → 34 failures; census 5,461 / 890 / 20. Example
-   `examples/enum_entry_bodies.kt`. Remaining enum sub-clusters: enum
-   companion statics (`PAPER on Game.Companion`, `X on G.O`, `entries on
-   MyEnum.Companion`: 6), bare entry names from lambdas / inner-class
-   constructors inside entry bodies (`FOO`: 7), secondary constructors and
-   `enum class E;` in the parser (4), entry init order with companion
-   access (3), vararg entry constructors (3).
-
-5. **Language feature flags and the name-based short form** (2026-09-05):
-   under `// LANGUAGE: +NameBasedDestructuring +EnableNameBasedDestructuringShortForm`
-   the parenthesized short form `val (a = first, second) = x` binds by
-   property name (in declarations, `for` loops, lambdas); without the
-   second flag `(a, b)` stays positional, so klio needed kotlinc-style
-   feature flags. `klio run --language=+Feature[,+Other]` (and
-   `KLIO_LANGUAGE`) set process-wide parser toggles; the runner passes
-   each test's `LANGUAGE:` directive; `scripts/corpus_check.py` already
-   forwarded `// Run with:` args and the in-process e2e replay now applies
-   `--language=` from that directive too. Found alongside: a name-based
-   `_ = prop` entry still reads its property (the read is its effect), and
-   a one-entry parenthesized group must not take the loop lowering's
-   single-variable fast paths. `nameBasedDestructuring/` 0 → 15 of 15;
-   census 5,477 / 874 / 20. Example `examples/name_based_short_form.kt`.
-
-6. **Corpus syntax gaps** (2026-09-05): a parenthesized callee invoked
-   on a receiver, `recv.(f)(args)`, lowers as `f(recv, args)` (Kotlin's
-   definition, the receiver being the callee's first parameter); an
-   extension property whose receiver is a parenthesized function type
-   (`val (Int.() -> String).baz`), registered under `Function` so a closure
-   receiver finds it; `!!` in prefix position as two negations; `for (…);`
-   as an empty body; `*spread` inside annotation arguments;
-   `suspend context(A) (P) -> R` with the context block after `suspend`.
-   Example `examples/parenthesized_callees_and_receivers.kt`.
-7. **Contextual anonymous functions** (2026-09-05): `context(x: A) fun (…)`
-   keeps its context parameters and binds each from the context stack at
-   entry, as a declared context function does; a local holding one, or
-   declared with a contextual function type, carries the call shape so
-   `f(ctx, arg)` lowers to `CtxCall`; and `CtxCall` passes the contexts
-   positionally when the callee declares every context as a leading
-   parameter (`fun (g: G, n: N)` passed where `context(G) (N) -> R` is
-   expected), the contextual type being that flattened function type. A
-   first cut that desugared the contexts into leading parameters misbound
-   them whenever a context value was in scope at the call. `contextParameters/`
-   25 → 21, `extensionFunctions/` 11 → 9; census 5,506 / 845 / 20. Example
-   `examples/context_anonymous_function.kt`.
-8. **`tailrec` self-calls** (2026-09-05): klio's tailrec lowering jumped on
-   every self-call and only recognized the bare form. Now a self-call is a
-   jump only in tail position — tracked by the lowering: a `return`
-   operand, an expression body, `if`/`when` arms, an elvis or `||`/`&&`
-   right side, an inline splice's body, a Unit body's last statement (or
-   one followed only by a bare `return`); `return 1 + f(x - 1)` recurses
-   and adds — and in every form: an explicit receiver (`(n - 1).f()`,
-   `this@C.f(…)`, an object dispatcher `O.f(…)`; `this@Outer.f(…)` from an
-   inner class names another function), infix (`(this - 1) f x`, the
-   written receiver being the leading parameter), omitted defaults filled
-   in parameter order after the written arguments, named arguments placed
-   by parameter, a local `tailrec` function's body in tail position. A
-   call whose omitted parameter has no default here (an override
-   inheriting one) stays a call. The statically resolved tailrec-to-tailrec
-   `TailCallFunc` emission carries the same tail-position condition.
-   `tailRecursion/` 25 → 44 of 46; census 5,530 / 822 / 19. Example
-   `examples/tailrec_forms.kt`.
-   Verdicts for the two left: `tailrecWithExplicitCompanionObjectDispatcher`
-   is not a tail call for kotlinc either (`C.rec(…)` through the outer
-   class) and needs 100,000 plain frames, klio's evaluation depth cap;
-   `recursiveCallInInlineLambda` is a non-local `return test()` inside a
-   private member `inline fun`'s lambda, which klio calls instead of
-   splicing (an open mechanism, one test).
-
-9. **Bare accessors; enum secondary constructors** (2026-09-05): a
-   property accessor written as its keyword alone (`get` on its own line,
-   `; private set` after the declaration, `lateinit var x: T set`) was
-   left unparsed (5 tests); it now declares the default accessor when
-   nothing follows it on the line. An enum body could not declare
-   secondary constructors (5 tests); they parse after the entries, and
-   an enum with secondary constructors or a vararg primary parameter
-   builds its entries through the ordinary instantiation path at VM start
-   (the entry's arguments pick the constructor, delegation and bodies run,
-   an entry passing nothing to a vararg gets an empty array), the way
-   entries with bodies already did. Census 5,542 / 810 / 19. Examples
-   `examples/bare_accessors.kt`, `examples/enum_secondary_constructors.kt`.
-   Verdict: `companionBlocksAndExtensions/*` (3 tests) use `companion { }`
-   blocks, not Kotlin syntax klio targets.
-10. **Secondary constructors in class hierarchies** (2026-09-05): a
-   subclass header `class C : A(5)` bound its arguments to the parent's
-   primary parameters whenever the count matched and never ran a parent
-   secondary constructor's body; `runSuperCtorChain` had the selection,
-   delegation, and body logic but only the `super(…)` path reached it. The
-   header chain now resolves a parent's arguments through
-   `expandParentSecondaryThisArgs`: the constructor the arguments fit by
-   count, defaults, and argument type (the secondary wins a same-count tie
-   only when its parameter types fit strictly better), named arguments
-   bound by parameter with gaps filled from defaults in order, `this(…)`
-   delegation feeding the primary, `super(…)` feeding the grandparent, and
-   each chosen body run after that class's initializers in the parents-first
-   pass. Also: a class without a primary constructor dispatches `A()` to a
-   defaulted secondary constructor; `super("0", *x, "4")` parses; an enum
-   class is extensible for dispatch, so `open`/`abstract` members overridden
-   in entry bodies dispatch virtually (`is_enum` on the IR class).
-   `secondaryConstructors/` 18 → 22 of 30, `enum/` 66 → 70 of 95; census
-   5,553 / 799 / 19. Example `examples/parent_secondary_constructors.kt`. Verdicts for the rest of
-   the directory: `varargs.kt` (a vararg secondary constructor needs arity
-   packing in the chooser), `superCallSecondary.kt` (a subclass secondary
-   constructor's `super(…)` runs after the shell's initializers, so the
-   parent body follows the subclass's init blocks), `localClasses.kt`
-   (a local class's init blocks are not registered for its secondary
-   constructor path), `innerClasses*.kt` (an inner class's secondary
-   constructor body cannot see the outer instance), `callFromLocalSubClass`
-   / `clashingDefaultConstructors` (a local subclass loses the field its
-   parent secondary constructor sets), `fieldInitializerOptimization.kt`.
-
-11. **CI red after #10 (2026-09-06), three mechanisms**: (a) the compose
-   examples failed with `unresolved global globalSnapshot`: the header
-   expansion of #10 let `Snapshot`'s `@Deprecated(level = HIDDEN)`
-   secondary `(Int, SnapshotIdSet)` win over the primary because the
-   runtime `snapshotId` arrives Int-tagged and scored better than the
-   `Long` head; the HIDDEN constructor's delegation re-entered the file's
-   `<clinit>`, the initializer deferred silently (`Unbound`), and the reader
-   missed. kotlinc never resolves a HIDDEN/low-priority constructor: header
-   resolution now considers only ordinary secondaries, and an integral
-   value scores equally against any integral head when a same-count
-   secondary is weighed against the primary. `KLIO_TOPPROP_TRACE=1` now
-   names a deferred top-level initializer and its error tag. (b) the e2e
-   in-process route panicked in `sweepFull → freeSmall` on
-   `enum_secondary_constructors`: entries rebuilt through `newInstance` are
-   slab-owned, and the VM-start constructor-arg patch then defined
-   page-allocated strings into them; the patch now skips rebuilt entries and
-   the name preset uses the VM allocator. (c) the compose plugin gate's
-   GC-stress preflight crashed in the marker: `keepalivePushSlice` stores the
-   slice by reference and the expansion pinned lists it then freed; pins
-   now cover only the final argument list. Bisect recipe: a worktree at the
-   last green commit with `kotlin`/`kotlin-klio` symlinked, `zig build
-   klio-harness`, the example on both binaries; then revert one hunk at a
-   time in the worktree. (d) A fourth mechanism sat behind (b): the
-   rebuilt entries were held only in a local array until the loop ended,
-   so an entry's instance was unreachable to the collector while the next
-   entry's header thunks ran user code; under `KLIO_GC_STRESS=1` the first
-   entry's fields were swept and their slots reused (`S.A.sym` read the
-   next entry's string). The rebuilt entry array is installed on the class
-   before any entry is constructed, and the name preset and constructor
-   arguments are pinned until the instance owns them. Bisect recipe for a
-   GC hole: the Debug harness with `KLIO_GC_STRESS=1` on a five-line enum,
-   then `KLIO_GC_GEN=0` / `KLIO_GC_MINOR_STOP=0` to tell a remembered-set
-   hole (vanishes) from an unrooted value (persists). (e) The in-process
-   e2e route still panicked in the program's boundary collection: the
-   "rebuilt" marker field was defined through the patch allocator, which
-   grew the instance's field list with page memory that the sweep later
-   freed through the slab (`freeSmall` on a foreign block reads the
-   0xAA-filled header as a size-class index). A field list is grown only
-   through the instance's own allocator. The CLI never sweeps a
-   still-referenced entry, so only a multi-program process showed it
-   (`KLIO_E2E_FILTER=enum_` on the cached test binary reproduces in 30 s).
-   Verified: e2e CI-shape green, GC-stress preflight green, every box
-   example under `KLIO_GC_STRESS=1` on the Debug harness, census unchanged
-   at 5,553 / 799 / 19, sweep 117/0, unit green. Landed 45b99090.
-   (f) Landing 45b99090 exposed one more in the corpus check:
-   `compose_foundation_lazy` aborted in a stack overflow because
-   `LazyLayoutPrefetchState()` — a class declaring a zero-parameter
-   primary and a deprecated two-default secondary — now reached the
-   secondary (the chooser accepted a defaulted arity) whose delegation
-   re-entered the same call. kotlinc keeps an applicable primary; a class
-   declaring one (`class A()`) is told apart from a class with none
-   (`class A { constructor(x: T = …) }`) by a new `has_primary_ctor` flag
-   carried from the parser through the IR class to the runtime
-   definition, and a defaulted secondary is a candidate only when no
-   primary takes the call.
-
-12. **Adapted callable references (2026-09-06)**: `callableReference/
-   adaptedReferences` sat at 57 of 81. Two mechanisms. (a) A call that
-   omits a trailing vararg after a defaulted parameter (`m(1)` for
-   `fun m(i: Int, s: String = "", vararg t: String)`) packed the padding
-   placeholder into the vararg, so `t` arrived as `[null]` — on the
-   direct-call route, the closure/reference route, and the member route,
-   each of which pads missing slots before packing. An omitted vararg
-   with no default of its own is now the empty typed array at all three
-   padding sites, and a vararg declared with a default takes that
-   default (the first cut regressed `varargWithDefaultValue` by padding
-   before consulting the default). This is what kotlinc's adapted
-   references need: `::foo` for `foo(vararg a: String, result: String =
-   "OK")` used as `() -> String` supplies the empty vararg and the
-   default, bound and unbound alike. (b) A fun interface whose method
-   declares `context(A, …)` parameters dropped the contexts when the
-   SAM-wrapped callable ran; the method's context types are now recorded
-   at lowering beside the receiver registry (`iface_member_ctx_types`,
-   serialized in the image) and `samInstanceDispatch` prepends each
-   context resolved from the call site's context scope. Example
-   `adapted_callable_references`. Subset 57 → 63 of 81; census
-   5,560 / 792 / 19; sweep 117/0; corpus 465/465; unit green. Left in the
-   subset: `varargOverloads` (`(Array<String>) -> Int = ::foo` picks the
-   `vararg Int` overload), `manyDefaultsAndVararg` (a default `= E` after
-   the vararg resolves to `kotlin.math.E` instead of the file's
-   `object E` on the adapted route), the suspend-conversion and
-   inner-constructor shapes, and three context-function shapes — carried
-   into the next clusters.
-
-13. **Annotation instances (2026-09-06)**: `annotations/instances` failed
-   24 of 30 because an instantiated annotation compared by identity. The
-   runtime never knew a class was an annotation: `is_annotation` now
-   travels from the AST through `ir.Class` and the image (format 56) to
-   the runtime definition, and the synthesized-member path serves
-   `equals` (every parameter, arrays by content, floating-point values by
-   bit pattern so NaN equals NaN and 0.0 differs from -0.0), `hashCode`
-   (the sum of `(127 * name.hashCode()) xor value.hashCode()`, arrays
-   hashed by content) and `toString` (`@fqn(name=value, ...)`, nested
-   annotations and arrays inline). The `==` operator's instance route
-   takes the same equality. Example `annotation_instances`. Subset 6 →
-   30 of 30.
-
-14. **Captured locals in super constructor calls (2026-09-06)**:
-   `closures/captureInSuperConstructorCall` failed 15 of 32. Four
-   mechanisms. (a) The anonymous-object path installs the capture SET the
-   member lowerings consult while the local-class path installed only the
-   name slice the bare-name lowering reads, so a lambda inside a local
-   class's method or parent-constructor argument read the captured `o` as
-   a global that exists only while the method runs; `registerClassCaptured`
-   now installs the set for its window (with a take/restore pair), the
-   lambda capture resolver accepts either list, and `visibleNames` lists
-   the captured names so an object expression declared there closes over
-   them. (b) `registerClass` registered the `$super$arg$<i>` thunks
-   without captures and the patch loop covered only the class's own
-   members; a `patchCaptureEntries` helper now covers the thunks and
-   recurses into nested classes on both registration paths. (c)
-   `Local().Inner(k)` failed because the inner-constructor member route
-   only constructed module classes; a runtime-registered inner class now
-   constructs through the class value with `outer` set. (d) An inner
-   class's secondary-constructor delegation arguments and defaults were
-   lowered without the enclosing members and without a receiver slot, so
-   `constructor() : super({ ok })` read `ok` as a global; the thunks now
-   take a leading receiver slot (the enclosing instance for an inner
-   class, like the primary defaults) and see the enclosing member set.
-   Example `captured_locals_in_super_calls`. Subset 17 → 31 of 32.
-   Verdict on the last, `properValueCapturedByClosure2`: `inner class
-   Inner : Outer({ ok })` must read the superclass companion's `ok` (the
-   superclass's static scope is part of the subclass's own scope, inner to
-   the outer instance's members); kotlinc confirmed. Not fixed here: the
-   bare-name lowering ranks the outer instance member first.
-   Known gap outside the corpus: a local class's primary-constructor
-   default that reads a captured local (`class L(x: String = o)`) is not
-   evaluated on the runtime-registered construction route.
-
-15. **Enum static scope (2026-09-06)**: `enum/` failed 23 of 95. Five
-   mechanisms. (a) Inside an enum's methods the entry names are own
-   members, but the companion object, a nested object and an entry body
-   are separate classes whose bare `B` became a field read on their own
-   instance; a bare read that misses on such an instance now resolves to
-   the entry of the enclosing enum (companion link, dotted class name, or
-   the registry's enclosing map), and `entries` reads forward to the enum
-   class the same way. (b) A lambda in an entry's constructor argument
-   (`FOO("O", { FOO.x })`) was lowered as a plain thunk with no scope; the
-   argument thunks now take the enum class as `this` with the enum's
-   visible member names, and the implicit-receiver walk's tail resolves a
-   scoped-getter owner's enclosing enum when no live receiver exists (the
-   entry-body class's lambdas). (c) The parser consumed and dropped the
-   labels of named entry arguments (`B(b = 1, a = 0)`); they are now kept
-   on the entry (and on the synthesized body class's supertype call) and
-   the argument thunks bind by parameter with defaults for the gaps. (d)
-   A body-declaring entry of `enum class Test(vararg xs: Int)` delegated
-   with no arguments and `xs` was absent; the super-constructor chain pads
-   an omitted trailing vararg with the empty typed array like every call
-   route. (e) A body-less enum's `init` blocks and body property
-   initializers never ran: its entries were built at build time and only
-   their fields were patched at start; an enum declaring either now
-   constructs its entries through the ordinary path. (f) The companion
-   of an enum initialized at the first entry's construction, before the
-   other entries had fields (`entries.map { it.symbol }` in the companion
-   read a placeholder); the body-less entries' fields are now patched
-   before any entry body runs, the companion waits while the entries are
-   under construction and initializes right after the last one. An enum
-   without a primary constructor keeps its entry arguments positional for
-   the secondary constructor (the reorder sizes its slots by the larger
-   of the parameter and argument counts). Example `enum_static_scope`.
-   Subset 72 → 82 of 95. Records #13-#15 together: census 5,623 / 729 /
-   19; sweep 117/0; corpus 468/468; unit green.
-   Left in the subset, next: six initialization-order tests
-   (`initEntriesInCompanionObject`, `initEntriesInValueOf`,
-   `enumCompanionInit`, `initEnumAfterObjectAccess`) need kotlinc's
-   lazy class initialization: an enum initializes at its first use, so
-   two enums' side effects interleave with the program's own statements
-   rather than all running at start. Three tests reference an entry from
-   an inner class constructed during that entry's own initialization,
-   and four singles remain.
-
-16. **`provideDelegate` convention (2026-09-06)**:
-   `delegatedProperty/provideDelegate` failed 16 of 24. Three mechanisms.
-   (a) The convention was applied only to class body properties and only
-   when the delegate's own runtime class chain declared the operator, so an
-   extension `provideDelegate` and every local or top-level delegated
-   property never saw it. One host hook now offers `provideDelegate(thisRef,
-   ::p)` to the delegate value through the ordinary member-or-extension
-   dispatch at every creation site — the lowering emits a `$provideDelegate`
-   member call the dispatcher serves with the fallback (only its own
-   dispatch miss keeps the value; a miss raised inside an operator that ran
-   is the initialization failure), the top-level delegate thunk ends with
-   it, and the body-property hook dropped its class-chain gate. (b) The
-   top-level read and write routes dispatched `getValue`/`setValue` only
-   for `Instance`/`PropertyRef` delegates; any delegate value dispatches
-   (a `String` delegate reads through `String.getValue`). (c) A local
-   delegated property called `getValue` at its declaration, which kotlinc
-   never does; the local binds the delegate and every read goes through the
-   delegate read. A property-reference delegate (`by contents::zone`,
-   `by ::top`) forwards every member call to its target, so it is never
-   offered the convention. Example `provide_delegate_convention`. Subset
-   8 → 21 of 24; census 5,647 / 705 / 19; sweep 117/0; corpus 469/469;
-   unit green. Left: a companion's delegated property read through the class
-   (`TestClass.test` returns the raw delegate), a member-extension
-   delegated property, and an extension property whose delegate names a
-   member of the enclosing object.
-
-17. **Callable reference equality (2026-09-06)**: `callableReference/
-    equality` failed 15 of 21. Four mechanisms. (a) Two loads of `::f` are
-    distinct closure records that compared by identity; closures now
-    compare by body function (through the host's closure table) and
-    captures, and a function value loaded from a declaration is marked so
-    the non-capturing-lambda singleton rule leaves `::f === ::f` false. (b)
-    A bound or class-qualified reference (`v::m`, `V::m`, `Foo::ext`) is a
-    `$bound_ref$` synth that compared by identity; its `equals`/`hashCode`
-    now use name, receiver (by `equals`) and adaptation. (c) An adapted
-    reference (fewer parameters through defaults, a vararg spread, a
-    result coerced to Unit) was the raw function value, so every
-    adaptation of a target compared equal; a top-level reference at a
-    function-typed slot whose shape differs now lowers as a forwarding
-    lambda stamped with a reference key (`fqn|arity|heads|unit`) that
-    equality and hashing compare, and a member reference carries the
-    slot's shape on the `MemberRef` instruction so the runtime stamps the
-    synth when the shape differs from the member's signature (a vararg
-    slot expecting the array itself is not an adaptation). The Unit mask
-    the call lowering computes for lambda arguments now covers reference
-    arguments too. (d) `equals`/`hashCode` called on a closure or property
-    reference resolved to the string builtins; they follow reference
-    equality, and a property reference equals another to the same
-    property. The first cut compared two distinct lambda objects with the
-    same body and equal captures as equal, which broke compose's remember
-    keys (three test classes); Kotlin reserves structural equality for
-    non-capturing literals and function references, so a capturing literal
-    keeps identity for `==` and `hashCode`. Example
-    `callable_reference_equality`. Subset 6 → 16 of 21;
-    census 5,665 / 687 / 19; sweep 117/0; corpus 470/470; unit green.
-    Left: suspend conversion (a `suspend` function-typed slot is not a
-    visible expectation at the reference site; 2), a vararg-as-array
-    member reference in a receiver-form slot, a Unit coercion combined
-    with a vararg spread, and a companion member reference.
-    CI after #16/#17 (compose plugin commontest 1385 → 1373): binding a
-    delegated local to its delegate exposed three routes that read the
-    plain binding: a bare call of the local (`handler()` for `val handler
-    by rememberUpdatedState(f)`) invoked the delegate object, a read inside
-    an anonymous object's method saw the delegate as an ordinary anonymous
-    capture, and an anonymous object's body property initialized from the
-    bare name took the captured value through the runtime's
-    literal-initializer shortcut. All three now read through the delegate
-    (example `delegated_local_calls`); `CompositionReusingTests` 25/25 and
-    `rememberObserverThrashing` pass again. The shard's other named
-    failures (`validatePotentialDeadlock`, the `concurrentMixingWriteApply`
-    pair) are the itest's documented allowed failures.
-
-18. **IEEE 754 comparisons (2026-09-06)**: `ieee754` failed 16 of 39. Four
-    mechanisms, all static-type-directed. (a) A smart cast (`x is Double
-    && x == y` on an `Any` local) narrows the local for the branch, but the
-    `==` lowering consulted only the local's declared-`Any` record and
-    emitted the boxed comparison, so `-0.0 == 0.0` was false and `NaN ==
-    NaN` true after the cast; a numeric narrowing now makes the operand
-    primitive, and a Double meets a Float as a Double at runtime (the
-    scalar arm promotes for the ordering and IEEE equality operators
-    only). (b) `Double.equals`/`Float.equals` as member calls compared
-    with the IEEE operator; they compare the boxed representation. (c) A
-    value read through `Comparable<Double>` (a cast or a parameter declared
-    so) orders by `compareTo` and compares by `equals`. (d) `Int`/`Long`
-    `compareTo` with a floating argument, and `Float.compareTo` with a
-    Double, convert to Double and follow the total order (`0.compareTo(
-    -0.0) == 1`, `compareTo(NaN) == -1`). Example `ieee754_comparisons`.
-    Subset 23 → 36 of 39; census 5,695 / 657 / 19; sweep 117/0; corpus
-    472/472; unit green. Left: generic and reified `Comparable` receivers
-    inside inline functions, an unstable smart cast (`var`) on NaN, and a
-    smart cast with numeric promotion between integer and floating types.
-
-19. **Typealiases (2026-09-06, partial)**: `typealias` failed 14 of 28.
-    (a) A `typealias` to a class was not a class name to the class pick, so
-    a generic alias constructor (`ST("a", 1)`), an alias of a companion
-    (`Alias.result`) and an alias in a supertype call were unresolved
-    references; the pick now follows an alias to its target's class head,
-    resolved in the reference's own scope (a bare simple-name lookup
-    across packs let kotlinx's `Node` alias answer other `Node`s and broke
-    every coroutine example).
-    (b) A `typealias` declared in a class body parsed as a member but was
-    never registered; it registers under `Owner.Alias` and the bare name
-    with its target resolved in the class's scope. (c) A member call
-    through an alias to an inner class (`c.TA()`) constructs the aliased
-    class. Subset 14 → 15 of 28; census 5,696 / 656 / 19; sweep 117/0;
-    corpus 472/472; compose plugin 1389 (baseline 1385); unit and e2e
-    green. Left: explicit type arguments on an alias
-    call reaching the constructor as values, alias targets inside a class
-    body from a method, an alias of a companion as a value, aliases in
-    anonymous object types and super calls, and alias-typed extension
-    functions.
-
-20. **Context parameters (2026-09-06, surveyed)**: `contextParameters`
-    fails 21 of its files across several mechanisms, each under five: a
-    named argument naming a CONTEXT parameter on a member with context and
-    no-context overloads (`c.foo(scope = scope)`: the member picker does not
-    count context parameters); a context parameter shadowed by the
-    extension receiver's same-named member (`context(a: X) fun X.f() =
-    a.foo()` reads the receiver's `a`); a companion object as a context
-    value; a context parameter used as another parameter's default; and
-    an outer inline receiver splice's subject not feeding a contextual
-    callee's context (`with("c1") { with(listOf("c2")) { test(...) } }`
-    binds only the inner subject — the fused tier's chain window seeds the
-    callee with the in-flight pushes above its base, and the outer subject
-    sits below it). Carried as verdicts; no single mechanism reaches five.
-
-21. **Inline classes (2026-09-06, surveyed)**: `inlineClasses` fails 17.
-    Six share one shape: `zs.contains(object {} as Any)` on a value class
-    implementing `Collection<Z>` must bind the `Iterable<T>.contains`
-    extension (the member `contains(element: Z)` is inapplicable to an
-    `Any` argument); klio dispatches the member at runtime. Landed the
-    static half: an argument written `as Any` is inapplicable to a
-    parameter of concrete class type (`ArgShape.cast_any`), and the
-    member-syntax lowering then tries the extension. Left: the extension
-    resolver rejects `Iterable<T>.contains` because `T` bound from the
-    receiver (`Z`) conflicts with the `Any` argument; kotlinc unifies `T`
-    to the common supertype `Any`. The rest are pairs: `super.hashCode()`
-    on a value class, mangled SAM wrappers, constructor references with
-    inline-class parameters, `swap` on `UIntArray`.
-
-22. **Constructor references (2026-09-06)**: `::A` naming a local class
-    lowered to a property reference of the name (the local class's
-    declaration binds the class value under the name; the reference now
-    loads it, and a call constructs). `Outer::Inner` for an inner class is
-    the unbound form taking the outer instance as its first argument; the
-    invocation appended it to the constructor's own parameters
-    (`Inner() expects 0 args, got 1`); it now constructs through the outer
-    exactly as `outer.Inner(...)`, and the bound form `outer::Inner` keeps
-    its receiver instead of degrading to the bare class value. Example
-    `constructor_references`. `callableReference/function` 74 → 78 of 90,
-    `inlineClasses/callableReferences` 54 → 56 of 56; census 5,706 / 648 /
-    17; sweep 117/0; corpus 473/473; unit green.
-
-23. **Reified `typeOf` (2026-09-06)**: `typeErasure` failed 12 of 24, ten
-    of them `inline fun <reified T> foo(a: T) = typeOf<T>()` compared
-    against `typeOf<X>()`. Two mechanisms. (a) `typeOf<T>()` yielded
-    synthetic `KType` instances that compared by identity, so even
-    `typeOf<String>() == typeOf<String>()` was false; a `KType` now
-    compares by classifier, arguments and nullability, hashes
-    consistently, and renders as the qualified type. (b) A reified
-    parameter unified against a bare local argument consulted only splice
-    parameter types, binding `T` to the runtime class; a caller local with
-    a declared type binds the static type (`val n: Number` → `T :=
-    Number`) with its type arguments intact (a local typed `List<Level>`
-    binds `List<Level>`, never bare `List`, which turned a
-    `serializer<T>()` into a polymorphic `List` lookup), and a nullable
-    bound spells its `?`. Example
-    `reified_type_of`. Subset 12 → 21 of 24. Left: a local declared
-    `Any?` reaches the binder as `Any` (its nullability record is not
-    visible at the unification site), and two context-parameter shapes.
-
- Log
-
-- 2026-09-05: opened.
-- 2026-09-05: Task 1 populated; Task 2 runner written (`box_support.zig`,
-  `box_conformance.zig`, `klio-census box`); Task 3 first census recorded
-  above and the ratchet set; battery green with the suite (948 s).
-- 2026-09-05: Task 4 #1 destructuring forms landed: 5409 / 942.
-- 2026-09-05: Task 4 #2 explicit primitive rangeTo + #3 invoked lambda
-  arguments landed: 5440 / 911.
-- 2026-09-05: Task 4 #4 enum entries with bodies landed: 5461 / 890.
-- 2026-09-05: Task 4 #5 language feature flags + name-based short form
-  landed: 5477 / 874.
-- 2026-09-05: Task 4 #6 corpus syntax gaps + #7 contextual anonymous
-  functions landed: 5506 / 845.
-- 2026-09-05: Task 4 #8 tailrec self-calls landed: 5530 / 822.
-- 2026-09-05: Task 4 #9 bare accessors + enum secondary constructors
-  landed: 5542 / 810.
-- 2026-09-05: Task 4 #10 parent secondary constructors + enum virtual
-  dispatch landed: 5553 / 799.
-- 2026-09-06: Task 4 #12 adapted callable references landed: 5560 / 792.
-- 2026-09-06: Task 4 #13 annotation instances, #14 captured locals in
-  super constructor calls, #15 enum static scope landed: 5623 / 729.
-- 2026-09-06: Task 4 #16 provideDelegate convention landed: 5647 / 705.
-- 2026-09-06: Task 4 #17 callable reference equality landed: 5665 / 687.
-- 2026-09-06: Task 4 #18 IEEE 754 comparisons landed: 5695 / 657.
-- 2026-09-06: capturing-lambda identity restored, #19 typealias partial: 5696 / 656.
-- 2026-09-06: Task 4 #22 constructor references + explicit-Any applicability landed: 5706 / 648.
-24. **Ranges: `in` resolution and progression arithmetic (2026-09-06)**:
-    `ranges/` failed 31 with 6 more crashing. Five mechanisms. (a) `x in
-    lo..hi` evaluated the element before the bounds and compared
-    numerically whatever the operand types; it now lowers as the desugared
-    `(lo..hi).contains(x)` member call (bounds first), keeping the scalar
-    compare only for provably non-null numeric operands with no user
-    `rangeTo`/`contains` declared. (b) A range's `contains` served every
-    argument as its own member; the member takes only the element kind,
-    and any other argument (a Long on an Int range, a String) goes to the
-    extension tiers, where a null element reads false and the Range value's
-    element kind decides between `ClosedRange<Int>` and `ClosedRange<UInt>`
-    twins. (c) A virtual call on a builtin receiver dropped its slot's
-    owner, so the stdlib's `(this as ClosedRange<Int>).contains(value)`
-    re-bound the `IntRange` twin and recursed; the slot owner is now the
-    declared receiver. (d) Unsigned `contains` on a host route took
-    `min/max` of the bounds, reading an empty `3u..1u` as `1u..3u`. (e) The
-    progression last element and the `contains` alignment test overflowed
-    i64 (`MIN..MAX step MAX`, ULong bounds above `Long.MAX_VALUE`); both
-    now run in the unsigned/widened domain, and the ULong iterator wraps
-    unsigned. Example `range_contains_resolution`. Subset 784 → 818 of 821.
-    Left (verdict): `inComparableRange` and `forInCharSequenceWithCustomIterator`
-    pick an extension by the runtime receiver where kotlinc binds by the
-    static type inside a generic or supertype-typed body (the same
-    static-receiver tower as #20's nested subjects), and
-    `inDoubleRangeLiteralVsComparableRangeLiteral` needs a `Comparable`-typed
-    `..` to build a `ComparableRange` rather than a numeric range.
-
-- 2026-09-06: Task 4 #23 KType structural equality + reified binding from a local's declared type landed: 5716 / 638.
-- 2026-09-06: Task 4 #24 ranges (`in` desugar, extension `contains`, progression arithmetic) landed: 5751 / 609.
+- contextParameters (21): five mechanisms, each under five: a named
+  argument naming a context parameter on a member with context and
+  no-context overloads; a context parameter shadowed by the extension
+  receiver's same-named member; a companion object as a context value; a
+  context parameter used as another parameter's default; an outer inline
+  receiver splice's subject not feeding a contextual callee's context
+  (the fused tier's chain window seeds from the in-flight pushes above
+  its base).
+- inlineClasses `zs.contains(object {} as Any)` (six files): the static
+  half landed (an explicit `as Any` argument is inapplicable to a
+  concrete parameter); the extension resolver still rejects
+  `Iterable<T>.contains` because `T` bound from the receiver conflicts
+  with the `Any` argument where kotlinc unifies to `Any`.
+- ranges (3): `inComparableRange` and
+  `forInCharSequenceWithCustomIterator` pick an extension by the runtime
+  receiver where kotlinc binds by the static type inside a generic or
+  supertype-typed body; `inDoubleRangeLiteralVsComparableRangeLiteral`
+  needs a `Comparable`-typed `..` to build a `ComparableRange`.
+- typeErasure (3): a local declared `Any?` reaches the reified binder as
+  `Any` (its nullability record is not visible at the unification site);
+  two context-parameter shapes.

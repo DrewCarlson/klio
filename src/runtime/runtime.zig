@@ -41,7 +41,7 @@ pub const envSetOnce = objcell.envSetOnce;
 pub const perf = @import("perf.zig");
 pub const AllocChoice = perf.AllocChoice;
 pub const allocChoice = perf.allocChoice;
-// Tracing GC (KGC) — see gc.zig / plans/GC.md.
+// Tracing GC (KGC) — see gc.zig / docs/design/GC.md.
 pub const gc = objcell.gc;
 // Page-returning slab allocator for the GC backend (keeps RSS tracking the
 // live set; smp/libc free-lists never return reclaimed pages to the OS).

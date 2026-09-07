@@ -467,7 +467,7 @@ var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 /// The suite registry: ONE source of truth for every commontest census
 /// config, consumed by the itest gates (CI authority) AND the link-free
 /// `klio-census` driver (`zig build klio-census`; iteration path per
-/// plans/verification-latency-campaign.md Task 2). Floors/ceilings are
+/// plans/verification-latency-campaign.md (git history) Task 2). Floors/ceilings are
 /// the ratchets — tighten only.
 pub const suites = [_]Config{
     .{
@@ -539,7 +539,7 @@ pub const suites = [_]Config{
     .{
         // Upstream kotlinx-serialization's JSON suite against the real
         // upstream json module + klio's generated serializers. First
-        // count 2026-09-02: see plans/serialization-surface-campaign.md.
+        // count 2026-09-02: see plans/serialization-surface-campaign.md (git history).
         .name = "serialization_json",
         .test_roots = &.{"kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-tests/commonTest/src"},
         .scratch_home = "/tmp/klio_itest_serialization_json_home",
@@ -637,7 +637,7 @@ pub const suites = [_]Config{
         // ui-util / ui-geometry / ui-unit / ui-graphics / ui-text / ui) run
         // against the installed ui packs. Kruth's assertion surface is a
         // klio-authored stand-in under tests/compose_ui_commontest_actuals.
-        // First count 2026-09-02: see plans/compose-ui-census-campaign.md.
+        // First count 2026-09-02: see plans/compose-ui-census-campaign.md (git history).
         .name = "compose_ui",
         .test_roots = &.{
             "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-util/src/commonTest/kotlin",

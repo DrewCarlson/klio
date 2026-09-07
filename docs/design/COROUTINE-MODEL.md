@@ -168,7 +168,7 @@ are the implementation notes behind these verdicts.
     bug distinct from the writeback fix.
   - **Shared root for `combine` (and the family): a suspend lambda's captured function-typed
     param mis-resolves to a co-captured `this@<ext>` value.** Minimal repro
-    `plans/repros/combine_captured_param_typeparam_cast.kt` (cap14): a `flow { helper(arrayOf(
+    `docs/design/repros/combine_captured_param_typeparam_cast.kt` (cap14): a `flow { helper(arrayOf(
     this@combineX, flow), …) { emit(transform(it[0] as T1, it[1] as T2)) } }` where the trailing
     suspend lambda is invoked inside `helper` (a foreign suspend frame). The bare `transform`
     (combineX's captured param) is invoked on `this@combineX` (a SafeFlow) → `invoke on SafeFlow`.

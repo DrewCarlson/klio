@@ -10,7 +10,7 @@
 //!
 //! Memory is freed by REACHABILITY, not by reference counts, so a missing
 //! retain or an extra release is harmless and cycles are collected. See
-//! `plans/GC.md` for the full design and the adversarial root-completeness
+//! `docs/design/GC.md` for the full design and the adversarial root-completeness
 //! analysis this implements.
 
 const std = @import("std");

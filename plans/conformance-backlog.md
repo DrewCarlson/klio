@@ -1,115 +1,46 @@
-# Conformance backlog — after the green-main work
+# Conformance backlog
 
-Register for the next block of work, in stage order. Each stage's exit
-conditions must be met before the next begins; the owning documents carry
-the task detail and their own logs.
+The active plan (register: `open-campaigns.md`). Stages run in order and
+each stage's exit conditions are met before the next begins. Stage 1 (the
+battery as the whole local gate) closed 2026-09-05; Stage 2 Tasks 1-3 (the
+box corpus populated, the runner, the first census and ratchet, the CI
+shard) closed 2026-09-05. The log of what landed is git history.
 
-Opened 2026-09-05 after `green-main-backlog.md` closed (CI green at
-d0d1541d, every census at baseline, every compute floor classified).
+## Stage 2 — Task 4: root-fix the box corpus by cluster
 
-## Stage 1 — the battery is the whole gate (`verification-speed-plan.md`)
+Owner: `kotlinc-box-conformance.md`. State 2026-09-07: census 5751 / 609 /
+11, ratchet 5751 / 609, 43 clusters of five or more remain (listed there).
 
-1. Fold the stdlib sweep into `scripts/stack.sh` (the example corpus was
-   already there as `itest-check_examples`, and the litmus runs last);
-   make `corpus_check.py` refuse the shared data home by default. Exit: one
-   `stack.sh` run is the whole local gate, its wall recorded (977 s
-   before).
+Left: fix every cluster of five or more or record its verdict, each fix
+shipping an `examples/` program, its `.out`, and a README row, matching
+kotlinc exactly and never by editing the corpus; ratchet after every
+landed batch; write the residue list (clusters under five) as the seed of
+the next campaign.
 
-## Stage 2 — kotlinc box-test conformance (`kotlinc-box-conformance.md`)
+Exit: no cluster of five or more without a fix or a verdict; the residue
+list written; the ratchet at the final census; CI green.
 
-2. Populate `compiler/testData/codegen/box` (+ helpers) in the sparse
-   `kotlin` checkout, locally and on CI.
-3. The `box` census runner: directive parser, `FILE:` splitting,
-   directive-based selection with counted exclusion reasons, synthesized
-   `main` asserting `"OK"`, per-directory batching, named failures.
-4. First full census recorded; baseline ratcheted with `MAX_FAILED 0`;
-   suite standing in `stack.sh` and a CI shard with a measured weight.
-5. Root-fix by cluster until every cluster of size ≥ 5 is fixed or carries
-   a verdict; each fix with an `examples/` program, its `.out`, and a
-   README row. Exit: the residue list is written as the seed of the next
-   campaign.
+## Stage 3 — the verification tier's allocation fill
 
-## Stage 3 — the verification tier's allocation fill (`safe-tier-allocation-fill.md`)
+Owner: `safe-tier-allocation-fill.md`. Not started.
 
-6. Measure the ReleaseSafe/ReleaseFast census ratio, list what the safe
-   tier has caught, decide (take the fill off hot containers / run
-   children on the fast harness with canaries / keep and record), and land
-   the decision with before/after CI walls. Exit: the decision and its
-   numbers in the record.
+Left: measure the ReleaseSafe/ReleaseFast census ratio on three suites;
+list what the safe tier has caught, with commit ids; decide among taking
+the fill off the hot containers, running census children on the fast
+harness with a canary per shard, or keeping the tier with its price
+recorded; land the decision with before/after CI walls.
 
-## Not in this plan
+Exit: the decision and its numbers in that record.
 
-- kotlinx-io pack actuals (`SegmentPool`, `isWindows`, line separator) —
-  `LANGUAGE-GAPS.md` "Pack-actual residuals"; reopen when a kotlinx-io
-  path contends.
-- Base-image reuse across load modes for `differential` — `LAZY-IMAGE.md`.
-- Widening `kl_` leaf eligibility — `c-transpiler-plan.md`; needs a real
-  program that misses it.
+## Rules that hold throughout
 
-## Register
+Root cause only, never a symptom hidden or a test edited; verify with the
+playbook (`docs/development/verification-playbook.md`); the whole battery
+once per stage plus e2e, pinned parity and the CLI corpus before a push;
+CI green on every push; commits straight to `main`; this file and the
+register updated as each stage closes.
 
-Listed as the active plan in `open-campaigns.md`. Close this document when
-Stages 1-3 have their exit conditions met and the register's "active plan"
-moves on.
+## Close
 
-## Log
-
-- 2026-09-05: opened; the owning documents carry the task detail.
-- 2026-09-06: Stage 2 Task 4 #24 ranges (`in` desugars to `contains` with bounds
-  first; range `contains` member takes only its element kind, other arguments go
-  to extensions with the file's own declaration outranking the stdlib; virtual
-  calls on builtin receivers carry the slot owner as declared receiver; unsigned
-  and full-width progression math): ranges 784 → 818 of 821; example
-  `range_contains_resolution`; census 5751 / 609. CI regression from #23 (a declared type spelled
-  with the enclosing function's own type parameter bound the inner reified `T`
-  to bare `T`: 20 coroutine `combine` tests, one pinned parity fixture) root-fixed
-  in the same push.
-- 2026-09-06: Stage 2 Task 4 #23 typeErasure (KType structural equality; a
-  reified parameter binds from a local's declared type): census 5716 / 638;
-  typeErasure 12 → 21 of 24; example `reified_type_of`.
-- 2026-09-06: Stage 2 Task 4 #22 constructor references (local and inner
-  classes) and the explicit-`Any` static applicability rule; verdicts
-  recorded for context parameters (#20) and the inline-class survey (#21).
-- 2026-09-06: closure equality regression (compose remember keys) fixed:
-  capturing lambdas keep identity; Task 4 #19 typealias partial (1):
-  census 5,696 / 656 / 19; compose plugin lane 1389.
-- 2026-09-06: Stage 2 Task 4 #18 IEEE 754 comparisons (13): census
-  5,695 / 657 / 19.
-- 2026-09-06: CI red on 697a9ad6/1b171137 (compose plugin shard): delegated
-  locals read the plain binding on three routes (bare call, anonymous
-  capture, initializer shortcut); root-fixed, record #17 addendum.
-- 2026-09-06: Stage 2 Task 4 #17 callable reference equality (10):
-  census 5,665 / 687 / 19.
-- 2026-09-06: Stage 2 Task 4 #16 `provideDelegate` convention (13):
-  census 5,647 / 705 / 19.
-- 2026-09-06: Stage 2 Task 4 #13-#15 annotation instances (24), captured
-  locals in super constructor calls (14), enum static scope and
-  initialization (10): records in `kotlinc-box-conformance.md`.
-- 2026-09-06: Stage 2 Task 4 #12 adapted callable references (omitted
-  varargs empty on every call route, SAM methods pass their context
-  parameters): census 5,560 / 792 / 19, sweep 117/0, corpus 465/465.
-- 2026-09-06: CI red on a8a753a3/84e43df9 (shards 0 and 5): five mechanisms
-  root-fixed in 45b99090 (hidden secondary constructors in header resolution,
-  keepalive slices freed under the marker, entries unreachable between
-  constructions, page-allocated name preset, marker field grown through the
-  patch allocator); record #11 in `kotlinc-box-conformance.md`.
-- 2026-09-05: Stage 2 Task 4 in progress — ten cluster fixes landed
-  (destructuring forms, explicit primitive rangeTo, invoked lambda
-  arguments, enum entry bodies as subclasses, language feature flags and
-  the name-based short form, corpus syntax gaps, contextual anonymous
-  functions, tailrec in every form, bare accessors and enum secondary
-  constructors, parent secondary constructors and enum virtual dispatch):
-  census 5,246 / 1,105 → 5,553 / 799 / 19. Records and verdicts in
-  `kotlinc-box-conformance.md`.
-- 2026-09-05: Stage 2 Tasks 1-3 landed (b5e42fd8) — corpus populated locally
-  and on CI, `box_support.zig` runner + `box_conformance` itest +
-  `klio-census box`, first census 5,246 / 1,105 / 20 of 6,371 selected
-  (980 excluded by directive), ratchet 5246 / 1105, shard weight 35,
-  stack.sh wave 2 (battery 948 s with the suite at 4 workers; the runner
-  now takes `KLIO_BOX_JOBS`, 12 in stack.sh). Task 4 (root-fix by
-  cluster) next.
-- 2026-09-05: Stage 1 landed — `stack.sh` runs the stdlib sweep after the
-  census waves and scrapes its zero-failure line into the verdict;
-  `corpus_check.py` refuses an unset or shared `KLIO_HOME` unless
-  `--allow-shared-home`; `quick-gate.sh` passes the local home. Battery
-  728 s, every suite at baseline, sweep 117/0.
+Close this document, and move the register's active plan on, when Stages
+2 and 3 have their exit conditions met.

@@ -2,7 +2,7 @@
 //! tree-walker's per-instruction union dispatch for the hot simple ops,
 //! with an ESCAPE op executing everything else through the walker's own
 //! `execInst` — total coverage, shared semantics (see the frozen v1 spec
-//! in plans/bytecode-vm-plan.md). Always on; it
+//! in plans/bytecode-vm-plan.md (git history)). Always on; it
 //! the pure walker.
 //!
 //! FUSED terminators: a function with no try/catch/finally metadata
@@ -437,7 +437,7 @@ test "stream encoding: an all-escape block builds no stream unfused" {
 }
 
 /// Human-readable decode of one block's stream — the decoder half of the C
-/// transpiler's emitter (`plans/c-transpiler-plan.md` stage 2): the emitter
+/// transpiler's emitter (`plans/c-transpiler-plan.md (git history)` stage 2): the emitter
 /// walks exactly these (op, operands) tuples and emits C statements instead
 /// of text lines.
 pub fn dumpStream(w: anytype, s: *const Stream) !void {

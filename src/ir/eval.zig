@@ -8059,7 +8059,7 @@ inline fn writeFastU(frame: *Frame, r: Reg, v: Value, allocator: Allocator) void
     if (runtime.reclaimEnabled()) old.release(allocator);
 }
 
-/// The C transpiler's native-function surface (plans/c-transpiler-plan.md
+/// The C transpiler's native-function surface (plans/c-transpiler-plan.md (git history)
 /// stage 2). A transpiled program registers per-fid C functions before the
 /// run starts; the frame loop then executes a registered function's blocks
 /// through the emitted C instead of the bytecode stream. The C code never
