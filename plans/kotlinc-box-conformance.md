@@ -6,7 +6,7 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-07, a1f95fb5)
+## State (2026-09-07, 94104fbd, CI green)
 
 Census 5951 passed / 398 failed / 8 did not complete (994 excluded: the
 runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
@@ -48,7 +48,7 @@ name, mixed Char comparisons, collection type-check bridges,
   stdlib sweep does not cover the coroutines census or the pinned parity
   corpus, and both have caught lowering regressions the sweep passed.
 
-## Left: clusters of five or more (2026-09-07 census, a1f95fb5)
+## Left: clusters of five or more (2026-09-07 census, a1f95fb5; CI green at 94104fbd)
 
 Fix each, or record a verdict here, until none remains; then write the
 residue list (every cluster under five) as the seed of the next campaign.
