@@ -185,9 +185,10 @@ residue list (every cluster under five) as the seed of the next campaign.
   (`field++` inside a getter), `privatePropertyInConstructor` (a private
   constructor property shadowed by a subclass's same-named property; the
   instance's field storage is keyed by name alone).
-- operatorConventions (5): `augmentedAssignmentWithArrayLHS` and
-  `reassignmentLhsCaching` need the receiver and index expressions of an
-  indexed compound assignment evaluated once (the member form is done);
+- operatorConventions (3 left): the lvalue-caching mechanism landed (a
+  member target's receiver is evaluated before the value; an indexed
+  target's receiver and indices are evaluated once for the read and the
+  write; a prefix increment's value is a fresh read); the rest are
   `infixFunctionOverBuiltinMember`, `kt14201_2`, `kt4987` (verdict above).
 - inline (6): local `inline` extension functions used inside lambdas
   (`localInlineExtensionFunction`, `localInlineFunctionComplex`),
