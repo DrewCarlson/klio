@@ -3018,6 +3018,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
                 defer mg.deinit();
                 return self.callFunc(allocator, mg.get(), fid, effective.items);
             }
+            if (try companionInvoke(self, allocator, class_def, effective.items)) |r| return r;
         }
     }
 
@@ -3123,19 +3124,7 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
                 }
             }
         }
-        // The companion's `operator fun invoke` is the call's target when
-        // neither a constructor nor a same-named function fits: `A(42)`
-        // beside `class A { companion object { operator fun invoke(i: Int) } }`.
-        {
-            const cls_val = Value{ .Class = class_def };
-            if (try host_fields.companionOfClassValue(self, &cls_val)) |comp| {
-                if (comp == .Instance) {
-                    const r = try host_call_member.callMember(self, allocator, &comp, "invoke", effective.items);
-                    if (!host_call_member.isDispatchMissFor(r, "invoke")) return r;
-                    host_call_member.freeDispatchMiss(allocator, r);
-                }
-            }
-        }
+        if (try companionInvoke(self, allocator, class_def, effective.items)) |r| return r;
         if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
             std.debug.print("[ctor-arity-miss] class={s} fqn={s} n_primary={d} got={d}\n", .{ class_name, classDefFqn(class_def), n_primary, effective.items.len });
             ir.eval.dumpFrameChainForDiagAlways();
@@ -3346,6 +3335,20 @@ fn padParentCtorDefaults(
         try args.append(allocator, v);
     }
     return .{ .ok = {} };
+}
+
+/// The companion's `operator fun invoke` is a constructor-shaped call's
+/// target when neither a constructor nor a same-named function fits:
+/// `A(42)` beside `class A { companion object { operator fun invoke(i: Int) } }`.
+/// Null when the class has no companion or the companion's `invoke` misses.
+fn companionInvoke(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), args: []const Value) Allocator.Error!?EvalResult {
+    const cls_val = Value{ .Class = class_def };
+    const comp = (try host_fields.companionOfClassValue(self, &cls_val)) orelse return null;
+    if (comp != .Instance) return null;
+    const r = try host_call_member.callMember(self, allocator, &comp, "invoke", args);
+    if (!host_call_member.isDispatchMissFor(r, "invoke")) return r;
+    host_call_member.freeDispatchMiss(allocator, r);
+    return null;
 }
 
 /// Among same-named factory overloads pick the best applicable declaration.
