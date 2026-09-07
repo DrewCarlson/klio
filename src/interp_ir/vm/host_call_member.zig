@@ -5638,9 +5638,50 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             if (pr == .ok and (isCallable(&pr.ok) or pr.ok == .Instance)) {
                 return callValueRec(self, allocator, &pr.ok, args);
             }
+        } else if (!hostHasMember(self, receiver, name) and host_fields.extPropDeclaredCallable(self, allocator, receiver, name)) {
+            // An EXTENSION property holding a callable (`val A.h: A.(String)
+            // -> String`) invoked as `a.h(recv, s)`: read it and invoke;
+            // a receiver-typed value takes its receiver as the first
+            // argument.
+            const pr = try host_fields.getField(self, allocator, receiver, name);
+            if (pr == .ok and (isCallable(&pr.ok) or pr.ok == .Instance)) {
+                return callValueRec(self, allocator, &pr.ok, args);
+            }
         }
     }
 
+    // A TOP-LEVEL property holding a receiver-callable (`val x: A.(A.() ->
+    // String) -> String`) invoked as `a.x(lambda)`: with no member or
+    // function of the name, the call is `x.invoke(a, lambda)`.
+    if (receiver.* == .Instance and !hostHasMember(self, receiver, name) and blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        const mod = mg.get();
+        if (mod.funcsBySimpleName(name).len != 0) break :blk false;
+        // A stored value costs nothing to read; a custom getter runs only
+        // when its declared type is callable.
+        if (host_globals.lookupGlobal(self, name) != null) break :blk true;
+        const getter = mod.registry.top_level_prop_getters.get(name) orelse break :blk false;
+        const gf = mod.funcById(getter) orelse break :blk false;
+        break :blk host_fields.declaredTypeIsCallable(mod, &gf.return_ty);
+    }) {
+        if (try topLevelPropertyGet(self, allocator, name)) |pr| {
+            if (pr == .ok and pr.ok == .IrClosure) {
+                const has_recv = if (self.closures.get(@intCast(pr.ok.IrClosure.id))) |info| info.has_receiver else false;
+                if (has_recv) return try host_call_value.callValueWithThis(self, allocator, &pr.ok, receiver, args, &.{});
+            }
+        }
+    }
+    // An extension property on a BUILTIN receiver holding a callable
+    // (`val String.o: String.() -> String by …`, called `"x".o("y")`).
+    if (receiver.* != .Instance and receiver.* != .Class and receiver.* != .Null and
+        host_fields.extPropDeclaredCallable(self, allocator, receiver, name))
+    {
+        const pr = try host_fields.getField(self, allocator, receiver, name);
+        if (pr == .ok and (isCallable(&pr.ok) or pr.ok == .Instance)) {
+            return callValueRec(self, allocator, &pr.ok, args);
+        }
+    }
     // Extension-function-typed member invoked with an explicit receiver.
     if (try enclosingCallableProperty(self, allocator, name)) |v| {
         // `invoke_callable_with_this` overrides the callable's captured
@@ -7212,6 +7253,7 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     if (rc == null or n_str == null) return null;
     const recv_capt = rc.?;
     const n = n_str.?;
+    if (runtime.envOnce("KLIO_ERR_TRACE") != null) std.debug.print("[boundref-dispatch] {s} via {s} recv={s} args={d} exact={}\n", .{ n, name, recv_capt.typeFqn(), args.len, exact_func != null });
     if (std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "simpleName")) {
         return null; // handled by get_field
     }
@@ -7309,7 +7351,9 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
         if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and args.len != 0) {
             const first = args[0];
             const rest = args[1..];
-            if (rest.len == 0 and memberIsProperty(self, &first, n)) {
+            if (rest.len == 0 and (memberIsProperty(self, &first, n) or
+                (!host_call_value.extensionFnNamed(self, n) and host_fields.hostHasExtProp(self, allocator, &first, n))))
+            {
                 // getFieldRec returns the field borrowed; this escapes as a
                 // callMember return whose register takes ownership, so retain.
                 var r = try getFieldRec(self, allocator, &first, n);
@@ -11244,8 +11288,19 @@ fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *
         // does not capture `7L.toInt()`; the member does, and the extension's
         // own `this.toInt()` reaches it (rather than calling itself for ever).
         const user_ext_shadows = try userToplevelExtShadows(self, allocator, receiver, name, args);
+        // A member is applicable only at its declared arity: `list[i, j]`
+        // with `operator fun ArrayList<T>.get(i: Int, j: Int)` declared is
+        // the extension's call, never the one-index member's.
+        const decl_owner: []const u8 = if (receiver.* == .Instance) blk: {
+            const g = receiver.Instance.borrow();
+            defer g.deinit();
+            const cg = g.get().class.borrow();
+            defer cg.deinit();
+            break :blk if (cg.get().fqn.len != 0) cg.get().fqn else cg.get().name;
+        } else type_fqn;
+        const member_arity_misfit = user_ext_shadows and memberDeclArityMisfit(self, decl_owner, name, args.len);
         for (probes[0..n], probe_is_member[0..n]) |probe, is_member| {
-            if (user_ext_shadows and !is_member) continue;
+            if (user_ext_shadows and (!is_member or member_arity_misfit)) continue;
             // A member outranks an extension only while its host binding is
             // applicable. Intrinsics whose Kotlin declarations are pruned
             // from the runtime image carry this small predicate alongside
@@ -11708,6 +11763,71 @@ fn userToplevelExtNamedExists(self: *VmHost, allocator: Allocator, receiver: *co
         if (try strictReceiverProven(self, allocator, receiver, fid, &f.params[0].ty)) return true;
     }
     return false;
+}
+
+/// Whether the receiver type declares `name` and none of its declarations
+/// takes `argc` value arguments (defaults and varargs count as taking any
+/// count at or beyond their minimum).
+fn memberDeclArityMisfit(self: *VmHost, type_fqn: []const u8, name: []const u8, argc: usize) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    var decl_buf: [16]FuncId = undefined;
+    var n_decls: usize = 0;
+    // The receiver type's own declarations, else the nearest supertypes'.
+    var stack: [32]ir.ClassId = undefined;
+    var sp: usize = 0;
+    var visited: usize = 0;
+    if (mod.classIdByFqn(type_fqn) orelse mod.classId(type_fqn)) |cid| {
+        stack[sp] = cid;
+        sp += 1;
+    }
+    for (mod.memberDecls(type_fqn, name)) |fid| {
+        if (n_decls < decl_buf.len) {
+            decl_buf[n_decls] = fid;
+            n_decls += 1;
+        }
+    }
+    while (n_decls == 0 and sp > 0 and visited < 64) : (visited += 1) {
+        sp -= 1;
+        const cid = stack[sp];
+        if (cid.int() >= mod.classes.items.len) continue;
+        const c = &mod.classes.items[cid.int()];
+        for (mod.memberDecls(c.fqn, name)) |fid| {
+            if (n_decls < decl_buf.len) {
+                decl_buf[n_decls] = fid;
+                n_decls += 1;
+            }
+        }
+        if (n_decls == 0) {
+            for (c.supertypes) |p| {
+                if (sp < stack.len) {
+                    stack[sp] = p;
+                    sp += 1;
+                }
+            }
+        }
+    }
+    const decls = decl_buf[0..n_decls];
+    if (decls.len == 0) return false;
+    for (decls) |fid| {
+        const f = funcAt(mod, fid) orelse return false;
+        const skip: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+        const value_params = f.params[skip..];
+        var min: usize = 0;
+        var open = false;
+        for (value_params) |*p| {
+            if (p.is_vararg) {
+                open = true;
+            } else if (!p.has_default) {
+                min += 1;
+            }
+        }
+        if (argc == value_params.len) return false;
+        if (open and argc >= min) return false;
+        if (argc >= min and argc <= value_params.len) return false;
+    }
+    return true;
 }
 
 fn userToplevelExtShadows(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!bool {

@@ -506,6 +506,18 @@ fn rselTraceOn() bool {
     return rsel_trace_on;
 }
 
+/// Whether any declaration named `name` is an extension function (a
+/// reference to the name then denotes a function, never a property).
+pub fn extensionFnNamed(self: *VmHost, name: []const u8) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    for (mg.get().funcsBySimpleName(name)) |fid| {
+        const f = mg.get().funcById(fid) orelse continue;
+        if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return true;
+    }
+    return false;
+}
+
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
     // A captured-and-written local is BOXED into a shared cell at its binding
     // site, so a function-typed one arrives here as the cell, not the closure.
@@ -613,7 +625,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             if (type_like and args.len != 0) {
                 const first = args[0];
                 const rest = args[1..];
-                if (rest.len == 0 and root.memberIsProperty(allocator, &self.classes, &first, name)) {
+                if (rest.len == 0 and (root.memberIsProperty(allocator, &self.classes, &first, name) or
+                    (!extensionFnNamed(self, name) and host_fields.hostHasExtProp(self, allocator, &first, name))))
+                {
                     return host_fields.getField(self, allocator, &first, name);
                 }
                 const mr = try host_call_member.callMemberNamedStatic(

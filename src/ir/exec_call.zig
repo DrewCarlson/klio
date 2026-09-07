@@ -1880,6 +1880,28 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                             }
                         }
                     }
+                    // A member of an ENCLOSING class's companion (or of a
+                    // companion that class inherits), read from a nested
+                    // class's body: the enclosing classes' static scope.
+                    if (comptime @hasDecl(H, "enclosingCompanionMember")) {
+                        var cands5_l = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, bare_name, null);
+                        defer releaseCands(allocator, &cands5_l);
+                        const ka5 = pinImplicitCandidates(cands5_l.items);
+                        defer runtime.keepaliveRestore(ka5);
+                        for (cands5_l.items) |c5| {
+                            if (c5.v != .Instance) continue;
+                            if (try host.enclosingCompanionMember(allocator, &c5.v, bare_name, null)) |r5| {
+                                switch (r5) {
+                                    .ok => |v5| {
+                                        orAudit("LoadFromThisOrGlobal", bare_name, "enclosing_companion", c5.depth, &c5.v);
+                                        try frame.write(lt.dst, v5);
+                                        return .cont;
+                                    },
+                                    .err => |e5| return raiseStep(frame, e5),
+                                }
+                            }
+                        }
+                    }
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{bare_name});
                     if (missTraceWant()) |w| {
                         if (std.mem.eql(u8, w, bare_name)) {
@@ -3049,7 +3071,22 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 if (host.bareUnsettledHeaderNoOp(frame.module, name_str, arg_values.len)) {
                     orAudit("CallMemberOrGlobal", name_str, "unsettled_header_noop", -1, null);
                     result = .Unit;
-                } else {
+                } else if (enclosing_companion: {
+                    // A member of an ENCLOSING class's companion called from
+                    // a nested class's body (`getO()` inside `Outer.Nested`
+                    // where `Outer`'s supertype declares a companion `getO`).
+                    if (comptime !@hasDecl(H, "enclosingCompanionMember")) break :enclosing_companion false;
+                    if (this_val != .Instance) break :enclosing_companion false;
+                    const r6 = (try host.enclosingCompanionMember(allocator, &this_val, name_str, arg_values)) orelse break :enclosing_companion false;
+                    switch (r6) {
+                        .ok => |v6| {
+                            orAudit("CallMemberOrGlobal", name_str, "enclosing_companion", -1, &this_val);
+                            result = v6;
+                        },
+                        .err => |e6| return raiseStep(frame, e6),
+                    }
+                    break :enclosing_companion true;
+                }) {} else {
                     const msg = try std.fmt.allocPrint(allocator, "unresolved global `{s}`", .{name_str});
                     if (missTraceWant()) |w| {
                         if (std.mem.eql(u8, w, name_str)) {

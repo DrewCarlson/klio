@@ -3196,6 +3196,122 @@ fn resolveExtensionPropSetter(
 /// setter (`var T.name set(value)`) declared on the receiver's type or any
 /// supertype. Used by the bare-name write path to route an implicit-`this`
 /// assignment to the extension setter instead of a top-level binding.
+pub fn hostHasExtProp(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) bool {
+    const recv_simple: []const u8 = switch (receiver.*) {
+        .Instance => |i| className(i),
+        else => lastSegment(receiver.typeFqn()),
+    };
+    const fid = resolveExtensionProp(self, allocator, receiver, recv_simple, name) catch return false;
+    if (fid != null) return true;
+    const delegated = resolveExtPropDelegate(self, allocator, receiver, recv_simple, name) catch return false;
+    return delegated != null;
+}
+
+/// Whether the extension property `name` on this receiver is DECLARED with
+/// a callable type (a function type, or a class declaring `invoke`), so
+/// that `recv.name(args)` is `recv.name.invoke(args)`. Decided from the
+/// declaration alone: reading the property to look at its value would run
+/// its getter.
+pub fn extPropDeclaredCallable(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) bool {
+    const recv_simple: []const u8 = switch (receiver.*) {
+        .Instance => |i| className(i),
+        else => lastSegment(receiver.typeFqn()),
+    };
+    const fid: FuncId = blk: {
+        if (resolveExtensionProp(self, allocator, receiver, recv_simple, name) catch null) |f| break :blk f;
+        if (resolveExtPropDelegate(self, allocator, receiver, recv_simple, name) catch null) |hit| break :blk hit.fid;
+        return false;
+    };
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    // The declaration's own type, keyed by the declared receiver head: the
+    // receiver's class and each supertype the property could bind through.
+    var head: ?[]const u8 = recv_simple;
+    var depth: usize = 0;
+    while (head) |h| : (depth += 1) {
+        if (depth > 32) break;
+        if (mod.registry.ext_prop_type_heads.get(.{ .a = h, .b = name })) |declared| {
+            if (std.mem.eql(u8, declared, "<function>")) return true;
+            const dt = ir.TypeRef{ .name = declared, .nullable = false, .args = &.{} };
+            return declaredTypeIsCallable(mod, &dt);
+        }
+        head = blk: {
+            const cg = self.classes.borrow();
+            defer cg.deinit();
+            const def = cg.get().get(h) orelse break :blk null;
+            const dg = def.borrow();
+            defer dg.deinit();
+            const p = dg.get().parent orelse break :blk null;
+            const pg = p.borrow();
+            defer pg.deinit();
+            break :blk pg.get().name;
+        };
+    }
+    const f = mod.funcById(fid) orelse return false;
+    return declaredTypeIsCallable(mod, &f.return_ty);
+}
+
+/// A function type, or a class whose hierarchy declares `invoke`.
+pub fn declaredTypeIsCallable(mod: *const ir.Module, ty: *const ir.TypeRef) bool {
+    if (root.isFunctionType(ty)) return true;
+    var head = std.mem.trimEnd(u8, ty.name, "?");
+    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    const cid = mod.classId(head) orelse mod.classIdByFqn(head) orelse return false;
+    return mod.classHierarchyDeclaresMember(cid, "invoke");
+}
+
+/// A bare name inside a nested class's body that names a member of an
+/// ENCLOSING class's companion object (or of a companion the enclosing class
+/// inherits): Kotlin's static scope of the enclosing classes. Walks the
+/// nesting chain outward from the instance's class; null when no companion
+/// on the chain declares `name`.
+pub fn enclosingCompanionMember(self: *VmHost, allocator: Allocator, inst: *const Value, name: []const u8, args: ?[]const Value) Allocator.Error!?EvalResult {
+    if (inst.* != .Instance) return null;
+    var cur: ?[]const u8 = className(inst.Instance);
+    var depth: usize = 0;
+    while (cur) |c| : (depth += 1) {
+        if (depth > 16) break;
+        const enc = blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().registry.enclosing_class.get(c);
+        } orelse break;
+        var owner: ?[]const u8 = enc;
+        var updepth: usize = 0;
+        while (owner) |o| : (updepth += 1) {
+            if (updepth > 32) break;
+            if (try companionInstanceForClass(self, o)) |comp| {
+                if (comp == .Instance and host_call_member.hostHasMember(self, &comp, name)) {
+                    if (args) |a| return try host_call_member.callMember(self, allocator, &comp, name, a);
+                    return try getField(self, allocator, &comp, name);
+                }
+                if (args == null) {
+                    const has_field = blk: {
+                        const g = comp.Instance.borrow();
+                        defer g.deinit();
+                        break :blk g.get().get(name) != null;
+                    };
+                    if (has_field) return try getField(self, allocator, &comp, name);
+                }
+            }
+            owner = blk: {
+                const cg = self.classes.borrow();
+                defer cg.deinit();
+                const def = cg.get().get(o) orelse break :blk null;
+                const dg = def.borrow();
+                defer dg.deinit();
+                const p = dg.get().parent orelse break :blk null;
+                const pg = p.borrow();
+                defer pg.deinit();
+                break :blk pg.get().name;
+            };
+        }
+        cur = enc;
+    }
+    return null;
+}
+
 pub fn hostHasExtPropSetter(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) bool {
     const recv_simple: []const u8 = switch (receiver.*) {
         .Instance => |i| className(i),

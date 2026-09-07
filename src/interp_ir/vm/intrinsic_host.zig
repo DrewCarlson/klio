@@ -20,6 +20,8 @@ const vmhost = @import("vmhost.zig");
 const scheduler = @import("scheduler.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_instances = @import("host_instances.zig");
+const host_fields = @import("host_fields.zig");
+const host_call_value = @import("host_call_value.zig");
 const trace = @import("trace.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
@@ -473,9 +475,13 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
                 target = r;
                 member_args = args;
             }
-            const as_property = member_args.len == 0 and
-                root.memberIsProperty(self.allocator, &self.classes, &target, nm);
             var host = vmHost(self, out);
+            // A property reference reads the property: a member property,
+            // or an extension property when no extension function owns
+            // the name.
+            const as_property = member_args.len == 0 and
+                (root.memberIsProperty(self.allocator, &self.classes, &target, nm) or
+                    (!host_call_value.extensionFnNamed(&host, nm) and host_fields.hostHasExtProp(&host, self.allocator, &target, nm)));
             // Dispatch under the reference's creation-site file (private
             // visibility is decided where the reference was written).
             var ref_pushed = false;
