@@ -9597,7 +9597,9 @@ fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Value, 
     // arithmetic fallback would print `ClassName@id` for a user element.
     // LEFT operand only: `String.plus(Any?)` is a member on String, while
     // `collection + element` is the collection's own `plus`.
-    const string_add = bo.op == .Add and l == .String;
+    // `String?.plus(Any?)` is the only `plus` a null receiver resolves to:
+    // `null + x` renders both sides.
+    const string_add = bo.op == .Add and (l == .String or l == .Null);
     if (bo.op == .StringConcat or string_add) {
         const ls = switch (try stringify(H, allocator, host, &l)) {
             .ok => |s| s,
@@ -9752,8 +9754,10 @@ fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Value, 
         // A comparison between a Char and another scalar has no builtin
         // order: it resolves to a `compareTo` extension the program
         // declares (`operator fun Int.compareTo(c: Char)`).
-        const char_mixed_compare = (bo.op == .Less or bo.op == .LessEq or bo.op == .Greater or bo.op == .GreaterEq) and
-            std.meta.activeTag(l) != std.meta.activeTag(r) and (l == .Char or r == .Char);
+        const is_compare = bo.op == .Less or bo.op == .LessEq or bo.op == .Greater or bo.op == .GreaterEq;
+        const char_mixed_compare = is_compare and
+            ((std.meta.activeTag(l) != std.meta.activeTag(r) and (l == .Char or r == .Char)) or
+                l == .Null or r == .Null or l == .Array or r == .Array);
         if (l == .Instance or r == .Instance or char_mixed_compare) {
             // A `fun interface` SAM wrapper has no equality of its own —
             // dispatching `equals` on it routes into the wrapped lambda.

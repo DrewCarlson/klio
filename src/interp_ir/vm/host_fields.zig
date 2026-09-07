@@ -2018,7 +2018,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
             const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
-            return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
+            return try delegateCall(self, allocator, &d, "getValue", &.{ receiver.*, prop_ref }, receiver);
         }
     }
     // Reflection-style accessors on `KClass` / `KProperty` values.
@@ -3178,7 +3178,7 @@ fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const Value
     if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, name)) |hit| {
         const d = try extPropDelegateInstance(self, allocator, hit.key, name, hit.fid);
         const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
-        return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
+        return try delegateCall(self, allocator, &d, "getValue", &.{ receiver.*, prop_ref }, receiver);
     }
     return null;
 }
@@ -3202,6 +3202,16 @@ fn resolveExtensionPropSetter(
 /// setter (`var T.name set(value)`) declared on the receiver's type or any
 /// supertype. Used by the bare-name write path to route an implicit-`this`
 /// assignment to the extension setter instead of a top-level binding.
+/// `getValue`/`setValue` on a delegate, with the delegated property's owner
+/// pushed as an enclosing receiver: the operator may be a MEMBER EXTENSION
+/// of the owner (`class A { operator fun Delegate.getValue(...) }`).
+fn delegateCall(self: *VmHost, allocator: Allocator, d: *const Value, name: []const u8, args: []const Value, owner: *const Value) Allocator.Error!EvalResult {
+    const pushed = owner.* == .Instance;
+    if (pushed) host_call_member.pushAccessEnclosing(self, owner);
+    defer if (pushed) host_call_member.popAccessEnclosing(self);
+    return self.callMember(allocator, d, name, args);
+}
+
 pub fn hostHasExtProp(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) bool {
     const recv_simple: []const u8 = switch (receiver.*) {
         .Instance => |i| className(i),
@@ -3989,7 +3999,7 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         };
         if (raw) |d| {
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
-            return try self.callMember(allocator, &d, "getValue", &.{ receiver.*, prop_ref });
+            return try delegateCall(self, allocator, &d, "getValue", &.{ receiver.*, prop_ref }, receiver);
         }
     }
     const recv_fqn = blk: {
@@ -5090,7 +5100,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, real_name)) |hit| {
             const d = try extPropDelegateInstance(self, allocator, hit.key, real_name, hit.fid);
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, real_name) } };
-            const r = try self.callMember(allocator, &d, "setValue", &.{ receiver.*, prop_ref, value });
+            const r = try delegateCall(self, allocator, &d, "setValue", &.{ receiver.*, prop_ref, value }, receiver);
             switch (r) {
                 .ok => return .{ .ok = {} },
                 .err => |e| return .{ .err = e },
@@ -5124,7 +5134,7 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                 };
                 if (raw) |d| {
                     const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, real_name) } };
-                    switch (try self.callMember(allocator, &d, "setValue", &.{ receiver.*, prop_ref, value })) {
+                    switch (try delegateCall(self, allocator, &d, "setValue", &.{ receiver.*, prop_ref, value }, receiver)) {
                         .ok => return .{ .ok = {} },
                         .err => |e| return .{ .err = e },
                     }

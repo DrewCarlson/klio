@@ -10902,7 +10902,92 @@ fn lambdaArgPrefersExtension(
     return false;
 }
 
+/// The indexing convention binds `a[i, j] = v` to `set(i, j, v)` with the
+/// VALUE in the last parameter: parameters between the indices and the value
+/// take their defaults, and a vararg index parameter absorbs every index.
+fn conventionSetCall(self: *VmHost, allocator: Allocator, receiver: *const Value, args: []const Value) Allocator.Error!?EvalResult {
+    if (receiver.* != .Instance or args.len < 2) return null;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const cls_fqn = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk if (cg.get().fqn.len != 0) cg.get().fqn else cg.get().name;
+    };
+    var cur: ?ir.ClassId = mod.classIdByFqn(cls_fqn) orelse mod.classId(cls_fqn);
+    var depth: usize = 0;
+    var hit: ?FuncId = null;
+    while (cur) |cid| : (depth += 1) {
+        if (depth > 32 or cid.int() >= mod.classes.items.len) break;
+        const c = &mod.classes.items[cid.int()];
+        const decls = mod.memberDecls(c.fqn, "set");
+        if (decls.len != 0) {
+            hit = decls[0];
+            break;
+        }
+        cur = if (c.supertypes.len != 0) c.supertypes[0] else null;
+    }
+    const fid = hit orelse return null;
+    const f = mod.funcById(fid) orelse return null;
+    const skip: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    const params = f.params[skip..];
+    if (params.len < 2) return null;
+    var vararg_at: ?usize = null;
+    for (params, 0..) |*p, i| if (p.is_vararg) {
+        vararg_at = i;
+    };
+    const value_param = params.len - 1;
+    if (params[value_param].is_vararg) return null;
+    const n_idx = args.len - 1;
+    // Already positionally exact with no vararg to pack: nothing to adapt.
+    if (vararg_at == null and n_idx == value_param) return null;
+    var adapted: std.ArrayList(Value) = .empty;
+    defer adapted.deinit(allocator);
+    if (vararg_at) |vi| {
+        if (vi >= value_param) return null;
+        try adapted.appendSlice(allocator, args[0..vi]);
+        var packed_args: std.ArrayList(Value) = .empty;
+        try packed_args.appendSlice(allocator, args[vi..n_idx]);
+        const items = try runtime.ValueList.init(allocator, packed_args);
+        try adapted.append(allocator, runtime.ArrayData.fromBoxedList(items));
+        var k: usize = vi + 1;
+        while (k < value_param) : (k += 1) {
+            if (!params[k].has_default) return null;
+            try adapted.append(allocator, .Null);
+        }
+    } else {
+        // Defaults between the indices and the value: bind the value by
+        // NAME so the gap takes its declared defaults.
+        if (n_idx > value_param) return null;
+        var k: usize = n_idx;
+        while (k < value_param) : (k += 1) {
+            if (!params[k].has_default) return null;
+        }
+        var named_args: std.ArrayList(Value) = .empty;
+        defer named_args.deinit(allocator);
+        var names: std.ArrayList(?[]const u8) = .empty;
+        defer names.deinit(allocator);
+        if (skip == 1) {
+            try named_args.append(allocator, receiver.*);
+            try names.append(allocator, null);
+        }
+        try named_args.appendSlice(allocator, args[0..n_idx]);
+        try names.appendNTimes(allocator, null, n_idx);
+        try named_args.append(allocator, args[n_idx]);
+        try names.append(allocator, params[value_param].name);
+        return try host_call_func.callFuncNamed(self, allocator, mod, fid, named_args.items, names.items);
+    }
+    try adapted.append(allocator, args[n_idx]);
+    return try invokeMethodFuncId(self, allocator, receiver, fid, adapted.items);
+}
+
 fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) Allocator.Error!?EvalResult {
+    if (std.mem.eql(u8, name, "set")) {
+        if (try conventionSetCall(self, allocator, receiver, args)) |r| return r;
+    }
     if (runtime.envSetOnce("KLIO_WALK_TRACE")) {
         std.debug.print("[ir-walk] {s} on {s} static={s}\n", .{ name, receiver.typeFqn(), static_recv orelse "-" });
     }
