@@ -1191,10 +1191,10 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
 /// class pipeline applies — the host's get/set detect the prefix and bypass
 /// the accessor dispatch, so a custom setter's `field = value` writes the
 /// stored property instead of recursing or landing on a phantom field.
-fn rewriteAccessorFieldRefs(allocator: Allocator, body: ast.FunctionBody, prop: []const u8) Allocator.Error!ast.FunctionBody {
+pub fn rewriteAccessorFieldRefs(allocator: Allocator, body: ast.FunctionBody, prop: []const u8) Allocator.Error!ast.FunctionBody {
     return switch (body) {
-        .Expr => |e| .{ .Expr = (try build.lift.substituteFieldWithThis(allocator, prop, &e)).* },
-        .Block => |blk| .{ .Block = try build.lift.rewriteBlockField(allocator, &blk, prop) },
+        .Expr => |e| .{ .Expr = (try build.lift.substituteFieldWithThis(allocator, prop, &e, null)).* },
+        .Block => |blk| .{ .Block = try build.lift.rewriteBlockField(allocator, &blk, prop, null) },
     };
 }
 

@@ -21,7 +21,6 @@ const host_call_func = @import("host_call_func.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_fields = @import("host_fields.zig");
 const host_call_value = @import("host_call_value.zig");
-const host_classes = @import("host_classes.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -1504,18 +1503,31 @@ fn bindThrowableArgs(self: *VmHost, inst: ObjRef(InstanceData), args: []const Va
     // The unset probe runs before the exclusive borrow below: the
     // instance lock is not reentrant, so a read taken under the held
     // write borrow deadlocks the constructing thread against itself.
+    // A sole throwable argument is the cause, and the message is its
+    // rendering, as the JVM constructor defines it.
+    const single_cause = args.len == 1 and (args[0] == .Exception or
+        (args[0] == .Instance and host_call_member.instanceIsThrowable(self, self.allocator, args[0].Instance)));
     const skip_single = only_when_unset and args.len == 1 and
-        hasNonNullField(inst, if (args[0] == .Instance) "cause" else "message");
+        hasNonNullField(inst, if (single_cause) "cause" else "message");
     if (skip_single) return;
+    const cause_message: ?Value = if (single_cause) blk: {
+        break :blk switch (try host_call_member.callMember(self, self.allocator, &args[0], "toString", &.{})) {
+            .ok => |s| s,
+            .err => null,
+        };
+    } else null;
     const g = inst.borrowMut();
     defer g.deinit();
     const i = g.get();
     if (args.len == 1) {
         const only = args[0];
-        const is_cause = only == .Instance;
-        const key: []const u8 = if (is_cause) "cause" else "message";
+        const key: []const u8 = if (single_cause) "cause" else "message";
         retainField(i, self.allocator, key);
         try pushField(i, self.allocator, key, only);
+        if (cause_message) |m| {
+            retainField(i, self.allocator, "message");
+            try pushField(i, self.allocator, "message", m);
+        }
     } else if (args.len >= 2) {
         retainField(i, self.allocator, "message");
         retainField(i, self.allocator, "cause");
@@ -4175,6 +4187,20 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             }
         }
     }
+    // `Throwable(cause)`: the single argument is the cause and the message
+    // is its rendering, as the JVM constructor defines it.
+    if (throwable_cause == null) {
+        if (throwable_message) |m| {
+            const is_cause = m == .Exception or (m == .Instance and host_call_member.instanceIsThrowable(self, allocator, m.Instance));
+            if (is_cause) {
+                throwable_cause = m;
+                throwable_message = switch (try host_call_member.callMember(self, allocator, &m, "toString", &.{})) {
+                    .ok => |s| s,
+                    .err => |e| return .{ .err = e },
+                };
+            }
+        }
+    }
     if (throwable_message) |m| {
         const g = inst.borrowMut();
         try g.get().fields.append(allocator, .{ .name = "message", .value = m });
@@ -5131,7 +5157,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             },
             .Property => |p| {
                 if (p.getter) |getter| if (!site_built) {
-                    const thunk = synthThunk(p.name, getter.body, getter.return_type, p.is_override);
+                    // `field` in the accessor body is the object's own
+                    // backing slot, exactly as in a module class's accessor.
+                    const gbody = try host_classes.rewriteAccessorFieldRefs(allocator, getter.body, p.name.name);
+                    const thunk = synthThunk(p.name, gbody, getter.return_type, p.is_override);
                     const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);
                     const fid = func.id;

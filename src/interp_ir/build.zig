@@ -3403,7 +3403,7 @@ fn buildModuleWithOverrides(
                 const nm = try std.fmt.allocPrint(a, "__get_{s}_{s}", .{ c.name.name, p.name.name });
                 const fid = switch (getter.body) {
                     .Expr => |body| blk: {
-                        const rewritten = try lift.substituteFieldWithThis(a, p.name.name, &body);
+                        const rewritten = try lift.substituteFieldWithThis(a, p.name.name, &body, c.name.name);
                         // The property's declared type is the expression body's
                         // expected type: a getter returning a lambda
                         // (`get() = { collectTo(it) }` typed `suspend (P) -> Unit`)
@@ -3411,7 +3411,7 @@ fn buildModuleWithOverrides(
                         break :blk try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, &own_members, &.{"this"}, rewritten, nm, p.ty);
                     },
                     .Block => |blk_body| blk: {
-                        const rewritten = try lift.rewriteBlockField(a, &blk_body, p.name.name);
+                        const rewritten = try lift.rewriteBlockField(a, &blk_body, p.name.name, c.name.name);
                         break :blk try ir.lower.lowerAccessorBlock(module, c.name.name, &own_members, &.{"this"}, &rewritten, nm);
                     },
                 };
@@ -3447,11 +3447,11 @@ fn buildModuleWithOverrides(
                 const vty_nullable = if (p.ty) |*t| t.nullable else false;
                 const fid = switch (setter.body) {
                     .Expr => |body| blk: {
-                        const rewritten = try lift.substituteFieldWithThis(a, p.name.name, &body);
+                        const rewritten = try lift.substituteFieldWithThis(a, p.name.name, &body, c.name.name);
                         break :blk try ir.lower.lowerSetterExprTyped(module, c.name.name, &own_members, &.{ "this", setter_param_name }, setter_param_name, vty_head, vty_nullable, rewritten, nm);
                     },
                     .Block => |blk_body| blk: {
-                        const rewritten = try lift.rewriteBlockField(a, &blk_body, p.name.name);
+                        const rewritten = try lift.rewriteBlockField(a, &blk_body, p.name.name, c.name.name);
                         break :blk try ir.lower.lowerSetterBlockTyped(module, c.name.name, &own_members, &.{ "this", setter_param_name }, setter_param_name, vty_head, vty_nullable, &rewritten, nm);
                     },
                 };

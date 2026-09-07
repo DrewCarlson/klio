@@ -9749,7 +9749,12 @@ fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Value, 
         if (l != .Instance and r != .Instance) return ok(.{ .Bool = if (neg) !eq else eq });
     }
     if (operatorMethod(bo.op)) |method| {
-        if (l == .Instance or r == .Instance) {
+        // A comparison between a Char and another scalar has no builtin
+        // order: it resolves to a `compareTo` extension the program
+        // declares (`operator fun Int.compareTo(c: Char)`).
+        const char_mixed_compare = (bo.op == .Less or bo.op == .LessEq or bo.op == .Greater or bo.op == .GreaterEq) and
+            std.meta.activeTag(l) != std.meta.activeTag(r) and (l == .Char or r == .Char);
+        if (l == .Instance or r == .Instance or char_mixed_compare) {
             // A `fun interface` SAM wrapper has no equality of its own —
             // dispatching `equals` on it routes into the wrapped lambda.
             // Compare through the wrapper (structuralEq unwraps both
@@ -9779,7 +9784,13 @@ fn binopValue(comptime H: type, allocator: Allocator, l_in: Value, r_in: Value, 
             // on a type declaring only `plusAssign` must not bind a
             // receiver-incompatible `plus` like `String?.plus(Any?)`.
             var result: Value = undefined;
-            switch (try host.callMemberStrictExt(allocator, recv_ptr, method, &.{arg_val}, &.{null}, null)) {
+            // The mixed Char comparison has no member: only an extension
+            // `compareTo` the program declares can serve it.
+            const ext_only: ?EvalResult = if (char_mixed_compare and comptime @hasDecl(H, "extensionFnFallback"))
+                try host.extensionFnFallback(allocator, recv_ptr, method, &.{arg_val}, false, null, null)
+            else
+                null;
+            switch (ext_only orelse try host.callMemberStrictExt(allocator, recv_ptr, method, &.{arg_val}, &.{null}, null)) {
                 .ok => |v| result = v,
                 .err => |e| switch (e) {
                     // `a OP= b` lowers to `a = a.OP(b)`, but the
