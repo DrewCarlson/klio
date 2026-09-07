@@ -114,6 +114,14 @@ residue list (every cluster under five) as the seed of the next campaign.
 - operatorConventions/kt4987 (1): `counter++` on a null `Int?` with a
   LOCAL `Int?.inc()` extension reaches the member call on a null
   receiver instead of the local closure.
+- fir/functionsDifferInTypeParameterBounds2, 3 (2): overloads that differ
+  only in which of several parameters carry a bound (`<S1, S2 : B, S3>`
+  against `<S11 : A, S12 : B, S13 : C>`): applicability now judges a
+  bounded parameter by its bound (the single-parameter case passes), but
+  the scorer does not rank a candidate by how many bounds it satisfies,
+  so the first applicable overload wins.
+- inlineClasses/inlineClassCollection (6): the `zs.contains(object {} as
+  Any)` verdict above (a value class implementing `List<Z>`).
 - classes/kt723, kt725, kt2711 (3): inside `operator fun Int?.inc()`,
   `this.inc()` after a null check must bind the MEMBER `Int.inc` through
   the smart cast; the lowering has no smart-cast record for `this`, so

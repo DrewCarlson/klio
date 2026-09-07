@@ -4218,7 +4218,7 @@ pub fn typeParamCastPassesIn(comptime H: type, module: *const Module, func: *con
     // A short uppercase name is an erased parameter unless the program
     // DECLARES a class of that name (`a as? B` against `class B` is a real
     // check); a reified binding published under the name still erases.
-    const declared = if (comptime @hasDecl(H, "isDeclaredClassName")) host.isDeclaredClassName(ty.name) else false;
+    const declared = if (comptime @hasDecl(H, "isDeclaredClassNameFrom")) host.isDeclaredClassNameFrom(ty.name, func.package) else false;
     if (isErasedTypeParamName(ty.name) and !declared) return true;
     if (!host.isConcreteCastTarget(ty.name)) return true;
     return false;
