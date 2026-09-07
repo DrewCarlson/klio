@@ -53,7 +53,7 @@ fn pushFunc(module: *Module, func_in: Func) Allocator.Error!FuncId {
     const id = module.nextFuncId();
     var func = func_in;
     func.id = id;
-    try module.funcs.append(moduleAllocator(module), func);
+    try module.appendFunc(func);
     // An extension-property getter is looked up BY NAME under the
     // `__ext_get_<Head>_<name>` contract (`extPropGetterReturn` types a
     // bare `indices` read from the getter's declared return); without the

@@ -993,6 +993,13 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return dst;
                 }
             }
+            if (b.resolve(pr.name.name) == null and !b.knowsOuter(pr.name.name)) {
+                if (enclosingObjectDeclaring(b, pr.name.name, pr.name.span.file)) |obj_cid| {
+                    const obj_r = try loadObjectValue(b, obj_cid);
+                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = obj_r, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
+                    return dst;
+                }
+            }
             const is_tracked = b.resolve(pr.name.name) != null or isTopLevelProp(pr.name.name);
             // A same-named enclosing member only shadows the global for `::name`
             // when it could actually be the referenced callable: if the use
@@ -1436,15 +1443,19 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return this_reg;
         },
         .Super => {
-            // `super` bare reads the same instance value as `this`.
+            // `super` bare reads the same instance value as `this`
+            // (`this@Outer` for a labeled `super@Outer`).
+            if (try superBase(b, expr.Super)) |base| return base.this_reg;
             if (try resolveSuperThisReg(b)) |this_reg| return this_reg;
             try b.push(.{ .Trace = .{ .span = exprSpan(expr) } });
             return b.emitConst(.Unit);
         },
-        .Spread => {
-            // A bare spread outside a call argument list has no lowering yet.
-            try b.push(.{ .Trace = .{ .span = exprSpan(expr) } });
-            return b.emitConst(.Unit);
+        .Spread => |sp| {
+            // A spread outside a call's argument run is a supertype
+            // constructor argument (`: Base(s, *ints)`) lowered as its own
+            // thunk: its value is the array itself, which the constructor
+            // path adopts as the packed vararg.
+            return lowerExpr(b, sp.expr);
         },
     }
 }
@@ -3262,26 +3273,24 @@ fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     // `super.<prop>` — dispatch its getter via the parent chain.
     if (receiver.* == .Super) {
-        if (try resolveSuperThisReg(b)) |this_reg| {
-            if (b.ownerClass()) |owner| {
-                const sup = receiver.Super;
-                const dst = b.allocReg();
-                const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
-                const oc = try b.module.internConst(b.allocator, .{ .String = owner });
-                const qual_const = try superQualifier(b, sup.qualifier, sup.label);
-                const args_start = b.allocReg();
-                try b.push(.{ .CallSuper = .{
-                    .dst = dst,
-                    .receiver = this_reg,
-                    .owner_class = oc,
-                    .qualifier = qual_const,
-                    .name = nm,
-                    .args = args_start,
-                    .n_args = 0,
-                    .arg_names = &.{},
-                } });
-                return dst;
-            }
+        const sup = receiver.Super;
+        if (try superBase(b, sup)) |base| {
+            const dst = b.allocReg();
+            const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
+            const oc = try b.module.internConst(b.allocator, .{ .String = base.owner });
+            const qual_const = try superQualifier(b, sup.qualifier);
+            const args_start = b.allocReg();
+            try b.push(.{ .CallSuper = .{
+                .dst = dst,
+                .receiver = base.this_reg,
+                .owner_class = oc,
+                .qualifier = qual_const,
+                .name = nm,
+                .args = args_start,
+                .n_args = 0,
+                .arg_names = &.{},
+            } });
+            return dst;
         }
     }
 
@@ -3732,15 +3741,32 @@ fn staticExtPropReadField(b: *FuncBuilder, receiver: *const Expr, name: []const 
     return try b.module.internConst(b.allocator, .{ .String = marker });
 }
 
-/// Intern the `super<Q>` qualifier (type ref) or `super@Q` label (ident).
-fn superQualifier(b: *FuncBuilder, qualifier: ?ast.TypeRef, label: ?ast.Ident) Allocator.Error!?ConstId {
+/// The `<Q>` of `super<Q>`: the supertype the call dispatches on. A
+/// `super@Label` names the class whose supertypes are walked and is carried
+/// by the owner/receiver pair (`superBase`), never by the qualifier.
+fn superQualifier(b: *FuncBuilder, qualifier: ?ast.TypeRef) Allocator.Error!?ConstId {
     if (qualifier) |t| {
         return try b.module.internConst(b.allocator, .{ .String = t.name.name });
     }
-    if (label) |id| {
-        return try b.module.internConst(b.allocator, .{ .String = id.name });
-    }
     return null;
+}
+
+const SuperBase = struct { this_reg: Reg, owner: []const u8 };
+
+/// The instance and class a `super` expression starts from. Unlabeled
+/// `super` starts at the enclosing class on `this`; `super@Outer` written in
+/// an inner class starts at `Outer` on `this@Outer`, so `super<K>@A.foo()`
+/// runs K's implementation against the A instance and its overrides.
+fn superBase(b: *FuncBuilder, sup: anytype) Allocator.Error!?SuperBase {
+    const this_reg = (try resolveSuperThisReg(b)) orelse return null;
+    const owner = b.ownerClass() orelse return null;
+    const label = sup.label orelse return .{ .this_reg = this_reg, .owner = owner };
+    const target = scopeTypeRename(b, label.name, label.span.file.int()) orelse label.name;
+    if (std.mem.eql(u8, target, owner)) return .{ .this_reg = this_reg, .owner = owner };
+    const nm = try b.module.internConst(b.allocator, .{ .String = target });
+    const dst = b.allocReg();
+    try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm } });
+    return .{ .this_reg = dst, .owner = target };
 }
 
 /// Replay the `finally { … }` bodies pushed above `base` inline, innermost
@@ -7225,7 +7251,11 @@ fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         // record; identify the overload by its declared
                         // parameter-name sequence (`type, block` vs
                         // `mask, block`) behind the implicit `this`.
-                        for (b.module.funcs.items) |*mf| {
+                        var fi: u32 = 0;
+                        const appended: u32 = @intCast(b.module.appendedFuncCount());
+                        const base_n: u32 = @intCast(b.module.func_header_offsets.len);
+                        while (fi < appended) : (fi += 1) {
+                            const mf = b.module.funcById(FuncId.from(base_n + fi)) orelse continue;
                             if (!std.mem.eql(u8, mf.name, mname)) continue;
                             if (mf.kind != .instance_method) continue;
                             if (mf.params.len != cf.params.len + 1) continue;
@@ -12412,6 +12442,52 @@ pub fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (tr) std.debug.print("[objref] {s} -> {s} object={}\n", .{ nm, cls.name, cls.is_object });
     if (!cls.is_object) return null;
     return .{ .name = cls.name, .nullable = false, .args = &.{} };
+}
+
+/// The IR class of `name` as seen from the builder's scope: a nested class
+/// resolves through its enclosing declaration first, so a same-named
+/// top-level class cannot stand in for it.
+fn classIdInScope(b: *FuncBuilder, name: []const u8, file: anytype) ?ir.ClassId {
+    if (b.module.registry.enclosing_class.get(name)) |enc| {
+        var qb: [192]u8 = undefined;
+        if (std.fmt.bufPrint(&qb, "{s}.{s}", .{ enc, name }) catch null) |qualified| {
+            if (b.module.classIdByQualifiedSuffix(qualified)) |cid| return cid;
+        }
+    }
+    return b.module.classIdIndexed(name, b.self_package, file) orelse b.module.classId(name);
+}
+
+/// The enclosing `object` declaration whose hierarchy declares `name`, for
+/// a bare reference written in a class nested inside it. Kotlin puts an
+/// object's members in the static scope of everything declared in it, so
+/// `class Foo : Base(::foo)` inside `object obj` passes `obj::foo` — bound
+/// at lowering, since no instance exists while a super-constructor argument
+/// evaluates. A member the owner class hierarchy declares itself is the
+/// nearer scope and stays on receiver dispatch.
+fn enclosingObjectDeclaring(b: *FuncBuilder, name: []const u8, file: anytype) ?ir.ClassId {
+    var cur = b.ownerClass() orelse build.currentOwnerClass() orelse return null;
+    if (classIdInScope(b, cur, file)) |own| {
+        if (b.module.classHierarchyDeclaresMember(own, name)) return null;
+    }
+    var hops: usize = 0;
+    while (hops < 16) : (hops += 1) {
+        const enc = b.module.registry.enclosing_class.get(cur) orelse return null;
+        const cid = classIdInScope(b, enc, file) orelse return null;
+        if (cid.int() >= b.module.classes.items.len) return null;
+        const cls = &b.module.classes.items[cid.int()];
+        if (cls.is_object and b.module.classHierarchyDeclaresMember(cid, name)) return cid;
+        cur = enc;
+    }
+    return null;
+}
+
+/// Load an `object` declaration's singleton by class identity.
+fn loadObjectValue(b: *FuncBuilder, cid: ir.ClassId) Allocator.Error!Reg {
+    const identity = b.module.classFqnById(cid) orelse b.module.classes.items[cid.int()].name;
+    const nm = try b.module.internConst(b.allocator, .{ .String = identity });
+    const dst = b.allocReg();
+    try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cid } });
+    return dst;
 }
 
 fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
@@ -20277,6 +20353,22 @@ fn lowerUnresolvedBareCall(
             if (f0) |f| (if (f.params.len != 0) f.params[f.params.len - 1].ty.args.len else 0) else 0,
         });
     }
+    if (enclosingObjectDeclaring(b, name0, callee.Path.segments[0].span.file)) |obj_cid| {
+        const obj_r = try loadObjectValue(b, obj_cid);
+        const run = try lowerArgRunWithArity(b, args, bare_arity);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        orEmitAudit(b, "enclosing_object_member", "CallMember", name0);
+        try b.push(.{ .CallMember = .{
+            .dst = dst,
+            .receiver = obj_r,
+            .name = nm,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+            .trailing_lambda = b.callTrailingLambda(),
+        } });
+        return dst;
+    }
     if (b.resolve("this")) |this_reg| {
         const run = try lowerArgRunWithArity(b, args, bare_arity);
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
@@ -23028,27 +23120,25 @@ fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!R
 
     // `super.method(...)`.
     if (receiver.* == .Super) {
-        if (try resolveSuperThisReg(b)) |this_reg| {
-            if (b.ownerClass()) |owner| {
-                const sup = receiver.Super;
-                const run = try lowerArgRun(b, args);
-                const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-                const dst = b.allocReg();
-                const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
-                const oc = try b.module.internConst(b.allocator, .{ .String = owner });
-                const qual_const = try superQualifier(b, sup.qualifier, sup.label);
-                try b.push(.{ .CallSuper = .{
-                    .dst = dst,
-                    .receiver = this_reg,
-                    .owner_class = oc,
-                    .qualifier = qual_const,
-                    .name = nm,
-                    .args = run[0],
-                    .n_args = run[1],
-                    .arg_names = arg_names,
-                } });
-                return dst;
-            }
+        const sup = receiver.Super;
+        if (try superBase(b, sup)) |base| {
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
+            const oc = try b.module.internConst(b.allocator, .{ .String = base.owner });
+            const qual_const = try superQualifier(b, sup.qualifier);
+            try b.push(.{ .CallSuper = .{
+                .dst = dst,
+                .receiver = base.this_reg,
+                .owner_class = oc,
+                .qualifier = qual_const,
+                .name = nm,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
         }
     }
 
@@ -25051,6 +25141,40 @@ test "super property in a lambda uses the enclosing this capture" {
     const call = func.blocks[0].insts[1].CallSuper;
     try testing.expectEqual(capture.dst, call.receiver);
     try testing.expectEqualStrings("this", func.capture_order[capture.idx]);
+}
+
+test "labeled super starts at the labeled outer class on this@Outer" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    b.setOwnerClass("Inner");
+    b.setOuterNames(StringSet.init(testing.allocator));
+    try b.bind("this", b.allocReg());
+
+    var receiver = Expr{ .Super = .{
+        .qualifier = null,
+        .label = .{ .name = "Outer", .span = dummySpan() },
+        .span = dummySpan(),
+    } };
+    const e = Expr{ .Member = .{
+        .receiver = &receiver,
+        .name = .{ .name = "label", .span = dummySpan() },
+        .safe = false,
+        .span = dummySpan(),
+    } };
+    const r = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "Inner.f", build.typeString());
+    defer freeFunc(func);
+
+    try testing.expectEqual(@as(usize, 2), func.blocks[0].insts.len);
+    const qthis = func.blocks[0].insts[0].QualifiedThis;
+    try testing.expectEqualStrings("Outer", m.consts.items[qthis.qualifier.int()].String);
+    const call = func.blocks[0].insts[1].CallSuper;
+    try testing.expectEqual(qthis.dst, call.receiver);
+    try testing.expectEqualStrings("Outer", m.consts.items[call.owner_class.int()].String);
+    try testing.expect(call.qualifier == null);
 }
 
 test "lowers int min value as int" {

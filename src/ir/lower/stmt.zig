@@ -1378,8 +1378,10 @@ fn lowerAssign(
     // `CompoundField` that reads the field, dispatches `<op>Assign` when the
     // value supports it, and otherwise falls back to read-modify-write
     // (needed for scalar properties like `obj.count += 1`).
+    // `super.prop += x` reads through the supertype's accessor and writes
+    // the base cell, so it takes the read-modify-write path below.
     if (op != .Assign) {
-        if (target.* == .Member and !target.Member.safe) {
+        if (target.* == .Member and !target.Member.safe and target.Member.receiver.* != .Super) {
             const m = target.Member;
             const recv = pre_recv orelse try lowerReceiver(b, m.receiver);
             const bin: BinOp = switch (op) {
@@ -1627,7 +1629,10 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
             // search at its supertypes, the same way a `super.prop` read does.
             const super_owner: ?ir.ConstId = blk: {
                 if (m.receiver.* != .Super) break :blk null;
-                const oc = b.ownerClass() orelse break :blk null;
+                const oc = if (m.receiver.Super.label) |l|
+                    expr_mod.scopeTypeRename(b, l.name, l.span.file.int()) orelse l.name
+                else
+                    b.ownerClass() orelse break :blk null;
                 break :blk try b.module.internConst(b.allocator, .{ .String = oc });
             };
             if (m.safe) {

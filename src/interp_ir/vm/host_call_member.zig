@@ -1968,6 +1968,9 @@ fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []const u8
             break :blk g.get().registry.companion_singletons.get(cname);
         };
         if (comp_name) |cn| try out.append(allocator, cn);
+        // An enclosing `object` declaration reached through the lexical
+        // walk is itself a singleton in scope for the nested class's bodies.
+        if (head != 0 and classIsObjectDecl(self, cname)) try out.append(allocator, cname);
         {
             const cg = self.classes.borrow();
             defer cg.deinit();
@@ -1977,14 +1980,34 @@ fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []const u8
                 for (dg.get().supertype_names) |sn| try queue.append(allocator, sn);
             }
         }
-        // An inner class reaches the lexically ENCLOSING class's
-        // companion too (AbstractList.ListIteratorImpl's init calls
-        // checkPositionIndex on AbstractList's companion).
-        if (std.mem.lastIndexOfAny(u8, cname, ".$")) |sep| {
-            if (sep > 0) try queue.append(allocator, cname[0..sep]);
-        }
+        // A nested class reaches the lexically ENCLOSING declaration's
+        // companion (AbstractList.ListIteratorImpl's init calls
+        // checkPositionIndex on AbstractList's companion) and an enclosing
+        // object's members. The runtime name carries the owner for a
+        // dotted or mangled nested name; a simple name resolves its owner
+        // through the registry's enclosing-class map.
+        const enclosing: ?[]const u8 = blk: {
+            if (std.mem.lastIndexOfAny(u8, cname, ".$")) |sep| {
+                if (sep > 0) break :blk cname[0..sep];
+            }
+            const g = self.module.borrow();
+            defer g.deinit();
+            break :blk g.get().registry.enclosing_class.get(cname);
+        };
+        if (enclosing) |enc| try queue.append(allocator, enc);
     }
     return out;
+}
+
+/// Whether `name` is a registered `object` declaration (not an anonymous
+/// object's synthetic class).
+fn classIsObjectDecl(self: *VmHost, name: []const u8) bool {
+    const g = self.classes.borrow();
+    defer g.deinit();
+    const d = g.get().get(name) orelse return false;
+    const dg = d.borrow();
+    defer dg.deinit();
+    return dg.get().is_object and !dg.get().is_anonymous;
 }
 
 // -------------------------------------------------------------------------
@@ -8268,18 +8291,24 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
     }
     var class_name: []const u8 = undefined;
     var recv_fqn: []const u8 = undefined;
+    var local_runtime = false;
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
         class_name = cg.get().name;
         recv_fqn = cg.get().fqn;
+        local_runtime = cg.get().is_local_runtime;
         cg.deinit();
         g.deinit();
     }
     // The best fit found so far that needed DEFAULTS to bind; used only when
     // the walk finds no exact-arity candidate anywhere in the hierarchy.
     var defaulted_hit: ?ResolvedMethod = null;
-    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8, hint: []const u8 = "" };
+    // `runtime_only`: a class registered at run time (a local class) has no
+    // IR row, and its name may coincide with a module class (`class B`
+    // declared inside `B.foo`), so it is never resolved through the index;
+    // the walk continues from its runtime ClassDef's supertypes.
+    const WalkItem = struct { cid: ?ir.ClassId, name: []const u8, hint: []const u8 = "", runtime_only: bool = false };
     var queue: std.ArrayList(WalkItem) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
@@ -8289,11 +8318,12 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
     // shadow it. The hierarchy is then walked by identity (each class's
     // resolved supertype ids), never re-resolved from a collidable simple name.
     const start_cid: ?ir.ClassId = blk: {
+        if (local_runtime) break :blk null;
         const mg = self.module.borrow();
         defer mg.deinit();
         break :blk mg.get().classIdByFqn(recv_fqn);
     };
-    try queue.append(allocator, .{ .cid = start_cid, .name = class_name });
+    try queue.append(allocator, .{ .cid = start_cid, .name = class_name, .runtime_only = local_runtime });
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const item = queue.items[head];
@@ -8309,7 +8339,7 @@ fn resolveInstanceMethod(self: *VmHost, allocator: Allocator, receiver: *const V
             if (item.cid) |cid| {
                 if (@intFromEnum(cid) < mod.classes.items.len) ir_class = mod.classes.items[@intFromEnum(cid)];
             }
-            if (ir_class == null) {
+            if (ir_class == null and !item.runtime_only) {
                 if (classByNamePreferring(mod, cur_name, item.hint)) |hit| {
                     ir_class = hit.cls;
                 }
@@ -15516,6 +15546,27 @@ fn supertypesClassFirst(self: *VmHost, allocator: Allocator, class_name: []const
     return out.toOwnedSlice(allocator);
 }
 
+/// Whether the class table holds an entry named `class_name`.
+fn classIsRegistered(self: *VmHost, class_name: []const u8) bool {
+    const g = self.classes.borrow();
+    defer g.deinit();
+    return g.get().get(class_name) != null;
+}
+
+/// The registered supertype of `class_name` whose dotted name ends in
+/// `.simple`, when the qualifier was written with the simple name only.
+fn ownerSupertypeBySuffix(self: *VmHost, class_name: []const u8, simple: []const u8) ?[]const u8 {
+    const g = self.classes.borrow();
+    defer g.deinit();
+    const d = g.get().get(class_name) orelse return null;
+    const dg = d.borrow();
+    defer dg.deinit();
+    for (dg.get().supertype_names) |s| {
+        if (s.len > simple.len + 1 and std.mem.endsWith(u8, s, simple) and s[s.len - simple.len - 1] == '.') return s;
+    }
+    return null;
+}
+
 /// Whether `q` is one of `class_name`'s registered supertypes.
 fn ownerHasSupertype(self: *VmHost, class_name: []const u8, q: []const u8) bool {
     const g = self.classes.borrow();
@@ -15543,19 +15594,22 @@ fn emitSuperPath(allocator: Allocator, decl_fqn: []const u8, fid: FuncId, target
 
 pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     _ = arg_names;
-    // Find the parent class of owner_class — `super.method()` walks one
-    // step up the inheritance chain. With `super<Q>`, dispatch on Q
-    // directly; with `super@Q`, dispatch on Q's own parent.
+    // `super.method()` walks the supertypes of owner_class (the class the
+    // call is written in, or the labeled `super@Outer`); `super<Q>` starts
+    // the walk at Q itself.
     var pending: std.ArrayList([]const u8) = .empty;
     defer pending.deinit(allocator);
     if (qualifier) |q| {
-        if (ownerHasSupertype(self, owner_class, q)) {
-            // `q` is the const-pool super qualifier (program-lifetime); borrow it.
+        // `q` is the const-pool super qualifier (program-lifetime); borrow it.
+        // A simple qualifier naming a nested supertype registered under its
+        // dotted name (`super<Base>` for `Outer.Base`) resolves through the
+        // owner's supertype list.
+        if (ownerHasSupertype(self, owner_class, q) or classIsRegistered(self, q)) {
             try pending.append(allocator, q);
+        } else if (ownerSupertypeBySuffix(self, owner_class, q)) |full| {
+            try pending.append(allocator, full);
         } else {
-            const sups = try supertypesClassFirst(self, allocator, q);
-            defer allocator.free(sups);
-            try pending.appendSlice(allocator, sups);
+            try pending.append(allocator, q);
         }
     } else {
         const sups = try supertypesClassFirst(self, allocator, owner_class);
@@ -15647,6 +15701,20 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                     return ir.eval.evalWith(VmHost, allocator, module_ref.borrow().get(), func, all, self);
                 }
                 mg.deinit();
+            }
+        }
+        // A builtin collection supertype has no IR class: the instance holds
+        // the host collection as its delegate for that supertype, and
+        // `super<ArrayList>.add(el)` dispatches on it.
+        if (receiver.* == .Instance) {
+            var kb: [96]u8 = undefined;
+            if (std.fmt.bufPrint(&kb, "__delegate__{s}", .{simpleName(cname)}) catch null) |key| {
+                const delegate: ?Value = blk: {
+                    const ig = receiver.Instance.borrow();
+                    defer ig.deinit();
+                    break :blk ig.get().get(key);
+                };
+                if (delegate) |d| return callMemberRec(self, allocator, &d, name, args);
             }
         }
         // Not here: continue through this class's own supertypes.

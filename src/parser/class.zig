@@ -351,7 +351,7 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
                 // (`ENTRY(1, "x", viaBroadcast = true)`, `A(b = 1, a = 0)`);
                 // the label names the parameter the argument binds.
                 const label = expr.tryConsumeNamedArgName(p);
-                const a = expr.parseExpr(p) orelse break;
+                const a = expr.parseValueArgument(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
                 arg_names.append(p.allocator, label) catch @panic("OOM");
                 support.skipNl(p);
@@ -612,19 +612,11 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
                 if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
                     break;
                 }
-                var this_name: ?[]const u8 = null;
-                if (std.meta.activeTag(support.peekKind(p).*) == .Ident) {
-                    const arg_save = p.pos;
-                    const label = support.parseIdent(p, "arg label");
-                    if (std.meta.activeTag(support.peekKind(p).*) == .Eq) {
-                        _ = support.bump(p);
-                        support.skipNl(p);
-                        if (label) |l| this_name = l.name;
-                    } else {
-                        p.pos = arg_save;
-                    }
-                }
-                const a = expr.parseExpr(p) orelse break;
+                // A supertype constructor argument is a value argument like
+                // any call's: `Base(ints = *ints, s = s)` spreads into the
+                // vararg slot under its name.
+                const this_name = expr.tryConsumeNamedArgName(p);
+                const a = expr.parseValueArgument(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
                 arg_names.append(p.allocator, this_name) catch @panic("OOM");
                 support.skipNl(p);

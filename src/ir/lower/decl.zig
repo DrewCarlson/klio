@@ -543,7 +543,7 @@ pub fn reserveMemberHeaders(
             renameParamHead(try loweredMemberTypeRef(module, a, owner_id, f, rt, false), rt)
         else
             build.typeUnit();
-        try module.funcs.append(a, .{
+        try module.appendFunc(.{
             .id = id,
             .name = f.name.name,
             .fqn = fqn,
@@ -1326,7 +1326,7 @@ pub fn lowerFunctionWithFile(
     const nm = f.name.name;
     try module.func_index.append(a, .{ .name = nm, .id = id });
     try funcNameIndexPush(module, nm, id);
-    try module.funcs.append(a, placed);
+    try module.appendFunc(placed);
     return placed;
 }
 
@@ -1649,7 +1649,7 @@ fn retainExpectMemberHeader(
         try loweredTypeRef(a, rt, true)
     else
         .{ .name = "Unit", .nullable = false, .args = &.{} };
-    try module.funcs.append(a, .{
+    try module.appendFunc(.{
         .id = id,
         .name = f.name.name,
         .fqn = member_fqn,
@@ -1728,7 +1728,7 @@ pub fn retainLocalClassMemberHeader(
         try loweredTypeRef(a, rt, true)
     else
         .{ .name = "Unit", .nullable = false, .args = &.{} };
-    try module.funcs.append(a, .{
+    try module.appendFunc(.{
         .id = id,
         .name = f.name.name,
         .fqn = member_fqn,
@@ -1834,7 +1834,7 @@ pub fn lowerMethodWithMemberContext(
             module.funcByIdMut(id).?.* = placed;
         } else {
             try module.recordFuncDeclSpan(a, f.name.span, id);
-            try module.funcs.append(a, placed);
+            try module.appendFunc(placed);
             try registerFuncTypeParams(module, f, id);
             const nm = f.name.name;
             try module.func_index.append(a, .{ .name = nm, .id = id });
@@ -1892,7 +1892,7 @@ pub fn lowerMethodWithMemberContext(
         module.funcByIdMut(id).?.* = placed;
     } else {
         try module.recordFuncDeclSpan(a, f.name.span, id);
-        try module.funcs.append(a, placed);
+        try module.appendFunc(placed);
         try registerFuncTypeParams(module, f, id);
     }
     try recordMethodParamDefaults(module, f, id, owner_class, own_members);
@@ -3075,7 +3075,7 @@ test "member body receiver keeps its reserved qualified generic owner" {
         .span = sp,
     };
     const reserved = m.nextFuncId();
-    try m.funcs.append(a, .{
+    try m.appendFunc(.{
         .id = reserved,
         .name = "value",
         .fqn = "right.Box.value",
@@ -3187,7 +3187,7 @@ test "function bounds shadow class bounds and mark intersections incomplete" {
 
     const sp = ast.Span{ .file = ir.FileId.from(0), .start = 0, .end = 1 };
     const reserved = m.nextFuncId();
-    try m.funcs.append(a, .{
+    try m.appendFunc(.{
         .id = reserved,
         .name = "value",
         .fqn = "sample.Owner.value",
