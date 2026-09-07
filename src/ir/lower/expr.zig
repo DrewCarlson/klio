@@ -762,6 +762,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const lbl: ?[]const u8 = if (brk.label) |i| i.name else null;
             if (b.loopFor(lbl)) |frame| {
                 const target = frame.break_target;
+                try leaveTryFramesForJump(b, frame.finally_base, frame.catch_base);
                 try replayFinallysForJump(b, frame.finally_base);
                 try emitTowerPopsForJump(b, frame.encl_tower_base);
                 b.terminate(.{ .Goto = target });
@@ -776,6 +777,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const lbl: ?[]const u8 = if (cont.label) |i| i.name else null;
             if (b.loopFor(lbl)) |frame| {
                 const target = frame.continue_target;
+                try leaveTryFramesForJump(b, frame.finally_base, frame.catch_base);
                 try replayFinallysForJump(b, frame.finally_base);
                 try emitTowerPopsForJump(b, frame.encl_tower_base);
                 b.terminate(.{ .Goto = target });
@@ -3776,6 +3778,24 @@ fn superBase(b: *FuncBuilder, sup: anytype) Allocator.Error!?SuperBase {
 /// within the finally body still unwinds correctly. The bypassed try
 /// regions' runtime `TryFrame`s are popped when the current block exits —
 /// the jump bypasses the finally sentinel that would pop them.
+/// A `break`/`continue` leaves every try entered inside the loop: their
+/// runtime frames are popped when the current block exits, and the finally
+/// bodies replayed for the jump then run OUTSIDE them, so an exception one
+/// of them throws is neither caught by a catch the jump already left nor
+/// routed back into the finally itself.
+fn leaveTryFramesForJump(b: *FuncBuilder, finally_base: usize, catch_base: usize) Allocator.Error!void {
+    const fin = try b.finallyBodiesFrom(finally_base);
+    defer b.allocator.free(fin);
+    const cat = try b.catchBodiesFrom(catch_base);
+    defer b.allocator.free(cat);
+    if (fin.len == 0 and cat.len == 0) return;
+    try b.appendPopOnExit(b.cur, fin);
+    try b.appendPopOnExit(b.cur, cat);
+    const next = try b.allocBlock();
+    b.terminate(.{ .Goto = next });
+    b.switchTo(next);
+}
+
 fn replayFinallysForJump(b: *FuncBuilder, base_raw: usize) Allocator.Error!void {
     const base = @min(base_raw, b.finally_stack.items.len);
     const pop_bodies = try b.finallyBodiesFrom(base);
