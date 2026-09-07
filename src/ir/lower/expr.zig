@@ -700,11 +700,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .Call => return lowerCall(b, expr),
         .DoWhile => |w| {
             const body_blk = try b.allocBlock();
+            // `continue` in a do-while goes to the condition, never back to
+            // the body's start.
+            const cond_blk = try b.allocBlock();
             const exit = try b.allocBlock();
             b.terminate(.{ .Goto = body_blk });
 
             b.switchTo(body_blk);
-            try b.pushLoop(null, body_blk, exit);
+            try b.pushLoop(null, cond_blk, exit);
             // Kotlin scopes the do-body's declarations into the `while`
             // condition; when the body is a block, lower its statements and the
             // condition in one shared scope so `do { val x = … } while (x …)`
@@ -716,6 +719,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     try hoistMutualLocalFns(b, block);
                     for (block.stmts) |*stmt| _ = try lowerStmt(b, stmt);
                     b.popLoop();
+                    b.terminate(.{ .Goto = cond_blk });
+                    b.switchTo(cond_blk);
                     const c = try lowerExpr(b, w.cond);
                     try b.popScope();
                     b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
@@ -725,6 +730,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 _ = try lowerExpr(b, body);
             }
             b.popLoop();
+            b.terminate(.{ .Goto = cond_blk });
+            b.switchTo(cond_blk);
             const c = try lowerExpr(b, w.cond);
             b.terminate(.{ .Branch = .{ .cond = c, .t = body_blk, .f = exit } });
 
@@ -3794,6 +3801,35 @@ fn leaveTryFramesForJump(b: *FuncBuilder, finally_base: usize, catch_base: usize
     const next = try b.allocBlock();
     b.terminate(.{ .Goto = next });
     b.switchTo(next);
+}
+
+/// Among same-named LOCAL function overloads (`f`, `f$ovl0`, …) the
+/// declaration whose parameter count matches the call; the plain name when
+/// it fits or when nothing does.
+fn localOverloadPick(b: *FuncBuilder, name: []const u8, argc: usize) []const u8 {
+    if (!b.isLocalFn(name)) return name;
+    var buf: [4][96]u8 = undefined;
+    var any_sibling = false;
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        const m = std.fmt.bufPrint(&buf[i], "{s}$ovl{d}", .{ name, i }) catch break;
+        if (b.isLocalFn(m)) any_sibling = true;
+    }
+    if (!any_sibling) return name;
+    if (localFnArity(b, name) == argc) return name;
+    i = 0;
+    while (i < 4) : (i += 1) {
+        const m = std.fmt.bufPrint(&buf[i], "{s}$ovl{d}", .{ name, i }) catch break;
+        if (!b.isLocalFn(m)) continue;
+        if (localFnArity(b, m) == argc) return b.module.func_name_index.allocator.dupe(u8, m) catch name;
+    }
+    return name;
+}
+
+fn localFnArity(b: *const FuncBuilder, name: []const u8) usize {
+    if (b.localFnParamTys(name)) |tys| return tys.len;
+    if (b.localExtFnArity(name)) |n| return @intCast(n);
+    return 0;
 }
 
 fn replayFinallysForJump(b: *FuncBuilder, base_raw: usize) Allocator.Error!void {
@@ -11631,7 +11667,7 @@ fn lowerValueInvocation(
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
 ) Allocator.Error!?Reg {
-    const name0 = callee.Path.segments[0].name;
+    const name0 = localOverloadPick(b, callee.Path.segments[0].name, args.len);
 
     // A bare call to a receiver-lambda param reached as a capture. The
     // declared receiver HEAD rides the instruction: the captured `this`
