@@ -23,4 +23,11 @@ fun main() {
     log = ""
     bar("P", a).prop += 5
     println("$log ${a.prop}")
+    log = ""
+    val arr = intArrayOf(1, 2, 3)
+    fun index(i: Int): Int { log += "i$i"; return i }
+    fun array(): IntArray { log += "arr"; return arr }
+    array()[index(1)] += 40
+    val pre = ++array()[index(2)]
+    println("$log $pre ${arr.toList()}")
 }

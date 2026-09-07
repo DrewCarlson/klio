@@ -582,6 +582,17 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return r;
                 }
                 const uo: UnOp = if (u.op == .PreInc) .Inc else .Dec;
+                if (stmt_mod.indexNeedsCaching(u.expr)) {
+                    try b.pushScope();
+                    defer b.popScope() catch {};
+                    const cached = try stmt_mod.cacheIndexTarget(b, &u.expr.Index);
+                    const cur = try lowerExpr(b, &cached);
+                    const dst = b.allocReg();
+                    try b.push(.{ .UnOp = .{ .dst = dst, .op = uo, .operand = cur } });
+                    try writeBackLvalue(b, &cached, dst);
+                    // The prefix form's value is a fresh read of the element.
+                    return try lowerExpr(b, &cached);
+                }
                 if (sideEffectingMemberTarget(u.expr)) {
                     // `++getA().x` evaluates `getA()` once.
                     const m = &u.expr.Member;
@@ -6214,6 +6225,16 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .Inc, .Dec => {
             const uo: UnOp = if (pf.op == .Inc) .Inc else .Dec;
+            if (stmt_mod.indexNeedsCaching(inner)) {
+                try b.pushScope();
+                defer b.popScope() catch {};
+                const cached = try stmt_mod.cacheIndexTarget(b, &inner.Index);
+                const old = try lowerExpr(b, &cached);
+                const new = b.allocReg();
+                try b.push(.{ .UnOp = .{ .dst = new, .op = uo, .operand = old } });
+                try writeBackLvalue(b, &cached, new);
+                return old;
+            }
             if (sideEffectingMemberTarget(inner)) {
                 // `getA().x++` evaluates `getA()` once.
                 const m = &inner.Member;
