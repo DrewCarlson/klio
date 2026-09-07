@@ -1360,6 +1360,10 @@ pub const Func = struct {
     /// in `params`; keeping that shape explicitly prevents the VM from
     /// inferring receiver binding from an extra argument or a `this` capture.
     lambda_has_receiver: bool = false,
+    /// True when the lambda kept its parser-injected `it` because no
+    /// expected function type constrained it (`val l = {}`, `{} as Any`):
+    /// kotlinc types such a lambda `() -> R`, so its arity reads as zero.
+    lambda_it_unconstrained: bool = false,
     /// Declared receiver head of a receiver-lambda body. Unlike a local
     /// extension function this receiver is supplied at invocation rather
     /// than occupying a parameter slot; the VM uses the head to select the

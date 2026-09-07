@@ -6275,12 +6275,24 @@ fn missTraceWant(name: []const u8) bool {
 /// allocated by `callMemberInnerStatic` (recognizable by its `Vm::call_member`
 /// prefix). Safe to call at any discard site: a static `.Unimplemented`
 /// literal does not match, so it is never freed. No-op under the arena.
-fn freeDispatchMiss(allocator: Allocator, r: EvalResult) void {
+pub fn freeDispatchMiss(allocator: Allocator, r: EvalResult) void {
     if (!runtime.freeScratch()) return;
     if (r == .err and r.err == .Unimplemented) {
         const m = r.err.Unimplemented;
         if (std.mem.startsWith(u8, m, "Vm::call_member")) allocator.free(m);
     }
+}
+
+/// Whether `r` is the top-level dispatch miss for `name` itself (the
+/// `Vm::call_member `name` on …` message), as opposed to a genuine error
+/// raised deeper in a member that did resolve.
+pub fn isDispatchMissFor(r: EvalResult, name: []const u8) bool {
+    if (!(r == .err and r.err == .Unimplemented)) return false;
+    const prefix = "Vm::call_member `";
+    const m = r.err.Unimplemented;
+    if (!std.mem.startsWith(u8, m, prefix)) return false;
+    const rest = m[prefix.len..];
+    return rest.len > name.len and std.mem.startsWith(u8, rest, name) and rest[name.len] == '`';
 }
 
 // -------------------------------------------------------------------------
@@ -6789,10 +6801,44 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
                             // through to other dispatch; the miss message is
                             // discarded here, so free it.
                             freeDispatchMiss(allocator, r);
+                            // A companion property holding a callable
+                            // (`A.handler(x)` with `val handler = Handler()`
+                            // in the companion) calls the value's `invoke`.
+                            const field: ?Value = blk: {
+                                const ig = s.Instance.borrow();
+                                defer ig.deinit();
+                                break :blk ig.get().get(name);
+                            };
+                            if (field) |fv| {
+                                if (fv == .Instance) {
+                                    const r2 = try callMemberRec(self, allocator, &fv, "invoke", args);
+                                    if (!isDispatchMissFor(r2, "invoke")) return r2;
+                                    freeDispatchMiss(allocator, r2);
+                                }
+                            }
                         },
                         else => return r,
                     },
                 }
+            }
+        }
+    }
+    // An enum entry as the callee (`A.ONE(42)`, or `ONE(42)` through
+    // `import A.ONE`): the entry's `operator fun invoke`.
+    if (is_enum and !std.mem.eql(u8, name, "values") and !std.mem.eql(u8, name, "valueOf")) {
+        const entry: ?Value = blk: {
+            const cg = cls.borrow();
+            defer cg.deinit();
+            for (cg.get().enum_entries) |e| {
+                if (std.mem.eql(u8, e.name, name)) break :blk e.value;
+            }
+            break :blk null;
+        };
+        if (entry) |ev| {
+            if (ev == .Instance) {
+                const r = try callMemberRec(self, allocator, &ev, "invoke", args);
+                if (!isDispatchMissFor(r, "invoke")) return r;
+                freeDispatchMiss(allocator, r);
             }
         }
     }
@@ -7251,7 +7297,20 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
                 if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
                 return r;
             }
-            return try callMemberRec(self, allocator, &first, n, rest);
+            const r = try callMemberRec(self, allocator, &first, n, rest);
+            // `Int::extProp` invoked with its receiver reads the extension
+            // property once the member forward has missed the name itself.
+            if (rest.len == 0 and isDispatchMissFor(r, n)) {
+                var r2 = try getFieldRec(self, allocator, &first, n);
+                if (runtime.envOnce("KLIO_ERR_TRACE") != null) std.debug.print("[boundref-unbound] {s} on {s}: field read {s}\n", .{ n, first.typeFqn(), if (r2 == .ok) "ok" else "miss" });
+                if (r2 == .ok) {
+                    freeDispatchMiss(allocator, r);
+                    if (runtime.reclaimEnabled()) r2.ok.retain();
+                    return r2;
+                }
+            }
+            if (runtime.envOnce("KLIO_ERR_TRACE") != null) std.debug.print("[boundref-unbound] {s} on {s}: forward {s}\n", .{ n, first.typeFqn(), if (r == .ok) "ok" else "err" });
+            return r;
         }
         return null;
     }
@@ -7285,6 +7344,16 @@ fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value,
     // Bound method reference: forward the call.
     const r = try callMemberRec(self, allocator, &recv_capt, n, args);
     if ((std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) and r == .err and r.err == .Unimplemented) {
+        // A bound EXTENSION-property reference invoked (`(::extProp)()`)
+        // reads the property once the member forward has missed the name.
+        if (args.len == 0 and isDispatchMissFor(r, n)) {
+            var r2 = try getFieldRec(self, allocator, &recv_capt, n);
+            if (r2 == .ok) {
+                freeDispatchMiss(allocator, r);
+                if (runtime.reclaimEnabled()) r2.ok.retain();
+                return r2;
+            }
+        }
         // The receiver's class declares no such member: the reference
         // names a top-level function (a `::fn` lowered as a member ref
         // before the function's header was registered). Resolve it
@@ -7423,7 +7492,7 @@ fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Val
 /// and a property declared with only a custom `get()` re-runs its 0-arg
 /// getter func on each read. Returns `null` when `pname` names no top-level
 /// property, leaving the remaining dispatch branches to handle it.
-fn topLevelPropertyGet(self: *VmHost, allocator: Allocator, pname: []const u8) Allocator.Error!?EvalResult {
+pub fn topLevelPropertyGet(self: *VmHost, allocator: Allocator, pname: []const u8) Allocator.Error!?EvalResult {
     switch (try self.lookupGlobalThrowing(allocator, pname)) {
         .ok => |maybe| if (maybe) |v| {
             v.retain();

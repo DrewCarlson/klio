@@ -183,6 +183,12 @@ fn flattenEval(r: EvalResult) RuntimeEvalResult {
 /// transient `VmHost` over the same shared state and delegate. Lets a
 /// constructor reference (`::Box`, `Outer::Nested`) be invoked uniformly
 /// from stdlib higher-order ops like `map`/`fold`.
+fn classDefIsInner(def: ObjRef(ClassDef)) bool {
+    const dg = def.borrow();
+    defer dg.deinit();
+    return dg.get().is_inner;
+}
+
 pub fn construct(self: *VmIntrinsicHost, class_id: ClassId, args: []const Value, out: Output) Allocator.Error!RawResult {
     var host = vmHost(self, out);
     return host.newInstance(self.allocator, class_id, args, null);
@@ -563,6 +569,22 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
         const class_id_opt = module_g.get().classIdByFqn(fqn) orelse module_g.get().classId(name);
         module_g.deinit();
         if (class_id_opt) |class_id| {
+            // An inner class's constructor reference (`Outer::Inner`) takes
+            // the enclosing instance as its leading argument.
+            const inner_outer: ?*const Value = blk: {
+                if (args.len == 0 or args[0] != .Instance) break :blk null;
+                if (!classDefIsInner(def)) break :blk null;
+                const mg = self.module.borrow();
+                defer mg.deinit();
+                if (class_id.int() >= mg.get().classes.items.len) break :blk null;
+                if (args.len != mg.get().classes.items[class_id.int()].primary_params.len + 1) break :blk null;
+                break :blk &args[0];
+            };
+            if (inner_outer) |oh| {
+                var host = vmHost(self, out);
+                const r = try host.newInstance(self.allocator, class_id, args[1..], oh);
+                return flattenEval(r);
+            }
             const r = try construct(self, class_id, args, out);
             return flattenEval(r);
         }
@@ -713,6 +735,24 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
             return result;
         }
         return invokeCallable(self, callable, args, out);
+    }
+
+    // An inner class's constructor reference called with receiver syntax
+    // (`val a: Foo.() -> Foo.Bar = Foo::Bar; Foo().a()`): the receiver is
+    // the enclosing instance.
+    if (callable.* == .Class and this_value.* == .Instance and classDefIsInner(callable.Class)) {
+        const class_id_opt = blk: {
+            const dg = callable.Class.borrow();
+            defer dg.deinit();
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk mg.get().classIdByFqn(dg.get().fqn) orelse mg.get().classId(dg.get().name);
+        };
+        if (class_id_opt) |class_id| {
+            var host = vmHost(self, out);
+            const r = try host.newInstance(self.allocator, class_id, args, this_value);
+            return flattenEval(r);
+        }
     }
 
     // A callable reference (`recv::method`, `Long::toByte`) invoked with

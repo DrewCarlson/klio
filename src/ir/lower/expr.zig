@@ -833,8 +833,29 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // so a type parameter named like a concrete class (`class
             // ScopeMap<Key, Scope>` alongside a test's `class Scope`) is not
             // checked against that class and a nullable instantiation does not
-            // throw. Reified type params are excluded (the reified splice
-            // substitutes the concrete type before this point).
+            // throw. A REIFIED parameter the enclosing splice bound is a
+            // checked cast to the bound type, nullability included.
+            if (cast.ty.type_args.len == 0) {
+                if (b.resolveReifiedTypeName(cast.ty.name.name)) |bound| {
+                    var head = bound;
+                    var nullable = cast.ty.nullable;
+                    if (std.mem.endsWith(u8, head, "?")) {
+                        head = head[0 .. head.len - 1];
+                        nullable = true;
+                    }
+                    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+                    if (head.len != 0) {
+                        const dst = b.allocReg();
+                        try b.push(.{ .Cast = .{
+                            .dst = dst,
+                            .src = s,
+                            .ty = .{ .name = head, .nullable = nullable, .args = &.{} },
+                            .safe = cast.safe,
+                        } });
+                        return dst;
+                    }
+                }
+            }
             if (b.isTypeParam(cast.ty.name.name)) return s;
             const dst = b.allocReg();
             try b.push(.{ .Cast = .{
@@ -854,6 +875,21 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // lower the reference as a zero-arg closure over the stamped
             // call instead.
             if (try reifiedRefClosure(b, pr.name.name, pr.name.span)) |r| return r;
+            // `::Array` / `::IntArray`: the array constructors are intrinsics
+            // with no function value to load; the reference forwards to the
+            // constructor call.
+            if (isArrayCtorRefName(pr.name.name) and b.resolve(pr.name.name) == null and
+                !b.knowsOuter(pr.name.name) and b.module.funcsBySimpleName(pr.name.name).len == 0)
+            {
+                if (try arrayCtorRefClosure(b, pr.name.name, pr.name.span)) |r| return r;
+            }
+            // `::arrayOf` against `(Array<T>) -> …`: a vararg intrinsic
+            // reference whose slot takes the array itself spreads it.
+            if (isVarargIntrinsicName(pr.name.name) and b.resolve(pr.name.name) == null and
+                !b.knowsOuter(pr.name.name) and !userFunctionDeclared(b, pr.name.name))
+            {
+                if (try varargIntrinsicRefClosure(b, pr.name.name, pr.name.span)) |r| return r;
+            }
             // `::name` naming a file-private top-level function mangled per
             // file (two files in one package each declaring the same
             // `private fun`) references the calling file's mangled name.
@@ -1031,6 +1067,46 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return dst;
                 }
             }
+            // `::ext` with no receiver, naming only EXTENSION functions whose
+            // receiver an enclosing `this` satisfies, is bound to that
+            // receiver.
+            if (class_pick == null and !member_shadows_ref and !is_tracked) ext_ref: {
+                const target_cls = bareRefExtensionReceiverClass(b, pr.name.name);
+                if (runtime.envOnce("KLIO_REF_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, pr.name.name)) {
+                        const tower = b.collectImplicitReceiverTower(b.allocator, eagerLambdaRecvHead(b)) catch &.{};
+                        defer b.allocator.free(tower);
+                        std.debug.print("[ref-ext] {s} target={?s} recvTy={?s} owner={?s} eager={?s} tower={d}:", .{ pr.name.name, target_cls, b.recvTy(), b.ownerClass(), eagerLambdaRecvHead(b), tower.len });
+                        for (tower) |h| std.debug.print(" {s}", .{h});
+                        std.debug.print("\n", .{});
+                    }
+                }
+                // No receiver type is known here (a receiver lambda lowered
+                // without its expected type), but a `this` is in scope and
+                // every candidate is an extension: bind it and let dispatch
+                // check the receiver.
+                const target_cls_v = target_cls orelse {
+                    if (!bareRefNamesOnlyExtensions(b, pr.name.name)) break :ext_ref;
+                    const this_reg = (try resolveThisRegKind(b, true, false)) orelse break :ext_ref;
+                    try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = this_reg, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
+                    return dst;
+                };
+                const this_reg = (try resolveThisRegKind(b, true, false)) orelse break :ext_ref;
+                var recv_reg = this_reg;
+                const innermost_lambda_recv = eagerLambdaRecvHead(b);
+                const direct = (if (b.recvTy()) |rt| std.mem.eql(u8, rt, target_cls_v) else false) or
+                    (if (innermost_lambda_recv) |lr| std.mem.eql(u8, lr, target_cls_v) else false) or
+                    (innermost_lambda_recv == null and b.recvTy() == null and
+                        (if (b.ownerClass()) |own| std.mem.eql(u8, own, target_cls_v) else false));
+                if (!direct) {
+                    const qnm = try b.module.internConst(b.allocator, .{ .String = target_cls_v });
+                    const qreg = b.allocReg();
+                    try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
+                    recv_reg = qreg;
+                }
+                try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv_reg, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
+                return dst;
+            }
             if (class_pick != null and !member_shadows_ref) {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = class_pick.?, .ctor_ref = true } });
             } else if (ref_pick != null and !member_shadows_ref) {
@@ -1083,6 +1159,16 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                                 try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
                                 recv_reg = qreg;
                             }
+                        }
+                    } else if (enclosingClassDeclaringMember(b, pr.name.name)) |decl| {
+                        // A member of an ENCLOSING class (`::outerMember`
+                        // inside an inner class) binds that class's instance.
+                        const own = b.ownerClass() orelse decl;
+                        if (!std.mem.eql(u8, decl, own)) {
+                            const qnm = try b.module.internConst(b.allocator, .{ .String = decl });
+                            const qreg = b.allocReg();
+                            try b.push(.{ .QualifiedThis = .{ .dst = qreg, .receiver = this_reg, .qualifier = qnm } });
+                            recv_reg = qreg;
                         }
                     }
                     try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = recv_reg, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
@@ -1155,6 +1241,12 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1 and
                 b.isLocalExtFn(mr.name.name))
             {
+                // `value::localExt` is BOUND: a lambda forwarding its
+                // arguments to `value.localExt(...)`.
+                const rn = mr.receiver.Path.segments[0].name;
+                if (b.resolve(rn) != null or b.knowsOuter(rn)) {
+                    if (try boundLocalExtRefClosure(b, mr.receiver, mr.name.name, mr.span)) |r| return r;
+                }
                 if (b.resolve(mr.name.name)) |r| return r;
                 if (b.knowsOuter(mr.name.name)) {
                     const idx = try b.recordCapture(mr.name.name);
@@ -4153,6 +4245,7 @@ fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (b.module.funcByIdMut(body_func)) |f| {
         f.lambda_receiver_shape_known = lambda_receiver_shape_known;
         f.lambda_has_receiver = lambda_has_receiver;
+        f.lambda_it_unconstrained = lam.implicit_it and expected_arity == -1;
         // The receiver HEAD is this lambda's OWN derivation — the body
         // builder's recvTy can carry the ENCLOSING lambda's receiver (a
         // placement block nested in a measure lambda recorded
@@ -16999,6 +17092,246 @@ fn expectedHeadsConst(b: *FuncBuilder) Allocator.Error!?ConstId {
 /// array (`(Array<String>) -> Unit` takes the vararg as written).
 fn isArrayHead(head: []const u8) bool {
     return std.mem.eql(u8, head, "Array") or std.mem.endsWith(u8, head, "Array");
+}
+
+fn isVarargIntrinsicName(name: []const u8) bool {
+    const names = [_][]const u8{
+        "arrayOf",       "intArrayOf",     "longArrayOf",   "shortArrayOf",  "byteArrayOf",
+        "charArrayOf",   "booleanArrayOf", "floatArrayOf",  "doubleArrayOf", "listOf",
+        "mutableListOf", "arrayListOf",    "setOf",         "mutableSetOf",  "hashSetOf",
+        "linkedSetOf",   "sequenceOf",     "sortedSetOf",
+    };
+    for (names) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// `{ p0 -> arrayOf(*p0) }`: the reference's single slot is the array a
+/// vararg intrinsic would otherwise wrap again.
+fn varargIntrinsicRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
+    const slot_is_array = blk: {
+        if (b.pending_ref_lambda_param_types) |types| {
+            if (b.pending_lambda_arity != 1) break :blk false;
+            break :blk types.len == 1 and isArrayHead(simpleTypeHead(types[0].name));
+        }
+        const expected = b.peekExpected() orelse break :blk false;
+        const ft = expected.function orelse break :blk false;
+        if (ft.receiver != null or ft.params.len != 1) break :blk false;
+        break :blk isArrayHead(simpleTypeHead(ft.params[0].name.name));
+    };
+    if (!slot_is_array) return null;
+    const ma = b.module.func_name_index.allocator;
+    const params = try ma.alloc(ast.Ident, 1);
+    const pn = try ma.dupe(u8, "$ref$p0");
+    params[0] = .{ .name = pn, .span = sp };
+    const segs_p = try ma.alloc(ast.Ident, 1);
+    segs_p[0] = .{ .name = pn, .span = sp };
+    const inner = try ma.create(ast.Expr);
+    inner.* = .{ .Path = .{ .segments = segs_p, .span = sp } };
+    const args = try ma.alloc(ast.Expr, 1);
+    args[0] = .{ .Spread = .{ .expr = inner, .span = sp } };
+    const anames = try ma.alloc(?[]const u8, 1);
+    anames[0] = null;
+    const segs = try ma.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = try ma.dupe(u8, name), .span = sp };
+    const callee = try ma.create(ast.Expr);
+    callee.* = .{ .Path = .{ .segments = segs, .span = sp } };
+    const stmts = try ma.alloc(ast.Stmt, 1);
+    stmts[0] = .{ .Expr = .{ .Call = .{
+        .callee = callee,
+        .args = args,
+        .arg_names = anames,
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } } };
+    const boxed = try ma.create(ast.Expr);
+    boxed.* = .{ .Lambda = .{
+        .params = params,
+        .body = .{ .stmts = stmts, .span = sp },
+        .span = sp,
+        .implicit_it = false,
+    } };
+    return try lowerExpr(b, boxed);
+}
+
+/// `{ p0, … -> value.localExt(p0, …) }` for a bound reference to a local
+/// extension function; the arity is the expected function type's, else the
+/// local's declared parameter count.
+fn boundLocalExtRefClosure(b: *FuncBuilder, receiver: *const Expr, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
+    const n: usize = if (b.pending_lambda_arity >= 0)
+        @intCast(b.pending_lambda_arity)
+    else if (b.localExtFnArity(name)) |declared|
+        @intCast(@max(declared, 0))
+    else
+        return null;
+    const ma = b.module.func_name_index.allocator;
+    const params = try ma.alloc(ast.Ident, n);
+    const args = try ma.alloc(ast.Expr, n);
+    for (0..n) |i| {
+        const pn = try std.fmt.allocPrint(ma, "$ref$p{d}", .{i});
+        params[i] = .{ .name = pn, .span = sp };
+        const segs_i = try ma.alloc(ast.Ident, 1);
+        segs_i[0] = .{ .name = pn, .span = sp };
+        args[i] = .{ .Path = .{ .segments = segs_i, .span = sp } };
+    }
+    const anames = try ma.alloc(?[]const u8, n);
+    for (anames) |*a| a.* = null;
+    const callee = try ma.create(ast.Expr);
+    callee.* = .{ .Member = .{ .receiver = @constCast(receiver), .name = .{ .name = try ma.dupe(u8, name), .span = sp }, .safe = false, .span = sp } };
+    const stmts = try ma.alloc(ast.Stmt, 1);
+    stmts[0] = .{ .Expr = .{ .Call = .{
+        .callee = callee,
+        .args = args,
+        .arg_names = anames,
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } } };
+    const boxed = try ma.create(ast.Expr);
+    boxed.* = .{ .Lambda = .{
+        .params = params,
+        .body = .{ .stmts = stmts, .span = sp },
+        .span = sp,
+        .implicit_it = false,
+    } };
+    return try lowerExpr(b, boxed);
+}
+
+fn isArrayCtorRefName(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "Array")) return true;
+    return std.mem.endsWith(u8, name, "Array") and isPrimitiveTypeName(name[0 .. name.len - "Array".len]);
+}
+
+/// `{ p0, p1 -> Array(p0, p1) }` for `::Array` (or `{ p0 -> IntArray(p0) }`
+/// for a size-only reference): the arity is the expected function type's,
+/// else the (size, init) form for `Array` and the size form for a
+/// primitive array.
+fn arrayCtorRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
+    const n: usize = if (b.pending_lambda_arity >= 0)
+        @intCast(b.pending_lambda_arity)
+    else if (std.mem.eql(u8, name, "Array")) 2 else 1;
+    if (n == 0 or n > 2) return null;
+    const ma = b.module.func_name_index.allocator;
+    const params = try ma.alloc(ast.Ident, n);
+    const args = try ma.alloc(ast.Expr, n);
+    for (0..n) |i| {
+        const pn = try std.fmt.allocPrint(ma, "$ref$p{d}", .{i});
+        params[i] = .{ .name = pn, .span = sp };
+        const segs_i = try ma.alloc(ast.Ident, 1);
+        segs_i[0] = .{ .name = pn, .span = sp };
+        args[i] = .{ .Path = .{ .segments = segs_i, .span = sp } };
+    }
+    const anames = try ma.alloc(?[]const u8, n);
+    for (anames) |*a| a.* = null;
+    const segs = try ma.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = try ma.dupe(u8, name), .span = sp };
+    const callee = try ma.create(ast.Expr);
+    callee.* = .{ .Path = .{ .segments = segs, .span = sp } };
+    const stmts = try ma.alloc(ast.Stmt, 1);
+    stmts[0] = .{ .Expr = .{ .Call = .{
+        .callee = callee,
+        .args = args,
+        .arg_names = anames,
+        .type_args = &.{},
+        .is_infix = false,
+        .span = sp,
+    } } };
+    const boxed = try ma.create(ast.Expr);
+    boxed.* = .{ .Lambda = .{
+        .params = params,
+        .body = .{ .stmts = stmts, .span = sp },
+        .span = sp,
+        .implicit_it = false,
+    } };
+    return try lowerExpr(b, boxed);
+}
+
+/// When every declaration named `name` is an extension function, the
+/// innermost implicit receiver class whose hierarchy satisfies one of
+/// their receiver types: the current extension receiver, the owner class,
+/// then each enclosing class outward. Null when none does.
+fn bareRefExtensionReceiverClass(b: *FuncBuilder, name: []const u8) ?[]const u8 {
+    const cands = b.module.funcsBySimpleName(name);
+    if (cands.len == 0) return null;
+    for (cands) |fid| {
+        const f = b.module.funcById(fid) orelse return null;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return null;
+    }
+    const Match = struct {
+        fn any(mod: *const ir.Module, fids: []const FuncId, cls: []const u8) bool {
+            for (fids) |fid| {
+                const f = mod.funcById(fid) orelse continue;
+                const head = simpleTypeHead(std.mem.trimEnd(u8, f.params[0].ty.name, "?"));
+                if (classHierarchyHasName(mod, cls, head)) return true;
+            }
+            return false;
+        }
+    };
+    if (b.recvTy()) |rt| {
+        if (Match.any(b.module, cands, rt)) return rt;
+    }
+    // Receiver lambdas (`with(a) { ::ext }`) contribute their receivers,
+    // innermost first, ahead of the lexical owner chain.
+    const tower = b.collectImplicitReceiverTower(b.allocator, eagerLambdaRecvHead(b)) catch &.{};
+    defer b.allocator.free(tower);
+    for (tower) |head| {
+        if (Match.any(b.module, cands, head)) return head;
+    }
+    var cur: ?[]const u8 = b.ownerClass();
+    var depth: usize = 0;
+    while (cur) |c| : (depth += 1) {
+        if (depth > 16) break;
+        if (Match.any(b.module, cands, c)) return c;
+        cur = b.module.registry.enclosing_class.get(c);
+    }
+    return null;
+}
+
+/// Whether `name` has declarations and every one is an extension function.
+fn bareRefNamesOnlyExtensions(b: *const FuncBuilder, name: []const u8) bool {
+    const cands = b.module.funcsBySimpleName(name);
+    if (cands.len == 0) return false;
+    for (cands) |fid| {
+        const f = b.module.funcById(fid) orelse return false;
+        if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return false;
+    }
+    return true;
+}
+
+/// The innermost class among the owner and its enclosing classes whose
+/// hierarchy declares a member named `name`; null when none does.
+fn enclosingClassDeclaringMember(b: *const FuncBuilder, name: []const u8) ?[]const u8 {
+    var cur: ?[]const u8 = b.ownerClass();
+    var depth: usize = 0;
+    while (cur) |c| : (depth += 1) {
+        if (depth > 16) break;
+        if (b.module.registry.hierarchy_methods.get(c)) |m| {
+            if (m.contains(name)) return c;
+        }
+        if (b.module.registry.hierarchy_shadow_names.get(c)) |hs| {
+            if (hs.names.contains(name)) return c;
+        }
+        cur = b.module.registry.enclosing_class.get(c);
+    }
+    return null;
+}
+
+fn classHierarchyHasName(module: *const ir.Module, class_name: []const u8, want: []const u8) bool {
+    if (std.mem.eql(u8, simpleTypeHead(class_name), want)) return true;
+    const cid = module.classId(class_name) orelse module.classIdByFqn(class_name) orelse return false;
+    return classIdHierarchyHasName(module, cid, want, 0);
+}
+
+fn classIdHierarchyHasName(module: *const ir.Module, cid: ir.ClassId, want: []const u8, depth: u8) bool {
+    if (depth >= 64 or cid.int() >= module.classes.items.len) return false;
+    const c = &module.classes.items[cid.int()];
+    if (std.mem.eql(u8, simpleTypeHead(c.name), want) or std.mem.eql(u8, simpleTypeHead(c.fqn), want)) return true;
+    for (c.supertypes) |p| {
+        if (classIdHierarchyHasName(module, p, want, depth + 1)) return true;
+    }
+    return false;
 }
 
 fn adaptedRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span, fid: FuncId) Allocator.Error!?Reg {

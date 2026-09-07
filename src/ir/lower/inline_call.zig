@@ -2592,6 +2592,16 @@ pub fn reifiedParamsUnusedInBody(allocator: Allocator, f: *const Function) Alloc
 /// Render a reified type argument's full spelling: the (already substituted)
 /// head plus its generic arguments, recursively — `List<Int>`, `Map<String,
 /// List<Int>>`, `*` for a star projection. A plain head renders as itself.
+/// A `Function` / `FunctionN` head: kotlin.jvm.functions has no class value
+/// to bind, and Kotlin erases function types under reification.
+fn functionTypeHead(head: []const u8) bool {
+    if (!std.mem.startsWith(u8, head, "Function")) return false;
+    for (head["Function".len..]) |ch| {
+        if (!std.ascii.isDigit(ch)) return false;
+    }
+    return true;
+}
+
 fn renderReifiedTypeName(b: *FuncBuilder, head: []const u8, a: *const ast.TypeRef) Allocator.Error![]const u8 {
     if (a.type_args.len == 0) {
         if (!a.nullable) return head;
@@ -3851,9 +3861,14 @@ pub fn tryInlineCallWithTypeArgs(
                 if (b.module.registry.class_super_names.get(key) == null) break :blk null;
                 break :blk b.allocator.dupe(u8, key) catch null;
             };
-            const head_sub = local_alias orelse b.resolveReifiedTypeName(a.name.name) orelse
-                reifiedQualifiedName(b, a) orelse
-                (expr_lower.scopeTypeRenameFrom(b, lexical_owner, a.name.name, a.name.span.file.int()) orelse a.name.name);
+            // An arrow-form argument (`check<(Int) -> Int>(x)`) binds the
+            // arity-indexed `FunctionN` its `is`/`as` checks compare against.
+            const head_sub = if (a.function) |ft|
+                try std.fmt.allocPrint(b.allocator, "Function{d}", .{ft.params.len + ft.context_params.len + @as(usize, @intFromBool(ft.receiver != null))})
+            else
+                local_alias orelse b.resolveReifiedTypeName(a.name.name) orelse
+                    reifiedQualifiedName(b, a) orelse
+                    (expr_lower.scopeTypeRenameFrom(b, lexical_owner, a.name.name, a.name.span.file.int()) orelse a.name.name);
             // Carry the FULL generic spelling, not just the head: a nested
             // reified consumer (`typeOf<T>()` inside a spliced
             // `typeInfo<List<Int>>()`) reads the stamped name at runtime and
@@ -3890,7 +3905,7 @@ pub fn tryInlineCallWithTypeArgs(
                 // the name (`Box<Int>`, from an enclosing binding or ctor-arg
                 // inference) loads `Box`.
                 const bare_head = if (std.mem.indexOfScalar(u8, a.name.name, '<')) |lt| a.name.name[0..lt] else a.name.name;
-                const resolved_name = if (a.function != null)
+                const resolved_name = if (a.function != null or (functionTypeHead(bare_head) and b.module.classId(bare_head) == null))
                     "Any"
                 else
                     reifiedQualifiedName(b, a) orelse
