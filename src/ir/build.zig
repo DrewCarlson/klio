@@ -1598,6 +1598,12 @@ pub const FuncBuilder = struct {
         return self.outer_names.contains(name);
     }
 
+    /// The capture-slot register `name` was hoisted into, if this builder
+    /// has captured it.
+    pub fn captureReg(self: *const FuncBuilder, name: []const u8) ?Reg {
+        return self.capture_regs.get(name);
+    }
+
     /// Capture-name list in declaration order.
     pub fn capturesTaken(self: *const FuncBuilder) []const []const u8 {
         return self.capture_order.items;

@@ -238,6 +238,7 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
         .Cast => |c| try w.print("r{d} <- Cast r{d}", .{ reg(c.dst), reg(c.src) }),
         .InstanceOf => |c| try w.print("r{d} <- InstanceOf r{d}", .{ reg(c.dst), reg(c.src) }),
         .NotNullAssert => |c| try w.print("r{d} <- NotNullAssert r{d}", .{ reg(c.dst), reg(c.src) }),
+        .LateinitCheck => |c| try w.print("r{d} <- LateinitCheck r{d} '{s}'", .{ reg(c.dst), reg(c.src), constStr(m, c.name) }),
         .Lambda => |c| try w.print("r{d} <- Lambda {s}#{d}", .{ reg(c.dst), funcName(m, c.body_func), c.body_func.int() }),
         .AstLambda => |c| {
             try w.print(

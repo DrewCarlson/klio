@@ -549,6 +549,7 @@ fn classifyFlattenable(f: *const Func) u8 {
                 .Cast,
                 .InstanceOf,
                 .NotNullAssert,
+                .LateinitCheck,
                 .LoadGlobal,
                 .LoadFromThisOrGlobal,
                 .StoreToThisOrGlobal,
@@ -1628,7 +1629,7 @@ fn fuseClassify(func: *const Func) u8 {
             switch (inst.*) {
                 .Const, .Move, .LoadParam, .LoadCapture, .BinOp, .UnOp, .Not, .Trace,
                 .GetField, .SetField, .Index, .IndexSet, .Cast, .InstanceOf,
-                .NotNullAssert, .Call, .MakeCell, .CellGet,
+                .NotNullAssert, .LateinitCheck, .Call, .MakeCell, .CellGet,
                 .CellSet, .QualifiedThis, .EnclosingPush, .EnclosingPop => {},
                 else => return 2 + @as(u8, @intFromEnum(std.meta.activeTag(inst.*))),
             }
@@ -2707,6 +2708,18 @@ pub inline fn ok(v: Value) EvalResult {
 
 pub inline fn errResult(e: EvalError) EvalResult {
     return .{ .err = e };
+}
+
+/// The throw for reading a `lateinit` property or local before its first
+/// assignment: `kotlin.UninitializedPropertyAccessException` with kotlinc's
+/// message naming the property.
+pub fn lateinitThrow(allocator: Allocator, name: []const u8) Allocator.Error!EvalError {
+    const m = try std.fmt.allocPrint(allocator, "lateinit property {s} has not been initialized", .{name});
+    return .{ .Throw = try Value.newException(allocator, .{
+        .fqn = try runtime.strInit(allocator, "kotlin.UninitializedPropertyAccessException"),
+        .message = .from(try runtime.strInitOwned(allocator, m)),
+        .cause = null,
+    }) };
 }
 
 /// One active try-region recorded on the eval's try-stack. Separates
@@ -9302,6 +9315,14 @@ noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, inst
             v.retain();
             try frame.write(nn.dst, v);
         },
+        .LateinitCheck => |lc| {
+            const v = frame.read(lc.src);
+            if (v == .Null) {
+                return raiseStep(frame, try lateinitThrow(allocator, constStr(frame.module, lc.name) orelse "?"));
+            }
+            v.retain();
+            try frame.write(lc.dst, v);
+        },
         .GetField => |*gf| {
             const gf_step = try execArmGetField(H, allocator, frame, gf, host);
             if (gfTraceWant()) |w0| {
@@ -12365,7 +12386,7 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
             };
             switch (inst.*) {
                 .Trace, .Const, .Move, .LoadParam, .BinOp, .Not, .GetField, .SetField,
-                .Index, .IndexSet, .NotNullAssert, .MakeCell,
+                .Index, .IndexSet, .NotNullAssert, .LateinitCheck, .MakeCell,
                 .CellGet, .CellSet, .EnclosingPush, .EnclosingPop => {},
                 .Cast => |ct| if (bareTypeVarHead(ct.ty.name)) return 2,
                 .InstanceOf => |io| if (bareTypeVarHead(io.ty.name)) return 2,
@@ -12926,6 +12947,13 @@ fn fusedInst(
                 return fusedRaise(.{ .Throw = exc });
             }
             fusedWrite(allocator, regs, nn.dst, v, reclaim, true);
+        },
+        .LateinitCheck => |lc| {
+            const v = fusedRead(regs, lc.src);
+            if (v == .Null) {
+                return fusedRaise(try lateinitThrow(allocator, constStr(module, lc.name) orelse "?"));
+            }
+            fusedWrite(allocator, regs, lc.dst, v, reclaim, true);
         },
         .MakeCell => |mc| {
             const v = fusedRead(regs, mc.src);

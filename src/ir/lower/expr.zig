@@ -2375,9 +2375,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (b.isBoxed(name0)) {
                 const dst = b.allocReg();
                 try b.push(.{ .CellGet = .{ .dst = dst, .cell = r } });
-                return dst;
+                return lateinitLocalRead(b, name0, dst, r);
             }
-            return r;
+            return lateinitLocalRead(b, name0, r, r);
         }
         // A bare read of a name the enclosing anon object closes over reads
         // the captured value. Whether the capture is a shared Cell (a
@@ -2389,7 +2389,7 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const cell = try b.loadCaptureHoisted(name0);
             const dst = b.allocReg();
             try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
-            return dst;
+            return lateinitLocalRead(b, name0, dst, null);
         }
         // Lambda-body capture.
         if (b.knowsOuter(name0)) {
@@ -2397,9 +2397,9 @@ fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (b.isBoxed(name0)) {
                 const dst = b.allocReg();
                 try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
-                return dst;
+                return lateinitLocalRead(b, name0, dst, null);
             }
-            return cell;
+            return lateinitLocalRead(b, name0, cell, null);
         }
         // An `it` written in a zero-parameter / receiver lambda whose
         // implicit `it` was suppressed, with no enclosing lambda supplying
@@ -3174,18 +3174,18 @@ fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
         if (b.isBoxed(ident.name)) {
             const dst = b.allocReg();
             try b.push(.{ .CellGet = .{ .dst = dst, .cell = r } });
-            return dst;
+            return lateinitLocalRead(b, ident.name, dst, r);
         }
-        return r;
+        return lateinitLocalRead(b, ident.name, r, r);
     }
     if (b.knowsOuter(ident.name)) {
         const cell = try b.loadCaptureHoisted(ident.name);
         if (b.isBoxed(ident.name)) {
             const dst = b.allocReg();
             try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
-            return dst;
+            return lateinitLocalRead(b, ident.name, dst, null);
         }
-        return cell;
+        return lateinitLocalRead(b, ident.name, cell, null);
     }
     // A renamed file-private top-level property (`"$prefix.Derived"` beside
     // another file's same-named private `prefix`) reads its per-file mangled
@@ -15049,6 +15049,45 @@ fn anyFunctionParam(params: []const ir.Param) bool {
 /// the hidden delegate binding is reachable here — bound in this scope, or
 /// captured from an enclosing one. Null when `x` is not a mutable delegated
 /// local (a plain local, or a `val x by lazy`, whose eager-once value stands).
+/// The hidden binding a local `lateinit var name` declares beside its home
+/// register. Its presence is what marks a read of `name` for the
+/// uninitialized check; a nested lambda sees it through the captured-name
+/// set exactly like the `$klio_delegate` binding of a delegated local.
+pub fn lateinitMarkerName(b: *FuncBuilder, name: []const u8) Allocator.Error![]const u8 {
+    const marker = try std.fmt.allocPrint(b.allocator, "{s}$klio_lateinit", .{name});
+    defer b.allocator.free(marker);
+    const id = try b.module.internConst(b.allocator, .{ .String = marker });
+    return b.module.consts.items[id.int()].String;
+}
+
+/// Whether a read of local `name` reads a `lateinit var`. `home` is the
+/// register the name resolved to in this builder (null when the name is
+/// only reachable as a capture): the marker must be bound to that same
+/// register, so a later same-named plain local or a lambda parameter that
+/// shadows the lateinit reads unchecked; a capture slot re-bound under the
+/// name defers to the captured-name set.
+fn lateinitLocalMarked(b: *FuncBuilder, name: []const u8, home: ?Reg) bool {
+    var namebuf: [512]u8 = undefined;
+    const marker = std.fmt.bufPrint(&namebuf, "{s}$klio_lateinit", .{name}) catch return false;
+    const outer = b.knowsOuter(marker) or isLowerAnonCapture(marker) or build.anonCaptureBinds(marker);
+    const h = home orelse return outer;
+    if (b.resolve(marker)) |m| return m.int() == h.int();
+    if (b.captureReg(name)) |c| {
+        if (c.int() == h.int()) return outer;
+    }
+    return false;
+}
+
+/// Guard a local read with the `lateinit` uninitialized check when the
+/// name is a lateinit local; otherwise the value passes through.
+fn lateinitLocalRead(b: *FuncBuilder, name: []const u8, value: Reg, home: ?Reg) Allocator.Error!Reg {
+    if (!lateinitLocalMarked(b, name, home)) return value;
+    const dst = b.allocReg();
+    const n = try b.module.internConst(b.allocator, .{ .String = name });
+    try b.push(.{ .LateinitCheck = .{ .dst = dst, .src = value, .name = n } });
+    return dst;
+}
+
 fn lowerDelegateRead(b: *FuncBuilder, name: []const u8) Allocator.Error!?Reg {
     var namebuf: [512]u8 = undefined;
     const dname_stack = std.fmt.bufPrint(&namebuf, "{s}$klio_delegate", .{name}) catch return null;
@@ -25072,6 +25111,42 @@ test "lowers string template as concat chain" {
     const insts = func.blocks[0].insts;
     try testing.expect(insts[insts.len - 1] == .BinOp);
     try testing.expectEqual(BinOp.StringConcat, insts[insts.len - 1].BinOp.op);
+}
+
+test "captured lateinit local reads through LateinitCheck in a lambda body" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    var outer = StringSet.init(testing.allocator);
+    try outer.put("s", {});
+    try outer.put("s$klio_lateinit", {});
+    b.setOuterNames(outer);
+
+    var segs = [_]ast.Ident{.{ .name = "s", .span = dummySpan() }};
+    const e = Expr{ .Path = .{ .segments = &segs, .span = dummySpan() } };
+    const r = try lowerExpr(&b, &e);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "f", build.typeString());
+    defer freeFunc(func);
+    const insts = func.blocks[0].insts;
+    try testing.expect(insts[insts.len - 1] == .LateinitCheck);
+    try testing.expectEqual(r.int(), insts[insts.len - 1].LateinitCheck.dst.int());
+    // A lambda parameter shadowing the captured name is a plain binding.
+    var b2 = try FuncBuilder.init(testing.allocator, &m);
+    defer b2.deinit();
+    var outer2 = StringSet.init(testing.allocator);
+    try outer2.put("s", {});
+    try outer2.put("s$klio_lateinit", {});
+    b2.setOuterNames(outer2);
+    const param = b2.allocReg();
+    try b2.bind("s", param);
+    const r2 = try lowerExpr(&b2, &e);
+    try testing.expectEqual(param.int(), r2.int());
+    b2.terminate(.{ .Return = r2 });
+    const func2 = try b2.finish("g", "g", build.typeString());
+    defer freeFunc(func2);
+    for (func2.blocks[0].insts) |inst| try testing.expect(inst != .LateinitCheck);
 }
 
 test "boxed capture interpolation reads the entry-hoisted cell value" {

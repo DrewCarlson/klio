@@ -1843,7 +1843,13 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
         }
     }
 
-    return .{ .ok = lookupGlobal(self, name) };
+    const found = lookupGlobal(self, name);
+    // A top-level `lateinit var` is bound by its first write; a read that
+    // finds no binding is the uninitialized access.
+    if (found == null and registryHasLateinitProp(self, name)) {
+        return .{ .err = try ir.eval.lateinitThrow(allocator, name) };
+    }
+    return .{ .ok = found };
 }
 
 /// Whether an ACTIVE scoped-global layer (a runtime-lowered method body's
@@ -1891,6 +1897,12 @@ fn registryHasDelegatedProp(self: *VmHost, name: []const u8) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
     return mg.get().registry.top_level_delegated_props.contains(name);
+}
+
+pub fn registryHasLateinitProp(self: *VmHost, name: []const u8) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    return mg.get().registry.top_level_lateinit_props.contains(name);
 }
 
 fn makePropertyRef(allocator: Allocator, name: []const u8) Allocator.Error!Value {

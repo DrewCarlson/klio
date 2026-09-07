@@ -4122,6 +4122,8 @@ fn buildModuleWithOverrides(
             const nm = try std.fmt.allocPrint(a, "__top_prop_delegate_{s}", .{p.name.name});
             const fid = try ir.lower.lowerDelegateExprAsThunk(module, delegate, nm, p.name.name);
             try top_level_props.append(a, .{ .name = p.name.name, .func = fid, .file = p.span.file.int() });
+        } else if (p.is_lateinit) {
+            try module.registry.top_level_lateinit_props.put(p.name.name, {});
         }
         if (p.delegate == null) {
             if (p.context_params.len != 0) module.has_context_decls = true;

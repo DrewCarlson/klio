@@ -1997,6 +1997,13 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                         return ok(.{ .Bool = initialised });
                     }
                 }
+                // A top-level `lateinit var` is initialized once its global
+                // binding exists (the first write creates it).
+                if (host_globals.registryHasLateinitProp(self, prop_name)) {
+                    const g = self.globals.borrow();
+                    defer g.deinit();
+                    return ok(.{ .Bool = g.get().lookup(prop_name) != null });
+                }
                 return ok(.{ .Bool = false });
             }
         },
@@ -2298,7 +2305,11 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     if (s == .Instance) {
                         switch (try getFieldInner(self, allocator, &s, name, suppress_cc_redirect, member_probe, suppress_ext)) {
                             .ok => |v| if (v != .Unit) return ok(v),
-                            .err => |e| freeFieldMiss(allocator, e),
+                            // The companion resolved the name and its read
+                            // threw (an uninitialized `lateinit`, a getter's
+                            // own exception): that is the read's outcome,
+                            // not a miss to walk past.
+                            .err => |e| if (e == .Throw) return errRes(e) else freeFieldMiss(allocator, e),
                         }
                     }
                 }
@@ -2597,7 +2608,12 @@ fn companionMemberOfClass(self: *VmHost, allocator: Allocator, class_name: []con
                 defer g.deinit();
                 break :blk g.get().get(name);
             };
-            if (field_v) |v| return ok(v);
+            if (field_v) |v| {
+                if (v == .Null and storedNullIsLateinit(s.Instance, name)) {
+                    return try lateinitReadError(allocator, name);
+                }
+                return ok(v);
+            }
             // No plain backing field — the companion member may be a
             // `val` with a custom getter.
             const comp_cls = className(s.Instance);
@@ -4248,12 +4264,7 @@ fn storedNullIsLateinit(inst: ObjRef(InstanceData), name: []const u8) bool {
 }
 
 fn lateinitReadError(allocator: Allocator, name: []const u8) Allocator.Error!EvalResult {
-    const m = try std.fmt.allocPrint(allocator, "lateinit property {s} has not been initialized", .{name});
-    return errRes(.{ .Throw = try Value.newException(allocator, .{
-        .fqn = try runtime.strInit(allocator, "kotlin.UninitializedPropertyAccessException"),
-        .message = .from(try runtime.strInitOwned(allocator, m)),
-        .cause = null,
-    }) });
+    return errRes(try ir.eval.lateinitThrow(allocator, name));
 }
 
 fn resolveInstanceGetter(
@@ -4522,6 +4533,9 @@ fn companionWalkSeeded(self: *VmHost, allocator: Allocator, seed: ObjRef(ClassDe
                     };
                     if (fv) |v| {
                         cg.deinit();
+                        if (v == .Null and storedNullIsLateinit(s.Instance, name)) {
+                            return try lateinitReadError(allocator, name);
+                        }
                         return ok(v);
                     }
                 }
