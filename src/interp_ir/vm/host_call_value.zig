@@ -600,6 +600,13 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // receiver when the named member is an instance method rather than a
             // companion member.
             // An unsigned-array type name in value position lowers to its
+            // `E::valueOf` / `E::values` / `E::entries`: an enum's static
+            // members take no receiver, so the arguments are the call's.
+            if (rv == .Class and (std.mem.eql(u8, name, "valueOf") or std.mem.eql(u8, name, "values") or
+                std.mem.eql(u8, name, "entries")))
+            {
+                return host_call_member.callMember(self, allocator, &rv, name, args);
+            }
             const type_like = (rv == .Class) or
                 (rv == .Instance and isCompanionInstance(rv) and
                     !companionServesName(self, &rv, name));
@@ -624,14 +631,26 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 // resolves extension getters).
                 if (rest.len == 0 and mr == .err and mr.err == .Unimplemented) {
                     const pr = try host_fields.getField(self, allocator, &first, name);
+                    if (runtime.envOnce("KLIO_ERR_TRACE") != null) std.debug.print("[boundref-typelike] {s} on {s}: field read {s}\n", .{ name, first.typeFqn(), if (pr == .ok) "ok" else "miss" });
                     if (pr == .ok) return pr;
                 }
+                if (runtime.envOnce("KLIO_ERR_TRACE") != null) std.debug.print("[boundref-typelike] {s} on {s}: forward {s}\n", .{ name, first.typeFqn(), if (mr == .ok) "ok" else "err" });
                 return mr;
             }
             if (args.len == 0 and root.memberIsProperty(allocator, &self.classes, &rv, name)) {
                 return host_fields.getField(self, allocator, &rv, name);
             }
             const r = try host_call_member.callMember(self, allocator, &rv, name, args);
+            // A bound EXTENSION-property reference invoked (`(::extProp)()`,
+            // `a::extProp` then `ref()`) reads the property once member
+            // dispatch has missed the name itself.
+            if (args.len == 0 and host_call_member.isDispatchMissFor(r, name)) {
+                const pr = try host_fields.getField(self, allocator, &rv, name);
+                if (pr == .ok) {
+                    host_call_member.freeDispatchMiss(allocator, r);
+                    return pr;
+                }
+            }
             // Fallback: a bare `::name` the lowerer bound to the enclosing
             // `this` may actually target a *top-level function* — the
             // binding is lowered before the function is registered (e.g. a
@@ -958,6 +977,10 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 return callValue(self, allocator, &callable, args);
             }
         }
+        // `(::topLevel)()` reads the property through its getter.
+        if (args.len == 0) {
+            if (try host_call_member.topLevelPropertyGet(self, allocator, name)) |r| return r;
+        }
         if (args.len == 1) {
             return host_fields.getField(self, allocator, &args[0], name);
         }
@@ -992,7 +1015,14 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             if (rv == .Class and args.len == 1) {
                 return host_fields.getField(self, allocator, &args[0], name);
             }
-            return host_call_member.callMember(self, allocator, &rv, name, args);
+            const r = try host_call_member.callMember(self, allocator, &rv, name, args);
+            // A bound PROPERTY reference invoked (`(::extProp)()`) reads the
+            // property; only a top-level miss of the name itself falls to it.
+            if (args.len == 0 and host_call_member.isDispatchMissFor(r, name)) {
+                host_call_member.freeDispatchMiss(allocator, r);
+                return host_fields.getField(self, allocator, &rv, name);
+            }
+            return r;
         }
     }
     if (callee.* == .IrClosure) {

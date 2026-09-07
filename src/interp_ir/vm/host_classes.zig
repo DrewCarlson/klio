@@ -78,6 +78,16 @@ pub fn isConcreteCastTarget(self: *VmHost, name: []const u8) bool {
     return isBuiltinTypeName(n);
 }
 
+/// Whether a closure body kept an unconstrained parser-injected `it`
+/// (see `Func.lambda_it_unconstrained`).
+fn closureItUnconstrained(self: *VmHost, body_func: ir.FuncId, sub_module: ?*const ir.Module) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = sub_module orelse mg.get();
+    const f = m.funcById(body_func) orelse return false;
+    return f.lambda_it_unconstrained;
+}
+
 pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     // `null is T?` is true for any nullable type. `null is T`
     // (non-null T) is false.
@@ -251,11 +261,21 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     // `Function1`, `Function2`, … (the arity-indexed `FunctionN`
     // hierarchy from kotlin.jvm.functions).
     switch (value.*) {
-        .IrClosure => {
+        .IrClosure => |c| {
             if (std.mem.eql(u8, ty.name, "Function")) return true;
             if (std.mem.startsWith(u8, ty.name, "Function")) {
                 const rest = ty.name["Function".len..];
-                if (rest.len != 0 and allAsciiDigit(rest)) return true;
+                if (rest.len != 0 and allAsciiDigit(rest)) {
+                    // `FunctionN` names an arity: the closure's declared
+                    // parameters plus its receiver (`Foo.() -> R` is
+                    // `Function1<Foo, R>`), the way kotlinc's `instanceof`
+                    // sees it.
+                    const want = std.fmt.parseInt(usize, rest, 10) catch return true;
+                    const info = self.closures.get(c.id) orelse return true;
+                    var have = info.n_params + @as(usize, @intFromBool(info.has_receiver));
+                    if (info.n_params == 1 and closureItUnconstrained(self, info.body_func, info.module)) have -= 1;
+                    return want == have;
+                }
             }
         },
         else => {},

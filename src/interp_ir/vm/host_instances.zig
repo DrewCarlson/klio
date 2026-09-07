@@ -18,6 +18,7 @@ const vmhost = @import("vmhost.zig");
 const host_globals = @import("host_globals.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_member = @import("host_call_member.zig");
+const host_fields = @import("host_fields.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -3119,6 +3120,19 @@ fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassD
                     if (std.mem.indexOf(u8, m3, "Vm::call_member") != null and runtime.freeScratch()) {
                         allocator.free(m3);
                     }
+                }
+            }
+        }
+        // The companion's `operator fun invoke` is the call's target when
+        // neither a constructor nor a same-named function fits: `A(42)`
+        // beside `class A { companion object { operator fun invoke(i: Int) } }`.
+        {
+            const cls_val = Value{ .Class = class_def };
+            if (try host_fields.companionOfClassValue(self, &cls_val)) |comp| {
+                if (comp == .Instance) {
+                    const r = try host_call_member.callMember(self, allocator, &comp, "invoke", effective.items);
+                    if (!host_call_member.isDispatchMissFor(r, "invoke")) return r;
+                    host_call_member.freeDispatchMiss(allocator, r);
                 }
             }
         }
