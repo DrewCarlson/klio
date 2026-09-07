@@ -8,9 +8,9 @@ git history under this file's name.
 
 ## State (2026-09-07, HEAD)
 
-Census 5976 passed / 378 failed / 3 did not complete (994 excluded: the
+Census 5985 passed / 369 failed / 3 did not complete (994 excluded: the
 runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
-`BASELINE = 5976`, `MAX_FAILED = 378` in `src/itests/box_support.zig`.
+`BASELINE = 5985`, `MAX_FAILED = 369` in `src/itests/box_support.zig`.
 Landed since 5751/609: function-type `is`/`as` by arity, companion and
 enum-entry `invoke`, inner constructor refs, bound extension and vararg
 refs, property references reading extension properties, callable-typed
@@ -19,7 +19,7 @@ properties invoked by name, enclosing-companion reads from nested classes,
 initialization), super (38/38), localClasses (41/41), typealias (28/28,
 an alias expansion pass), value classes (38 → 12), Char arithmetic by
 name, mixed Char comparisons, collection type-check bridges,
-`Throwable(cause)`, `field` inside nested objects, null string plus, nullable and array `compareTo` extensions, `set` value binding with defaults and varargs, delegate operators as member extensions, jumps leaving try frames before finally replay (finally 24/24), do-while `continue`, nullable-local `++`/`--` through `inc`/`dec` extensions.
+`Throwable(cause)`, `field` inside nested objects, null string plus, nullable and array `compareTo` extensions, `set` value binding with defaults and varargs, delegate operators as member extensions, jumps leaving try frames before finally replay (finally 24/24), do-while `continue`, nullable-local `++`/`--` through `inc`/`dec` extensions, `null as T` NPE and declared one-letter cast targets (casts 57/61), `super.Inner(args)`, imported object member writes.
 
 ## How to work it
 
@@ -63,7 +63,7 @@ residue list (every cluster under five) as the seed of the next campaign.
 | secondaryConstructors | 7 | field initializer order against a super constructor's virtual call, default-argument constructor chains, local subclass delegation, mixed spread in super arguments |
 | evaluate | 7 (+4) | unsigned `const val` receivers (verdict below), `kCallableName`, char ops, enum name in init |
 | collectionLiterals | 7 | the `[a, b]` collection literal syntax with the `of` operator convention (not parsed) |
-| casts | 7 | `Unit as Any`, definitely-not-null casts, generic `as` failures |
+| casts | 4 | `asWithGeneric`, `kt50577`, `unitAsAny`/`unitAsSafeAny` (pass alone; the census-side runner marker now goes through `kotlin.io.println`) |
 | properties, operatorConventions, objects, inlineClasses/inlineClassCollection, inline, functions/localFunctions, delegatedProperty, controlStructures/breakContinueInExpressions, classes, callableReference/function | 6 each | single-file shapes; the breakContinueInExpressions six are `break`/`continue` inside inlined lambdas |
 | defaultArguments, coroutines/intrinsicSemantics, coroutines/featureIntersection, callableReference/equality, arrays | 5 each | single-file shapes; arrays: two-index operators on a stub-class instance (verdict below) and non-local return from an array constructor lambda |
 
