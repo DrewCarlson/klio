@@ -1364,6 +1364,24 @@ test "spread_arg_parsed" {
     try testing.expect(call.args[0] == .Spread);
 }
 
+test "supertype_ctor_args_accept_named_spread" {
+    try skipIfStubbed();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const out = try parse(
+        arena.allocator(),
+        "abstract class Base(val s: String, vararg ints: Int)\nfun foo(s: String, ints: IntArray) = object : Base(ints = *ints, s = s) {}\n",
+    );
+    try testing.expect(!out.parser.diagnostics.hasErrors());
+    const obj = out.file.decls[1].Function.body.?.Expr.ObjectExpr;
+    const args = obj.supertype_args[0].?;
+    try testing.expectEqual(@as(usize, 2), args.len);
+    try testing.expect(args[0] == .Spread);
+    const names = obj.supertype_arg_names[0].?;
+    try testing.expectEqualStrings("ints", names[0].?);
+    try testing.expectEqualStrings("s", names[1].?);
+}
+
 test "integer_form_float_literal_parses" {
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

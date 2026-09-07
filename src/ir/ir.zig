@@ -2007,6 +2007,14 @@ pub const Module = struct {
     cid_memo_vals: [cid_memo_slots]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
 
     funcs: std.ArrayList(Func) = .empty,
+    /// Funcs appended after the module went live (a side module whose
+    /// earlier funcs are already executing), each in its own allocation:
+    /// an append never moves a `Func` a running frame points at, whereas
+    /// `funcs` reallocates on growth.
+    late_funcs: std.ArrayList(*Func) = .empty,
+    /// Route `appendFunc` to `late_funcs` from now on. Set when frames may
+    /// hold `*const Func` into this module while it still grows.
+    funcs_live: bool = false,
     /// True when any declaration in this module has a `context(...)`
     /// parameter clause. Gates the per-frame receiver push that feeds the
     /// context-resolution stack, so non-context programs pay nothing.
@@ -2616,8 +2624,15 @@ pub const Module = struct {
         const i = id.int();
         const base_n: u32 = @intCast(self.func_header_offsets.len);
         // Ids at/after the lazy base range are this module's own appended funcs,
-        // stored densely in `funcs.items` starting at id == base_n.
-        if (i >= base_n) return idGet(Func, self.funcs.items, i - base_n);
+        // stored densely in `funcs.items` starting at id == base_n, then in
+        // `late_funcs`.
+        if (i >= base_n) {
+            const j = i - base_n;
+            if (j < self.funcs.items.len) return &self.funcs.items[j];
+            const k = j - self.funcs.items.len;
+            if (k < self.late_funcs.items.len) return self.late_funcs.items[k];
+            return null;
+        }
         // i < base_n: a base func owned by the lazy header section (this module,
         // or the base it was cloned from, shares the section). Decode + memoise.
         if (i >= self.func_cache.len) return null;
@@ -2642,14 +2657,35 @@ pub const Module = struct {
         const base_n: u32 = @intCast(self.func_header_offsets.len);
         if (i < base_n) return null;
         const j = i - base_n;
-        if (j >= self.funcs.items.len) return null;
-        return &self.funcs.items[j];
+        if (j < self.funcs.items.len) return &self.funcs.items[j];
+        const k = j - self.funcs.items.len;
+        if (k < self.late_funcs.items.len) return self.late_funcs.items[k];
+        return null;
+    }
+
+    /// Number of funcs this module appended past its lazy base range.
+    pub fn appendedFuncCount(self: *const Module) usize {
+        return self.funcs.items.len + self.late_funcs.items.len;
+    }
+
+    /// Append a lowered func under the id `nextFuncId` reported. Every
+    /// append goes through the module's own table allocator; a live module
+    /// keeps the func at a stable address.
+    pub fn appendFunc(self: *Module, func: Func) Allocator.Error!void {
+        const a = self.func_name_index.allocator;
+        if (self.funcs_live) {
+            const cell = try a.create(Func);
+            cell.* = func;
+            try self.late_funcs.append(a, cell);
+        } else {
+            try self.funcs.append(a, func);
+        }
     }
 
     /// The id the next appended func will take (first id past the lazy base
     /// range + already-appended funcs).
     pub fn nextFuncId(self: *const Module) FuncId {
-        return FuncId.from(@intCast(self.func_header_offsets.len + self.funcs.items.len));
+        return FuncId.from(@intCast(self.func_header_offsets.len + self.appendedFuncCount()));
     }
 
     /// Add one declaration to its owner-scoped overload set. Re-registering
@@ -7625,11 +7661,13 @@ pub const Module = struct {
     /// Number of functions addressable by id (eager table length, or the lazy
     /// offset-table length when loaded from an image).
     pub fn funcCount(self: *const Module) usize {
-        return self.func_header_offsets.len + self.funcs.items.len;
+        return self.func_header_offsets.len + self.appendedFuncCount();
     }
 
     pub fn deinit(self: *Module, allocator: Allocator) void {
         self.funcs.deinit(allocator);
+        for (self.late_funcs.items) |f| allocator.destroy(f);
+        self.late_funcs.deinit(allocator);
         self.classes.deinit(allocator);
         for (self.consts.items) |c| {
             if (c == .String) allocator.free(c.String);
@@ -8193,7 +8231,7 @@ pub const Module = struct {
     pub fn eagerCallTarget(self: *const Module, callee_span: span.Span) ?FuncId {
         if (self.eager_call_fids) |*fm| {
             if (fm.get(callee_span)) |fid| {
-                if (fid < self.funcs.items.len or self.funcById(FuncId.from(fid)) != null) {
+                if (fid < self.appendedFuncCount() or self.funcById(FuncId.from(fid)) != null) {
                     return FuncId.from(fid);
                 }
             }
@@ -8551,6 +8589,9 @@ pub const Module = struct {
         for (self.funcs.items) |f| {
             if (fqnHasHeadSegment(f.fqn, head)) return true;
         }
+        for (self.late_funcs.items) |f| {
+            if (fqnHasHeadSegment(f.fqn, head)) return true;
+        }
         for (self.classes.items) |c| {
             if (fqnHasHeadSegment(c.fqn, head)) return true;
         }
@@ -8566,8 +8607,10 @@ pub const Module = struct {
             for (self.func_fqn_heads) |h| try self.pkg_head_cache.put(gpa, h, {});
             self.pkg_head_heads_done = true;
         }
-        while (self.pkg_head_funcs_n < self.funcs.items.len) : (self.pkg_head_funcs_n += 1) {
-            try insertFqnPrefixes(&self.pkg_head_cache, gpa, self.funcs.items[self.pkg_head_funcs_n].fqn);
+        while (self.pkg_head_funcs_n < self.appendedFuncCount()) : (self.pkg_head_funcs_n += 1) {
+            const n = self.pkg_head_funcs_n;
+            const fqn = if (n < self.funcs.items.len) self.funcs.items[n].fqn else self.late_funcs.items[n - self.funcs.items.len].fqn;
+            try insertFqnPrefixes(&self.pkg_head_cache, gpa, fqn);
         }
         while (self.pkg_head_classes_n < self.classes.items.len) : (self.pkg_head_classes_n += 1) {
             try insertFqnPrefixes(&self.pkg_head_cache, gpa, self.classes.items[self.pkg_head_classes_n].fqn);

@@ -1,0 +1,2 @@
+C.test(22) a=11
+outer B(x=1)

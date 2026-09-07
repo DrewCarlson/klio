@@ -20,6 +20,7 @@ const host_classes = @import("host_classes.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_fields = @import("host_fields.zig");
+const host_call_value = @import("host_call_value.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -3659,6 +3660,44 @@ fn selectInnerOuter(self: *VmHost, allocator: Allocator, class_def: ObjRef(Class
     return null;
 }
 
+const BuiltinBase = struct { key: []const u8, value: Value };
+const BuiltinBaseName = struct { name: []const u8, key: []const u8 };
+
+/// A stdlib collection class a user class extends (`class N :
+/// ArrayList<Any>()`), named by its resolved fqn. The stdlib declares it as
+/// an `expect` header with no bodies and klio implements it as a host
+/// value, so the supertype's constructor call builds the host collection
+/// and the instance keeps it as the delegate for that supertype: members
+/// the class does not declare forward to it and `super.add(x)` dispatches
+/// on it.
+fn builtinCollectionBase(fqn: []const u8) ?BuiltinBaseName {
+    const pkg = "kotlin.collections.";
+    if (!std.mem.startsWith(u8, fqn, pkg)) return null;
+    var simple = fqn[pkg.len..];
+    if (std.mem.indexOfScalar(u8, simple, '<')) |lt| simple = simple[0..lt];
+    const bases = [_]BuiltinBaseName{
+        .{ .name = "ArrayList", .key = "__delegate__ArrayList" },
+        .{ .name = "HashMap", .key = "__delegate__HashMap" },
+        .{ .name = "LinkedHashMap", .key = "__delegate__LinkedHashMap" },
+        .{ .name = "HashSet", .key = "__delegate__HashSet" },
+        .{ .name = "LinkedHashSet", .key = "__delegate__LinkedHashSet" },
+        .{ .name = "ArrayDeque", .key = "__delegate__ArrayDeque" },
+    };
+    for (bases) |b| {
+        if (std.mem.eql(u8, simple, b.name)) return b;
+    }
+    return null;
+}
+
+/// Construct the host collection for a builtin collection supertype from
+/// the supertype call's evaluated arguments, through the stdlib factory of
+/// the same name (`ArrayList(initialCapacity)`, `HashMap(original)`).
+fn buildBuiltinBase(self: *VmHost, allocator: Allocator, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
+    const factory = host_globals.lookupGlobal(self, name) orelse
+        return .{ .err = try typeErr(allocator, "`{s}` has no constructor", .{name}) };
+    return host_call_value.callValue(self, allocator, &factory, args);
+}
+
 fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, args: []const Value, outer_hint: ?*const Value) Allocator.Error!EvalResult {
     const class_name = classDefName(class_def);
     const class_fqn = classDefFqn(class_def);
@@ -3722,6 +3761,7 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         deferred_bodies.deinit(allocator);
     }
     var pending_super_args: ?std.ArrayList(Value) = null;
+    var builtin_base: ?BuiltinBase = null;
     while (true) {
         const thunks_opt = parentCtorArgThunks(self, cur_fqn, cur_class);
         if (thunks_opt == null and pending_super_args == null) break;
@@ -3778,6 +3818,20 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             break;
         }
         if (std.mem.eql(u8, pname, cur_class)) {
+            parent_args.deinit(allocator);
+            break;
+        }
+        if (builtinCollectionBase(pref.fqn orelse pname)) |base| {
+            switch (try buildBuiltinBase(self, allocator, base.name, parent_args.items)) {
+                .ok => |v| {
+                    runtime.keepalivePush(v);
+                    builtin_base = .{ .key = base.key, .value = v };
+                },
+                .err => |e| {
+                    parent_args.deinit(allocator);
+                    return .{ .err = e };
+                },
+            }
             parent_args.deinit(allocator);
             break;
         }
@@ -3985,6 +4039,10 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             entry_slot = preset.slot;
             enum_entry_preset = null;
         }
+    }
+    if (builtin_base) |bb| {
+        if (runtime.reclaimEnabled()) bb.value.retain();
+        try fields.append(allocator, .{ .name = bb.key, .value = bb.value });
     }
     // Materialise the instance.
     const inst = try ObjRef(InstanceData).init(allocator, .{
@@ -4792,6 +4850,9 @@ pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Modul
         shared_anon_arena = holder;
         var cloned = try mg.get().cloneForExtend(holder.allocator());
         cloned.anon_side = true;
+        // Every anon site lowers into this one module while earlier sites'
+        // bodies run in it: a growing func table must not move their funcs.
+        cloned.funcs_live = true;
         // PERMANENT cell, and never on the program-perm list: this cache
         // outlives programs and is freed only by the identity swap above.
         // A nursery mint here was swept by the next unrelated major (no
@@ -5907,6 +5968,7 @@ fn runAnonThunk(
 /// bare captured name, then a field reached through the captured outer
 /// `this`.
 fn evalSuperArg(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, capture_pairs: []const NameValue) Allocator.Error!Value {
+    if (expr.* == .Spread) return evalSuperArg(self, allocator, expr.Spread.expr, capture_pairs);
     if (try simpleLiteral(allocator, expr)) |v| return v;
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const nm = expr.Path.segments[0].name;
