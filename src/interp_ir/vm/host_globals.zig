@@ -327,6 +327,10 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
         }
     }
 
+    if (try enumOwnerInitForCompanion(self, name)) |e| {
+        clearObjectState(self, name);
+        return .{ .err = e };
+    }
     const r = self.newInstance(allocator, class_id, &.{}, null) catch |e| {
         clearObjectState(self, name);
         return e;
@@ -468,6 +472,10 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
         }
         break;
     }
+    if (try enumOwnerInitForCompanion(self, simple)) |e| {
+        clearObjectState(self, fqn);
+        return .{ .err = e };
+    }
     const r = self.newInstance(allocator, class_id, &.{}, null) catch |e| {
         clearObjectState(self, fqn);
         return e;
@@ -566,6 +574,392 @@ fn restashObjectCause(self: *VmHost, raw_name: []const u8, cause: Value) void {
                 std.debug.print("[init-debug] {s} restash-cause\n", .{name});
         }
     }
+}
+
+// -------------------------------------------------------------------------
+// Enum class initialization.
+// -------------------------------------------------------------------------
+
+/// A companion object of an enum class initializes as the last step of the
+/// enum's own initialization: a first access through the companion
+/// (`Foo.boo`, `Foo.foo()`) initializes the enum first, entries included.
+/// Null when `name` is not an enum's companion (or the enum is already
+/// initializing on this thread); an enum init failure otherwise.
+fn enumOwnerInitForCompanion(self: *VmHost, name: []const u8) Allocator.Error!?EvalError {
+    const sep = std.mem.indexOf(u8, name, "$Companion$") orelse return null;
+    const owner_name = name[0..sep];
+    const owner: ObjRef(ClassDef) = blk: {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        break :blk (cg.get().get(owner_name) orelse return null).clone();
+    };
+    defer owner.deinit();
+    const is_enum = blk: {
+        const g = owner.borrow();
+        defer g.deinit();
+        break :blk g.get().is_enum;
+    };
+    if (!is_enum) return null;
+    return try ensureEnumInit(self, owner);
+}
+
+/// Kotlin initializes an enum class on its first active use — an entry
+/// read, `values`/`valueOf`/`entries`, or a companion member — never on the
+/// access of a nested object, which is a class of its own. The
+/// initialization constructs every entry in declaration order and then
+/// initializes the companion object. A read re-entered from the
+/// initialization itself (an entry body reading a sibling, the companion
+/// reading `values()`) observes the table as built so far; another thread
+/// waits for the initializing one. A failed initialization stays failed and
+/// every later use rethrows it.
+pub fn ensureEnumInit(self: *VmHost, cdef: ObjRef(ClassDef)) Allocator.Error!?EvalError {
+    const fqn: []const u8 = blk: {
+        const g = cdef.borrow();
+        defer g.deinit();
+        const c = g.get();
+        if (!c.is_enum or c.enum_entries.len == 0) return null;
+        if (c.enum_init_state.load(.acquire) == 2) return null;
+        break :blk c.fqn;
+    };
+    var wait_rounds: u32 = 0;
+    while (true) {
+        if (cdef.asPtr().enum_init_state.load(.acquire) == 2) return null;
+        switch (claimObjectInit(self, fqn)) {
+            .construct => break,
+            .reentrant => return null,
+            .failed => |stashed| return try fileInitFailedThrow(self.allocator, stashed),
+            .wait => {
+                wait_rounds +|= 1;
+                if (wait_rounds <= 64) {
+                    std.Thread.yield() catch {};
+                } else {
+                    if (wait_rounds == 2000 and runtime.envOnce("KLIO_ERR_TRACE") != null) {
+                        std.debug.print("[init-wait] {s} owner={?d} self={d}\n", .{ fqn, objectInitOwner(self, fqn), std.Thread.getCurrentId() });
+                        runtime.trace.dumpCurrent(.{});
+                    }
+                    runtime.clockSleepMillis(1);
+                }
+                continue;
+            },
+        }
+    }
+    cdef.asPtr().enum_init_state.store(1, .release);
+    if (try buildEnumClass(self, cdef, fqn)) |e| {
+        initDebugLog(fqn, e);
+        markObjectFailed(self, fqn, null);
+        return switch (e) {
+            .Throw => |cause| try fileInitFailedThrow(self.allocator, cause),
+            else => e,
+        };
+    }
+    cdef.asPtr().enum_init_state.store(2, .release);
+    clearObjectState(self, fqn);
+    return null;
+}
+
+/// `ensureEnumInit` for resolution chains that carry no error: an init
+/// failure resolves to false here and the next throwing use surfaces it
+/// (the swallowed wrapper's cause is put back for that read).
+pub fn ensureEnumInitQuiet(self: *VmHost, cdef: ObjRef(ClassDef)) bool {
+    const r = ensureEnumInit(self, cdef) catch return false;
+    const e = r orelse return true;
+    if (e == .Throw and e.Throw == .Exception) {
+        if (e.Throw.Exception.cause) |cause_cell| {
+            const cause = (runtime.ValueBox{ .cell = cause_cell }).asPtr().*;
+            const fqn = blk: {
+                const g = cdef.borrow();
+                defer g.deinit();
+                break :blk g.get().fqn;
+            };
+            restashObjectCause(self, fqn, cause);
+        }
+    }
+    return false;
+}
+
+/// Whether the enum's entries are constructed (no initialization is driven).
+pub fn enumInitDone(cdef: ObjRef(ClassDef)) bool {
+    return cdef.asPtr().enum_init_state.load(.acquire) == 2;
+}
+
+fn enumSimpleName(fqn: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
+}
+
+/// Construct the entries of one enum class, then initialize its companion.
+fn buildEnumClass(self: *VmHost, cdef: ObjRef(ClassDef), enum_fqn: []const u8) Allocator.Error!?EvalError {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const module = mg.get();
+    const pa: Allocator = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().patch_allocator orelse self.allocator;
+    };
+    const prev_under_init = host_instances.setEnumUnderInit(enum_fqn);
+    defer _ = host_instances.setEnumUnderInit(prev_under_init);
+
+    if (try patchEnumEntryArgs(self, module, cdef, pa)) |e| return e;
+    if (try instantiateEnumEntries(self, module, cdef, enum_fqn, pa)) |e| return e;
+
+    // Every entry exists: the companion initializes now, after the entries
+    // and before any other use of the class.
+    const class_name = blk: {
+        const g = cdef.borrow();
+        defer g.deinit();
+        break :blk g.get().name;
+    };
+    const companion = module.registry.companion_singletons.get(class_name) orelse
+        module.registry.companion_singletons.get(enumSimpleName(enum_fqn));
+    if (companion) |cn| {
+        _ = host_instances.setEnumUnderInit(prev_under_init);
+        defer _ = host_instances.setEnumUnderInit(enum_fqn);
+        switch (try ensureObjectSingleton(self, cn)) {
+            .ok => {},
+            .err => |e| return e,
+        }
+    }
+    return null;
+}
+
+/// A body-less entry is the build-time instance: evaluate its constructor
+/// arguments and store them as its fields, before any entry body or the
+/// companion runs user code that may read it (`entries.map { it.symbol }`).
+fn patchEnumEntryArgs(self: *VmHost, module: *const Module, cdef: ObjRef(ClassDef), pa: Allocator) Allocator.Error!?EvalError {
+    const allocator = self.allocator;
+    const inits = blk: {
+        const pg = self.prog.borrow();
+        defer pg.deinit();
+        break :blk pg.get().enum_entry_arg_inits;
+    };
+    const class_name = blk: {
+        const g = cdef.borrow();
+        defer g.deinit();
+        break :blk g.get().name;
+    };
+    var param_names: std.ArrayList([]const u8) = .empty;
+    defer param_names.deinit(allocator);
+    {
+        const dg = cdef.borrow();
+        defer dg.deinit();
+        for (dg.get().primary_params) |p| try param_names.append(allocator, p.name);
+    }
+    for (inits) |entry| {
+        if (!std.mem.eql(u8, entry.class_name, class_name)) continue;
+        var entry_inst: ?ObjRef(InstanceData) = null;
+        {
+            const dg = cdef.borrow();
+            defer dg.deinit();
+            for (dg.get().enum_entries) |e| {
+                if (std.mem.eql(u8, e.name, entry.entry_name)) {
+                    if (e.value == .Instance) entry_inst = e.value.Instance.clone();
+                    break;
+                }
+            }
+        }
+        const inst = entry_inst orelse continue;
+        defer inst.deinit();
+        // An entry rebuilt through the ordinary instantiation path (a body
+        // subclass, a secondary or vararg constructor) bound its constructor
+        // fields there; patching those in again would define page-allocated
+        // values into a slab-owned instance.
+        {
+            const g = inst.borrow();
+            defer g.deinit();
+            const icg = g.get().class.borrow();
+            const built_class = icg.get().is_enum and icg.get().enum_entries.len == 0;
+            icg.deinit();
+            if (built_class or g.get().get("__enum_entry_built__") != null) continue;
+        }
+        // A cached base shares these instances across per-program Vms, and
+        // the ctor args are per-class constants: once one Vm has patched the
+        // fields, re-evaluating them would only swap equal values — and the
+        // release of the previous Vm's value would cross allocators. Skip
+        // entries whose fields are already complete.
+        const already_patched = blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            for (param_names.items) |pn| {
+                if (g.get().get(pn) == null) break :blk false;
+            }
+            break :blk true;
+        };
+        if (already_patched) continue;
+        for (entry.funcs, 0..) |fid, idx| {
+            const init_func = module.funcById(fid) orelse continue;
+            var thunk_args: std.ArrayList(Value) = .empty;
+            try thunk_args.append(allocator, .{ .Class = cdef.clone() });
+            const v = switch (try ir.eval.evalWith(VmHost, allocator, module, init_func, thunk_args, self)) {
+                .ok => |val| val,
+                .err => |e| return e,
+            };
+            if (idx >= param_names.items.len) continue;
+            // The instance is shared through the base cache, so the value
+            // stored must share the CACHE's lifetime: copy a string into
+            // the patch allocator (scalars are by value; anything else is
+            // left as-is and noted by the trace above when it appends).
+            const stored: Value = switch (v) {
+                .String => |sref| blk: {
+                    const sg = sref.borrow();
+                    defer sg.deinit();
+                    break :blk .{ .String = try runtime.strInit(pa, sg.get().bytes) };
+                },
+                else => v,
+            };
+            const g = inst.borrowMut();
+            defer g.deinit();
+            // A baked enum instance carries every constructor-parameter
+            // field, so this define REPLACES in place. An append here
+            // means the bake dropped a field — name it, because the
+            // shared image instance cannot grow a per-VM buffer.
+            if (g.get().get(param_names.items[idx]) == null and
+                runtime.envOnce("KLIO_ENUM_INIT_TRACE") != null)
+            {
+                std.debug.print("[enum-init-append] class={s} entry={s} field={s}\n", .{
+                    entry.class_name, entry.entry_name, param_names.items[idx],
+                });
+            }
+            g.get().define(pa, param_names.items[idx], stored) catch {};
+        }
+    }
+    return null;
+}
+
+/// An enum entry declared with a body (`B(args) { … }`) is an instance of
+/// the nested class `$B : Enum(args)` the parser synthesized for it.
+/// Construct it through the ordinary class path (parent constructor
+/// arguments, property initializers, init blocks), carry the entry's name
+/// and ordinal over, and make it the entry's value. An enum declaring
+/// secondary or vararg constructors, init blocks or body properties builds
+/// every entry through that path: the entry's arguments pick the
+/// constructor and its body runs as written.
+fn instantiateEnumEntries(self: *VmHost, module: *const Module, cdef: ObjRef(ClassDef), enum_fqn: []const u8, pa: Allocator) Allocator.Error!?EvalError {
+    const allocator = self.allocator;
+    const n_entries = blk: {
+        const dg = cdef.borrow();
+        defer dg.deinit();
+        break :blk dg.get().enum_entries.len;
+    };
+    const enum_cid = module.classIdByFqn(enum_fqn) orelse return null;
+    const class_name = blk: {
+        const dg = cdef.borrow();
+        defer dg.deinit();
+        break :blk dg.get().name;
+    };
+    const has_secondary = blk: {
+        const dg = cdef.borrow();
+        defer dg.deinit();
+        if (dg.get().secondary_ctors.len != 0) break :blk true;
+        // A vararg primary parameter needs the ordinary argument packing
+        // too (an entry passing nothing still gets an empty array).
+        for (module.classes.items[enum_cid.int()].primary_params) |prm| if (prm.is_vararg) break :blk true;
+        // `init` blocks and body property initializers are user code
+        // that runs per entry: only the ordinary path runs them.
+        if (dg.get().init_blocks.len != 0) break :blk true;
+        for (dg.get().body_properties) |bp| if (bp.init != null) break :blk true;
+        break :blk false;
+    };
+    // The rebuilt entries are installed on the class before any is
+    // constructed: an entry's construction runs user code (safe points),
+    // and an instance held only in a local array between iterations is
+    // unreachable to the collector, which swept the first entry while
+    // the second was being built and left its fields dangling.
+    const replaced: []runtime.ClassDef.EnumEntry = blk: {
+        const dg = cdef.borrow();
+        defer dg.deinit();
+        const copy = try pa.alloc(runtime.ClassDef.EnumEntry, n_entries);
+        @memcpy(copy, dg.get().enum_entries);
+        break :blk copy;
+    };
+    {
+        const dg = cdef.borrowMut();
+        dg.get().enum_entries = replaced;
+        dg.deinit();
+    }
+    for (0..n_entries) |i| {
+        var entry_name: []const u8 = undefined;
+        var current_class: []const u8 = "";
+        var entry_rebuilt = false;
+        {
+            const e = replaced[i];
+            entry_name = e.name;
+            if (e.value == .Instance) {
+                const ig = e.value.Instance.borrow();
+                const icg = ig.get().class.borrow();
+                current_class = icg.get().name;
+                icg.deinit();
+                entry_rebuilt = ig.get().get("__enum_entry_built__") != null;
+                ig.deinit();
+            }
+        }
+        const synth = try std.fmt.allocPrint(allocator, "${s}", .{entry_name});
+        defer allocator.free(synth);
+        const body_cid = module.classIdNestedIn(enum_cid, synth);
+        if (body_cid == null and !has_secondary) continue;
+        if (body_cid != null and std.mem.eql(u8, current_class, synth)) continue;
+        if (body_cid == null and entry_rebuilt) continue;
+        var ctor_args: std.ArrayList(Value) = .empty;
+        defer ctor_args.deinit(allocator);
+        if (body_cid == null) {
+            const inits = blk: {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                break :blk pg.get().enum_entry_arg_inits;
+            };
+            for (inits) |init_entry| {
+                if (!std.mem.eql(u8, init_entry.class_name, class_name) or !std.mem.eql(u8, init_entry.entry_name, entry_name)) continue;
+                for (init_entry.funcs) |fid| {
+                    const init_func = module.funcById(fid) orelse continue;
+                    var thunk_args: std.ArrayList(Value) = .empty;
+                    try thunk_args.append(allocator, .{ .Class = cdef.clone() });
+                    switch (try ir.eval.evalWith(VmHost, allocator, module, init_func, thunk_args, self)) {
+                        .ok => |val| try ctor_args.append(allocator, val),
+                        .err => |e| return e,
+                    }
+                }
+                break;
+            }
+        }
+        const target_cid = body_cid orelse enum_cid;
+        if (runtime.envOnce("KLIO_ENUM_INIT_TRACE") != null) std.debug.print("[enum-init] build {s}.{s} via {s} (body={}, secondary={}, nargs={d})\n", .{ enum_fqn, entry_name, module.classes.items[target_cid.int()].fqn, body_cid != null, has_secondary, ctor_args.items.len });
+        // The name string and the constructor arguments are pinned until
+        // the instance owns them: the header thunks run user code first.
+        const preset_name: Value = .{ .String = try runtime.strInit(allocator, entry_name) };
+        const entry_keepalive = runtime.keepaliveMark();
+        defer runtime.keepaliveRestore(entry_keepalive);
+        runtime.keepalivePush(preset_name);
+        runtime.keepalivePushSlice(ctor_args.items);
+        // The entry's slot takes the instance as soon as its shell exists:
+        // the entry's own initializers (and its inner classes) refer to the
+        // entry by name while it is still under construction, and kotlinc
+        // binds that reference to the instance itself.
+        host_instances.setEnumEntryPreset(.{
+            .class_fqn = module.classes.items[target_cid.int()].fqn,
+            .name = preset_name,
+            .ordinal = Value.newInt(@intCast(i)),
+            .slot = &replaced[i].value,
+        });
+        const made = switch (try self.newInstance(allocator, target_cid, ctor_args.items, null)) {
+            .ok => |v| v,
+            .err => |e| {
+                host_instances.setEnumEntryPreset(null);
+                return e;
+            },
+        };
+        host_instances.setEnumEntryPreset(null);
+        if (made != .Instance) continue;
+        if (body_cid == null) {
+            // The marker is appended through the instance's own allocator:
+            // a field list grown with the patch allocator is freed through
+            // the slab at sweep.
+            const g = made.Instance.borrowMut();
+            defer g.deinit();
+            try g.get().define(allocator, "__enum_entry_built__", .{ .Bool = true });
+        }
+        const published = replaced[i].value == .Instance and replaced[i].value.Instance.ptrEq(made.Instance);
+        if (!published) replaced[i].value = made;
+    }
+    return null;
 }
 
 /// Whether the (possibly not-yet-initialized) singleton class

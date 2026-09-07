@@ -1002,7 +1002,14 @@ fn collectOwnMembers(class: *const ast.Class, out: *StringSet) Allocator.Error!v
 ///
 /// Recurses, so a class nested two deep inside a local class registers too.
 fn registerNestedClasses(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!void {
-    for (class.members) |*m| {
+    try registerNestedMembers(self, allocator, class.name.name, class.members);
+}
+
+/// Register the classes and objects declared in the body of a runtime
+/// class (a local class, an anonymous object) under `owner`: each becomes
+/// a runtime class the body's members construct by bare name.
+pub fn registerNestedMembers(self: *VmHost, allocator: Allocator, owner: []const u8, members: []const ast.Decl) Allocator.Error!void {
+    for (members) |*m| {
         switch (m.*) {
             .Class => |*nested| {
                 if (nested.is_companion) {
@@ -1012,12 +1019,12 @@ fn registerNestedClasses(self: *VmHost, allocator: Allocator, class: *const ast.
                     // so a member call on the class value forwards to it
                     // (`W.serializer()` on a local `@Serializable` class).
                     var renamed = nested.*;
-                    renamed.name = .{ .name = try std.fmt.allocPrint(allocator, "{s}$Companion", .{class.name.name}), .span = nested.name.span };
+                    renamed.name = .{ .name = try std.fmt.allocPrint(allocator, "{s}$Companion", .{owner}), .span = nested.name.span };
                     renamed.is_companion = false;
                     const owned = try allocator.create(ast.Class);
                     owned.* = renamed;
                     _ = try registerClass(self, allocator, owned);
-                    try publishLocalSingleton(self, allocator, owned.name.name, try std.fmt.allocPrint(allocator, "$companion:{s}", .{class.name.name}));
+                    try publishLocalSingleton(self, allocator, owned.name.name, try std.fmt.allocPrint(allocator, "$companion:{s}", .{owner}));
                     continue;
                 }
                 _ = try registerClass(self, allocator, nested);

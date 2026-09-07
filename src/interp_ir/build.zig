@@ -255,6 +255,9 @@ pub const SecondaryCtorEntry = struct {
     /// kotlinc does not offer such a constructor to source at all — HIDDEN exists
     /// only for binary compatibility — so it must never win over an ordinary one.
     low_priority: bool = false,
+    /// Index of the `vararg` parameter, if the constructor declares one:
+    /// it takes any number of trailing arguments, none included.
+    vararg_index: ?usize = null,
 };
 
 /// Result of building an IR module from a single Kotlin file.
@@ -4061,6 +4064,10 @@ fn buildModuleWithOverrides(
                 .default_arg_thunks = default_arg_thunks,
                 .body = body_fid,
                 .low_priority = ir.lower.decl.annotationsAreLowPriority(sc.annotations),
+                .vararg_index = blk: {
+                    for (sc.params, 0..) |*p, i| if (p.is_vararg) break :blk i;
+                    break :blk null;
+                },
             };
         }
         try secondary_ctors.put(c.name.name, entries);

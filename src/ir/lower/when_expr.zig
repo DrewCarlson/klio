@@ -346,39 +346,26 @@ fn lowerSubjectPatternCond(
             try b.push(.{ .Not = .{ .dst = neg, .src = raw } });
             return neg;
         },
-        .InRange => |e| {
-            const range_r = try lowerExpr(b, &e);
-            const args_start = b.allocReg();
-            try b.push(.{ .Move = .{ .dst = args_start, .src = subj } });
-            const dst = b.allocReg();
-            const nm = try b.module.internConst(b.allocator, .{ .String = "contains" });
-            try b.push(.{ .CallMember = .{
-                .dst = dst,
-                .receiver = range_r,
-                .name = nm,
-                .args = args_start,
-                .n_args = 1,
-                .arg_names = &.{},
-            } });
-            return dst;
-        },
-        .NotInRange => |e| {
-            const range_r = try lowerExpr(b, &e);
-            const args_start = b.allocReg();
-            try b.push(.{ .Move = .{ .dst = args_start, .src = subj } });
-            const raw = b.allocReg();
-            const nm = try b.module.internConst(b.allocator, .{ .String = "contains" });
-            try b.push(.{ .CallMember = .{
-                .dst = raw,
-                .receiver = range_r,
-                .name = nm,
-                .args = args_start,
-                .n_args = 1,
-                .arg_names = &.{},
-            } });
-            const neg = b.allocReg();
-            try b.push(.{ .Not = .{ .dst = neg, .src = raw } });
-            return neg;
+        .InRange, .NotInRange => |*e| {
+            // `in y` on the subject is the `y.contains(subject)` the binary
+            // form desugars to; lowering that form binds `contains` the way
+            // any call does (a local extension operator included). The
+            // subject register is bound under a synthetic name so the
+            // synthesized call can name it.
+            const subj_name = try std.fmt.allocPrint(b.allocator, "$when_subject_{d}", .{subj.int()});
+            try b.bind(subj_name, subj);
+            const segments = try b.allocator.alloc(ast.Ident, 1);
+            segments[0] = .{ .name = subj_name, .span = p.span };
+            const lhs = try b.allocator.create(Expr);
+            lhs.* = .{ .Path = .{ .segments = segments, .span = p.span } };
+            const bin = try b.allocator.create(Expr);
+            bin.* = .{ .Binary = .{
+                .op = if (p.kind == .InRange) .In else .NotIn,
+                .lhs = lhs,
+                .rhs = @constCast(e),
+                .span = p.span,
+            } };
+            return try lowerExpr(b, bin);
         },
         .Else => {
             try b.push(.{ .Trace = .{ .span = p.span } });

@@ -6824,23 +6824,42 @@ fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *const V
         }
     }
     // An enum entry as the callee (`A.ONE(42)`, or `ONE(42)` through
-    // `import A.ONE`): the entry's `operator fun invoke`.
+    // `import A.ONE`): the entry's `operator fun invoke`. Naming an entry
+    // is an active use, so the enum initializes first.
     if (is_enum and !std.mem.eql(u8, name, "values") and !std.mem.eql(u8, name, "valueOf")) {
-        const entry: ?Value = blk: {
+        const names_entry = blk: {
             const cg = cls.borrow();
             defer cg.deinit();
             for (cg.get().enum_entries) |e| {
-                if (std.mem.eql(u8, e.name, name)) break :blk e.value;
+                if (std.mem.eql(u8, e.name, name)) break :blk true;
             }
-            break :blk null;
+            break :blk false;
         };
-        if (entry) |ev| {
-            if (ev == .Instance) {
-                const r = try callMemberRec(self, allocator, &ev, "invoke", args);
-                if (!isDispatchMissFor(r, "invoke")) return r;
-                freeDispatchMiss(allocator, r);
+        if (names_entry) {
+            if (try host_globals.ensureEnumInit(self, cls)) |e| return .{ .err = e };
+            const entry: ?Value = blk: {
+                const cg = cls.borrow();
+                defer cg.deinit();
+                for (cg.get().enum_entries) |e| {
+                    if (std.mem.eql(u8, e.name, name)) break :blk e.value;
+                }
+                break :blk null;
+            };
+            if (entry) |ev| {
+                if (ev == .Instance) {
+                    const r = try callMemberRec(self, allocator, &ev, "invoke", args);
+                    if (!isDispatchMissFor(r, "invoke")) return r;
+                    freeDispatchMiss(allocator, r);
+                }
             }
         }
+    }
+    // `values()` / `valueOf()` are static uses of the enum class: its first
+    // one initializes it.
+    if (is_enum and ((std.mem.eql(u8, name, "values") and args.len == 0) or
+        (std.mem.eql(u8, name, "valueOf") and args.len == 1 and args[0] == .String)))
+    {
+        if (try host_globals.ensureEnumInit(self, cls)) |e| return .{ .err = e };
     }
     // Enum.values()
     if (is_enum and std.mem.eql(u8, name, "values") and args.len == 0) {
