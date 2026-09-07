@@ -5198,7 +5198,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 if (p.getter) |getter| if (!site_built) {
                     // `field` in the accessor body is the object's own
                     // backing slot, exactly as in a module class's accessor.
-                    const gbody = try host_classes.rewriteAccessorFieldRefs(allocator, getter.body, p.name.name);
+                    const gbody = try host_classes.rewriteAccessorFieldRefs(std.heap.page_allocator, getter.body, p.name.name);
                     const thunk = synthThunk(p.name, gbody, getter.return_type, p.is_override);
                     const sub_ref = try anonSiteModule(self, allocator, &site_mod);
                     const func = try ir.lower.lowerMethod(&sub_ref.cell.data, &thunk, synth_class_name, &own_members);

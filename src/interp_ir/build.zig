@@ -529,6 +529,7 @@ fn collectUserComposableFiles(allocator: Allocator, files: []const KotlinFile) A
 }
 
 fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
+    ir.build.localClassScopeReset();
     const ComposeMaps = struct {
         names: std.StringHashMap(void),
         sinks: std.StringHashMap(void),

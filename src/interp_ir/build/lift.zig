@@ -175,9 +175,14 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
                 .this_member => |owner| if (owner) |own| .{ .object_member = own } else mode,
                 else => mode,
             };
-            for (o.members) |*m| try walkFieldDecl(allocator, m, prop, inner);
+            // The object's members are rewritten in place inside an AST
+            // that can outlive this lowering (a pack class body lowered
+            // again by a later program in the same process), so the
+            // replacement nodes must outlive it too.
+            const keep = std.heap.page_allocator;
+            for (o.members) |*m| try walkFieldDecl(keep, m, prop, inner);
             for (o.init_blocks) |*blk| {
-                for (blk.stmts) |*st| try walkFieldStmt(allocator, st, prop, inner);
+                for (blk.stmts) |*st| try walkFieldStmt(keep, st, prop, inner);
             }
         },
         .Try => |*t| {
@@ -644,7 +649,7 @@ test "substituteFieldWithThis rewrites a bare field reference" {
     const a = arena.allocator();
     var segs = [_]Ident{.{ .name = "field", .span = dummySpan }};
     const e = Expr{ .Path = .{ .segments = &segs, .span = dummySpan } };
-    const out = try substituteFieldWithThis(a, "x", &e);
+    const out = try substituteFieldWithThis(a, "x", &e, null);
     try testing.expect(out.* == .Member);
     try testing.expectEqualStrings("__klio_field__x", out.Member.name.name);
     try testing.expect(out.Member.receiver.* == .Path);
