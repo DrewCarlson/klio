@@ -6,11 +6,11 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-07, 94104fbd, CI green)
+## State (2026-09-07, HEAD)
 
-Census 5951 passed / 398 failed / 8 did not complete (994 excluded: the
+Census 5976 passed / 378 failed / 3 did not complete (994 excluded: the
 runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
-`BASELINE = 5951`, `MAX_FAILED = 398` in `src/itests/box_support.zig`.
+`BASELINE = 5976`, `MAX_FAILED = 378` in `src/itests/box_support.zig`.
 Landed since 5751/609: function-type `is`/`as` by arity, companion and
 enum-entry `invoke`, inner constructor refs, bound extension and vararg
 refs, property references reading extension properties, callable-typed
@@ -19,7 +19,7 @@ properties invoked by name, enclosing-companion reads from nested classes,
 initialization), super (38/38), localClasses (41/41), typealias (28/28,
 an alias expansion pass), value classes (38 → 12), Char arithmetic by
 name, mixed Char comparisons, collection type-check bridges,
-`Throwable(cause)`, `field` inside nested objects.
+`Throwable(cause)`, `field` inside nested objects, null string plus, nullable and array `compareTo` extensions, `set` value binding with defaults and varargs, delegate operators as member extensions, jumps leaving try frames before finally replay (finally 24/24), do-while `continue`, nullable-local `++`/`--` through `inc`/`dec` extensions.
 
 ## How to work it
 
@@ -56,26 +56,16 @@ residue list (every cluster under five) as the seed of the next campaign.
 | Cluster | Fails | Dominant shape |
 | --- | --- | --- |
 | contextParameters | 23 | verdict recorded below |
-| callableReference/adaptedReferences | 15 | context-parameter refs (5), suspend conversion of extension/context refs as supertypes (6: `startCoroutine` on the receiver), vararg/default adaptation (4) |
+| callableReference/adaptedReferences | 15 | context-parameter refs (5), suspend conversion of extension/context refs as supertypes (6), vararg/default adaptation (4) |
 | coroutines | 13 (+10 in subdirs) | intrinsic semantics (`startCoroutineUninterceptedOrReturn`, `intercepted`), suspend function types as supertypes, `handleResult` try/finally shapes |
 | extensionFunctions | 10 (+1 crash) | anonymous extension function values, extension in a value class, local extension in a SAM, `last` set on a builtin list |
 | fir | 9 | overloads differing only in type-parameter bounds (3), context-sensitive resolution of enum entries (2), anonymous/local override with defaults (3) |
-| delegatedProperty | 8 | `getValue`/`setValue` as member extensions of the enclosing class, delegate to a singleton/null, `Delegates.notNull` |
-| secondaryConstructors | 7 | field initializer order with secondary constructors, local subclass delegation, varargs |
-| inline | 7 | local inline extension functions inside lambdas, references to local functions |
-| evaluate | 7 (+4) | const evaluation of unsigned named operations (`plus1`), `kCallableName`, char ops, enum name in init |
-| collectionLiterals | 7 | the `[a, b]` collection literal syntax with the `of` operator convention (not parsed yet) |
+| secondaryConstructors | 7 | field initializer order against a super constructor's virtual call, default-argument constructor chains, local subclass delegation, mixed spread in super arguments |
+| evaluate | 7 (+4) | unsigned `const val` receivers (verdict below), `kCallableName`, char ops, enum name in init |
+| collectionLiterals | 7 | the `[a, b]` collection literal syntax with the `of` operator convention (not parsed) |
 | casts | 7 | `Unit as Any`, definitely-not-null casts, generic `as` failures |
-| properties | 6 | eager initialization, private constructor properties, generic names |
-| operatorConventions | 6 | convention resolution edges |
-| objects | 6 | companion access from an anonymous object in a nested class, object init order |
-| inlineClasses/inlineClassCollection | 6 | anonymous object implementing `List<VC>` reading the value class's field |
-| functions/localFunctions | 6 | local function capture |
-| controlStructures | 6 (+6 breakContinueInExpressions) | `break`/`continue` inside inlined lambdas and loop conditions, `finally` ordering |
-| callableReference/function | 6 | local extension refs by receiver type, `overloadedFunVsVal`, companion member refs |
-| defaultArguments | 5 (+8 in subdirs) | defaults on convention operators (`set`), fake overrides with defaults, 32-argument masks |
-| callableReference/equality | 5 | adapted references must not be equal to each other |
-| strings, intrinsics, increment, finally, arrays | 5 each | single-file mismatches; arrays: two-index `get`/`set` on an `ArrayList` instance and non-local return from an array constructor lambda |
+| properties, operatorConventions, objects, inlineClasses/inlineClassCollection, inline, functions/localFunctions, delegatedProperty, controlStructures/breakContinueInExpressions, classes, callableReference/function | 6 each | single-file shapes; the breakContinueInExpressions six are `break`/`continue` inside inlined lambdas |
+| defaultArguments, coroutines/intrinsicSemantics, coroutines/featureIntersection, callableReference/equality, arrays | 5 each | single-file shapes; arrays: two-index operators on a stub-class instance (verdict below) and non-local return from an array constructor lambda |
 
 ## Verdicts recorded (closed; reopen only with a new mechanism)
 
@@ -111,6 +101,19 @@ residue list (every cluster under five) as the seed of the next campaign.
   a spliced inline extension, miss (`isInsertHandle` on `LinkComposer`,
   291 compose plugin tests). A library's aliases are still collected, so
   a program using them expands them.
+- evaluate unsigned const receivers (3-5): `const val one = 1u` then
+  `one.plus(2u)` dispatches `plus` on a receiver that reads as `Int` at
+  the member-call site (`two.plus(2u)` with a plain `val two = 2u` works;
+  `one is UInt` is true; the initializer thunk returns a `UInt` const),
+  so top-level `const val` unsigned operations (`plus1`, `and1`) miss;
+  the binding path was not isolated.
+- functions/localFunctions overloadedLocalFunction (2): a nested-scope
+  local `fun foo(x: String)` shadows the outer `fun foo(x: String, y: Int)`
+  by name; kotlinc picks the outer by arity, which needs an enumeration of
+  every binding of the name across the scope chain.
+- operatorConventions/kt4987 (1): `counter++` on a null `Int?` with a
+  LOCAL `Int?.inc()` extension reaches the member call on a null
+  receiver instead of the local closure.
 - properties/fieldInsideField (1): an anonymous object's property with
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
