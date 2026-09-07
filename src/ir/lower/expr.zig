@@ -577,6 +577,10 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             // Prefix ++ / -- need both an Inc/Dec UnOp AND a write-back to
             // the lvalue; return the NEW value.
             if (u.op == .PreInc or u.op == .PreDec) {
+                if (try nullableIncDecCall(b, u.expr, u.op == .PreInc)) |r| {
+                    try writeBackLvalue(b, u.expr, r);
+                    return r;
+                }
                 const operand = try lowerExpr(b, u.expr);
                 const dst = b.allocReg();
                 const uo: UnOp = if (u.op == .PreInc) .Inc else .Dec;
@@ -6139,6 +6143,25 @@ fn ctorRealignedArgNames(b: *FuncBuilder, class_id: ir.ClassId, args: []const Ex
     return out;
 }
 
+/// `x++`/`--x` on a local declared NULLABLE (`var i: Int? = …`): the
+/// builtin `inc`/`dec` members do not take a nullable receiver, so the
+/// program's `T?.inc()`/`T?.dec()` extension is the target — lowered as the
+/// call it is. Null when the operand is not such a local or no extension is
+/// declared.
+fn nullableIncDecCall(b: *FuncBuilder, operand: *const Expr, inc: bool) Allocator.Error!?Reg {
+    if (operand.* != .Path or operand.Path.segments.len != 1) return null;
+    const name = operand.Path.segments[0].name;
+    if (!b.localDeclNullable(name)) return null;
+    const op_name: []const u8 = if (inc) "inc" else "dec";
+    if (!userFunctionDeclared(b, op_name) and !b.isLocalExtFn(op_name)) return null;
+    const sp = operand.Path.span;
+    const ma = b.module.func_name_index.allocator;
+    const callee = try ma.create(ast.Expr);
+    callee.* = .{ .Member = .{ .receiver = @constCast(operand), .name = .{ .name = op_name, .span = sp }, .safe = false, .span = sp } };
+    const call = ast.Expr{ .Call = .{ .callee = callee, .args = &.{}, .arg_names = &.{}, .type_args = &.{}, .is_infix = false, .span = sp } };
+    return try lowerExpr(b, &call);
+}
+
 fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const pf = expr.Postfix;
     const inner = pf.expr;
@@ -6151,6 +6174,15 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .Inc, .Dec => {
             const uo: UnOp = if (pf.op == .Inc) .Inc else .Dec;
+            if (inner.* == .Path and inner.Path.segments.len == 1 and
+                b.localDeclNullable(inner.Path.segments[0].name) and
+                (userFunctionDeclared(b, if (pf.op == .Inc) "inc" else "dec") or b.isLocalExtFn(if (pf.op == .Inc) "inc" else "dec")))
+            {
+                const old = try lowerExpr(b, inner);
+                const call = (try nullableIncDecCall(b, inner, pf.op == .Inc)).?;
+                try writeBackLvalue(b, inner, call);
+                return old;
+            }
             // Index target: evaluate receiver + keys once.
             if (inner.* == .Index) {
                 const ix = inner.Index;
