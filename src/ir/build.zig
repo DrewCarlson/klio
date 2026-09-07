@@ -232,6 +232,13 @@ pub fn localClassScopeRestore(mark: usize) void {
     if (mark <= local_class_scope.len) local_class_scope_len = mark;
 }
 
+/// Empty the scope at the start of a program build: the names are slices
+/// of that program's AST, and an entry left by an earlier program in the
+/// same process would be read after its AST was freed.
+pub fn localClassScopeReset() void {
+    local_class_scope_len = 0;
+}
+
 pub fn isLocalClassInScope(name: []const u8) bool {
     for (local_class_scope[0..local_class_scope_len]) |n| {
         if (std.mem.eql(u8, n, name)) return true;

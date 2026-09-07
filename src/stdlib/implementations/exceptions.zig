@@ -391,7 +391,8 @@ test "single throwable argument is treated as the cause" {
     try testing.expect(r == .ok);
     const exc = r.ok.Exception;
     defer freeException(exc);
-    try testing.expect(!exc.message.isSome());
+    // The message is the cause's rendering, as the JVM constructor defines it.
+    try testing.expect(exc.message.isSome());
     try testing.expect(exc.cause != null);
     const cause_box = ValueBox{ .cell = exc.cause.? };
     try testing.expect(cause_box.asPtr().* == .Exception);

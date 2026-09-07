@@ -1895,7 +1895,9 @@ test "integer member applicability rejects non-numeric overload arguments" {
     defer text.deinit();
     const other_args = [_]Value{.{ .String = text }};
     try testing.expectEqual(false, applicable("kotlin.Int.or", &other_args).?);
-    try testing.expect(applicable("kotlin.Int.compareTo", &numeric_args) == null);
+    try testing.expectEqual(true, applicable("kotlin.Int.compareTo", &numeric_args).?);
+    const char_args = [_]Value{ .{ .Int = 2 }, .{ .Char = 'A' } };
+    try testing.expectEqual(false, applicable("kotlin.Int.compareTo", &char_args).?);
 }
 
 test "param names round trip" {

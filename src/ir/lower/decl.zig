@@ -1779,6 +1779,11 @@ pub fn lowerMethodWithMemberContext(
     enclosing_members: *const StringSet,
     own_member_arity: ?*const std.StringHashMap(u64),
 ) Allocator.Error!Func {
+    // A method body lowered on its own (a runtime-registered class, an
+    // anonymous object's accessor thunk) declares its local classes into
+    // the same scope stack a function body does, and must leave it as found.
+    const local_class_mark = build.localClassScopeMark();
+    defer build.localClassScopeRestore(local_class_mark);
     const a = module.registry.allocator;
     // A member extension function (`class C { fun R.f(p) { … } }`) binds
     // its *extension* receiver as `this`, like a top-level extension fn.
