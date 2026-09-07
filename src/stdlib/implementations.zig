@@ -56,6 +56,13 @@ pub const concurrent_lock_exit = concurrent.concurrent_lock_exit;
 const ApplicableFn = *const fn (args: []const Value) bool;
 const Entry = struct { fqn: []const u8, f: StdlibFn, applicable: ?ApplicableFn = null };
 
+/// A number's `compareTo` overloads take numbers: a Char argument resolves
+/// to a program's `compareTo` extension instead.
+fn numericCompareApplicable(args: []const Value) bool {
+    if (args.len != 2) return true;
+    return args[1] != .Char and args[1] != .String;
+}
+
 fn integerBinaryApplicable(args: []const Value) bool {
     return args.len == 1 and args[0].asI64() != null;
 }
@@ -327,7 +334,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Char.toTitleCase", .f = char.char_titlecase_char },
     .{ .fqn = "kotlin.Char.isISOControl", .f = char.char_is_iso_control },
     .{ .fqn = "kotlin.Int.and", .f = numeric.int_and, .applicable = integerBinaryApplicable },
-    .{ .fqn = "kotlin.Int.compareTo", .f = numeric.int_compare_to },
+    .{ .fqn = "kotlin.Int.compareTo", .f = numeric.int_compare_to, .applicable = numericCompareApplicable },
     .{ .fqn = "kotlin.Int.inv", .f = numeric.int_inv },
     .{ .fqn = "kotlin.Int.or", .f = numeric.int_or, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.Int.shl", .f = numeric.int_shl, .applicable = integerBinaryApplicable },
@@ -342,7 +349,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Int.ushr", .f = numeric.int_ushr, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.Int.xor", .f = numeric.int_xor, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.Long.and", .f = numeric.long_and, .applicable = integerBinaryApplicable },
-    .{ .fqn = "kotlin.Long.compareTo", .f = numeric.long_compare_to },
+    .{ .fqn = "kotlin.Long.compareTo", .f = numeric.long_compare_to, .applicable = numericCompareApplicable },
     .{ .fqn = "kotlin.Long.inv", .f = numeric.long_inv },
     .{ .fqn = "kotlin.Long.or", .f = numeric.long_or, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.Long.shl", .f = numeric.long_shl, .applicable = integerBinaryApplicable },
@@ -449,7 +456,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.UByte.toDouble", .f = numeric.unsigned_to_double },
     .{ .fqn = "kotlin.UByte.toFloat", .f = numeric.unsigned_to_float },
     .{ .fqn = "kotlin.UByte.toString", .f = numeric.unsigned_to_string },
-    .{ .fqn = "kotlin.Double.compareTo", .f = numeric.double_compare_to },
+    .{ .fqn = "kotlin.Double.compareTo", .f = numeric.double_compare_to, .applicable = numericCompareApplicable },
     .{ .fqn = "kotlin.Double.isFinite", .f = numeric.double_is_finite },
     .{ .fqn = "kotlin.Double.isInfinite", .f = numeric.double_is_infinite },
     .{ .fqn = "kotlin.Double.isNaN", .f = numeric.double_is_nan },
@@ -479,7 +486,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Double.toBits", .f = numeric.double_to_bits },
     .{ .fqn = "kotlin.Double.fromBits", .f = numeric.double_from_bits },
     .{ .fqn = "kotlin.Double.Companion.fromBits", .f = numeric.double_from_bits },
-    .{ .fqn = "kotlin.Float.compareTo", .f = numeric.float_compare_to },
+    .{ .fqn = "kotlin.Float.compareTo", .f = numeric.float_compare_to, .applicable = numericCompareApplicable },
     .{ .fqn = "kotlin.Float.isFinite", .f = numeric.float_is_finite },
     .{ .fqn = "kotlin.Float.isInfinite", .f = numeric.float_is_infinite },
     .{ .fqn = "kotlin.Float.isNaN", .f = numeric.float_is_nan },

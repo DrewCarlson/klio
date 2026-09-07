@@ -4304,6 +4304,11 @@ pub fn prepareVirtualFlatCall(
     args: []const Value,
 ) Allocator.Error!?ir.eval.FlatCallReq {
     const vtrace = vflatTraceOn();
+    if (args.len == 1 and receiver.* == .Instance) {
+        if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vn| {
+            if (bridgeForReceiver(self, receiver, vn, args) != null) return null;
+        }
+    }
     // Persistent-vector contains/indexOf are host-served (the
     // invokeVirtualMember intercept); a flat-prepared interpreted body
     // would bypass that.
@@ -6116,6 +6121,19 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // resolve — upstream Compose calls `slot.rem(SLOTS_PER_INT)` directly.
     // Placed at the miss tail so it never preempts the stdlib operator
     // dispatch (which handles overflow, `mod` vs `rem`, bitwise, etc.).
+    // `Char` arithmetic by name: `'A'.plus(1)` is a Char, `'B'.minus('A')`
+    // an Int, `'B'.minus(1)` a Char, `compareTo` the code difference.
+    if (receiver.* == .Char and args.len == 1) {
+        const c: i64 = @intCast(receiver.Char);
+        if (std.mem.eql(u8, name, "plus")) {
+            if (args[0] == .Int) return .{ .ok = .{ .Char = @intCast(@mod(c + args[0].Int, 0x10000)) } };
+        } else if (std.mem.eql(u8, name, "minus")) {
+            if (args[0] == .Char) return .{ .ok = Value.newInt(c - @as(i64, @intCast(args[0].Char))) };
+            if (args[0] == .Int) return .{ .ok = .{ .Char = @intCast(@mod(c - args[0].Int, 0x10000)) } };
+        } else if (std.mem.eql(u8, name, "compareTo")) {
+            if (args[0] == .Char) return .{ .ok = Value.newInt(c - @as(i64, @intCast(args[0].Char))) };
+        }
+    }
     if (isNumericValue(receiver)) {
         if (args.len == 1) {
             if (numericOpMethod(name)) |op| {
@@ -7881,6 +7899,7 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
     const f = funcAt(module_rc, hit.func) orelse {
         return .{ .err = try typeErr(allocator, "anon method FuncId {d} out of range", .{@intFromEnum(hit.func)}) };
     };
+    if (builtinBridgeDefault(self, receiver, &f, args)) |dflt| return .{ .ok = dflt };
     var all: std.ArrayList(Value) = .empty;
     try all.append(allocator, receiver.*);
     try all.appendSlice(allocator, args);
@@ -9417,6 +9436,7 @@ pub fn invokeVirtualMember(
     // virtual slot, so serve it here too.
     if (args.len == 1 and receiver.* == .Instance) {
         if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vname| {
+            if (bridgeForReceiver(self, receiver, vname, args)) |dflt| return .{ .ok = dflt };
             if (std.mem.eql(u8, vname, "contains") or std.mem.eql(u8, vname, "indexOf")) {
                 if (persistent_list_eq.tryIndexOf(receiver.Instance, &args[0])) |idx| {
                     if (vname.len == 8) return .{ .ok = .{ .Bool = idx >= 0 } };
@@ -10013,6 +10033,11 @@ fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Valu
             const f = mg.get().funcById(fid) orelse break :blk "";
             break :blk f.name;
         };
+        if (blk: {
+            const mg = self.module.borrow();
+            defer mg.deinit();
+            break :blk if (mg.get().funcById(fid)) |f| builtinBridgeDefault(self, receiver, f, args_in) else null;
+        }) |dflt| return .{ .ok = dflt };
         if (std.mem.eql(u8, fname, "contains") or std.mem.eql(u8, fname, "indexOf")) {
             if (persistent_list_eq.tryIndexOf(receiver.Instance, &args_in[0])) |idx| {
                 if (fname.len == 8) return .{ .ok = .{ .Bool = idx >= 0 } };
@@ -10876,6 +10901,70 @@ fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, nam
         std.debug.print("[ir-walk-fill] {s} strict={} key={} unamb={} -> cached={}\n", .{ name, strict_key != null, key != null, resolved.unambiguous, key != null and (resolved.unambiguous or strict_key != null) });
     }
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
+}
+
+/// `builtinBridgeDefault` for a virtual-slot call: the receiver class's
+/// own declaration of `name` (or the nearest ancestor's) is the override
+/// whose parameter type the bridge checks.
+fn bridgeForReceiver(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value) ?Value {
+    if (args.len != 1 or receiver.* != .Instance) return null;
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    var cur: ?ObjRef(ClassDef) = blk: {
+        const g = receiver.Instance.borrow();
+        defer g.deinit();
+        break :blk g.get().class.clone();
+    };
+    var depth: usize = 0;
+    while (cur) |cd| : (depth += 1) {
+        const cg = cd.borrow();
+        const fqn = if (cg.get().fqn.len != 0) cg.get().fqn else cg.get().name;
+        const decls = mod.memberDecls(fqn, name);
+        if (decls.len != 0) {
+            const f = mod.funcById(decls[0]);
+            cg.deinit();
+            cd.deinit();
+            return if (f) |ff| builtinBridgeDefault(self, receiver, ff, args) else null;
+        }
+        const next: ?ObjRef(ClassDef) = if (cg.get().parent) |pp| pp.clone() else null;
+        cg.deinit();
+        cd.deinit();
+        if (depth > 32) {
+            if (next) |n| n.deinit();
+            return null;
+        }
+        cur = next;
+    }
+    return null;
+}
+
+/// The JVM's type-checking bridges on a user collection or map: an
+/// argument outside the override's declared parameter type never reaches
+/// the override. `get`/`remove` on a map answer null, `contains`,
+/// `containsKey`, `containsValue` and a collection's `remove` answer
+/// false, `indexOf`/`lastIndexOf` answer -1.
+fn builtinBridgeDefault(self: *VmHost, receiver: *const Value, f: *const Func, args: []const Value) ?Value {
+    const name = f.name;
+    if (args.len != 1 or receiver.* != .Instance) return null;
+    const is_map_name = std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "containsKey") or
+        std.mem.eql(u8, name, "containsValue") or std.mem.eql(u8, name, "remove");
+    const is_coll_name = std.mem.eql(u8, name, "contains") or std.mem.eql(u8, name, "remove") or
+        std.mem.eql(u8, name, "indexOf") or std.mem.eql(u8, name, "lastIndexOf");
+    if (!is_map_name and !is_coll_name) return null;
+    const on_map = receiverImplementsType(self, receiver, "Map") or receiverImplementsType(self, receiver, "MutableMap");
+    const on_coll = !on_map and (receiverImplementsType(self, receiver, "Collection") or receiverImplementsType(self, receiver, "MutableCollection") or
+        receiverImplementsType(self, receiver, "List") or receiverImplementsType(self, receiver, "MutableList") or
+        receiverImplementsType(self, receiver, "Set") or receiverImplementsType(self, receiver, "MutableSet"));
+    if (!(on_map and is_map_name) and !(on_coll and is_coll_name)) return null;
+    const skip: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+    if (f.params.len != skip + 1) return null;
+    const pty = &f.params[skip].ty;
+    const misfit = if (args[0] == .Null) !pty.nullable else argDefinitelyNotParamType(self, pty, &args[0]);
+    if (!misfit) return null;
+    if (on_map and (std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "remove"))) return .Null;
+    if (std.mem.eql(u8, name, "indexOf") or std.mem.eql(u8, name, "lastIndexOf")) return Value.newInt(-1);
+    return .{ .Bool = false };
 }
 
 /// A SAM-converted `Sequence { ... }` / `Iterable { ... }` instance: its
@@ -12785,7 +12874,7 @@ pub var ext_fb_plain_hit: u64 = 0;
 pub var ext_fb_chain_hit: u64 = 0;
 pub var ext_fb_walk: u64 = 0;
 
-fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
+pub fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
 
     runtime.prof.opRoute(3);
     ext_fb_total += 1;

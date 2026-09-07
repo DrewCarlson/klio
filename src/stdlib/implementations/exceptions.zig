@@ -73,9 +73,11 @@ pub fn buildException(ctx: *CallCtx, fqn: []const u8) std.mem.Allocator.Error!Ev
                 },
             }
         } else {
-            if (v.* == .Exception) {
+            if (v.* == .Exception or v.* == .Instance) {
+                // `Throwable(cause)`: the message is the cause's rendering.
                 v.retain();
                 cause = try Value.boxRef(ctx.allocator, v.*);
+                message = try messageOf(ctx.allocator, v);
             } else {
                 message = try messageOf(ctx.allocator, v);
             }

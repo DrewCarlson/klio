@@ -36,17 +36,20 @@ const dummySpan = Span.init(FileId.from(0), 0, 0);
 /// How a bare `field` reference in an accessor body maps onto storage:
 /// instance accessors read/write `this.__klio_field__<prop>`; top-level
 /// accessors read/write the `__klio_topfield__<prop>` global binding.
-pub const FieldSubst = enum { this_member, global };
+/// `this_member` carries the owning class name when known, so a `field`
+/// read inside an anonymous object declared in the accessor reaches the
+/// OWNER's backing slot (`object_member`) rather than the object's `this`.
+pub const FieldSubst = union(enum) { this_member: ?[]const u8, object_member: []const u8, global };
 
 /// Replace every bare `field` identifier in `expr` with
 /// `this.__klio_field__<prop_name>`. Used by accessor-body lowering so
 /// the IR thunk reads / writes the backing field on the receiver.
 ///
 /// Returns a freshly-allocated rewritten expression owned by `allocator`.
-pub fn substituteFieldWithThis(allocator: Allocator, prop_name: []const u8, expr: *const Expr) Allocator.Error!*Expr {
+pub fn substituteFieldWithThis(allocator: Allocator, prop_name: []const u8, expr: *const Expr, owner: ?[]const u8) Allocator.Error!*Expr {
     const out = try allocator.create(Expr);
     out.* = expr.*;
-    try walkField(allocator, out, prop_name, .this_member);
+    try walkField(allocator, out, prop_name, .{ .this_member = owner });
     return out;
 }
 
@@ -76,6 +79,17 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
                     this_segs[0] = .{ .name = "this", .span = dummySpan };
                     const recv = try allocator.create(Expr);
                     recv.* = .{ .Path = .{ .segments = this_segs, .span = dummySpan } };
+                    e.* = .{ .Member = .{
+                        .receiver = recv,
+                        .name = .{ .name = backing, .span = dummySpan },
+                        .safe = false,
+                        .span = dummySpan,
+                    } };
+                },
+                .object_member => |owner| {
+                    const backing = try std.fmt.allocPrint(allocator, "__klio_field__{s}", .{prop});
+                    const recv = try allocator.create(Expr);
+                    recv.* = .{ .This = .{ .qualifier = .{ .name = owner, .span = dummySpan }, .span = dummySpan } };
                     e.* = .{ .Member = .{
                         .receiver = recv,
                         .name = .{ .name = backing, .span = dummySpan },
@@ -156,6 +170,16 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
             try walkField(allocator, f.body, prop, mode);
         },
         .Labeled => |l| try walkField(allocator, l.expr, prop, mode),
+        .ObjectExpr => |*o| {
+            const inner: FieldSubst = switch (mode) {
+                .this_member => |owner| if (owner) |own| .{ .object_member = own } else mode,
+                else => mode,
+            };
+            for (o.members) |*m| try walkFieldDecl(allocator, m, prop, inner);
+            for (o.init_blocks) |*blk| {
+                for (blk.stmts) |*st| try walkFieldStmt(allocator, st, prop, inner);
+            }
+        },
         .Try => |*t| {
             for (t.body.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
             for (t.catches) |*c| {
@@ -192,23 +216,33 @@ fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8, mode: FieldSu
         // its initializer in a `Decl.Property`; its `field` reference must be
         // rewritten too. A local declaration cannot itself have custom
         // accessors, so only the initializer / delegate is walked.
-        .Decl => |*d| {
-            if (d.* == .Property) {
-                const p = d.Property;
-                if (p.init) |*init| try walkField(allocator, init, prop, mode);
-                if (p.delegate) |del| try walkField(allocator, del, prop, mode);
-            }
-        },
+        .Decl => |*d| try walkFieldDecl(allocator, d, prop, mode),
         .DestructuringDecl => |*dd| try walkField(allocator, &dd.init, prop, mode),
+    }
+}
+
+fn walkFieldDecl(allocator: Allocator, d: *Decl, prop: []const u8, mode: FieldSubst) Allocator.Error!void {
+    switch (d.*) {
+        .Property => |p| {
+            if (p.init) |*init| try walkField(allocator, init, prop, mode);
+            if (p.delegate) |del| try walkField(allocator, del, prop, mode);
+        },
+        .Function => |*f| {
+            if (f.body) |*body| switch (body.*) {
+                .Block => |*blk| for (blk.stmts) |*st| try walkFieldStmt(allocator, st, prop, mode),
+                .Expr => |*ex| try walkField(allocator, ex, prop, mode),
+            };
+        },
+        else => {},
     }
 }
 
 /// Rewrite a `field` backing reference inside an accessor block. Returns
 /// a freshly-allocated block whose statements have had each bare `field`
 /// reference replaced with the synthetic backing-slot access.
-pub fn rewriteBlockField(allocator: Allocator, block: *const Block, prop: []const u8) Allocator.Error!Block {
+pub fn rewriteBlockField(allocator: Allocator, block: *const Block, prop: []const u8, owner: ?[]const u8) Allocator.Error!Block {
     const stmts = try allocator.dupe(Stmt, block.stmts);
-    for (stmts) |*s| try walkFieldStmt(allocator, s, prop, .this_member);
+    for (stmts) |*s| try walkFieldStmt(allocator, s, prop, .{ .this_member = owner });
     return .{ .stmts = stmts, .span = block.span };
 }
 

@@ -375,6 +375,7 @@ pub const VmHost = struct {
     pub const enclosingEnumEntry = host_fields.enclosingEnumEntry;
     pub const enclosingEnumEntryByOwner = host_fields.enclosingEnumEntryByOwner;
     pub const enclosingCompanionMember = host_fields.enclosingCompanionMember;
+    pub const extensionFnFallback = host_call_member.extensionFnFallback;
     pub const stampRefAdaptation = host_fields.stampRefAdaptation;
     pub const closureRefEquals = builtin_members.closureRefEquals;
     pub const fieldSiteRoute = host_fields.fieldSiteRoute;
