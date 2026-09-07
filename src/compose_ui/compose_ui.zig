@@ -828,7 +828,7 @@ fn winPoll(ctx: *CallCtx) Error!EvalResult {
 // OS-driven frame loop (mobile): the platform owns the run loop and calls
 // klio_render_frame each vsync on the resident VM. `application` (KlioWindow)
 // registers a per-frame render callback and returns instead of looping; the app
-// shell drives it (iOS CADisplayLink). See plans/MOBILE-TARGETS.md.
+// shell drives it (iOS CADisplayLink). See plans/open-campaigns.md.
 // ---------------------------------------------------------------------------
 
 // The OS-provided surface layer + geometry the app installs before running the

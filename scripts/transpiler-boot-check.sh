@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage-1 gate of plans/c-transpiler-plan.md: a plain C host drives the
+# Stage-1 gate of plans/c-transpiler-plan.md (git history): a plain C host drives the
 # klio runtime end to end through the C ABI static library.
 set -euo pipefail
 cd "$(dirname "$0")/.."

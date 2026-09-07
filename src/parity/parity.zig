@@ -2132,6 +2132,14 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         runtime.gc.drainRemembered();
         if (gc_run) {
             runtime.gc.program_perm_collect = false;
+            // Drain AGAIN, here. The earlier drain was before `vm.deinit` and
+            // the final collect, and both re-remember through the write
+            // barrier — a tenured cell mutated during teardown rejoins the set
+            // after that drain and before these cells are freed. On Linux the
+            // trim below then hands the page back to the OS and the next
+            // drain writes through it; macOS leaves it mapped and the same bug
+            // is a silent write into freed memory.
+            runtime.gc.drainRemembered();
             runtime.gc.freeProgramPerm();
         }
         runtime.gc.external_accounting = prev_external_accounting;
@@ -2249,6 +2257,14 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
             // The finished program's build-phase permanent cells (its own VM
             // class/global graph) — the Vm is already out of the root set and
             // the remembered set was drained while these were still mapped.
+            // Drain AGAIN, here. The earlier drain was before `vm.deinit` and
+            // the final collect, and both re-remember through the write
+            // barrier — a tenured cell mutated during teardown rejoins the set
+            // after that drain and before these cells are freed. On Linux the
+            // trim below then hands the page back to the OS and the next
+            // drain writes through it; macOS leaves it mapped and the same bug
+            // is a silent write into freed memory.
+            runtime.gc.drainRemembered();
             runtime.gc.freeProgramPerm();
             // The collect's own trim is rate-limited (32MB of sweep credit);
             // a program boundary is exactly when dormant slab pages should
@@ -2302,7 +2318,7 @@ fn runMainBigStack(vm: *interp_ir.Vm, main_id: interp_ir.FuncId, out: interp_ir.
         .time_mode = interp_ir.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
     };
-    return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
+    return runtime.runOnBigStackMainThread(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 
 /// Per-program wall cap (ms) for the in-process itest harnesses: a spinning

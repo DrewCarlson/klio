@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The full verification stack (plans/verification-latency-campaign.md).
+# The full verification stack (plans/verification-latency-campaign.md (git history)).
 # Critical path = the compose gate's validatePotentialDeadlock (~510s
 # solo, GC-relaxed): it gets one whole L3 domain to itself; everything
 # else overlaps it full-parallel on the other domain; litmus runs last
@@ -70,7 +70,7 @@ if [ "$nproc" -ge 16 ] && command -v taskset >/dev/null; then
     pin=(taskset -c "6-$((nproc-1))")
   fi
 fi
-# Structure (measured, plans/verification-latency-campaign.md): vpd
+# Structure (measured, plans/verification-latency-campaign.md (git history)): vpd
 # owns one whole L3 domain (its in-stack wall is 525s there, vs 602s
 # sharing L3 with load — the inflation was LLC eviction, not CPU).
 # Everything else runs full-parallel on the other domain: with vpd's
@@ -90,7 +90,7 @@ wave2_steps=(
 s=$(date +%s)
 rest_log=$(mktemp)
 gate_log=$(mktemp)
-# Leaf pack for the census waves (plans/leaf-production-campaign.md):
+# Leaf pack for the census waves (plans/leaf-production-campaign.md (git history)):
 # pure-scalar library bodies served natively inside the interpreter.
 # FAIL-OPEN — a build failure just runs the censuses leafless (and is
 # reported); correctness never depends on the artifact. The compose

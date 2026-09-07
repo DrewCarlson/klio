@@ -214,7 +214,7 @@ def run_one(binary, target, support, targets, provider, texts, eager):
     try:
         p = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=900, env=env)
     except subprocess.TimeoutExpired:
-        return target, -1, [("__TIMEOUT__", "")]
+        return target, -1, [("__TIMEOUT__", timeout_detail(target, 900))]
     passed = None
     m = re.search(rb"(\d+) passed,", p.stdout)
     if m:
@@ -290,7 +290,7 @@ def run_dir(binary, tdir, dir_targets, support, all_targets, provider, texts, ea
     try:
         p = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=1800, env=env)
     except subprocess.TimeoutExpired:
-        return tdir, -1, [("__TIMEOUT__", "")]
+        return tdir, -1, [("__TIMEOUT__", timeout_detail(tdir, 1800))]
     run_dir_times[tdir] = time.monotonic() - t0
     passed = None
     m = re.search(rb"(\d+) passed,", p.stdout)
@@ -349,6 +349,14 @@ def sweep(binary, run_targets, all_targets, support, provider, texts, eager, job
     return results
 
 
+def timeout_detail(target, limit):
+    """What a timed-out child needs to say: how long it got, and the exact
+    command that reproduces it alone. A timeout reported as a bare failure
+    reads as a broken test, and the whole point is that nothing was measured."""
+    return (f"no result within {limit}s (killed) — rerun alone: "
+            f"python3 scripts/commontest-sweep.py <binary> --filter {os.path.basename(target)} --no-batch")
+
+
 def render(results, show_passes):
     out = []
     for t in sorted(results):
@@ -356,7 +364,10 @@ def render(results, show_passes):
         if show_passes:
             out.append(f"{passed}\t{t}")
         for name, reason in fails:
-            out.append(f"{t}\t{name}\t{reason}")
+            if name == "__TIMEOUT__":
+                out.append(f"TIMEOUT\t{t}\t{reason}")
+            else:
+                out.append(f"{t}\t{name}\t{reason}")
     return out
 
 
@@ -402,10 +413,18 @@ def main():
         # `--eager both` invocation still works (it just runs twice).
         label = "run"
         lines = render(results, args.passes)
-        total_fails = sum(len(f) for _, f in results.values())
-        print(f"== {label}: {len(matched)} files, {total_fails} failures")
+        timed_out = [t for t, (_, f) in results.items()
+                     if any(n == "__TIMEOUT__" for n, _ in f)]
+        total_fails = sum(len([1 for n, _ in f if n != "__TIMEOUT__"])
+                          for _, f in results.values())
+        suffix = f", {len(timed_out)} TIMED OUT" if timed_out else ""
+        print(f"== {label}: {len(matched)} files, {total_fails} failures{suffix}")
         for line in lines:
             print(line)
+        if timed_out:
+            # Separate from failures: a timeout measured nothing, so it is a
+            # missing result, not a wrong one.
+            print(f"== TIMED OUT ({len(timed_out)}): " + " ".join(sorted(timed_out)))
 
     if len(modes) == 2:
         a, b = per_mode[False], per_mode[True]

@@ -1,5 +1,5 @@
 //! `klio-census` — the link-free census driver
-//! (plans/verification-latency-campaign.md Task 2). Runs any commontest
+//! (plans/verification-latency-campaign.md (git history) Task 2). Runs any commontest
 //! suite from the SHARED registry (`commontest_support.suites`) against the
 //! installed `zig-out/bin/klio-harness`, so iterating on the interpreter
 //! costs one harness rebuild instead of a whole-program itest link per

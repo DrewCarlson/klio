@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the wide library leaf pack (plans/leaf-production-campaign.md):
+# Build the wide library leaf pack (plans/leaf-production-campaign.md (git history)):
 # every pure-scalar body on the kotlin.* / kotlinx.* surfaces, emitted
 # as a self-contained shared library the interpreter loads via
 # KLIO_LEAVES. Keyed fqn#sig, bake-independent; the loader and the

@@ -7,7 +7,7 @@
 //! — the genuinely parallel surface). The `ByteChannel` programs run
 //! the write/read sides through the cooperative pump: a continuation
 //! parked on one pump cannot yet be resumed from a foreign OS thread
-//! (see plans/KTOR-UPSTREAM.md), so cross-thread channel contention is
+//! (see plans/open-campaigns.md), so cross-thread channel contention is
 //! exercised at the lock level, not the suspension level.
 //!
 //! Each program runs in a real `klio` child process against installed

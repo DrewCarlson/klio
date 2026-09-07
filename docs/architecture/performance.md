@@ -92,7 +92,7 @@ ownership and must be freed when a fallback consumes or rejects them. The
 native stack or by the active intrinsic FQN.
 
 The full design, including the root-completeness analysis, is in
-`plans/GC.md`; the JIT design record is `plans/JIT-DESIGN.md`.
+`docs/design/GC.md`; the JIT design record is `docs/design/JIT-DESIGN.md`.
 
 ## The stdlib image cache
 

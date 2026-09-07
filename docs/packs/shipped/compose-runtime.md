@@ -94,7 +94,7 @@ What remains is downstream of the runtime: the **node-emission (Applier) layer**
 node-based UI is built on (the current composer renders via side effects, not a node
 tree), then the Mosaic (terminal) and Compose-UI/Skia rendering packs, plus the full
 MVCC snapshot transaction API and movable content. See
-`plans/UI-RENDERING-PACKS.md` for that plan.
+`plans/open-campaigns.md` for that plan.
 
 See `examples/compose_*.kt` for runnable demonstrations of each feature, and
-`plans/UI-RENDERING-PACKS.md` for the rendering roadmap.
+`plans/open-campaigns.md` for the rendering roadmap.

@@ -45,6 +45,13 @@ your code also runs it.
 - Ship a program as one self-contained executable with
   [`klio bundle`](BUNDLE.md).
 
+## Design records
+
+- [Design records](design/ARCHITECTURE.md) — the plan-side architecture
+  summary, the coroutine model, GC, JIT, diagnostics, benchmarks, stdlib
+  and intrinsics records, and the `analysis/` notes that document
+  load-bearing decisions.
+
 ## Architecture
 
 - [Pipeline overview](architecture/pipeline.md) — where each Kotlin

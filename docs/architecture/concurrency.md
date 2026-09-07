@@ -264,6 +264,6 @@ adaptive reference-counted cell.
 `Channel`, `Flow`, and the memory model are working and gated —
 cancellation and timeouts run the consumed upstream common code
 end-to-end. The design record for the coroutine engine is
-`plans/COROUTINE-MODEL.md`. Do not add library-type-specific
+`docs/design/COROUTINE-MODEL.md`. Do not add library-type-specific
 branches to `ir` / `interp_ir` to work around a coroutine bug; fix
 the general mechanism.
