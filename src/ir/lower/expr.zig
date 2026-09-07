@@ -3073,7 +3073,7 @@ fn sgetterName(b: *FuncBuilder, name: []const u8) Allocator.Error!ConstId {
     return b.module.internConst(b.allocator, .{ .String = name });
 }
 
-const ImportRewrite = struct { segs: []const []const u8 };
+pub const ImportRewrite = struct { segs: []const []const u8 };
 
 /// Resolve a bare name imported via `import a.b.C…MEMBER` into the qualified
 /// access path starting at the rightmost segment naming a class this module
@@ -3083,7 +3083,7 @@ const ImportRewrite = struct { segs: []const []const u8 };
 /// because a companion member is reached through the class itself
 /// (`import X.Companion.member` → `X.member`). Returns null when the path names
 /// no declared class, or the class is the leaf (a bare type reference).
-fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?ImportRewrite {
+pub fn importCompanionRewrite(b: *FuncBuilder, file: ir.FileId, name: []const u8) ?ImportRewrite {
     const segs = b.module.importAliasIn(file, name) orelse return null;
     // Find the rightmost segment naming a class the module declares (skips the
     // leading package), then extend left across any enclosing-class chain so the
@@ -3225,6 +3225,15 @@ fn lowerShortInterp(b: *FuncBuilder, ident: ast.Ident) Allocator.Error!Reg {
         var segs = [_]ast.Ident{.{ .name = renamed, .span = ident.span }};
         const path = Expr{ .Path = .{ .segments = &segs, .span = ident.span } };
         return lowerExpr(b, &path);
+    }
+    // `$x` for an `import Object.x` member reads the object's property.
+    if (!b.hasOwnMember(ident.name)) {
+        if (importCompanionRewrite(b, ident.span.file, ident.name)) |rw| {
+            const rsegs = try b.allocator.alloc(ast.Ident, rw.segs.len);
+            for (rw.segs, 0..) |sname, k| rsegs[k] = .{ .name = sname, .span = ident.span };
+            const path = Expr{ .Path = .{ .segments = rsegs, .span = ident.span } };
+            return lowerExpr(b, &path);
+        }
     }
     if (b.hasOwnMember(ident.name) and b.resolve("this") != null) {
         const this_reg = b.resolve("this").?;
