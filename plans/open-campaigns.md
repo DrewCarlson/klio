@@ -9,8 +9,9 @@ work lands; close a document when its exit conditions are met.
 ## The active plan
 
 `conformance-backlog.md`: Stage 2 Task 4, root-fixing the kotlinc box
-corpus by cluster (`kotlinc-box-conformance.md`: census 5985 / 369 / 3 at
-eb4d1fcc, 43 clusters of five or more left), then Stage 3, the
+corpus by cluster (`kotlinc-box-conformance.md`: census 5991 / 363 / 3 at
+17cb100a, every cluster of five or more has a fix or a verdict and the
+residue list is written), then Stage 3, the
 verification tier's allocation fill (`safe-tier-allocation-fill.md`, not
 started). Standing gates: every library census at baseline, compose plugin
 1390 / 0, stdlib sweep 117 files clean, CI green (unit plus eight shards).

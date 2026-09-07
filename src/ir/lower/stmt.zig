@@ -1243,7 +1243,7 @@ fn lowerAssign(
     // (`bar("A", a).prop = try { … }` runs `bar` first).
     if (op == .Assign) {
         switch (target.*) {
-            .Member => |m| if (!m.safe and m.receiver.* != .Path and m.receiver.* != .This) {
+            .Member => |m| if (!m.safe and m.receiver.* != .Path and m.receiver.* != .This and m.receiver.* != .Super) {
                 pre_recv = try lowerReceiver(b, m.receiver);
             },
             else => {},

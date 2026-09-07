@@ -6,11 +6,11 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-07, 59637fc8, CI green)
+## State (2026-09-07, 17cb100a)
 
-Census 5985 passed / 369 failed / 3 did not complete (994 excluded: the
+Census 5991 passed / 363 failed / 3 did not complete (994 excluded: the
 runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
-`BASELINE = 5985`, `MAX_FAILED = 369` in `src/itests/box_support.zig`.
+`BASELINE = 5991`, `MAX_FAILED = 363` in `src/itests/box_support.zig`.
 Landed since 5751/609: function-type `is`/`as` by arity, companion and
 enum-entry `invoke`, inner constructor refs, bound extension and vararg
 refs, property references reading extension properties, callable-typed
@@ -236,3 +236,47 @@ residue list (every cluster under five) as the seed of the next campaign.
 - properties/fieldInsideField (1): an anonymous object's property with
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
+
+## Residue (clusters under five at 5991 / 363 / 3, 17cb100a)
+
+Every directory with five or more failures above has a fix or a verdict.
+The remaining failures, grouped by directory, are the seed of the next
+campaign; the first column is the failure count.
+
+| n | directory | shape |
+|---|-----------|-------|
+| 4 | strings | `String.format` locale forms, `trimMargin` on raw templates, `Char.code` in templates |
+| 4 | intrinsics | JVM intrinsic bridges (`hashCode` on nullable, `arrayOfNulls` typed) |
+| 4 | initializers | init-order across companion and nested object initializers |
+| 4 | inference | PCLA builder inference through generic receivers |
+| 4 | extensionProperties | extension property on a type parameter / nullable receiver, `by` on an extension |
+| 4 | evaluate/intrinsicConst | `const val` folding of intrinsics (`Int.MAX_VALUE.toString()`, `length`) |
+| 4 | delegation | delegation to a type-parameter-typed field, `by` an interface with generic defaults |
+| 4 | defaultArguments/function | 32/33-argument mask boundaries, defaults reading earlier defaults |
+| 4 | coroutines/featureIntersection | coroutines with bound refs, inline classes, tail calls |
+| 4 | companionBlocksAndExtensions | companion extension shadowing and `init` blocks |
+| 4 | closures | captured `var` in nested closures inside super-constructor calls |
+| 4 | callableReference/bound | bound references to `Any` members and to value-class receivers |
+| 3 | typeErasure | the erased-cast verdict |
+| 3 | reified | `Array<T>` construction with a reified `T`, `T::class` on a nested class |
+| 3 | regressions | assorted kt-numbered regressions |
+| 3 | reflection/classes | `KClass.simpleName`/`qualifiedName` on local and anonymous classes |
+| 3 | primitiveTypes | `-0.0` equality, `Long` to `Char`, boxed identity |
+| 3 | operatorConventions | `infixFunctionOverBuiltinMember`, `kt14201_2`, `kt4987` |
+| 3 | multiDecl | destructuring an `Iterator` via extension `componentN` |
+| 3 | inlineClasses | value-class boxing at `Any` boundaries |
+| 3 | ieee754 | `Double`-vs-`Float` comparison rules under smart casts |
+| 3 | funInterface | fun interface SAM conversion with default methods |
+| 3 | functions | `nothisnoclosure` (memory cap) and two `invoke` shapes |
+| 3 | function | `Function22`/`FunctionN` arity limits |
+| 3 | dataClasses | `copy` with defaults from the primary, `toString` of nested arrays |
+| 3 | controlStructures | `for` over a custom iterator with `hasNext` side effects |
+| 3 | callableReference/property | references to extension properties on generic receivers |
+| 3 | binaryOp | `Long shl Int`, `compareTo` between mixed numerics |
+| 3 | basics | assorted single files |
+| 2 | unsignedTypes, traits, topLevelInitializtion, super, statics, reified/catchParameter, reflection/typeOf/noReflect/nonReifiedTypeParameters, ranges/contains, multiDecl/forRange, mixedNamedPosition, ir, innerNested/superConstructorCall, innerNested, inlineEvaluationOrder, inlineClasses/funInterface, functions/invoke, functions/functionExpression, fir/contextSensitiveResolution, diagnostics/functions/tailRecursion, delegatedProperty/provideDelegate, delegatedProperty/delegateToSingleton, dataObjects, dataClasses/toString, controlflow, collections, casts, callableReference | pairs |
+| 1 | 66 directories | singletons (`[box-fail]` lines of the census log) |
+
+Crashes (3): the two `extensionFunctionWithExtensionInSAMInterface` files
+(unbounded recursion, verdict above) and `functions/nothisnoclosure` (the
+process memory cap: a 100k-iteration loop allocating a closure per call).
