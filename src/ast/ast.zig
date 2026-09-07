@@ -43,6 +43,7 @@ pub const AnnotationUseSite = enum {
 /// Use-site targeting machinery: U(A) derivation from `@Target`, `@all:`
 /// expansion, and the defaulting rule for target-less property annotations.
 pub const annotation_targets = @import("annotation_targets.zig");
+pub const alias_expand = @import("alias_expand.zig");
 
 /// A single `@Foo(args)` / `@use-site:Foo` annotation at a declaration
 /// site. Values inside are parsed best-effort; downstream passes treat
@@ -1208,4 +1209,5 @@ test "recursive expr nodes box through pointers" {
 
 test {
     _ = annotation_targets;
+    _ = alias_expand;
 }

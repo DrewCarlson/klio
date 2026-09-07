@@ -496,6 +496,38 @@ pub fn buildModuleFilesExtend(allocator: Allocator, base: *const StdlibBase, use
     return buildModuleFilesInner(allocator, user_files, base, null);
 }
 
+/// Files where a bare `@Composable` is the program's own annotation class:
+/// their package declares `annotation class Composable` (the compose runtime's
+/// own package excepted) and the file imports no other `Composable`.
+fn collectUserComposableFiles(allocator: Allocator, files: []const KotlinFile) Allocator.Error!std.AutoHashMap(ir.FileId, void) {
+    var out = std.AutoHashMap(ir.FileId, void).init(allocator);
+    errdefer out.deinit();
+    var own_pkgs = std.StringHashMap(void).init(allocator);
+    defer own_pkgs.deinit();
+    for (files) |*f| {
+        const pkg = try packagePrefix(allocator, f.package);
+        if (std.mem.eql(u8, pkg, "androidx.compose.runtime")) continue;
+        for (f.decls) |*d| {
+            if (d.* != .Class or !d.Class.is_annotation) continue;
+            if (!std.mem.eql(u8, d.Class.name.name, "Composable")) continue;
+            try own_pkgs.put(pkg, {});
+        }
+    }
+    if (own_pkgs.count() == 0) return out;
+    for (files) |*f| {
+        const pkg = try packagePrefix(allocator, f.package);
+        if (!own_pkgs.contains(pkg)) continue;
+        var imports_other = false;
+        for (f.imports) |imp| {
+            if (imp.wildcard or imp.path.len == 0) continue;
+            const visible = if (imp.alias) |al| al.name else imp.path[imp.path.len - 1].name;
+            if (std.mem.eql(u8, visible, "Composable")) imports_other = true;
+        }
+        if (!imports_other) try out.put(f.span.file, {});
+    }
+    return out;
+}
+
 fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile, base: ?*const StdlibBase, out_lifted: ?*[]Decl) Allocator.Error!BuiltModule {
     const ComposeMaps = struct {
         names: std.StringHashMap(void),
@@ -553,6 +585,14 @@ fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile, bas
     // Kotlin before anything reads the decls, so packs and programs alike
     // carry real generated serializers.
     const files: []KotlinFile = try serialization_pass.transformFiles(allocator, files_in);
+    // Typealias expansion: every alias reference becomes its target before
+    // any phase reads the declarations (`KLIO_ALIAS_EXPAND=0` skips it).
+    const alias_expand_off = if (runtime.envOnce("KLIO_ALIAS_EXPAND")) |v| std.mem.eql(u8, v, "0") else false;
+    if (!alias_expand_off) try ast.alias_expand.expandFiles(allocator, files);
+    var user_composable_files = try collectUserComposableFiles(allocator, files);
+    defer user_composable_files.deinit();
+    compose_pass.user_composable_files = &user_composable_files;
+    defer compose_pass.user_composable_files = null;
     for (files) |*f| {
         try file_modules.put(f.span.file, compilation_module);
         const prefix = try packagePrefix(allocator, f.package);

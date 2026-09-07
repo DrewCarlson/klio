@@ -1,0 +1,12 @@
+OK
+42
+concrete
+true [0, 10] [1, 2, 3]
+via-alias
+header-generic header-concrete object-literal
+companion
+inside/7/nested/ref
+top-level
+5
+bound-ref
+OK
