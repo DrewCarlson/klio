@@ -8,13 +8,15 @@ work lands; close a document when its exit conditions are met.
 
 ## The active plan
 
-`conformance-backlog.md`: Stage 2 Task 4, root-fixing the kotlinc box
-corpus by cluster (`kotlinc-box-conformance.md`: census 5991 / 363 / 3 at
-17cb100a, every cluster of five or more has a fix or a verdict and the
-residue list is written), then Stage 3, the
-verification tier's allocation fill (`safe-tier-allocation-fill.md`, not
-started). Standing gates: every library census at baseline, compose plugin
-1390 / 0, stdlib sweep 117 files clean, CI green (unit plus eight shards).
+`kotlinc-box-conformance.md`: the box residue. Census 5991 / 363 / 3 at
+8c8c613a (CI green), ratchet 5991 / 363; every cluster of five or more
+has a fix or a recorded verdict, and the residue table there (clusters
+under five, grouped by directory) is the work list: fix by mechanism,
+ship an `examples/` program per fix, ratchet after every landed batch,
+never edit the corpus. The conformance backlog (Stage 2 Task 4 and the
+safe-tier decision) closed 2026-09-07; its records are in git history.
+Standing gates: every library census at baseline, compose plugin 1390 / 0,
+stdlib sweep 117 files clean, CI green (unit plus eight shards).
 
 ## Deferred fronts
 
