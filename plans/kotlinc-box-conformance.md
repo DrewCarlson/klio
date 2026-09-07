@@ -6,7 +6,7 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-07, HEAD)
+## State (2026-09-07, 59637fc8, CI green)
 
 Census 5985 passed / 369 failed / 3 did not complete (994 excluded: the
 runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
