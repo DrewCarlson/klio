@@ -1617,10 +1617,11 @@ lexer and parser; they diverge after the AST.</p>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>   ▼  lexer            UTF-8 source → tokens
 <a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>   ▼  parser           tokens → ast.KotlinFile
 <a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>   ▼  (pack loading)   merge installed pack ASTs into the module
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>   ▼  ir               AST → register IR (lowering)
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>   ▼  interp_ir        build the IR module, then Vm.run
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>   ▼
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>program output
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>   ▼  ast passes       typealias expansion, @Serializable and @Composable plugins
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>   ▼  ir               AST → register IR (lowering)
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>   ▼  interp_ir        build the IR module, then Vm.run
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>   ▼
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>program output
 </code></pre></div>
 <p>The Vm executes the lowered IR directly. There is no AST evaluator
 and no bytecode VM — <code>ir</code> lowers every supported construct
@@ -1629,6 +1630,19 @@ structured IR instructions, and the Vm dispatches on them. Under the
 default <code>fast</code> profile, hot loops and functions additionally compile
 to native code through the tiered JIT; see
 <a href="../performance/">Performance</a>.</p>
+<p>Before lowering, whole-program AST passes rewrite the parsed files in
+place. The first is typealias expansion (<code>ast.alias_expand</code>): every
+reference to a <code>typealias</code> — a type position, a constructor call
+<code>Alias(args)</code> / <code>recv.Alias(args)</code>, a supertype of a class or object
+literal, a value read of an aliased object or companion, a callable
+reference <code>::Alias</code> — becomes the aliased type with the alias's type
+parameters substituted, resolved with Kotlin's scoping (enclosing class
+body, explicit imports, own package, star imports; the target itself
+resolves in the alias's declaring file). Lowering and the runtime then
+only ever see the target. An alias name the program also declares as a
+classifier, function or value is left for the lowering's scope model.
+<code>KLIO_ALIAS_EXPAND=0</code> skips the pass. The <code>@Serializable</code> and
+<code>@Composable</code> plugin passes follow.</p>
 <p>With <code>KLIO_EAGER=1</code> the run path also executes the resolver and type
 checker ahead of lowering, and lowering consumes their answers
 (call targets, receiver types) instead of deferring those decisions

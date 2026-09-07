@@ -1903,6 +1903,12 @@ plus <code>KLIO_MISS_TRACE</code> (which runtime tail missed).</p>
 <td><code>[bare]</code></td>
 </tr>
 <tr>
+<td><code>KLIO_ALIAS_EXPAND</code></td>
+<td><code>0</code></td>
+<td>Skip the typealias expansion pass that rewrites every alias reference to its target before lowering; the lowering's per-site alias registry then serves the program (bisect an alias-related difference)</td>
+<td>—</td>
+</tr>
+<tr>
 <td><code>KLIO_EXT_TRACE</code></td>
 <td><code>&lt;name&gt;</code></td>
 <td>How an explicit-receiver extension call resolved during lowering: receiver type, implicit dispatch owners, lexical owner, and exact target; also the static member-resolution verdict and self-recursive-bind arg shapes for <code>name</code></td>
