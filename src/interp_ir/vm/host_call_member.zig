@@ -4845,6 +4845,17 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     // simple-name view is only the fallback for synthesized shapes.
     if (receiver.* == .Instance) {
         const def_opt = blk: {
+            // A runtime-local receiver constructs the nested class of its
+            // own registration family, not the latest one by that name.
+            {
+                const g = receiver.Instance.borrow();
+                defer g.deinit();
+                const cg = g.get().class.borrow();
+                defer cg.deinit();
+                for (cg.get().local_captures) |c| {
+                    if (c.value == .Class and std.mem.eql(u8, c.name, name)) break :blk c.value.Class.clone();
+                }
+            }
             const cg = self.classes.borrow();
             defer cg.deinit();
             var outer_cls: ?ObjRef(ClassDef) = blk2: {
@@ -4906,8 +4917,24 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                 defer if (runtime.reclaimEnabled()) cls_val.release(allocator);
                 const r = try host_call_value.callValue(self, allocator, &cls_val, args);
                 if (r == .ok and r.ok == .Instance) {
+                    // An inner class of an anonymous object reads the
+                    // object's captured scope through its outer: carry the
+                    // per-instance captures onto the inner instance.
+                    const outer_caps: []const InstanceData.Capture = ocap: {
+                        const og = receiver.Instance.borrow();
+                        defer og.deinit();
+                        break :ocap og.get().anon_captures;
+                    };
                     const ig = r.ok.Instance.borrowMut();
                     ig.get().outer = .{ .Instance = receiver.Instance.clone() };
+                    if (outer_caps.len != 0 and ig.get().anon_captures.len == 0) {
+                        const copy = try allocator.alloc(InstanceData.Capture, outer_caps.len);
+                        for (outer_caps, copy) |c, *slot| {
+                            if (runtime.reclaimEnabled()) c.value.retain();
+                            slot.* = c;
+                        }
+                        ig.get().anon_captures = copy;
+                    }
                     ig.deinit();
                 }
                 return r;
@@ -7674,7 +7701,62 @@ fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const Valu
             return try invokeAnonMethod(self, allocator, receiver, hit, args, inst);
         }
     }
+    // A method inherited from a runtime-local supertype (`inner class
+    // Inner : Local()` with `Local` a local class): its body is registered
+    // under the ancestor's name and runs with the ancestor's captured
+    // scope, the receiver staying the instance.
+    var cur: ?ObjRef(ClassDef) = blk: {
+        const g = inst.borrow();
+        defer g.deinit();
+        const cg = g.get().class.borrow();
+        defer cg.deinit();
+        break :blk if (cg.get().parent) |p| p.clone() else null;
+    };
+    var steps: usize = 0;
+    while (cur) |c| : (steps += 1) {
+        if (steps > 64) {
+            c.deinit();
+            break;
+        }
+        const info: struct { name: []const u8, local: bool, next: ?ObjRef(ClassDef) } = blk: {
+            const g = c.borrow();
+            defer g.deinit();
+            break :blk .{
+                .name = g.get().name,
+                .local = g.get().is_local_runtime,
+                .next = if (g.get().parent) |p| p.clone() else null,
+            };
+        };
+        if (info.local) {
+            if (lookupAnonMethod(self, allocator, info.name, arity_name, name)) |hit| {
+                if (!anonMethodDisproven(self, hit, args)) {
+                    if (info.next) |n| n.deinit();
+                    defer c.deinit();
+                    const src: Value = .{ .Class = c };
+                    return try invokeAnonMethodFrom(self, allocator, receiver, &src, hit, args, inst);
+                }
+            }
+        }
+        c.deinit();
+        cur = info.next;
+    }
     return null;
+}
+
+/// Run a thunk registered under a runtime-local class (`$default$<i>`)
+/// in the class's captured scope, before any instance of it exists.
+/// `receiver` is the enclosing receiver the class captured (or Null).
+pub fn invokeLocalClassThunk(self: *VmHost, allocator: Allocator, cls: ObjRef(ClassDef), name: []const u8, receiver: *const Value, args: []const Value) Allocator.Error!EvalResult {
+    const cls_name = blk: {
+        const g = cls.borrow();
+        defer g.deinit();
+        break :blk g.get().name;
+    };
+    const hit = lookupAnonMethod(self, allocator, cls_name, name, name) orelse {
+        return .{ .err = try typeErr(allocator, "local class `{s}` has no `{s}` thunk", .{ cls_name, name }) };
+    };
+    const src: Value = .{ .Class = cls };
+    return invokeAnonMethodFrom(self, allocator, receiver, &src, hit, args, null);
 }
 
 /// Whether some supplied argument definitely cannot bind the anon method's
@@ -7860,13 +7942,49 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
         defer g.deinit();
         break :blk g.get().anon_captures;
     };
-    const chain_seed: []const ir.eval.EnclosingEntry = blk: {
-        if (capture_src.* != .Instance) break :blk &.{};
-        const g = capture_src.Instance.borrow();
+    // A runtime-local class carries its declaration scope on its def
+    // (`ClassDef.local_captures`, one registration = one scope), so an
+    // instance reads the scope it was declared in even after the same
+    // declaration ran again; a `.Class` source is a thunk running before
+    // any instance exists (a constructor default).
+    const class_caps: []const InstanceData.Capture = blk: {
+        if (inst_caps.len != 0) break :blk &.{};
+        const cls: ObjRef(ClassDef) = switch (capture_src.*) {
+            .Instance => |i| inner: {
+                const g = i.borrow();
+                defer g.deinit();
+                break :inner g.get().class.clone();
+            },
+            .Class => |c| c.clone(),
+            else => break :blk &.{},
+        };
+        defer cls.deinit();
+        const g = cls.borrow();
         defer g.deinit();
-        break :blk g.get().anon_enclosing;
+        break :blk g.get().local_captures;
     };
-    const caps: []const NameValue = if (inst_caps.len != 0) @ptrCast(inst_caps) else hit.captures;
+    const chain_seed: []const ir.eval.EnclosingEntry = blk: {
+        const cls: ObjRef(ClassDef) = switch (capture_src.*) {
+            .Instance => |i| inner: {
+                const g = i.borrow();
+                defer g.deinit();
+                if (g.get().anon_enclosing.len != 0) break :blk g.get().anon_enclosing;
+                break :inner g.get().class.clone();
+            },
+            .Class => |c| c.clone(),
+            else => break :blk &.{},
+        };
+        defer cls.deinit();
+        const g = cls.borrow();
+        defer g.deinit();
+        break :blk g.get().local_enclosing;
+    };
+    const caps: []const NameValue = if (inst_caps.len != 0)
+        @ptrCast(inst_caps)
+    else if (class_caps.len != 0)
+        @ptrCast(class_caps)
+    else
+        hit.captures;
 
     // Layer captured outer-env names onto globals + build the capture vec.
     const prev = self.globals.clone();
@@ -9673,7 +9791,16 @@ pub fn invokeVirtualMember(
     // When the receiver's class has no entry for it, or the entry names a
     // declaration with nothing to execute, dispatch by the member's name — the
     // same result the site produced before it was bound, rather than a failure.
-    const slot_name: ?[]const u8 = if (module.funcById(FuncId.from(slot.int()))) |f| f.name else null;
+    // The slot's declaration may live in the calling frame's SIDE module: a
+    // call site lowered inside a local class's method (or a closure in it)
+    // reserved its header there, and the main module has no func at that id.
+    const slot_name: ?[]const u8 = blk: {
+        if (module.funcById(FuncId.from(slot.int()))) |f| break :blk f.name;
+        const fm = ir.eval.currentFrameModule() orelse break :blk null;
+        if (fm == module) break :blk null;
+        if (fm.funcById(FuncId.from(slot.int()))) |f| break :blk f.name;
+        break :blk null;
+    };
     // A host-synthesized class implements its members as native intrinsics
     // keyed by its own FQN, and that binding is the most-derived override of
     // the slot. The synth's `supertype_names` exist for type checks, so

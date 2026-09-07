@@ -21,6 +21,7 @@ const host_call_func = @import("host_call_func.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_fields = @import("host_fields.zig");
 const host_call_value = @import("host_call_value.zig");
+const host_classes = @import("host_classes.zig");
 const VmHost = vmhost.VmHost;
 const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
@@ -5088,6 +5089,11 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     const inherited_tps: []const []const u8 =
         if (site_built) &.{} else ir.eval.currentFrameTypeParams();
     anonLowerEnter();
+    // The object's nested and inner classes register once per site, before
+    // any member body runs: a property initializer may construct an inner
+    // class declared further down the body (`val a = A("OK")` above
+    // `inner class A`), since a class body is one scope.
+    if (!site_built) try host_classes.registerNestedClassMembers(self, allocator, synth_class_name, members);
     // Occurrence counter per `name#arity`: two same-arity overloads of one
     // name share that key, so each also registers under an indexed key.
     var overload_seen = std.StringHashMap(usize).init(allocator);

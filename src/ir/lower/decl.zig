@@ -2265,6 +2265,11 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             for (names.items) |pname| {
                 if (assigned.contains(pname)) try boxed.put(pname, {});
             }
+            for (build.anonBoxedCaptureNames()) |n| try boxed.put(n, {});
+            b.setBoxedVars(boxed);
+        } else if (build.anonBoxedCaptureNames().len != 0) {
+            var boxed = mod.ast_scan.StringSet.init(a);
+            for (build.anonBoxedCaptureNames()) |n| try boxed.put(n, {});
             b.setBoxedVars(boxed);
         }
     }

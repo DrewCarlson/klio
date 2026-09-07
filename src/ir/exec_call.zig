@@ -2001,7 +2001,10 @@ pub noinline fn execArmQualifiedThis(comptime H: type, allocator: Allocator, fra
             v.retain();
             try frame.write(qt.dst, v);
         },
-        .err => |e| return raiseStep(frame, e),
+        .err => |e| {
+            if (!qt.soft) return raiseStep(frame, e);
+            try frame.write(qt.dst, .Null);
+        },
     }
     return .cont;
 }

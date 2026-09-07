@@ -106,6 +106,24 @@ fn consumePendingParamTypes(b: *FuncBuilder, params: []const []const u8) Allocat
     }
 }
 
+/// Bind a member extension property accessor's receiver under its label
+/// (`this@<prop>`) and record its dispatch owner when the declaration
+/// lowering stashed them. A no-op otherwise.
+fn consumePendingAccessorReceiver(b: *FuncBuilder, params: []const []const u8) Allocator.Error!void {
+    const label = b.module.pending_accessor_this_label;
+    const owner = b.module.pending_accessor_dispatch_owner;
+    b.module.pending_accessor_this_label = null;
+    b.module.pending_accessor_dispatch_owner = null;
+    if (!leadsWithThis(params)) return;
+    const this_reg = b.resolve("this") orelse return;
+    if (label) |l| {
+        const slot = try std.fmt.allocPrint(b.allocator, "this@{s}", .{l});
+        try b.bind(slot, this_reg);
+        b.setOwnThisLabel(l);
+    }
+    if (owner) |o| b.setDispatchOwner(o);
+}
+
 /// Install the owner class's member arity mask when the declaration lowering
 /// stashed one. A no-op otherwise, so a thunk whose caller records no arities
 /// keeps the permissive default (`ownMemberApplicable` says yes for an
@@ -468,6 +486,7 @@ fn lowerAccessorExprFull(
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
     if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
     try bindParams(&b, params);
+    try consumePendingAccessorReceiver(&b, params);
     if (declared_params) |typed| {
         try b.setLocalDeclType("this", owner_class);
         for (typed) |p| {
@@ -564,6 +583,7 @@ pub fn lowerAccessorBlockRet(
     // a copy and lose the write.
     try setInitBlockBoxedVars(&b, allocator, params, block);
     try bindParams(&b, params);
+    try consumePendingAccessorReceiver(&b, params);
     // A secondary constructor's BODY reads that constructor's parameters,
     // and this builder knew their names alone.
     try consumePendingParamTypes(&b, params);
