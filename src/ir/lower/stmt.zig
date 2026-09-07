@@ -249,7 +249,10 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             b.restoreExpected(prev);
             break :blk r;
         },
-        false => try b.emitConst(.Unit),
+        // A `lateinit var` starts as `Null`, the state every read checks
+        // for (`LateinitCheck`); a deferred-init `val` has no read before
+        // its definite assignment and needs no sentinel.
+        false => try b.emitConst(if (p.is_lateinit) .Null else .Unit),
     };
     // Allocate a "home" register and Move the init value
     // into it for `var`, or for `val` declared without an
@@ -451,6 +454,7 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         try b.setMutableHome(p.name.name, home);
         try b.markMutable(p.name.name);
         try b.bind(p.name.name, home);
+        if (p.is_lateinit) try b.bind(try expr_mod.lateinitMarkerName(b, p.name.name), home);
     } else if (p.mutable or p.init == null) {
         const home = b.allocReg();
         try b.push(.{ .Move = .{ .dst = home, .src = init } });
@@ -459,6 +463,7 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             try b.markMutable(p.name.name);
         }
         try b.bind(p.name.name, home);
+        if (p.is_lateinit) try b.bind(try expr_mod.lateinitMarkerName(b, p.name.name), home);
     } else {
         // `val x = y` where `y` is a reassignable var reads `y`'s home register
         // directly; a later write to `y` (`y = …`) Moves into that home and
@@ -2023,6 +2028,97 @@ test "var declaration gets a mutable home slot" {
     try testing.expect(func.blocks[0].insts[0] == .Trace);
     try testing.expect(func.blocks[0].insts.len == 2);
     try testing.expect(func.blocks[0].insts[1] == .Const);
+}
+
+test "lateinit var starts Null, binds its marker, and reads through LateinitCheck" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    var p = ast.Property{
+        .mutable = true,
+        .name = .{ .name = "s", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = null,
+        .init = null,
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = true,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+    const decl = Stmt{ .Decl = .{ .Property = &p } };
+    _ = try lowerStmt(&b, &decl);
+    // The marker binding shares the lateinit's home register.
+    const home = b.resolve("s").?;
+    try testing.expectEqual(home.int(), b.resolve("s$klio_lateinit").?.int());
+    var segs = [_]ast.Ident{.{ .name = "s", .span = dummySpan() }};
+    const read = Expr{ .Path = .{ .segments = &segs, .span = dummySpan() } };
+    const r = try expr_mod.lowerExpr(&b, &read);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    const insts = func.blocks[0].insts;
+    // The declaration's Null lands in the home slot; the read is guarded.
+    var saw_null = false;
+    for (insts) |inst| {
+        if (inst == .Const and m.consts.items[inst.Const.value.int()] == .Null) saw_null = true;
+    }
+    try testing.expect(saw_null);
+    const last = insts[insts.len - 1];
+    try testing.expect(last == .LateinitCheck);
+    try testing.expectEqual(home.int(), last.LateinitCheck.src.int());
+    try testing.expectEqual(r.int(), last.LateinitCheck.dst.int());
+    try testing.expectEqualStrings("s", m.consts.items[last.LateinitCheck.name.int()].String);
+}
+
+test "plain var declared without lateinit reads unchecked" {
+    var m = Module.default(testing.allocator);
+    defer m.deinit(testing.allocator);
+    var b = try FuncBuilder.init(testing.allocator, &m);
+    defer b.deinit();
+    var p = ast.Property{
+        .mutable = true,
+        .name = .{ .name = "n", .span = dummySpan() },
+        .receiver_type = null,
+        .ty = null,
+        .init = intLit(0),
+        .delegate = null,
+        .getter = null,
+        .setter = null,
+        .is_abstract = false,
+        .is_open = false,
+        .is_override = false,
+        .is_lateinit = false,
+        .is_const = false,
+        .is_inline = false,
+        .is_expect = false,
+        .is_actual = false,
+        .setter_visibility = null,
+        .visibility = .Public,
+        .annotations = &.{},
+        .span = dummySpan(),
+    };
+    const decl = Stmt{ .Decl = .{ .Property = &p } };
+    _ = try lowerStmt(&b, &decl);
+    try testing.expect(b.resolve("n$klio_lateinit") == null);
+    var segs = [_]ast.Ident{.{ .name = "n", .span = dummySpan() }};
+    const read = Expr{ .Path = .{ .segments = &segs, .span = dummySpan() } };
+    const r = try expr_mod.lowerExpr(&b, &read);
+    b.terminate(.{ .Return = r });
+    const func = try b.finish("f", "test.f", build.typeUnit());
+    defer freeFunc(func);
+    for (func.blocks[0].insts) |inst| try testing.expect(inst != .LateinitCheck);
 }
 
 test "any-typed val is marked" {

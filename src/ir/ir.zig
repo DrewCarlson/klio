@@ -681,6 +681,10 @@ pub const Inst = union(enum) {
     },
     /// `!!` not-null assertion.
     NotNullAssert: struct { dst: Reg, src: Reg },
+    /// Read of a local `lateinit var`: `src` still holding the declaration's
+    /// `Null` means the variable was never assigned, which throws
+    /// `kotlin.UninitializedPropertyAccessException` naming `name`.
+    LateinitCheck: struct { dst: Reg, src: Reg, name: ConstId },
     /// Marker for the evaluator's debugger / tracing hook.
     Trace: struct { span: Span },
     /// Push the value in `src` onto the executing frame's
@@ -11676,6 +11680,11 @@ pub const ModuleRegistry = struct {
     /// Reads/writes route through the stored delegate's `getValue` /
     /// `setValue` methods.
     top_level_delegated_props: std.StringHashMap(void),
+    /// Top-level `lateinit var` names. Such a property has no initializer
+    /// and no global binding until its first write; a read that finds no
+    /// binding throws `UninitializedPropertyAccessException`, and
+    /// `::name.isInitialized` answers from the binding's presence.
+    top_level_lateinit_props: std.StringHashMap(void),
     /// Class simple name → the set of member *function* names it
     /// declares or inherits (transitively over supertypes). Lets the
     /// lowerer honor Kotlin's separate function/property namespaces.
@@ -11950,6 +11959,7 @@ pub const ModuleRegistry = struct {
             .func_type_param_bounds = std.AutoHashMap(FuncId, []const TypeParamBound).init(allocator),
             .class_type_param_bounds = std.StringHashMap([]const TypeParamBound).init(allocator),
             .top_level_delegated_props = std.StringHashMap(void).init(allocator),
+            .top_level_lateinit_props = std.StringHashMap(void).init(allocator),
             .hierarchy_methods = std.StringHashMap(std.StringHashMap(void)).init(allocator),
             .hierarchy_shadow_names = std.StringHashMap(HierarchyShadowSet).init(allocator),
             .member_trailing_lambda_shapes = StrPairMap(std.ArrayList(MemberTrailingLambdaShape)).init(allocator),
@@ -12013,6 +12023,7 @@ pub const ModuleRegistry = struct {
             self.class_type_param_bounds.deinit();
         }
         self.top_level_delegated_props.deinit();
+        self.top_level_lateinit_props.deinit();
         {
             self.private_shadow_props.deinit();
             self.override_cell_props.deinit();
@@ -12158,6 +12169,10 @@ pub const ModuleRegistry = struct {
         {
             var it = self.top_level_delegated_props.keyIterator();
             while (it.next()) |k| try out.top_level_delegated_props.put(k.*, {});
+        }
+        {
+            var it = self.top_level_lateinit_props.keyIterator();
+            while (it.next()) |k| try out.top_level_lateinit_props.put(k.*, {});
         }
         {
             var it = self.hierarchy_methods.iterator();

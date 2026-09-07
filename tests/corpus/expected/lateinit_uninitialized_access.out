@@ -1,0 +1,33 @@
+top initialized: false
+top threw UninitializedPropertyAccessException: lateinit property top has not been initialized
+top.length threw UninitializedPropertyAccessException: lateinit property top has not been initialized
+top initialized: true
+top = set
+filePrivate threw UninitializedPropertyAccessException: lateinit property filePrivate has not been initialized
+filePrivate = fp
+Holder.read threw UninitializedPropertyAccessException: lateinit property name has not been initialized
+Holder.read = holder
+box initialized: false false
+box.readValue threw UninitializedPropertyAccessException: lateinit property value has not been initialized
+box.value threw UninitializedPropertyAccessException: lateinit property value has not been initialized
+box initialized: true true
+box.value = boxed
+Box.tag via instance threw UninitializedPropertyAccessException: lateinit property tag has not been initialized
+Box.tag threw UninitializedPropertyAccessException: lateinit property tag has not been initialized
+Box.tag via instance = tagged
+local threw UninitializedPropertyAccessException: lateinit property local has not been initialized
+local.length threw UninitializedPropertyAccessException: lateinit property local has not been initialized
+template threw UninitializedPropertyAccessException: lateinit property local has not been initialized
+eval threw UninitializedPropertyAccessException: lateinit property local has not been initialized
+captured read threw UninitializedPropertyAccessException: lateinit property local has not been initialized
+local = local
+eval = local
+written = written in lambda
+inner shadow = null
+outer shadow threw UninitializedPropertyAccessException: lateinit property shadow has not been initialized
+acc += threw UninitializedPropertyAccessException: lateinit property acc has not been initialized
+acc = ab
+anon object threw UninitializedPropertyAccessException: lateinit property forObj has not been initialized
+local fn threw UninitializedPropertyAccessException: lateinit property forObj has not been initialized
+anon object = obj
+local fn = obj
