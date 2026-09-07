@@ -8,29 +8,23 @@ shard) closed 2026-09-05. The log of what landed is git history.
 
 ## Stage 2 — Task 4: root-fix the box corpus by cluster
 
-Owner: `kotlinc-box-conformance.md`. State 2026-09-07: census 5751 / 609 /
-11, ratchet 5751 / 609, 43 clusters of five or more remain (listed there).
+Owner: `kotlinc-box-conformance.md`. Closed 2026-09-07 at 8c8c613a: census
+5991 / 363 / 3 from 5751 / 609 / 11, ratchet 5991 / 363, every cluster of
+five or more with a fix or a verdict, the residue table written there as
+the seed of the next campaign, CI green.
 
-Left: fix every cluster of five or more or record its verdict, each fix
-shipping an `examples/` program, its `.out`, and a README row, matching
-kotlinc exactly and never by editing the corpus; ratchet after every
-landed batch; write the residue list (clusters under five) as the seed of
-the next campaign.
-
-Exit: no cluster of five or more without a fix or a verdict; the residue
-list written; the ratchet at the final census; CI green.
+Exit met.
 
 ## Stage 3 — the verification tier's allocation fill
 
-Owner: `safe-tier-allocation-fill.md`. Not started.
+Owner: `safe-tier-allocation-fill.md`. Closed 2026-09-07.
 
-Left: measure the ReleaseSafe/ReleaseFast census ratio on three suites;
-list what the safe tier has caught, with commit ids; decide among taking
-the fill off the hot containers, running census children on the fast
-harness with a canary per shard, or keeping the tier with its price
-recorded; land the decision with before/after CI walls.
+The ratio on three suites (datetime 1.22, serialization_json 1.14,
+coroutines 1.40, identical pass counts), the seven-entry catch list with
+commit ids, and the decision: keep ReleaseSafe on every verification
+wall, the ratio recorded as its price. No change landed.
 
-Exit: the decision and its numbers in that record.
+Exit met: the decision and its numbers are in that record.
 
 ## Rules that hold throughout
 
@@ -42,5 +36,5 @@ register updated as each stage closes.
 
 ## Close
 
-Close this document, and move the register's active plan on, when Stages
-2 and 3 have their exit conditions met.
+Closed 2026-09-07: Stages 2 and 3 have their exit conditions met. The
+register's active plan moves to the box residue.

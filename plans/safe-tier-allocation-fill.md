@@ -40,6 +40,22 @@ Parent plan: `conformance-backlog.md`.
    Exit: the decision, its numbers, and (if a change) the CI walls before
    and after.
 
+## The tier gap (Task 1)
+
+Three census suites, cores 0-7, nothing else running, ReleaseSafe
+`klio-harness` against ReleaseFast `klio-harness-fast`, back to back at
+8c8c613a. Pass counts are identical on both tiers.
+
+| suite | ReleaseSafe wall | ReleaseFast wall | ratio | passed |
+|-------|-----------------:|-----------------:|------:|-------:|
+| datetime | 132 s | 108 s | 1.22 | 519 / 519 |
+| serialization_json | 174 s | 152 s | 1.14 | 747 / 747 |
+| coroutines | 102 s | 73 s | 1.40 | 1299 / 1299 |
+
+The fill is one part of that gap; bounds, overflow and unreachable
+checks are the rest, and the profiles that opened this plan put the fill
+at 11-21% of the hottest single tests, not of a suite.
+
 ## What the safe tier has caught
 
 The undefined fill is one of several checks the tier turns on; the list
@@ -63,4 +79,30 @@ check sees.
 
 ## Log
 
+## Decision (Task 3)
+
+Keep ReleaseSafe on every verification wall and record the ratio above as
+the price of the tier. The reasons, in order:
+
+- The fill lives in `std.mem.Allocator`'s generic `alloc`/`free` path,
+  which every standard container goes through; taking it off "the hot
+  containers" means bypassing that path container by container. The
+  interpreter's own hot buffers already do (7841712f, the slab); what is
+  left is spread across `ArrayList`/`HashMap` use in lowering and the
+  host, where no single site dominates.
+- Two of the seven defects in the catch list (222ff8fd, 879a0af1) are
+  use-after-free classes that only the free-side fill made deterministic,
+  and both were found by the e2e run, which is exactly the census/corpus
+  child a fast-harness tier would have moved off the safe build. A canary
+  suite per shard keeps the checks on a fraction of the programs; the
+  defects were found by the programs that ran, not by a sample.
+- The measured price is 14-40% of a suite wall, and the CI budget already
+  holds all eight shards under sixty minutes with that price paid
+  (e6740915).
+
+No change lands, so there are no before/after CI walls; the current wall
+is the "before" and stands.
+
 - 2026-09-05: opened from the compute-floors profiles.
+- 2026-09-07: Tasks 1-3 closed at 8c8c613a: the ratio table, the catch
+  list and the decision to keep the tier.
