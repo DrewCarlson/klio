@@ -45,17 +45,18 @@ const UnitResult = ir.eval.UnitResult;
 /// or a builtin). Anything else is an erased type parameter, for
 /// which `x as <that>` is an unchecked, non-throwing cast.
 /// Whether the program or a loaded library declares a class spelled `name`.
-pub fn isDeclaredClassName(self: *VmHost, name: []const u8) bool {
+/// Whether a class spelled `name` is declared in package `pkg`: the
+/// program's own `class B` makes `as? B` a real check at a site in that
+/// package, while a library function's `as T` never sees it.
+pub fn isDeclaredClassNameFrom(self: *VmHost, name: []const u8, pkg: []const u8) bool {
     const n = std.mem.trimEnd(u8, name, "?");
     if (n.len == 0) return false;
-    {
-        const mg = self.module.borrow();
-        defer mg.deinit();
-        if (mg.get().classId(n) != null) return true;
-    }
-    const cg = self.classes.borrow();
-    defer cg.deinit();
-    return cg.get().contains(n);
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const mod = mg.get();
+    const cid = mod.classId(n) orelse return false;
+    if (cid.int() >= mod.classes.items.len) return false;
+    return std.mem.eql(u8, mod.classes.items[cid.int()].package, pkg);
 }
 
 pub fn isConcreteCastTarget(self: *VmHost, name: []const u8) bool {

@@ -1231,6 +1231,16 @@ fn lowerAssign(
     // reason. The own-member compound below reads through `this` instead.
     var pre_cur: ?Reg = null;
     var pre_recv: ?Reg = null;
+    // A plain assignment evaluates its target's receiver BEFORE the value
+    // (`bar("A", a).prop = try { … }` runs `bar` first).
+    if (op == .Assign) {
+        switch (target.*) {
+            .Member => |m| if (!m.safe and m.receiver.* != .Path and m.receiver.* != .This) {
+                pre_recv = try lowerReceiver(b, m.receiver);
+            },
+            else => {},
+        }
+    }
     if (op != .Assign) {
         switch (target.*) {
             .Member => |m| if (!m.safe) {
@@ -1455,6 +1465,10 @@ fn lowerAssign(
             break :blk dst;
         },
     };
+    if (pre_recv) |recv_reg| if (op == .Assign and target.* == .Member) {
+        try storeMemberThroughReg(b, &target.Member, recv_reg, combined);
+        return null;
+    };
     try storeCombinedToTarget(b, target, combined);
     return null;
 }
@@ -1491,6 +1505,21 @@ fn emitDelegateSetValue(b: *FuncBuilder, dname: []const u8, prop: []const u8, va
 // Path name (local / cell / capture / member / global), a Member field,
 // or an Index `set` call. Shared by compound-assign, prefix ++/--, and
 // postfix ++/-- so the write-back decision lives in exactly one place.
+/// Store `value` into member `m` of an ALREADY EVALUATED receiver: the
+/// register is bound under a scoped name so the member store lowers a
+/// plain local read instead of re-evaluating the receiver expression.
+pub fn storeMemberThroughReg(b: *FuncBuilder, m: *const @FieldType(ast.Expr, "Member"), recv_reg: Reg, value: Reg) Allocator.Error!void {
+    try b.pushScope();
+    defer b.popScope() catch {};
+    try b.bind("$assign$recv", recv_reg);
+    const segs = try b.allocator.alloc(ast.Ident, 1);
+    segs[0] = .{ .name = "$assign$recv", .span = m.span };
+    const recv_path = try b.allocator.create(Expr);
+    recv_path.* = .{ .Path = .{ .segments = segs, .span = m.span } };
+    const rewritten = Expr{ .Member = .{ .receiver = recv_path, .name = m.name, .safe = false, .span = m.span } };
+    try storeCombinedToTarget(b, &rewritten, value);
+}
+
 pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg) Allocator.Error!void {
     switch (target.*) {
         .Path => |p| {

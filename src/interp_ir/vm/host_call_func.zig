@@ -1113,10 +1113,49 @@ fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8)
 
 /// Per-candidate `SigView` for the shared applicability scorer, read straight
 /// off the `Func` (the same sources the legacy `overloadScore` reads).
+/// Parameters of `cand` with every bare bounded type parameter replaced by
+/// its bound (`fun <S : B> foo(s: S)` is applicable to a `B`, not to a
+/// `C`), built once per function and kept for the process.
+threadlocal var bounded_params_cache: ?std.AutoHashMap(u32, []const ir.Param) = null;
+
+pub fn boundedParams(module: *const Module, cand: FuncId, f: *const Func) ?[]const ir.Param {
+    const bounds = module.registry.func_type_param_bounds.get(cand) orelse return null;
+    if (bounds.len == 0) return null;
+    if (bounded_params_cache == null) bounded_params_cache = std.AutoHashMap(u32, []const ir.Param).init(std.heap.page_allocator);
+    if (bounded_params_cache.?.get(cand.int())) |cached| return cached;
+    var any = false;
+    for (f.params) |*p| {
+        var head = std.mem.trimEnd(u8, p.ty.name, "?");
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        for (bounds) |b| {
+            if (std.mem.eql(u8, b.param, head) and !std.mem.eql(u8, applicability.simpleName(b.bound), "Any")) any = true;
+        }
+    }
+    if (!any) return null;
+    const a = std.heap.page_allocator;
+    const out = a.alloc(ir.Param, f.params.len) catch return null;
+    for (f.params, out) |*p, *o| {
+        o.* = p.*;
+        var head = std.mem.trimEnd(u8, p.ty.name, "?");
+        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        for (bounds) |b| {
+            if (!std.mem.eql(u8, b.param, head)) continue;
+            var bn = std.mem.trim(u8, b.bound, " ");
+            if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
+            const bn_nullable = std.mem.endsWith(u8, bn, "?");
+            bn = std.mem.trimEnd(u8, bn, "?");
+            if (std.mem.eql(u8, applicability.simpleName(bn), "Any")) continue;
+            o.ty = .{ .name = bn, .nullable = p.ty.nullable or bn_nullable, .args = &.{} };
+        }
+    }
+    bounded_params_cache.?.put(cand.int(), out) catch {};
+    return out;
+}
+
 fn sigViewOfFunc(self: *VmHost, module: *const Module, cand: FuncId, argc: usize) ?applicability.SigView {
     const f = funcAt(module, cand) orelse return null;
     return .{
-        .params = f.params,
+        .params = boundedParams(module, cand, f) orelse f.params,
         .defaults = funcDefaults(self, cand),
         .has_body = executableForm(self, module, cand, argc),
         .low_priority = f.low_priority,

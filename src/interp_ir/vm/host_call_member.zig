@@ -2186,8 +2186,13 @@ fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape {
 
 /// Per-candidate `SigView` for the shared scorer, read off the `Func`.
 fn sigViewOfMember(self: *VmHost, f: *const Func, is_ext: bool) applicability.SigView {
+    const params = blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk host_call_func.boundedParams(mg.get(), f.id, f) orelse f.params;
+    };
     return .{
-        .params = f.params,
+        .params = params,
         .defaults = funcDefaults(self, f),
         .has_body = f.hasBody(),
         .low_priority = f.low_priority,
@@ -5739,6 +5744,20 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         const pr = try host_fields.getField(self, allocator, receiver, name);
         if (pr == .ok and (isCallable(&pr.ok) or pr.ok == .Instance)) {
             return callValueRec(self, allocator, &pr.ok, args);
+        }
+    }
+    // A TOP-LEVEL property holding a receiver-callable, called on a
+    // builtin receiver (`val a = fun String.(y: String) = …; "O".a("K")`).
+    if (receiver.* != .Instance and receiver.* != .Class and receiver.* != .Null and blk: {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        break :blk mg.get().funcsBySimpleName(name).len == 0 and host_globals.lookupGlobal(self, name) != null;
+    }) {
+        if (host_globals.lookupGlobal(self, name)) |gv| {
+            if (gv == .IrClosure) {
+                const has_recv = if (self.closures.get(@intCast(gv.IrClosure.id))) |info| info.has_receiver else false;
+                if (has_recv) return try host_call_value.callValueWithThis(self, allocator, &gv, receiver, args, &.{});
+            }
         }
     }
     // Extension-function-typed member invoked with an explicit receiver.
