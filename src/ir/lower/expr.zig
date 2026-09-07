@@ -581,9 +581,24 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     try writeBackLvalue(b, u.expr, r);
                     return r;
                 }
+                const uo: UnOp = if (u.op == .PreInc) .Inc else .Dec;
+                if (sideEffectingMemberTarget(u.expr)) {
+                    // `++getA().x` evaluates `getA()` once.
+                    const m = &u.expr.Member;
+                    const recv = try lowerReceiver(b, m.receiver);
+                    const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
+                    const cur = b.allocReg();
+                    try b.push(.{ .GetField = .{ .dst = cur, .receiver = recv, .field = field } });
+                    const dst = b.allocReg();
+                    try b.push(.{ .UnOp = .{ .dst = dst, .op = uo, .operand = cur } });
+                    try stmt_mod.storeMemberThroughReg(b, m, recv, dst);
+                    // The prefix form's value is a fresh read of the property.
+                    const result = b.allocReg();
+                    try b.push(.{ .GetField = .{ .dst = result, .receiver = recv, .field = field } });
+                    return result;
+                }
                 const operand = try lowerExpr(b, u.expr);
                 const dst = b.allocReg();
-                const uo: UnOp = if (u.op == .PreInc) .Inc else .Dec;
                 try b.push(.{ .UnOp = .{ .dst = dst, .op = uo, .operand = operand } });
                 try writeBackLvalue(b, u.expr, dst);
                 return dst;
@@ -6178,6 +6193,15 @@ fn nullableIncDecCall(b: *FuncBuilder, operand: *const Expr, inc: bool) Allocato
     return try lowerExpr(b, &call);
 }
 
+/// A `recv.member` target whose receiver is an expression with possible
+/// side effects (a call, an index, a nested member), so it must be
+/// evaluated exactly once for a read-modify-write.
+fn sideEffectingMemberTarget(e: *const Expr) bool {
+    if (e.* != .Member or e.Member.safe) return false;
+    const r = e.Member.receiver;
+    return r.* != .Path and r.* != .This and r.* != .Super;
+}
+
 fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const pf = expr.Postfix;
     const inner = pf.expr;
@@ -6190,6 +6214,18 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .Inc, .Dec => {
             const uo: UnOp = if (pf.op == .Inc) .Inc else .Dec;
+            if (sideEffectingMemberTarget(inner)) {
+                // `getA().x++` evaluates `getA()` once.
+                const m = &inner.Member;
+                const recv = try lowerReceiver(b, m.receiver);
+                const field = try b.module.internConst(b.allocator, .{ .String = m.name.name });
+                const old = b.allocReg();
+                try b.push(.{ .GetField = .{ .dst = old, .receiver = recv, .field = field } });
+                const new = b.allocReg();
+                try b.push(.{ .UnOp = .{ .dst = new, .op = uo, .operand = old } });
+                try stmt_mod.storeMemberThroughReg(b, m, recv, new);
+                return old;
+            }
             if (inner.* == .Path and inner.Path.segments.len == 1 and
                 b.localDeclNullable(inner.Path.segments[0].name) and
                 (userFunctionDeclared(b, if (pf.op == .Inc) "inc" else "dec") or b.isLocalExtFn(if (pf.op == .Inc) "inc" else "dec")))

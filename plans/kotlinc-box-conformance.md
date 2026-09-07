@@ -114,6 +114,112 @@ residue list (every cluster under five) as the seed of the next campaign.
 - operatorConventions/kt4987 (1): `counter++` on a null `Int?` with a
   LOCAL `Int?.inc()` extension reaches the member call on a null
   receiver instead of the local closure.
+- callableReference/adaptedReferences (15): five are context-parameter
+  references (the contextParameters verdict); six are `suspend` conversion
+  of an extension or context reference used as a SUPERTYPE (`class A :
+  suspend () -> Unit`, `startCoroutine` on the instance), which needs the
+  `SuspendFunctionN` interfaces modeled as classes an object can extend;
+  four adapt a vararg or a defaulted parameter through an inner or nested
+  constructor reference (`innerConstructorWithVararg`,
+  `nestedClassConstructorWithDefault`, `varargOverloads`,
+  `adaptedVarargFunImportedFromObject`), where the adapter stamps only
+  functions with a body.
+- callableReference/equality (5): adapted references (unit coercion,
+  vararg-as-array, suspend conversion) must be distinct objects that are
+  not equal to each other or to the plain reference; klio's references are
+  closures keyed by function id, so two adaptations of one function
+  compare equal.
+- coroutines (13 + intrinsicSemantics 5 + featureIntersection 5):
+  `intercepted`/`startCoroutineUninterceptedOrReturn`/
+  `suspendCoroutineUninterceptedOrReturn` need the continuation
+  interception model (a `ContinuationInterceptor` wrapping each resume);
+  `suspend` function types as supertypes (`suspendFunctionAsSupertype*`,
+  `suspendFunctionIsAs`, `...IsCheckWithArity`) need the
+  `SuspendFunctionN` interfaces; `handleResult` try/finally shapes
+  (`try*WithHandleResult`) expect the exception thrown from
+  `handleResult` to unwind through the coroutine's finally blocks; the
+  rest are single files (`accessorForSuspend`, `createCoroutinesOnManualInstances`,
+  `functionReference_invokeAsFunction`, `innerSuspensionCalls`, `kt15930`,
+  `kt46813`, `kt51530`, `nestedLocals`, `rethrowInFinallyWithSuspension`,
+  `suspendConversionBetweenFunInterfaces`, `operators`,
+  `manyParametersNoCapture`, `crossinline`, `varargCallFromSuspend`).
+- extensionFunctions (8 + 1 crash): `extensionFunctionWithExtensionInSAMInterface`
+  (and its callableReference/function twin) recurse without bound: a fun
+  interface whose single method is a member extension, implemented by a
+  reference, re-dispatches to itself; the rest are single files
+  (`delegatedPropertyWithExtensionType`, `extensionFunctionInValueClass`,
+  `extensionFunctionLocal`, `functionWithTheSameDispatchAndExtensionReceiver`,
+  `kt1953`, `kt475` (`last` set on a builtin list), `kt606`,
+  `suspendConversionForExtensionFunAsASuperType`).
+- fir (rest): `contextSensitiveResolution` (2) is the Kotlin 2.2 bare enum
+  entry in a `when` over an enum subject; the anonymous/local override
+  with defaults (3) resolves `super.foo` on a local or anonymous override
+  and renders `Unit`; `localInvokeExtension` (1).
+- secondaryConstructors (7): `fieldInitializerOptimization` expects the
+  JVM's elision of default-value field initializers (a field set from
+  the super constructor's virtual call keeps its value);
+  `superCallSecondary`/`innerClassesInheritance` interleave `init` blocks
+  and secondary constructor bodies in declaration order across the
+  chain; `clashingDefaultConstructors` picks among defaulted primary and
+  secondary constructors by argument types; `callFromLocalSubClass`,
+  `localClasses` (`$init$block` on a local class) and `varargs` (a mixed
+  spread in a super call) are single files.
+- evaluate (rest): the unsigned `const val` verdict above covers
+  `uintOperations`, `ulongOperations`, `unsignedConst`, `ubyteOperations`,
+  `ushortOperations`; `kCallableName*` need `::name` on a KCallable
+  evaluated as a constant; `charOperations`, `enumNameWithInit`, `incDec`,
+  `stringConcatenationWithObject` are single files.
+- collectionLiterals (7): the `[a, b]` collection literal expression
+  (`-XXLanguage:+CollectionLiterals`, `operator fun of`) is not parsed
+  outside annotations.
+- controlStructures/breakContinueInExpressions (6): `break`/`continue`
+  from a lambda passed to an inline function (`inlinedBreakContinue/*`,
+  `-Xnon-local-break-continue`) surface as `LabeledReturn`; the splice
+  does not carry the enclosing loop's targets into the lambda body.
+- objects (5): `useImportedMember*` import overloaded companion members
+  by name and pick among `f(Int)`/`f(String)`/`Boolean.f()`; `kt3684`,
+  `objectLiteral`, `thisRefToObjectInNestedClassConstructorCall` are
+  single files.
+- properties (6): `classFieldInsideLocalInSetter`, `companionFieldInsideLambda`,
+  `fieldInsideField` (verdict above), `genericWithSameName`, `kt4140`
+  (`field++` inside a getter), `privatePropertyInConstructor` (a private
+  constructor property shadowed by a subclass's same-named property; the
+  instance's field storage is keyed by name alone).
+- operatorConventions (5): `augmentedAssignmentWithArrayLHS` and
+  `reassignmentLhsCaching` need the receiver and index expressions of an
+  indexed compound assignment evaluated once (the member form is done);
+  `infixFunctionOverBuiltinMember`, `kt14201_2`, `kt4987` (verdict above).
+- inline (6): local `inline` extension functions used inside lambdas
+  (`localInlineExtensionFunction`, `localInlineFunctionComplex`),
+  references to local functions (`callableReferenceOfLocalFun`,
+  `callableReferenceOfLocalInline`), `continueInLoopWithInlinableCondition`,
+  `inline25`, `operators`.
+- functions/localFunctions (6): the nested-scope overload verdict above
+  (2), `kt4119`, `kt4783`/`kt4784` (a local function whose receiver is a
+  type parameter), `kt4989`.
+- classes (6): the `Int?.inc` smart-cast verdict above (3),
+  `extensionFunWithDefaultParam`, `kt2477`, `nestedInitBlocksWithLambda`.
+- callableReference/function (6): `extensionFunctionLocal` (two local
+  extensions of the same name told apart by receiver type),
+  `extensionWithNestedFunction`, `genericCallableReferenceWithReifiedTypeParam`,
+  `overloadedFunVsVal` (a property and a function of one name picked by
+  the expected type), `referenceToCompanionMember` (`Function0`/`Function1`
+  checks on a bound-reference instance), `genericConstructorReference`.
+- defaultArguments (5 + 8 in subdirs): defaults on convention operators
+  with 32-argument masks (`innerClass32Args`, `memberFunctionManyArgs`),
+  fake overrides with defaults (`implementedByFake*`, `funInTraitChain`),
+  `kt36188*`, `kt36853_fibonacci`, `kt47073_nested`, `incWithDefaultInGetter`.
+- arrays (5): the two-index verdict above (2), `nonLocalReturnArrayConstructor`
+  (a non-local `return` from an `Array(n) { }` initializer: the constructor
+  is an intrinsic, not an inline splice), `kt4348` (`operator fun
+  String.get(vararg)`), `primitiveArrays`.
+- delegatedProperty (remaining 13, cluster 6): `delegateToNull`/
+  `delegateToSingleton` (a `val x by null`/object delegate),
+  `delegateWithPrivateSet` (`Delegates.notNull` unresolved),
+  `delegatedByExtensionProperty`, `custom`, `genericDelegateUncheckedCast2`,
+  `kt9712`/`commonCaseForInference` (parse and inference diagnostics),
+  `kt40815_2`, `memberExtension`/`noInitializationOfOuterClass` (file
+  initialization order), `referenceEnclosingClassFieldInReceiver*`.
 - fir/functionsDifferInTypeParameterBounds2, 3 (2): overloads that differ
   only in which of several parameters carry a bound (`<S1, S2 : B, S3>`
   against `<S11 : A, S12 : B, S13 : C>`): applicability now judges a
