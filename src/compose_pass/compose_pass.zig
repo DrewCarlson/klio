@@ -94,12 +94,27 @@ const composable_lambda_instance_path = [_][]const u8{ "androidx", "compose", "r
 /// group's first child subtree).
 const remember_composable_lambda_path = [_][]const u8{ "androidx", "compose", "runtime", "internal", "rememberComposableLambda" };
 
+/// Files whose bare `@Composable` names an annotation class the program
+/// declares itself (a package other than `androidx.compose.runtime`
+/// declaring `annotation class Composable`, with no import of another
+/// `Composable`): there the annotation is the program's own, not the
+/// compose runtime's, and the plugin leaves those declarations alone.
+pub var user_composable_files: ?*const std.AutoHashMap(span_mod.FileId, void) = null;
+
 /// Whether a declaration's annotations include `@Composable`. Matches both the
-/// bare `Composable` and any dotted path ending in `Composable`.
+/// bare `Composable` and any dotted path ending in `Composable`, except a bare
+/// `Composable` written in a file where the name is the program's own
+/// annotation class.
 pub fn isComposable(annotations: []const ast.Annotation) bool {
     for (annotations) |a| {
         if (a.path.len == 0) continue;
-        if (std.mem.eql(u8, a.path[a.path.len - 1].name, "Composable")) return true;
+        if (!std.mem.eql(u8, a.path[a.path.len - 1].name, "Composable")) continue;
+        if (a.path.len == 1) {
+            if (user_composable_files) |files| {
+                if (files.contains(a.span.file)) continue;
+            }
+        }
+        return true;
     }
     return false;
 }

@@ -12,6 +12,7 @@ lexer and parser; they diverge after the AST.
    ▼  lexer            UTF-8 source → tokens
    ▼  parser           tokens → ast.KotlinFile
    ▼  (pack loading)   merge installed pack ASTs into the module
+   ▼  ast passes       typealias expansion, @Serializable and @Composable plugins
    ▼  ir               AST → register IR (lowering)
    ▼  interp_ir        build the IR module, then Vm.run
    ▼
@@ -25,6 +26,20 @@ structured IR instructions, and the Vm dispatches on them. Under the
 default `fast` profile, hot loops and functions additionally compile
 to native code through the tiered JIT; see
 [Performance](performance.md).
+
+Before lowering, whole-program AST passes rewrite the parsed files in
+place. The first is typealias expansion (`ast.alias_expand`): every
+reference to a `typealias` — a type position, a constructor call
+`Alias(args)` / `recv.Alias(args)`, a supertype of a class or object
+literal, a value read of an aliased object or companion, a callable
+reference `::Alias` — becomes the aliased type with the alias's type
+parameters substituted, resolved with Kotlin's scoping (enclosing class
+body, explicit imports, own package, star imports; the target itself
+resolves in the alias's declaring file). Lowering and the runtime then
+only ever see the target. An alias name the program also declares as a
+classifier, function or value is left for the lowering's scope model.
+`KLIO_ALIAS_EXPAND=0` skips the pass. The `@Serializable` and
+`@Composable` plugin passes follow.
 
 With `KLIO_EAGER=1` the run path also executes the resolver and type
 checker ahead of lowering, and lowering consumes their answers
