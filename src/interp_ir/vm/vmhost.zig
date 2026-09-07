@@ -407,6 +407,7 @@ pub const VmHost = struct {
     pub const ctxActivate = host_context.ctxActivate;
     pub const ctxIsActive = host_context.ctxIsActive;
     pub const isConcreteCastTarget = host_classes.isConcreteCastTarget;
+    pub const isDeclaredClassName = host_classes.isDeclaredClassName;
     pub const registerClass = host_classes.registerClass;
     pub const registerClassCaptured = host_classes.registerClassCaptured;
     pub const localClassValue = host_classes.localClassValue;

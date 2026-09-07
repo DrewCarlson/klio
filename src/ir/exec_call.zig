@@ -1431,18 +1431,18 @@ pub noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Fram
     if (host.instanceOf(&v, cast.ty)) {
         v.retain();
         try frame.write(cast.dst, v);
+    } else if (typeParamCastPasses(H, frame, cast.ty, host)) {
+        v.retain();
+        try frame.write(cast.dst, v);
     } else if (v == .Null and !cast.ty.nullable and !cast.safe) {
-        // `null as T` for a non-null `T` is a NullPointerException, not a
-        // ClassCastException, whatever `T` is.
+        // `null as T` for a concrete non-null `T` is a NullPointerException,
+        // not a ClassCastException (an erased parameter passed above).
         const exc = try Value.newException(allocator, .{
             .fqn = try runtime.strInit(allocator, "kotlin.NullPointerException"),
             .message = .from(try runtime.strInit(allocator, "null cannot be cast to non-null type")),
             .cause = null,
         });
         return raiseStep(frame, .{ .Throw = exc });
-    } else if (typeParamCastPasses(H, frame, cast.ty, host)) {
-        v.retain();
-        try frame.write(cast.dst, v);
     } else if (cast.safe) {
         try frame.write(cast.dst, .Null);
     } else {
@@ -4215,9 +4215,10 @@ pub fn typeParamCastPassesIn(comptime H: type, module: *const Module, func: *con
             if (std.mem.eql(u8, t, ty.name)) return true;
         }
     }
-    // A short uppercase name is an erased parameter only when no class
-    // spells it: `a as? B` against `class B` is a real check.
-    if (host.isConcreteCastTarget(ty.name)) return false;
-    if (isErasedTypeParamName(ty.name)) return true;
-    return true;
+    // A short uppercase name is an erased parameter unless the program
+    // DECLARES a class of that name (`a as? B` against `class B` is a real
+    // check); a reified binding published under the name still erases.
+    if (isErasedTypeParamName(ty.name) and !host.isDeclaredClassName(ty.name)) return true;
+    if (!host.isConcreteCastTarget(ty.name)) return true;
+    return false;
 }

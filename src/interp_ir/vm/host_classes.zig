@@ -44,6 +44,20 @@ const UnitResult = ir.eval.UnitResult;
 /// against (user/pack class, a reified type-param bound to a class,
 /// or a builtin). Anything else is an erased type parameter, for
 /// which `x as <that>` is an unchecked, non-throwing cast.
+/// Whether the program or a loaded library declares a class spelled `name`.
+pub fn isDeclaredClassName(self: *VmHost, name: []const u8) bool {
+    const n = std.mem.trimEnd(u8, name, "?");
+    if (n.len == 0) return false;
+    {
+        const mg = self.module.borrow();
+        defer mg.deinit();
+        if (mg.get().classId(n) != null) return true;
+    }
+    const cg = self.classes.borrow();
+    defer cg.deinit();
+    return cg.get().contains(n);
+}
+
 pub fn isConcreteCastTarget(self: *VmHost, name: []const u8) bool {
     const n = std.mem.trimEnd(u8, name, "?");
     if (n.len == 0) return false;
