@@ -31,10 +31,13 @@ pub const ImplicitReceiver = struct {
 pub const ClassDef = struct {
     /// A class definition is built once and, after two-phase linking backpatches
     /// `parent`/`interfaces`/`enum_entries` at single-threaded startup, is
-    /// immutable — the dispatch path already reads it lock-free. Nothing takes an
-    /// exclusive borrow of a class cell (lazily-initialized bits like `companion`
-    /// live in their own nested cells with their own locks), so its reader lock is
-    /// pure overhead; elide it (see `objcell.LockFor`).
+    /// immutable — the dispatch path already reads it lock-free. The one later
+    /// write, an enum's initialization installing its constructed entries, runs
+    /// under the enum's initialization claim, which serializes every reader
+    /// that could observe it. Nothing else takes an exclusive borrow of a class
+    /// cell (lazily-initialized bits like `companion` live in their own nested
+    /// cells with their own locks), so its reader lock is pure overhead; elide
+    /// it (see `objcell.LockFor`).
     pub const objref_immutable = true;
 
     name: []const u8,
@@ -102,9 +105,13 @@ pub const ClassDef = struct {
     is_anonymous: bool,
     /// Secondary constructors in source-declared order.
     secondary_ctors: []const forest.ForestField(ast.SecondaryCtor),
-    /// Eagerly-constructed enum entries in source order. Arena slice filled
-    /// once during linking; immutable and lock-free thereafter.
+    /// Enum entries in source order. The table is filled once during
+    /// linking with an instance shell per entry; the enum's first active use
+    /// constructs the entries in place (`host_globals.ensureEnumInit`).
     enum_entries: []const EnumEntry,
+    /// Enum class initialization: 0 = not started, 1 = in progress, 2 = the
+    /// entries are constructed and the companion has initialized.
+    enum_init_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     /// Companion object instance, if any.
     companion: ObjRef(?ObjRef(InstanceData)),
     /// For a companion-object class, the enclosing class.

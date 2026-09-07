@@ -2833,6 +2833,16 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                 if (cls_value) |cv| {
                     if (cv == .Class) {
                         const cls = cv.Class;
+                        const enum_cls = blk: {
+                            const g = cls.borrow();
+                            defer g.deinit();
+                            break :blk g.get().is_enum;
+                        };
+                        // The reified enum intrinsics are static uses of the
+                        // class: the first one initializes it.
+                        if (enum_cls) {
+                            if (try host_globals.ensureEnumInit(self, cls)) |e| return .{ .err = e };
+                        }
                         const cd = cls.borrow();
                         const is_enum = cd.get().is_enum;
                         if (is_enum) {

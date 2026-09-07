@@ -71,7 +71,9 @@ const EXCLUDE = [_][]const u8{
 /// Directives klio honors (`WITH_STDLIB`, `WITH_COROUTINES`, `LANGUAGE`
 /// enabling a feature, the value-class placeholder) or can ignore: notes,
 /// per-backend mutes, IR/bytecode dump and listing checks that sit beside
-/// the `box()` answer, JS/wasm/native pipeline flags.
+/// the `box()` answer, JS/wasm/native pipeline flags. A
+/// `DONT_TARGET_EXACT_BACKEND` naming the JVM excludes instead: klio
+/// follows the JVM, and such a test asserts another backend's behavior.
 const ALLOW = [_][]const u8{
     "WITH_STDLIB",                  "WITH_RUNTIME",                        "WITH_COROUTINES",
     "LANGUAGE",                     "WORKS_WHEN_VALUE_CLASS",              "ISSUE",
@@ -208,6 +210,11 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
                     // and `_MULTI_MODULE` mutes a mode this runner never
                     // uses; both stay selected.
                     reason = reason orelse try std.fmt.allocPrint(a, "{s}:ANY", .{d.name});
+                } else if (std.mem.eql(u8, d.name, "DONT_TARGET_EXACT_BACKEND") and namesJvmBackend(d.value)) {
+                    // The test asserts a JS/Wasm/Native-only behavior (a
+                    // class-initialization order the JVM does not have);
+                    // klio follows the JVM.
+                    reason = reason orelse "DONT_TARGET_EXACT_BACKEND:JVM";
                 } else if (std.mem.eql(u8, d.name, "WITH_COROUTINES")) {
                     c.with_coroutines = true;
                 } else if (std.mem.eql(u8, d.name, "WORKS_WHEN_VALUE_CLASS")) {
@@ -553,6 +560,24 @@ pub fn printSummary(label: []const u8, s: Summary, baseline: usize, max_failed: 
         "{s}: {d} passed, {d} failed, {d} did not complete of {d} selected ({d} excluded of {d} files; baseline {d}, max_failed {d})\n",
         .{ label, s.passed, s.failed, s.incomplete, s.selected, s.excluded, s.total, baseline, max_failed },
     );
+}
+
+/// Whether a backend list names the JVM (`JVM`, `JVM_IR`).
+fn namesJvmBackend(value: []const u8) bool {
+    var it = std.mem.tokenizeAny(u8, value, ", ");
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "JVM") or std.mem.eql(u8, tok, "JVM_IR")) return true;
+    }
+    return false;
+}
+
+test "a test that does not target the JVM backend is excluded" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const js_only = try parseCase(arena.allocator(), "x/a.kt", "// DONT_TARGET_EXACT_BACKEND: JVM_IR\nfun box() = \"OK\"\n");
+    try std.testing.expectEqualStrings("DONT_TARGET_EXACT_BACKEND:JVM", js_only.reason.?);
+    const not_js = try parseCase(arena.allocator(), "x/b.kt", "// DONT_TARGET_EXACT_BACKEND: JS_IR\nfun box() = \"OK\"\n");
+    try std.testing.expect(not_js.reason == null);
 }
 
 test "directive lines parse and ordinary comments do not" {

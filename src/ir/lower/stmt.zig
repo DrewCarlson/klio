@@ -1223,6 +1223,29 @@ fn lowerAssign(
         },
         else => null,
     };
+    // A compound assignment evaluates its target — the receiver of the
+    // operator — before the operand, as kotlinc orders `a = a.plus(b)` and
+    // `a.plusAssign(b)`: an operand whose evaluation writes the target (a
+    // class initializer it triggers) is folded into the value read first.
+    // A member target evaluates its receiver expression first for the same
+    // reason. The own-member compound below reads through `this` instead.
+    var pre_cur: ?Reg = null;
+    var pre_recv: ?Reg = null;
+    if (op != .Assign) {
+        switch (target.*) {
+            .Member => |m| if (!m.safe) {
+                pre_recv = try lowerReceiver(b, m.receiver);
+            },
+            .Path => |p| {
+                const own_member_compound = p.segments.len == 1 and
+                    b.resolve(p.segments[0].name) == null and
+                    b.hasOwnMember(p.segments[0].name) and
+                    b.resolve("this") != null;
+                if (!own_member_compound) pre_cur = try lowerExpr(b, target);
+            },
+            else => pre_cur = try lowerExpr(b, target),
+        }
+    }
     const prev_expected = if (assign_expected != null) b.pushExpected(assign_expected) else null;
     const v = try lowerExpr(b, value);
     if (assign_expected != null) b.restoreExpected(prev_expected);
@@ -1233,7 +1256,7 @@ fn lowerAssign(
     // where the declared types are still in hand.
     if (op == .Add or op == .Sub) {
         if (try compoundSingleElementMember(b, target, value, op)) |single| {
-            const cur = try lowerExpr(b, target);
+            const cur = pre_cur orelse try lowerExpr(b, target);
             const args_start = b.allocReg();
             try b.push(.{ .Move = .{ .dst = args_start, .src = v } });
             const dst = b.allocReg();
@@ -1330,7 +1353,7 @@ fn lowerAssign(
             .Rem => "remAssign",
             .Assign => unreachable,
         };
-        const recv = try lowerExpr(b, target);
+        const recv = pre_cur orelse try lowerExpr(b, target);
         const args_start = b.allocReg();
         try b.push(.{ .Move = .{ .dst = args_start, .src = v } });
         const dst = b.allocReg();
@@ -1358,7 +1381,7 @@ fn lowerAssign(
     if (op != .Assign) {
         if (target.* == .Member and !target.Member.safe) {
             const m = target.Member;
-            const recv = try lowerReceiver(b, m.receiver);
+            const recv = pre_recv orelse try lowerReceiver(b, m.receiver);
             const bin: BinOp = switch (op) {
                 .Add => .Add,
                 .Sub => .Sub,
@@ -1380,7 +1403,7 @@ fn lowerAssign(
     const combined: Reg = switch (op) {
         .Assign => v,
         .Add, .Sub, .Mul, .Div, .Rem => blk: {
-            const cur0 = try lowerExpr(b, target);
+            const cur0 = pre_cur orelse try lowerExpr(b, target);
             // `xs += y` / `xs -= y` on a statically broad collection
             // (`Iterable`/`Collection`) rebinds to a `List`; coerce a `Set`
             // runtime value to a list first so the `List`-returning operator

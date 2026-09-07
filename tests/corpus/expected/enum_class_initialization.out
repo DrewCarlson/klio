@@ -1,0 +1,10 @@
+before any use: []
+after Color.Names: [Color.Names;]
+after Color.GREEN: [Color.Names;Color.RED;Color.GREEN;Color.companion(2);] code=2
+Color.first()=RED count=2 names.of(c)=green
+no further initialization: [Color.Names;Color.RED;Color.GREEN;Color.companion(2);]
+after Level.valueOf: [Level.LOW;Level.HIGH;Level.companion;caught;]
+modes=2
+after Mode.describe(): [Mode.ON;Mode.OFF;Mode.companion;]
+1
+after enumValueOf<Unit2>: [Unit2.METER;Unit2.SECOND;]

@@ -146,6 +146,13 @@ pub const ProgramImage = struct {
     /// unordered). Used to drive a file's `<clinit>` in order on demand.
     /// Borrows the Vm's `top_level_props` slice (run-stable).
     top_level_props_ordered: []const NameFunc = &.{},
+    /// Enum-entry constructor-argument thunks, borrowed from the Vm for
+    /// the run; `host_globals.ensureEnumInit` evaluates them on the enum's
+    /// first active use.
+    enum_entry_arg_inits: []const EnumEntryArgInit = &.{},
+    /// Allocator for values stored into a base-cached enum entry (they
+    /// must share the cache's lifetime); null means the Vm allocator.
+    patch_allocator: ?Allocator = null,
     body_prop_inits: PairFuncMap,
     instance_prop_getters: PairFuncMap,
     /// Property names having ANY custom getter (across all classes). Gates

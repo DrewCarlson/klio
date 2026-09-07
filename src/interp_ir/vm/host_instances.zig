@@ -16,6 +16,7 @@ const stdlib = @import("stdlib");
 const root = @import("../interp_ir.zig");
 const vmhost = @import("vmhost.zig");
 const host_globals = @import("host_globals.zig");
+const host_classes = @import("host_classes.zig");
 const host_call_func = @import("host_call_func.zig");
 const host_call_member = @import("host_call_member.zig");
 const host_fields = @import("host_fields.zig");
@@ -68,9 +69,10 @@ threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
 /// `name`/`ordinal` for the enum-entry subclass instance about to be
 /// constructed: Kotlin's `Enum` constructor sets them before the entry's
 /// own initializers and `init` blocks run (`init { println(this.name) }`
-/// inside an entry body sees the name). Set by the VM-start entry
-/// construction, consumed once by the matching class's materialization.
-pub const EnumEntryPreset = struct { class_fqn: []const u8, name: Value, ordinal: Value };
+/// inside an entry body sees the name). Set by the enum's initialization,
+/// consumed once by the matching class's materialization, which also
+/// publishes the shell into the entry's table slot (`slot`).
+pub const EnumEntryPreset = struct { class_fqn: []const u8, name: Value, ordinal: Value, slot: ?*Value = null };
 threadlocal var enum_entry_preset: ?EnumEntryPreset = null;
 /// The enum whose entries are being constructed: its companion waits until
 /// every entry exists (kotlinc initializes the entries first, then the
@@ -397,6 +399,21 @@ fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.build.Secondary
         var best_score: i32 = -1;
         for (entries) |e| {
             if (e.low_priority != want_low) continue;
+            // A `vararg` parameter takes any number of trailing arguments,
+            // none included, once the fixed prefix is supplied. Under an
+            // exact-arity pick (the primary can take the call) it needs at
+            // least one: kotlinc ranks the non-vararg candidate above it,
+            // and it never earns the exact-count bonus.
+            if (e.vararg_index) |v| {
+                if (args.len < v) continue;
+                if (exact_arity and args.len < e.param_count) continue;
+                const score = scoreCtorHeadsVararg(self, e.param_type_heads, v, args) orelse continue;
+                if (score > best_score) {
+                    best_score = score;
+                    best = e;
+                }
+                continue;
+            }
             // A constructor whose trailing parameters all carry defaults
             // takes fewer arguments (`constructor(arg1: String = global)`
             // from `A()`); an exact count still outranks it.
@@ -593,6 +610,10 @@ fn expandParentSecondaryThisArgs(
             if (secondary_score <= primary_score) {
                 return .{ .ok = {} };
             }
+        }
+        if (try packSecondaryVarargs(self, allocator, entry, args.items)) |pk| {
+            args.deinit(allocator);
+            args.* = std.ArrayList(Value).fromOwnedSlice(pk);
         }
         var full_args: std.ArrayList(Value) = .empty;
         try full_args.appendSlice(allocator, args.items);
@@ -1223,6 +1244,74 @@ fn pathConstDefault(self: *VmHost, e: *const ast.Expr) Allocator.Error!?Value {
     return null;
 }
 
+/// The primary constructor's `vararg` parameter (index and element type
+/// name), if it declares one. Reads the module class: the runtime param
+/// defs do not record the modifier.
+fn primaryVarargParam(self: *VmHost, class_fqn: ?[]const u8, class_name: []const u8) struct { ?usize, []const u8 } {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    const cid = (if (class_fqn) |f| m.classIdByFqn(f) else null) orelse m.classId(class_name) orelse return .{ null, "" };
+    if (cid.int() >= m.classes.items.len) return .{ null, "" };
+    for (m.classes.items[cid.int()].primary_params, 0..) |ip, i| {
+        if (ip.is_vararg) return .{ i, ip.ty.name };
+    }
+    return .{ null, "" };
+}
+
+/// Whether the primary constructor takes a call of `nargs` positional
+/// arguments: every parameter past them carries a default, or is the
+/// `vararg` (which also absorbs any surplus).
+fn primaryCanTake(self: *VmHost, class_def: ObjRef(ClassDef), nargs: usize) bool {
+    const dg = class_def.borrow();
+    defer dg.deinit();
+    const c = dg.get();
+    if (!c.has_primary_ctor) return false;
+    const vararg_at, _ = primaryVarargParam(self, c.fqn, c.name);
+    if (nargs > c.primary_params.len) return vararg_at != null;
+    var i = nargs;
+    while (i < c.primary_params.len) : (i += 1) {
+        if (vararg_at != null and vararg_at.? == i) continue;
+        if (c.primary_params[i].default == null) return false;
+    }
+    return true;
+}
+
+/// `scoreCtorHeads` for a candidate whose parameter `vararg_at` is a
+/// `vararg`: the arguments from that position score against the element
+/// type. A lone array already in the slot (a spread) scores the prefix only.
+fn scoreCtorHeadsVararg(self: *VmHost, heads: []const []const u8, vararg_at: usize, args: []const Value) ?i32 {
+    if (vararg_at >= heads.len) return scoreCtorHeads(self, heads, args);
+    if (args.len == vararg_at + 1 and args[vararg_at] == .Array) {
+        return scoreCtorHeads(self, heads[0..vararg_at], args[0..vararg_at]);
+    }
+    var buf: [32][]const u8 = undefined;
+    if (args.len > buf.len) return scoreCtorHeads(self, heads, args);
+    for (0..args.len) |i| buf[i] = if (i < vararg_at) heads[i] else heads[vararg_at];
+    return scoreCtorHeads(self, buf[0..args.len], args);
+}
+
+/// Pack the trailing arguments of a chosen `vararg` secondary constructor
+/// into its array slot (the element type names a primitive array where it
+/// is one). Null when the constructor has no vararg or the slot already
+/// holds a lone array (a spread).
+fn packSecondaryVarargs(self: *VmHost, allocator: Allocator, e: root.build.SecondaryCtorEntry, args: []const Value) Allocator.Error!?[]Value {
+    _ = self;
+    const v = e.vararg_index orelse return null;
+    if (args.len < v) return null;
+    if (args.len == v + 1 and args[v] == .Array) return null;
+    var out: std.ArrayList(Value) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, args[0..v]);
+    var rest: std.ArrayList(Value) = .empty;
+    try rest.appendSlice(allocator, args[v..]);
+    // The packed array owns one reference per element.
+    if (runtime.reclaimEnabled()) for (rest.items) |el| el.retain();
+    const elem_head: []const u8 = if (v < e.param_type_heads.len) e.param_type_heads[v] else "";
+    try out.append(allocator, try host_call_func.packVarargArray(allocator, elem_head, rest));
+    return try out.toOwnedSlice(allocator);
+}
+
 /// Pack trailing positional args into the primary ctor's `vararg` slot.
 /// `class_fqn`, when known, keys the module class exactly so a
 /// same-simple-name class from another package cannot supply the params.
@@ -1479,18 +1568,48 @@ fn runSuperCtorChain(
         return .{ .ok = {} };
     }
     const entries = secondaryCtors(self, class_fqn, class_name);
-    const chosen: ?root.build.SecondaryCtorEntry = chooseSecondaryCtor(self, entries, args);
+    const chain_def = classDefByName(self, sideTableKey(class_fqn, class_name));
+    defer if (chain_def) |d| d.deinit();
+    // A secondary constructor takes the call when the primary cannot (its
+    // arity, defaults and vararg considered); otherwise only an exact fit.
+    const primary_takes = if (chain_def) |d| primaryCanTake(self, d, args.len) else true;
+    const chosen: ?root.build.SecondaryCtorEntry = if (primary_takes)
+        chooseSecondaryCtor(self, entries, args)
+    else
+        chooseSecondaryCtorDefaulted(self, entries, args);
+    const packed_args: ?[]Value = if (chosen) |e| try packSecondaryVarargs(self, self.allocator, e, args) else null;
+    defer if (packed_args) |pk| self.allocator.free(pk);
+    const sargs: []const Value = packed_args orelse args;
     // The chosen constructor's declared numeric parameter types retag
     // integer arguments the same way the primary path does.
-    const args_typed: []Value = try self.allocator.dupe(Value, args);
-    defer self.allocator.free(args_typed);
+    var args_typed_list: std.ArrayList(Value) = .empty;
+    defer args_typed_list.deinit(self.allocator);
+    try args_typed_list.appendSlice(self.allocator, sargs);
     if (chosen) |e| {
-        for (args_typed, 0..) |*arg, i| {
+        for (args_typed_list.items, 0..) |*arg, i| {
             if (i >= e.param_type_heads.len) break;
             if (arg.* != .Int) continue;
             if (scalarRetag(e.param_type_heads[i], arg.Int)) |rv| arg.* = rv;
         }
+        // Parameters the call omits take their defaults, in order.
+        var idx = args_typed_list.items.len;
+        while (idx < e.param_count) : (idx += 1) {
+            const dfid = (if (idx < e.default_arg_thunks.len) e.default_arg_thunks[idx] else null) orelse break;
+            const fr = try funcAt(self, dfid, "secondary ctor default");
+            switch (fr) {
+                .err => |err| return .{ .err = err },
+                .ok => |func| {
+                    const thunk_args = try ctorThunkArgs(self.allocator, chain_def, outer_hint, args_typed_list.items, e.param_count);
+                    defer self.allocator.free(thunk_args);
+                    switch (try evalThunk(self, func, thunk_args)) {
+                        .ok => |v| try args_typed_list.append(self.allocator, v),
+                        .err => |err| return .{ .err = err },
+                    }
+                },
+            }
+        }
     }
+    const args_typed: []Value = args_typed_list.items;
     const entry = chosen orelse {
         // No secondary ctor takes this shape: the class delegates through
         // its PRIMARY ctor (`open class A(msg: String) : B(msg)`). Bind
@@ -1548,8 +1667,6 @@ fn runSuperCtorChain(
 
     var next_args: std.ArrayList(Value) = .empty;
     defer next_args.deinit(self.allocator);
-    const chain_def = classDefByName(self, sideTableKey(class_fqn, class_name));
-    defer if (chain_def) |d| d.deinit();
     const args_with_recv = try ctorThunkArgs(self.allocator, chain_def, outer_hint, args_typed, 0);
     defer self.allocator.free(args_with_recv);
     for (entry.delegation_arg_thunks) |fid| {
@@ -2692,14 +2809,7 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
     // A defaulted secondary is a candidate only when the primary cannot
     // take the call (a class without a primary, or an arity the primary and
     // its own defaults do not cover).
-    const primary_takes = blk: {
-        const dg = class_def.borrow();
-        defer dg.deinit();
-        if (!dg.get().has_primary_ctor) break :blk false;
-        const n_primary = dg.get().primary_params.len;
-        if (n_primary == 0) break :blk args.len == 0;
-        break :blk args.len <= n_primary;
-    };
+    const primary_takes = primaryCanTake(self, class_def, args.len);
     var chosen: ?root.build.SecondaryCtorEntry = if (primary_takes)
         chooseSecondaryCtor(self, entries, args)
     else
@@ -2744,14 +2854,17 @@ fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, cl
         }
     }
     const entry = chosen orelse return null;
+    const packed_args: ?[]Value = try packSecondaryVarargs(self, allocator, entry, args);
+    defer if (packed_args) |pk| allocator.free(pk);
+    const sargs: []const Value = packed_args orelse args;
 
     // Materialize the full positional argument list, filling trailing
     // params the caller omitted from their default thunks.
     var full_args: std.ArrayList(Value) = .empty;
     defer full_args.deinit(allocator);
-    try full_args.appendSlice(allocator, args);
+    try full_args.appendSlice(allocator, sargs);
     {
-        var idx = args.len;
+        var idx = sargs.len;
         while (idx < entry.param_count) : (idx += 1) {
             if (idx >= entry.default_arg_thunks.len or entry.default_arg_thunks[idx] == null) {
                 return EvalResult{ .err = try typeErr(allocator, "secondary ctor param {d} has no default to apply", .{idx}) };
@@ -3286,8 +3399,14 @@ fn padParentCtorDefaults(
     const n_primary = classDefPrimaryParamCount(parent_def);
     if (args.items.len >= n_primary) return .{ .ok = {} };
     const default_thunks = primaryDefaultThunks(self, fqn, name);
+    // An omitted `vararg` parameter is the empty array, not a default.
+    const vararg_at: ?usize, const vararg_elem: []const u8 = primaryVarargParam(self, fqn, name);
     var idx = args.items.len;
     while (idx < n_primary) : (idx += 1) {
+        if (vararg_at != null and vararg_at.? == idx) {
+            try args.append(allocator, try host_call_func.packVarargArray(allocator, vararg_elem, .empty));
+            continue;
+        }
         var dflt_expr: ?*const ast.Expr = null;
         {
             const dg = parent_def.borrow();
@@ -3858,10 +3977,12 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
     }
 
+    var entry_slot: ?*Value = null;
     if (enum_entry_preset) |preset| {
         if (std.mem.eql(u8, preset.class_fqn, class_fqn)) {
             try fields.append(allocator, .{ .name = "name", .value = preset.name });
             try fields.append(allocator, .{ .name = "ordinal", .value = preset.ordinal });
+            entry_slot = preset.slot;
             enum_entry_preset = null;
         }
     }
@@ -3874,6 +3995,14 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         .native_state = null,
     });
     const inst_value = Value{ .Instance = inst };
+    // An enum entry's own initializers (its inner classes included) may
+    // name the entry while it is under construction; kotlinc binds that
+    // reference to the instance itself, so the entry table holds the shell
+    // before any of them runs.
+    if (entry_slot) |slot| {
+        if (runtime.reclaimEnabled()) inst_value.retain();
+        slot.* = inst_value;
+    }
     // The instance under construction is reachable only through this host local
     // until it is returned and bound; its body-property/init-block initializers
     // run user code (safe points), so pin it across construction or a collection
@@ -5303,6 +5432,10 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
             defer g.deinit();
             try g.get().put(synth_class_name, cd.clone());
         }
+        // The classes and objects declared in the body are runtime classes
+        // of their own, constructed by bare name from the body's members
+        // and initializers.
+        try host_classes.registerNestedMembers(self, allocator, synth_class_name, members);
         break :blk cd;
     };
     // The synthesized anon class lives only in this stack local until it is
@@ -5458,6 +5591,16 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     });
     if (throwable_args) |ta| try bindThrowableArgs(self, inst, ta, true);
     const inst_value: Value = .{ .Instance = inst.clone() };
+    // An `inner` class of the body constructs with this object as its
+    // outer instance: the default-outer table serves the bare-name
+    // construction path, which carries no outer of its own.
+    for (members) |*m| {
+        if (m.* != .Class or !m.Class.is_inner) continue;
+        const g = self.class_default_outer.borrowMut();
+        defer g.deinit();
+        if (runtime.reclaimEnabled()) inst_value.retain();
+        try g.get().put(m.Class.name.name, inst_value);
+    }
 
     // Run the concrete superclass chain's body-property initializers.
     var parent_chain: std.ArrayList(ObjRef(ClassDef)) = .empty;

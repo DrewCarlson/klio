@@ -387,6 +387,67 @@ pub fn leafStaticMember(self: *VmHost, owner: []const u8, member: []const u8) ?V
     const dg = def.borrow();
     defer dg.deinit();
     if (!dg.get().is_enum) return null;
+    // An enum not yet initialized has no entries to serve: the leaf bails
+    // to the interpreted read, which drives the initialization.
+    if (!host_globals.enumInitDone(def)) return null;
+    for (dg.get().enum_entries) |*e| {
+        if (std.mem.eql(u8, e.name, member)) return e.value;
+    }
+    return null;
+}
+
+/// The class whose `enum_entries` describe `cls`'s entries (see
+/// `enumTableClass`), as an owned handle.
+pub fn enumTableDef(cls: runtime.ObjRef(runtime.ClassDef)) runtime.ObjRef(runtime.ClassDef) {
+    const g = cls.borrow();
+    defer g.deinit();
+    if (g.get().is_enum and g.get().enum_entries.len == 0) {
+        if (g.get().parent) |parent| {
+            const pg = parent.borrow();
+            defer pg.deinit();
+            if (pg.get().is_enum) return parent.clone();
+        }
+    }
+    return cls.clone();
+}
+
+/// Whether `name` is an entry of the enum `cls` or its `entries` list —
+/// the static members whose first read initializes the enum class.
+pub fn enumStaticNameHits(cls: runtime.ObjRef(runtime.ClassDef), name: []const u8) bool {
+    const g = cls.borrow();
+    defer g.deinit();
+    if (!g.get().is_enum) return false;
+    if (std.mem.eql(u8, name, "entries")) return true;
+    for (g.get().enum_entries) |*e| {
+        if (std.mem.eql(u8, e.name, name)) return true;
+    }
+    return false;
+}
+
+/// The entry `member` of the enum class `owner`, initializing the enum on
+/// this first use. The bare-name read paths that reach here carry no
+/// error channel, so a failed initializer surfaces on the next throwing
+/// use of the enum instead.
+fn enumEntryByOwner(self: *VmHost, owner: []const u8, member: []const u8) ?Value {
+    const def = blk: {
+        const cg = self.classes.borrow();
+        defer cg.deinit();
+        break :blk (cg.get().get(owner) orelse return null).clone();
+    };
+    defer def.deinit();
+    {
+        const dg = def.borrow();
+        defer dg.deinit();
+        if (!dg.get().is_enum) return null;
+        var hit = false;
+        for (dg.get().enum_entries) |*e| {
+            if (std.mem.eql(u8, e.name, member)) hit = true;
+        }
+        if (!hit) return null;
+    }
+    if (!host_globals.ensureEnumInitQuiet(self, def)) return null;
+    const dg = def.borrow();
+    defer dg.deinit();
     for (dg.get().enum_entries) |*e| {
         if (std.mem.eql(u8, e.name, member)) return e.value;
     }
@@ -417,7 +478,7 @@ pub fn enclosingEnumEntry(self: *VmHost, receiver: *const Value, name: []const u
         const eg = e.borrow();
         const owner = eg.get().name;
         eg.deinit();
-        if (leafStaticMember(self, owner, name)) |v| return v;
+        if (enumEntryByOwner(self, owner, name)) |v| return v;
     }
     return enclosingEnumEntryByOwner(self, cls_name, name);
 }
@@ -472,7 +533,7 @@ pub fn enclosingEnumDef(self: *VmHost, receiver: *const Value) ?runtime.ObjRef(r
 /// `owner` (the owner itself when it is the enum, else its enclosing
 /// classes by the registry's map or the dotted class name).
 pub fn enclosingEnumEntryByOwner(self: *VmHost, owner: []const u8, name: []const u8) ?Value {
-    if (leafStaticMember(self, owner, name)) |v| return v;
+    if (enumEntryByOwner(self, owner, name)) |v| return v;
     var current: []const u8 = owner;
     var hops: u8 = 0;
     while (hops < 8) : (hops += 1) {
@@ -483,7 +544,7 @@ pub fn enclosingEnumEntryByOwner(self: *VmHost, owner: []const u8, name: []const
             if (std.mem.lastIndexOfScalar(u8, current, '.')) |d| break :blk current[0..d];
             return null;
         };
-        if (leafStaticMember(self, enclosing, name)) |v| return v;
+        if (enumEntryByOwner(self, enclosing, name)) |v| return v;
         current = enclosing;
     }
     return null;
@@ -1768,6 +1829,11 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
             break :blk g.get().is_enum;
         };
         if (is_enum) {
+            // A first read of an entry or of `entries` initializes the enum;
+            // any other member (a nested object) leaves it untouched.
+            if (enumStaticNameHits(receiver.Class, name)) {
+                if (try host_globals.ensureEnumInit(self, receiver.Class)) |e| return .{ .err = e };
+            }
             if (std.mem.eql(u8, name, "entries")) {
                 var items: std.ArrayList(Value) = .empty;
                 errdefer items.deinit(allocator);
@@ -3867,6 +3933,17 @@ fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     }
     // Enum entry bare-name access. An entry declared with a body is an
     // instance of its own subclass, whose entry table is the parent enum's.
+    {
+        const table = blk: {
+            const g = inst.borrow();
+            defer g.deinit();
+            break :blk enumTableDef(g.get().class);
+        };
+        defer table.deinit();
+        if (enumStaticNameHits(table, name)) {
+            if (try host_globals.ensureEnumInit(self, table)) |e| return .{ .err = e };
+        }
+    }
     {
         const g = inst.borrow();
         const cg = enumTableClass(g.get().class);
