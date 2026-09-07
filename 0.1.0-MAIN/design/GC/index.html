@@ -1,0 +1,1769 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="An experimental Kotlin interpreter written in Zig.">
+      
+      
+      
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/design/GC/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>KLIO garbage collector — hardened design & staged implementation plan - Klio</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#klio-garbage-collector-hardened-design-staged-implementation-plan" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Klio
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              KLIO garbage collector — hardened design & staged implementation plan
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Klio
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/hello-world/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Hello, world
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Tour
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing Your Code
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../BUNDLE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bundling Programs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pipeline Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/interpreter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The Vm
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/stdlib/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Standard Library
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/concurrency/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concurrency
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/memory-model/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Model
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/overview/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    What is a Pack?
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/format/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pack Format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/using/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Using Packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/authoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authoring a Pack
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/native-bindings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Native Bindings
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Shipped Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Shipped Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/atomicfu/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.atomicfu
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/io/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.io
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/datetime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.datetime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/coroutines/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.coroutines
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/serialization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.serialization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/ktor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    io.ktor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    androidx.compose.runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Development
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/workspace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workspace Layout
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/debugging/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#completed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Completed
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#external-bytes-appel-accounting-keepalive-hole-close-out" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        External-bytes Appel accounting + keepalive-hole close-out
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#chosen-approach" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Chosen approach
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#final-design-hardened" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Final design (hardened)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#staged-implementation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Staged implementation
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Staged implementation">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#stage-2-generational-nursery-throughput-with-the-complete-write-barrier-set" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stage 2: Generational nursery (throughput) with the complete write-barrier set
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#stage-3-incrementalconcurrent-marking-latency-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Stage 3: Incremental/concurrent marking (latency, optional)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#residual-risks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Residual risks
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/design/GC.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="klio-garbage-collector-hardened-design-staged-implementation-plan">KLIO garbage collector — hardened design &amp; staged implementation plan<a class="headerlink" href="#klio-garbage-collector-hardened-design-staged-implementation-plan" title="Permanent link">&para;</a></h1>
+<p>Replaces manual reference counting with a precise, stop-the-world, non-moving tracing
+mark-sweep GC ("KGC"). Objects are freed by <strong>reachability</strong>, so missing-retain /
+over-release become harmless and cycles are collected. The ~19 audited per-site fixes
+keep the interim refcount path correct; the GC is the general, any-program answer.</p>
+<blockquote>
+<p>Adversarial root-completeness review found <strong>6 fatal + 10 serious</strong> holes
+in the first design (verdicts: unsound, sound-with-fixes, unsound); ALL are folded into the design below.</p>
+</blockquote>
+<h2 id="completed">Completed<a class="headerlink" href="#completed" title="Permanent link">&para;</a></h2>
+<p>The shipped collector (design below, delivered through Stages 0–1 plus the
+multi-thread / coroutine / closure / host-temporary close-out):</p>
+<ul>
+<li>STW tracing mark-sweep GC is the default reclaim mode (<code>src/runtime/gc.zig</code>:
+  GcHeader, Marker / shade / drain grey worklist, the <code>all_cells</code> intrusive
+  registry, <code>collect</code>, the epoch mark, and the KLIO_GC_STRESS / KLIO_GC_NOFREE /
+  KLIO_GC_POISON oracles). The default arena path is unchanged (the collector is
+  inert unless <code>gc_enabled</code>).</li>
+<li>Multi-thread STW with thread roots: <code>stop_flag</code> / <code>parked_count</code> / <code>parkForStop</code>
+  rendezvous and <code>registerThreadRoot</code> / <code>markThreadRoots</code> bring real-threaded
+  programs (Dispatchers.Default, withContext(IO), cross-dispatcher channels) under
+  the collector byte-identically to the arena baseline.</li>
+<li>Closure reclamation: <code>SharedClosures.reclaimDead</code> + free list and
+  <code>markClosureHook</code> keep the live closure set bounded (a slot is freed only after a
+  full mark proved no live value referenced its id).</li>
+<li>Coroutine GC-root completeness: <code>markSuspendHook</code> / <code>freeSuspendHook</code> root parked
+  frame snapshots, scope deltas, queued launches, and pending resume values.</li>
+<li>Per-request value graphs: anonymous-object captures moved onto the instance
+  (<code>InstanceData.anon_captures</code>) and anon class/method registrations keyed by the
+  source AST node, so a ktor server's live-cell counts stay flat across requests.</li>
+<li>Slab page-return with idle hysteresis (<code>src/runtime/slab.zig</code>): same-size cells
+  grouped into slabs, <code>munmap</code> on last-free, and MAP_FIXED decommit of stably-idle
+  slab pages so RSS tracks the live set.</li>
+</ul>
+<p>Open next tier: Stage 2 (generational nursery) and Stage 3 (incremental/concurrent
+marking), both below. External-byte accounting is now part of the shipped
+collector; its remaining stress hardening is described directly below.</p>
+<h2 id="external-bytes-appel-accounting-keepalive-hole-close-out">External-bytes Appel accounting + keepalive-hole close-out<a class="headerlink" href="#external-bytes-appel-accounting-keepalive-hole-close-out" title="Permanent link">&para;</a></h2>
+<p>The Appel trigger (<code>threshold = max(floor, live*2)</code>) only counts bytes on the
+sweep registry — refcounted cells. But two large allocation classes live in libc
+storage OUTSIDE the registry: frame register buffers (<code>acquireRegs</code>) and
+suspension snapshots (the <code>dupe</code>d regs/params/captures a park captures). They are
+traced through the frame chain (never swept directly), so they are sound, but
+their growth never advances the trigger. Consequence: a program that builds a
+deep suspended chain (DeepRecursive, a long generator) keeps the trigger pinned
+at the floor and re-marks the whole growing chain on every collection — the
+observed quadratic in <code>runFrameInner</code> self-time.</p>
+<p>The fix is enabled by default (<code>external_accounting</code> in <code>gc.zig</code>, with
+<code>KLIO_GC_EXT=0</code> retained as a diagnostic override): <code>noteExternalBytes</code> /
+<code>noteExternalFreed</code> add/subtract these buffers
+at their acquire/release/pool-transition sites (<code>acquireRegs</code>, <code>releaseRegs</code>
+pool return, the snapshot <code>dupe</code>, <code>freeSnapshotBuffers</code>), and <code>external_live</code>
+feeds the threshold as <code>max(floor, (live + external_live)*2)</code>. With it on,
+DeepRecursive at 150k levels dropped 33s → 17s in the original measurement.
+On the current 100k-depth upstream test, the same change reduces the JIT-off
+runtime from 47.15s to 27.28s (42%).</p>
+<p>Turning it on collects more often, and the added pressure exposed a class of
+latent keepalive holes — host paths that hold a Value only in a Zig local across
+a re-entrant eval, invisible to the mark. This is exactly Residual risk #1 made
+acute. Two real holes were found and fixed via
+<code>KLIO_GC_POISON</code> (a swept cell traps on next touch):
+- <code>SeqIterState.gcTrace</code>/<code>deinit</code> skipped <code>iter_obj</code> — the Iterator an
+  <code>IteratorFn</code> source produced. Any collection between pulls swept the live
+  iterator; the next pull read freed memory (an eternal borrow spin or a
+  <code>0xdddddddd…</code> segfault). Now traced and released.
+- A fresh builder cursor (<code>freshBuilderState</code>) driven by a host loop
+  (<code>streamSequence</code>, the <code>sequence.zig</code> drive sites) was reachable only through
+  a Zig local. <code>pinBuilderState</code> now roots it through the keepalive stack for
+  the drive window.</p>
+<p><strong>Remaining hardening:</strong>
+1. Run the full corpus + parity sweep under <code>KLIO_GC_POISON=1</code>
+   (and <code>KLIO_GC_STRESS=1</code>); every trap is another host path holding a Value in
+   a local across an invoke without a keepalive scope. Fix each by opening a
+   <code>keepaliveMark</code>/<code>keepaliveRestore</code> window (or routing the value onto a rooted
+   structure) — same mechanism as <code>pinBuilderState</code>.
+2. Extend the Debug keepalive lint (Residual risk #1's structural backstop) so a
+   host fn that binds a Value local AND calls invoke/eval between binding it and
+   its last use requires an open keepalive scope — the two holes above would
+   have been caught statically.
+3. After the full stress matrix is clean, remove the diagnostic gate and its
+   conditional guards entirely.</p>
+<p><strong>Validation:</strong> the accounting change is byte-identical in output to the
+disabled path (it only changes collection <em>timing</em>). The 2026-07-21 stdlib
+commonTest sweep passed all 117 files in both eager modes with
+<code>KLIO_GC_POISON=1</code>, and the isolated DeepRecursive test passed with poison while
+showing the timing win above. The corpus/parity stress matrix remains the final
+hardening gate.</p>
+<h2 id="chosen-approach">Chosen approach<a class="headerlink" href="#chosen-approach" title="Permanent link">&para;</a></h2>
+<p>Precise-rooted, stop-the-world, non-moving tracing mark-sweep ("KGC") layered on the existing ObjRef/ControlBlock object model, with explicit per-thread and global root registries (NO conservative stack scan), GC deferred to opcode-boundary safe points, a cooperative multi-thread stop-the-world handshake reusing the existing abandon-poll machinery, and a staged path to a generational nursery. This is essentially Design 5/Design 4 unified, hardened with Design 1's epoch-mark and deferred-trigger rules and Design 3's generational stage, and deliberately rejecting Design 2/3's conservative native-stack scan.</p>
+<h2 id="final-design-hardened">Final design (hardened)<a class="headerlink" href="#final-design-hardened" title="Permanent link">&para;</a></h2>
+<p>UNIFIED TRACING-GC DESIGN (final, all fatal/serious adversarial fixes folded in)</p>
+<p>OBJECT MODEL &amp; CELL REGISTRY
+- The GC-managed set is exactly every ControlBlock(T) born through ObjRef(T).initOwned (objcell.zig:326) — the single allocation chokepoint covering StringRef bytes, InstanceData, the three ValueList backings, MapEntries, ValueBox, ValueSlice, Env, ClassDef, Comparator steps, SequenceData/RegexData/MatchData/DelegateKind, StringBuilder, Iterator pos, RangeIter cur, NativeBox, and the SuspendFrame/SuspendBody cells. Value.box (value.zig:432) — the lone bare <em>Value escape — is routed through ValueBox so the heap is uniformly registered cells.
+- ControlBlock(T) (objcell.zig:266) gains a non-generic prefix GcHeader the type-erased collector reads: { gc_next: ?</em>GcHeader (intrusive all-cells link), gc_mark: usize (an EPOCH counter — marked iff gc_mark == current_epoch, so unmark is implicit; widened from the design's u8 to usize per the epoch-wrap fix so wrap is astronomically far away and the Stage-2 concurrent path needs no separate unmark), gc_trace: <em>const fn(</em>anyopaque, <em>Marker) void, gc_finalize: </em>const fn(<em>anyopaque, Allocator) void }. Lay out as struct { hdr: GcHeader, refcount, lock, data: T, allocator } so an erased </em>GcHeader recovers data by fixed offset. The atomic refcount and per-cell SpinRwLock STAY physically (the lock still mediates cross-thread interior-mutability borrows; refcount is neutralized in migration). gc_mark is placed on its own word, separate from the SpinRwLock state word, with release/acquire ordering specified between the shade CAS and lock ops for Stage 2.
+- CRITICAL CORRECTION to the design's central claim: gc_trace is NOT comptime-auto-synthesizable from Value.forEachChildCell — forEachChildCell is a Value method, but the registry holds ControlBlocks of MANY non-Value payloads (Env, ClassDef, InstanceData, ObjectStates map, DriverWakeup, MapEntries, []ComparatorStep, NativeBox, the doubly-wrapped ?ObjRef(...) payloads). Each such T must supply a hand-authored <code>pub fn gcTrace(self: *const T, m: *Marker) void</code> and a shallow <code>pub fn gcFinalize(self: *T, a: Allocator) void</code>. ControlBlock(T) installs thunks that call them and FAILS AT COMPTIME (@hasDecl guard) if a registered T lacks gcTrace/gcFinalize, so no payload can be added without a trace. Value-payload cells (StringRef, ValueList, MapEntries, ValueBox, ValueSlice) get a gcTrace that drives forEachChildCell over their contained Values; the ~15 non-Value payloads get bespoke thunks (Env: walk vars values + parent; ClassDef: parent/interfaces/companion/object_singleton/enclosing_class/captured_env/nested_classes/enum_entries values; InstanceData: class/fields values/outer/native_state.trace; ObjectStates: each InProgress.instance and Done value; DriverWakeup: mailbox_entries values; ComparatorStep: selector Values; the ?ObjRef(InstanceData)/?ObjRef(ClassDef) payloads: mark the inner cell).
+- REGISTRY: process-global intrusive list head gc_all_cells: ?*GcHeader + gc_bytes/gc_cell_count atomics, guarded by the existing objcell SpinMutex (objcell.zig:192). initOwned push-fronts the new cell (one pointer write + atomic bump) and fills the trace/finalize thunks. This list is the authoritative sweep enumeration.</p>
+<p>ROOTS (the correctness core; NO conservative scan):
+1. ACTIVE FRAMES, ALL THREADS. Threadlocal frame_chain: ?<em>Frame + a gc_link field on Frame (eval.zig:433); push in Frame.newWithCaptures/activate, pop in Frame.deinit (eval.zig:549), bracketing eval_depth inc/dec (Debug assert chain depth == eval_depth). Collector traces each frame's regs/params/captures/enclosing_this. Tail-jump mutates the same registered Frame in place. active_chain/active_chain_base alias the top frame's enclosing_this — covered.
+2. PER-THREAD GC RECORDS. Process-global gc_threads registry (intrusive, SpinMutex-guarded) of records { &amp;frame_chain, &amp;coro_stack, &amp;active_scope_stack, &amp;resuming_frames, &amp;host_keepalive, &amp;pinned_task, at_safepoint }. Threads register on entry / deregister on exit at the SAME seams that call setReclaim today (scheduler.zig:323, intrinsic_host.zig:735) and inherit process-global gc_enabled.
+3. PARKED COROUTINE SuspendStates. Per-thread coro_stack/active_scope_stack live in the thread GC record (root 2). PersistedParked.map (coroutines.zig:262) and SlotOwners.pending (coroutines.zig:181) register once in the global root list and get a mark pass (not just the existing run-boundary drain): trace every snapshot regs/params/captures/enclosing_this, every scope_delta, every pending resume Value. markSuspendState reuses the retainSnapshotValues walk shape (eval.zig:405). FIX (fatal mid-resume hole): resumeContinuation's in-flight Zig-local <code>frames</code> ArrayList (eval.zig:745) of not-yet-materialized outer FrameSnapshots is rooted via a threadlocal resuming_frames: ?</em>ArrayList(FrameSnapshot) in the thread GC record, set at resumeContinuation entry / cleared at exit / saved-restored for nesting; markValue traces frames.items[head..]. scope_delta (coroutines.zig:1263) is provably re-rooted on the registered active_scope_stack before the slice is freed.
+4. SCHEDULER + CROSS-THREAD IN-FLIGHT. Register the global Pool, the coro_reg channel registry, DriverWakeups, and SlotOwners.pending as global root providers; under each's existing mutex during STW, trace every queued Task.block + Task.seed handle set, every channel buffer/send_waiter/receive_iter_waiter Value+iter, every mailbox entry. FIX (fatal channel hole): coro_reg (kotlinx_coroutines.zig) is a separate module-global with NO Vm linkage and a synthetic-id-keyed map; it is made a first-class GC root provider with an explicit trace under coro_reg_mutex that marks channels.valueIterator() state.buffer elements, send_waiters[<em>].value, receive_iter_waiters[</em>].iter, and the iterator instances — the GC adds a MARK pass over exactly the containers the existing sweepRegistryAtRunBoundary/drainSlotOwners teardown already centrally knows. FIX (worker pop window): the per-thread GC record gains pinned_task: ?<em>Task; in Pool.workerMain (scheduler.zig:280-296) the pin is set under the pool mutex at the moment takeEligible returns the task (scheduler.zig:289), BEFORE releasing the queue mutex, and cleared only after the child Vm is registered in gc_vms; the record trace walks pinned_task.block AND pinned_task.seed handle set. The same pin covers kotlin.concurrent.thread's workerEntry args.block (intrinsic_host.zig:739).
+5. GLOBALS / PROGRAM GRAPH. The live Vm (and worker child Vms, which share cells by handle clone) registers its handle set in a global gc_vms list at vmNew, deregisters at vmDeinit. Marking is idempotent so registering all Vms is redundant-safe: Vm.globals, classes (ClassTable→ClassDef graph), prog, object_states (incl. ObjectInitState.InProgress.instance), class_default_outer, anon_methods, out_sink. FIX (fatal closure-registry leak, defeats bounded RSS): SharedClosures (interp_ir.zig:481) is NOT a strong root. It is converted from an append-only vector into a SLOT MAP WITH A FREE-LIST: each ClosureInfo carries the canonical capture cell, an IrClosure Value holds the id, and the sweep drops a ClosureInfo (and frees its slot id for reuse) when no live IrClosure references that id. To make "no live IrClosure references the id" decidable by tracing, the IrClosure's separate dup'd ValueSlice (host_call_value.zig:646) is UNIFIED with the canonical table cell: the IrClosure carries the same capture cell the table indexes (a clone, not a dup), so liveness of the captures follows liveness of the IrClosure, and the table holds only a weak id→slot mapping the sweep nulls. Concretely: SharedClosures.obj is traced WEAKLY (its entries' captures are NOT marked through the table); after mark, a sweep-time pass over the table frees any slot whose captures cell came back unmarked (white) and returns its id to the free-list; buildLambda (host_call_value.zig:634), funcValueById (host_globals.zig:563), and host_call_value.zig:660 allocate into a free slot when available. This is the only way the design's primary bounded-RSS goal is attainable.
+6. HOST-OP TEMPORARIES (the design's residual — promoted from "optional fallback" to MANDATORY mechanism). A per-thread traced host_keepalive root stack (an ArrayList of Value/[]Value, in the thread GC record). The "route through a frame register" strategy is REJECTED as the primary approach: pure-host re-entry (a host op iterating a host-built slice and calling a user selector via invoke/invokeCallable/callValueRec) has NO calling frame register that holds the accumulator — the value was created by the host and lives only in the host's ArrayList. Every host op that holds a Value/MapPair local (an accumulator ArrayList, an iterableItems/snapshot slice including freshly-boxed Map MapEntry cells, a comparator's a/b/ka locals) across an invoke</em> / callValueRec call pushes its in-progress contents onto host_keepalive before the first re-entrant call and pops at host-op exit. The GC traces host_keepalive during STW. A Debug assertion verifies host_keepalive is empty at every opcode boundary reached from top-level (not mid-host-op) to catch leaked obligations; a comptime/Debug lint flags any stdlib fn containing both an accumulator local and an invoke call without a keepalive scope.</p>
+<p>NATIVE STATE (minor fix, latent UAF closed): NativeBox (class.zig:398) gains an optional gc_trace: ?<em>const fn(</em>anyopaque, *Marker) void alongside destroy. Bindings that box Values supply it; bindings with value-free payloads (the kotlinx.io.Buffer placeholder) leave it null. InstanceData.gcTrace calls native_state.data's gc_trace when present. A Debug assertion at the ensureNativeState boundary asserts a null trace implies a Value-free payload, so a future value-bearing native binding cannot silently reintroduce a UAF.</p>
+<p>PARTIAL-SINGLETON WINDOW (serious fix): the in-construction object/companion/enum shell is pinned on host_keepalive from ObjRef(InstanceData).init (host_instances.zig:2004) until it is published into ObjectInitState.InProgress.instance under the object_states writer lock, with no intervening opcode boundary; materializeInstance and the lazy-object/companion/enum_entry_arg_inits routines are audited for the create→publish gap.</p>
+<p>MAP-VIEW BACKING (fatal fix — freed-while-live source map under a live view): forEachChildCell is given a GC-mark variant (a separate visitor from retain/release) that DOES visit <code>backing</code> for List/Set and MapEntry.backing, turning the non-owning write-through view into an owning root from the GC's perspective (it cannot leak: a dropped source map means the view is the legitimate sole owner). Additionally MapBacking (value.zig:49) — today a raw a.create(MapBacking) (collections.zig:3762,3782,3806) that is neither on gc_all_cells nor traceable — is promoted to a registered ObjRef(MapBacking) cell with a gcTrace that marks backing.entries, so it is both swept and reaches the source map. The audit enumerates ALL non-cell raw *T allocations that transitively hold ObjRefs/Values (MapBacking is the one found) and registers each. The Stage-1 write barrier list is extended past the five named sites: MapEntry.setValue's write-through (host_call_member.zig:3839) and syncMapView's in-place rewrite (collections.zig:2212) are funneled through a single MapEntries.writeThrough helper that contains the barrier; raw borrowMut().get().items[i] = value on a MapEntries is forbidden from host ops.</p>
+<p>MARK &amp; SWEEP
+- MARK: tri-color with an EXPLICIT work-list (ArrayList of *GcHeader), never native recursion. Seed greys from all roots via markValue(v) driving the GC-mark forEachChildCell variant: CAS-set each child's gc_mark to current_epoch (white→grey) and push. Pop a grey, call its gc_trace thunk, shade children grey, blacken self. A cell already at current_epoch is skipped, so cycles terminate.
+- SWEEP: single pass over gc_all_cells. If gc_mark != current_epoch: unlink, run gc_finalize (the SHALLOW teardown — own buffers/bytes/HashMap spine only, NEVER child Values), then allocator.destroy(cell). Payload deinits are split: InstanceData.gcFinalize keeps fields.deinit(allocator) but DROPS the <code>for fields |f| f.value.release()</code> loop (class.zig:324) and <code>outer.release</code> and <code>class.deinit</code>; Env.gcFinalize keeps vars.deinit() drops parent.deinit() (env.zig:27); releaseValueList/releaseSliceElems/the Map last-owner element release (value.zig:580-598) are gated off — only the buffer free remains. Each cell is freed exactly once; no resurrection (no Kotlin finalizers). The weak closure-table sweep pass (root 5) runs after the cell sweep. Epoch-wrap invariant documented: every reachable cell is re-marked every collection, so wrap can only DELAY (never prevent) reclamation of an unreachable cell — a bounded leak, not a UAF — and the usize width makes it unobservable.</p>
+<p>SAFE POINTS &amp; CONCURRENCY
+- WHEN: only at opcode boundaries — top of the while(true) block loop / before each execInst (eval.zig:891/925), beside shouldAbandon() (eval.zig:896); plus the pump loop top and the worker idle loop (scheduler.zig:279). Check: <code>if (runtime.gcPending()) runtime.gcSafePoint();</code>.
+- DEFERRED TRIGGER: initOwned bumps gc_bytes; crossing the threshold ONLY sets a threadlocal+global gc_pending flag and returns the cell — NEVER collects inline. So no safe point exists inside a host op; its in-construction temporaries are observed by a collector only AFTER they are either written into a frame register or pushed onto host_keepalive.
+- MULTI-THREAD STW HANDSHAKE (reuses the abandon pattern): global gc_phase {Idle, Requested, Running}; the threshold-crosser CASes Idle→Requested. The collector sets stop_the_world; every mutator polls it at its safe point, publishes quiescent roots, bumps at_safepoint, spins until cleared. The collector waits until at_safepoint == live_mutator_count (from gc_threads). A thread inside a real blocking primitive (clockSleepMillis, Thread.join, idle park) brackets it with enterBlockingSafe()/exitBlockingSafe() — it holds no live unrooted Value (state in registered frames/snapshots/pins), counts as already-safe, re-checks stop_the_world on wake before touching the heap. Cell SpinRwLocks are NEVER held across a safe point (objcell.zig:18 invariant). SINGLE-THREADED common case: live_mutator_count==1, handshake degenerates to "collect right here". The worst-case STW wait (a worker deep in a long host loop with no nearby opcode boundary, e.g. a big comparator sort) is bounded by inserting safe-point polls into the long host loops, or documented as worst-case pause = longest host op between opcode boundaries.</p>
+<p>TRIGGER &amp; PERF
+- Allocation-bytes watermark: after each collection gc_threshold = max(min_heap, live_bytes * GROWTH), GROWTH ~2.0 (heap ~2x live → amortized O(1)/byte, bounded RSS). A hard ceiling forces a collection regardless. Only cell-birth pays one atomic add; steady-state read/write pays nothing.</p>
+<p>REFCOUNT MIGRATION (remove RC as reclamation, keep handle/lock plumbing; gate where reclaim_tls gates today): ObjRef.clone drops the fetchAdd (plain handle copy — most of the throughput win). ObjRef.deinit is a NO-OP under GC mode (same early return as !reclaim_tls). Value.retain/release are no-ops under GC. Payload deinits split into shallow gcFinalize. AllocChoice (objcell.zig:130) and main.zig gain a .gc arm installing a freeing backing allocator (smp_allocator, or a dedicated page/size-class free-list). Arena mode stays (fastest for short scripts); smp+reclaim stays behind a flag as the differential oracle. reclaimEnabled()/setReclaim retired in favor of gcEnabled()/GC-context registration; workers inherit process-global gc_enabled.</p>
+<h2 id="staged-implementation">Staged implementation<a class="headerlink" href="#staged-implementation" title="Permanent link">&para;</a></h2>
+<h3 id="stage-2-generational-nursery-throughput-with-the-complete-write-barrier-set">Stage 2: Generational nursery (throughput) with the complete write-barrier set<a class="headerlink" href="#stage-2-generational-nursery-throughput-with-the-complete-write-barrier-set" title="Permanent link">&para;</a></h3>
+<p><strong>Files:</strong> src/runtime/gc.zig (young bump region, remembered set, minor vs major collection, promotion); src/runtime/class.zig (InstanceData.define/set barrier); src/runtime/env.zig (Env.define barrier); src/runtime/value.zig (Cell write, ValueList append barriers; MapEntries.writeThrough barrier — already funneled in Stage 1); src/interp_ir/vm/host_call_member.zig (MapEntry.setValue routes through MapEntries.writeThrough); src/stdlib/implementations/collections.zig (syncMapView routes through MapEntries.writeThrough)</p>
+<p><strong>Changes:</strong> Add a young-gen bump region; minor GC scans only roots + remembered set. Install the write barrier on the COMPLETE store-site set: the five named chokepoints (InstanceData.define/set, Env.define, Cell write, ValueList append, MapEntries put) PLUS the two write-through paths the design missed — MapEntry.setValue (host_call_member.zig:3839) and syncMapView (collections.zig:2212), both now going through the single MapEntries.writeThrough helper installed in Stage 1. Frame register writes need NO barrier (registers are roots, scanned every collection). The audit grep (<code>.items[...] =</code>, <code>slot.value =</code>, <code>entries.items[...] =</code> assigning a Value into a borrowed backing) is run to confirm no other unbarriered store exists.</p>
+<p><strong>Validation:</strong> zig build test green in .gc mode. Re-run corpus + parity under KLIO_GC_STRESS=1 AND a new KLIO_GC_MINOR_STRESS=1 that forces a minor collection at every safe point — a missed barrier (old→young pointer not in the remembered set) frees a live young Value and crashes deterministically, caught against the smp+reclaim oracle. Microbenchmark a copy-heavy workload (string-template concat, boxed Pair/Result churn, xs.map): .gc Stage 2 must beat smp+reclaim (no per-copy atomic) and approach arena raw speed while keeping flat RSS. Explicit test: store a freshly-allocated young Value via MapEntry.setValue and syncMapView into an old backing map, force a minor GC, read it back through the live map — must not UAF.</p>
+<h3 id="stage-3-incrementalconcurrent-marking-latency-optional">Stage 3: Incremental/concurrent marking (latency, optional)<a class="headerlink" href="#stage-3-incrementalconcurrent-marking-latency-optional" title="Permanent link">&para;</a></h3>
+<p><strong>Files:</strong> src/runtime/gc.zig (incremental mark scheduling, Dijkstra write barrier sharing the Stage-2 store sites; gc_mark on its own cacheline-aligned word with documented release/acquire vs the SpinRwLock); src/ir/eval.zig + src/interp_ir/vm/scheduler.zig (incremental mark steps at safe points)</p>
+<p><strong>Changes:</strong> Add a Dijkstra write barrier (shade-on-store) on the same store sites as Stage 2 to bound STW pause on a large old-gen; the mark worklist and trace thunks are unchanged, only scheduling differs. Specify memory ordering between the white→grey shade CAS and the cell lock acquire/release, and keep gc_mark on a separate word from the SpinRwLock state to avoid false sharing.</p>
+<p><strong>Validation:</strong> zig build test green. Corpus + parity under KLIO_GC_STRESS and a concurrent-mark stress (mutator runs during mark) against the smp+reclaim oracle. Latency benchmark: large steady-state heap (long-running server with a big old-gen) shows STW pause bounded to a fraction of a full mark; throughput regression vs Stage 2 stays within budget. ThreadSanitizer-equivalent (KLIO_RACE_JITTER + concurrent mark) finds no data race on gc_mark/lock.</p>
+<h2 id="residual-risks">Residual risks<a class="headerlink" href="#residual-risks" title="Permanent link">&para;</a></h2>
+<ol>
+<li>
+<p>Host-op keepalive completeness is the remaining manual obligation (~93 invoke + the callValueRec re-entry sites across 9+ stdlib/host files). The mechanism is mandatory (not the rejected frame-register routing), the Debug "host_keepalive empty at top-level opcode boundary" assertion plus the comptime/Debug lint catch leaks, and KLIO_GC_STRESS crashes a miss deterministically — but only if the corpus EXERCISES that exact path. Mitigation: the lint (any host fn with both an accumulator local and an invoke must open a keepalive scope) is the structural backstop; new stdlib ops cannot silently regress. Risk is reduced from the ~226 retain sites to an auditable, lint-enforced ~100, and a miss is a reproducible crash under stress, never a silent corruption.</p>
+</li>
+<li>
+<p>STW worst-case pause: a worker genuinely running a long host loop with no nearby opcode boundary (a huge comparator sort, a long compareValuesBuiltin) makes the STW initiator spin until that worker reaches its next execInst. Stage 1 mitigates by inserting safe-point polls into the known long host loops; the residual is the as-yet-uninstrumented long loop. Stage 3 (incremental) removes the full-mark pause but not the handshake-rendezvous latency. Documented worst case = longest host op between safe points until every long loop is instrumented.</p>
+</li>
+<li>
+<p>gcTrace fan-out correctness: ~15 hand-authored non-Value trace thunks each carry the per-type miss risk the design hoped to eliminate via auto-synthesis (which is genuinely impossible — forEachChildCell is Value-only). Mitigation: the comptime @hasDecl guard forces every registered payload to have a thunk; each thunk has a field-coverage unit test; KLIO_GC_STRESS exercises them. The residual is a field added to a payload struct without updating its thunk — caught by the field-coverage test only if that test is updated. A future hardening is a comptime reflection check that the thunk visits every ObjRef/Value-typed field.</p>
+</li>
+<li>
+<p>NativeBox value-bearing payloads: today zero production bindings box Values (only the io.Buffer placeholder), so the hole is latent. The optional gc_trace + ensureNativeState Debug assert (null trace ⇒ Value-free payload) make a future value-bearing binding fail loudly rather than UAF, but a binding author who supplies a trace that misses a field reintroduces the risk — same class as #3.</p>
+</li>
+<li>
+<p>Epoch-wrap is a non-issue for soundness (usize width makes it astronomically far; documented invariant: reachable cells are re-marked every collection so wrap can only delay, never prevent, reclamation of an unreachable cell — a bounded leak, never a UAF).</p>
+</li>
+<li>
+<p>Stage 2/3 concurrency: the Dijkstra/generational barriers add memory-ordering obligations between the shade CAS and the per-cell SpinRwLock; gc_mark is kept on its own word with specified ordering, but concurrent-mark correctness is the hardest-to-test part and is deliberately the LAST, optional stage — Stage 1 (STW, non-moving) is the complete, correct, bounded-RSS GC that can ship and become the default on its own.</p>
+</li>
+</ol>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2026 Klio Contributors
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/DrewCarlson/klio" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>

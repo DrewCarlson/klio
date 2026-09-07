@@ -1,0 +1,2907 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="An experimental Kotlin interpreter written in Zig.">
+      
+      
+      
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/design/analysis/zig-freedoms/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Zig Freedoms: Where the Rust→Zig Port Can Shed Ported Ownership Machinery - Klio</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#zig-freedoms-where-the-rustzig-port-can-shed-ported-ownership-machinery" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Klio
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Zig Freedoms: Where the Rust→Zig Port Can Shed Ported Ownership Machinery
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Klio
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../getting-started/installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../getting-started/hello-world/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Hello, world
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../getting-started/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Tour
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing Your Code
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../BUNDLE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bundling Programs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pipeline Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/interpreter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The Vm
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/stdlib/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Standard Library
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/concurrency/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concurrency
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/memory-model/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Model
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/overview/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    What is a Pack?
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/format/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pack Format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/using/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Using Packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/authoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authoring a Pack
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/native-bindings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Native Bindings
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Shipped Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Shipped Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/atomicfu/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.atomicfu
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/io/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.io
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/datetime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.datetime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/coroutines/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.coroutines
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/serialization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.serialization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/ktor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    io.ktor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/compose-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    androidx.compose.runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Development
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/workspace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workspace Layout
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/debugging/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-executive-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Executive summary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-per-area-findings" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Per-area findings
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Per-area findings">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#2a-objref-smart-pointer-machinery" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2A. ObjRef / smart-pointer machinery
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2A. ObjRef / smart-pointer machinery">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#2a1-the-adaptive-unsharedshared-cell-taxes-1178-single-thread-borrow-sites" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2A.1 The adaptive UNSHARED→SHARED cell taxes 1,178 single-thread borrow sites
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2a2-objguardobjguardmut-carry-a-runtime-shared-bool-branched-at-every-release" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2A.2 ObjGuard/ObjGuardMut carry a runtime shared: bool branched at every release
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2a3-fenceandpublish-is-a-documented-no-op-kept-as-a-named-seam" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2A.3 fenceAndPublish is a documented no-op kept as a "named seam"
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2a4-publishdeeppublishenvdeep-walk-the-entire-reachable-graph-on-every-spawn" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2A.4 publishDeep/publishEnvDeep walk the entire reachable graph on every spawn
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2a5-three-parallel-hand-rolled-arc-equivalents-reimplement-objrefs-refcount" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2A.5 Three parallel hand-rolled Arc-equivalents reimplement ObjRef's refcount
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2a6-controlblock-stores-a-per-cell-allocator-16-bytes-per-object" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2A.6 ControlBlock stores a per-cell allocator (~16 bytes per object)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2a7-classdef-wraps-build-time-immutable-structure-in-per-field-objref-cells" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2A.7 ClassDef wraps build-time-immutable structure in per-field ObjRef cells
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2b-concurrency-coroutines-threads" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2B. Concurrency: coroutines + threads
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2B. Concurrency: coroutines + threads">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#2b1-the-entire-scheduler-trait-is-vestigial-scaffolding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2B.1 The entire Scheduler trait is vestigial scaffolding
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2b2-dispatch_coroutinejoin_dispatched-elasticgated-are-a-no-op-fork-of-spawnjoin" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2B.2 dispatch_coroutine/join_dispatched + elastic/gated are a no-op fork of spawn/join
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2b3-coroutinearmslot-and-coroutineparkslot-are-byte-identical" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2B.3 coroutineArmSlot and coroutineParkSlot are byte-identical
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2b4-coroutine_resume_slot-no-value-duplicates-coroutine_resume_slot_value" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2B.4 coroutine_resume_slot (no-value) duplicates coroutine_resume_slot_value
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2b5-cross-thread-resume-routing-has-three-near-parallel-paths-a-never-freed-registry" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2B.5 Cross-thread resume routing has three near-parallel paths + a never-freed registry
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2b6-fenceandpublish-concurrency-view-see-2a3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2B.6 fenceAndPublish (concurrency view) — see 2A.3.
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2b7-two-spin-lock-implementations-diverge-in-backoff-behavior" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2B.7 Two spin-lock implementations diverge in backoff behavior
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2b8-per-evaluation-host-bundle-clones-10-handles-20-atomicscall-at-6-sites-see-2c7-2d5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2B.8 Per-evaluation host bundle clones 10 handles (~20 atomics/call) at ~6 sites — see 2C.7 / 2D.5.
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2c-memory-ownership-allocators" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2C. Memory ownership / allocators
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2C. Memory ownership / allocators">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#2c1-workers-share-one-process-arena-sound-under-zig-016-but-on-unasserted-invariants" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2C.1 Workers share one process arena — sound under Zig 0.16, but on unasserted invariants
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2c2-constraintsystem-mixes-an-internal-type_arena-with-gpa-backed-containers-holding-arena-owned-slices" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2C.2 ConstraintSystem mixes an internal type_arena with gpa-backed containers holding arena-owned slices
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2c3-value-graph-teardown-is-faked-by-the-arena-envdeinit-leaks-its-values-masked-by-arena-reclaim" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2C.3 Value-graph teardown is faked by the arena: Env.deinit leaks its values, masked by arena reclaim
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2c4-objref-per-cell-allocator-makes-cross-allocator-graphs-a-latent-double-allocator-hazard" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2C.4 ObjRef per-cell allocator makes cross-allocator graphs a latent double-allocator hazard
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2c5-resolverresolution-duplicate-the-arena-gpa-containers-manual-deinit-pattern-redundantly-resolved-r20" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2C.5 Resolver/Resolution duplicate the "arena + gpa containers + manual deinit" pattern redundantly — RESOLVED (R20)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2c6-vm-construction-does-a-14-field-move-and-leave-empty-dance-to-dodge-double-deinit-out-of-r20-scope-runtime-layer-r16-owned" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2C.6 VM construction does a 14-field "move and leave empty" dance to dodge double-deinit — OUT OF R20 SCOPE (runtime layer, R16-owned)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2c7-vmhostvmintrinsichost-clone-10-objref-roots-with-a-matching-hand-written-deinit-per-call" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2C.7 VmHost/VmIntrinsicHost clone 10 ObjRef roots with a matching hand-written deinit per call
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2d-rust-isms-zig-idioms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D. Rust-isms / Zig idioms
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2D. Rust-isms / Zig idioms">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#2d1-srcirevalhostzig-is-dead-code-712-lines" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D.1 src/ir/eval/host.zig is dead code (712 lines)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2d2-two-parallel-error-as-data-unions-hand-marshalled-at-every-host-boundary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D.2 Two parallel error-as-data unions hand-marshalled at every host boundary
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2d3-40-slot-host-vtable-with-one-real-implementer-three-layers-of-per-slot-boilerplate-resolved-r18" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D.3 ~40-slot Host vtable with one real implementer, three layers of per-slot boilerplate — RESOLVED (R18)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2d4-stdlib-intrinsic-lookup-is-an-on-memeql-scan-over-a-1136-entry-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D.4 Stdlib intrinsic lookup is an O(n) mem.eql scan over a ~1,136-entry table
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2d5-transient-same-thread-hosts-defensively-clone-then-deinit-all-handles-see-2c7" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D.5 Transient same-thread hosts defensively clone-then-deinit all handles — see 2C.7.
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2d6-per-thread-interpreter-state-lives-as-process-global-threadlocal-vars" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D.6 Per-thread interpreter state lives as process-global threadlocal vars
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2d7-boxvalue-boxing-helper-re-implemented-in-7-files" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D.7 Box&lt;Value&gt; boxing helper re-implemented in ~7 files
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2d8-isruntimetype-spins-up-a-16-kb-fixedbufferallocator-per-is-check" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D.8 isRuntimeType spins up a 16 KB FixedBufferAllocator per is check
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2d9-aggregate-boxvalue-fields-cost-two-allocations-two-indirections-per-construction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2D.9 Aggregate Box&lt;Value&gt; fields cost two allocations + two indirections per construction
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-prioritized-remediation-roadmap" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Prioritized remediation roadmap
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Prioritized remediation roadmap">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#tier-0-zero-risk-deletions-and-pure-wins-do-first" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tier 0 — Zero-risk deletions and pure wins (do first)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tier-1-safe-structural-wins-on-the-hot-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tier 1 — Safe structural wins on the hot path
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tier-2-correctness-items-rust-prevented-at-compile-time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tier 2 — Correctness items Rust prevented at compile time
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tier-3-larger-structural-refactors-gated-incremental" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tier 3 — Larger structural refactors (gated, incremental)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-do-not-touch-load-bearing-clones-ownership-that-prevent-real-uaf-or-races" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Do NOT touch — load-bearing clones / ownership that prevent real UAF or races
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/design/analysis/zig-freedoms.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="zig-freedoms-where-the-rustzig-port-can-shed-ported-ownership-machinery">Zig Freedoms: Where the Rust→Zig Port Can Shed Ported Ownership Machinery<a class="headerlink" href="#zig-freedoms-where-the-rustzig-port-can-shed-ported-ownership-machinery" title="Permanent link">&para;</a></h1>
+<p>Read-only analysis. Every claim below is grounded in concrete <code>file:line</code>
+citations against the current Zig source. No source was modified.</p>
+<h2 id="1-executive-summary">1. Executive summary<a class="headerlink" href="#1-executive-summary" title="Permanent link">&para;</a></h2>
+<p>KLIO's runtime is a faithful transliteration of a Rust design built on
+<code>Arc&lt;RefCell&lt;T&gt;&gt;</code>, <code>&amp;mut dyn</code> trait objects, <code>thread_local!</code>, <code>Send</code>/<code>Sync</code>,
+and per-allocation <code>Drop</code>. Rust's borrow checker, lifetimes, and <code>Sync</code>
+global allocator made that machinery <em>safe by construction</em>; Zig has none of
+those constraints. The result is a large body of ported scaffolding that is
+now either <strong>pure runtime overhead</strong>, <strong>dead/duplicated code</strong>, or — in one
+confirmed case (<code>ConstraintSystem</code>'s cross-allocator free) — a <strong>latent
+correctness hazard that Rust's type system used to prevent</strong>. A second item
+that earlier drafts called a "shared-arena data race" (2C.1) turns out to be a
+<strong>non-bug under this toolchain</strong>: Zig 0.16's <code>ArenaAllocator</code> alloc/free path is
+lock-free thread-safe over a thread-safe child allocator, so the worker-shared
+arena is sound today. It is reclassified below as an undocumented invariant to
+guard, not a race to fix.</p>
+<p>The single most important structural fact: the entire runtime — production
+<code>klio run</code> (<code>src/main.zig:5-7</code>) and every integration/parity test
+(<code>src/parity/parity.zig:1119</code>, <code>src/cli/commands.zig:264</code>) — executes on one
+process-lifetime <code>std.heap.ArenaAllocator</code> over the page allocator, freed once
+at exit. Against an arena, <code>allocator.destroy(cell)</code> reclaims nothing, yet
+every <code>ObjRef.clone</code>/<code>deinit</code> still does atomic refcount traffic and every
+<code>Vm.deinit</code> walks the whole value graph. The bulk of the inherited Arc/RefCell
+discipline is dead weight in the dominant configuration.</p>
+<p>The concurrency core, however, is <strong>genuinely load-bearing and sound</strong>. The
+interpreter runs real OS threads in two places — Kotlin <code>thread {}</code>
+(<code>src/stdlib/implementations/concurrent.zig:161</code> → <code>startWorker</code>,
+<code>src/interp_ir/vm/intrinsic_host.zig:827</code>) and dispatched coroutines
+<code>Dispatchers.Default/IO</code> (<code>dispatchCoroutine</code>,
+<code>src/interp_ir/vm/intrinsic_host.zig:950</code>). In both, the child <code>Vm</code> shares the
+<em>same cells</em> as the still-running parent via <code>spawnSeed</code>'s per-handle
+<code>.clone()</code> (<code>src/interp_ir/vm/intrinsic_host.zig:870-890</code>). Concurrent borrow
+of one cell from two threads is real, so the <code>publish()</code>/SHARED-rwlock protocol
+in <code>src/runtime/objcell.zig</code> is exercised and must survive any refactor.</p>
+<p>What is <strong>not</strong> load-bearing is the <em>shape</em> of that support: an adaptive
+dual-mode cell paying an acquire-load-plus-branch on <strong>1,178</strong> single-thread
+borrow sites (verified: <code>988</code> <code>.borrow()</code> + <code>184</code> <code>.borrowMut()</code> + <code>3</code>
+<code>.tryBorrow()</code> + <code>3</code> <code>.tryBorrowMut()</code> across <code>src/</code>), a guard <code>bool</code>+branch on
+every release, an
+O(live-heap) publish walk per spawn, ~6 copies of a 10-handle clone bundle
+(~20 atomics per delegated call), three parallel hand-rolled Arc clones, a
+vestigial <code>Scheduler</code> trait, <code>17</code> process-global <code>threadlocal var</code>s in
+<code>interp_ir/vm</code> (<code>24</code> across all of <code>src/</code>) holding per-<code>Vm</code> state, and a
+712-line orphaned dead-code file.</p>
+<p>The two safest highest-value wins are (a) <strong>borrow-don't-clone the transient
+host bundle</strong> and (b) <strong>delete confirmed-dead code</strong> (the orphan file, the
+<code>Scheduler</code> trait, the no-op <code>fenceAndPublish</code>). One genuine correctness item
+remains — the <strong>cross-allocator free in <code>ConstraintSystem</code></strong> — which Rust's
+<code>'arena</code> lifetime prevented at compile time and should be treated as a latent
+bug, not an optimization. The worker-shared arena (2C.1) is sound under Zig
+0.16 but rests on invariants the code never asserts; it warrants a guard, not a
+rewrite.</p>
+<hr />
+<h2 id="2-per-area-findings">2. Per-area findings<a class="headerlink" href="#2-per-area-findings" title="Permanent link">&para;</a></h2>
+<h3 id="2a-objref-smart-pointer-machinery">2A. ObjRef / smart-pointer machinery<a class="headerlink" href="#2a-objref-smart-pointer-machinery" title="Permanent link">&para;</a></h3>
+<h4 id="2a1-the-adaptive-unsharedshared-cell-taxes-1178-single-thread-borrow-sites">2A.1 The adaptive UNSHARED→SHARED cell taxes 1,178 single-thread borrow sites<a class="headerlink" href="#2a1-the-adaptive-unsharedshared-cell-taxes-1178-single-thread-borrow-sites" title="Permanent link">&para;</a></h4>
+<blockquote>
+<p><strong>Resolved by R15.</strong> The adaptive split is gone: <code>borrow</code>/<code>borrowMut</code> now
+always take the per-cell reader/writer spin-lock. The <code>state</code> byte, the
+non-atomic <code>flag</code>, and the load-plus-branch on every borrow were deleted.
+A/B benchmark showed e2e geomean −0.08% (perf-neutral). The analysis below
+is retained for context.</p>
+</blockquote>
+<p><code>ControlBlock(T)</code> (<code>src/runtime/objcell.zig:95-106</code>) carries <code>refcount</code>
+(<code>atomic(usize)</code>), <code>state</code> (<code>atomic(u8)</code>), <code>flag</code> (<code>isize</code>), a <code>SpinRwLock</code>,
+<code>data</code>, and an <code>allocator</code>. Every <code>tryBorrow</code>/<code>tryBorrowMut</code>
+(<code>src/runtime/objcell.zig:196-227</code>) begins with <code>cell.state.load(.acquire)</code>
+and branches: SHARED → spin rwlock (<code>:203</code>, <code>:221</code>), UNSHARED → the non-atomic
+<code>RefCell</code> <code>flag</code> (<code>:206-209</code>, <code>:224-226</code>). <code>publish()</code> is a release store of
+<code>SHARED</code> (<code>src/runtime/objcell.zig:232-234</code>).</p>
+<p>Verified: <strong>1,178</strong> borrow sites across <code>src/</code> (<code>988</code> <code>.borrow()</code>, <code>184</code>
+<code>.borrowMut()</code>, <code>3</code> <code>.tryBorrow()</code>, <code>3</code> <code>.tryBorrowMut()</code>).
+The acquire-load-plus-branch is paid on all of them even though the SHARED path
+is only ever taken after a real OS thread spawns. In Rust this adaptivity was
+forced — <code>RefCell</code> is <code>!Sync</code>, so the type system <em>required</em> a publish/RwLock
+split. In Zig there is no <code>!Sync</code>; the split is now a pure runtime optimization.</p>
+<p>Soundness note (do NOT regress): the transition is never itself concurrent.
+<code>publish()</code> always runs on the spawning thread <em>before</em> <code>std.Thread.spawn</code>
+(<code>src/interp_ir/vm/intrinsic_host.zig:854-887</code> then <code>:887</code>), so there is no
+torn-<code>flag</code> race. The protocol is correct; only its shape is vestigial.</p>
+<h4 id="2a2-objguardobjguardmut-carry-a-runtime-shared-bool-branched-at-every-release">2A.2 <code>ObjGuard</code>/<code>ObjGuardMut</code> carry a runtime <code>shared: bool</code> branched at every release<a class="headerlink" href="#2a2-objguardobjguardmut-carry-a-runtime-shared-bool-branched-at-every-release" title="Permanent link">&para;</a></h4>
+<blockquote>
+<p><strong>Resolved by R15.</strong> The guard <code>shared: bool</code> and both <code>deinit</code> branches are
+gone; each guard unconditionally releases its reader/writer lock.</p>
+</blockquote>
+<p>Each guard stores <code>shared: bool</code> captured at borrow time
+(<code>src/runtime/objcell.zig:269</code>, <code>:296</code>) and <code>deinit</code> branches on it
+(<code>:277-285</code>, <code>:304-312</code>): SHARED releases the rwlock, UNSHARED
+decrements/clears <code>flag</code>. The bool is the erased tag of the Rust enum that
+unified <code>RefCell</code> borrow tokens with <code>RwLockGuard</code>. It is provably constant for
+a guard's lifetime (publish never runs concurrently with a live borrow). If the
+lock becomes unconditional, the bool and both branches vanish.</p>
+<h4 id="2a3-fenceandpublish-is-a-documented-no-op-kept-as-a-named-seam">2A.3 <code>fenceAndPublish</code> is a documented no-op kept as a "named seam"<a class="headerlink" href="#2a3-fenceandpublish-is-a-documented-no-op-kept-as-a-named-seam" title="Permanent link">&para;</a></h4>
+<p><code>pub inline fn fenceAndPublish() void {}</code> — empty body
+(<code>src/runtime/objcell.zig:316-322</code>). Verified call sites (8):
+<code>src/interp_ir/vm/run.zig:480</code>, <code>src/interp_ir/vm/intrinsic_host.zig:810</code>,
+<code>:861</code>, <code>:922</code>, <code>src/interp_ir/vm/host_impl.zig:116</code>,
+<code>src/stdlib/implementations/concurrent.zig:120</code>, <code>:124</code>, <code>:177</code>. It emits no
+fence; the real happens-before edges come from <code>publish()</code>'s release store
+paired with the acquire load in <code>borrow</code>, plus <code>std.Thread.spawn</code>/<code>join</code>'s own
+ordering. An empty named seam invites a future reader to believe synchronization
+happens there when it does not (and the empty wrapper is exactly the kind of
+AI-tell scaffolding CLAUDE.md warns against). The <code>synchronized</code> enter/exit case
+(<code>concurrent.zig:120-124</code>) is already covered by the <code>SpinMutex</code> acquire/release
+at <code>src/interp_ir/interp_ir.zig:135-146</code>, so the fence calls are genuinely dead.</p>
+<h4 id="2a4-publishdeeppublishenvdeep-walk-the-entire-reachable-graph-on-every-spawn">2A.4 <code>publishDeep</code>/<code>publishEnvDeep</code> walk the entire reachable graph on every spawn<a class="headerlink" href="#2a4-publishdeeppublishenvdeep-walk-the-entire-reachable-graph-on-every-spawn" title="Permanent link">&para;</a></h4>
+<blockquote>
+<p><strong>Resolved by R15.</strong> With the cell's lock unconditional there is no SHARED
+transition to flip, so the publish walk has no purpose. <code>gc_traverse.zig</code>
+(the whole publish walk), <code>value.publishDeep</code>, <code>env.publishEnvDeep</code>, the
+per-spawn publish prelude in <code>startWorker</code>, and the <code>publish()</code>/<code>isShared()</code>
+API were all deleted. Spawning a worker no longer walks the reachable graph.</p>
+</blockquote>
+<p>Before each <code>startWorker</code>, the code walks the escaping block value, the whole
+globals <code>Env</code> chain, every class, and every <code>class_default_outer</code> entry, calling
+<code>.publish()</code> on each reached cell
+(<code>src/interp_ir/vm/intrinsic_host.zig:830-861</code>). The traversal
+(<code>src/runtime/gc_traverse.zig:35-432</code>,
+<code>src/runtime/value.zig:920-925</code>, <code>src/runtime/env.zig:140-149</code>) is a full
+cycle-aware GC-style walk with a per-call <code>seen</code> set, so it is O(total reachable
+cells) per spawn and re-publishes already-published cells on every subsequent
+spawn (the <code>seen</code> set is not persistent). The Rust design needed a one-time deep
+publish to flip every cell to RwLock mode before the graph was observable
+<code>Sync</code>-ly; it over-approximates because missing a cell would be a soundness hole
+in Rust. In Zig, if the cell lock becomes unconditional, <code>publish()</code> is a no-op and the
+publish walk (the <code>publish*</code> traversal at <code>gc_traverse.zig:35-432</code>, within the
+536-line file, plus the per-spawn cost) can be deleted. Verify first that no
+non-<code>publish</code> consumer depends on the same traversal scaffolding: grep confirms
+the only callers of <code>publishDeep</code>/<code>publishEnvDeep</code>/<code>markCell</code> are the spawn path
+in <code>intrinsic_host.zig</code> and <code>workerEntry</code>'s result publication
+(<code>intrinsic_host.zig:813</code>, <code>:818</code>), so deletion is self-contained, but the
+<code>seen</code>-set/visit helpers must be removed together, not piecemeal.</p>
+<h4 id="2a5-three-parallel-hand-rolled-arc-equivalents-reimplement-objrefs-refcount">2A.5 Three parallel hand-rolled Arc-equivalents reimplement ObjRef's refcount<a class="headerlink" href="#2a5-three-parallel-hand-rolled-arc-equivalents-reimplement-objrefs-refcount" title="Permanent link">&para;</a></h4>
+<p><code>SharedOutput</code> (<code>src/interp_ir/interp_ir.zig:154-213</code>), <code>SharedClosures</code>
+(<code>src/interp_ir/interp_ir.zig:230-280</code>), and the runtime's own <code>SharedOutput</code>
+(<code>src/runtime/output.zig:146-213</code>) each hand-roll an <code>Inner</code> struct with
+<code>refcount: atomic(usize)</code>, a <code>SpinMutex</code>, payload, and <code>clone</code>/<code>deinit</code> that
+duplicate <code>ObjRef.clone</code>/<code>deinit</code> line-for-line
+(<code>interp_ir.zig:175-187</code>). There are at least three near-identical <code>SpinMutex</code>
+definitions (<code>src/interp_ir/interp_ir.zig:135</code>, <code>src/runtime/output.zig:119</code>,
+<code>src/stdlib/implementations/concurrent.zig:16</code>) plus the rwlock in objcell.zig.
+By contrast <code>ThreadTable</code> (<code>src/interp_ir/interp_ir.zig:284-296</code>) already <em>is</em>
+<code>ObjRef(AutoHashMap)</code> — the correct pattern. <code>SharedClosures.list</code> is mutex-
+guarded only because closure ids must stay append-stable across threads, which
+is exactly <code>ObjRef(ArrayList)</code> plus the existing rwlock's exclusive borrow.</p>
+<h4 id="2a6-controlblock-stores-a-per-cell-allocator-16-bytes-per-object">2A.6 <code>ControlBlock</code> stores a per-cell <code>allocator</code> (~16 bytes per object)<a class="headerlink" href="#2a6-controlblock-stores-a-per-cell-allocator-16-bytes-per-object" title="Permanent link">&para;</a></h4>
+<p>Every <code>ControlBlock(T)</code> carries <code>allocator: std.mem.Allocator</code>
+(<code>src/runtime/objcell.zig:104</code>) so <code>clone</code>/<code>deinit</code>/<code>borrow</code> need no allocator
+argument (<code>:151-163</code>). The shipped CLI creates all cells from one <code>gpa</code>
+(<code>src/cli/commands.zig:264-266</code>, itself the <code>main</code> arena), so the stored
+allocator is identical in every cell. Rust's <code>Arc&lt;T&gt;</code> stores no allocator
+because the global allocator is implicit; the field is convenience, not
+correctness. <strong>Real tension:</strong> the parity harness wraps the <code>Vm</code> in an arena
+while the CLI uses its own arena, and the coroutine <code>SlotOwners</code> registry uses
+<code>page_allocator</code> — so a single process-global allocator is not currently a safe
+assumption across all entry points (see 2C.4, and the invariant discussion in
+2C.1). Lower priority; flagged for completeness.</p>
+<h4 id="2a7-classdef-wraps-build-time-immutable-structure-in-per-field-objref-cells">2A.7 <code>ClassDef</code> wraps build-time-immutable structure in per-field ObjRef cells<a class="headerlink" href="#2a7-classdef-wraps-build-time-immutable-structure-in-per-field-objref-cells" title="Permanent link">&para;</a></h4>
+<p><strong>RETIRED (R17).</strong> <code>parent</code> is now <code>?ObjRef(ClassDef)</code>; <code>interfaces</code>,
+<code>enum_entries</code>, <code>nested_classes</code>, <code>supertype_delegates</code>, <code>delegate_forwarders</code>
+are plain <code>[]const T</code> arena slices, backpatched once by the two-phase linker
+then read lock-free on the dispatch path. <code>companion</code>/<code>object_singleton</code>/
+<code>enclosing_class</code> stay cells (lazy/out-of-scope). Verified no path mutates the
+six post-link before freezing them. The original analysis below is kept for
+context.</p>
+<p><code>ClassDef.parent</code> is <code>ObjRef(?ObjRef(ClassDef))</code>; <code>interfaces</code>, <code>enum_entries</code>,
+<code>nested_classes</code>, <code>supertype_delegates</code>, <code>delegate_forwarders</code> are
+<code>ObjRef(ArrayList(...))</code>; <code>companion</code>, <code>enclosing_class</code>, <code>object_singleton</code> are
+<code>ObjRef(?ObjRef(...))</code> (<code>src/runtime/class.zig:42-76</code>). Method resolution
+(<code>findMethodWalk</code>, <code>parentClone</code>, <code>src/runtime/class.zig:419-457</code>, <code>:520-531</code>)
+borrows each on every dispatch, and the publish walk recurses through all of
+them (<code>src/runtime/gc_traverse.zig:55-156</code>). Most are populated once during
+<code>build_module</code> and never mutated again (<code>companion</code>/<code>object_singleton</code> are the
+lazy exceptions). In Rust each needed <code>Arc&lt;RefCell&lt;...&gt;&gt;</code> because two-phase class
+linking mutated them after all classes were seen. Post-link they are immutable
+for the rest of the process and could be plain arena slices (like <code>methods</code>/
+<code>primary_params</code> already are at <code>src/runtime/class.zig:21-30</code>), removing them from
+both the dispatch borrow hot path and the publish traversal. This is the single
+biggest reducer of borrow-branch count on dispatch — but it requires reworking
+the two-phase linker to backpatch arena slots instead of <code>borrowMut</code>-ing cells.</p>
+<h3 id="2b-concurrency-coroutines-threads">2B. Concurrency: coroutines + threads<a class="headerlink" href="#2b-concurrency-coroutines-threads" title="Permanent link">&para;</a></h3>
+<h4 id="2b1-the-entire-scheduler-trait-is-vestigial-scaffolding">2B.1 The entire <code>Scheduler</code> trait is vestigial scaffolding<a class="headerlink" href="#2b1-the-entire-scheduler-trait-is-vestigial-scaffolding" title="Permanent link">&para;</a></h4>
+<p><code>Scheduler</code> is a <code>{ctx, vtable}</code> pair with <code>spawn</code>/<code>scheduleResume</code>/
+<code>drainLaunches</code>/<code>drainResumes</code> (<code>src/runtime/host.zig:212-283</code>), a <strong>required</strong>
+VTable slot (<code>src/runtime/host.zig:46</code>), allocated per <code>Vm</code>
+(<code>src/interp_ir/vm/run.zig:54-55</code>), re-allocated per worker
+(<code>src/interp_ir/interp_ir.zig:391</code>), and cloned by pointer into every
+host/seed. Verified: <code>spawn()</code>, <code>drainLaunches()</code>, <code>drainResumes()</code> have <strong>zero
+live callers</strong> outside host.zig's own unit test (<code>src/runtime/host.zig:338-344</code>).
+<code>scheduleResume()</code> has exactly one caller — <code>__kxco_scheduleResume</code>
+(<code>src/kotlinx_coroutines/kotlinx_coroutines.zig:723-728</code>, <code>:802</code>) — and the
+<code>resumes</code> queue it writes is <strong>never drained</strong>. Real launch/resume goes through
+<code>CooperativeInterceptor.enqueueLaunch</code>/<code>ready</code>
+(<code>src/interp_ir/vm/coroutines.zig:391</code>, <code>:297</code>), not the Scheduler. (Note:
+<code>InProcessScheduler</code> also appears in three stdlib <em>test-helper</em> structs at
+<code>src/stdlib/implementations/control.zig:190</code>, <code>result.zig:373</code>,
+<code>comparisons.zig:235</code> — local test scaffolds, not the production resume path.)</p>
+<h4 id="2b2-dispatch_coroutinejoin_dispatched-elasticgated-are-a-no-op-fork-of-spawnjoin">2B.2 <code>dispatch_coroutine</code>/<code>join_dispatched</code> + <code>elastic</code>/<code>gated</code> are a no-op fork of <code>spawn</code>/<code>join</code><a class="headerlink" href="#2b2-dispatch_coroutinejoin_dispatched-elasticgated-are-a-no-op-fork-of-spawnjoin" title="Permanent link">&para;</a></h4>
+<p><code>dispatchCoroutine(block, elastic)</code> calls <code>startWorker(block, elastic,
+gated=true)</code>; <code>spawnOsThread</code> calls <code>startWorker(block, false, false)</code>
+(<code>src/interp_ir/vm/intrinsic_host.zig:827</code>, <code>:950-957</code>). Inside <code>startWorker</code>
+the <code>elastic</code>/<code>gated</code> bits are copied into <code>WorkerArgs</code>
+(<code>src/interp_ir/vm/intrinsic_host.zig:884-885</code>) and <strong>never read</strong> — <code>workerEntry</code>
+(<code>:798-824</code>) just materializes a child <code>Vm</code> and runs the block on a fresh
+<code>std.Thread.spawn</code> with a fixed 64 MiB stack. <code>joinDispatched</code> is literally
+<code>return joinOsThread(self, id)</code>. So <code>Dispatchers.Default</code>, <code>Dispatchers.IO</code>, and a
+raw <code>kotlin.concurrent.thread</code> all do the identical thing: one OS thread per
+call, no pool, no elasticity. Two vtable slots (<code>src/runtime/host.zig:74-78</code>,
+defaults aliasing spawn/join) and two stdlib bindings
+(<code>src/kotlinx_coroutines/kotlinx_coroutines.zig:679-718</code>) sit on a single path.</p>
+<h4 id="2b3-coroutinearmslot-and-coroutineparkslot-are-byte-identical">2B.3 <code>coroutineArmSlot</code> and <code>coroutineParkSlot</code> are byte-identical<a class="headerlink" href="#2b3-coroutinearmslot-and-coroutineparkslot-are-byte-identical" title="Permanent link">&para;</a></h4>
+<p>Both call the same <code>CooperativeInterceptor.setPendingSlot(slot)</code>
+(<code>src/interp_ir/vm/coroutines.zig:848-856</code>, impl at <code>:318-321</code>). Two vtable
+slots (<code>src/runtime/host.zig:66-68</code>), two trampolines
+(<code>src/interp_ir/vm/vmhost.zig:332-340</code>), and two wrappers exist for one
+operation. Only <code>coroutineDisarmSlot</code> (<code>clearPendingSlot</code>) has a genuinely
+distinct caller (<code>src/stdlib/implementations/result.zig:274</code> pairs arm/disarm).</p>
+<h4 id="2b4-coroutine_resume_slot-no-value-duplicates-coroutine_resume_slot_value">2B.4 <code>coroutine_resume_slot</code> (no-value) duplicates <code>coroutine_resume_slot_value</code><a class="headerlink" href="#2b4-coroutine_resume_slot-no-value-duplicates-coroutine_resume_slot_value" title="Permanent link">&para;</a></h4>
+<p><code>resumeSlot(slot)</code> and <code>resumeSlotValue(slot, value)</code> differ only in that the
+former omits the <code>token_resume_value</code> (<code>src/interp_ir/vm/coroutines.zig:329-348</code>,
+<code>:863-879</code>); the drive loop already defaults to <code>Value.Unit</code> when no value was
+posted (<code>:672</code>). Two vtable slots (<code>src/runtime/host.zig:69-70</code>), two stack-scan
+wrappers. Since <code>Value.Unit</code> is a zero-cost tag, resume-no-value <em>is</em>
+resume-with-Unit.</p>
+<h4 id="2b5-cross-thread-resume-routing-has-three-near-parallel-paths-a-never-freed-registry">2B.5 Cross-thread resume routing has three near-parallel paths + a never-freed registry<a class="headerlink" href="#2b5-cross-thread-resume-routing-has-three-near-parallel-paths-a-never-freed-registry" title="Permanent link">&para;</a></h4>
+<p><code>coroutineResumeExternal</code> (<code>src/interp_ir/vm/coroutines.zig:894-923</code>) tries, in
+order: (1) scan this thread's <code>coro_stack</code>; (2) <code>lookupSlotOwner(slot)</code> →
+<code>postResume</code> into the owning driver's <code>DriverWakeup</code> mailbox (the real
+cross-thread case); (3) drain from <code>persisted_parked</code> inline. <code>SlotOwners</code>
+(<code>src/interp_ir/vm/coroutines.zig:136-159</code>) is a process-global <code>AutoHashMap</code>
+whose spine is <code>std.heap.page_allocator</code>-backed; since R14 it is <strong>run-scoped</strong>:
+<code>drainSlotOwners</code> empties it and frees the spine at the run boundary
+(<code>joinAllThreads</code>, after every worker has joined), holding <code>ObjRef(DriverWakeup)</code>
+clones only for the duration of one run. The driver pump
+(<code>src/interp_ir/vm/coroutines.zig:719-739</code>) busy-polls with <code>sleepMillis(1)</code> while
+a worker is pending. The <code>DriverWakeup</code> mailbox is the one genuinely needed
+cross-thread primitive; the never-freed global registry and the 1 ms busy-poll
+are over-built. (Zig 0.16 has no <code>std.Thread.Futex</code> — see toolchain note in §5 —
+so a futex wait is not a drop-in; this caps the realistic improvement here.)</p>
+<h4 id="2b6-fenceandpublish-concurrency-view-see-2a3">2B.6 <code>fenceAndPublish</code> (concurrency view) — see 2A.3.<a class="headerlink" href="#2b6-fenceandpublish-concurrency-view-see-2a3" title="Permanent link">&para;</a></h4>
+<h4 id="2b7-two-spin-lock-implementations-diverge-in-backoff-behavior">2B.7 Two spin-lock implementations diverge in backoff behavior<a class="headerlink" href="#2b7-two-spin-lock-implementations-diverge-in-backoff-behavior" title="Permanent link">&para;</a></h4>
+<p><code>objcell</code>'s <code>SpinRwLock</code> backs off with <code>spinLoopHint</code> + <code>Thread.yield</code>
+(<code>src/runtime/objcell.zig:85-88</code>), while <code>interp_ir</code>'s <code>SpinMutex</code>
+(<code>src/interp_ir/interp_ir.zig:135-146</code>) busy-spins with <strong>only</strong> <code>spinLoopHint</code>
+and no <code>yield</code> — so under contention on a worker thread it can starve a holder on
+the same core. They were written at different times against the same Zig-0.16
+constraint and never reconciled. (See 2A.5 for the refcount-duplication half of
+this.)</p>
+<h4 id="2b8-per-evaluation-host-bundle-clones-10-handles-20-atomicscall-at-6-sites-see-2c7-2d5">2B.8 Per-evaluation host bundle clones 10 handles (~20 atomics/call) at ~6 sites — see 2C.7 / 2D.5.<a class="headerlink" href="#2b8-per-evaluation-host-bundle-clones-10-handles-20-atomicscall-at-6-sites-see-2c7-2d5" title="Permanent link">&para;</a></h4>
+<p>This is the cross-cutting hot-path cost; detailed under memory ownership and
+Rust-isms because the fix is the same <code>SharedState</code>-by-borrow refactor.</p>
+<h3 id="2c-memory-ownership-allocators">2C. Memory ownership / allocators<a class="headerlink" href="#2c-memory-ownership-allocators" title="Permanent link">&para;</a></h3>
+<h4 id="2c1-workers-share-one-process-arena-sound-under-zig-016-but-on-unasserted-invariants">2C.1 Workers share one process arena — sound under Zig 0.16, but on unasserted invariants<a class="headerlink" href="#2c1-workers-share-one-process-arena-sound-under-zig-016-but-on-unasserted-invariants" title="Permanent link">&para;</a></h4>
+<p><code>main</code> builds one <code>std.heap.ArenaAllocator.init(std.heap.page_allocator)</code> and
+threads <code>.allocator()</code> straight through with <strong>no wrapping</strong>
+(<code>src/main.zig:5</code>, <code>src/cli/commands.zig:264-266</code>). <code>vmSpawnChild</code> copies
+<code>self.allocator</code> verbatim into the <code>SendableVmSeed</code>
+(<code>src/interp_ir/vm/run.zig:216-230</code>); <code>workerEntry</code> then <code>materialize()</code>s a
+child <code>Vm</code> <strong>on a brand-new OS thread</strong> (<code>std.Thread.spawn</code>,
+<code>src/interp_ir/vm/intrinsic_host.zig:887</code>) and that thread allocates Values,
+Envs, instance fields, ObjRef control blocks, and calls <code>vm.deinit()</code>
+(<code>src/interp_ir/vm/intrinsic_host.zig:805</code>) — all against the <strong>same shared
+arena</strong>.</p>
+<p>Earlier drafts called this a data race. <strong>It is not, on this toolchain.</strong> Zig
+0.16's <code>ArenaAllocator</code> is documented thread-safe for the <code>Allocator</code> interface
+when its child allocator is thread-safe
+(<code>/config/.local/zig-0.16.0/lib/std/heap/ArenaAllocator.zig:6-7</code>), and the
+<code>alloc</code>/free path is lock-free: it advances <code>end_index</code> with <code>@atomicRmw(.Add,
+.acquire)</code> and reclaims overshoot with a <code>@cmpxchgStrong</code>
+(<code>ArenaAllocator.zig:358-369</code>), and pushes/steals nodes with release/acquire
+<code>@cmpxchg</code>/<code>@atomicRmw</code> (<code>:280</code>, <code>:287-323</code>). The child here is
+<code>std.heap.page_allocator</code>, which is thread-safe. So concurrent allocation <strong>and</strong>
+concurrent <code>destroy</code>/free from two workers are within the documented contract.
+<code>vm.deinit()</code> on the worker only frees ObjRef control blocks via the same
+thread-safe interface — it never touches <code>ArenaAllocator.deinit</code>/<code>.reset</code>
+(the genuinely non-thread-safe methods, <code>ArenaAllocator.zig:50</code>, <code>:67</code>).</p>
+<p>The only <code>ArenaAllocator.deinit</code> is the process-exit <code>defer arena.deinit()</code> in
+<code>main</code> (<code>src/main.zig:6</code>), and <code>Vm.run</code> joins <strong>every</strong> outstanding worker via
+<code>joinAllThreads</code> before returning (<code>src/interp_ir/vm/run.zig:444</code>, <code>:451-481</code>),
+so the non-thread-safe teardown never overlaps a live worker. The model is
+sound today.</p>
+<p>What is missing is any <em>enforcement</em> of the two invariants this soundness rests
+on: (1) the shared backing allocator must be thread-safe, and (2) nothing may
+call <code>.reset()</code>/<code>.deinit()</code> on it while a worker is live. Neither is asserted.
+A future entry point that backs the <code>Vm</code> with a non-thread-safe child (a bare
+<code>FixedBufferAllocator</code>, a single-threaded debug allocator) or that resets an
+arena to reuse it across runs would silently reintroduce a real race. <strong>The
+remedy is a guard, not a wrapper:</strong> see R12 — assert the thread-safety
+precondition at the spawn seam (or, where an entry point cannot guarantee it,
+back the <code>Vm</code> with <code>std.heap.smp_allocator</code>, which <em>is</em> thread-safe in 0.16).
+Note <code>std.heap.ThreadSafeAllocator</code> <strong>does not exist</strong> in this toolchain
+(<code>heap/</code> contains only <code>ArenaAllocator</code>, <code>SmpAllocator</code>, <code>FixedBufferAllocator</code>,
+<code>PageAllocator</code>, <code>BrkAllocator</code>, <code>debug_allocator</code>, <code>memory_pool</code>), so any fix
+prescribing it would fail to compile.</p>
+<h4 id="2c2-constraintsystem-mixes-an-internal-type_arena-with-gpa-backed-containers-holding-arena-owned-slices">2C.2 <code>ConstraintSystem</code> mixes an internal <code>type_arena</code> with gpa-backed containers holding arena-owned slices<a class="headerlink" href="#2c2-constraintsystem-mixes-an-internal-type_arena-with-gpa-backed-containers-holding-arena-owned-slices" title="Permanent link">&para;</a></h4>
+<p><code>ConstraintSystem</code> holds <code>type_arena</code> for every owned <code>Type</code>
+(<code>src/types/constraints.zig:337</code>, <code>:397-399</code>) while <code>bounds</code>, <code>var_names</code>,
+<code>pending</code>, <code>type_pool</code>, <code>equiv</code> are all <code>gpa</code>-backed (init at <code>:369-377</code>).</p>
+<p>Be precise about <em>where</em> the cross-allocator free actually lands. The
+<code>ConstraintSystem.deinit</code> body (<code>:381-395</code>) calls <code>bs.lower.deinit(self.gpa)</code> /
+<code>bs.upper.deinit(self.gpa)</code> (<code>:384-385</code>), but those are <code>ArrayList(Type).deinit</code>
+calls that free only the <strong>list spine</strong> — they never invoke <code>Type.deinit</code> on
+the elements, so no arena-owned <code>Type</code> internal slice is freed there. (There is
+a <em>separate</em> latent smell in the same struct: <code>BoundSet.new</code> appends its seed
+elements with <code>gpa</code> (<code>:98</code>, <code>:102</code>) while <code>addLower</code>/<code>addUpper</code> append with
+<code>arena</code> (<code>:127</code>, <code>:135</code>), yet <code>deinit</code> frees the spine with <code>gpa</code> — a
+spine-allocator mismatch, distinct from the <code>Type</code>-contents free discussed
+here.)</p>
+<p>The confirmed cross-allocator free is narrower and lives in the <code>local_subst</code>
+cleanup path, not in <code>ConstraintSystem.deinit</code>. In
+<code>src/typeck/check/expr_calls.zig</code>, <code>local_subst</code>'s deferred cleanup runs
+<code>t.deinit(self.allocator)</code> over its values (<code>:756-757</code>), and <code>Type.deinit</code> on a
+<code>.TypeParam</code> does <code>allocator.free(name)</code> (<code>src/types/types.zig:190</code>). A
+<code>fresh[1]</code> <code>TypeParam</code> carries an <strong>arena-owned</strong> name, so freeing it through
+<code>self.allocator</code> releases arena memory and corrupts live <code>var_names</code> keys. That
+is the cross-allocator free commit <code>1c03f7bc</code> chased; the fix stores a self-owned
+clone instead — <code>try local_subst.put(name, try fresh[1].clone(self.allocator))</code>
+(<code>src/typeck/check/expr_calls.zig:775</code>, with the explaining comment at
+<code>:770-774</code>). In Rust the <code>'arena</code> lifetime made mixing <code>&amp;'arena Type</code> into a
+<code>self.allocator</code>-freed container a compile error; Zig has no lifetime tracking,
+so the same shape compiles and silently produces a cross-allocator free. <strong>This
+is the one confirmed latent correctness item Rust prevented at compile time.</strong></p>
+<h4 id="2c3-value-graph-teardown-is-faked-by-the-arena-envdeinit-leaks-its-values-masked-by-arena-reclaim">2C.3 Value-graph teardown is faked by the arena: <code>Env.deinit</code> leaks its values, masked by arena reclaim<a class="headerlink" href="#2c3-value-graph-teardown-is-faked-by-the-arena-envdeinit-leaks-its-values-masked-by-arena-reclaim" title="Permanent link">&para;</a></h4>
+<p><code>Env.deinit</code> (<code>src/runtime/env.zig:27-30</code>) only <code>self.vars.deinit()</code>s the HashMap
+<em>spine</em> and recurses into the parent — it <strong>never deinits the <code>Value</code>s stored in
+<code>vars</code></strong>, so every ObjRef bound into an environment is leaked on env teardown.
+<code>Value</code> has no <code>clone</code>/<code>deinit</code> (<code>src/runtime/value.zig:256-296</code>); callers
+hand-balance the lifetime by hand — verified <code>229</code> <code>.clone()</code> and <code>1,045</code>
+<code>.deinit()</code> call sites under <code>src/interp_ir/vm/</code> (the whole <code>src/interp_ir/</code>
+crate has <code>229</code>/<code>1,161</code>). In production all of this is harmless because everything is the
+arena; the unit tests are also wrapped in a per-run arena
+(<code>src/parity/parity.zig:1119</code>), so the leak is invisible. The elaborate
+per-node refcount discipline does real work but the leaf Values it forgets to
+free never matter because the arena reclaims them wholesale. The discipline is a
+direct port of Rust <code>Clone</code>/<code>Drop</code> (the comment at <code>src/runtime/objcell.zig:113-118</code>
+names "the Rust <code>Clone</code>/<code>Drop</code> discipline"); Rust's <code>HashMap&lt;String,Value&gt;</code>
+dropped its values for free, so no <code>Env::deinit</code> body was needed, and the Zig
+port dropped the value-drop on the floor.</p>
+<h4 id="2c4-objref-per-cell-allocator-makes-cross-allocator-graphs-a-latent-double-allocator-hazard">2C.4 <code>ObjRef</code> per-cell allocator makes cross-allocator graphs a latent double-allocator hazard<a class="headerlink" href="#2c4-objref-per-cell-allocator-makes-cross-allocator-graphs-a-latent-double-allocator-hazard" title="Permanent link">&para;</a></h4>
+<p>Each <code>ControlBlock(T)</code> captures its <code>allocator</code> at <code>init</code>
+(<code>src/runtime/objcell.zig:104</code>, <code>:128-163</code>). A value graph can therefore freely
+mix cells from different allocators with no record at the graph level. The
+coroutine <code>SlotOwners</code> registry is process-global with a <code>page_allocator</code>-backed
+spine (<code>src/interp_ir/vm/coroutines.zig:144-159</code>), holding <code>ObjRef(DriverWakeup)</code>
+clones — and a <code>DriverWakeup</code> cell is itself arena-backed (minted from the Vm's
+allocator). This was a real latent cross-run UAF under the in-process harnesses:
+an error/abort path could leave a slot registered (register/unregister was not
+balanced on the <code>driveRoot</code> error <code>coroPop</code> paths), and the next program's arena
+reset reused the cell the stale clone pointed at. <strong>R14 fixed it</strong> by run-scoping
+the registry — <code>drainSlotOwners</code> empties the map and frees the spine at the run
+boundary (after every worker has joined), so no entry can survive a run. The
+broader <code>ObjRef</code>-per-cell-allocator observation (a value graph may still mix cells
+from different allocators with no graph-level record) stands as a lower-priority
+hygiene note.</p>
+<h4 id="2c5-resolverresolution-duplicate-the-arena-gpa-containers-manual-deinit-pattern-redundantly-resolved-r20">2C.5 Resolver/Resolution duplicate the "arena + gpa containers + manual deinit" pattern redundantly — RESOLVED (R20)<a class="headerlink" href="#2c5-resolverresolution-duplicate-the-arena-gpa-containers-manual-deinit-pattern-redundantly-resolved-r20" title="Permanent link">&para;</a></h4>
+<p>The resolver now allocates every container and string from the single
+driver-owned arena it is handed; the child <code>*ArenaAllocator</code>, the
+<code>Resolution.deinit</code>/<code>Scope.deinit</code> bodies, and the <code>arena</code>/<code>allocator</code> result
+fields are deleted. Same shape applied to the type checker (<code>TypeCheck</code>/
+<code>Checker</code>/<code>ClassInfo</code> deinits gone). Original finding kept for reference:</p>
+<p><code>Resolver.init</code> creates a <em>child</em> <code>ArenaAllocator.init(allocator)</code>
+(<code>src/resolver/resolver.zig:288-307</code>) for resolver-owned strings while keeping
+<code>scopes</code>/<code>symbols</code>/<code>uses</code>/<code>diagnostics</code>/<code>fn_sig_keys</code> on the passed allocator.
+<code>Resolution.deinit</code> (<code>:124-138</code>) manually deinits each gpa container AND calls
+<code>self.arena.deinit()</code> AND <code>gpa.destroy(arena)</code>. In production <code>runCheck</code> passes
+the main arena (<code>src/cli/commands.zig:113-114</code>), so the child arena is
+arena-nested-in-arena and the manual deinits no-op. The split exists solely so
+unit tests with <code>testing.allocator</code> can leak-check.</p>
+<h4 id="2c6-vm-construction-does-a-14-field-move-and-leave-empty-dance-to-dodge-double-deinit-out-of-r20-scope-runtime-layer-r16-owned">2C.6 VM construction does a 14-field "move and leave empty" dance to dodge double-deinit — OUT OF R20 SCOPE (runtime layer, R16-owned)<a class="headerlink" href="#2c6-vm-construction-does-a-14-field-move-and-leave-empty-dance-to-dodge-double-deinit-out-of-r20-scope-runtime-layer-r16-owned" title="Permanent link">&para;</a></h4>
+<p>This <code>vmFromBuilt</code> dance lives in the <code>interp_ir</code> VM/<code>ProgramImage</code> layer, not
+a compiler phase; it is tied to the per-cell <code>ObjRef</code> allocator and the R16
+<code>reclaim=false</code> gate (which already makes the <code>BuiltModule</code>/<code>Vm</code> teardown a
+no-op on arena-backed runs). R20 covered the compiler phases (resolver/typeck)
+only. Original finding kept for reference:</p>
+<p><code>vmFromBuilt</code> (<code>src/interp_ir/vm/run.zig:78-175</code>) transfers ~14 side tables from
+<code>BuiltModule</code> into the <code>ProgramImage</code> by, for each, deinit-ing the destination's
+empty map, assigning the source, then reassigning the source to a fresh empty map
+so <code>BuiltModule.deinit</code> no-ops it (e.g. <code>body_prop_inits</code> at <code>:109-111</code>, repeated
+for <code>instance_prop_getters</code>, <code>parent_ctor_args</code>, <code>init_blocks</code>, <code>extension_props</code>,
+<code>secondary_ctors</code>, <code>func_defaults</code>, plus <code>classes</code> at <code>:80-85</code> and
+<code>enum_entry_arg_inits</code> at <code>:89-91</code>). Each is a place where forgetting the
+"leave empty" step is a double-free and forgetting the destination deinit is a
+leak; all are safe today only because the arena tolerates either mistake. This is
+the Zig hand-encoding of Rust's by-value <code>move</code> (the comments say so).</p>
+<h4 id="2c7-vmhostvmintrinsichost-clone-10-objref-roots-with-a-matching-hand-written-deinit-per-call">2C.7 <code>VmHost</code>/<code>VmIntrinsicHost</code> clone 10 ObjRef roots with a matching hand-written deinit per call<a class="headerlink" href="#2c7-vmhostvmintrinsichost-clone-10-objref-roots-with-a-matching-hand-written-deinit-per-call" title="Permanent link">&para;</a></h4>
+<p><code>vmHost</code>/<code>childHost</code>/<code>spawnSeed</code> (<code>src/interp_ir/vm/intrinsic_host.zig:56-137</code>,
+verified verbatim) and <code>vmMakeHost</code>/<code>vmRunThreadBlock</code>
+(<code>src/interp_ir/vm/run.zig:196-264</code>) each <code>.clone()</code> <strong>10</strong> ObjRef handles
+(<code>globals</code>, <code>module</code>, <code>instance_id_counter</code>, <code>classes</code>, <code>prog</code>, <code>anon_methods</code>,
+<code>class_default_outer</code>, <code>closures</code>, <code>out_sink</code>, <code>threads</code>) and a matching <code>deinit</code>
+drops them (<code>vmHost</code> <code>:58-69</code>, <code>vmHostDeinit</code> <code>:75-86</code>). The <code>scheduler</code> and
+<code>allocator</code> fields are plain value copies, <strong>not</strong> clones (<code>:60</code>, <code>:70</code>), so they
+add no atomic traffic. The same ~10-line clone block and ~10-line deinit block
+appear at <strong>~6 sites</strong>, twice inlined into eval paths
+(<code>src/interp_ir/vm/intrinsic_host.zig:291-326</code>). A single delegated lambda call
+is therefore ~20 atomic refcount ops (10 <code>fetchAdd</code> on clone + 10 <code>fetchSub</code> on
+deinit) purely to build and tear down the host shell; a <code>list.map { }</code> over N
+elements pays that per element. Each transient host lives strictly within the
+parent's lifetime and never escapes — the clones buy nothing. Only the
+genuinely-escaping <code>spawnSeed</code>/<code>WorkerArgs</code> case must actually clone for
+ownership.</p>
+<h3 id="2d-rust-isms-zig-idioms">2D. Rust-isms / Zig idioms<a class="headerlink" href="#2d-rust-isms-zig-idioms" title="Permanent link">&para;</a></h3>
+<h4 id="2d1-srcirevalhostzig-is-dead-code-712-lines">2D.1 <code>src/ir/eval/host.zig</code> is dead code (712 lines)<a class="headerlink" href="#2d1-srcirevalhostzig-is-dead-code-712-lines" title="Permanent link">&para;</a></h4>
+<p>Verified: <code>grep -rn "eval/host" src/</code> returns zero references outside the file
+itself; <code>src/ir/ir.zig:22</code> exports only <code>eval = @import("eval.zig")</code>, and
+<code>eval.zig</code> redefines its own live <code>Host</code>, <code>EvalError</code> (with an extra <code>Suspended</code>
+variant), and <code>nullHost</code>. The orphan defines a 40-slot <code>Host</code> vtable, an
+8-variant <code>EvalError</code>, the result wrappers, <code>NullHost</code>, and ~130 lines of tests
+— a complete, silently-diverging second copy left behind during the port. It
+already lacks <code>Suspended</code> and uses the old <code>*const TypeRef</code> slot shape.</p>
+<h4 id="2d2-two-parallel-error-as-data-unions-hand-marshalled-at-every-host-boundary">2D.2 Two parallel error-as-data unions hand-marshalled at every host boundary<a class="headerlink" href="#2d2-two-parallel-error-as-data-unions-hand-marshalled-at-every-host-boundary" title="Permanent link">&para;</a></h4>
+<p><code>runtime.RuntimeError</code> (<code>src/runtime/value.zig:1322-1355</code>) and <code>ir.eval.EvalError</code>
+(<code>src/ir/eval.zig:82-116</code>) structurally overlap (Type/Arity/Unbound/
+Unimplemented/Throw/Return/control-flow/suspend variants). The VM hand-writes
+converters — <code>runtimeErrorToEval</code>, <code>runtimeErrorFromEval</code>, <code>mapRuntimeError</code>,
+<code>mapDriverErr</code> — that switch over every variant at each crossing
+(<code>src/interp_ir/vm/host_call_func.zig:179-199</code>,
+<code>src/interp_ir/vm/host_call_member.zig:227</code>,
+<code>src/interp_ir/vm/intrinsic_host.zig:146</code>,
+<code>src/interp_ir/vm/coroutines.zig:588</code>). The two enums must be kept in lockstep by
+hand. (The error-as-data shape itself is <em>required</em> — control-flow signals carry
+<code>Value</code> payloads a Zig <code>error{}</code> set can't — so keep that; only the duplicate
+enum + converters are removable.)</p>
+<h4 id="2d3-40-slot-host-vtable-with-one-real-implementer-three-layers-of-per-slot-boilerplate-resolved-r18">2D.3 ~40-slot <code>Host</code> vtable with one real implementer, three layers of per-slot boilerplate — RESOLVED (R18)<a class="headerlink" href="#2d3-40-slot-host-vtable-with-one-real-implementer-three-layers-of-per-slot-boilerplate-resolved-r18" title="Permanent link">&para;</a></h4>
+<p>The evaluator is now generic over <code>comptime H: type</code> and calls
+<code>host.method(...)</code> as plain comptime-duck-typed methods; the <code>{ctx, vtable}</code>
+pair, the 36-slot <code>VTable</code>, the per-slot wrapper methods, and the <code>vt*</code>
+trampolines + <code>host_vtable</code> literal in <code>vmhost.zig</code> are deleted. <code>VmHost</code>
+aliases the sibling free functions as method decls; <code>NullHost</code> is a concrete
+second host type carrying the former vtable defaults. The layering is
+unchanged (<code>ir</code> parametric over <code>H</code>, <code>VmHost</code> supplied at the <code>interp_ir</code>
+call site) and verified by <code>zigcheck.py ir</code> passing standalone. Original
+finding kept for reference:</p>
+<p><code>ir.eval.Host</code> is a <code>{ctx, vtable}</code> pair (<code>src/ir/eval.zig:2500</code>) whose
+<code>VTable</code> declares <strong>41</strong> optional fn-pointer slots
+(<code>src/ir/eval.zig:2504-2546</code>), with the dispatch wrappers following at
+<code>:2549-2900</code>. The sole production implementer is <code>VmHost</code>; <code>nullHost</code> covers
+tests. Wiring takes three artifacts per slot: the free fn over <code>*VmHost</code> in a
+<code>host_*.zig</code> sibling, a <code>vt*</code> trampoline in <code>src/interp_ir/vm/vmhost.zig:131-292</code>
+doing <code>@ptrCast(@alignCast(ctx))</code> + forward (~161 lines of pure forwarding,
+ending at the <code>host_vtable</code> literal <code>:252-292</code>), and the <code>host_vtable</code> literal
+entry.
+Self-recursive dispatch rebuilds a fresh <code>Host</code> pair at ~41 sites. This is Rust's
+<code>dyn Host</code> (the dependency arrow is <code>interp_ir → ir</code>, never the reverse — the
+inversion is real and worth keeping). With one impl, the runtime vtable is
+unnecessary: making the evaluator generic over the host type
+(<code>pub fn eval(comptime H: type, host: *H, ...)</code>) keeps the boundary, deletes the
+trampolines and vtable literal, and turns recursive calls direct.</p>
+<h4 id="2d4-stdlib-intrinsic-lookup-is-an-on-memeql-scan-over-a-1136-entry-table">2D.4 Stdlib intrinsic lookup is an O(n) <code>mem.eql</code> scan over a ~1,136-entry table<a class="headerlink" href="#2d4-stdlib-intrinsic-lookup-is-an-on-memeql-scan-over-a-1136-entry-table" title="Permanent link">&para;</a></h4>
+<p><code>implementations.lookup(fqn)</code> and <code>lookupParamNames(fqn)</code>
+(<code>src/stdlib/implementations.zig:1198-1210</code>) loop over <code>TABLE</code> / <code>PARAM_NAMES</code>
+doing <code>std.mem.eql</code> per entry. Called on the hot path for every qualified-call
+and builtin-member dispatch (<code>src/interp_ir/vm/host_call_member.zig:161-169</code>), so
+resolving <code>"hi".uppercase()</code> can walk ~1,100 string compares. The keys are all
+comptime string literals — a <code>std.StaticStringMap</code> built via <code>.initComptime</code>
+makes lookups hashed with the table as the single source of truth. Pure win, no
+behavior change, isolated to one file.</p>
+<h4 id="2d5-transient-same-thread-hosts-defensively-clone-then-deinit-all-handles-see-2c7">2D.5 Transient same-thread hosts defensively clone-then-deinit all handles — see 2C.7.<a class="headerlink" href="#2d5-transient-same-thread-hosts-defensively-clone-then-deinit-all-handles-see-2c7" title="Permanent link">&para;</a></h4>
+<h4 id="2d6-per-thread-interpreter-state-lives-as-process-global-threadlocal-vars">2D.6 Per-thread interpreter state lives as process-global <code>threadlocal var</code>s<a class="headerlink" href="#2d6-per-thread-interpreter-state-lives-as-process-global-threadlocal-vars" title="Permanent link">&para;</a></h4>
+<p>Verified <strong>17</strong> <code>threadlocal var</code>s in <code>src/interp_ir/vm</code> (<code>24</code> across all of
+<code>src/</code>) holding resolution/coroutine/init state:
+<code>in_progress</code> (<code>src/interp_ir/vm/host_impl.zig:28</code>, with manual <code>page_allocator</code>
+dupe/free of keys at <code>:66-67</code>, <code>:37</code>), <code>member_only_probe</code>/<code>map_fallback_active</code>/
+<code>iterable_fallback_active</code>/<code>outer_this</code>
+(<code>src/interp_ir/vm/host_call_member.zig:54-65</code>), <code>coro_stack</code>/<code>active_scope_stack</code>/
+<code>persisted_parked</code> (<code>src/interp_ir/vm/coroutines.zig:514-527</code>),
+<code>ctor_guard</code>/<code>top_level_init_depth</code> (<code>src/interp_ir/vm/host_globals.zig:54-55</code>),
+<code>ctor_guard</code>/<code>inner_outer_hint</code> (<code>src/interp_ir/vm/host_instances.zig:61-62</code>),
+<code>field_resolve_stack</code>/<code>field_outer_active</code>/<code>cc_explicit_read</code>
+(<code>src/interp_ir/vm/host_fields.zig:62-70</code>). Several allocate from
+<code>std.heap.page_allocator</code> because a threadlocal can't reach the per-eval
+allocator; <code>outerThisStack</code> leaks a page-allocator ArrayList
+(<code>src/interp_ir/vm/host_call_member.zig:69</code>). This is a direct port of Rust
+<code>thread_local!</code>, but each worker already materializes its own <code>Vm</code>/<code>VmHost</code>
+(<code>spawnSeed</code>/<code>materialize</code>), so this is per-instance state masquerading as global.</p>
+<p><strong>R11 progress.</strong> The one true bug is fixed: <code>in_progress</code> (<code>host_impl.zig</code>)
+leaked its hash-map bucket backing per thread-lifetime, on top of the manual
+<code>page_allocator</code> per-key dupe/free. <code>in_progress</code> is now an
+<code>ArrayListUnmanaged([]const u8)</code> of the program-image-owned (run-stable) key
+slices, page-allocator backed and <code>clearRetainingCapacity</code>-reset at the run
+boundary through <code>resetReceiverTls</code>, exactly like its sibling guards
+(<code>field_resolve_stack</code>, <code>ctor_guard</code>, <code>inner_outer_hint</code>). No bucket array, no
+per-key copy, so nothing leaks and the cycle-breaking semantics (a re-entrant
+read of a still-initializing top-level prop returns <code>null</code>) are unchanged.</p>
+<p>The broader move (onto <code>Vm</code>/<code>VmHost</code>) is NOT as safe as §2D.6 first assumed:
+after R6, <code>VmHost</code>/<code>VmIntrinsicHost</code> are transient borrowed value-types rebuilt
+per call (<code>VmHost.borrowed</code> from <code>SharedHandles</code>, with no back-pointer to the
+owning <code>Vm</code>), so a field on the host would not survive across a re-entrant
+synchronous call stack, which is the exact thing each guard exists to detect. A
+field on <code>Vm</code> would survive (one <code>Vm</code> per thread), but reaching it from the
+sibling free functions would mean threading a handle through
+<code>SharedHandles</code>/<code>borrowed</code>/the seed and every ad-hoc
+<code>VmHost{...}</code>/<code>VmIntrinsicHost{...}</code> literal, and the <code>eval.zig</code> guards
+(<code>eval_depth</code>, <code>active_chain</code>) live a layer below <code>interp_ir</code> where <code>Vm</code> is not
+even visible. The guards are also deliberately page-allocator backed and
+capacity-retained across runs (a per-run-arena backing would dangle the retained
+capacity once that arena is torn down). So the remaining guards stay
+thread-local: correct re-entrancy detection on a per-thread call stack with no
+leak, and <code>active_chain</code> stays per-thread as item 6 already established.</p>
+<h4 id="2d7-boxvalue-boxing-helper-re-implemented-in-7-files">2D.7 <code>Box&lt;Value&gt;</code> boxing helper re-implemented in ~7 files<a class="headerlink" href="#2d7-boxvalue-boxing-helper-re-implemented-in-7-files" title="Permanent link">&para;</a></h4>
+<p><code>Pair</code>/<code>Triple</code>/<code>MapEntry</code>/<code>Result</code>/<code>Exception</code>/<code>Generate</code>/<code>BoundMethod</code> store
+<code>*Value</code> (verified: <code>src/runtime/value.zig:200</code>, <code>:308</code>, <code>:319</code>, <code>:348</code>, <code>:350</code>,
+<code>:353-354</code>, <code>:361</code>), filled by an <code>allocator.create(Value)</code>+assign idiom. The
+duplication is in two forms. <strong>Three</strong> are named private helpers:
+<code>boxValue</code> (<code>src/stdlib/implementations/exceptions.zig:94</code>,
+<code>src/stdlib/implementations/result.zig:38</code>) and <code>box</code>
+(<code>src/stdlib/implementations/collections.zig:76</code>). (The same-named <code>box</code> in
+<code>src/parser/control.zig:84</code>, <code>src/parser/primary.zig:31</code>, and
+<code>src/types/types.zig:684</code> box <code>Expr</code>/<code>Type</code>, not <code>Value</code>, and are unrelated.)
+The remaining sites inline the <code>create(Value)</code>+assign directly:
+<code>src/stdlib/implementations/sequence.zig:322</code>, <code>:333</code>, <code>:337</code>,
+<code>src/interp_ir/vm/coroutines.zig:888</code>,
+<code>src/kotlinx_coroutines/kotlinx_coroutines.zig:343</code>, <code>:355</code>,
+<code>src/interp_ir/vm/host_call_member.zig:2095-2097</code>. One
+<code>pub fn box(allocator, v)</code> in <code>runtime.value</code> (next to <code>newCell</code>) replaces the
+three named helpers and the simple inline sites mechanically; the inline sites
+that box two fields inside a loop (the <code>host_call_member.zig:2095-2097</code>
+map-entry pair, the <code>sequence.zig</code> <code>generate</code> step) need the call applied
+per-field, so those few are not a blind find-and-replace.</p>
+<h4 id="2d8-isruntimetype-spins-up-a-16-kb-fixedbufferallocator-per-is-check">2D.8 <code>isRuntimeType</code> spins up a 16 KB <code>FixedBufferAllocator</code> per <code>is</code> check<a class="headerlink" href="#2d8-isruntimetype-spins-up-a-16-kb-fixedbufferallocator-per-is-check" title="Permanent link">&para;</a></h4>
+<p><code>Value.isRuntimeType</code> for <code>.Instance</code> (<code>src/runtime/value.zig:747-759</code>) declares
+<code>var buf: [16*1024]u8</code> on the stack and builds a <code>FixedBufferAllocator</code> over it
+for the subtype-walk frontier on every <code>is</code>/<code>as</code>/<code>when</code>-is check, "to avoid
+threading [an allocator] through the predicate." A 16 KB stack-frame spike on a
+hot path; thread the run arena or hold a small reusable host scratch buffer.</p>
+<h4 id="2d9-aggregate-boxvalue-fields-cost-two-allocations-two-indirections-per-construction">2D.9 Aggregate <code>Box&lt;Value&gt;</code> fields cost two allocations + two indirections per construction<a class="headerlink" href="#2d9-aggregate-boxvalue-fields-cost-two-allocations-two-indirections-per-construction" title="Permanent link">&para;</a></h4>
+<p><code>Pair{first:*Value,second:*Value}</code> (<code>src/runtime/value.zig:348</code>) and
+<code>Triple{first,second,third:*Value}</code> (<code>:350</code>) each require a separate
+<code>allocator.create(Value)</code> per field (<code>src/stdlib/implementations/collections.zig:77</code>,
+<code>result.zig:39</code>). Replacing the multi-field box with one pointer to a small inline
+array (<code>Pair</code> → <code>*[2]Value</code>, <code>Triple</code> → <code>*[3]Value</code>) halves boxing allocations and
+indirections while preserving the recursive-type break. <code>MapEntry</code>
+(<code>:352-357</code>) is <strong>not</strong> a clean candidate: it carries a third <code>backing:
+?MapEntries</code> field and <code>setValue</code> writes through <code>value</code> against the live map,
+so its two <code>*Value</code> fields are not interchangeable array slots — leave it as
+distinct boxed fields. <strong>Do NOT inline any of these fully into the union</strong> —
+that is the one thing the box legitimately prevents (it would blow up
+<code>@sizeOf(Value)</code>).</p>
+<hr />
+<h2 id="3-prioritized-remediation-roadmap">3. Prioritized remediation roadmap<a class="headerlink" href="#3-prioritized-remediation-roadmap" title="Permanent link">&para;</a></h2>
+<p>Sequenced safest-and-highest-value first. Every item must keep <code>zig build test</code>
+(135 steps / 1,506 tests) green and the 79/79 e2e corpus byte-identical;
+benchmark single-thread items against the bench suite (the e2e corpus <em>is</em> the
+single-thread path — a regression there is what breaks green). Verify a module
+with <code>python3 scripts/zigcheck.py &lt;mod&gt;</code>.</p>
+<h3 id="tier-0-zero-risk-deletions-and-pure-wins-do-first">Tier 0 — Zero-risk deletions and pure wins (do first)<a class="headerlink" href="#tier-0-zero-risk-deletions-and-pure-wins-do-first" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Item</th>
+<th>Impact</th>
+<th>Risk</th>
+<th>Effort</th>
+<th>Deps</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R1</td>
+<td><strong>Delete <code>src/ir/eval/host.zig</code></strong> (712 lines, unreferenced; 2D.1)</td>
+<td>medium</td>
+<td>low</td>
+<td>S</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R2</td>
+<td><strong><code>std.StaticStringMap</code> for stdlib lookup</strong> (2D.4)</td>
+<td>medium</td>
+<td>low</td>
+<td>S</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R3</td>
+<td><strong>Delete <code>fenceAndPublish</code> + its 8 call sites</strong> (replace with <code>///</code> where the seam matters; 2A.3)</td>
+<td>low</td>
+<td>low</td>
+<td>S</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R4</td>
+<td><strong>Centralize <code>box(allocator, v)</code> helper</strong> in <code>runtime.value</code>; replace 7 copies (2D.7)</td>
+<td>low</td>
+<td>low</td>
+<td>S</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R5</td>
+<td><strong>Give <code>SpinMutex</code> the same <code>spinLoopHint</code>+<code>Thread.yield</code> backoff</strong> as <code>SpinRwLock</code> (2B.7) — one-line anti-livelock fix</td>
+<td>low</td>
+<td>low</td>
+<td>S</td>
+<td>none</td>
+</tr>
+</tbody>
+</table>
+<p>These are isolated, mechanically verifiable, and cannot regress the suite.</p>
+<h3 id="tier-1-safe-structural-wins-on-the-hot-path">Tier 1 — Safe structural wins on the hot path<a class="headerlink" href="#tier-1-safe-structural-wins-on-the-hot-path" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Item</th>
+<th>Impact</th>
+<th>Risk</th>
+<th>Effort</th>
+<th>Deps</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R6</td>
+<td><strong>Borrow-don't-clone the transient host bundle</strong> (2C.7 / 2D.5 / 2B.8): introduce one <code>SharedState</code> the host points at; transient <code>vmHost</code>/<code>childHost</code>/<code>vmMakeHost</code> copy by value WITHOUT refcount bump; <code>spawnSeed</code> keeps real clones. Removes ~20 atomics/delegated call, collapses 6 duplicated clone/deinit blocks.</td>
+<td>high</td>
+<td>medium</td>
+<td>M</td>
+<td>none (safest large win — do first in tier)</td>
+</tr>
+<tr>
+<td>R7</td>
+<td><strong>Delete the <code>Scheduler</code> trait</strong> + <code>InProcessScheduler</code> + the <code>scheduler</code> vtable slot/field; make <code>__kxco_scheduleResume</code> a no-op or route through <code>coroutineResumeExternal</code> (2B.1). Confirm the Kotlin shim never relies on a drained resume queue (nothing drains it).</td>
+<td>high</td>
+<td>low</td>
+<td>M</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R8</td>
+<td><strong>Collapse <code>dispatch_coroutine</code>/<code>join_dispatched</code> into spawn/join</strong>; drop <code>elastic</code>/<code>gated</code> (2B.2).</td>
+<td>medium</td>
+<td>low</td>
+<td>M</td>
+<td>R7 (same vtable)</td>
+</tr>
+<tr>
+<td>R9</td>
+<td><strong>Merge <code>coroutine_park_slot</code>→<code>coroutine_arm_slot</code></strong> and <strong><code>coroutine_resume_slot</code>→<code>coroutine_resume_slot_value</code></strong> (pass <code>Value.Unit</code>) (2B.3, 2B.4).</td>
+<td>low</td>
+<td>low</td>
+<td>S</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R10</td>
+<td><strong>Fold <code>SharedOutput</code>/<code>SharedClosures</code> onto <code>ObjRef(T)</code></strong> (like <code>ThreadTable</code> already is); unify to one <code>SpinMutex</code> definition (2A.5).</td>
+<td>medium</td>
+<td>low</td>
+<td>M</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R11</td>
+<td><strong>Move per-thread <code>threadlocal var</code>s onto <code>VmHost</code>/<code>Vm</code></strong> (or a per-eval <code>ResolveCtx</code>), arena-backed; deletes the <code>in_progress</code> page_allocator dupe/free and the <code>outerThisStack</code> leak (2D.6, also 2C.4-adjacent).</td>
+<td>medium</td>
+<td>medium</td>
+<td>L</td>
+<td>R6 (host struct in flux)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tier-2-correctness-items-rust-prevented-at-compile-time">Tier 2 — Correctness items Rust prevented at compile time<a class="headerlink" href="#tier-2-correctness-items-rust-prevented-at-compile-time" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Item</th>
+<th>Impact</th>
+<th>Risk</th>
+<th>Effort</th>
+<th>Deps</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R12</td>
+<td><strong>Assert the worker-shared allocator's thread-safety precondition at the spawn seam</strong> (2C.1) — <em>not</em> a <code>ThreadSafeAllocator</code> wrap (that type does not exist in Zig 0.16). The arena alloc/free path is already lock-free thread-safe over <code>page_allocator</code>, so this is a guard, not a fix: document the two invariants (thread-safe child allocator; no <code>.reset()</code>/<code>.deinit()</code> while a worker is live) and add a debug assert at <code>vmSpawnChild</code>/<code>workerEntry</code>. For any entry point that cannot guarantee a thread-safe child, back the <code>Vm</code> with <code>std.heap.smp_allocator</code>.</td>
+<td>low</td>
+<td>low</td>
+<td>S</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R13</td>
+<td><strong>Collapse <code>ConstraintSystem</code> to a single ownership story</strong> — make all container storage arena-owned and delete the per-field <code>gpa</code> deinit (option a), removing the cross-allocator-free class entirely and making the defensive <code>clone(self.allocator)</code> at <code>expr_calls.zig:775</code> unnecessary; also reconcile the <code>BoundSet</code> spine-allocator mismatch (<code>gpa</code> seed append vs <code>arena</code> later appends, <code>gpa</code> deinit) (2C.2).</td>
+<td>high</td>
+<td>medium</td>
+<td>M</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R14</td>
+<td><strong>DONE.</strong> Run-scoped the process-global <code>SlotOwners</code> registry (option b). <strong>Found a real latent cross-run UAF:</strong> <code>setPendingSlot</code>→<code>registerSlotOwner</code> stores an <code>ObjRef(DriverWakeup)</code> clone, and <code>DriverWakeup</code> is created from the Vm's allocator (<code>CooperativeInterceptor.new</code> → <code>DriverWakeup.new(allocator)</code>), i.e. the <strong>per-program arena</strong> under the in-process e2e/parity/differential harnesses. register/unregister was <strong>NOT balanced on every path</strong>: the four error/early-return <code>coroPop</code> sites in <code>driveRoot</code> (a root that <code>.Throw</code>s / <code>NonLocalReturn</code>s / hits any non-suspend error while a slot is still armed) pop+deinit the interceptor but never call <code>releaseOwnedSlots</code>, so the registry kept a clone of the arena-backed wakeup after the run ended. The harness then <code>arena.reset(.retain_capacity)</code>s under <code>reclaim=false</code> (no cell deinit), so the surviving clone dangles into reused arena memory — a later <code>lookupSlotOwner</code>/<code>deinit</code> on it is a UAF (a stubbed-drain negative test segfaults deterministically, confirming UAF not hygiene). Fix: <code>SlotOwners.drainAll</code>/<code>drainSlotOwners</code> empties the map and frees its <code>page_allocator</code> spine; called from <code>joinAllThreads</code> (the one run-boundary seam that runs only on the top-level driver thread, after every worker has joined — workers go through <code>vmRunThreadBlock</code>, which never reaches it), so the defensive sweep balances <code>registerSlotOwner</code> on <strong>all</strong> paths incl. error/abort/cancel/worker-error and reclaims the per-run map capacity. Worker→driver resume routing is unchanged: register/lookup/unregister behave identically during a run; the wakeup mailbox cell + R15 rwlock are untouched (no publish reintroduced). Net +49 LOC. Gates: <code>zig build test</code> 139/139 steps · 1521/1521 tests · 0 skips; <code>corpus_check.py --no-rust</code> 83/83; differential byte-identical (3 pack modes); <code>tl_wakeup_hammer</code>/<code>parity_threaded_litmus</code>/<code>runtime_objref_threads</code> green under <code>KLIO_RACE_JITTER=1</code> (repeated); suspend fuzzer <code>KLIO_FUZZ_SEEDS=128</code> clean; cross-run coroutine-heavy stress (arena reset between programs) clean; <code>KLIO_TRACE_INVARIANTS=1</code>/<code>KLIO_RESOLVE_AUDIT=1</code>/<code>KLIO_LINK_AUDIT=1</code> = 0. 2C.4's <code>SlotOwners</code> half and 2B.5's never-freed-registry half retired.</td>
+<td>medium</td>
+<td>medium</td>
+<td>L</td>
+<td>R13/R16 (arena model)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="tier-3-larger-structural-refactors-gated-incremental">Tier 3 — Larger structural refactors (gated, incremental)<a class="headerlink" href="#tier-3-larger-structural-refactors-gated-incremental" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Item</th>
+<th>Impact</th>
+<th>Risk</th>
+<th>Effort</th>
+<th>Deps</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R15</td>
+<td><strong>DONE.</strong> Collapsed the adaptive cell to an unconditional reader/writer spin-lock: deleted <code>flag</code>, <code>state</code>, <code>UNSHARED</code>/<code>SHARED</code>, the <code>publish()</code>/<code>isShared()</code> protocol, the guard <code>shared: bool</code>, and the whole <code>gc_traverse.zig</code> publish walk (file deleted) plus its callers (<code>value.publishDeep</code>, <code>env.publishEnvDeep</code>, the <code>startWorker</code> publish prelude, the <code>SharedOutput</code>/<code>SharedClosures</code>/<code>registerSlotOwner</code> publishes). <code>borrow</code>/<code>borrowMut</code> now always take the lock — one uncontended <code>cmpxchg</code> replaces the <code>state.load(.acquire)</code> + branch + non-atomic <code>flag</code> arithmetic, and the guard <code>deinit</code> loses its mode branch. Re-entrancy: KLIO single-thread code already copies out of a borrow before running any user code, so no overlapping <em>conflicting</em> borrow on one cell exists (it would have panicked the <code>flag</code> already) — verified by the 83/83 e2e corpus running byte-identical with zero deadlocks. A/B (interleaved median of 3 alternating rounds, ReleaseFast, pinned core): e2e <strong>geomean −0.08%</strong> (neutral), borrow-heavy <code>object_fields</code> −5.4%, <code>map_ops</code> −7.2%, <code>fib_recursive</code> −9.0%; worst single program <code>behavior_tree</code> +4.2% (low-iter noise, swings ±4% between rounds). The <code>DriverWakeup</code>-style publish race (commit that landed it) is now structurally impossible: there is no publish step to skip. 2A.1/2A.2/2A.4 retired.</td>
+<td>high</td>
+<td>medium</td>
+<td>L</td>
+<td>R3 (fence gone)</td>
+</tr>
+<tr>
+<td>R16</td>
+<td><strong>DONE.</strong> Added a thread-local <code>reclaim</code> flag in <code>src/runtime/objcell.zig</code> (<code>setReclaim</code>/<code>reclaimEnabled</code>, default <code>true</code> = full Arc/Drop path). <code>ObjRef.deinit</code> consults it first: under <code>reclaim=false</code> it returns immediately with NO atomic refcount decrement, NO payload <code>T.deinit</code>, and NO <code>allocator.destroy</code> — the backing arena reclaims every cell on reset. <code>Vm.deinit</code> (<code>vmDeinit</code>, <code>run.zig</code>) skips the value-graph handle teardown under <code>reclaim=false</code> but always runs <code>resetReceiverThreadLocals()</code> (a non-memory thread-local clear); the OS thread joins are unaffected because they happen in <code>joinAllThreads</code> at the end of <code>vmRunInner</code>, before <code>vmDeinit</code>, on both paths. <strong>T.deinit audit:</strong> every payload reachable from a Vm cell (ProgramImage side tables, ClassTable, Env, RecordingSink, closure/anon-method maps) is a HashMap/ArrayList over the run allocator — pure memory, no OS/non-arena resource — so skipping them is sound. The page_allocator scratch buffers (<code>host_impl</code>/<code>host_fields</code>/<code>host_instances</code> thread-local stacks, comparison/format scratch) are not owned by any <code>ObjRef</code> cell, free locally, and are untouched by the gate. <strong>Gate:</strong> arena-backed configs opt in (<code>runInMode</code> → e2e/parity/differential/fuzzer, and the binary's <code>runBuilt</code> run path; both restore the prior mode after, and propagate the flag to the big-stack <code>main</code> thread and to spawned workers via <code>WorkerArgs.reclaim</code>/<code>workerEntry</code>). The leak-checking unit tests and the real-thread objcell/objref stress tests never call <code>setReclaim</code>, so they stay on the default <code>reclaim=true</code> — UAF/leak detection intact. <strong>Spot-check (reverted):</strong> dropping a <code>defer obj.deinit()</code> in the <code>testing.allocator</code> round-trip test still trips the leak detector (<code>objcell.zig:393 leaked</code>, exit 1), proving the gate did not flip those configs. Gates: <code>zig build test</code> 139/139 steps · 1520/1520 tests · 0 skips; <code>corpus_check.py --no-rust</code> 83/83; differential byte-identical (91 programs, 11 pack-using ≥2 modes); thread stress + <code>tl_wakeup_hammer</code> green under <code>KLIO_RACE_JITTER=1</code>; suspend fuzzer <code>KLIO_FUZZ_SEEDS=128</code> clean; <code>KLIO_TRACE_INVARIANTS=1</code>/<code>KLIO_RESOLVE_AUDIT=1</code>/<code>KLIO_LINK_AUDIT=1</code> = 0; worker-spawn + coroutine programs run through the arena binary with threads joined, no UAF/hang. Teardown elision is structurally real (drops all per-cell <code>ObjRef.deinit</code> atomics/destroys + the <code>vmDeinit</code> graph walk) but sub-millisecond against the per-run stdlib build, so not separately measurable at program granularity. 2C.3/2A.6/2C.6 fall out.</td>
+<td>high</td>
+<td>medium</td>
+<td>L</td>
+<td>R15</td>
+</tr>
+<tr>
+<td>R17</td>
+<td><strong>DONE.</strong> Converted all six build-time-immutable <code>ClassDef</code> fields from per-cell <code>ObjRef</code>s to plain arena slices/optionals read lock-free on dispatch: <code>parent: ?ObjRef(ClassDef)</code>, <code>interfaces: []const ObjRef(ClassDef)</code>, <code>enum_entries: []const EnumEntry</code>, <code>nested_classes: []const NestedClass</code>, <code>supertype_delegates: []const SupertypeDelegate</code>, <code>delegate_forwarders: []const MethodDef</code>. <strong>STEP 0 immutability verdict (per-field):</strong> <code>nested_classes</code>/<code>supertype_delegates</code>/<code>delegate_forwarders</code> are <strong>never populated anywhere</strong> — every construction site sets them <code>.empty</code> and no site mutates them (the live delegation mechanism is <code>MethodDef.delegate_field</code> + the <code>class_delegates</code>/lift thunk path, and the AST-side <code>Class.supertype_delegates: []?Expr</code> is a different field); <code>nested_classes</code>/<code>supertype_delegates</code> are never even read, <code>delegate_forwarders</code> is read once in <code>findMethodWalk</code> (always an empty list). <code>enum_entries</code> is mutated ONLY by the enum-link loop (<code>build.zig</code>, before user code) and read-only on dispatch. <code>interfaces</code> is appended ONLY by the second linker phase (<code>build.zig</code>) and read-only thereafter. <code>parent</code> is backpatched ONCE by the same second linker phase (<code>if (parent == null) parent = sup</code>) and read-only thereafter — no runtime mutation of any of the six, so all six are safe to freeze (no field had to stay a cell for a runtime-mutation reason). <strong>Linker backpatch-then-freeze:</strong> the linker still mutates through the <em>outer</em> <code>ObjRef(ClassDef)</code> cell's <code>borrowMut</code> (which is unchanged), but now writes the inner plain field directly — <code>enum_entries</code> is <code>toOwnedSlice</code>'d once per enum class; <code>interfaces</code> is accumulated into a per-class local <code>ArrayList</code> across the supertype loop and <code>toOwnedSlice</code>'d once; <code>parent</code> is a direct single-write optional. After the linker's parent/interface phase returns the fields are <code>const</code>-shaped and read with NO inner borrow/lock. <strong>Kept as cells (unchanged):</strong> <code>companion</code>, <code>object_singleton</code> (lazy runtime mutation), <code>enclosing_class</code> (out of R17 scope; constructed <code>null</code> everywhere, <code>enclosingClone</code> reads it — left a cell to keep the change minimal), <code>captured_env</code>. <strong>Dispatch-path borrow reduction:</strong> deleted <strong>44</strong> <code>.borrow()</code>/<code>.borrowMut()</code>/paired <code>.deinit()</code> calls on these fields off the dispatch path (the full method/property/super walk, enum lookup, <code>is</code>/<code>as</code> supertype walk, ctor-chain parent walk) plus 3 link-time <code>borrowMut</code>s — <code>findMethodWalk</code>/<code>findMethodForArgWalk</code>/<code>findBodyPropertyWalk</code>/<code>parentClone</code>/<code>collectCompanionsWalk</code>/<code>interfaceRefs</code> in <code>class.zig</code> and the parent/interface/enum readers across <code>host_call_member.zig</code>/<code>host_fields.zig</code>/<code>host_instances.zig</code>/<code>host_classes.zig</code>/<code>host_call_func.zig</code>/<code>interp_ir.zig</code>/<code>run.zig</code>/<code>kotlinx_serialization.zig</code>. Net <strong>−86 LOC</strong> src. <strong>Perf:</strong> dispatch-heavy class-hierarchy/enum programs run with the inner-cell lock gone from every supertype/method-resolution step; not separately benchmarkable at program granularity against the per-run stdlib build, but the borrow-branch is structurally removed on the hottest walk. <strong>Gates:</strong> <code>zig build test --summary all</code> 139/139 steps · 1521/1521 tests · 0 skips; <code>corpus_check.py --no-rust</code> 83/83; differential byte-identical (3 pack modes); all 83 examples run under <code>KLIO_TRACE_INVARIANTS=1</code>+<code>KLIO_RESOLVE_AUDIT=1</code>+<code>KLIO_LINK_AUDIT=1</code> with 0 violations; inheritance/interface/enum/sealed/nested/<code>by</code>-delegation parity itests pass unmodified; suspend fuzzer <code>KLIO_FUZZ_SEEDS=128</code> 0 crashes / 0 cross-mode divergence; real-thread stress green; leak-checking <code>testing.allocator</code> ClassFixture tests green (the slices are arena-owned, no double-free). 2A.7 retired.</td>
+<td>high</td>
+<td>high</td>
+<td>XL</td>
+<td>R15</td>
+</tr>
+<tr>
+<td>R18</td>
+<td><strong>DONE.</strong> Made the IR evaluator generic over the host type (<code>comptime H</code>). Every eval entry point and internal that threaded the host (<code>evalWith</code>/<code>evalWithCaptures</code>/<code>evalWithCapturesIn</code>/<code>resumeContinuation</code>/<code>runFrame</code>/<code>runFrameInner</code>/<code>findCatch</code>/<code>execInst</code>/<code>execCallMemberOrGlobal</code>/<code>stringify</code>/<code>typeParamCastPasses</code>) now takes <code>comptime H: type, host: *H</code> and calls <code>host.method(...)</code> as a comptime-duck-typed direct method — no <code>host.vtable.slot.?(host.ctx, ...)</code>. <strong>Feasibility key confirmed:</strong> the generic is <em>defined</em> in <code>ir/eval.zig</code> but the concrete <code>VmHost</code> is supplied at the <code>interp_ir</code> call site (<code>ir.eval.evalWith(VmHost, …)</code>), so <code>ir</code> stays parametric over <code>H</code> and does NOT depend on <code>interp_ir</code> — <code>zigcheck.py ir</code> compiles + passes all 93 tests STANDALONE with <code>H = NullHost</code>, proving the layering held (this is what R19 could not do: it needed an ir-type <em>inside</em> a runtime union). <strong>Deleted:</strong> the <code>Host</code> struct (the <code>{ctx,*const VTable}</code> pair), the 36-slot <code>Host.VTable</code>, the 36 wrapper methods with their <code>null</code>-default plumbing, the <code>null_vtable</code>/<code>null_ctx</code>, and in <code>vmhost.zig</code> the 36 <code>vt*</code> trampolines, the <code>host_vtable</code> literal, the <code>hp()</code> opaque-cast helper, and <code>hostInterface()</code>. <strong>Replaced</strong> <code>nullHost()</code> with a concrete <code>NullHost</code> struct (36 methods returning the same <code>Unsupported</code>/<code>null</code>/<code>false</code>/empty/Instance-fallback the vtable defaults returned). The 4 enclosing-<code>this</code> forwarders (<code>enclosingThis</code>/<code>enclosingThisChain</code>/<code>pushAccessEnclosing</code>/<code>popAccessEnclosing</code>) were never host state — they call eval-internal thread-locals — so eval now calls those (<code>enclosingThisLast</code>/<code>enclosingThisChainAlloc</code>/<code>pushEnclosing</code>/<code>popEnclosing</code>) directly and <code>implicitReceiverChain</code> drops its now-unused host param. <strong>VmHost</strong> aliases each sibling free function (<code>host_call_value.callValue</code>, …) as a struct method decl so method-call syntax resolves directly; the in-file <code>*Rec</code> recursive-dispatch helpers and the <code>intrinsic_host.zig</code> transient-host call sites pass <code>*VmHost</code> straight to eval. <strong>Instantiation set:</strong> <code>{VmHost, NullHost}</code> only — <code>VmIntrinsicHost</code> reaches the evaluator by building a transient <code>VmHost</code> (<code>vmHost</code>/<code>VmHost.borrowed</code>) and instantiating eval with that, so no third monomorphization, and its own <code>runtime.IntrinsicHost</code> <code>{ctx,vtable}</code> seam is untouched (out of R18 scope). <strong>No host call needed a runtime-dynamic dispatch</strong> — every one is a plain comptime method, so no residual vtable remains. <strong>Deltas:</strong> net <strong>−229 LOC</strong> src (<code>eval.zig</code> −60, <code>vmhost.zig</code> −115, call sites net the rest); ReleaseFast binary <strong>−119,616 bytes (−0.34%)</strong> — the two monomorphizations (<code>VmHost</code> real + <code>NullHost</code> trivial no-ops) cost less than the deleted trampolines/vtable/wrapper-methods, so no size regression; compile time unchanged (full <code>--summary all</code> ~5.8 min, same as baseline). <strong>Gates:</strong> <code>zig build test --summary all</code> 139/139 steps · 1521/1521 tests · 0 skips; <code>zigcheck.py ir</code>/<code>interp_ir</code>/<code>runtime</code> pass; <code>corpus_check.py --no-rust</code> 83/83; differential byte-identical (91 programs, 11 pack-using ≥2 modes); suspend fuzzer <code>KLIO_FUZZ_SEEDS=128</code> 0 crashes / 0 cross-mode divergence; real-thread stress (<code>tl_wakeup_hammer</code>/<code>runtime_objref_threads</code>) green; 83/83 e2e through the binary under <code>KLIO_TRACE_INVARIANTS=1</code>+<code>KLIO_RESOLVE_AUDIT=1</code>+<code>KLIO_LINK_AUDIT=1</code> with 0 violations. 2D.3 retired.</td>
+<td>high</td>
+<td>medium</td>
+<td>XL</td>
+<td>R7-R9 (fewer slots first)</td>
+</tr>
+<tr>
+<td>R19</td>
+<td><strong>Unify <code>RuntimeError</code>/<code>EvalError</code></strong> into one shared union in <code>runtime</code>, re-exported by <code>ir.eval</code>; delete the four converters (2D.2). Keep the double-result <code>Allocator.Error!Union</code> (coroutine unwind depends on it).</td>
+<td>medium</td>
+<td>medium</td>
+<td>L</td>
+<td>none</td>
+</tr>
+<tr>
+<td>R20</td>
+<td><strong>DONE.</strong> Single driver-owned arena per compiler phase. <strong>Ownership contract:</strong> the driver hands the resolver and the type checker <strong>one</strong> allocator (production: the process-lifetime arena in <code>main.zig</code>; tests: an <code>ArenaAllocator(testing.allocator)</code>); each phase allocates <strong>all</strong> its data — scratch <em>and</em> result — from it and frees nothing, and the driver reclaims the whole phase workspace by freeing that one arena once the phase's last reader (resolution → typeck → lowering → image) is done. <strong>Deleted deinit bodies (5):</strong> <code>Resolution.deinit</code> + <code>Scope.deinit</code> (<code>src/resolver/resolver.zig</code>; also dropped the resolver's child <code>*ArenaAllocator</code> field, its <code>init</code> allocation, and the <code>arena</code>/<code>allocator</code> result fields — the per-file string arena now <em>is</em> the driver arena), <code>TypeCheck.deinit</code>, <code>Checker.deinit</code>, <code>ClassInfo.deinit</code> (<code>src/typeck/check.zig</code>), plus the two orphaned helpers <code>freeCfg</code> + <code>deinitMapOfList</code> that only the two deleted typeck deinits called. <strong>Move dance eliminated:</strong> the resolver no longer threads <code>fn_sig_keys</code> through a <code>defer …deinit()</code> scratch-free, and the typeck driver no longer hand-frees the <code>Checker</code>'s ~30 scratch containers; both phases just return the arena-backed result view. <strong>Kept (with reason — NOT arena-owned phase teardown):</strong> <code>Frame.deinit</code> (called mid-phase by <code>popFrame</code> on every scope exit — bounded intra-phase scope memory, not phase result); <code>ConstraintSystem.deinit</code> (releases a per-root-call <strong>sub-arena</strong> off the driver arena, freed by <code>expr_calls.zig</code> after each inference session — caps inference workspace mid-phase; making it driver-arena-backed would accumulate unboundedly per call); the value-level <code>Type</code>/<code>GenericArg</code>/<code>TypeError.deinit</code> (used pervasively as <code>defer t.deinit(a)</code> on <strong>mid-phase scratch Types</strong> across typeck — these free intra-phase temporaries, not the phase container, so their backing does not move to the arena). <strong>2C.6's <code>vmFromBuilt</code> 14-field move dance is OUT of scope</strong> — it lives in the <code>interp_ir</code> VM/<code>ProgramImage</code> layer tied to the R16 reclaim gate + per-cell <code>ObjRef</code> allocator, not a compiler phase; R16 already neutralizes that teardown under <code>reclaim=false</code>. <strong>2A.6's per-cell <code>ControlBlock</code> allocator is R16-owned and untouched.</strong> Consumers updated to drop the now-deleted calls: <code>commands.zig</code> (<code>runCheck</code>), <code>pack_build.zig</code> (<code>buildTypeckBundle</code>), <code>bench.zig</code> (resolve/typeck stages), and the resolver's 16 unit tests now wrap an <code>ArenaAllocator(testing.allocator)</code>; the typeck <code>checkFile</code>/<code>Checked</code> harness and <code>itests/typeck_negative.zig</code> already used the arena model. Net <strong>−95 LOC</strong> src. <strong>Leak-checking proof:</strong> all phase modules stay green on the leak-checking <code>testing.allocator</code> via the per-test arena — a phase arena freed too early would surface as a <code>DebugAllocator</code> UAF and too late as a leak; neither occurs. Gates: <code>zig build test --summary all</code> 139/139 steps · 1521/1521 tests · 0 skips; <code>corpus_check.py --no-rust</code> 83/83; differential 91 programs (11 pack-using ≥2 modes) byte-identical across 3 pack modes with per-program arena reset; suspend fuzzer <code>KLIO_FUZZ_SEEDS=128</code> 0 crashes / 0 cross-mode divergence; real-thread stress (<code>runtime_objref_threads</code>/<code>tl_wakeup_hammer</code>/<code>parity_threaded_litmus</code>) green under <code>KLIO_RACE_JITTER=1</code>; <code>KLIO_TRACE_INVARIANTS=1</code>/<code>KLIO_RESOLVE_AUDIT=1</code>/<code>KLIO_LINK_AUDIT=1</code> = 0; <code>zigcheck.py</code> resolver/typeck/types/interp_ir/ir each compile + pass standalone. 2C.5 retired; 2C.6 (compiler-phase half) and 2A.6 remain R16-owned/out-of-scope as noted. This was the last open zig-freedoms item.</td>
+<td>high</td>
+<td>high</td>
+<td>XL</td>
+<td>R16</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Recommended execution order:</strong> R1-R5 (a day of safe cleanup) → R6 (safest
+large win, validates the bench harness) → R7-R10 → R13 (the one confirmed
+correctness bug) + R12 (cheap invariant guard) → R11 → <strong>R15 (done — the
+adaptive cell is now an unconditional reader/writer lock)</strong> → R16 →
+<strong>R18 (done — the evaluator is generic over the host type; the <code>Host</code>
+vtable + trampolines are gone)</strong> → <strong>R17 (done — the six build-time-immutable
+<code>ClassDef</code> fields are now arena slices/optionals, off the dispatch borrow
+path)</strong> → <strong>R20 (done — each compiler phase now allocates everything from one
+driver-owned arena and exposes no container teardown; <code>Resolution.deinit</code>,
+<code>Scope.deinit</code>, <code>TypeCheck.deinit</code>, <code>Checker.deinit</code>, <code>ClassInfo.deinit</code> and
+the resolver's child string arena are gone, and the move dance with them)</strong>.
+<strong>All roadmap items are now landed.</strong></p>
+<p>One deliberate carve-out from the R20 contract: the type checker's
+flow-sensitive queries (smart-cast / VIA / reachability in
+<code>src/typeck/check/narrowing.zig</code>) run a dataflow solve per query, once per
+name read or statement. That working set is mid-phase scratch whose volume
+dwarfs the phase result — on the driver arena, where <code>free</code> is a no-op, a
+whole-module <code>klio check</code> accreted gigabytes. The <code>Checker</code> therefore owns
+one retained <code>ArenaAllocator</code> backed by the page allocator
+(<code>Checker.query_scratch</code>): each query resets it with capacity retained, and
+the <code>typecheck</code>/<code>typecheckModule</code> entry points tear it down
+(<code>destroyQueryScratch</code>) once the checker is done. Anything escaping a query
+is cloned onto the phase allocator first. Alongside it, the per-statement
+reachability solve is memoized per function (<code>Checker.reach_cache</code>, keyed
+by function span and invalidated by <code>nothing_epoch</code> whenever the set of
+<code>Nothing</code>-typed spans changes), and the solve consumes the per-function
+<code>nothing_by_fn</code> bucket instead of a snapshot of the whole <code>types</code> map.</p>
+<hr />
+<h2 id="4-do-not-touch-load-bearing-clones-ownership-that-prevent-real-uaf-or-races">4. Do NOT touch — load-bearing clones / ownership that prevent real UAF or races<a class="headerlink" href="#4-do-not-touch-load-bearing-clones-ownership-that-prevent-real-uaf-or-races" title="Permanent link">&para;</a></h2>
+<p>These are correct and necessary. Removing or weakening them reintroduces the
+exact races/UAFs Rust's type system used to forbid.</p>
+<ol>
+<li>
+<p><strong>The per-cell <code>SpinRwLock</code>'s acquire/release ordering</strong> (<code>src/runtime/objcell.zig</code>,
+   <code>SpinRwLock</code>). Since R15 every <code>borrow</code>/<code>borrowMut</code> takes this lock; its
+   acquire on lock and release on unlock are the happens-before edges that make
+   the thread/coroutine model sound (the old <code>publish()</code> release-store + acquire
+   load, now removed, is subsumed by the lock taken on the very first
+   cross-thread borrow). Real OS threads concurrently borrow the shared
+   class/prog/anon-methods cells (<code>startWorker</code>,
+   <code>src/interp_ir/vm/intrinsic_host.zig</code>); the lock is the discipline for those
+   borrows. Do not weaken the acquire/release ordering or special-case the
+   uncontended path back into a non-atomic flag — the single-thread fast path is
+   already an uncontended <code>cmpxchg</code>, measured perf-neutral.</p>
+</li>
+<li>
+<p><strong><code>spawnSeed</code>'s per-handle <code>.clone()</code></strong> (<code>src/interp_ir/vm/intrinsic_host.zig:870-890</code>)
+   and <code>WorkerArgs</code>/<code>SendableVmSeed</code> ownership transfer. This is the ONE
+   genuinely-escaping case — the child <code>Vm</code> outlives the call frame on another
+   thread, so these clones are real ownership, not the removable transient-host
+   clones of R6.</p>
+</li>
+<li>
+<p><strong><code>DriverWakeup</code></strong> as the cross-thread resume mailbox
+   (<code>src/interp_ir/vm/coroutines.zig:53-134</code>). It is the one sound worker→driver
+   primitive; only the never-freed registry <em>around</em> it and the busy-poll are
+   over-built (2B.5). Keep the mailbox.</p>
+</li>
+<li>
+<p><strong>The hand-rolled spin locks are NOT a Rust-ism to "fix" with
+   <code>std.Thread.Mutex</code>.</strong> Verified against the local toolchain
+   (<code>/config/.local/zig-0.16.0</code>): Zig 0.16 has <strong>no</strong>
+   <code>std.Thread.Mutex</code>/<code>RwLock</code>/<code>Condition</code>/<code>Futex</code>/<code>Semaphore</code> (each grep of
+   <code>std/Thread.zig</code> returns zero) — synchronization moved behind the <code>Io</code>
+   interface (only <code>std.Io.RwLock</code>/<code>std.Io.Semaphore</code> exist). The spin locks are
+   a justified toolchain workaround. R5 only adds <code>yield</code> backoff; do not replace
+   them with <code>std.Thread.Mutex</code>. <strong>The same toolchain check sinks
+   <code>std.heap.ThreadSafeAllocator</code>:</strong> it does not exist in 0.16 — <code>lib/std/heap/</code>
+   ships only <code>ArenaAllocator</code>, <code>SmpAllocator</code>, <code>FixedBufferAllocator</code>,
+   <code>PageAllocator</code>, <code>BrkAllocator</code>, <code>debug_allocator</code>, and <code>memory_pool</code>. Any
+   recommendation that names <code>ThreadSafeAllocator</code> would fail to compile; the
+   thread-safe options in this toolchain are <code>std.heap.smp_allocator</code> and
+   <code>ArenaAllocator</code>-over-a-thread-safe-child (see 2C.1, R12).</p>
+</li>
+<li>
+<p><strong>The error-as-data union shape</strong> (Type/Return/Break/Continue/Suspend ride the
+   same channel as real errors). R19 may <em>unify the two duplicate unions</em> but must
+   NOT convert control-flow signals to a Zig <code>error{}</code> set — they carry <code>Value</code>
+   payloads a <code>error{}</code> set cannot.</p>
+</li>
+<li>
+<p><strong><code>*Value</code> boxes that genuinely break the recursive type</strong>
+   (<code>BoundMethod.receiver</code>, <code>Exception.cause</code>, <code>Pair</code>/<code>Triple</code>/<code>MapEntry</code>,
+   <code>src/runtime/value.zig:308</code>, <code>:319</code>, <code>:348-361</code>). Keep them as pointers. R-style
+   coalescing of multi-field boxes into one allocation (2D.9) is fine; <strong>fully
+   inlining into the union is not</strong> — it bloats <code>@sizeOf(Value)</code>, the one thing the
+   box legitimately prevents.</p>
+</li>
+<li>
+<p><strong><code>Vm.deinit</code>'s teardown of real OS thread join handles + the scheduler/driver</strong>
+   (<code>src/interp_ir/vm/run.zig:565-580</code>, thread join at <code>:480</code>). Even under the
+   arena (R16), these are genuine OS resources that must be joined/freed; only the
+   <em>value-graph</em> walk may become a no-op.</p>
+</li>
+<li>
+<p><strong>The leak-checking unit-test allocator config.</strong> R16's <code>reclaim=false</code>
+   arena fast-path must remain gated so the <code>testing.allocator</code>-backed tests
+   (including the concurrent objcell stress tests in <code>src/runtime/objcell.zig</code>
+   that use real threads) keep exercising the full refcount/free path. Those tests
+   are the safety net for the cell and must keep passing unchanged.</p>
+</li>
+</ol>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2026 Klio Contributors
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/DrewCarlson/klio" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>

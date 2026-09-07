@@ -1,0 +1,3103 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="An experimental Kotlin interpreter written in Zig.">
+      
+      
+      
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/design/analysis/guard-inventory/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>KLIO Guard / Special-Case Inventory - Klio</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#klio-guard-special-case-inventory" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Klio
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              KLIO Guard / Special-Case Inventory
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Klio
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../getting-started/installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../getting-started/hello-world/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Hello, world
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../getting-started/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Tour
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing Your Code
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../BUNDLE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bundling Programs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pipeline Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/interpreter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The Vm
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/stdlib/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Standard Library
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/concurrency/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concurrency
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/memory-model/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Model
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/overview/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    What is a Pack?
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/format/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pack Format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/using/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Using Packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/authoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authoring a Pack
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/native-bindings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Native Bindings
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Shipped Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Shipped Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/atomicfu/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.atomicfu
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/io/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.io
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/datetime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.datetime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/coroutines/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.coroutines
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/serialization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.serialization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/ktor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    io.ktor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/compose-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    androidx.compose.runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Development
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/workspace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workspace Layout
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/debugging/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#summary-table" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Summary table
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#class-a-divergent-closure-execution-lambda-variable-access" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Class A — Divergent closure execution (lambda variable access)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Class A — Divergent closure execution (lambda variable access)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#a1-scoped_env-name-seeding-write-back-on-the-hof-path-removed-4b" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A1 — scoped_env name-seeding + write-back on the HOF path — REMOVED (4b)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a2-storeglobal-for-capture-lowering-the-write-half-of-a1-removed-4b" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A2 — StoreGlobal-for-capture lowering (the write half of A1) — REMOVED (4b)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a3-receiver-lambda-value-rebuild-on-the-main-value-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A3 — Receiver-lambda value rebuild on the main value path
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a4-callvaluewiththis-main-path-bind-and-redispatch" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A4 — callValueWithThis main-path bind-and-redispatch
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a5-pack-binding-short-circuit-inside-callvalue-for-a-closure-body-removed-item-9" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A5 — Pack-binding short-circuit inside callValue for a closure body — REMOVED (item 9)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a6-capture-metadata-recomputation-in-buildclosure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A6 — Capture-metadata recomputation in buildClosure
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a7-valuelambda-dead-ast-closure-arms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A7 — Value.Lambda dead AST-closure arms
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a8-stub-closure-shape-predicates-callablereceivershape-etc" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A8 — Stub closure-shape predicates (callableReceiverShape etc.)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#a9-isshadowingcapture-callable-only-restriction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A9 — isShadowingCapture callable-only restriction
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#class-b-receiver-this-context-lost-across-suspend-inline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Class B — Receiver / this context lost across suspend / inline
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Class B — Receiver / this context lost across suspend / inline">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#b1-outer_this-thread-local-stack-two-push-helpers-removed-item-6" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B1 — outer_this thread-local stack + two push helpers — REMOVED (item 6)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b2-push-enclosing-around-call-for-an-extension-callee" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B2 — Push-enclosing around Call for an extension callee
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b3-push-enclosing-around-callmember" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B3 — Push-enclosing around CallMember
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b4-receiver-lambda-enclosing-pushes-main-value-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B4 — Receiver-lambda enclosing pushes (main value path)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b5-receiver-lambda-enclosing-pushes-intrinsic-host-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B5 — Receiver-lambda enclosing pushes (intrinsic-host path)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b6-member_only_probe-thread-local-removed-item-6-close-out" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B6 — member_only_probe thread-local — REMOVED (item-6 close-out)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b7-cc_explicit_read-thread-local-coroutinecontext-redirect-removed-item-6-close-out" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B7 — cc_explicit_read thread-local (coroutineContext redirect) — REMOVED (item-6 close-out)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b8-field_resolve_stack-re-entrancy-bound" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B8 — field_resolve_stack re-entrancy bound
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b9-field_outer_active-re-entrancy-flag" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B9 — field_outer_active re-entrancy flag
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b10-inner_outer_hint-thread-local-removed-item-6-close-out" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B10 — inner_outer_hint thread-local — REMOVED (item-6 close-out)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b11-inline-receiver-bound-as-a-scope-local-this" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B11 — Inline-receiver bound as a scope local "this"
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b12-islambdabody-forces-this-capture-in-lambda-bodies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B12 — isLambdaBody() forces this-capture in lambda bodies
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b13-callerthisvalue-instance-only-restriction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B13 — callerThisValue .Instance-only restriction
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#b14-coroutine_time_mode_tls" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        B14 — coroutine_time_mode_tls
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#class-c-pack-vs-direct-resolution-divergence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Class C — Pack-vs-direct resolution divergence
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Class C — Pack-vs-direct resolution divergence">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#c1-funcid-first_user-orelse-first_body-orelse-first-tie-break-removed-as-a-resolution-input-item-8-steps-23" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C1 — funcId first_user orelse first_body orelse first tie-break — REMOVED as a resolution input (item 8 steps 2+3)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c2-classid-first-by-simple-name-superseded-as-a-resolution-input-item-8-steps-23" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C2 — classId first-by-simple-name — SUPERSEDED as a resolution input (item 8 steps 2+3)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c3-nested-type-collision-mangling-outername" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C3 — Nested-type collision mangling (Outer$Name)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c4-vm-bare-global-kotlin-prefix-probe-ladder-removed-item-8-steps-23" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C4 — VM bare-global kotlin.* prefix-probe ladder — REMOVED (item 8 steps 2+3)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c5-vm-bare-global-installed_bindings-suffix-scan-removed-item-8-steps-23" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C5 — VM bare-global installed_bindings suffix scan — REMOVED (item 8 steps 2+3)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c6-callfunc-pack-binding-fqn-short-circuit-removed-item-9" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C6 — callFunc pack-binding FQN short-circuit — REMOVED (item 9)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c7-callfunc-mis-bound-type-specialized-overload-fallback" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C7 — callFunc mis-bound type-specialized-overload fallback
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c8-callfunc-bodyless-expect-sibling-redirect-prefix-probe" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C8 — callFunc bodyless-expect sibling redirect + prefix probe
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c9-irmethodwalk-dual-key-fqn-then-simple-name-class-resolution" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C9 — irMethodWalk dual-key (FQN then simple-name) class resolution
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c10-instancemethodwalknamed-companion-simple-name-scans" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C10 — instanceMethodWalkNamed / companion* simple-name scans
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c11-islambdabody-forks-fqn-head-resolution-removed-item-10" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C11 — isLambdaBody() forks FQN-head resolution — REMOVED (item 10)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#c12-inline-fn-table-keyed-by-bare-simple-name-folded-into-the-symbol-index-item-8d" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        C12 — Inline-fn table keyed by bare simple name — FOLDED into the symbol index (item 8d)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#other-correctness-re-entrancy-not-primarily-a-guard-mostly-keep" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Other-correctness / re-entrancy (NOT primarily a guard — mostly keep)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Other-correctness / re-entrancy (NOT primarily a guard — mostly keep)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#o1-map_fallback_active-iterable_fallback_active" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        O1 — map_fallback_active / iterable_fallback_active
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#o2-call_outer_active-removed-finding-4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        O2 — call_outer_active — REMOVED (finding 4)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#o3-ctor_guard-was-defined-twice-duplication-removed-item-6-close-out" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        O3 — ctor_guard (was defined twice) — duplication REMOVED (item-6 close-out)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#o4-top_level_init_depth" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        O4 — top_level_init_depth
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#o5-coroutine-driver-tls-coro_stack-active_scope_stack-persisted_parked" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        O5 — coroutine driver TLS (coro_stack, active_scope_stack, persisted_parked)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#o6-materializeusermap-drainiterabletolist-fallbacks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        O6 — materializeUserMap / drainIterableToList fallbacks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#o7-extensionfnfallback-param0this-admission-member_ext_owner_class-gate" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        O7 — extensionFnFallback param[0]=="this" admission + member_ext_owner_class gate
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#keep-list-load-bearing-do-not-delete-as-point-fixes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Keep list (load-bearing — do NOT delete as "point-fixes")
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#cross-cutting-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-cutting notes
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/design/analysis/guard-inventory.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="klio-guard-special-case-inventory">KLIO Guard / Special-Case Inventory<a class="headerlink" href="#klio-guard-special-case-inventory" title="Permanent link">&para;</a></h1>
+<p>Status: read-only audit of the live Zig tree at <code>main</code>. Builds on
+<code>docs/design/analysis/execution-architecture.md</code> (the three bug classes A/B/C, the
+branch map §3, the unified design §4, the §6 roadmap). Every entry below is
+grounded in a concrete <code>file:line</code> citation.</p>
+<p>Scope reminder: a <em>guard</em> here is a point-fix branch / fallback / thread-local
+that masks a specific instance of one of the three structural bug classes
+instead of fixing the underlying handling. Per the project owner each such guard
+is both a <strong>removal target</strong> (it should be deletable once the matching §6
+structural work lands) and a <strong>test signal</strong> (removing it and keeping the suite +
+differential harness green proves the real fix; a guard that cannot be removed
+without breakage pinpoints remaining structural debt).</p>
+<p>A guard's "removal test" names the passing signal that would prove it safe to
+delete. Note up front: as <code>execution-architecture.md</code> §5.1/§6 records, the
+differential harness (<code>src/itests/differential.zig</code>), the closures+suspend fuzzer
+(<code>src/itests/fuzz_closures_suspend.zig</code>), and the single-path tracer do <strong>not yet
+exist</strong>, and the nested-collision regression (<code>nested_name_collision.kt</code>) runs
+only under the kotlinc-oracle parity sweep, <strong>not</strong> the default <code>zig build test</code>
+target (it is absent from <code>itests_files</code>, <code>build.zig:48-62</code>). So most "removal
+tests" below are <em>prospective</em> — they name the detector that §6 items 1–3 must
+build first. Where a guard is covered by an existing in-tree itest today, that is
+called out explicitly.</p>
+<hr />
+<h2 id="summary-table">Summary table<a class="headerlink" href="#summary-table" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Class</th>
+<th>Guards catalogued</th>
+<th>Deletable (point-fix)</th>
+<th>Keep (load-bearing)</th>
+<th>Needs-verification</th>
+<th>Removed</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A — closure execution / lambda variable access</td>
+<td>9</td>
+<td>7</td>
+<td>1</td>
+<td>1</td>
+<td>3 (A1, A2 via 4b; A5 via item 9)</td>
+</tr>
+<tr>
+<td>B — receiver/<code>this</code> across suspend/inline</td>
+<td>14</td>
+<td>8</td>
+<td>1</td>
+<td>2</td>
+<td>4 (B1 via item 6; B2–B5 relocated onto the frame chain; B6, B7, B10 via the item-6 close-out)</td>
+</tr>
+<tr>
+<td>C — pack-vs-direct resolution</td>
+<td>12</td>
+<td>10</td>
+<td>1</td>
+<td>1</td>
+<td>1 (C6 via item 9)</td>
+</tr>
+<tr>
+<td>Other-correctness / re-entrancy</td>
+<td>7</td>
+<td>0</td>
+<td>5</td>
+<td>0</td>
+<td>2 (O3's duplicate copy collapsed, guard stays; O2 removed via finding 4)</td>
+</tr>
+<tr>
+<td><strong>Total</strong></td>
+<td><strong>42</strong></td>
+<td><strong>25</strong></td>
+<td><strong>8</strong></td>
+<td><strong>4</strong></td>
+<td><strong>10</strong></td>
+</tr>
+</tbody>
+</table>
+<p>(A guard counted "needs-verification" is also counted in exactly one of
+deletable/keep per its best-current assessment; the four NV rows are A4, B9,
+B13, C12. A1 and A2 are now REMOVED via §6 item 4b; A5 (a Class-C
+two-executable-forms guard catalogued under Class A) and C6 are now REMOVED via
+§6 item 9; B6, B7, B10 and O3's duplicate copy are now REMOVED via the item-6
+receiver-context close-out — see their entries.)</p>
+<p>The <strong>keep list</strong> (load-bearing branches that are NOT point-fixes and must not be
+deleted) is consolidated at the bottom.</p>
+<hr />
+<h2 id="class-a-divergent-closure-execution-lambda-variable-access">Class A — Divergent closure execution (lambda variable access)<a class="headerlink" href="#class-a-divergent-closure-execution-lambda-variable-access" title="Permanent link">&para;</a></h2>
+<p>The root mechanism (<code>execution-architecture.md</code> §2 Class A): an <code>IrClosure</code> is
+executed by three engines that disagree on capture store and env. These guards
+are the seams and the fallbacks that paper over the disagreement.</p>
+<h3 id="a1-scoped_env-name-seeding-write-back-on-the-hof-path-removed-4b">A1 — <code>scoped_env</code> name-seeding + write-back on the HOF path — REMOVED (4b)<a class="headerlink" href="#a1-scoped_env-name-seeding-write-back-on-the-hof-path-removed-4b" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED in §6 item <strong>4b</strong>. Both the <code>evalClosureRaw</code> and
+  <code>invokeCallable</code> scoped-env setups (the <code>Env.withParent(globals)</code> seed, the
+  swap-in as the host <code>globals</code>, and the post-run read-back into <code>info.captures</code>)
+  are deleted. The HOF invoke path now runs the closure body over the real
+  top-level env, exactly like the main value path. A captured-and-written outer
+  <code>var</code> is boxed into a shared <code>Value.Cell</code> at its binding site (var decl,
+  function/lambda parameter, or inline-splice parameter), so the write is a
+  <code>CellSet</code> on the shared cell and is visible at the declaration site by
+  reference — no name-seeded scratch env or capture read-back.</li>
+<li><strong>Was at:</strong> <code>src/interp_ir/vm/intrinsic_host.zig</code> (the two scoped-env blocks).</li>
+<li><strong>Class:</strong> A.</li>
+<li><strong>Verified by:</strong> <code>zig build test</code> (1517/1517, incl. the differential harness
+  byte-identical across SourcePacks/CompiledPacks, the closures+suspend fuzzer,
+  <code>parity_closures_advanced</code>/<code>parity_closures_deep</code>, and the
+  <code>captured_var_carrier</code> e2e), corpus 80/80, <code>KLIO_FUZZ_SEEDS=128</code>,
+  <code>KLIO_TRACE_INVARIANTS=1</code> (0 violations). A prove-dead pass replaced the
+  captured-<code>var</code> <code>StoreGlobal</code> emission with a hard panic across the full detector
+  set; the only hit was a captured <em>function parameter</em>
+  (<code>kotlinx-coroutines-core/.../channels/Deprecated.kt</code>'s
+  <code>toMap(destination: M) { consumeEach { destination += it } }</code>), root-caused as a
+  boxing gap — <code>computeBoxedVars</code> boxed only <code>var</code> decls, not parameters a nested
+  closure writes — and fixed by boxing such parameters, not by restoring the guard.</li>
+</ul>
+<h3 id="a2-storeglobal-for-capture-lowering-the-write-half-of-a1-removed-4b">A2 — <code>StoreGlobal</code>-for-capture lowering (the write half of A1) — REMOVED (4b)<a class="headerlink" href="#a2-storeglobal-for-capture-lowering-the-write-half-of-a1-removed-4b" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED in §6 item <strong>4b</strong>. The three <code>b.knowsOuter(...)</code> capture
+  arms that recorded a capture, emitted <code>StoreGlobal name</code>, and rebound locally
+  are deleted: <code>writeBackLvalue</code> (compound assignment), the postfix <code>++</code>/<code>--</code>
+  path (both <code>src/ir/lower/expr.zig</code>), and <code>storeCombinedToTarget</code>
+  (<code>src/ir/lower/stmt.zig</code>). A captured-and-written outer var now always reaches
+  the boxed <code>CellSet</code> branch (boxed at its binding site). The now-dead capture
+  write-back machinery is also removed: the <code>WritebackCaptures</code> instruction
+  (<code>ir.zig</code> + its <code>eval.zig</code> handler), the <code>emitWritebacks</code>/<code>lowerCallWith*</code>
+  capture-writeback emission, <code>Host.readLambdaCapture</code> (the eval vtable slot, its
+  <code>vmhost.zig</code> wiring, and the <code>host_call_value.zig</code> impl), and
+  <code>lambdaMutatedOuterVars</code> + its walkers. <code>StoreGlobal</code> itself is kept — it is
+  still the legit instruction for genuine top-level-global <code>var</code> writes (the final
+  <code>else</code> "top-level binding" arm) and the inline trampoline <code>tp_global</code>.</li>
+<li><strong>Was at:</strong> <code>src/ir/lower/expr.zig</code>, <code>src/ir/lower/stmt.zig</code>.</li>
+<li><strong>Class:</strong> A.</li>
+<li><strong>Verified by:</strong> same gates as A1. A <code>KLIO_FUZZ_SEEDS=128</code>-wide prove-dead pass
+  confirmed no non-boxed mutated outer var reaches the writeback emission before it
+  was deleted.</li>
+</ul>
+<h3 id="a3-receiver-lambda-value-rebuild-on-the-main-value-path">A3 — Receiver-lambda value rebuild on the main value path<a class="headerlink" href="#a3-receiver-lambda-value-rebuild-on-the-main-value-path" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_value.zig:299-360</code> (the
+  <code>!last_vararg and args.len == info.n_params + 1 and this_cap_idx != null</code>
+  branch): clone the closure's captures, overwrite the <code>this</code> slot with <code>args[0]</code>,
+  build a fresh <code>IrClosure</code> value, and re-dispatch on the main path.</li>
+<li><strong>What it does:</strong> special-cases an <code>R.(P)-&gt;T</code> lambda invoked value-style with one
+  extra leading arg, binding arg0 as the receiver by <strong>mutating the value-carried
+  capture snapshot</strong> (which the main path reads and the HOF path ignores —
+  <code>execution-architecture.md</code> §2 Class A "aggravating factor").</li>
+<li><strong>Class:</strong> A (the divergent capture-store seam), with a B aspect (it also pushes
+  the displaced <code>this</code> onto <code>outer_this</code>, see B1).</li>
+<li><strong>Deletable?</strong> Deletable. A single <code>invokeClosure(id, args, this_override)</code>
+  (§4.1) subsumes this: the receiver override is a routine parameter, not a value
+  rebuild.</li>
+<li><strong>Removes via:</strong> §6 item <strong>4b</strong> + <strong>5</strong> (one closure routine + thin adapter).</li>
+<li><strong>Removal test:</strong> differential harness over the ktor/builder examples (the engine
+  interceptor <code>interceptor.invoke(pipelineContext, subject)</code> case named in the
+  comment) byte-identical across modes, plus <code>parity_lambdas_and_dispatch</code> and
+  <code>parity_suspend_shapes</code> green.</li>
+</ul>
+<h3 id="a4-callvaluewiththis-main-path-bind-and-redispatch">A4 — <code>callValueWithThis</code> main-path bind-and-redispatch<a class="headerlink" href="#a4-callvaluewiththis-main-path-bind-and-redispatch" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_value.zig:424-451</code>: when the callee is
+  an <code>IrClosure</code> with a <code>this</code> capture and exactly one extra leading arg, clone
+  captures, set the <code>this</code> slot to <code>this_value</code>, and re-dispatch via <code>callValue</code>
+  (the main path) instead of the intrinsic-host invoke below it.</li>
+<li><strong>What it does:</strong> routes an explicit-receiver receiver-lambda call onto the
+  frame-snapshotting main path so a <code>suspend</code> body parks correctly — duplicating
+  A3's logic for the <code>CallValueWithThis</code> instruction.</li>
+<li><strong>Class:</strong> A (capture-store seam) / B (suspend correctness motive).</li>
+<li><strong>Deletable?</strong> <strong>Needs-verification.</strong> It is structurally the same point-fix as
+  A3 and should fold into the same <code>invokeClosure</code>, but the comment claims a
+  concrete behavioral dependency (ktor <code>on(Send)</code> <code>handler(Sender(this,…), request)</code>)
+  whose differential coverage does not yet exist — confirm the unified routine
+  reproduces it before deleting.</li>
+<li><strong>Removes via:</strong> §6 item <strong>4b</strong> + <strong>5</strong>.</li>
+<li><strong>Removal test:</strong> differential harness over the ktor send-pipeline example +
+  <code>parity_suspend_shapes</code> green; verify the <code>Sender(this,…)</code> case parks/resumes
+  identically.</li>
+</ul>
+<h3 id="a5-pack-binding-short-circuit-inside-callvalue-for-a-closure-body-removed-item-9">A5 — Pack-binding short-circuit inside <code>callValue</code> for a closure body — REMOVED (item 9)<a class="headerlink" href="#a5-pack-binding-short-circuit-inside-callvalue-for-a-closure-body-removed-item-9" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED in §6 item <strong>9</strong>. The per-call
+  <code>installed_bindings.resolve(func.fqn)</code> probe before running an <code>IrClosure</code> body
+  is deleted. Each symbol's single executable form (native binding OR lowered
+  body) is now resolved ONCE at link time by <code>ProgramImage.linkResolvedForms</code>
+  into the <code>resolved_native</code> table keyed by <code>FuncId</code>. The closure-body path
+  consults <code>host_call_func.resolvedNativeForm(self, func.id)</code> directly — no
+  per-call FQN probe — so a closure wrapping a pack top-level fn
+  (<code>kotlinx.datetime.__kxdt_*</code>) still dispatches the native binding, but the
+  decision is fixed at link time and load-order-independent.</li>
+<li><strong>Was at:</strong> <code>src/interp_ir/vm/host_call_value.zig</code> (the closure-body short-circuit block).</li>
+<li><strong>Class:</strong> C primarily (two-executable-forms, <code>execution-architecture.md</code> §2
+  Class C "Two executable forms"), surfaced inside the Class-A closure engine.</li>
+<li><strong>Verified by:</strong> <code>KLIO_LINK_AUDIT=1</code> (the link form equals the per-call probe's
+  pick — 0 divergences over the full suite + all 82 examples + the differential
+  corpus), <code>zig build test</code> green, corpus 82/82, the differential harness
+  byte-identical across SourcePacks/CompiledPacks/EmbeddedOnly.</li>
+<li><strong>Removal test:</strong> differential harness with <code>mode=CompiledPacks</code> vs <code>SourcePacks</code>
+  byte-identical for a <code>kotlinx.datetime</code>-using example.</li>
+</ul>
+<h3 id="a6-capture-metadata-recomputation-in-buildclosure">A6 — Capture-metadata recomputation in <code>buildClosure</code><a class="headerlink" href="#a6-capture-metadata-recomputation-in-buildclosure" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_value.zig:484-507</code> (and the twin
+  <code>buildAstLambdaWithFlagFuncid</code> <code>:510-527</code>): runtime re-reads <code>f.capture_order</code>
+  to derive <code>n_params</code> + <code>capture_names</code>, then stores <strong>both</strong> a live cell
+  (<code>info.captures</code>) and a value-carried snapshot (<code>caps_ref</code>).</li>
+<li><strong>What it does:</strong> maintains the two-store duplication (cell + snapshot) that A1/A3
+  exploit divergently; capture metadata is computed at lower time
+  (<code>build.zig:435-458</code>) and again here.</li>
+<li><strong>Class:</strong> A.</li>
+<li><strong>Deletable?</strong> Deletable (the <em>duplication</em> is). One capture vector keyed by
+  <code>capture_order</code> (§4.1 "one capture-metadata authority"); drop the snapshot.</li>
+<li><strong>Removes via:</strong> §6 item <strong>11</strong> (single capture-metadata authority) + <strong>4b</strong>.</li>
+<li><strong>Removal test:</strong> single-path tracer (§5.5) asserts one capture store per closure;
+  full <code>itests</code> green (capture mis-binding by position would fail many).</li>
+</ul>
+<h3 id="a7-valuelambda-dead-ast-closure-arms">A7 — <code>Value.Lambda</code> dead AST-closure arms<a class="headerlink" href="#a7-valuelambda-dead-ast-closure-arms" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> the <code>.Lambda</code> tag is constructed only in two test sites
+  (<code>src/runtime/runtime.zig</code> GC test, <code>src/typeck/check/tests.zig</code> typeck test per
+  §3.6) yet is handled in <strong>31</strong> <code>.Lambda =&gt;</code> switch arms across the tree (e.g.
+  <code>host_call_member.zig:248,1513</code>, <code>host_call_value.zig:215,868</code>,
+  <code>host_globals.zig:689,716</code>, <code>eval.zig:1177</code>, …).</li>
+<li><strong>What it does:</strong> every callable-handling switch carries a dead arm for a value
+  that the real pipeline never produces.</li>
+<li><strong>Class:</strong> A (cleanup).</li>
+<li><strong>Deletable?</strong> Deletable — but it is 31 arms + 2 test constructors, not a one-liner
+  (§3.6 caution).</li>
+<li><strong>Removes via:</strong> §6 item <strong>11</strong>.</li>
+<li><strong>Removal test:</strong> remove the two test constructors and the 31 arms; <code>zig build
+  test</code> compiles and stays green (1506 tests).</li>
+</ul>
+<h3 id="a8-stub-closure-shape-predicates-callablereceivershape-etc">A8 — Stub closure-shape predicates (<code>callableReceiverShape</code> etc.)<a class="headerlink" href="#a8-stub-closure-shape-predicates-callablereceivershape-etc" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_value.zig:529-545</code>:
+  <code>callableReceiverShape</code> returns <code>null</code>, <code>closureNeedsThisCapture</code> returns
+  <code>false</code>, <code>overrideClosureThis</code> is a no-op. Consumed by the <code>CallValue</code> arm
+  (<code>eval.zig:1160-1172</code>).</li>
+<li><strong>What it does:</strong> vestigial host methods for a closure-shape protocol that was
+  never wired; the <code>CallValue</code> arm's receiver-lambda handling is effectively dead
+  through these and relies on A3/A4 instead.</li>
+<li><strong>Class:</strong> A (cleanup).</li>
+<li><strong>Deletable?</strong> Deletable. Dead seams; the real receiver-lambda binding happens in
+  A3/A4.</li>
+<li><strong>Removes via:</strong> §6 item <strong>4b</strong>/<strong>5</strong> (cleanup alongside the unification).</li>
+<li><strong>Removal test:</strong> delete the three stubs and their <code>eval.zig:1160-1172</code> callers;
+  <code>itests</code> green.</li>
+</ul>
+<h3 id="a9-isshadowingcapture-callable-only-restriction">A9 — <code>isShadowingCapture</code> callable-only restriction<a class="headerlink" href="#a9-isshadowingcapture-callable-only-restriction" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_globals.zig:681-692</code>: returns true only when
+  the innermost scoped-global layer binds the name to a <code>Lambda</code>/<code>IrClosure</code>/
+  <code>Function</code>. Consumed by <code>execCallMemberOrGlobal</code> (<code>eval.zig:1643</code>).</li>
+<li><strong>What it does:</strong> decides whether a bare name is a closed-over callable that
+  shadows a same-named member — but only because the HOF path's <code>scoped_env</code> (A1)
+  puts captures in a child layer in the first place. Path-dependent by
+  construction (<code>hasParent()</code> is only true on the HOF path).</li>
+<li><strong>Class:</strong> A.</li>
+<li><strong>Deletable?</strong> Deletable once A1 is gone (globals always the real top-level env →
+  <code>hasParent()</code> is uniformly false → this predicate degenerates).</li>
+<li><strong>Removes via:</strong> §6 item <strong>4b</strong> (per §4.1: <code>isShadowingCapture</code> becomes
+  path-independent).</li>
+<li><strong>Removal test:</strong> with <code>scoped_env</code> deleted, <code>isShadowingCapture</code> returns a
+  constant; <code>parity_closures_advanced</code>/<code>parity_functional_patterns</code> green.</li>
+</ul>
+<hr />
+<h2 id="class-b-receiver-this-context-lost-across-suspend-inline">Class B — Receiver / <code>this</code> context lost across suspend / inline<a class="headerlink" href="#class-b-receiver-this-context-lost-across-suspend-inline" title="Permanent link">&para;</a></h2>
+<p>Root mechanism (<code>execution-architecture.md</code> §2 Class B): the enclosing-<code>this</code>
+chain and its companion resolution flags live in process-wide thread-locals that
+are NOT part of <code>FrameSnapshot</code> (<code>eval.zig:149-167</code>), so they leak across a park
+or a re-entrant dispatch.</p>
+<h3 id="b1-outer_this-thread-local-stack-two-push-helpers-removed-item-6">B1 — <code>outer_this</code> thread-local stack + two push helpers — REMOVED (item 6)<a class="headerlink" href="#b1-outer_this-thread-local-stack-two-push-helpers-removed-item-6" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED in §6 item <strong>6</strong>. The <code>outer_this</code> thread-local, its lazy
+  <code>outerThisStack</code> page-allocator init, and the run-boundary <code>resetReceiverTls</code>
+  (plus its call site in <code>resetReceiverThreadLocals</code>) are deleted. The
+  enclosing-<code>this</code> chain is now the current <code>Frame</code>'s <code>enclosing_this</code> field in
+  <code>src/ir/eval.zig</code>: it is seeded at frame entry from the caller's active chain
+  (so a frame inherits the enclosing implicit receivers a dispatch pushed),
+  snapshotted into <code>FrameSnapshot.enclosing_this</code> on suspend, and restored
+  verbatim in <code>resumeContinuation</code>. A thread-local <code>active_chain</code> pointer routes
+  reads/pushes to the <em>currently executing</em> frame's field; it is never receiver
+  state of its own (it always points at a live frame, or is <code>null</code> between
+  runs), so a frame-scoped chain cannot leak past the frame or across a <code>run</code>
+  boundary. The push helpers (<code>pushAccessEnclosing</code>/<code>popAccessEnclosing</code>/
+  <code>pushOuterThis</code>/<code>popOuterThis</code>) and readers (<code>enclosingThis</code>/
+  <code>enclosingThisChain</code>) are kept as thin wrappers delegating to the <code>ir.eval</code>
+  frame-chain primitives, so all existing call sites are unchanged.</li>
+<li><strong>Was at:</strong> <code>src/interp_ir/vm/host_call_member.zig</code> (the TLS + helpers).</li>
+<li><strong>Class:</strong> B (the root carrier).</li>
+<li><strong>Verified by:</strong> <code>examples/receiver_across_suspend.kt</code> (e2e corpus, byte-
+  identical) and the <code>enclosing_this_chain_survives_suspend</code> itest — a <code>suspend</code>
+  member-extension parks at <code>delay</code> then resolves a bare member of its enclosing
+  <code>this@Owner</code> after resume; before the fix this reported <code>unresolved global
+  'owned'</code>. Reverting the frame carrier (restoring the TLS) makes both fail.</li>
+</ul>
+<h3 id="b2-push-enclosing-around-call-for-an-extension-callee">B2 — Push-enclosing around <code>Call</code> for an extension callee<a class="headerlink" href="#b2-push-enclosing-around-call-for-an-extension-callee" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/ir/eval.zig:1117-1135</code>: when the callee's first param is named
+  <code>"this"</code>, push the caller's <code>this</code> param onto <code>outer_this</code> for the call, pop
+  after.</li>
+<li><strong>What it does:</strong> keeps the caller's receiver reachable while an extension /
+  member-extension runs — a fallback that recovers the receiver the snapshot
+  doesn't carry.</li>
+<li><strong>Class:</strong> B.</li>
+<li><strong>Deletable?</strong> Deletable. The dispatch sets the callee frame's receiver slot
+  directly (§4.2).</li>
+<li><strong>Removes via:</strong> §6 item <strong>6</strong>.</li>
+<li><strong>Removal test:</strong> <code>parity_extension_resolution</code> + the fuzzer green with frame-
+  receiver threading; no <code>outer_this</code> push at this site.</li>
+</ul>
+<h3 id="b3-push-enclosing-around-callmember">B3 — Push-enclosing around <code>CallMember</code><a class="headerlink" href="#b3-push-enclosing-around-callmember" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/ir/eval.zig:1261-1271</code>: push <code>frame.params[0]</code> (the caller's
+  instance <code>this</code>) onto <code>outer_this</code> around a <code>recv.member()</code> call when distinct
+  from the receiver.</li>
+<li><strong>What it does:</strong> same as B2 for the member-call instruction.</li>
+<li><strong>Class:</strong> B.</li>
+<li><strong>Deletable?</strong> Deletable (same as B2).</li>
+<li><strong>Removes via:</strong> §6 item <strong>6</strong>.</li>
+<li><strong>Removal test:</strong> same as B2.</li>
+</ul>
+<h3 id="b4-receiver-lambda-enclosing-pushes-main-value-path">B4 — Receiver-lambda enclosing pushes (main value path)<a class="headerlink" href="#b4-receiver-lambda-enclosing-pushes-main-value-path" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_value.zig:339-358</code>: push the displaced
+  <code>prior_this</code> and/or the receiver onto <code>outer_this</code> around the receiver-lambda
+  re-dispatch (paired with A3).</li>
+<li><strong>What it does:</strong> keeps the lexically-enclosing receiver reachable for bare
+  members in the receiver-lambda body across the displacement.</li>
+<li><strong>Class:</strong> B.</li>
+<li><strong>Deletable?</strong> Deletable (folds into §4.2 frame receiver context once A3 is gone).</li>
+<li><strong>Removes via:</strong> §6 item <strong>6</strong> (with <strong>4b</strong> for A3).</li>
+<li><strong>Removal test:</strong> ktor engine-interceptor example differential identical; fuzzer
+  green.</li>
+</ul>
+<h3 id="b5-receiver-lambda-enclosing-pushes-intrinsic-host-path">B5 — Receiver-lambda enclosing pushes (intrinsic-host path)<a class="headerlink" href="#b5-receiver-lambda-enclosing-pushes-intrinsic-host-path" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/intrinsic_host.zig:636-661</code> (<code>pushOuterThis</code>/
+  <code>popOuterThis</code> around <code>invokeCallable</code>), and the same pattern in <code>callMember</code>'s
+  <code>enclosingCallableProperty</code> branch <code>host_call_member.zig:1797-1813</code>.</li>
+<li><strong>What it does:</strong> the HOF/<code>with</code>/<code>apply</code> twin of B4.</li>
+<li><strong>Class:</strong> B.</li>
+<li><strong>Deletable?</strong> Deletable (same as B4).</li>
+<li><strong>Removes via:</strong> §6 item <strong>5</strong> + <strong>6</strong>.</li>
+<li><strong>Removal test:</strong> <code>parity_functional_patterns</code> (<code>with</code>/<code>apply</code>/<code>run</code> with member
+  calls) + fuzzer green.</li>
+</ul>
+<h3 id="b6-member_only_probe-thread-local-removed-item-6-close-out">B6 — <code>member_only_probe</code> thread-local — REMOVED (item-6 close-out)<a class="headerlink" href="#b6-member_only_probe-thread-local-removed-item-6-close-out" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED. <code>member_only</code> is now an explicit parameter:
+  <code>callMemberOnly</code> calls <code>callMemberNamedInner(..., member_only = true)</code>,
+  which forwards it to <code>callMemberInner</code>; the public <code>callMember</code>/
+  <code>callMemberNamed</code> host surface forwards <code>false</code>. The flag is scoped to one
+  resolution by construction — it can no longer be stolen by a re-entrant
+  <code>callMember</code> inside <code>copyNamed</code>/<code>stdlibNamedDispatch</code>/<code>userMethodNamed</code>
+  (the old TLS was consumed-and-cleared by whichever dispatch read it
+  first). <code>irMethodWalk</code>/<code>samInstanceDispatch</code>/<code>extensionFnFallback</code> already
+  took it as a parameter.</li>
+<li><strong>Removal test (passing):</strong> <code>parity_extension_resolution</code> (17 tests) green
+  with <code>member_only</code> passed as a function arg; full suite + differential +
+  single-path oracle green.</li>
+</ul>
+<h3 id="b7-cc_explicit_read-thread-local-coroutinecontext-redirect-removed-item-6-close-out">B7 — <code>cc_explicit_read</code> thread-local (coroutineContext redirect) — REMOVED (item-6 close-out)<a class="headerlink" href="#b7-cc_explicit_read-thread-local-coroutinecontext-redirect-removed-item-6-close-out" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED. The flag is now a <code>suppress_cc_redirect: bool</code>
+  parameter on <code>getFieldInner</code> (the public <code>getField</code> forwards <code>false</code>); the
+  <code>$coroutineContext$explicit</code> sentinel arm calls the inner fn with <code>true</code>,
+  and the flag is threaded through the fallback ladder's own recursion
+  (including <code>withFieldResolvePair</code>) so the dynamic extent of one explicit
+  read matches the old TLS window without being able to leak into a
+  dispatched getter body.</li>
+<li><strong>Removal test (passing):</strong> <code>parity_coroutines_realistic</code> /
+  <code>parity_suspend_shapes</code> green with the flag threaded as a parameter.</li>
+</ul>
+<h3 id="b8-field_resolve_stack-re-entrancy-bound">B8 — <code>field_resolve_stack</code> re-entrancy bound<a class="headerlink" href="#b8-field_resolve_stack-re-entrancy-bound" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_fields.zig:67</code> (TLS), <code>withFieldResolvePair</code>
+  <code>:95-117</code>, consumed at <code>:726,758</code>.</li>
+<li><strong>What it does:</strong> <code>(instance id, field name)</code> stack bounding the heuristic
+  <code>get_field</code> enclosing-receiver recursion. TLS, leakable across suspend.</li>
+<li><strong>Class:</strong> B (TLS) — but the recursion it bounds only exists <em>because</em> field
+  resolution falls back through the enclosing-<code>this</code> chain (B1).</li>
+<li><strong>Deletable?</strong> Deletable once the enclosing chain is a frame field and field
+  resolution no longer recurses through TLS-held receivers; the bound becomes
+  unnecessary or a local set.</li>
+<li><strong>Removes via:</strong> §6 item <strong>6</strong> (and the §4.3 single resolver removing the ad-hoc
+  fallback ladder).</li>
+<li><strong>Removal test:</strong> <code>parity_properties_accessors</code> + <code>parity_inner_classes</code> green
+  with the stack removed; differential identical.</li>
+</ul>
+<h3 id="b9-field_outer_active-re-entrancy-flag">B9 — <code>field_outer_active</code> re-entrancy flag<a class="headerlink" href="#b9-field_outer_active-re-entrancy-flag" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_fields.zig:70</code> (TLS), used <code>:765-767</code>.</li>
+<li><strong>What it does:</strong> prevents the inner-class outer-chain <em>field</em> fallback from
+  recursing.</li>
+<li><strong>Class:</strong> B (TLS) / other-correctness (loop prevention).</li>
+<li><strong>Stays a TLS — confirmed reason (re-checked at the findings 4/8/9 fold).</strong>
+  This is the field-READ analog of the call-side <code>outerChainFallback</code> that
+  finding 4 deleted (O2), but it does NOT die with that fold and does NOT
+  ride the receiver-chain carrier. It walks the receiver <em>value's</em> <code>outer</code>
+  links (not the frame's <code>enclosing_this</code> chain — the chain-based
+  enclosing-receiver field fallback is the separate block just above it,
+  which correctly respects subject discipline) and re-enters <code>getFieldInner</code>
+  → host dispatch, so the recursion crosses the host→eval→host boundary and
+  the guard must survive that whole synchronous activation, which a
+  parameter cannot follow. With findings 4/8 landed, the with-subject and
+  bare-read leniencies are closed by the candidate resolver upstream (a bare
+  enclosing-member read lowers to <code>LoadFromThisOrGlobal</code> and resolves
+  through <code>implicitCandidatesAlloc</code>), so this fallback now only serves
+  explicit <code>recv.field</code> access where <code>recv</code> has an <code>outer</code> link — the
+  residual chain-top rescue §4.2 documents (a leniency over kotlinc for
+  explicit qualified outer access, not a wrong value for valid programs).
+  Removing it standalone leaves that residual unchanged (it flows through a
+  different path) while risking the inner-class field-read positives, so it
+  stays a TLS with run-boundary asserts.</li>
+<li><strong>Removal test:</strong> <code>parity_inner_classes</code> + companion-with-cyclic-outer fixtures
+  green; the residual explicit-qualified outer field-read leniency is tracked
+  in <code>execution-architecture.md</code> §4.2, not by this guard.</li>
+</ul>
+<h3 id="b10-inner_outer_hint-thread-local-removed-item-6-close-out">B10 — <code>inner_outer_hint</code> thread-local — REMOVED (item-6 close-out)<a class="headerlink" href="#b10-inner_outer_hint-thread-local-removed-item-6-close-out" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED, and its replacement also fixed a live bug. The hint is
+  now an <code>outer_hint: ?*const Value</code> parameter on <code>newInstanceNamed</code>,
+  threaded through <code>newInstance</code> → <code>dispatchSecondaryCtor</code>/<code>superDelegation</code>
+  (the same hint flows through nested shell constructions) →
+  <code>primaryCtorPath</code> → <code>materializeInstance</code>; the <code>NewInstance</code> arm passes
+  the frame's own <code>this</code> directly and the push/pop helpers, the <code>VmHost</code>
+  aliases, and the NullHost stubs are deleted. <code>selectInnerOuter</code>
+  (<code>host_instances.zig</code>) picks the outer by the inner class's lexically
+  enclosing class (<code>registry.enclosing_class</code>), walking the receivers in
+  scope at the construction site innermost-first the way kotlinc resolves
+  the inner constructor's dispatch receiver: the hint itself, then the
+  hint's class-nesting tower (<code>hint.outer</code>, <code>hint.outer.outer</code>, … — a
+  member of <code>Inner</code> constructing a sibling <code>Inner()</code> reaches <code>this@Outer</code>
+  through its own outer link, never through a receiver inherited from a
+  caller frame), then the enclosing-receiver chain innermost-first where
+  each dispatch-receiver entry carries its own tower but a <code>with</code>/<code>run</code>
+  subject contributes only itself. Chain entries are tagged at the push
+  site (<code>ir.eval.EnclosingEntry.is_subject</code>; the three receiver-lambda
+  dispatch sites push the subject via <code>pushEnclosingSubject</code>/
+  <code>pushOuterSubject</code>/<code>pushAccessEnclosingSubject</code> and the displaced prior
+  <code>this</code> as a plain receiver), and the hint's tower walk is skipped when
+  the hint IS the innermost subject (a displaced receiver-lambda <code>this</code>
+  slot — its outers are not in scope; the lambda's lexical tower continues
+  with the displaced entry on the chain). On the build side a lambda body
+  lowering a bare <code>Inner()</code> to <code>NewInstance</code> records a <code>this</code> capture
+  (kotlinc's <code>this$0</code>), keyed on <code>ir.Class.is_inner</code> — stamped both by
+  <code>lowerClassWithExtras</code> and on the <code>reserveClass</code> stub so the rule is
+  declaration-order independent — and the <code>NewInstance</code> arm sources the
+  hint via <code>callerThisValue</code> (param or capture). This fixed
+  <code>with(other) { Inner().show() }</code> inside an Outer member (previously
+  <code>Vm::get_field `tag` on `&lt;instance&gt;</code>: no lambda-side construction path
+  stamped <code>outer</code>, and the getField rescue consults only the chain top),
+  the same-named-subject shadowing variants, inner instances escaping HOF
+  lambdas, user-HOF lambdas, two-level <code>inner</code> nesting, sibling <code>Inner()</code>
+  construction from a member of Inner under a polluted caller chain, and
+  forward-referenced sibling inner classes constructed from lambdas.</li>
+<li><strong>Removal test (passing):</strong> <code>parity_inner_classes</code>
+  (<code>inner_class_captures_outer_this</code>, <code>inner_class_constructed_inside_with_lambda</code>,
+  <code>inner_class_constructed_inside_map_lambda</code>, <code>inner_class_escapes_lambda_with_outer</code>,
+  <code>sibling_inner_construction_ignores_caller_receivers</code>,
+  <code>later_declared_sibling_inner_class_from_lambda</code>,
+  <code>with_subject_of_enclosing_class_supplies_outer</code>,
+  <code>with_subject_outer_links_not_in_scope</code>,
+  <code>with_unrelated_subject_in_inner_member_reaches_outer</code>)
+  plus the suspend pins <code>inner_class_constructed_after_park</code> /
+  <code>inner_class_in_receiver_lambda_after_park</code> /
+  <code>sibling_inner_constructed_after_park</code> and <code>examples/inner_class_suspend.kt</code>.
+  The sibling/<code>with</code>-subject expectations are confirmed against
+  kotlinc-native 2.3.10 (the suspend variants via their sync shapes).</li>
+</ul>
+<h3 id="b11-inline-receiver-bound-as-a-scope-local-this">B11 — Inline-receiver bound as a scope local <code>"this"</code><a class="headerlink" href="#b11-inline-receiver-bound-as-a-scope-local-this" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/ir/lower/inline_call.zig:459-463</code>: an <code>inline fun</code> with a
+  receiver binds the receiver as a builder scope local named <code>"this"</code> (a register),
+  not a param named <code>"this"</code>.</li>
+<li><strong>What it does:</strong> after inlining, the caller frame's <code>this</code> is a register, so the
+  runtime <code>frameThisParam</code> scan (<code>eval.zig:1847-1852</code>) cannot see it and nested-
+  receiver references fall back to <code>outer_this</code> (B1) — the inline variant of Class
+  B (§2 Class B "Inline variant").</li>
+<li><strong>Class:</strong> B.</li>
+<li><strong>Deletable?</strong> Deletable. The inline splice should set the frame's receiver slot
+  for the spliced region (§4.2 / §4.4-item-6), making inline-body resolution use
+  the normal method-body path.</li>
+<li><strong>Removes via:</strong> §6 item <strong>10</strong> (inline splice sets frame receiver slot).</li>
+<li><strong>Removal test:</strong> differential over the builder-DSL/kotlinx itests (the gate §4.4
+  requires for item 10) byte-identical; <code>parity_dsl_operators</code> green.</li>
+</ul>
+<h3 id="b12-islambdabody-forces-this-capture-in-lambda-bodies">B12 — <code>isLambdaBody()</code> forces <code>this</code>-capture in lambda bodies<a class="headerlink" href="#b12-islambdabody-forces-this-capture-in-lambda-bodies" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/ir/lower/lambda_body.zig:66-72</code> (forward <code>this</code> through the
+  lambda's own capture slot when <code>isLambdaBody()</code>), <code>src/ir/lower/expr.zig:1846</code>,
+  <code>:1859</code>, <code>:2147</code>, <code>:2335</code> (<code>knowsOuter("this") or b.isLambdaBody()</code> →
+  <code>recordCapture("this")</code>), <code>:2670</code> (<code>isLambdaBody()</code> → <code>CallMemberOrGlobal</code> with a
+  captured <code>this_idx</code>).</li>
+<li><strong>What it does:</strong> because a lambda's implicit <code>this</code> arrives via the closure's
+  capture slot rather than a scope binding, lowering special-cases lambda bodies to
+  capture <code>this</code> positionally. Pairs with the runtime <code>this</code>-capture readers.</li>
+<li><strong>Class:</strong> B (receiver origin) — also a Class-C aggravator where the <em>same</em>
+  <code>isLambdaBody()</code> predicate forks FQN resolution (see C11).</li>
+<li><strong>Deletable?</strong> Deletable as a <em>special case</em> for <code>this</code>: with the frame receiver
+  context (§4.2) a lambda body resolves <code>this</code> through the frame slot like any
+  body, no positional-capture fork.</li>
+<li><strong>Removes via:</strong> §6 item <strong>6</strong> (and <strong>10</strong> for the FQN-resolution facet, C11).</li>
+<li><strong>Removal test:</strong> fuzzer (nested lambdas capturing receivers) + the full closures
+  itests green with <code>this</code> resolved via the frame context.</li>
+</ul>
+<h3 id="b13-callerthisvalue-instance-only-restriction">B13 — <code>callerThisValue</code> <code>.Instance</code>-only restriction<a class="headerlink" href="#b13-callerthisvalue-instance-only-restriction" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/ir/eval.zig:1856-1870</code> (and the same <code>== .Instance</code> gate at
+  <code>:1858,1864</code>).</li>
+<li><strong>What it does:</strong> recovers the frame receiver from a <code>this</code>-param or <code>this</code>-capture
+  but <strong>only when it is <code>.Instance</code></strong>, so primitive/<code>String</code> receivers in
+  <code>with</code>/<code>apply</code> cannot thread through this path (§2 Class B).</li>
+<li><strong>Class:</strong> B (a <em>correctness gap</em>, not a fallback that masks — but it is the
+  point-restriction the structural fix removes).</li>
+<li><strong>Deletable?</strong> <strong>Needs-verification</strong> as a deletion vs a <em>fix</em>. §4.2 explicitly
+  says "Drop the <code>== .Instance</code> restriction so primitive/<code>String</code> receivers thread
+  identically" — but dropping it standalone (without the frame receiver context)
+  may change resolution for cases currently handled elsewhere; verify against a
+  <code>with(5) { … }</code> / <code>"x".apply { … }</code>-style differential.</li>
+<li><strong>Removes via:</strong> §6 item <strong>6</strong>.</li>
+<li><strong>Removal test:</strong> a <code>with(primitive){}</code> / <code>String.apply{}</code> differential
+  (<code>runWithPacks</code> vs <code>runWithKtc</code>) identical once the <code>.Instance</code> gate is gone and
+  the receiver travels on the frame.</li>
+</ul>
+<h3 id="b14-coroutine_time_mode_tls">B14 — <code>coroutine_time_mode_tls</code><a class="headerlink" href="#b14-coroutine_time_mode_tls" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/interp_ir.zig:323</code> (TLS), setter/getter <code>:327,332</code>.</li>
+<li><strong>What it does:</strong> holds the coroutine timing policy (Wall/Virtual) in a process-
+  wide TLS, mutated as a side effect of driver setup; never reset between programs
+  in a multi-program test binary (§2 Class B companion list).</li>
+<li><strong>Class:</strong> B (TLS anti-pattern).</li>
+<li><strong>Deletable?</strong> Deletable as a <em>thread-local</em> — carry the time mode on the
+  coroutine driver/scope, not TLS.</li>
+<li><strong>Removes via:</strong> §6 item <strong>6</strong> (companion TLS) + §5.2 reset asserts as interim.</li>
+<li><strong>Removal test:</strong> §5.2 "TLS empty/reset between runs" debug assert holds across
+  the coroutine itests run back-to-back; <code>parity_coroutines_realistic</code> green.</li>
+</ul>
+<hr />
+<h2 id="class-c-pack-vs-direct-resolution-divergence">Class C — Pack-vs-direct resolution divergence<a class="headerlink" href="#class-c-pack-vs-direct-resolution-divergence" title="Permanent link">&para;</a></h2>
+<p>Root mechanism (<code>execution-architecture.md</code> §2 Class C): every resolution table is
+keyed by <strong>bare simple name</strong> and tie-broken by <strong>declaration order</strong>; packs are
+the only thing that both add same-simple-name competitors from other packages and
+get a fixed insertion position.</p>
+<h3 id="c1-funcid-first_user-orelse-first_body-orelse-first-tie-break-removed-as-a-resolution-input-item-8-steps-23">C1 — <code>funcId</code> <code>first_user orelse first_body orelse first</code> tie-break — REMOVED as a resolution input (item 8 steps 2+3)<a class="headerlink" href="#c1-funcid-first_user-orelse-first_body-orelse-first-tie-break-removed-as-a-resolution-input-item-8-steps-23" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> <code>isShippedFqn</code> is deleted; <code>funcId</code> ranks over the per-decl
+  <code>Func.package</code> and survives only as the order-stable FALLBACK for shapes
+  the symbol index defers on (extensions, overload sets). Resolution policy
+  is the (package+imports)→FQN index (<code>resolveBareCallIndexed</code> /
+  <code>resolveBareRefIndexed</code>), with a unique pick emitted as an exact
+  <code>FuncId</code> on the instruction (<code>LoadGlobal.func</code>, <code>Call.func</code>) — no
+  simple-name re-resolution at runtime. Out-of-scope (tier-5) index
+  verdicts are now an unresolved-reference lowering error matching kotlinc.
+  The stale-name-index rungs are deleted (item 8 close-out): <code>funcIdLegacy</code>
+  and the <code>hasFuncNamed</code> <code>func_index</code> walk were proven unreachable — every
+  build pipeline pairs each <code>func_index</code> append with a name-index push and
+  the pack format never serializes a <code>Module</code>, and the instrumented sweep
+  (<code>legacy_funcid</code>/<code>legacy_hasfunc</code> audit lines) logged 0 hits over the
+  corpus + fixtures — so the name index is the single authority.</li>
+<li><strong>Was at:</strong> <code>src/ir/ir.zig</code> (<code>funcId</code>/<code>funcIdLegacy</code>, <code>isShippedFqn</code>).</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Verified by:</strong> <code>KLIO_RESOLVE_AUDIT</code>/<code>KLIO_RESOLVE_STRICT</code> sweeps (0
+  unexplained divergences), both-orders cross-package itests in
+  <code>itests/resolve_ambiguity.zig</code>, and the differential harness.</li>
+</ul>
+<h3 id="c2-classid-first-by-simple-name-superseded-as-a-resolution-input-item-8-steps-23">C2 — <code>classId</code> first-by-simple-name — SUPERSEDED as a resolution input (item 8 steps 2+3)<a class="headerlink" href="#c2-classid-first-by-simple-name-superseded-as-a-resolution-input-item-8-steps-23" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> bare construction and <code>::Ctor</code> reference sites resolve through
+  <code>classIdIndexed</code> (caller package + imports) and carry the resolved
+  <code>ClassId</code> end-to-end: <code>NewInstance</code> materializes by the IR class FQN
+  against the FQN-keyed runtime class registry (authoritative FQN entries;
+  first-wins user-over-shipped simple-name aliases), <code>addClass</code> no longer
+  collapses a root-package class onto a packaged twin's slot, and the
+  per-class side tables (ctor args, init blocks, secondary ctors, defaults,
+  body-prop inits, delegates) are dual-keyed by FQN and read through the
+  resolved identity. The simple-name <code>classId</code> remains only as the legacy
+  fallback for synthesized shapes with no resolved id.</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Verified by:</strong> both-orders cross-package class itests in
+  <code>itests/resolve_ambiguity.zig</code> (ctor, <code>::Ctor</code>, <code>copy</code>, named-arg,
+  data-class arity) + <code>itest-parity_inner_classes</code> green.</li>
+</ul>
+<h3 id="c3-nested-type-collision-mangling-outername">C3 — Nested-type collision mangling (<code>Outer$Name</code>)<a class="headerlink" href="#c3-nested-type-collision-mangling-outername" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/build/lift.zig:240-241</code> (object), <code>:314-320</code> (nested
+  class), keyed on <code>top_level_type_names</code> membership. Resolved on read by the
+  mangled-singleton/class probes in <code>host_fields.zig:877-906</code>
+  (<code>classReceiverField</code>).</li>
+<li><strong>What it does:</strong> the <strong>landed</strong> point-fix for the "load-order bug" (§2 Class C
+  "One instance of this class is fixed"): a nested <code>object</code>/<code>class</code> lifted to its
+  bare top-level name would overwrite a same-named true top-level type; this mangles
+  the colliding nested type to <code>Outer$Name</code>.</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Deletable?</strong> Deletable — this is the archetypal point-fix that masks <em>one</em> family
+  of collisions. The general FQN-keyed index (§4.4) makes the mangling unnecessary.</li>
+<li><strong>Removes via:</strong> §6 item <strong>8</strong>.</li>
+<li><strong>Removal test:</strong> with FQN-keyed resolution, delete the mangling;
+  <code>nested_name_collision.kt</code> (top-level <code>Application.who()=="top-level"</code> vs
+  <code>Holder.Application.who()=="nested"</code>) passes <strong>unmodified</strong> under the differential
+  harness — the §2 root-cause-only requirement.</li>
+</ul>
+<h3 id="c4-vm-bare-global-kotlin-prefix-probe-ladder-removed-item-8-steps-23">C4 — VM bare-global <code>kotlin.*</code> prefix-probe ladder — REMOVED (item 8 steps 2+3)<a class="headerlink" href="#c4-vm-bare-global-kotlin-prefix-probe-ladder-removed-item-8-steps-23" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED. The per-call prefix probe is replaced by the
+  link-settled <code>ProgramImage.default_import_globals</code> map (one name→FQN edge,
+  first package in <code>bare_probe_packages</code> order wins a cross-package
+  collision — rank semantics unit-pinned, including the <code>StringBuilder</code>
+  production collision and a synthetic two-package collision that fails on
+  rank inversion).</li>
+<li><strong>Was at:</strong> <code>src/interp_ir/vm/host_globals.zig</code> (the prefix list in
+  <code>lookupGlobal</code>).</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Verified by:</strong> the map unit tests in <code>interp_ir.zig</code> + differential
+  byte-identical across modes.</li>
+</ul>
+<h3 id="c5-vm-bare-global-installed_bindings-suffix-scan-removed-item-8-steps-23">C5 — VM bare-global <code>installed_bindings</code> suffix scan — REMOVED (item 8 steps 2+3)<a class="headerlink" href="#c5-vm-bare-global-installed_bindings-suffix-scan-removed-item-8-steps-23" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED. The hash-order <code>endsWith</code> scan is replaced by the
+  link-settled <code>ProgramImage.pack_bare_aliases</code> map: package-level binding
+  keys only (receiver-qualified member keys like
+  <code>kotlinx.coroutines.Job.join</code> are excluded — a bare name can never mean
+  one), lexicographically smallest FQN wins a collision, so the alias is
+  hash-order independent. Both properties are unit-pinned.</li>
+<li><strong>Was at:</strong> <code>src/interp_ir/vm/host_globals.zig</code> (the <code>installed_bindings</code>
+  suffix scan in <code>lookupGlobal</code>).</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Verified by:</strong> the alias unit tests in <code>interp_ir.zig</code> + differential
+  <code>SourcePacks</code> vs <code>CompiledPacks</code> byte-identical.</li>
+</ul>
+<h3 id="c6-callfunc-pack-binding-fqn-short-circuit-removed-item-9">C6 — <code>callFunc</code> pack-binding FQN short-circuit — REMOVED (item 9)<a class="headerlink" href="#c6-callfunc-pack-binding-fqn-short-circuit-removed-item-9" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED in §6 item <strong>9</strong>. The per-call branch that matched <code>f.fqn</code>
+  against <code>installed_bindings</code> and <code>dispatchIntrinsic</code>'d instead of running the
+  lowered body is deleted. <code>callFunc</code> now consults the link-time-resolved form
+  (<code>host_call_func.resolvedNativeForm(self, func)</code> against the <code>resolved_native</code>
+  table populated once by <code>ProgramImage.linkResolvedForms</code>) — native-binding vs
+  lowered-body is no longer decided per call site, so the call no longer forks on
+  pack-install state. The "two executable forms" of §2 Class C are collapsed to
+  one form per symbol, settled at link time independent of load order.</li>
+<li><strong>Was at:</strong> <code>src/interp_ir/vm/host_call_func.zig</code> (the "Pack-installed binding fast path" block).</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Verified by:</strong> <code>KLIO_LINK_AUDIT=1</code> (the link form equals the per-call probe's
+  pick — 0 divergences over the full suite + all 82 examples + the differential
+  corpus), differential across modes byte-identical for a pack-shimmed function,
+  <code>zig build test</code> green, corpus 82/82.</li>
+</ul>
+<h3 id="c7-callfunc-mis-bound-type-specialized-overload-fallback">C7 — <code>callFunc</code> mis-bound type-specialized-overload fallback<a class="headerlink" href="#c7-callfunc-mis-bound-type-specialized-overload-fallback" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_func.zig:468-491</code>: when the resolved
+  body's concrete primitive param types mismatch the runtime args and a same-FQN
+  intrinsic exists, dispatch the intrinsic.</li>
+<li><strong>What it does:</strong> patches the case where a bare call lowered to a single FuncId
+  bound the wrong type-specialized overload — a symptom of order-based resolution
+  (C1) plus the lack of arg-type info at lower time.</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Deletable?</strong> Deletable. With FQN/import-resolved calls and the §4.3 single
+  resolver carrying arg types, the wrong overload is never bound.</li>
+<li><strong>Removes via:</strong> §6 item <strong>7</strong> + <strong>8</strong>.</li>
+<li><strong>Removal test:</strong> <code>parity_operator_edge_cases</code>/<code>parity_type_system_shapes</code> green
+  without the fallback; differential identical.</li>
+</ul>
+<h3 id="c8-callfunc-bodyless-expect-sibling-redirect-prefix-probe">C8 — <code>callFunc</code> bodyless-<code>expect</code> sibling redirect + prefix probe<a class="headerlink" href="#c8-callfunc-bodyless-expect-sibling-redirect-prefix-probe" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_func.zig:493-533</code>: a bodyless <code>expect</code>
+  decl redirects to a same-name same-arity body sibling, else probes the declared
+  FQN, else the <code>kotlin.*</code> prefix list by simple name.</li>
+<li><strong>What it does:</strong> resolves <code>expect</code>/<code>actual</code> and bodyless stdlib decls by simple
+  name + order + prefix ladder.</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Deletable?</strong> Deletable — the prefix-ladder portion folds into the FQN index
+  (§4.4). The expect→actual link should be a build-time binding, not a runtime
+  sibling scan.</li>
+<li><strong>Removes via:</strong> §6 item <strong>8</strong>.</li>
+<li><strong>Removal test:</strong> <code>parity_type_system_shapes</code> + multiplatform-shim examples green;
+  differential identical.</li>
+</ul>
+<h3 id="c9-irmethodwalk-dual-key-fqn-then-simple-name-class-resolution">C9 — <code>irMethodWalk</code> dual-key (FQN then simple-name) class resolution<a class="headerlink" href="#c9-irmethodwalk-dual-key-fqn-then-simple-name-class-resolution" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_member.zig:3363-3380</code>: resolve the
+  receiver's IR class by FQN for its own class (<code>first</code>), else fall back to a linear
+  simple-name scan of <code>mod.classes</code>.</li>
+<li><strong>What it does:</strong> the simple-name scan is what makes pack-mangled classes layout-
+  sensitive (§3.4): a same-simple-name class from another pack can be hit by the
+  scan.</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Deletable?</strong> Deletable as the <em>simple-name scan</em> — keep the FQN resolution. The
+  supertype walk should also resolve supertypes by FQN once the registry is
+  FQN-keyed.</li>
+<li><strong>Removes via:</strong> §6 item <strong>8</strong>.</li>
+<li><strong>Removal test:</strong> differential over a program with same-simple-name classes in two
+  packages; <code>parity_inheritance_dispatch</code> green.</li>
+</ul>
+<h3 id="c10-instancemethodwalknamed-companion-simple-name-scans">C10 — <code>instanceMethodWalkNamed</code> / <code>companion</code>* simple-name scans<a class="headerlink" href="#c10-instancemethodwalknamed-companion-simple-name-scans" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_member.zig:4247-4258</code>
+  (<code>instanceMethodWalkNamed</code> linear <code>c.name</code>==cur scan), and the companion walks
+  <code>classCompanionForward</code> <code>:3903-3929</code> / <code>instanceCompanionFallback</code> <code>:3931-3976</code>
+  keyed on simple class name via <code>companion_singletons.get</code>.</li>
+<li><strong>What it does:</strong> named-arg method resolution and companion forwarding both walk
+  by bare class name.</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Deletable?</strong> Deletable as resolution-by-simple-name (fold into the FQN-keyed
+  registry). The walk <em>structure</em> (supertype traversal) is legitimate; the <em>key</em> is
+  the guard.</li>
+<li><strong>Removes via:</strong> §6 item <strong>8</strong>.</li>
+<li><strong>Removal test:</strong> <code>parity_named_args_defaults</code> + <code>parity_properties_accessors</code>
+  green; differential identical.</li>
+</ul>
+<h3 id="c11-islambdabody-forks-fqn-head-resolution-removed-item-10">C11 — <code>isLambdaBody()</code> forks FQN-head resolution — REMOVED (item 10)<a class="headerlink" href="#c11-islambdabody-forks-fqn-head-resolution-removed-item-10" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location (was):</strong> <code>src/ir/lower/expr.zig</code> four sites, each a
+  <code>(isPkgRoot(head) or !b.isLambdaBody())</code> gate on whether a dotted head lowers to a
+  <code>LoadGlobal</code>-of-FQN vs a member/<code>this</code> walk.</li>
+<li><strong>What it did:</strong> the same dotted path lowered differently inside a lambda; since
+  pack/DSL code is consumed almost entirely through builder lambdas, this was a
+  primary Class-C aggravator (§2 Class C "Aggravating factors").</li>
+<li><strong>Class:</strong> C.</li>
+<li><strong>Removed (item 10).</strong> <code>isLambdaBody()</code> is gone from all four resolution sites.
+  Package-head vs receiver-member is now decided by the one principled predicate
+  <code>headIsPackage(b, head)</code> (<code>expr.zig</code>): a head is a package head when it is a real
+  package root (<code>isPkgRoot</code>) or names a package the program contributes a top-level
+  symbol to (<code>Module.packageHeadDeclared</code> — <code>head.&lt;rest&gt;</code> is a declared FQN prefix
+  over the complete phase-1 header set). A captured/local name or an enclosing-class
+  member shadows a package head (the sites filter those with
+  <code>resolve</code>/<code>knowsOuter</code>/<code>hasEnclosingMember</code>/<code>classId</code> guards). The same head
+  resolves the same way regardless of lambda nesting — independent of declaration
+  order and load mode. The inline splice already binds the inline body's receiver as
+  a scope local named <code>"this"</code> (<code>inline_call.zig</code>), so inline-body dotted heads
+  resolve through the same predicate without a lambda axis (no new frame-receiver
+  slot needed at the splice).</li>
+<li><strong>Removal test:</strong> the builder-DSL differential — <code>examples/dsl_dotted_head.kt</code>
+  (package head + receiver-member dotted heads inside <code>@DslMarker</code> / <code>apply</code> / <code>with</code>
+  receiver lambdas) and <code>tests/fixtures/coroutine_smoke/cs8_dotted_in_builder.kt</code>
+  (<code>kotlin.math.*</code> dotted heads inside <code>flow</code>/<code>launch</code>/<code>coroutineScope</code> builders) —
+  byte-identical across EmbeddedOnly / SourcePacks / CompiledPacks, plus the
+  unmodified <code>parity_extension_resolution</code> / <code>parity_dsl_operators</code> /
+  <code>parity_suspend_shapes</code> / <code>parity_inner_classes</code> / <code>parity_functional_patterns</code> /
+  <code>parity_lambdas_and_dispatch</code> itests and <code>KLIO_RESOLVE_AUDIT</code>/<code>KLIO_LINK_AUDIT</code> =
+  0 over the corpus.</li>
+</ul>
+<h3 id="c12-inline-fn-table-keyed-by-bare-simple-name-folded-into-the-symbol-index-item-8d">C12 — Inline-fn table keyed by bare simple name — FOLDED into the symbol index (item 8d)<a class="headerlink" href="#c12-inline-fn-table-keyed-by-bare-simple-name-folded-into-the-symbol-index-item-8d" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> bare-call inline resolution is index-first. The build driver
+  registers every top-level <code>inline fun</code>'s AST under its phase-1 header
+  stub's <code>FuncId</code> (<code>inline_state.registerInlineFnId</code>, called from the stub
+  loop), and <code>inlineTargetForBareCall</code> (<code>src/ir/lower/expr.zig</code>) resolves the
+  bare name through <code>resolveBareCallIndexed</code> FIRST: an inline winner splices
+  exactly the resolved declaration (<code>tryInlineCallWithTypeArgs</code> now takes the
+  resolved target), a non-inline winner suppresses the splice so the normal
+  call path binds it, and a receiver-matched extension pick keeps the
+  narrowing's choice (mirroring <code>preferredBareTarget</code>). The simple-name
+  shape/receiver narrowing (<code>inlineFnAstFor*</code>) survives only as the
+  tie-break for shapes the index defers on: extension forms, overload sets,
+  default/vararg/trailing-lambda shapes, class/object member inline fns (no
+  stub, never index-resolved), and class-method bodies lowered before the
+  phase-1 headers exist. <code>shadowed_inline_names</code> no longer has its own
+  construction: its name domain comes from <code>stdlib.noteBareNameMapping</code> —
+  the same constructor behind the link-time <code>default_import_globals</code> /
+  <code>any_member_globals</code> maps — over <code>IMPLICITLY_IMPORTED_PACKAGES</code>.</li>
+<li><strong>Location:</strong> <code>src/ir/lower/inline_state.zig</code> (<code>inline_fn_asts</code> simple-name
+  candidates, <code>inline_fn_ids</code> FuncId-keyed ASTs, <code>shadowed_inline_names</code>),
+  <code>src/ir/lower/expr.zig</code> (<code>inlineTargetForBareCall</code>).</li>
+<li><strong>Class:</strong> C (resolved).</li>
+<li><strong>Verified by:</strong> the KLIO_RESOLVE_AUDIT <code>inline</code> records — one line per
+  bare inline-candidate call comparing the old simple-name-first pick to the
+  index-first pick on the splice that would actually occur, each divergence
+  graded as a shape correction (the simple-name pick matches less exactly:
+  vararg at ANY parameter position, a default, an arity mismatch) or a tier
+  correction (the index pick ranks in a strictly better scope tier — e.g. a
+  named import outranking a same-package reified inline namesake, a program
+  property pinned strict-mode-on in <code>itests/resolve_ambiguity.zig</code>). Corpus +
+  fixture sweep: 517,022 records, 0 unexplained divergences; 48 graded shape
+  corrections, all at one root site (the four deprecated <code>combineLatest</code>
+  bodies in kotlinx-coroutines <code>Migration.kt</code>, where the simple-name table —
+  which only ever holds the inline overloads — spliced the reified vararg
+  <code>combine</code> for calls whose exact-arity match is the non-inline
+  <code>combine(flow, flow2, transform)</code>; the index pick is the kotlinc-correct
+  binding, pinned fold-sensitively by the equal-arity vararg-vs-exact test
+  in <code>itests/resolve_ambiguity.zig</code>, which fails under a name-first
+  mutation). The surviving narrowing is receiver-aware in class methods:
+  the enclosing class (falling back from the enclosing extension's
+  receiver) matches candidate receivers through the transitive supertype
+  chain (<code>registry.class_super_names</code> / <code>Module.classIsOrExtends</code>),
+  nearest first, with the same subtype-aware receiver veto in the splice
+  gate — <code>A.label</code>/<code>B.label</code> twins splice per enclosing class in either
+  declaration order, a base-class extension accepts a subclass method's
+  receiver, and the subclass's own extension outranks the base one
+  (<code>itests/parity_extension_resolution.zig</code>). <code>KLIO_RESOLVE_STRICT</code>
+  hard-fails an unexplained inline divergence. Differential (93 programs,
+  all modes), <code>parity_advanced_idioms</code>, <code>parity_suspend_shapes</code>, coroutine
+  smoke green.</li>
+</ul>
+<hr />
+<h2 id="other-correctness-re-entrancy-not-primarily-a-guard-mostly-keep">Other-correctness / re-entrancy (NOT primarily a guard — mostly keep)<a class="headerlink" href="#other-correctness-re-entrancy-not-primarily-a-guard-mostly-keep" title="Permanent link">&para;</a></h2>
+<p>These branches bound legitimate recursion or implement genuine protocol. They are
+catalogued so nobody mistakes them for Class-A/B/C point-fixes; most are <strong>keep</strong>.</p>
+<h3 id="o1-map_fallback_active-iterable_fallback_active">O1 — <code>map_fallback_active</code> / <code>iterable_fallback_active</code><a class="headerlink" href="#o1-map_fallback_active-iterable_fallback_active" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_member.zig:57,60</code>; used
+  <code>:1821-1836,1839-1857</code>.</li>
+<li><strong>What it does:</strong> prevents the user-<code>Map</code>/<code>Iterable</code> → builtin materialization
+  fallback from re-entering itself while it drains the user collection (which calls
+  back into <code>callMember</code>).</li>
+<li><strong>Class:</strong> other-correctness (re-entrancy bound). It is <em>also</em> a TLS, so it shares
+  Class B's "not reset between runs" hazard.</li>
+<li><strong>Deletable?</strong> <strong>Keep</strong> the protection, but the TLS <em>mechanism</em> is deletable —
+  pass the in-progress flag as a parameter of the drain call (§4.2 "guards become
+  params"). Standalone deletion would infinitely recurse on a user Map/Iterable.</li>
+<li><strong>Hardened (item-6 close-out):</strong> the set/clear windows are now
+  <code>defer</code>-cleared blocks (a Zig error from the drain can no longer leak the
+  flag), and <code>host_call_member.resetReceiverTls</code> Debug-asserts both flags
+  false at every run boundary (wired into
+  <code>vmhost.resetReceiverThreadLocals</code>) — previously the only TLS-holding VM
+  module with no run-boundary assert.</li>
+<li><strong>Stays a TLS — confirmed reason.</strong> It guards a purely intra-thread host
+  materialization re-entrancy: while the Map/Iterable fallback drains the
+  user collection, the drain calls back into <code>callMember</code> (host→eval→host),
+  and the flag must survive that whole synchronous activation, which a
+  parameter of one call cannot. It is NOT a resolver-order flag, so the
+  single resolver (§6 item 7, done) does not retire it; and NOT the
+  finding-12 axis (that carries the coroutine <em>scope</em> per parked activation
+  at the pump level — this flag is unrelated to suspension). The receiver-
+  chain fold (findings 4/8) does not let it ride the carrier either: the
+  carrier is per-frame receiver state, while this is per-activation
+  re-entrancy state for a host-internal drain that has no receiver to ride.
+  Stays a TLS with run-boundary asserts.</li>
+<li><strong>Removal test:</strong> <code>parity_collections_intensive</code>/<code>parity_maps_intensive</code> with a
+  user-defined <code>Map</code>/<code>Iterable</code>; must stay green (a regression would hang).</li>
+</ul>
+<h3 id="o2-call_outer_active-removed-finding-4">O2 — <code>call_outer_active</code> — REMOVED (finding 4)<a class="headerlink" href="#o2-call_outer_active-removed-finding-4" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> REMOVED. It guarded exactly the <code>outerChainFallback</code> that
+  finding 4 deleted, so it had no remaining caller and died with that fold.
+  Finding 4 was root-caused in the <em>lowering</em>, not the runtime: an
+  enclosing-member bare call inside a lifted nested/inner class body was
+  lowered to a plain <code>CallMember</code> on this receiver (because the enclosing
+  class's members were merged into the method builder's <code>own_members</code>), and
+  reached the enclosing member only via the runtime outer-link
+  <code>outerChainFallback</code> — which also fired for a <code>with</code>/<code>run</code>/<code>apply</code> subject
+  whose outer tower is not in scope. The fix keeps the enclosing-class
+  members as the builder's <code>enclosing_members</code> (distinct from
+  <code>own_members</code>), so such a call lowers to <code>CallMemberOrGlobal</code> and the
+  single candidate resolver (<code>implicitCandidatesAlloc</code>) walks the proper
+  implicit-receiver tower: a dispatch receiver brings its <code>outer</code> links, a
+  subject brings only itself. With the fallback gone the guard is gone; its
+  line is removed from <code>host_call_member.resetReceiverTls</code>.</li>
+<li><strong>Was at:</strong> <code>src/interp_ir/vm/host_call_member.zig</code> (the
+  <code>outerChainFallback</code> block).</li>
+<li><strong>Class:</strong> other-correctness (re-entrancy bound for a now-deleted walk).</li>
+<li><strong>Verified by:</strong> <code>with_subject_outer_member_call_rejected</code> (rejection),
+  <code>inner_member_calls_outer_member</code> (positive — the companion-outer /
+  inner-outer member resolution that this guard's walk used to serve now
+  resolves through the candidate tower) and <code>backtick_this_param_not_receiver</code>
+  in <code>parity_corpus_pinned.zig</code>, plus <code>parity_inner_classes</code> green.</li>
+</ul>
+<h3 id="o3-ctor_guard-was-defined-twice-duplication-removed-item-6-close-out">O3 — <code>ctor_guard</code> (was defined twice) — duplication REMOVED (item-6 close-out)<a class="headerlink" href="#o3-ctor_guard-was-defined-twice-duplication-removed-item-6-close-out" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Status:</strong> collapsed to ONE guard. The <code>host_globals.zig</code> copy had <strong>no
+  writer anywhere</strong> (the shell pushes wrote <code>host_instances.zig</code>'s distinct
+  threadlocal), so the deferred-<code>object</code> gate read in <code>lookupGlobal</code> was
+  provably always false — a silently broken port of Rust's single shared
+  <code>EXEC</code> thread-local. <code>host_instances.ctorGuardContains</code> is now <code>pub</code> and
+  <code>host_globals.lookupGlobal</code> consults it, restoring the intended
+  cross-file semantics; the dead copy, its reset lines, and its private
+  <code>contains</code> are deleted.</li>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_instances.zig</code> (the one guard:
+  push/pop around secondary-ctor shell construction, read as
+  <code>shell_guarded</code> and by <code>host_globals.lookupGlobal</code>).</li>
+<li><strong>What it does:</strong> a deferred <code>object</code> is only driven on-access when its own ctor is
+  not already running; the same stack guards secondary-ctor shell dispatch.</li>
+<li><strong>Class:</strong> other-correctness. The guard itself stays.</li>
+<li><strong>Removal test (passing):</strong> <code>parity_properties_accessors</code> (object init
+  order, incl. <code>object_self_reference_during_init</code>) green with one
+  <code>ctor_guard</code>.</li>
+</ul>
+<h3 id="o4-top_level_init_depth">O4 — <code>top_level_init_depth</code><a class="headerlink" href="#o4-top_level_init_depth" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_globals.zig:55-60</code>.</li>
+<li><strong>What it does:</strong> a forward reference during startup re-drives the real top-level
+  initializer rather than observing the <code>Null</code> placeholder.</li>
+<li><strong>Class:</strong> other-correctness.</li>
+<li><strong>Deletable?</strong> <strong>Keep</strong> (genuine init-order semantics); TLS→explicit driver state
+  under §6 item 6.</li>
+<li><strong>Removal test:</strong> startup forward-reference fixtures green.</li>
+</ul>
+<h3 id="o5-coroutine-driver-tls-coro_stack-active_scope_stack-persisted_parked">O5 — coroutine driver TLS (<code>coro_stack</code>, <code>active_scope_stack</code>, <code>persisted_parked</code>)<a class="headerlink" href="#o5-coroutine-driver-tls-coro_stack-active_scope_stack-persisted_parked" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/coroutines.zig</code> (<code>coro_stack</code>,
+  <code>active_scope_stack</code>, <code>PersistedParked</code>).</li>
+<li><strong>What it does:</strong> the coroutine interceptor stack, active-scope stack, and
+  indefinitely-parked continuation map — the real coroutine machinery.</li>
+<li><strong>Class:</strong> other (genuine runtime state) — but per §2 Class B companion list it is
+  the same "TLS, never reset between runs" hazard.</li>
+<li><strong>Deletable?</strong> <strong>Keep</strong> the state; it should be owned by the driver and asserted
+  empty between runs (§5.2), not deleted.</li>
+<li><strong>Per-activation scope fix (finding 12 close-out):</strong> the <code>active_scope_stack</code>
+  is no longer read at the top of stack on resume — that was the
+  cancellation-over-delivery bug. Each parked activation now owns its scope
+  delta (<code>ParkedEntry.scope_delta</code> / <code>PersistedParked.Entry.scope_delta</code>):
+  <code>park</code> captures and removes the activation's own scope pushes off the live
+  stack, and each resume site restores them just before the activation runs.
+  The TLS stack stays (it is the live driver's working scope), but it is no
+  longer the per-activation carrier — that rides the parked entry. The
+  threadlocal would still move onto the driver under §6 item 6.</li>
+<li><strong>Removes via:</strong> §5.2 reset asserts (interim) + §6 item 6 (own it on the driver).</li>
+<li><strong>Removal test:</strong> §5.2 "TLS empty between runs" assert; <code>parity_coroutine_smoke</code>
+  green run back-to-back; the over-delivery pins <code>tl_cancel_sibling_plain</code> /
+  <code>tl_cancel_sibling_after_scope</code> / <code>tl_cancel_root_not_independent</code>.</li>
+</ul>
+<h3 id="o6-materializeusermap-drainiterabletolist-fallbacks">O6 — <code>materializeUserMap</code> / <code>drainIterableToList</code> fallbacks<a class="headerlink" href="#o6-materializeusermap-drainiterabletolist-fallbacks" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>host_call_member.zig:611-658</code> / <code>:833-869</code>, the 1,000,000-iteration
+  drain bound <code>:841</code>.</li>
+<li><strong>What it does:</strong> materialize a user collection into a builtin so stdlib intrinsics
+  apply. Legitimate protocol bridging (gated by O1).</li>
+<li><strong>Class:</strong> other-correctness (legitimate-not-a-guard).</li>
+<li><strong>Deletable?</strong> <strong>Keep.</strong> This is real interop behavior, not a masking fallback.</li>
+</ul>
+<h3 id="o7-extensionfnfallback-param0this-admission-member_ext_owner_class-gate">O7 — <code>extensionFnFallback</code> <code>param[0]=="this"</code> admission + <code>member_ext_owner_class</code> gate<a class="headerlink" href="#o7-extensionfnfallback-param0this-admission-member_ext_owner_class-gate" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Location:</strong> <code>src/interp_ir/vm/host_call_member.zig:3692-3711</code> (admit funcs whose
+  first param is <code>"this"</code>, gate by <code>member_ext_owner_class</code>), the gate's twin in
+  <code>userMemberExtShadows</code> <code>:3604-3621</code> and <code>resolveExtOverloadLocal</code> <code>:4197-4221</code>;
+  the registry field <code>ir.zig:985</code>, populated <code>decl.zig:592</code>.</li>
+<li><strong>What it does:</strong> the member-extension dispatch surface. <code>param[0]=="this"</code> admits
+  both synthesized method receivers and synthesized extension receivers (the ktor
+  double-<code>execute</code> root cause, §3.4); the <code>member_ext_owner_class</code> gate is what makes
+  member-extension visibility work.</li>
+<li><strong>Class:</strong> other / dispatch-taxonomy. This is the §4.3 "Caution": it is NOT a pure
+  point-fix — collapsing "is in <code>class.methods</code>" ⇒ "not an extension" would drop the
+  member-extension dispatch ktor relies on.</li>
+<li><strong>Deletable?</strong> <strong>Keep the behavior.</strong> The member-extension <em>recognition</em> heuristic
+  is now backed by a first-class registry kind (item 7): <code>Func.kind ==
+  .member_extension</code> is authoritative via <code>isMemberExt</code>, and the five owner-gated
+  dispatch sites route through <code>memberExtVisible</code>/<code>isMemberExt</code> in
+  <code>host_call_member.zig</code> instead of probing <code>member_ext_owner_class</code> directly. The
+  <code>param[0]=="this"</code> admission in <code>extensionFnFallback</code>/<code>resolveExtOverloadLocal</code>
+  stays as the <em>candidate-shape</em> filter (it still admits top-level extensions and
+  synthesized method receivers, which also lead with <code>"this"</code>); the kind only
+  disambiguates which of those candidates are owner-gated member extensions. The
+  <code>member_ext_owner_class</code> gate is preserved exactly — the side table is kept as
+  the owner-class data source.</li>
+<li><strong>Removes via:</strong> §6 item <strong>7</strong> (registry func-kind) — PARTIAL: kind landed and is
+  authoritative for recognition + gating; the gate semantics are preserved, not
+  removed.</li>
+<li><strong>Removal test:</strong> <code>parity_extension_resolution</code> (17/17), <code>parity_inner_classes</code>
+  (member-extension on outer / on <code>String</code>), <code>parity_dsl_operators</code>,
+  <code>parity_functional_patterns</code> green under the kind-based scorer; differential
+  identical across modes.</li>
+</ul>
+<hr />
+<h2 id="keep-list-load-bearing-do-not-delete-as-point-fixes">Keep list (load-bearing — do NOT delete as "point-fixes")<a class="headerlink" href="#keep-list-load-bearing-do-not-delete-as-point-fixes" title="Permanent link">&para;</a></h2>
+<p>These are branches that an over-eager guard-removal pass might mistake for
+point-fixes. They implement real semantics or bound real recursion. The
+structural roadmap <em>relocates</em> most (TLS→frame field / TLS→param / heuristic→
+registry-kind) rather than deleting the behavior.</p>
+<ol>
+<li><strong><code>scoped_env</code> write-back (A1) / <code>StoreGlobal</code>-for-capture (A2)</strong> — REMOVED in
+   §6 item 4b (4a's precise captured-<code>var</code> carrier landed first, then 4b deleted
+   both). No longer a keep entry; see the A1/A2 entries above.</li>
+<li><strong><code>map_fallback_active</code> / <code>iterable_fallback_active</code> (O1)</strong> — the <em>flag</em> is a TLS
+   to relocate, but the re-entrancy protection it provides is mandatory (infinite
+   recursion otherwise).</li>
+<li><strong><code>call_outer_active</code> (O2)</strong> — REMOVED via finding 4 (it guarded the deleted
+   <code>outerChainFallback</code>); no longer a keep entry.</li>
+<li><strong><code>ctor_guard</code> (O3)</strong> — object/secondary-ctor init guard; the duplicate is now
+   collapsed (item-6 close-out), keep the one guard.</li>
+<li><strong><code>top_level_init_depth</code> (O4)</strong> — forward-reference init-order semantics.</li>
+<li><strong>Coroutine driver TLS (O5)</strong> — genuine suspend/resume machinery; own-on-driver +
+   reset-assert, do not delete.</li>
+<li><strong><code>materializeUserMap</code> / <code>drainIterableToList</code> (O6)</strong> — real collection interop.</li>
+<li><strong><code>extensionFnFallback</code> member-extension gate (O7)</strong> — the <code>member_ext_owner_class</code>
+   gate is the load-bearing member-extension visibility mechanism (§4.3 caution);
+   replace the <code>param[0]=="this"</code> heuristic with a registry kind, never drop the
+   gate.</li>
+<li><strong><code>classIdByFqn</code> unambiguous-only resolution (<code>ir.zig:879-889</code>)</strong> — already the
+   <em>correct</em> FQN-keyed path (returns <code>null</code> on residual collision rather than
+   binding the wrong class); it is the <em>destination</em> of the Class-C fix, not a
+   guard. Keep and extend.</li>
+</ol>
+<hr />
+<h2 id="cross-cutting-notes">Cross-cutting notes<a class="headerlink" href="#cross-cutting-notes" title="Permanent link">&para;</a></h2>
+<ul>
+<li>
+<p><strong>The dead duplicate Host is already gone.</strong> <code>execution-architecture.md</code>
+  §3.3/§4.5/§6-item-0a calls for deleting <code>src/ir/eval/host.zig</code>; that file and the
+  <code>src/ir/eval/</code> directory <strong>do not exist</strong> in the live tree (verified:
+  <code>find src/ir/eval</code> → no such directory; the only <code>host.zig</code> files are
+  <code>src/runtime/host.zig</code> and the VM host modules). §6 item 0a is therefore already
+  satisfied — no guard to catalogue, but the roadmap entry should be marked done.</p>
+</li>
+<li>
+<p><strong>Detection scaffolding does not exist yet.</strong> None of <code>src/itests/differential.zig</code>,
+  <code>src/itests/fuzz_closures_suspend.zig</code>, or the <code>KLIO_TRACE_PATH</code>/
+  <code>assert_single_path.py</code> tooling is present, and <code>nested_name_collision.kt</code> is not
+  in <code>itests_files</code> (<code>build.zig:48-62</code>). The "removal test" column above is
+  therefore mostly <em>prospective</em>: §6 items 1–3 must build these detectors before
+  most guards can be proven safe to remove. The guards covered by an <em>existing</em>
+  default-target itest today are B6 (<code>parity_extension_resolution</code>), B10
+  (<code>parity_inner_classes</code>), O1 (<code>parity_maps_intensive</code>/<code>collections_intensive</code>),
+  and the A1/A2 keep-condition (<code>parity_closures_advanced</code>/<code>closures_deep</code>).</p>
+</li>
+<li>
+<p><strong>TLS reset is the cheapest interim signal.</strong> Per §5.2, a Debug-only "all of
+  <code>outer_this</code> / <code>coro_stack</code> / <code>active_scope_stack</code> / <code>field_resolve_stack</code> /
+  <code>ctor_guard</code> empty between runs" assert + <code>clearRetainingCapacity</code> would make the
+  Class-B TLS leak a loud failure and make every differential result trustworthy —
+  it is a prerequisite for trusting the removal tests of B1–B14, O1–O5.</p>
+</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2026 Klio Contributors
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/DrewCarlson/klio" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>

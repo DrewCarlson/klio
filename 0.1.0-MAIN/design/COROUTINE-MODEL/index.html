@@ -1,0 +1,2535 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="An experimental Kotlin interpreter written in Zig.">
+      
+      
+      
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/design/COROUTINE-MODEL/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Coroutine model: complete async-compose story + the eager-outside-driver divergence - Klio</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#coroutine-model-complete-async-compose-story-the-eager-outside-driver-divergence" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Klio
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Coroutine model: complete async-compose story + the eager-outside-driver divergence
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Klio
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/hello-world/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Hello, world
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Tour
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing Your Code
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../BUNDLE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bundling Programs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pipeline Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/interpreter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The Vm
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/stdlib/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Standard Library
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/concurrency/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concurrency
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/memory-model/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Model
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../architecture/performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/overview/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    What is a Pack?
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/format/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pack Format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/using/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Using Packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/authoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authoring a Pack
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/native-bindings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Native Bindings
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Shipped Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Shipped Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/atomicfu/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.atomicfu
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/io/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.io
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/datetime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.datetime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/coroutines/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.coroutines
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/serialization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.serialization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/ktor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    io.ktor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    androidx.compose.runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Development
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/workspace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workspace Layout
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/debugging/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../development/contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#the-dispatched-task-terminal-state-contract-2026-08-18" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The dispatched-task terminal-state contract (2026-08-18)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#status-2026-06-27-verified-current-state-and-remaining-work" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        STATUS 2026-06-27 — verified current state and remaining work
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="STATUS 2026-06-27 — verified current state and remaining work">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#done" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Done
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#partial-one-concrete-remnant-each" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Partial — one concrete remnant each
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#open-not-started" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Open — not started
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#adjacent-defect" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Adjacent defect
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#0-what-the-machinery-actually-is-verified" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        0. What the machinery actually is (verified)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#1-root-cause-of-the-stateflow-suspend-inside-synchronized-overflow-part-a-blocker" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Root cause of the StateFlow / suspend-inside-synchronized overflow (PART A blocker)
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/design/COROUTINE-MODEL.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="coroutine-model-complete-async-compose-story-the-eager-outside-driver-divergence">Coroutine model: complete async-compose story + the eager-outside-driver divergence<a class="headerlink" href="#coroutine-model-complete-async-compose-story-the-eager-outside-driver-divergence" title="Permanent link">&para;</a></h1>
+<p>Author role: concurrency runtime architect. This plan is grounded in the live code
+(file:line below), not the probe summaries alone.</p>
+<hr />
+<h2 id="the-dispatched-task-terminal-state-contract-2026-08-18">The dispatched-task terminal-state contract (2026-08-18)<a class="headerlink" href="#the-dispatched-task-terminal-state-contract-2026-08-18" title="Permanent link">&para;</a></h2>
+<p>The park/wake machinery's invariants used to live only in comments, and
+three real bugs came out of it in one week: a cross-thread resume
+dereferencing the parker's dead thread-local state (SEGV), a dispatched
+task's internal failure never waking the parked root (silent hang), and
+the pool's <code>first_error</code> being read only at the run boundary. What follows
+is the contract as TESTABLE statements, each naming the fixture that pins
+it. A statement with no fixture is a gap, not a convention.</p>
+<p>Every dispatched task ends in exactly one terminal state, and each has a
+required observable outcome:</p>
+<table>
+<thead>
+<tr>
+<th>terminal state</th>
+<th>required behavior</th>
+<th>pinned by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>completes normally</td>
+<td>the Job completes; <code>join()</code> returns; the parent is untouched</td>
+<td><code>tl_dispatch_many</code>, <code>tl_dispatch_thread_names</code></td>
+</tr>
+<tr>
+<td>throws before suspending</td>
+<td>the Job completes as FAILED, the parent scope is cancelled per structured concurrency, and the run crashes (rc=1)</td>
+<td><code>tl_dispatched_failure_join</code>, <code>tl_dispatched_failure_no_join</code></td>
+</tr>
+<tr>
+<td>throws AFTER suspending (the resume path)</td>
+<td>identical to the above — but the throw lands on whichever worker resumed the continuation, not the one that started it</td>
+<td><code>tl_dispatched_failure_after_resume</code></td>
+</tr>
+<tr>
+<td>throws and the body catches it</td>
+<td>no failure escapes; the parent survives</td>
+<td><code>tl_dispatched_failure_caught</code></td>
+</tr>
+<tr>
+<td>throws <code>CancellationException</code></td>
+<td>NOT a failure — it is that coroutine's own normal cancellation. The parent scope must survive and the run must not crash</td>
+<td><code>tl_dispatched_cancellation_is_not_failure</code></td>
+</tr>
+<tr>
+<td>fails with an INTERNAL eval error (not a Kotlin throwable)</td>
+<td>the run must END with that error, never hang. Internal errors never reach the coroutine machinery, so the pump polls the pool's <code>first_error</code> from its parked-root idle arm</td>
+<td><code>tl_dispatched_internal_error_fails_run</code></td>
+</tr>
+<tr>
+<td>cancelled by its parent</td>
+<td>the child observes cancellation; siblings and the root follow structured-concurrency rules</td>
+<td><code>tl_cancel_dispatched_child</code>, <code>tl_cancel_sibling_plain</code>, <code>tl_cancel_sibling_after_scope</code>, <code>tl_cancel_root_not_independent</code></td>
+</tr>
+<tr>
+<td>still running when the root finishes (daemon)</td>
+<td>abandoned at the run boundary rather than joined; the process must not outlive it and must not hang</td>
+<td><code>tl_daemon_not_awaited</code>, <code>tl_daemon_queued_dropped</code>, <code>tl_daemon_infinite_abandoned</code></td>
+</tr>
+</tbody>
+</table>
+<p>Two invariants underneath the table, both learned from failures:</p>
+<ol>
+<li><strong>A resume may land on a different thread than the park.</strong> A parked
+   activation must be rebound to the RESUMING thread's eval state before
+   reactivation; the parker's thread-local storage may already be dead.
+   The snapshot-resume path builds a fresh frame and is safe by
+   construction; the live-activation path must rebind explicitly.</li>
+<li><strong>An internal error is not a Kotlin throwable</strong>, so it cannot complete a
+   Job as failed and no resume will ever arrive for a root waiting on it.
+   Anything that can leave the root parked forever must therefore be
+   surfaced from the pump's idle arm, not only at the run boundary.</li>
+</ol>
+<p>The failure-vs-cancellation pair is one <code>throw</code> apart and the two fixtures
+exist so that a change collapsing them is caught.</p>
+<hr />
+<h2 id="status-2026-06-27-verified-current-state-and-remaining-work">STATUS 2026-06-27 — verified current state and remaining work<a class="headerlink" href="#status-2026-06-27-verified-current-state-and-remaining-work" title="Permanent link">&para;</a></h2>
+<p>The original framing ("eager model, no async event loop") is <strong>superseded</strong>: klio has a
+working cooperative pump + ready-queue (<code>coroutines.zig</code>), correct launch ordering
+(<code>runBlocking { launch{A}; print B }</code> → <code>B A</code>), and the async-compose story below works
+end-to-end. The state here comes from a fresh 12-category audit (every verdict
+adversarially re-probed against the live build, 2026-06-27); it supersedes the earlier
+"33 divergences" list. The detailed PART A / PART B / root-cause sections further down
+are the implementation notes behind these verdicts.</p>
+<h3 id="done">Done<a class="headerlink" href="#done" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Async-compose story (PART A).</strong> <code>kotlin.synchronized</code> inline actual (block can
+  suspend); the <code>StateFlow</code>/<code>SharedFlow</code> collect machinery; frame clock + async
+  <code>Recomposer.runRecomposeAndApplyChanges</code> + <code>snapshotFlow</code> + <code>Flow.collectAsState</code>
+  <strong>and</strong> <code>StateFlow.collectAsState</code> — all green and matching <code>kotlinc</code>
+  (<code>examples/compose_frame_clock.kt</code>, <code>compose_snapshot_flow.kt</code>, <code>compose_stateflow.kt</code>).</li>
+<li><strong>Channel API + semantics (#3, 6/6).</strong> <code>trySend</code>/<code>tryReceive</code> return <code>ChannelResult</code>;
+  <code>isClosedForSend</code>/<code>isClosedForReceive</code> are properties; <code>produce</code> works; a rendezvous
+  <code>send</code> suspends until a receiver; a conflated channel keeps only the latest.</li>
+<li><strong>#1 runBlocking job name</strong> — <code>toString</code> reports <code>BlockingCoroutine{…}</code> (nameString override).</li>
+<li><strong>Flow operators, dispatch cluster</strong> — <code>map</code>/<code>filter</code>/<code>onEach</code>/<code>transform</code>/<code>take</code>/<code>reduce</code>/
+  <code>toList</code>/<code>flatMapConcat</code> already worked; now also <code>drop</code>/<code>dropWhile</code>/<code>onCompletion</code>+<code>catch</code>
+  (writeback bare-extension receiver walk) and <code>produceIn</code>/<code>buffer</code>/<code>flowOn</code> (named-arg
+  overload applicability — the wrong <code>produce</code> overload was bound). See the #5 note below for
+  the exact root causes and the operators still open (<code>zip</code>/<code>combine</code>/<code>conflate</code>/<code>flatMapMerge</code>/
+  <code>takeWhile</code>).</li>
+</ul>
+<h3 id="partial-one-concrete-remnant-each">Partial — one concrete remnant each<a class="headerlink" href="#partial-one-concrete-remnant-each" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong><code>select</code> + <code>Semaphore</code> (#4, 6/6 — DONE).</strong> Working: <code>onReceive</code>/<code>onReceiveCatching</code>
+  (incl. observing a close while parked), <code>onSend</code> (receiver-first or sender-first, and
+  feeding a <code>for (x in channel)</code> iterator consumer), <code>onAwait</code> (ready + deferred),
+  <code>Semaphore.withPermit</code> under contention, and now an <code>onTimeout</code> that <em>loses</em> to a
+  channel/<code>onAwait</code> clause after parking. The crash was NOT in the
+  <code>CancellableContinuationImpl</code> decision loop: the dispatcher resume path invokes the
+  resume <code>Runnable</code> as a function value (<code>block()</code>), and klio errored
+  <code>invoke on kotlinx.coroutines.Runnable</code> because a <code>Runnable</code> fun-interface's abstract
+  method is <code>run</code>, not <code>invoke</code>. Fix: a value-call on an <code>Instance</code> that has a <code>run</code> member
+  but no <code>invoke</code> dispatches <code>run()</code> (<code>src/interp_ir/vm/host_call_value.zig</code>).
+  Example/probe: <code>examples/select_on_timeout_loses.kt</code>.</li>
+<li><strong>Structured-concurrency parent-job leak (#1, 9/10).</strong> Fixed: a caught-externally
+  <code>coroutineScope</code>/<code>supervisorScope</code> child failure no longer double-delivers to stderr/
+  exit 1; non-<code>runBlocking</code> job <code>toString</code>s report the correct upstream names
+  (StandaloneCoroutine/DeferredCoroutine/ScopeCoroutine/SupervisorCoroutine). <strong>Remaining:</strong>
+  the <code>runBlocking</code> job's <code>toString</code> still leaks the internal class name
+  (<code>KlioBlockingCoroutine{Active}@…</code> vs upstream <code>BlockingCoroutine{…}</code>). Fix: rename (or
+  override <code>nameString()</code> for) <code>private class KlioBlockingCoroutine</code> at
+  <code>klioMain/kotlinx/coroutines/KlioRuntime.kt:45</code>.</li>
+<li><strong>CoroutineExceptionHandler (#2, 2/3).</strong> Fixed: a CEH in <code>GlobalScope.launch</code> / a
+  <code>supervisorScope</code> child receives the uncaught exception with the right type; a regular
+  non-root <code>launch</code> correctly ignores its CEH; <code>async</code> does not fire a CEH. <strong>Remaining:</strong>
+  <code>CoroutineScope(SupervisorJob() + handler)</code> SEGFAULTs (stack overflow) when the scope has
+  more than one <em>throwing</em> child (two non-throwing children that <code>join</code> are fine — <code>i2d</code>).
+  Root: the failure path runs the upstream <code>LockFreeLinkedListNode</code> CAS loop for the job's
+  completion-handler list (<code>loop</code>/<code>compareAndSet</code>/<code>lazySet</code>/<code>finishAdd</code>/<code>removeOrNext</code>/
+  <code>removed</code> all appear in the spin), and klio's atomicfu CAS shims can't satisfy the
+  multi-node remove-under-cancellation, so the helping logic recurses without progress until
+  the (small, worker-thread) stack overflows in <code>instanceBindingProbe</code>'s <code>allocPrint</code>
+  (~host_call_member.zig:3215). The real fix is either real atomicfu CAS semantics or a
+  native bypass of the job node-list (mirroring the native channel bypass). DEEP — deferred.</li>
+<li><strong>launch/async OUTSIDE a driver (PART B, 1/2).</strong> Fixed: an outside-<code>runBlocking</code>
+  <code>launch</code>/<code>async</code> no longer runs eagerly — it routes through <code>Dispatchers.Default</code>
+  (<code>ContextActuals.kt</code> <code>newCoroutineContext</code>); an uncaught exception reports to the worker
+  reporter and the process still exits 0. <strong>Remaining (root nailed):</strong> delays are REAL
+  wall-clock by default (<code>delay(3000)</code> ≈ 3.5s). On a <code>Dispatchers.Default</code>/<code>IO</code> <em>worker</em>
+  there is no cooperative pump, so <code>scheduleResumeAfterDelay</code>'s <code>__kxco_spawn { … }</code> runs
+  EAGERLY INLINE on the worker thread — <code>__kxco_delayMillis</code> becomes a blocking real sleep
+  that nothing can preempt. So <code>launch(Dispatchers.Default){ delay(10_000) }</code> +
+  <code>cancelAndJoin()</code> waits the FULL 10s (pb1: 10546ms) instead of returning at once, while the
+  same on the runBlocking pump aborts instantly (pb7: 586ms — <code>__kxco_spawn</code> enqueues and the
+  delay parks cooperatively + cancellably). Fix is PART-B(b'): give every dispatched worker
+  task a cooperative driver (<code>driveRoot(persist=true)</code> around <code>runVmTask</code>) so its
+  <code>__kxco_spawn</code> delays park instead of blocking and the <code>CancellableContinuation</code>'s
+  cancellation can resume them early. DEEP (worker-pump infrastructure).</li>
+</ul>
+<h3 id="open-not-started">Open — not started<a class="headerlink" href="#open-not-started" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Channel-backed flow operators (#5, partial).</strong> FIXED: <code>drop</code>/<code>dropWhile</code>/<code>onCompletion</code>
+  (a bare extension call whose trailing lambda mutated an outer var pinned the nearest <code>this</code>
+  instead of walking implicit receivers; captured-write calls now use the ordinary shared
+  call resolver) and <code>produceIn</code>/<code>buffer</code>/<code>flowOn</code> (overload resolution bound the wrong
+  <code>produce</code> overload: a named arg that re-targets a positionally-filled parameter must make
+  the overload inapplicable — <code>memberApplicableForWalkNamed</code>/<code>resolveExtOverloadLocal</code> in
+  <code>src/interp_ir/vm/host_call_member.zig</code>). The decisive divergence was
+  <code>scope.produce(ctx, cap, onBufferOverflow, start=…, block=…)</code> binding the 5-arg deprecated
+  overload, dropping <code>onBufferOverflow</code> into <code>start</code> and <code>block</code> into <code>onCompletion</code>, so
+  <code>coroutine.invokeOnCompletion(handler = onBufferOverflow)</code> ran with a <code>BufferOverflow</code> where
+  a <code>JobNode</code> was expected. REMAINING:</li>
+<li><code>zip</code> → <code>invokeOnClose</code> is now implemented (a real channel intrinsic + close-handler list;
+    <code>examples/channel_invoke_on_close.kt</code>). zip now progresses past it to a deeper layer:
+    <code>Vm::get_field coroutineContext on StackFrameContinuation</code> (the <code>withContextUndispatched</code> +
+    <code>threadContextElements</code> + suspend-implicit <code>coroutineContext</code> machinery). Still open.</li>
+<li><code>combine</code> → builder layer FIXED (the <code>fun Flow&lt;T1&gt;.combine(flow: Flow&lt;T2&gt;, …) = flow { … }</code>
+    parameter named <code>flow</code> shadowed the <code>flow {}</code> builder; see the non-fn-param shadow commit).
+    It now reaches a deeper <code>collect on SafeCollector</code> layer in <code>combineInternal</code>'s
+    <code>flows[i].collect { … }</code>. Isolated: a call to an <strong>inline</strong> Flow extension (<code>collect</code>,
+    <code>first</code>) whose receiver is a <strong>local / array-index value</strong> (type not statically a Flow),
+    made inside a <code>FlowCollector&lt;R&gt;</code> extension body, splices with the receiver bound to the
+    enclosing implicit <code>this</code> (the SafeCollector) instead of the actual receiver value —
+    <code>f.collect{}</code> with <code>f: Flow</code> <em>param</em> works (ci_min4), <code>val f = flows[i]; f.collect{}</code> fails
+    (ci_min5). Narrowed further: it is <strong>receiver-type inference</strong>, not the splice per se —
+    <code>f.collect{}</code>/<code>f.collect(collector)</code> dispatch on the actual receiver only when klio can
+    statically infer the receiver is a <code>Flow</code>. <code>val f = other</code> (other a <code>Flow</code> param) works
+    (lv1); <code>flows[i]</code> does not, because <code>inferReceiverType</code> (<code>inline_call.zig:38</code>) has no
+    <code>.Index</code> case and <code>localDeclType</code> carries only a type <em>head</em> ("Array"), losing the
+    <code>Array&lt;out Flow&lt;T&gt;&gt;</code> element. Fix needs element-type inference for an index receiver (and
+    combine has further layers — the batched <code>resultChannel.receiveCatching()</code> loop — beyond it).
+    Still open.</li>
+<li><code>conflate</code> → FIXED. <code>conflate() = buffer(CONFLATED)</code>, and the <code>@Deprecated(level=HIDDEN)</code>
+    binary-compat <code>Flow.buffer(capacity) = buffer(capacity)</code> (Context.kt:143) self-recursed
+    because the runtime extension resolver's lenient pass kept low-priority candidates. Now
+    low-priority overloads are dropped up front when an ordinary candidate exists
+    (<code>extensionFnFallback</code>). <code>flatMapMerge</code> still SIGSEGVs — it needs <code>ChannelFlowMerge</code>
+    (the channel-merge + concurrent inner-collect machinery, in the combine cluster).</li>
+<li><code>takeWhile</code>/<code>transformWhile</code> → <code>invoke on $anon$0</code>: inside <code>unsafeFlow { collectWhile { … } }</code>
+    a bare <code>emit</code>/<code>predicate</code> in the (non-inline) takeWhile lambda, once spliced into
+    <code>collectWhile</code>'s inline <code>object : FlowCollector</code> body, re-binds to that inner object instead
+    of the captured outer <code>this@unsafeFlow</code> collector — an inline-splice bare-name re-resolution
+    bug distinct from the writeback fix.</li>
+<li><strong>Shared root for <code>combine</code> (and the family): a suspend lambda's captured function-typed
+    param mis-resolves to a co-captured <code>this@&lt;ext&gt;</code> value.</strong> Minimal repro
+    <code>docs/design/repros/combine_captured_param_typeparam_cast.kt</code> (cap14): a <code>flow { helper(arrayOf(
+    this@combineX, flow), …) { emit(transform(it[0] as T1, it[1] as T2)) } }</code> where the trailing
+    suspend lambda is invoked inside <code>helper</code> (a foreign suspend frame). The bare <code>transform</code>
+    (combineX's captured param) is invoked on <code>this@combineX</code> (a SafeFlow) → <code>invoke on SafeFlow</code>.
+    Bisected triggers (ALL required): (1) the lambda runs in a <em>foreign suspend frame</em>
+    (non-suspend plain-class equivalent cap17 works); (2) it captures <code>this@&lt;ext&gt;</code> as a value
+    (passing flows as plain params, cap_E, works); (3) it casts to <strong>two distinct</strong> enclosing
+    type parameters <code>as T1</code>/<code>as T2</code> (a single cast cap16 works; concrete <code>as Int</code> cap11 works).
+    So the suspend-state capture/restore mis-indexes value captures when type-parameter casts
+    add reified captures — <code>transform</code> reads the slot holding <code>this@combineX</code>. Fix lives in the
+    suspend activation capture machinery (<code>src/ir/eval.zig</code>), NOT in member dispatch. DEEP.</li>
+<li><strong>Hot-flow suspending collector (#6, 2/3 — collector FIXED).</strong> A <code>SharedFlow</code>/<code>StateFlow</code>
+  collector that suspends and takes a <em>second</em> (and further) emit now works
+  (<code>MutableSharedFlow().collect{}</code> over two <code>emit</code>s → both delivered; <code>MutableStateFlow</code>
+  collect over <code>value=1; value=2</code> → 0,1,2). The field-receiver-lambda park (the "real B1") is
+  resolved. <strong>Remaining:</strong> <code>subscriptionCount.value</code> → <code>unresolved global lastReplayedLocked</code>.
+  This is NOT the runtime getter walk (that is fixed — see the inherited-getter BFS commit;
+  a plain iface-first inherited property read works). It is the LOWERING: inside
+  <code>SubscriptionCountStateFlow.value</code>'s <code>synchronized(this) { lastReplayedLocked }</code>, the
+  <code>synchronized</code> inline-splice loses the receiver context, so <code>inReceiverContext</code> is false at
+  the bare read and it lowers to <code>LoadGlobal</code> instead of the receiver-walking
+  <code>LoadFromThisOrGlobal</code> (expr.zig:1149). An inline-splice receiver-context loss; subscriptionCount
+  is niche. Still open.</li>
+<li><strong><code>Dispatchers.Unconfined</code> eager-start ordering (#7, 0/3).</strong> <code>Unconfined</code> must start the
+  child undispatched on the current thread until the first suspension, and <code>yield()</code> under
+  it must drain an unconfined event loop. Requires a distinct Unconfined dispatcher (not
+  aliased to <code>KlioDispatcher</code> at <code>KlioRuntime.kt:191</code>) + an eager-start branch in
+  <code>coroutineLaunch</code>. Shares a root with the #4 <code>onTimeout</code> crash (the missing event loop).</li>
+<li><strong><code>yield()</code> resume ordering (#8, 0/1).</strong> An externally-resumed <code>CancellableContinuation</code>
+  must be ordered ahead of a subsequently-yielding coroutine in the ready queue; today a
+  <code>cont.resume()</code> + <code>yield()</code> re-schedules the yielder first, hanging the resumed coroutine
+  (<code>coroutineResumeExternal</code>/<code>resumeSlotValue</code> vs the yield ready-queue append in
+  <code>src/interp_ir/vm/coroutines.zig</code>).</li>
+<li><strong>User top-level <code>coroutineContext</code> symbol (#9, 0/1).</strong> A user-declared top-level
+  <code>coroutineContext</code> shadows the suspend-implicit intrinsic read at
+  <code>kotlin-klio/kotlin-coroutines/Intrinsics.kt:29</code> (and :121 / Actuals.kt) →
+  <code>ClassCastException: cast to Map failed</code>. A name-domain/resolution bug.</li>
+<li><strong><code>Dispatchers.Default</code> worker missed-wakeup deadlock (#10, 0/1).</strong> Two-plus <code>Default</code>
+  workers producing into a channel + a worker consumer + a worker join-closer deadlock on
+  a dropped cross-thread wakeup (NOT subsumed by the channel fixes). Cross-thread resume
+  path <code>coroutineResumeExternal</code> / the DriverWakeup mailbox / SlotOwners in
+  <code>src/interp_ir/vm/coroutines.zig</code>.</li>
+</ul>
+<h3 id="adjacent-defect">Adjacent defect<a class="headerlink" href="#adjacent-defect" title="Permanent link">&para;</a></h3>
+<ul>
+<li>
+<p><strong>Cancel of a coroutine parked on a channel <code>send</code>/<code>receive</code> hangs.</strong> klio's channel
+  park is a host intrinsic (<code>coroutineArmSlot</code>), so it bypasses <code>CancellableContinuation</code>
+  and <code>Job.cancel</code> cannot reach it — <code>cancelAndJoin</code> of a parked send <em>or</em> receive never
+  resumes with <code>CancellationException</code>. Related to the PART B worker-cancel remnant: a
+  channel park must register cancellation interest so a cancel resumes its slot with the
+  exception.</p>
+</li>
+<li>
+<p><strong><code>DeepRecursiveFunction</code> works under <code>klio test</code> but crashes under <code>klio run</code>.</strong>
+  <code>runCallLoop</code> calls <code>function.startCoroutineUninterceptedOrReturn(this, value, cont)</code>,
+  an extension on a <code>suspend R.(P) -&gt; T</code> function value. Under <code>klio test</code> the call
+  resolves as a top-level function (<code>path=call_func</code>,
+  <code>decl=kotlin.coroutines.intrinsics.startCoroutineUninterceptedOrReturn</code>) and runs. Under
+  <code>klio run</code> (the embedded-image path) the same call is left to runtime extension
+  resolution on the function-typed receiver, which misses and errors:
+  <code>Vm::call_member 'startCoroutineUninterceptedOrReturn' on 'kotlin.Function'</code>. So this is
+  an embedded-image-vs-test <strong>extension-resolution divergence</strong> on a function-typed
+  receiver, not a coroutine-machinery bug — the machinery is proven correct by the passing
+  <code>test</code> path. Repro:
+  <code>scratchpad/b6/deeprec2.kt</code> (<code>val depth: DeepRecursiveFunction&lt;Int, Int&gt; =
+  DeepRecursiveFunction { n -&gt; if (n == 0) 0 else callRecursive(n - 1) + 1 };
+  println(depth(100_000))</code>) — fails under <code>klio run</code>, passes as a <code>@Test</code>. Root-cause the
+  divergence: why the embedded image does not resolve the <code>startCoroutineUninterceptedOrReturn</code>
+  extension on a <code>kotlin.Function</code> receiver the way the test-compiled program does (likely
+  a missing intrinsic/extension registration or a receiver-head match that only the test
+  path's symbol index carries). Fix ships a deterministic probe promoted into the e2e
+  corpus so <code>klio run</code> and <code>klio test</code> stay in lockstep.</p>
+</li>
+</ul>
+<p><strong>Suggested fix order:</strong> the #4 <code>onTimeout</code> remnant + the cancel-on-channel-park defect
+(closes out the select work); then #1 + #2 (shared <code>KlioRuntime</code> root, one segfault);
+then the flow/dispatch cluster #5–#8 (largest, with #7 Unconfined the shared root the #4
+<code>onTimeout</code> crash also touches); #9/#10 are isolated. Each fix ships a deterministic probe
+promoted into the parity/e2e corpus.</p>
+<hr />
+<h2 id="0-what-the-machinery-actually-is-verified">0. What the machinery actually is (verified)<a class="headerlink" href="#0-what-the-machinery-actually-is-verified" title="Permanent link">&para;</a></h2>
+<p>Two layers, exactly as mapped:</p>
+<ul>
+<li><strong>Layer 1 — dispatcher/time-agnostic suspension.</strong> <code>src/ir/eval.zig</code> returns
+  <code>error.Suspend</code>; the activation is packed into a <code>SuspendState</code>. No clock, no
+  dispatcher.</li>
+<li><strong>Layer 2 — <code>CooperativeInterceptor</code> pump.</strong> <code>src/interp_ir/vm/coroutines.zig</code>.
+  Per-<code>runBlocking</code>/per-root cooperative pump on one OS thread. Owns a ready
+  queue, a token→<code>ParkedEntry</code> map, a slot table, a virtual clock, a cross-thread
+  <code>DriverWakeup</code> mailbox.</li>
+<li><code>runBlocking</code> → <code>__kxco_rbPump</code> → <code>driveRunBlocking</code>/<code>driveRoot(persist=false)</code>
+    (coroutines.zig:1600-1601, 1186-1187).</li>
+<li><code>pumpLoop</code> (coroutines.zig:1320-1505): drain launches, resume ready tokens,
+    <code>advanceTimeGated</code> (:818-899) advances virtual time gated by the global
+    <code>VirtualClock</code> barrier (:353-438), drain worker mailbox, break when the root
+    completes.</li>
+<li><code>park</code> requires an active pump: <code>coroTop() orelse return error.OutOfMemory</code>
+    (coroutines.zig:1178). Suspending with <strong>no</strong> pump is an error.</li>
+</ul>
+<p>Real OS parallelism: <code>Dispatchers.Default</code>/<code>IO</code> → <code>__kxco_dispatch</code> →
+<code>coroutineDispatchPooled</code> → <code>scheduler.zig</code> worker pool; each task materializes a
+fresh child <code>Vm</code> and runs the block via <code>runVmTask</code>/<code>runThreadBlock</code>
+(scheduler.zig:327-345). Cross-thread resume routes back through <code>SlotOwners</code> +
+the owning driver's mailbox, or <code>PersistedParked</code> after the driver exited
+(<code>coroutineResumeExternal</code>, coroutines.zig:1693-1747).</p>
+<p><strong>The divergence.</strong> <code>coroutineLaunch</code> (coroutines.zig:1642-1654): with an active
+pump it enqueues the child onto the pump; with <strong>no</strong> pump it runs the child
+<strong>eagerly inline</strong> via <code>invokeCallable</code>, so <code>delay</code> is a no-op and <code>await</code>
+returns immediately. The reason a bare <code>GlobalScope.launch{}</code> hits this path is
+that klio's <code>newCoroutineContext</code> actual installs the Unconfined-like
+<code>KlioDispatcher</code> as the default (ContextActuals.kt:9-11) instead of upstream's
+<code>Dispatchers.Default</code>. <code>KlioDispatcher.dispatch</code> → <code>__kxco_spawn</code> →
+<code>coroutineLaunch</code> with no pump → eager.</p>
+<p>Verified probes that the design relies on:
+- <strong>DRIVEN works.</strong> <code>withContext(Dispatchers.Default){delay;…}</code> inside
+  <code>runBlocking</code> → <code>1\n2\ndone</code> (p1a). <code>awaitCancellation()</code>+<code>cancel()</code>+<code>join()</code>
+  inside a launch → finally runs (p6). Channel producer/consumer inside
+  <code>runBlocking</code> completes (p4). <code>CoroutineScope(Dispatchers.Default).launch</code>
+  outside <code>runBlocking</code> already dispatches + <code>delay</code> works (p1b). <strong>Conclusion:
+  everything PART A needs already works as long as it runs under <code>runBlocking</code>.</strong>
+- <strong>Eager footgun.</strong> <code>GlobalScope.launch{child;delay;child-end}</code> outside
+  <code>runBlocking</code> runs eager: <code>child-start\nchild-end\nmain-after-launch\ndone</code>
+  (p1c). This is PART B.
+- <strong>Blocker.</strong> <code>StateFlow.collect</code> (and <code>StateFlow.first()</code>) inside a launch
+  stack-overflows at 10001 frames through <code>concurrent_synchronized →
+  invokeCallable → dispatchIntrinsic</code> (p5/p5b/p5c). Root-caused below.</p>
+<h2 id="1-root-cause-of-the-stateflow-suspend-inside-synchronized-overflow-part-a-blocker">1. Root cause of the StateFlow / suspend-inside-<code>synchronized</code> overflow (PART A blocker)<a class="headerlink" href="#1-root-cause-of-the-stateflow-suspend-inside-synchronized-overflow-part-a-blocker" title="Permanent link">&para;</a></h2>
+<p><code>concurrent_synchronized</code> (src/stdlib/implementations/concurrent.zig):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>try monitorEnter(key);
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>const result = ctx.host.invokeCallable(&amp;block, &amp;.{}, ctx.out);  // body may .Suspend
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>_ = try monitorExit(key);
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>return result;   // .Suspended propagates out
+</code></pre></div>
+<p>When the body suspends <em>inside</em> the monitor, the IR activation for the body is
+captured into a <code>SuspendState</code>, but the <strong>host</strong> frame <code>concurrent_synchronized</code>
+is not part of that captured activation. It runs <code>monitorExit</code> and returns
+<code>.Suspended</code>. The upstream <code>SharedFlowImpl.awaitValue</code> / <code>emitSuspend</code> call
+<code>suspendCancellableCoroutine{…}</code> <strong>inside</strong> <code>synchronized(this){…}</code>
+(SharedFlow.kt:670-671, 497-499). On resume the interpreter re-enters the
+suspending function from its start rather than from the suspend point that was
+captured under the host monitor frame — so <code>collect</code> re-runs from the top, calls
+<code>awaitValue</code> again, suspends again, ad infinitum: the 10001-frame recursion.</p>
+<p>Two correct fixes (do the cheaper one first, keep the second as the real fix):</p>
+<ul>
+<li>
+<p><strong>Fix B1 (real fix): make the suspend point survive a host-monitor frame.</strong>
+  The captured <code>SuspendState</code> must record that it is nested inside an open
+  monitor so that (a) on park the monitor is released, and (b) on resume the
+  monitor is re-acquired <em>before</em> the activation continues, and the activation
+  continues from the suspend point — not from <code>collect</code>'s entry. Concretely:
+  <code>concurrent_synchronized</code>, on observing <code>.Suspended</code>, must push a
+  "monitor-reacquire" continuation marker onto the <code>SuspendState</code> (a
+  <code>pending_monitor: usize</code> field on <code>ParkedEntry</code>, coroutines.zig:524-536) and
+  release the monitor (<code>monitorExit</code>). <code>resume</code> (coroutines.zig:1398-1399), after
+  restoring the scope delta, calls <code>monitorEnter(pending_monitor)</code> before
+  re-entering the activation. This matches Kotlin/JVM where a monitor is NOT held
+  across a suspension boundary in the cooperative model but the function resumes
+  at the suspend point. This is the root-cause fix and unblocks all of
+  SharedFlow/StateFlow.</p>
+</li>
+<li>
+<p><strong>Fix B0 (cheaper, narrower — verify first whether it is sufficient):</strong> the
+  upstream <code>SharedFlow.collect</code> continuation must be a <em>real</em> IR continuation,
+  not restarted. If the overflow is actually that <code>invokeCallable</code> re-runs the
+  whole closure on resume (a continuation-identity bug) rather than a
+  monitor-specific bug, the fix is in how a suspended closure body resumes — it
+  should resume the captured activation, never re-invoke <code>invokeCallable</code> from
+  scratch. Add a probe: a plain <code>suspend fun f(){ synchronized(x){ delay(1) } }</code>
+  under <code>runBlocking</code>. If that alone overflows, the bug is monitor-specific
+  (B1). If a <code>suspend fun</code> that suspends inside <em>any</em> host intrinsic (not just
+  synchronized) restarts, the bug is in resume identity and must be fixed there.</p>
+</li>
+</ul>
+<p><code>snapshotFlow</code> itself does <strong>not</strong> suspend inside <code>synchronized</code> — its
+<code>synchronized(lock){…}</code> blocks only read/snapshot subscription sets
+(SnapshotFlow.kt:258,319,344,410,438,463) and the suspend points are
+<code>withFrameNanos</code>/<code>emit</code> <em>outside</em> the lock. <code>BroadcastFrameClock.withFrameNanos</code>
+also enqueues under <code>synchronized</code> (AwaiterQueue.addAwaiter, AwaiterQueue.kt:51)
+but the actual park (<code>suspendCancellableCoroutine</code>) returns the suspend directive
+<em>after</em> <code>synchronized</code> has returned — so the frame clock and snapshotFlow are
+viable even before B1 lands. <strong>collectAsState on a StateFlow is the only PART A
+surface that hard-requires B1.</strong> Plan accordingly: ship frame clock + recomposer
++ LaunchedEffect/produceState/snapshotFlow first (no B1 needed), then land B1 to
+enable <code>StateFlow.collectAsState</code>.</p>
+<hr />
+<h1 id="part-a-primary-complete-async-compose-story-inside-a-driver">PART A (PRIMARY): complete async-compose story inside a driver<a class="headerlink" href="#part-a-primary-complete-async-compose-story-inside-a-driver" title="Permanent link">&para;</a></h1>
+<p>Everything runs under <code>runBlocking</code>, where klio's cooperative pump is already
+correct (p1a/p4/p6). No new low-level engine. The pieces:</p>
+<h2 id="a1-frame-clock-compose-pack-kliomain">A1. Frame clock (compose pack klioMain)<a class="headerlink" href="#a1-frame-clock-compose-pack-kliomain" title="Permanent link">&para;</a></h2>
+<p>Add to the compose pack so the upstream files parse, but supply the engine in
+klioMain to avoid pulling the whole atomic/<code>AwaiterQueue</code> graph.</p>
+<ol>
+<li>
+<p><strong><code>klio.toml</code> include additions</strong> (kotlin-klio/klio-compose-runtime/klio.toml,
+   the <code>include = [...]</code> list): add
+   <code>MonotonicFrameClock.kt</code> (pure interface + <code>withFrameNanos</code>/<code>withFrameMillis</code>
+   top-levels + <code>monotonicFrameClock</code> accessor — depends only on
+   <code>CoroutineContext</code>, all available). Do <strong>not</strong> add the upstream
+   <code>BroadcastFrameClock.kt</code> (it needs <code>internal/AwaiterQueue</code> + the platform
+   <code>synchronized</code> expect); instead supply a klioMain <code>BroadcastFrameClock</code>.</p>
+</li>
+<li>
+<p><strong>klioMain <code>BroadcastFrameClock.kt</code></strong> — a minimal, parse-clean reimplementation
+   that parks awaiters on slots via the existing intrinsics
+   (<code>__kxco_newSlot</code>/<code>__kxco_parkSlot</code>/<code>__kxco_resumeSlot</code>, bound at
+   kotlinx_coroutines.zig:873-875), avoiding <code>AwaiterQueue</code>. Shape:</p>
+</li>
+</ol>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kd">class</span><span class="w"> </span><span class="nc">BroadcastFrameClock</span><span class="p">(</span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">onNewAwaiters</span><span class="p">:</span><span class="w"> </span><span class="p">(()</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="kt">Unit</span><span class="p">)</span><span class="o">?</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="n">MonotonicFrameClock</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">class</span><span class="w"> </span><span class="nc">Awaiter</span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="p">(</span><span class="kd">val</span><span class="w"> </span><span class="nv">onFrame</span><span class="p">:</span><span class="w"> </span><span class="p">(</span><span class="kt">Long</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">R</span><span class="p">,</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">cont</span><span class="p">:</span><span class="w"> </span><span class="n">CancellableContinuation</span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="p">)</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">lock</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kt">Any</span><span class="p">()</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">var</span><span class="w"> </span><span class="nv">awaiters</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ArrayList</span><span class="o">&lt;</span><span class="n">Awaiter</span><span class="o">&lt;*&gt;&gt;</span><span class="p">()</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">var</span><span class="w"> </span><span class="nv">spare</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ArrayList</span><span class="o">&lt;</span><span class="n">Awaiter</span><span class="o">&lt;*&gt;&gt;</span><span class="p">()</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">hasAwaiters</span><span class="p">:</span><span class="w"> </span><span class="kt">Boolean</span><span class="w"> </span><span class="k">get</span><span class="p">()</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">synchronized</span><span class="p">(</span><span class="n">lock</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">awaiters</span><span class="p">.</span><span class="na">isNotEmpty</span><span class="p">()</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">    </span><span class="kd">override</span><span class="w"> </span><span class="kd">suspend</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="w"> </span><span class="nf">withFrameNanos</span><span class="p">(</span><span class="n">onFrame</span><span class="p">:</span><span class="w"> </span><span class="p">(</span><span class="kt">Long</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">R</span><span class="p">):</span><span class="w"> </span><span class="n">R</span><span class="w"> </span><span class="o">=</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">        </span><span class="n">suspendCancellableCoroutine</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">co</span><span class="w"> </span><span class="o">-&gt;</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">            </span><span class="kd">val</span><span class="w"> </span><span class="nv">a</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Awaiter</span><span class="p">(</span><span class="n">onFrame</span><span class="p">,</span><span class="w"> </span><span class="n">co</span><span class="p">)</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">            </span><span class="kd">val</span><span class="w"> </span><span class="nv">hadAwaiters</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">synchronized</span><span class="p">(</span><span class="n">lock</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="w">                </span><span class="kd">val</span><span class="w"> </span><span class="nv">had</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">awaiters</span><span class="p">.</span><span class="na">isNotEmpty</span><span class="p">();</span><span class="w"> </span><span class="n">awaiters</span><span class="p">.</span><span class="na">add</span><span class="p">(</span><span class="n">a</span><span class="p">);</span><span class="w"> </span><span class="n">had</span>
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="w">            </span><span class="p">}</span>
+<a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">hadAwaiters</span><span class="p">)</span><span class="w"> </span><span class="n">onNewAwaiters</span><span class="o">?.</span><span class="na">invoke</span><span class="p">()</span>
+<a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="w">            </span><span class="n">co</span><span class="p">.</span><span class="na">invokeOnCancellation</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">synchronized</span><span class="p">(</span><span class="n">lock</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">awaiters</span><span class="p">.</span><span class="na">remove</span><span class="p">(</span><span class="n">a</span><span class="p">)</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>
+<a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="w">    </span><span class="kd">fun</span><span class="w"> </span><span class="nf">sendFrame</span><span class="p">(</span><span class="n">timeNanos</span><span class="p">:</span><span class="w"> </span><span class="kt">Long</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">toResume</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">synchronized</span><span class="p">(</span><span class="n">lock</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a><span class="w">            </span><span class="kd">val</span><span class="w"> </span><span class="nv">cur</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">awaiters</span><span class="p">;</span><span class="w"> </span><span class="n">awaiters</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">spare</span><span class="p">;</span><span class="w"> </span><span class="n">spare</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cur</span><span class="p">;</span><span class="w"> </span><span class="n">cur</span>
+<a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a><span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">a</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">toResume</span><span class="p">)</span><span class="w"> </span><span class="n">resumeAwaiter</span><span class="p">(</span><span class="n">a</span><span class="p">,</span><span class="w"> </span><span class="n">timeNanos</span><span class="p">)</span>
+<a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a><span class="w">        </span><span class="n">toResume</span><span class="p">.</span><span class="na">clear</span><span class="p">()</span>
+<a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-1-25" name="__codelineno-1-25" href="#__codelineno-1-25"></a><span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="w"> </span><span class="nf">resumeAwaiter</span><span class="p">(</span><span class="n">a</span><span class="p">:</span><span class="w"> </span><span class="n">Awaiter</span><span class="o">&lt;</span><span class="n">R</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">t</span><span class="p">:</span><span class="w"> </span><span class="kt">Long</span><span class="p">)</span><span class="w"> </span><span class="o">=</span>
+<a id="__codelineno-1-26" name="__codelineno-1-26" href="#__codelineno-1-26"></a><span class="w">        </span><span class="n">a</span><span class="p">.</span><span class="na">cont</span><span class="p">.</span><span class="na">resumeWith</span><span class="p">(</span><span class="n">runCatching</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">a</span><span class="p">.</span><span class="na">onFrame</span><span class="p">(</span><span class="n">t</span><span class="p">)</span><span class="w"> </span><span class="p">})</span>
+<a id="__codelineno-1-27" name="__codelineno-1-27" href="#__codelineno-1-27"></a><span class="p">}</span>
+</code></pre></div>
+<p>Note: the <code>suspendCancellableCoroutine</code> body enqueues under <code>synchronized</code> but
+   the park happens after the lambda returns, so this is safe pre-B1 (see §1).</p>
+<ol>
+<li><strong><code>MonotonicFrameClock</code> as a <code>CoroutineContext.Element</code>.</strong> The upstream
+   interface already extends <code>CoroutineContext.Element</code> with <code>key = Key</code>. klio's
+   context machinery must resolve <code>coroutineContext[MonotonicFrameClock]</code> to the
+   element installed via <code>withContext(frameClock)</code>. Verify klio's
+   <code>CoroutineContext.get(key)</code> finds an element by companion-object key
+   (kotlinx.coroutines pack already does this for <code>ContinuationInterceptor</code>,
+   <code>Job</code>, <code>CoroutineName</code>). No host intrinsic needed.</li>
+</ol>
+<h2 id="a2-recomposerrunrecomposeandapplychanges-compose-pack-kliomain">A2. Recomposer.runRecomposeAndApplyChanges (compose pack klioMain)<a class="headerlink" href="#a2-recomposerrunrecomposeandapplychanges-compose-pack-kliomain" title="Permanent link">&para;</a></h2>
+<p>Do <strong>not</strong> port the 78k-line upstream <code>Recomposer.kt</code>. Extend the existing klio
+<code>Recomposer</code> (Composition.kt:26-50) with an async loop built on the same
+primitives the upstream loop uses (Recomposer.kt:565 <code>runRecomposeAndApplyChanges</code>
+→ <code>recompositionRunner</code> → <code>parentFrameClock.withFrameNanos{...}</code>):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kd">public</span><span class="w"> </span><span class="kd">class</span><span class="w"> </span><span class="nc">Recomposer</span><span class="p">(</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">effectContext</span><span class="p">:</span><span class="w"> </span><span class="n">CoroutineContext</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">EmptyCoroutineContext</span><span class="p">,</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">compositions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ArrayList</span><span class="o">&lt;</span><span class="n">KlioComposition</span><span class="o">&gt;</span><span class="p">()</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">broadcastFrameClock</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BroadcastFrameClock</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* invalidations woke us */</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">invalidations</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="c1">// a wake slot / channel-of-units</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">    </span><span class="kd">internal</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">recomposeContext</span><span class="p">:</span><span class="w"> </span><span class="n">CoroutineContext</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">        </span><span class="k">get</span><span class="p">()</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">effectContext</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">broadcastFrameClock</span><span class="w">   </span><span class="c1">// effects launch onto this</span>
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">    </span><span class="c1">// The async driver. Run inside runBlocking; awaits work, asks the parent</span>
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">    </span><span class="c1">// clock for a frame, recomposes invalidated compositions, applies.</span>
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">suspend</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="nf">runRecomposeAndApplyChanges</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">        </span><span class="n">recomposeAndApplyChanges</span><span class="p">(</span><span class="kt">Long</span><span class="p">.</span><span class="na">MAX_VALUE</span><span class="p">)</span><span class="w">   </span><span class="c1">// run forever until cancelled</span>
+<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>
+<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="w">    </span><span class="kd">suspend</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="nf">recomposeAndApplyChanges</span><span class="p">(</span><span class="n">frameCount</span><span class="p">:</span><span class="w"> </span><span class="kt">Long</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="w">        </span><span class="kd">var</span><span class="w"> </span><span class="nv">frames</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">0L</span>
+<a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="w">        </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">frames</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">frameCount</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="w">            </span><span class="n">awaitWorkAvailable</span><span class="p">()</span><span class="w">                    </span><span class="c1">// suspend until an invalidation</span>
+<a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="w">            </span><span class="c1">// ask the PARENT clock (the driver's frame clock) for a frame tick:</span>
+<a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a><span class="w">            </span><span class="n">parentFrameClock</span><span class="p">().</span><span class="na">withFrameNanos</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">frameNanos</span><span class="w"> </span><span class="o">-&gt;</span>
+<a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a><span class="w">                </span><span class="c1">// 1) deliver this frame tick to composition-internal awaiters</span>
+<a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="w">                </span><span class="n">broadcastFrameClock</span><span class="p">.</span><span class="na">sendFrame</span><span class="p">(</span><span class="n">frameNanos</span><span class="p">)</span>
+<a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a><span class="w">                </span><span class="c1">// 2) recompose every composition with pending invalidations</span>
+<a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a><span class="w">                </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">c</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">compositions</span><span class="p">.</span><span class="na">toList</span><span class="p">())</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">c</span><span class="p">.</span><span class="na">hasInvalidations</span><span class="p">)</span><span class="w"> </span><span class="n">c</span><span class="p">.</span><span class="na">recompose</span><span class="p">()</span>
+<a id="__codelineno-2-26" name="__codelineno-2-26" href="#__codelineno-2-26"></a><span class="w">            </span><span class="p">}</span>
+<a id="__codelineno-2-27" name="__codelineno-2-27" href="#__codelineno-2-27"></a><span class="w">            </span><span class="n">frames</span><span class="o">++</span>
+<a id="__codelineno-2-28" name="__codelineno-2-28" href="#__codelineno-2-28"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-2-29" name="__codelineno-2-29" href="#__codelineno-2-29"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-2-30" name="__codelineno-2-30" href="#__codelineno-2-30"></a><span class="p">}</span>
+</code></pre></div>
+<p><code>awaitWorkAvailable()</code> parks on a slot (via <code>__kxco_newSlot</code>/<code>__kxco_parkSlot</code>)
+that the <code>StateObservation</code> write-observer resumes
+(<code>__kxco_resumeSlot</code>) when a state write invalidates a registered composition.
+Wire this in <code>KlioComposition.ensureWriteObserver</code> (Composition.kt:68-74): on
+<code>composer.invalidate(state)</code>, also call <code>parent.notifyWorkAvailable()</code> which
+resumes the recomposer's await slot.</p>
+<p><code>parentFrameClock()</code> reads <code>coroutineContext[MonotonicFrameClock]</code> — the clock
+the <em>driver</em> installed (the app's <code>BroadcastFrameClock</code>, see A4). This mirrors
+upstream where the recomposer awaits the platform/host frame clock and re-fans it
+to compositions through its own <code>broadcastFrameClock</code>.</p>
+<h2 id="a3-effects-launch-onto-the-recomposer-context">A3. Effects launch onto the recomposer context<a class="headerlink" href="#a3-effects-launch-onto-the-recomposer-context" title="Permanent link">&para;</a></h2>
+<p><code>CoroutineEffects.kt</code> today launches onto <code>CoroutineScope(Job())</code> with no driver
+(CoroutineEffects.kt:23,45-47), which is why they run eagerly. Change them to
+launch onto a scope whose context carries the recomposer's <code>recomposeContext</code>
+(so <code>withFrameNanos</code>/the frame clock resolve) and whose <code>Job</code> is a child of the
+recomposer, cancelled on dispose:</p>
+<ul>
+<li><code>rememberCoroutineScope()</code> → <code>CoroutineScope(recomposer.recomposeContext + Job())</code>.
+  The composer must know its <code>Recomposer</code> (thread it through
+  <code>KlioComposition</code>/<code>KlioComposer</code>; the composition already holds <code>parent</code>).</li>
+<li><code>launchEffect</code> → <code>scope.launch { block() }</code> where <code>scope</code> carries the recompose
+  context. Because the recomposer runs under <code>runBlocking</code>, <code>coroTop()</code> is
+  non-null when these launch, so <code>coroutineLaunch</code> enqueues onto the <strong>pump</strong>
+  (coroutines.zig:1644-1646) instead of running eager. <code>delay</code>, <code>withFrameNanos</code>,
+  <code>flow.collect</code> now park correctly. This is the whole fix — verified-correct
+  driven behavior (p1a/p6) does the rest.</li>
+<li><code>produceState</code> (CoroutineEffects.kt:97-118) already routes through
+  <code>LaunchedEffect</code>; once LaunchedEffect launches onto the pump, <code>awaitDispose</code>
+  can become a real <code>awaitCancellation()</code> (p6 proves it parks + runs finally) so
+  a producer can legitimately suspend forever and be cancelled on dispose,
+  instead of the current eager <code>throw CancellationException</code>.</li>
+</ul>
+<h2 id="a4-snapshotflow-collectasstate-compose-pack-kliomain">A4. snapshotFlow + collectAsState (compose pack klioMain)<a class="headerlink" href="#a4-snapshotflow-collectasstate-compose-pack-kliomain" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong><code>snapshotFlow</code></strong> — klioMain reimplementation built on <code>flow{}</code> +
+  <code>Snapshot.registerApplyObserver</code> semantics. klio already has
+  <code>StateObservation</code> (StateObservation.kt) with a write-observer. Implement:</li>
+</ul>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="kd">fun</span><span class="w"> </span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="nf">snapshotFlow</span><span class="p">(</span><span class="n">block</span><span class="p">:</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">T</span><span class="p">):</span><span class="w"> </span><span class="n">Flow</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">flow</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">seen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">HashSet</span><span class="o">&lt;</span><span class="kt">Any</span><span class="o">&gt;</span><span class="p">()</span><span class="w">      </span><span class="c1">// read state objects</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nv">last</span><span class="p">:</span><span class="w"> </span><span class="kt">Any?</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">NoValue</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="kc">true</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">readSet</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">HashSet</span><span class="o">&lt;</span><span class="kt">Any</span><span class="o">&gt;</span><span class="p">()</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">v</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">StateObservation</span><span class="p">.</span><span class="na">observe</span><span class="p">({</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">readSet</span><span class="p">.</span><span class="na">add</span><span class="p">(</span><span class="n">s</span><span class="p">)</span><span class="w"> </span><span class="p">})</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">block</span><span class="p">()</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">v</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">last</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">emit</span><span class="p">(</span><span class="n">v</span><span class="p">);</span><span class="w"> </span><span class="n">last</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">v</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="w">        </span><span class="c1">// suspend until any read state object is written:</span>
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a><span class="w">        </span><span class="n">awaitWriteTo</span><span class="p">(</span><span class="n">readSet</span><span class="p">)</span><span class="w">      </span><span class="c1">// parks on a slot resumed by the write-observer</span>
+<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a><span class="p">}</span>
+</code></pre></div>
+<p><code>awaitWriteTo</code> registers a one-shot write observer over <code>readSet</code> that
+  <code>__kxco_resumeSlot</code>s a parked slot. <code>emit</code> is a normal flow emit (suspends into
+  the collector's continuation). Because this <code>flow{}</code> is <code>collect</code>ed inside a
+  <code>LaunchedEffect</code> that now runs on the pump, the whole thing parks correctly.
+  <code>snapshotFlow</code> does NOT suspend inside <code>synchronized</code>, so it works pre-B1.</p>
+<ul>
+<li><strong><code>collectAsState</code></strong> — klioMain, two overloads (SnapshotFlow.kt:52/66 shapes):
+  <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nd">@Composable</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="nf">Flow</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">.</span><span class="na">collectAsState</span><span class="p">(</span><span class="n">initial</span><span class="p">:</span><span class="w"> </span><span class="n">T</span><span class="p">,</span><span class="w"> </span><span class="n">context</span><span class="p">:</span><span class="w"> </span><span class="n">CoroutineContext</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">EmptyCoroutineContext</span><span class="p">):</span><span class="w"> </span><span class="n">State</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">state</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">remember</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">mutableStateOf</span><span class="p">(</span><span class="n">initial</span><span class="p">)</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">    </span><span class="n">LaunchedEffect</span><span class="p">(</span><span class="k">this</span><span class="p">,</span><span class="w"> </span><span class="n">context</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">context</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">EmptyCoroutineContext</span><span class="p">)</span><span class="w"> </span><span class="n">collect</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">state</span><span class="p">.</span><span class="na">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">it</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">        </span><span class="k">else</span><span class="w"> </span><span class="n">withContext</span><span class="p">(</span><span class="n">context</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">collect</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">state</span><span class="p">.</span><span class="na">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">it</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">state</span>
+<a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="p">}</span>
+<a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a><span class="nd">@Composable</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="nf">StateFlow</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">.</span><span class="na">collectAsState</span><span class="p">(</span><span class="n">context</span><span class="p">:</span><span class="w"> </span><span class="n">CoroutineContext</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">EmptyCoroutineContext</span><span class="p">):</span><span class="w"> </span><span class="n">State</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="o">=</span>
+<a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a><span class="w">    </span><span class="n">collectAsState</span><span class="p">(</span><span class="n">value</span><span class="p">,</span><span class="w"> </span><span class="n">context</span><span class="p">)</span>
+</code></pre></div>
+  The <code>StateFlow</code> overload requires the SharedFlow suspend-in-<code>synchronized</code>
+  blocker (B1) to be fixed; the plain <code>Flow&lt;T&gt;</code> overload (and snapshotFlow) do
+  not.</li>
+</ul>
+<h2 id="a5-public-driver-api-a-klio-compose-app-uses">A5. Public driver API a klio compose app uses<a class="headerlink" href="#a5-public-driver-api-a-klio-compose-app-uses" title="Permanent link">&para;</a></h2>
+<p>The app drives the whole thing under <code>runBlocking</code>, so the existing pump <em>is</em> the
+frame loop. Provide a thin entry point in klioMain:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1">// androidx/compose/runtime/RecomposerRunner.kt (klioMain)</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">runComposeApp</span><span class="p">(</span><span class="n">frames</span><span class="p">:</span><span class="w"> </span><span class="kt">Int</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">-</span><span class="m">1</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="w"> </span><span class="nd">@Composable</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="kt">Unit</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">runBlocking</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">clock</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BroadcastFrameClock</span><span class="p">()</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">    </span><span class="n">withContext</span><span class="p">(</span><span class="n">clock</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">                       </span><span class="c1">// install the driver frame clock</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">recomposer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Recomposer</span><span class="p">(</span><span class="n">coroutineContext</span><span class="p">)</span>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">composition</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Composition</span><span class="p">(</span><span class="n">recomposer</span><span class="p">)</span>
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a><span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">runner</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">launch</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">recomposer</span><span class="p">.</span><span class="na">runRecomposeAndApplyChanges</span><span class="p">()</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a><span class="w">        </span><span class="n">composition</span><span class="p">.</span><span class="na">setContent</span><span class="p">(</span><span class="n">content</span><span class="p">)</span><span class="w">        </span><span class="c1">// initial composition</span>
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a><span class="w">        </span><span class="c1">// Drive frames deterministically:</span>
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a><span class="w">        </span><span class="kd">var</span><span class="w"> </span><span class="nv">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">0</span>
+<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a><span class="w">        </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">frames</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">frames</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-5-12" name="__codelineno-5-12" href="#__codelineno-5-12"></a><span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">recomposer</span><span class="p">.</span><span class="na">hasPendingWork</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="o">!</span><span class="n">clock</span><span class="p">.</span><span class="na">hasAwaiters</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-5-13" name="__codelineno-5-13" href="#__codelineno-5-13"></a><span class="w">                </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">frames</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="m">0</span><span class="p">)</span><span class="w"> </span><span class="k">break</span><span class="w">          </span><span class="c1">// quiescent: nothing more to do</span>
+<a id="__codelineno-5-14" name="__codelineno-5-14" href="#__codelineno-5-14"></a><span class="w">            </span><span class="p">}</span>
+<a id="__codelineno-5-15" name="__codelineno-5-15" href="#__codelineno-5-15"></a><span class="w">            </span><span class="n">clock</span><span class="p">.</span><span class="na">sendFrame</span><span class="p">(</span><span class="n">n</span><span class="p">.</span><span class="na">toLong</span><span class="p">()</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">16</span><span class="n">_000_000L</span><span class="p">)</span><span class="w">   </span><span class="c1">// 16ms/frame, monotonic</span>
+<a id="__codelineno-5-16" name="__codelineno-5-16" href="#__codelineno-5-16"></a><span class="w">            </span><span class="n">yield</span><span class="p">()</span><span class="w">                            </span><span class="c1">// let the pump run the frame</span>
+<a id="__codelineno-5-17" name="__codelineno-5-17" href="#__codelineno-5-17"></a><span class="w">            </span><span class="n">n</span><span class="o">++</span>
+<a id="__codelineno-5-18" name="__codelineno-5-18" href="#__codelineno-5-18"></a><span class="w">        </span><span class="p">}</span>
+<a id="__codelineno-5-19" name="__codelineno-5-19" href="#__codelineno-5-19"></a><span class="w">        </span><span class="n">recomposer</span><span class="p">.</span><span class="na">close</span><span class="p">()</span><span class="w">                     </span><span class="c1">// cancel runner + effect jobs</span>
+<a id="__codelineno-5-20" name="__codelineno-5-20" href="#__codelineno-5-20"></a><span class="w">        </span><span class="n">runner</span><span class="p">.</span><span class="na">cancelAndJoin</span><span class="p">()</span>
+<a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a><span class="w">        </span><span class="n">composition</span><span class="p">.</span><span class="na">dispose</span><span class="p">()</span>
+<a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-5-23" name="__codelineno-5-23" href="#__codelineno-5-23"></a><span class="p">}</span>
+</code></pre></div>
+<p>This is deterministic: frame N has <code>frameTimeNanos = N * 16ms</code>, frames advance
+only when the app calls <code>sendFrame</code>, and the loop stops when the composition
+quiesces (no invalidations, no awaiters) in the bounded/<code>frames&lt;0</code> case. Apps
+that need infinite animation pass a fixed <code>frames</code> count for a deterministic run.</p>
+<p><code>Recomposer.close()</code> cancels the runner job and all effect child jobs (structured
+concurrency: effect scopes are children of <code>recomposeContext</code>'s Job).</p>
+<h2 id="a6-host-intrinsics-needed-for-part-a">A6. Host intrinsics needed for PART A<a class="headerlink" href="#a6-host-intrinsics-needed-for-part-a" title="Permanent link">&para;</a></h2>
+<p><strong>None new.</strong> Everything is reachable through existing bindings:
+<code>__kxco_newSlot</code>/<code>__kxco_parkSlot</code>/<code>__kxco_resumeSlot</code> (kotlinx_coroutines.zig:873-875),
+<code>__kxco_spawn</code>/<code>__kxco_dispatch</code>, <code>__kxco_rbPump</code>, <code>advanceTimeGated</code>/virtual clock
+already in place. The only Zig change PART A <em>requires</em> is <strong>B1</strong> (monitor across
+suspend) and only for <code>StateFlow.collectAsState</code>; the frame clock, recomposer,
+LaunchedEffect/produceState, snapshotFlow, and plain-<code>Flow</code> collectAsState need
+zero Zig changes.</p>
+<h2 id="a7-why-part-a-works-with-klios-current-driven-behavior-citations">A7. Why PART A works with klio's current driven behavior (citations)<a class="headerlink" href="#a7-why-part-a-works-with-klios-current-driven-behavior-citations" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Effects launched inside the <code>runBlocking</code>-driven recomposer enqueue onto the
+  pump, not eager: <code>coroutineLaunch</code> with <code>coroTop()!=null</code>
+  (coroutines.zig:1644-1646). Proven equivalent by p1a/p4/p6.</li>
+<li><code>withFrameNanos</code> parks on a slot and is resumed by <code>sendFrame</code> →
+  <code>__kxco_resumeSlot</code> → <code>coroutineResumeSlotValue</code> →
+  <code>coroutineResumeExternal</code> enqueues onto this pump (coroutines.zig:1684-1703).</li>
+<li><code>delay</code> inside an effect parks with <code>wake_at</code> and is fired by
+  <code>advanceTimeGated</code> (coroutines.zig:818-899) under the global <code>VirtualClock</code>
+  barrier, so deterministic ordering across the recomposer + effect coroutines.</li>
+<li>Cancellation on <code>close()</code>/dispose delivers <code>CancellationException</code> through the
+  slot mechanism; finally blocks run (p6).</li>
+</ul>
+<h2 id="a8-part-a-implementation-order">A8. PART A implementation order<a class="headerlink" href="#a8-part-a-implementation-order" title="Permanent link">&para;</a></h2>
+<ol>
+<li>Add <code>MonotonicFrameClock.kt</code> to <code>klio.toml</code> include; confirm it resolves
+   (<code>withFrameNanos</code>/<code>monotonicFrameClock</code>). Probe: a <code>runBlocking{ withContext(BroadcastFrameClock()){...} }</code> that calls <code>withFrameNanos</code>.</li>
+<li>klioMain <code>BroadcastFrameClock.kt</code> (A1.2). Test it standalone (A-test-1 below).</li>
+<li>Extend <code>Recomposer</code> with <code>recomposeContext</code> + <code>runRecomposeAndApplyChanges</code> +
+   <code>awaitWorkAvailable</code>/<code>notifyWorkAvailable</code> (A2).</li>
+<li>Thread the <code>Recomposer</code> into <code>KlioComposition</code>/<code>KlioComposer</code>; wire the
+   write-observer to <code>notifyWorkAvailable</code> (A2/Composition.kt:68-74).</li>
+<li>Repoint <code>rememberCoroutineScope</code>/<code>launchEffect</code>/<code>produceState</code> onto
+   <code>recomposeContext</code> (A3).</li>
+<li><code>RecomposerRunner.runComposeApp</code> public API (A5).</li>
+<li>snapshotFlow + plain-<code>Flow</code> collectAsState (A4); test A-test-3/4.</li>
+<li>Land B1 (monitor-across-suspend); enable <code>StateFlow.collectAsState</code>; test
+   A-test-5.</li>
+</ol>
+<h2 id="a9-part-a-tests-deterministic-match-kotlinc">A9. PART A tests (deterministic, match kotlinc)<a class="headerlink" href="#a9-part-a-tests-deterministic-match-kotlinc" title="Permanent link">&para;</a></h2>
+<p>All <code>runComposeApp(frames = N){...}</code> with <code>println</code>-instrumented effects so
+output is a fixed transcript checkable against kotlinc + compose-runtime-test
+(<code>androidx.compose.runtime.mock</code> / <code>compositionTest</code>).</p>
+<ul>
+<li><strong>A-test-1 (frame clock):</strong> <code>runBlocking{ withContext(BroadcastFrameClock() as MonotonicFrameClock){ launch{ println("f="+withFrameMillis{it}) }; (ctx clock).sendFrame(16_000_000) } }</code> → <code>f=16</code>.</li>
+<li><strong>A-test-2 (LaunchedEffect suspends, not eager):</strong>
+  <div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>setContent { LaunchedEffect(Unit){ println("a"); delay(50); println("b") } }
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>// before first sendFrame:
+</code></pre></div>
+  Expected transcript: composition prints nothing from the effect's post-delay
+  half until virtual time advances 50ms across frames; ordering <code>a</code> (on launch),
+  then <code>b</code> after the pump advances 50ms. Contrast current eager output <code>a\nb</code>
+  emitted synchronously at setContent. The test asserts that a marker printed by
+  <code>setContent</code>'s caller <em>after</em> <code>setContent</code> appears between <code>a</code> and <code>b</code>.</li>
+<li><strong>A-test-3 (snapshotFlow):</strong> a <code>mutableStateOf(0)</code>; a <code>LaunchedEffect</code> collecting
+  <code>snapshotFlow { state.value }</code>; drive frames mutating state 0→1→2; expect
+  <code>0\n1\n2</code> (distinct-until-changed, one emit per applied write).</li>
+<li><strong>A-test-4 (produceState + frame loop):</strong> <code>produceState(0){ repeat(3){ delay(10); value = it+1 } }</code>; assert the recomposing reader sees <code>0,1,2,3</code> across frames.</li>
+<li><strong>A-test-5 (StateFlow.collectAsState, post-B1):</strong> <code>MutableStateFlow(0)</code>,
+  <code>collectAsState</code>, mutate, assert recompositions observe updates — and crucially
+  that it no longer stack-overflows (the p5 regression test).</li>
+<li><strong>A-test-6 (cancel on dispose):</strong> an effect with <code>try{ awaitCancellation() }
+  finally { println("disposed") }</code>; <code>runComposeApp</code> closes → <code>disposed</code> printed
+  exactly once.</li>
+</ul>
+<h2 id="a10-part-a-risks">A10. PART A risks<a class="headerlink" href="#a10-part-a-risks" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>B1 correctness.</strong> Re-acquiring the monitor on resume must use the <em>same</em>
+  monitor key and must not double-release. Mitigate: store the key on
+  <code>ParkedEntry</code>; assert depth bookkeeping with a unit test that suspends N deep
+  inside nested <code>synchronized</code>.</li>
+<li><strong>Frame determinism vs. the global VirtualClock barrier.</strong> If an effect's
+  <code>delay</code> and the frame loop's <code>sendFrame</code> race on virtual time, ordering could
+  wobble. Mitigate: <code>sendFrame</code> uses an explicit monotonic <code>N*16ms</code>; <code>delay</code>
+  resumes are gated by <code>advanceTimeGated</code>; both are on the <em>same</em> pump (single
+  thread), so they are totally ordered by the ready queue.</li>
+<li><strong><code>coroutineContext[MonotonicFrameClock]</code> resolution.</strong> If klio's context-get
+  doesn't dispatch on a companion-object key for a user-defined element, A1.3
+  fails. Mitigate: probe early (step A8.1); if broken, fix context-key dispatch
+  (same path that already resolves <code>Job</code>/<code>CoroutineName</code>).</li>
+<li><strong>Quiescence detection.</strong> <code>hasPendingWork &amp;&amp; hasAwaiters</code> must be evaluated on
+  the pump thread between frames; an effect that re-invalidates every frame would
+  loop forever in <code>frames&lt;0</code> mode — that is correct (it is animating), and the
+  bounded-<code>frames</code> mode handles deterministic tests.</li>
+</ul>
+<hr />
+<h1 id="part-b-secondary-make-launchasync-outside-a-driver-match-kotlin">PART B (SECONDARY): make launch/async OUTSIDE a driver match Kotlin<a class="headerlink" href="#part-b-secondary-make-launchasync-outside-a-driver-match-kotlin" title="Permanent link">&para;</a></h1>
+<p>The eager divergence is <code>coroutineLaunch</code>'s no-pump branch
+(coroutines.zig:1648), reached because <code>GlobalScope</code>/default context uses the
+Unconfined-like <code>KlioDispatcher</code> (ContextActuals.kt:9-11) rather than
+<code>Dispatchers.Default</code>.</p>
+<h2 id="recommendation-do-both-a-and-b-a-is-the-primary-root-cause-fix">Recommendation: do BOTH (a) and (b); (a) is the primary root-cause fix.<a class="headerlink" href="#recommendation-do-both-a-and-b-a-is-the-primary-root-cause-fix" title="Permanent link">&para;</a></h2>
+<h3 id="b-a-default-context-uses-dispatchersdefault-primary-root-cause">B-(a) — default context uses <code>Dispatchers.Default</code> (primary, root cause)<a class="headerlink" href="#b-a-default-context-uses-dispatchersdefault-primary-root-cause" title="Permanent link">&para;</a></h3>
+<p>Change <code>CoroutineScope.newCoroutineContext</code> actual (ContextActuals.kt:9-11) to
+add <code>KlioDefaultDispatcher</code> (== <code>Dispatchers.Default</code>) when no interceptor is
+present, exactly matching upstream jvm <code>CoroutineContext.kt:28-29</code>:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="k">return</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">combined</span><span class="o">[</span><span class="n">ContinuationInterceptor</span><span class="o">]</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="w">    </span><span class="n">combined</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">Dispatchers</span><span class="p">.</span><span class="na">Default</span><span class="w">      </span><span class="c1">// was: + KlioDispatcher</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="k">else</span><span class="w"> </span><span class="n">combined</span>
+</code></pre></div>
+<p>Effect: <code>GlobalScope.launch{}</code> now routes through <code>KlioDefaultDispatcher.dispatch</code>
+→ <code>__kxco_dispatch</code> → <code>coroutineDispatchPooled</code> → the worker pool — the <strong>exact
+path</strong> that <code>CoroutineScope(Dispatchers.Default).launch</code> already takes and that
+p1b proves works (main-after-launch prints first, <code>delay</code> honored). The eager
+<code>invokeCallable</code> branch is no longer reached for the common case.</p>
+<p>Why this is the root-cause fix: Kotlin/JVM's <code>GlobalScope.launch{}</code> <em>does</em> use
+<code>Dispatchers.Default</code>. klio currently diverges by defaulting to Unconfined. p1b
+already demonstrates the pooled path suspends correctly outside <code>runBlocking</code>,
+because <code>coroutineDispatchPooled</code> posts to the worker which — per the scheduler
+mapping — establishes a pump for its task. (Confirm: <code>runVmTask</code> materializes a
+child Vm; for <code>delay</code> to suspend there, the worker task must run under a driver.
+p1b's success means the dispatch path already drives suspension for the pooled
+task. If it relies on the resume routing back to a <em>caller's</em> pump rather than a
+worker-local pump, that is fine for <code>GlobalScope.launch</code> because there is no
+caller pump — see the note in B-(b) about giving the worker its own pump.)</p>
+<h3 id="b-b-make-the-eager-no-pump-branch-honor-suspension-defensive-for-genuine-unconfined">B-(b) — make the eager no-pump branch honor suspension (defensive, for genuine Unconfined)<a class="headerlink" href="#b-b-make-the-eager-no-pump-branch-honor-suspension-defensive-for-genuine-unconfined" title="Permanent link">&para;</a></h3>
+<p>There remain builders that legitimately want an Unconfined-on-the-current-thread
+coroutine (e.g. <code>launch(Dispatchers.Unconfined){…}</code> outside <code>runBlocking</code>, or
+internal delay continuations). Today those still hit eager <code>invokeCallable</code>.
+Change <code>coroutineLaunch</code>'s no-pump branch (coroutines.zig:1648) to spin a fresh
+<code>persist=true</code> driver via the existing <code>coroutineRunRoot</code>/<code>driveRoot</code> path — the
+<em>same</em> mechanism <code>startCoroutine</code>/<code>__klio_co_runRoot</code> already uses
+(coroutines.zig:1604-1639, result.zig coro_run_root):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="c1">// No active runBlocking — drive the child on a fresh persisted pump so</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="c1">// delay/await suspend instead of becoming no-ops (matches Kotlin's</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="c1">// dispatch to a default executor; finite blocks complete, suspending</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="c1">// blocks park on the persisted registry and resume on a later pump).</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="k">return</span><span class="w"> </span><span class="n">coroutineRunRoot</span><span class="p">(</span><span class="n">self</span><span class="p">,</span><span class="w"> </span><span class="n">scope</span><span class="p">,</span><span class="w"> </span><span class="n">block</span><span class="p">,</span><span class="w"> </span><span class="n">out</span><span class="p">);</span><span class="w">   </span><span class="c1">// persist=true path</span>
+</code></pre></div>
+<p>This makes <code>delay</code>/<code>await</code> honored even for the Unconfined default, and a
+suspending block parks in <code>PersistedParked</code> (coroutines.zig:275-323) to be
+resumed by a later pump — the protocol already exists.</p>
+<h3 id="scheduler-mapping-check-does-the-worker-pool-drive-suspension">Scheduler-mapping check: does the worker pool drive suspension?<a class="headerlink" href="#scheduler-mapping-check-does-the-worker-pool-drive-suspension" title="Permanent link">&para;</a></h3>
+<p>Per the scheduler mapping, a pooled task runs <code>runVmTask</code> → <code>runThreadBlock</code> with
+a fresh child <code>Vm</code> but <strong>no interceptor push</strong> (scheduler.zig:327-345), so a
+<code>delay</code>/channel op <em>inside</em> the worker task would hit <code>park</code>'s
+<code>coroTop() orelse error</code> (coroutines.zig:1178). Yet p1b (delay inside
+<code>CoroutineScope(Dispatchers.Default).launch</code> outside runBlocking) <strong>works</strong>. The
+reconciliation: in p1b the <em>outer</em> launch is what dispatches to the pool; the
+worker runs the launch <em>body</em>, and the body's <code>delay</code> must park somewhere. The
+two possibilities — (1) the worker establishes its own pump in <code>runThreadBlock</code>,
+or (2) the launch body's continuation routes back through <code>coroutineResumeExternal</code>
+to a driver — must be confirmed by reading <code>runThreadBlock</code>. <strong>Action item B-(b').</strong>
+If the worker does NOT establish a pump, then B-(a) alone is insufficient for a
+worker task that <em>itself</em> suspends, and the real fix is to wrap the worker's
+block execution in <code>driveRoot(persist=true)</code> (a worker-local pump), coordinating
+its timers through the same global <code>VirtualClock</code> barrier. This is the
+scheduler-side analogue of B-(b): give every dispatched task a cooperative pump.</p>
+<blockquote>
+<p>Resolve B-(b') before shipping B-(a): read <code>run.zig:280</code> <code>runThreadBlock</code>. If it
+already pushes an interceptor, B-(a) is complete and B-(b) is the only extra
+work. If not, add a <code>driveRoot</code> wrapper in <code>runVmTask</code> (scheduler.zig:327-345)
+so dispatched tasks have a pump.</p>
+</blockquote>
+<h3 id="why-not-stay-eager">Why NOT "stay eager"<a class="headerlink" href="#why-not-stay-eager" title="Permanent link">&para;</a></h3>
+<p>Eager-outside-driver is observably wrong (p1c): it reorders output relative to
+Kotlin and turns <code>delay</code> into a no-op. The JVM-daemon-abandonment argument ("a
+<code>GlobalScope.launch</code> whose process exits before the child finishes is racy
+anyway") does not justify making <code>delay</code> a no-op <em>while the process is alive</em> —
+a <code>runBlocking{}</code> later in the same program, or a <code>Thread.sleep</code>/join, gives the
+child real time to run on the JVM, and klio should match. Eager also breaks any
+<code>GlobalScope</code>-launched effect body that escapes the recomposer scope. So: fix it.</p>
+<h2 id="part-b-keep-inside-runblocking-behavior-unchanged">PART B — keep inside-runBlocking behavior unchanged<a class="headerlink" href="#part-b-keep-inside-runblocking-behavior-unchanged" title="Permanent link">&para;</a></h2>
+<p>Both changes are gated on <code>coroTop() == null</code>:
+- B-(a) only changes which dispatcher the <em>default context</em> installs; inside
+  <code>runBlocking</code> the context already has an interceptor (the
+  <code>combined[ContinuationInterceptor] != null</code> branch), so <code>newCoroutineContext</code>
+  is unchanged there. The driven path (p1a/p4/p6) is untouched.
+- B-(b) only rewrites the <code>else</code> branch of <code>coroutineLaunch</code> that runs when
+  <code>coroTop()</code> is null; the <code>if (coroTop()) |top| { enqueueLaunch }</code> branch
+  (coroutines.zig:1644-1646) — the inside-runBlocking path — is byte-for-byte
+  unchanged.</p>
+<p>Regression guard: re-run p1a/p4/p6 and the full coroutine corpus after each
+change; they must stay green.</p>
+<h2 id="part-b-implementation-order">PART B implementation order<a class="headerlink" href="#part-b-implementation-order" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>B-(b')</strong> — read <code>run.zig</code> <code>runThreadBlock</code>; determine whether pooled tasks
+   have a pump. Add a <code>driveRoot</code> wrapper in <code>runVmTask</code> if not.</li>
+<li><strong>B-(a)</strong> — flip <code>newCoroutineContext</code> actual to <code>Dispatchers.Default</code>. Run
+   p1b/p1c equivalents; p1c must now print <code>main-after-launch\nchild-start\nchild-end\ndone</code> (or <code>done</code> may interleave per real concurrency — make the test join).</li>
+<li><strong>B-(b)</strong> — rewrite the eager branch to <code>coroutineRunRoot</code>. Test
+   <code>launch(Dispatchers.Unconfined){ println(1); delay(5); println(2) }</code> outside
+   <code>runBlocking</code> honors the delay.</li>
+<li>Re-run inside-runBlocking regression suite (p1a/p4/p6 + corpus).</li>
+</ol>
+<h2 id="part-b-tests-deterministic-match-kotlinc">PART B tests (deterministic, match kotlinc)<a class="headerlink" href="#part-b-tests-deterministic-match-kotlinc" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>B-test-1 (GlobalScope.launch dispatches):</strong> the p1c program, but with a
+  <code>Thread.sleep(200)</code> or an explicit join so the child completes deterministically;
+  expected kotlinc-matching order <code>main-after-launch\nchild-start\nchild-end</code>.</li>
+<li><strong>B-test-2 (Unconfined honors delay):</strong> <code>runBlocking</code>-free
+  <code>launch(Dispatchers.Unconfined){println("a");delay(10);println("b")}</code> + a join;
+  <code>a\nb</code> with real virtual-time delay (not a no-op).</li>
+<li><strong>B-test-3 (worker task self-suspends):</strong> <code>async(Dispatchers.Default){ delay(5);
+  41+1 }.let{ runBlocking{ println(it.await()) } }</code> style — assert the pooled task
+  suspended and resumed rather than erroring.</li>
+<li><strong>B-regression:</strong> p1a/p4/p6 unchanged; full <code>tests/corpus</code> coroutine examples
+  green off and on (<code>KLIO_JIT</code> both states).</li>
+</ul>
+<h2 id="part-b-risks">PART B risks<a class="headerlink" href="#part-b-risks" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Process exit before <code>GlobalScope</code> children finish.</strong> Matching JVM means a
+  bare <code>GlobalScope.launch</code> may not complete before the program returns from
+  <code>main</code>. Keep klio's existing process-exit semantics; do not block on orphan
+  daemon-equivalent children (that <em>would</em> diverge). Tests must join.</li>
+<li><strong><code>PersistedParked</code> growth (B-(b)).</strong> A suspending Unconfined block with no
+  resumer leaks a persisted entry. Mitigate: persisted entries are already bounded
+  by the registry; an abandoned <code>GlobalScope.launch{ delay(forever) }</code> is the
+  user's leak, same as JVM.</li>
+<li><strong>Worker-pool pump + VirtualClock barrier interaction (B-(b')).</strong> A worker-local
+  pump must register with the global barrier so its <code>delay</code> doesn't race ahead of
+  the main pump. The barrier (coroutines.zig:353-438) already supports lazy
+  multi-pump registration; the worker pump must publish its floor like any pump.</li>
+</ul>
+<hr />
+<h1 id="sequencing-across-both-parts">Sequencing across both parts<a class="headerlink" href="#sequencing-across-both-parts" title="Permanent link">&para;</a></h1>
+<p>PART A and PART B are orthogonal (A runs under <code>runBlocking</code>; B fixes the
+no-driver case). Ship A first (it is the goal and needs no PART B work), landing
+B1 (monitor-across-suspend) as the one Zig prerequisite for <code>StateFlow</code>. Then ship
+PART B as the general correctness fix, B-(a) first (root cause), B-(b)/B-(b') as
+the defensive completions. Every step keeps the verified driven behavior
+(p1a/p4/p6) green.</p>
+<h2 id="root-cause-found-field-receiver-lambda-park-the-real-b1">Root cause found: field receiver-lambda park (the real "B1")<a class="headerlink" href="#root-cause-found-field-receiver-lambda-park-the-real-b1" title="Permanent link">&para;</a></h2>
+<p>The blocker for snapshotFlow + StateFlow.collectAsState is NOT monitor-across-
+suspend. It is narrower and exact: a call <code>recv.lambda()</code> where <code>lambda</code> is a
+<strong>receiver-typed suspend lambda read from a field/property</strong> (not a local), whose
+body <strong>parks</strong>, breaks on resume — the activation re-invokes the lambda from the
+top (producer re-runs) or the root driver re-invokes a non-closure (<code>Vm: Type</code>).</p>
+<p>Confirmed minimal repro (no flows involved):
+- V3 <code>recv.block()</code> where <code>block</code> is a <strong>param</strong>            → resumes OK
+- V5 <code>val b = block; recv.b()</code> (copy field to a local)      → resumes OK
+- V4 <code>recv.block()</code> where <code>block</code> is a <strong>field</strong>            → BREAKS</p>
+<p><code>SafeFlow</code> is V4 verbatim: <code>private val block: suspend FlowCollector&lt;T&gt;.() -&gt; Unit</code>
++ <code>collectSafely(collector) { collector.block() }</code>. So every <code>flow{}</code> that parks
+inside its producer hits this.</p>
+<p>Mechanism: <code>recv.fieldLambda()</code> lowers to a name-resolving <code>CallMember</code> on <code>recv</code>;
+<code>recv</code> has no such member, so eval falls back to the enclosing-<code>this</code> closure. That
+works the first time, but the suspend-activation capture records "re-invoke this
+member call" rather than "resume the closure's continuation" — so resume re-runs
+(or re-resolves the name on <code>recv</code>, which is not a closure → Type).</p>
+<p>Fix direction: when a <code>CallMember</code> resolves to an enclosing-<code>this</code> closure, invoke
+it as a value call (<code>CallValueWithThis</code> shape) so the park captures the closure
+continuation — exactly what the local-copy V5 already does. Either lower
+<code>recv.enclosingFieldReceiverLambda()</code> to <code>CallValueWithThis(GetField(this,name),
+this=recv)</code>, or fix the CallMember eval's enclosing-<code>this</code> fallback to do so.</p>
+<p>snapshotFlow + both collectAsState overloads are written and correct (held out of
+the pack) and will work once this lands.</p>
+<h2 id="parking-select-layered-blockers-ready-clause-select-semaphore-work">Parking <code>select</code> — layered blockers (ready-clause select + Semaphore work)<a class="headerlink" href="#parking-select-layered-blockers-ready-clause-select-semaphore-work" title="Permanent link">&para;</a></h2>
+<p>A <code>select</code> whose clauses are all ready (a buffered <code>onReceive</code>, <code>onTimeout</code>, an
+<code>onAwait</code> on a completed <code>Deferred</code>) and <code>Semaphore</code> under contention work. A
+<code>select</code> that must <em>park</em> on a not-yet-ready clause and be woken by a concurrent
+<code>trySelect</code> was a never-exercised path; reaching it uncovered a stack of distinct
+bugs. Three were general interpreter bugs, now fixed:</p>
+<ol>
+<li><strong>Star-import shadows an enclosing receiver member.</strong> <code>import Enum.*</code> rewrote a
+   bare name to <code>Enum.name</code> whenever it was not an <em>own</em> member; a lambda has no
+   own class, so <code>state</code> inside <code>SelectImplementation.waitUntilSelected</code>'s lambda
+   became <code>TrySelectDetailedResult.state</code> (the AtomicRef read the wrong receiver).
+   Fixed: gate on <code>hasEnclosingMember</code>.</li>
+<li><strong>A labeled return from a non-inlined lambda was dropped.</strong> <code>return@sc</code> from the
+   lambda passed to the (called-not-spliced) inline <code>atomicfu.loop</code> lowered to a
+   plain <code>Return</code>, so <code>state.loop { … return@sc }</code> looped forever. Fixed: always
+   emit <code>LabeledReturn</code> for a labeled return.</li>
+<li><strong>A star-import outranked a same-scope top-level decl.</strong> Bare <code>STATE_COMPLETED</code>
+   (a top-level <code>val</code>) became <code>TrySelectDetailedResult.STATE_COMPLETED</code>, reading a
+   bogus enum field -&gt; an internal <code>Symbol</code> where the state machine expected its
+   sentinel. Fixed: skip the wildcard rewrite for a known top-level property/fn.</li>
+</ol>
+<p>Two more were the wake-up itself, now fixed:</p>
+<ol>
+<li><strong>Offer value-handoff (FIXED).</strong> A rendezvous send hands its value to the
+   parked select through <code>trySelect</code>'s result; <code>klioProcessReceive</code>/<code>Catching</code>
+   now return that result rather than re-polling the channel a rendezvous never
+   buffered.</li>
+<li><strong><code>cont.tryResume(onCancellation)</code> bound the wrong overload (FIXED).</strong> It must
+   bind the <code>Boolean</code>-returning extension <code>CancellableContinuation&lt;Unit&gt;.tryResume</code>,
+   not the member <code>tryResume(value: T): Any?</code>; the erased type argument <code>Unit</code>
+   does not accept the function argument so only the extension applies. The
+   dispatcher now prefers a function-typed extension over a member whose matching
+   parameter is a bare type-parameter when the argument is a function (or a null
+   where a nullable function is expected). Without it <code>trySelect</code> returned a resume
+   token where a <code>Bool</code> was expected.</li>
+</ol>
+<p>Plus <code>channel.onSend(value) { }</code> now dispatches (the clause-invoke fallback passes
+the leading value before the trailing lambda).</p>
+<p>Two more were the channel <code>poll</code> paths missing a parked counterparty, now fixed:</p>
+<ol>
+<li><strong><code>onReceive</code> select missed a parked sender on a rendezvous channel (FIXED).</strong>
+   <code>channelSelectPollReceive</code> only drained the buffer; on an empty-buffer
+   (rendezvous) channel with a parked sender it returned not-ready, so the select
+   parked even though a sender was waiting. It now takes a parked sender's value
+   directly, mirroring a plain <code>receive</code>. This is what made a fan-in select loop
+   over a rendezvous channel (<code>launch { c.send(1); c.send(2) }</code> + two
+   <code>select { c.onReceive }</code>) hang: the second select never saw the second send.</li>
+<li><strong><code>onSend</code> select woken by a receive never placed its value (FIXED).</strong> A plain
+   <code>receive</code> that parked did not offer itself to a registered <code>onSend</code> select, and
+   <code>offerSendToSelectSenders</code> signalled the woken select with <code>Unit</code> — which
+   <code>klioProcessSend</code> reads as "already sent during registration" and skips
+   placement. A parking <code>receive</code> now offers to <code>onSend</code> selects, and the wake
+   signals placement so the value reaches the receiver.</li>
+</ol>
+<p>An <code>onSend</code> select feeding a <code>for (x in channel)</code> iterator consumer was a third
+manifestation, also fixed: the iterator's parked <code>hasNext</code> (in <code>receive_iter_waiters</code>)
+now carries the channel handle and offers itself to registered <code>onSend</code> selects, so an
+iterator consumer is woken for every element, not just the first.</p>
+<p><strong>Working and reliable:</strong> a single parking <code>select</code> over channel <code>onReceive</code>/
+<code>onReceiveCatching</code> (incl. observing a close while parked), a deferred <code>onAwait</code> (ready
+and parking), <code>onSend</code> (receiver-first or sender-first, and feeding a channel-iterator
+consumer), <code>Semaphore</code> under contention, a multi-clause select where one clause parks, a
+select loop over a buffered <em>or</em> rendezvous channel, and a balanced fan-in/out where
+either party arrives first. An unbalanced program (more sends than receives, or
+vice-versa) still deadlocks — correctly, as it must.</p>
+<p>The earlier suspicion that the rendezvous-park case was the B1 continuation-identity bug
+was wrong: the activation resume path was fine; the channel <code>poll</code> paths above simply
+never admitted a parked counterparty. B1 remains relevant only to
+<code>StateFlow.collectAsState</code> / suspending flow collectors, not to <code>select</code>.</p>
+<p><strong>Remaining <code>select</code> work (see STATUS at the top):</strong> an <code>onTimeout</code> timer that is
+registered, parks, and then <em>loses</em> to a channel/<code>onAwait</code> clause crashes
+<code>Vm::call_member invoke on kotlinx.coroutines.Runnable</code> inside the
+<code>CancellableContinuationImpl.tryResume</code> decision-state loop — the parked select's
+installed cancel handler colliding with the resume while the timer continuation is still
+scheduled (a shared root with the missing unconfined event loop, #7). <code>onTimeout</code> that
+wins is fine. Separately, cancelling a coroutine parked on a channel <code>send</code>/<code>receive</code>
+hangs, because the channel park is a host intrinsic that bypasses <code>CancellableContinuation</code>.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2026 Klio Contributors
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/DrewCarlson/klio" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>

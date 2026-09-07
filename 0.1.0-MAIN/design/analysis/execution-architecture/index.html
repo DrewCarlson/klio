@@ -1,0 +1,2992 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="An experimental Kotlin interpreter written in Zig.">
+      
+      
+      
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/design/analysis/execution-architecture/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>KLIO Execution & Resolution Architecture - Klio</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    <body dir="ltr">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#klio-execution-resolution-architecture" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Klio
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              KLIO Execution & Resolution Architecture
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Klio
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://drewcarlson.github.io/klio/" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Drewcarlson
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../getting-started/installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../getting-started/hello-world/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Hello, world
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../getting-started/cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Tour
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing Your Code
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../BUNDLE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bundling Programs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Architecture
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Architecture
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/pipeline/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pipeline Overview
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/interpreter/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The Vm
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/stdlib/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Standard Library
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/concurrency/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Concurrency
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/memory-model/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Memory Model
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/diagnostics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Diagnostics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../architecture/performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/overview/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    What is a Pack?
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/format/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Pack Format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/using/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Using Packs
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/authoring/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Authoring a Pack
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/native-bindings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Native Bindings
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Shipped Packs
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Shipped Packs
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/atomicfu/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.atomicfu
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/io/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.io
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/datetime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.datetime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/coroutines/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.coroutines
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/serialization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    kotlinx.serialization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/ktor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    io.ktor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../packs/shipped/compose-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    androidx.compose.runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Development
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Development
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/workspace/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Workspace Layout
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/testing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Testing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/debugging/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Debugging
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../../development/contributing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contributing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-executive-summary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Executive summary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-taxonomy-of-the-three-bug-classes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Taxonomy of the three bug classes
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. Taxonomy of the three bug classes">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#class-a-divergent-closure-execution-lambda-variable-access" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Class A — Divergent closure execution (lambda variable access)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#class-b-receiver-context-lost-across-suspendinline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Class B — Receiver context lost across suspend/inline
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#class-c-pack-vs-direct-resolution-divergence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Class C — Pack-vs-direct resolution divergence
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-current-execution-resolution-branch-map" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Current execution / resolution branch map
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. Current execution / resolution branch map">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-build-load-one-structural-path-three-call-time-configs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.1 Build &amp; load (one structural path, three call-time configs)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-instruction-decode-nine-call-shapes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.2 Instruction decode — nine call shapes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#33-host-vtables-two-abstractions-one-real-boundary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.3 Host vtables — two abstractions, one real boundary
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#34-member-dispatch-one-long-linear-cascade-subsets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.4 Member dispatch — one long linear cascade + subsets
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#35-receiver-this-sources-three-competing-origins" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.5 Receiver / this sources (three competing origins)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#36-closure-execution-call-site-count" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.6 Closure execution call-site count
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-proposed-unified-execution-resolution-architecture" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Proposed unified execution + resolution architecture
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="4. Proposed unified execution + resolution architecture">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#41-one-closure-value-one-capture-store-one-invocation-routine-class-a" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.1 One closure value, one capture store, one invocation routine (→ Class A)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#42-one-receiver-context-threaded-on-the-frame-class-b" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.2 One receiver context, threaded on the Frame (→ Class B)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#43-one-name-resolution-function-class-ab-dispatch-order" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.3 One name-resolution function (→ Class A/B dispatch order)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#44-one-packagefqn-keyed-symbol-index-class-c" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.4 One package/FQN-keyed symbol index (→ Class C)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#45-cleanup-supporting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4.5 Cleanup (supporting)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-detection-prevention-infrastructure" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Detection / prevention infrastructure
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="5. Detection / prevention infrastructure">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#51-differential-pack-vs-direct-harness-highest-leverage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.1 Differential pack-vs-direct harness (highest leverage)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#52-reset-thread-the-hidden-vm-state" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.2 Reset / thread the hidden VM state
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#53-single-dispatch-entry-invariant-assertions-at-the-choke-point" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.3 Single dispatch entry + invariant assertions at the choke point
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#54-property-fuzz-generator-for-closures-suspend" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.4 Property / fuzz generator for closures + suspend
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#55-delete-the-dead-host-assert-single-execution-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5.5 Delete the dead Host + assert single execution path
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-sequenced-remediation-roadmap" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Sequenced remediation roadmap
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/design/analysis/execution-architecture.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
+    </a>
+  
+  
+
+
+<h1 id="klio-execution-resolution-architecture">KLIO Execution &amp; Resolution Architecture<a class="headerlink" href="#klio-execution-resolution-architecture" title="Permanent link">&para;</a></h1>
+<p>Status: analysis + design proposal. Read-only audit of the current Zig tree at
+<code>main</code>. Every claim below is grounded in concrete <code>file:line</code> citations against
+live source under <code>src/</code>. The stale <code>crates/...</code> paths visible in <code>git status</code>
+are Rust artifacts left from the port and are NOT the live pipeline.</p>
+<hr />
+<h2 id="1-executive-summary">1. Executive summary<a class="headerlink" href="#1-executive-summary" title="Permanent link">&para;</a></h2>
+<p>KLIO has <strong>one</strong> build pipeline and <strong>many</strong> runtime execution paths. The build
+side is structurally unified (pack ASTs are concatenated into one synthetic file
+and lowered as a single program), but every downstream resolution and dispatch
+decision fans out into independently-grown branches that re-derive the same
+answers through different mechanisms. Three recurring bug classes all reduce to
+this fan-out:</p>
+<ol>
+<li>
+<p><strong>Variable access in anonymous lambdas resolves inconsistently.</strong> The same
+   <code>IrClosure</code> body is executed by three separate engines that disagree on the
+   capture store, the runtime env, and write-back behavior. A lambda called
+   directly (<code>host_call_value.callValue</code>) reads the value's positional capture
+   snapshot over the real globals; the same lambda called from a stdlib HOF
+   (<code>intrinsic_host.invokeCallable</code>) reads a side-table cell and runs the body
+   over a <em>capture-name-seeded child env</em> layered on globals. Captured-<code>var</code>
+   writes lower to <code>StoreGlobal</code>, which only round-trips on the HOF path's
+   scoped env. Same body, different name scope by caller.</p>
+</li>
+<li>
+<p><strong>Implicit-receiver / <code>this</code> resolution breaks across <code>suspend</code>.</strong> The
+   enclosing-<code>this</code> chain lives in a process-wide <code>threadlocal</code> stack
+   (<code>outer_this</code>), pushed/popped around synchronous calls. It is <strong>not</strong> part of
+   <code>FrameSnapshot</code>, so when a frame parks and resumes (possibly on another
+   driver iteration), the receiver context is whatever the resuming thread's TLS
+   happens to hold — not what the parked frame had.</p>
+</li>
+<li>
+<p><strong>Code loaded from PACKS resolves differently than the same code loaded
+   directly.</strong> There is no separate "pack branch"; the divergence is that every
+   resolution table (<code>funcId</code>, <code>classId</code>, the resolver scope, the inline-fn
+   table, the VM global lookup) is keyed by <strong>bare simple name</strong> and tie-broken
+   by <strong>declaration order</strong>. Packs are the only thing that both add same-simple-
+   name competitors from other packages and get inserted at a fixed position in
+   that order. A symbol can also have two executable forms (native binding vs
+   lowered shim body), chosen per dispatch site.</p>
+</li>
+</ol>
+<p>The structural root cause is shared: <strong>KLIO has no single threaded execution-
+context value, no single dispatch entry point, and no package/FQN-keyed symbol
+resolution.</strong> Receiver context, inline tables, and coroutine state all live in
+separate process-wide thread-locals mutated as side effects of dispatch; the
+same source resolves differently based on (a) which TLS the resuming thread
+holds and (b) how a symbol was registered (FQN vs simple name vs mangled).</p>
+<p>The remediation is to collapse the branches into canonical paths: one closure-
+invocation routine reading one capture store; one receiver context threaded on
+the <code>Frame</code> (and therefore on <code>FrameSnapshot</code>); one name-resolution function
+shared by qualified and unqualified dispatch; one package/FQN-keyed symbol index
+that makes pack-vs-direct indistinguishable at runtime.</p>
+<p><strong>Status of the evidence.</strong> The default test target (<code>zig build test</code>) is GREEN
+(135 steps, 1506 tests; 79/79 e2e corpus byte-identical to kotlinc). The three
+bug classes below are argued <strong>structurally</strong> — they identify the mechanism by
+which the same source can resolve or execute differently — and several have
+landed <em>point fixes</em> that mask a specific instance while leaving the general
+mechanism in place (Class C's nested-name-collision fix is the clearest example,
+see §2 Class C). Where a class is currently masked on <code>main</code> rather than
+reproducible, that is called out inline. The first deliverable in §6 is therefore
+detection scaffolding (a differential harness, choke-point invariants, a fuzzer):
+it converts each structural mechanism into a reproducible, failing test before
+the invasive unifications land, instead of asserting the divergence on faith.</p>
+<hr />
+<h2 id="2-taxonomy-of-the-three-bug-classes">2. Taxonomy of the three bug classes<a class="headerlink" href="#2-taxonomy-of-the-three-bug-classes" title="Permanent link">&para;</a></h2>
+<h3 id="class-a-divergent-closure-execution-lambda-variable-access">Class A — Divergent closure execution (lambda variable access)<a class="headerlink" href="#class-a-divergent-closure-execution-lambda-variable-access" title="Permanent link">&para;</a></h3>
+<p><strong>Symptom.</strong> A captured variable read or write inside an anonymous lambda
+produces a different result depending on whether the lambda was invoked directly
+or through a stdlib higher-order function.</p>
+<p><strong>Root cause.</strong> An <code>IrClosure</code> is executed by three functions, each
+re-implementing capture loading, arg padding, and write-back:</p>
+<ul>
+<li><strong>Main IR path</strong> — <code>host_call_value.callValue</code>, reached from the
+  <code>CallValue</code>/<code>Call*</code>/<code>CallMember*</code> arms. It reads the <em>value-carried</em> snapshot
+  slice <code>callee.IrClosure.captures</code> (<code>src/interp_ir/vm/host_call_value.zig:254-256</code>,
+  passed positionally), runs the body over the raw <code>self.globals</code> with no
+  child env, and never writes captures back. The receiver-lambda special case
+  rebuilds a fresh closure value with an overridden <code>this</code> capture
+  (<code>host_call_value.zig:299-360</code>).</li>
+<li><strong>HOF path</strong> — <code>intrinsic_host.invokeCallable</code>, reached by every stdlib HOF
+  (<code>map</code>/<code>filter</code>/<code>let</code>/<code>apply</code>/<code>with</code>/<code>run</code>). It reads the <em>side-table</em> cell
+  <code>info.captures</code> (<code>src/interp_ir/vm/intrinsic_host.zig:465-470</code>, NOT the value
+  slice), builds a fresh <code>scoped_env = Env.withParent(globals)</code> and <code>define</code>s
+  every captured <strong>name</strong> into it (<code>intrinsic_host.zig:472-485</code>), swaps that
+  child env in as the host's <code>globals</code> (<code>intrinsic_host.zig:504-518</code>), then reads
+  each name back out and overwrites <code>info.captures</code> (<code>intrinsic_host.zig:523-536</code>).</li>
+<li><strong>Coroutine driver path</strong> — <code>intrinsic_host.evalClosureRaw</code> (and the
+  receiver-lambda variant <code>invokeCallableWithThis</code>,
+  <code>src/interp_ir/vm/intrinsic_host.zig:585-674</code>) prefer the live captures but
+  ALSO seed a name-keyed <code>scoped_env</code> over globals.</li>
+</ul>
+<p>Because the HOF/coroutine paths layer captured names into a child env and the
+main path does not, a <code>LoadGlobal name</code> instruction inside the same lambda finds
+the capture in the scoped env on the HOF path but must fall back to a positional
+<code>LoadCapture</code> / enclosing-<code>this</code> chain on the main path. Captured-<code>var</code> writes
+compound this: <code>computeBoxedVars</code> is a syntactic over-approximation
+(<code>src/ir/lower/ast_scan.zig:289-306</code>); anything it misses lowers to a
+<code>StoreGlobal name</code> + local <code>rebind</code> (<code>src/ir/lower/expr.zig:665-669</code>,
+<code>expr.zig:1424-1428</code>). At runtime <code>StoreGlobal</code> assigns through <code>self.globals</code>
+(<code>src/interp_ir/vm/host_globals.zig:624-633</code>). On the main path <code>self.globals</code>
+is the parentless top-level env, so the write clobbers or defines a global and
+the capturing frame never sees it; only the HOF path's <code>scoped_env</code> catches it.</p>
+<p><strong>Aggravating factor.</strong> <code>info.captures</code> (the cell) and <code>Value.IrClosure.captures</code>
+(the snapshot) are two stores for the same data; the HOF path reading the cell
+silently ignores a closure value rebound with overridden captures (the
+receiver-lambda binding the main path produces).</p>
+<p><strong>Resolved (4a + 4b).</strong> This divergence was the HOF path's <code>scoped_env</code>
+write-back: historically the only mechanism that made a captured-<code>var</code> <em>write</em>
+from a stdlib HOF lambda visible at the declaration site when <code>computeBoxedVars</code>
+under-approximated (i.e. the var was not boxed into a <code>Cell</code>). 4a made the
+carrier precise (boxing captured-and-written <code>var</code>s — including across the inline
+splice — into a shared <code>Cell</code>); 4b then extended that boxing to function/lambda
+<em>parameters</em> a nested closure writes (the captured-param gap surfaced by a
+prove-dead pass: <code>toMap(destination){ consumeEach { destination += it } }</code>) and
+deleted both the <code>scoped_env</code> layering and the <code>StoreGlobal</code>-for-capture lowering
+(plus the now-dead <code>WritebackCaptures</code>/<code>readLambdaCapture</code> capture-sync). The HOF
+invoke path now runs the closure body over the real top-level env, identical to
+the main value path; a captured write is a <code>CellSet</code> on the shared cell and is
+visible by reference on every closure-execution path. <code>globals</code> is path-
+independent again. The <code>captured_var_carrier</code> e2e + <code>closures_advanced</code> /
+<code>closures_deep</code> itests pass unmodified.</p>
+<p><strong>Evidence summary</strong> (the <code>runtime env</code> / <code>write-back</code> rows are the pre-4b state;
+post-4b both paths run over the real top-level env with no write-back — captured
+writes round-trip through the shared <code>Cell</code>).</p>
+<table>
+<thead>
+<tr>
+<th>concern</th>
+<th>main path</th>
+<th>HOF/coroutine path</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>capture source</td>
+<td>value snapshot <code>host_call_value.zig:393-398</code></td>
+<td>side-table cell <code>intrinsic_host.zig:465-470</code></td>
+</tr>
+<tr>
+<td>runtime env</td>
+<td>raw <code>self.globals</code></td>
+<td>raw <code>self.globals</code> (post-4b; was name-seeded <code>scoped_env</code>)</td>
+</tr>
+<tr>
+<td>write-back</td>
+<td>none</td>
+<td>none (post-4b; was read-back into <code>info.captures</code>)</td>
+</tr>
+<tr>
+<td><code>this</code> override</td>
+<td>fresh closure value <code>host_call_value.zig:306-360</code></td>
+<td>mutate cell + restore <code>intrinsic_host.zig:603-660</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="class-b-receiver-context-lost-across-suspendinline">Class B — Receiver context lost across <code>suspend</code>/<code>inline</code><a class="headerlink" href="#class-b-receiver-context-lost-across-suspendinline" title="Permanent link">&para;</a></h3>
+<p><strong>Symptom.</strong> A bare member reference or <code>this@Outer</code> that resolved correctly
+before a suspension point resolves differently or fails after resume.</p>
+<p><strong>Root cause.</strong> The enclosing-<code>this</code> chain is a process-global
+<code>threadlocal var outer_this: ?*std.ArrayList(Value)</code> lazily allocated on the page
+allocator (<code>src/interp_ir/vm/host_call_member.zig:65-73</code>). It is pushed/popped
+around <code>Call</code>/<code>CallMember</code> (<code>src/ir/eval.zig:1119-1135</code>, <code>eval.zig:1259-1271</code>),
+around the main value path (<code>host_call_value.zig:349-358</code> via
+<code>pushAccessEnclosing</code>), and around the intrinsic path (<code>intrinsic_host.zig:645-661</code>
+via <code>pushOuterThis</code>) — two push helpers, one backing store. <code>enclosingThis</code> /
+<code>enclosingThisChain</code> read it (<code>host_call_member.zig:875-916</code>), and
+<code>CallMemberOrGlobal</code>, <code>LoadGlobal</code>, and <code>LoadFromThisOrGlobal</code> all consult it to
+resolve a bare name against an implicit receiver
+(<code>eval.zig:1466-1486</code>, <code>eval.zig:1500-1522</code>).</p>
+<p><code>FrameSnapshot</code> serializes only <code>func/module/block/inst_idx/regs/params/captures/
+try_stack/is_lambda/resume_reg</code> (<code>src/ir/eval.zig:149-167</code>). The <code>outer_this</code>
+stack is <strong>not</strong> in it. On suspend the Zig stack unwinds without running the
+matching <code>popAccessEnclosing</code>/<code>popOuterThis</code>; on resume <code>resumeContinuation</code>
+rebuilds the frame purely from the snapshot (<code>eval.zig:349</code>+) and a fresh
+<code>VmHost</code> is constructed, so <code>enclosingThisChain()</code> returns whatever TLS currently
+holds. Only <code>this</code> carried as a frame param (<code>frameThisParam</code>, <code>eval.zig:1847-1852</code>)
+or as a <code>this</code>-named capture (<code>callerThisValue</code>, <code>eval.zig:1856-1870</code>) survives —
+and <code>callerThisValue</code> additionally drops any receiver that is not <code>.Instance</code>
+(<code>eval.zig:1858</code>), so primitive/<code>String</code> receivers in <code>with</code>/<code>apply</code> cannot
+thread through this path at all.</p>
+<p><strong>Companion thread-locals, same anti-pattern — now mostly resolved.</strong>
+<code>member_only_probe</code> (with the whole member-only probe mode) is deleted —
+the §4.3 resolver's innermost-first candidate walk replaced its only use;
+the cascade's one flag is now the <code>strict_ext</code> parameter on
+<code>callMemberInner</code>/<code>callMemberNamedInner</code>. <code>cc_explicit_read</code> and
+<code>inner_outer_hint</code> are explicit parameters (<code>suppress_cc_redirect</code> on
+<code>getFieldInner</code>, <code>outer_hint</code> on the <code>newInstanceNamed</code> →
+<code>materializeInstance</code> construction path), and the dead duplicate
+<code>ctor_guard</code> in <code>host_globals.zig</code> is collapsed
+onto <code>host_instances.ctorGuardContains</code>. What remains in TLS is genuine
+re-entrancy / driver state: <code>map_fallback_active</code>, <code>iterable_fallback_active</code>,
+<code>call_outer_active</code> (<code>host_call_member.zig</code>, now <code>defer</code>-cleared and asserted
+clear at run boundaries via <code>host_call_member.resetReceiverTls</code>);
+<code>field_resolve_stack</code>, <code>field_outer_active</code> (<code>src/interp_ir/vm/host_fields.zig</code>);
+the one <code>ctor_guard</code> (<code>host_instances.zig</code>); <code>coro_stack</code>,
+<code>active_scope_stack</code>, <code>persisted_parked</code> (<code>src/interp_ir/vm/coroutines.zig</code>);
+<code>coroutine_time_mode_tls</code> (<code>src/interp_ir/interp_ir.zig</code>). Every TLS-holding
+VM module is wired into the run-boundary assert
+(<code>vmhost.resetReceiverThreadLocals</code>).</p>
+<p><strong>Inline variant.</strong> An <code>inline fun</code> with a receiver binds the receiver as a
+lowering-time scope local named <code>"this"</code> in the caller's builder
+(<code>src/ir/lower/inline_call.zig:459-463</code>), so after inlining the caller frame's
+<code>this</code> is a register, not a param named <code>"this"</code> — the runtime <code>frameThisParam</code>
+scan does not see it, and nested-receiver references fall back to the same
+suspend-fragile <code>outer_this</code> stack. The inline tables themselves are
+build-scoped thread-locals (<code>src/ir/lower/inline_state.zig:31-49</code>).</p>
+<p><strong>Resolved (item 6).</strong> The enclosing-<code>this</code> chain is no longer a process-global
+thread-local: it is the current <code>Frame</code>'s <code>enclosing_this</code> field, snapshotted
+into <code>FrameSnapshot</code> on suspend and restored verbatim on resume, so the <strong>narrow
+window</strong> that masked this — a <code>this@Outer</code> needed <em>only</em> via the chain (not a
+param/capture) across a real <code>delay</code>/park — is closed structurally. The
+regression is pinned by <code>examples/receiver_across_suspend.kt</code> (e2e corpus) and
+the <code>enclosing_this_chain_survives_suspend</code> itest: a <code>suspend</code> member-extension
+parks at <code>delay</code>, then resolves a bare member of its enclosing <code>this@Owner</code>
+<em>after</em> resume; before the fix this reported <code>unresolved global 'owned'</code>. The
+inline-receiver variant below (a lowering-time scope local named <code>"this"</code>) is a
+separate facet handled by item 10.</p>
+<h3 id="class-c-pack-vs-direct-resolution-divergence">Class C — Pack-vs-direct resolution divergence<a class="headerlink" href="#class-c-pack-vs-direct-resolution-divergence" title="Permanent link">&para;</a></h3>
+<p><strong>Symptom.</strong> Byte-identical source resolves a name (e.g. a <code>routing</code> extension)
+correctly when loaded one way and reports "unresolved global" when loaded
+another; load <em>order</em> of pack source files is resolution-significant.</p>
+<p><strong>Root cause.</strong> There is no pack pipeline. <code>runModuleFiles</code>/<code>runFileIrVm</code> build
+<code>all_asts = loaded.asts ++ user_asts</code> (pack-first) and hand the concatenation to
+<code>buildModuleFiles</code>, which flattens every file's decls into ONE synthetic
+<code>KotlinFile</code> with <code>.package = null</code> (<code>src/cli/commands.zig:210-218</code>,
+<code>commands.zig:245-253</code>, <code>src/interp_ir/build.zig:253-283</code>). All divergence comes
+from declaration <strong>order</strong> and <strong>FQN-mangling</strong>, because every downstream table
+is keyed by bare simple name and tie-broken by order:</p>
+<ul>
+<li><strong><code>Module.funcId</code></strong> returns <code>first_user orelse first_body orelse first</code>,
+  ranked over the per-decl <code>Func.package</code> (<code>isShippedFqn</code> is deleted). It is
+  no longer a resolution input: the symbol index
+  (<code>resolveBareCallIndexed</code>/<code>resolveBareRefIndexed</code>) is the primary path and
+  <code>funcId</code> only breaks the shapes the index defers on (extensions, overload
+  sets), order-stably.</li>
+<li><strong><code>Module.classId</code></strong> (first <code>class_index</code> entry by simple name) remains only
+  as the legacy fallback: bare construction/reference sites resolve through
+  <code>classIdIndexed</code> (caller package + imports) and carry the resolved
+  <code>ClassId</code> to the runtime, whose class registry is FQN-keyed (the
+  simple-name view is a first-wins, user-over-shipped alias for callers with
+  no resolved identity). The resolver declares per-package scopes —
+  redeclaration is detected per package and the module scope is a
+  diagnostics-free first-wins mirror for cross-package reads
+  (<code>resolver.zig</code> <code>resolveModule</code>/<code>mirrorModuleBinding</code>).</li>
+<li><strong>Inline-fn table</strong> is a process-global <code>StringHashMap</code> keyed by bare simple
+  name, merged across packs + user (<code>src/ir/lower/inline_state.zig:31</code>,
+  <code>inline_state.zig:72-93</code>, <code>inline_state.zig:284-302</code>); a pack <code>inline fun foo</code>
+  and a user <code>inline fun foo</code> share one bucket, tie-broken by shape/order.</li>
+<li><strong>VM global lookup. RESOLVED (item 8 steps 2+3).</strong> The <code>kotlin.*</code>
+  prefix-probe ladder and the <code>installed_bindings</code> suffix scan are deleted;
+  a bare name resolves through link-settled name→FQN maps
+  (<code>default_import_globals</code>, first-package-wins; <code>pack_bare_aliases</code>,
+  receiver-qualified keys excluded, lexicographic tie-break) and an
+  index-resolved reference bypasses names entirely (<code>lookupGlobalById</code> on
+  the emitted <code>FuncId</code>/<code>ClassId</code>).</li>
+<li><strong>Two executable forms. RESOLVED (item 9).</strong> <code>callFunc</code>/<code>callValue</code> used to
+  short-circuit any FQN matching an <code>installed_bindings</code> entry to
+  <code>dispatchIntrinsic</code> (a native binding) instead of the lowered body, deciding the
+  form per call from pack-install state. That per-call probe is deleted: each
+  symbol's single form is now resolved once at link time
+  (<code>ProgramImage.linkResolvedForms</code> → the <code>resolved_native</code> table keyed by
+  <code>FuncId</code>), and both dispatch paths consult that resolved form by <code>FuncId</code>
+  (<code>host_call_func.resolvedNativeForm</code>). The form is fixed at link time
+  independent of load order, so it no longer depends on how a symbol was loaded.</li>
+</ul>
+<p><strong>Aggravating factors.</strong> Lowering used to fork FQN resolution on
+<code>isLambdaBody()</code> (the four <code>expr.zig</code> dotted-head sites), so the same dotted path
+lowered to a <code>LoadGlobal</code>-of-FQN at top level but a member/<code>this</code> walk inside a
+lambda — and pack code is heavily consumed through builder lambdas. <strong>Resolved
+(item 10):</strong> the lambda axis is gone; package-head vs receiver-member is now the
+one predicate <code>headIsPackage</code> (real package root or a declared FQN-prefix package
+via <code>Module.packageHeadDeclared</code>), so a dotted head resolves identically whether
+or not it is lexically inside a lambda. Span-keyed FQN overrides still fire only
+for files WITH a package header (<code>build.zig:264-283</code>), so packaged pack decls and
+package-less user scripts take structurally different mangling/retain branches in
+the same build.</p>
+<p><strong>One instance of this class is fixed and regression-protected — not live.</strong>
+The ktor "load-order bug":
+consuming <code>ContentTypes.kt</code> (which contains a nested <code>object Application</code>) broke
+the server's <code>Application.routing</code> extension. Its root cause is NOT <code>rel_path</code>
+sort order — <code>pack_cache.zig:560-626</code> iterates <code>bundle.files</code> in bundle order and
+appends via <code>out_asts.append</code> (<code>:624</code>) with no sorting anywhere in that file. The
+actual root cause is <strong>last-writer-wins on a bare simple name</strong>: a nested
+<code>object</code> lifted to its bare top-level name overwrote a same-named true top-level
+type in the global table. That fix has <strong>landed in Zig</strong>:
+<code>src/interp_ir/build/lift.zig:240-241</code> (object) and <code>:314-320</code> (nested class)
+mangle a colliding nested type to <code>Outer$Name</code> (keyed on <code>top_level_type_names</code>
+membership), and <code>tests/fixtures/parity_corpus/nested_name_collision.kt</code> asserts
+top-level <code>Application.who() == "top-level"</code> while <code>Holder.Application.who() ==
+"nested"</code>. So this specific symptom is a resolved, test-protected case — not live
+evidence. (Caveat: <code>parity_corpus</code> is checked by the kotlinc-oracle parity sweep
+via <code>parity.zig:654 corpusDir</code> / <code>parity/main.zig:122</code>, NOT by any in-process
+itest, so this regression test does <strong>not</strong> run under the default <code>zig build
+test</code> target — see §5.1.)</p>
+<p>What remains genuinely live is the <strong>general mechanism</strong>: every resolution table
+is still keyed by bare simple name and tie-broken by declaration order
+(<code>funcId</code> <code>ir.zig:787-801</code>, <code>classId</code> <code>ir.zig:748-753</code>, the suffix scan
+<code>host_globals.zig:480-485</code>). The nested-collision fix mangles <em>one</em> family of
+collisions; it does not make resolution a function of <code>(package, imports, FQN)</code>,
+so a same-simple-name competitor introduced from another package by a pack
+remains order-sensitive. The differential harness (§5.1) is what would surface
+any still-live instance of this class as a test failure rather than a field bug.</p>
+<hr />
+<h2 id="3-current-execution-resolution-branch-map">3. Current execution / resolution branch map<a class="headerlink" href="#3-current-execution-resolution-branch-map" title="Permanent link">&para;</a></h2>
+<h3 id="31-build-load-one-structural-path-three-call-time-configs">3.1 Build &amp; load (one structural path, three call-time configs)<a class="headerlink" href="#31-build-load-one-structural-path-three-call-time-configs" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>source .kt / compiled .pack
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>        |
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>   loadInstalledPacks (CLI)  /  registerAstPackage + embedded stdlib (parity)
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>        |
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>   all_asts = pack_asts ++ user_asts        (commands.zig:210-218 / 245-253)
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>        |
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>   buildModuleFiles  -&gt; one synthetic KotlinFile (.package = null)   (build.zig:253-283)
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>        |  flatten decls; span-keyed FQN overrides only for packaged files (build.zig:264-283)
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>        |
+<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>   Module { funcs, classes, func_index, class_index, const pool, installed_bindings }
+<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>        |
+<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>   Vm.fromBuilt -&gt; vm.run
+</code></pre></div>
+<p>Three load configurations feed the <strong>same</strong> VM but never cross-check each other:</p>
+<table>
+<thead>
+<tr>
+<th>runner</th>
+<th>packs</th>
+<th>host bindings</th>
+<th>used by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>runWithKtc</code> (<code>parity.zig:1118</code>)</td>
+<td>embedded stdlib only</td>
+<td>none</td>
+<td><code>check()</code> kotlinc oracle</td>
+</tr>
+<tr>
+<td><code>runWithPacks</code> (<code>parity.zig:1505</code>)</td>
+<td>kotlinx source dirs</td>
+<td>coroutines + atomicfu</td>
+<td>all itests, e2e</td>
+</tr>
+<tr>
+<td><code>runFileIrVm</code> (<code>commands.zig:222</code>)</td>
+<td>compiled <code>.pack</code> binaries</td>
+<td>larger merged set</td>
+<td>the real binary</td>
+</tr>
+</tbody>
+</table>
+<p>Nothing runs one program through two of these and diffs the output.</p>
+<h3 id="32-instruction-decode-nine-call-shapes">3.2 Instruction decode — nine call shapes<a class="headerlink" href="#32-instruction-decode-nine-call-shapes" title="Permanent link">&para;</a></h3>
+<p><code>eval.zig</code> decodes nine call-shaped instructions (<code>src/ir/eval.zig:818-828</code>):
+<code>Call</code> (FuncId), <code>CallValue</code>, <code>CallValueWithThis</code>, <code>CallSpread</code>, <code>CallSuper</code>,
+<code>CallMember</code>, <code>CallMemberOrGlobal</code>, <code>CallMemberOrValue</code>, <code>CallValueOrMember</code>.
+Three of them encode <em>unresolved</em> dispatch the lowerer could not classify
+(<code>eval.zig:1250</code>, <code>1277</code>, <code>1298</code>) and re-derive resolution at runtime by probing
+in different orders. <code>execCallMemberOrGlobal</code> (<code>eval.zig:1616-1832</code>) is a ~220-
+line multi-tier fallback (member-only probe, this-param probe, enclosing-this
+probe, inner-outer chain, has-member probe, lexical-extension probe, named-
+overload, global value, frame-this last resort), each tier calling a different
+Host method. The probe order is itself the language's name-resolution policy,
+duplicated against — and divergent from — the order <code>callMember</code> uses for
+qualified <code>recv.name()</code>.</p>
+<h3 id="33-host-vtables-two-abstractions-one-real-boundary">3.3 Host vtables — two abstractions, one real boundary<a class="headerlink" href="#33-host-vtables-two-abstractions-one-real-boundary" title="Permanent link">&para;</a></h3>
+<p>Two host vtables back two structs cloning the same 11 shared handles:</p>
+<ul>
+<li><code>ir.eval.Host</code> (<code>src/ir/eval.zig:2500</code>+) — evaluator-facing, ~40 slots:
+  <code>callValue</code>, <code>callMember</code>, <code>callFunc</code>, <code>lookupGlobal</code>, <code>storeGlobal</code>,
+  <code>isShadowingCapture</code>, <code>enclosingThis</code>, etc.</li>
+<li><code>runtime.IntrinsicHost</code> (<code>src/interp_ir/vm/intrinsic_host.zig:683-696</code>) —
+  stdlib-facing, ~25 slots: <code>invokeCallable</code>, <code>invokeCallableWithThis</code>,
+  <code>invokeMethod</code>, coroutine seams.</li>
+</ul>
+<p>The boundary is not real: <code>invokeMethod</code> builds a <code>VmHost</code> and forwards to
+<code>Host.callMember</code>, i.e. the IntrinsicHost path tunnels back into the eval.Host
+path. The closure-execution divergence of Class A lives exactly at this seam,
+because <code>invokeCallable</code> does NOT reuse <code>callValue</code>.</p>
+<p>A <strong>dead duplicate</strong> <code>Host</code>/<code>VTable</code>/<code>NullHost</code> lives in <code>src/ir/eval/host.zig</code>
+(712 lines) with no importer in the tree (verified: no <code>@import</code> of <code>eval/host</code>
+anywhere). Its <code>defaultCallFunc</code> (<code>host.zig:550</code>) calls <code>eval(module, f, args)</code>
+with a 3-arg signature that no longer matches the live
+<code>eval(allocator, module, func, args)</code> (<code>eval.zig:285</code>). The drift is real but
+never type-checked: the file is never <code>@import</code>ed and <code>defaultCallFunc</code> is never
+instantiated (it is additionally guarded by an <code>@hasDecl</code> + lazy <code>@import</code>
+inside the fn body, <code>host.zig:545-547</code>). It compiles fine <em>because</em> it is dead —
+but it is a second, drifted source of truth for the dispatch contract and should
+be deleted (§4.5).</p>
+<h3 id="34-member-dispatch-one-long-linear-cascade-subsets">3.4 Member dispatch — one long linear cascade + subsets<a class="headerlink" href="#34-member-dispatch-one-long-linear-cascade-subsets" title="Permanent link">&para;</a></h3>
+<p><code>callMember</code> (<code>src/interp_ir/vm/host_call_member.zig:1301-1832</code>, ~530 source
+lines before the first sibling helper at <code>:4021</code>) linearly checks dozens of
+(receiver-variant, method-name) special cases — Delegate protocol,
+Thread handles, Intrinsic/Class static probes, List/Iterator/Sequence/Range
+protocols, data-class auto members, anon-object dispatch (<code>anonMethodDispatch</code>),
+IR class+supertype walk (<code>irMethodWalk</code>, <code>host_call_member.zig:3339-3448</code>), Any
+fallback, stdlib member dispatch, delegate forwarding, companion forwarding,
+function-typed property invocation, extension-fn fallback — in fixed order, each
+<code>if (try X) |r| return r</code>. <code>callMemberNamed</code> and <code>callMemberStrictExt</code>
+re-enter the cascade with one flag: <code>strict_ext</code> (threaded through
+<code>callMemberInner</code> to <code>extensionFnFallback</code>) demands a proven
+receiver-type match for extension candidates — the bare-name resolver's
+per-receiver probe uses it so an inapplicable extension cannot bind at an
+inner receiver. The old member-only restriction (<code>callMemberOnly</code>,
+<code>member_only</code> parameter, SAM-lambda deferral) is deleted: its only caller
+was the resolver's former member-only pre-pass, which the innermost-first
+candidate walk replaced. <code>irMethodWalk</code> resolves the
+receiver class by two different keys — FQN
+(<code>host_call_member.zig:3369</code>) then a simple-name scan (<code>:3373-3380</code>) — which is
+what makes pack-mangled classes layout-sensitive. <code>extensionFnFallback</code>
+(<code>:3692-3711</code>) admits any func whose first param is named <code>"this"</code> and whose
+<code>member_ext_owner_class</code> gate is absent, conflating synthesized method receivers
+with synthesized extension receivers — the ktor double-<code>execute</code> root cause.</p>
+<h3 id="35-receiver-this-sources-three-competing-origins">3.5 Receiver / <code>this</code> sources (three competing origins)<a class="headerlink" href="#35-receiver-this-sources-three-competing-origins" title="Permanent link">&para;</a></h3>
+<p>At any dispatch, the receiver is sourced from up to three unsynchronized places:</p>
+<ol>
+<li>a param literally named <code>"this"</code> (<code>frameThisParam</code>, <code>eval.zig:1847-1852</code>),</li>
+<li>a capture named <code>"this"</code> (<code>callerThisValue</code> scans <code>capture_order</code>,
+   <code>eval.zig:1862-1868</code>, <code>.Instance</code>-only),</li>
+<li>the thread-local <code>outer_this</code> stack (<code>enclosingThisChain</code>,
+   <code>host_call_member.zig:875-891</code>),</li>
+</ol>
+<p>The fourth origin — the <code>inner_outer_hint</code> thread-local for inner-class outer
+receivers — is gone: the outer is an explicit <code>outer_hint</code> parameter on the
+construction path, and <code>selectInnerOuter</code> picks it by the inner class's
+lexically enclosing class (<code>registry.enclosing_class</code>) over the hint's
+class-nesting tower (its <code>outer</code> links) and the subject-tagged frame chain.
+For the bare-name <code>*OrGlobal</code> family the three origins are consumed through
+one producer (<code>implicitCandidatesAlloc</code>, <code>src/ir/eval.zig</code>): capture slot →
+<code>this</code> param (call form) → frame chain entries → non-subject towers, in that
+order, so the read/write/call arms cannot disagree on receiver precedence.
+There is still no assertion that the origins agree for the <em>other</em> dispatch
+shapes (explicit <code>CallMember</code>, host-internal rescues).</p>
+<h3 id="36-closure-execution-call-site-count">3.6 Closure execution call-site count<a class="headerlink" href="#36-closure-execution-call-site-count" title="Permanent link">&para;</a></h3>
+<p>22+ distinct <code>evalWith*</code>/<code>evalWithCaptures</code>/<code>evalWithCapturesIn</code>/
+<code>resumeContinuation</code> call sites reach <code>ir.eval.eval*</code> across the VM
+(<code>host_call_func.zig:592</code>, <code>host_call_value.zig:400,684</code>,
+<code>host_instances.zig:2475</code>, <code>host_call_member.zig:3301,3324</code>,
+<code>intrinsic_host.zig:308,521</code>, plus the resume path). Capture metadata is also
+computed twice: lowering records <code>capture_order</code> (<code>src/ir/build.zig:435-458</code>),
+and runtime <code>buildClosure</code> re-reads it (<code>host_call_value.zig:484-527</code>), so a
+mismatch silently mis-binds captures by position. <code>Value.Lambda</code> (formerly
+<code>src/runtime/value.zig:287-303</code>) was a dead Env-based closure representation
+parallel to <code>Value.IrClosure</code>: the live interp_ir pipeline never produced it (the
+<code>AstLambda</code> instruction's runtime handler <code>buildAstLambdaWithFlagFuncid</code> already
+built an <code>IrClosure</code>), and the only constructor was a single GC unit test
+(<code>src/runtime/runtime.zig</code>). <strong>Deleted (§6 item 11):</strong> the variant, the test
+constructor, and every Value-context <code>.Lambda =&gt;</code> arm. The capture authority is
+now <code>func.capture_order</code> flowing through <code>ClosureInfo.captures</code>; there is no
+parallel per-value Env snapshot. (<code>tests.zig:313</code> builds <code>Expr.Lambda</code>, the AST
+syntax node, which is unrelated and stays.)</p>
+<hr />
+<h2 id="4-proposed-unified-execution-resolution-architecture">4. Proposed unified execution + resolution architecture<a class="headerlink" href="#4-proposed-unified-execution-resolution-architecture" title="Permanent link">&para;</a></h2>
+<p>The goal is to collapse each fan-out into a single canonical path so that the
+same source produces the same resolution regardless of caller, suspend state, or
+load configuration. Five canonical components, each mapping directly to a bug
+class.</p>
+<h3 id="41-one-closure-value-one-capture-store-one-invocation-routine-class-a">4.1 One closure value, one capture store, one invocation routine (→ Class A)<a class="headerlink" href="#41-one-closure-value-one-capture-store-one-invocation-routine-class-a" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>One representation.</strong> <code>Value.IrClosure</code> holds the stable <code>id</code> plus its
+  capture snapshot. The single source-of-truth capture vector lives in
+  <code>ClosureInfo.captures</code> (the shared cell). <code>Value.Lambda</code> (the parallel
+  Env-based closure) is deleted (§6 item 11): it was unreachable on the live
+  interp_ir pipeline, so <code>IrClosure</code> is the sole closure value form. The
+  per-value snapshot slice on <code>IrClosure</code> is the remaining duplication to fold.</li>
+<li><strong>One routine.</strong> A single <code>invokeClosure(id, args, this_override)</code> reads/writes
+  the cell and uses one env strategy. <code>host_call_value.callValue</code> and
+  <code>intrinsic_host.invokeCallable</code>/<code>invokeCallableWithThis</code>/<code>evalClosureRaw</code> all
+  delegate to it (build a transient <code>VmHost</code> if needed). <code>VmIntrinsicHost</code>
+  becomes a thin adapter that forwards ALL callable/method invocation to the
+  eval.Host implementations — as <code>invokeMethod</code> already does for members —
+  keeping only genuinely intrinsic-only slots (coroutine seams, thread spawn).</li>
+<li><strong>Stop swapping <code>self.globals</code></strong> — DONE (4a then 4b). The precise carrier was
+  proven first (4a: box captured-and-written <code>var</code>s, including across the inline
+  splice, into a shared <code>Cell</code>; 4b extended it to function/lambda parameters a
+  nested closure writes), then the fallbacks were deleted (4b): the
+  <code>StoreGlobal</code>-for-capture lowering, the <code>scoped_env</code> layering on both HOF invoke
+  sites, and the now-dead <code>WritebackCaptures</code>/<code>readLambdaCapture</code> capture-sync.
+  <code>globals</code> now always points at the real top-level env on every path;
+  <code>isShadowingCapture</code>/<code>storeGlobal</code>/<code>lookupGlobal</code> are path-independent, and
+  reads and writes of a captured name share one path on both invocation routes.</li>
+<li><strong>One capture-metadata authority.</strong> Treat <code>func.capture_order</code> as canonical:
+  the construction site emits capture values strictly in capture-order index
+  order (assert it); <code>invokeClosure</code> stores exactly one capture vector keyed by
+  that order. Drop the cell/snapshot duplication.</li>
+</ul>
+<h3 id="42-one-receiver-context-threaded-on-the-frame-class-b">4.2 One receiver context, threaded on the Frame (→ Class B)<a class="headerlink" href="#42-one-receiver-context-threaded-on-the-frame-class-b" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Receiver chain: DONE (item 6; seeding made lexical with item 7).</strong> The
+  enclosing-<code>this@</code> chain is an <code>enclosing_this</code> field of <code>Frame</code> and of
+  <code>FrameSnapshot</code>. It is duped on suspend and restored verbatim in
+  <code>resumeContinuation</code>, so the chain travels with the parked continuation by
+  construction; the suspend-<code>this</code> bug disappears. The <code>outer_this</code>
+  thread-local and <code>outerThisStack</code> are deleted, and <code>enclosingThis</code>/
+  <code>enclosingThisChain</code>/<code>pushAccessEnclosing</code>/<code>popAccessEnclosing</code> read/write
+  the current frame's chain via a thread-local <code>active_chain</code> pointer that
+  only ever points at a live frame's field. Frame-entry seeding is LEXICAL,
+  not inherited from the dynamic caller: a closure body's chain is the
+  closure's creation-time snapshot (<code>ClosureInfo.chain</code>, taken by
+  <code>captureChainAlloc</code> at <code>Lambda</code>/<code>AstLambda</code> execution), a method /
+  extension body's chain starts from its own dispatch receiver
+  (<code>ownReceiverEntry</code>: a dispatch receiver enters as <code>.receiver</code> with its
+  nesting tower and companion; an extension receiver as <code>.subject</code>, itself
+  only), and the only caller entries that cross the frame boundary are the
+  in-flight pushes the dispatch made for this very call (a bound
+  receiver-lambda subject, a displaced <code>this</code>, a member-extension owner) —
+  tracked past <code>active_chain_base</code>, with <code>.access</code> entries (dispatch-time
+  visibility for the extension-owner filters) never transferring.</li>
+<li><strong>Inner-class outer receiver: DONE (item-6 close-out).</strong> The
+  <code>inner_outer_hint</code> thread-local and its push/pop helpers are deleted. The
+  outer is an explicit <code>outer_hint: ?*const Value</code> parameter on
+  <code>newInstanceNamed</code>, threaded through <code>newInstance</code> →
+  <code>dispatchSecondaryCtor</code>/<code>superDelegation</code> (nested shell constructions see
+  the same hint) → <code>primaryCtorPath</code> → <code>materializeInstance</code>, where
+  <code>selectInnerOuter</code> picks the outer by the inner class's lexically
+  enclosing class (<code>registry.enclosing_class</code> /
+  <code>ClassDef.enclosing_class</code>), walking the receivers in scope at the
+  construction site innermost-first the way kotlinc resolves the inner
+  constructor's dispatch receiver: the hint itself; the hint's
+  class-nesting tower (<code>outer</code> links — a member of <code>Inner</code> constructing a
+  sibling <code>Inner()</code> reaches <code>this@Outer</code> through its own outer link, never
+  through a receiver inherited from a caller frame), skipped when the hint
+  is the innermost receiver-lambda subject (a displaced <code>with(x)</code> slot —
+  the subject brings only itself into scope); then the enclosing-receiver
+  chain, each entry direct plus — for non-subject entries — its own tower.
+  Chain entries carry the subject/receiver distinction from the push site
+  (<code>ir.eval.EnclosingEntry.is_subject</code>; the three receiver-lambda dispatch
+  sites push the subject tagged, the displaced prior <code>this</code> plain). On the
+  build side, a lambda body lowering a bare <code>Inner()</code> to <code>NewInstance</code> now
+  records a <code>this</code> capture (kotlinc's <code>this$0</code>: the inner construction is
+  a <em>use</em> of the enclosing instance), <code>ir.Class</code> carries <code>is_inner</code> to key
+  that decision — stamped on the <code>reserveClass</code> stub too, so a
+  forward-referenced sibling inner class lowers identically in either
+  declaration order — and the <code>NewInstance</code> arm sources the hint via
+  <code>callerThisValue</code> (param or capture). Together these fixed
+  <code>with(other) { Inner().show() }</code> inside an Outer member — including the
+  shadowing case where the unrelated subject declares a same-named
+  property (the stamped <code>outer</code> resolves through <code>instanceField</code>'s early
+  outer-instance walk, ahead of the dynamic chain-top rescue) — plus inner
+  instances escaping HOF lambdas, user-HOF lambdas, two-level <code>inner</code>
+  nesting, sibling construction under a polluted caller chain, and
+  later-declared siblings built from lambdas. Pinned by the
+  <code>inner_class_constructed_inside_with_lambda</code> /
+  <code>inner_class_in_with_lambda_ignores_shadowing_subject</code> /
+  <code>inner_class_constructed_inside_user_hof_lambda</code> /
+  <code>inner_class_two_level_nesting</code> /
+  <code>inner_class_escapes_lambda_with_outer</code> /
+  <code>sibling_inner_construction_ignores_caller_receivers</code> /
+  <code>later_declared_sibling_inner_class_from_lambda</code> /
+  <code>with_subject_of_enclosing_class_supplies_outer</code> /
+  <code>with_subject_outer_links_not_in_scope</code> /
+  <code>with_unrelated_subject_in_inner_member_reaches_outer</code> itests
+  (sibling/<code>with</code>-subject expectations confirmed against kotlinc-native
+  2.3.10), the suspend pins in <code>parity_suspend_shapes</code> (including
+  <code>sibling_inner_constructed_after_park</code>), and
+  <code>examples/inner_class_suspend.kt</code>.</li>
+<li><strong>Guards → params: DONE (item-6 close-out) for the deletable set.</strong>
+  <code>member_only_probe</code> and its <code>member_only</code> parameter successor are gone
+  entirely (item 7): the resolver's innermost-first candidate walk replaced
+  the member-only pre-pass, so <code>callMemberOnly</code> and the SAM-lambda deferral
+  were deleted with their only caller; the one remaining cascade flag is
+  the <code>strict_ext</code> parameter (proven-receiver extension filter).
+  <code>cc_explicit_read</code> is the <code>suppress_cc_redirect</code> parameter of
+  <code>getFieldInner</code>. The duplicate <code>ctor_guard</code> is collapsed: the
+  <code>host_globals.zig</code> copy had no writer (its deferred-<code>object</code> gate read
+  was always false), and <code>lookupGlobal</code> now consults the one real guard via
+  <code>host_instances.ctorGuardContains</code>. The load-bearing re-entrancy flags
+  stay as TLS (<code>map/iterable_fallback_active</code>, <code>call_outer_active</code>,
+  <code>field_outer_active</code>, <code>field_resolve_stack</code>), <code>defer</code>-cleared and covered
+  by run-boundary asserts (<code>host_call_member.resetReceiverTls</code> is wired
+  into <code>vmhost.resetReceiverThreadLocals</code>). Re-checked at the §4.3 close:
+  none is a resolver-order flag, so the single resolver does not retire
+  them — each breaks a recursion that crosses the eval boundary (the
+  Map/Iterable materialization, the outer-chain walk, and the field
+  rescue all re-enter host dispatch through <code>ir.eval</code> frames), which a
+  parameter cannot follow. They stay TLS with this as the documented
+  reason.</li>
+<li><strong>Frame's own <code>this</code> — DONE (findings 4/8 fold), kind-disciplined.</strong>
+  The frame's own receiver is still recovered by <code>frameThisParam</code> /
+  <code>callerThisValue</code> / <code>implicitThisValue</code>, but the recovery is now gated by
+  the SAME synthesized-receiver provenance the chain's <code>ownReceiverEntry</code>
+  uses, so the two are one discipline rather than two divergent name scans.
+  <code>frameThisParam</code> consults a new <code>Func.has_receiver_param</code> flag (set
+  wherever the lowerer injects a leading <code>this</code>: method / extension bodies,
+  local-extension lambdas, constructors / init / accessor / default-arg
+  thunks) instead of a bare name scan, so a user parameter spelled
+  <code>this</code> (<code>fun probe(\</code>this`: Box)<code>) is no longer treated as a dispatch
+  receiver — a bare call in its body resolves no implicit receiver,
+  matching kotlinc (</code>unresolved reference<code>). The depth-assumption churn the
+  validator flagged was avoided because finding 4's</code>with<code>-subject leniency
+  was root-caused in the LOWERING (an enclosing-member bare call now lowers
+  to</code>CallMemberOrGlobal<code>, resolved by the candidate walk, instead of a
+  plain</code>CallMember<code>that reached the enclosing member only via the runtime</code>outerChainFallback<code>), not by shifting the chain's depth-0 slot; so</code>implicitCandidatesAlloc<code>, the getField rescues,</code>enclosingOwnerSet<code>/</code>enclosingChainClassOrder<code>,</code>checkReceiverChain<code>, and
+  the B13</code>.Instance<code>gate keep their existing assumptions. The deeper ideal
+  — deleting the by-name recovery entirely for a single</code>enclosing_this[0]<code>read — was deliberately not taken: with</code>has_receiver_param<code>the by-name
+  path and the chain agree by construction, and removing the recovery would
+  churn the capture-slot / depth-0 handling for no behavioral gain. Pinned by</code>with_subject_outer_member_call_rejected<code>/</code>inner_member_calls_outer_member<code>/</code>backtick_this_param_not_receiver<code>(</code>parity_corpus_pinned.zig<code>, kotlinc-jvm 2.3.21). Known residual: the
+  dynamic chain-top rescue in</code>getField<code>(the</code>field_outer_active<code>walk,
+  guard B9) can still resolve an explicit</code>recv.field<code>against</code>recv<code>'s</code>outer` link inside an inner-class context — a leniency over kotlinc for
+  explicit qualified outer access, not a wrong value for valid programs.</li>
+</ul>
+<h3 id="43-one-name-resolution-function-class-ab-dispatch-order">4.3 One name-resolution function (→ Class A/B dispatch order)<a class="headerlink" href="#43-one-name-resolution-function-class-ab-dispatch-order" title="Permanent link">&para;</a></h3>
+<p>Define ONE resolver <code>resolve(frame_receiver_ctx, name, args) -&gt; ResolvedTarget</code>
+behind the runtime member-vs-global decision, so the bare-name read, write,
+and call forms traverse identical receiver precedence. Statically classify
+every emit site whose context proves no implicit receiver can shadow the
+name; keep the "Or" forms only where the receiver is genuinely unknowable at
+lower time (lambda bodies, method bodies — <code>ir.TypeRef</code> erases <code>R.()-&gt;T</code>
+receivers and lambda lowering receives no receiver type). Mark every func
+with an explicit kind in the registry at build time (<code>instance-method</code> /
+<code>member-extension</code> / <code>top-level-extension</code>) so the extension scorer selects
+candidates by kind, not by <code>param[0] == "this"</code>.</p>
+<p><strong>Landed (item 7, member-extension kind).</strong> <code>Func.kind: FuncKind</code> now carries
+<code>member_extension</code> as a first-class category (<code>src/ir/ir.zig</code>), set at the
+member-extension lowering site (<code>src/ir/lower/decl.zig</code>) alongside the existing
+<code>member_ext_owner_class</code> side-table entry — the two are co-populated for the same
+<code>FuncId</code>, so <code>kind == .member_extension</code> and <code>member_ext_owner_class.contains(fid)</code>
+are equivalent predicates over the same set. The five member-extension dispatch
+sites in <code>host_call_member.zig</code> route through <code>isMemberExt(mod, fid)</code> (kind is
+authoritative) and <code>memberExtVisible(mod, fid, &amp;visible_owners)</code> (the owner-class
+gate). The side table is kept as the owner-class data source (per the caution
+below — the kind is additive, the gate is preserved exactly).</p>
+<p><strong>Landed (item 7, one resolver + lexical receiver scope + static
+classification — CLOSED).</strong> Kotlin receiver scope is lexical, and the runtime
+now enforces that structurally: frames stop inheriting the dynamic caller's
+chain. A closure snapshots its creation-time receiver chain
+(<code>ClosureInfo.chain</code> via <code>captureChainAlloc</code>) and every later invocation —
+any frame, coroutine resume, worker thread — seeds the body frame from that
+snapshot (<code>evalWithCapturesChained</code>); a method / extension body seeds from
+its own dispatch (<code>ownReceiverEntry</code>: dispatch receivers as <code>.receiver</code> with
+nesting tower + companion, extension receivers as <code>.subject</code>, themselves
+only); the only caller entries that transfer are the in-flight pushes the
+dispatch made for this call (receiver-lambda subject — including a null
+subject, which only a nullable-receiver extension proves against — displaced
+<code>this</code>, member-extension owner), while <code>.access</code> pushes serve dispatch-time
+visibility filters and never enter a callee's scope. A lambda created in a
+no-receiver scope therefore writes the top-level <code>var</code> even when invoked
+inside a member dispatch, and a <code>with</code>-created lambda keeps its receiver
+wherever it runs — both kotlinc-pinned
+(<code>closure_lexical_receiver_scope</code> / <code>anon_fun_receiver_scope</code> fixtures and
+the <code>parity_lambdas_and_dispatch</code> itests).</p>
+<p>The three <code>*OrGlobal</code> handlers share one candidate producer
+(<code>implicitCandidatesAlloc</code>, <code>src/ir/eval.zig</code>): the frame's own implicit
+<code>this</code> (or the seeded chain entry it dedups into), each enclosing receiver
+innermost-first; dispatch receivers bring their class-nesting tower and —
+when it owns a member of the searched name — the class's companion-object
+singleton at the class's own depth (<code>companionWithMember</code>); subjects bring
+only themselves. One precedence policy, kotlinc-pinned: candidates
+innermost-first; within one receiver, members before applicable extensions;
+receiver candidates before the top-level tiers (runtime overload pick →
+lowering-resolved identity → global by name → error). The handlers differ
+only in terminal op, and each terminal op is now per-candidate honest:
+reads probe <code>getMemberField</code> (a strict <code>getField</code> whose global / enclosing
+/ outer-chain / companion adoption tails are disabled, so an inner receiver
+cannot "resolve" a top-level binding and shadow an outer receiver's real
+member; a <code>Unit</code>-valued member is a hit); writes gate on <code>hostHasProperty</code>
+(an assignment LHS resolves only to properties — a member <em>function</em> of the
+written name never swallows a write) and <code>setField</code>; calls probe
+<code>callMemberStrictExt</code> first and retry leniently only after every receiver
+missed. The strict extension gate (<code>strictReceiverProven</code>,
+<code>host_call_member.zig</code>) PROVES the declared receiver: a function-shape
+receiver only against an actual function value (arity-checked, with the
+synthetic implicit-<code>it</code> slot tolerated for <code>Function0</code>), a bounded type
+parameter only when the receiver satisfies every declared bound
+(<code>registry.func_type_param_bounds</code>), a typealias after registry expansion,
+generic arguments against the elements the runtime value actually carries
+(a <code>List&lt;String&gt;</code> extension is disproven on a list of Ints, proven on a
+list of Strings, unprovable — and deferred to the lenient pass — on an
+empty one), and low-priority guard stubs never strictly bind; the strict
+pick must also be arity-applicable (<code>extArityApplicable</code>).</p>
+<p>Statically classified emit sites (<code>inReceiverContext</code>,
+<code>src/ir/lower/expr.zig</code> — anonymous-function bodies count as receiver
+contexts exactly like lambda bodies, carried on a dedicated
+<code>is_anon_fn_body</code> bit): in a context with no implicit receiver, bare reads,
+short interpolations, multi-segment heads, class/builtin-type-name values,
+and unresolved bare calls emit <code>LoadGlobal</code>/<code>CallValue</code>/<code>StoreGlobal</code>
+directly, so a top-level function resolving a bare name against a <em>caller's</em>
+receiver is an unresolved-reference error exactly as kotlinc rejects it. In
+receiver contexts a bare name is statically bound only when no runtime
+receiver can shadow it: the program-wide member-name universe
+(<code>registry.class_member_names</code>) gates both known top-level property reads
+and known top-level function calls — where some class declares a member of
+the name, the read stays <code>LoadFromThisOrGlobal</code> and the call becomes
+<code>CallMemberOrGlobal</code>, each carrying the index's resolved identity for the
+global arm (<code>.func</code>/<code>.class</code>, bound via <code>lookupGlobalById</code> behind an
+<code>isShadowingCapture</code> gate), so a member function or an invoke-convention
+member property of a runtime receiver outranks the package-scope function
+exactly as kotlinc resolves it. The "Or" forms are NOT merged into one
+<code>CallUnresolved</code>: the read/write/call payloads are real instruction data the
+evaluator needs regardless, and a merge re-encodes them as a mode tag while
+removing no runtime decision. <code>CallMemberOrValue</code> / <code>CallValueOrMember</code> stay
+out of the resolver deliberately — their question is
+member-vs-local-callable on an explicit receiver, the same runtime-typed
+dispatch as <code>CallMember</code> itself. The Or family is observable end-to-end via
+<code>KLIO_OR_AUDIT</code> (emit-site context lines at lowering + arm-won lines at
+runtime). The lenient arm's residue is swept on demand by
+<code>python3 scripts/or_audit_sweep.py</code> (deliberately not wired into
+<code>zig build test</code>): it runs examples + coroutine_smoke + parity_corpus with
+<code>KLIO_OR_AUDIT=1</code>, dedups identical runtime <code>arm=member_lenient</code> lines per
+program, and fails iff any lenient name falls outside the documented
+<code>{dispatch}</code> residue set. Current baseline: 10 deduped lines across 10
+programs (38 raw occurrences), all <code>name=dispatch</code>.</p>
+<p><strong>Caution — the taxonomy must distinguish member-extension from plain
+instance-method, not collapse "is in <code>class.methods</code>" ⇒ "not an extension".</strong>
+The current <code>extensionFnFallback</code> (<code>host_call_member.zig:3692-3711</code>) deliberately
+also serves <em>synthesized member-receiver</em> methods: it admits funcs whose first
+param is named <code>"this"</code> (<code>:3705</code>) and gates them by <code>member_ext_owner_class</code>
+(<code>:3706-3708</code>), and that gate is what makes member-extension visibility (e.g.
+<code>with(a) { memberExtFn() }</code>) work. KLIO lowers member extensions — and some
+member methods — to funcs with a leading <code>"this"</code> param (<code>inline_call.zig:462</code>
+binds <code>"this"</code> as a local). A registry kind that excludes <em>every</em> func appearing
+in <code>class.methods</code> from the extension set would drop the member-extension
+dispatch the ktor paths rely on. The kind field must therefore carry
+<code>member-extension</code> as a first-class category distinct from both
+<code>instance-method</code> and <code>top-level-extension</code>; the scorer admits
+<code>member-extension</code> candidates exactly when their <code>member_ext_owner_class</code> is in
+the visible-owner set, preserving the current <code>:3706-3708</code> gate behavior.</p>
+<h3 id="44-one-packagefqn-keyed-symbol-index-class-c">4.4 One package/FQN-keyed symbol index (→ Class C)<a class="headerlink" href="#44-one-packagefqn-keyed-symbol-index-class-c" title="Permanent link">&para;</a></h3>
+<p>Make resolution a pure function of (caller package, caller imports, complete FQN
+header set) — provably independent of pack load order:</p>
+<ol>
+<li><strong>Tag every decl with its declaring package</strong> at flatten time (empty string
+   for user scripts) — one uniform field, not a presence-gated span map. The
+   "no package" case becomes <code>package = ""</code>, not a separate code path. <strong>DONE
+   (item 8).</strong> <code>Func.package</code> / <code>Class.package</code> (<code>ir.zig</code>) is a uniform field
+   set at the func-stub / class-shell lowering site from <code>packageOfFqn</code>
+   (<code>ir.zig</code>); the build-driver seeds the caller package onto <code>FuncBuilder</code>
+   (<code>self_package</code>) per top-level decl and per class.</li>
+<li><strong>Two-phase consumption.</strong> Phase 1 registers every source's type/function/
+   extension HEADERS (FQN + receiver type) across all packs, features, and user
+   files. Phase 2 resolves bodies and extension-receiver bindings against that
+   complete, package-qualified header set. <strong>DONE (item 8, made explicit).</strong>
+   <code>buildModuleWithOverrides</code> (<code>interp_ir/build.zig</code>) reserves every class name
+   and emits every func stub (FQN + package + receiver <code>this</code>) — the complete
+   phase-1 header set — before any body lowers in phase 2.</li>
+<li><strong>Build one symbol index</strong> mapping (caller-package + caller-imports) → FQN →
+   <code>FuncId</code>/<code>ClassId</code>. Bare calls follow Kotlin's scoping order: named imports,
+   then the caller's own package, then star imports, then the default imports,
+   then built-in stdlib. <strong>DONE (item 8, PRIMARY path; hardened, fallback
+   retained for classified shapes).</strong>
+   <code>Module.resolveBareCallIndexed(name, caller_pkg, caller_file, arity, …)</code>
+   (<code>ir.zig</code>) ranks each non-extension candidate by tier (0 file-named import
+   — kotlinc-probed: an explicit import outranks even a same-file declaration
+   — 1 own package, 2 file-wildcard import, 3 default-import package — the
+   spec's implicitly imported set, mirrored from
+   <code>stdlib.IMPLICITLY_IMPORTED_PACKAGES</code> with a lockstep test — 4 built-in
+   stdlib, 5 other), commits the unique exact-arity no-default no-vararg
+   candidate in the best non-empty tier, and otherwise returns a reason-tagged
+   deferral (<code>ResolveDeferReason</code>: no_candidates / extension_form /
+   intrinsic_owned / ambiguous_tier / type_overload / unimported_set /
+   arity_mismatch / default_param_shape / bodyless_only / low_priority_only /
+   vararg_only / trailing_lambda_shape / cast_disambiguated). Forward
+   references rank order-independently: phase-1 header stubs carry their
+   declared arity (<code>decl_user_arity</code>), declared parameter types at FULL
+   structural granularity (<code>decl_user_sig</code>, rendered by the same
+   <code>loweredTypeRef</code> body params use — generic arguments, function-type
+   receiver/parameter/return shapes, suspend and <code>T &amp; Any</code> markers), and
+   AST-derived <code>low_priority</code>, so the index's answer does not depend on
+   whether a candidate's body has been lowered yet; default-parameter shapes
+   defer identically from the stub AND the body gate for the same reason. A
+   file's same-leaf named imports are ALL kept (<code>registry.import_aliases</code>
+   maps leaf → import-path list): a second <code>import pkg2.f</code> after
+   <code>import pkg1.f</code> is a tie the index classifies, not a shadow. Lowering
+   (<code>lower/expr.zig lowerPathCall</code>) prefers the index target when it
+   resolves — except a receiver-matched extension pick, which stays with the
+   heuristic (the index never models receivers) — and otherwise keeps the
+   order-based heuristic pick for the classified deferral shapes.
+   <strong>Ambiguity is a lowering diagnostic (default-on), scoped precisely:</strong> it
+   fires only for a CALLED, non-extension bare call whose in-scope (tier ≤ 3)
+   same-arity candidates carry no defaults or varargs and prove identical at
+   full signature granularity — the sets kotlinc itself rejects. Two
+   identical FQNs render as
+   "<code>file.kt:4: error: conflicting overloads of</code>f<code>: identical signatures
+   declared at file.kt:2 and file.kt:3 — rename or remove one of the
+   declarations</code>" (qualifying cannot separate one FQN); distinct FQNs render
+   as "<code>file.kt:4: error: ambiguous reference</code>f<code>: candidates</code>a.f<code>,</code>b.f<code>—
+   qualify the call or import one explicitly</code>". Surfaced by the run pipeline
+   (<code>commands.zig runBuilt</code>, <code>parity.zig runInMode</code>) with <code>file:line</code> from the
+   <code>SourceMap</code>. NOT diagnosed (deferred to the heuristic, kotlinc-stricter
+   shapes): identical pairs exercised through default parameters or varargs,
+   extension-form candidates, and pairs that are never called.
+   Type-distinguishable overload sets (<code>type_overload</code> — anything not
+   provably identical at full granularity) stay runtime-resolved, cast-picked
+   sets reclassify as <code>cast_disambiguated</code>, and identical sets visible only
+   outside Kotlin scoping (<code>unimported_set</code>) keep klio's lenient pick. The
+   <code>KLIO_RESOLVE_AUDIT</code> detector emits one machine-readable line per bare call
+   (outcome + reason + tier + counts + heuristic pick + emitted shape +
+   divergence grade) and flags divergences; every index/heuristic divergence
+   is graded (<code>tier_correction</code> — index pick in a strictly better tier;
+   <code>shape_correction</code> — same tier, heuristic fell back to a
+   vararg/default/arity-mismatched candidate where the index found an exact
+   overload; <code>receiver_pref</code> — heuristic's extension pick retained) and
+   <code>KLIO_RESOLVE_STRICT</code> turns an unexplained divergence into a hard failure.
+   Strict+audit sweep over all 85 examples + the coroutine fixtures: 0
+   failures, 0 unexplained divergences; the graded divergences are 300
+   <code>checkIndexOverflow</code> tier corrections (own-package target over the
+   heuristic's cross-package pick) and 12 <code>CompletableDeferred</code> shape
+   corrections (exact-arity overload over the default-param sibling, with
+   runtime type dispatch unchanged since non-exact calls re-resolve through
+   <code>pickOverload</code>). Items 8b/8c are landed: <code>isShippedFqn</code> is deleted
+   (<code>funcId</code> ranks by <code>Func.package</code>), the resolver declares per-package
+   scopes (redeclaration is per package; the module scope is a
+   diagnostics-free first-wins mirror), and the runtime class registry is
+   FQN-keyed — the simple-name views that remain are order-stable
+   fallbacks behind identity-carrying emission, not resolution inputs.</li>
+<li><strong>Lowering emits identity-carrying <code>Call</code>/<code>LoadGlobal</code>. DONE</strong> (incl. the
+   inline-fn fold, 8d). A unique index pick emits
+   <code>LoadGlobal</code> carrying the exact <code>FuncId</code>/<code>ClassId</code> (<code>lookupGlobalById</code>
+   binds it directly — no name round-trip, so extension twins sharing a
+   receiverless FQN string and dotless root-package FQNs bind exactly);
+   the three runtime ladders are DELETED — the <code>lookupGlobal</code> prefix probe
+   and suffix scan replaced by the link-time
+   <code>default_import_globals</code>/<code>pack_bare_aliases</code> maps, the <code>callFunc</code>
+   bodyless ladder by link-settled <code>resolved_redirect</code>/<code>resolved_native</code>
+   (<code>KLIO_LINK_AUDIT</code> re-derives the deleted algorithms independently).
+   The pre-deletion inventory was <code>KLIO_TRACE_RESOLVE</code>-gated
+   <code>ladder=&lt;which&gt; name=&lt;simple&gt; fqn=&lt;resolved&gt;</code> lines, so a corpus sweep
+   enumerates exactly which (program, name, fqn) still reach them.
+   <strong>Inline-fn resolution is folded into the same entry point (8d):</strong> the
+   build driver registers every top-level <code>inline fun</code>'s AST under its
+   phase-1 header stub <code>FuncId</code> (<code>inline_state.registerInlineFnId</code>), and
+   bare-call inline pre-emption (<code>inlineTargetForBareCall</code>, <code>lower/expr.zig</code>)
+   consults <code>resolveBareCallIndexed</code> FIRST — an inline winner splices
+   exactly the resolved declaration (<code>tryInlineCallWithTypeArgs</code> takes the
+   resolved target), a non-inline winner suppresses the splice so the
+   normal call path binds it, and a receiver-matched extension keeps the
+   narrowing's pick (the <code>preferredBareTarget</code> rule). The index's shape
+   gates skip a <code>vararg</code> candidate at ANY parameter position (stub and
+   body gates alike — Kotlin's vararg-before-trailing-lambda shape is as
+   inexact a match as a trailing one). The simple-name shape/receiver
+   narrowing survives only as the tie-break for the shapes the index
+   defers on: extension forms, overload sets,
+   default/vararg/trailing-lambda shapes, member inline fns (no stub), and
+   class-method bodies lowered before the headers exist — and it is
+   receiver-aware there: inside a class method the enclosing class is the
+   narrowing receiver (falling back from the enclosing extension's
+   declared receiver), matched against each candidate's declared receiver
+   through the transitive supertype chain
+   (<code>registry.class_super_names</code> / <code>Module.classIsOrExtends</code>), nearest
+   first, so <code>A.label</code>/<code>B.label</code> twins splice per enclosing class, a
+   base-class extension accepts a subclass method's receiver, and the
+   subclass's own extension outranks the base one. The
+   <code>shadowed_inline_names</code> set derives from <code>stdlib.noteBareNameMapping</code> —
+   the same constructor behind the link-time bare-name maps — over the
+   implicitly imported packages, one source of truth. Gate: the
+   KLIO_RESOLVE_AUDIT <code>inline</code> records (one per inline-candidate bare
+   call, old simple-name pick vs index pick on the splice that would
+   occur), graded like the call records — a shape correction (the
+   simple-name pick matches less exactly: vararg at any position, a
+   default, an arity mismatch) or a tier correction (the index pick ranks
+   in a strictly better scope tier, e.g. a named import outranking a
+   same-package reified inline namesake — a program property, pinned
+   strict-mode-on in <code>itests/resolve_ambiguity.zig</code>); corpus + fixture
+   sweep = 517,022 records, 0 unexplained divergences, 48 graded shape
+   corrections at one root site (the four deprecated <code>combineLatest</code>
+   bodies in kotlinx <code>Migration.kt</code>, where the inline-only simple-name
+   table spliced the reified vararg <code>combine</code> for calls whose exact-arity
+   target is the non-inline <code>combine(flow, flow2, transform)</code> — the index
+   pick is the kotlinc-correct binding, pinned fold-sensitively by the
+   equal-arity vararg-vs-exact test in <code>itests/resolve_ambiguity.zig</code>,
+   which fails under a name-first mutation).</li>
+<li><strong>One executable form per symbol. DONE (item 9).</strong> Pack-vs-source identity is
+   resolved once at link time: <code>ProgramImage.linkResolvedForms</code> (<code>interp_ir.zig</code>)
+   runs after the two-phase build and the <code>installed_bindings</code> overlay exist, and
+   for every top-level <code>FuncId</code> whose FQN maps to a native binding records that
+   binding in <code>resolved_native</code> (keyed by <code>FuncId.int()</code>); funcs with no binding
+   run their lowered body and are absent. The decision is a pure function of
+   <code>(FuncId → fqn, installed_bindings)</code>, settled deterministically independent of
+   load order. The per-call FQN short-circuit in <code>callFunc</code> and <code>callValue</code> (the
+   "Pack-installed binding fast path" / closure-body overlay probe) is deleted;
+   both now consult <code>host_call_func.resolvedNativeForm</code> by <code>FuncId</code>. The
+   <code>KLIO_LINK_AUDIT</code> detector compares the link form to the deleted per-call
+   probe's pick on every dispatch and reports 0 divergences over the green corpus
+   — the executable proof the link form is a faithful, behavior-preserving
+   replacement.</li>
+<li><strong>Remove <code>isLambdaBody()</code> as a resolution axis. DONE (item 10).</strong> The four
+   <code>(isPkgRoot(head) or !b.isLambdaBody())</code> gates in <code>expr.zig</code> are replaced by
+   one principled predicate, <code>headIsPackage(b, head)</code>: a dotted head is a
+   package-qualified global (flatten to <code>LoadGlobal</code>-of-FQN) when it is a real
+   package root (<code>isPkgRoot</code>) or names a package the program contributes a
+   top-level symbol to (<code>Module.packageHeadDeclared</code> — <code>head.&lt;rest&gt;</code> is a
+   declared FQN prefix over the complete phase-1 header set); otherwise it is a
+   member of an implicit receiver and walks <code>this</code>. A captured/local name or an
+   enclosing-class member shadows a package head (the sites already filter those
+   with <code>resolve</code>/<code>knowsOuter</code>/<code>hasEnclosingMember</code>/<code>classId</code> guards). The answer
+   is independent of lambda nesting AND of declaration order / load mode, so the
+   same dotted head inside a builder/DSL lambda lowers identically to the same
+   head at top level — which also fixes the latent Class-C bug where
+   <code>isLambdaBody</code> <em>blocked</em> a legitimately package-qualified head from flattening
+   inside a builder lambda. The inline splice binds the inline body's receiver as
+   a scope local named <code>"this"</code> already, so inline-body dotted heads resolve
+   through the same predicate without a lambda axis (no extra frame-receiver slot
+   was required at the splice). Gated behind the builder-DSL differential pass:
+   <code>examples/dsl_dotted_head.kt</code> + <code>coroutine_smoke/cs8_dotted_in_builder.kt</code>
+   byte-identical across EmbeddedOnly / SourcePacks / CompiledPacks, the
+   extension/dsl/suspend/inner-class/functional/lambda itests unmodified, and
+   <code>KLIO_RESOLVE_AUDIT</code>/<code>KLIO_LINK_AUDIT</code> = 0 over the corpus.</li>
+</ol>
+<h3 id="45-cleanup-supporting">4.5 Cleanup (supporting)<a class="headerlink" href="#45-cleanup-supporting" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Delete <code>src/ir/eval/host.zig</code> (the dead duplicate Host) and the now-empty
+  <code>src/ir/eval/</code> directory.</li>
+<li>Extract one <code>dispatchIntrinsic</code> + one <code>runtimeErrorToEval</code> + one
+  <code>makeIntrinsicHost</code>/<code>intrinsicHostDeinit</code> pair into a shared <code>host_impl.zig</code>,
+  removing the ~8 copied 11-handle clone/deinit blocks and guaranteeing one
+  suspend-mapping (<code>host_call_func.zig:123-199</code>, <code>host_call_value.zig:563-638</code>,
+  <code>host_call_member.zig:163-175</code>, <code>host_globals.zig:79-118</code>).</li>
+<li>Keep the <code>internConst</code> value-owning fix (<code>ir.zig:921-933</code>); make the
+  <code>SourceMap</code>-lifetime contract explicit (borrow/assert it outlives the returned
+  module) and replace the O(n) dedup scan with a hash set.</li>
+</ul>
+<hr />
+<h2 id="5-detection-prevention-infrastructure">5. Detection / prevention infrastructure<a class="headerlink" href="#5-detection-prevention-infrastructure" title="Permanent link">&para;</a></h2>
+<p>Each item below names a concrete attach point in the live tree.</p>
+<h3 id="51-differential-pack-vs-direct-harness-highest-leverage">5.1 Differential pack-vs-direct harness (highest leverage)<a class="headerlink" href="#51-differential-pack-vs-direct-harness-highest-leverage" title="Permanent link">&para;</a></h3>
+<p>Add a canonical <code>loadProgram(allocator, io, file, mode) -&gt; {asts, bindings,
+main_hint}</code> in <code>parity.zig</code> with <code>mode ∈ {EmbeddedOnly, SourcePacks,
+CompiledPacks}</code>, and rewrite <code>runWithKtc</code> (<code>parity.zig:1118</code>), <code>runWithPacks</code>
+(<code>parity.zig:1505</code>), and <code>cli/commands.zig:runFileIrVm</code> (<code>commands.zig:222</code>) to
+call it — three paths become one function with three data inputs. Then add
+<code>src/itests/differential.zig</code> (append its name to the <code>itests_files</code> list at
+<code>build.zig:48</code>; it needs <code>setCwd</code> like e2e — generalize the e2e match at
+<code>build.zig:136</code> to also match <code>"differential"</code>). For every <code>examples/*.kt</code> it
+runs the program through every available mode and asserts <strong>byte-identical</strong>
+output, failing with the first divergent line. Run under one arena over
+<code>page_allocator</code> exactly as <code>e2e.zig:18-21</code>. This turns Class C from a field bug
+into a compile-test failure.</p>
+<blockquote>
+<p>Why this is needed even though a Class C instance is already "covered."
+<code>tests/fixtures/parity_corpus/nested_name_collision.kt</code> (the landed
+nested-collision regression test, §2 Class C) is consumed only by the
+kotlinc-oracle parity sweep (<code>parity.zig:654 corpusDir</code>, driven by
+<code>parity/main.zig:122</code> and the bench/sweep tooling) — it is NOT in the
+<code>itests_files</code> list (<code>build.zig:51-61</code>) and therefore does NOT run under the
+default <code>zig build test</code> (1506 tests). The in-process itests only walk
+<code>conformance</code> / <code>coroutine_smoke</code> / <code>threaded_litmus</code> / <code>typeck_negative</code>. A
+<code>src/itests/differential.zig</code> registered in <code>itests_files</code> is what brings
+Class C protection <em>into the default target</em>, where a regression cannot pass
+CI silently.</p>
+</blockquote>
+<h3 id="52-reset-thread-the-hidden-vm-state">5.2 Reset / thread the hidden VM state<a class="headerlink" href="#52-reset-thread-the-hidden-vm-state" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Cheap, immediate.</strong> In <code>Vm.deinit</code> (<code>src/interp_ir/vm/run.zig</code>) and at the
+  top of each public runner (<code>parity.zig:1118</code>, <code>1505</code>; <code>commands.zig:222</code>),
+  assert in Debug that <code>outer_this</code>, <code>coro_stack</code>, <code>active_scope_stack</code>,
+  <code>field_resolve_stack</code>, and <code>ctor_guard</code> are empty, then
+  <code>clearRetainingCapacity</code> them. This makes leaked-across-runs state a loud
+  failure and makes the differential harness trustworthy.</li>
+<li><strong>Real fix.</strong> Add the receiver context to <code>FrameSnapshot</code> (<code>eval.zig:149</code>) and
+  save/restore it in the <code>Suspended</code> unwind and <code>resumeContinuation</code>
+  (<code>eval.zig:349</code>) alongside <code>regs/params/captures</code> — implements §4.2.</li>
+</ul>
+<h3 id="53-single-dispatch-entry-invariant-assertions-at-the-choke-point">5.3 Single dispatch entry + invariant assertions at the choke point<a class="headerlink" href="#53-single-dispatch-entry-invariant-assertions-at-the-choke-point" title="Permanent link">&para;</a></h3>
+<p>Funnel every user-function execution through one private
+<code>dispatchUserFunc(self, allocator, module, func, args, captures, receiver_ctx)</code>
+(the ~22 <code>evalWith*</code> call sites delegate to it; <code>callMemberNamed</code>/<code>Only</code> and
+<code>callValueNamed</code> already forward — extend the pattern). At its top, Debug-only
+invariants: (i) <code>func.body_func</code>/<code>FuncId</code> in range; (ii) no-dangling-name — any
+name resolved is non-empty and selects exactly one declaration (assert the
+overload candidate set at <code>host_call_member.zig:924</code> is unique or
+deterministically ordered); (iii) receiver-chain consistency — if a <code>"this"</code>
+param and a <code>"this"</code> capture both exist they are the same <code>Instance</code>, and the
+enclosing chain has no <code>Null</code>/<code>Unit</code> interior entries unless intended. Emit
+violations as machine-readable lines through the existing tracer
+(<code>src/interp_ir/vm/trace.zig:76</code>) under a new <code>KLIO_TRACE_INVARIANTS</code> gate.</p>
+<h3 id="54-property-fuzz-generator-for-closures-suspend">5.4 Property / fuzz generator for closures + suspend<a class="headerlink" href="#54-property-fuzz-generator-for-closures-suspend" title="Permanent link">&para;</a></h3>
+<p>Add <code>src/itests/fuzz_closures_suspend.zig</code> (append to <code>build.zig:48</code>; needs
+<code>setCwd</code>). Use <code>std.Random</code> with a fixed, env-overridable seed to emit small but
+valid Kotlin programs from a constrained grammar: N nested lambdas each capturing
+a mutable <code>Int</code>, M of them suspending (<code>delay</code>) inside <code>runBlocking</code>/<code>launch</code>,
+with implicit-receiver method calls at varying depth. For each program: (a) run
+through <code>runWithPacks</code> AND <code>runWithKtc</code> and assert identical (reuses §5.1's
+invariant); (b) when <code>KLIO_SKIP_KOTLINC_PARITY</code> is unset, call <code>parity.check</code>
+(<code>parity.zig:1764</code>) to diff against kotlinc and shrink-report the minimal failing
+program. Keep ~200 seeds per CI run; persist any failing seed+source under
+<code>tests/corpus/</code> so it becomes a permanent regression case (monotonic-corpus
+rule).</p>
+<h3 id="55-delete-the-dead-host-assert-single-execution-path">5.5 Delete the dead Host + assert single execution path<a class="headerlink" href="#55-delete-the-dead-host-assert-single-execution-path" title="Permanent link">&para;</a></h3>
+<p>Delete <code>src/ir/eval/host.zig</code> (no importer; confirm with a build) — it is a false
+second source of truth for the dispatch contract that has already drifted from
+the live <code>Host</code> at <code>eval.zig:2500</code>. Extend the tracer (<code>trace.zig:76</code>) to emit
+structured records (one line per dispatch: <code>{fn, receiver_type, chosen_decl,
+path_tag}</code>) under a new <code>KLIO_TRACE_PATH=1</code> gate, where <code>path_tag</code> identifies
+which consolidated dispatch entry (§5.3) handled it. Add a small
+<code>scripts/assert_single_path.py</code> (targeting <code>zig-out/bin/klio</code>, replacing the
+stale Rust-path <code>corpus_check.py</code>) that runs a program with <code>KLIO_TRACE_PATH=1</code>
+and asserts each <code>(fn, receiver_type)</code> pair maps to exactly one <code>path_tag</code> and
+one <code>chosen_decl</code> — turning "one execution path" into an executable check.</p>
+<blockquote>
+<p>Note: <code>scripts/assert_single_path.py</code> is the live replacement: it targets
+<code>zig-out/bin/klio</code>, runs the examples + coroutine-smoke corpus under
+<code>KLIO_TRACE_PATH=1</code>, and asserts decl determinism, single-path grouping, and
+cross-run record stability. <code>corpus_check.py</code> remains usable only in
+<code>--no-rust</code> mode; <code>scripts/klio-parity-sweep.sh</code>, <code>klio-smoke.sh</code>, and
+<code>klio-guard.sh</code> still reference Rust/cargo paths (<code>target/release/klio</code>,
+<code>cargo build -p klio-parity</code>, <code>crates/klio-parity/tests/corpus</code>) and are
+stale post-port. Any new script should target <code>zig-out/bin/klio</code> and
+<code>tests/corpus/expected/</code>.</p>
+</blockquote>
+<hr />
+<h2 id="6-sequenced-remediation-roadmap">6. Sequenced remediation roadmap<a class="headerlink" href="#6-sequenced-remediation-roadmap" title="Permanent link">&para;</a></h2>
+<p>Ordered for maximum risk reduction per step: land detection before invasive
+refactors, then the structural unifications in dependency order.</p>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Work item</th>
+<th>Class</th>
+<th>Impact</th>
+<th>Risk</th>
+<th>Effort</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0a</td>
+<td>Delete dead <code>src/ir/eval/host.zig</code> + empty dir</td>
+<td>cleanup</td>
+<td>low</td>
+<td>low</td>
+<td>S</td>
+</tr>
+<tr>
+<td>0b</td>
+<td>Extract shared <code>dispatchIntrinsic</code>/<code>runtimeErrorToEval</code>/<code>makeIntrinsicHost</code> into <code>host_impl.zig</code></td>
+<td>cleanup</td>
+<td>medium</td>
+<td>low</td>
+<td>M</td>
+</tr>
+<tr>
+<td>0c</td>
+<td>Debug-only "TLS empty between runs" asserts + <code>clearRetainingCapacity</code> (§5.2 cheap)</td>
+<td>B detect</td>
+<td>high</td>
+<td>low</td>
+<td>S</td>
+</tr>
+<tr>
+<td>1</td>
+<td>Differential harness <code>loadProgram</code> + <code>src/itests/differential.zig</code> (§5.1)</td>
+<td>C detect</td>
+<td>high</td>
+<td>medium</td>
+<td>L</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Single <code>dispatchUserFunc</code> choke point + invariant asserts (§5.3)</td>
+<td>A/B detect</td>
+<td>high</td>
+<td>medium</td>
+<td>L</td>
+</tr>
+<tr>
+<td>3</td>
+<td>Fuzz generator for closures + suspend (§5.4)</td>
+<td>A/B detect</td>
+<td>high</td>
+<td>low</td>
+<td>M</td>
+</tr>
+<tr>
+<td>4a</td>
+<td>Precise captured-<code>var</code> carrier FIRST: <code>StoreCapture</code> instr OR precise boxing (replace syntactic <code>computeBoxedVars</code>), proven green with closures itests + §5.1 (§4.1)</td>
+<td>A</td>
+<td>high</td>
+<td>medium</td>
+<td>L</td>
+</tr>
+<tr>
+<td>4b</td>
+<td>DONE — stop swapping <code>self.globals</code>, deleted <code>StoreGlobal</code>-for-capture + <code>scoped_env</code> + the now-dead <code>WritebackCaptures</code>/<code>readLambdaCapture</code> capture-sync; the HOF invoke path runs over the real top-level env and captured-<code>var</code> writes round-trip through the shared <code>Cell</code>. Required extending 4a's boxing to function/lambda <em>parameters</em> a nested closure writes (the captured-param gap, e.g. <code>toMap(destination){ consumeEach { destination += it } }</code>). (§4.1)</td>
+<td>A</td>
+<td>high</td>
+<td>high</td>
+<td>L</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>VmIntrinsicHost</code> becomes thin adapter delegating to eval.Host (§4.1)</td>
+<td>A</td>
+<td>high</td>
+<td>medium</td>
+<td>L</td>
+</tr>
+<tr>
+<td>6</td>
+<td>DONE (receiver chain + close-out) — enclosing-<code>this</code> chain is now a <code>Frame</code> field (<code>enclosing_this</code>), snapshotted into <code>FrameSnapshot</code> on suspend and restored on resume; the <code>outer_this</code> thread-local + <code>outerThisStack</code> + its <code>resetReceiverTls</code> are deleted and <code>enclosingThis</code>/<code>enclosingThisChain</code>/<code>pushAccessEnclosing</code>/<code>popAccessEnclosing</code> read/write the current frame's chain. Close-out landed: <code>inner_outer_hint</code> TLS replaced by an explicit <code>outer_hint</code> param (sourced via <code>callerThisValue</code> — param or capture) with class-keyed outer selection in <code>materializeInstance</code>, plus a lambda-side <code>this</code> capture for bare inner-class construction keyed on the new <code>ir.Class.is_inner</code> (fixes <code>with(other){Inner()}</code> incl. shadowing subjects, lambda-escaping inners, user-HOF lambdas, two-level nesting), <code>member_only_probe</code>/<code>cc_explicit_read</code> are now params, the dead duplicate <code>ctor_guard</code> is collapsed onto <code>host_instances.ctorGuardContains</code> (activating the deferred-<code>object</code> gate), and <code>host_call_member</code>'s re-entrancy flags are defer-cleared + run-boundary-asserted. Remaining §4.2 line item: fold the frame's own <code>this</code> into the carrier (see §4.2 consumer inventory). (§4.2)</td>
+<td>B</td>
+<td>high</td>
+<td>high</td>
+<td>XL</td>
+</tr>
+<tr>
+<td>7</td>
+<td>DONE (one resolver + LEXICAL receiver scope + static classification + exact global arm) — frames stop inheriting the dynamic caller's chain: closures snapshot their creation-time receiver chain (<code>ClosureInfo.chain</code> via <code>captureChainAlloc</code>, seeded at every invocation through <code>evalWithCapturesChained</code> — across coroutine resume and worker threads), method/extension frames seed from their own dispatch (<code>ownReceiverEntry</code>: dispatch receivers as <code>.receiver</code> with tower+companion, extension receivers as <code>.subject</code>), and only the dispatch's in-flight pushes (subject — incl. a null subject for nullable-receiver extensions — displaced <code>this</code>, member-extension owner) cross the frame boundary, <code>.access</code> entries never. The three <code>*OrGlobal</code> handlers resolve through ONE candidate producer (<code>implicitCandidatesAlloc</code> in <code>ir/eval.zig</code>: own implicit <code>this</code> → enclosing receivers innermost-first → dispatch-receiver class-nesting towers and member-owning companions at the class's own depth via <code>companionWithMember</code>, <code>EnclosingEntry.kind</code>-aware) and one precedence policy (per-receiver members-then-PROVEN-extensions, kotlinc-pinned by the <code>bare_write_*</code>/<code>inner_ext_over_outer_member</code>/<code>innermost_member_*</code>/<code>closure_lexical_receiver_scope</code>/<code>ext_receiver_strict_proof</code>/<code>companion_implicit_receiver</code>/<code>member_shadows_top_level_call</code> parity fixtures + itests), differing only in terminal op (read <code>getMemberField</code> — a strict member-only probe with every global/enclosing/outer-chain/companion adoption tail disabled / write <code>hostHasProperty</code>+<code>setField</code> — an assignment LHS never resolves to a member function / call <code>callMemberStrictExt</code> then lenient retry). The strict extension prover (<code>strictReceiverProven</code>) demands the declared receiver: function-shape receivers only against actual function values (arity-checked), bounded type params only when every bound holds (<code>registry.func_type_param_bounds</code>), typealiases registry-expanded, generic args checked against actual elements (unprovable → lenient pass), low-priority stubs never strict, and the pick must be arity-applicable (<code>extArityApplicable</code>). Real semantic fixes landed with kotlinc oracle evidence: bare writes now reach outer receivers and inner-class nesting towers (was: silent global write); an extension applicable to an inner receiver outranks an outer receiver's member; the call form's seven ad-hoc tiers are gone (strict receiver-proven extension pass first via <code>callMemberStrictExt</code>/<code>receiverImplementsType</code>, lenient unproven-type pass only after every receiver missed — fixes the kotlinx <code>SafeCollector</code>/<code>Flow.collect</code> wrong-receiver recursion class); <code>callMemberOnly</code> and the <code>member_only</code> threading (SAM-lambda deferral) are deleted with their only caller. Statically classified (<code>inReceiverContext</code> gate, <code>ir/lower/expr.zig</code>): no-receiver-context bare reads / short interps / multi-seg heads / class- and builtin-type-name values / unresolved bare calls emit <code>LoadGlobal</code>/<code>CallValue</code>/<code>StoreGlobal</code>, and <code>LoadGlobal</code>'s receiver-probe fallback arm is deleted (KLIO_OR_AUDIT sweep over examples+fixtures: 0 hits) — a top-level fn resolving a bare name against a caller's <code>with</code> receiver is now rejected like kotlinc; receiver-context class-name values flipped the other way (static <code>LoadGlobal</code> → runtime Or + exact <code>ClassId</code>) because a receiver member shadows a classifier in expression position (kotlinc-probed). Exact global arm: <code>LoadFromThisOrGlobal</code> carries <code>func</code>/<code>class</code> (index pick; <code>isShadowingCapture</code>-gated <code>lookupGlobalById</code>), and <code>CallMemberOrGlobal</code> carries <code>class</code> AND <code>func</code> — a bare call (or known top-level property read) in a receiver context stays statically bound only when no program class declares a member of the name (<code>registry.class_member_names</code>); where one does, the call/read decides at runtime with the index pick riding as the exact global arm, so a member function or invoke-convention member property of a runtime receiver outranks the package-scope declaration exactly as kotlinc resolves it (anonymous-function bodies count as receiver contexts via the dedicated <code>is_anon_fn_body</code> bit). The four "Or" instructions are deliberately NOT merged into one <code>CallUnresolved</code>: read/write/call payloads are real instruction data and a merge removes no runtime decision; they remain only where the receiver is statically unknowable (lambda/method bodies — <code>ir.TypeRef</code> erases <code>R.()-&gt;T</code>; removable if lambda receiver typing ever lands). <code>CallMemberOrValue</code>/<code>CallValueOrMember</code> stay runtime-typed dispatch, same status as <code>CallMember</code>. Detector: <code>KLIO_OR_AUDIT</code> logs every emit decision (site + receiver-context) and every runtime arm won (member@depth / overload / global_id / global); sweep readout (examples + coroutine_smoke + parity_corpus, 444 programs): <code>*OrGlobal</code> arms = 461 member (348 call / 73 read / 40 write), 384 global-by-name, 572 global-by-id, 42 overload, 10 lenient-pass (deduped runtime <code>arm=member_lenient</code> lines, one unique line per program across 10 programs, 38 raw occurrences — all <code>name=dispatch</code>, the kotlinx coroutine-internal <code>dispatch</code> member-extensions whose erased receiver the prover cannot model — the lenient tier's designed residue; re-measured over examples + coroutine_smoke + parity_corpus, 583 programs, by <code>python3 scripts/or_audit_sweep.py</code>, an on-demand detector deliberately not wired into <code>zig build test</code> that fails iff any lenient name falls outside the documented <code>{dispatch}</code> residue set), 0 fallback-arm; RESOLVE/LINK audit = 0 ungraded divergences (342 graded: 300 tier + 12 shape + 30 receiver-pref), 0 link divergences, 0 invariant hits. (A/B)</td>
+<td>A/B</td>
+<td>high</td>
+<td>high</td>
+<td>XL</td>
+</tr>
+<tr>
+<td>8</td>
+<td>DONE (steps 1-4 + tightening + the steps-2/3 ladder deletion + the 8d inline fold landed) — per-decl <code>package</code> tag on <code>Func</code>/<code>Class</code>, explicit two-phase header registration, and the package/FQN symbol index (<code>Module.resolveBareCallIndexed</code>) as the PRIMARY bare-call path, now hardened: reason-tagged deferrals (<code>ResolveDeferReason</code>, 13 classified shapes), order-independent forward references (phase-1 stubs rank by declared arity <code>decl_user_arity</code>, full-granularity declared types <code>decl_user_sig</code> rendered by the same <code>loweredTypeRef</code> body params use, and AST-derived <code>low_priority</code>; default-param shapes defer from stub and body gates alike), a six-tier preference order matching kotlinc's probed scoping (named import → own package → wildcard import → default-import package → shipped → other; a named import outranks even a same-file declaration; same-leaf named imports are ALL kept in <code>registry.import_aliases</code> so a second import of one leaf is a classified tie, not a shadow; wildcard imports per file in <code>registry.import_wildcards</code>, default imports mirroring <code>stdlib.IMPLICITLY_IMPORTED_PACKAGES</code> under a lockstep test), and ambiguity as a DEFAULT-ON lowering diagnostic scoped to what kotlinc rejects: a CALLED, non-extension bare call whose in-scope identical-FULL-signature candidates carry no defaults/varargs records <code>Module.resolve_diags</code>, surfaced by <code>klio run</code>/parity with <code>file:line</code> — same-FQN duplicates as "conflicting overloads … identical signatures declared at a.kt:2 and a.kt:3 — rename or remove one of the declarations", cross-package ties as "ambiguous reference … qualify the call or import one explicitly" (exact-wording + both-orders coverage in <code>itests/resolve_ambiguity.zig</code>); NOT diagnosed (heuristic-deferred): default/vararg-exercised, extension-form, and never-called identical pairs. Type-distinguishable sets — anything not provably identical at full granularity, incl. generic-argument-only and function-shape-only differences — stay runtime-resolved (<code>type_overload</code>), cast picks reclassify (<code>cast_disambiguated</code>). Out-of-scope references are now an error matching kotlinc across BOTH the call and value-position forms AND the loose-arity shapes (finding-3 close-out): a bare <em>call</em> whose every candidate lives in a package the caller neither declares, imports, nor sees by default or via the shipped surface (tier 5, index-verdict shapes — <code>resolved</code>/<code>unimported_set</code>/<code>type_overload</code>) records an "unresolved reference … add <code>import pkg.f</code> or qualify the call" lowering diagnostic; the same tier-5 verdict now also rejects (a) VALUE references — <code>::name</code>, <code>::Ctor</code>, and a bare read of an unimported cross-package top-level function or property — via <code>bareRefTier</code>/<code>classRefTier</code>/<code>topLevelPropRefTier</code> over the same scope tiers (<code>recordOutOfScopeRef</code>), with top-level property scoping carried in a new <code>registry.top_level_prop_pkgs</code> (simple name → {fqn, package} per declaration); and (b) LOOSE-SHAPE calls — default-arg / vararg / trailing-lambda / arity-mismatched / low-priority-only / bodyless-only deferrals, plus an <code>extension_form</code> deferral the index returns only because an in-scope extension namesake exists — but ONLY when the winning tier is tier 5 (no in-scope candidate of any shape) AND the call is OUTSIDE any receiver context, since inside a receiver context a runtime member of the same name may still bind (<code>g.apply { greet() }</code> keeps resolving to the receiver's member, kotlinc-pinned). The member-redispatch guard is therefore the <code>inReceiverContext</code> predicate the bare-call member-shadowable routing already uses (<code>CallMemberOrGlobal</code>). A bare-FQN declaration (no package prefix — a lift artifact whose scoping metadata is unreliable, e.g. upstream <code>io.ktor.utils.io.ClosedByteChannelException</code> reading as the empty package) is NEVER reported out of scope, so the resolver's lenient bind stands where the metadata cannot be trusted. The vararg-before-trailing-lambda call shape was also a runtime mis-bind independent of tier 5 (<code>vlam(1,2){}</code> packed the lambda into the vararg and crashed <code>call_value on kotlin.Int</code>); the bare <code>Call</code> now synthesizes the trailing-lambda's parameter name (<code>trailingLambdaArgNames</code>) so it binds the last function-typed parameter rather than the vararg, fixing both the legitimate same-package/imported call and the ex-crash. Pinned by the <code>tier5_value_ref_*</code> (fn-ref / bare-read / ctor-ref rejected), <code>tier5_loose_*_rejected</code> (default / vararg / default+lambda / vararg+lambda rejected), and <code>tier5_*_resolves</code> (imported cross-package, same-package, and member-redispatch positives) multi-file fixtures in <code>parity_corpus_pinned.zig</code>, all kotlinc-jvm 2.3.21 verified. Every lowering entry point now seeds the caller package (<code>ir.build.setLowerSelfPackage</code> read by every <code>FuncBuilder</code>; class bodies get the file's true package via the <code>decl_pkg</code> span map — a companion's class-qualified FQN is not a package). <code>KLIO_RESOLVE_AUDIT</code> emits a machine-readable per-call readout incl. a divergence grade (<code>tier_correction</code> / <code>shape_correction</code> / <code>receiver_pref</code>); <code>KLIO_RESOLVE_STRICT</code> (in the test cache key) hard-fails any ungraded divergence. Sweep readout (85 examples + coroutine fixtures): 0 failures, 0 ungraded divergences; 300 <code>checkIndexOverflow</code> tier corrections + 12 <code>CompletableDeferred</code> shape corrections. Steps 2+3 (items 8b/8c) are landed: <code>isShippedFqn</code> is deleted (<code>funcId</code> ranks by <code>Func.package</code> and is only the order-based fallback behind the index); the <code>lookupGlobal</code> prefix ladder and <code>installed_bindings</code> suffix scan are replaced by link-time name→FQN maps (<code>ProgramImage.default_import_globals</code> / <code>pack_bare_aliases</code> / <code>any_member_globals</code>, first-package-wins rank + lexicographic pack tie-break, both unit-pinned incl. the StringBuilder production collision); the <code>callFunc</code> bodyless ladder is replaced by link-settled <code>resolved_redirect</code>/<code>resolved_native</code> (<code>KLIO_LINK_AUDIT</code> re-derives the DELETED ladder's algorithm — old prefix order <code>deleted_bodyless_prefixes</code>, per-call sibling scan — independently of the new tables, so a divergence is detectable). Resolved identity is carried end-to-end: value-position bare refs AND <code>::name</code>/<code>::Ctor</code> callable references resolve through the index and emit <code>LoadGlobal</code> with the exact <code>FuncId</code>/<code>ClassId</code> (<code>refAudit</code> instruments both arms); the runtime class registry is FQN-keyed with a user-over-shipped first-wins simple-name alias view, <code>NewInstance</code>/named-arg/copy/secondary-ctor/parent-chain materialization resolve by FQN (side tables dual-keyed), and the per-class side tables are read through the resolved identity. Cross-phase consistency: typeck's T0094 conflicting-overloads check is per-package (<code>file_packages</code> on the Checker), matching the resolver's per-package scopes; expect-fn default parameter values transplant onto the superseding <code>actual</code> before the expect drops (Kotlin: defaults live on the expect only). Close-out (8d + heuristic survey): the parallel simple-name inline table is folded into the index — top-level inline ASTs register under their phase-1 stub <code>FuncId</code>s, bare-call inline pre-emption resolves through <code>resolveBareCallIndexed</code> first and splices exactly the resolved declaration (non-inline winner = no splice; receiver-matched extension keeps the narrowing pick), the index's shape gates skip a vararg candidate at ANY parameter position (stub + body gates alike), the shape/receiver narrowing survives only as the tie-break for index-deferred shapes — receiver-aware in class methods: the enclosing class (falling back from the enclosing extension receiver) matches candidate receivers through the transitive supertype chain (<code>registry.class_super_names</code>/<code>Module.classIsOrExtends</code>), nearest first, with the same subtype-aware receiver veto in the splice gate — and <code>shadowed_inline_names</code> derives from the same <code>stdlib.noteBareNameMapping</code> constructor as the link-time bare-name maps; KLIO_RESOLVE_AUDIT <code>inline</code> records gate the fold, graded as shape corrections (vararg-at-any-position/default/arity fallbacks) or tier corrections (index pick in a strictly better scope tier, e.g. a named import over a same-package reified inline namesake — pinned strict-mode-on in <code>itests/resolve_ambiguity.zig</code>) (corpus+fixtures: 517,022 records, 0 unexplained, 48 graded shape corrections at one root site — kotlinx <code>Migration.kt</code>'s deprecated <code>combineLatest</code> bodies, where the inline-only table mis-spliced the reified vararg <code>combine</code>; the index pick is the kotlinc binding, pinned fold-sensitively by the equal-arity vararg-vs-exact itest, which fails under a name-first mutation). Heuristic-rung survey (audit <code>rung=</code> field, corpus+fixtures sweep): every rung of the order-based ladder is a live final binder for a classified deferral shape and is KEPT with reason — <code>ext_arity</code> 97,289 + <code>recv_rebind</code> 49,462 + <code>ext_arity_tl</code> 111 (extension forms; receiver dispatch is item 7's domain), <code>non_ext_arity</code> 19,451 + <code>non_ext_arity_tl</code> 12 (type_overload / default-param sets the runtime re-picks), <code>cast</code> 48 (cast_disambiguated), <code>decl_arity_*</code> 45,792 (forward-referenced stubs with non-exact shapes), <code>imported</code> 87 (unique-import fast path); DELETED: the stale-name-index rungs <code>funcIdLegacy</code> and the <code>hasFuncNamed</code> <code>func_index</code> walk, proven unreachable (every <code>func_index</code> append is paired with a name-index push; the pack format never serializes a <code>Module</code>; instrumented sweep = 0 <code>legacy_*</code> hits) — the name index is the single resolution authority. NOT absorbed (decided from the re-sequencing experiment): bare calls inside class-method bodies still lower before the phase-1 stubs and stay runtime-resolved (<code>CallMemberOrGlobal</code>) — they are receiver-dependent by classification: re-sequencing the build (stubs before class bodies) exposed them to the type-blind heuristic ladder, which statically bound <code>CoroutineScope.async</code> with a wrong-typed <code>this</code> inside <code>Snd.execute</code> (infinite resume loop, <code>parity_suspend_shapes</code>) and mis-bound bare <code>coroutineContext</code> reads; binding them statically requires the receiver-aware single resolver, which is row 7's open work — the four "Or" instructions row 7 deferred to this item therefore remain, encoding exactly this receiver-dependent residue. Gates at close: zig build test 169/169 steps (0 skips), corpus 88/88, differential all modes, assert_single_path 96/96 --rerun 2, KLIO_RESOLVE_AUDIT+STRICT sweep 0 unexplained, or_audit_sweep within <code>{dispatch}</code> residue, KLIO_TRACE_INVARIANTS 0, ktor itests green.</td>
+<td>C</td>
+<td>high</td>
+<td>high</td>
+<td>XL</td>
+</tr>
+<tr>
+<td>9</td>
+<td>DONE — one executable form per symbol resolved at link time (<code>ProgramImage.linkResolvedForms</code> → the <code>resolved_native</code> table keyed by <code>FuncId</code>, populated once after the module + <code>installed_bindings</code> exist); the per-call FQN short-circuit in <code>callFunc</code> and <code>callValue</code> is deleted, both now consulting the resolved form by <code>FuncId</code> (<code>host_call_func.resolvedNativeForm</code>). Pack-vs-source identity is settled at link time, load-order-independent. <code>KLIO_LINK_AUDIT</code> is a permanent env-gated detector proving the link form equals the deleted per-call probe's pick (0 divergences over the full suite + 82 examples + the differential corpus). (§4.4)</td>
+<td>C</td>
+<td>high</td>
+<td>high</td>
+<td>XL</td>
+</tr>
+<tr>
+<td>10</td>
+<td>DONE — removed <code>isLambdaBody()</code> as a resolution axis at the four <code>expr.zig</code> dotted-head sites; package-head vs receiver-member is now the one predicate <code>headIsPackage</code> (real package root or <code>Module.packageHeadDeclared</code> FQN-prefix), shadowed by captured/local/enclosing-member names — order- and load-mode-independent, no lambda special case. The inline splice already binds the inline receiver as a <code>"this"</code> scope local, so no extra frame-receiver slot was needed. Gated green behind the builder-DSL differential (<code>examples/dsl_dotted_head.kt</code> + <code>coroutine_smoke/cs8_dotted_in_builder.kt</code>, byte-identical across all three pack modes); both audits 0. (§4.4/§4.2)</td>
+<td>C/B</td>
+<td>medium</td>
+<td>high</td>
+<td>M</td>
+</tr>
+<tr>
+<td>11</td>
+<td>DONE — deleted <code>Value.Lambda</code> (vestigial Env-based closure the live IR VM never produced; <code>AstLambda</code> already built <code>IrClosure</code>). Removed the variant, its one GC-test constructor, and every Value-context <code>.Lambda =&gt;</code> arm; <code>IrClosure</code> is now the single closure value form and <code>func.capture_order</code> (via <code>ClosureInfo.captures</code>) is the sole capture-metadata authority.</td>
+<td>cleanup</td>
+<td>medium</td>
+<td>medium</td>
+<td>M</td>
+</tr>
+<tr>
+<td>12</td>
+<td>DONE — <code>KLIO_TRACE_PATH=1</code> emits one structured <code>[PATH]</code> record per terminal dispatch through the tracer (<code>fn</code>/<code>recv</code>/<code>argc</code>/<code>args</code>/<code>decl</code>/<code>path</code>), instrumented at every terminal site: <code>callFunc</code> body + default thunks, <code>callValue</code> closure body + default thunk, <code>irMethodWalk</code>, <code>invokeAnonMethod</code>, <code>callSuper</code> (labelled <code>super(Target)</code> — super dispatch is static, so keying on the runtime receiver would collide with the virtual call's key), getter/setter, ctor/init thunks, anon-object build, top-level prop init, the closure trio (<code>call_value_closure</code>/<code>hof_invoke</code>/<code>coroutine_closure</code>), and every native <code>dispatchIntrinsic</code> terminal (each now carries the resolved FQN). Value labels report the <code>typeFqn</code> simple name — the axis member dispatch probes — so <code>MutableList</code>/<code>List</code> and <code>IntRange</code>/<code>IntProgression</code> stay distinct. <code>scripts/assert_single_path.py</code> (§5.5) asserts, per program with <code>--rerun</code>: (1) one declaration per call shape, (2) one dispatch-path group per target, (3) identical record sets across runs; green over all examples + coroutine-smoke. Two corrections to this row's original spec proved necessary: the chosen-decl assertion keys on <code>(fn, recv, argc, arg-tags)</code> rather than <code>(fn, recv)</code> because Kotlin overloads legitimately map one <code>(fn, recv)</code> to several declarations; and the three behaviorally-unified-but-structurally-distinct closure execution sites form one <code>closure_body</code> group (with anonymous bodies identified by declaration, and named function-reference wrappers joining the direct-call group), since a literal one-tag assertion is false by design until the closure sites are structurally merged.</td>
+<td>detect</td>
+<td>medium</td>
+<td>low</td>
+<td>M</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Critical path.</strong> 0a–0c and 1–3 are detection scaffolding that should land
+first — they make every later refactor verifiable and convert the three
+structural mechanisms into loud test failures (on the green tree, none of the
+three classes is reproducible by an existing default-target test, so this
+scaffolding is what makes the later steps <em>checkable</em> rather than faith-based).
+Then the structural unifications fall in dependency order: <strong>4a (precise
+captured-<code>var</code> carrier) must land and be proven green before 4b (deleting
+<code>scoped_env</code>/StoreGlobal-for-capture)</strong> — collapsing them in one step silently
+drops HOF-lambda captured-<code>var</code> mutations and regresses the closures itests. 4b
+then unblocks 5 (adapter) and is the prerequisite for 6's frame-receiver work to
+be coherent; 7 (one resolver) depends on 6's receiver context existing, and its
+extension scorer must keep <code>member-extension</code> as a first-class kind (§4.3
+caution) so it does not drop the <code>member_ext_owner_class</code>-gated member-extension
+dispatch the ktor paths rely on; 8→9→10 form the pack-vs-direct chain and depend
+on 7's single resolver to route the FQN-keyed lookups — with 8's simple-name
+tightening gated on the §4.4-item-3 uniqueness proof and 10 gated on a
+builder-DSL differential pass. Items 4b, 6, 8, 9 are the XL/high-risk structural
+root-cause fixes; everything else is supporting consolidation.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      Copyright &copy; 2026 Klio Contributors
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/DrewCarlson/klio" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>

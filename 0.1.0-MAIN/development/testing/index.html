@@ -1719,7 +1719,7 @@ cases, and every diagnostic the code can emit.</p>
   roughly current when their cost changes materially.</li>
 </ul>
 <p>Fast resolution-audit cycle: the overload-resolution unification work
-(<code>plans/resolution-unification-plan.md</code>) verifies a scorer slice with
+(<code>plans/resolution-unification-plan.md (git history)</code>) verifies a scorer slice with
 <code>scripts/resolve_audit_sweep.py --build</code>, not the ~18-minute ReleaseSafe
 canonical. It rebuilds the fast Debug <code>klio</code> (~2s incremental) and sweeps the
 whole stdlib commonTest corpus with <code>KLIO_RESOLVE_AUDIT=1</code>, reporting every
@@ -1816,7 +1816,7 @@ the external sweep's ad-hoc flags:</p>
 <p>The <code>src/itests/*_commontest.zig</code> suites drive these per library and
 ratchet the pass count. The migration from the per-file driver + the
 Python sweep to a single <code>klio test &lt;project&gt; --format=json</code> is
-tracked in <code>plans/project-manifest.md</code>.</p>
+tracked in <code>plans/open-campaigns.md</code>.</p>
 <h2 id="5-pack-smoke-tests">5. Pack smoke tests<a class="headerlink" href="#5-pack-smoke-tests" title="Permanent link">&para;</a></h2>
 <p>Every pack ships a smoke flow:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>./zig-out/bin/klio<span class="w"> </span>pack<span class="w"> </span>build<span class="w"> </span>kotlin-klio/klio-kotlinx-datetime
@@ -1881,7 +1881,7 @@ no <code>build.zig</code> edit, no rebuilding of unrelated modules. Pass
 </ul>
 <h2 id="the-iteration-playbook">The iteration playbook<a class="headerlink" href="#the-iteration-playbook" title="Permanent link">&para;</a></h2>
 <p>Match the check to the size of the change
-(<code>plans/verification-speed-plan.md</code> is the working record):</p>
+(<code>docs/development/verification-playbook.md</code> is the working record):</p>
 <ul>
 <li><strong>Edit-repro loop</strong> (fixing one bug, running one program):
   <code>zig build klio-harness -Dharness-optimize=Debug</code> (~16 s per

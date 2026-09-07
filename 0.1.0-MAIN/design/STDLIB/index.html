@@ -10,28 +10,24 @@
       
       
       
-        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/packs/shipped/compose-runtime/">
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/design/STDLIB/">
       
       
-        <link rel="prev" href="../ktor/">
-      
-      
-        <link rel="next" href="../../../development/workspace/">
       
       
         
       
       
-      <link rel="icon" href="../../../assets/images/favicon.png">
+      <link rel="icon" href="../../assets/images/favicon.png">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
-        <title>androidx.compose.runtime - Klio</title>
+        <title>Stdlib strategy - Klio</title>
       
     
     
-      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
       
       
 
@@ -50,9 +46,9 @@
       
     
     
-      <link rel="stylesheet" href="../../../stylesheets/extra.css">
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
     
-    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -70,7 +66,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#androidxcomposeruntime" class="md-skip">
+        <a href="#stdlib-strategy" class="md-skip">
           Skip to content
         </a>
       
@@ -90,7 +86,7 @@
 
 <header class="md-header md-header--shadow" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href="../../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
+    <a href="../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
       
   
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
@@ -110,7 +106,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              androidx.compose.runtime
+              Stdlib strategy
             
           </span>
         </div>
@@ -202,7 +198,7 @@
 
 <nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href="../../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
+    <a href="../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
       
   
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
@@ -232,7 +228,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../.." class="md-nav__link">
+      <a href="../.." class="md-nav__link">
         
   
   
@@ -323,7 +319,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../getting-started/installation/" class="md-nav__link">
+      <a href="../../getting-started/installation/" class="md-nav__link">
         
   
   
@@ -351,7 +347,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../getting-started/hello-world/" class="md-nav__link">
+      <a href="../../getting-started/hello-world/" class="md-nav__link">
         
   
   
@@ -379,7 +375,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../getting-started/cli/" class="md-nav__link">
+      <a href="../../getting-started/cli/" class="md-nav__link">
         
   
   
@@ -407,7 +403,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../testing/" class="md-nav__link">
+      <a href="../../testing/" class="md-nav__link">
         
   
   
@@ -435,7 +431,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../BUNDLE/" class="md-nav__link">
+      <a href="../../BUNDLE/" class="md-nav__link">
         
   
   
@@ -538,7 +534,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/pipeline/" class="md-nav__link">
+      <a href="../../architecture/pipeline/" class="md-nav__link">
         
   
   
@@ -566,7 +562,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/interpreter/" class="md-nav__link">
+      <a href="../../architecture/interpreter/" class="md-nav__link">
         
   
   
@@ -594,7 +590,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/stdlib/" class="md-nav__link">
+      <a href="../../architecture/stdlib/" class="md-nav__link">
         
   
   
@@ -622,7 +618,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/concurrency/" class="md-nav__link">
+      <a href="../../architecture/concurrency/" class="md-nav__link">
         
   
   
@@ -650,7 +646,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/memory-model/" class="md-nav__link">
+      <a href="../../architecture/memory-model/" class="md-nav__link">
         
   
   
@@ -678,7 +674,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/diagnostics/" class="md-nav__link">
+      <a href="../../architecture/diagnostics/" class="md-nav__link">
         
   
   
@@ -706,7 +702,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/performance/" class="md-nav__link">
+      <a href="../../architecture/performance/" class="md-nav__link">
         
   
   
@@ -738,10 +734,8 @@
       
   
   
-    
   
   
-  
     
     
       
@@ -766,11 +760,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
         
           
           <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
@@ -791,7 +785,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4">
             <span class="md-nav__icon md-icon"></span>
             
@@ -809,7 +803,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../overview/" class="md-nav__link">
+      <a href="../../packs/overview/" class="md-nav__link">
         
   
   
@@ -837,7 +831,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../format/" class="md-nav__link">
+      <a href="../../packs/format/" class="md-nav__link">
         
   
   
@@ -865,7 +859,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../using/" class="md-nav__link">
+      <a href="../../packs/using/" class="md-nav__link">
         
   
   
@@ -893,7 +887,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../authoring/" class="md-nav__link">
+      <a href="../../packs/authoring/" class="md-nav__link">
         
   
   
@@ -921,7 +915,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../native-bindings/" class="md-nav__link">
+      <a href="../../packs/native-bindings/" class="md-nav__link">
         
   
   
@@ -946,10 +940,8 @@
                 
   
   
-    
   
   
-  
     
     
       
@@ -973,11 +965,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" >
         
           
           <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="0">
@@ -998,7 +990,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4_6">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1016,7 +1008,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../atomicfu/" class="md-nav__link">
+      <a href="../../packs/shipped/atomicfu/" class="md-nav__link">
         
   
   
@@ -1044,7 +1036,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../io/" class="md-nav__link">
+      <a href="../../packs/shipped/io/" class="md-nav__link">
         
   
   
@@ -1072,7 +1064,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../datetime/" class="md-nav__link">
+      <a href="../../packs/shipped/datetime/" class="md-nav__link">
         
   
   
@@ -1100,7 +1092,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../coroutines/" class="md-nav__link">
+      <a href="../../packs/shipped/coroutines/" class="md-nav__link">
         
   
   
@@ -1128,7 +1120,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../serialization/" class="md-nav__link">
+      <a href="../../packs/shipped/serialization/" class="md-nav__link">
         
   
   
@@ -1156,7 +1148,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../ktor/" class="md-nav__link">
+      <a href="../../packs/shipped/ktor/" class="md-nav__link">
         
   
   
@@ -1181,37 +1173,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    androidx.compose.runtime
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose-runtime/" class="md-nav__link">
         
   
   
@@ -1227,59 +1192,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#surface" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Surface
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#how-it-works-no-compiler-plugin" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        How it works (no compiler plugin)
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#status" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Status
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -1369,7 +1281,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../development/workspace/" class="md-nav__link">
+      <a href="../../development/workspace/" class="md-nav__link">
         
   
   
@@ -1397,7 +1309,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../development/testing/" class="md-nav__link">
+      <a href="../../development/testing/" class="md-nav__link">
         
   
   
@@ -1425,7 +1337,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../development/debugging/" class="md-nav__link">
+      <a href="../../development/debugging/" class="md-nav__link">
         
   
   
@@ -1453,7 +1365,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../development/contributing/" class="md-nav__link">
+      <a href="../../development/contributing/" class="md-nav__link">
         
   
   
@@ -1508,10 +1420,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#surface" class="md-nav__link">
+  <a href="#guiding-principles" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Surface
+        Guiding principles
       
     </span>
   </a>
@@ -1519,10 +1431,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#how-it-works-no-compiler-plugin" class="md-nav__link">
+  <a href="#sources-of-truth-in-the-kotlin-checkout" class="md-nav__link">
     <span class="md-ellipsis">
       
-        How it works (no compiler plugin)
+        Sources of truth in the kotlin/ checkout
       
     </span>
   </a>
@@ -1530,10 +1442,32 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#status" class="md-nav__link">
+  <a href="#architecture" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Status
+        Architecture
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#implementation-discipline" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Implementation discipline
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-we-are-explicitly-not-doing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What we are explicitly not doing
       
     </span>
   </a>
@@ -1557,7 +1491,7 @@
 
 
   
-    <a href="https://drewcarlson.github.io/klio/edit/main/docs/packs/shipped/compose-runtime.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/design/STDLIB.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -1565,128 +1499,94 @@
   
 
 
-<h1 id="androidxcomposeruntime">androidx.compose.runtime<a class="headerlink" href="#androidxcomposeruntime" title="Permanent link">&para;</a></h1>
-<p>The Compose Multiplatform runtime, running on klio with <strong>no Compose compiler
-plugin</strong>. The pack consumes the upstream <code>androidx.compose.runtime</code> annotation
-surface verbatim (vendored from compose-multiplatform-core v1.11.1) and supplies
-a klio-authored engine — composer, composition, recomposer, observable state,
-CompositionLocal, and effects — in <code>klioMain</code>.</p>
-<h2 id="surface">Surface<a class="headerlink" href="#surface" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.Composable</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.Composition</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.Recomposer</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.mutableStateOf</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.remember</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.getValue</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.setValue</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="nd">@Composable</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">Counter</span><span class="p">(</span><span class="n">count</span><span class="p">:</span><span class="w"> </span><span class="kt">Int</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">label</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">remember</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="s">"count"</span><span class="w"> </span><span class="p">}</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">    </span><span class="n">println</span><span class="p">(</span><span class="s">"</span><span class="si">$</span><span class="n">label</span><span class="s"> = </span><span class="si">$</span><span class="n">count</span><span class="s">"</span><span class="p">)</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="p">}</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>
-<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">recomposer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Recomposer</span><span class="p">()</span>
-<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">composition</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Composition</span><span class="p">(</span><span class="n">recomposer</span><span class="p">)</span>
-<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">state</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mutableStateOf</span><span class="p">(</span><span class="m">0</span><span class="p">)</span>
-<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>
-<a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="w">    </span><span class="n">composition</span><span class="p">.</span><span class="na">setContent</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">Counter</span><span class="p">(</span><span class="n">state</span><span class="p">.</span><span class="na">value</span><span class="p">)</span><span class="w"> </span><span class="p">}</span><span class="w">   </span><span class="c1">// count = 0</span>
-<a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="w">    </span><span class="n">state</span><span class="p">.</span><span class="na">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">1</span>
-<a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a><span class="w">    </span><span class="n">recomposer</span><span class="p">.</span><span class="na">recompose</span><span class="p">()</span><span class="w">                            </span><span class="c1">// count = 1</span>
-<a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="w">    </span><span class="n">composition</span><span class="p">.</span><span class="na">dispose</span><span class="p">()</span>
-<a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="p">}</span>
-</code></pre></div>
-<p>Available:</p>
+<h1 id="stdlib-strategy">Stdlib strategy<a class="headerlink" href="#stdlib-strategy" title="Permanent link">&para;</a></h1>
+<p>The Kotlin stdlib is <strong>the</strong> runtime surface a program has access to. klio ships a complete implementation that behaves exactly like Kotlin 2.4.0's stdlib on the JVM where semantics are platform-agnostic.</p>
+<h2 id="guiding-principles">Guiding principles<a class="headerlink" href="#guiding-principles" title="Permanent link">&para;</a></h2>
+<ol>
+<li>
+<p><strong>Upstream source is the implementation.</strong> The stdlib pack's Kotlin source is the upstream tree itself (<code>kotlin/libraries/stdlib</code>, pinned at v2.4.0) plus klio-authored actuals under <code>kotlin-klio/</code>, interpreted like any other Kotlin. Hand-written Zig intrinsics (<code>src/stdlib/implementations/</code>) shadow individual functions at dispatch where host access (IO, clock, threads) or performance demands a native body. This inverts the original plan (all-native, CPython-style): interpreting upstream keeps behavior exactly aligned and makes version bumps a re-pin, not a rewrite.</p>
+</li>
+<li>
+<p><strong>The API surface is mined, not maintained by hand.</strong> <code>stdlib_gen</code> reads <code>kotlin/libraries/stdlib/</code> and produces the symbol index (<code>SymbolEntry</code> per public symbol: FQN, kind, signature, modifiers, source span) that the resolver and the Vm's dispatch consult. Bumping Kotlin versions regenerates the surface mechanically.</p>
+</li>
+<li>
+<p><strong>Pin to Kotlin 2.4.0.</strong> The <code>kotlin/</code> submodule is pinned at the tag; bumping is a deliberate, tracked operation.</p>
+</li>
+<li>
+<p><strong>Coverage is enforced by upstream's own tests.</strong> The upstream stdlib <code>commonTest</code> suite (117 files, ~2,150 tests) runs directly under the interpreter. <code>src/itests/stdlib_commontest.zig</code> ratchets the pass count (never lower it); <code>scripts/commontest-sweep.py</code> gives per-file iteration. The suite passes per-file at 100% as of 2026-07-06.</p>
+</li>
+</ol>
+<h2 id="sources-of-truth-in-the-kotlin-checkout">Sources of truth in the <code>kotlin/</code> checkout<a class="headerlink" href="#sources-of-truth-in-the-kotlin-checkout" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
-<th>Group</th>
-<th>Members</th>
+<th>Path</th>
+<th>Role</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td>State</td>
-<td><code>mutableStateOf</code>, <code>State</code>, <code>MutableState</code>, <code>getValue</code>/<code>setValue</code>, the equality policies (<code>structuralEqualityPolicy</code> / <code>referentialEqualityPolicy</code> / <code>neverEqualPolicy</code>)</td>
+<td><code>libraries/stdlib/common/src/kotlin/</code></td>
+<td>Hand-written headers declaring the common surface (often with <code>expect</code>).</td>
 </tr>
 <tr>
-<td>Primitive state</td>
-<td><code>mutableIntStateOf</code> / <code>mutableLongStateOf</code> / <code>mutableFloatStateOf</code> / <code>mutableDoubleStateOf</code> (+ the <code>*State</code> / <code>Mutable*State</code> interfaces)</td>
+<td><code>libraries/stdlib/common/src/generated/</code></td>
+<td>JetBrains-generated files: <code>_Collections.kt</code>, <code>_Arrays.kt</code>, <code>_Sequences.kt</code>, <code>_Maps.kt</code>, <code>_Ranges.kt</code>, <code>_Strings.kt</code>, <code>_Comparisons.kt</code>, and unsigned-variant siblings.</td>
 </tr>
 <tr>
-<td>Observable collections</td>
-<td><code>mutableStateListOf</code>, <code>mutableStateMapOf</code>, <code>mutableStateSetOf</code> (<code>SnapshotStateList</code> / <code>Map</code> / <code>Set</code>), <code>toMutableStateList</code></td>
+<td><code>libraries/stdlib/src/kotlin/</code></td>
+<td>Pure-Kotlin definitions shared across platforms (no <code>expect</code>).</td>
 </tr>
 <tr>
-<td>Derived</td>
-<td><code>derivedStateOf</code>, <code>rememberUpdatedState</code></td>
+<td><code>libraries/stdlib/jvm/src/</code></td>
+<td>JVM <code>actual</code> implementations — read <strong>only</strong> to disambiguate semantics, never linked.</td>
 </tr>
 <tr>
-<td>Composition</td>
-<td><code>Composition</code>, <code>Recomposer</code>, <code>Composer</code>, <code>setContent</code>, <code>recompose</code>, <code>dispose</code></td>
+<td><code>libraries/stdlib/test/</code></td>
+<td>The <code>commonTest</code> suite klio runs as its conformance gate.</td>
 </tr>
 <tr>
-<td>Memoization</td>
-<td><code>remember</code>, <code>remember(key…)</code>, <code>key</code></td>
-</tr>
-<tr>
-<td>CompositionLocal</td>
-<td><code>compositionLocalOf</code>, <code>staticCompositionLocalOf</code>, <code>CompositionLocalProvider</code>, <code>CompositionLocal.current</code></td>
-</tr>
-<tr>
-<td>Effects</td>
-<td><code>SideEffect</code>, <code>DisposableEffect</code> (<code>onDispose</code>)</td>
-</tr>
-<tr>
-<td>Coroutine effects</td>
-<td><code>rememberCoroutineScope</code>, <code>LaunchedEffect</code>, <code>produceState</code></td>
+<td><code>libraries/kotlin.test/</code></td>
+<td>The <code>kotlin.test</code> API shipped as the kotlin.test pack.</td>
 </tr>
 </tbody>
 </table>
-<h2 id="how-it-works-no-compiler-plugin">How it works (no compiler plugin)<a class="headerlink" href="#how-it-works-no-compiler-plugin" title="Permanent link">&para;</a></h2>
-<p>The Compose compiler plugin normally rewrites every <code>@Composable</code> function to
-thread a synthetic <code>$composer</code> parameter and to bracket its body with positional
-group-key and slot calls. klio has no plugin, so the <strong>interpreter</strong> supplies
-that role:</p>
+<h2 id="architecture">Architecture<a class="headerlink" href="#architecture" title="Permanent link">&para;</a></h2>
+<p>Three Zig modules plus the pack machinery deliver the stdlib
+(details in <code>docs/architecture/stdlib.md</code>):</p>
 <ul>
-<li>A per-thread <strong>composer stack</strong> lives in the VM. A <code>Composition</code> pushes its
-  composer around the content lambda, so every <code>@Composable</code> call inside runs
-  against it; <code>currentComposer</code> resolves to the stack head.</li>
-<li>The interpreter brackets every <code>@Composable</code> call with
-  <code>startGroup(callSiteKey)</code> / <code>endGroup</code> on the current composer. The key is
-  derived from the <strong>call site's source span</strong>, so the same source position maps
-  to the same slot group across recompositions — the basis of <code>remember</code>.</li>
-<li><code>remember</code> reads/writes a slot in the calling composable's group; the value's
-  calculation runs once and is reused on later compositions.</li>
-<li>State reads during composition subscribe the running composable's group; a
-  state write invalidates those groups. <code>recompose()</code> re-runs from the root but
-  <strong>skips</strong> any group that was composed before, whose arguments are unchanged,
-  and which is not on an invalidated path — so only the affected composables (and
-  their ancestors) re-run.</li>
+<li><strong><code>stdlib</code></strong> — the native intrinsics keyed by FQN, the
+  <code>HostBindings</code> registry, and the implicit-import package list.</li>
+<li><strong><code>stdlib_gen</code></strong> — mines the upstream tree into the symbol index
+  committed under <code>src/stdlib/</code>.</li>
+<li><strong><code>stdlib_pack</code></strong> — resolves the pack bytes the interpreter loads
+  at startup: <code>KLIO_STDLIB_PACK</code> override, else a fresh build from
+  the cwd checkout (so in-repo stdlib edits need no rebuild), else
+  the bytes embedded into the binary by <code>build.zig</code>.</li>
 </ul>
-<p>This means a <code>@Composable</code> works unmodified: positional memoization, selective
-recomposition, CompositionLocal scoping, and effects all behave as on the JVM,
-without a compiler plugin.</p>
-<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
-<p>The runtime is functional for synchronous composition and finite effects:
-state (incl. primitive + observable collections), composition + selective
-recomposition (with arg-change skipping), <code>remember</code>, <code>key</code>-stable list identity,
-CompositionLocal, <code>SideEffect</code>/<code>DisposableEffect</code>, <code>derivedStateOf</code>, and the
-coroutine effects (<code>LaunchedEffect</code> / <code>rememberCoroutineScope</code> / <code>produceState</code>)
-for effects that complete.</p>
-<p>The async story is now functional too (klio has a cooperative coroutine pump):
-the async <code>Recomposer.runRecomposeAndApplyChanges</code> loop + the upstream frame clock,
-<code>snapshotFlow</code>, <code>Flow.collectAsState</code>, and <code>StateFlow.collectAsState</code> on hot sources
-all work (<code>examples/compose_frame_clock.kt</code>, <code>compose_snapshot_flow.kt</code>,
-<code>compose_stateflow.kt</code>). Long-running <code>LaunchedEffect</code>s drive under the Recomposer.</p>
-<p>What remains is downstream of the runtime: the <strong>node-emission (Applier) layer</strong> that
-node-based UI is built on (the current composer renders via side effects, not a node
-tree), then the Mosaic (terminal) and Compose-UI/Skia rendering packs, plus the full
-MVCC snapshot transaction API and movable content. See
-<code>plans/open-campaigns.md</code> for that plan.</p>
-<p>See <code>examples/compose_*.kt</code> for runnable demonstrations of each feature, and
-<code>plans/open-campaigns.md</code> for the rendering roadmap.</p>
+<p>At dispatch, <code>stdlib.implementation(fqn)</code> is the single resolution
+path: when an intrinsic exists for a FQN it shadows the lowered
+Kotlin body, otherwise the interpreted upstream source runs. The
+lowered stdlib is baked to a content-addressed image under
+<code>~/.klio/cache</code> so runs after the first skip re-lowering it.</p>
+<h2 id="implementation-discipline">Implementation discipline<a class="headerlink" href="#implementation-discipline" title="Permanent link">&para;</a></h2>
+<p>For every stdlib gap that closes:</p>
+<ol>
+<li><strong>Prefer consuming more upstream source</strong> over adding an
+   intrinsic; an intrinsic is for host access or measured hot paths.</li>
+<li><strong>Match Kotlin/JVM semantics exactly</strong>: integer overflow wraps,
+   <code>Double</code>/<code>Float</code> follow IEEE-754 with JVM formatting, <code>String</code> is
+   UTF-16 in observable behavior.</li>
+<li><strong>Test through upstream's own suite</strong> — the commonTest ratchet
+   only goes up — plus parity corpus programs for anything
+   user-visible.</li>
+</ol>
+<h2 id="what-we-are-explicitly-not-doing">What we are explicitly <em>not</em> doing<a class="headerlink" href="#what-we-are-explicitly-not-doing" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Loading the upstream stdlib's compiled <code>.klib</code> / <code>.jar</code> artifacts.</li>
+<li>Implementing JVM-runtime-dependent pieces (<code>java.*</code> interop
+  helpers) beyond what upstream's common surface requires.</li>
+</ul>
 
 
 
@@ -1762,10 +1662,10 @@ MVCC snapshot transaction API and movable content. See
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
     
     
-      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
       
     
   </body>

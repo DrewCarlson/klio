@@ -10,28 +10,24 @@
       
       
       
-        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/packs/shipped/compose-runtime/">
+        <link rel="canonical" href="https://klio.dev/0.1.0-MAIN/design/JIT-DESIGN/">
       
       
-        <link rel="prev" href="../ktor/">
-      
-      
-        <link rel="next" href="../../../development/workspace/">
       
       
         
       
       
-      <link rel="icon" href="../../../assets/images/favicon.png">
+      <link rel="icon" href="../../assets/images/favicon.png">
       <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
     
     
       
-        <title>androidx.compose.runtime - Klio</title>
+        <title>KLIO JIT — tiered native compiler (design) - Klio</title>
       
     
     
-      <link rel="stylesheet" href="../../../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
       
       
 
@@ -50,9 +46,9 @@
       
     
     
-      <link rel="stylesheet" href="../../../stylesheets/extra.css">
+      <link rel="stylesheet" href="../../stylesheets/extra.css">
     
-    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
     
       
 
@@ -70,7 +66,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#androidxcomposeruntime" class="md-skip">
+        <a href="#klio-jit-tiered-native-compiler-design" class="md-skip">
           Skip to content
         </a>
       
@@ -90,7 +86,7 @@
 
 <header class="md-header md-header--shadow" data-md-component="header">
   <nav class="md-header__inner md-grid" aria-label="Header">
-    <a href="../../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
+    <a href="../.." title="Klio" class="md-header__button md-logo" aria-label="Klio" data-md-component="logo">
       
   
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
@@ -110,7 +106,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              androidx.compose.runtime
+              KLIO JIT — tiered native compiler (design)
             
           </span>
         </div>
@@ -202,7 +198,7 @@
 
 <nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
   <label class="md-nav__title" for="__drawer">
-    <a href="../../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
+    <a href="../.." title="Klio" class="md-nav__button md-logo" aria-label="Klio" data-md-component="logo">
       
   
   <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
@@ -232,7 +228,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../.." class="md-nav__link">
+      <a href="../.." class="md-nav__link">
         
   
   
@@ -323,7 +319,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../getting-started/installation/" class="md-nav__link">
+      <a href="../../getting-started/installation/" class="md-nav__link">
         
   
   
@@ -351,7 +347,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../getting-started/hello-world/" class="md-nav__link">
+      <a href="../../getting-started/hello-world/" class="md-nav__link">
         
   
   
@@ -379,7 +375,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../getting-started/cli/" class="md-nav__link">
+      <a href="../../getting-started/cli/" class="md-nav__link">
         
   
   
@@ -407,7 +403,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../testing/" class="md-nav__link">
+      <a href="../../testing/" class="md-nav__link">
         
   
   
@@ -435,7 +431,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../BUNDLE/" class="md-nav__link">
+      <a href="../../BUNDLE/" class="md-nav__link">
         
   
   
@@ -538,7 +534,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/pipeline/" class="md-nav__link">
+      <a href="../../architecture/pipeline/" class="md-nav__link">
         
   
   
@@ -566,7 +562,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/interpreter/" class="md-nav__link">
+      <a href="../../architecture/interpreter/" class="md-nav__link">
         
   
   
@@ -594,7 +590,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/stdlib/" class="md-nav__link">
+      <a href="../../architecture/stdlib/" class="md-nav__link">
         
   
   
@@ -622,7 +618,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/concurrency/" class="md-nav__link">
+      <a href="../../architecture/concurrency/" class="md-nav__link">
         
   
   
@@ -650,7 +646,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/memory-model/" class="md-nav__link">
+      <a href="../../architecture/memory-model/" class="md-nav__link">
         
   
   
@@ -678,7 +674,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/diagnostics/" class="md-nav__link">
+      <a href="../../architecture/diagnostics/" class="md-nav__link">
         
   
   
@@ -706,7 +702,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../architecture/performance/" class="md-nav__link">
+      <a href="../../architecture/performance/" class="md-nav__link">
         
   
   
@@ -738,10 +734,8 @@
       
   
   
-    
   
   
-  
     
     
       
@@ -766,11 +760,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
         
           
           <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
@@ -791,7 +785,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4">
             <span class="md-nav__icon md-icon"></span>
             
@@ -809,7 +803,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../overview/" class="md-nav__link">
+      <a href="../../packs/overview/" class="md-nav__link">
         
   
   
@@ -837,7 +831,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../format/" class="md-nav__link">
+      <a href="../../packs/format/" class="md-nav__link">
         
   
   
@@ -865,7 +859,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../using/" class="md-nav__link">
+      <a href="../../packs/using/" class="md-nav__link">
         
   
   
@@ -893,7 +887,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../authoring/" class="md-nav__link">
+      <a href="../../packs/authoring/" class="md-nav__link">
         
   
   
@@ -921,7 +915,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../native-bindings/" class="md-nav__link">
+      <a href="../../packs/native-bindings/" class="md-nav__link">
         
   
   
@@ -946,10 +940,8 @@
                 
   
   
-    
   
   
-  
     
     
       
@@ -973,11 +965,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4_6" >
         
           
           <label class="md-nav__link" for="__nav_4_6" id="__nav_4_6_label" tabindex="0">
@@ -998,7 +990,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="2" aria-labelledby="__nav_4_6_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_4_6">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1016,7 +1008,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../atomicfu/" class="md-nav__link">
+      <a href="../../packs/shipped/atomicfu/" class="md-nav__link">
         
   
   
@@ -1044,7 +1036,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../io/" class="md-nav__link">
+      <a href="../../packs/shipped/io/" class="md-nav__link">
         
   
   
@@ -1072,7 +1064,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../datetime/" class="md-nav__link">
+      <a href="../../packs/shipped/datetime/" class="md-nav__link">
         
   
   
@@ -1100,7 +1092,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../coroutines/" class="md-nav__link">
+      <a href="../../packs/shipped/coroutines/" class="md-nav__link">
         
   
   
@@ -1128,7 +1120,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../serialization/" class="md-nav__link">
+      <a href="../../packs/shipped/serialization/" class="md-nav__link">
         
   
   
@@ -1156,7 +1148,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../ktor/" class="md-nav__link">
+      <a href="../../packs/shipped/ktor/" class="md-nav__link">
         
   
   
@@ -1181,37 +1173,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    androidx.compose.runtime
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../../packs/shipped/compose-runtime/" class="md-nav__link">
         
   
   
@@ -1227,59 +1192,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#surface" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Surface
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#how-it-works-no-compiler-plugin" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        How it works (no compiler plugin)
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#status" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Status
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -1369,7 +1281,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../development/workspace/" class="md-nav__link">
+      <a href="../../development/workspace/" class="md-nav__link">
         
   
   
@@ -1397,7 +1309,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../development/testing/" class="md-nav__link">
+      <a href="../../development/testing/" class="md-nav__link">
         
   
   
@@ -1425,7 +1337,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../development/debugging/" class="md-nav__link">
+      <a href="../../development/debugging/" class="md-nav__link">
         
   
   
@@ -1453,7 +1365,7 @@
   
   
     <li class="md-nav__item">
-      <a href="../../../development/contributing/" class="md-nav__link">
+      <a href="../../development/contributing/" class="md-nav__link">
         
   
   
@@ -1508,10 +1420,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#surface" class="md-nav__link">
+  <a href="#principle-additive-tier-never-a-rewrite" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Surface
+        Principle: additive tier, never a rewrite
       
     </span>
   </a>
@@ -1519,10 +1431,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#how-it-works-no-compiler-plugin" class="md-nav__link">
+  <a href="#stages" class="md-nav__link">
     <span class="md-ellipsis">
       
-        How it works (no compiler plugin)
+        Stages
       
     </span>
   </a>
@@ -1530,13 +1442,85 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#status" class="md-nav__link">
+  <a href="#interop-contract" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Status
+        Interop contract
       
     </span>
   </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#why-this-is-the-only-path-to-the-goal" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why this is the only path to the goal
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#whole-function-mode-native-recursion" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Whole-function mode (native recursion)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#interpreter-call-fast-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Interpreter call fast path
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#architecture-backends" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Architecture backends
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Architecture backends">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#executable-memory-wx" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Executable memory (W^X)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#verified-targets" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Verified targets
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -1557,7 +1541,7 @@
 
 
   
-    <a href="https://drewcarlson.github.io/klio/edit/main/docs/packs/shipped/compose-runtime.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
+    <a href="https://drewcarlson.github.io/klio/edit/main/docs/design/JIT-DESIGN.md" title="Edit this page" class="md-content__button md-icon" rel="edit">
       
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M10 20H6V4h7v5h5v3.1l2-2V8l-6-6H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h4zm10.2-7c.1 0 .3.1.4.2l1.3 1.3c.2.2.2.6 0 .8l-1 1-2.1-2.1 1-1c.1-.1.2-.2.4-.2m0 3.9L14.1 23H12v-2.1l6.1-6.1z"/></svg>
     </a>
@@ -1565,128 +1549,131 @@
   
 
 
-<h1 id="androidxcomposeruntime">androidx.compose.runtime<a class="headerlink" href="#androidxcomposeruntime" title="Permanent link">&para;</a></h1>
-<p>The Compose Multiplatform runtime, running on klio with <strong>no Compose compiler
-plugin</strong>. The pack consumes the upstream <code>androidx.compose.runtime</code> annotation
-surface verbatim (vendored from compose-multiplatform-core v1.11.1) and supplies
-a klio-authored engine — composer, composition, recomposer, observable state,
-CompositionLocal, and effects — in <code>klioMain</code>.</p>
-<h2 id="surface">Surface<a class="headerlink" href="#surface" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.Composable</span>
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.Composition</span>
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.Recomposer</span>
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.mutableStateOf</span>
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.remember</span>
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.getValue</span>
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="k">import</span><span class="w"> </span><span class="nn">androidx.compose.runtime.setValue</span>
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="nd">@Composable</span>
-<a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">Counter</span><span class="p">(</span><span class="n">count</span><span class="p">:</span><span class="w"> </span><span class="kt">Int</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">label</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">remember</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="s">"count"</span><span class="w"> </span><span class="p">}</span>
-<a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a><span class="w">    </span><span class="n">println</span><span class="p">(</span><span class="s">"</span><span class="si">$</span><span class="n">label</span><span class="s"> = </span><span class="si">$</span><span class="n">count</span><span class="s">"</span><span class="p">)</span>
-<a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a><span class="p">}</span>
-<a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>
-<a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a><span class="kd">fun</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
-<a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">recomposer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Recomposer</span><span class="p">()</span>
-<a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">composition</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Composition</span><span class="p">(</span><span class="n">recomposer</span><span class="p">)</span>
-<a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a><span class="w">    </span><span class="kd">val</span><span class="w"> </span><span class="nv">state</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mutableStateOf</span><span class="p">(</span><span class="m">0</span><span class="p">)</span>
-<a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>
-<a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a><span class="w">    </span><span class="n">composition</span><span class="p">.</span><span class="na">setContent</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">Counter</span><span class="p">(</span><span class="n">state</span><span class="p">.</span><span class="na">value</span><span class="p">)</span><span class="w"> </span><span class="p">}</span><span class="w">   </span><span class="c1">// count = 0</span>
-<a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a><span class="w">    </span><span class="n">state</span><span class="p">.</span><span class="na">value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">1</span>
-<a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a><span class="w">    </span><span class="n">recomposer</span><span class="p">.</span><span class="na">recompose</span><span class="p">()</span><span class="w">                            </span><span class="c1">// count = 1</span>
-<a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a><span class="w">    </span><span class="n">composition</span><span class="p">.</span><span class="na">dispose</span><span class="p">()</span>
-<a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a><span class="p">}</span>
-</code></pre></div>
-<p>Available:</p>
-<table>
-<thead>
-<tr>
-<th>Group</th>
-<th>Members</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>State</td>
-<td><code>mutableStateOf</code>, <code>State</code>, <code>MutableState</code>, <code>getValue</code>/<code>setValue</code>, the equality policies (<code>structuralEqualityPolicy</code> / <code>referentialEqualityPolicy</code> / <code>neverEqualPolicy</code>)</td>
-</tr>
-<tr>
-<td>Primitive state</td>
-<td><code>mutableIntStateOf</code> / <code>mutableLongStateOf</code> / <code>mutableFloatStateOf</code> / <code>mutableDoubleStateOf</code> (+ the <code>*State</code> / <code>Mutable*State</code> interfaces)</td>
-</tr>
-<tr>
-<td>Observable collections</td>
-<td><code>mutableStateListOf</code>, <code>mutableStateMapOf</code>, <code>mutableStateSetOf</code> (<code>SnapshotStateList</code> / <code>Map</code> / <code>Set</code>), <code>toMutableStateList</code></td>
-</tr>
-<tr>
-<td>Derived</td>
-<td><code>derivedStateOf</code>, <code>rememberUpdatedState</code></td>
-</tr>
-<tr>
-<td>Composition</td>
-<td><code>Composition</code>, <code>Recomposer</code>, <code>Composer</code>, <code>setContent</code>, <code>recompose</code>, <code>dispose</code></td>
-</tr>
-<tr>
-<td>Memoization</td>
-<td><code>remember</code>, <code>remember(key…)</code>, <code>key</code></td>
-</tr>
-<tr>
-<td>CompositionLocal</td>
-<td><code>compositionLocalOf</code>, <code>staticCompositionLocalOf</code>, <code>CompositionLocalProvider</code>, <code>CompositionLocal.current</code></td>
-</tr>
-<tr>
-<td>Effects</td>
-<td><code>SideEffect</code>, <code>DisposableEffect</code> (<code>onDispose</code>)</td>
-</tr>
-<tr>
-<td>Coroutine effects</td>
-<td><code>rememberCoroutineScope</code>, <code>LaunchedEffect</code>, <code>produceState</code></td>
-</tr>
-</tbody>
-</table>
-<h2 id="how-it-works-no-compiler-plugin">How it works (no compiler plugin)<a class="headerlink" href="#how-it-works-no-compiler-plugin" title="Permanent link">&para;</a></h2>
-<p>The Compose compiler plugin normally rewrites every <code>@Composable</code> function to
-thread a synthetic <code>$composer</code> parameter and to bracket its body with positional
-group-key and slot calls. klio has no plugin, so the <strong>interpreter</strong> supplies
-that role:</p>
+<h1 id="klio-jit-tiered-native-compiler-design">KLIO JIT — tiered native compiler (design)<a class="headerlink" href="#klio-jit-tiered-native-compiler-design" title="Permanent link">&para;</a></h1>
+<p>Goal: close the remaining gap to node-class throughput. The interpreter, after
+the CPU-efficiency campaign, sits at interpreter class (~CPython, ~15× node). A
+tracing/method JIT that emits native machine code for hot IR is the only path to
+node-class performance — no interpreter reaches V8.</p>
+<h2 id="principle-additive-tier-never-a-rewrite">Principle: additive tier, never a rewrite<a class="headerlink" href="#principle-additive-tier-never-a-rewrite" title="Permanent link">&para;</a></h2>
+<p>The JIT is built <strong>on top of</strong> the existing IR interpreter, never replacing it:</p>
 <ul>
-<li>A per-thread <strong>composer stack</strong> lives in the VM. A <code>Composition</code> pushes its
-  composer around the content lambda, so every <code>@Composable</code> call inside runs
-  against it; <code>currentComposer</code> resolves to the stack head.</li>
-<li>The interpreter brackets every <code>@Composable</code> call with
-  <code>startGroup(callSiteKey)</code> / <code>endGroup</code> on the current composer. The key is
-  derived from the <strong>call site's source span</strong>, so the same source position maps
-  to the same slot group across recompositions — the basis of <code>remember</code>.</li>
-<li><code>remember</code> reads/writes a slot in the calling composable's group; the value's
-  calculation runs once and is reused on later compositions.</li>
-<li>State reads during composition subscribe the running composable's group; a
-  state write invalidates those groups. <code>recompose()</code> re-runs from the root but
-  <strong>skips</strong> any group that was composed before, whose arguments are unchanged,
-  and which is not on an invalidated path — so only the affected composables (and
-  their ancestors) re-run.</li>
+<li>The interpreter remains the sole correct execution engine and the fallback for
+  any IR the JIT does not (yet) compile. The build stays green at every step.</li>
+<li>A function is interpreted until it crosses a hotness threshold (call count /
+  loop back-edge count). Then the JIT attempts to compile it. On success, future
+  entries run native code; on any unsupported IR, the compile bails and the
+  function stays interpreted.</li>
+<li>On by default for the <code>klio</code> binary via the <code>fast</code> performance profile
+  (<code>--opt fast</code> / <code>KLIO_OPT=fast</code>); <code>--opt safe</code> keeps the interpreter. The
+  in-process multi-program test harness uses the conservative default profile
+  (interpreter), so a hot loop never compiles per worker. The legacy <code>KLIO_JIT</code>
+  / <code>KLIO_FUNC_JIT</code> env vars remain as per-feature overrides on top of the
+  profile. See <code>src/runtime/perf.zig</code>.</li>
 </ul>
-<p>This means a <code>@Composable</code> works unmodified: positional memoization, selective
-recomposition, CompositionLocal scoping, and effects all behave as on the JVM,
-without a compiler plugin.</p>
-<h2 id="status">Status<a class="headerlink" href="#status" title="Permanent link">&para;</a></h2>
-<p>The runtime is functional for synchronous composition and finite effects:
-state (incl. primitive + observable collections), composition + selective
-recomposition (with arg-change skipping), <code>remember</code>, <code>key</code>-stable list identity,
-CompositionLocal, <code>SideEffect</code>/<code>DisposableEffect</code>, <code>derivedStateOf</code>, and the
-coroutine effects (<code>LaunchedEffect</code> / <code>rememberCoroutineScope</code> / <code>produceState</code>)
-for effects that complete.</p>
-<p>The async story is now functional too (klio has a cooperative coroutine pump):
-the async <code>Recomposer.runRecomposeAndApplyChanges</code> loop + the upstream frame clock,
-<code>snapshotFlow</code>, <code>Flow.collectAsState</code>, and <code>StateFlow.collectAsState</code> on hot sources
-all work (<code>examples/compose_frame_clock.kt</code>, <code>compose_snapshot_flow.kt</code>,
-<code>compose_stateflow.kt</code>). Long-running <code>LaunchedEffect</code>s drive under the Recomposer.</p>
-<p>What remains is downstream of the runtime: the <strong>node-emission (Applier) layer</strong> that
-node-based UI is built on (the current composer renders via side effects, not a node
-tree), then the Mosaic (terminal) and Compose-UI/Skia rendering packs, plus the full
-MVCC snapshot transaction API and movable content. See
-<code>plans/open-campaigns.md</code> for that plan.</p>
-<p>See <code>examples/compose_*.kt</code> for runnable demonstrations of each feature, and
-<code>plans/open-campaigns.md</code> for the rendering roadmap.</p>
+<h2 id="stages">Stages<a class="headerlink" href="#stages" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>Foundation.</strong> <code>src/jit/jit.zig</code>: W^X executable memory
+   (<code>mmap</code> RW → write → <code>mprotect</code> RX) + a minimal x86-64 (System V) emitter.
+   Unit-tested by emitting and calling a trivial function. No interpreter change.</li>
+<li><strong>Encoder breadth.</strong> Registers, <code>mov</code>/<code>add</code>/<code>sub</code>/<code>imul</code>/<code>cmp</code>/<code>jcc</code>/<code>call</code>,
+   stack frame prologue/epilogue, RIP-relative loads. Table-tested against known
+   encodings.</li>
+<li><strong>Type-specialized arithmetic loops.</strong> Compile the hottest shape first — an
+   integer loop over <code>BinOp</code> + a fast-path array subscript — by unboxing <code>Value</code>
+   to native <code>i64</code> under a type <strong>guard</strong>; on guard failure, <strong>deopt</strong> back to
+   the interpreter at the IR instruction boundary (reusing the same register
+   file / <code>Frame</code> so state is consistent). This is where the win is: native
+   arithmetic on unboxed scalars instead of 64-byte <code>Value</code> churn.</li>
+<li><strong>Calls + dispatch.</strong> Compile member/intrinsic calls via a trampoline into the
+   existing host dispatch; inline-cache monomorphic receivers.</li>
+<li><strong>Coverage growth.</strong> Widen compiled IR opcode set; keep interpreter fallback
+   for the long tail (coroutine suspends, exceptions unwinding, reflection).</li>
+</ol>
+<h2 id="interop-contract">Interop contract<a class="headerlink" href="#interop-contract" title="Permanent link">&para;</a></h2>
+<p>JIT'd code shares the interpreter's <code>Frame</code> (register array, params). A compiled
+function reads/writes the same <code>regs</code> slots, so deopt and partial compilation are
+seamless: an uncompiled instruction hands control back to <code>runFrameInner</code> at that
+index with the live register file intact.</p>
+<h2 id="why-this-is-the-only-path-to-the-goal">Why this is the only path to the goal<a class="headerlink" href="#why-this-is-the-only-path-to-the-goal" title="Permanent link">&para;</a></h2>
+<p>Measured in <code>bench/memcompare</code>: CPython (a mature bytecode VM) is itself ~15×
+slower than node on the numeric workload. An interpreter cannot reach a JIT;
+native code generation with type specialization is required.</p>
+<h2 id="whole-function-mode-native-recursion">Whole-function mode (native recursion)<a class="headerlink" href="#whole-function-mode-native-recursion" title="Permanent link">&para;</a></h2>
+<p>The loop tier covers hot loops; recursion and call-bound code with no enclosing
+loop (e.g. <code>fib</code>) stayed in the interpreter, bound by per-instruction dispatch.
+Function mode closes that gap: when a function entry is hot, its <strong>whole body</strong>
+(entry → <code>Return</code>) compiles to native code.</p>
+<ul>
+<li><strong>Enabled by the <code>fast</code> profile</strong> (default for the binary); <code>KLIO_FUNC_JIT</code>
+  remains a per-feature override. It compiles
+  whole bodies (including recursion) per thread with no cross-thread eviction
+  path — correct and bounded for a normal single-program process, but the
+  in-process multi-program test harness would accumulate per-worker compiled
+  code, so it is off unless explicitly requested.</li>
+<li><strong>Trigger.</strong> A per-function entry counter; at the threshold, <code>tryCompileFunc</code>
+  compiles the body. Coexists with the loop tier — function mode fires at the
+  entry block, the loop tier at inner loop headers; whichever applies first wins,
+  and either bails to the interpreter on an unsupported shape.</li>
+<li><strong>Shape.</strong> User-code only (stdlib / kotlinx-pack bodies stay interpreted so the
+  tier never alters the runtime machinery cooperative scheduling relies on);
+  scalar params/locals/return (exactly <code>Int</code>/<code>Long</code>/<code>Double</code>/<code>Float</code>/<code>Boolean</code>,
+  or <code>Unit</code>); terminators <code>Goto</code>/<code>Branch</code>/<code>Return</code>; instructions limited to scalar
+  arithmetic, <code>LoadParam</code>, and positional top-level calls. <code>/</code> and <code>%</code> are
+  excluded (a divide-by-zero is the only deopt a body could raise, and a frameless
+  callee has no frame to resume into).</li>
+<li><strong>Param/return ABI.</strong> Scalar params are packed into reserved slots at entry
+  (specialized on the first hot call's kinds; a later mismatch deopts to the
+  interpreter); a <code>Return</code> writes the scalar result to a result slot and exits.</li>
+<li><strong>Native recursion.</strong> A compiled body calling a compiled callee runs the
+  callee's body directly through the call trampoline — no interpreter frame, no
+  dispatch — bounded by a native-recursion depth limit (beyond it, the
+  frame-based path takes over so deep recursion raises a catchable
+  <code>StackOverflowError</code> instead of faulting the native stack). A callee throw
+  propagates out without re-running (no double effects); scalar callees are pure,
+  so the rare fallback re-run is observably identical.</li>
+<li><strong>Result.</strong> <code>fib(34)</code> ~6× over the interpreter; identical output JIT off/on.</li>
+</ul>
+<h2 id="interpreter-call-fast-path">Interpreter call fast path<a class="headerlink" href="#interpreter-call-fast-path" title="Permanent link">&para;</a></h2>
+<p>Independent of the JIT: a plain top-level user function (single overload, has
+body, non-extension, no varargs/defaults/type-params/native-binding) caches an
+eligibility plan on its <code>Func</code> and dispatches straight to its body, skipping the
+per-call overload re-resolution, extension-receiver handling, reified-type
+binding, and redundant argument copies. Positional, exact-arity calls only.</p>
+<h2 id="architecture-backends">Architecture backends<a class="headerlink" href="#architecture-backends" title="Permanent link">&para;</a></h2>
+<p>The emitter is split into per-target backends behind one method-level API, so
+the loop/function compiler in <code>ir/jit_loop.zig</code> is arch-neutral — it programs a
+fixed-role register machine (<code>T0</code>/<code>T1</code>/<code>T2</code> scratch, <code>REGS</code> base pointer, two
+float scratch, args in <code>rdi</code>/<code>rsi</code>, result in the <code>rax</code> role) and never branches
+on architecture. <code>jit.zig</code> exposes abstract <code>Reg</code>/<code>Xmm</code>/<code>Cond</code>/<code>SetCc</code>/<code>ElemW</code>
+types and selects the backend at compile time:</p>
+<ul>
+<li><strong>x86-64 (System V)</strong> — <code>X86Emitter</code> in <code>jit.zig</code>.</li>
+<li><strong>AArch64 (AAPCS64)</strong> — <code>arm64.zig</code>. Maps the role registers to ARM64 GPRs and
+  honors the same contract: <code>sdiv</code>/<code>msub</code> leave quotient and remainder in the
+  <code>T0</code>/<code>T2</code> roles, <code>ret</code> reconciles the <code>rax</code> role to <code>x0</code>, <code>push</code>/<code>pop</code> pair the
+  base-pointer save with the link register so a trampoline <code>blr</code> is transparent,
+  abstract conditions lower to <code>NZCV</code> (the <code>a</code>/<code>ae</code>/<code>be</code> forms only follow
+  <code>fcmp</code>), and <code>fcvtzs</code> gives Kotlin's NaN→0 / saturating float→int directly.</li>
+</ul>
+<p>Any architecture without a backend (e.g. riscv64) returns <code>Unsupported</code> from
+<code>finalize</code> and runs on the interpreter.</p>
+<h3 id="executable-memory-wx">Executable memory (W^X)<a class="headerlink" href="#executable-memory-wx" title="Permanent link">&para;</a></h3>
+<p><code>finalize</code> writes code into fresh pages, seals them, and syncs the instruction
+cache (mandatory on AArch64; elided on x86):</p>
+<ul>
+<li><strong>Apple platforms (<code>isDarwin()</code>)</strong> — <code>MAP_JIT</code> pages with the per-thread
+  <code>pthread_jit_write_protect_np</code> write toggle, then <code>sys_icache_invalidate</code>. The
+  jit module links libc on Darwin targets for those entry points.</li>
+<li><strong>Linux / Android</strong> — <code>mmap</code> read+write, <code>mprotect</code> to read+execute, then a
+  <code>dc cvau</code> / <code>ic ivau</code> / <code>dsb</code> / <code>isb</code> cache-maintenance sequence on AArch64. No
+  libc dependency.</li>
+</ul>
+<h3 id="verified-targets">Verified targets<a class="headerlink" href="#verified-targets" title="Permanent link">&para;</a></h3>
+<p>macOS arm64 is the native host (full suite + example parity, JIT on and off).
+The AArch64 backend's execution tests also run green on a real Android arm64
+device via adb, exercising the Linux <code>mmap</code>/<code>mprotect</code>/icache path. The JIT
+cross-compiles for x86-64 and aarch64 Linux, Android (arm64 + x86-64), and
+aarch64 iOS; riscv64 builds and falls back to the interpreter.</p>
 
 
 
@@ -1762,10 +1749,10 @@ MVCC snapshot transaction API and movable content. See
     
       
       
-      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.action.edit", "content.code.copy", "content.code.annotate", "navigation.sections", "navigation.indexes", "navigation.top", "search.suggest", "search.highlight"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"provider": "mike"}}</script>
     
     
-      <script src="../../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
       
     
   </body>
