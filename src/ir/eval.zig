@@ -10757,6 +10757,45 @@ fn constMatches(module: *const Module, id: ConstId, v: *const Value) bool {
         defer g.deinit();
         return std.mem.eql(u8, c.String, g.get().bytes);
     }
+    // An unsuffixed integer literal takes the subject's type (`when (l:
+    // Long) { 42 -> }` compares `42L`), so an integral key compares by
+    // value against any signed integral subject, and an unsigned key
+    // against any unsigned one.
+    switch (c.*) {
+        .Int, .Long, .Short, .Byte => {
+            const k: i64 = switch (c.*) {
+                .Int => |i| i,
+                .Long => |l| l,
+                .Short => |x| x,
+                .Byte => |x| x,
+                else => unreachable,
+            };
+            return switch (v.*) {
+                .Int => |i| i == k,
+                .Long => |l| l == k,
+                .Short => |x| @as(i64, x) == k,
+                .Byte => |x| @as(i64, x) == k,
+                else => false,
+            };
+        },
+        .UInt, .ULong, .UShort, .UByte => {
+            const k: u64 = switch (c.*) {
+                .UInt => |x| x,
+                .ULong => |x| x,
+                .UShort => |x| x,
+                .UByte => |x| x,
+                else => unreachable,
+            };
+            return switch (v.*) {
+                .UInt => |x| @as(u64, x) == k,
+                .ULong => |x| x == k,
+                .UShort => |x| @as(u64, x) == k,
+                .UByte => |x| @as(u64, x) == k,
+                else => false,
+            };
+        },
+        else => {},
+    }
     var lhs = constToValueNoAlloc(c);
     return Value.structuralEq(&lhs, v);
 }

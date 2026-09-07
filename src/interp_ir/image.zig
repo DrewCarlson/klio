@@ -761,6 +761,7 @@ const ClassDefImage = struct {
     annotation_names: []const []const u8,
     annotation_records: []const runtime.AnnotationRecord,
     type_params: []const []const u8,
+    type_param_bounds: []const []const u8 = &.{},
     primary_params: []ClassParamImage,
     methods: []MethodImage,
     body_properties: []PropertyImage,
@@ -1978,6 +1979,7 @@ fn classDefToImage(
         .annotation_names = cd.annotation_names,
         .annotation_records = cd.annotation_records,
         .type_params = cd.type_params,
+        .type_param_bounds = cd.type_param_bounds,
         .primary_params = primary,
         .methods = methods,
         .body_properties = props,
@@ -2348,6 +2350,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
             .annotation_names = ci.annotation_names,
             .annotation_records = ci.annotation_records,
             .type_params = ci.type_params,
+            .type_param_bounds = ci.type_param_bounds,
             .primary_params = blk: {
                 const params = try a.alloc(runtime.ClassParamDef, ci.primary_params.len);
                 for (ci.primary_params, 0..) |p, j| {

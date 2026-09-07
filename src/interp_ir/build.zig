@@ -149,6 +149,30 @@ pub const TypedDefault = enum(u8) {
 /// when the qualifier is exactly `kotlin`.
 /// Simple type-name head for ctor-overload disambiguation: drop any package
 /// qualifier, generic arguments, and trailing nullability.
+/// The simple head of each class type parameter's upper bound, from the
+/// inline `<T : Int>` form or a `where T : Int` clause; empty when the
+/// parameter is unbounded or bounded by a function type.
+pub fn classTypeParamBoundHeads(a: Allocator, type_params: []const ast.TypeParam, where_bounds: []const ast.WhereBound) Allocator.Error![]const []const u8 {
+    if (type_params.len == 0) return &.{};
+    const out = try a.alloc([]const u8, type_params.len);
+    for (type_params, out) |*tp, *slot| {
+        slot.* = "";
+        var bound: ?*const ast.TypeRef = if (tp.upper_bound) |*ub| ub else null;
+        if (bound == null) {
+            for (where_bounds) |*wb| {
+                if (std.mem.eql(u8, wb.name.name, tp.name.name)) {
+                    bound = &wb.bound;
+                    break;
+                }
+            }
+        }
+        const b = bound orelse continue;
+        if (b.function != null) continue;
+        slot.* = try a.dupe(u8, simpleTypeHead(b.name.name));
+    }
+    return out;
+}
+
 fn simpleTypeHead(name: []const u8) []const u8 {
     var s = name;
     if (std.mem.lastIndexOfScalar(u8, s, '.')) |i| s = s[i + 1 ..];
@@ -5094,6 +5118,7 @@ fn buildClassDef(
             for (c.type_params, names) |*tp, *out| out.* = tp.name.name;
             break :blk names;
         },
+        .type_param_bounds = try classTypeParamBoundHeads(a, c.type_params, c.where_bounds),
         .primary_params = primary_params,
         .methods = &.{},
         .body_properties = try body_props.toOwnedSlice(a),

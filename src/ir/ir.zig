@@ -9169,10 +9169,21 @@ pub const Module = struct {
     /// Whether the call's trailing lambda can bind `f`'s last (function-
     /// typed) parameter with every gap parameter defaulted — the shape
     /// the heuristic's trailing-lambda rung accepts and the index defers.
-    fn tlShapeMatches(f: *const Func, want: usize) bool {
+    /// Whether a declared parameter type names a `fun interface`.
+    pub fn typeNamesFunInterface(self: *const Module, ty_name: []const u8) bool {
+        const nm = std.mem.trimEnd(u8, ty_name, "?");
+        const cid = self.classIdByFqn(nm) orelse self.classId(nm) orelse return false;
+        if (cid.int() >= self.classes.items.len) return false;
+        return self.classes.items[cid.int()].is_fun_interface;
+    }
+
+    fn tlShapeMatches(self: *const Module, f: *const Func, want: usize) bool {
         const up = funcUserArity(f);
+        // A trailing lambda also fills a `fun interface` parameter (SAM
+        // conversion): `g { A("K") }` for `fun g(unit: Unit = Unit, b: B)`.
         const last_is_fn = f.params.len != 0 and
-            std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function");
+            (std.mem.startsWith(u8, f.params[f.params.len - 1].ty.name, "Function") or
+                self.typeNamesFunInterface(f.params[f.params.len - 1].ty.name));
         if (!f.hasBody() or !last_is_fn or up < want or want < 1) return false;
         const this_off: usize = if (funcHasImplicitThis(f)) 1 else 0;
         const lead = want - 1;
@@ -9330,7 +9341,7 @@ pub const Module = struct {
                     continue;
                 }
                 const used = positionalDefaultsUsed(f, want_arity) orelse {
-                    if (last_arg_lambda and tlShapeMatches(f, want_arity)) {
+                    if (last_arg_lambda and self.tlShapeMatches(f, want_arity)) {
                         saw_tl = true;
                     } else if (omittedPositionHasDefault(f, want_arity)) {
                         saw_default = true;
