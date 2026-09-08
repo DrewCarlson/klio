@@ -2669,6 +2669,23 @@ fn companionMemberOfClass(self: *VmHost, allocator: Allocator, class_name: []con
     };
     if (singleton) |s| {
         if (s == .Instance) {
+            // A property with a CUSTOM GETTER runs its getter, even when a
+            // backing field is also present (`var p = 1; get() = field++`):
+            // reading the stored slot directly would skip the getter's body
+            // and its side effects. Only a property with no getter reads the
+            // slot below.
+            const comp_cls0 = className(s.Instance);
+            const custom_getter: ?FuncId = blk: {
+                const pg = self.prog.borrow();
+                defer pg.deinit();
+                break :blk lookupPairFunc(pg.get().instance_prop_getters, comp_cls0, name);
+            };
+            if (custom_getter) |fid| {
+                const mptr0: *const Module = self.module.asPtr();
+                if (fid.int() < mptr0.funcCount()) {
+                    return try evalGetterTagged(self, allocator, fid, s, "companion-getter");
+                }
+            }
             const field_v: ?Value = blk: {
                 const g = s.Instance.borrow();
                 defer g.deinit();
