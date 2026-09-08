@@ -1957,6 +1957,14 @@ fn bindDestructured(b: *FuncBuilder, name: []const u8, value: Reg, mutable: bool
     try b.bind(name, home);
 }
 
+/// A destructuring entry named `_` is a positional skip placeholder only
+/// when it is written bare. A backtick-escaped `` `_` `` is a real name
+/// (its span carries the backticks, so it is longer than the stripped
+/// name), and it binds and reads like any other identifier.
+pub fn isUnderscorePlaceholder(name: ast.Ident) bool {
+    return std.mem.eql(u8, name.name, "_") and name.span.len() == 1;
+}
+
 fn lowerDestructuringDecl(
     b: *FuncBuilder,
     names: []const ast.Ident,
@@ -1986,13 +1994,13 @@ fn lowerDestructuringDecl(
             const field = try b.module.internConst(b.allocator, .{ .String = sources[i].name });
             const dst = b.allocReg();
             try b.push(.{ .GetField = .{ .dst = dst, .receiver = recv, .field = field } });
-            if (std.mem.eql(u8, name.name, "_")) continue;
+            if (isUnderscorePlaceholder(name)) continue;
             try bindDestructured(b, name.name, dst, mutable);
         }
         return null;
     }
     for (names, 0..) |name, i| {
-        if (std.mem.eql(u8, name.name, "_")) continue;
+        if (isUnderscorePlaceholder(name)) continue;
         const comp_name = try std.fmt.allocPrint(b.allocator, "component{d}", .{i + 1});
         const nm = try b.module.internConst(b.allocator, .{ .String = comp_name });
         const args_start = b.allocReg();

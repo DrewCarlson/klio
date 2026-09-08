@@ -6,11 +6,19 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-07, 8c8c613a, CI green)
+## State (2026-09-08, 53a1056f, CI green)
 
-Census 6002 passed / 352 failed / 3 did not complete (994 excluded: the
-runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
-`BASELINE = 6002`, `MAX_FAILED = 352` in `src/itests/box_support.zig`.
+Census 6028 passed / 325 failed / 4 did not complete (994 excluded: the
+runner also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
+`BASELINE = 6028`, `MAX_FAILED = 325` in `src/itests/box_support.zig`.
+
+The `multiDecl` positional-destructuring cluster is closed: a bare `_` is
+a skip placeholder (no bind, no `componentN()` call), a backtick-escaped
+`` `_` `` is a real name (distinguished by the identifier span length),
+single-element `[b]`/`for ([b] in xs)` reads `component1()` via a new
+`For.destructured` flag, the full form `[val a, val b] = x` parses at
+statement level, and the short-form string template interpolates an
+escaped name (`` $`_` ``).
 Landed since 5751/609: function-type `is`/`as` by arity, companion and
 enum-entry `invoke`, inner constructor refs, bound extension and vararg
 refs, property references reading extension properties, callable-typed

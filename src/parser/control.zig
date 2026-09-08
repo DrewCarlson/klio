@@ -383,8 +383,10 @@ pub fn parseFor(p: *Parser) ?Expr {
     var vars: []Ident = undefined;
     var for_by_name = false;
     var var_sources: []Ident = &.{};
+    var destructured = false;
     const opener = std.meta.activeTag(support.peekKind(p).*);
     if (opener == .LParen or opener == .LBracket) {
+        destructured = true;
         _ = support.bump(p);
         const entries = parseDestructEntries(
             p,
@@ -417,6 +419,7 @@ pub fn parseFor(p: *Parser) ?Expr {
     return Expr{ .For = .{
         .vars = vars,
         .by_name = for_by_name,
+        .destructured = destructured,
         .var_sources = var_sources,
         .var_ty = var_ty,
         .iter = box(p, iter),

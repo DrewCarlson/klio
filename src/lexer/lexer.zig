@@ -1089,22 +1089,35 @@ pub const Lexer = struct {
                     try self.modes.append(self.allocator, .{ .Interp = .{ .brace_depth = 0 } });
                     return;
                 }
-                // `$ident` short form.
+                // `$ident` short form, including a backtick-escaped name
+                // (`` $`_` ``): `simpleIdentifier` admits the escaped form.
                 if (after) |b1| {
-                    if (isIdentStartByte(b1)) {
+                    if (isIdentStartByte(b1) or b1 == '`') {
                         var i: u32 = 0;
                         while (i < extra) : (i += 1) try text.append(self.allocator, '$');
                         self.pos += extra;
                         try self.flushStringText(tokens, &text, segment_start);
                         const short_start = self.pos;
                         self.pos += dollars; // consume the marker
-                        const ident_start = self.pos;
-                        while (self.peekByte(0)) |c| {
-                            if (isIdentContByte(c)) {
+                        const name = if (self.peekByte(0) == @as(?u8, '`')) blk: {
+                            self.pos += 1; // opening backtick
+                            const nm_start = self.pos;
+                            while (self.peekByte(0)) |c| {
+                                if (c == '`' or c == '\n' or c == '\r' or c == 0) break;
                                 self.pos += 1;
-                            } else break;
-                        }
-                        const name = try self.allocator.dupe(u8, self.src[ident_start..self.pos]);
+                            }
+                            const nm = try self.allocator.dupe(u8, self.src[nm_start..self.pos]);
+                            if (self.peekByte(0) == @as(?u8, '`')) self.pos += 1; // closing
+                            break :blk nm;
+                        } else blk: {
+                            const ident_start = self.pos;
+                            while (self.peekByte(0)) |c| {
+                                if (isIdentContByte(c)) {
+                                    self.pos += 1;
+                                } else break;
+                            }
+                            break :blk try self.allocator.dupe(u8, self.src[ident_start..self.pos]);
+                        };
                         try tokens.append(self.allocator, .{
                             .kind = .{ .ShortInterp = name },
                             .span = Span.init(self.file, short_start, self.pos),
