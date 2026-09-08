@@ -1224,11 +1224,14 @@ pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator,
     const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
     defer freeArgNames(allocator, names);
     var invocable = valueInvocable(frame.module, callee_v);
-    // A runtime-registered class (an object expression extending a
-    // function type) keeps its `invoke` outside the module registry.
+    // A runtime-registered class that EXTENDS a function type (an object
+    // expression `object : (Int) -> Unit`) keeps its `invoke` outside the
+    // module registry. Gate on the function-type supertype, not a mere
+    // `invoke` member: a compose `MovableContent` invoked as
+    // `receiver.content()` must stay on the member arm.
     if (!invocable and callee_v == .Instance) {
-        if (comptime @hasDecl(H, "instanceHasInvokeSurface")) {
-            invocable = host.instanceHasInvokeSurface(&callee_v);
+        if (comptime @hasDecl(H, "instanceExtendsFunctionType")) {
+            invocable = host.instanceExtendsFunctionType(&callee_v);
         }
     }
     // A callable whose DECLARED params definitely refute the runtime

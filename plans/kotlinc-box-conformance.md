@@ -168,9 +168,12 @@ residue list (every cluster under five) as the seed of the next campaign.
   constructor bodies in DECLARATION order between the super call and the
   body (`superCallSecondary`, `innerClassesInheritance`). `fieldInitializerOptimization`
   and `varargs` are single files.
-- evaluate (rest): the unsigned `const val` verdict above covers
-  `uintOperations`, `ulongOperations`, `unsignedConst`, `ubyteOperations`,
-  `ushortOperations`; `kCallableName*` need `::name` on a KCallable
+- evaluate (8 left): the unsigned `const val` receiver bug is FIXED
+  (`literalToConst` folded `2u` to `Int`, so a const-val global lost its
+  unsigned type; `uintOperations`, `ulongOperations`, `unsignedConst` now
+  pass). `ubyteOperations`/`ushortOperations` still fail because
+  `UByte.and`/`UShort.and` return `Byte`/`Short` not the unsigned type (a
+  value-class boundary, the inlineClasses cluster). The rest: `kCallableName*` need `::name` on a KCallable
   evaluated as a constant; `charOperations`, `enumNameWithInit`, `incDec`,
   `stringConcatenationWithObject` are single files.
 - collectionLiterals (7): the `[a, b]` collection literal expression
@@ -184,11 +187,17 @@ residue list (every cluster under five) as the seed of the next campaign.
   by name and pick among `f(Int)`/`f(String)`/`Boolean.f()`; `kt3684`,
   `objectLiteral`, `thisRefToObjectInNestedClassConstructorCall` are
   single files.
-- properties (6): `classFieldInsideLocalInSetter`, `companionFieldInsideLambda`,
-  `fieldInsideField` (verdict above), `genericWithSameName`, `kt4140`
-  (`field++` inside a getter), `privatePropertyInConstructor` (a private
-  constructor property shadowed by a subclass's same-named property; the
-  instance's field storage is keyed by name alone).
+- properties (6, needs a fix — not JVM-only): backing-field access from
+  nested scopes. `kt4140` (`field++` in a COMPANION getter) returns
+  1,1,2 not 1,2,3 — the getter's `field` write targets a non-canonical
+  companion instance on first access (a companion-materialization
+  mechanism, cf. the imported-companion-val-baking dedup fix; a plain
+  class/object getter's `field++` is correct). `companionFieldInsideLambda`
+  shares that root. `classFieldInsideLocalInSetter` (a local fn in a setter
+  writing `field`), `fieldInsideField` (verdict above), `genericWithSameName`,
+  `privatePropertyInConstructor` (a private constructor property shadowed
+  by a subclass's same-named property; instance field storage is keyed by
+  name alone) are separate roots.
 - operatorConventions (3 left): the lvalue-caching mechanism landed (a
   member target's receiver is evaluated before the value; an indexed
   target's receiver and indices are evaluated once for the read and the
@@ -241,7 +250,7 @@ residue list (every cluster under five) as the seed of the next campaign.
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
 
-## Residue (clusters under five at 6004 / 350 / 3, 34d1a79f)
+## Residue (clusters under five at 6007 / 347 / 3, 34d1a79f)
 
 Every directory with five or more failures above has a fix or a verdict.
 The remaining failures, grouped by directory, are the seed of the next

@@ -2412,6 +2412,50 @@ fn paramHasDefault(defaults: ?[]const ?FuncId, idx: usize) bool {
 /// it carries a SAM-conversion target, or its supertype closure names a
 /// `Function*` type (kotlinc: assignability needs the type relation — a
 /// class merely declaring an `invoke` member is not a Function subtype).
+/// Whether the instance's class hierarchy names a function type as a
+/// supertype (an erased `FunctionN` / `SuspendFunctionN`), i.e. the class
+/// was declared `class A : (Int) -> Unit`. This is stricter than
+/// `instanceHasInvokeSurface`, which is true for any class merely
+/// declaring an `invoke` member (a compose `MovableContent`, a
+/// `ComposableLambdaImpl`); only a genuine function-type subtype should be
+/// invoked as a bare value in `CallValueOrMember`.
+pub fn instanceExtendsFunctionType(self: *VmHost, v: *const Value) bool {
+    if (v.* != .Instance) return false;
+    const a = self.allocator;
+    var queue: std.ArrayList([]const u8) = .empty;
+    defer queue.deinit(a);
+    var seen: std.StringHashMap(void) = .init(a);
+    defer seen.deinit();
+    {
+        const g = v.Instance.borrow();
+        const cg = g.get().class.borrow();
+        queue.append(a, cg.get().name) catch {};
+        cg.deinit();
+        g.deinit();
+    }
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const name = queue.items[head];
+        if (seen.contains(name)) continue;
+        seen.put(name, {}) catch {};
+        if (std.mem.startsWith(u8, name, "Function") or std.mem.startsWith(u8, name, "SuspendFunction")) {
+            const rest = if (std.mem.startsWith(u8, name, "SuspendFunction")) name["SuspendFunction".len..] else name["Function".len..];
+            if (rest.len != 0 and blk: {
+                for (rest) |ch| if (ch < '0' or ch > '9') break :blk false;
+                break :blk true;
+            }) return true;
+        }
+        const cg = self.classes.borrow();
+        if (cg.get().get(name)) |d| {
+            const dg = d.borrow();
+            for (dg.get().supertype_names) |sn| queue.append(a, sn) catch {};
+            dg.deinit();
+        }
+        cg.deinit();
+    }
+    return false;
+}
+
 pub fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
     // A class declaring `operator fun invoke` is function-like whatever its
     // nominal supertypes: a memo-wrapped ComposableLambdaImpl (22 invoke

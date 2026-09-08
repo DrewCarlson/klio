@@ -1739,8 +1739,17 @@ fn literalToConst(e: *const ast.Expr) ?Const {
                 Const{ .Int = @truncate(lit.value) }
             else
                 Const{ .Long = lit.value },
-            .UInt => Const{ .Int = @truncate(lit.value) },
-            .Long, .ULong => Const{ .Long = lit.value },
+            // Unsigned literals keep their unsigned Const type, matching
+            // `constLiteralOf`; folding them to Int/Long made a `const val`
+            // materialise its global as the signed type, so a member call
+            // whose receiver read that global (`twoVal.plus(oneVal)`) hit a
+            // mixed Int/UInt BinOp.
+            .UInt => blk: {
+                const wide: u64 = @bitCast(lit.value);
+                break :blk if (std.math.cast(u32, wide)) |v| Const{ .UInt = v } else null;
+            },
+            .Long => Const{ .Long = lit.value },
+            .ULong => Const{ .ULong = @bitCast(lit.value) },
         },
         .FloatLit => |lit| switch (lit.kind) {
             .Double => Const{ .Double = lit.value },
