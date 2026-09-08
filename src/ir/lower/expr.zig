@@ -12977,6 +12977,24 @@ fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
                 };
                 for (ranges) |rr| {
                     if (std.mem.eql(u8, lh, rr.e)) {
+                        // A USER class that shadows the builtin range's
+                        // simple name (`class IntRange`) must NOT capture
+                        // `1..2`'s members: typing the range as that name
+                        // would bind the user class's `contains` (an
+                        // unbounded recursion in `IntRange.contains =
+                        // (1..2).contains(a)`). Drop the static type so the
+                        // member dispatches dynamically to the builtin range
+                        // value. The stdlib's OWN range classes
+                        // (`kotlin.ranges.UIntRange`, ...) are legitimate and
+                        // keep their static type — the shadow guard fires
+                        // only for a non-`kotlin.` (program) class.
+                        const shadow_cid = b.module.classIdIndexed(rr.r, b.self_package, arg.span().file) orelse b.module.classId(rr.r);
+                        if (shadow_cid) |cid| {
+                            if (cid.int() < b.module.classes.items.len) {
+                                const fqn = b.module.classes.items[cid.int()].fqn;
+                                if (!std.mem.startsWith(u8, fqn, "kotlin.")) return null;
+                            }
+                        }
                         return .{ .name = rr.r, .nullable = false, .args = &.{} };
                     }
                 }

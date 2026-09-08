@@ -8,8 +8,8 @@ work lands; close a document when its exit conditions are met.
 
 ## The active plan
 
-`kotlinc-box-conformance.md`: the box residue. Census 6016 / 338 / 3 at
-34d1a79f, ratchet 6016 / 338; every cluster of five or more
+`kotlinc-box-conformance.md`: the box residue. Census 6017 / 337 / 3 at
+34d1a79f, ratchet 6017 / 337; every cluster of five or more
 has a fix or a recorded verdict, and the residue table there (clusters
 under five, grouped by directory) is the work list: fix by mechanism,
 ship an `examples/` program per fix, ratchet after every landed batch,

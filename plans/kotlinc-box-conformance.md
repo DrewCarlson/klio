@@ -213,7 +213,7 @@ residue list (every cluster under five) as the seed of the next campaign.
   kt723 and kt725 (a `!!`-asserted or `if (this != null)`-narrowed receiver
   resolves against the NON-null type -> builtin `Int.inc`, not the nullable
   extension). Remaining: kt2711 (below), `extensionFunWithDefaultParam`,
-  `kt2477`, `nestedInitBlocksWithLambda`.
+  `kt2477`, `nestedInitBlocksWithLambda` (kt2711 also fixed).
 - callableReference/function (6): `extensionFunctionLocal` (two local
   extensions of the same name told apart by receiver type),
   `extensionWithNestedFunction`, `genericCallableReferenceWithReifiedTypeParam`,
@@ -250,13 +250,15 @@ residue list (every cluster under five) as the seed of the next campaign.
 - classes/kt2711 (1): a user class NAMED `IntRange` shadows the builtin;
   `(1..2).contains(a)` inside its `contains` must bind the BUILTIN range's
   contains, not re-enter the user class's same-named method (a
-  same-name-as-builtin resolution clash). kt723/kt725 FIXED (a `!!` /
-  null-narrowed receiver resolves against its non-null type).
+  same-name-as-builtin resolution clash). FIXED: the range-type derivation
+  drops the static type when a USER (non-`kotlin.`) class shadows the range
+  name, so `.contains` dispatches to the builtin range value. kt723/kt725/
+  kt2711 ALL FIXED — the classes crash trio is closed.
 - properties/fieldInsideField (1): an anonymous object's property with
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
 
-## Residue (clusters under five at 6016 / 338 / 3, 34d1a79f)
+## Residue (clusters under five at 6017 / 337 / 3, 34d1a79f)
 
 Every directory with five or more failures above has a fix or a verdict.
 The remaining failures, grouped by directory, are the seed of the next
@@ -299,3 +301,46 @@ campaign; the first column is the failure count.
 Crashes (3): the two `extensionFunctionWithExtensionInSAMInterface` files
 (unbounded recursion, verdict above) and `functions/nothisnoclosure` (the
 process memory cap: a 100k-iteration loop allocating a closure per call).
+
+## defaultArguments roots (2026-09-08, diagnosed)
+
+- implementedByFake/2/3 (3): a class `B : A(), I` inherits `f(x)` from the
+  superclass `A` (no default) and the DEFAULT for `f` from interface `I`
+  (`fun f(x: String = "1")`, no body). `b.f()` misses: A.f declines
+  undersupply (needs 1 arg), I.f is collected=0 (no body). The fix
+  synthesises the fake override — apply I's default thunk for the missing
+  param, then dispatch to A.f — at the arity-decline point in member
+  dispatch (host_call_member `[pmo] decline=undersupply`).
+- kt47073_nested (1): a LOCAL function's default `x = k` references the
+  ENCLOSING class property `k`; the default thunk (registerLocalFnDefaults
+  -> lowerExprAsParamThunk in stmt.zig) binds only the param prefix, no
+  enclosing `this`, so `k` is an unresolved global. The fix lowers the
+  thunk with the enclosing owner (lowerExprAsParamThunkScopedEnclosing)
+  AND threads the captured `this` into the local-fn default padding.
+
+## contextParameters state (2026-09-08, partial infra exists)
+
+The AST (`ContextParam`, `context_params` on Function/Property/AnonFun/
+FunctionTypeRef), lowering (`emitContextParamLoads` -> `CtxLoad`), and IR
+(`CtxScope`/`CtxCall`) already exist. BASIC supply WORKS: `context(a: C)
+fun greet() = a.v` called inside `with(C("OK"))` returns "OK". The 23
+failures are gaps, by sub-mechanism:
+- Default arg referencing a context param (`fun f(b: C = a)`): the plain-fn
+  default `a` is evaluated in the CALLER's scope (which has no `a`) ->
+  `unresolved global a`. Needs a callee-side default thunk that binds the
+  context params (like emitContextParamLoads), so the default reads the
+  runtime context stack. (contextParameterToDefaultArgument.)
+- `CtxLoad` returns `Nothing` (`get_field <ctx> on kotlin.Nothing`): the
+  context is not on the stack at the call — context PROPAGATION (a context
+  fn calling another, a context lambda, a nested/substituted context) is
+  incomplete. (kt52459, kt63430, substitutedContextReceivers,
+  contextualLocalFunWithExtensiionReceiver, contextPropertyInInterface,
+  propertyCompoundAssignment.)
+- Context-receiver member resolution / overloads (`call_member foo on
+  Nothing/ClassBoth`): companionObjectInContext, contextAndNoContextOverloads,
+  contextOnInvokeResolve, invokeOnTypeWithContext, dispatchExtension...,
+  sameExtension..., sameNameWith*.
+- inline/suspend/typealias context: contextualInlineCall, inlineContextParameter,
+  suspendContextParemetersWithExtension, typealiasOnTypeWithContext, kt51290,
+  kt51863, kt63430, arrayAccessCompositveOperators, choosingTheNearestContext.
+This is a feature completion across ~4 sub-mechanisms, not one fix.
