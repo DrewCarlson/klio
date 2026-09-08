@@ -3293,6 +3293,16 @@ fn buildModuleWithOverrides(
                     if (p.default) |default_expr| {
                         const bind_upto = @min(offset + idx, name_refs.items.len);
                         const widened = ir.lower.widenNumericLiteral(default_expr, &p.ty);
+                        // A default that references a CONTEXT parameter
+                        // (`context(a: C) fun f(b: C = a)`) resolves it the
+                        // way the body does: the thunk runs at call time with
+                        // the context on the stack, so stash the context
+                        // params for the thunk's `consumePendingCtx` to bind
+                        // via `CtxLoad` (cleared per thunk after it consumes).
+                        if (f.context_params.len != 0) {
+                            module.has_context_decls = true;
+                            module.pending_ctx = .{ .params = f.context_params, .type_params = f.type_params };
+                        }
                         const thunk_name = try std.fmt.allocPrint(a, "__default_{s}_{s}", .{ f.name.name, p.name.name });
                         const target_expr: *const ast.Expr = if (widened) |*w| w else default_expr;
                         const fid = try ir.lower.lowerExprAsParamThunk(module, name_refs.items[0..bind_upto], target_expr, thunk_name);
