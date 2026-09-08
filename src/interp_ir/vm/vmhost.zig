@@ -377,6 +377,7 @@ pub const VmHost = struct {
     pub const enclosingCompanionMember = host_fields.enclosingCompanionMember;
     pub const extensionFnFallback = host_call_member.extensionFnFallback;
     pub const instanceHasInvokeSurface = host_call_member.instanceHasInvokeSurface;
+    pub const instanceExtendsFunctionType = host_call_member.instanceExtendsFunctionType;
     pub const stampRefAdaptation = host_fields.stampRefAdaptation;
     pub const closureRefEquals = builtin_members.closureRefEquals;
     pub const fieldSiteRoute = host_fields.fieldSiteRoute;

@@ -2301,8 +2301,10 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
         }
         // A plain instance of a class extending a function type: its
         // `invoke` takes the call's arguments, and a receiver-form call
-        // (`r.fn()`, `R.() -> T`) passes the receiver as the first one.
-        if (name_v == null and host_call_member.instanceHasInvokeSurface(self, callee)) {
+        // (`r.fn()`, `R.() -> T`) passes the receiver as the first one. A
+        // mere `invoke` member (compose `MovableContent`) is NOT such a
+        // subtype and stays on its own dispatch.
+        if (name_v == null and host_call_member.instanceExtendsFunctionType(self, callee)) {
             const direct = try host_call_member.callMemberNamed(self, allocator, callee, "invoke", args, &.{});
             if (!host_call_member.isDispatchMissFor(direct, "invoke")) return direct;
             host_call_member.freeDispatchMiss(allocator, direct);
