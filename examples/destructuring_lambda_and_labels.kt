@@ -19,4 +19,13 @@ fun main() {
         for (j in 1..3) { if (j == 2) continue@inner; hits++ }
     }
     println(hits)
+
+    println(Widget.tag)
+}
+
+class Widget {
+    // `companion { ... }` is shorthand for `companion object { ... }`.
+    companion {
+        val tag = "W"
+    }
 }

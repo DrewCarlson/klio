@@ -502,12 +502,16 @@ pub fn parseCompanionObjectAsClass(
     visibility: Visibility,
     annotations: []Annotation,
 ) ?Class {
-    const kw = support.bump(p); // `object`
+    // The `object` keyword is OPTIONAL: `companion { ... }` is the
+    // shorthand for `companion object { ... }`. Consume it only when
+    // present; otherwise start at the (optional) name or the body `{`.
+    const kw_span = support.currentSpan(p);
+    if (std.meta.activeTag(support.peekKind(p).*) == .Keyword and support.peekKind(p).*.Keyword == .Object) _ = support.bump(p);
     // Optional companion name. If absent, name as "Companion".
     const name = if (std.meta.activeTag(support.peekKind(p).*) == .Ident)
         (support.parseIdent(p, "companion name") orelse return null)
     else
-        Ident{ .name = "Companion", .span = kw.span };
+        Ident{ .name = "Companion", .span = kw_span };
     const sup = parseOptionalSupertypesFull(p);
     const cb = parseClassBody(p);
     const end = p.tokens[p.pos -| 1].span;
@@ -541,7 +545,7 @@ pub fn parseCompanionObjectAsClass(
         .visibility = visibility,
         .primary_ctor_visibility = null,
         .annotations = annotations,
-        .span = kw.span.join(end),
+        .span = kw_span.join(end),
     };
 }
 
