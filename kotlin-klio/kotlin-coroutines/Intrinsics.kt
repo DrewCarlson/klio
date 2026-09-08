@@ -169,7 +169,8 @@ internal fun <T> startBlock(completion: Continuation<T>, body: () -> T): Any? {
     // resume the completion, keeping the synchronous no-double-complete contract.
     var suspended = false
     var delivered = false
-    val r = __klio_co_startRootOrSuspended(completion) {
+    val r = try {
+        __klio_co_startRootOrSuspended(completion) {
         __klio_co_pushScope(completion)
         try {
             val v = body()
@@ -197,8 +198,25 @@ internal fun <T> startBlock(completion: Continuation<T>, body: () -> T): Any? {
         } finally {
             __klio_co_popScope()
         }
+        }
+    } catch (e: Throwable) {
+        // The body parked, was resumed by the driving pump, and then threw:
+        // its starter already moved on, so the failure is the completion's.
+        if (!__klio_co_lastRootParkedOnce() || delivered) throw e
+        delivered = true
+        completion.resumeWith(Result.failure(e))
+        return kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
     }
     if (r === kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED) suspended = true
+    // The body parked and the pump drove it to completion before the start
+    // returned: the starter is owed COROUTINE_SUSPENDED, the completion the
+    // value.
+    if (!suspended && !delivered && __klio_co_lastRootParkedOnce()) {
+        delivered = true
+        @Suppress("UNCHECKED_CAST")
+        completion.resumeWith(Result.success(r as T))
+        return kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
+    }
     return r
 }
 

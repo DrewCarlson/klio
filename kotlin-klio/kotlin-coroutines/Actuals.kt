@@ -90,6 +90,11 @@ internal fun __klio_co_hasDriver(): Boolean = false
 @PublishedApi
 internal fun <T> __klio_co_startRootOrSuspended(scope: Any?, block: () -> T): Any? = block()
 
+// Whether the root body the last __klio_co_startRootOrSuspended ran parked
+// before it completed.
+@PublishedApi
+internal fun __klio_co_lastRootParkedOnce(): Boolean = false
+
 // --- the continuation klio hands to a suspendCoroutine block -------
 
 @PublishedApi

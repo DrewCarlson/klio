@@ -251,6 +251,7 @@ pub fn coro_park(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     ctx.host.coroutineArmSlot(slot);
+    ctx.host.coroutineNoteSuspensionHit();
     return .{ .err = .{ .Suspend = -1 } };
 }
 
@@ -272,6 +273,12 @@ pub fn coro_arm_slot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 pub fn coro_disarm_slot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     ctx.host.coroutineDisarmSlot();
     return .{ .ok = Value.Unit };
+}
+
+/// `__klio_co_lastRootParkedOnce()` — whether the root body the last
+/// `__klio_co_startRootOrSuspended` ran parked before it completed.
+pub fn coro_last_root_parked_once(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
+    return .{ .ok = .{ .Bool = ctx.host.coroutineLastRootParkedOnce() } };
 }
 
 /// `__klio_co_pushScope(scope)` — make `scope` the active coroutine

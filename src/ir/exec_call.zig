@@ -1223,7 +1223,14 @@ pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator,
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
     defer freeArgNames(allocator, names);
-    const invocable = valueInvocable(frame.module, callee_v);
+    var invocable = valueInvocable(frame.module, callee_v);
+    // A runtime-registered class (an object expression extending a
+    // function type) keeps its `invoke` outside the module registry.
+    if (!invocable and callee_v == .Instance) {
+        if (comptime @hasDecl(H, "instanceHasInvokeSurface")) {
+            invocable = host.instanceHasInvokeSurface(&callee_v);
+        }
+    }
     // A callable whose DECLARED params definitely refute the runtime
     // args is not the target — Kotlin resolved the call to the
     // same-named enclosing member overload; fall to the member arm.

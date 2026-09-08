@@ -2248,6 +2248,13 @@ pub fn loweredOwnedLocalTypeRef(b: *const FuncBuilder, ty: *const ast.TypeRef) A
 /// same-simple-name class from another package. A nested-class path
 /// (`Outer.Inner`) still maps to its lifted/mangled name.
 pub fn loweredCheckTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []const u8 {
+    // A function type checks as its erased `FunctionN` / `SuspendFunctionN`
+    // name, the arity counting a receiver, as kotlinc's `instanceof` does.
+    if (ty.function) |ft| {
+        const arity = ft.params.len + @as(usize, @intFromBool(ft.receiver != null));
+        const prefix: []const u8 = if (ft.is_suspend) "SuspendFunction" else "Function";
+        return std.fmt.allocPrint(b.allocator, "{s}{d}", .{ prefix, arity }) catch ty.name.name;
+    }
     if (ty.qualified_path) |qp| {
         if (lastTwoSegments(qp)) |key| {
             if (b.module.registry.mangled_nested.get(key)) |m| return m;

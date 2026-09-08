@@ -1354,6 +1354,24 @@ pub fn loweredTypeName(allocator: Allocator, ty: *const ast.TypeRef) Allocator.E
     return ty.name.name;
 }
 
+/// The erased names a class inherits from a function-type supertype
+/// (`class A : suspend Int.() -> Unit`): `Function{p}` in the lowering's
+/// receiver-excluded convention, `Function{p+1}` for a receiver form (the
+/// arity `is FunctionN` sees), and the `SuspendFunction` twins of both for
+/// a suspend type.
+pub fn functionSupertypeTags(allocator: Allocator, ft: *const ast.FunctionTypeRef) Allocator.Error![]const []const u8 {
+    var tags: std.ArrayList([]const u8) = .empty;
+    errdefer tags.deinit(allocator);
+    const p = ft.params.len;
+    try tags.append(allocator, try std.fmt.allocPrint(allocator, "Function{d}", .{p}));
+    if (ft.receiver != null) try tags.append(allocator, try std.fmt.allocPrint(allocator, "Function{d}", .{p + 1}));
+    if (ft.is_suspend) {
+        try tags.append(allocator, try std.fmt.allocPrint(allocator, "SuspendFunction{d}", .{p}));
+        if (ft.receiver != null) try tags.append(allocator, try std.fmt.allocPrint(allocator, "SuspendFunction{d}", .{p + 1}));
+    }
+    return tags.toOwnedSlice(allocator);
+}
+
 /// Lowered structural form of a declared type: the head keeps
 /// `loweredTypeName`'s rendering (so runtime overload matching, which
 /// reads only the head name and nullability, is unchanged) while `args`

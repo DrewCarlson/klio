@@ -1521,6 +1521,7 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.coroutines.__klio_co_newSlot", .f = result.coro_new_slot },
     .{ .fqn = "kotlin.coroutines.__klio_co_armSlot", .f = result.coro_arm_slot },
     .{ .fqn = "kotlin.coroutines.__klio_co_disarmSlot", .f = result.coro_disarm_slot },
+    .{ .fqn = "kotlin.coroutines.__klio_co_lastRootParkedOnce", .f = result.coro_last_root_parked_once },
     .{ .fqn = "kotlin.coroutines.__klio_co_park", .f = result.coro_park },
     .{ .fqn = "kotlin.coroutines.__klio_co_resume", .f = result.coro_resume },
     .{ .fqn = "kotlin.coroutines.__klio_co_runRoot", .f = result.coro_run_root },

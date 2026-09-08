@@ -5488,8 +5488,23 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 .primitive_zero = build.primitiveZeroFor(p),
             });
         }
-        var supertype_names = try allocator.alloc([]const u8, supertypes.len);
+        var fn_extra: usize = 0;
+        for (supertypes) |*t| if (t.function) |ft| {
+            const tags = try ir.lower.decl.functionSupertypeTags(allocator, ft);
+            fn_extra += tags.len - 1;
+        };
+        var supertype_names = try allocator.alloc([]const u8, supertypes.len + fn_extra);
+        var extra_slot: usize = supertypes.len;
         for (supertypes, 0..) |*t, i| {
+            if (t.function) |ft| {
+                const tags = try ir.lower.decl.functionSupertypeTags(allocator, ft);
+                supertype_names[i] = tags[0];
+                for (tags[1..]) |tag| {
+                    supertype_names[extra_slot] = tag;
+                    extra_slot += 1;
+                }
+                continue;
+            }
             supertype_names[i] = ir.build.anonScopeRename(t.name.name) orelse sup: {
                 // A qualified supertype (`object : Modifier.Node()`) names a
                 // lifted nested class registered under its mangled name

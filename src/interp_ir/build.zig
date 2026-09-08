@@ -5115,7 +5115,14 @@ fn buildClassDef(
     // An annotation class implicitly implements `kotlin.Annotation`: an
     // instance passes an `Annotation`-typed parameter and `is Annotation`.
     const annotation_supertype = c.is_annotation;
-    const extra: usize = @as(usize, @intFromBool(serializer_supertype)) + @as(usize, @intFromBool(annotation_supertype));
+    // A function-type supertype contributes its erased `FunctionN` names,
+    // the first in its own slot and the rest as extras.
+    var fn_extra: usize = 0;
+    for (c.supertypes) |*t| if (t.function) |ft| {
+        const tags = try ir.lower.decl.functionSupertypeTags(a, ft);
+        fn_extra += tags.len - 1;
+    };
+    const extra: usize = @as(usize, @intFromBool(serializer_supertype)) + @as(usize, @intFromBool(annotation_supertype)) + fn_extra;
     var supertype_names = try a.alloc([]const u8, c.supertypes.len + extra);
     var supertype_paths = try a.alloc(?[]const u8, c.supertypes.len + extra);
     {
@@ -5128,9 +5135,21 @@ fn buildClassDef(
         if (annotation_supertype) {
             supertype_names[slot] = "Annotation";
             supertype_paths[slot] = null;
+            slot += 1;
         }
+        for (c.supertypes, 0..) |*t, i| if (t.function) |ft| {
+            const tags = try ir.lower.decl.functionSupertypeTags(a, ft);
+            supertype_names[i] = tags[0];
+            supertype_paths[i] = null;
+            for (tags[1..]) |tag| {
+                supertype_names[slot] = tag;
+                supertype_paths[slot] = null;
+                slot += 1;
+            }
+        };
     }
     for (c.supertypes, 0..) |*t, i| {
+        if (t.function != null) continue;
         // A supertype naming a renamed file-private class resolves to the
         // mangled lift name; the rename is keyed by the reference's own
         // span file, matching the file scope of the declaration.
