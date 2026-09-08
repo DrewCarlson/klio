@@ -301,3 +301,19 @@ campaign; the first column is the failure count.
 Crashes (3): the two `extensionFunctionWithExtensionInSAMInterface` files
 (unbounded recursion, verdict above) and `functions/nothisnoclosure` (the
 process memory cap: a 100k-iteration loop allocating a closure per call).
+
+## defaultArguments roots (2026-09-08, diagnosed)
+
+- implementedByFake/2/3 (3): a class `B : A(), I` inherits `f(x)` from the
+  superclass `A` (no default) and the DEFAULT for `f` from interface `I`
+  (`fun f(x: String = "1")`, no body). `b.f()` misses: A.f declines
+  undersupply (needs 1 arg), I.f is collected=0 (no body). The fix
+  synthesises the fake override — apply I's default thunk for the missing
+  param, then dispatch to A.f — at the arity-decline point in member
+  dispatch (host_call_member `[pmo] decline=undersupply`).
+- kt47073_nested (1): a LOCAL function's default `x = k` references the
+  ENCLOSING class property `k`; the default thunk (registerLocalFnDefaults
+  -> lowerExprAsParamThunk in stmt.zig) binds only the param prefix, no
+  enclosing `this`, so `k` is an unresolved global. The fix lowers the
+  thunk with the enclosing owner (lowerExprAsParamThunkScopedEnclosing)
+  AND threads the captured `this` into the local-fn default padding.
