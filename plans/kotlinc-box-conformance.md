@@ -258,7 +258,7 @@ residue list (every cluster under five) as the seed of the next campaign.
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
 
-## Residue (clusters under five at 6017 / 337 / 3, 34d1a79f)
+## Residue (clusters under five at 6018 / 336 / 3, 34d1a79f)
 
 Every directory with five or more failures above has a fix or a verdict.
 The remaining failures, grouped by directory, are the seed of the next
