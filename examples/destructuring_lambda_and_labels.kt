@@ -12,4 +12,11 @@ fun main() {
     label@ val n = 10
     tag@ fun triple() = n * 3
     println(n + triple())
+
+    // A soft-keyword name (`inner`) works as a loop label.
+    var hits = 0
+    inner@ for (i in 1..3) {
+        for (j in 1..3) { if (j == 2) continue@inner; hits++ }
+    }
+    println(hits)
 }

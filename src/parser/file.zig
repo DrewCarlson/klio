@@ -420,6 +420,12 @@ pub fn skipModifiersWithFlagsLevel(p: *Parser, at_stmt_level: bool) ModifierFlag
         }
         switch (support.peekKind(p).*) {
             .Ident => {
+                // A soft-keyword-named modifier immediately followed by `@`
+                // is a LABEL, not a modifier (`inner@ for`, `data@ while`):
+                // leave it for the label/expression path.
+                if (kindAt(p, 1)) |nk| {
+                    if (std.meta.activeTag(nk) == .AtNoWs or std.meta.activeTag(nk) == .AtPostWs) return flags;
+                }
                 const t = support.text(p, support.currentSpan(p));
                 if (std.mem.eql(u8, t, "data")) {
                     flags.is_data = true;
