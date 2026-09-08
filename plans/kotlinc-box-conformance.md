@@ -8,9 +8,9 @@ git history under this file's name.
 
 ## State (2026-09-07, 8c8c613a, CI green)
 
-Census 5991 passed / 363 failed / 3 did not complete (994 excluded: the
+Census 6002 passed / 352 failed / 3 did not complete (994 excluded: the
 runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
-`BASELINE = 5991`, `MAX_FAILED = 363` in `src/itests/box_support.zig`.
+`BASELINE = 6002`, `MAX_FAILED = 352` in `src/itests/box_support.zig`.
 Landed since 5751/609: function-type `is`/`as` by arity, companion and
 enum-entry `invoke`, inner constructor refs, bound extension and vararg
 refs, property references reading extension properties, callable-typed
@@ -129,13 +129,13 @@ residue list (every cluster under five) as the seed of the next campaign.
   not equal to each other or to the plain reference; klio's references are
   closures keyed by function id, so two adaptations of one function
   compare equal.
-- coroutines (13 + intrinsicSemantics 5 + featureIntersection 5):
-  `intercepted`/`startCoroutineUninterceptedOrReturn`/
-  `suspendCoroutineUninterceptedOrReturn` need the continuation
-  interception model (a `ContinuationInterceptor` wrapping each resume);
-  `suspend` function types as supertypes (`suspendFunctionAsSupertype*`,
-  `suspendFunctionIsAs`, `...IsCheckWithArity`) need the
-  `SuspendFunctionN` interfaces; `handleResult` try/finally shapes
+- coroutines (mechanisms landed 8c8c613a..): function types as
+  supertypes, suspend is-checks, callable instances, and inline-resumed
+  `startCoroutineUninterceptedOrReturn`/
+  `suspendCoroutineUninterceptedOrReturn` are fixed. The remaining
+  interception trio (`intercepted`, `releaseIntercepted`,
+  `startCoroutineUninterceptedOrReturnInterception`) needs the
+  `ContinuationInterceptor` model (a wrapper counted per resume); `handleResult` try/finally shapes
   (`try*WithHandleResult`) expect the exception thrown from
   `handleResult` to unwind through the coroutine's finally blocks; the
   rest are single files (`accessorForSuspend`, `createCoroutinesOnManualInstances`,
@@ -155,15 +155,19 @@ residue list (every cluster under five) as the seed of the next campaign.
   entry in a `when` over an enum subject; the anonymous/local override
   with defaults (3) resolves `super.foo` on a local or anonymous override
   and renders `Unit`; `localInvokeExtension` (1).
-- secondaryConstructors (7): `fieldInitializerOptimization` expects the
-  JVM's elision of default-value field initializers (a field set from
-  the super constructor's virtual call keeps its value);
-  `superCallSecondary`/`innerClassesInheritance` interleave `init` blocks
-  and secondary constructor bodies in declaration order across the
-  chain; `clashingDefaultConstructors` picks among defaulted primary and
-  secondary constructors by argument types; `callFromLocalSubClass`,
-  `localClasses` (`$init$block` on a local class) and `varargs` (a mixed
-  spread in a super call) are single files.
+- secondaryConstructors (7, needs a fix — not JVM-only): two roots.
+  (1) LOCAL-class secondary constructors do not run — `synthLocalClassDef`
+  (`host_classes.zig`) registers a local class with `secondary_ctors =
+  &.{}`, and the build-time entry builder (`build.zig` ~3928) walks only
+  top-level `decls`, so a local `constructor() : this(...)` never runs the
+  primary's field init: `callFromLocalSubClass`, `clashingDefaultConstructors`,
+  `localClasses` fail with `get_field x on B`. The fix recurses the entry
+  builder into function-body classes (delegation-arg and body thunks
+  lowered in the local scope; capture-free cases first) or synthesises
+  entries at registration. (2) `init` blocks interleave with secondary
+  constructor bodies in DECLARATION order between the super call and the
+  body (`superCallSecondary`, `innerClassesInheritance`). `fieldInitializerOptimization`
+  and `varargs` are single files.
 - evaluate (rest): the unsigned `const val` verdict above covers
   `uintOperations`, `ulongOperations`, `unsignedConst`, `ubyteOperations`,
   `ushortOperations`; `kCallableName*` need `::name` on a KCallable
@@ -237,7 +241,7 @@ residue list (every cluster under five) as the seed of the next campaign.
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
 
-## Residue (clusters under five at 5991 / 363 / 3, 17cb100a)
+## Residue (clusters under five at 6004 / 350 / 3, 34d1a79f)
 
 Every directory with five or more failures above has a fix or a verdict.
 The remaining failures, grouped by directory, are the seed of the next

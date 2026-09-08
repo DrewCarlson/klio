@@ -753,7 +753,7 @@ fn extReceiverSpecificity(self: *VmHost, receiver: *const Value, ty_name: []cons
     if (isTopOrGenericType(ty_name)) return 0;
     const pn = std.mem.trimEnd(u8, simpleName(ty_name), "?");
     if (receiver.* == .Instance) {
-        if (instanceSubtypeDistance(self, receiver, pn)) |dist| {
+        if (instanceFunctionDistance(self, receiver, pn)) |dist| {
             const d: i32 = @intCast(@min(dist, @as(usize, 50)));
             return 100 - d;
         }
@@ -1110,6 +1110,9 @@ fn extArityApplicableTL(self: *VmHost, f: *const Func, want: usize, last_arg_cal
 fn receiverIsFunctionShaped(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
     switch (receiver.*) {
         .IrClosure, .Intrinsic, .BoundMethod => {},
+        // An instance of a class that extends a function type carries the
+        // erased `FunctionN` name in its supertype chain.
+        .Instance => return instanceFunctionDistance(self, receiver, pn) != null,
         else => return false,
     }
     const digits = pn["Function".len..];
@@ -2101,6 +2104,27 @@ fn invokeMemberExtFuncId(
 
 /// Distance from an instance's runtime class to `target` along the
 /// supertype graph, or `null` when unreachable.
+/// `instanceSubtypeDistance` for a target that may be an erased function
+/// name: the lowering names a receiver form `R.(P) -> T` by its value
+/// parameters alone (`Function{p}`), while a class extending the same
+/// type written `(R, P) -> T` records `Function{p+1}`; both spell one
+/// Kotlin type, so the receiver-form name also accepts the wider tag.
+fn instanceFunctionDistance(self: *VmHost, arg: *const Value, target: []const u8) ?usize {
+    if (instanceSubtypeDistance(self, arg, target)) |d| return d;
+    const prefix: []const u8 = if (std.mem.startsWith(u8, target, "SuspendFunction"))
+        "SuspendFunction"
+    else if (std.mem.startsWith(u8, target, "Function"))
+        "Function"
+    else
+        return null;
+    const digits = target[prefix.len..];
+    if (digits.len == 0) return null;
+    const n = std.fmt.parseInt(usize, digits, 10) catch return null;
+    var buf: [32]u8 = undefined;
+    const wider = std.fmt.bufPrint(&buf, "{s}{d}", .{ prefix, n + 1 }) catch return null;
+    return instanceSubtypeDistance(self, arg, wider);
+}
+
 fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const u8) ?usize {
     const inst = switch (arg.*) {
         .Instance => |i| i,
@@ -2388,7 +2412,7 @@ fn paramHasDefault(defaults: ?[]const ?FuncId, idx: usize) bool {
 /// it carries a SAM-conversion target, or its supertype closure names a
 /// `Function*` type (kotlinc: assignability needs the type relation — a
 /// class merely declaring an `invoke` member is not a Function subtype).
-fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
+pub fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
     // A class declaring `operator fun invoke` is function-like whatever its
     // nominal supertypes: a memo-wrapped ComposableLambdaImpl (22 invoke
     // overloads, no Function* supertype in common code) satisfies a

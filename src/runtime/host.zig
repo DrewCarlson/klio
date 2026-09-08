@@ -90,6 +90,11 @@ pub const IntrinsicHost = struct {
         coroutine_spawn_timeout: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_arm_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         coroutine_disarm_slot: ?*const fn (ctx: *anyopaque) void = null,
+        /// Whether the last root started by `startCoroutineUninterceptedOrReturn`
+        /// parked before it completed. `null` => false.
+        coroutine_last_root_parked_once: ?*const fn (ctx: *anyopaque) bool = null,
+        /// Note that a suspension boundary was crossed. `null` => no-op.
+        coroutine_note_suspension_hit: ?*const fn (ctx: *anyopaque) void = null,
         /// Mark the pump owning `slot` as driven by an external dispatcher (a
         /// `runTest` `TestCoroutineScheduler`): a channel delivery to one of its
         /// waiters routed through that dispatcher, not the pump queue. `null` =>
@@ -232,6 +237,15 @@ pub const IntrinsicHost = struct {
 
     pub fn coroutineDisarmSlot(self: IntrinsicHost) void {
         if (self.vtable.coroutine_disarm_slot) |f| f(self.ctx);
+    }
+
+    pub fn coroutineLastRootParkedOnce(self: IntrinsicHost) bool {
+        if (self.vtable.coroutine_last_root_parked_once) |f| return f(self.ctx);
+        return false;
+    }
+
+    pub fn coroutineNoteSuspensionHit(self: IntrinsicHost) void {
+        if (self.vtable.coroutine_note_suspension_hit) |f| f(self.ctx);
     }
 
     pub fn coroutinePushScope(self: IntrinsicHost, scope: *const Value) void {

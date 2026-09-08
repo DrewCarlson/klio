@@ -100,6 +100,14 @@ pub fn isConcreteCastTarget(self: *VmHost, name: []const u8) bool {
 
 /// Whether a closure body kept an unconstrained parser-injected `it`
 /// (see `Func.lambda_it_unconstrained`).
+fn closureIsSuspend(self: *VmHost, body_func: ir.FuncId, sub_module: ?*const ir.Module) bool {
+    const mg = self.module.borrow();
+    defer mg.deinit();
+    const m = sub_module orelse mg.get();
+    const f = m.funcById(body_func) orelse return false;
+    return f.is_suspend;
+}
+
 fn closureItUnconstrained(self: *VmHost, body_func: ir.FuncId, sub_module: ?*const ir.Module) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -283,17 +291,22 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     switch (value.*) {
         .IrClosure => |c| {
             if (std.mem.eql(u8, ty.name, "Function")) return true;
-            if (std.mem.startsWith(u8, ty.name, "Function")) {
-                const rest = ty.name["Function".len..];
+            const is_suspend_name = std.mem.startsWith(u8, ty.name, "SuspendFunction");
+            if (is_suspend_name or std.mem.startsWith(u8, ty.name, "Function")) {
+                const rest = ty.name[(if (is_suspend_name) "SuspendFunction".len else "Function".len)..];
                 if (rest.len != 0 and allAsciiDigit(rest)) {
                     // `FunctionN` names an arity: the closure's declared
                     // parameters plus its receiver (`Foo.() -> R` is
                     // `Function1<Foo, R>`), the way kotlinc's `instanceof`
-                    // sees it.
+                    // sees it. A suspend closure is `SuspendFunctionN` and,
+                    // carrying its continuation, `Function(N+1)`.
                     const want = std.fmt.parseInt(usize, rest, 10) catch return true;
                     const info = self.closures.get(c.id) orelse return true;
                     var have = info.n_params + @as(usize, @intFromBool(info.has_receiver));
                     if (info.n_params == 1 and closureItUnconstrained(self, info.body_func, info.module)) have -= 1;
+                    const suspend_body = closureIsSuspend(self, info.body_func, info.module);
+                    if (is_suspend_name) return suspend_body and want == have;
+                    if (suspend_body) have += 1;
                     return want == have;
                 }
             }
@@ -416,7 +429,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                     if (containsStr(&builtin_exception_names, sup) and
                         containsStr(&builtin_exception_names, target_simple)) return true;
                 }
-                if (cdef.is_anonymous) {
+                if (cdef.is_anonymous or target_fqn == null) {
                     for (cdef.supertype_names) |n| {
                         if (std.mem.eql(u8, n, target_simple)) return true;
                     }
@@ -501,6 +514,9 @@ fn supertypeNameChainMatches(
         const name = queue.items[head];
         if (containsStr(seen.items, name)) continue;
         seen.append(a, name) catch return false;
+        // A supertype with no class of its own (an erased `FunctionN`
+        // name, a builtin interface) matches the target by name.
+        if (target_fqn == null and std.mem.eql(u8, name, target_simple)) return true;
         const def = classDefByNameLocal(self, name) orelse continue;
         defer def.deinit();
         const dg = def.borrow();
@@ -639,9 +655,26 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
             .primitive_zero = build.primitiveZeroFor(p),
         });
     }
-    var supertype_names = try allocator.alloc([]const u8, class.supertypes.len);
-    var supertype_paths = try allocator.alloc(?[]const u8, class.supertypes.len);
+    var fn_extra: usize = 0;
+    for (class.supertypes) |*t| if (t.function) |ft| {
+        const tags = try ir.lower.decl.functionSupertypeTags(allocator, ft);
+        fn_extra += tags.len - 1;
+    };
+    var supertype_names = try allocator.alloc([]const u8, class.supertypes.len + fn_extra);
+    var supertype_paths = try allocator.alloc(?[]const u8, class.supertypes.len + fn_extra);
+    var extra_slot: usize = class.supertypes.len;
     for (class.supertypes, 0..) |*t, i| {
+        if (t.function) |ft| {
+            const tags = try ir.lower.decl.functionSupertypeTags(allocator, ft);
+            supertype_names[i] = tags[0];
+            supertype_paths[i] = null;
+            for (tags[1..]) |tag| {
+                supertype_names[extra_slot] = tag;
+                supertype_paths[extra_slot] = null;
+                extra_slot += 1;
+            }
+            continue;
+        }
         supertype_names[i] = t.name.name;
         supertype_paths[i] = t.qualified_path;
     }
@@ -669,6 +702,9 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 const module = mg.get();
+                // An erased function-type tag past the written supertypes
+                // names no class.
+                if (i >= class.supertypes.len) break :static null;
                 const file = class.supertypes[i].name.span.file;
                 const cid = if (qualified) |path|
                     module.classIdByQualifiedSuffix(path)

@@ -2735,6 +2735,7 @@ pub fn coroutineHasDriver() bool {
 /// is 0 when nothing was pushed.
 pub const UndispatchedEnter = struct { base: usize, ident: usize };
 pub fn undispatchedFlatEnter(scope: *const Value) UndispatchedEnter {
+    root_suspension_hit = false;
     const base = activeScopeDepth();
     const g = ActiveScopeGuard.enter(scope);
     return .{ .base = base, .ident = if (g.pushed) g.ident else 0 };
@@ -2759,6 +2760,7 @@ pub fn undispatchedFlatLeaveIdent(ident: usize) void {
 /// this thread (the barrier prepare handles that branch).
 pub fn rootPumpFlatEnter(allocator: Allocator, scope: *const Value) Allocator.Error!?UndispatchedEnter {
     if (coroTop() != null) return null;
+    root_suspension_hit = false;
     try coroPush(allocator);
     if (!vmhost.scheduler.onPoolWorker()) (coroTop().?).claimNow();
     const base = activeScopeDepth();
@@ -2825,6 +2827,7 @@ pub fn coroutineStartRootOrSuspended(self: *VmIntrinsicHost, scope: ?*const Valu
         const scope_base = activeScopeDepth();
         var guard = ActiveScopeGuard.enter(scope_v);
         defer guard.leave();
+        root_suspension_hit = false;
         switch (try intrinsic_host.evalClosureRaw(self, block, &.{}, scope_v, out)) {
             .ok => |v| return .{ .ok = v },
             .err => |e| switch (e) {
@@ -2915,6 +2918,31 @@ pub fn coroutineArmSlot(self: *VmIntrinsicHost, slot: i64) void {
 pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
     _ = self;
     if (coroTop()) |top| top.clearPendingSlot();
+}
+
+/// Whether the most recent `coroutineStartRootOrSuspended` on this thread
+/// saw its root body park before completing.
+threadlocal var last_root_parked_once: bool = false;
+
+/// Set by `coroutineArmSuspensionHit` (from `coro_park`) whenever a
+/// suspension boundary is crossed; reset when an undispatched start begins
+/// its body. Read by `__klio_co_lastRootParkedOnce` to tell a start that
+/// crossed a suspension point (even one resumed inline before the block
+/// returned) from one that ran straight through.
+threadlocal var root_suspension_hit: bool = false;
+
+pub fn coroutineNoteSuspensionHit(self: *VmIntrinsicHost) void {
+    _ = self;
+    root_suspension_hit = true;
+}
+
+pub fn coroutineResetSuspensionHit() void {
+    root_suspension_hit = false;
+}
+
+pub fn coroutineLastRootParkedOnce(self: *VmIntrinsicHost) bool {
+    _ = self;
+    return root_suspension_hit;
 }
 
 /// Push the active coroutine scope for an undispatched block running

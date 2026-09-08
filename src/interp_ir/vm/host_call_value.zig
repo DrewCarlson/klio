@@ -2299,6 +2299,19 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
             }
             return mr;
         }
+        // A plain instance of a class extending a function type: its
+        // `invoke` takes the call's arguments, and a receiver-form call
+        // (`r.fn()`, `R.() -> T`) passes the receiver as the first one.
+        if (name_v == null and host_call_member.instanceHasInvokeSurface(self, callee)) {
+            const direct = try host_call_member.callMemberNamed(self, allocator, callee, "invoke", args, &.{});
+            if (!host_call_member.isDispatchMissFor(direct, "invoke")) return direct;
+            host_call_member.freeDispatchMiss(allocator, direct);
+            var all: std.ArrayList(Value) = .empty;
+            defer all.deinit(allocator);
+            try all.append(allocator, this_value.*);
+            try all.appendSlice(allocator, args);
+            return host_call_member.callMemberNamed(self, allocator, callee, "invoke", all.items, &.{});
+        }
     }
     var sink = self.out_sink.clone();
     defer sink.deinit();

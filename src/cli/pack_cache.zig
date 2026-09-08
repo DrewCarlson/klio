@@ -478,6 +478,7 @@ fn loadEmbeddedStdlibSources(
         "kotlin.coroutines.__klio_co_park",
         "kotlin.coroutines.__klio_co_resume",
         "kotlin.coroutines.__klio_co_runRoot",
+        "kotlin.coroutines.__klio_co_lastRootParkedOnce",
     };
     for (platform_fqns) |fqn| {
         if (merged.resolve(fqn)) |f| {

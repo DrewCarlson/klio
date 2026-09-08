@@ -385,6 +385,14 @@ pub fn coroutineDisarmSlot(self: *VmIntrinsicHost) void {
     coroutines.coroutineDisarmSlot(self);
 }
 
+pub fn coroutineLastRootParkedOnce(self: *VmIntrinsicHost) bool {
+    return coroutines.coroutineLastRootParkedOnce(self);
+}
+
+pub fn coroutineNoteSuspensionHit(self: *VmIntrinsicHost) void {
+    coroutines.coroutineNoteSuspensionHit(self);
+}
+
 pub fn coroutinePushScope(self: *VmIntrinsicHost, scope: *const Value) void {
     _ = self;
     coroutines.coroutinePushScope(scope);

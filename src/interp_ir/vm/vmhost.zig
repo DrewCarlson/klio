@@ -376,6 +376,7 @@ pub const VmHost = struct {
     pub const enclosingEnumEntryByOwner = host_fields.enclosingEnumEntryByOwner;
     pub const enclosingCompanionMember = host_fields.enclosingCompanionMember;
     pub const extensionFnFallback = host_call_member.extensionFnFallback;
+    pub const instanceHasInvokeSurface = host_call_member.instanceHasInvokeSurface;
     pub const stampRefAdaptation = host_fields.stampRefAdaptation;
     pub const closureRefEquals = builtin_members.closureRefEquals;
     pub const fieldSiteRoute = host_fields.fieldSiteRoute;
@@ -542,6 +543,12 @@ fn ivCoroutineArmSlot(ctx: *anyopaque, slot: i64) void {
 fn ivCoroutineDisarmSlot(ctx: *anyopaque) void {
     intrinsic_host.coroutineDisarmSlot(ip(ctx));
 }
+fn ivCoroutineLastRootParkedOnce(ctx: *anyopaque) bool {
+    return intrinsic_host.coroutineLastRootParkedOnce(ip(ctx));
+}
+fn ivCoroutineNoteSuspensionHit(ctx: *anyopaque) void {
+    intrinsic_host.coroutineNoteSuspensionHit(ip(ctx));
+}
 fn ivCoroutinePushScope(ctx: *anyopaque, scope: *const Value) void {
     intrinsic_host.coroutinePushScope(ip(ctx), scope);
 }
@@ -639,6 +646,8 @@ const intrinsic_vtable: IntrinsicHost.VTable = .{
     .coroutine_spawn_timeout = ivCoroutineSpawnTimeout,
     .coroutine_arm_slot = ivCoroutineArmSlot,
     .coroutine_disarm_slot = ivCoroutineDisarmSlot,
+    .coroutine_last_root_parked_once = ivCoroutineLastRootParkedOnce,
+    .coroutine_note_suspension_hit = ivCoroutineNoteSuspensionHit,
     .coroutine_push_scope = ivCoroutinePushScope,
     .coroutine_pop_scope = ivCoroutinePopScope,
     .coroutine_resume_slot_value = ivCoroutineResumeSlotValue,
