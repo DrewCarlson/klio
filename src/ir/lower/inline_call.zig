@@ -187,6 +187,14 @@ pub fn gateReceiverHead(b: *const FuncBuilder, receiver: *const Expr) Allocator.
             if (nm2.len == 0) return null;
             return nm2;
         },
+        // `x!!` fixes the receiver's static type to the NON-null projection
+        // of `x`'s: `this!!.inc()` inside `operator fun Int?.inc()` is a
+        // builtin `Int.inc`, not a re-entrant call to the nullable
+        // extension (the caller trims the `?`).
+        .Postfix => |pf| if (pf.op == .NotNull)
+            return (try gateReceiverHead(b, pf.expr))
+        else
+            return null,
         else => return null,
     }
 }
