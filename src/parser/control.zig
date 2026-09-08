@@ -1007,7 +1007,16 @@ pub fn parseLambdaHeader(p: *Parser) LambdaHeader {
                     const sp = lparen.span.join(rparen.span);
                     const outer = std.fmt.allocPrint(p.allocator, "$$dest_{d}", .{local.items.len}) catch @panic("OOM in parser");
                     local.append(p.allocator, .{ .name = outer, .span = sp }) catch @panic("OOM in parser");
-                    local_tys.append(p.allocator, null) catch @panic("OOM in parser");
+                    // A destructuring lambda parameter may carry a type
+                    // annotation on the whole group: `{ (a, b): Pair<A, B> -> … }`.
+                    var dest_ty: ?TypeRef = null;
+                    support.skipNl(p);
+                    if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
+                        _ = support.bump(p);
+                        dest_ty = parseType(p);
+                        support.skipNl(p);
+                    }
+                    local_tys.append(p.allocator, dest_ty) catch @panic("OOM in parser");
                     pending_dest.append(p.allocator, .{
                         .idx = local.items.len - 1,
                         .names = entries.names,

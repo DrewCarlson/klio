@@ -72,6 +72,25 @@ pub fn skipStmtSeparators(p: *Parser) void {
 // Single match-dispatch over statement-leading tokens; splitting would fragment it.
 pub fn parseStmt(p: *Parser) ?Stmt {
     const save = p.pos;
+    // A label before a local DECLARATION (`a@ val x = 1`, `b@ fun f() = 2`)
+    // is a no-op at runtime; consume the `ident@` so the declaration parses.
+    // A label before an EXPRESSION or loop (`loop@ for(...)`) keeps its
+    // meaning and is handled by the expression path, so only strip the
+    // label here when a declaration keyword follows it.
+    if (std.meta.activeTag(support.peekKind(p).*) == .Ident and
+        p.pos + 2 < p.tokens.len and
+        (std.meta.activeTag(p.tokens[p.pos + 1].kind) == .AtNoWs or
+            std.meta.activeTag(p.tokens[p.pos + 1].kind) == .AtPostWs) and
+        std.meta.activeTag(p.tokens[p.pos + 2].kind) == .Keyword and
+        switch (p.tokens[p.pos + 2].kind.Keyword) {
+            .Val, .Var, .Fun => true,
+            else => false,
+        })
+    {
+        _ = support.bump(p); // label ident
+        _ = support.bump(p); // `@`
+        support.skipNl(p);
+    }
     const flags = file.skipModifiersWithFlagsLevel(p, true);
     switch (support.peekKind(p).*) {
         .LParen => {
