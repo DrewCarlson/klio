@@ -829,6 +829,24 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .IsCheck => |ck| {
             const s = try lowerExpr(b, ck.expr);
             const dst = b.allocReg();
+            // A function-type `is` check tests the erased `FunctionN` /
+            // `SuspendFunctionN` name (the arity counting a receiver), as
+            // kotlinc's `instanceof` does. A cast to a function type stays
+            // erased (`loweredCheckTypeName`), matching kotlinc's arity-only
+            // CHECKCAST that never narrows past the value already being a
+            // function.
+            if (ck.ty.function) |ft| {
+                const arity = ft.params.len + @as(usize, @intFromBool(ft.receiver != null));
+                const prefix: []const u8 = if (ft.is_suspend) "SuspendFunction" else "Function";
+                const fname = std.fmt.allocPrint(b.allocator, "{s}{d}", .{ prefix, arity }) catch ck.ty.name.name;
+                try b.push(.{ .InstanceOf = .{ .dst = dst, .src = s, .ty = .{ .name = fname, .nullable = ck.ty.nullable, .args = &.{} } } });
+                if (ck.negated) {
+                    const neg = b.allocReg();
+                    try b.push(.{ .Not = .{ .dst = neg, .src = dst } });
+                    return neg;
+                }
+                return dst;
+            }
             // An enclosing splice's reified parameter is substituted here,
             // NULLABILITY included. Leaving the parameter name for the
             // runtime to resolve through its bound class value loses the
@@ -2248,13 +2266,6 @@ pub fn loweredOwnedLocalTypeRef(b: *const FuncBuilder, ty: *const ast.TypeRef) A
 /// same-simple-name class from another package. A nested-class path
 /// (`Outer.Inner`) still maps to its lifted/mangled name.
 pub fn loweredCheckTypeName(b: *const FuncBuilder, ty: *const ast.TypeRef) []const u8 {
-    // A function type checks as its erased `FunctionN` / `SuspendFunctionN`
-    // name, the arity counting a receiver, as kotlinc's `instanceof` does.
-    if (ty.function) |ft| {
-        const arity = ft.params.len + @as(usize, @intFromBool(ft.receiver != null));
-        const prefix: []const u8 = if (ft.is_suspend) "SuspendFunction" else "Function";
-        return std.fmt.allocPrint(b.allocator, "{s}{d}", .{ prefix, arity }) catch ty.name.name;
-    }
     if (ty.qualified_path) |qp| {
         if (lastTwoSegments(qp)) |key| {
             if (b.module.registry.mangled_nested.get(key)) |m| return m;
