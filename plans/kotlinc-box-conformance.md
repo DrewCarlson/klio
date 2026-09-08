@@ -317,3 +317,30 @@ process memory cap: a 100k-iteration loop allocating a closure per call).
   enclosing `this`, so `k` is an unresolved global. The fix lowers the
   thunk with the enclosing owner (lowerExprAsParamThunkScopedEnclosing)
   AND threads the captured `this` into the local-fn default padding.
+
+## contextParameters state (2026-09-08, partial infra exists)
+
+The AST (`ContextParam`, `context_params` on Function/Property/AnonFun/
+FunctionTypeRef), lowering (`emitContextParamLoads` -> `CtxLoad`), and IR
+(`CtxScope`/`CtxCall`) already exist. BASIC supply WORKS: `context(a: C)
+fun greet() = a.v` called inside `with(C("OK"))` returns "OK". The 23
+failures are gaps, by sub-mechanism:
+- Default arg referencing a context param (`fun f(b: C = a)`): the plain-fn
+  default `a` is evaluated in the CALLER's scope (which has no `a`) ->
+  `unresolved global a`. Needs a callee-side default thunk that binds the
+  context params (like emitContextParamLoads), so the default reads the
+  runtime context stack. (contextParameterToDefaultArgument.)
+- `CtxLoad` returns `Nothing` (`get_field <ctx> on kotlin.Nothing`): the
+  context is not on the stack at the call — context PROPAGATION (a context
+  fn calling another, a context lambda, a nested/substituted context) is
+  incomplete. (kt52459, kt63430, substitutedContextReceivers,
+  contextualLocalFunWithExtensiionReceiver, contextPropertyInInterface,
+  propertyCompoundAssignment.)
+- Context-receiver member resolution / overloads (`call_member foo on
+  Nothing/ClassBoth`): companionObjectInContext, contextAndNoContextOverloads,
+  contextOnInvokeResolve, invokeOnTypeWithContext, dispatchExtension...,
+  sameExtension..., sameNameWith*.
+- inline/suspend/typealias context: contextualInlineCall, inlineContextParameter,
+  suspendContextParemetersWithExtension, typealiasOnTypeWithContext, kt51290,
+  kt51863, kt63430, arrayAccessCompositveOperators, choosingTheNearestContext.
+This is a feature completion across ~4 sub-mechanisms, not one fix.
