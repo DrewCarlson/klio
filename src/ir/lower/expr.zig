@@ -12510,7 +12510,9 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         if (b.thisNarrow()) |h| {
             return .{ .name = b.allocator.dupe(u8, std.mem.trimEnd(u8, h, "?")) catch h, .nullable = false, .args = &.{} };
         }
-        return null;
+        // Un-narrowed `this`: fall through to the normal derivation below
+        // (returning null here would strip the receiver type from every
+        // `this.method()` call).
     }
     // `x!!` has `x`'s type made NON-null: a member call on it resolves
     // against the non-null type, so `this!!.inc()` inside `Int?.inc` binds
