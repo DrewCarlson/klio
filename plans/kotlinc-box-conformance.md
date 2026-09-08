@@ -187,11 +187,17 @@ residue list (every cluster under five) as the seed of the next campaign.
   by name and pick among `f(Int)`/`f(String)`/`Boolean.f()`; `kt3684`,
   `objectLiteral`, `thisRefToObjectInNestedClassConstructorCall` are
   single files.
-- properties (6): `classFieldInsideLocalInSetter`, `companionFieldInsideLambda`,
-  `fieldInsideField` (verdict above), `genericWithSameName`, `kt4140`
-  (`field++` inside a getter), `privatePropertyInConstructor` (a private
-  constructor property shadowed by a subclass's same-named property; the
-  instance's field storage is keyed by name alone).
+- properties (6, needs a fix — not JVM-only): backing-field access from
+  nested scopes. `kt4140` (`field++` in a COMPANION getter) returns
+  1,1,2 not 1,2,3 — the getter's `field` write targets a non-canonical
+  companion instance on first access (a companion-materialization
+  mechanism, cf. the imported-companion-val-baking dedup fix; a plain
+  class/object getter's `field++` is correct). `companionFieldInsideLambda`
+  shares that root. `classFieldInsideLocalInSetter` (a local fn in a setter
+  writing `field`), `fieldInsideField` (verdict above), `genericWithSameName`,
+  `privatePropertyInConstructor` (a private constructor property shadowed
+  by a subclass's same-named property; instance field storage is keyed by
+  name alone) are separate roots.
 - operatorConventions (3 left): the lvalue-caching mechanism landed (a
   member target's receiver is evaluated before the value; an indexed
   target's receiver and indices are evaluated once for the read and the
