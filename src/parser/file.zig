@@ -228,6 +228,22 @@ pub fn parseImports(p: *Parser) []ImportDecl {
 
 pub fn parseTopDecl(p: *Parser) ?Decl {
     const flags = skipModifiersWithFlags(p);
+    // `companion { ... }` / `companion Name { ... }` — the `object` keyword
+    // omitted (shorthand for `companion object`). When `companion` was the
+    // last modifier and no `object` follows, route to the companion parser,
+    // which now consumes `object` only when present.
+    if (flags.is_companion and !atKeyword(p, .Object)) {
+        const at_body = switch (support.peekKind(p).*) {
+            .LBrace => true,
+            .Ident => true,
+            else => false,
+        };
+        if (at_body) {
+            const c = class.parseCompanionObjectAsClass(p, flags.visibility, flags.annotations.items);
+            if (c) |cls| return Decl{ .Class = cls };
+            return null;
+        }
+    }
     switch (support.peekKind(p).*) {
         .Keyword => |kw| switch (kw) {
             .Fun => {

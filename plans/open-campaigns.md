@@ -9,8 +9,8 @@ work lands; close a document when its exit conditions are met.
 ## The active plan
 
 `kotlinc-box-conformance.md`: the box residue campaign — drive every
-remaining box failure to a fix or a JVM-only verdict. Census 6018 / 336 / 3
-at 7be21d63, ratchet 6018 / 336 (from 5991 / 363). The three mandated
+remaining box failure to a fix or a JVM-only verdict. Census 6022 / 331 / 4
+at 7be21d63, ratchet 6022 / 331 (from 5991 / 363). The three mandated
 crashes are FIXED. Landed mechanisms this campaign: function-types-as-
 supertypes, assignment order, unsigned const-vals, companion getters,
 multi-index operators, the smart-cast/`!!`/range-name crash trio, and the
