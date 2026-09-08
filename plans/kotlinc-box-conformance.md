@@ -221,10 +221,14 @@ residue list (every cluster under five) as the seed of the next campaign.
   with 32-argument masks (`innerClass32Args`, `memberFunctionManyArgs`),
   fake overrides with defaults (`implementedByFake*`, `funInTraitChain`),
   `kt36188*`, `kt36853_fibonacci`, `kt47073_nested`, `incWithDefaultInGetter`.
-- arrays (5): the two-index verdict above (2), `nonLocalReturnArrayConstructor`
+- arrays (2 left): the multi-index `a[i, j]` / `a[i, j] = v` operator is
+  FIXED — a builtin collection's `get`/`set` no longer swallows the extra
+  index; `stdlibMemberDispatch` declines an over-arity `get`(>1)/`set`(>2)
+  so the user operator resolves (`collectionGetMultiIndex`,
+  `collectionAssignGetMultiIndex`). Remaining: `nonLocalReturnArrayConstructor`
   (a non-local `return` from an `Array(n) { }` initializer: the constructor
   is an intrinsic, not an inline splice), `kt4348` (`operator fun
-  String.get(vararg)`), `primitiveArrays`.
+  String.get(vararg)`).
 - delegatedProperty (remaining 13, cluster 6): `delegateToNull`/
   `delegateToSingleton` (a `val x by null`/object delegate),
   `delegateWithPrivateSet` (`Delegates.notNull` unresolved),

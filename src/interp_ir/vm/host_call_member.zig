@@ -11612,6 +11612,15 @@ fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     // express wins resolution; decline so the walk's extension fallback
     // runs its body (declaration decides, the registry only serves).
     if (declaredLambdaOverloadWins(self, name, args)) return null;
+    // A multi-index `a[i, j]` / `a[i, j] = v` desugars to `a.get(i, j)` /
+    // `a.set(i, j, v)`, which only a user-declared operator provides — the
+    // builtin indexed `get` takes ONE index and `set` takes (index, value).
+    // Decline the over-arity call (args exclude the receiver) so the
+    // extension fallback resolves the user operator instead of the builtin
+    // silently dropping the extra index. Returned BEFORE the resolution
+    // cache so the normal 1-index / (index,value) forms are unaffected.
+    if (std.mem.eql(u8, name, "get") and args.len > 1) return null;
+    if (std.mem.eql(u8, name, "set") and args.len > 2) return null;
     const type_fqn = receiver.typeFqn();
     // Resolution cache: the winning intrinsic (or "none") is a pure function
     // of (type, name, args-empty), so memoize it and skip the per-call probe
