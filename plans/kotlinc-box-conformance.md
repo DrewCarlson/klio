@@ -8,9 +8,9 @@ git history under this file's name.
 
 ## State (2026-09-07, 8c8c613a, CI green)
 
-Census 5991 passed / 363 failed / 3 did not complete (994 excluded: the
+Census 6002 passed / 352 failed / 3 did not complete (994 excluded: the
 runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
-`BASELINE = 5991`, `MAX_FAILED = 363` in `src/itests/box_support.zig`.
+`BASELINE = 6002`, `MAX_FAILED = 352` in `src/itests/box_support.zig`.
 Landed since 5751/609: function-type `is`/`as` by arity, companion and
 enum-entry `invoke`, inner constructor refs, bound extension and vararg
 refs, property references reading extension properties, callable-typed
@@ -129,13 +129,13 @@ residue list (every cluster under five) as the seed of the next campaign.
   not equal to each other or to the plain reference; klio's references are
   closures keyed by function id, so two adaptations of one function
   compare equal.
-- coroutines (13 + intrinsicSemantics 5 + featureIntersection 5):
-  `intercepted`/`startCoroutineUninterceptedOrReturn`/
-  `suspendCoroutineUninterceptedOrReturn` need the continuation
-  interception model (a `ContinuationInterceptor` wrapping each resume);
-  `suspend` function types as supertypes (`suspendFunctionAsSupertype*`,
-  `suspendFunctionIsAs`, `...IsCheckWithArity`) need the
-  `SuspendFunctionN` interfaces; `handleResult` try/finally shapes
+- coroutines (mechanisms landed 8c8c613a..): function types as
+  supertypes, suspend is-checks, callable instances, and inline-resumed
+  `startCoroutineUninterceptedOrReturn`/
+  `suspendCoroutineUninterceptedOrReturn` are fixed. The remaining
+  interception trio (`intercepted`, `releaseIntercepted`,
+  `startCoroutineUninterceptedOrReturnInterception`) needs the
+  `ContinuationInterceptor` model (a wrapper counted per resume); `handleResult` try/finally shapes
   (`try*WithHandleResult`) expect the exception thrown from
   `handleResult` to unwind through the coroutine's finally blocks; the
   rest are single files (`accessorForSuspend`, `createCoroutinesOnManualInstances`,
@@ -237,7 +237,7 @@ residue list (every cluster under five) as the seed of the next campaign.
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
 
-## Residue (clusters under five at 5991 / 363 / 3, 17cb100a)
+## Residue (clusters under five at 6002 / 352 / 3, 34d1a79f)
 
 Every directory with five or more failures above has a fix or a verdict.
 The remaining failures, grouped by directory, are the seed of the next

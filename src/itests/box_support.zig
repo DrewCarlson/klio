@@ -51,8 +51,8 @@ pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 /// from a local's declared type: 5716 / 638. Ranges: `in` desugars to
 /// `contains`, extensions serve non-element arguments, progression math in
 /// the element domain: 5751 / 609.
-pub const BASELINE: usize = 5991;
-pub const MAX_FAILED: usize = 363;
+pub const BASELINE: usize = 6002;
+pub const MAX_FAILED: usize = 352;
 
 /// Directives that bind a test to a framework feature klio has no
 /// counterpart for: a backend restriction, a second module, reflection,
