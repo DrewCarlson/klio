@@ -9,12 +9,19 @@ work lands; close a document when its exit conditions are met.
 ## The active plan
 
 `kotlinc-box-conformance.md`: the box residue campaign — drive every
-remaining box failure to a fix or a JVM-only verdict. Census 6022 / 331 / 4
-at 7be21d63, ratchet 6022 / 331 (from 5991 / 363). The three mandated
-crashes are FIXED. Landed mechanisms this campaign: function-types-as-
-supertypes, assignment order, unsigned const-vals, companion getters,
-multi-index operators, the smart-cast/`!!`/range-name crash trio, and the
-context-param default argument. NOT YET fixed/verdicted (diagnosed in the
+remaining box failure to a fix or a JVM-only verdict. Census 6031 / 325 / 1
+at b3c55ec9, **zero crashes**, ratchet 6031 / 325 (from 5991 / 363). All
+three mandated crashes are now genuinely fixed: the memory-cap file
+(`nothisnoclosure` — a function-typed local in a `while` body misparsed as
+a lambda) and the SAM-extension pair (an abstract member extension of a
+`fun interface` on a function type, dispatched through a `with` receiver).
+Landed mechanisms this campaign: function-types-as-supertypes, assignment
+order, unsigned const-vals, companion getters, multi-index operators, the
+smart-cast/`!!`/range-name crash trio, the context-param default argument,
+the `multiDecl` positional-destructuring cluster (bare-`_` placeholder,
+escaped `` `_` `` name, single-element `component1()`, full form,
+escaped-name templates), the loop-body-function-local parse fix, and the
+SAM member-extension dispatch. NOT YET fixed/verdicted (diagnosed in the
 plan): the remaining >=5 clusters are large features or multi-part
 restructures — contextParameters (22: use-site context supply, member
 properties, resolution/overloads, inline/suspend), adapted references (14),

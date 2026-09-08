@@ -6,6 +6,7 @@ const ast = @import("ast");
 const ir = @import("../ir.zig");
 const build = @import("../build.zig");
 const expr = @import("expr.zig");
+const stmt_mod = @import("stmt.zig");
 
 const Allocator = std.mem.Allocator;
 const FuncBuilder = build.FuncBuilder;
@@ -21,11 +22,12 @@ pub fn lowerFor(
     b: *FuncBuilder,
     vars: []const ast.Ident,
     by_name: bool,
+    destructured: bool,
     sources: []const ast.Ident,
     iter: *const Expr,
     body: *const Expr,
 ) Allocator.Error!Reg {
-    return lowerForLabeled(b, vars, by_name, sources, iter, body, null);
+    return lowerForLabeled(b, vars, by_name, destructured, sources, iter, body, null);
 }
 
 
@@ -37,6 +39,7 @@ pub fn lowerForLabeled(
     b: *FuncBuilder,
     vars: []const ast.Ident,
     by_name: bool,
+    destructured: bool,
     sources: []const ast.Ident,
     iter: *const Expr,
     body: *const Expr,
@@ -48,7 +51,7 @@ pub fn lowerForLabeled(
     // calls per iteration. The iterator form dominated the interpreter's
     // loop profile (two CallVirtuals per iteration plus the range fields).
     // `KLIO_COUNTED=0` restores the iterator lowering for bisection.
-    if (vars.len == 1 and !by_name and countedEnabled()) counted: {
+    if (vars.len == 1 and !by_name and !destructured and countedEnabled()) counted: {
         var lo_e: ?*const Expr = null;
         var hi_e: ?*const Expr = null;
         var inclusive = false;
@@ -459,7 +462,7 @@ pub fn lowerForLabeled(
         .n_args = 0,
         .arg_names = &.{},
     } });
-    if (vars.len == 1 and !by_name) {
+    if (vars.len == 1 and !by_name and !destructured) {
         try b.bind(vars[0].name, next_reg);
         if (try expr.iterableElementTypeName(b, iter)) |elem| {
             try b.setLocalDeclTypeOwned(vars[0].name, .{
@@ -477,7 +480,7 @@ pub fn lowerForLabeled(
             const dst = b.allocReg();
             const field = try b.module.internConst(b.allocator, .{ .String = sources[i].name });
             try b.push(.{ .GetField = .{ .dst = dst, .receiver = next_reg, .field = field } });
-            if (std.mem.eql(u8, v.name, "_")) continue;
+            if (stmt_mod.isUnderscorePlaceholder(v)) continue;
             try b.bind(v.name, dst);
         }
     } else {
@@ -486,6 +489,9 @@ pub fn lowerForLabeled(
         var elem_ty = try expr.iterableElementTypeRef(b, iter);
         defer if (elem_ty) |*t| t.deinit(b.allocator);
         for (vars, 0..) |v, i| {
+            // A bare positional `_` skips its `componentN()` call entirely
+            // (kotlinc never invokes the accessor for a discarded slot).
+            if (stmt_mod.isUnderscorePlaceholder(v)) continue;
             const comp = b.allocReg();
             const comp_name = try std.fmt.allocPrint(b.allocator, "component{d}", .{i + 1});
             const nm = try b.module.internConst(b.allocator, .{ .String = comp_name });

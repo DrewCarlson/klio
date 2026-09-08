@@ -1554,7 +1554,12 @@ pub fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []
         pn = std.mem.trimEnd(u8, simpleName(t), "?");
     }
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
-    if (std.mem.startsWith(u8, pn, "Function")) return true;
+    // A function type: `Function0`/`Function1`/... or the interpreter's
+    // `<function>` marker for a receiver written as `T.() -> R`. A member
+    // extension declared on a function type (a SAM whose abstract method is
+    // `(Int.() -> String).accept()`) records its receiver head this way, and
+    // any callable value satisfies it.
+    if (std.mem.startsWith(u8, pn, "Function") or std.mem.eql(u8, pn, "<function>")) return true;
     // A short all-caps head is a TYPE PARAMETER (`T`, `R`, `E1`), which any
     // receiver satisfies -- unless the program declares a class of that name,
     // in which case it is that user type and must be proven like any other.
@@ -7351,8 +7356,38 @@ fn samAbstractExtRecvType(self: *VmHost, name: []const u8) ?[]const u8 {
 /// The extension receiver comes off the enclosing tower: the innermost `this` that
 /// implements the interface method's declared receiver type (the coordinator, a
 /// `MeasureScope`).
-fn samMemberExtOnCallable(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+/// Whether the enclosing `this` chain holds a fun-interface (SAM) instance
+/// whose abstract member extension is `name`. When one is present the call
+/// belongs to `enclosingSamMemberExtDispatch` — the callable receiver is the
+/// abstract method's EXTENSION receiver, not a SAM-converted body — so
+/// `samMemberExtOnCallable` (which would invoke the receiver as the body)
+/// must stand down.
+fn enclosingSamInstanceHandles(self: *VmHost, allocator: Allocator, name: []const u8) Allocator.Error!bool {
+    const entries = try ir.eval.enclosingEntriesAlloc(allocator);
+    defer allocator.free(entries);
+    for (entries) |e| {
+        if (e.v != .Instance) continue;
+        var cls_name: []const u8 = undefined;
+        {
+            const g = e.v.Instance.borrow();
+            defer g.deinit();
+            if (g.get().get("__sam_target__") == null) continue;
+            const cg = g.get().class.borrow();
+            cls_name = cg.get().name;
+            cg.deinit();
+        }
+        if (samMemberExtRecvType(self, cls_name, name) != null) return true;
+    }
+    return false;
+}
+
+fn samMemberExtOnCallable(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8,args: []const Value) Allocator.Error!?EvalResult {
     const recv_ty = samAbstractExtRecvType(self, name) orelse return null;
+    // Stand down when an enclosing SAM instance owns this abstract method:
+    // the callable receiver is then the extension receiver, not the body,
+    // and `enclosingSamMemberExtDispatch` serves it through the instance's
+    // wrapped target.
+    if (try enclosingSamInstanceHandles(self, allocator, name)) return null;
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
     for (entries) |e| {
@@ -7384,6 +7419,17 @@ fn enclosingSamMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver: 
         }
         const recv_ty = samMemberExtRecvType(self, cls_name, name) orelse continue;
         if (!receiverImplementsType(self, receiver, recv_ty)) continue;
+        // The abstract slot's extension receiver maps to the wrapped
+        // callable. A bound callable reference (`x::foo`) or plain function
+        // value takes it as the leading ARGUMENT; a receiver lambda
+        // (`F { … this … }`) takes it as `this`.
+        if (isBoundReference(&target.?)) {
+            const call_args = try allocator.alloc(Value, args.len + 1);
+            defer allocator.free(call_args);
+            call_args[0] = receiver.*;
+            @memcpy(call_args[1..], args);
+            return try callValueRec(self, allocator, &target.?, call_args);
+        }
         return try host_call_value.callValueWithThis(self, allocator, &target.?, receiver, args, &.{});
     }
     return null;

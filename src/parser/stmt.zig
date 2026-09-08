@@ -91,6 +91,7 @@ pub fn parseStmt(p: *Parser) ?Stmt {
         _ = support.bump(p); // `@`
         support.skipNl(p);
     }
+    const before_mods = p.pos;
     const flags = file.skipModifiersWithFlagsLevel(p, true);
     switch (support.peekKind(p).*) {
         .LParen => {
@@ -102,6 +103,19 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                 return parseNameBasedDestructuringStmt(p);
             }
             return parseFallthroughStmt(p, save);
+        },
+        .LBracket => {
+            // `[val a, val b] = expr` / `[a, b] = expr` — the positional
+            // full form at statement level opens with `[` and carries no
+            // leading `val`/`var`. A statement-leading `[` is only ever a
+            // positional destructuring in Kotlin (there is no array literal
+            // expression), so route it there. But a soft-keyword identifier
+            // (`data`, `value`, ...) is wrongly eaten as a modifier above,
+            // leaving its `[` index access at the switch: if modifiers were
+            // consumed, this `[` is a postfix index, not a destructuring, so
+            // rewind and parse the statement as an expression.
+            if (p.pos != before_mods) return parseFallthroughStmt(p, save);
+            return parseBracketDestructuringStmt(p);
         },
         .Keyword => |kw| switch (kw) {
             .Val, .Var => {
@@ -292,6 +306,25 @@ pub fn parseDestructuringDecl(p: *Parser) ?Stmt {
 pub fn parseNameBasedDestructuringStmt(p: *Parser) ?Stmt {
     const open = support.bump(p); // `(`
     const entries = control.parseDestructEntries(p, .RParen, false, "destructured name") orelse return null;
+    _ = support.expect(p, .Eq, "`=`") orelse return null;
+    support.skipNl(p);
+    const init = expr.parseExpr(p) orelse return null;
+    const sp = open.span.join(init.span());
+    return Stmt{ .DestructuringDecl = .{
+        .mutable = entries.any_var,
+        .names = entries.names,
+        .by_name = entries.by_name,
+        .sources = entries.sources,
+        .init = init,
+        .span = sp,
+    } };
+}
+
+/// The positional full form at statement level, `[val a, val b] = x` or
+/// `[a, b] = x`, which opens with `[` and carries no leading keyword.
+pub fn parseBracketDestructuringStmt(p: *Parser) ?Stmt {
+    const open = support.bump(p); // `[`
+    const entries = control.parseDestructEntries(p, .RBracket, true, "destructured name") orelse return null;
     _ = support.expect(p, .Eq, "`=`") orelse return null;
     support.skipNl(p);
     const init = expr.parseExpr(p) orelse return null;

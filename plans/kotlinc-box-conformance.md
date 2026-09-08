@@ -6,11 +6,35 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-07, 8c8c613a, CI green)
+## State (2026-09-08, b3c55ec9, CI green)
 
-Census 6002 passed / 352 failed / 3 did not complete (994 excluded: the
-runner now also skips `DONT_TARGET_EXACT_BACKEND: JVM*` files). Ratchet
-`BASELINE = 6002`, `MAX_FAILED = 352` in `src/itests/box_support.zig`.
+Census 6031 passed / 325 failed / 1 did not complete, **zero crashes**
+(994 excluded: the runner also skips `DONT_TARGET_EXACT_BACKEND: JVM*`
+files). Ratchet `BASELINE = 6031`, `MAX_FAILED = 325` in
+`src/itests/box_support.zig`.
+
+All three goal crashes are fixed. `functions/nothisnoclosure.kt`: a
+function-typed local in a `while`/`do-while` body was misparsed as a
+lambda because the arrow inside its `(Int) -> Unit` type read as a lambda
+header arrow; the loop body became a never-invoked closure and spun to the
+memory cap. `lambdaHasHeader` now ends its header scan at a `val`/`var`/
+`fun` keyword, `=`, or `;` at brace depth zero. The SAM-extension pair
+(`callableReference/function/` and `extensionFunctions/`
+`extensionFunctionWithExtensionInSAMInterface.kt`): a `fun interface`
+whose abstract method is a member extension on a function type, dispatched
+through a `with` receiver, now resolves — `<function>` receiver heads
+count as callable-satisfied, a bound-reference target takes the extension
+receiver as its argument (a lambda target as `this`), and the
+callable-receiver SAM arm stands down when an enclosing SAM instance owns
+the method.
+
+The `multiDecl` positional-destructuring cluster is closed: a bare `_` is
+a skip placeholder (no bind, no `componentN()` call), a backtick-escaped
+`` `_` `` is a real name (distinguished by the identifier span length),
+single-element `[b]`/`for ([b] in xs)` reads `component1()` via a new
+`For.destructured` flag, the full form `[val a, val b] = x` parses at
+statement level, and the short-form string template interpolates an
+escaped name (`` $`_` ``).
 Landed since 5751/609: function-type `is`/`as` by arity, companion and
 enum-entry `invoke`, inner constructor refs, bound extension and vararg
 refs, property references reading extension properties, callable-typed

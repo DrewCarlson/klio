@@ -383,8 +383,10 @@ pub fn parseFor(p: *Parser) ?Expr {
     var vars: []Ident = undefined;
     var for_by_name = false;
     var var_sources: []Ident = &.{};
+    var destructured = false;
     const opener = std.meta.activeTag(support.peekKind(p).*);
     if (opener == .LParen or opener == .LBracket) {
+        destructured = true;
         _ = support.bump(p);
         const entries = parseDestructEntries(
             p,
@@ -417,6 +419,7 @@ pub fn parseFor(p: *Parser) ?Expr {
     return Expr{ .For = .{
         .vars = vars,
         .by_name = for_by_name,
+        .destructured = destructured,
         .var_sources = var_sources,
         .var_ty = var_ty,
         .iter = box(p, iter),
@@ -908,7 +911,18 @@ pub fn lambdaHasHeader(p: *const Parser) bool {
     while (i < p.tokens.len) : (i += 1) {
         switch (p.tokens[i].kind) {
             .Arrow => if (depth == 0) return true,
-            .Keyword => |kw| if (depth == 0 and kw == .As) return false,
+            // A declaration keyword, `=`, or `;` at the brace's top level
+            // before any header `->` means these braces are a block body,
+            // not a lambda: none can appear in a lambda parameter list. This
+            // guards a `->` that belongs to a function-TYPE annotation
+            // (`{ val u: (Int) -> Unit = { }; … }`) — the `(Int)` parens
+            // close before the arrow, dropping it to depth 0 where it would
+            // otherwise read as a header arrow.
+            .Keyword => |kw| if (depth == 0) switch (kw) {
+                .As, .Val, .Var, .Fun => return false,
+                else => {},
+            },
+            .Eq, .Semicolon => if (depth == 0) return false,
             .LParen, .LBracket, .LBrace => {
                 depth += 1;
             },

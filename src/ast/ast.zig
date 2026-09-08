@@ -873,6 +873,11 @@ pub const Expr = union(enum) {
         vars: []Ident,
         /// `for ((val k, val v) in xs)`: name-based, see `DestructuringDecl`.
         by_name: bool = false,
+        /// True when the source wrote a `(...)`/`[...]` group, even a
+        /// single-element one like `for ([b] in xs)`. Distinguishes a
+        /// one-element destructuring (calls `component1()`) from a plain
+        /// single loop variable `for (x in xs)` (binds the element).
+        destructured: bool = false,
         var_sources: []Ident = &.{},
         var_ty: ?TypeRef,
         iter: *Expr,
