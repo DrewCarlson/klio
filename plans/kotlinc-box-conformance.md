@@ -344,3 +344,27 @@ failures are gaps, by sub-mechanism:
   suspendContextParemetersWithExtension, typealiasOnTypeWithContext, kt51290,
   kt51863, kt63430, arrayAccessCompositveOperators, choosingTheNearestContext.
 This is a feature completion across ~4 sub-mechanisms, not one fix.
+
+## context WORKS/GAPS map (2026-09-08b)
+
+Verified with minimal repros:
+- WORKS: top-level context fn (`context(c) fun f()=c.v` under `with`);
+  top-level context property getter; member context FUNCTION; a default
+  arg referencing a context param (FIXED this session, func_defaults +
+  method-defaults now set `pending_ctx` for the thunk's `consumePendingCtx`).
+- GAP (propagation / use-site supply): a member context PROPERTY read
+  (`Holder().prop`) lowers to a plain `GetField prop`, which does NOT push
+  the ambient context, so the getter's `CtxLoad` misses and the body's `c`
+  falls back to an owner-member access -> `get_field c on Holder`. Same
+  root as the other `get_field <ctx> on Nothing/<owner>` cases
+  (member-ext with context, local contextual fn, nested/substituted
+  contexts): the USE SITE must supply the ambient context to the callee.
+  The fn-call path does this (CtxCall); property reads, member-ext
+  dispatch, and local contextual fns do not. Fixing use-site context
+  supply for these forms closes ~8-10 of the 22.
+- GAP (resolution/overloads): companionObjectInContext,
+  contextAndNoContextOverloads, contextOnInvokeResolve, invokeOnTypeWithContext,
+  dispatch/sameExtension/sameName* — context-receiver-aware overload and
+  member resolution.
+- GAP (inline/suspend/typealias): contextualInlineCall, inlineContextParameter,
+  suspendContextParemetersWithExtension, typealiasOnTypeWithContext, etc.
