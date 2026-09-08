@@ -6,12 +6,22 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-08, b3c55ec9, CI green)
+## State (2026-09-09, fake-override, CI green)
 
-Census 6031 passed / 325 failed / 1 did not complete, **zero crashes**
+Census 6038 passed / 318 failed / 1 did not complete, **zero crashes**
 (994 excluded: the runner also skips `DONT_TARGET_EXACT_BACKEND: JVM*`
-files). Ratchet `BASELINE = 6031`, `MAX_FAILED = 325` in
+files). Ratchet `BASELINE = 6038`, `MAX_FAILED = 318` in
 `src/itests/box_support.zig`.
+
+Non-local break/continue from an inline lambda now targets the CALL-SITE
+loop, not the inline function's own loop (`loopWithinInlineFunction`,
+`withReturnValueNested`). Loop frames pushed while lowering an inline
+function's body carry `from_inline_fn_body`; while a spliced lambda body
+lowers, `loopFor` skips them. Still open in the cluster:
+`inlineFunctionWithMultipleParameters` (a parenthesized non-trailing lambda
+arg is not spliced inline, so its break/continue is a no-op),
+`inlineConstructor` (LabeledReturn), `breakInLoopConditions`, and the
+`lambdaPassedToInlineFunction` deep-nesting DNC.
 
 All three goal crashes are fixed. `functions/nothisnoclosure.kt`: a
 function-typed local in a `while`/`do-while` body was misparsed as a
@@ -333,14 +343,35 @@ process memory cap: a 100k-iteration loop allocating a closure per call).
   (`fun f(x: String = "1")`, no body). `b.f()` misses: A.f declines
   undersupply (needs 1 arg), I.f is collected=0 (no body). The fix
   synthesises the fake override — apply I's default thunk for the missing
-  param, then dispatch to A.f — at the arity-decline point in member
-  dispatch (host_call_member `[pmo] decline=undersupply`).
-- kt47073_nested (1): a LOCAL function's default `x = k` references the
-  ENCLOSING class property `k`; the default thunk (registerLocalFnDefaults
-  -> lowerExprAsParamThunk in stmt.zig) binds only the param prefix, no
-  enclosing `this`, so `k` is an unresolved global. The fix lowers the
-  thunk with the enclosing owner (lowerExprAsParamThunkScopedEnclosing)
-  AND threads the captured `this` into the local-fn default padding.
+  param, then dispatch to A.f. LANDED 2026-09-09 (`fakeOverrideInheritedDefault`
+  at the instance-MISS tail): +5 files to 6038/318. A first attempt at the
+  miss tail regressed coroutines 1299->1289 (channel ProduceTest/
+  BroadcastTest): the fallback fired for a deep channel member whose call
+  returning `Vm::call_member` is pattern-matched by downstream host
+  dispatch, and a success there preempts it. `!is_suspend` + exact
+  `defaults.len == f.params.len` gates were not enough. THE GATE THAT
+  WORKED: the body method must come from a DIRECT superclass of the
+  receiver and the default from a DIRECT interface (`B : A(), I` — both
+  first-level parents); a channel's many-layered hierarchy is not this
+  shape, so the walk is a single pass over the receiver's direct
+  supertypes, not a recursive class-chain BFS. Verified coroutines back to
+  1299/0.
+- kt47073_nested + closures/kt5589 (2): a LOCAL function's default
+  references the ENCLOSING scope — a class property (`x = k` = `this.k`,
+  kt47073) or a plain enclosing local (`y = x`, kt5589). The default thunk
+  (registerLocalFnDefaults -> lowerExprAsParamThunk in stmt.zig) binds only
+  the param prefix, so the reference is an unresolved global. ARCHITECTURAL
+  MISMATCH confirmed 2026-09-09: local-fn defaults are MODULE-LEVEL thunk
+  FuncIds filled at dispatch (host_call_value ~1117 `callFunc(dfid, args)`),
+  but the enclosing state they need (`this`, an enclosing local) is
+  PER-CLOSURE-INSTANCE — a `LoadCapture` in the thunk cannot resolve under
+  the standalone `callFunc`, and inline-padding at the call site needs the
+  default AST retained per call site. The fix is feature-scale: either
+  (a) capture the defaults' free enclosing names into the local-fn closure
+  and thread the closure's captures to the thunk at the fill dispatch, or
+  (b) inline-pad the default in the enclosing scope at the local-fn call
+  site. Closure captures ARE named-accessible at dispatch
+  (`info.capture_names`), so (a) is viable but multi-part.
 
 ## contextParameters state (2026-09-08, partial infra exists)
 

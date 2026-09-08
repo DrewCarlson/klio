@@ -687,6 +687,108 @@ pub fn inheritedMemberDefaults(self: *VmHost, allocator: Allocator, supertypes: 
 
 /// Find a function-typed property `name` reachable from the enclosing-this
 /// chain or any of those instances' `outer` links.
+/// A fake override inheriting a default: the receiver's class inherits `name`'s
+/// BODY from a superclass (whose own parameters carry no default) and the
+/// DEFAULT from an interface (a bodyless declaration). An undersupplied call
+/// declines the superclass body, so fill the omitted parameters from the
+/// interface's default thunk and dispatch the inherited body.
+fn fakeOverrideInheritedDefault(
+    self: *VmHost,
+    allocator: Allocator,
+    receiver: *const Value,
+    name: []const u8,
+    args: []const Value,
+) Allocator.Error!?EvalResult {
+    if (receiver.* != .Instance) return null;
+    var stypes: std.ArrayList([]const u8) = .empty;
+    defer stypes.deinit(allocator);
+    {
+        const g = receiver.Instance.borrow();
+        const cg = g.get().class.borrow();
+        for (cg.get().supertype_names) |s| stypes.append(allocator, s) catch {};
+        cg.deinit();
+        g.deinit();
+    }
+    if (stypes.items.len == 0) return null;
+    const defaults = (try inheritedMemberDefaults(self, allocator, stypes.items, name)) orelse return null;
+    defer allocator.free(defaults);
+
+    const mg = self.module.borrow();
+    var mg_open = true;
+    defer if (mg_open) mg.deinit();
+    const mod = mg.get();
+
+    // Direct supertypes only: the fake-override shape declares the body
+    // superclass and the default interface side by side (`B : A(), I`),
+    // both direct parents. A deep hierarchy (a channel's many layers of
+    // Send/Receive channels) is NOT this shape, and intercepting a member
+    // there preempts the coroutine host dispatch it needs.
+    var method_fid: ?FuncId = null;
+    {
+        var direct: std.ArrayList([]const u8) = .empty;
+        defer direct.deinit(allocator);
+        {
+            const g = receiver.Instance.borrow();
+            const cg = g.get().class.borrow();
+            for (cg.get().supertype_names) |sn| direct.append(allocator, sn) catch {};
+            cg.deinit();
+            g.deinit();
+        }
+        for (direct.items) |cn| {
+            var is_iface = false;
+            const fqn: []const u8 = blk: {
+                const cgr = self.classes.borrow();
+                defer cgr.deinit();
+                if (cgr.get().get(cn)) |d| {
+                    const dg = d.borrow();
+                    defer dg.deinit();
+                    is_iface = dg.get().is_interface;
+                    break :blk dg.get().fqn;
+                }
+                break :blk cn;
+            };
+            // The inherited BODY comes from a superCLASS, not an interface.
+            if (is_iface) continue;
+            for (mod.memberDecls(fqn, name)) |fid| {
+                const f = funcAt(mod, fid) orelse continue;
+                if (!f.hasBody()) continue;
+                // A suspend member dispatches through the coroutine machinery.
+                if (f.is_suspend) continue;
+                // The interface default's slot layout must match the body
+                // method's parameters exactly (a genuine fake override).
+                if (defaults.len != f.params.len) continue;
+                const has_this = f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this");
+                const user_params = f.params.len - @intFromBool(has_this);
+                if (args.len < user_params) {
+                    method_fid = fid;
+                    break;
+                }
+            }
+            if (method_fid != null) break;
+        }
+    }
+    const fid = method_fid orelse return null;
+    const f = funcAt(mod, fid) orelse return null;
+    var provided = try allocator.alloc(Value, 1 + args.len);
+    defer allocator.free(provided);
+    provided[0] = receiver.*;
+    @memcpy(provided[1..], args);
+    if (provided.len >= f.params.len) return null;
+
+    const padded = switch (try padArgsWithDefaultsFor(self, allocator, mod, f.params.len, provided, defaults, f.params)) {
+        .ok => |p| p,
+        .err => |e| return .{ .err = e },
+    };
+    defer allocator.free(padded);
+    // Release the module borrow before dispatching: `invokeMethodFuncId`
+    // takes its own.
+    mg.deinit();
+    mg_open = false;
+    // `invokeMethodFuncId` takes the receiver separately; the value arguments
+    // are the padded list past the leading receiver slot.
+    return try invokeMethodFuncId(self, allocator, receiver, fid, padded[1..]);
+}
+
 fn enclosingCallableProperty(self: *VmHost, allocator: Allocator, name: []const u8) Allocator.Error!?Value {
     var work: std.ArrayList(Value) = .empty;
     defer work.deinit(allocator);
@@ -6215,6 +6317,12 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
             }
         }
         if (try composeMemberPairRetry(self, allocator, receiver, name, args, strict_ext, static_recv, no_ext, declared_recv)) |r| return r;
+        // A fake override inheriting a default from an interface: the class
+        // inherits `f`'s BODY from a superclass (no default) and `f`'s DEFAULT
+        // from an interface (bodyless). An undersupplied `b.f()` declines the
+        // superclass body (its own params carry no default). Fill the gap from
+        // the interface's default thunk, then run the inherited body.
+        if (try fakeOverrideInheritedDefault(self, allocator, receiver, name, args)) |r| return r;
         const g = receiver.Instance.borrow();
         defer g.deinit();
         const cg = g.get().class.borrow();

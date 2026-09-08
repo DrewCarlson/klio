@@ -1233,7 +1233,17 @@ pub fn spliceInlineLambdaOn(
     // The spliced body sits where the call sits: a tail-position call
     // hands its tail position to the last statement of the lambda.
     b.tail_pos = b.tail_call_ok;
+    // The lambda body is lexically the caller's: while it lowers, the callee's
+    // own loops (`from_inline_fn_body`) must not capture the lambda's
+    // `break`/`continue`. Suspend the inline-fn-body flag (so loops the lambda
+    // introduces are its own) and mark the spliced region so `loopFor` skips
+    // callee loops on the stack.
+    const prev_inline_fn_body = b.lowering_inline_fn_body;
+    b.lowering_inline_fn_body = 0;
+    b.in_spliced_lambda_body += 1;
     const v = try lowerBlock(b, &body);
+    b.in_spliced_lambda_body -= 1;
+    b.lowering_inline_fn_body = prev_inline_fn_body;
     b.inline_stack_visible_base = prev_decl_base;
     if (encl_pushed) {
         b.encl_tower_depth -= 1;
@@ -4036,6 +4046,14 @@ pub fn tryInlineCallWithTypeArgs(
         b.switchTo(region);
         b.setLrAbsorb(region, f.name.name, join, result);
     }
+    // Lowering the callee's OWN body: its loops are lexical for its own
+    // `break`/`continue`, so suspend any enclosing spliced-lambda context
+    // (an inline call inside a spliced lambda must not let that lambda's
+    // skip-callee-loops rule swallow the callee's own break). A lambda the
+    // body itself splices re-enters that context through spliceInlineLambdaOn.
+    const prev_in_spliced = b.in_spliced_lambda_body;
+    b.in_spliced_lambda_body = 0;
+    b.lowering_inline_fn_body += 1;
     const body_val = switch (body.*) {
         // Lower an expression body with the inline function's own declared
         // return type as the expected (tail-position) type — exactly as a
@@ -4051,6 +4069,8 @@ pub fn tryInlineCallWithTypeArgs(
         },
         .Block => |*blk| try lowerBlock(b, blk),
     };
+    b.lowering_inline_fn_body -= 1;
+    b.in_spliced_lambda_body = prev_in_spliced;
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
     if (ext_splice) b.lambda_splice_resolve = prev_splice_window;
     b.terminate(.{ .Goto = join });
