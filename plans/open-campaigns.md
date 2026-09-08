@@ -8,13 +8,24 @@ work lands; close a document when its exit conditions are met.
 
 ## The active plan
 
-`kotlinc-box-conformance.md`: the box residue. Census 6018 / 336 / 3 at
-34d1a79f, ratchet 6018 / 336; every cluster of five or more
-has a fix or a recorded verdict, and the residue table there (clusters
-under five, grouped by directory) is the work list: fix by mechanism,
-ship an `examples/` program per fix, ratchet after every landed batch,
-never edit the corpus. The conformance backlog (Stage 2 Task 4 and the
-safe-tier decision) closed 2026-09-07; its records are in git history.
+`kotlinc-box-conformance.md`: the box residue campaign — drive every
+remaining box failure to a fix or a JVM-only verdict. Census 6018 / 336 / 3
+at 7be21d63, ratchet 6018 / 336 (from 5991 / 363). The three mandated
+crashes are FIXED. Landed mechanisms this campaign: function-types-as-
+supertypes, assignment order, unsigned const-vals, companion getters,
+multi-index operators, the smart-cast/`!!`/range-name crash trio, and the
+context-param default argument. NOT YET fixed/verdicted (diagnosed in the
+plan): the remaining >=5 clusters are large features or multi-part
+restructures — contextParameters (22: use-site context supply, member
+properties, resolution/overloads, inline/suspend), adapted references (14),
+defaultArguments (fake-override; local-fn default enclosing this),
+collectionLiterals, secondaryConstructors (3 roots), coroutine interception,
+inline (callable-ref-to-local, local inline ext), overloadedLocalFunction
+(var-vs-fn namespace), and the residue/singletons. Priority by payoff:
+context use-site supply, then adapted references, then fake-override
+defaults. Fix by mechanism, ship an `examples/` program per fix, ratchet
+after every batch, never edit the corpus. The conformance backlog (Stage 2
+Task 4 and the safe-tier decision) closed 2026-09-07; records in git history.
 Standing gates: every library census at baseline, compose plugin 1390 / 0,
 stdlib sweep 117 files clean, CI green (unit plus eight shards).
 
