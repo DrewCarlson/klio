@@ -209,8 +209,11 @@ residue list (every cluster under five) as the seed of the next campaign.
 - functions/localFunctions (6): the nested-scope overload verdict above
   (2), `kt4119`, `kt4783`/`kt4784` (a local function whose receiver is a
   type parameter), `kt4989`.
-- classes (6): the `Int?.inc` smart-cast verdict above (3),
-  `extensionFunWithDefaultParam`, `kt2477`, `nestedInitBlocksWithLambda`.
+- classes (4 left): the `Int?.inc` smart-cast/`!!` recursion is FIXED for
+  kt723 and kt725 (a `!!`-asserted or `if (this != null)`-narrowed receiver
+  resolves against the NON-null type -> builtin `Int.inc`, not the nullable
+  extension). Remaining: kt2711 (below), `extensionFunWithDefaultParam`,
+  `kt2477`, `nestedInitBlocksWithLambda`.
 - callableReference/function (6): `extensionFunctionLocal` (two local
   extensions of the same name told apart by receiver type),
   `extensionWithNestedFunction`, `genericCallableReferenceWithReifiedTypeParam`,
@@ -244,10 +247,11 @@ residue list (every cluster under five) as the seed of the next campaign.
   so the first applicable overload wins.
 - inlineClasses/inlineClassCollection (6): the `zs.contains(object {} as
   Any)` verdict above (a value class implementing `List<Z>`).
-- classes/kt723, kt725, kt2711 (3): inside `operator fun Int?.inc()`,
-  `this.inc()` after a null check must bind the MEMBER `Int.inc` through
-  the smart cast; the lowering has no smart-cast record for `this`, so
-  the call re-enters the extension until the evaluation depth cap.
+- classes/kt2711 (1): a user class NAMED `IntRange` shadows the builtin;
+  `(1..2).contains(a)` inside its `contains` must bind the BUILTIN range's
+  contains, not re-enter the user class's same-named method (a
+  same-name-as-builtin resolution clash). kt723/kt725 FIXED (a `!!` /
+  null-narrowed receiver resolves against its non-null type).
 - properties/fieldInsideField (1): an anonymous object's property with
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
