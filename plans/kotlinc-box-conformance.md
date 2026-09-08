@@ -213,7 +213,7 @@ residue list (every cluster under five) as the seed of the next campaign.
   kt723 and kt725 (a `!!`-asserted or `if (this != null)`-narrowed receiver
   resolves against the NON-null type -> builtin `Int.inc`, not the nullable
   extension). Remaining: kt2711 (below), `extensionFunWithDefaultParam`,
-  `kt2477`, `nestedInitBlocksWithLambda`.
+  `kt2477`, `nestedInitBlocksWithLambda` (kt2711 also fixed).
 - callableReference/function (6): `extensionFunctionLocal` (two local
   extensions of the same name told apart by receiver type),
   `extensionWithNestedFunction`, `genericCallableReferenceWithReifiedTypeParam`,
@@ -250,8 +250,10 @@ residue list (every cluster under five) as the seed of the next campaign.
 - classes/kt2711 (1): a user class NAMED `IntRange` shadows the builtin;
   `(1..2).contains(a)` inside its `contains` must bind the BUILTIN range's
   contains, not re-enter the user class's same-named method (a
-  same-name-as-builtin resolution clash). kt723/kt725 FIXED (a `!!` /
-  null-narrowed receiver resolves against its non-null type).
+  same-name-as-builtin resolution clash). FIXED: the range-type derivation
+  drops the static type when a USER (non-`kotlin.`) class shadows the range
+  name, so `.contains` dispatches to the builtin range value. kt723/kt725/
+  kt2711 ALL FIXED — the classes crash trio is closed.
 - properties/fieldInsideField (1): an anonymous object's property with
   both an initializer and a `field`-reading getter stores the initializer
   under the plain name, not the raw backing slot.
