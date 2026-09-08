@@ -155,15 +155,19 @@ residue list (every cluster under five) as the seed of the next campaign.
   entry in a `when` over an enum subject; the anonymous/local override
   with defaults (3) resolves `super.foo` on a local or anonymous override
   and renders `Unit`; `localInvokeExtension` (1).
-- secondaryConstructors (7): `fieldInitializerOptimization` expects the
-  JVM's elision of default-value field initializers (a field set from
-  the super constructor's virtual call keeps its value);
-  `superCallSecondary`/`innerClassesInheritance` interleave `init` blocks
-  and secondary constructor bodies in declaration order across the
-  chain; `clashingDefaultConstructors` picks among defaulted primary and
-  secondary constructors by argument types; `callFromLocalSubClass`,
-  `localClasses` (`$init$block` on a local class) and `varargs` (a mixed
-  spread in a super call) are single files.
+- secondaryConstructors (7, needs a fix — not JVM-only): two roots.
+  (1) LOCAL-class secondary constructors do not run — `synthLocalClassDef`
+  (`host_classes.zig`) registers a local class with `secondary_ctors =
+  &.{}`, and the build-time entry builder (`build.zig` ~3928) walks only
+  top-level `decls`, so a local `constructor() : this(...)` never runs the
+  primary's field init: `callFromLocalSubClass`, `clashingDefaultConstructors`,
+  `localClasses` fail with `get_field x on B`. The fix recurses the entry
+  builder into function-body classes (delegation-arg and body thunks
+  lowered in the local scope; capture-free cases first) or synthesises
+  entries at registration. (2) `init` blocks interleave with secondary
+  constructor bodies in DECLARATION order between the super call and the
+  body (`superCallSecondary`, `innerClassesInheritance`). `fieldInitializerOptimization`
+  and `varargs` are single files.
 - evaluate (rest): the unsigned `const val` verdict above covers
   `uintOperations`, `ulongOperations`, `unsignedConst`, `ubyteOperations`,
   `ushortOperations`; `kCallableName*` need `::name` on a KCallable
