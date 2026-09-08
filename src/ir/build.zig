@@ -536,6 +536,17 @@ pub const FuncBuilder = struct {
     /// optional `label` matches an explicit `break@label` /
     /// `continue@label`; bare jumps target the innermost frame.
     loops: std.ArrayList(LoopFrame) = .empty,
+    /// Nesting depth of inline-function BODY lowering (not counting a
+    /// spliced lambda body, which suspends it). Loops pushed while this is
+    /// nonzero belong to the inline function itself and are lexically
+    /// invisible to a `break`/`continue` written in a lambda passed to it.
+    lowering_inline_fn_body: u32 = 0,
+    /// Nesting depth of spliced inline-lambda BODY lowering. While nonzero,
+    /// `loopFor` skips loop frames that belong to an inline function body
+    /// (`from_inline_fn_body`), so a non-local `break`/`continue` targets the
+    /// loop enclosing the lambda at the call site, matching kotlinc's
+    /// `BreakContinueInInlineLambdas`.
+    in_spliced_lambda_body: u32 = 0,
     /// Names declared as `var` (mutable) in any live scope. `val`
     /// bindings are absent. Used by compound-assignment lowering to
     /// pick between rebind (Path target on a `var`) and plusAssign
@@ -1641,6 +1652,7 @@ pub const FuncBuilder = struct {
     pub fn pushLoop(self: *FuncBuilder, label: ?[]const u8, cont_t: BlockId, brk_t: BlockId) Allocator.Error!void {
         try self.loops.append(self.allocator, .{
             .label = label,
+            .from_inline_fn_body = self.lowering_inline_fn_body > 0,
             .continue_target = cont_t,
             .break_target = brk_t,
             .finally_base = self.finally_stack.items.len,
@@ -1652,19 +1664,31 @@ pub const FuncBuilder = struct {
         _ = self.loops.pop();
     }
     pub fn loopFor(self: *const FuncBuilder, label: ?[]const u8) ?*const LoopFrame {
+        // Inside a spliced inline-lambda body, the callee's own loops are not
+        // lexically in scope for the lambda's `break`/`continue`: skip them so
+        // the jump reaches the loop enclosing the lambda at the call site (or a
+        // loop the lambda body itself introduced).
+        const skip_inline = self.in_spliced_lambda_body > 0;
         if (label) |l| {
             var i = self.loops.items.len;
             while (i > 0) {
                 i -= 1;
                 const f = &self.loops.items[i];
+                if (skip_inline and f.from_inline_fn_body) continue;
                 if (f.label) |fl| {
                     if (std.mem.eql(u8, fl, l)) return f;
                 }
             }
             return null;
         }
-        if (self.loops.items.len == 0) return null;
-        return &self.loops.items[self.loops.items.len - 1];
+        var i = self.loops.items.len;
+        while (i > 0) {
+            i -= 1;
+            const f = &self.loops.items[i];
+            if (skip_inline and f.from_inline_fn_body) continue;
+            return f;
+        }
+        return null;
     }
 
     /// Bind a name in the current scope.
@@ -3580,6 +3604,11 @@ pub const SubjectBind = struct {
 
 pub const LoopFrame = struct {
     label: ?[]const u8,
+    /// The frame was pushed while lowering an inline function's own body
+    /// (outside any spliced lambda). A non-local `break`/`continue` in a
+    /// lambda passed to that function skips this frame: the loop is inside
+    /// the callee, not lexically enclosing the lambda.
+    from_inline_fn_body: bool = false,
     continue_target: BlockId,
     /// Depth of `catch_body_stack` at loop entry: a jump out of the loop
     /// leaves every catch-only try entered inside it.

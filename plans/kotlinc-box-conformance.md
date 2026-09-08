@@ -6,12 +6,22 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-08, b3c55ec9, CI green)
+## State (2026-09-08, cfa831d3, CI green)
 
-Census 6031 passed / 325 failed / 1 did not complete, **zero crashes**
+Census 6033 passed / 323 failed / 1 did not complete, **zero crashes**
 (994 excluded: the runner also skips `DONT_TARGET_EXACT_BACKEND: JVM*`
-files). Ratchet `BASELINE = 6031`, `MAX_FAILED = 325` in
+files). Ratchet `BASELINE = 6033`, `MAX_FAILED = 323` in
 `src/itests/box_support.zig`.
+
+Non-local break/continue from an inline lambda now targets the CALL-SITE
+loop, not the inline function's own loop (`loopWithinInlineFunction`,
+`withReturnValueNested`). Loop frames pushed while lowering an inline
+function's body carry `from_inline_fn_body`; while a spliced lambda body
+lowers, `loopFor` skips them. Still open in the cluster:
+`inlineFunctionWithMultipleParameters` (a parenthesized non-trailing lambda
+arg is not spliced inline, so its break/continue is a no-op),
+`inlineConstructor` (LabeledReturn), `breakInLoopConditions`, and the
+`lambdaPassedToInlineFunction` deep-nesting DNC.
 
 All three goal crashes are fixed. `functions/nothisnoclosure.kt`: a
 function-typed local in a `while`/`do-while` body was misparsed as a

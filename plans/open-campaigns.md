@@ -9,8 +9,8 @@ work lands; close a document when its exit conditions are met.
 ## The active plan
 
 `kotlinc-box-conformance.md`: the box residue campaign — drive every
-remaining box failure to a fix or a JVM-only verdict. Census 6031 / 325 / 1
-at b3c55ec9, **zero crashes**, ratchet 6031 / 325 (from 5991 / 363). All
+remaining box failure to a fix or a JVM-only verdict. Census 6033 / 323 / 1
+at cfa831d3, **zero crashes**, ratchet 6033 / 323 (from 5991 / 363). All
 three mandated crashes are now genuinely fixed: the memory-cap file
 (`nothisnoclosure` — a function-typed local in a `while` body misparsed as
 a lambda) and the SAM-extension pair (an abstract member extension of a
