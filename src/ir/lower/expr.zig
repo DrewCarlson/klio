@@ -642,8 +642,11 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             var not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer not_null.deinit(b.allocator);
             try narrowNullCheckAll(b, f.cond, true, &not_null);
+            const this_nn = condNarrowsThisNotNull(f.cond, true);
+            const prev_this_narrow = if (this_nn) b.setThisNarrow(b.recvTy()) else null;
             b.tail_pos = tail_here;
             const t_val = try lowerExpr(b, f.then_branch);
+            if (this_nn) _ = b.setThisNarrow(prev_this_narrow);
             var nn = not_null.items.len;
             while (nn > 0) : (nn -= 1) b.restoreLocal(not_null.items[nn - 1]);
             var ni = narrowed.items.len;
@@ -6269,7 +6272,13 @@ fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 b.localDeclNullable(inner.Path.segments[0].name) and
                 (userFunctionDeclared(b, if (pf.op == .Inc) "inc" else "dec") or b.isLocalExtFn(if (pf.op == .Inc) "inc" else "dec")))
             {
-                const old = try lowerExpr(b, inner);
+                // Snapshot the OLD value into a fresh register: `inner` is
+                // a mutable var whose register the write-back below
+                // reassigns, so returning the live load would yield the NEW
+                // value (post-increment must return the old one).
+                const old_src = try lowerExpr(b, inner);
+                const old = b.allocReg();
+                try b.push(.{ .Move = .{ .dst = old, .src = old_src } });
                 const call = (try nullableIncDecCall(b, inner, pf.op == .Inc)).?;
                 try writeBackLvalue(b, inner, call);
                 return old;
@@ -12435,6 +12444,30 @@ pub fn narrowNullCheckAll(
     if (try narrowNullCheck(b, cond, truthy)) |n| try out.append(b.allocator, n);
 }
 
+/// Whether `cond` narrows the bare `this` receiver to non-null under
+/// `truthy` (`if (this != null) ...`), including through `&&`/`||` chains.
+/// Used to set the this-narrow so a member call in the branch resolves
+/// against the non-null receiver type.
+fn condNarrowsThisNotNull(cond: *const Expr, truthy: bool) bool {
+    if (cond.* == .Binary) {
+        const op = cond.Binary.op;
+        if ((truthy and op == .And) or (!truthy and op == .Or)) {
+            return condNarrowsThisNotNull(cond.Binary.lhs, truthy) or condNarrowsThisNotNull(cond.Binary.rhs, truthy);
+        }
+        const unequal = op == .Neq or op == .IdentNeq;
+        const equal = op == .Eq or op == .IdentEq;
+        if (!(if (truthy) unequal else equal)) return false;
+        const value = if (cond.Binary.lhs.* == .NullLit)
+            cond.Binary.rhs
+        else if (cond.Binary.rhs.* == .NullLit)
+            cond.Binary.lhs
+        else
+            return false;
+        return value.* == .This and value.This.qualifier == null;
+    }
+    return false;
+}
+
 fn narrowNullCheck(
     b: *FuncBuilder,
     cond: *const Expr,
@@ -12467,6 +12500,32 @@ fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     // wrong head DISPROVES valid candidates downstream. The seam flips
     // only after the type-head audit below reaches zero disagreement,
     // mirroring the call channel's per-class trust discipline.
+    // A bare `this` narrowed non-null by an enclosing `if (this != null)`
+    // resolves member calls against the non-null receiver type: inside
+    // `operator fun Int?.inc()`, `this.inc()` in the non-null branch binds
+    // the builtin `Int.inc`, not the nullable extension (a recursion).
+    // Only the narrowed case answers; an un-narrowed `this` keeps its
+    // declared (possibly nullable) type from the ordinary receiver path.
+    if (arg.* == .This and arg.This.qualifier == null) {
+        if (b.thisNarrow()) |h| {
+            return .{ .name = b.allocator.dupe(u8, std.mem.trimEnd(u8, h, "?")) catch h, .nullable = false, .args = &.{} };
+        }
+        return null;
+    }
+    // `x!!` has `x`'s type made NON-null: a member call on it resolves
+    // against the non-null type, so `this!!.inc()` inside `Int?.inc` binds
+    // the builtin `Int.inc`, not the nullable extension (a recursion).
+    if (arg.* == .Postfix and arg.Postfix.op == .NotNull) {
+        if (argDeclTypeRef(b, arg.Postfix.expr)) |inner| {
+            var out = inner;
+            out.nullable = false;
+            if (std.mem.endsWith(u8, out.name, "?")) {
+                out.name = std.mem.trimEnd(u8, out.name, "?");
+            }
+            return out;
+        }
+        return null;
+    }
     var lazy_ans = argDeclTypeRefLazy(b, arg);
     // E2.1, ADDITIVE-ONLY: typeck's head fills in where the AST probes
     // have no answer; the declared (AST) answer always wins when both
