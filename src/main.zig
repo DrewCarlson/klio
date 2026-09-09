@@ -104,21 +104,26 @@ fn resolveProfile(args: std.process.Args) runtime.perf.Profile {
     return runtime.perf.resolveBinaryProfile(list.items);
 }
 
-/// Every command runs on a dedicated thread with a large stack reserve
-/// (virtual until touched): lowering a dependency base whose sources carry
-/// deeply-chained expressions recurses far past what a default main-thread
-/// stack holds, and the fault appears only on a cold bake — the warm-cache
-/// paths never re-lower.
-fn cliBody(a: std.mem.Allocator, args: std.process.Args, out: *u8) void {
-    out.* = cli.run(a, args) catch 1;
+/// Every command runs on a large stack reserve (virtual until touched):
+/// lowering a dependency base whose sources carry deeply-chained expressions
+/// recurses far past what a default main-thread stack holds, and the fault
+/// appears only on a cold bake — the warm-cache paths never re-lower.
+///
+/// The reserve comes from an in-thread stack switch, not a worker thread, so
+/// the command keeps running on the process main thread: a program that opens
+/// a Compose UI drives AppKit/Metal from there, and those reject a call made
+/// from any other thread.
+const CliCtx = struct {
+    a: std.mem.Allocator,
+    args: std.process.Args,
+};
+
+fn cliBody(ctx: CliCtx) u8 {
+    return cli.run(ctx.a, ctx.args) catch 1;
 }
 
 fn runCli(a: std.mem.Allocator, args: std.process.Args) u8 {
-    var code: u8 = 1;
-    const t = std.Thread.spawn(.{ .stack_size = 256 << 20 }, cliBody, .{ a, args, &code }) catch
-        return cli.run(a, args) catch 1;
-    t.join();
-    return code;
+    return runtime.runOnBigStackMainThread(CliCtx, u8, cliBody, .{ .a = a, .args = args });
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {

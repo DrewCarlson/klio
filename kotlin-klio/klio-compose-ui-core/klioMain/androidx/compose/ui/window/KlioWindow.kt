@@ -38,6 +38,9 @@ import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 
+/** Opaque white, the background a desktop compose window starts from. */
+private val WINDOW_BACKGROUND: Int = 0xFFFFFFFF.toInt()
+
 /** The window's coordinate space IS the root's: screen == local. */
 private object IdentityPositionCalculator : PositionCalculator {
     override fun screenToLocal(positionOnScreen: Offset): Offset = positionOnScreen
@@ -79,7 +82,9 @@ fun runComposeWindow(
         owner.measureAndLayoutForFrame()
         val surface = __composeui_winSurface(handle)
         if (surface == 0L) return
-        __composeui_winClear(handle, 0xFF000000.toInt())
+        // Desktop windows start white: content that draws no background of its
+        // own (the default LocalContentColor is black) stays readable.
+        __composeui_winClear(handle, WINDOW_BACKGROUND)
         klioDrawToSurface(surface) { owner.drawTo(this) }
         __composeui_winPresent(handle)
     }
@@ -282,7 +287,7 @@ private fun renderWindowFrame(holder: KlioWindowHolder) {
     holder.owner.measureAndLayoutForFrame()
     val surface = __composeui_winSurface(holder.handle)
     if (surface == 0L) return
-    __composeui_winClear(holder.handle, 0xFF000000.toInt())
+    __composeui_winClear(holder.handle, WINDOW_BACKGROUND)
     klioDrawToSurface(surface) { holder.owner.drawTo(this) }
     __composeui_winPresent(holder.handle)
     holder.dirty = false
