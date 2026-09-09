@@ -61,20 +61,35 @@ inline fn errRes(e: EvalError) EvalResult {
 /// `(instance id, field name)` pairs currently being resolved through
 /// the `get_field` heuristic fallbacks. Bounds the recursion to the
 /// distinct instances on the stack.
-threadlocal var field_resolve_stack: std.ArrayList(ResolvePair) = .empty;
 
 /// Re-entrancy flag for the inner-class outer-chain field fallback.
-threadlocal var field_outer_active: bool = false;
 
 /// Assert (Debug) the field-resolution stack and its re-entrancy flags are
 /// clear at a run boundary and reset them so leaked-across-runs state is a
 /// loud failure.
 pub fn resetReceiverTls() void {
-    std.debug.assert(field_resolve_stack.items.len == 0);
-    std.debug.assert(!field_outer_active);
-    field_resolve_stack.clearRetainingCapacity();
-    field_outer_active = false;
+    std.debug.assert(fld_tls.field_resolve_stack.items.len == 0);
+    std.debug.assert(!fld_tls.field_outer_active);
+    fld_tls.field_resolve_stack.clearRetainingCapacity();
+    fld_tls.field_outer_active = false;
 }
+
+/// Every per-thread cache this module keeps, as ONE threadlocal. Darwin
+/// resolves a threadlocal access through a `_tlv_get_addr` CALL, and the
+/// field paths touch several of these per operation — as one struct the
+/// base is fetched once and each cache is an offset from it.
+const FieldsTls = struct {
+    field_resolve_stack: std.ArrayList(ResolvePair) = .empty,
+    field_outer_active: bool = false,
+    anon_recv_depth: usize = 0,
+    owner_keyed_memo: [1024]OwnerKeyedSlot = @splat(.{}),
+    owner_keyed_memo_set: [1024]OwnerKeyedSlot = @splat(.{}),
+    tl_field_read_cache: [TL_FIELD_CACHE_SIZE]TlFieldReadEntry = @splat(.{}),
+    tl_field_write_cache: [TL_FIELD_CACHE_SIZE]TlFieldWriteEntry = @splat(.{}),
+    super_write_owner: ?[]const u8 = null,
+    anon_key_buf: [512]u8 = undefined,
+};
+threadlocal var fld_tls: FieldsTls = .{};
 
 const ResolvePair = struct { id: usize, name: []const u8 };
 
@@ -108,20 +123,20 @@ fn withFieldResolvePair(
     suppress_cc_redirect: bool,
     member_probe: bool,
 ) Allocator.Error!?EvalResult {
-    for (field_resolve_stack.items) |k| {
+    for (fld_tls.field_resolve_stack.items) |k| {
         if (k.id == id and std.mem.eql(u8, k.name, name)) return null;
     }
     // Back the process-global guard stack on `page_allocator` (it is cleared
     // capacity-retaining at run boundaries; a per-run-arena backing would
     // leave the retained capacity dangling once that arena is torn down).
-    field_resolve_stack.append(std.heap.page_allocator, .{ .id = id, .name = name }) catch {};
+    fld_tls.field_resolve_stack.append(std.heap.page_allocator, .{ .id = id, .name = name }) catch {};
     const r = try getFieldInner(self, allocator, receiver, name, suppress_cc_redirect, member_probe, false);
-    var i: usize = field_resolve_stack.items.len;
+    var i: usize = fld_tls.field_resolve_stack.items.len;
     while (i > 0) {
         i -= 1;
-        const k = field_resolve_stack.items[i];
+        const k = fld_tls.field_resolve_stack.items[i];
         if (k.id == id and std.mem.eql(u8, k.name, name)) {
-            _ = field_resolve_stack.orderedRemove(i);
+            _ = fld_tls.field_resolve_stack.orderedRemove(i);
             break;
         }
     }
@@ -770,7 +785,6 @@ fn freeMissErr(allocator: Allocator, e: EvalError) void {
 
 /// Depth bound for the lexical-receiver fallback below: an object literal
 /// written inside another one chains, but a capture cycle must not.
-threadlocal var anon_recv_depth: usize = 0;
 
 pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true, false));
@@ -981,15 +995,15 @@ fn lexicalReceiverFallback(
     const e = r.err;
     if (e != .Unimplemented) return r;
     if (receiver.* != .Instance) return r;
-    if (anon_recv_depth >= 8) return r;
+    if (fld_tls.anon_recv_depth >= 8) return r;
     const caps: []const InstanceData.Capture = blk: {
         const g = receiver.Instance.borrow();
         defer g.deinit();
         break :blk g.get().anon_captures;
     };
     if (caps.len == 0) return r;
-    anon_recv_depth += 1;
-    defer anon_recv_depth -= 1;
+    fld_tls.anon_recv_depth += 1;
+    defer fld_tls.anon_recv_depth -= 1;
     for (caps) |c| {
         // Only the LABELLED receivers: the plain `this` capture is the object's
         // `outer` link, already on the normal lookup path.
@@ -2485,9 +2499,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     }
     // Inner-class outer-chain fallback: walk the receiver's captured
     // `outer` link for a field of an enclosing-class instance.
-    if (!member_probe and !field_outer_active) {
-        field_outer_active = true;
-        defer field_outer_active = false;
+    if (!member_probe and !fld_tls.field_outer_active) {
+        fld_tls.field_outer_active = true;
+        defer fld_tls.field_outer_active = false;
         var cur: ?Value = switch (receiver.*) {
             .Instance => |i| blk: {
                 const g = i.borrow();
@@ -3461,8 +3475,6 @@ fn runThunkValue(self: *VmHost, allocator: Allocator, fid: FuncId) Allocator.Err
 /// negative answer is as cacheable as the positive one.
 const OwnerKeyedSlot = struct { key: u64 = 0, gen: u32 = 0, fid: u32 = NO_FID, hit: bool = false };
 const NO_FID: u32 = std.math.maxInt(u32);
-threadlocal var owner_keyed_memo: [1024]OwnerKeyedSlot = @splat(.{});
-threadlocal var owner_keyed_memo_set: [1024]OwnerKeyedSlot = @splat(.{});
 
 fn ownerKeyedSlotKey(cls_ident: usize, recv_key: []const u8, name: []const u8) u64 {
     var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
@@ -3529,7 +3541,7 @@ fn ownerKeyedProbeOne(owner: []const u8, kb: []u8, map: anytype, recv_key: []con
 /// shares its (receiver, name) pair across owners, and only the
 /// declaration whose owner is in scope is the one kotlinc bound.
 fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
-    const memo: *[1024]OwnerKeyedSlot = if (setters) &owner_keyed_memo_set else &owner_keyed_memo;
+    const memo: *[1024]OwnerKeyedSlot = if (setters) &fld_tls.owner_keyed_memo_set else &fld_tls.owner_keyed_memo;
     var it = ir.eval.frameThisChainIter();
     while (it.next()) |v| {
         if (v != .Instance) continue;
@@ -4287,9 +4299,7 @@ fn enclosingCompanionDeclares(self: *VmHost, allocator: Allocator, class_name: [
 /// including on still-parked pool worker threads.
 const TL_FIELD_CACHE_SIZE = 1024;
 const TlFieldReadEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, state: u8 = 0, miss_ttl: u8 = 0, hit: root.ProgramImage.FieldReadHit = .{ .getter = 0, .stored_idx = 0 } };
-threadlocal var tl_field_read_cache: [TL_FIELD_CACHE_SIZE]TlFieldReadEntry = @splat(.{});
 const TlFieldWriteEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, state: u8 = 0, miss_ttl: u8 = 0, hit: root.ProgramImage.FieldWriteHit = .{ .setter = 0, .store_name = "" } };
-threadlocal var tl_field_write_cache: [TL_FIELD_CACHE_SIZE]TlFieldWriteEntry = @splat(.{});
 
 inline fn tlFieldSlot(class_p: usize, name_p: usize) usize {
     const h = (@as(u64, @intCast(class_p)) *% 0x9E3779B97F4A7C15) ^ @as(u64, @intCast(name_p));
@@ -4298,7 +4308,7 @@ inline fn tlFieldSlot(class_p: usize, name_p: usize) usize {
 
 fn fieldReadCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.ProgramImage.FieldReadHit {
     const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
-    const e = &tl_field_read_cache[tlFieldSlot(class_p, name_p)];
+    const e = &fld_tls.tl_field_read_cache[tlFieldSlot(class_p, name_p)];
     if (e.state != 0 and e.class_p == class_p and e.name_p == name_p and e.gen == gen) {
         // state 2: the shared map had no entry at last probe. It is
         // add-only, so re-probe every 64th consult rather than paying
@@ -4325,7 +4335,7 @@ fn fieldReadCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.Program
 
 fn fieldWriteCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.ProgramImage.FieldWriteHit {
     const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
-    const e = &tl_field_write_cache[tlFieldSlot(class_p, name_p)];
+    const e = &fld_tls.tl_field_write_cache[tlFieldSlot(class_p, name_p)];
     if (e.state != 0 and e.class_p == class_p and e.name_p == name_p and e.gen == gen) {
         if (e.state == 2) {
             if (e.miss_ttl > 0) {
@@ -4987,7 +4997,6 @@ fn instanceDeclaresProperty(self: *VmHost, receiver: *const Value, name: []const
 /// write. The setter search then starts at that class's SUPERTYPES: an
 /// overriding setter whose body writes `super.prop` must reach the base
 /// accessor, never itself.
-threadlocal var super_write_owner: ?[]const u8 = null;
 
 pub fn setField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
     return setFieldInner(self, allocator, receiver, name, value);
@@ -5002,9 +5011,9 @@ pub fn setFieldFrom(
     super_owner: ?[]const u8,
 ) Allocator.Error!UnitResult {
     if (super_owner == null) return setFieldInner(self, allocator, receiver, name, value);
-    const prev = super_write_owner;
-    super_write_owner = super_owner;
-    defer super_write_owner = prev;
+    const prev = fld_tls.super_write_owner;
+    fld_tls.super_write_owner = super_owner;
+    defer fld_tls.super_write_owner = prev;
     return setFieldInner(self, allocator, receiver, name, value);
 }
 
@@ -5012,8 +5021,8 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // CONSUME the marker: it belongs to this write only. Writes made inside the
     // base setter we are about to reach are ordinary ones.
     const super_owner: ?[]const u8 = blk: {
-        const o = super_write_owner;
-        super_write_owner = null;
+        const o = fld_tls.super_write_owner;
+        fld_tls.super_write_owner = null;
         break :blk o;
     };
     // Companion forwarding for writes: `Foo.count = 1` routes to the
@@ -5520,9 +5529,8 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
 /// Anon-method registry key `"<class>\u{1f}<method>"`. The registry is
 /// keyed on a single string, built as a unit-separated concatenation of
 /// `(class, name)` cached per-call.
-threadlocal var anon_key_buf: [512]u8 = undefined;
 fn anonKey(class_name: []const u8, method: []const u8) []const u8 {
-    return std.fmt.bufPrint(&anon_key_buf, "{s}\u{1f}{s}", .{ class_name, method }) catch class_name;
+    return std.fmt.bufPrint(&fld_tls.anon_key_buf, "{s}\u{1f}{s}", .{ class_name, method }) catch class_name;
 }
 
 /// The runtime class simple name of an instance.
