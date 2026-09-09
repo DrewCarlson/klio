@@ -921,8 +921,11 @@ pub fn build(b: *std.Build) void {
         if (runs_programs) {
             // The parity harness caches one base snapshot per (load-mode,
             // pack-mask) combo without eviction, so give the corpus runners
-            // headroom over the 6 GB default RSS watchdog cap.
-            run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "6815744");
+            // headroom over the 6 GB default RSS watchdog cap. The corpus runs
+            // every example twice (JIT on, JIT off) and peaks around 8 GB;
+            // measured the same either side of the in-thread stack switch, so
+            // the ceiling tracks the corpus size, not a leak.
+            run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "10485760");
             run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
             run_t.step.dependOn(&base_images_install.step);
             run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));
