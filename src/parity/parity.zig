@@ -2302,7 +2302,7 @@ fn runMainBigStack(vm: *interp_ir.Vm, main_id: interp_ir.FuncId, out: interp_ir.
         .time_mode = interp_ir.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
     };
-    return runtime.runOnBigStack(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
+    return runtime.runOnBigStackMainThread(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 
 /// Per-program wall cap (ms) for the in-process itest harnesses: a spinning

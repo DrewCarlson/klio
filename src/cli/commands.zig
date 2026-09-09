@@ -2993,7 +2993,7 @@ fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
     runtime.setReclaim(ctx.reclaim);
     // KLIO_PROF profiles `klio test` exactly as it does `klio run` (the
-    // sampler is per-thread; this worker thread executes the tests).
+    // sampler is per-thread; this thread executes the tests).
     runtime.prof.maybeStart();
     defer runtime.prof.maybeReport();
     return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out, ctx.only_fids, ctx.filter) catch |err| {
@@ -3293,9 +3293,11 @@ fn runTestsOnBuilt(
     }
 
     var stdout = io.StdoutSink{};
-    // Run on the large interpreter stack: a test exercises arbitrary
-    // (possibly deep) program recursion, same as `main`.
-    var report = runtime.runOnBigStack(TestRunCtx, test_runner.Report, testRunEntry, .{
+    // Run on the large interpreter stack, in place on this thread: a test
+    // exercises arbitrary (possibly deep) program recursion, same as `main`,
+    // and a test that opens a window needs the process main thread just as
+    // much as a program does.
+    var report = runtime.runOnBigStackMainThread(TestRunCtx, test_runner.Report, testRunEntry, .{
         .gpa = gpa,
         .vm = &vm,
         .user_asts = user_asts,

@@ -52,7 +52,7 @@ fn fillHotLayoutSlot() void {
     }
 }
 
-fn runFileBody(path: [:0]const u8, code_out: *c_int) void {
+fn runFileBody(path: [:0]const u8) c_int {
     runtime.perf.setProfile(runtime.perf.resolveBinaryProfile(&.{}));
     fillHotLayoutSlot();
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -60,52 +60,47 @@ fn runFileBody(path: [:0]const u8, code_out: *c_int) void {
     const gpa = runtime.allocTrackWrap(arena.allocator());
     var features = cli.commands.RequestedFeatures.init(gpa);
     defer features.deinit();
-    code_out.* = @intCast(cli.commands.runFileIrVm(gpa, path, &features));
+    return @intCast(cli.commands.runFileIrVm(gpa, path, &features));
 }
 
 /// Run the Kotlin program at `path` exactly as `klio run <path>` would,
 /// on the default process-lifetime arena profile. Returns the process
 /// exit code (0 success, 1 diagnostics/runtime error).
 ///
-/// The work runs on a dedicated thread with an explicit large stack: the
-/// klio binary's Zig start code honors the executable's 16MB GNU_STACK
-/// request, but a transpiled binary's C `main` runs on the libc crt with
+/// The work runs on an explicit large stack, switched to in place on the
+/// calling thread: a transpiled binary's C `main` runs on the libc crt with
 /// whatever the process rlimit gives (typically 8MB), and lowering a
-/// deeply-nested expression recurses past that.
+/// deeply-nested expression recurses past that. The switch keeps the program
+/// on the thread the caller invoked it from — the process main thread for the
+/// emitted `main`, which is where a program that opens a window must run.
 export fn klio_rt_run_file(path: [*:0]const u8) c_int {
-    var code: c_int = 1;
-    const t = std.Thread.spawn(
-        .{ .stack_size = 256 << 20 },
-        runFileBody,
-        .{ std.mem.span(path), &code },
-    ) catch return 1;
-    t.join();
-    return code;
+    return runtime.runOnBigStackMainThread([:0]const u8, c_int, runFileBody, std.mem.span(path));
 }
 
-fn runImageBody(base: [:0]const u8, path: [:0]const u8, code_out: *c_int) void {
+const ImageRunCtx = struct {
+    base: [:0]const u8,
+    path: [:0]const u8,
+};
+
+fn runImageBody(ctx: ImageRunCtx) c_int {
     runtime.perf.setProfile(runtime.perf.resolveBinaryProfile(&.{}));
     fillHotLayoutSlot();
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const gpa = runtime.allocTrackWrap(arena.allocator());
-    code_out.* = @intCast(cli.bundle.runImage(gpa, base, &.{path}, &.{}));
+    return @intCast(cli.bundle.runImage(gpa, ctx.base, &.{ctx.path}, &.{}));
 }
 
 /// Run the Kotlin program at `path` against the pre-baked dependency base
 /// at `base_image`, exactly as `klio run-image` would. This is the entry
 /// transpiled programs use: the emitted ids are only meaningful against
-/// the module assembled from that exact artifact. Same large-stack thread
+/// the module assembled from that exact artifact. Same large-stack switch
 /// as `klio_rt_run_file`.
 export fn klio_rt_run_image(base_image: [*:0]const u8, path: [*:0]const u8) c_int {
-    var code: c_int = 1;
-    const t = std.Thread.spawn(
-        .{ .stack_size = 256 << 20 },
-        runImageBody,
-        .{ std.mem.span(base_image), std.mem.span(path), &code },
-    ) catch return 1;
-    t.join();
-    return code;
+    return runtime.runOnBigStackMainThread(ImageRunCtx, c_int, runImageBody, .{
+        .base = std.mem.span(base_image),
+        .path = std.mem.span(path),
+    });
 }
 
 /// The hot-view layout descriptor: byte offsets into `runtime.Value`
