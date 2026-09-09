@@ -12,8 +12,11 @@ pattern="${1:-examples/*.kt}"
 jobs="${JOBS:-8}"
 skip_re='compose_ui_dashboard|compose_ui_input|compose_ui_window|compose_window|compose_multiwindow|compose_foundation_lazy'
 
-zig build
-zig build klio-rt
+# ReleaseFast on both sides: the gate compares the interpreter's output against
+# a compiled native binary under a wall-clock cap, and a debug interpreter runs
+# the compose examples for minutes — they timed out without ever being compared.
+zig build -Doptimize=ReleaseFast
+zig build klio-rt -Doptimize=ReleaseFast
 
 out=zig-out/transpiler-corpus
 rm -rf "$out"
@@ -24,11 +27,21 @@ export out
 # phase, the limit, and the command that reproduces it alone. Reported as a
 # plain failure it reads as a wrong answer, and a slow machine then looks like
 # a broken transpiler (a 6-way parallel run once reported 23 of them).
+# An example that needs a pack feature or a language flag says so in a
+# `Run with:` line; both sides need it, or the program fails to build and the
+# gate reports a wrong answer where there is none.
+run_flags() {
+    sed -n '1,12p' "$1" | sed -n 's/.*Run with:.*//p' > /dev/null
+    sed -n '1,12p' "$1" | grep -o -- '--feature [^ ]*\|--feature=[^ ]*\|--language=[^ ]*' | tr '\n' ' '
+}
+
 check_one() {
     local kt="$1"
     local name rc
     name=$(basename "$kt" .kt)
-    timeout 600 ./zig-out/bin/klio transpile "$kt" -o "$out/$name.c" > "$out/$name.transpile.log" 2>&1
+    local flags
+    read -r -a flags <<< "$(run_flags "$kt")"
+    timeout 600 ./zig-out/bin/klio transpile "${flags[@]}" "$kt" -o "$out/$name.c" > "$out/$name.transpile.log" 2>&1
     rc=$?
     if [ $rc = 124 ]; then
         echo "TIMEOUT transpile" > "$out/$name.status"
@@ -46,7 +59,7 @@ check_one() {
     # (no lowering pass), so those warnings legitimately appear only on
     # the interpreter side. Runtime errors still differ loudly (rc +
     # remaining stderr lines).
-    timeout 120 ./zig-out/bin/klio run "$kt" > "$out/$name.interp.out" 2> "$out/$name.interp.err"
+    timeout 120 ./zig-out/bin/klio run "${flags[@]}" "$kt" > "$out/$name.interp.out" 2> "$out/$name.interp.err"
     local interp_rc=$?
     timeout 120 "$out/$name" > "$out/$name.native.out" 2> "$out/$name.native.err"
     local native_rc=$?
@@ -68,7 +81,7 @@ check_one() {
     fi
     echo "PASS" > "$out/$name.status"
 }
-export -f check_one
+export -f check_one run_flags
 
 ls $pattern | grep -Ev "$skip_re" | xargs -P "$jobs" -I{} bash -c 'check_one "$@"' _ {}
 
