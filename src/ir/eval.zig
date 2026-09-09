@@ -986,6 +986,11 @@ pub fn gcUninstallFrameRoot() void {
     if (runtime.gc.gc_enabled and evtls.regs_pool.items.len > 0) {
         drainRegsPool(&evtls, std.heap.c_allocator);
         evtls.regs_pool.deinit(std.heap.c_allocator);
+        // `deinit` leaves the list undefined. That was invisible while this seam
+        // only ever ran on a thread about to be destroyed; the interpreter now
+        // runs on the process main thread, whose threadlocals outlive the seam,
+        // and the next evaluation read a garbage length.
+        evtls.regs_pool = .empty;
     }
 }
 
