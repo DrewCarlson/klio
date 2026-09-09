@@ -1117,12 +1117,31 @@ fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8)
 /// its bound (`fun <S : B> foo(s: S)` is applicable to a `B`, not to a
 /// `C`), built once per function and kept for the process.
 threadlocal var bounded_params_cache: ?std.AutoHashMap(u32, []const ir.Param) = null;
+threadlocal var bounded_params_gen: u32 = 0;
+
+/// The cache keys on a bare `FuncId` and its entries point INTO the module's
+/// parameter type names, so an entry outlives the program that produced it
+/// only as a dangling slice — the next program reusing that id would read
+/// freed IR. It rides the dispatch-cache generation the program boundary
+/// bumps, exactly like the other pointer-keyed caches here.
+fn boundedParamsCache() *std.AutoHashMap(u32, []const ir.Param) {
+    const gen = host_call_member.dispatchCacheGen();
+    if (bounded_params_cache == null) {
+        bounded_params_cache = std.AutoHashMap(u32, []const ir.Param).init(std.heap.page_allocator);
+    } else if (bounded_params_gen != gen) {
+        var it = bounded_params_cache.?.valueIterator();
+        while (it.next()) |v| std.heap.page_allocator.free(v.*);
+        bounded_params_cache.?.clearRetainingCapacity();
+    }
+    bounded_params_gen = gen;
+    return &bounded_params_cache.?;
+}
 
 pub fn boundedParams(module: *const Module, cand: FuncId, f: *const Func) ?[]const ir.Param {
     const bounds = module.registry.func_type_param_bounds.get(cand) orelse return null;
     if (bounds.len == 0) return null;
-    if (bounded_params_cache == null) bounded_params_cache = std.AutoHashMap(u32, []const ir.Param).init(std.heap.page_allocator);
-    if (bounded_params_cache.?.get(cand.int())) |cached| return cached;
+    const cache = boundedParamsCache();
+    if (cache.get(cand.int())) |cached| return cached;
     var any = false;
     for (f.params) |*p| {
         var head = std.mem.trimEnd(u8, p.ty.name, "?");
@@ -1148,7 +1167,7 @@ pub fn boundedParams(module: *const Module, cand: FuncId, f: *const Func) ?[]con
             o.ty = .{ .name = bn, .nullable = p.ty.nullable or bn_nullable, .args = &.{} };
         }
     }
-    bounded_params_cache.?.put(cand.int(), out) catch {};
+    cache.put(cand.int(), out) catch {};
     return out;
 }
 
@@ -1679,20 +1698,24 @@ fn missingActual(allocator: Allocator, f: *const Func) EvalResult {
 /// activation, so the cost of a miss (a class-table probe per parameter) is
 /// paid once per function, and the overwhelmingly common answer — zero — is a
 /// single comparison thereafter.
-const SamMaskEntry = struct { func_p: usize = 0, mask: u32 = 0, valid: bool = false };
+/// `gen` is the dispatch-cache generation the program boundary bumps: the key
+/// is a `*const Func` ADDRESS, which the next program's module may reuse for a
+/// different function.
+const SamMaskEntry = struct { func_p: usize = 0, mask: u32 = 0, valid: bool = false, gen: u32 = 0 };
 threadlocal var sam_mask_cache: [1024]SamMaskEntry = @splat(.{});
 
 fn samParamMask(self: *VmHost, func: *const ir.Func) u32 {
     const key = @intFromPtr(func);
+    const gen = host_call_member.dispatchCacheGen();
     const slot = &sam_mask_cache[(key >> 4) % sam_mask_cache.len];
-    if (slot.valid and slot.func_p == key) return slot.mask;
+    if (slot.valid and slot.func_p == key and slot.gen == gen) return slot.mask;
     var mask: u32 = 0;
     for (func.params, 0..) |*p, i| {
         if (i >= 32) break;
         if (p.is_vararg) continue;
         if (host_instances.paramTypeIsFunInterface(self, p.ty.name)) mask |= @as(u32, 1) << @intCast(i);
     }
-    slot.* = .{ .func_p = key, .mask = mask, .valid = true };
+    slot.* = .{ .func_p = key, .mask = mask, .valid = true, .gen = gen };
     return mask;
 }
 

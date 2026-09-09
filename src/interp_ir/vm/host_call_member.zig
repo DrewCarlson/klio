@@ -3941,13 +3941,16 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
 /// filter the overwhelming majority of member names without hashing —
 /// a false positive just runs the walk.
 threadlocal var recv_fn_gate_mod: ?*const Module = null;
+threadlocal var recv_fn_gate_gen: u32 = 0;
 threadlocal var recv_fn_gate_any: bool = true;
 threadlocal var recv_fn_len_mask: u64 = ~@as(u64, 0);
 threadlocal var recv_fn_byte_mask: u64 = ~@as(u64, 0);
 
 fn recvFnPropsAny(self: *VmHost) bool {
     const mp: *const Module = self.module.asPtr();
-    if (recv_fn_gate_mod == mp) return recv_fn_gate_any;
+    // A module ADDRESS is reusable across programs in one process, so the
+    // gate rides the generation the program boundary bumps.
+    if (recv_fn_gate_mod == mp and recv_fn_gate_gen == cacheGen()) return recv_fn_gate_any;
     const g = self.module.borrow();
     const reg = &g.get().registry;
     const any = reg.recv_fn_props.count() != 0;
@@ -3969,6 +3972,7 @@ fn recvFnPropsAny(self: *VmHost) bool {
     recv_fn_len_mask = lm;
     recv_fn_byte_mask = bm;
     recv_fn_gate_mod = mp;
+    recv_fn_gate_gen = cacheGen();
     recv_fn_gate_any = any;
     return any;
 }
@@ -7417,14 +7421,23 @@ pub fn delegateFieldAt(v: *const Value, idx: usize) ?Value {
     return null;
 }
 
+/// Both memo slices point into the module's own name storage, so they are
+/// dangling once its program ends; the generation the program boundary bumps
+/// is what keeps a later `mem.eql` from reading freed IR.
 threadlocal var sam_ext_memo_name: ?[]const u8 = null;
 threadlocal var sam_ext_memo_ty: ?[]const u8 = null;
+threadlocal var sam_ext_memo_gen: u32 = 0;
 
 /// The extension-receiver type of `name` when some `fun interface` declares it as
 /// its abstract member-EXTENSION method, else null. `fun interface MeasurePolicy`
 /// declares `fun MeasureScope.measure(measurables, constraints)`, so `measure`
 /// answers `MeasureScope`.
 fn samAbstractExtRecvType(self: *VmHost, name: []const u8) ?[]const u8 {
+    if (sam_ext_memo_gen != cacheGen()) {
+        sam_ext_memo_name = null;
+        sam_ext_memo_ty = null;
+        sam_ext_memo_gen = cacheGen();
+    }
     if (sam_ext_memo_name) |n| {
         if (std.mem.eql(u8, n, name)) return sam_ext_memo_ty;
     }
@@ -9419,9 +9432,16 @@ const HostSlotOp = enum {
 };
 
 threadlocal var host_slot_ops: ?std.AutoHashMapUnmanaged(u32, ?HostSlotOp) = null;
+threadlocal var host_slot_ops_gen: u32 = 0;
 
 fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
     if (host_slot_ops == null) host_slot_ops = .{};
+    // Keyed by a bare function id, which the next program mints again for a
+    // different function: drop the whole map when the generation moves.
+    if (host_slot_ops_gen != cacheGen()) {
+        host_slot_ops.?.clearRetainingCapacity();
+        host_slot_ops_gen = cacheGen();
+    }
     const map = &host_slot_ops.?;
     if (map.get(target.int())) |cached| return cached;
     const fqn = if (module.funcById(target)) |f| f.fqn else return null;
@@ -12572,6 +12592,9 @@ fn collectClassClosure(
 /// costs a walk of the receiver's own supertypes instead of a scan of every
 /// same-named declaration in the program.
 const MEXT_OVERRIDE_MAX = 4;
+/// `gen` is the dispatch-cache generation the program boundary bumps: the key
+/// is a class identity plus a name's storage address, both of which the next
+/// program can mint again, and the entry holds that program's function ids.
 const MextOverrideEntry = struct {
     cls: u64 = 0,
     name_p: usize = 0,
@@ -12579,6 +12602,7 @@ const MextOverrideEntry = struct {
     n: u32 = 0,
     fids: [MEXT_OVERRIDE_MAX]u32 = @splat(0),
     valid: bool = false,
+    gen: u32 = 0,
 };
 const MEXT_OVERRIDE_SLOTS = 1024;
 threadlocal var mext_override_cache: [MEXT_OVERRIDE_SLOTS]MextOverrideEntry = @splat(.{});
@@ -12599,7 +12623,7 @@ pub fn memberExtOverridesFor(self: *VmHost, receiver: *const Value, name: []cons
     };
     const slot = (cls_id ^ (@intFromPtr(name.ptr) >> 3) ^ (nparams *% 0x9E37)) & (MEXT_OVERRIDE_SLOTS - 1);
     const e = mext_override_cache[slot];
-    if (e.valid and e.cls == cls_id and e.name_p == @intFromPtr(name.ptr) and e.nparams == nparams) {
+    if (e.valid and e.gen == cacheGen() and e.cls == cls_id and e.name_p == @intFromPtr(name.ptr) and e.nparams == nparams) {
         const n = @min(e.n, out.len);
         for (0..n) |i| out[i] = @enumFromInt(e.fids[i]);
         return n;
@@ -12612,6 +12636,7 @@ pub fn memberExtOverridesFor(self: *VmHost, receiver: *const Value, name: []cons
         .nparams = @intCast(nparams),
         .n = @intCast(n),
         .valid = true,
+        .gen = cacheGen(),
     };
     for (0..n) |i| entry.fids[i] = @intCast(found[i].int());
     mext_override_cache[slot] = entry;
