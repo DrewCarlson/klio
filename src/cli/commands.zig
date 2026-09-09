@@ -3951,6 +3951,11 @@ fn runMainBigStack(vm: *Vm, main: interp_ir.FuncId, out: interp_ir.Output) inter
 fn runMainEntry(ctx: MainRunCtx) interp_ir.VmResult {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
     runtime.setReclaim(ctx.reclaim);
+    runtime.runstats.markExecStart();
+    defer {
+        runtime.runstats.markExecEnd();
+        runtime.runstats.report();
+    }
     return ctx.vm.run(ctx.main, ctx.out) catch return .{ .err = .{ .Eval = "out of memory" } };
 }
 
