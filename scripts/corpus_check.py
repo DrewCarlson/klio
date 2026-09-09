@@ -51,6 +51,11 @@ def extra_args(path):
     return []
 
 
+# Returned as the exit code when a run is killed at the limit: a timeout
+# measured nothing, so it must not read as a wrong answer.
+TIMED_OUT = "timeout"
+
+
 def run(binary, path, timeout):
     try:
         p = subprocess.run(
@@ -59,7 +64,7 @@ def run(binary, path, timeout):
         )
         return p.returncode, p.stdout.decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
-        return None, "<timeout>"
+        return TIMED_OUT, ""
     except FileNotFoundError:
         return None, "<binary-not-found>"
 
@@ -103,6 +108,9 @@ def main():
     def check(f):
         rel = os.path.relpath(f, ROOT)
         zrc, zout = run(args.zig, f, args.timeout)
+        if zrc == TIMED_OUT:
+            cmd = " ".join([args.zig, "run", rel] + extra_args(f))
+            return rel, False, f"TIMED OUT after {args.timeout:g}s — rerun: {cmd}", ""
         if args.no_rust:
             ok = zrc == 0
             detail = f"zig rc={zrc}"
@@ -125,6 +133,9 @@ def main():
                     detail = f"zig rc={zrc} output != tests/corpus/expected-cli/{stem}.out"
         else:
             rrc, rout = run(args.rust, f, args.timeout)
+            if rrc == TIMED_OUT:
+                cmd = " ".join([args.rust, "run", rel] + extra_args(f))
+                return rel, False, f"TIMED OUT after {args.timeout:g}s (rust) — rerun: {cmd}", ""
             ok = zrc == 0 and rrc == 0 and zout == rout
             detail = f"zig rc={zrc} rust rc={rrc} stdout {'==' if zout == rout else '!='}"
         return rel, ok, detail, zout if args.no_rust else (zout, rout)
@@ -137,10 +148,19 @@ def main():
             else:
                 failed.append((rel, detail, out))
 
-    print(f"\nCORPUS: {passed}/{len(files)} passed, {len(failed)} failed")
+    timed_out = [(rel, detail) for rel, detail, _ in failed if detail.startswith("TIMED OUT")]
+    real_fails = len(failed) - len(timed_out)
+    suffix = f", {len(timed_out)} TIMED OUT" if timed_out else ""
+    print(f"\nCORPUS: {passed}/{len(files)} passed, {real_fails} failed{suffix}")
+    # Timeouts print unconditionally: nothing was measured, and the name is
+    # the whole signal.
+    for rel, detail in timed_out:
+        print(f"  {detail.split(' — ')[0]}: {rel}\n    {detail.split(' — ', 1)[1]}"
+              if " — " in detail else f"  {rel}: {detail}")
     if args.list_fail:
         for rel, detail, _ in failed:
-            print(f"  FAIL {rel}: {detail}")
+            if not detail.startswith("TIMED OUT"):
+                print(f"  FAIL {rel}: {detail}")
     return 0 if not failed else 1
 
 
