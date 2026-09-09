@@ -1014,6 +1014,44 @@ fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator
 /// ancestor's primary-param fields, run its body-property init thunks, and
 /// continue up with that level's own parent-ctor-arg thunks. Parent
 /// `init { }` blocks are not yet replayed here.
+/// Append a zero/null slot for every backing-field body property the class and
+/// its ancestors declare, skipping any already present. Kotlin's rule: the field
+/// exists (zero-initialized) from allocation, and the initializer merely
+/// overwrites it. `lateinit`, delegated and accessor-only properties have no
+/// backing field and are left out — a `lateinit` read must still fail.
+fn predeclareBackingFields(
+    self: *VmHost,
+    allocator: Allocator,
+    cls: ObjRef(ClassDef),
+    fields: *std.ArrayList(InstanceData.Field),
+) Allocator.Error!void {
+    var cur: ?ObjRef(ClassDef) = cls.clone();
+    var depth: usize = 0;
+    while (cur) |d| {
+        defer d.deinit();
+        depth += 1;
+        if (depth > 64) break; // cycle guard, matching the other hierarchy walks
+        const dg = d.borrow();
+        for (dg.get().body_properties) |bp| {
+            if (!bp.has_backing or bp.is_lateinit or bp.is_abstract) continue;
+            if (bp.delegate != null or bp.getter != null) continue;
+            var present = false;
+            for (fields.items) |f| {
+                if (std.mem.eql(u8, f.name, bp.name)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (present) continue;
+            try fields.append(allocator, .{ .name = bp.name, .value = bp.primitive_zero orelse Value.Null });
+        }
+        const parent = if (dg.get().parent) |p| p.clone() else null;
+        dg.deinit();
+        cur = parent;
+    }
+    _ = self;
+}
+
 pub fn initLocalParentChain(
     self: *VmHost,
     allocator: Allocator,
@@ -4116,6 +4154,16 @@ fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         if (runtime.reclaimEnabled()) bb.value.retain();
         try fields.append(allocator, .{ .name = bb.key, .value = bb.value });
     }
+    // Every backing field exists from ALLOCATION, holding its type's zero (or
+    // null), exactly as it does on the JVM. A property's slot used to appear
+    // only when its initializer ran, so a superclass `init` calling an
+    // overridden method saw the subclass's field MISSING — `open class A { init
+    // { show() } }` with `class B : A() { var n = 5; override fun show() =
+    // println(n) }` failed with "get_field `n` on `B`" where Kotlin prints 0.
+    // It also gives the instance one stable layout for its whole life, so a
+    // compiled method's shape guard holds instead of drifting as fields appear.
+    try predeclareBackingFields(self, allocator, class_def, &fields);
+
     // Materialise the instance.
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = class_def.clone(),
