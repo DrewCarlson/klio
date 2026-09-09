@@ -6,11 +6,11 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-09, fake-override, CI green)
+## State (2026-09-09, inherited-default-order, CI green)
 
-Census 6038 passed / 318 failed / 1 did not complete, **zero crashes**
+Census 6040 passed / 316 failed / 1 did not complete, **zero crashes**
 (994 excluded: the runner also skips `DONT_TARGET_EXACT_BACKEND: JVM*`
-files). Ratchet `BASELINE = 6038`, `MAX_FAILED = 318` in
+files). Ratchet `BASELINE = 6040`, `MAX_FAILED = 316` in
 `src/itests/box_support.zig`.
 
 Non-local break/continue from an inline lambda now targets the CALL-SITE
