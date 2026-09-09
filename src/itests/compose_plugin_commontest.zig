@@ -279,6 +279,14 @@ fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayL
 }
 
 /// The test CLASS a file contributes, or null when it declares none.
+/// Number of `@Test` occurrences in a file — the shard-balancing weight, and
+/// the same quantity the ratchet counts, so a slice's share of the baseline is
+/// its share of this.
+fn testCount(a: std.mem.Allocator, io: std.Io, path: []const u8) usize {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return 0;
+    return std.mem.count(u8, bytes, "@Test");
+}
+
 fn testClassOf(a: std.mem.Allocator, io: std.Io, path: []const u8) ?[]const u8 {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return null;
     if (std.mem.indexOf(u8, bytes, "@Test") == null) return null;
@@ -423,9 +431,30 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
 
     var sources: std.ArrayList([]const u8) = .empty;
     var classes: std.ArrayList([]const u8) = .empty;
+    var class_files: std.ArrayList([]const u8) = .empty;
     for (all.items) |p| {
         try sources.append(a, p);
-        if (testClassOf(a, io, p)) |cls| try classes.append(a, cls);
+        if (testClassOf(a, io, p)) |cls| {
+            try classes.append(a, cls);
+            try class_files.append(a, p);
+        }
+    }
+
+    // KLIO_COMMONTEST_SHARD=K/N runs one slice of the class list so CI can fan
+    // this suite across parallel jobs. It is the suite wall by a wide margin
+    // (~25 minutes, against ~10 for the next heaviest), and no packing puts a
+    // shard below a suite it cannot divide.
+    var shard_k: usize = 0;
+    var shard_n: usize = 1;
+    if (runtime.envOnce("KLIO_COMMONTEST_SHARD")) |sv| {
+        if (std.mem.indexOfScalar(u8, sv, '/')) |sep| {
+            const k = std.fmt.parseInt(usize, sv[0..sep], 10) catch 0;
+            const n = std.fmt.parseInt(usize, sv[sep + 1 ..], 10) catch 1;
+            if (n != 0 and k < n) {
+                shard_k = k;
+                shard_n = n;
+            }
+        }
     }
 
     // Copying an interpreted Map re-enters Kotlin while a native intrinsic
@@ -467,8 +496,35 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             break;
         }
     }
+    // Weighted slice assignment, greedy to the lightest — the same shape
+    // `stdlib_commontest` uses. Weighting by `@Test` count keeps a slice's
+    // share of the PASS COUNT proportional, which is what the ratchet below
+    // scales by. It does not model time (`validatePotentialDeadlock` is one
+    // test and ~9 minutes of the wall), so the slice holding it stays the
+    // longest — sharding trades the suite's 25 minutes for that floor plus a
+    // share of the rest, not for a perfect split.
+    const slice_of = try a.alloc(usize, classes.items.len);
+    var my_weight: usize = 0;
+    var total_weight: usize = 0;
+    {
+        const loads = try a.alloc(usize, shard_n);
+        @memset(loads, 0);
+        for (classes.items, 0..) |_, ci| {
+            const w = @max(testCount(a, io, class_files.items[ci]), 1);
+            total_weight += w;
+            var best: usize = 0;
+            for (loads, 0..) |ld, si| {
+                if (ld < loads[best]) best = si;
+            }
+            slice_of[ci] = best;
+            loads[best] += w;
+        }
+        my_weight = loads[shard_k];
+    }
+
     var job_names: std.ArrayList([]const u8) = .empty;
-    for (classes.items) |cls| {
+    for (classes.items, 0..) |cls, cls_i| {
+        if (slice_of[cls_i] != shard_k) continue;
         // `validatePotentialDeadlock` IS the suite wall (~500s solo), and the
         // rest of RecomposerTests queued behind it in the same child pushed
         // the wall past 750s. The test gets its own child, scheduled first;
@@ -633,15 +689,31 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     }
     for (threads.items) |t| t.join();
 
+    // A slice is gated on its proportional share. The slack is wider than
+    // `stdlib_commontest`'s 20% because `@Test` occurrences predict a class's
+    // pass count less well here: measured at N=3 the slices carried 43/31/26%
+    // of the passes against weights of 32/36/32, and a class whose tests are
+    // ignored or whose helpers live in a sibling contributes weight without
+    // passes. At 20% the lightest slice cleared its floor by seven passes,
+    // which is a flake, not a gate. The EXACT ratchet is still enforced by
+    // every unsharded run (local test-all, nightly).
+    const min_pass = if (shard_n == 1)
+        BASELINE
+    else
+        (BASELINE * my_weight / @max(total_weight, 1)) * 65 / 100;
     std.debug.print(
-        "compose_plugin_commontest: {d} passed, {d} failed across {d} test classes, {d} did not complete (baseline {d})\n",
-        .{ total_passed.load(.monotonic), total_failed.load(.monotonic), classes.items.len, hung.load(.monotonic), BASELINE },
+        "compose_plugin_commontest: {d} passed, {d} failed across {d} jobs (shard {d}/{d}), {d} did not complete (min {d}, baseline {d})\n",
+        .{
+            total_passed.load(.monotonic), total_failed.load(.monotonic), jobs.items.len,
+            shard_k,                       shard_n,                       hung.load(.monotonic),
+            min_pass,                      BASELINE,
+        },
     );
     // Names first: a red gate without the failing names is not actionable
     // (the expect aborts the test body).
     const failed = total_failed.load(.monotonic);
     failed_names.report("compose_plugin_commontest");
-    try std.testing.expect(total_passed.load(.monotonic) >= BASELINE);
+    try std.testing.expect(total_passed.load(.monotonic) >= min_pass);
     if (failed > MAX_FAILED) {
         std.debug.print(
             "compose_plugin_commontest: {d} failed exceeds the ceiling {d}\n",

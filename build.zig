@@ -100,19 +100,103 @@ const Itest = struct {
     /// stay on the default optimize mode.
     interprets: bool = true,
     /// Relative run cost for `-Ditest-shard` bin packing: the suite's
-    /// measured wall on the CI configuration (4 cores, ReleaseSafe harness)
-    /// in tens of seconds. Re-measure a heavy suite when its shape changes
-    /// so the shards stay balanced.
+    /// measured RUN wall on the CI configuration (4 cores, ReleaseSafe
+    /// harness) in tens of seconds — the run step alone, not the job, so a
+    /// shard's compile time does not get folded into one suite's number.
+    /// `--summary all` names each run step after its suite, so a CI log gives
+    /// these numbers directly; take them from a run rather than estimating.
+    /// A SLICED suite is priced at its heaviest slice, since the packer applies
+    /// `weight` to each one and the slices are not evenly matched.
+    /// Re-measure a heavy suite when its shape changes so the shards stay
+    /// balanced; `--summary all` prints each run step's wall in CI.
     weight: u16 = 2,
     /// Split this suite into N run steps, each with KLIO_COMMONTEST_SHARD=i/N
     /// so a single heavy suite can spread across CI shard jobs. `weight`
     /// applies to each slice.
     shards: u8 = 1,
+    /// Suites this entry's binary FOLDS IN. A suite that interprets in-process
+    /// links the whole interpreter, and that whole-program optimize is paid per
+    /// BINARY, not per suite: thirty such suites compiled separately cost thirty
+    /// optimizes (3-5 minutes each on the CI runner) to run thirteen minutes of
+    /// tests. Folded into group binaries they cost one optimize apiece.
+    ///
+    /// A member keeps its own `itest-<name>` step for local runs but stops
+    /// attaching to the sharded `itest` chain, so its tests run exactly once —
+    /// inside the group. The group's root file under `src/itests` is where
+    /// membership actually lives; this list is checked against it at configure
+    /// time so a suite cannot be dropped from one and left in the other.
+    members: []const []const u8 = &.{},
 };
+
+/// Whether `name` is folded into some group's binary, and so must not attach to
+/// the shard chain (nor be packed) in its own right.
+fn foldedIntoGroup(name: []const u8) bool {
+    for (itests_files) |g| {
+        for (g.members) |m| {
+            if (std.mem.eql(u8, m, name)) return true;
+        }
+    }
+    return false;
+}
+
+/// A group's declared members must match the `@import`s in its root file: a
+/// member missing from the file would silently stop running, which no test
+/// result would reveal.
+fn verifyItestGroups(b: *std.Build) void {
+    const io = b.graph.io;
+    for (itests_files) |g| {
+        if (g.members.len == 0) continue;
+        const path = b.fmt("src/itests/{s}.zig", .{g.name});
+        const src = b.build_root.handle.readFileAlloc(io, path, b.allocator, .limited(1 << 20)) catch
+            std.debug.panic("itest group {s}: cannot read {s}", .{ g.name, path });
+        var imports: usize = 0;
+        var it = std.mem.splitScalar(u8, src, '\n');
+        while (it.next()) |line| {
+            if (std.mem.indexOf(u8, line, "@import(\"") != null and
+                std.mem.indexOf(u8, line, ".zig\")") != null) imports += 1;
+        }
+        for (g.members) |m| {
+            const needle = b.fmt("@import(\"{s}.zig\")", .{m});
+            if (std.mem.indexOf(u8, src, needle) == null) {
+                std.debug.panic("itest group {s}: declared member {s} is not imported by {s}", .{ g.name, m, path });
+            }
+        }
+        if (imports != g.members.len) {
+            std.debug.panic("itest group {s}: {s} imports {d} suites but {d} are declared", .{ g.name, path, imports, g.members.len });
+        }
+        // A suite folded into two groups would run its tests twice.
+        for (g.members) |m| {
+            for (itests_files) |h| {
+                if (std.mem.eql(u8, h.name, g.name)) continue;
+                for (h.members) |n2| {
+                    if (std.mem.eql(u8, n2, m)) {
+                        std.debug.panic("itest suite {s} is folded into both {s} and {s}", .{ m, g.name, h.name });
+                    }
+                }
+            }
+        }
+    }
+}
 
 const itests_files = [_]Itest{
     .{ .name = "cfa_builder", .parity_data = false, .interprets = false },
     .{ .name = "cfa_smartcast", .parity_data = false, .interprets = false },
+    .{ .name = "group_parity_core", .weight = 4, .dirs = &.{ "tests/fixtures/parity_corpus", "examples/file_private_collision", "tests/fixtures/coroutine_smoke" }, .members = &.{
+        "parity_array_bulk_ops",    "parity_closures_deep",       "parity_collections_intensive", "parity_corpus_pinned",
+        "parity_coroutines_realistic", "parity_data_class_features", "parity_dsl_operators",      "parity_exceptions_and_flow",
+    } },
+    .{ .name = "group_parity_types", .weight = 2, .members = &.{
+        "parity_extension_resolution", "parity_generics_advanced", "parity_inheritance_dispatch", "parity_inner_classes",
+        "parity_lambdas_and_dispatch", "parity_named_args_defaults", "parity_nullability_deep",   "parity_object_init",
+    } },
+    .{ .name = "group_parity_shapes", .weight = 2, .members = &.{
+        "parity_operator_edge_cases", "parity_properties_accessors", "parity_sealed_when_patterns", "parity_strings_numbers",
+        "parity_stdlib_isolation",    "parity_suspend_shapes",       "parity_type_system_shapes",   "parity_visibility_modifiers",
+    } },
+    .{ .name = "group_lang_features", .weight = 3, .fuzz_env = true, .dirs = &.{"examples"}, .members = &.{
+        "explicit_backing_fields", "annotation_targets", "context_parameters",
+        "resolve_ambiguity",       "check_examples",     "fuzz_closures_suspend",
+    } },
     .{ .name = "parity_array_bulk_ops" },
     .{ .name = "parity_closures_deep" },
     .{ .name = "parity_collections_intensive" },
@@ -152,7 +236,7 @@ const itests_files = [_]Itest{
     .{ .name = "runtime_objref_threads", .parity_data = false, .interprets = false },
     .{ .name = "typeck_negative", .parity_data = false, .interprets = false, .dirs = &.{"tests/fixtures/typeck_negative"} },
     .{ .name = "check_examples", .dirs = &.{"examples"}, .weight = 2 },
-    .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" }, .weight = 18 },
+    .{ .name = "differential", .dirs = &.{ "examples", "tests/fixtures/coroutine_smoke" }, .weight = 24 },
     .{ .name = "fuzz_closures_suspend", .fuzz_env = true, .weight = 2 },
     // End-to-end ktor gate: child `klio` + in-test HTTP server + installed packs.
     .{ .name = "ktor_client_get", .parity_data = false, .needs_exe = true, .dirs = &.{
@@ -179,7 +263,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-ktor",
-    }, .weight = 2 },
+    }, .weight = 3 },
     // Threaded stress gate for the pack concurrency primitives
     // (ConcurrentMap/Attributes computeIfAbsent once-only, the ktor locks
     // actuals, ByteChannel written from a Default worker) through child
@@ -189,7 +273,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-ktor",
-    }, .weight = 2 },
+    }, .weight = 3 },
     // Reified inline Json extension shapes through the installed pack
     // (kotlinc-verified expected output; the in-process parity harness
     // does not fold in the serialization pack).
@@ -199,7 +283,7 @@ const itests_files = [_]Itest{
     // Baked stdlib image gate: bake -> hit -> fallback -> staleness ->
     // corruption through a child `klio` against a scratch HOME, plus the
     // in-process bake/load round trip.
-    .{ .name = "stdlib_image", .needs_exe = true, .weight = 4 },
+    .{ .name = "stdlib_image", .needs_exe = true, .weight = 5 },
     // Single-executable bundle gate: `klio bundle` output runs against an
     // empty HOME byte-identically to `klio run` (argv, resources, exit
     // code, stdin, corruption refusal, inspect, determinism).
@@ -221,7 +305,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-androidx-collection",
         "kotlin-klio/klio-compose-runtime-engine",
         "kotlin-klio/klio-compose-ui",
-    }, .weight = 3 },
+    }, .weight = 1 },
     // Bootstrapping proof: Kotlin's own stdlib commonTest sources run through
     // a child `klio test` against the installed kotlin.test pack.
     // kotlinc's own box-test corpus (`fun box(): String` == "OK"), one
@@ -229,20 +313,20 @@ const itests_files = [_]Itest{
     .{ .name = "box_conformance", .needs_exe = true, .dirs = &.{
         "kotlin/compiler/testData/codegen/box",
         "kotlin/compiler/testData/diagnostics/helpers/coroutines",
-    }, .weight = 35 },
+    }, .weight = 96 },
     .{ .name = "stdlib_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlin-test",
         "kotlin/libraries/kotlin.test",
         "kotlin/libraries/stdlib/test",
         "tests/stdlib_commontest_actuals",
-    }, .weight = 16, .shards = 2 },
+    }, .weight = 42, .shards = 2 },
     // androidx.collection's own commonTest sources run through a child
     // `klio test` against the installed androidx.collection pack.
     .{ .name = "androidx_collection_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-androidx-collection",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 62 },
+    }, .weight = 66 },
     // The upstream Compose runtime's own test suite (CompositionTests,
     // RestartTests, MovableContentTests, the snapshot suites) run through a
     // child `klio test` against the ENGINE pack with the `@Composable` lowering
@@ -253,26 +337,30 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 126 },
+        // Sharded: the suite is ~25 minutes undivided, and its slice holding
+        // `RecomposerTests.validatePotentialDeadlock` (one test, ~9 of those
+        // minutes) sets the floor — so the weight is the heaviest slice's, not
+        // a third of the whole.
+    }, .weight = 90, .shards = 3 },
     // Each bundled library's own commonTest sources run through a child
     // `klio test` against its installed pack (see commontest_support.zig).
     .{ .name = "atomicfu_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 3 },
+    }, .weight = 5 },
     .{ .name = "io_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 17 },
+    }, .weight = 12 },
     .{ .name = "datetime_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-datetime",
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 30 },
+    }, .weight = 48 },
     .{ .name = "serialization_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 3 },
+    }, .weight = 6 },
     .{ .name = "serialization_json_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-kotlin-test",
@@ -281,14 +369,14 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 24 },
+    }, .weight = 48 },
     .{ .name = "ktor_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-ktor",
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-io",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 5 },
+    }, .weight = 6 },
     .{ .name = "compose_ui_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-compose-runtime",
         "kotlin-klio/klio-compose-runtime-engine",
@@ -303,7 +391,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
         "tests/compose_ui_commontest_actuals",
-    }, .weight = 6 },
+    }, .weight = 12 },
 };
 
 /// Read by every parity-pipeline run: the stdlib pack is built at runtime from
@@ -600,6 +688,11 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "parity-base",
     });
     const base_images_path = b.getInstallPath(.prefix, "parity-base");
+    // Nameable so a CI producer job can build the base images (and the harness
+    // universe they share) once and bank the cache every shard restores,
+    // instead of each shard regenerating them.
+    const base_images_step = b.step("parity-base", "Build+install the parity base images");
+    base_images_step.dependOn(&base_images_install.step);
 
     // Install the compiled static library to zig-out/lib/libzstd.a so
     // per-module verification (scripts/zigcheck.py) can link the extern
@@ -786,6 +879,7 @@ pub fn build(b: *std.Build) void {
     // parallel jobs. Without the option every suite runs. Assignment is
     // greedy over descending declared weights, so it is deterministic for a
     // given suite list.
+    verifyItestGroups(b);
     const shards = ItestShards.fromOption(b);
     // Serialize the run steps attached to `itest` within a shard. Each
     // commontest suite spawns a per-core worker pool of child `klio test`
@@ -872,7 +966,12 @@ pub fn build(b: *std.Build) void {
                     b.fmt("{s}#{d}", .{ spec.name, slice_i })
                 else
                     spec.name;
-                if (shards.includes(slice_name)) {
+                // Name the run step after its suite. `--summary all` otherwise
+                // prints every one as a bare `run test`, so a CI log shows which
+                // suites a shard ran and how long each took, but not which time
+                // belongs to which suite — and `weight` is meant to BE that time.
+                run_t.step.name = b.fmt("run itest {s}", .{slice_name});
+                if (!foldedIntoGroup(spec.name) and shards.includes(slice_name)) {
                     // Serialize only under an explicit shard (CI): chaining the
                     // run steps otherwise leaks into the targeted `itest-<name>`
                     // step (which depends on the same run step) so a single named
@@ -921,8 +1020,11 @@ pub fn build(b: *std.Build) void {
         if (runs_programs) {
             // The parity harness caches one base snapshot per (load-mode,
             // pack-mask) combo without eviction, so give the corpus runners
-            // headroom over the 6 GB default RSS watchdog cap.
-            run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "6815744");
+            // headroom over the 6 GB default RSS watchdog cap. The corpus runs
+            // every example twice (JIT on, JIT off) and peaks around 8 GB;
+            // measured the same either side of the in-thread stack switch, so
+            // the ceiling tracks the corpus size, not a leak.
+            run_t.setEnvironmentVariable("KLIO_RSS_CAP_KB", "10485760");
             run_t.setEnvironmentVariable("KLIO_PARITY_BASE_IMAGES", base_images_path);
             run_t.step.dependOn(&base_images_install.step);
             run_t.addFileInput(base_images.path(b, "embedded-gate0.klio-image"));
@@ -983,22 +1085,29 @@ const ItestShards = struct {
         const n = std.fmt.parseInt(usize, raw[slash + 1 ..], 10) catch badShardOption(raw);
         if (n == 0 or k >= n) badShardOption(raw);
 
-        const Suite = struct { name: []const u8, weight: u16 };
+        const Suite = struct { name: []const u8, weight: u16, links_interpreter: bool };
         var suites: std.ArrayList(Suite) = .empty;
         for (itests_files) |spec| {
+            if (foldedIntoGroup(spec.name)) continue;
+            // A suite that only drives `klio-harness` as a child never reaches
+            // the interpreter, and Zig codegens only what is reachable, so its
+            // binary links in seconds. One that interprets in-process pays the
+            // whole-program optimize.
+            const links = spec.interprets and !spec.needs_exe;
             if (spec.shards > 1) {
                 for (0..spec.shards) |si| {
                     suites.append(b.allocator, .{
                         .name = b.fmt("{s}#{d}", .{ spec.name, si }),
                         .weight = spec.weight,
+                        .links_interpreter = links,
                     }) catch @panic("oom");
                 }
             } else {
-                suites.append(b.allocator, .{ .name = spec.name, .weight = spec.weight }) catch @panic("oom");
+                suites.append(b.allocator, .{ .name = spec.name, .weight = spec.weight, .links_interpreter = links }) catch @panic("oom");
             }
         }
-        suites.append(b.allocator, .{ .name = "e2e", .weight = e2e_weight }) catch @panic("oom");
-        suites.append(b.allocator, .{ .name = "bench", .weight = bench_weight }) catch @panic("oom");
+        suites.append(b.allocator, .{ .name = "e2e", .weight = e2e_weight, .links_interpreter = true }) catch @panic("oom");
+        suites.append(b.allocator, .{ .name = "bench", .weight = bench_weight, .links_interpreter = true }) catch @panic("oom");
         // Descending weight, name-tiebroken: deterministic greedy packing.
         std.mem.sort(Suite, suites.items, {}, struct {
             fn lt(_: void, x: Suite, y: Suite) bool {
@@ -1007,6 +1116,19 @@ const ItestShards = struct {
             }
         }.lt);
 
+        // Every suite in a bin also costs a whole-program COMPILE of its test
+        // binary (~1 minute on the CI runner, since each links the entire
+        // interpreter), and `weight` measures only the run. Without this term
+        // the packer treats one 25-minute suite and eleven one-minute ones as
+        // interchangeable: measured, the eleven-suite bins ran 28-31m against
+        // 26m for the single heavy one they were supposedly heavier than.
+        // Measured on the CI runner, in the same tens-of-seconds unit as
+        // `weight`: a binary that links the interpreter takes 3-5 minutes to
+        // optimize, one that only spawns the harness a few seconds. Pricing both
+        // at one flat number put four interpreter-linking binaries in a bin
+        // beside a child driver and called them even.
+        const link_compile_weight: u64 = 24;
+        const spawn_compile_weight: u64 = 1;
         const bin_totals = b.allocator.alloc(u64, n) catch @panic("oom");
         @memset(bin_totals, 0);
         var selected = std.StringHashMap(void).init(b.allocator);
@@ -1015,8 +1137,16 @@ const ItestShards = struct {
             for (bin_totals, 0..) |w, i| {
                 if (w < bin_totals[lightest]) lightest = i;
             }
-            bin_totals[lightest] += s.weight;
+            bin_totals[lightest] += @as(u64, s.weight) +
+                (if (s.links_interpreter) link_compile_weight else spawn_compile_weight);
             if (lightest == k) selected.put(s.name, {}) catch @panic("oom");
+        }
+        // `-Ditest-shard=K/N -Ditest-shard-list` prints the bin and stops, so the
+        // packing can be inspected without running twenty minutes of tests.
+        if (b.option(bool, "itest-shard-list", "Print this shard's suites and exit") orelse false) {
+            var it2 = selected.keyIterator();
+            while (it2.next()) |kk| std.debug.print("shard {d}/{d}: {s}\n", .{ k, n, kk.* });
+            std.process.exit(0);
         }
         return .{ .selected = selected };
     }

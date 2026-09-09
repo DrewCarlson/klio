@@ -1,0 +1,4 @@
+during A.init: n=0 flag=false label=null
+during A.init: n=5 flag=true label=null
+during A.init: count=0
+during A.init: count=7
