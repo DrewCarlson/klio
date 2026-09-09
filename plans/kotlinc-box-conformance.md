@@ -6,11 +6,11 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-08, cfa831d3, CI green)
+## State (2026-09-09, fake-override, CI green)
 
-Census 6033 passed / 323 failed / 1 did not complete, **zero crashes**
+Census 6038 passed / 318 failed / 1 did not complete, **zero crashes**
 (994 excluded: the runner also skips `DONT_TARGET_EXACT_BACKEND: JVM*`
-files). Ratchet `BASELINE = 6033`, `MAX_FAILED = 323` in
+files). Ratchet `BASELINE = 6038`, `MAX_FAILED = 318` in
 `src/itests/box_support.zig`.
 
 Non-local break/continue from an inline lambda now targets the CALL-SITE
@@ -343,20 +343,19 @@ process memory cap: a 100k-iteration loop allocating a closure per call).
   (`fun f(x: String = "1")`, no body). `b.f()` misses: A.f declines
   undersupply (needs 1 arg), I.f is collected=0 (no body). The fix
   synthesises the fake override — apply I's default thunk for the missing
-  param, then dispatch to A.f — at the arity-decline point in member
-  dispatch (host_call_member `[pmo] decline=undersupply`). ATTEMPTED
-  2026-09-09 as a fallback at the general instance-MISS tail
-  (`fakeOverrideInheritedDefault`): fixed the 3 files (+2 more) to 6038/318,
-  BUT regressed coroutines_commontest 1299 -> 1289 (10 channel tests:
-  ProduceTest/BroadcastTest `produce`/`close`/`awaitClose`). The miss tail
-  is where a call returning `Vm::call_member` is pattern-matched by
-  DOWNSTREAM coroutine/channel host fallbacks — a success there preempts
-  them. Gating on `!is_suspend` and exact `defaults.len == f.params.len`
-  did NOT recover coroutines (the intercepted channel members are neither).
-  Reverted. CORRECT placement: at `pickMethodOverload`'s undersupply
-  decline (thread the receiver in, check `inheritedMemberDefaults` there,
-  accept + pad), NOT the miss tail — so it only affects calls that reach
-  overload resolution and undersupply, never the channel host path.
+  param, then dispatch to A.f. LANDED 2026-09-09 (`fakeOverrideInheritedDefault`
+  at the instance-MISS tail): +5 files to 6038/318. A first attempt at the
+  miss tail regressed coroutines 1299->1289 (channel ProduceTest/
+  BroadcastTest): the fallback fired for a deep channel member whose call
+  returning `Vm::call_member` is pattern-matched by downstream host
+  dispatch, and a success there preempts it. `!is_suspend` + exact
+  `defaults.len == f.params.len` gates were not enough. THE GATE THAT
+  WORKED: the body method must come from a DIRECT superclass of the
+  receiver and the default from a DIRECT interface (`B : A(), I` — both
+  first-level parents); a channel's many-layered hierarchy is not this
+  shape, so the walk is a single pass over the receiver's direct
+  supertypes, not a recursive class-chain BFS. Verified coroutines back to
+  1299/0.
 - kt47073_nested + closures/kt5589 (2): a LOCAL function's default
   references the ENCLOSING scope — a class property (`x = k` = `this.k`,
   kt47073) or a plain enclosing local (`y = x`, kt5589). The default thunk
