@@ -714,6 +714,138 @@ fn regWrittenInBody(func: *const Func, body: []const BlockId, r: Reg) bool {
 /// scalar ops, parameter loads, or `this`-field accesses (get/set of a scalar
 /// field on the `LoadParam 0` register), with scalar required parameters and a
 /// scalar-or-`Unit` return. `this_reg` receives the register `LoadParam 0` binds.
+/// Inline a SELF call — `this.helper(...)`, which the lowerer emits as a static
+/// `Call` with the receiver moved into arg 0 — into a compiled method. That Move
+/// is what made the whole method uncompilable (a receiver register may appear
+/// only as a field-op receiver), so a method delegating to a sibling helper
+/// compiled nothing and ran slower than interpreted. Splicing a callee that
+/// never touches `this` makes both the Move and the call disappear, and the
+/// method still runs frameless at the seam: 1049ms -> 351ms on such a loop.
+///
+/// `KLIO_FJ_SELF_INLINE=0` disables it. On by default so every corpus and sweep
+/// run exercises the path — the reason it stayed off for its first hours is that
+/// the corpus contained exactly ONE program that reached it.
+var fj_self_inline_cache: ?bool = null;
+fn fjSelfInlineEnabled() bool {
+    if (fj_self_inline_cache) |v| return v;
+    const on = if (runtime.envOnce("KLIO_FJ_SELF_INLINE")) |v| !(v.len != 0 and v[0] == '0') else true;
+    fj_self_inline_cache = on;
+    return on;
+}
+
+/// A callee this tier can splice into its caller at a self-call: a single-block
+/// scalar expression that never touches `this`. Refusing any `this` use is what
+/// keeps the receiver out of the compiled body — the register holding it is
+/// never materialized, which is the whole reason the caller can compile.
+fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32) bool {
+    if (f.is_suspend or f.is_lambda) return false;
+    if (!f.has_receiver_param) return false;
+    if (f.params.len != n_args) return false;
+    if (f.blocks.len != 1) return false;
+    const blk = &f.blocks[0];
+    if (blk.terminator != .Return) return false;
+    if (blk.terminator.Return == null) return false;
+    if (blk.insts.len == 0 or blk.insts.len > INLINE_MAX_INSTS) return false;
+    if (f.n_locals == 0) return false;
+    for (f.params[1..]) |p| {
+        if (p.is_vararg or p.default != null or !isScalarRt(retRegType(p.ty))) return false;
+    }
+    if (!isScalarRt(retRegType(f.return_ty))) return false;
+    // The lowerer emits a `LoadParam` for EVERY parameter, so the receiver load
+    // is present even in a body that ignores `this`. What matters is that the
+    // register it lands in is never read: the emitter skips that load, so a body
+    // reading it would see an empty slot.
+    var this_dst: ?u32 = null;
+    for (blk.insts) |*ci| {
+        if (ci.* == .LoadParam and ci.LoadParam.idx == 0) this_dst = ci.LoadParam.dst.int();
+        if (trampolinableFieldOf(module, ci) != null) return false;
+        if (trampolinableFieldSetOf(module, ci) != null) return false;
+        switch (ci.*) {
+            .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .LoadParam => {},
+            else => return false,
+        }
+    }
+    if (this_dst) |td| {
+        var reads: usize = 0;
+        for (blk.insts) |*ci| {
+            if (ci.* == .LoadParam and ci.LoadParam.idx == 0) continue;
+            const Ctx = struct { r: u32, n: *usize };
+            var cx = Ctx{ .r = td, .n = &reads };
+            ir.visitInstRegs(ci, &cx, struct {
+                fn count(c: *Ctx, rr: Reg, _: bool) void {
+                    if (rr.int() == c.r) c.n.* += 1;
+                }
+            }.count);
+        }
+        {
+            const Ctx = struct { r: u32, n: *usize };
+            var cx = Ctx{ .r = td, .n = &reads };
+            ir.visitTerminatorRegs(&blk.terminator, &cx, struct {
+                fn count(c: *Ctx, rr: Reg, _: bool) void {
+                    if (rr.int() == c.r) c.n.* += 1;
+                }
+            }.count);
+        }
+        if (reads != 0) return false;
+    }
+    return true;
+}
+
+/// A (block, instruction) position inside a compiled body.
+const BodyInstPos = struct { b: u32, i: u32 };
+
+/// The single `Move` that loads the receiver into `reg` for the call at
+/// (`call_b`, `call_i`), when `reg` is referenced by NOTHING else in the body.
+/// Exhaustive: `visitInstRegs` forces every instruction shape to be considered,
+/// so a register read the splice would leave stale cannot slip through.
+fn soleReceiverMove(
+    func: *const Func,
+    body: []const BlockId,
+    reg: u32,
+    call_b: u32,
+    call_i: u32,
+    recv_regs: []const u32,
+    n_recv: usize,
+) ?BodyInstPos {
+    var found: ?BodyInstPos = null;
+    var other_refs: usize = 0;
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        for (blk.insts, 0..) |*inst, ii| {
+            if (bid.int() == call_b and ii == call_i) continue; // the call itself
+            if (inst.* == .Move) {
+                const m = inst.Move;
+                if (m.dst.int() == reg) {
+                    if (found != null) return null; // more than one writer
+                    var src_is_recv = false;
+                    for (recv_regs[0..n_recv]) |x| {
+                        if (x == m.src.int()) src_is_recv = true;
+                    }
+                    if (!src_is_recv) return null;
+                    found = .{ .b = bid.int(), .i = @intCast(ii) };
+                    continue;
+                }
+            }
+            const Ctx = struct { r: u32, n: *usize };
+            var cx = Ctx{ .r = reg, .n = &other_refs };
+            ir.visitInstRegs(inst, &cx, struct {
+                fn f(c: *Ctx, rr: Reg, _: bool) void {
+                    if (rr.int() == c.r) c.n.* += 1;
+                }
+            }.f);
+        }
+        const Ctx2 = struct { r: u32, n: *usize };
+        var cx2 = Ctx2{ .r = reg, .n = &other_refs };
+        ir.visitTerminatorRegs(&blk.terminator, &cx2, struct {
+            fn f(c: *Ctx2, rr: Reg, _: bool) void {
+                if (rr.int() == c.r) c.n.* += 1;
+            }
+        }.f);
+    }
+    if (other_refs != 0) return null;
+    return found;
+}
+
 fn inlinableMemberCallee(module: *const Module, f: *const Func, this_reg_out: *u32) bool {
     if (f.is_suspend) return false;
     if (f.blocks.len != 1) return false;
@@ -4342,6 +4474,68 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         }
     }.f;
 
+    // Self-call inlining (opt-in): `this.helper(args)` lowers to a static Call
+    // with the receiver MOVED into arg 0, and that Move is what makes the whole
+    // method uncompilable — a receiver register may otherwise appear only as a
+    // field-op receiver. When the callee never touches `this`, the splice makes
+    // both the Move and the call disappear, so the receiver is never
+    // materialized and the method can still run frameless at the seam.
+    const InstPos = BodyInstPos;
+    var inline_sites: std.ArrayListUnmanaged(InlineSite) = .empty;
+    defer inline_sites.deinit(a);
+    var skip_insts: std.ArrayListUnmanaged(InstPos) = .empty;
+    defer skip_insts.deinit(a);
+    var total_regs: u32 = n_regs;
+    if (is_method and fjSelfInlineEnabled()) {
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            for (blk.insts, 0..) |*inst, ii| {
+                const tc = trampolinableCallOf(inst) orelse continue;
+                if (tc.n_args == 0 or tc.n_args > 6) continue;
+                const cf = module.funcById(tc.func) orelse continue;
+                if (!selfInlinableCallee(module, cf, tc.n_args)) continue;
+                const mv = soleReceiverMove(func, body, tc.args_reg, bid.int(), @intCast(ii), &recv_regs_buf, n_recv_regs) orelse continue;
+                inline_sites.append(a, .{
+                    .block = bid,
+                    .inst = @intCast(ii),
+                    .callee = cf,
+                    .base = total_regs,
+                    // Member convention: parameter 1 is the first real argument,
+                    // and parameter 0 (the receiver) is skipped by the emitter.
+                    .args_reg = tc.args_reg + 1,
+                    .n_args = tc.n_args - 1,
+                    .dst = tc.dst,
+                    .is_member = true,
+                    .recv_reg = tc.args_reg,
+                    .this_reg = 0,
+                    .field_site_base = 0,
+                    .n_field_sites = 0,
+                    .has_result = true,
+                }) catch return null;
+                skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
+                total_regs += cf.n_locals;
+                if (total_regs > 4096) return null;
+                if (debugEnabled()) std.debug.print("[jit]   inlining self-call {s} into {s} at b{d}:{d} (move b{d}:{d})\n", .{ cf.name, func.name, bid.int(), ii, mv.b, mv.i });
+            }
+        }
+    }
+    const inlinedAt = struct {
+        fn f(sites: []const InlineSite, b: u32, i: u32) bool {
+            for (sites) |*s| {
+                if (s.block.int() == b and s.inst == i) return true;
+            }
+            return false;
+        }
+    }.f;
+    const skippedAt = struct {
+        fn f(list: []const InstPos, b: u32, i: u32) bool {
+            for (list) |p| {
+                if (p.b == b and p.i == i) return true;
+            }
+            return false;
+        }
+    }.f;
+
     var has_div = false;
     var n_escapes: u32 = 0;
     const EscapePos = struct { b: u32, i: u32 };
@@ -4363,6 +4557,10 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             }
         }
         for (blk.insts, 0..) |*inst, inst_i| {
+            // The receiver Move an inlined self-call consumed, and the call it
+            // fed, are spliced away — neither reaches the emitter.
+            if (skippedAt(skip_insts.items, bid.int(), @intCast(inst_i))) continue;
+            if (inlinedAt(inline_sites.items, bid.int(), @intCast(inst_i))) continue;
             if (numericConvOf(module, inst)) |nc| {
                 if (isRecvReg(recv_regs, nc.src.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4175\n", .{func.name}); return null; }
                 continue;
@@ -4542,7 +4740,16 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         }
     }
 
-    const types = try inferFuncTypes(a, module, func, n_regs, params);
+    const base_types = try inferFuncTypes(a, module, func, n_regs, params);
+    // Inlined callee registers live above the caller's, so the type array (and
+    // the slot space derived from it) covers both.
+    const types = if (total_regs == n_regs) base_types else blk_t: {
+        const t = a.alloc(RegType, total_regs) catch return null;
+        @memcpy(t[0..n_regs], base_types);
+        @memset(t[n_regs..], .unknown);
+        a.free(base_types);
+        break :blk_t t;
+    };
     defer if (!ok) a.free(types);
     // Seed field-read destination types, object-param registers, and
     // member/virtual result types, then re-run the fixpoint so they
@@ -4670,6 +4877,14 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         }
     }
 
+    // Inlined callee registers are typed LAST: their parameters take the types
+    // of the caller registers feeding the call, and a field read only gets its
+    // type in the pass above — typing the splice before it left every callee
+    // parameter unknown and the emit refused the body.
+    for (inline_sites.items) |*site| {
+        fillInlineTypes(a, module, site, types[0..n_regs], types, field_resolver, resolver_user, &.{}) catch return null;
+    }
+
     // CASCADE: any instruction reading a register the typing could not
     // settle (an escaped producer's destination) escapes too — escaped
     // instructions read the live frame, where the arm-written values are
@@ -4779,6 +4994,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 if (d.int() < n_regs) def[d.int()] = true;
             }
             const tc = trampolinableCallOf(inst) orelse continue;
+            if (inlinedAt(inline_sites.items, bid.int(), @intCast(i))) continue; // spliced in place
             // A suspend callee would park through the trampoline; every
             // function-mode body must be suspension-free so a flat-driver
             // native run's outcomes stay RETURN / throw / deopt only.
@@ -4827,6 +5043,10 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     for (body) |bid| {
         const blk = &func.blocks[bid.int()];
         for (blk.insts, 0..) |*inst, i| {
+            // The receiver Move an inlined self-call consumed is spliced away:
+            // registering it as an object move would put a boxed copy back and
+            // make the method need a frame again.
+            if (skippedAt(skip_insts.items, bid.int(), @intCast(i))) continue;
             if (inst.* == .Move) {
                 // An object move copies one boxed FRAME register into another
                 // — the handler does it; the native scalar Move would copy a
@@ -5079,8 +5299,8 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     }
 
     const has_calls = call_sites.items.len != 0;
-    const param_slot_base: u32 = n_regs;
-    const after_params: u32 = n_regs + n_params;
+    const param_slot_base: u32 = total_regs;
+    const after_params: u32 = total_regs + n_params;
     const uc_slot: u32 = after_params;
     const tramp_slot: u32 = after_params + 1;
     const calls_base: u32 = after_params + (if (has_calls) @as(u32, 2) else 0);
@@ -5099,7 +5319,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .array_info = &.{},
         .cell_info = &.{},
         .call_sites = call_sites.items,
-        .inline_sites = &.{},
+        .inline_sites = inline_sites.items,
         .nullable = &.{},
         .null_flag_slot = &.{},
         .uc_slot = uc_slot,
