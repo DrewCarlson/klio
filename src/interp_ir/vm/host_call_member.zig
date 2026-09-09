@@ -416,9 +416,9 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// `EvalError`. Mirrors `dispatch_intrinsic`.
 fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(allocator, "intrinsic_call_member", fqn, null, null, args);
-    const keepalive = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(keepalive);
-    runtime.keepalivePushSlice(args);
+    const keepalive = self.ka.mark();
+    defer self.ka.restore(keepalive);
+    self.ka.pushSlice(args);
     var intrinsic = makeIntrinsicHost(self);
     defer deinitIntrinsicHost(&intrinsic);
     var ihost = intrinsic.intrinsicHost();
@@ -3940,14 +3940,27 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
 /// masks over the declared prop names' (length, first byte) signatures
 /// filter the overwhelming majority of member names without hashing —
 /// a false positive just runs the walk.
-threadlocal var recv_fn_gate_mod: ?*const Module = null;
-threadlocal var recv_fn_gate_any: bool = true;
-threadlocal var recv_fn_len_mask: u64 = ~@as(u64, 0);
-threadlocal var recv_fn_byte_mask: u64 = ~@as(u64, 0);
+/// One threadlocal, not five. Darwin resolves each `threadlocal` through a
+/// `_tlv_get_addr` call, and this gate is inlined into the hottest member
+/// dispatch there is: splitting its state across separate variables put one
+/// call per variable at every inlined site (measured 250ms -> 2380ms on a
+/// compose startup when a fifth was added).
+const RecvFnGate = struct {
+    mod: ?*const Module = null,
+    /// The module ADDRESS alone cannot say the answer is current — the next
+    /// program in this process can mint a module at the same address — so the
+    /// gate also rides the generation the program boundary bumps.
+    gen: u32 = 0,
+    any: bool = true,
+    len_mask: u64 = ~@as(u64, 0),
+    byte_mask: u64 = ~@as(u64, 0),
+};
+threadlocal var recv_fn_gate: RecvFnGate = .{};
 
 fn recvFnPropsAny(self: *VmHost) bool {
     const mp: *const Module = self.module.asPtr();
-    if (recv_fn_gate_mod == mp) return recv_fn_gate_any;
+    const gate = &recv_fn_gate;
+    if (gate.mod == mp and gate.gen == cacheGen()) return gate.any;
     const g = self.module.borrow();
     const reg = &g.get().registry;
     const any = reg.recv_fn_props.count() != 0;
@@ -3966,10 +3979,11 @@ fn recvFnPropsAny(self: *VmHost) bool {
         }
     }
     g.deinit();
-    recv_fn_len_mask = lm;
-    recv_fn_byte_mask = bm;
-    recv_fn_gate_mod = mp;
-    recv_fn_gate_any = any;
+    gate.len_mask = lm;
+    gate.byte_mask = bm;
+    gate.mod = mp;
+    gate.gen = cacheGen();
+    gate.any = any;
     return any;
 }
 
@@ -3977,8 +3991,9 @@ fn recvFnPropHeadOf(self: *VmHost, receiver: *const Value, name: []const u8) ?[]
     if (receiver.* != .Instance) return null;
     if (!recvFnPropsAny(self)) return null;
     if (name.len == 0) return null;
-    if ((recv_fn_len_mask >> @intCast(@min(name.len, 63))) & 1 == 0) return null;
-    if ((recv_fn_byte_mask >> @intCast(name[0] & 63)) & 1 == 0) return null;
+    const gate = &recv_fn_gate;
+    if ((gate.len_mask >> @intCast(@min(name.len, 63))) & 1 == 0) return null;
+    if ((gate.byte_mask >> @intCast(name[0] & 63)) & 1 == 0) return null;
     const mg = self.module.borrow();
     defer mg.deinit();
     const reg = &mg.get().registry;
@@ -7417,14 +7432,23 @@ pub fn delegateFieldAt(v: *const Value, idx: usize) ?Value {
     return null;
 }
 
+/// Both memo slices point into the module's own name storage, so they are
+/// dangling once its program ends; the generation the program boundary bumps
+/// is what keeps a later `mem.eql` from reading freed IR.
 threadlocal var sam_ext_memo_name: ?[]const u8 = null;
 threadlocal var sam_ext_memo_ty: ?[]const u8 = null;
+threadlocal var sam_ext_memo_gen: u32 = 0;
 
 /// The extension-receiver type of `name` when some `fun interface` declares it as
 /// its abstract member-EXTENSION method, else null. `fun interface MeasurePolicy`
 /// declares `fun MeasureScope.measure(measurables, constraints)`, so `measure`
 /// answers `MeasureScope`.
 fn samAbstractExtRecvType(self: *VmHost, name: []const u8) ?[]const u8 {
+    if (sam_ext_memo_gen != cacheGen()) {
+        sam_ext_memo_name = null;
+        sam_ext_memo_ty = null;
+        sam_ext_memo_gen = cacheGen();
+    }
     if (sam_ext_memo_name) |n| {
         if (std.mem.eql(u8, n, name)) return sam_ext_memo_ty;
     }
@@ -8322,8 +8346,8 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
     // The host's active globals scope is only held in this stack-local VmHost
     // field; pin it so a collection during the body eval cannot sweep the
     // transient capture-layer env (its parent chain reaches the rooted globals).
-    const ka = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(ka);
+    const ka = self.ka.mark();
+    defer self.ka.restore(ka);
     runtime.keepalivePushCell(&self.globals.cell.hdr);
     var cap_vec: std.ArrayList(Value) = .empty;
     for (f.capture_order) |cn| {
@@ -9419,9 +9443,16 @@ const HostSlotOp = enum {
 };
 
 threadlocal var host_slot_ops: ?std.AutoHashMapUnmanaged(u32, ?HostSlotOp) = null;
+threadlocal var host_slot_ops_gen: u32 = 0;
 
 fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
     if (host_slot_ops == null) host_slot_ops = .{};
+    // Keyed by a bare function id, which the next program mints again for a
+    // different function: drop the whole map when the generation moves.
+    if (host_slot_ops_gen != cacheGen()) {
+        host_slot_ops.?.clearRetainingCapacity();
+        host_slot_ops_gen = cacheGen();
+    }
     const map = &host_slot_ops.?;
     if (map.get(target.int())) |cached| return cached;
     const fqn = if (module.funcById(target)) |f| f.fqn else return null;
@@ -12572,6 +12603,9 @@ fn collectClassClosure(
 /// costs a walk of the receiver's own supertypes instead of a scan of every
 /// same-named declaration in the program.
 const MEXT_OVERRIDE_MAX = 4;
+/// `gen` is the dispatch-cache generation the program boundary bumps: the key
+/// is a class identity plus a name's storage address, both of which the next
+/// program can mint again, and the entry holds that program's function ids.
 const MextOverrideEntry = struct {
     cls: u64 = 0,
     name_p: usize = 0,
@@ -12579,6 +12613,7 @@ const MextOverrideEntry = struct {
     n: u32 = 0,
     fids: [MEXT_OVERRIDE_MAX]u32 = @splat(0),
     valid: bool = false,
+    gen: u32 = 0,
 };
 const MEXT_OVERRIDE_SLOTS = 1024;
 threadlocal var mext_override_cache: [MEXT_OVERRIDE_SLOTS]MextOverrideEntry = @splat(.{});
@@ -12599,7 +12634,7 @@ pub fn memberExtOverridesFor(self: *VmHost, receiver: *const Value, name: []cons
     };
     const slot = (cls_id ^ (@intFromPtr(name.ptr) >> 3) ^ (nparams *% 0x9E37)) & (MEXT_OVERRIDE_SLOTS - 1);
     const e = mext_override_cache[slot];
-    if (e.valid and e.cls == cls_id and e.name_p == @intFromPtr(name.ptr) and e.nparams == nparams) {
+    if (e.valid and e.gen == cacheGen() and e.cls == cls_id and e.name_p == @intFromPtr(name.ptr) and e.nparams == nparams) {
         const n = @min(e.n, out.len);
         for (0..n) |i| out[i] = @enumFromInt(e.fids[i]);
         return n;
@@ -12612,6 +12647,7 @@ pub fn memberExtOverridesFor(self: *VmHost, receiver: *const Value, name: []cons
         .nparams = @intCast(nparams),
         .n = @intCast(n),
         .valid = true,
+        .gen = cacheGen(),
     };
     for (0..n) |i| entry.fids[i] = @intCast(found[i].int());
     mext_override_cache[slot] = entry;

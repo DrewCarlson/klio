@@ -477,6 +477,13 @@ pub const PropertyDef = struct {
     /// inferred type — descriptor consumers fall back to the dynamic
     /// element descriptor.
     type_head: ?[]const u8 = null,
+    /// The property's type is a NON-NULLABLE scalar, so a read of its stored
+    /// field can never produce null. `type_head` cannot answer this: it keeps
+    /// only the head, so `Int?` and `Int` both read as "Int". The JIT needs the
+    /// distinction to compile a method deopt-free — without it a body property
+    /// only counted as non-null when it had NO initializer (`primitive_zero`),
+    /// which excluded `var n = 0`, i.e. the ordinary shape.
+    scalar_nn: bool = false,
 };
 
 /// Interned instance-LAYOUT identity. Two instances carry the same shape id

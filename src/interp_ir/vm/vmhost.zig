@@ -268,6 +268,16 @@ pub const VmHost = struct {
     object_states: ObjectStates,
     singletons_by_id: root.SingletonsById,
     allocator: Allocator,
+    /// This THREAD's field caches, resolved once when the view is built. A
+    /// view is stack-local to the thread that builds it (never stored, never
+    /// shared), so the pointer stays valid for the view's whole life — and the
+    /// per-field-operation paths reach the caches through it instead of
+    /// re-resolving a threadlocal, which on Darwin is a `_tlv_get_addr` CALL.
+    tls: *host_fields.FieldsTls,
+    /// This THREAD's keepalive handle, resolved with `tls`: pinning across a
+    /// host re-entry happens on every member call, and each mark/push/restore
+    /// was its own threadlocal resolution.
+    ka: runtime.KeepaliveHandle,
 
     /// Build a transient `VmHost` that BORROWS another host/Vm's shared
     /// handles by value, with no refcount bump. The view never outlives the
@@ -291,6 +301,8 @@ pub const VmHost = struct {
             .object_states = state.object_states,
             .singletons_by_id = state.singletons_by_id,
             .allocator = state.allocator,
+            .tls = host_fields.currentTls(),
+            .ka = runtime.keepaliveHandle(),
         };
     }
 

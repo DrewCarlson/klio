@@ -182,6 +182,12 @@ const DEFAULT_MAX_EVAL_DEPTH: usize = 2_000;
 /// Per-thread evaluator activation depth. Incremented on entry to each
 /// `runFrame` and decremented on exit, so it counts native recursion across
 /// the host call-back boundary (every nested Kotlin call re-enters here).
+/// Left as a plain threadlocal on purpose. The owner fast path that pays for
+/// itself on the walker banks and field caches LOSES here: this state is read
+/// on the JIT's per-call seam, where the extra atomic load and branch cost more
+/// than the `_tlv_get_addr` they replace (a member-call loop measured 1173ms
+/// with the threadlocal against 1277ms behind the fast path, while the
+/// interpreter-only path moved 1785ms -> 1770ms — a bad trade either way).
 threadlocal var evtls: EvalTls = .{};
 
 /// The evaluator's per-thread hot state, batched into ONE threadlocal so a
@@ -304,13 +310,13 @@ pub const EnclosingEntry = runtime.ImplicitReceiver;
 /// The compose `@Composable` hook reads this to derive a stable positional
 /// group key per call site (set per-statement by the `.Trace` instruction).
 pub fn currentCallSiteSpan() ?ir.Span {
-    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain) {
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain) {
         // The walker records each Trace op's span on its mark, exactly as
         // a frame tracks cur_span — including the null of a body that has
         // executed no Trace (a synthesized accessor): span-derived gates
         // read the INNERMOST executing code's site or nothing, never the
         // caller's.
-        return fused_tls.marks[fused_tls.depth - 1].span;
+        return fusedTls().marks[fusedTls().depth - 1].span;
     }
     return if (evtls.frame_chain) |fr| fr.cur_span else null;
 }
@@ -320,8 +326,8 @@ pub fn currentCallSiteSpan() ?ir.Span {
 /// nullable extension properties in different packages resolve to the
 /// one the executing code can see.
 pub fn currentFramePackage() ?[]const u8 {
-    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain) {
-        const pkg = fused_tls.marks[fused_tls.depth - 1].func.package;
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain) {
+        const pkg = fusedTls().marks[fusedTls().depth - 1].func.package;
         if (pkg.len != 0) return pkg;
     }
     const fr = evtls.frame_chain orelse return null;
@@ -351,7 +357,7 @@ pub const ThisChainIter = struct {
     pub fn next(self: *ThisChainIter) ?Value {
         while (self.fused_i > 0) {
             self.fused_i -= 1;
-            const v = fused_tls.marks[self.fused_i].recv orelse continue;
+            const v = fusedTls().marks[self.fused_i].recv orelse continue;
             if (self.prev) |p| {
                 if (p == .Instance and v == .Instance and
                     ObjRef(InstanceData).ptrEq(p.Instance, v.Instance)) continue;
@@ -376,7 +382,7 @@ pub const ThisChainIter = struct {
 };
 
 pub fn frameThisChainIter() ThisChainIter {
-    return .{ .cur = evtls.frame_chain, .fused_i = fused_tls.depth };
+    return .{ .cur = evtls.frame_chain, .fused_i = fusedTls().depth };
 }
 
 pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
@@ -399,8 +405,8 @@ pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
 /// frames without one (synthesized accessors / init thunks carry no
 /// package of their own; their lexical home is the calling frame's).
 pub fn nearestFramePackage() ?[]const u8 {
-    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain) {
-        const pkg = fused_tls.marks[fused_tls.depth - 1].func.package;
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain) {
+        const pkg = fusedTls().marks[fusedTls().depth - 1].func.package;
         if (pkg.len != 0) return pkg;
     }
     var cur = evtls.frame_chain;
@@ -474,8 +480,8 @@ pub fn currentFrameModule() ?*const Module {
 }
 
 pub fn currentFrameFunc() ?*const ir.Func {
-    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain)
-        return fused_tls.marks[fused_tls.depth - 1].func;
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain)
+        return fusedTls().marks[fusedTls().depth - 1].func;
     return if (evtls.frame_chain) |fr| fr.func else null;
 }
 
@@ -486,8 +492,8 @@ const FusedMark = struct { func: *const ir.Func, mod: *const Module, head: ?*Fra
 /// type variables (`ConcurrentSet<Key>()`'s literal declares `add(element:
 /// Key)` against the factory's `Key`, not a nominal class of that name).
 pub fn currentFrameTypeParams() []const []const u8 {
-    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain) {
-        const mk = &fused_tls.marks[fused_tls.depth - 1];
+    if (fusedTls().depth > 0 and fusedTls().marks[fusedTls().depth - 1].head == evtls.frame_chain) {
+        const mk = &fusedTls().marks[fusedTls().depth - 1];
         const tps = mk.mod.registry.func_type_params.get(mk.func.id) orelse return &.{};
         return tps.items;
     }
@@ -963,7 +969,7 @@ inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallFrameRoot() void {
     if (frame_troot_inited) return;
     frame_troot_inited = true;
-    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .fused_chains = &fused_tls.chain, .fused_depth = &fused_tls.depth, .tid = runtime.gc.currentTid() };
+    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .fused_chains = &fusedTls().chain, .fused_depth = &fusedTls().depth, .tid = runtime.gc.currentTid() };
     frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
     runtime.gc.registerThreadRoot(&frame_troot);
 }
@@ -990,28 +996,28 @@ pub fn gcUninstallFrameRoot() void {
 /// slice is owned by the returned cell.
 fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
     // The live call stack is the pushed frame chain (`frame_chain`) with the
-    // fully-fused activations (`fused_tls.marks`) layered on top. A fused body
+    // fully-fused activations (`fusedTls().marks`) layered on top. A fused body
     // never opens a Frame, so a trace built from `frame_chain` alone drops
     // every fused call — and a small program that fuses end to end has NO
     // pushed frames at all, so the trace comes out empty. Each fused mark
     // records the `frame_chain` head it sits on; interleave them
-    // innermost-first (a higher `fused_tls.marks` index is more inner, and a mark
+    // innermost-first (a higher `fusedTls().marks` index is more inner, and a mark
     // is more inner than the frame it is fused onto).
     var frame_n: usize = 0;
     {
         var cur = evtls.frame_chain;
         while (cur) |f| : (cur = f.gc_link) frame_n += 1;
     }
-    const total = fused_tls.depth + frame_n;
+    const total = fusedTls().depth + frame_n;
     if (total == 0) return null;
     const frames = try allocator.alloc(runtime.StackFrame, total);
     errdefer allocator.free(frames);
     var i: usize = 0;
-    var fi: usize = fused_tls.depth;
+    var fi: usize = fusedTls().depth;
     var fr = evtls.frame_chain;
     while (true) {
-        while (fi > 0 and fused_tls.marks[fi - 1].head == fr) {
-            const mk = &fused_tls.marks[fi - 1];
+        while (fi > 0 and fusedTls().marks[fi - 1].head == fr) {
+            const mk = &fusedTls().marks[fi - 1];
             const label = if (mk.func.fqn.len != 0) mk.func.fqn else mk.func.name;
             if (mk.span) |sp| {
                 frames[i] = .{ .fqn = label, .file_id = @intFromEnum(sp.file), .offset = sp.start, .has_pos = true };
@@ -12409,7 +12415,14 @@ const FusedTls = struct {
     marks: [FUSED_BANK_DEPTH]FusedMark = undefined,
     depth: usize = 0,
 };
-threadlocal var fused_tls: FusedTls = .{};
+/// Owner thread reads the global copy, every other thread its own — see
+/// `runtime.tls_fast`. Same per-thread guarantee, without a `_tlv_get_addr`
+/// call on every helper that touches the walker's banks.
+var fused_tls_owner: FusedTls = .{};
+threadlocal var fused_tls_other: FusedTls = .{};
+inline fn fusedTls() *FusedTls {
+    return if (runtime.tls_fast.isOwner()) &fused_tls_owner else &fused_tls_other;
+}
 
 var fused_enabled_state: u8 = 0;
 var fused_enabled_val: bool = true;
@@ -12661,7 +12674,7 @@ pub fn fusedExecOpt(
         g.deinit();
         if (has_outer) return null;
     }
-    if (fused_tls.depth >= FUSED_BANK_DEPTH) return null;
+    if (fusedTls().depth >= FUSED_BANK_DEPTH) return null;
     // Function-tier handshake: a hot fully-fusable body yields to the framed
     // path so the JIT can count and compile it (the walker otherwise starves
     // the tier — a fused body never opens a frame).
@@ -12685,12 +12698,20 @@ fn fusedRun(
     args_in: []const Value,
     host: *H,
 ) Allocator.Error!EvalResult {
+    // Both per-thread bases resolved ONCE for the activation: on Darwin every
+    // threadlocal access is a `_tlv_get_addr` CALL, and this function touched
+    // them fifteen times per activation.
+    const ft = fusedTls();
+    const ev: *EvalTls = &evtls;
+    // One handle for the activation's pins: mark + push + restore were three
+    // separate threadlocal resolutions, and on Darwin each is a call.
+    const ka = runtime.keepaliveHandle();
     const reclaim = runtime.reclaimEnabled();
     var eff_args = args_in;
     {
         const plan = coercePlanFor(module, func);
         if (plan & 6 != 0 and args_in.len <= ir.LEAF_MAX_REGS) {
-            const coerce_buf: []Value = coerce_bank[fused_tls.depth % LEAF_BANK_DEPTH][0..args_in.len];
+            const coerce_buf: []Value = coerce_bank[ft.depth % LEAF_BANK_DEPTH][0..args_in.len];
             @memcpy(coerce_buf, args_in);
             if (plan & 2 != 0) coerceIntArgsToLong(func, coerce_buf);
             if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, coerce_buf);
@@ -12698,9 +12719,9 @@ fn fusedRun(
         }
     }
     const nlive: usize = @min(@as(usize, func.n_locals), FUSED_MAX_REGS);
-    const regs: []Value = fused_tls.bank[fused_tls.depth][0..nlive];
-    fused_tls.depth += 1;
-    defer fused_tls.depth -= 1;
+    const regs: []Value = ft.bank[ft.depth][0..nlive];
+    ft.depth += 1;
+    defer ft.depth -= 1;
     // Unlike the leaf bank there is no def-before-use proof here: fill the
     // bank so the register file is always well-formed, and pin it for the
     // collector for the whole run (fused bodies allocate and call).
@@ -12709,23 +12730,23 @@ fn fusedRun(
     // `_tlv_get_addr` CALL, so re-reading this per instruction (the `Trace` arm
     // ran on nearly every statement) put thread-local access at the top of the
     // profile.
-    const mark: *FusedMark = &fused_tls.marks[fused_tls.depth - 1];
+    const mark: *FusedMark = &ft.marks[ft.depth - 1];
     mark.* = .{
         .func = func,
         .mod = module,
-        .head = evtls.frame_chain,
+        .head = ev.frame_chain,
         .recv = if (func.has_receiver_param and eff_args.len > 0 and eff_args[0] == .Instance) eff_args[0] else null,
     };
     if (runtime.gc.gc_enabled) gcInstallFrameRoot();
-    const pin_mark = runtime.keepaliveMark();
-    runtime.keepalivePushSlice(regs);
+    const pin_mark = ka.mark();
+    ka.pushSlice(regs);
     // The args slice is NOT otherwise a root: a dispatch that assembled it
     // in a scratch buffer (a defaulted call's argv) may hold the only
     // reference to a value in it, and unlike a framed call — which moves
     // argv into rooted params before any safe point — the fused body runs
     // through safe points with argv still in the scratch buffer.
-    runtime.keepalivePushSlice(eff_args);
-    defer runtime.keepaliveRestore(pin_mark);
+    ka.pushSlice(eff_args);
+    defer ka.restore(pin_mark);
     defer if (reclaim) {
         for (regs) |*v| v.release(allocator);
     };
@@ -12735,10 +12756,10 @@ fn fusedRun(
     // DETACHED (host trampolines null it) lost its own subject pushes —
     // `apply { add(...) }`'s subject silently vanished and the framed
     // remainder resolved `add` against the test instance.
-    const chain = &fused_tls.chain[fused_tls.depth - 1];
+    const chain = &ft.chain[ft.depth - 1];
     chain.clearRetainingCapacity();
-    if (evtls.active_chain) |caller| {
-        const base = @min(evtls.active_chain_base, caller.items.len);
+    if (ev.active_chain) |caller| {
+        const base = @min(ev.active_chain_base, caller.items.len);
         for (caller.items[base..]) |e| {
             if (e.kind == .access) continue;
             try chain.append(chainAllocator(), e);
@@ -12748,13 +12769,13 @@ fn fusedRun(
         const dup = chain.items.len > 0 and sameReceiver(chain.items[chain.items.len - 1].v, own.v);
         if (!dup) try chain.append(chainAllocator(), own);
     }
-    const prev_chain = evtls.active_chain;
-    const prev_chain_base = evtls.active_chain_base;
-    evtls.active_chain = chain;
-    evtls.active_chain_base = chain.items.len;
+    const prev_chain = ev.active_chain;
+    const prev_chain_base = ev.active_chain_base;
+    ev.active_chain = chain;
+    ev.active_chain_base = chain.items.len;
     defer {
-        evtls.active_chain = prev_chain;
-        evtls.active_chain_base = prev_chain_base;
+        ev.active_chain = prev_chain;
+        ev.active_chain_base = prev_chain_base;
     }
     var pushed_enclosing: usize = 0;
     defer while (pushed_enclosing > 0) : (pushed_enclosing -= 1) popEnclosing();

@@ -127,6 +127,10 @@ fn runCli(a: std.mem.Allocator, args: std.process.Args) u8 {
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
+    // The thread the program runs on reads its per-thread interpreter state
+    // from ordinary globals; every other thread keeps a threadlocal. Claimed
+    // here, before any interpreter thread exists.
+    runtime.tls_fast.claimOwner();
     runtime.runstats.markStart();
     // attachSegfaultHandler pulls the `SelfInfo` symbolizer (unavailable on
     // mobile — see the panic override above); gate it out there at comptime.

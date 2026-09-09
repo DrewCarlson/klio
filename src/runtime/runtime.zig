@@ -58,6 +58,8 @@ pub var debug_frame_dump: ?*const fn () void = null;
 // Host-op temporary keepalive (a GC root for accumulators/snapshots held across
 // a re-entrant user callable). No-ops unless the GC is active.
 pub const keepaliveMark = value_mod.keepaliveMark;
+pub const keepaliveHandle = value_mod.keepaliveHandle;
+pub const KeepaliveHandle = value_mod.KeepaliveHandle;
 pub const keepalivePush = value_mod.keepalivePush;
 pub const keepalivePushSlice = value_mod.keepalivePushSlice;
 pub const keepalivePushPairs = value_mod.keepalivePushPairs;
@@ -246,6 +248,7 @@ pub const runOnBigStack = safety_mod.runOnBigStack;
 pub const runOnBigStackMainThread = safety_mod.runOnBigStackMainThread;
 pub const runstats = @import("runstats.zig");
 pub const backing = @import("backing.zig");
+pub const tls_fast = @import("tls_fast.zig");
 pub const runOnPersistentBigStack = safety_mod.runOnPersistentBigStack;
 pub const currentRssKb = safety_mod.currentRssKb;
 pub const INTERPRET_STACK_SIZE = safety_mod.INTERPRET_STACK_SIZE;
