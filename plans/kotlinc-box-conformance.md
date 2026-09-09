@@ -344,7 +344,19 @@ process memory cap: a 100k-iteration loop allocating a closure per call).
   undersupply (needs 1 arg), I.f is collected=0 (no body). The fix
   synthesises the fake override — apply I's default thunk for the missing
   param, then dispatch to A.f — at the arity-decline point in member
-  dispatch (host_call_member `[pmo] decline=undersupply`).
+  dispatch (host_call_member `[pmo] decline=undersupply`). ATTEMPTED
+  2026-09-09 as a fallback at the general instance-MISS tail
+  (`fakeOverrideInheritedDefault`): fixed the 3 files (+2 more) to 6038/318,
+  BUT regressed coroutines_commontest 1299 -> 1289 (10 channel tests:
+  ProduceTest/BroadcastTest `produce`/`close`/`awaitClose`). The miss tail
+  is where a call returning `Vm::call_member` is pattern-matched by
+  DOWNSTREAM coroutine/channel host fallbacks — a success there preempts
+  them. Gating on `!is_suspend` and exact `defaults.len == f.params.len`
+  did NOT recover coroutines (the intercepted channel members are neither).
+  Reverted. CORRECT placement: at `pickMethodOverload`'s undersupply
+  decline (thread the receiver in, check `inheritedMemberDefaults` there,
+  accept + pad), NOT the miss tail — so it only affects calls that reach
+  overload resolution and undersupply, never the channel host path.
 - kt47073_nested + closures/kt5589 (2): a LOCAL function's default
   references the ENCLOSING scope — a class property (`x = k` = `this.k`,
   kt47073) or a plain enclosing local (`y = x`, kt5589). The default thunk
