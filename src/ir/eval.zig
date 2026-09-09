@@ -3998,7 +3998,7 @@ fn leafExprServeAt(
     var pin: ?usize = null;
     defer if (pin) |m| runtime.keepaliveRestore(m);
     const fs: ?*const bc.FuncStreams = if (bc.enabled())
-        bc.funcStreams(func, !jit_loop.enabled(), module.consts.items)
+        bc.funcStreams(func, !func.bc_jit_owned, module.consts.items)
     else
         null;
     const out = (if (fs) |f|
@@ -6871,7 +6871,11 @@ fn runFrameExec(
     // Fused terminator ops only when the loop JIT is off: the JIT's
     // compile trigger lives at this loop's block entry, and fused edges
     // would starve it.
-    const bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, !jit_on, module.consts.items) else null;
+    // Fusion is per FUNCTION, not per process: only a function the loop JIT has
+    // compiled into needs the unfused stream (its deopts resume at instruction
+    // indices). Gating on `jit_on` slowed every un-compiled function in the
+    // program the moment the JIT was enabled.
+    var bc_streams: ?*const bc.FuncStreams = if (bc.enabled()) bc.funcStreams(func, !func.bc_jit_owned, module.consts.items) else null;
     // The C transpiler's native table: a registered function's blocks run
     // as emitted C instead of the stream (one lookup per activation; the
     // table is empty in every non-transpiled process).
@@ -7268,6 +7272,17 @@ fn runFrameExec(
                             return er;
                         }
                         const nb: BlockId = @enumFromInt(target);
+                        if (jit_fj) |fj| {
+                            // A back edge the stream would follow itself: the
+                            // frame loop's JIT probe never sees it, so count it
+                            // here and give the block back once it is hot.
+                            if (nb.int() <= bcur.int() and jit_loop.streamBackEdge(fj, nb.int())) {
+                                if (bs.fused) bc_streams = bc.funcStreams(func, false, module.consts.items);
+                                cur = bcur;
+                                bc_goto = nb;
+                                break :bc_loop;
+                            }
+                        }
                         if (bs.streams[nb.int()]) |ns| {
                             bcur = nb;
                             binsts = frame.func.blocks[nb.int()].insts;
@@ -7319,6 +7334,17 @@ fn runFrameExec(
                             return er;
                         }
                         const nb: BlockId = @enumFromInt(if (taken.?) code[pc + 6] else code[pc + 7]);
+                        if (jit_fj) |fj| {
+                            // A back edge the stream would follow itself: the
+                            // frame loop's JIT probe never sees it, so count it
+                            // here and give the block back once it is hot.
+                            if (nb.int() <= bcur.int() and jit_loop.streamBackEdge(fj, nb.int())) {
+                                if (bs.fused) bc_streams = bc.funcStreams(func, false, module.consts.items);
+                                cur = bcur;
+                                bc_goto = nb;
+                                break :bc_loop;
+                            }
+                        }
                         if (bs.streams[nb.int()]) |ns| {
                             bcur = nb;
                             binsts = frame.func.blocks[nb.int()].insts;
@@ -8094,6 +8120,30 @@ var native_mutex: runtime.SpinMutex = .{};
 const NativeEntry = struct { f: NativeFn, fqn: []const u8 };
 var native_table: std.AutoHashMapUnmanaged(u32, NativeEntry) = .empty;
 var native_any: std.atomic.Value(bool) = .init(false);
+/// Set at the first lookup: the table is complete from then on and reads take
+/// no lock. A registration after this point would race, so registration is
+/// refused once frozen (the generated entry always registers first).
+var native_frozen: std.atomic.Value(bool) = .init(false);
+/// The frozen table, indexed by fid. Empty until the first lookup.
+var native_slots: []const ?NativeEntry = &.{};
+
+/// Flatten the registered table into a fid-indexed array and publish it. Called
+/// once, at the first lookup; registration is closed from here on.
+fn freezeNativeTable() void {
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    if (native_frozen.load(.acquire)) return;
+    var max_fid: u32 = 0;
+    var it = native_table.keyIterator();
+    while (it.next()) |k| max_fid = @max(max_fid, k.*);
+    if (std.heap.smp_allocator.alloc(?NativeEntry, max_fid + 1)) |slots| {
+        @memset(slots, null);
+        var ei = native_table.iterator();
+        while (ei.next()) |e| slots[e.key_ptr.*] = e.value_ptr.*;
+        native_slots = slots;
+    } else |_| {}
+    native_frozen.store(true, .release);
+}
 
 /// Registration happens from the transpiled binary's `main` before the
 /// program runs; the table is read-only afterwards. `fqn` is the emitted
@@ -8106,15 +8156,22 @@ pub fn registerNative(fid: u32, f: NativeFn, fqn: []const u8) void {
     native_mutex.lock();
     defer native_mutex.unlock();
     const owned = std.heap.smp_allocator.dupe(u8, fqn) catch return;
+    if (native_frozen.load(.acquire)) return; // execution started; the table is read lock-free now
     native_table.put(std.heap.smp_allocator, fid, .{ .f = f, .fqn = owned }) catch return;
     native_any.store(true, .release);
 }
 
 fn nativeFor(fid: u32, fqn: []const u8) ?NativeFn {
     if (!native_any.load(.acquire)) return null;
-    native_mutex.lock();
-    defer native_mutex.unlock();
-    const e = native_table.get(fid) orelse return null;
+    // Registration happens once, from the generated `klio_transpiled_register`,
+    // before the program runs. The first lookup freezes the table into a
+    // fid-indexed array, so every later activation is one bounds check and one
+    // load: the hash probe under a process-global lock, paid per activation,
+    // cost a transpiled compose program ~40% of its run time.
+    if (!native_frozen.load(.acquire)) freezeNativeTable();
+    const slots = native_slots;
+    if (fid >= slots.len) return null;
+    const e = slots[fid] orelse return null;
     if (!std.mem.eql(u8, e.fqn, fqn)) {
         if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
             std.debug.print("[native-fqn] fid={d} table={s} frame={s}\n", .{ fid, e.fqn, fqn });
@@ -12660,6 +12717,14 @@ fn fusedRun(
     };
 
     var cur: BlockId = func.entry;
+    // A hot loop inside a fused body reaches no tier that can compile it: the
+    // walker follows its own back edges, so the loop JIT — which counts block
+    // entries in the framed loop — never sees the code it exists for. Count the
+    // back edges here and, once hot, materialize a real frame at the loop
+    // header and continue framed (no replay: the header's instructions have not
+    // run yet). The framed loop then counts, compiles, and runs it natively.
+    const jit_yield_on = jit_loop.enabled();
+    var back_edges: u32 = 0;
     walk: while (true) {
         // The framed loop's GC safe point, once per block, UNCONDITIONAL:
         // `pending()` never sees another thread's stop_flag, so gating on it
@@ -12672,6 +12737,7 @@ fn fusedRun(
         // stopping here is root-exact.
         if (runtime.gc.gc_enabled) runtime.gc.safePoint();
         const blk = &func.blocks[cur.int()];
+        const blk_id = cur.int();
         for (blk.insts, 0..) |*inst, idx| {
             fusedInst(H, allocator, module, func, eff_args, host, inst, regs, reclaim, &pushed_enclosing) catch |e| switch (e) {
                 error.Raise => return .{ .err = fused_err },
@@ -12730,6 +12796,33 @@ fn fusedRun(
             },
             .Unreachable => return .{ .err = .{ .Type = "unreachable block executed" } },
             else => unreachable,
+        }
+        if (jit_yield_on and cur.int() <= blk_id) {
+            back_edges +|= 1;
+            if (back_edges >= jit_loop.FUSED_YIELD_BACK_EDGES) {
+                if (jit_loop.loopDeclined(func, cur.int())) {
+                    // The tier already refused this loop: stay fused rather
+                    // than pay a materialization to be refused again.
+                    back_edges = 0;
+                    continue :walk;
+                }
+                if (jit_loop.debugEnabled())
+                    std.debug.print("[jit]   fused body {s} yields its hot loop at b{d}\n", .{ func.name, cur.int() });
+                const moved_pushes = pushed_enclosing;
+                pushed_enclosing = 0;
+                return try fusedMaterializeAndRun(
+                    H,
+                    allocator,
+                    module,
+                    func,
+                    args_in,
+                    regs,
+                    cur,
+                    0,
+                    moved_pushes,
+                    host,
+                );
+            }
         }
         continue :walk;
     }

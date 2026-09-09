@@ -21,6 +21,11 @@ int klio_rt_run_file(const char *path);
  * assembled from that exact artifact. */
 int klio_rt_run_image(const char *base_image, const char *path);
 
+/* Run a whole-program image (`klio transpile` writes one beside the C file):
+ * the module is complete, so the process neither parses nor lowers — the same
+ * boot a bundled program gets. This is what an emitted `main` calls. */
+int klio_rt_run_program_image(const char *program_image);
+
 /* The hot-view layout descriptor: Value byte offsets measured against
  * the running library at startup, so generated inline scalar ops are
  * correct by construction. `usable == 0` means the process reclaim mode
