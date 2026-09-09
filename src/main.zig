@@ -127,6 +127,7 @@ fn runCli(a: std.mem.Allocator, args: std.process.Args) u8 {
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
+    runtime.runstats.markStart();
     // attachSegfaultHandler pulls the `SelfInfo` symbolizer (unavailable on
     // mobile — see the panic override above); gate it out there at comptime.
     if (comptime !is_mobile_target) {

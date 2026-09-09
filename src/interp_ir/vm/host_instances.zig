@@ -233,7 +233,20 @@ fn takeCtorStaticHeads() ?[]const ?[]const u8 {
 fn secondaryCtors(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const root.build.SecondaryCtorEntry {
     const g = self.prog.borrow();
     defer g.deinit();
-    return g.get().secondary_ctors.get(sideTableKey(fqn, name)) orelse &.{};
+    const key = sideTableKey(fqn, name);
+    const entries = g.get().secondary_ctors.get(key) orelse &.{};
+    if (runtime.envOnce("KLIO_CTOR_TRACE") != null) {
+        std.debug.print("[ctor] lookup key={s} entries={d}", .{ key, entries.len });
+        for (entries) |e| {
+            var withdef: usize = 0;
+            for (e.default_arg_thunks) |d| {
+                if (d != null) withdef += 1;
+            }
+            std.debug.print(" [params={d} defaults={d}]", .{ e.param_count, withdef });
+        }
+        std.debug.print("\n", .{});
+    }
+    return entries;
 }
 
 /// Whether any declared secondary constructor of the class can bind `n`
@@ -942,9 +955,16 @@ fn funcAt(self: *VmHost, fid: FuncId, comptime ctx: []const u8) Allocator.Error!
     const mg = self.module.borrow();
     defer mg.deinit();
     const m = mg.get();
-    return .{ .ok = m.funcById(fid) orelse {
+    const f = m.funcById(fid) orelse {
         return .{ .err = try typeErr(self.allocator, ctx ++ " FuncId {d} out of range", .{fid.int()}) };
-    } };
+    };
+    // A function reached by id from a side table is about to be CALLED, and an
+    // image decodes bodies lazily: without this the call runs an empty body and
+    // returns Unit. That is how a defaulted secondary-constructor parameter read
+    // `null` in every bundled program while the same source ran correctly from
+    // the CLI, whose module was never deferred.
+    if (f.blocks.len == 0) _ = m.ensureFuncBody(@constCast(f));
+    return .{ .ok = f };
 }
 
 /// The storage key for `prop` declared by `cls`: the owner-mangled

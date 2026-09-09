@@ -931,6 +931,13 @@ pub fn collect() void {
     collectImpl(true);
 }
 
+/// Live cells the last collection kept (the collector's own count, not bytes).
+/// Read by the `KLIO_RUN_STATS` report to separate what a run retains from what
+/// its backing store merely still holds.
+pub fn liveCellsAfterCollect() usize {
+    return last_live.load(.monotonic);
+}
+
 fn collectImpl(force_major: bool) void {
     // Single collector at a time. A thread that loses the race for `gc_lock`
     // found a collection already underway; it parks (publishing its roots) and

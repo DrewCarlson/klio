@@ -412,7 +412,7 @@ pub fn runOnPersistentBigStack(
 /// Write directly to the stderr fd. Used on the abort path, so it must not
 /// allocate (a memory breach has already fired). Linux issues the raw
 /// syscall; other platforms fall back to the buffered file writer.
-fn writeStderr(msg: []const u8) void {
+pub fn writeStderr(msg: []const u8) void {
     if (builtin.os.tag == .linux) {
         var off: usize = 0;
         while (off < msg.len) {

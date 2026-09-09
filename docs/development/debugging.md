@@ -306,6 +306,8 @@ path — it always runs. These knobs bisect its two emissions.
 | `KLIO_COMPOSE_DBG` | set | One activation summary line (oracle sizes) plus group-emission debug inside the pass | `[compose-pass]` |
 | `KLIO_COMPOSER_BIND_TRACE` | set | Each call that threads the `$composer, $changed` pair: the owning declaration and the composer's class (a non-Composer instance in the pair slot also dumps the frame chain) | `[composer-bind-fn]`, `[composer-bind]` |
 | `KLIO_RSS_LOG` | set | Prints process RSS on each rendered Compose UI frame | `[rss]` |
+| `KLIO_CTOR_TRACE` | set | Every secondary-constructor side-table lookup: the key, how many entries it found, and each entry's parameter/default counts. The table that decides whether a defaulted secondary constructor can take a call | `[ctor]` |
+| `KLIO_RUN_STATS` | set | One line when the program's `main` returns: the boot/exec time split, RSS at `main` and at exit, RSS + mapped bytes after a forced final collection, and the live cell count that collection kept. Works the same for `klio run`, a bundle, and a transpiled binary, so the three are comparable | `[run-stats]` |
 
 ```sh
 ./zig-out/bin/klio run scene.kt      # plugin lowering
@@ -526,6 +528,31 @@ KLIO_COMPOSE_SKIP=0 ./zig-out/bin/klio run scene.kt            # no skip calculu
 Rebuild any baked pack between flips (the flag is part of the pack
 cache key), and add `KLIO_COMPOSE_DBG=1` to confirm the pass
 activated.
+
+## Per-thread state and the owner fast path
+
+Darwin resolves every `threadlocal` access through a `_tlv_get_addr` CALL rather
+than a register-relative load, and LLVM can only hoist that call within a
+function — so in an interpreter the cost lands on every hot helper. It measured
+25% of samples on a member-call loop, with the JIT on and off alike.
+
+`src/runtime/tls_fast.zig` answers it: the thread that calls `claimOwner()` at
+process entry reads the hot per-thread structures (the fused walker's banks,
+`host_fields`' caches, the keepalive stack) from ordinary globals, and every
+other thread keeps its threadlocal. The owner never changes, so no state
+migrates between the two storages — a thread reads the same object for the
+process's life. A binary that never claims an owner (the test harnesses) behaves
+exactly as before.
+
+Two things to know before extending it:
+
+- It is NOT a win everywhere. The evaluator's own `EvalTls` is read on the JIT's
+  per-call seam, where the compare that replaces the call costs more than the
+  call did; it is deliberately left a plain threadlocal, and the comment at its
+  declaration says so with the numbers.
+- Grouping threadlocals into one struct does nothing on its own. The compiler
+  already reuses a repeated access within a function; the cost is one resolution
+  per hot helper CALL, so only removing the resolution helps.
 
 ## Measuring peak RSS (and the spin-loop trap)
 
