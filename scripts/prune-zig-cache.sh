@@ -27,6 +27,16 @@ if pgrep -x zig >/dev/null 2>&1; then
   exit 1
 fi
 
+# Sizes in KiB and mtimes through stat: `du -sb` and `find -printf` are GNU
+# only, and under `set -e` either one aborts the whole run on a BSD/macOS
+# toolchain — before the h/ wipe below, which is what leaves the dangling
+# manifests this script exists to clear.
+if stat -f '%m' "$CACHE" >/dev/null 2>&1; then
+  mtime_of() { stat -f '%m' "$1"; }
+else
+  mtime_of() { stat -c '%Y' "$1"; }
+fi
+
 before=$(du -sh "$CACHE" | cut -f1)
 
 # Pass 1: age.
@@ -34,17 +44,21 @@ find "$CACHE/o" -mindepth 1 -maxdepth 1 -type d -mtime "+$DAYS" -exec rm -rf {} 
 rm -rf "$CACHE/tmp"/* 2>/dev/null || true
 
 # Pass 2: size target, oldest first, sparing the last 6 hours.
-target_bytes=$((TARGET_GB * 1000000000))
-used=$(du -sb "$CACHE/o" | cut -f1)
-if [ "$used" -gt "$target_bytes" ]; then
-  excess=$((used - target_bytes))
-  freed=0
-  while IFS=$'\t' read -r _mtime dir; do
-    [ "$freed" -ge "$excess" ] && break
-    sz=$(du -sb "$dir" 2>/dev/null | cut -f1) || continue
+target_kb=$((TARGET_GB * 1000000))
+used_kb=$(du -sk "$CACHE/o" | cut -f1)
+if [ "$used_kb" -gt "$target_kb" ]; then
+  excess_kb=$((used_kb - target_kb))
+  freed_kb=0
+  while IFS= read -r dir; do
+    [ "$freed_kb" -ge "$excess_kb" ] && break
+    sz=$(du -sk "$dir" 2>/dev/null | cut -f1) || continue
     rm -rf "$dir" 2>/dev/null || continue
-    freed=$((freed + sz))
-  done < <(find "$CACHE/o" -mindepth 1 -maxdepth 1 -type d -mmin +360 -printf '%T@\t%p\n' 2>/dev/null | sort -n)
+    freed_kb=$((freed_kb + sz))
+  done < <(
+    find "$CACHE/o" -mindepth 1 -maxdepth 1 -type d -mmin +360 2>/dev/null |
+      while IFS= read -r d; do printf '%s\t%s\n' "$(mtime_of "$d")" "$d"; done |
+      sort -n | cut -f2-
+  )
 fi
 
 # Manifests die whenever artifacts were pruned: h/ names do not map to
