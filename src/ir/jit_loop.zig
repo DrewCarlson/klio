@@ -2663,12 +2663,16 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                     if (resolver == null or field_resolver == null) continue;
                     if (mc.recv.int() >= regs.len or regs[mc.recv.int()] != .Instance) continue;
                     if (regWrittenInBody(func, body, mc.recv)) continue;
+                    // The resolver reads every argument it is handed, so the
+                    // buffer must be FULLY filled at the length passed: a
+                    // partial fill handed over at `n_args` let it read
+                    // undefined Values, and a call past the buffer sliced off
+                    // the end of it. Decline both rather than resolve on a
+                    // truncated list, which could select another overload.
                     var av: [6]Value = undefined;
-                    var k: u8 = 0;
-                    while (k < mc.n_args and k < 6) : (k += 1) {
-                        if (mc.args_reg + k >= regs.len) break;
-                        av[k] = regs[mc.args_reg + k];
-                    }
+                    if (mc.n_args > av.len) continue;
+                    if (@as(usize, mc.args_reg) + mc.n_args > regs.len) continue;
+                    for (0..mc.n_args) |k| av[k] = regs[mc.args_reg + k];
                     const fid = resolver.?(resolver_user.?, &regs[mc.recv.int()], mc.name, av[0..mc.n_args]) orelse continue;
                     const callee = module.funcById(fid) orelse continue;
                     var this_reg: u32 = 0;
@@ -2771,12 +2775,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 if (arrays.items.len != 0) return null;
                 if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len) return null;
                 var av: [6]Value = undefined;
-                var k: u8 = 0;
-                while (k < mc.n_args) : (k += 1) {
-                    const ar = mc.args_reg + k;
-                    if (ar >= regs.len) return null;
-                    av[k] = regs[ar];
-                }
+                if (mc.n_args > av.len) return null;
+                if (@as(usize, mc.args_reg) + mc.n_args > regs.len) return null;
+                for (0..mc.n_args) |k| av[k] = regs[mc.args_reg + k];
                 if (mc.resolved) |fid| {
                     if (module.funcById(fid)) |f| {
                         if (f.is_suspend) return null;
@@ -3952,6 +3953,19 @@ fn fjFieldsEnabled() bool {
 }
 
 var fj_escape_cache: ?bool = null;
+/// Escapes let a compiled body keep the instructions this tier cannot emit
+/// natively: it calls back into the interpreter for that one instruction and
+/// carries on. Without them a single unsupported instruction disqualifies the
+/// whole function, and `CallMemberOrGlobal`, `GetField` and `NewInstance` alone
+/// account for most declines in a compose program.
+///
+/// Still OPT-IN (`KLIO_FJ_ESCAPE=1`), because widening acceptance this way buys
+/// nothing measurable: it took compose_material3 from 2 compiled functions to 6
+/// with execution time unchanged (251ms vs 251ms), and the same on four other
+/// programs. An escaped instruction costs a call back into the interpreter,
+/// which is what the interpreter would have cost anyway — the tier only starts
+/// paying once dispatch and field access are emitted natively rather than
+/// escaped.
 fn fjEscapeEnabled() bool {
     if (fj_escape_cache) |v| return v;
     const on = if (runtime.envOnce("KLIO_FJ_ESCAPE")) |v| v.len != 0 and v[0] == '1' else false;
@@ -4186,10 +4200,13 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             if (std.mem.eql(u8, nm, func.name)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4081\n", .{func.name}); return null; }
         }
     }
-    // Only user-code functions: stdlib / kotlinx-pack bodies are left to the
-    // interpreter so the whole-function tier never alters the runtime machinery
-    // (coroutine dispatch, cancellation) that cooperative scheduling relies on.
-    if (std.mem.startsWith(u8, func.package, "kotlin")) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4087\n", .{func.name}); return null; }
+    // No package gate. This tier is entered from a frame that is ALREADY
+    // running the function's lowered body, so it can only ever replace a body
+    // the runtime chose to run — a symbol the link settled onto a native
+    // binding never reaches here, and `is_suspend` is refused above, which is
+    // what cooperative scheduling actually rides on. Excluding every `kotlin*`
+    // package instead left the whole stdlib interpreted for no mechanism.
+    // `KLIO_FJ_SKIP` still bisects a specific body.
     const n_params: u32 = @intCast(func.params.len);
     if (n_params > 16 or params.len < n_params) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4089\n", .{func.name}); return null; }
     // Result must be scalar or Unit.
@@ -4533,14 +4550,18 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     } else if (resolver != null) {
                         for (obj_loads) |opl| {
                             if (opl.reg == mc2.recv.int()) {
+                                // Placeholder arguments: this asks which
+                                // overload the NAME and ARITY select, so the
+                                // values are stand-ins — but every slot the
+                                // resolver reads must exist. The partial fill
+                                // that used to break out early handed it
+                                // undefined Values and segfaulted under load.
                                 var av2: [6]Value = undefined;
-                                var k2: u8 = 0;
-                                while (k2 < mc2.n_args and k2 < 6) : (k2 += 1) {
-                                    if (mc2.args_reg + k2 >= params.len) break;
-                                    av2[k2] = .Unit;
-                                }
-                                if (resolver.?(resolver_user.?, &params[opl.param_idx], mc2.name, av2[0..mc2.n_args])) |fid2| {
-                                    if (module.funcById(fid2)) |f2| rt2 = funcReturnRegType(module, f2);
+                                if (mc2.n_args <= av2.len) {
+                                    for (0..mc2.n_args) |k2| av2[k2] = .Unit;
+                                    if (resolver.?(resolver_user.?, &params[opl.param_idx], mc2.name, av2[0..mc2.n_args])) |fid2| {
+                                        if (module.funcById(fid2)) |f2| rt2 = funcReturnRegType(module, f2);
+                                    }
                                 }
                                 break;
                             }
