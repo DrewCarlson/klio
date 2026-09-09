@@ -406,6 +406,12 @@ pub const CompiledLoop = struct {
     /// `Return` emit; `maxInt(u32)` there means the scalar `result_slot`
     /// (or Unit) carries the value instead.
     result_reg_slot: u32 = 0,
+    /// Calls that go STRAIGHT into another compiled unit's native code. The
+    /// callee is a deopt-free method body over the same receiver, so it needs
+    /// no frame, no trampoline and no resume machinery: this unit seeds the
+    /// callee's argument slots and receiver field base inside its own slot
+    /// array, calls it, and reads its result slot.
+    direct_sites: []const DirectSite = &.{},
     self_dbg_name: []const u8 = "",
     allocator: Allocator,
 
@@ -425,7 +431,30 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.field_bases);
         self.allocator.free(self.call_sites);
         if (self.param_rt.len != 0) self.allocator.free(self.param_rt);
+        if (self.direct_sites.len != 0) self.allocator.free(self.direct_sites);
     }
+};
+
+/// One direct call between compiled units. `slot_base` is where the callee's
+/// whole slot window lives inside the caller's slot array, so the call is a
+/// pointer bump and a `call` — no boxing, no host callback, no frame.
+///
+/// The callee's code address is baked into the caller. That address outlives
+/// every run of the caller: reaching the caller's compiled body goes through
+/// its own `FuncJit`, whose fingerprint is re-checked first, so a state map
+/// that dropped the callee (a freed module whose `*Func` address was reused)
+/// has already invalidated the caller too.
+pub const DirectSite = struct {
+    block: BlockId,
+    inst: u32,
+    callee: *const CompiledLoop,
+    slot_base: u32,
+    /// The call's argument register base; index 0 is the receiver, so callee
+    /// parameter `i` reads caller register `args_reg + i`.
+    args_reg: u32,
+    n_args: u32,
+    dst: Reg,
+    has_result: bool,
 };
 
 // --- supported-shape predicates ---------------------------------------------
@@ -929,6 +958,70 @@ fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32, recv:
     return true;
 }
 
+/// `KLIO_FJ_DIRECT=0` disables direct calls between compiled units, so a
+/// regression can be bisected against the trampolined form.
+var fj_direct_cache: ?bool = null;
+fn fjDirectEnabled() bool {
+    if (fj_direct_cache) |v| return v;
+    const on = if (runtime.envOnce("KLIO_FJ_DIRECT")) |v| !(v.len != 0 and v[0] == '0') else true;
+    fj_direct_cache = on;
+    return on;
+}
+
+/// Compile nesting a direct call may trigger: A's compile compiles B, whose
+/// compile may compile C. Bounded so a deep helper chain cannot recurse the
+/// compiler off the stack.
+threadlocal var direct_compile_depth: u32 = 0;
+const DIRECT_COMPILE_MAX_DEPTH: u32 = 4;
+
+/// The compiled unit a direct call may target: a deopt-free method body on the
+/// same receiver, taking scalar arguments and delivering a scalar or nothing.
+/// Deopt-freedom is what makes the call a plain `call` — RETURN is the body's
+/// only outcome, so there is no resume point to reconstruct and no frame to
+/// own. The callee is compiled on demand, specialized on this receiver and on
+/// its own declared parameter kinds.
+fn directCallTarget(
+    module: *const Module,
+    cf: *const Func,
+    n_args: u32,
+    recv: *const Value,
+    resolver: ?MemberResolver,
+    virt_resolver: ?VirtResolver,
+    field_resolver: ?FieldResolver,
+    field_nn_resolver: ?FieldResolver,
+    resolver_user: ?*anyopaque,
+) ?*const CompiledLoop {
+    if (cf.is_suspend or cf.is_lambda or !cf.hasBody()) return null;
+    if (!cf.has_receiver_param) return null;
+    if (n_args == 0 or n_args > 8 or cf.params.len != n_args) return null;
+    if (recv.* != .Instance) return null;
+    var argv: [8]Value = undefined;
+    argv[0] = recv.*;
+    for (cf.params[1..], 1..) |pp, i| {
+        if (pp.is_vararg or pp.default != null) return null;
+        const prt = retRegType(pp.ty);
+        if (!isScalarRt(prt)) return null;
+        argv[i] = valueFromSlot(prt, 0);
+    }
+    if (direct_compile_depth >= DIRECT_COMPILE_MAX_DEPTH) return null;
+    direct_compile_depth += 1;
+    defer direct_compile_depth -= 1;
+    const cl = compileCalleeForCall(module, cf, argv[0..n_args], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse return null;
+    if (!cl.func_mode or !cl.method_mode or cl.can_deopt or cl.has_tramp_sites) return null;
+    if (cl.n_params != n_args or cl.param_rt.len != n_args) return null;
+    if (cl.param_rt[0] != .object) return null;
+    for (cl.param_rt[1..], 1..) |prt, i| {
+        if (!isScalarRt(prt) or prt != retRegType(cf.params[i].ty)) return null;
+    }
+    // Nothing seeds the callee's frame registers or capture vector here: with
+    // no trampoline and no deopt, its body never reads them, but a unit that
+    // wants more than its receiver boxed is out of scope.
+    if (cl.capture_loads.len != 0 or cl.obj_param_loads.len > 1) return null;
+    if (cl.guard_class != instanceClassIdentity(recv.*)) return null;
+    if (!isScalarRt(cl.result_rt) and cl.result_rt != .unit) return null;
+    return cl;
+}
+
 /// A (block, instruction) position inside a compiled body.
 const BodyInstPos = struct { b: u32, i: u32 };
 
@@ -1029,6 +1122,11 @@ fn inlinableMemberCallee(module: *const Module, f: *const Func, this_reg_out: *u
         }
     }
     return true;
+}
+
+/// The byte displacement of a slot index from the slots base register.
+fn slotBytes(slot: u32) i32 {
+    return @intCast(@as(u64, slot) * 8);
 }
 
 /// Copy an instruction with every register reference shifted by `base` — used to
@@ -2072,6 +2170,7 @@ const Compiler = struct {
     cell_info: []const ?RegType,
     call_sites: []const CallSite,
     inline_sites: []const InlineSite,
+    direct_sites: []const DirectSite = &.{},
     /// Per-register: is this a nullable-scalar register, and its null-flag slot.
     nullable: []const bool,
     null_flag_slot: []const u32,
@@ -2093,6 +2192,9 @@ const Compiler = struct {
     n_params: u32 = 0,
     result_slot: u32 = 0,
     result_reg_slot: u32 = 0,
+    /// Method mode: the slot holding the receiver's field-buffer pointer, which
+    /// a direct call hands to the callee (the same receiver, so the same base).
+    entry_fbase_slot: u32 = 0,
     em: jit.Emitter,
     block_label: []?jit.Label,
     exit_targets: std.ArrayListUnmanaged(BlockId),
@@ -2127,6 +2229,14 @@ const Compiler = struct {
     /// The inline expansion at the current (block, inst), if any.
     fn inlineSiteAt(self: *Compiler) ?*const InlineSite {
         for (self.inline_sites) |*s| {
+            if (s.block.int() == self.cur_block.int() and s.inst == self.cur_inst) return s;
+        }
+        return null;
+    }
+
+    /// The direct call at the current (block, inst), if any.
+    fn directSiteAt(self: *Compiler) ?*const DirectSite {
+        for (self.direct_sites) |*s| {
             if (s.block.int() == self.cur_block.int() and s.inst == self.cur_inst) return s;
         }
         return null;
@@ -2489,6 +2599,32 @@ const Compiler = struct {
         }
     }
 
+    /// A call straight into another compiled unit. The callee is a deopt-free
+    /// method body over the SAME receiver, so the whole calling convention is
+    /// three stores and a `call`: its scalar arguments, the receiver's field
+    /// base (this unit's own — a self call shares the receiver), and the slots
+    /// pointer the unit was compiled to read. Its only outcome is RETURN, so
+    /// there is no resume code to interpret and no register to rebox; the
+    /// result comes back out of the callee's own result slot.
+    fn emitDirectCall(self: *Compiler, site: *const DirectSite) !void {
+        const cal = site.callee;
+        var i: u32 = 1;
+        while (i < cal.n_params) : (i += 1) {
+            try self.loadSlot(T0, Reg.from(site.args_reg + i));
+            try self.em.storeMem(REGS, slotBytes(site.slot_base + cal.param_slot_base + i), T0);
+        }
+        try self.em.loadMem(T0, REGS, slotBytes(self.entry_fbase_slot));
+        try self.em.storeMem(REGS, slotBytes(site.slot_base + cal.entry_fbase_slot), T0);
+        try self.em.movReg(.rdi, REGS);
+        try self.em.addImm32(.rdi, slotBytes(site.slot_base));
+        try self.em.movImm64(.rax, @intFromPtr(cal.exec.mem.ptr));
+        try self.em.callReg(.rax);
+        if (site.has_result) {
+            try self.em.loadMem(T0, REGS, slotBytes(site.slot_base + cal.result_slot));
+            try self.storeSlot(site.dst, T0);
+        }
+    }
+
     /// Native scalar field read/write on a loop-invariant receiver: the field
     /// buffer pointer is cached in `site.fbase_slot` at loop entry, so this is a
     /// direct memory access with no host callback. A read guards the field value's
@@ -2575,6 +2711,10 @@ const Compiler = struct {
         // resumes there and the interpreter re-runs the (pure) call.
         if (self.inlineSiteAt()) |site| {
             try self.emitInlinedCall(site);
+            return;
+        }
+        if (self.directSiteAt()) |site| {
+            try self.emitDirectCall(site);
             return;
         }
         // A trampolined site (call / member / field / object op / subscript) is a
@@ -4747,6 +4887,48 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             return false;
         }
     }.f;
+    // A self call the splice cannot take — the helper is too big, loops, or
+    // reads something the splice refuses — becomes a DIRECT call into the
+    // callee's own compiled code. Without it that call is a trampoline site,
+    // which costs a boxed round trip per iteration AND makes this body able to
+    // deopt, so it loses the frameless seam. With it the receiver Move
+    // disappears the same way the splice's does, and both bodies stay native.
+    var direct_sites: std.ArrayListUnmanaged(DirectSite) = .empty;
+    defer direct_sites.deinit(a);
+    if (is_method and fjDirectEnabled() and params.len > 0 and params[0] == .Instance) {
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            for (blk.insts, 0..) |*inst, ii| {
+                if (inlinedAt(inline_sites.items, bid.int(), @intCast(ii))) continue;
+                const tc = trampolinableCallOf(inst) orelse continue;
+                if (tc.n_args == 0 or tc.n_args > 6) continue;
+                const cf = module.funcById(tc.func) orelse continue;
+                if (cf == func) continue; // a self-recursive call would reuse one slot window
+                const mv = soleReceiverMove(func, body, tc.args_reg, bid.int(), @intCast(ii), &recv_regs_buf, n_recv_regs) orelse continue;
+                const cl = directCallTarget(module, cf, tc.n_args, &params[0], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse continue;
+                direct_sites.append(a, .{
+                    .block = bid,
+                    .inst = @intCast(ii),
+                    .callee = cl,
+                    .slot_base = 0, // assigned once the caller's own slots are laid out
+                    .args_reg = tc.args_reg,
+                    .n_args = tc.n_args,
+                    .dst = tc.dst,
+                    .has_result = false, // set once the caller's register types are known
+                }) catch return null;
+                skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
+                if (debugEnabled()) std.debug.print("[jit]   direct call {s} from {s} at b{d}:{d} (move b{d}:{d})\n", .{ cf.name, func.name, bid.int(), ii, mv.b, mv.i });
+            }
+        }
+    }
+    const directAt = struct {
+        fn f(sites: []DirectSite, b: u32, i: u32) ?*DirectSite {
+            for (sites) |*s| {
+                if (s.block.int() == b and s.inst == i) return s;
+            }
+            return null;
+        }
+    }.f;
     const skippedAt = struct {
         fn f(list: []const InstPos, b: u32, i: u32) bool {
             for (list) |p| {
@@ -5218,6 +5400,25 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             }
             const tc = trampolinableCallOf(inst) orelse continue;
             if (inlinedAt(inline_sites.items, bid.int(), @intCast(i))) continue; // spliced in place
+            if (directAt(direct_sites.items, bid.int(), @intCast(i))) |ds| {
+                // Called straight into the callee's code, so no trampoline site
+                // and no boxing — but the argument kinds this body actually
+                // holds must be the ones the callee was compiled for.
+                var dk: u32 = 1;
+                while (dk < ds.n_args) : (dk += 1) {
+                    const ar = ds.args_reg + dk;
+                    if (ar >= n_regs or types[ar] != ds.callee.param_rt[dk]) {
+                        if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-arg-kind\n", .{func.name});
+                        return null;
+                    }
+                }
+                ds.has_result = tc.dst.int() < n_regs and isScalarRt(typeAt(types, tc.dst));
+                if (ds.has_result and typeAt(types, tc.dst) != ds.callee.result_rt) {
+                    if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-result-kind\n", .{func.name});
+                    return null;
+                }
+                continue;
+            }
             // A suspend callee would park through the trampoline; every
             // function-mode body must be suspension-free so a flat-driver
             // native run's outcomes stay RETURN / throw / deopt only.
@@ -5580,7 +5781,22 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     const fbase_slot: u32 = calls_base;
     const result_slot: u32 = calls_base + (if (is_method) @as(u32, 1) else 0);
     const result_reg_slot: u32 = result_slot + 1;
-    const n_slots: u32 = result_reg_slot + 1;
+    // A direct callee runs on a slot window carved out of this body's own slot
+    // array, so a call is a pointer bump: no allocation, no frame. One window
+    // serves every direct call here — only one is ever live at a time, and a
+    // callee's own nested calls already fit inside its `n_slots`.
+    var n_slots: u32 = result_reg_slot + 1;
+    if (direct_sites.items.len != 0) {
+        var window: u32 = 0;
+        for (direct_sites.items) |*ds| {
+            ds.slot_base = n_slots;
+            if (ds.callee.n_slots > window) window = ds.callee.n_slots;
+        }
+        n_slots += window;
+        // 192 is the seam's per-depth slot bank: a body that outgrows it falls
+        // off the frameless path, which costs more than the call it saves.
+        if (n_slots > 192) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-slots\n", .{func.name}); return null; }
+    }
     for (call_sites.items[field_sites_base..]) |*site| site.fbase_slot = fbase_slot;
 
     var c = Compiler{
@@ -5593,10 +5809,12 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .cell_info = &.{},
         .call_sites = call_sites.items,
         .inline_sites = inline_sites.items,
+        .direct_sites = direct_sites.items,
         .nullable = &.{},
         .null_flag_slot = &.{},
         .uc_slot = uc_slot,
         .tramp_slot = tramp_slot,
+        .entry_fbase_slot = fbase_slot,
         .n_regs = n_regs,
         .reg_slots = n_slots,
         .val_payload_off = valuePayloadOffset(),
@@ -5648,10 +5866,23 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         (a.dupe(ObjParamLoad, cap_loads) catch return null)
     else
         &.{};
+    // A direct callee reads and writes `this` through ITS OWN field indexes on
+    // the same receiver, and its entry guard never runs (the call bypasses it),
+    // so those (index, name) pairs join this body's — one entry check covers
+    // both bodies.
     const method_fields_owned: []MethodFieldCheck = blk: {
-        if (field_pres.items.len == 0) break :blk &.{};
-        const out2 = a.alloc(MethodFieldCheck, field_pres.items.len) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4748\n", .{func.name}); return null; };
-        for (field_pres.items, out2) |fp, *o| o.* = .{ .idx = fp.idx, .name = fp.name };
+        var n_mf: usize = field_pres.items.len;
+        for (direct_sites.items) |*ds| n_mf += ds.callee.method_fields.len;
+        if (n_mf == 0) break :blk &.{};
+        const out2 = a.alloc(MethodFieldCheck, n_mf) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4748\n", .{func.name}); return null; };
+        for (field_pres.items, out2[0..field_pres.items.len]) |fp, *o| o.* = .{ .idx = fp.idx, .name = fp.name };
+        var mf_n: usize = field_pres.items.len;
+        for (direct_sites.items) |*ds| {
+            for (ds.callee.method_fields) |mf| {
+                out2[mf_n] = mf;
+                mf_n += 1;
+            }
+        }
         break :blk out2;
     };
     // Re-verify every (index, name) pair and read the layout id under ONE
@@ -5714,6 +5945,10 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .method_fields = method_fields_owned,
         .guard_shape = guard_shape,
         .result_reg_slot = result_reg_slot,
+        .direct_sites = if (direct_sites.items.len != 0)
+            (a.dupe(DirectSite, direct_sites.items) catch return null)
+        else
+            &.{},
         .self_dbg_name = func.name,
         .allocator = a,
     };
@@ -6023,7 +6258,7 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
         // owns the value for the run.
         regs.items[cpl.reg] = captures[cpl.param_idx];
     }
-    var stack_slots: [128]i64 = undefined;
+    var stack_slots: [192]i64 = undefined;
     var heap_slots: ?[]i64 = null;
     defer if (heap_slots) |hs| metadata_allocator.free(hs);
     const slots: []i64 = if (cl.n_slots <= stack_slots.len)
@@ -6162,7 +6397,7 @@ pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, re
     // call can re-enter this hook for a nested hot loop, and that inner run must
     // not alias (or reallocate) the outer loop's live slots. Small loops use a
     // stack buffer; the rare larger loop falls back to a freed heap allocation.
-    var stack_slots: [128]i64 = undefined;
+    var stack_slots: [192]i64 = undefined;
     var heap_slots: ?[]i64 = null;
     defer if (heap_slots) |hs| metadata_allocator.free(hs);
     const slots: []i64 = if (cl.n_slots <= stack_slots.len)
