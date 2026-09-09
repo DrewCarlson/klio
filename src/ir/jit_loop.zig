@@ -599,6 +599,72 @@ fn bitwiseOpOf(module: *const Module, inst: *const Inst) ?BitOp {
 }
 
 const INLINE_MAX_INSTS: usize = 24;
+const INLINE_MAX_BLOCKS: usize = 8;
+/// Upper bound on a splice candidate's block count, so the reachability scan
+/// and the emitter's per-block label table are fixed-size.
+const CALLEE_BLOCK_LIMIT: usize = 64;
+
+/// The blocks a splice covers: those reachable from the callee's entry, entry
+/// first then ascending index. Null when the callee has an unsupported
+/// terminator, a bad edge, or more blocks than the splice's budget. Blocks that
+/// are unreachable never reach the emitter, so their shape does not matter.
+fn calleeBlockOrder(f: *const Func, buf: []u32) ?[]u32 {
+    if (f.blocks.len == 0 or f.blocks.len > CALLEE_BLOCK_LIMIT) return null;
+    const entry = f.entry.int();
+    if (entry >= f.blocks.len) return null;
+    var reach = [_]bool{false} ** CALLEE_BLOCK_LIMIT;
+    var stack: [CALLEE_BLOCK_LIMIT]u32 = undefined;
+    var sp: usize = 0;
+    reach[entry] = true;
+    stack[sp] = entry;
+    sp += 1;
+    while (sp > 0) {
+        sp -= 1;
+        const blk = &f.blocks[stack[sp]];
+        var succ: [2]u32 = undefined;
+        var n_succ: usize = 0;
+        switch (blk.terminator) {
+            .Goto => |t| {
+                succ[0] = t.int();
+                n_succ = 1;
+            },
+            .Branch => |br| {
+                succ[0] = br.t.int();
+                succ[1] = br.f.int();
+                n_succ = 2;
+            },
+            .Return => {},
+            else => return null,
+        }
+        for (succ[0..n_succ]) |s| {
+            if (s >= f.blocks.len) return null;
+            if (reach[s]) continue;
+            reach[s] = true;
+            stack[sp] = s;
+            sp += 1;
+        }
+    }
+    if (buf.len == 0) return null;
+    buf[0] = entry;
+    var n: usize = 1;
+    var i: u32 = 0;
+    while (i < f.blocks.len) : (i += 1) {
+        if (!reach[i] or i == entry) continue;
+        if (n >= buf.len) return null;
+        buf[n] = i;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// Whether a splice-eligible callee delivers a value. `selfInlinableCallee` has
+/// already proven every reachable return agrees on this.
+fn calleeReturnsValue(f: *const Func) bool {
+    for (f.blocks) |*b| {
+        if (b.terminator == .Return and b.terminator.Return != null) return true;
+    }
+    return false;
+}
 
 /// Whether a top-level callee can be inlined into the native loop: a single block
 /// returning a value, made only of scalar instructions (no nested calls, object
@@ -741,19 +807,44 @@ fn fjSelfInlineEnabled() bool {
     return on;
 }
 
-/// A callee this tier can splice into its caller at a self-call: a single-block
-/// scalar expression that never touches `this`. Refusing any `this` use is what
+/// A callee this tier can splice into its caller at a self-call: scalar
+/// control flow over the callee's own registers, reading and writing `this`
+/// only through the field-site machinery. Refusing any other `this` use is what
 /// keeps the receiver out of the compiled body — the register holding it is
 /// never materialized, which is the whole reason the caller can compile.
+///
+/// A callee with branches splices as several blocks: the emitter gives each one
+/// a label in the caller's code, so an `if`/`when` helper is as inlinable as a
+/// straight-line expression.
 fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32, recv: ?*const Value, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) bool {
     if (f.is_suspend or f.is_lambda) return false;
     if (!f.has_receiver_param) return false;
     if (f.params.len != n_args) return false;
-    if (f.blocks.len != 1) return false;
-    const blk = &f.blocks[0];
-    if (blk.terminator != .Return) return false;
-    if (blk.insts.len == 0 or blk.insts.len > INLINE_MAX_INSTS) return false;
+    var order_buf: [INLINE_MAX_BLOCKS]u32 = undefined;
+    const order = calleeBlockOrder(f, &order_buf) orelse return false;
     if (f.n_locals == 0) return false;
+    var total_insts: usize = 0;
+    var value_rets: usize = 0;
+    var void_rets: usize = 0;
+    for (order) |b| {
+        const blk = &f.blocks[b];
+        if (blk.catches.len != 0 or blk.finally != null) return false;
+        switch (blk.terminator) {
+            .Goto, .Branch => {},
+            .Return => |r| if (r != null) {
+                value_rets += 1;
+            } else {
+                void_rets += 1;
+            },
+            else => return false,
+        }
+        total_insts += blk.insts.len;
+    }
+    // A callee whose returns disagree would need the splice to deliver a value
+    // on one path and nothing on another; the join has one shape, so decline.
+    if (value_rets != 0 and void_rets != 0) return false;
+    if (value_rets + void_rets == 0) return false;
+    if (total_insts == 0 or total_insts > INLINE_MAX_INSTS) return false;
     for (f.params[1..]) |p| {
         if (p.is_vararg or p.default != null or !isScalarRt(retRegType(p.ty))) return false;
     }
@@ -761,40 +852,48 @@ fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32, recv:
     // simply produces no result. Requiring a value excluded every mutator
     // (`fun widen(k: Int) { w = w + k }`), which is half the shape this exists
     // for.
-    if (blk.terminator.Return != null and !isScalarRt(retRegType(f.return_ty))) return false;
+    if (value_rets != 0 and !isScalarRt(retRegType(f.return_ty))) return false;
     // The lowerer emits a `LoadParam` for EVERY parameter, so the receiver load
     // is present even in a body that ignores `this`. What matters is that the
     // register it lands in is never read: the emitter skips that load, so a body
     // reading it would see an empty slot.
     var this_dst: ?u32 = null;
-    for (blk.insts) |*ci| {
-        if (ci.* == .LoadParam and ci.LoadParam.idx == 0) this_dst = ci.LoadParam.dst.int();
-        // A `this`-field read or write is fine: the call is a SELF call, so the
-        // callee's receiver is the caller's, and the field access rides the
-        // caller's own entry field-base. Anything else touching `this` is not.
-        if (trampolinableFieldOf(module, ci) != null) continue;
-        if (trampolinableFieldSetOf(module, ci) != null) continue;
-        switch (ci.*) {
-            .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .LoadParam => {},
-            else => return false,
+    for (order) |b| {
+        for (f.blocks[b].insts) |*ci| {
+            if (ci.* == .LoadParam and ci.LoadParam.idx == 0) this_dst = ci.LoadParam.dst.int();
+            // A `this`-field read or write is fine: the call is a SELF call, so
+            // the callee's receiver is the caller's, and the field access rides
+            // the caller's own entry field-base. Anything else touching `this`
+            // is not.
+            if (trampolinableFieldOf(module, ci) != null) continue;
+            if (trampolinableFieldSetOf(module, ci) != null) continue;
+            // Bitwise and numeric-conversion ops lower to a `CallMember` shape
+            // the emitter has a native form for, and neither can deopt.
+            if (bitwiseOpOf(module, ci) != null) continue;
+            if (numericConvOf(module, ci) != null) continue;
+            switch (ci.*) {
+                .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .LoadParam => {},
+                else => return false,
+            }
         }
     }
     if (this_dst) |td| {
         var reads: usize = 0;
-        for (blk.insts) |*ci| {
-            if (ci.* == .LoadParam and ci.LoadParam.idx == 0) continue;
-            // Field ops name `this` as their receiver by design.
-            if (trampolinableFieldOf(module, ci) != null) continue;
-            if (trampolinableFieldSetOf(module, ci) != null) continue;
-            const Ctx = struct { r: u32, n: *usize };
-            var cx = Ctx{ .r = td, .n = &reads };
-            ir.visitInstRegs(ci, &cx, struct {
-                fn count(c: *Ctx, rr: Reg, _: bool) void {
-                    if (rr.int() == c.r) c.n.* += 1;
-                }
-            }.count);
-        }
-        {
+        for (order) |b| {
+            const blk = &f.blocks[b];
+            for (blk.insts) |*ci| {
+                if (ci.* == .LoadParam and ci.LoadParam.idx == 0) continue;
+                // Field ops name `this` as their receiver by design.
+                if (trampolinableFieldOf(module, ci) != null) continue;
+                if (trampolinableFieldSetOf(module, ci) != null) continue;
+                const Ctx = struct { r: u32, n: *usize };
+                var cx = Ctx{ .r = td, .n = &reads };
+                ir.visitInstRegs(ci, &cx, struct {
+                    fn count(c: *Ctx, rr: Reg, _: bool) void {
+                        if (rr.int() == c.r) c.n.* += 1;
+                    }
+                }.count);
+            }
             const Ctx = struct { r: u32, n: *usize };
             var cx = Ctx{ .r = td, .n = &reads };
             ir.visitTerminatorRegs(&blk.terminator, &cx, struct {
@@ -807,17 +906,23 @@ fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32, recv:
     }
     // A deopt inside the splice re-runs the whole call, so a callee that WRITES
     // a field must not be able to deopt first: every field it reads has to be a
-    // non-nullable scalar. Otherwise a re-run would apply the write twice.
+    // non-nullable scalar, and it must contain no division (whose zero-divisor
+    // deopt would otherwise land after the write and apply it twice).
     var writes = false;
-    for (blk.insts) |*ci| {
-        if (trampolinableFieldSetOf(module, ci) != null) writes = true;
+    for (order) |b| {
+        for (f.blocks[b].insts) |*ci| {
+            if (trampolinableFieldSetOf(module, ci) != null) writes = true;
+        }
     }
     if (writes) {
-        for (blk.insts) |*ci| {
-            if (trampolinableFieldOf(module, ci)) |fld| {
-                const fr = field_nn_resolver orelse return false;
-                const rv = recv orelse return false;
-                if (fr(resolver_user.?, rv, memberFieldName(fld.name)) == null) return false;
+        for (order) |b| {
+            for (f.blocks[b].insts) |*ci| {
+                if (ci.* == .BinOp and isDivBinOp(ci.BinOp.op)) return false;
+                if (trampolinableFieldOf(module, ci)) |fld| {
+                    const fr = field_nn_resolver orelse return false;
+                    const rv = recv orelse return false;
+                    if (fr(resolver_user.?, rv, memberFieldName(fld.name)) == null) return false;
+                }
             }
         }
     }
@@ -1278,11 +1383,13 @@ fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite,
     // For a member inline, parameter index 1 maps to the first call argument (index
     // 0 is the receiver); a top-level inline maps index 0 to the first argument.
     const arg_base: i64 = if (site.is_member) @as(i64, site.args_reg) - 1 else @as(i64, site.args_reg);
+    var order_buf: [INLINE_MAX_BLOCKS]u32 = undefined;
+    const order = calleeBlockOrder(callee, &order_buf) orelse return;
     var changed = true;
     var iters: usize = 0;
     while (changed and iters < 16) : (iters += 1) {
         changed = false;
-        for (callee.blocks[0].insts) |*inst| {
+        for (order) |ob| for (callee.blocks[ob].insts) |*inst| {
             if (inst.* == .LoadParam) {
                 const lp = inst.LoadParam;
                 if (site.is_member and lp.idx == 0) continue; // receiver: not a scalar
@@ -1310,7 +1417,7 @@ fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite,
                 if (trampolinableFieldSetOf(module, inst) != null) continue;
             }
             if (setDefType(t, module, inst, eai, eci)) changed = true;
-        }
+        };
     }
 }
 
@@ -2312,12 +2419,56 @@ const Compiler = struct {
     /// parameter slot, emit the callee's single block remapped into the caller's
     /// extended register space, then copy the (remapped) return value to the dst.
     fn emitInlinedCall(self: *Compiler, site: *const InlineSite) !void {
-        const callee_blk = &site.callee.blocks[0];
-        // Member inline: argument i is the (i-1)-th call argument (index 0 is the
-        // receiver); a `this`-field access is one of the registered field sites,
-        // emitted in body order.
+        var order_buf: [INLINE_MAX_BLOCKS]u32 = undefined;
+        const order = calleeBlockOrder(site.callee, &order_buf) orelse return jit.JitError.Unsupported;
+        if (order.len == 1) {
+            var field_n: u32 = 0;
+            try self.emitInlinedBlock(site, &site.callee.blocks[order[0]], &field_n);
+            if (site.has_result) {
+                const ret = site.callee.blocks[order[0]].terminator.Return.?;
+                try self.loadSlot(T0, Reg.from(site.base + ret.int()));
+                try self.storeSlot(site.dst, T0);
+            }
+            return;
+        }
+        // A branching callee splices as blocks: each gets a label in the
+        // caller's code, its edges jump between them, and every return lands on
+        // one join after delivering the result.
+        var label_of = [_]?jit.Label{null} ** CALLEE_BLOCK_LIMIT;
+        for (order) |b| label_of[b] = try self.em.newLabel();
+        const join = try self.em.newLabel();
         var field_n: u32 = 0;
-        for (callee_blk.insts) |*ci| {
+        for (order) |b| {
+            const blk = &site.callee.blocks[b];
+            try self.em.bind(label_of[b].?);
+            try self.emitInlinedBlock(site, blk, &field_n);
+            switch (blk.terminator) {
+                .Goto => |t| try self.em.jmp(label_of[t.int()] orelse return jit.JitError.Unsupported),
+                .Branch => |br| {
+                    try self.loadSlot(T0, Reg.from(site.base + br.cond.int()));
+                    try self.em.testReg(T0, T0);
+                    try self.em.jcc(.ne, label_of[br.t.int()] orelse return jit.JitError.Unsupported);
+                    try self.em.jmp(label_of[br.f.int()] orelse return jit.JitError.Unsupported);
+                },
+                .Return => |r| {
+                    if (site.has_result) {
+                        try self.loadSlot(T0, Reg.from(site.base + (r orelse return jit.JitError.Unsupported).int()));
+                        try self.storeSlot(site.dst, T0);
+                    }
+                    try self.em.jmp(join);
+                },
+                else => return jit.JitError.Unsupported,
+            }
+        }
+        try self.em.bind(join);
+    }
+
+    /// One spliced callee block: bind its parameter loads to the call's argument
+    /// slots, turn its `this`-field accesses into the caller's registered field
+    /// sites (consumed in body order, which is why `field_n` threads across
+    /// blocks), and emit the rest remapped into the caller's register space.
+    fn emitInlinedBlock(self: *Compiler, site: *const InlineSite, blk: *const ir.Block, field_n: *u32) !void {
+        for (blk.insts) |*ci| {
             if (ci.* == .LoadParam) {
                 const lp = ci.LoadParam;
                 if (site.is_member and lp.idx == 0) continue; // receiver: field sites read it
@@ -2328,18 +2479,13 @@ const Compiler = struct {
             }
             if (site.is_member) {
                 if (trampolinableFieldOf(self.module, ci) != null or trampolinableFieldSetOf(self.module, ci) != null) {
-                    try self.emitCallSite(site.field_site_base + field_n);
-                    field_n += 1;
+                    try self.emitCallSite(site.field_site_base + field_n.*);
+                    field_n.* += 1;
                     continue;
                 }
             }
             const rinst = remapInst(ci.*, site.base);
             try self.emitInstBody(&rinst);
-        }
-        if (site.has_result) {
-            const ret = callee_blk.terminator.Return.?;
-            try self.loadSlot(T0, Reg.from(site.base + ret.int()));
-            try self.storeSlot(site.dst, T0);
         }
     }
 
@@ -4584,7 +4730,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     .this_reg = 0,
                     .field_site_base = 0,
                     .n_field_sites = 0,
-                    .has_result = cf.blocks[0].terminator.Return != null,
+                    .has_result = calleeReturnsValue(cf),
                 }) catch return null;
                 skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
                 total_regs += cf.n_locals;
@@ -5338,7 +5484,9 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     for (inline_sites.items) |*site| {
         site.field_site_base = @intCast(call_sites.items.len + field_pres.items.len);
         var nf: u32 = 0;
-        for (site.callee.blocks[0].insts) |*ci| {
+        var forder_buf: [INLINE_MAX_BLOCKS]u32 = undefined;
+        const forder = calleeBlockOrder(site.callee, &forder_buf) orelse return null;
+        for (forder) |fb| for (site.callee.blocks[fb].insts) |*ci| {
             const is_set = trampolinableFieldSetOf(module, ci) != null;
             const fname = if (trampolinableFieldOf(module, ci)) |fld|
                 memberFieldName(fld.name)
@@ -5374,7 +5522,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 .name = fname,
             }) catch return null;
             nf += 1;
-        }
+        };
         site.n_field_sites = nf;
     }
 
