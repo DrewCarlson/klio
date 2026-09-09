@@ -737,20 +737,23 @@ fn fjSelfInlineEnabled() bool {
 /// scalar expression that never touches `this`. Refusing any `this` use is what
 /// keeps the receiver out of the compiled body — the register holding it is
 /// never materialized, which is the whole reason the caller can compile.
-fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32) bool {
+fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32, recv: ?*const Value, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) bool {
     if (f.is_suspend or f.is_lambda) return false;
     if (!f.has_receiver_param) return false;
     if (f.params.len != n_args) return false;
     if (f.blocks.len != 1) return false;
     const blk = &f.blocks[0];
     if (blk.terminator != .Return) return false;
-    if (blk.terminator.Return == null) return false;
     if (blk.insts.len == 0 or blk.insts.len > INLINE_MAX_INSTS) return false;
     if (f.n_locals == 0) return false;
     for (f.params[1..]) |p| {
         if (p.is_vararg or p.default != null or !isScalarRt(retRegType(p.ty))) return false;
     }
-    if (!isScalarRt(retRegType(f.return_ty))) return false;
+    // A `Unit` method invoked for its effect returns no register — the splice
+    // simply produces no result. Requiring a value excluded every mutator
+    // (`fun widen(k: Int) { w = w + k }`), which is half the shape this exists
+    // for.
+    if (blk.terminator.Return != null and !isScalarRt(retRegType(f.return_ty))) return false;
     // The lowerer emits a `LoadParam` for EVERY parameter, so the receiver load
     // is present even in a body that ignores `this`. What matters is that the
     // register it lands in is never read: the emitter skips that load, so a body
@@ -758,8 +761,11 @@ fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32) bool 
     var this_dst: ?u32 = null;
     for (blk.insts) |*ci| {
         if (ci.* == .LoadParam and ci.LoadParam.idx == 0) this_dst = ci.LoadParam.dst.int();
-        if (trampolinableFieldOf(module, ci) != null) return false;
-        if (trampolinableFieldSetOf(module, ci) != null) return false;
+        // A `this`-field read or write is fine: the call is a SELF call, so the
+        // callee's receiver is the caller's, and the field access rides the
+        // caller's own entry field-base. Anything else touching `this` is not.
+        if (trampolinableFieldOf(module, ci) != null) continue;
+        if (trampolinableFieldSetOf(module, ci) != null) continue;
         switch (ci.*) {
             .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .LoadParam => {},
             else => return false,
@@ -769,6 +775,9 @@ fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32) bool 
         var reads: usize = 0;
         for (blk.insts) |*ci| {
             if (ci.* == .LoadParam and ci.LoadParam.idx == 0) continue;
+            // Field ops name `this` as their receiver by design.
+            if (trampolinableFieldOf(module, ci) != null) continue;
+            if (trampolinableFieldSetOf(module, ci) != null) continue;
             const Ctx = struct { r: u32, n: *usize };
             var cx = Ctx{ .r = td, .n = &reads };
             ir.visitInstRegs(ci, &cx, struct {
@@ -787,6 +796,22 @@ fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32) bool 
             }.count);
         }
         if (reads != 0) return false;
+    }
+    // A deopt inside the splice re-runs the whole call, so a callee that WRITES
+    // a field must not be able to deopt first: every field it reads has to be a
+    // non-nullable scalar. Otherwise a re-run would apply the write twice.
+    var writes = false;
+    for (blk.insts) |*ci| {
+        if (trampolinableFieldSetOf(module, ci) != null) writes = true;
+    }
+    if (writes) {
+        for (blk.insts) |*ci| {
+            if (trampolinableFieldOf(module, ci)) |fld| {
+                const fr = field_nn_resolver orelse return false;
+                const rv = recv orelse return false;
+                if (fr(resolver_user.?, rv, memberFieldName(fld.name)) == null) return false;
+            }
+        }
     }
     return true;
 }
@@ -1230,7 +1255,7 @@ fn promoteArith(lt: RegType, rt: RegType) RegType {
 /// Fill `ext[site.base .. site.base + callee.n_locals]` with the inlined callee's
 /// register types: parameters seeded from the caller's argument types, then the
 /// scalar propagation run over the callee's single block.
-fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite, caller_types: []const RegType, ext: []RegType, field_resolver: ?FieldResolver, resolver_user: ?*anyopaque, regs: []const Value) Allocator.Error!void {
+fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite, caller_types: []const RegType, ext: []RegType, field_resolver: ?FieldResolver, resolver_user: ?*anyopaque, regs: []const Value, recv_value: ?*const Value) Allocator.Error!void {
     const callee = site.callee;
     const n = callee.n_locals;
     if (n == 0) return;
@@ -1262,8 +1287,9 @@ fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite,
             if (site.is_member) {
                 if (trampolinableFieldOf(module, inst)) |fld| {
                     if (field_resolver) |fr| {
-                        if (fr(resolver_user.?, &regs[site.recv_reg], memberFieldName(fld.name))) |idx| {
-                            const g = regs[site.recv_reg].Instance.borrow();
+                        const rv: *const Value = recv_value orelse &regs[site.recv_reg];
+                        if (fr(resolver_user.?, rv, memberFieldName(fld.name))) |idx| {
+                            const g = rv.Instance.borrow();
                             const fv: ?Value = if (idx < g.get().fields.items.len) g.get().fields.items[idx].value else null;
                             g.deinit();
                             if (fv) |v| if (cellScalarType(v)) |rt| {
@@ -3068,7 +3094,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         const ext = a.alloc(RegType, total_regs) catch return null;
         @memset(ext, .unknown);
         @memcpy(ext[0..n_regs], caller_types);
-        for (inline_sites.items) |*site| try fillInlineTypes(a, module, site, caller_types, ext, field_resolver, resolver_user, regs);
+        for (inline_sites.items) |*site| try fillInlineTypes(a, module, site, caller_types, ext, field_resolver, resolver_user, regs, null);
         break :ext_blk ext;
     };
     var ok = false;
@@ -4493,7 +4519,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 const tc = trampolinableCallOf(inst) orelse continue;
                 if (tc.n_args == 0 or tc.n_args > 6) continue;
                 const cf = module.funcById(tc.func) orelse continue;
-                if (!selfInlinableCallee(module, cf, tc.n_args)) continue;
+                if (!selfInlinableCallee(module, cf, tc.n_args, if (params.len > 0) &params[0] else null, field_nn_resolver, resolver_user)) continue;
                 const mv = soleReceiverMove(func, body, tc.args_reg, bid.int(), @intCast(ii), &recv_regs_buf, n_recv_regs) orelse continue;
                 inline_sites.append(a, .{
                     .block = bid,
@@ -4510,7 +4536,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     .this_reg = 0,
                     .field_site_base = 0,
                     .n_field_sites = 0,
-                    .has_result = true,
+                    .has_result = cf.blocks[0].terminator.Return != null,
                 }) catch return null;
                 skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
                 total_regs += cf.n_locals;
@@ -4882,7 +4908,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     // type in the pass above — typing the splice before it left every callee
     // parameter unknown and the emit refused the body.
     for (inline_sites.items) |*site| {
-        fillInlineTypes(a, module, site, types[0..n_regs], types, field_resolver, resolver_user, &.{}) catch return null;
+        fillInlineTypes(a, module, site, types[0..n_regs], types, field_resolver, resolver_user, &.{}, if (params.len > 0) &params[0] else null) catch return null;
     }
 
     // CASCADE: any instruction reading a register the typing could not
@@ -5253,6 +5279,54 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             return null;
         }
     }
+    // A spliced callee's `this`-field ops become the caller's own native field
+    // sites, contiguous per site so the inline emit can index them in body
+    // order. The receiver is the caller's `this` (a SELF call), so they ride the
+    // same entry field-base and stay native — no trampoline, so the method can
+    // still run frameless at the seam.
+    for (inline_sites.items) |*site| {
+        site.field_site_base = @intCast(call_sites.items.len + field_pres.items.len);
+        var nf: u32 = 0;
+        for (site.callee.blocks[0].insts) |*ci| {
+            const is_set = trampolinableFieldSetOf(module, ci) != null;
+            const fname = if (trampolinableFieldOf(module, ci)) |fld|
+                memberFieldName(fld.name)
+            else if (trampolinableFieldSetOf(module, ci)) |fs|
+                memberFieldName(fs.name)
+            else
+                continue;
+            if (params.len == 0 or params[0] != .Instance) return null;
+            const idx = (field_resolver orelse return null)(resolver_user.?, &params[0], fname) orelse return null;
+            const reg: u32 = if (is_set)
+                site.base + trampolinableFieldSetOf(module, ci).?.value.int()
+            else
+                site.base + trampolinableFieldOf(module, ci).?.dst.int();
+            if (reg >= total_regs or !isScalarRt(typeAt(types, Reg.from(reg)))) return null;
+            const fv: Value = blk_fv: {
+                const g = params[0].Instance.borrow();
+                defer g.deinit();
+                const items = g.get().fields.items;
+                if (idx >= items.len) return null;
+                break :blk_fv items[idx].value;
+            };
+            const nn = !is_set and field_nn_resolver != null and
+                field_nn_resolver.?(resolver_user.?, &params[0], fname) != null;
+            field_pres.append(a, .{
+                .block = site.block.int(),
+                .inst = site.inst,
+                .idx = idx,
+                .rt = typeAt(types, Reg.from(reg)),
+                .tag = @intFromEnum(std.meta.activeTag(fv)),
+                .is_set = is_set,
+                .dst_or_src = reg,
+                .nn = nn,
+                .name = fname,
+            }) catch return null;
+            nf += 1;
+        }
+        site.n_field_sites = nf;
+    }
+
     const field_sites_base: usize = call_sites.items.len;
     for (field_pres.items) |fp| {
         var span2: ?ir.Span = null;
