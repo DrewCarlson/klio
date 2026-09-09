@@ -345,12 +345,22 @@ process memory cap: a 100k-iteration loop allocating a closure per call).
   synthesises the fake override — apply I's default thunk for the missing
   param, then dispatch to A.f — at the arity-decline point in member
   dispatch (host_call_member `[pmo] decline=undersupply`).
-- kt47073_nested (1): a LOCAL function's default `x = k` references the
-  ENCLOSING class property `k`; the default thunk (registerLocalFnDefaults
-  -> lowerExprAsParamThunk in stmt.zig) binds only the param prefix, no
-  enclosing `this`, so `k` is an unresolved global. The fix lowers the
-  thunk with the enclosing owner (lowerExprAsParamThunkScopedEnclosing)
-  AND threads the captured `this` into the local-fn default padding.
+- kt47073_nested + closures/kt5589 (2): a LOCAL function's default
+  references the ENCLOSING scope — a class property (`x = k` = `this.k`,
+  kt47073) or a plain enclosing local (`y = x`, kt5589). The default thunk
+  (registerLocalFnDefaults -> lowerExprAsParamThunk in stmt.zig) binds only
+  the param prefix, so the reference is an unresolved global. ARCHITECTURAL
+  MISMATCH confirmed 2026-09-09: local-fn defaults are MODULE-LEVEL thunk
+  FuncIds filled at dispatch (host_call_value ~1117 `callFunc(dfid, args)`),
+  but the enclosing state they need (`this`, an enclosing local) is
+  PER-CLOSURE-INSTANCE — a `LoadCapture` in the thunk cannot resolve under
+  the standalone `callFunc`, and inline-padding at the call site needs the
+  default AST retained per call site. The fix is feature-scale: either
+  (a) capture the defaults' free enclosing names into the local-fn closure
+  and thread the closure's captures to the thunk at the fill dispatch, or
+  (b) inline-pad the default in the enclosing scope at the local-fn call
+  site. Closure captures ARE named-accessible at dispatch
+  (`info.capture_names`), so (a) is viable but multi-part.
 
 ## contextParameters state (2026-09-08, partial infra exists)
 
