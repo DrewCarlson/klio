@@ -1118,8 +1118,12 @@ pub fn plainStoredScalarFieldNN(self: *VmHost, allocator: Allocator, receiver: *
             }
             for (dg.get().body_properties) |p| {
                 if (std.mem.eql(u8, p.name, name)) {
-                    // A non-nullable primitive property carries a primitive zero.
-                    const nn = p.primitive_zero != null;
+                    // Non-nullable scalar by declaration (or by a primitive
+                    // literal initializer). `primitive_zero` alone answered
+                    // only for a property with NO initializer, so `var n = 0`
+                    // — the ordinary shape — was never provably non-null and
+                    // every method touching one compiled deopt-capable.
+                    const nn = p.scalar_nn or p.primitive_zero != null;
                     cg.deinit();
                     return if (nn) idx else null;
                 }

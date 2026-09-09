@@ -1767,11 +1767,53 @@ fn literalToConst(e: *const ast.Expr) ?Const {
 
 /// Default `Value` for a non-nullable primitive property with no
 /// initializer — so such a field starts as `0`/`false` instead of `Null`.
+/// Whether the property's type is a non-nullable scalar: an annotation says so
+/// directly, and an inferred type is read off a primitive literal initializer.
+/// A custom getter can return anything, and a delegate/lateinit has no plain
+/// stored field, so neither qualifies.
+pub fn scalarNonNullProp(p: *const ast.Property) bool {
+    if (p.is_abstract or p.is_lateinit or p.delegate != null or p.getter != null) return false;
+    if (p.ty) |ty| {
+        if (ty.nullable) return false;
+        const n = ty.name.name;
+        const names = [_][]const u8{ "Int", "Long", "Double", "Float", "Boolean", "Byte", "Short", "Char" };
+        for (names) |s2| if (std.mem.eql(u8, n, s2)) return true;
+        return false;
+    }
+    const init = p.init orelse return false;
+    return switch (init) {
+        .IntLit, .BoolLit, .FloatLit, .CharLit => true,
+        else => false,
+    };
+}
+
+/// The value a property's stored field holds BEFORE its initializer runs.
+///
+/// A non-nullable scalar reads as its type's zero, exactly as it does on the
+/// JVM — a superclass `init` that calls an overridden method sees `0`, not an
+/// uninitialized slot. klio previously left such a field Null until the
+/// initializer ran (only an UNINITIALIZED declaration got a zero), so that
+/// program failed with "get_field `n` on `B`" instead of printing 0. It is also
+/// what lets the JIT prove a scalar field read non-null: the slot never holds
+/// Null at any point in the object's life.
 pub fn primitiveZeroFor(p: *const ast.Property) ?Value {
-    if (p.init != null or p.is_abstract or p.is_lateinit or p.getter != null or p.delegate != null) return null;
-    const ty = p.ty orelse return null;
-    if (ty.nullable) return null;
-    const n = ty.name.name;
+    if (p.is_abstract or p.is_lateinit or p.getter != null or p.delegate != null) return null;
+    if (p.ty) |ty| {
+        if (ty.nullable) return null;
+        return zeroForScalarName(ty.name.name);
+    }
+    // Inferred: a primitive literal initializer names the type exactly.
+    const init = p.init orelse return null;
+    return switch (init) {
+        .IntLit => Value{ .Int = 0 },
+        .BoolLit => Value{ .Bool = false },
+        .FloatLit => Value{ .Double = 0.0 },
+        .CharLit => Value{ .Char = 0 },
+        else => null,
+    };
+}
+
+fn zeroForScalarName(n: []const u8) ?Value {
     if (std.mem.eql(u8, n, "Int")) return Value{ .Int = 0 };
     if (std.mem.eql(u8, n, "Long")) return Value{ .Long = 0 };
     if (std.mem.eql(u8, n, "Short")) return Value{ .Short = 0 };
@@ -5100,6 +5142,7 @@ fn buildClassDef(
             }),
             .has_backing = memberHasBackingField(p),
             .type_head = if (p.ty) |*ty| ty.name.name else inferredPropTypeHead(p),
+            .scalar_nn = scalarNonNullProp(p),
         });
     }
 

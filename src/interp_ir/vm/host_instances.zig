@@ -5506,6 +5506,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 .is_abstract = p.is_abstract,
                 .is_lateinit = p.is_lateinit,
                 .primitive_zero = build.primitiveZeroFor(p),
+                .scalar_nn = build.scalarNonNullProp(p),
             });
         }
         var fn_extra: usize = 0;
