@@ -631,18 +631,18 @@ pub fn build(b: *std.Build) void {
     // The C-ABI runtime library the C transpiler's output links against
     // (plans/c-transpiler-plan.md stage 1): `zig build klio-rt` installs
     // lib/libklio_rt.a + include/klio_rt.h. Ships inside every transpiled
-    // binary, so it builds from the HARNESS module universe at
-    // harness_optimize (ReleaseSafe by default) — the plain build's
-    // Debug universe made a transpiled binary's interpreter half run 3x
-    // slower than klio-harness, sinking the native floor the campaign
-    // guarantees (native >= interpreted, apples-to-apples).
+    // binary, so it builds from the HARNESS module universe (a full module
+    // graph without the CLI exe's extras) at the BUILD's optimize level:
+    // pinning it to ReleaseSafe left every transpiled program running a
+    // checked interpreter against a ReleaseFast `klio` — measured 26-42%
+    // slower execution on the same pinned image the bundle runs.
     const rt_lib = b.addLibrary(.{
         .name = "klio_rt",
         .linkage = .static,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/klio_rt/klio_rt.zig"),
             .target = target,
-            .optimize = harness_optimize,
+            .optimize = optimize,
             .link_libc = true,
             .imports = &.{
                 .{ .name = "cli", .module = harness_mods.get("cli").? },

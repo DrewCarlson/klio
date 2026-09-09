@@ -8120,6 +8120,30 @@ var native_mutex: runtime.SpinMutex = .{};
 const NativeEntry = struct { f: NativeFn, fqn: []const u8 };
 var native_table: std.AutoHashMapUnmanaged(u32, NativeEntry) = .empty;
 var native_any: std.atomic.Value(bool) = .init(false);
+/// Set at the first lookup: the table is complete from then on and reads take
+/// no lock. A registration after this point would race, so registration is
+/// refused once frozen (the generated entry always registers first).
+var native_frozen: std.atomic.Value(bool) = .init(false);
+/// The frozen table, indexed by fid. Empty until the first lookup.
+var native_slots: []const ?NativeEntry = &.{};
+
+/// Flatten the registered table into a fid-indexed array and publish it. Called
+/// once, at the first lookup; registration is closed from here on.
+fn freezeNativeTable() void {
+    native_mutex.lock();
+    defer native_mutex.unlock();
+    if (native_frozen.load(.acquire)) return;
+    var max_fid: u32 = 0;
+    var it = native_table.keyIterator();
+    while (it.next()) |k| max_fid = @max(max_fid, k.*);
+    if (std.heap.smp_allocator.alloc(?NativeEntry, max_fid + 1)) |slots| {
+        @memset(slots, null);
+        var ei = native_table.iterator();
+        while (ei.next()) |e| slots[e.key_ptr.*] = e.value_ptr.*;
+        native_slots = slots;
+    } else |_| {}
+    native_frozen.store(true, .release);
+}
 
 /// Registration happens from the transpiled binary's `main` before the
 /// program runs; the table is read-only afterwards. `fqn` is the emitted
@@ -8132,15 +8156,22 @@ pub fn registerNative(fid: u32, f: NativeFn, fqn: []const u8) void {
     native_mutex.lock();
     defer native_mutex.unlock();
     const owned = std.heap.smp_allocator.dupe(u8, fqn) catch return;
+    if (native_frozen.load(.acquire)) return; // execution started; the table is read lock-free now
     native_table.put(std.heap.smp_allocator, fid, .{ .f = f, .fqn = owned }) catch return;
     native_any.store(true, .release);
 }
 
 fn nativeFor(fid: u32, fqn: []const u8) ?NativeFn {
     if (!native_any.load(.acquire)) return null;
-    native_mutex.lock();
-    defer native_mutex.unlock();
-    const e = native_table.get(fid) orelse return null;
+    // Registration happens once, from the generated `klio_transpiled_register`,
+    // before the program runs. The first lookup freezes the table into a
+    // fid-indexed array, so every later activation is one bounds check and one
+    // load: the hash probe under a process-global lock, paid per activation,
+    // cost a transpiled compose program ~40% of its run time.
+    if (!native_frozen.load(.acquire)) freezeNativeTable();
+    const slots = native_slots;
+    if (fid >= slots.len) return null;
+    const e = slots[fid] orelse return null;
     if (!std.mem.eql(u8, e.fqn, fqn)) {
         if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
             std.debug.print("[native-fqn] fid={d} table={s} frame={s}\n", .{ fid, e.fqn, fqn });
