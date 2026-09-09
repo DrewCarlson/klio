@@ -5249,16 +5249,30 @@ fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: *std
         // Transitive supertype closure.
         var anc: std.ArrayList(usize) = .empty;
         defer anc.deinit(a);
-        var queue: std.ArrayList(ClassId) = .empty;
-        defer queue.deinit(a);
-        try queue.appendSlice(a, c.supertypes);
         var seen = std.AutoHashMap(u32, void).init(a);
         defer seen.deinit();
-        while (queue.pop()) |sid| {
-            if ((try seen.getOrPut(sid.int())).found_existing) continue;
-            if (by_id.get(sid.int())) |idx| {
-                try anc.append(a, idx);
-                try queue.appendSlice(a, module.classes.items[idx].supertypes);
+        // Ancestors in DECLARATION order: each direct supertype's whole chain
+        // in turn. A conflicting inherited default is resolved to the first
+        // supertype in declaration order that supplies it (`Impl : A2, B`
+        // where `A2 : A` takes A's default over B's), and the fold below is
+        // first-wins per slot — so the ancestor order must be declaration
+        // order, not a reverse breadth-first pop.
+        for (c.supertypes) |direct| {
+            var stack: std.ArrayList(ClassId) = .empty;
+            defer stack.deinit(a);
+            try stack.append(a, direct);
+            while (stack.pop()) |sid| {
+                if ((try seen.getOrPut(sid.int())).found_existing) continue;
+                if (by_id.get(sid.int())) |idx| {
+                    try anc.append(a, idx);
+                    // Push supertypes reversed so they pop in declaration order.
+                    const supers = module.classes.items[idx].supertypes;
+                    var i = supers.len;
+                    while (i > 0) {
+                        i -= 1;
+                        try stack.append(a, supers[i]);
+                    }
+                }
             }
         }
 

@@ -6,11 +6,11 @@ selected by directive, 980 excluded) run through `klio`, each asserting
 ratchet, and the CI shard landed 2026-09-05, and the fixed clusters live in
 git history under this file's name.
 
-## State (2026-09-09, fake-override, CI green)
+## State (2026-09-09, inherited-default-order, CI green)
 
-Census 6038 passed / 318 failed / 1 did not complete, **zero crashes**
+Census 6040 passed / 316 failed / 1 did not complete, **zero crashes**
 (994 excluded: the runner also skips `DONT_TARGET_EXACT_BACKEND: JVM*`
-files). Ratchet `BASELINE = 6038`, `MAX_FAILED = 318` in
+files). Ratchet `BASELINE = 6040`, `MAX_FAILED = 316` in
 `src/itests/box_support.zig`.
 
 Non-local break/continue from an inline lambda now targets the CALL-SITE
@@ -335,6 +335,24 @@ campaign; the first column is the failure count.
 Crashes (3): the two `extensionFunctionWithExtensionInSAMInterface` files
 (unbounded recursion, verdict above) and `functions/nothisnoclosure` (the
 process memory cap: a 100k-iteration loop allocating a closure per call).
+
+## fir OverrideWithDefault roots (2026-09-09, diagnosed)
+
+The `fir/{anonymous,local}OverrideWithDefaultIn{,Local}Overridden` cluster
+(4 files): a LOCAL/anonymous class `MyClass : A()` overrides `foo(x, y)`
+(no default of its own) and inherits `A.foo`'s default (`y = null`). Two
+roots. (1) `*InOverridden` (returns e.g. `Okotlin.Unit` — `y` padded with
+Unit, not `null`): the build pass that folds a superclass method's
+`func_defaults` onto an override runs only over MODULE classes; a LOCAL
+class is runtime-registered (host_classes.zig `registerClassCaptured`,
+`is_local_runtime`) and never gets the fold, so `MyClass.foo`'s
+func_defaults stays empty. FIX: replicate the declaration-order inherited
+default fold (see the interp_ir/build.zig ~5250 anc walk, already fixed for
+module classes 2026-09-09) at local-class registration — local-class
+specific, off the general dispatch path. (2) `*InLocalOverridden` (`super.foo:
+no matching method up the supertype chain from MyClass`): a separate
+local-class `super.<method>` resolution root — the local base class's
+method is not found walking the runtime supertype chain.
 
 ## defaultArguments roots (2026-09-08, diagnosed)
 
