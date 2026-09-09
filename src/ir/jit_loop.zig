@@ -3861,6 +3861,11 @@ pub fn valueFromSlotTagged(rt: RegType, tag: u8, s: i64) Value {
 
 const HOT_THRESHOLD: u32 = 64;
 
+/// Back edges a fused body may follow before it hands its loop to the framed
+/// engine so this tier can compile it. Above the framed threshold so a loop
+/// that runs a handful of iterations stays on the (cheaper) fused walk.
+pub const FUSED_YIELD_BACK_EDGES: u32 = 128;
+
 /// `Func.func_jit_probe` encoding: low 30 bits count activations, bit 30 =
 /// COMPILED somewhere (consult the per-thread state), bit 31 = DECLINED
 /// (sticky — stop probing; the probe tax on never-compiled bodies measured
@@ -3962,7 +3967,7 @@ fn fjMemberEnabled() bool {
     return on;
 }
 
-fn debugEnabled() bool {
+pub fn debugEnabled() bool {
     if (jit_debug_cache) |d| return d;
     const v = runtime.envOnce("KLIO_JIT_DEBUG");
     const on = v != null and v.?.len > 0 and !std.mem.eql(u8, v.?, "0");
@@ -5387,6 +5392,29 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
     return runFunc(cl, regs.items, params, slots, rtags, tramp, user);
 }
 
+/// Whether this tier already gave up on the loop with that header — the fused
+/// walker asks before handing its loop over, so a body the JIT cannot compile
+/// keeps its (cheaper) fused walk instead of escalating on every call.
+pub fn loopDeclined(func: *const Func, block: u32) bool {
+    const s = states.get(@intFromPtr(func)) orelse return false;
+    if (s.blocks_fp != @intFromPtr(func.blocks.ptr)) return false;
+    return block < s.dead.len and s.dead[block];
+}
+
+/// Stream-tier back edge: the bytecode tier follows branches inside its own
+/// loop, so a hot loop never reaches the frame loop's block-entry probe and the
+/// JIT never sees the code it exists for. The stream calls this on every back
+/// edge; `true` means "give the block back to the frame loop", either because
+/// compiled code is waiting or because the block just went hot. A block the JIT
+/// gave up on stays in the stream forever.
+pub fn streamBackEdge(fj: *FuncJit, block: u32) bool {
+    if (block >= fj.counts.len) return false;
+    if (fj.slots[block] != null) return true;
+    if (fj.dead[block]) return false;
+    fj.counts[block] +|= 1;
+    return fj.counts[block] >= HOT_THRESHOLD;
+}
+
 /// Interpreter hook: at the start of block `cur`, count the entry and — once
 /// hot — compile and run the natural loop with that header. Returns the resume
 /// point (registers reboxed) when a compiled loop ran, else null. KLIO_JIT only.
@@ -5405,6 +5433,8 @@ pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, re
     if (fj.slots[bi] == null) {
         if (fj.dead[bi]) return null;
         fj.counts[bi] += 1;
+        if (debugEnabled() and fj.counts[bi] == 1)
+            std.debug.print("[jit]   probe reached {s} b{d}\n", .{ func.name, bi });
         if (fj.counts[bi] < HOT_THRESHOLD) return null;
         var transient = false;
         const compiled = tryCompile(metadata_allocator, module, func, cur, regs.items, resolver, virt_resolver, field_resolver, field_nn_resolver, user, &transient) catch null;
@@ -5420,6 +5450,9 @@ pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, re
             return null;
         }
         if (debugEnabled()) std.debug.print("[jit] compiled {s} block {d}\n", .{ func.name, bi });
+        // Compiled code deopts to an instruction index, so this function's
+        // streams must stop fusing; every other function keeps fusion.
+        @constCast(func).bc_jit_owned = true;
         const clp = fj.a.create(CompiledLoop) catch return null;
         clp.* = compiled.?;
         fj.slots[bi] = clp;

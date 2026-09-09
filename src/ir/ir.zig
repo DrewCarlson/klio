@@ -1332,6 +1332,11 @@ pub const Func = struct {
     /// the shared-cache path. Benign-race fill.
     bc_memo: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     bc_memo_fuse: u8 = 0,
+    /// The loop JIT owns a block of this function: its compiled code deopts to
+    /// an instruction index, which only an UNFUSED stream can resume at, so
+    /// this function's streams stop fusing once the flag is set. Every other
+    /// function keeps fusion whether or not the JIT is enabled.
+    bc_jit_owned: bool = false,
     /// Function-JIT hotness probe, shared across threads so the per-activation
     /// cost is one atomic load instead of a per-thread state-map lookup: low
     /// bits count activations, bit 30 = some thread compiled a body (consult

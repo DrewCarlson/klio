@@ -84,7 +84,10 @@ pub const FuncStreams = struct {
 };
 
 var cache_mutex: runtime.SpinMutex = .{};
-var cache: ?std.AutoHashMap(usize, *const FuncStreams) = null;
+/// Streams are cached per (function, fuse variant): the loop JIT takes single
+/// functions off fusion, so both variants can be live in one process.
+const CacheKey = struct { blocks: usize, fuse: bool };
+var cache: ?std.AutoHashMap(CacheKey, *const FuncStreams) = null;
 
 /// Generation for the per-Func `bc_memo` fast path. `resetCacheForTest`
 /// FREES every cached FuncStreams; a Func that survives the reset (an
@@ -143,11 +146,13 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
             return if (m == 1) null else @ptrFromInt(m);
         }
     }
-    const key = @intFromPtr(func.blocks.ptr);
+    // Keyed by the fuse variant as well: with per-function fusion a process
+    // holds both variants, and a ptr-only key hands back the wrong one.
+    const key: CacheKey = .{ .blocks = @intFromPtr(func.blocks.ptr), .fuse = allow_fuse };
     cache_mutex.lock();
     defer cache_mutex.unlock();
     if (cache == null) {
-        cache = std.AutoHashMap(usize, *const FuncStreams).init(std.heap.smp_allocator);
+        cache = std.AutoHashMap(CacheKey, *const FuncStreams).init(std.heap.smp_allocator);
     }
     if (cache.?.get(key)) |fs| {
         @constCast(func).bc_memo_fuse = want_fuse;

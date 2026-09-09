@@ -55,9 +55,12 @@ fn fillHotLayoutSlot() void {
 fn runFileBody(path: [:0]const u8) c_int {
     runtime.perf.setProfile(runtime.perf.resolveBinaryProfile(&.{}));
     fillHotLayoutSlot();
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const gpa = runtime.allocTrackWrap(arena.allocator());
+    // The same backing the `klio` binary installs for the resolved profile:
+    // the default is the collector over the page-returning slab, not the
+    // never-free arena this used to hardcode.
+    var arena: ?std.heap.ArenaAllocator = null;
+    defer if (arena) |*a| a.deinit();
+    const gpa = runtime.allocTrackWrap(runtime.backing.processAllocator(&arena));
     var features = cli.commands.RequestedFeatures.init(gpa);
     defer features.deinit();
     return @intCast(cli.commands.runFileIrVm(gpa, path, &features));
@@ -83,12 +86,21 @@ const ImageRunCtx = struct {
     path: [:0]const u8,
 };
 
+fn runProgramImageBody(image_path: [:0]const u8) c_int {
+    runtime.perf.setProfile(runtime.perf.resolveBinaryProfile(&.{}));
+    fillHotLayoutSlot();
+    var arena: ?std.heap.ArenaAllocator = null;
+    defer if (arena) |*a| a.deinit();
+    const gpa = runtime.allocTrackWrap(runtime.backing.processAllocator(&arena));
+    return @intCast(cli.bundle.runProgramImage(gpa, image_path, &.{}));
+}
+
 fn runImageBody(ctx: ImageRunCtx) c_int {
     runtime.perf.setProfile(runtime.perf.resolveBinaryProfile(&.{}));
     fillHotLayoutSlot();
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const gpa = runtime.allocTrackWrap(arena.allocator());
+    var arena: ?std.heap.ArenaAllocator = null;
+    defer if (arena) |*a| a.deinit();
+    const gpa = runtime.allocTrackWrap(runtime.backing.processAllocator(&arena));
     return @intCast(cli.bundle.runImage(gpa, ctx.base, &.{ctx.path}, &.{}));
 }
 
@@ -103,6 +115,14 @@ export fn klio_rt_run_image(base_image: [*:0]const u8, path: [*:0]const u8) c_in
         .base = std.mem.span(base_image),
         .path = std.mem.span(path),
     });
+}
+
+/// Run the whole-program image at `path`: the module is complete, so this
+/// neither parses nor lowers — the boot a bundle gets, for a transpiled binary.
+/// The emitted ids are meaningful against exactly this artifact.
+export fn klio_rt_run_program_image(image_path: [*:0]const u8) c_int {
+    runtime.runstats.markStart();
+    return runtime.runOnBigStackMainThread([:0]const u8, c_int, runProgramImageBody, std.mem.span(image_path));
 }
 
 /// The hot-view layout descriptor: byte offsets into `runtime.Value`

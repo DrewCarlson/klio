@@ -440,11 +440,20 @@ pub fn runTranspile(
         const stem = if (std.mem.endsWith(u8, c_out, ".c")) c_out[0 .. c_out.len - 2] else c_out;
         break :blk std.fmt.allocPrint(gpa, "{s}.klio-image", .{stem}) catch return 1;
     };
+    // Prefer the WHOLE-PROGRAM image: the binary then boots the way a bundle
+    // does — mmap, load, run — instead of re-parsing and re-lowering the
+    // program against a dependency base on every start.
+    if (bundle.bakeProgramImageFile(gpa, paths, features, image_path) == 0) {
+        if (bundle.loadProgramImage(gpa, image_path)) |asm_r| {
+            var built = asm_r.built;
+            return transpileEmit(gpa, &built, path, c_out, image_path, .program);
+        }
+    }
     const bake_rc = bundle.bakeImage(gpa, paths, features, image_path);
     if (bake_rc == 0) {
         if (bundle.assembleImageBuild(gpa, image_path, paths)) |asm_r| {
             var built = asm_r.built;
-            return transpileEmit(gpa, &built, path, c_out, image_path);
+            return transpileEmit(gpa, &built, path, c_out, image_path, .base);
         }
     }
     // A program the image path cannot serve (an unbakeable base, or a
@@ -486,8 +495,13 @@ pub fn runTranspile(
         return 1;
     };
     defer built.deinit();
-    return transpileEmit(gpa, &built, path, c_out, null);
+    return transpileEmit(gpa, &built, path, c_out, null, .none);
 }
+
+/// Which artifact the emitted `main` runs against: a whole-program image (no
+/// parse, no lowering), a dependency base the program is re-extended onto, or
+/// nothing — the legacy whole-program lowering from source.
+const TranspileEntry = enum { program, base, none };
 
 fn transpileEmit(
     gpa: std.mem.Allocator,
@@ -495,6 +509,7 @@ fn transpileEmit(
     path: []const u8,
     out_path: []const u8,
     image_path: ?[]const u8,
+    entry: TranspileEntry,
 ) u8 {
     const mg = built.module.borrow();
     defer mg.deinit();
@@ -946,7 +961,10 @@ fn transpileEmit(
         emitCString(w, e.fqn) catch return 1;
         w.print(");\n", .{}) catch return 1;
     }
-    if (image_path) |ip| {
+    if (entry == .program) {
+        w.print("}}\n\n#ifndef KLIO_TRANSPILED_NO_MAIN\nint main(void) {{\n  klio_transpiled_register();\n  return klio_rt_run_program_image(", .{}) catch return 1;
+        emitCString(w, image_path.?) catch return 1;
+    } else if (image_path) |ip| {
         w.print("}}\n\n#ifndef KLIO_TRANSPILED_NO_MAIN\nint main(void) {{\n  klio_transpiled_register();\n  return klio_rt_run_image(", .{}) catch return 1;
         emitCString(w, ip) catch return 1;
         w.print(", ", .{}) catch return 1;

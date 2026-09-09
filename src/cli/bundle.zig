@@ -106,6 +106,64 @@ pub fn bakeImage(gpa: Allocator, paths: []const []const u8, requested: *Requeste
     return 0;
 }
 
+/// Bake the WHOLE program — dependencies AND user files, lowered as one module —
+/// to an image file. This is the artifact a bundle boots from: loading it runs
+/// `main` with no parse and no lowering, which is why a bundle starts in a
+/// fraction of the time `run-image` needs. A transpiled binary pins the same
+/// artifact.
+pub fn bakeProgramImageFile(gpa: Allocator, paths: []const []const u8, requested: *RequestedFeatures, out_path: []const u8) u8 {
+    var scratch_map = SourceMap.init(gpa);
+    const user = stdlib_image.parseUserFiles(gpa, &scratch_map, paths, null) orelse {
+        return commands.runCheck(gpa, paths, .Plain, requested);
+    };
+    var report = pack_cache.EmbeddedReport{};
+    var selection = pack_cache.Selection{};
+    const deps = stdlib_image.bundleDepLoad(gpa, user.asts, requested, &report, &selection) orelse return 1;
+    const bytes = bakeProgramImage(gpa, &deps, paths, user.texts, &report) orelse {
+        io.writeStderr("error: this program cannot bake to a whole-program image\n");
+        return 1;
+    };
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = out_path, .data = bytes }) catch {
+        io.printStderr(gpa, "error: cannot write {s}\n", .{out_path});
+        return 1;
+    };
+    io.printStdout(gpa, "wrote {s} ({d} bytes)\n", .{ out_path, bytes.len });
+    return 0;
+}
+
+/// Load a whole-program image: the module is complete, so this neither parses
+/// nor lowers. Shared by the transpiler (which emits against these exact ids)
+/// and by `klio_rt_run_program_image` (which runs them).
+pub fn loadProgramImage(gpa: Allocator, image_path: []const u8) ?ImageAssembly {
+    const bytes = blk: {
+        var threaded: std.Io.Threaded = .init(gpa, .{});
+        defer threaded.deinit();
+        break :blk std.Io.Dir.cwd().readFileAlloc(threaded.io(), image_path, gpa, .unlimited) catch {
+            io.printStderr(gpa, "error: cannot read program image {s}\n", .{image_path});
+            return null;
+        };
+    };
+    const loaded = (image.load(gpa, bytes) catch null) orelse {
+        io.printStderr(gpa, "error: program image rejected ({s})\n", .{image.lastLoadFailure()});
+        return null;
+    };
+    for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
+    span.active_map = loaded.map;
+    return .{ .built = loaded.base.built, .map = loaded.map, .binding_fqns = loaded.binding_fqns };
+}
+
+/// Run a whole-program image: the entry a transpiled binary calls.
+pub fn runProgramImage(gpa: Allocator, image_path: []const u8, program_args: []const []const u8) u8 {
+    const asm_r = loadProgramImage(gpa, image_path) orelse return 1;
+    var bindings = pack_cache.mergedHostBindings(gpa);
+    for (asm_r.binding_fqns) |fqn| {
+        if (bindings.resolve(fqn)) |f| bindings.register(fqn, f) catch {};
+    }
+    return commands.runBuiltModuleArgs(gpa, asm_r.built, bindings, asm_r.map, "error: no main function found", program_args);
+}
+
 /// `klio run-image <base.klio-image> <program.kt> [args...]`: load a pre-baked
 /// dependency base from a file and run the program against it. The heavy
 /// stdlib + pack lowering is already in the base, so only the small program is

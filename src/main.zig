@@ -171,40 +171,7 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             // Tracing GC (KGC): a freeing backing allocator + reachability-based
             // reclamation. Reference counting is neutralized (deinit/retain/
             // release no-op), so the collector alone frees, by reachability.
-            runtime.gc.gc_enabled = true;
-            if (runtime.envOnce("KLIO_GC_STRESS")) |v| {
-                runtime.gc.gc_stress = v.len != 0 and !std.mem.eql(u8, v, "0");
-            }
-            if (runtime.envOnce("KLIO_GC_DEBUG")) |v| {
-                runtime.gc.gc_debug = v.len != 0 and !std.mem.eql(u8, v, "0");
-            }
-            if (runtime.envOnce("KLIO_GC_HIST")) |v| {
-                runtime.gc.gc_hist = v.len != 0 and !std.mem.eql(u8, v, "0");
-            }
-            if (runtime.envOnce("KLIO_GC_NOFREE")) |v| {
-                runtime.gc.gc_nofree = v.len != 0 and !std.mem.eql(u8, v, "0");
-            }
-            if (runtime.envOnce("KLIO_GC_EXT")) |v| {
-                runtime.gc.external_accounting = v.len != 0 and !std.mem.eql(u8, v, "0");
-            }
-            if (runtime.envOnce("KLIO_GC_POISON")) |v| {
-                runtime.gc.gc_poison = v.len != 0 and !std.mem.eql(u8, v, "0");
-            }
-            if (runtime.envOnce("KLIO_GC_MINOR_STOP")) |v| {
-                runtime.gc.minor_stops_at_tenured = v.len != 0 and !std.mem.eql(u8, v, "0");
-            }
-            if (runtime.envOnce("KLIO_GC_THRESHOLD_KB")) |v| {
-                if (std.fmt.parseInt(usize, v, 10) catch null) |kb| {
-                    if (kb != 0) runtime.gc.setThresholdFloor(kb * 1024);
-                }
-            }
-            if (runtime.envOnce("KLIO_GC_STRESS_EVERY")) |v| {
-                runtime.gc.gc_stress_every = std.fmt.parseInt(usize, v, 10) catch 0;
-            }
-            if (runtime.envOnce("KLIO_GC_GEN")) |v| {
-                runtime.gc.generational = v.len != 0 and !std.mem.eql(u8, v, "0");
-            }
-            runtime.setReclaim(false);
+            runtime.backing.configureGcFromEnv();
             if (runtime.envOnce("KLIO_GC_GUARD")) |v| {
                 // GUARD=dbg: route the GC's freeing backing through the checking
                 // allocator so a use-after-free of a swept cell is caught at the
