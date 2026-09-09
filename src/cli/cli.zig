@@ -163,6 +163,11 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     } else if (std.mem.eql(u8, cmd, "transpile")) {
         var files: std.ArrayList([]const u8) = .empty;
         defer files.deinit(gpa);
+        // A program that needs a pack feature or a language flag to RUN needs
+        // the same to transpile: the emitter lowers the same sources.
+        var feature_specs: std.ArrayList([]const u8) = .empty;
+        defer feature_specs.deinit(gpa);
+        if (std.c.getenv("KLIO_LANGUAGE")) |env_specs| applyLanguageSpecs(std.mem.span(env_specs));
         var out: ?[]const u8 = null;
         var bad = false;
         var i: usize = 0;
@@ -174,17 +179,28 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
                 }
                 out = rest[i + 1];
                 i += 1;
+            } else if (std.mem.eql(u8, rest[i], "--feature")) {
+                i += 1;
+                if (i >= rest.len) {
+                    printErr(gpa, "error: --feature requires a `<pack>/<feature>` value\n", .{});
+                    return 2;
+                }
+                feature_specs.append(gpa, rest[i]) catch return 1;
+            } else if (optionValue(rest[i], "--feature=")) |v| {
+                feature_specs.append(gpa, v) catch return 1;
+            } else if (optionValue(rest[i], "--language=")) |v| {
+                applyLanguageSpecs(v);
             } else {
                 files.append(gpa, rest[i]) catch return 1;
             }
         }
         if (bad or files.items.len == 0) {
-            printErr(gpa, "usage: klio transpile <file.kt> [more.kt ...] [-o out.c]\n", .{});
+            printErr(gpa, "usage: klio transpile <file.kt> [more.kt ...] [-o out.c] [--feature <pack>/<feat>] [--language=<spec>]\n", .{});
             return 2;
         }
-        var features = commands.RequestedFeatures.init(gpa);
-        defer features.deinit();
-        return commands.runTranspile(gpa, files.items, out, &features);
+        var requested = parseRequestedFeatures(gpa, feature_specs.items);
+        defer deinitRequestedFeatures(&requested);
+        return commands.runTranspile(gpa, files.items, out, &requested);
     }
     if (std.c.getenv("KLIO_LANGUAGE")) |env_specs| applyLanguageSpecs(std.mem.span(env_specs));
     if (std.mem.eql(u8, cmd, "run")) {
