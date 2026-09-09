@@ -6653,6 +6653,44 @@ fn LoopTramp(comptime H: type) type {
                         return jit_loop.throwCode(site.block);
                     };
                 }
+                // Inline cache: lowering could not name this site's target, so
+                // the interpreter re-ran FULL by-name dispatch (candidate scan +
+                // overload ranking) on every call from compiled code. Resolve
+                // once per (receiver class, argument shape) and call the target
+                // directly while the shape holds.
+                if (comptime @hasDecl(H, "resolveMemberFuncId") and @hasDecl(H, "invokeResolvedMember")) {
+                    if (site.dispatch_recv_reg == null and site.declared_name.len == 0 and
+                        @as(usize, @intCast(site_idx)) < cl.member_ics.len)
+                    {
+                        const ic = &cl.member_ics[@intCast(site_idx)];
+                        const key = jit_loop.memberICKey(&recv, argbuf[0..site.n_args]);
+                        if (key != 0) {
+                            if (!(ic.valid and ic.key == key)) {
+                                if (lc.host.resolveMemberFuncId(lc.allocator, &recv, site.name, argbuf[0..site.n_args])) |fid| {
+                                    ic.* = .{ .key = key, .target = fid, .valid = true };
+                                } else {
+                                    // Unresolvable at this shape: leave the entry
+                                    // invalid so the next call retries rather than
+                                    // caching a miss forever.
+                                    ic.valid = false;
+                                }
+                            }
+                            if (ic.valid and ic.key == key) {
+                                break :member lc.host.invokeResolvedMember(
+                                    lc.allocator,
+                                    null,
+                                    &recv,
+                                    ic.target,
+                                    argbuf[0..site.n_args],
+                                    &.{},
+                                ) catch {
+                                    lc.pending = .{ .Type = "out of memory in JIT-compiled call" };
+                                    return jit_loop.throwCode(site.block);
+                                };
+                            }
+                        }
+                    }
+                }
                 if (comptime !@hasDecl(H, "callMemberNamed")) {
                     break :member EvalResult{ .err = .{
                         .Type = "host cannot dispatch member calls",
@@ -12803,6 +12841,15 @@ fn fusedRun(
                 if (jit_loop.loopDeclined(func, cur.int())) {
                     // The tier already refused this loop: stay fused rather
                     // than pay a materialization to be refused again.
+                    back_edges = 0;
+                    continue :walk;
+                }
+                // Leaving the bank for a frame is one-way, so commit only to
+                // compiled code: compile FIRST and stay on the walk when the
+                // tier refuses. (Resolvers are the framed path's; without a
+                // frame there is no trampoline context to offer, so a loop that
+                // needs one to type its members simply keeps walking.)
+                if (!jit_loop.compileHotLoopFor(module, func, cur, regs, null, null, null, null, null)) {
                     back_edges = 0;
                     continue :walk;
                 }

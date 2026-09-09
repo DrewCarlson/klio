@@ -285,6 +285,38 @@ pub const ObjParamLoad = struct { param_idx: u16, reg: u32 };
 /// corrupt an unrelated field.
 pub const MethodFieldCheck = struct { idx: u32, name: []const u8 };
 
+/// Monomorphic inline cache for a by-name member site. Lowering resolves most
+/// member calls; the ones it cannot (`CallMemberOrGlobal`, an overload set, a
+/// receiver whose class is only known at run time) reached the interpreter's
+/// FULL by-name dispatch on EVERY call from compiled code — candidate scan,
+/// overload ranking, the lot. The cache records what the last dispatch at this
+/// site resolved to and the shape it resolved for; a later call with the same
+/// shape calls that target directly.
+///
+/// The key is the receiver's class AND the arguments' shape, because overload
+/// selection reads the arguments, not just the receiver: caching on the class
+/// alone would keep one overload's target for a call that should pick another.
+pub const MemberIC = struct {
+    key: u64 = 0,
+    target: FuncId = @enumFromInt(0),
+    valid: bool = false,
+};
+
+/// Shape key for an inline-cache probe: the receiver class plus each argument's
+/// tag, and for an instance argument its class too. Zero means "do not cache"
+/// (a receiver with no class identity).
+pub fn memberICKey(recv: *const Value, args: []const Value) u64 {
+    if (recv.* != .Instance) return 0;
+    var h: u64 = instanceClassIdentity(recv.*);
+    if (h == 0) return 0;
+    h = h *% 0x9E3779B97F4A7C15;
+    for (args) |*a| {
+        h = (h ^ @intFromEnum(std.meta.activeTag(a.*))) *% 0x100000001B3;
+        if (a.* == .Instance) h = (h ^ instanceClassIdentity(a.*)) *% 0x100000001B3;
+    }
+    return h | 1; // never 0: 0 marks an unusable key
+}
+
 pub const FieldBase = struct {
     recv_reg: u32,
     ptr_slot: u32,
@@ -357,6 +389,9 @@ pub const CompiledLoop = struct {
     /// (borrowed, like object params); `param_idx` is the capture index.
     capture_loads: []ObjParamLoad = &.{},
     method_fields: []MethodFieldCheck = &.{},
+    /// One inline cache per call site, indexed alongside `call_sites`. Mutable
+    /// through a const unit: the cache is runtime state, not compiled code.
+    member_ics: []MemberIC = &.{},
     /// The compile-time receiver's LAYOUT identity, bound to the verified
     /// `method_fields` (index, name) pairs under one borrow. An entry whose
     /// live receiver matches it skips the per-field name loop (`shape is not
@@ -383,6 +418,7 @@ pub const CompiledLoop = struct {
         if (self.obj_param_loads.len != 0) self.allocator.free(self.obj_param_loads);
         if (self.capture_loads.len != 0) self.allocator.free(self.capture_loads);
         if (self.method_fields.len != 0) self.allocator.free(self.method_fields);
+        if (self.member_ics.len != 0) self.allocator.free(self.member_ics);
         self.allocator.free(self.arrays);
         self.allocator.free(self.cells);
         self.allocator.free(self.nullables);
@@ -3609,6 +3645,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .nullables = nullables_owned,
         .field_bases = fbases_owned,
         .call_sites = sites_owned,
+        .member_ics = blk: {
+            const ics = a.alloc(MemberIC, sites_owned.len) catch break :blk &.{};
+            @memset(ics, .{});
+            break :blk ics;
+        },
         .uc_slot = uc_slot,
         .tramp_slot = tramp_slot,
         .allocator = a,
@@ -4043,6 +4084,7 @@ pub fn evictIfOverBudget() void {
 }
 
 fn clearStates() void {
+    seam_gen +%= 1;
     var it = states.valueIterator();
     while (it.next()) |s| {
         s.*.deinit();
@@ -4081,6 +4123,7 @@ pub fn forFunc(func: *const Func) ?*FuncJit {
         if (s.blocks_fp == fp) return s;
         // Address reused for a different function (a freed module's storage):
         // drop the stale state (and its compiled code) and rebuild.
+        seam_gen +%= 1;
         s.deinit();
         a.destroy(s);
         _ = states.remove(key);
@@ -5145,6 +5188,11 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .nullables = &.{},
         .field_bases = &.{},
         .call_sites = sites_owned,
+        .member_ics = blk: {
+            const ics = a.alloc(MemberIC, sites_owned.len) catch break :blk &.{};
+            @memset(ics, .{});
+            break :blk ics;
+        },
         .uc_slot = uc_slot,
         .tramp_slot = tramp_slot,
         .func_mode = true,
@@ -5299,13 +5347,34 @@ pub fn methodSeamPeek(func: *const Func) ?*const CompiledLoop {
     return null;
 }
 
+/// Compiled-unit lookup for the seam, keyed by function pointer. `forFunc` is a
+/// threadlocal HASH probe, and the seam runs it on EVERY member call — it showed
+/// up as its own entry in the profile of a member-call loop. Entries carry the
+/// state generation so a cleared or rebuilt `states` map invalidates them
+/// wholesale. Compiled units stay per-thread, so this cache is too.
+const SeamEntry = struct { fp: usize = 0, gen: u32 = 0, cl: ?*CompiledLoop = null };
+threadlocal var seam_cache: [64]SeamEntry = @splat(.{});
+threadlocal var seam_gen: u32 = 1;
+
+inline fn seamSlot(func: *const Func) *SeamEntry {
+    return &seam_cache[(@intFromPtr(func) >> 4) & (seam_cache.len - 1)];
+}
+
 pub fn methodSeamProbe(func: *const Func) SeamProbe {
     if (!funcEnabled()) return .no;
     const pr = probeWord(func).load(.monotonic);
     if (pr & PROBE_DECLINED != 0) return .no;
     if (pr & PROBE_COMPILED != 0) {
+        const slot = seamSlot(func);
+        if (slot.fp == @intFromPtr(func) and slot.gen == seam_gen) {
+            if (slot.cl) |cl| {
+                if (cl.method_mode and !cl.can_deopt) return .{ .run = cl };
+            }
+            return .no;
+        }
         const fj = forFunc(func) orelse return .no;
         if (fj.func_jit) |*cl| {
+            slot.* = .{ .fp = @intFromPtr(func), .gen = seam_gen, .cl = cl };
             if (cl.method_mode and !cl.can_deopt) return .{ .run = cl };
             return .no;
         }
@@ -5342,7 +5411,14 @@ pub fn fusedShouldYieldToFuncTier(func: *const Func) bool {
     if (!funcEnabled()) return false;
     const pr = probeWord(func).load(.monotonic);
     if (pr & PROBE_DECLINED != 0) return false;
-    if (pr & PROBE_COMPILED != 0) return true;
+    if (pr & PROBE_COMPILED != 0) {
+        // Compiled is not the same as RUNNABLE HERE: the seam refuses a unit
+        // that can deopt, so yielding for one bought a framed activation per
+        // call and ran the compiled code never. The fused walk beats that
+        // framed path — a member-call loop measured 732ms fused against
+        // 1020ms framed — so only yield when the seam will really take it.
+        return methodSeamProbe(func) == .run;
+    }
     return probeCount(func);
 }
 
@@ -5420,6 +5496,48 @@ pub fn loopDeclined(func: *const Func, block: u32) bool {
     const s = states.get(@intFromPtr(func)) orelse return false;
     if (s.blocks_fp != @intFromPtr(func.blocks.ptr)) return false;
     return block < s.dead.len and s.dead[block];
+}
+
+/// Compile the hot loop at `header` NOW, for a tier that must commit before it
+/// can hand the loop over. The fused walker leaves its bank for a real frame to
+/// reach this tier, and that move is one-way: if the compile then bails, the
+/// loop finishes on the framed path, which is SLOWER than the walk it left (a
+/// member-call loop measured 722ms fused against 987ms framed). So the walker
+/// asks here first and only moves when there is compiled code to move to.
+/// A refusal is recorded exactly as the block-entry probe records it, so the
+/// walker stops asking instead of re-attempting every hot back edge.
+pub fn compileHotLoopFor(
+    module: *const Module,
+    func: *const Func,
+    header: BlockId,
+    regs: []const Value,
+    resolver: ?MemberResolver,
+    virt_resolver: ?VirtResolver,
+    field_resolver: ?FieldResolver,
+    field_nn_resolver: ?FieldResolver,
+    resolver_user: ?*anyopaque,
+) bool {
+    const fj = forFunc(func) orelse return false;
+    const bi = header.int();
+    if (bi >= fj.counts.len) return false;
+    if (fj.slots[bi] != null) return true;
+    if (fj.dead[bi]) return false;
+    var transient = false;
+    const compiled = tryCompile(metadata_allocator, module, func, header, regs, resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user, &transient) catch null;
+    if (compiled == null) {
+        fj.attempts[bi] += 1;
+        if (transient and fj.attempts[bi] < MAX_COMPILE_ATTEMPTS) return false;
+        fj.dead[bi] = true;
+        return false;
+    }
+    const clp = fj.a.create(CompiledLoop) catch return false;
+    clp.* = compiled.?;
+    fj.slots[bi] = clp;
+    fj.counts[bi] = HOT_THRESHOLD;
+    noteCompiled();
+    @constCast(func).bc_jit_owned = true;
+    if (debugEnabled()) std.debug.print("[jit] compiled {s} block {d} (for the fused walker)\n", .{ func.name, bi });
+    return true;
 }
 
 /// Stream-tier back edge: the bytecode tier follows branches inside its own
