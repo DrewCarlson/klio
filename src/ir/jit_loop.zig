@@ -494,6 +494,14 @@ fn isArithBinOp(op: ir.BinOp) bool {
 fn isDivBinOp(op: ir.BinOp) bool {
     return op == .Div or op == .Mod;
 }
+/// Integer bitwise / shift operators. Their result takes the LEFT operand's
+/// kind, the same rule `bitwiseOpOf` applies to the call-shaped spellings.
+fn isBitwiseBinOp(op: ir.BinOp) bool {
+    return switch (op) {
+        .And, .Or, .Xor, .Shl, .Shr, .UShr => true,
+        else => false,
+    };
+}
 fn isCmpBinOp(op: ir.BinOp) bool {
     return switch (op) {
         .Eq, .NotEq, .Less, .LessEq, .Greater, .GreaterEq => true,
@@ -1490,6 +1498,10 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
             if (isArithBinOp(b.op) or isDivBinOp(b.op)) {
                 break :blk .{ .r = b.dst, .t = promoteArith(typeOf(types, b.lhs), typeOf(types, b.rhs)) };
             }
+            // A bitwise/shift BinOp went untyped, so its destination stayed
+            // `unknown` and poisoned every later read — one `xor` left a whole
+            // arithmetic helper uncompilable.
+            if (isBitwiseBinOp(b.op)) break :blk .{ .r = b.dst, .t = typeOf(types, b.lhs) };
             break :blk null;
         },
         .Not => |n| .{ .r = n.dst, .t = .boolean },
@@ -2536,6 +2548,42 @@ const Compiler = struct {
                 const is_cmp = isCmpBinOp(b.op);
                 const is_arith = isArithBinOp(b.op);
                 const is_div = isDivBinOp(b.op);
+                // A bitwise/shift BinOp: the same emit `bitwiseOpOf` uses for the
+                // call-shaped spelling, which was unreachable from this form —
+                // one `xor` written as an operator made the whole body
+                // uncompilable even though the machinery was right there.
+                if (isBitwiseBinOp(b.op)) {
+                    const blt = typeOf(self.types, b.lhs);
+                    const brt = typeOf(self.types, b.rhs);
+                    if (!isNumeric(blt) or isFloat(blt) or !isNumeric(brt) or isFloat(brt))
+                        return jit.JitError.Unsupported;
+                    const bw64 = blt == .i64;
+                    try self.loadSlot(T0, b.lhs);
+                    try self.loadSlot(T1, b.rhs); // shift count lands in cl (T1 == rcx)
+                    switch (b.op) {
+                        .And => try self.em.andReg(T0, T1),
+                        .Or => try self.em.orReg(T0, T1),
+                        .Xor => try self.em.xorReg(T0, T1),
+                        .Shl => try self.em.shlCl(T0, bw64),
+                        .Shr => try self.em.sarCl(T0, bw64),
+                        .UShr => {
+                            // A 32-bit value sits SIGN-extended in its slot, so a
+                            // logical shift has to clear the high half first or
+                            // the shifted-in bits come from the sign. Masking
+                            // through a scratch register is the one spelling both
+                            // emitters share.
+                            if (!bw64) {
+                                try self.em.movImm64(T2, 0xFFFF_FFFF);
+                                try self.em.andReg(T0, T2);
+                            }
+                            try self.em.shrCl(T0, bw64);
+                        },
+                        else => return jit.JitError.Unsupported,
+                    }
+                    if (typeOf(self.types, b.dst) == .i32) try self.em.movsxd(T0, T0);
+                    try self.storeSlot(b.dst, T0);
+                    return;
+                }
                 if (!is_cmp and !is_arith and !is_div) return jit.JitError.Unsupported;
                 const lt = typeOf(self.types, b.lhs);
                 const rt = typeOf(self.types, b.rhs);
@@ -4633,15 +4681,18 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 continue;
             }
             switch (inst.*) {
-                // `/` and `%` are excluded: a divide-by-zero deopt from a
-                // native-RECURSED callee has no frame to resume into. Method
-                // bodies never recurse natively, so they may divide.
+                // `/` and `%` divide: the deopt they can raise has no frame to
+                // resume into when the body runs as a native-recursed callee.
+                // That is survivable because such a body is PURE — it runs with
+                // no trampoline, so it cannot call out or touch anything — and
+                // the recursion site falls back to re-running it interpreted,
+                // which is where the real divide-by-zero is raised. Refusing
+                // division outright kept ordinary arithmetic helpers (anything
+                // with a `%`) uncompiled, and their callers then trampolined
+                // per iteration and ran slower than the plain interpreter.
                 .BinOp => |b| {
                     if (isRecvReg(recv_regs, b.lhs.int()) or isRecvReg(recv_regs, b.rhs.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4228\n", .{func.name}); return null; }
-                    if (isDivBinOp(b.op)) {
-                        if (!is_method) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4230\n", .{func.name}); return null; }
-                        has_div = true;
-                    }
+                    if (isDivBinOp(b.op)) has_div = true;
                 },
                 .Move => |m| if (isRecvReg(recv_regs, m.src.int()) or isRecvReg(recv_regs, m.dst.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4234\n", .{func.name}); return null; },
                 .Not => |nt| if (isRecvReg(recv_regs, nt.src.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4235\n", .{func.name}); return null; },
@@ -5738,6 +5789,44 @@ pub fn fusedShouldYieldToFuncTier(func: *const Func) bool {
         return methodSeamProbe(func) == .run;
     }
     return probeCount(func);
+}
+
+/// Compile a callee reached from COMPILED code. The tier's probes live on the
+/// INTERPRETER's call paths, so a function only ever called from compiled code
+/// was never counted and never compiled: the caller then trampolined into the
+/// interpreter on every iteration, which measured SLOWER than not compiling the
+/// caller at all (947ms interpreted against 1119ms with the loop compiled). A
+/// call arriving here is hot by construction — its caller is already native — so
+/// the body is offered to the tier once, with the same probe bookkeeping that
+/// keeps a refusal from being retried.
+pub fn compileCalleeForCall(
+    module: *const Module,
+    func: *const Func,
+    params: []const Value,
+    resolver: ?MemberResolver,
+    virt_resolver: ?VirtResolver,
+    field_resolver: ?FieldResolver,
+    field_nn_resolver: ?FieldResolver,
+    resolver_user: ?*anyopaque,
+) ?*const CompiledLoop {
+    if (!funcEnabled()) return null;
+    const pr = probeWord(func).load(.monotonic);
+    if (pr & PROBE_DECLINED != 0) return null;
+    const fj = forFunc(func) orelse return null;
+    if (fj.func_jit) |*cl| return cl;
+    if (fj.func_tried) return null;
+    fj.func_tried = true;
+    const compiled = tryCompileFunc(metadata_allocator, module, func, params, &.{}, resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) catch null;
+    if (compiled == null) {
+        if (debugEnabled()) std.debug.print("[jit]   callee-for-call declined {s}\n", .{func.name});
+        _ = probeWord(func).fetchOr(PROBE_DECLINED, .monotonic);
+        return null;
+    }
+    fj.func_jit = compiled;
+    noteCompiled();
+    _ = probeWord(func).fetchOr(PROBE_COMPILED, .monotonic);
+    if (debugEnabled()) std.debug.print("[jit] compiled callee {s} for a native call\n", .{func.name});
+    return &fj.func_jit.?;
 }
 
 pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, captures: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {

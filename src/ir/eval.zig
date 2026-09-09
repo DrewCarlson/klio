@@ -6551,7 +6551,13 @@ fn LoopTramp(comptime H: type) type {
             // safely fall back to the frame-based path by re-running it below.
             if (!site.is_member and !site.is_virtual and !runtime.shouldAbandon()) {
                 if (lc.module.funcById(site.func)) |callee| {
-                    if (jit_loop.compiledFunc(callee)) |callee_cl| {
+                    // A callee only ever called from compiled code is never
+                    // probed by the interpreter, so it stayed uncompiled and this
+                    // site trampolined every iteration. The call is hot by
+                    // construction; offer the body to the tier once.
+                    const compiled_callee = jit_loop.compiledFunc(callee) orelse
+                        jit_loop.compileCalleeForCall(lc.module, callee, argbuf[0..site.n_args], &resolveMember, &resolveVirtual, &resolveField, &resolveFieldNN, ctx_opaque);
+                    if (compiled_callee) |callee_cl| {
                         if (!callee_cl.no_native_recurse and
                             evtls.jit_native_depth < NATIVE_SLOT_BANK_DEPTH and callee_cl.n_slots <= 192)
                         {
