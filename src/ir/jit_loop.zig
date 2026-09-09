@@ -3926,7 +3926,9 @@ inline fn probeCount(func: *const Func) bool {
     const pw = probeWord(func);
     const pr = pw.load(.monotonic);
     const n = pr & PROBE_COUNT_MASK;
-    if (n < HOT_THRESHOLD * 2) _ = pw.fetchAdd(1, .monotonic);
+    // Counts past the threshold too: the yield budget reads this to notice a
+    // body that stayed hot without the tier ever taking it.
+    if (n < HOT_THRESHOLD * 4) _ = pw.fetchAdd(1, .monotonic);
     return n + 1 >= HOT_THRESHOLD;
 }
 /// A loop whose receiver/field types are read from the live frame can bail when
@@ -5068,6 +5070,13 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         if (!fp.is_set and !fp.nn) all_reads_nn = false;
     }
     const can_deopt = !(is_method and field_sites_base == 0 and !has_div and all_reads_nn);
+    if (can_deopt and is_method and debugEnabled()) {
+        // Which condition refused this method the seam — the histogram that says
+        // where the next widening belongs.
+        std.debug.print("[jit]   method {s} can deopt: tramp-calls={d} div={} reads-nn={}\n", .{
+            func.name, field_sites_base, has_div, all_reads_nn,
+        });
+    }
 
     const has_calls = call_sites.items.len != 0;
     const param_slot_base: u32 = n_regs;
@@ -5407,10 +5416,25 @@ pub fn methodSeamCompile(module: *const Module, func: *const Func, params: []con
     }
 }
 
+/// Yields a hot fused body is allowed before the tier must have produced
+/// something. The yield sends the body to the framed path so a compile hook can
+/// see it — but the hooks live on specific paths, and a body served by another
+/// one (a flat or leaf serve) would never be compiled NOR marked declined, so
+/// it yielded forever and simply ran slower: a method calling a sibling method
+/// measured 1167ms against 1042ms interpreted, with nothing ever compiled.
+const YIELD_BUDGET: u32 = HOT_THRESHOLD;
+
 pub fn fusedShouldYieldToFuncTier(func: *const Func) bool {
     if (!funcEnabled()) return false;
     const pr = probeWord(func).load(.monotonic);
     if (pr & PROBE_DECLINED != 0) return false;
+    if (pr & PROBE_COMPILED == 0 and (pr & PROBE_COUNT_MASK) >= HOT_THRESHOLD + YIELD_BUDGET) {
+        // Hot long enough that a compile would have happened by now. Stop
+        // paying the framed path for a tier that never took the body.
+        _ = probeWord(func).fetchOr(PROBE_DECLINED, .monotonic);
+        if (debugEnabled()) std.debug.print("[jit]   yield budget spent, staying fused: {s}\n", .{func.name});
+        return false;
+    }
     if (pr & PROBE_COMPILED != 0) {
         // Compiled is not the same as RUNNABLE HERE: the seam refuses a unit
         // that can deopt, so yielding for one bought a framed activation per
