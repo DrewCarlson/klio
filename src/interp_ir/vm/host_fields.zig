@@ -68,17 +68,17 @@ inline fn errRes(e: EvalError) EvalResult {
 /// clear at a run boundary and reset them so leaked-across-runs state is a
 /// loud failure.
 pub fn resetReceiverTls() void {
-    std.debug.assert(fld_tls.field_resolve_stack.items.len == 0);
-    std.debug.assert(!fld_tls.field_outer_active);
-    fld_tls.field_resolve_stack.clearRetainingCapacity();
-    fld_tls.field_outer_active = false;
+    std.debug.assert(fldTls().field_resolve_stack.items.len == 0);
+    std.debug.assert(!fldTls().field_outer_active);
+    fldTls().field_resolve_stack.clearRetainingCapacity();
+    fldTls().field_outer_active = false;
 }
 
 /// Every per-thread cache this module keeps, as ONE threadlocal. Darwin
 /// resolves a threadlocal access through a `_tlv_get_addr` CALL, and the
 /// field paths touch several of these per operation — as one struct the
 /// base is fetched once and each cache is an offset from it.
-const FieldsTls = struct {
+pub const FieldsTls = struct {
     field_resolve_stack: std.ArrayList(ResolvePair) = .empty,
     field_outer_active: bool = false,
     anon_recv_depth: usize = 0,
@@ -89,7 +89,22 @@ const FieldsTls = struct {
     super_write_owner: ?[]const u8 = null,
     anon_key_buf: [512]u8 = undefined,
 };
-threadlocal var fld_tls: FieldsTls = .{};
+/// Owner thread reads the global copy, every other thread its own — see
+/// `runtime.tls_fast`.
+var fld_tls_owner: FieldsTls = .{};
+threadlocal var fld_tls_other: FieldsTls = .{};
+inline fn fldTls() *FieldsTls {
+    return if (runtime.tls_fast.isOwner()) &fld_tls_owner else &fld_tls_other;
+}
+
+/// This thread's field caches. Resolved ONCE when a `VmHost` view is built (a
+/// handful of times per run) and reached through `self.tls` afterwards: on
+/// Darwin a threadlocal access is a `_tlv_get_addr` CALL, and these caches sit
+/// on the per-field-operation path, so re-resolving them per operation put
+/// thread-local access at the top of the interpreter profile.
+pub fn currentTls() *FieldsTls {
+    return fldTls();
+}
 
 const ResolvePair = struct { id: usize, name: []const u8 };
 
@@ -123,20 +138,20 @@ fn withFieldResolvePair(
     suppress_cc_redirect: bool,
     member_probe: bool,
 ) Allocator.Error!?EvalResult {
-    for (fld_tls.field_resolve_stack.items) |k| {
+    for (fldTls().field_resolve_stack.items) |k| {
         if (k.id == id and std.mem.eql(u8, k.name, name)) return null;
     }
     // Back the process-global guard stack on `page_allocator` (it is cleared
     // capacity-retaining at run boundaries; a per-run-arena backing would
     // leave the retained capacity dangling once that arena is torn down).
-    fld_tls.field_resolve_stack.append(std.heap.page_allocator, .{ .id = id, .name = name }) catch {};
+    fldTls().field_resolve_stack.append(std.heap.page_allocator, .{ .id = id, .name = name }) catch {};
     const r = try getFieldInner(self, allocator, receiver, name, suppress_cc_redirect, member_probe, false);
-    var i: usize = fld_tls.field_resolve_stack.items.len;
+    var i: usize = fldTls().field_resolve_stack.items.len;
     while (i > 0) {
         i -= 1;
-        const k = fld_tls.field_resolve_stack.items[i];
+        const k = fldTls().field_resolve_stack.items[i];
         if (k.id == id and std.mem.eql(u8, k.name, name)) {
-            _ = fld_tls.field_resolve_stack.orderedRemove(i);
+            _ = fldTls().field_resolve_stack.orderedRemove(i);
             break;
         }
     }
@@ -244,9 +259,9 @@ fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: 
             ir.eval.dumpFrameChainForDiagAlways();
         }
     }
-    const ka = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(ka);
-    runtime.keepalivePush(receiver);
+    const ka = self.ka.mark();
+    defer self.ka.restore(ka);
+    self.ka.push(receiver);
     var args: std.ArrayList(Value) = .empty;
     defer args.deinit(allocator);
     try args.append(allocator, receiver);
@@ -311,9 +326,9 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// `EvalError`.
 fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(allocator, "intrinsic_fields", fqn, null, null, args);
-    const keepalive = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(keepalive);
-    runtime.keepalivePushSlice(args);
+    const keepalive = self.ka.mark();
+    defer self.ka.restore(keepalive);
+    self.ka.pushSlice(args);
     var ih = VmIntrinsicHost{
         .module = self.module,
         .closures = self.closures,
@@ -995,15 +1010,15 @@ fn lexicalReceiverFallback(
     const e = r.err;
     if (e != .Unimplemented) return r;
     if (receiver.* != .Instance) return r;
-    if (fld_tls.anon_recv_depth >= 8) return r;
+    if (fldTls().anon_recv_depth >= 8) return r;
     const caps: []const InstanceData.Capture = blk: {
         const g = receiver.Instance.borrow();
         defer g.deinit();
         break :blk g.get().anon_captures;
     };
     if (caps.len == 0) return r;
-    fld_tls.anon_recv_depth += 1;
-    defer fld_tls.anon_recv_depth -= 1;
+    fldTls().anon_recv_depth += 1;
+    defer fldTls().anon_recv_depth -= 1;
     for (caps) |c| {
         // Only the LABELLED receivers: the plain `this` capture is the object's
         // `outer` link, already on the normal lookup path.
@@ -2499,9 +2514,9 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     }
     // Inner-class outer-chain fallback: walk the receiver's captured
     // `outer` link for a field of an enclosing-class instance.
-    if (!member_probe and !fld_tls.field_outer_active) {
-        fld_tls.field_outer_active = true;
-        defer fld_tls.field_outer_active = false;
+    if (!member_probe and !self.tls.field_outer_active) {
+        self.tls.field_outer_active = true;
+        defer self.tls.field_outer_active = false;
         var cur: ?Value = switch (receiver.*) {
             .Instance => |i| blk: {
                 const g = i.borrow();
@@ -3541,7 +3556,7 @@ fn ownerKeyedProbeOne(owner: []const u8, kb: []u8, map: anytype, recv_key: []con
 /// shares its (receiver, name) pair across owners, and only the
 /// declaration whose owner is in scope is the one kotlinc bound.
 fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
-    const memo: *[1024]OwnerKeyedSlot = if (setters) &fld_tls.owner_keyed_memo_set else &fld_tls.owner_keyed_memo;
+    const memo: *[1024]OwnerKeyedSlot = if (setters) &fldTls().owner_keyed_memo_set else &fldTls().owner_keyed_memo;
     var it = ir.eval.frameThisChainIter();
     while (it.next()) |v| {
         if (v != .Instance) continue;
@@ -4308,7 +4323,7 @@ inline fn tlFieldSlot(class_p: usize, name_p: usize) usize {
 
 fn fieldReadCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.ProgramImage.FieldReadHit {
     const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
-    const e = &fld_tls.tl_field_read_cache[tlFieldSlot(class_p, name_p)];
+    const e = &self.tls.tl_field_read_cache[tlFieldSlot(class_p, name_p)];
     if (e.state != 0 and e.class_p == class_p and e.name_p == name_p and e.gen == gen) {
         // state 2: the shared map had no entry at last probe. It is
         // add-only, so re-probe every 64th consult rather than paying
@@ -4335,7 +4350,7 @@ fn fieldReadCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.Program
 
 fn fieldWriteCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.ProgramImage.FieldWriteHit {
     const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
-    const e = &fld_tls.tl_field_write_cache[tlFieldSlot(class_p, name_p)];
+    const e = &self.tls.tl_field_write_cache[tlFieldSlot(class_p, name_p)];
     if (e.state != 0 and e.class_p == class_p and e.name_p == name_p and e.gen == gen) {
         if (e.state == 2) {
             if (e.miss_ttl > 0) {
@@ -5011,9 +5026,9 @@ pub fn setFieldFrom(
     super_owner: ?[]const u8,
 ) Allocator.Error!UnitResult {
     if (super_owner == null) return setFieldInner(self, allocator, receiver, name, value);
-    const prev = fld_tls.super_write_owner;
-    fld_tls.super_write_owner = super_owner;
-    defer fld_tls.super_write_owner = prev;
+    const prev = fldTls().super_write_owner;
+    fldTls().super_write_owner = super_owner;
+    defer fldTls().super_write_owner = prev;
     return setFieldInner(self, allocator, receiver, name, value);
 }
 
@@ -5021,8 +5036,8 @@ fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // CONSUME the marker: it belongs to this write only. Writes made inside the
     // base setter we are about to reach are ordinary ones.
     const super_owner: ?[]const u8 = blk: {
-        const o = fld_tls.super_write_owner;
-        fld_tls.super_write_owner = null;
+        const o = self.tls.super_write_owner;
+        self.tls.super_write_owner = null;
         break :blk o;
     };
     // Companion forwarding for writes: `Foo.count = 1` routes to the
@@ -5530,7 +5545,7 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
 /// keyed on a single string, built as a unit-separated concatenation of
 /// `(class, name)` cached per-call.
 fn anonKey(class_name: []const u8, method: []const u8) []const u8 {
-    return std.fmt.bufPrint(&fld_tls.anon_key_buf, "{s}\u{1f}{s}", .{ class_name, method }) catch class_name;
+    return std.fmt.bufPrint(&fldTls().anon_key_buf, "{s}\u{1f}{s}", .{ class_name, method }) catch class_name;
 }
 
 /// The runtime class simple name of an instance.

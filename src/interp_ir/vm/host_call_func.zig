@@ -614,9 +614,9 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
 /// the IR evaluator's `EvalError` data path.
 fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(allocator, "intrinsic_call_func", fqn, null, null, args);
-    const keepalive = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(keepalive);
-    runtime.keepalivePushSlice(args);
+    const keepalive = self.ka.mark();
+    defer self.ka.restore(keepalive);
+    self.ka.pushSlice(args);
     var intrinsic = VmIntrinsicHost{
         .module = self.module.clone(),
         .closures = self.closures.clone(),

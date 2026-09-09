@@ -595,8 +595,8 @@ fn captureBuilderTemplate(inst: ObjRef(InstanceData), ownership: *const Value) v
 /// (the first cycle of a process runs interpreted).
 pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) Allocator.Error!?Value {
     if (!classMatches(map_inst, &map_class_hit, MAP_FQN)) return null;
-    const km = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(km);
+    const km = self.ka.mark();
+    defer self.ka.restore(km);
     if (builder_tmpl.gen != cacheGen() or builder_tmpl.class == null) {
         if (runtime.envOnce("KLIO_MAPMUT_TRACE") != null) {
             const S = struct {
@@ -625,7 +625,7 @@ pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) A
         .identity = host_instances.mintInstanceId(self),
         .native_state = null,
     });
-    runtime.keepalivePush(.{ .Instance = owner_inst });
+    self.ka.push(.{ .Instance = owner_inst });
     const map_v: Value = .{ .Instance = map_inst };
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     try fields.ensureTotalCapacity(a, t.count);
@@ -681,8 +681,8 @@ fn readBuilder(inst: ObjRef(InstanceData)) ?BuilderState {
 /// or Null; null bails to the interpreted body.
 pub fn tryPut(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData), key: *const Value, value: *const Value) Allocator.Error!?Value {
     if (!isBuilderClass(inst)) return null;
-    const km = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(km);
+    const km = self.ka.mark();
+    defer self.ka.restore(km);
     if (!keyHostable(key)) return null;
     const key_hash = Value.kotlinScalarHash(key) orelse return null;
     const st = readBuilder(inst) orelse return null;
@@ -1183,8 +1183,8 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
         // this attempt reads (and the previous value inside its buffers)
         // while they sit in native locals the collector cannot see — pin
         // for the attempt, and hold a reference under reclaim.
-        const km = runtime.keepaliveMark();
-        defer runtime.keepaliveRestore(km);
+        const km = self.ka.mark();
+        defer self.ka.restore(km);
         // Read phase, mirroring mutate's `synchronized(sync) { ... }`.
         if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT_TRACE") orelse "", "3")) {
             std.debug.print("[ssm:{d}] enter gc={} reclaim={}\n", .{ std.Thread.getCurrentId(), runtime.gc.gc_enabled, runtime.reclaimEnabled() });
@@ -1211,7 +1211,7 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
         }
         if (runtime.reclaimEnabled()) old_map.retain();
         defer if (runtime.reclaimEnabled()) old_map.release(a);
-        runtime.keepalivePush(old_map);
+        self.ka.push(old_map);
         const old_size: i32 = blk: {
             const g = old_map.Instance.borrow();
             const sv = g.get().getCached(&fn_size, "size");
@@ -1237,7 +1237,7 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
         _ = old_size;
         const builder_v = (try tryBuilder(self, a, old_map.Instance)) orelse return null;
         if (builder_v != .Instance) return null;
-        runtime.keepalivePush(builder_v);
+        self.ka.push(builder_v);
         defer if (runtime.reclaimEnabled()) builder_v.release(a);
         const prev = (try tryPut(self, a, builder_v.Instance, key, value)) orelse return null;
         const new_map = (try tryBuild(self, a, builder_v.Instance)) orelse {
@@ -1250,7 +1250,7 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
             if (runtime.reclaimEnabled()) new_map.release(a);
             return prev;
         }
-        runtime.keepalivePush(new_map);
+        self.ka.push(new_map);
         ssmPhase("minted");
 
         // KLIO_SSMPUT=2: compute-only bisect mode — mint then bail to the
@@ -1362,8 +1362,8 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
 /// ownership for the builder. Bails on any shape surprise.
 pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!?Value {
     if (!isBuilderClass(inst)) return null;
-    const km = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(km);
+    const km = self.ka.mark();
+    defer self.ka.restore(km);
     const st = readBuilder(inst) orelse return null;
     const map_v: Value = blk: {
         const g = inst.borrow();
@@ -1418,7 +1418,7 @@ pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocat
         .identity = host_instances.mintInstanceId(self),
         .native_state = null,
     });
-    runtime.keepalivePush(.{ .Instance = new_map });
+    self.ka.push(.{ .Instance = new_map });
     // Fresh ownership: an empty instance of the ownership's own class.
     const new_owner: Value = blk: {
         if (st.ownership != .Instance) return null;

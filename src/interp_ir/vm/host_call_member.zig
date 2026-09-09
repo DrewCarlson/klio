@@ -416,9 +416,9 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// `EvalError`. Mirrors `dispatch_intrinsic`.
 fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(allocator, "intrinsic_call_member", fqn, null, null, args);
-    const keepalive = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(keepalive);
-    runtime.keepalivePushSlice(args);
+    const keepalive = self.ka.mark();
+    defer self.ka.restore(keepalive);
+    self.ka.pushSlice(args);
     var intrinsic = makeIntrinsicHost(self);
     defer deinitIntrinsicHost(&intrinsic);
     var ihost = intrinsic.intrinsicHost();
@@ -8322,8 +8322,8 @@ fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Va
     // The host's active globals scope is only held in this stack-local VmHost
     // field; pin it so a collection during the body eval cannot sweep the
     // transient capture-layer env (its parent chain reaches the rooted globals).
-    const ka = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(ka);
+    const ka = self.ka.mark();
+    defer self.ka.restore(ka);
     runtime.keepalivePushCell(&self.globals.cell.hdr);
     var cap_vec: std.ArrayList(Value) = .empty;
     for (f.capture_order) |cn| {

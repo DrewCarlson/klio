@@ -10,6 +10,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const objcell = @import("objcell.zig");
+const tls_fast = @import("tls_fast.zig");
 const trace_mod = @import("trace.zig");
 const float_fmt = @import("float_fmt.zig");
 const class_mod = @import("class.zig");
@@ -1761,7 +1762,13 @@ const KeepaliveTls = struct {
     troot: objcell.gc.ThreadRoot = undefined,
     troot_inited: bool = false,
 };
-threadlocal var keepalive_tls: KeepaliveTls = .{};
+/// Owner thread reads the global copy, every other thread its own — see
+/// `tls_fast`.
+var keepalive_owner: KeepaliveTls = .{};
+threadlocal var keepalive_other: KeepaliveTls = .{};
+inline fn keepaliveTls() *KeepaliveTls {
+    return if (tls_fast.isOwner()) &keepalive_owner else &keepalive_other;
+}
 
 fn gcMarkKeepaliveCtx(ctx: *anyopaque, m: *objcell.gc.Marker) void {
     const stack: *const std.ArrayListUnmanaged(KeepEntry) = @ptrCast(@alignCast(ctx));
@@ -1775,16 +1782,52 @@ fn gcMarkKeepaliveCtx(ctx: *anyopaque, m: *objcell.gc.Marker) void {
 
 /// Unlink this thread's keepalive root node at its exit seam.
 pub fn gcUninstallKeepaliveRoot() void {
-    const k = &keepalive_tls;
+    const k = keepaliveTls();
     if (!k.troot_inited) return;
     objcell.gc.unregisterThreadRoot(&k.troot);
     k.troot_inited = false;
 }
 
+/// A handle to this thread's keepalive state, resolved ONCE. Darwin resolves a
+/// threadlocal through a `_tlv_get_addr` CALL, and a body that pins across a
+/// host re-entry marks, pushes and restores — three fetches per activation on
+/// the interpreter's hottest path. Take a handle and pay one.
+pub const KeepaliveHandle = struct {
+    k: *KeepaliveTls,
+
+    pub inline fn mark(self: KeepaliveHandle) usize {
+        return self.k.stack.items.len;
+    }
+
+    pub inline fn pushSlice(self: KeepaliveHandle, vs: []const Value) void {
+        if (!objcell.gc.gc_enabled) return;
+        ensureKeepaliveRoot(self.k);
+        self.k.stack.append(std.heap.page_allocator, .{ .many = vs }) catch
+            @panic("KGC: host_keepalive push failed");
+    }
+
+    pub inline fn push(self: KeepaliveHandle, v: Value) void {
+        if (!objcell.gc.gc_enabled) return;
+        ensureKeepaliveRoot(self.k);
+        self.k.stack.append(std.heap.page_allocator, .{ .one = v }) catch
+            @panic("KGC: host_keepalive push failed");
+    }
+
+    pub inline fn restore(self: KeepaliveHandle, m: usize) void {
+        if (!objcell.gc.gc_enabled) return;
+        self.k.stack.items.len = m;
+    }
+};
+
+/// This thread's keepalive handle.
+pub fn keepaliveHandle() KeepaliveHandle {
+    return .{ .k = keepaliveTls() };
+}
+
 /// Snapshot the keepalive depth; pass to `keepaliveRestore` to pop everything
 /// pushed since. Valid (and cheap) even when the GC is off.
 pub inline fn keepaliveMark() usize {
-    return keepalive_tls.stack.items.len;
+    return keepaliveTls().stack.items.len;
 }
 
 /// Register the keepalive root provider once. Lazy: the first push on any thread
@@ -1801,7 +1844,7 @@ inline fn ensureKeepaliveRoot(k: *KeepaliveTls) void {
 /// Pin a single Value across a re-entrant host call. No-op unless GC is on.
 pub fn keepalivePush(v: Value) void {
     if (!objcell.gc.gc_enabled) return;
-    const k = &keepalive_tls;
+    const k = keepaliveTls();
     ensureKeepaliveRoot(k);
     k.stack.append(std.heap.page_allocator, .{ .one = v }) catch
         @panic("KGC: host_keepalive push failed");
@@ -1812,7 +1855,7 @@ pub fn keepalivePush(v: Value) void {
 /// restore. No-op unless GC is on.
 pub fn keepalivePushSlice(vs: []const Value) void {
     if (!objcell.gc.gc_enabled) return;
-    const k = &keepalive_tls;
+    const k = keepaliveTls();
     ensureKeepaliveRoot(k);
     k.stack.append(std.heap.page_allocator, .{ .many = vs }) catch
         @panic("KGC: host_keepalive push failed");
@@ -1822,7 +1865,7 @@ pub fn keepalivePushSlice(vs: []const Value) void {
 /// across a re-entrant host call. No-op unless GC is on.
 pub fn keepalivePushPairs(ps: []const MapPair) void {
     if (!objcell.gc.gc_enabled) return;
-    const k = &keepalive_tls;
+    const k = keepaliveTls();
     ensureKeepaliveRoot(k);
     k.stack.append(std.heap.page_allocator, .{ .pairs = ps }) catch
         @panic("KGC: host_keepalive push failed");
@@ -1834,7 +1877,7 @@ pub fn keepalivePushPairs(ps: []const MapPair) void {
 /// own `gc_trace` reaches its contents. No-op unless GC is on.
 pub fn keepalivePushCell(h: *objcell.gc.GcHeader) void {
     if (!objcell.gc.gc_enabled) return;
-    const k = &keepalive_tls;
+    const k = keepaliveTls();
     ensureKeepaliveRoot(k);
     k.stack.append(std.heap.page_allocator, .{ .cell = h }) catch
         @panic("KGC: host_keepalive push failed");
@@ -1843,7 +1886,7 @@ pub fn keepalivePushCell(h: *objcell.gc.GcHeader) void {
 /// Pop the keepalive stack back to a depth from `keepaliveMark`.
 pub inline fn keepaliveRestore(mark: usize) void {
     if (!objcell.gc.gc_enabled) return;
-    keepalive_tls.stack.items.len = mark;
+    keepaliveTls().stack.items.len = mark;
 }
 
 /// The runtime value: a tagged union over every Kotlin value the

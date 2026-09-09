@@ -77,6 +77,7 @@ fn runFileBody(path: [:0]const u8) c_int {
 /// on the thread the caller invoked it from — the process main thread for the
 /// emitted `main`, which is where a program that opens a window must run.
 export fn klio_rt_run_file(path: [*:0]const u8) c_int {
+    runtime.tls_fast.claimOwner();
     runtime.runstats.markStart();
     return runtime.runOnBigStackMainThread([:0]const u8, c_int, runFileBody, std.mem.span(path));
 }
@@ -110,6 +111,7 @@ fn runImageBody(ctx: ImageRunCtx) c_int {
 /// the module assembled from that exact artifact. Same large-stack switch
 /// as `klio_rt_run_file`.
 export fn klio_rt_run_image(base_image: [*:0]const u8, path: [*:0]const u8) c_int {
+    runtime.tls_fast.claimOwner();
     runtime.runstats.markStart();
     return runtime.runOnBigStackMainThread(ImageRunCtx, c_int, runImageBody, .{
         .base = std.mem.span(base_image),
@@ -121,6 +123,7 @@ export fn klio_rt_run_image(base_image: [*:0]const u8, path: [*:0]const u8) c_in
 /// neither parses nor lowers — the boot a bundle gets, for a transpiled binary.
 /// The emitted ids are meaningful against exactly this artifact.
 export fn klio_rt_run_program_image(image_path: [*:0]const u8) c_int {
+    runtime.tls_fast.claimOwner();
     runtime.runstats.markStart();
     return runtime.runOnBigStackMainThread([:0]const u8, c_int, runProgramImageBody, std.mem.span(image_path));
 }

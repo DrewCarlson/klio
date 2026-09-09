@@ -925,10 +925,10 @@ fn instantiateEnumEntries(self: *VmHost, module: *const Module, cdef: ObjRef(Cla
         // The name string and the constructor arguments are pinned until
         // the instance owns them: the header thunks run user code first.
         const preset_name: Value = .{ .String = try runtime.strInit(allocator, entry_name) };
-        const entry_keepalive = runtime.keepaliveMark();
-        defer runtime.keepaliveRestore(entry_keepalive);
-        runtime.keepalivePush(preset_name);
-        runtime.keepalivePushSlice(ctor_args.items);
+        const entry_keepalive = self.ka.mark();
+        defer self.ka.restore(entry_keepalive);
+        self.ka.push(preset_name);
+        self.ka.pushSlice(ctor_args.items);
         // The entry's slot takes the instance as soon as its shell exists:
         // the entry's own initializers (and its inner classes) refer to the
         // entry by name while it is still under construction, and kotlinc
@@ -1086,9 +1086,9 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
 /// `EvalError`, preserving the thrown `Value` for try/catch matching.
 fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!union(enum) { ok: Value, err: EvalError } {
     vmhost.emitPath(allocator, "intrinsic_globals", fqn, null, null, args);
-    const keepalive = runtime.keepaliveMark();
-    defer runtime.keepaliveRestore(keepalive);
-    runtime.keepalivePushSlice(args);
+    const keepalive = self.ka.mark();
+    defer self.ka.restore(keepalive);
+    self.ka.pushSlice(args);
     var intrinsic = VmIntrinsicHost{
         .module = self.module.clone(),
         .closures = self.closures.clone(),
