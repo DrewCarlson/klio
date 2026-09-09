@@ -1084,6 +1084,44 @@ pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *con
     return null;
 }
 
+/// The zero a DECLARED backing-field property of the receiver's class (or an
+/// ancestor's) holds before its initializer runs. Null when the class declares
+/// no such property, or when the property has no backing field — `lateinit`,
+/// delegated and accessor-only properties must still fail their read.
+fn declaredBackingZero(self: *VmHost, receiver: *const Value, name: []const u8) ?Value {
+    var cur: ?[]const u8 = className(receiver.Instance);
+    var depth: usize = 0;
+    while (cur) |cn| {
+        depth += 1;
+        if (depth > 64) break; // cycle guard, as the other hierarchy walks use
+        const cg = self.classes.borrow();
+        const def = cg.get().get(cn);
+        if (def == null) {
+            cg.deinit();
+            break;
+        }
+        const dg = def.?.borrow();
+        for (dg.get().body_properties) |bp| {
+            if (!std.mem.eql(u8, bp.name, name)) continue;
+            const backed = bp.has_backing and !bp.is_lateinit and !bp.is_abstract and
+                bp.delegate == null and bp.getter == null;
+            const zero: ?Value = if (backed) (bp.primitive_zero orelse Value.Null) else null;
+            dg.deinit();
+            cg.deinit();
+            return zero;
+        }
+        const parent_name: ?[]const u8 = if (dg.get().parent) |p| blk: {
+            const pg = p.borrow();
+            defer pg.deinit();
+            break :blk pg.get().name;
+        } else null;
+        dg.deinit();
+        cg.deinit();
+        cur = parent_name;
+    }
+    return null;
+}
+
 fn isScalarTypeName(n: []const u8) bool {
     const names = [_][]const u8{ "Int", "Long", "Double", "Float", "Boolean", "Byte", "Short", "Char" };
     for (names) |s| if (std.mem.eql(u8, n, s)) return true;
@@ -2649,6 +2687,28 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
                     .err => |e| freeFieldMiss(allocator, e),
                 }
             }
+        }
+    }
+    // A DECLARED backing field that has no slot yet: the instance is still under
+    // construction, and this read reached it through a superclass `init` calling
+    // an overridden method. On the JVM the field already exists holding its
+    // type's zero, so materialize it here rather than failing — `open class A {
+    // init { show() } }` with `class B : A() { var n = 5; override fun show() =
+    // println(n) }` printed a `get_field` error where Kotlin prints 0.
+    //
+    // Lazily, on the read that needs it: pre-declaring every backing field at
+    // allocation gave the same semantics but DOUBLED a compose program's
+    // residency (782MB -> 1781MB) for slots nothing ever touched.
+    if (receiver.* == .Instance) {
+        if (declaredBackingZero(self, receiver, name)) |zero| {
+            const g = receiver.Instance.borrowMut();
+            defer g.deinit();
+            if (g.get().get(name) == null) {
+                try g.get().ensureFieldsOwned(allocator, 1);
+                try g.get().fields.append(allocator, .{ .name = name, .value = zero });
+                g.get().invalidateShape();
+            }
+            return .{ .ok = zero };
         }
     }
     const tf = try allocator.dupe(u8, receiverLabel(receiver));
