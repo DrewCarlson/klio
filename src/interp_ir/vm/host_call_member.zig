@@ -3940,17 +3940,27 @@ pub fn valueCouldServeName(self: *VmHost, allocator: Allocator, v: *const Value,
 /// masks over the declared prop names' (length, first byte) signatures
 /// filter the overwhelming majority of member names without hashing —
 /// a false positive just runs the walk.
-threadlocal var recv_fn_gate_mod: ?*const Module = null;
-threadlocal var recv_fn_gate_gen: u32 = 0;
-threadlocal var recv_fn_gate_any: bool = true;
-threadlocal var recv_fn_len_mask: u64 = ~@as(u64, 0);
-threadlocal var recv_fn_byte_mask: u64 = ~@as(u64, 0);
+/// One threadlocal, not five. Darwin resolves each `threadlocal` through a
+/// `_tlv_get_addr` call, and this gate is inlined into the hottest member
+/// dispatch there is: splitting its state across separate variables put one
+/// call per variable at every inlined site (measured 250ms -> 2380ms on a
+/// compose startup when a fifth was added).
+const RecvFnGate = struct {
+    mod: ?*const Module = null,
+    /// The module ADDRESS alone cannot say the answer is current — the next
+    /// program in this process can mint a module at the same address — so the
+    /// gate also rides the generation the program boundary bumps.
+    gen: u32 = 0,
+    any: bool = true,
+    len_mask: u64 = ~@as(u64, 0),
+    byte_mask: u64 = ~@as(u64, 0),
+};
+threadlocal var recv_fn_gate: RecvFnGate = .{};
 
 fn recvFnPropsAny(self: *VmHost) bool {
     const mp: *const Module = self.module.asPtr();
-    // A module ADDRESS is reusable across programs in one process, so the
-    // gate rides the generation the program boundary bumps.
-    if (recv_fn_gate_mod == mp and recv_fn_gate_gen == cacheGen()) return recv_fn_gate_any;
+    const gate = &recv_fn_gate;
+    if (gate.mod == mp and gate.gen == cacheGen()) return gate.any;
     const g = self.module.borrow();
     const reg = &g.get().registry;
     const any = reg.recv_fn_props.count() != 0;
@@ -3969,11 +3979,11 @@ fn recvFnPropsAny(self: *VmHost) bool {
         }
     }
     g.deinit();
-    recv_fn_len_mask = lm;
-    recv_fn_byte_mask = bm;
-    recv_fn_gate_mod = mp;
-    recv_fn_gate_gen = cacheGen();
-    recv_fn_gate_any = any;
+    gate.len_mask = lm;
+    gate.byte_mask = bm;
+    gate.mod = mp;
+    gate.gen = cacheGen();
+    gate.any = any;
     return any;
 }
 
@@ -3981,8 +3991,9 @@ fn recvFnPropHeadOf(self: *VmHost, receiver: *const Value, name: []const u8) ?[]
     if (receiver.* != .Instance) return null;
     if (!recvFnPropsAny(self)) return null;
     if (name.len == 0) return null;
-    if ((recv_fn_len_mask >> @intCast(@min(name.len, 63))) & 1 == 0) return null;
-    if ((recv_fn_byte_mask >> @intCast(name[0] & 63)) & 1 == 0) return null;
+    const gate = &recv_fn_gate;
+    if ((gate.len_mask >> @intCast(@min(name.len, 63))) & 1 == 0) return null;
+    if ((gate.byte_mask >> @intCast(name[0] & 63)) & 1 == 0) return null;
     const mg = self.module.borrow();
     defer mg.deinit();
     const reg = &mg.get().registry;
