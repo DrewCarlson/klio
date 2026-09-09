@@ -836,7 +836,7 @@ const FrameAnchor = struct {
     /// Owning thread, for the frame-walk audit (`KLIO_GC_FRAME_AUDIT=1`):
     /// a collector marking ANOTHER thread's chain must find that thread
     /// parked, so a torn frame there names an unparked mutator.
-    tid: u32 = 0,
+    tid: runtime.gc.Tid = 0,
 };
 threadlocal var frame_anchor: FrameAnchor = undefined;
 /// This thread's GC root node. Its `ctx` is `&frame_anchor`, so the collector
@@ -911,7 +911,7 @@ fn gcMarkFramesCtx(ctx: *anyopaque, m: *runtime.gc.Marker) void {
         fi += 1;
     }) {
         if (audit) {
-            const me: u32 = @bitCast(std.Thread.getCurrentId());
+            const me = runtime.gc.currentTid();
             const bad = @intFromPtr(f) < 0x1000 or (@intFromPtr(f) >> 47) != 0 or
                 f.captures.items.len > 4096 or f.params.items.len > 4096 or
                 f.regs.items.len > 65536;
@@ -964,7 +964,7 @@ inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallFrameRoot() void {
     if (frame_troot_inited) return;
     frame_troot_inited = true;
-    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .fused_chains = &fused_chain, .fused_depth = &fused_depth, .tid = @bitCast(std.Thread.getCurrentId()) };
+    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .fused_chains = &fused_chain, .fused_depth = &fused_depth, .tid = runtime.gc.currentTid() };
     frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
     runtime.gc.registerThreadRoot(&frame_troot);
 }
@@ -3607,7 +3607,7 @@ pub const Frame = struct {
         // chain right now — a rendezvous hole, and exactly the shape that
         // makes a mark walk read freed frame buffers.
         if (stwAuditOn() and runtime.gc.worldStopped()) {
-            const me: u32 = @bitCast(std.Thread.getCurrentId());
+            const me = runtime.gc.currentTid();
             if (me != runtime.gc.collector_tid.load(.acquire)) {
                 if (runtime.gc.blocking_safe_depth == 0) {
                     std.debug.print("[gc-stw] tid={d} collector={d} bs={d} park_depth={d} mut={} mutators={d} parked={d} cpark={d} func={s}\n", .{ me, runtime.gc.collector_tid.load(.acquire), runtime.gc.blocking_safe_depth, runtime.gc.park_depth, runtime.gc.is_mutator, runtime.gc.dbg_mutators.load(.acquire), runtime.gc.dbg_parked.load(.acquire), runtime.gc.dbg_collector_park.load(.acquire), self.func.name });

@@ -702,7 +702,16 @@ pub fn worldStopped() bool {
 /// True only between "every other mutator is parked" and the end of the
 /// sweep — the window in which no mutator may touch its own state.
 pub var world_marking: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-pub var collector_tid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+/// Thread identity as this build stores it. `std.Thread.Id` is 64-bit on
+/// Darwin and 32-bit elsewhere, and a 32-bit target has no 64-bit atomic, so
+/// the id is narrowed to a pointer-width value there. Ids are dense small
+/// integers, so the low bits keep them distinct.
+pub const Tid = if (@bitSizeOf(std.Thread.Id) <= @bitSizeOf(usize)) std.Thread.Id else usize;
+pub var collector_tid: std.atomic.Value(Tid) = std.atomic.Value(Tid).init(0);
+/// This thread's id in that width.
+pub inline fn currentTid() Tid {
+    return @truncate(std.Thread.getCurrentId());
+}
 /// Diagnostics: the rendezvous numbers the collector saw when it began
 /// marking.
 pub var dbg_mutators: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
@@ -931,7 +940,7 @@ fn collectImpl(force_major: bool) void {
         return;
     }
     defer gc_lock.unlock();
-    collector_tid.store(@bitCast(std.Thread.getCurrentId()), .release);
+    collector_tid.store(currentTid(), .release);
     defer collector_tid.store(0, .release);
     // The collector's own buffered external delta joins the shared counters
     // before the threshold math reads them (other threads' buffers are
