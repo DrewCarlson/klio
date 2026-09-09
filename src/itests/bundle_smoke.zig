@@ -216,6 +216,35 @@ test "pack-using bundle (kotlinx.serialization + feature) matches klio run" {
     try assertMatchesRun(c, program, bundle_path, &.{ "--feature", "kotlinx.serialization/json" });
 }
 
+test "a class with only secondary constructors keeps its parameter defaults" {
+    const c = try ctx();
+    const program = try writeProgram(c.a, c.io,
+        "secctor.kt",
+        \\class Q {
+        \\    val s: String
+        \\    constructor(v: String = "sec-default") { s = v }
+        \\}
+        \\
+        \\open class Base {
+        \\    val label: String
+        \\    constructor(s: String = "default") { label = s }
+        \\    constructor(s: String = "default", n: Int) { label = "$s#$n" }
+        \\}
+        \\
+        \\class Named : Base(n = 3)
+        \\
+        \\fun main() {
+        \\    println(Q().s)
+        \\    println(Base().label)
+        \\    println(Base("x").label)
+        \\    println(Named().label)
+        \\}
+        \\
+    );
+    const bundle_path = try bundleProgram(c, program, "secctor", &.{});
+    try assertMatchesRun(c, program, bundle_path, &.{});
+}
+
 test "argv passes through to main(args)" {
     const c = try ctx();
     const program = try writeProgram(c.a, c.io,

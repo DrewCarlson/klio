@@ -65,7 +65,7 @@ const BuiltModule = build.BuiltModule;
 /// Bump on ANY change to the encoded layout or to the types it reaches
 /// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
 /// caller rebakes.
-pub const FORMAT_VERSION: u32 = 58;
+pub const FORMAT_VERSION: u32 = 59;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
@@ -783,6 +783,11 @@ const ClassDefImage = struct {
     is_abstract: bool,
     is_inner: bool,
     is_anonymous: bool,
+    /// A class declaring only secondary constructors has NO primary. Without
+    /// this the decoder's default (`true`) made every restored class look like
+    /// it had an empty primary, so a zero-argument construction picked that
+    /// instead of the defaulted secondary and its parameter defaults never ran.
+    has_primary_ctor: bool = true,
     secondary_ctors: []const FF(ast.SecondaryCtor),
     enum_entries: []struct { name: []const u8, value: ValueImage, annotation_records: []const runtime.AnnotationRecord },
     enclosing: ?u32,
@@ -2001,6 +2006,7 @@ fn classDefToImage(
         .is_abstract = cd.is_abstract,
         .is_inner = cd.is_inner,
         .is_anonymous = cd.is_anonymous,
+        .has_primary_ctor = cd.has_primary_ctor,
         .secondary_ctors = @constCast(cd.secondary_ctors),
         .enum_entries = entries,
         .enclosing = enclosing,
@@ -2404,6 +2410,7 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
             .is_abstract = ci.is_abstract,
             .is_inner = ci.is_inner,
             .is_anonymous = ci.is_anonymous,
+            .has_primary_ctor = ci.has_primary_ctor,
             .secondary_ctors = ci.secondary_ctors,
             .enum_entries = &.{},
             .companion = try ObjRef(?ObjRef(InstanceData)).init(a, null),

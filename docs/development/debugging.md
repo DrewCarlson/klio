@@ -306,6 +306,7 @@ path — it always runs. These knobs bisect its two emissions.
 | `KLIO_COMPOSE_DBG` | set | One activation summary line (oracle sizes) plus group-emission debug inside the pass | `[compose-pass]` |
 | `KLIO_COMPOSER_BIND_TRACE` | set | Each call that threads the `$composer, $changed` pair: the owning declaration and the composer's class (a non-Composer instance in the pair slot also dumps the frame chain) | `[composer-bind-fn]`, `[composer-bind]` |
 | `KLIO_RSS_LOG` | set | Prints process RSS on each rendered Compose UI frame | `[rss]` |
+| `KLIO_CTOR_TRACE` | set | Every secondary-constructor side-table lookup: the key, how many entries it found, and each entry's parameter/default counts. The table that decides whether a defaulted secondary constructor can take a call | `[ctor]` |
 | `KLIO_RUN_STATS` | set | One line when the program's `main` returns: the boot/exec time split, RSS at `main` and at exit, RSS + mapped bytes after a forced final collection, and the live cell count that collection kept. Works the same for `klio run`, a bundle, and a transpiled binary, so the three are comparable | `[run-stats]` |
 
 ```sh
