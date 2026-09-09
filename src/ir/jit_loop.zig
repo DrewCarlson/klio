@@ -377,6 +377,11 @@ pub const CompiledLoop = struct {
     /// (receiver fields, scalar args) and may run at the RECURSIVE CALL SEAM
     /// with no frame at all — its only outcome is RETURN.
     can_deopt: bool = true,
+    /// Whether the body stores to any `this`-field. A deopt out of a body that
+    /// has already written one cannot be answered by re-running the call — the
+    /// write would land twice — so this is what decides whether a CALLER may
+    /// reach this body through a direct call that deopts.
+    writes_fields: bool = true,
     /// Any call site that actually calls back through the trampoline (a
     /// NATIVE field site is direct memory access and needs none).
     has_tramp_sites: bool = true,
@@ -406,6 +411,12 @@ pub const CompiledLoop = struct {
     /// `Return` emit; `maxInt(u32)` there means the scalar `result_slot`
     /// (or Unit) carries the value instead.
     result_reg_slot: u32 = 0,
+    /// Calls that go STRAIGHT into another compiled unit's native code. The
+    /// callee is a deopt-free method body over the same receiver, so it needs
+    /// no frame, no trampoline and no resume machinery: this unit seeds the
+    /// callee's argument slots and receiver field base inside its own slot
+    /// array, calls it, and reads its result slot.
+    direct_sites: []const DirectSite = &.{},
     self_dbg_name: []const u8 = "",
     allocator: Allocator,
 
@@ -425,7 +436,35 @@ pub const CompiledLoop = struct {
         self.allocator.free(self.field_bases);
         self.allocator.free(self.call_sites);
         if (self.param_rt.len != 0) self.allocator.free(self.param_rt);
+        if (self.direct_sites.len != 0) self.allocator.free(self.direct_sites);
     }
+};
+
+/// One direct call between compiled units. `slot_base` is where the callee's
+/// whole slot window lives inside the caller's slot array, so the call is a
+/// pointer bump and a `call` — no boxing, no host callback, no frame.
+///
+/// The callee's code address is baked into the caller. That address outlives
+/// every run of the caller: reaching the caller's compiled body goes through
+/// its own `FuncJit`, whose fingerprint is re-checked first, so a state map
+/// that dropped the callee (a freed module whose `*Func` address was reused)
+/// has already invalidated the caller too.
+pub const DirectSite = struct {
+    block: BlockId,
+    inst: u32,
+    callee: *const CompiledLoop,
+    slot_base: u32,
+    /// The call's argument register base; index 0 is the receiver, so callee
+    /// parameter `i` reads caller register `args_reg + i`.
+    args_reg: u32,
+    n_args: u32,
+    dst: Reg,
+    has_result: bool,
+    /// The callee can deopt, so the caller tests the returned resume code and
+    /// re-runs the whole call interpreted when it is not RETURN.
+    may_deopt: bool = false,
+    /// Where that re-run resumes: the receiver `Move` this call removed.
+    resume_at: BodyInstPos,
 };
 
 // --- supported-shape predicates ---------------------------------------------
@@ -494,6 +533,14 @@ fn isArithBinOp(op: ir.BinOp) bool {
 fn isDivBinOp(op: ir.BinOp) bool {
     return op == .Div or op == .Mod;
 }
+/// Integer bitwise / shift operators. Their result takes the LEFT operand's
+/// kind, the same rule `bitwiseOpOf` applies to the call-shaped spellings.
+fn isBitwiseBinOp(op: ir.BinOp) bool {
+    return switch (op) {
+        .And, .Or, .Xor, .Shl, .Shr, .UShr => true,
+        else => false,
+    };
+}
 fn isCmpBinOp(op: ir.BinOp) bool {
     return switch (op) {
         .Eq, .NotEq, .Less, .LessEq, .Greater, .GreaterEq => true,
@@ -553,6 +600,27 @@ fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
                 return null;
             return .{ .dst = cm.dst, .src = cm.receiver, .to = to };
         },
+        // The same conversion on a scalar also lowers as a VIRTUAL call
+        // (`k.toLong()` did), and the slot is rooted at its declaring
+        // function — so the name comes from there. Only the builtin
+        // declarations count: a user class's own `toLong()` is a real call.
+        .CallVirtual => |cv| {
+            if (cv.arg_names.len != 0 or cv.n_args != 0) return null;
+            if (cv.arg_params != null or cv.trailing_lambda) return null;
+            const decl = module.funcById(ir.FuncId.from(cv.slot.int())) orelse return null;
+            if (!std.mem.startsWith(u8, decl.fqn, "kotlin.")) return null;
+            const to: RegType = if (std.mem.eql(u8, decl.name, "toDouble"))
+                .f64
+            else if (std.mem.eql(u8, decl.name, "toFloat"))
+                .f32
+            else if (std.mem.eql(u8, decl.name, "toLong"))
+                .i64
+            else if (std.mem.eql(u8, decl.name, "toInt"))
+                .i32
+            else
+                return null;
+            return .{ .dst = cv.dst, .src = cv.receiver, .to = to };
+        },
         else => return null,
     }
 }
@@ -591,6 +659,72 @@ fn bitwiseOpOf(module: *const Module, inst: *const Inst) ?BitOp {
 }
 
 const INLINE_MAX_INSTS: usize = 24;
+const INLINE_MAX_BLOCKS: usize = 8;
+/// Upper bound on a splice candidate's block count, so the reachability scan
+/// and the emitter's per-block label table are fixed-size.
+const CALLEE_BLOCK_LIMIT: usize = 64;
+
+/// The blocks a splice covers: those reachable from the callee's entry, entry
+/// first then ascending index. Null when the callee has an unsupported
+/// terminator, a bad edge, or more blocks than the splice's budget. Blocks that
+/// are unreachable never reach the emitter, so their shape does not matter.
+fn calleeBlockOrder(f: *const Func, buf: []u32) ?[]u32 {
+    if (f.blocks.len == 0 or f.blocks.len > CALLEE_BLOCK_LIMIT) return null;
+    const entry = f.entry.int();
+    if (entry >= f.blocks.len) return null;
+    var reach = [_]bool{false} ** CALLEE_BLOCK_LIMIT;
+    var stack: [CALLEE_BLOCK_LIMIT]u32 = undefined;
+    var sp: usize = 0;
+    reach[entry] = true;
+    stack[sp] = entry;
+    sp += 1;
+    while (sp > 0) {
+        sp -= 1;
+        const blk = &f.blocks[stack[sp]];
+        var succ: [2]u32 = undefined;
+        var n_succ: usize = 0;
+        switch (blk.terminator) {
+            .Goto => |t| {
+                succ[0] = t.int();
+                n_succ = 1;
+            },
+            .Branch => |br| {
+                succ[0] = br.t.int();
+                succ[1] = br.f.int();
+                n_succ = 2;
+            },
+            .Return => {},
+            else => return null,
+        }
+        for (succ[0..n_succ]) |s| {
+            if (s >= f.blocks.len) return null;
+            if (reach[s]) continue;
+            reach[s] = true;
+            stack[sp] = s;
+            sp += 1;
+        }
+    }
+    if (buf.len == 0) return null;
+    buf[0] = entry;
+    var n: usize = 1;
+    var i: u32 = 0;
+    while (i < f.blocks.len) : (i += 1) {
+        if (!reach[i] or i == entry) continue;
+        if (n >= buf.len) return null;
+        buf[n] = i;
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// Whether a splice-eligible callee delivers a value. `selfInlinableCallee` has
+/// already proven every reachable return agrees on this.
+fn calleeReturnsValue(f: *const Func) bool {
+    for (f.blocks) |*b| {
+        if (b.terminator == .Return and b.terminator.Return != null) return true;
+    }
+    return false;
+}
 
 /// Whether a top-level callee can be inlined into the native loop: a single block
 /// returning a value, made only of scalar instructions (no nested calls, object
@@ -648,6 +782,10 @@ const InlineSite = struct {
     n_field_sites: u32 = 0,
     /// Has a value return (false for a `Unit` method invoked for its effect).
     has_result: bool = true,
+    /// Where a deopt inside the spliced body resumes: the receiver `Move` this
+    /// splice removed. Null for a top-level inline, which removes nothing, so
+    /// the call's own position is right.
+    resume_at: ?BodyInstPos = null,
 };
 
 /// The destination register an instruction writes, if any (covering every shape
@@ -714,6 +852,308 @@ fn regWrittenInBody(func: *const Func, body: []const BlockId, r: Reg) bool {
 /// scalar ops, parameter loads, or `this`-field accesses (get/set of a scalar
 /// field on the `LoadParam 0` register), with scalar required parameters and a
 /// scalar-or-`Unit` return. `this_reg` receives the register `LoadParam 0` binds.
+/// Inline a SELF call — `this.helper(...)`, which the lowerer emits as a static
+/// `Call` with the receiver moved into arg 0 — into a compiled method. That Move
+/// is what made the whole method uncompilable (a receiver register may appear
+/// only as a field-op receiver), so a method delegating to a sibling helper
+/// compiled nothing and ran slower than interpreted. Splicing a callee that
+/// never touches `this` makes both the Move and the call disappear, and the
+/// method still runs frameless at the seam: 1049ms -> 351ms on such a loop.
+///
+/// `KLIO_FJ_SELF_INLINE=0` disables it. On by default so every corpus and sweep
+/// run exercises the path — the reason it stayed off for its first hours is that
+/// the corpus contained exactly ONE program that reached it.
+var fj_self_inline_cache: ?bool = null;
+fn fjSelfInlineEnabled() bool {
+    if (fj_self_inline_cache) |v| return v;
+    const on = if (runtime.envOnce("KLIO_FJ_SELF_INLINE")) |v| !(v.len != 0 and v[0] == '0') else true;
+    fj_self_inline_cache = on;
+    return on;
+}
+
+/// A callee this tier can splice into its caller at a self-call: scalar
+/// control flow over the callee's own registers, reading and writing `this`
+/// only through the field-site machinery. Refusing any other `this` use is what
+/// keeps the receiver out of the compiled body — the register holding it is
+/// never materialized, which is the whole reason the caller can compile.
+///
+/// A callee with branches splices as several blocks: the emitter gives each one
+/// a label in the caller's code, so an `if`/`when` helper is as inlinable as a
+/// straight-line expression.
+fn selfInlinableCallee(module: *const Module, f: *const Func, n_args: u32, recv: ?*const Value, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) bool {
+    if (f.is_suspend or f.is_lambda) return false;
+    if (!f.has_receiver_param) return false;
+    if (f.params.len != n_args) return false;
+    var order_buf: [INLINE_MAX_BLOCKS]u32 = undefined;
+    const order = calleeBlockOrder(f, &order_buf) orelse return false;
+    if (f.n_locals == 0) return false;
+    var total_insts: usize = 0;
+    var value_rets: usize = 0;
+    var void_rets: usize = 0;
+    for (order) |b| {
+        const blk = &f.blocks[b];
+        if (blk.catches.len != 0 or blk.finally != null) return false;
+        switch (blk.terminator) {
+            .Goto, .Branch => {},
+            .Return => |r| if (r != null) {
+                value_rets += 1;
+            } else {
+                void_rets += 1;
+            },
+            else => return false,
+        }
+        total_insts += blk.insts.len;
+    }
+    // A callee whose returns disagree would need the splice to deliver a value
+    // on one path and nothing on another; the join has one shape, so decline.
+    if (value_rets != 0 and void_rets != 0) return false;
+    if (value_rets + void_rets == 0) return false;
+    if (total_insts == 0 or total_insts > INLINE_MAX_INSTS) return false;
+    for (f.params[1..]) |p| {
+        if (p.is_vararg or p.default != null or !isScalarRt(retRegType(p.ty))) return false;
+    }
+    // A `Unit` method invoked for its effect returns no register — the splice
+    // simply produces no result. Requiring a value excluded every mutator
+    // (`fun widen(k: Int) { w = w + k }`), which is half the shape this exists
+    // for.
+    if (value_rets != 0 and !isScalarRt(retRegType(f.return_ty))) return false;
+    // The lowerer emits a `LoadParam` for EVERY parameter, so the receiver load
+    // is present even in a body that ignores `this`. What matters is that the
+    // register it lands in is never read: the emitter skips that load, so a body
+    // reading it would see an empty slot.
+    var this_dst: ?u32 = null;
+    for (order) |b| {
+        for (f.blocks[b].insts) |*ci| {
+            if (ci.* == .LoadParam and ci.LoadParam.idx == 0) this_dst = ci.LoadParam.dst.int();
+            // A `this`-field read or write is fine: the call is a SELF call, so
+            // the callee's receiver is the caller's, and the field access rides
+            // the caller's own entry field-base. Anything else touching `this`
+            // is not.
+            if (trampolinableFieldOf(module, ci) != null) continue;
+            if (trampolinableFieldSetOf(module, ci) != null) continue;
+            // Bitwise and numeric-conversion ops lower to a `CallMember` shape
+            // the emitter has a native form for, and neither can deopt.
+            if (bitwiseOpOf(module, ci) != null) continue;
+            if (numericConvOf(module, ci) != null) continue;
+            switch (ci.*) {
+                .Const, .Move, .BinOp, .Not, .UnOp, .Trace, .LoadParam => {},
+                else => return false,
+            }
+        }
+    }
+    if (this_dst) |td| {
+        var reads: usize = 0;
+        for (order) |b| {
+            const blk = &f.blocks[b];
+            for (blk.insts) |*ci| {
+                if (ci.* == .LoadParam and ci.LoadParam.idx == 0) continue;
+                // Field ops name `this` as their receiver by design.
+                if (trampolinableFieldOf(module, ci) != null) continue;
+                if (trampolinableFieldSetOf(module, ci) != null) continue;
+                const Ctx = struct { r: u32, n: *usize };
+                var cx = Ctx{ .r = td, .n = &reads };
+                ir.visitInstRegs(ci, &cx, struct {
+                    fn count(c: *Ctx, rr: Reg, _: bool) void {
+                        if (rr.int() == c.r) c.n.* += 1;
+                    }
+                }.count);
+            }
+            const Ctx = struct { r: u32, n: *usize };
+            var cx = Ctx{ .r = td, .n = &reads };
+            ir.visitTerminatorRegs(&blk.terminator, &cx, struct {
+                fn count(c: *Ctx, rr: Reg, _: bool) void {
+                    if (rr.int() == c.r) c.n.* += 1;
+                }
+            }.count);
+        }
+        if (reads != 0) return false;
+    }
+    // A deopt inside the splice re-runs the whole call, so a callee that WRITES
+    // a field must not be able to deopt first: every field it reads has to be a
+    // non-nullable scalar, and it must contain no division (whose zero-divisor
+    // deopt would otherwise land after the write and apply it twice).
+    var writes = false;
+    for (order) |b| {
+        for (f.blocks[b].insts) |*ci| {
+            if (trampolinableFieldSetOf(module, ci) != null) writes = true;
+        }
+    }
+    if (writes) {
+        for (order) |b| {
+            for (f.blocks[b].insts) |*ci| {
+                if (ci.* == .BinOp and isDivBinOp(ci.BinOp.op)) return false;
+                if (trampolinableFieldOf(module, ci)) |fld| {
+                    const fr = field_nn_resolver orelse return false;
+                    const rv = recv orelse return false;
+                    if (fr(resolver_user.?, rv, memberFieldName(fld.name)) == null) return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/// `KLIO_FJ_DIRECT=0` disables direct calls between compiled units, so a
+/// regression can be bisected against the trampolined form.
+var fj_direct_cache: ?bool = null;
+fn fjDirectEnabled() bool {
+    if (fj_direct_cache) |v| return v;
+    const on = if (runtime.envOnce("KLIO_FJ_DIRECT")) |v| !(v.len != 0 and v[0] == '0') else true;
+    fj_direct_cache = on;
+    return on;
+}
+
+/// Compile nesting a direct call may trigger: A's compile compiles B, whose
+/// compile may compile C. Bounded so a deep helper chain cannot recurse the
+/// compiler off the stack.
+threadlocal var direct_compile_depth: u32 = 0;
+const DIRECT_COMPILE_MAX_DEPTH: u32 = 4;
+
+/// The compiled unit a direct call may target: a deopt-free method body on the
+/// same receiver, taking scalar arguments and delivering a scalar or nothing.
+/// Deopt-freedom is what makes the call a plain `call` — RETURN is the body's
+/// only outcome, so there is no resume point to reconstruct and no frame to
+/// own. The callee is compiled on demand, specialized on this receiver and on
+/// its own declared parameter kinds.
+fn directCallTarget(
+    module: *const Module,
+    cf: *const Func,
+    n_args: u32,
+    recv: *const Value,
+    resolver: ?MemberResolver,
+    virt_resolver: ?VirtResolver,
+    field_resolver: ?FieldResolver,
+    field_nn_resolver: ?FieldResolver,
+    resolver_user: ?*anyopaque,
+) ?*const CompiledLoop {
+    if (cf.is_suspend or cf.is_lambda or !cf.hasBody()) return null;
+    if (!cf.has_receiver_param) return null;
+    if (n_args == 0 or n_args > 8 or cf.params.len != n_args) return null;
+    if (recv.* != .Instance) return null;
+    var argv: [8]Value = undefined;
+    argv[0] = recv.*;
+    for (cf.params[1..], 1..) |pp, i| {
+        if (pp.is_vararg or pp.default != null) return null;
+        const prt = retRegType(pp.ty);
+        if (!isScalarRt(prt)) return null;
+        argv[i] = valueFromSlot(prt, 0);
+    }
+    if (direct_compile_depth >= DIRECT_COMPILE_MAX_DEPTH) return null;
+    direct_compile_depth += 1;
+    defer direct_compile_depth -= 1;
+    const cl = compileCalleeForCall(module, cf, argv[0..n_args], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse return null;
+    if (!cl.func_mode or !cl.method_mode or cl.has_tramp_sites) return null;
+    // A callee that CAN deopt is still reachable: the caller tests the resume
+    // code it returns and re-runs the whole call interpreted, exactly as the
+    // splice does. That answer is only correct while the callee has changed
+    // nothing observable first, so a body that stores a field must be able to
+    // reach its RETURN — a re-run would apply the store twice.
+    if (cl.can_deopt and cl.writes_fields) return null;
+    if (cl.n_params != n_args or cl.param_rt.len != n_args) return null;
+    if (cl.param_rt[0] != .object) return null;
+    for (cl.param_rt[1..], 1..) |prt, i| {
+        if (!isScalarRt(prt) or prt != retRegType(cf.params[i].ty)) return null;
+    }
+    // Nothing seeds the callee's frame registers or capture vector here: with
+    // no trampoline and no deopt, its body never reads them, but a unit that
+    // wants more than its receiver boxed is out of scope.
+    if (cl.capture_loads.len != 0 or cl.obj_param_loads.len > 1) return null;
+    if (cl.guard_class != instanceClassIdentity(recv.*)) return null;
+    if (!isScalarRt(cl.result_rt) and cl.result_rt != .unit) return null;
+    return cl;
+}
+
+/// Whether an instruction is a call-SHAPED op the emitter lowers inline: a
+/// numeric conversion or a bitwise op over scalars. Both spell as a member or
+/// virtual call, so a site pass that does not recognize them either trampolines
+/// two instructions' worth of work through the host (the loop tier) or rejects
+/// the whole body for a non-object receiver (the function tier).
+///
+/// The operand check is what keeps it honest: the same names on a BOXED
+/// receiver (`Number.toInt()`) have no inline form, and claiming one would turn
+/// a body that trampolines correctly into one that does not compile at all.
+fn nativeScalarCallShape(module: *const Module, inst: *const Inst, types: []const RegType, n_regs: u32) bool {
+    if (numericConvOf(module, inst)) |nc| {
+        return nc.src.int() < n_regs and isScalarRt(typeAt(types, nc.src));
+    }
+    if (bitwiseOpOf(module, inst)) |bo| {
+        return bo.lhs.int() < n_regs and bo.rhs.int() < n_regs and
+            isScalarRt(typeAt(types, bo.lhs)) and isScalarRt(typeAt(types, bo.rhs));
+    }
+    return false;
+}
+
+/// A (block, instruction) position inside a compiled body.
+const BodyInstPos = struct { b: u32, i: u32 };
+
+/// The single `Move` that loads the receiver into `reg` for the call at
+/// (`call_b`, `call_i`), when `reg` is referenced by NOTHING else in the body.
+/// Exhaustive: `visitInstRegs` forces every instruction shape to be considered,
+/// so a register read the splice would leave stale cannot slip through.
+fn soleReceiverMove(
+    func: *const Func,
+    body: []const BlockId,
+    reg: u32,
+    call_b: u32,
+    call_i: u32,
+    recv_regs: []const u32,
+    n_recv: usize,
+) ?BodyInstPos {
+    var found: ?BodyInstPos = null;
+    var other_refs: usize = 0;
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        for (blk.insts, 0..) |*inst, ii| {
+            if (bid.int() == call_b and ii == call_i) continue; // the call itself
+            if (inst.* == .Move) {
+                const m = inst.Move;
+                if (m.dst.int() == reg) {
+                    if (found != null) return null; // more than one writer
+                    var src_is_recv = false;
+                    for (recv_regs[0..n_recv]) |x| {
+                        if (x == m.src.int()) src_is_recv = true;
+                    }
+                    if (!src_is_recv) return null;
+                    found = .{ .b = bid.int(), .i = @intCast(ii) };
+                    continue;
+                }
+            }
+            const Ctx = struct { r: u32, n: *usize };
+            var cx = Ctx{ .r = reg, .n = &other_refs };
+            ir.visitInstRegs(inst, &cx, struct {
+                fn f(c: *Ctx, rr: Reg, _: bool) void {
+                    if (rr.int() == c.r) c.n.* += 1;
+                }
+            }.f);
+        }
+        const Ctx2 = struct { r: u32, n: *usize };
+        var cx2 = Ctx2{ .r = reg, .n = &other_refs };
+        ir.visitTerminatorRegs(&blk.terminator, &cx2, struct {
+            fn f(c: *Ctx2, rr: Reg, _: bool) void {
+                if (rr.int() == c.r) c.n.* += 1;
+            }
+        }.f);
+    }
+    if (other_refs != 0) return null;
+    // A deopt out of the spliced body re-runs the whole call from the
+    // interpreter, and the Move being removed here is what fills the call's
+    // receiver argument — so the interpreter has to resume AT the Move, not at
+    // the call. That is only sound while the instructions it would re-run in
+    // between are idempotent, which for the lowered call shape (the remaining
+    // argument moves) they are.
+    const mv = found orelse return null;
+    if (mv.b != call_b or mv.i >= call_i) return null;
+    const blk = &func.blocks[call_b];
+    var k: u32 = mv.i + 1;
+    while (k < call_i) : (k += 1) {
+        switch (blk.insts[k]) {
+            .Move, .Const, .Trace => {},
+            else => return null,
+        }
+    }
+    return found;
+}
+
 fn inlinableMemberCallee(module: *const Module, f: *const Func, this_reg_out: *u32) bool {
     if (f.is_suspend) return false;
     if (f.blocks.len != 1) return false;
@@ -759,6 +1199,11 @@ fn inlinableMemberCallee(module: *const Module, f: *const Func, this_reg_out: *u
         }
     }
     return true;
+}
+
+/// The byte displacement of a slot index from the slots base register.
+fn slotBytes(slot: u32) i32 {
+    return @intCast(@as(u64, slot) * 8);
 }
 
 /// Copy an instruction with every register reference shifted by `base` — used to
@@ -1098,7 +1543,7 @@ fn promoteArith(lt: RegType, rt: RegType) RegType {
 /// Fill `ext[site.base .. site.base + callee.n_locals]` with the inlined callee's
 /// register types: parameters seeded from the caller's argument types, then the
 /// scalar propagation run over the callee's single block.
-fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite, caller_types: []const RegType, ext: []RegType, field_resolver: ?FieldResolver, resolver_user: ?*anyopaque, regs: []const Value) Allocator.Error!void {
+fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite, caller_types: []const RegType, ext: []RegType, field_resolver: ?FieldResolver, resolver_user: ?*anyopaque, regs: []const Value, recv_value: ?*const Value) Allocator.Error!void {
     const callee = site.callee;
     const n = callee.n_locals;
     if (n == 0) return;
@@ -1113,11 +1558,13 @@ fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite,
     // For a member inline, parameter index 1 maps to the first call argument (index
     // 0 is the receiver); a top-level inline maps index 0 to the first argument.
     const arg_base: i64 = if (site.is_member) @as(i64, site.args_reg) - 1 else @as(i64, site.args_reg);
+    var order_buf: [INLINE_MAX_BLOCKS]u32 = undefined;
+    const order = calleeBlockOrder(callee, &order_buf) orelse return;
     var changed = true;
     var iters: usize = 0;
     while (changed and iters < 16) : (iters += 1) {
         changed = false;
-        for (callee.blocks[0].insts) |*inst| {
+        for (order) |ob| for (callee.blocks[ob].insts) |*inst| {
             if (inst.* == .LoadParam) {
                 const lp = inst.LoadParam;
                 if (site.is_member and lp.idx == 0) continue; // receiver: not a scalar
@@ -1130,8 +1577,9 @@ fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite,
             if (site.is_member) {
                 if (trampolinableFieldOf(module, inst)) |fld| {
                     if (field_resolver) |fr| {
-                        if (fr(resolver_user.?, &regs[site.recv_reg], memberFieldName(fld.name))) |idx| {
-                            const g = regs[site.recv_reg].Instance.borrow();
+                        const rv: *const Value = recv_value orelse &regs[site.recv_reg];
+                        if (fr(resolver_user.?, rv, memberFieldName(fld.name))) |idx| {
+                            const g = rv.Instance.borrow();
                             const fv: ?Value = if (idx < g.get().fields.items.len) g.get().fields.items[idx].value else null;
                             g.deinit();
                             if (fv) |v| if (cellScalarType(v)) |rt| {
@@ -1144,7 +1592,7 @@ fn fillInlineTypes(a: Allocator, module: *const Module, site: *const InlineSite,
                 if (trampolinableFieldSetOf(module, inst) != null) continue;
             }
             if (setDefType(t, module, inst, eai, eci)) changed = true;
-        }
+        };
     }
 }
 
@@ -1332,6 +1780,10 @@ fn setDefType(types: []RegType, module: *const Module, inst: *const Inst, array_
             if (isArithBinOp(b.op) or isDivBinOp(b.op)) {
                 break :blk .{ .r = b.dst, .t = promoteArith(typeOf(types, b.lhs), typeOf(types, b.rhs)) };
             }
+            // A bitwise/shift BinOp went untyped, so its destination stayed
+            // `unknown` and poisoned every later read — one `xor` left a whole
+            // arithmetic helper uncompilable.
+            if (isBitwiseBinOp(b.op)) break :blk .{ .r = b.dst, .t = typeOf(types, b.lhs) };
             break :blk null;
         },
         .Not => |n| .{ .r = n.dst, .t = .boolean },
@@ -1795,6 +2247,7 @@ const Compiler = struct {
     cell_info: []const ?RegType,
     call_sites: []const CallSite,
     inline_sites: []const InlineSite,
+    direct_sites: []const DirectSite = &.{},
     /// Per-register: is this a nullable-scalar register, and its null-flag slot.
     nullable: []const bool,
     null_flag_slot: []const u32,
@@ -1816,6 +2269,9 @@ const Compiler = struct {
     n_params: u32 = 0,
     result_slot: u32 = 0,
     result_reg_slot: u32 = 0,
+    /// Method mode: the slot holding the receiver's field-buffer pointer, which
+    /// a direct call hands to the callee (the same receiver, so the same base).
+    entry_fbase_slot: u32 = 0,
     em: jit.Emitter,
     block_label: []?jit.Label,
     exit_targets: std.ArrayListUnmanaged(BlockId),
@@ -1825,6 +2281,10 @@ const Compiler = struct {
     epilogue: jit.Label,
     cur_block: BlockId = undefined,
     cur_inst: u32 = 0,
+    /// While a spliced or direct call is emitted, where a deopt must resume:
+    /// the receiver `Move` the compiler removed, so the interpreter re-runs
+    /// from the point that fills the argument register native code never wrote.
+    deopt_override: ?BodyInstPos = null,
 
     fn inBody(self: *Compiler, b: BlockId) bool {
         for (self.body) |x| if (x.int() == b.int()) return true;
@@ -1850,6 +2310,14 @@ const Compiler = struct {
     /// The inline expansion at the current (block, inst), if any.
     fn inlineSiteAt(self: *Compiler) ?*const InlineSite {
         for (self.inline_sites) |*s| {
+            if (s.block.int() == self.cur_block.int() and s.inst == self.cur_inst) return s;
+        }
+        return null;
+    }
+
+    /// The direct call at the current (block, inst), if any.
+    fn directSiteAt(self: *Compiler) ?*const DirectSite {
+        for (self.direct_sites) |*s| {
             if (s.block.int() == self.cur_block.int() and s.inst == self.cur_inst) return s;
         }
         return null;
@@ -2077,7 +2545,10 @@ const Compiler = struct {
 
     /// A deopt stub for resuming the interpreter at the current instruction.
     fn deoptLabel(self: *Compiler) !jit.Label {
-        const code = encodeResume(self.cur_block, self.cur_inst);
+        const code = if (self.deopt_override) |p|
+            encodeResume(BlockId.from(p.b), p.i)
+        else
+            encodeResume(self.cur_block, self.cur_inst);
         for (self.deopt_codes.items, 0..) |c, i| {
             if (c == code) return self.deopt_labels.items[i];
         }
@@ -2142,12 +2613,59 @@ const Compiler = struct {
     /// parameter slot, emit the callee's single block remapped into the caller's
     /// extended register space, then copy the (remapped) return value to the dst.
     fn emitInlinedCall(self: *Compiler, site: *const InlineSite) !void {
-        const callee_blk = &site.callee.blocks[0];
-        // Member inline: argument i is the (i-1)-th call argument (index 0 is the
-        // receiver); a `this`-field access is one of the registered field sites,
-        // emitted in body order.
+        const saved = self.deopt_override;
+        self.deopt_override = site.resume_at;
+        defer self.deopt_override = saved;
+        var order_buf: [INLINE_MAX_BLOCKS]u32 = undefined;
+        const order = calleeBlockOrder(site.callee, &order_buf) orelse return jit.JitError.Unsupported;
+        if (order.len == 1) {
+            var field_n: u32 = 0;
+            try self.emitInlinedBlock(site, &site.callee.blocks[order[0]], &field_n);
+            if (site.has_result) {
+                const ret = site.callee.blocks[order[0]].terminator.Return.?;
+                try self.loadSlot(T0, Reg.from(site.base + ret.int()));
+                try self.storeSlot(site.dst, T0);
+            }
+            return;
+        }
+        // A branching callee splices as blocks: each gets a label in the
+        // caller's code, its edges jump between them, and every return lands on
+        // one join after delivering the result.
+        var label_of = [_]?jit.Label{null} ** CALLEE_BLOCK_LIMIT;
+        for (order) |b| label_of[b] = try self.em.newLabel();
+        const join = try self.em.newLabel();
         var field_n: u32 = 0;
-        for (callee_blk.insts) |*ci| {
+        for (order) |b| {
+            const blk = &site.callee.blocks[b];
+            try self.em.bind(label_of[b].?);
+            try self.emitInlinedBlock(site, blk, &field_n);
+            switch (blk.terminator) {
+                .Goto => |t| try self.em.jmp(label_of[t.int()] orelse return jit.JitError.Unsupported),
+                .Branch => |br| {
+                    try self.loadSlot(T0, Reg.from(site.base + br.cond.int()));
+                    try self.em.testReg(T0, T0);
+                    try self.em.jcc(.ne, label_of[br.t.int()] orelse return jit.JitError.Unsupported);
+                    try self.em.jmp(label_of[br.f.int()] orelse return jit.JitError.Unsupported);
+                },
+                .Return => |r| {
+                    if (site.has_result) {
+                        try self.loadSlot(T0, Reg.from(site.base + (r orelse return jit.JitError.Unsupported).int()));
+                        try self.storeSlot(site.dst, T0);
+                    }
+                    try self.em.jmp(join);
+                },
+                else => return jit.JitError.Unsupported,
+            }
+        }
+        try self.em.bind(join);
+    }
+
+    /// One spliced callee block: bind its parameter loads to the call's argument
+    /// slots, turn its `this`-field accesses into the caller's registered field
+    /// sites (consumed in body order, which is why `field_n` threads across
+    /// blocks), and emit the rest remapped into the caller's register space.
+    fn emitInlinedBlock(self: *Compiler, site: *const InlineSite, blk: *const ir.Block, field_n: *u32) !void {
+        for (blk.insts) |*ci| {
             if (ci.* == .LoadParam) {
                 const lp = ci.LoadParam;
                 if (site.is_member and lp.idx == 0) continue; // receiver: field sites read it
@@ -2158,17 +2676,50 @@ const Compiler = struct {
             }
             if (site.is_member) {
                 if (trampolinableFieldOf(self.module, ci) != null or trampolinableFieldSetOf(self.module, ci) != null) {
-                    try self.emitCallSite(site.field_site_base + field_n);
-                    field_n += 1;
+                    try self.emitCallSite(site.field_site_base + field_n.*);
+                    field_n.* += 1;
                     continue;
                 }
             }
             const rinst = remapInst(ci.*, site.base);
             try self.emitInstBody(&rinst);
         }
+    }
+
+    /// A call straight into another compiled unit. The callee is a deopt-free
+    /// method body over the SAME receiver, so the whole calling convention is
+    /// three stores and a `call`: its scalar arguments, the receiver's field
+    /// base (this unit's own — a self call shares the receiver), and the slots
+    /// pointer the unit was compiled to read. Its only outcome is RETURN, so
+    /// there is no resume code to interpret and no register to rebox; the
+    /// result comes back out of the callee's own result slot.
+    fn emitDirectCall(self: *Compiler, site: *const DirectSite) !void {
+        const saved = self.deopt_override;
+        self.deopt_override = site.resume_at;
+        defer self.deopt_override = saved;
+        const cal = site.callee;
+        var i: u32 = 1;
+        while (i < cal.n_params) : (i += 1) {
+            try self.loadSlot(T0, Reg.from(site.args_reg + i));
+            try self.em.storeMem(REGS, slotBytes(site.slot_base + cal.param_slot_base + i), T0);
+        }
+        try self.em.loadMem(T0, REGS, slotBytes(self.entry_fbase_slot));
+        try self.em.storeMem(REGS, slotBytes(site.slot_base + cal.entry_fbase_slot), T0);
+        try self.em.movReg(.rdi, REGS);
+        try self.em.addImm32(.rdi, slotBytes(site.slot_base));
+        try self.em.movImm64(.rax, @intFromPtr(cal.exec.mem.ptr));
+        try self.em.callReg(.rax);
+        if (site.may_deopt) {
+            // The callee hands back its own resume code. RETURN is the only one
+            // this frame can continue from; anything else re-runs the call in
+            // the interpreter, which is where the real throw is raised. The
+            // callee wrote no field, so re-running repeats nothing.
+            try self.em.movImm64(T1, returnCode());
+            try self.em.cmpReg(T0, T1);
+            try self.em.jcc(.ne, try self.deoptLabel());
+        }
         if (site.has_result) {
-            const ret = callee_blk.terminator.Return.?;
-            try self.loadSlot(T0, Reg.from(site.base + ret.int()));
+            try self.em.loadMem(T0, REGS, slotBytes(site.slot_base + cal.result_slot));
             try self.storeSlot(site.dst, T0);
         }
     }
@@ -2259,6 +2810,10 @@ const Compiler = struct {
         // resumes there and the interpreter re-runs the (pure) call.
         if (self.inlineSiteAt()) |site| {
             try self.emitInlinedCall(site);
+            return;
+        }
+        if (self.directSiteAt()) |site| {
+            try self.emitDirectCall(site);
             return;
         }
         // A trampolined site (call / member / field / object op / subscript) is a
@@ -2378,6 +2933,42 @@ const Compiler = struct {
                 const is_cmp = isCmpBinOp(b.op);
                 const is_arith = isArithBinOp(b.op);
                 const is_div = isDivBinOp(b.op);
+                // A bitwise/shift BinOp: the same emit `bitwiseOpOf` uses for the
+                // call-shaped spelling, which was unreachable from this form —
+                // one `xor` written as an operator made the whole body
+                // uncompilable even though the machinery was right there.
+                if (isBitwiseBinOp(b.op)) {
+                    const blt = typeOf(self.types, b.lhs);
+                    const brt = typeOf(self.types, b.rhs);
+                    if (!isNumeric(blt) or isFloat(blt) or !isNumeric(brt) or isFloat(brt))
+                        return jit.JitError.Unsupported;
+                    const bw64 = blt == .i64;
+                    try self.loadSlot(T0, b.lhs);
+                    try self.loadSlot(T1, b.rhs); // shift count lands in cl (T1 == rcx)
+                    switch (b.op) {
+                        .And => try self.em.andReg(T0, T1),
+                        .Or => try self.em.orReg(T0, T1),
+                        .Xor => try self.em.xorReg(T0, T1),
+                        .Shl => try self.em.shlCl(T0, bw64),
+                        .Shr => try self.em.sarCl(T0, bw64),
+                        .UShr => {
+                            // A 32-bit value sits SIGN-extended in its slot, so a
+                            // logical shift has to clear the high half first or
+                            // the shifted-in bits come from the sign. Masking
+                            // through a scratch register is the one spelling both
+                            // emitters share.
+                            if (!bw64) {
+                                try self.em.movImm64(T2, 0xFFFF_FFFF);
+                                try self.em.andReg(T0, T2);
+                            }
+                            try self.em.shrCl(T0, bw64);
+                        },
+                        else => return jit.JitError.Unsupported,
+                    }
+                    if (typeOf(self.types, b.dst) == .i32) try self.em.movsxd(T0, T0);
+                    try self.storeSlot(b.dst, T0);
+                    return;
+                }
                 if (!is_cmp and !is_arith and !is_div) return jit.JitError.Unsupported;
                 const lt = typeOf(self.types, b.lhs);
                 const rt = typeOf(self.types, b.rhs);
@@ -2936,7 +3527,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         const ext = a.alloc(RegType, total_regs) catch return null;
         @memset(ext, .unknown);
         @memcpy(ext[0..n_regs], caller_types);
-        for (inline_sites.items) |*site| try fillInlineTypes(a, module, site, caller_types, ext, field_resolver, resolver_user, regs);
+        for (inline_sites.items) |*site| try fillInlineTypes(a, module, site, caller_types, ext, field_resolver, resolver_user, regs, null);
         break :ext_blk ext;
     };
     var ok = false;
@@ -3128,6 +3719,10 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     for (body) |bid| {
         const blk_insts = func.blocks[bid.int()].insts;
         for (blk_insts, 0..) |*inst, i| {
+            // Same inline forms as the function tier: registering one as a
+            // member/virtual site trampolines to the host once per iteration
+            // for two instructions' worth of work.
+            if (nativeScalarCallShape(module, inst, types, n_regs)) continue;
             const is_call = trampolinableCallOf(inst) != null;
             const is_member = trampolinableMemberOf(module, inst) != null;
             const is_virtual = trampolinableVirtualOf(inst) != null;
@@ -4342,6 +4937,113 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         }
     }.f;
 
+    // Self-call inlining (opt-in): `this.helper(args)` lowers to a static Call
+    // with the receiver MOVED into arg 0, and that Move is what makes the whole
+    // method uncompilable — a receiver register may otherwise appear only as a
+    // field-op receiver. When the callee never touches `this`, the splice makes
+    // both the Move and the call disappear, so the receiver is never
+    // materialized and the method can still run frameless at the seam.
+    const InstPos = BodyInstPos;
+    var inline_sites: std.ArrayListUnmanaged(InlineSite) = .empty;
+    defer inline_sites.deinit(a);
+    var skip_insts: std.ArrayListUnmanaged(InstPos) = .empty;
+    defer skip_insts.deinit(a);
+    var total_regs: u32 = n_regs;
+    if (is_method and fjSelfInlineEnabled()) {
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            for (blk.insts, 0..) |*inst, ii| {
+                const tc = trampolinableCallOf(inst) orelse continue;
+                if (tc.n_args == 0 or tc.n_args > 6) continue;
+                const cf = module.funcById(tc.func) orelse continue;
+                if (!selfInlinableCallee(module, cf, tc.n_args, if (params.len > 0) &params[0] else null, field_nn_resolver, resolver_user)) continue;
+                const mv = soleReceiverMove(func, body, tc.args_reg, bid.int(), @intCast(ii), &recv_regs_buf, n_recv_regs) orelse continue;
+                inline_sites.append(a, .{
+                    .block = bid,
+                    .inst = @intCast(ii),
+                    .callee = cf,
+                    .base = total_regs,
+                    // Member convention: parameter 1 is the first real argument,
+                    // and parameter 0 (the receiver) is skipped by the emitter.
+                    .args_reg = tc.args_reg + 1,
+                    .n_args = tc.n_args - 1,
+                    .dst = tc.dst,
+                    .is_member = true,
+                    .recv_reg = tc.args_reg,
+                    .this_reg = 0,
+                    .field_site_base = 0,
+                    .n_field_sites = 0,
+                    .has_result = calleeReturnsValue(cf),
+                    .resume_at = .{ .b = mv.b, .i = mv.i },
+                }) catch return null;
+                skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
+                total_regs += cf.n_locals;
+                if (total_regs > 4096) return null;
+                if (debugEnabled()) std.debug.print("[jit]   inlining self-call {s} into {s} at b{d}:{d} (move b{d}:{d})\n", .{ cf.name, func.name, bid.int(), ii, mv.b, mv.i });
+            }
+        }
+    }
+    const inlinedAt = struct {
+        fn f(sites: []const InlineSite, b: u32, i: u32) bool {
+            for (sites) |*s| {
+                if (s.block.int() == b and s.inst == i) return true;
+            }
+            return false;
+        }
+    }.f;
+    // A self call the splice cannot take — the helper is too big, loops, or
+    // reads something the splice refuses — becomes a DIRECT call into the
+    // callee's own compiled code. Without it that call is a trampoline site,
+    // which costs a boxed round trip per iteration AND makes this body able to
+    // deopt, so it loses the frameless seam. With it the receiver Move
+    // disappears the same way the splice's does, and both bodies stay native.
+    var direct_sites: std.ArrayListUnmanaged(DirectSite) = .empty;
+    defer direct_sites.deinit(a);
+    if (is_method and fjDirectEnabled() and params.len > 0 and params[0] == .Instance) {
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            for (blk.insts, 0..) |*inst, ii| {
+                if (inlinedAt(inline_sites.items, bid.int(), @intCast(ii))) continue;
+                const tc = trampolinableCallOf(inst) orelse continue;
+                if (tc.n_args == 0 or tc.n_args > 6) continue;
+                const cf = module.funcById(tc.func) orelse continue;
+                if (cf == func) continue; // a self-recursive call would reuse one slot window
+                const mv = soleReceiverMove(func, body, tc.args_reg, bid.int(), @intCast(ii), &recv_regs_buf, n_recv_regs) orelse continue;
+                const cl = directCallTarget(module, cf, tc.n_args, &params[0], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse continue;
+                direct_sites.append(a, .{
+                    .block = bid,
+                    .inst = @intCast(ii),
+                    .callee = cl,
+                    .slot_base = 0, // assigned once the caller's own slots are laid out
+                    .args_reg = tc.args_reg,
+                    .n_args = tc.n_args,
+                    .dst = tc.dst,
+                    .has_result = false, // set once the caller's register types are known
+                    .may_deopt = cl.can_deopt,
+                    .resume_at = .{ .b = mv.b, .i = mv.i },
+                }) catch return null;
+                skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
+                if (debugEnabled()) std.debug.print("[jit]   direct call {s} from {s} at b{d}:{d} (move b{d}:{d})\n", .{ cf.name, func.name, bid.int(), ii, mv.b, mv.i });
+            }
+        }
+    }
+    const directAt = struct {
+        fn f(sites: []DirectSite, b: u32, i: u32) ?*DirectSite {
+            for (sites) |*s| {
+                if (s.block.int() == b and s.inst == i) return s;
+            }
+            return null;
+        }
+    }.f;
+    const skippedAt = struct {
+        fn f(list: []const InstPos, b: u32, i: u32) bool {
+            for (list) |p| {
+                if (p.b == b and p.i == i) return true;
+            }
+            return false;
+        }
+    }.f;
+
     var has_div = false;
     var n_escapes: u32 = 0;
     const EscapePos = struct { b: u32, i: u32 };
@@ -4363,6 +5065,10 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             }
         }
         for (blk.insts, 0..) |*inst, inst_i| {
+            // The receiver Move an inlined self-call consumed, and the call it
+            // fed, are spliced away — neither reaches the emitter.
+            if (skippedAt(skip_insts.items, bid.int(), @intCast(inst_i))) continue;
+            if (inlinedAt(inline_sites.items, bid.int(), @intCast(inst_i))) continue;
             if (numericConvOf(module, inst)) |nc| {
                 if (isRecvReg(recv_regs, nc.src.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4175\n", .{func.name}); return null; }
                 continue;
@@ -4409,15 +5115,18 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 continue;
             }
             switch (inst.*) {
-                // `/` and `%` are excluded: a divide-by-zero deopt from a
-                // native-RECURSED callee has no frame to resume into. Method
-                // bodies never recurse natively, so they may divide.
+                // `/` and `%` divide: the deopt they can raise has no frame to
+                // resume into when the body runs as a native-recursed callee.
+                // That is survivable because such a body is PURE — it runs with
+                // no trampoline, so it cannot call out or touch anything — and
+                // the recursion site falls back to re-running it interpreted,
+                // which is where the real divide-by-zero is raised. Refusing
+                // division outright kept ordinary arithmetic helpers (anything
+                // with a `%`) uncompiled, and their callers then trampolined
+                // per iteration and ran slower than the plain interpreter.
                 .BinOp => |b| {
                     if (isRecvReg(recv_regs, b.lhs.int()) or isRecvReg(recv_regs, b.rhs.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4228\n", .{func.name}); return null; }
-                    if (isDivBinOp(b.op)) {
-                        if (!is_method) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4230\n", .{func.name}); return null; }
-                        has_div = true;
-                    }
+                    if (isDivBinOp(b.op)) has_div = true;
                 },
                 .Move => |m| if (isRecvReg(recv_regs, m.src.int()) or isRecvReg(recv_regs, m.dst.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4234\n", .{func.name}); return null; },
                 .Not => |nt| if (isRecvReg(recv_regs, nt.src.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4235\n", .{func.name}); return null; },
@@ -4542,7 +5251,16 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         }
     }
 
-    const types = try inferFuncTypes(a, module, func, n_regs, params);
+    const base_types = try inferFuncTypes(a, module, func, n_regs, params);
+    // Inlined callee registers live above the caller's, so the type array (and
+    // the slot space derived from it) covers both.
+    const types = if (total_regs == n_regs) base_types else blk_t: {
+        const t = a.alloc(RegType, total_regs) catch return null;
+        @memcpy(t[0..n_regs], base_types);
+        @memset(t[n_regs..], .unknown);
+        a.free(base_types);
+        break :blk_t t;
+    };
     defer if (!ok) a.free(types);
     // Seed field-read destination types, object-param registers, and
     // member/virtual result types, then re-run the fixpoint so they
@@ -4670,6 +5388,14 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         }
     }
 
+    // Inlined callee registers are typed LAST: their parameters take the types
+    // of the caller registers feeding the call, and a field read only gets its
+    // type in the pass above — typing the splice before it left every callee
+    // parameter unknown and the emit refused the body.
+    for (inline_sites.items) |*site| {
+        fillInlineTypes(a, module, site, types[0..n_regs], types, field_resolver, resolver_user, &.{}, if (params.len > 0) &params[0] else null) catch return null;
+    }
+
     // CASCADE: any instruction reading a register the typing could not
     // settle (an escaped producer's destination) escapes too — escaped
     // instructions read the live frame, where the arm-written values are
@@ -4779,6 +5505,26 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 if (d.int() < n_regs) def[d.int()] = true;
             }
             const tc = trampolinableCallOf(inst) orelse continue;
+            if (inlinedAt(inline_sites.items, bid.int(), @intCast(i))) continue; // spliced in place
+            if (directAt(direct_sites.items, bid.int(), @intCast(i))) |ds| {
+                // Called straight into the callee's code, so no trampoline site
+                // and no boxing — but the argument kinds this body actually
+                // holds must be the ones the callee was compiled for.
+                var dk: u32 = 1;
+                while (dk < ds.n_args) : (dk += 1) {
+                    const ar = ds.args_reg + dk;
+                    if (ar >= n_regs or types[ar] != ds.callee.param_rt[dk]) {
+                        if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-arg-kind\n", .{func.name});
+                        return null;
+                    }
+                }
+                ds.has_result = tc.dst.int() < n_regs and isScalarRt(typeAt(types, tc.dst));
+                if (ds.has_result and typeAt(types, tc.dst) != ds.callee.result_rt) {
+                    if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-result-kind\n", .{func.name});
+                    return null;
+                }
+                continue;
+            }
             // A suspend callee would park through the trampoline; every
             // function-mode body must be suspension-free so a flat-driver
             // native run's outcomes stay RETURN / throw / deopt only.
@@ -4827,6 +5573,10 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     for (body) |bid| {
         const blk = &func.blocks[bid.int()];
         for (blk.insts, 0..) |*inst, i| {
+            // The receiver Move an inlined self-call consumed is spliced away:
+            // registering it as an object move would put a boxed copy back and
+            // make the method need a frame again.
+            if (skippedAt(skip_insts.items, bid.int(), @intCast(i))) continue;
             if (inst.* == .Move) {
                 // An object move copies one boxed FRAME register into another
                 // — the handler does it; the native scalar Move would copy a
@@ -4919,6 +5669,12 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 }
                 continue;
             }
+            // A numeric conversion or a bitwise op spells as a member or
+            // virtual call on a SCALAR receiver, and the emitter lowers both
+            // inline. Reaching the member branch rejected the whole body for a
+            // non-object receiver, so a method doing `k.toLong()` or `x shl 3`
+            // never compiled.
+            if (nativeScalarCallShape(module, inst, types, n_regs)) continue;
             const kind: enum { member, virt } = if (trampolinableMemberOf(module, inst) != null) .member else if (trampolinableVirtualOf(inst) != null) .virt else continue;
             // The receiver register must be object-typed: the handler reads
             // its value from the FRAME, which holds every object def (handler
@@ -5033,6 +5789,56 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
             return null;
         }
     }
+    // A spliced callee's `this`-field ops become the caller's own native field
+    // sites, contiguous per site so the inline emit can index them in body
+    // order. The receiver is the caller's `this` (a SELF call), so they ride the
+    // same entry field-base and stay native — no trampoline, so the method can
+    // still run frameless at the seam.
+    for (inline_sites.items) |*site| {
+        site.field_site_base = @intCast(call_sites.items.len + field_pres.items.len);
+        var nf: u32 = 0;
+        var forder_buf: [INLINE_MAX_BLOCKS]u32 = undefined;
+        const forder = calleeBlockOrder(site.callee, &forder_buf) orelse return null;
+        for (forder) |fb| for (site.callee.blocks[fb].insts) |*ci| {
+            const is_set = trampolinableFieldSetOf(module, ci) != null;
+            const fname = if (trampolinableFieldOf(module, ci)) |fld|
+                memberFieldName(fld.name)
+            else if (trampolinableFieldSetOf(module, ci)) |fs|
+                memberFieldName(fs.name)
+            else
+                continue;
+            if (params.len == 0 or params[0] != .Instance) return null;
+            const idx = (field_resolver orelse return null)(resolver_user.?, &params[0], fname) orelse return null;
+            const reg: u32 = if (is_set)
+                site.base + trampolinableFieldSetOf(module, ci).?.value.int()
+            else
+                site.base + trampolinableFieldOf(module, ci).?.dst.int();
+            if (reg >= total_regs or !isScalarRt(typeAt(types, Reg.from(reg)))) return null;
+            const fv: Value = blk_fv: {
+                const g = params[0].Instance.borrow();
+                defer g.deinit();
+                const items = g.get().fields.items;
+                if (idx >= items.len) return null;
+                break :blk_fv items[idx].value;
+            };
+            const nn = !is_set and field_nn_resolver != null and
+                field_nn_resolver.?(resolver_user.?, &params[0], fname) != null;
+            field_pres.append(a, .{
+                .block = site.block.int(),
+                .inst = site.inst,
+                .idx = idx,
+                .rt = typeAt(types, Reg.from(reg)),
+                .tag = @intFromEnum(std.meta.activeTag(fv)),
+                .is_set = is_set,
+                .dst_or_src = reg,
+                .nn = nn,
+                .name = fname,
+            }) catch return null;
+            nf += 1;
+        };
+        site.n_field_sites = nf;
+    }
+
     const field_sites_base: usize = call_sites.items.len;
     for (field_pres.items) |fp| {
         var span2: ?ir.Span = null;
@@ -5069,7 +5875,19 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     for (field_pres.items) |fp| {
         if (!fp.is_set and !fp.nn) all_reads_nn = false;
     }
-    const can_deopt = !(is_method and field_sites_base == 0 and !has_div and all_reads_nn);
+    var writes_fields = false;
+    for (field_pres.items) |fp| {
+        if (fp.is_set) writes_fields = true;
+    }
+    // A direct call into a callee that can deopt gives THIS body a deopt edge
+    // of its own: the site re-runs the call from the interpreter, which needs a
+    // frame to resume into, so the body no longer qualifies for the frameless
+    // seam.
+    var direct_may_deopt = false;
+    for (direct_sites.items) |*ds| {
+        if (ds.may_deopt) direct_may_deopt = true;
+    }
+    const can_deopt = direct_may_deopt or !(is_method and field_sites_base == 0 and !has_div and all_reads_nn);
     if (can_deopt and is_method and debugEnabled()) {
         // Which condition refused this method the seam — the histogram that says
         // where the next widening belongs.
@@ -5079,15 +5897,30 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     }
 
     const has_calls = call_sites.items.len != 0;
-    const param_slot_base: u32 = n_regs;
-    const after_params: u32 = n_regs + n_params;
+    const param_slot_base: u32 = total_regs;
+    const after_params: u32 = total_regs + n_params;
     const uc_slot: u32 = after_params;
     const tramp_slot: u32 = after_params + 1;
     const calls_base: u32 = after_params + (if (has_calls) @as(u32, 2) else 0);
     const fbase_slot: u32 = calls_base;
     const result_slot: u32 = calls_base + (if (is_method) @as(u32, 1) else 0);
     const result_reg_slot: u32 = result_slot + 1;
-    const n_slots: u32 = result_reg_slot + 1;
+    // A direct callee runs on a slot window carved out of this body's own slot
+    // array, so a call is a pointer bump: no allocation, no frame. One window
+    // serves every direct call here — only one is ever live at a time, and a
+    // callee's own nested calls already fit inside its `n_slots`.
+    var n_slots: u32 = result_reg_slot + 1;
+    if (direct_sites.items.len != 0) {
+        var window: u32 = 0;
+        for (direct_sites.items) |*ds| {
+            ds.slot_base = n_slots;
+            if (ds.callee.n_slots > window) window = ds.callee.n_slots;
+        }
+        n_slots += window;
+        // 192 is the seam's per-depth slot bank: a body that outgrows it falls
+        // off the frameless path, which costs more than the call it saves.
+        if (n_slots > 192) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-slots\n", .{func.name}); return null; }
+    }
     for (call_sites.items[field_sites_base..]) |*site| site.fbase_slot = fbase_slot;
 
     var c = Compiler{
@@ -5099,11 +5932,13 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .array_info = &.{},
         .cell_info = &.{},
         .call_sites = call_sites.items,
-        .inline_sites = &.{},
+        .inline_sites = inline_sites.items,
+        .direct_sites = direct_sites.items,
         .nullable = &.{},
         .null_flag_slot = &.{},
         .uc_slot = uc_slot,
         .tramp_slot = tramp_slot,
+        .entry_fbase_slot = fbase_slot,
         .n_regs = n_regs,
         .reg_slots = n_slots,
         .val_payload_off = valuePayloadOffset(),
@@ -5155,10 +5990,23 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         (a.dupe(ObjParamLoad, cap_loads) catch return null)
     else
         &.{};
+    // A direct callee reads and writes `this` through ITS OWN field indexes on
+    // the same receiver, and its entry guard never runs (the call bypasses it),
+    // so those (index, name) pairs join this body's — one entry check covers
+    // both bodies.
     const method_fields_owned: []MethodFieldCheck = blk: {
-        if (field_pres.items.len == 0) break :blk &.{};
-        const out2 = a.alloc(MethodFieldCheck, field_pres.items.len) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4748\n", .{func.name}); return null; };
-        for (field_pres.items, out2) |fp, *o| o.* = .{ .idx = fp.idx, .name = fp.name };
+        var n_mf: usize = field_pres.items.len;
+        for (direct_sites.items) |*ds| n_mf += ds.callee.method_fields.len;
+        if (n_mf == 0) break :blk &.{};
+        const out2 = a.alloc(MethodFieldCheck, n_mf) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4748\n", .{func.name}); return null; };
+        for (field_pres.items, out2[0..field_pres.items.len]) |fp, *o| o.* = .{ .idx = fp.idx, .name = fp.name };
+        var mf_n: usize = field_pres.items.len;
+        for (direct_sites.items) |*ds| {
+            for (ds.callee.method_fields) |mf| {
+                out2[mf_n] = mf;
+                mf_n += 1;
+            }
+        }
         break :blk out2;
     };
     // Re-verify every (index, name) pair and read the layout id under ONE
@@ -5215,12 +6063,17 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .entry_fbase_slot = fbase_slot,
         .no_native_recurse = is_method,
         .can_deopt = can_deopt,
+        .writes_fields = writes_fields,
         .has_tramp_sites = field_sites_base != 0,
         .obj_param_loads = obj_loads_owned,
         .capture_loads = cap_loads_owned,
         .method_fields = method_fields_owned,
         .guard_shape = guard_shape,
         .result_reg_slot = result_reg_slot,
+        .direct_sites = if (direct_sites.items.len != 0)
+            (a.dupe(DirectSite, direct_sites.items) catch return null)
+        else
+            &.{},
         .self_dbg_name = func.name,
         .allocator = a,
     };
@@ -5446,6 +6299,44 @@ pub fn fusedShouldYieldToFuncTier(func: *const Func) bool {
     return probeCount(func);
 }
 
+/// Compile a callee reached from COMPILED code. The tier's probes live on the
+/// INTERPRETER's call paths, so a function only ever called from compiled code
+/// was never counted and never compiled: the caller then trampolined into the
+/// interpreter on every iteration, which measured SLOWER than not compiling the
+/// caller at all (947ms interpreted against 1119ms with the loop compiled). A
+/// call arriving here is hot by construction — its caller is already native — so
+/// the body is offered to the tier once, with the same probe bookkeeping that
+/// keeps a refusal from being retried.
+pub fn compileCalleeForCall(
+    module: *const Module,
+    func: *const Func,
+    params: []const Value,
+    resolver: ?MemberResolver,
+    virt_resolver: ?VirtResolver,
+    field_resolver: ?FieldResolver,
+    field_nn_resolver: ?FieldResolver,
+    resolver_user: ?*anyopaque,
+) ?*const CompiledLoop {
+    if (!funcEnabled()) return null;
+    const pr = probeWord(func).load(.monotonic);
+    if (pr & PROBE_DECLINED != 0) return null;
+    const fj = forFunc(func) orelse return null;
+    if (fj.func_jit) |*cl| return cl;
+    if (fj.func_tried) return null;
+    fj.func_tried = true;
+    const compiled = tryCompileFunc(metadata_allocator, module, func, params, &.{}, resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) catch null;
+    if (compiled == null) {
+        if (debugEnabled()) std.debug.print("[jit]   callee-for-call declined {s}\n", .{func.name});
+        _ = probeWord(func).fetchOr(PROBE_DECLINED, .monotonic);
+        return null;
+    }
+    fj.func_jit = compiled;
+    noteCompiled();
+    _ = probeWord(func).fetchOr(PROBE_COMPILED, .monotonic);
+    if (debugEnabled()) std.debug.print("[jit] compiled callee {s} for a native call\n", .{func.name});
+    return &fj.func_jit.?;
+}
+
 pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.ArrayList(Value), params: []const Value, captures: []const Value, allocator: Allocator, tramp: ?TrampFn, user: ?*anyopaque, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver) ?FuncOutcome {
     if (!funcEnabled()) return null;
     // Shared probe first: a declined body costs one atomic load per
@@ -5492,7 +6383,7 @@ pub fn maybeRunHotFunc(module: *const Module, func: *const Func, regs: *std.Arra
         // owns the value for the run.
         regs.items[cpl.reg] = captures[cpl.param_idx];
     }
-    var stack_slots: [128]i64 = undefined;
+    var stack_slots: [192]i64 = undefined;
     var heap_slots: ?[]i64 = null;
     defer if (heap_slots) |hs| metadata_allocator.free(hs);
     const slots: []i64 = if (cl.n_slots <= stack_slots.len)
@@ -5631,7 +6522,7 @@ pub fn maybeRunHotPre(fj: *FuncJit, module: *const Module, func: *const Func, re
     // call can re-enter this hook for a nested hot loop, and that inner run must
     // not alias (or reallocate) the outer loop's live slots. Small loops use a
     // stack buffer; the rare larger loop falls back to a freed heap allocation.
-    var stack_slots: [128]i64 = undefined;
+    var stack_slots: [192]i64 = undefined;
     var heap_slots: ?[]i64 = null;
     defer if (heap_slots) |hs| metadata_allocator.free(hs);
     const slots: []i64 = if (cl.n_slots <= stack_slots.len)
