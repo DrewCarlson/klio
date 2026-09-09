@@ -304,13 +304,13 @@ pub const EnclosingEntry = runtime.ImplicitReceiver;
 /// The compose `@Composable` hook reads this to derive a stable positional
 /// group key per call site (set per-statement by the `.Trace` instruction).
 pub fn currentCallSiteSpan() ?ir.Span {
-    if (fused_depth > 0 and fused_marks[fused_depth - 1].head == evtls.frame_chain) {
+    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain) {
         // The walker records each Trace op's span on its mark, exactly as
         // a frame tracks cur_span — including the null of a body that has
         // executed no Trace (a synthesized accessor): span-derived gates
         // read the INNERMOST executing code's site or nothing, never the
         // caller's.
-        return fused_marks[fused_depth - 1].span;
+        return fused_tls.marks[fused_tls.depth - 1].span;
     }
     return if (evtls.frame_chain) |fr| fr.cur_span else null;
 }
@@ -320,8 +320,8 @@ pub fn currentCallSiteSpan() ?ir.Span {
 /// nullable extension properties in different packages resolve to the
 /// one the executing code can see.
 pub fn currentFramePackage() ?[]const u8 {
-    if (fused_depth > 0 and fused_marks[fused_depth - 1].head == evtls.frame_chain) {
-        const pkg = fused_marks[fused_depth - 1].func.package;
+    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain) {
+        const pkg = fused_tls.marks[fused_tls.depth - 1].func.package;
         if (pkg.len != 0) return pkg;
     }
     const fr = evtls.frame_chain orelse return null;
@@ -351,7 +351,7 @@ pub const ThisChainIter = struct {
     pub fn next(self: *ThisChainIter) ?Value {
         while (self.fused_i > 0) {
             self.fused_i -= 1;
-            const v = fused_marks[self.fused_i].recv orelse continue;
+            const v = fused_tls.marks[self.fused_i].recv orelse continue;
             if (self.prev) |p| {
                 if (p == .Instance and v == .Instance and
                     ObjRef(InstanceData).ptrEq(p.Instance, v.Instance)) continue;
@@ -376,7 +376,7 @@ pub const ThisChainIter = struct {
 };
 
 pub fn frameThisChainIter() ThisChainIter {
-    return .{ .cur = evtls.frame_chain, .fused_i = fused_depth };
+    return .{ .cur = evtls.frame_chain, .fused_i = fused_tls.depth };
 }
 
 pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
@@ -399,8 +399,8 @@ pub fn frameThisChainAlloc(allocator: Allocator) Allocator.Error![]Value {
 /// frames without one (synthesized accessors / init thunks carry no
 /// package of their own; their lexical home is the calling frame's).
 pub fn nearestFramePackage() ?[]const u8 {
-    if (fused_depth > 0 and fused_marks[fused_depth - 1].head == evtls.frame_chain) {
-        const pkg = fused_marks[fused_depth - 1].func.package;
+    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain) {
+        const pkg = fused_tls.marks[fused_tls.depth - 1].func.package;
         if (pkg.len != 0) return pkg;
     }
     var cur = evtls.frame_chain;
@@ -474,21 +474,20 @@ pub fn currentFrameModule() ?*const Module {
 }
 
 pub fn currentFrameFunc() ?*const ir.Func {
-    if (fused_depth > 0 and fused_marks[fused_depth - 1].head == evtls.frame_chain)
-        return fused_marks[fused_depth - 1].func;
+    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain)
+        return fused_tls.marks[fused_tls.depth - 1].func;
     return if (evtls.frame_chain) |fr| fr.func else null;
 }
 
 const FusedMark = struct { func: *const ir.Func, mod: *const Module, head: ?*Frame, recv: ?Value, span: ?ir.Span = null };
-threadlocal var fused_marks: [FUSED_BANK_DEPTH]FusedMark = undefined;
 
 /// Type-parameter names declared by the innermost frame's function. An
 /// `object` expression lowered at run time inherits these as its members'
 /// type variables (`ConcurrentSet<Key>()`'s literal declares `add(element:
 /// Key)` against the factory's `Key`, not a nominal class of that name).
 pub fn currentFrameTypeParams() []const []const u8 {
-    if (fused_depth > 0 and fused_marks[fused_depth - 1].head == evtls.frame_chain) {
-        const mk = &fused_marks[fused_depth - 1];
+    if (fused_tls.depth > 0 and fused_tls.marks[fused_tls.depth - 1].head == evtls.frame_chain) {
+        const mk = &fused_tls.marks[fused_tls.depth - 1];
         const tps = mk.mod.registry.func_type_params.get(mk.func.id) orelse return &.{};
         return tps.items;
     }
@@ -964,7 +963,7 @@ inline fn markFrameClosure(closure_id: ?u64, m: *runtime.gc.Marker) void {
 pub fn gcInstallFrameRoot() void {
     if (frame_troot_inited) return;
     frame_troot_inited = true;
-    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .fused_chains = &fused_chain, .fused_depth = &fused_depth, .tid = runtime.gc.currentTid() };
+    frame_anchor = .{ .chain = &evtls.frame_chain, .resuming = &evtls.resuming, .fused_chains = &fused_tls.chain, .fused_depth = &fused_tls.depth, .tid = runtime.gc.currentTid() };
     frame_troot = .{ .ctx = @ptrCast(&frame_anchor), .mark = gcMarkFramesCtx };
     runtime.gc.registerThreadRoot(&frame_troot);
 }
@@ -991,28 +990,28 @@ pub fn gcUninstallFrameRoot() void {
 /// slice is owned by the returned cell.
 fn captureStack(allocator: Allocator) Allocator.Error!?runtime.StackRef {
     // The live call stack is the pushed frame chain (`frame_chain`) with the
-    // fully-fused activations (`fused_marks`) layered on top. A fused body
+    // fully-fused activations (`fused_tls.marks`) layered on top. A fused body
     // never opens a Frame, so a trace built from `frame_chain` alone drops
     // every fused call — and a small program that fuses end to end has NO
     // pushed frames at all, so the trace comes out empty. Each fused mark
     // records the `frame_chain` head it sits on; interleave them
-    // innermost-first (a higher `fused_marks` index is more inner, and a mark
+    // innermost-first (a higher `fused_tls.marks` index is more inner, and a mark
     // is more inner than the frame it is fused onto).
     var frame_n: usize = 0;
     {
         var cur = evtls.frame_chain;
         while (cur) |f| : (cur = f.gc_link) frame_n += 1;
     }
-    const total = fused_depth + frame_n;
+    const total = fused_tls.depth + frame_n;
     if (total == 0) return null;
     const frames = try allocator.alloc(runtime.StackFrame, total);
     errdefer allocator.free(frames);
     var i: usize = 0;
-    var fi: usize = fused_depth;
+    var fi: usize = fused_tls.depth;
     var fr = evtls.frame_chain;
     while (true) {
-        while (fi > 0 and fused_marks[fi - 1].head == fr) {
-            const mk = &fused_marks[fi - 1];
+        while (fi > 0 and fused_tls.marks[fi - 1].head == fr) {
+            const mk = &fused_tls.marks[fi - 1];
             const label = if (mk.func.fqn.len != 0) mk.func.fqn else mk.func.name;
             if (mk.span) |sp| {
                 frames[i] = .{ .fqn = label, .file_id = @intFromEnum(sp.file), .offset = sp.start, .has_pos = true };
@@ -12399,9 +12398,18 @@ const FUSED_BANK_DEPTH: usize = 24;
 const FUSED_MAX_BLOCKS: usize = 64;
 const FUSED_MAX_INSTS: usize = 256;
 
-threadlocal var fused_bank: [FUSED_BANK_DEPTH][FUSED_MAX_REGS]Value = undefined;
-threadlocal var fused_chain: [FUSED_BANK_DEPTH]std.ArrayList(EnclosingEntry) = @splat(.empty);
-threadlocal var fused_depth: usize = 0;
+/// The fused walker's per-thread state lives in ONE threadlocal: Darwin resolves
+/// every threadlocal access through a `_tlv_get_addr` CALL, and the walker
+/// touched four separate variables per activation, which put thread-local
+/// access at the top of an interpreter profile. As one struct the base is
+/// fetched once and every bank is an offset from it.
+const FusedTls = struct {
+    bank: [FUSED_BANK_DEPTH][FUSED_MAX_REGS]Value = undefined,
+    chain: [FUSED_BANK_DEPTH]std.ArrayList(EnclosingEntry) = @splat(.empty),
+    marks: [FUSED_BANK_DEPTH]FusedMark = undefined,
+    depth: usize = 0,
+};
+threadlocal var fused_tls: FusedTls = .{};
 
 var fused_enabled_state: u8 = 0;
 var fused_enabled_val: bool = true;
@@ -12653,7 +12661,7 @@ pub fn fusedExecOpt(
         g.deinit();
         if (has_outer) return null;
     }
-    if (fused_depth >= FUSED_BANK_DEPTH) return null;
+    if (fused_tls.depth >= FUSED_BANK_DEPTH) return null;
     // Function-tier handshake: a hot fully-fusable body yields to the framed
     // path so the JIT can count and compile it (the walker otherwise starves
     // the tier — a fused body never opens a frame).
@@ -12682,7 +12690,7 @@ fn fusedRun(
     {
         const plan = coercePlanFor(module, func);
         if (plan & 6 != 0 and args_in.len <= ir.LEAF_MAX_REGS) {
-            const coerce_buf: []Value = coerce_bank[fused_depth % LEAF_BANK_DEPTH][0..args_in.len];
+            const coerce_buf: []Value = coerce_bank[fused_tls.depth % LEAF_BANK_DEPTH][0..args_in.len];
             @memcpy(coerce_buf, args_in);
             if (plan & 2 != 0) coerceIntArgsToLong(func, coerce_buf);
             if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, coerce_buf);
@@ -12690,14 +12698,19 @@ fn fusedRun(
         }
     }
     const nlive: usize = @min(@as(usize, func.n_locals), FUSED_MAX_REGS);
-    const regs: []Value = fused_bank[fused_depth][0..nlive];
-    fused_depth += 1;
-    defer fused_depth -= 1;
+    const regs: []Value = fused_tls.bank[fused_tls.depth][0..nlive];
+    fused_tls.depth += 1;
+    defer fused_tls.depth -= 1;
     // Unlike the leaf bank there is no def-before-use proof here: fill the
     // bank so the register file is always well-formed, and pin it for the
     // collector for the whole run (fused bodies allocate and call).
     for (regs) |*v| v.* = .Unit;
-    fused_marks[fused_depth - 1] = .{
+    // Resolved once for the whole walk: on Darwin each threadlocal access is a
+    // `_tlv_get_addr` CALL, so re-reading this per instruction (the `Trace` arm
+    // ran on nearly every statement) put thread-local access at the top of the
+    // profile.
+    const mark: *FusedMark = &fused_tls.marks[fused_tls.depth - 1];
+    mark.* = .{
         .func = func,
         .mod = module,
         .head = evtls.frame_chain,
@@ -12722,7 +12735,7 @@ fn fusedRun(
     // DETACHED (host trampolines null it) lost its own subject pushes —
     // `apply { add(...) }`'s subject silently vanished and the framed
     // remainder resolved `add` against the test instance.
-    const chain = &fused_chain[fused_depth - 1];
+    const chain = &fused_tls.chain[fused_tls.depth - 1];
     chain.clearRetainingCapacity();
     if (evtls.active_chain) |caller| {
         const base = @min(evtls.active_chain_base, caller.items.len);
@@ -12777,7 +12790,7 @@ fn fusedRun(
         const blk = &func.blocks[cur.int()];
         const blk_id = cur.int();
         for (blk.insts, 0..) |*inst, idx| {
-            fusedInst(H, allocator, module, func, eff_args, host, inst, regs, reclaim, &pushed_enclosing) catch |e| switch (e) {
+            fusedInst(H, allocator, module, func, eff_args, host, inst, regs, reclaim, &pushed_enclosing, mark) catch |e| switch (e) {
                 error.Raise => return .{ .err = fused_err },
                 // A heavy op: build the real Frame from the bank and run
                 // the remainder framed, starting AT this instruction (no
@@ -12988,12 +13001,18 @@ fn fusedInst(
     regs: []Value,
     reclaim: bool,
     pushed_enclosing: *usize,
+    /// This walk's mark, resolved ONCE by the caller. Reading it from the
+    /// threadlocal here cost two `_tlv_get_addr` calls per `Trace` — and a
+    /// `Trace` precedes nearly every statement, which made thread-local
+    /// access the single hottest leaf in a member-call profile on Darwin,
+    /// where each threadlocal access is a call rather than a register offset.
+    mark: *FusedMark,
 ) FusedFail!void {
     switch (inst.*) {
         // The walker's cur_span: recorded on the mark so span-derived
         // context (file-private scoping, diagnostics) sees the executing
         // call site, exactly as a frame tracks it.
-        .Trace => |t| fused_marks[fused_depth - 1].span = t.span,
+        .Trace => |t| mark.span = t.span,
         .LoadParam => |lp| {
             const v = if (lp.idx < args.len) args[lp.idx] else Value.Unit;
             fusedWrite(allocator, regs, lp.dst, v, reclaim, true);
@@ -13265,7 +13284,7 @@ fn fusedInst(
                 if (plan & ir.FAST_CALL_AMBIG_FLAG != 0) {
                     var verdict = @atomicLoad(u8, @constCast(&c.fuse_site), .acquire);
                     if (verdict == 0) {
-                        const cfile: ?ir.FileId = if (fused_marks[fused_depth - 1].span) |sp| sp.file else null;
+                        const cfile: ?ir.FileId = if (mark.span) |sp| sp.file else null;
                         verdict = if (host.fuseSiteBinds(module, c.func, func.package, cfile)) 2 else 1;
                         @atomicStore(u8, @constCast(&c.fuse_site), verdict, .release);
                     }
