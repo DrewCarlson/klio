@@ -4909,8 +4909,21 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     var r: usize = 0;
     while (r < self.n_regs) : (r += 1) {
         slots[r] = 0;
-        if (!self.read_set[r]) continue;
-        if (r >= regs.len) return .bail;
+        // A register the loop READS must carry its live-in value or the run is
+        // simply wrong, so a kind that does not fit its slot bails to the
+        // interpreter. A register the loop only WRITES carries it too where it
+        // can: the write may sit behind a branch this run never takes, and the
+        // exit reboxes every written register — an unseeded slot then reports
+        // zero (`var ok = true` inside a loop that never clears it came back
+        // false). Its live-in value need not be recoverable, though: a register
+        // first assigned inside the loop holds `Unit` here and nothing reads the
+        // old value afterwards, so a misfit leaves the zero rather than bailing.
+        const must_seed = self.read_set[r];
+        if (!must_seed and !self.def_set[r]) continue;
+        if (r >= regs.len) {
+            if (must_seed) return .bail;
+            continue;
+        }
         const v = regs[r];
         switch (self.reg_types[r]) {
             .i32 => switch (v) {
@@ -4929,30 +4942,30 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
                     slots[r] = x;
                     if (!self.def_set[r]) tags[r] = @intFromEnum(@as(std.meta.Tag(Value), .Byte));
                 },
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
             .i64 => switch (v) {
                 .Long => |x| slots[r] = x,
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
             .f64 => switch (v) {
                 .Double => |x| slots[r] = @bitCast(x),
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
             .f32 => switch (v) {
                 .Float => |x| slots[r] = @as(u32, @bitCast(x)),
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
             .boolean => switch (v) {
                 .Bool => |b| slots[r] = if (b) 1 else 0,
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
-            .unit => if (v != .Unit) return .bail,
-            .null_ => if (v != .Null) return .bail,
+            .unit => if (v != .Unit and must_seed) return .bail,
+            .null_ => if (v != .Null and must_seed) return .bail,
             // Object registers are never slot-backed (excluded from read_set);
             // they stay in `regs`. Reaching here would be a bug, but it is safe.
             .object => {},
-            .unknown => return .bail,
+            .unknown => if (must_seed) return .bail,
         }
     }
 
