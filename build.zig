@@ -100,9 +100,11 @@ const Itest = struct {
     /// stay on the default optimize mode.
     interprets: bool = true,
     /// Relative run cost for `-Ditest-shard` bin packing: the suite's
-    /// measured wall on the CI configuration (4 cores, ReleaseSafe harness)
-    /// in tens of seconds. Re-measure a heavy suite when its shape changes
-    /// so the shards stay balanced.
+    /// measured RUN wall on the CI configuration (4 cores, ReleaseSafe
+    /// harness) in tens of seconds — the run step alone, not the job, so a
+    /// shard's compile time does not get folded into one suite's number.
+    /// Re-measure a heavy suite when its shape changes so the shards stay
+    /// balanced; `--summary all` prints each run step's wall in CI.
     weight: u16 = 2,
     /// Split this suite into N run steps, each with KLIO_COMMONTEST_SHARD=i/N
     /// so a single heavy suite can spread across CI shard jobs. `weight`
@@ -229,7 +231,7 @@ const itests_files = [_]Itest{
     .{ .name = "box_conformance", .needs_exe = true, .dirs = &.{
         "kotlin/compiler/testData/codegen/box",
         "kotlin/compiler/testData/diagnostics/helpers/coroutines",
-    }, .weight = 35 },
+    }, .weight = 96 },
     .{ .name = "stdlib_commontest", .needs_exe = true, .dirs = &.{
         "kotlin-klio/klio-kotlin-test",
         "kotlin/libraries/kotlin.test",
@@ -242,7 +244,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-androidx-collection",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 62 },
+    }, .weight = 72 },
     // The upstream Compose runtime's own test suite (CompositionTests,
     // RestartTests, MovableContentTests, the snapshot suites) run through a
     // child `klio test` against the ENGINE pack with the `@Composable` lowering
@@ -253,7 +255,7 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 126 },
+    }, .weight = 150 },
     // Each bundled library's own commonTest sources run through a child
     // `klio test` against its installed pack (see commontest_support.zig).
     .{ .name = "atomicfu_commontest", .needs_exe = true, .dirs = &.{
