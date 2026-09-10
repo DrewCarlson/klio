@@ -67,7 +67,7 @@ fn eqVal(a: *const Value, b: *const Value) ?bool {
 }
 
 fn sameArrayCell(a: ArrayData, b: ArrayData) bool {
-    return a.cell == b.cell;
+    return a.cellPtr() == b.cellPtr();
 }
 
 /// Ordered compare of the first `remaining` logical elements under a

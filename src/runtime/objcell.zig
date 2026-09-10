@@ -402,7 +402,12 @@ pub fn ControlBlock(comptime T: type) type {
 
         /// GC header first so the type-erased collector recovers `data` by a
         /// fixed offset via `@fieldParentPtr("hdr", header)`.
-        hdr: gc.GcHeader,
+        ///
+        /// 16-byte aligned so a `Value` payload can TAG a cell pointer in its
+        /// low four bits and still hold one pointer. The slab allocator already
+        /// hands out 16-byte-aligned cells (`CELL_ALIGN`) and libc's malloc
+        /// guarantees it for these sizes, so this costs nothing.
+        hdr: gc.GcHeader align(16),
         refcount: std.atomic.Value(usize),
         lock: LockFor(T),
         data: T,
@@ -617,13 +622,17 @@ pub fn ObjRef(comptime T: type) type {
         /// The GC trace thunk for this cell type: recover the control block from
         /// its `hdr` and walk the payload's out-edges.
         fn gcTraceThunk(h: *gc.GcHeader, m: *gc.Marker) void {
-            const cb: *Cell = @fieldParentPtr("hdr", h);
+            // Every cell is 16-byte aligned (see `hdr`), so recovering the block
+            // from its header re-establishes that alignment.
+            const cb: *Cell = @fieldParentPtr("hdr", @as(*align(16) gc.GcHeader, @alignCast(h)));
             gcTraceData(T, &cb.data, m);
         }
         /// The GC finalize thunk: shallow-free the payload's own buffers, then
         /// destroy the control block. Child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
-            const cb: *Cell = @fieldParentPtr("hdr", h);
+            // Every cell is 16-byte aligned (see `hdr`), so recovering the block
+            // from its header re-establishes that alignment.
+            const cb: *Cell = @fieldParentPtr("hdr", @as(*align(16) gc.GcHeader, @alignCast(h)));
             if (h.gc_remembered and getenvSlice("KLIO_GC_REMEMBER_TRACE") != null) {
                 std.debug.print("[gc-freed-remembered] SWEEP h={*} type={s}\n", .{ h, h.gc_type });
                 trace.dumpCurrent(.{});

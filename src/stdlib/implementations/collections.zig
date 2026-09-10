@@ -2137,7 +2137,7 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
     // either alias, matching Kotlin's inline value-class storage.
     if (call_args.len == 1 and prim != null and call_args[0] == .Array) {
         const arr = call_args[0].Array;
-        if (arr.prim) |src| {
+        if (arr.primKind()) |src| {
             const is_view = (prim.? == .UByte and src == .Byte) or
                 (prim.? == .UShort and src == .Short) or
                 (prim.? == .UInt and src == .Int) or
@@ -2401,7 +2401,7 @@ pub fn arrayAsListView(a: Allocator, arr: runtime.ArrayData) Error!Value {
             .mod_count = .{},
         }),
         .scalars => |buf| {
-            const view_kind = arr.prim orelse blk: {
+            const view_kind = arr.primKind() orelse blk: {
                 const g = buf.borrow();
                 defer g.deinit();
                 break :blk g.get().kind;
@@ -7089,7 +7089,7 @@ fn arrayPrimDefault(prim: ?PrimitiveArrayKind) Value {
 
 fn arrayPrimOf(v: Value) ?PrimitiveArrayKind {
     return switch (v) {
-        .Array => |arr| arr.prim,
+        .Array => |arr| arr.primKind(),
         else => null,
     };
 }
@@ -7124,7 +7124,7 @@ pub fn array_slice_impl(ctx: *CallCtx) Error!EvalResult {
     const recv = ctx.args[0];
     if (recv != .Array) return typeErr("sliceArray requires an array receiver");
     const arr = recv.Array;
-    const prim = arr.prim;
+    const prim = arr.primKind();
     if (ctx.args.len < 2) return arityErr("sliceArray expects (receiver, range)");
     const src = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(src);
@@ -7505,7 +7505,7 @@ pub fn array_copy_of(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("copyOf requires an array receiver");
     const arr = ctx.args[0].Array;
-    const prim = arr.prim;
+    const prim = arr.primKind();
     const cur_len: i64 = @intCast(arr.len());
     const new_size = switch (try arrayOptIndex(a, ctx, 1, cur_len, "copyOf")) {
         .idx => |v| v,
@@ -7534,7 +7534,7 @@ pub fn array_copy_of_range(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("copyOfRange requires an array receiver");
     const arr = ctx.args[0].Array;
-    const prim = arr.prim;
+    const prim = arr.primKind();
     const len: i64 = @intCast(arr.len());
     const from = switch (try arrayOptIndex(a, ctx, 1, 0, "copyOfRange")) {
         .idx => |v| v,
@@ -7588,7 +7588,7 @@ pub fn array_fill(ctx: *CallCtx) Error!EvalResult {
 pub fn array_as_signed_view(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("asArray requires an array receiver");
     const arr = ctx.args[0].Array;
-    const src = arr.prim orelse return typeErr("asArray requires a primitive array");
+    const src = arr.primKind() orelse return typeErr("asArray requires a primitive array");
     const dst: PrimitiveArrayKind = switch (src) {
         .UByte => .Byte,
         .UShort => .Short,
@@ -7737,7 +7737,7 @@ pub fn array_sum_int(ctx: *CallCtx) Error!EvalResult {
 pub fn array_sum_unsigned(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sum requires an array receiver");
-    const prim = ctx.args[0].Array.prim orelse return typeErr("sum requires a primitive unsigned array");
+    const prim = ctx.args[0].Array.primKind() orelse return typeErr("sum requires a primitive unsigned array");
     const items = switch (try iterableItemsCtx(ctx, ctx.args[0], "sum")) {
         .items => |x| x,
         .err => |e| return e,
@@ -8162,7 +8162,7 @@ test "int array of tags primitive kind" {
     var c = h.ctx(&args);
     const r = try coll_int_array_of(&c);
     try testing.expect(r == .ok and r.ok == .Array);
-    try testing.expectEqual(PrimitiveArrayKind.Int, r.ok.Array.prim.?);
+    try testing.expectEqual(PrimitiveArrayKind.Int, r.ok.Array.primKind().?);
 }
 
 test "array content equals" {

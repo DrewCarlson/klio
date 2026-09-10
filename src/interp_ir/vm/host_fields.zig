@@ -2178,7 +2178,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // mechanism `IntArray.asUIntArray()` uses in the other direction.
     if (std.mem.eql(u8, name, "storage") and receiver.* == .Array) {
         const a = receiver.Array;
-        if (a.prim) |k| {
+        if (a.primKind()) |k| {
             if (k.signedCounterpart()) |signed| {
                 if (a.storage() == .scalars) {
                     return ok(.{ .Array = runtime.ArrayData.scalars(a.storage().scalars.clone(), signed) });

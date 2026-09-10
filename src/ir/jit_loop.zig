@@ -1653,7 +1653,7 @@ pub fn liveElementAt(recv: Value, idx: i64) ?Value {
             const items = g.get().items;
             return if (u < items.len) items[u] else null;
         },
-        .Array => |arr| return if (arr.prim == null and u < arr.len()) arr.get(u) else null,
+        .Array => |arr| return if (arr.primKind() == null and u < arr.len()) arr.get(u) else null,
         else => return null,
     }
 }
@@ -3187,12 +3187,12 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             // non-packed receiver (a `List`/reference `Array` of objects, or a
             // `Map`) is left for the object-subscript / map paths; a non-packed
             // `set` is compilable only for a `Map`.
-            const packed_ok = v == .Array and v.Array.prim != null and v.Array.storage() == .scalars;
+            const packed_ok = v == .Array and v.Array.primKind() != null and v.Array.storage() == .scalars;
             if (!packed_ok) {
                 if (op.is_set and v != .Map) return null;
                 continue;
             }
-            const kind = v.Array.prim.?;
+            const kind = v.Array.primKind().?;
             const shape = arrayElemShape(kind) orelse return null;
             const k: u32 = @intCast(arrays.items.len);
             array_info[rr.int()] = .{
@@ -4318,7 +4318,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     for (self.arrays) |au| {
         if (au.reg.int() >= regs.len) return .bail;
         const v = regs[au.reg.int()];
-        if (v != .Array or v.Array.prim != au.kind or v.Array.storage() != .scalars) return .bail;
+        if (v != .Array or v.Array.primKind() != au.kind or v.Array.storage() != .scalars) return .bail;
         const g = v.Array.storage().scalars.borrow();
         const pb = g.get();
         slots[au.ptr_slot] = @bitCast(@intFromPtr(pb.bytes.items.ptr));

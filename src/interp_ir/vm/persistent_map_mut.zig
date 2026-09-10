@@ -190,7 +190,7 @@ const NodeView = struct {
         const buf = d.getCached(&fn_buffer, "buffer") orelse return null;
         const ob = d.getCached(&fn_ownedby, "ownedBy") orelse return null;
         if (dm != .Int or nm != .Int or buf != .Array) return null;
-        if (buf.Array.prim != null) return null;
+        if (buf.Array.primKind() != null) return null;
         const owned = ob == .Instance and owner.* == .Instance and
             ObjRef(InstanceData).ptrEq(ob.Instance, owner.Instance);
         return .{ .inst = inst, .data_map = dm.Int, .node_map = nm.Int, .buffer = buf.Array, .owned = owned };

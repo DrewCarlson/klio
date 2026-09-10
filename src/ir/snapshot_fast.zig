@@ -307,7 +307,7 @@ fn currentSnapshotRaw(thread_snapshot: *const Value, global_snapshot: *const Val
             else => return null,
         };
         if (keys_v != .Array or values_v != .Array) return null;
-        if (keys_v.Array.prim != .Long) return null;
+        if (keys_v.Array.primKind() != .Long) return null;
         if (n > keys_v.Array.len() or n > values_v.Array.len()) return null;
         var lo: usize = 0;
         var hi: usize = n;

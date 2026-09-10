@@ -1088,7 +1088,7 @@ test "make_string_array wraps values in a non-prim Array" {
     vals[1] = "body";
     const v = try make_string_array(a, vals);
     try testing.expect(v == .Array);
-    try testing.expect(v.Array.prim == null);
+    try testing.expect(v.Array.primKind() == null);
     const items = try v.Array.snapshot(a);
     defer a.free(items);
     try testing.expectEqual(@as(usize, 2), items.len);

@@ -816,7 +816,7 @@ pub fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Val
         },
         .Array => |arr| {
             const items = try cloneArrayItems(allocator, arr);
-            return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = arr.prim, .pos = 0, .exp_mod = 0 }) };
+            return .{ .ok = try Value.newIterator(allocator, .{ .items = try ObjRef(std.ArrayList(Value)).init(allocator, items), .prim = arr.primKind(), .pos = 0, .exp_mod = 0 }) };
         },
         .String => |s| {
             const g = s.borrow();
