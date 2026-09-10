@@ -36,6 +36,20 @@ const E = jit.Reg;
 const FIELD_STRIDE: u32 = @sizeOf(runtime.InstanceData.Field);
 const FIELD_VALUE_OFF: u32 = @offsetOf(runtime.InstanceData.Field, "value");
 
+/// Offsets a native receiver guard walks: from a frame `Value` to the instance
+/// cell, and from there to the class cell. `ObjRef.identity` is the address of
+/// a cell's `data`, so comparing classes is comparing pointers — no borrow.
+/// Derived from the live types, like `valuePayloadOffset`, so a layout change
+/// carries automatically.
+const InstCell = runtime.ObjRef(runtime.InstanceData).Cell;
+const VALUE_SIZE: u32 = @sizeOf(Value);
+const CELL_DATA_OFF: u32 = @offsetOf(InstCell, "data");
+const INST_CLASS_OFF: u32 = CELL_DATA_OFF + @offsetOf(runtime.InstanceData, "class");
+
+fn instanceTagValue() u8 {
+    return @intFromEnum(@as(std.meta.Tag(Value), .Instance));
+}
+
 fn valuePayloadOffset() u32 {
     var v: Value = .{ .Long = 0 };
     return @intCast(@intFromPtr(&v.Long) - @intFromPtr(&v));
@@ -411,6 +425,9 @@ pub const CompiledLoop = struct {
     /// `Return` emit; `maxInt(u32)` there means the scalar `result_slot`
     /// (or Unit) carries the value instead.
     result_reg_slot: u32 = 0,
+    /// Slot holding the FRAME register base. A guarded arm reads its receiver's
+    /// `Value` from there, because object registers are not slot-backed.
+    regs_ptr_slot: u32 = 0,
     /// Calls that go STRAIGHT into another compiled unit's native code. The
     /// callee is a deopt-free method body over the same receiver, so it needs
     /// no frame, no trampoline and no resume machinery: this unit seeds the
@@ -795,6 +812,14 @@ const InlineSite = struct {
     /// splice removed. Null for a top-level inline, which removes nothing, so
     /// the call's own position is right.
     resume_at: ?BodyInstPos = null,
+    /// One arm of a per-iteration receiver guard: run this body only when the
+    /// receiver's class matches `guard_class`. Arms at the same position are
+    /// emitted as a chain, and the last miss falls through to `fallback_site`,
+    /// the trampoline the call registered. The guard is what makes the arm
+    /// SOUND — the class set that chose the arms is only a heuristic.
+    guarded: bool = false,
+    guard_class: usize = 0,
+    fallback_site: u32 = 0,
 };
 
 /// The destination register an instruction writes, if any (covering every shape
@@ -1148,6 +1173,63 @@ fn loopReceiverSource(
     if (regWrittenInBody(func, body, Reg.from(got.src))) return null;
     if (got.mv.b != call_b or got.mv.i >= call_i) return null;
     return got;
+}
+
+const MAX_RECV_CLASSES: usize = 4;
+
+/// The distinct classes a per-iteration receiver can hold, when it is produced
+/// inside the loop by a read from a LOOP-INVARIANT collection. Enumerating the
+/// container is what lets a polymorphic site be specialized without guessing a
+/// class: the guard chain covers exactly what is there.
+///
+/// This is a performance heuristic, never a correctness one — each emitted arm
+/// re-checks the receiver's class at run time and a miss falls through to the
+/// trampoline, so a stale or partial enumeration costs speed and nothing else.
+fn receiverClassSet(
+    func: *const Func,
+    body: []const BlockId,
+    recv_reg: u32,
+    regs: []const Value,
+    out: *[MAX_RECV_CLASSES]Value,
+) ?[]const Value {
+    // The receiver must have exactly one producer in the loop, and that
+    // producer must read from a container the loop never rewrites.
+    var producer: ?*const Inst = null;
+    for (body) |bid| {
+        for (func.blocks[bid.int()].insts) |*inst| {
+            const d = instAnyDst(inst) orelse continue;
+            if (d.int() != recv_reg) continue;
+            if (producer != null) return null;
+            producer = inst;
+        }
+    }
+    const p = producer orelse return null;
+    const container: Reg = switch (p.*) {
+        .CallMember => |cm| cm.receiver,
+        .Index => |ix| ix.receiver,
+        else => return null,
+    };
+    if (container.int() >= regs.len) return null;
+    if (regWrittenInBody(func, body, container)) return null;
+    const cv = regs[container.int()];
+    if (cv != .List and cv != .Array) return null;
+    var n: usize = 0;
+    var i: i64 = 0;
+    while (i < 1024) : (i += 1) {
+        const elem = liveElementAt(cv, i) orelse break;
+        if (elem != .Instance) return null;
+        const id = instanceClassIdentity(elem);
+        var seen = false;
+        for (out[0..n]) |x| {
+            if (instanceClassIdentity(x) == id) seen = true;
+        }
+        if (seen) continue;
+        if (n == MAX_RECV_CLASSES) return null; // too many shapes to be worth arms
+        out[n] = elem;
+        n += 1;
+    }
+    if (n == 0) return null;
+    return out[0..n];
 }
 
 /// A (block, instruction) position inside a compiled body.
@@ -2321,6 +2403,8 @@ const Compiler = struct {
     call_sites: []const CallSite,
     inline_sites: []const InlineSite,
     direct_sites: []const DirectSite = &.{},
+    /// Frame register base slot, read by a guarded arm to reach its receiver.
+    regs_ptr_slot: u32 = 0,
     /// Instructions a direct call consumed (the receiver Move), which must not
     /// be emitted.
     skip_insts: []const BodyInstPos = &.{},
@@ -2688,7 +2772,54 @@ const Compiler = struct {
     /// Emit an inlined call: copy each scalar arg into the callee's (remapped)
     /// parameter slot, emit the callee's single block remapped into the caller's
     /// extended register space, then copy the (remapped) return value to the dst.
-    fn emitInlinedCall(self: *Compiler, site: *const InlineSite) !void {
+    /// Prove the per-iteration receiver's class, jumping to `miss` otherwise.
+    /// The receiver lives in a FRAME register (objects are not slot-backed), so
+    /// this reads its `Value` through the frame base. `identity` is the address
+    /// of the class cell's data, which is what `instanceClassIdentity` returns.
+    fn emitReceiverGuard(self: *Compiler, recv_reg: u32, class: usize, miss: jit.Label) !void {
+        try self.em.loadMem(T1, REGS, slotBytes(self.regs_ptr_slot));
+        try self.em.addImm32(T1, @intCast(recv_reg * VALUE_SIZE));
+        try self.em.loadMemB(T0, T1, @intCast(self.val_tag_off));
+        try self.em.cmpImm32(T0, instanceTagValue());
+        try self.em.jcc(.ne, miss);
+        try self.em.loadMem(T1, T1, @intCast(self.val_payload_off));
+        try self.em.loadMem(T0, T1, @intCast(INST_CLASS_OFF));
+        try self.em.addImm32(T0, @intCast(CELL_DATA_OFF));
+        try self.em.movImm64(T2, class);
+        try self.em.cmpReg(T0, T2);
+        try self.em.jcc(.ne, miss);
+    }
+
+    /// Every inline site at the current position. A single unguarded site is
+    /// spliced outright; guarded arms form a chain ending in the trampoline.
+    fn emitInlinedChain(self: *Compiler) !void {
+        var first: ?*const InlineSite = null;
+        var n_arms: usize = 0;
+        for (self.inline_sites) |*s| {
+            if (s.block.int() != self.cur_block.int() or s.inst != self.cur_inst) continue;
+            if (first == null) first = s;
+            n_arms += 1;
+        }
+        const head = first orelse return;
+        if (!head.guarded) {
+            try self.emitInlinedBody(head);
+            return;
+        }
+        const done = try self.em.newLabel();
+        for (self.inline_sites) |*s| {
+            if (s.block.int() != self.cur_block.int() or s.inst != self.cur_inst) continue;
+            const miss = try self.em.newLabel();
+            try self.emitReceiverGuard(s.recv_reg, s.guard_class, miss);
+            try self.emitInlinedBody(s);
+            try self.em.jmp(done);
+            try self.em.bind(miss);
+        }
+        // Every arm missed: the class is one this loop was not specialized for.
+        try self.emitCallSite(head.fallback_site);
+        try self.em.bind(done);
+    }
+
+    fn emitInlinedBody(self: *Compiler, site: *const InlineSite) !void {
         const saved = self.deopt_override;
         self.deopt_override = site.resume_at;
         defer self.deopt_override = saved;
@@ -2884,8 +3015,8 @@ const Compiler = struct {
         // remapped callee instructions, copy the return value to the call's dst.
         // `cur_inst` stays the call's instruction, so any deopt inside the body
         // resumes there and the interpreter re-runs the (pure) call.
-        if (self.inlineSiteAt()) |site| {
-            try self.emitInlinedCall(site);
+        if (self.inlineSiteAt()) |_| {
+            try self.emitInlinedChain();
             return;
         }
         if (self.directSiteAt()) |site| {
@@ -3321,7 +3452,49 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 if (trampolinableVirtualOf(inst)) |vc| blk: {
                     if (virt_resolver == null or field_resolver == null) break :blk;
                     if (vc.recv.int() >= regs.len or regs[vc.recv.int()] != .Instance) break :blk;
-                    if (regWrittenInBody(func, body, vc.recv)) break :blk;
+                    // A receiver the loop REWRITES each iteration is specialized
+                    // per class instead: enumerate what its container holds and
+                    // give each class an arm, guarded at run time. The call still
+                    // registers its trampoline site, which the final miss uses.
+                    if (regWrittenInBody(func, body, vc.recv)) {
+                        var reps_buf: [MAX_RECV_CLASSES]Value = undefined;
+                        const reps = receiverClassSet(func, body, vc.recv.int(), regs, &reps_buf) orelse break :blk;
+                        var arms: usize = 0;
+                        for (reps) |rep| {
+                            const afid = virt_resolver.?(resolver_user.?, &rep, vc.slot) orelse break :blk;
+                            const acallee = module.funcById(afid) orelse break :blk;
+                            var athis: u32 = 0;
+                            if (!inlinableMemberCallee(module, acallee, &athis)) break :blk;
+                            if (acallee.params.len != @as(usize, vc.n_args) + 1) break :blk;
+                            // An arm that touches `this`-fields would need its
+                            // field sites rebound to the base this guard loads
+                            // per iteration; that is not built yet.
+                            for (acallee.blocks[0].insts) |*ci| {
+                                if (trampolinableFieldOf(module, ci) != null or
+                                    trampolinableFieldSetOf(module, ci) != null) break :blk;
+                            }
+                            inline_sites.append(a, .{
+                                .block = bid,
+                                .inst = @intCast(ii),
+                                .callee = acallee,
+                                .base = total_regs,
+                                .args_reg = vc.args_reg,
+                                .n_args = vc.n_args,
+                                .dst = vc.dst,
+                                .is_member = true,
+                                .recv_reg = vc.recv.int(),
+                                .this_reg = athis,
+                                .has_result = acallee.blocks[0].terminator.Return != null,
+                                .guarded = true,
+                                .guard_class = instanceClassIdentity(rep),
+                            }) catch return null;
+                            total_regs += acallee.n_locals;
+                            if (total_regs > 4096) return null;
+                            arms += 1;
+                        }
+                        if (debugEnabled()) std.debug.print("[jit]   guarded virtual dispatch: {d} arm(s) in {s}\n", .{ arms, func.name });
+                        break :blk; // falls through so the trampoline site registers
+                    }
                     const fid = virt_resolver.?(resolver_user.?, &regs[vc.recv.int()], vc.slot) orelse break :blk;
                     const callee = module.funcById(fid) orelse break :blk;
                     var this_reg: u32 = 0;
@@ -4112,9 +4285,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 }) catch return null;
             } else if (is_virtual) {
                 // An inlined virtual call is emitted in place, not trampolined.
+                // Only an UNGUARDED splice consumes the call: guarded arms need
+                // this site as the fallback their final miss jumps to.
                 var inlined_v = false;
                 for (inline_sites.items) |s| {
-                    if (s.block.int() == bid.int() and s.inst == i) {
+                    if (s.block.int() == bid.int() and s.inst == i and !s.guarded) {
                         inlined_v = true;
                         break;
                     }
@@ -4295,6 +4470,38 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     var n_slots: u32 = nullable_end + @as(u32, @intCast(field_bases.items.len));
     if (debugEnabled() and field_bases.items.len != 0) std.debug.print("[jit]   native field access on {d} receiver(s) in {s}\n", .{ field_bases.items.len, func.name });
 
+    // Point every guarded arm at the trampoline site its final miss falls to.
+    // An arm with no such site would have nowhere to go, so it is dropped and
+    // the call simply trampolines as before.
+    {
+        var gi: usize = 0;
+        while (gi < inline_sites.items.len) {
+            const isite = &inline_sites.items[gi];
+            if (!isite.guarded) {
+                gi += 1;
+                continue;
+            }
+            var found = false;
+            for (call_sites.items, 0..) |cs, ci| {
+                if (cs.block.int() == isite.block.int() and cs.inst == isite.inst) {
+                    isite.fallback_site = @intCast(ci);
+                    found = true;
+                    break;
+                }
+            }
+            if (found) gi += 1 else _ = inline_sites.orderedRemove(gi);
+        }
+    }
+    // A guarded arm reads its receiver's `Value` out of the FRAME (objects are
+    // not slot-backed), so it needs the frame register base in a slot.
+    var regs_ptr_slot: u32 = 0;
+    for (inline_sites.items) |*isite| {
+        if (!isite.guarded) continue;
+        regs_ptr_slot = n_slots;
+        n_slots += 1;
+        break;
+    }
+
     // A member call on a LOOP-INVARIANT receiver whose target is a deopt-free
     // compiled method goes straight into that method's code. Loop entry already
     // proves the receiver's class (`recv_class`) and already caches its field
@@ -4425,6 +4632,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .inline_sites = inline_sites.items,
         .direct_sites = direct_sites.items,
         .skip_insts = skip_call_insts.items,
+        .regs_ptr_slot = regs_ptr_slot,
         .nullable = nullable,
         .null_flag_slot = null_flag_slot,
         .uc_slot = uc_slot,
@@ -4497,6 +4705,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .cells = cells_owned,
         .nullables = nullables_owned,
         .field_bases = fbases_owned,
+        .regs_ptr_slot = regs_ptr_slot,
         .direct_sites = if (direct_sites.items.len != 0)
             (a.dupe(DirectSite, direct_sites.items) catch return null)
         else
@@ -4624,6 +4833,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     // TRAMPOLINE site left: a direct call consumes the only call site a loop may
     // have had, and its receiver's field base still has to be cached.
     {
+        if (self.regs_ptr_slot != 0) slots[self.regs_ptr_slot] = @bitCast(@intFromPtr(regs.ptr));
         for (self.field_bases) |fb| {
             if (fb.recv_reg >= regs.len or regs[fb.recv_reg] != .Instance) return .bail;
             const g = regs[fb.recv_reg].Instance.borrow();
