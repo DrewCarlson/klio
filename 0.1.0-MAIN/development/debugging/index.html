@@ -1563,6 +1563,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#per-thread-state-and-the-owner-fast-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-thread state and the owner fast path
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#measuring-peak-rss-and-the-spin-loop-trap" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1797,6 +1808,17 @@
     <span class="md-ellipsis">
       
         Workflow recipes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#per-thread-state-and-the-owner-fast-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Per-thread state and the owner fast path
       
     </span>
   </a>
@@ -2964,6 +2986,36 @@ path — it always runs. These knobs bisect its two emissions.</p>
 <td>Prints process RSS on each rendered Compose UI frame</td>
 <td><code>[rss]</code></td>
 </tr>
+<tr>
+<td><code>KLIO_FJ_ESCAPE</code></td>
+<td><code>1</code> enables</td>
+<td>Lets a compiled body call back into the interpreter for one instruction instead of declining the whole function. Off: it widened acceptance with execution time unchanged, because an escaped instruction costs what the interpreter would have</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>KLIO_FJ_SELF_INLINE</code></td>
+<td><code>0</code> disables</td>
+<td>The whole-function tier splices a self call (<code>this.helper(...)</code>) whose callee is scalar control flow over its own registers, reading and writing <code>this</code> only through the field sites. On by default: the receiver Move such a call needs is otherwise what makes the whole method uncompilable</td>
+<td><code>[jit] inlining self-call</code></td>
+</tr>
+<tr>
+<td><code>KLIO_FJ_DIRECT</code></td>
+<td><code>0</code> disables</td>
+<td>A self call the splice cannot take goes STRAIGHT into the callee's compiled code — a deopt-free method body over the same receiver, so no frame, no boxing, no host callback. On by default; without it such a call is a trampoline site, which also costs the caller its frameless seam</td>
+<td><code>[jit] direct call</code></td>
+</tr>
+<tr>
+<td><code>KLIO_CTOR_TRACE</code></td>
+<td>set</td>
+<td>Every secondary-constructor side-table lookup: the key, how many entries it found, and each entry's parameter/default counts. The table that decides whether a defaulted secondary constructor can take a call</td>
+<td><code>[ctor]</code></td>
+</tr>
+<tr>
+<td><code>KLIO_RUN_STATS</code></td>
+<td>set</td>
+<td>One line when the program's <code>main</code> returns: the boot/exec time split, RSS at <code>main</code> and at exit, RSS + mapped bytes after a forced final collection, and the live cell count that collection kept. Works the same for <code>klio run</code>, a bundle, and a transpiled binary, so the three are comparable</td>
+<td><code>[run-stats]</code></td>
+</tr>
 </tbody>
 </table>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>./zig-out/bin/klio<span class="w"> </span>run<span class="w"> </span>scene.kt<span class="w">      </span><span class="c1"># plugin lowering</span>
@@ -3710,6 +3762,28 @@ emissions:</p>
 <p>Rebuild any baked pack between flips (the flag is part of the pack
 cache key), and add <code>KLIO_COMPOSE_DBG=1</code> to confirm the pass
 activated.</p>
+<h2 id="per-thread-state-and-the-owner-fast-path">Per-thread state and the owner fast path<a class="headerlink" href="#per-thread-state-and-the-owner-fast-path" title="Permanent link">&para;</a></h2>
+<p>Darwin resolves every <code>threadlocal</code> access through a <code>_tlv_get_addr</code> CALL rather
+than a register-relative load, and LLVM can only hoist that call within a
+function — so in an interpreter the cost lands on every hot helper. It measured
+25% of samples on a member-call loop, with the JIT on and off alike.</p>
+<p><code>src/runtime/tls_fast.zig</code> answers it: the thread that calls <code>claimOwner()</code> at
+process entry reads the hot per-thread structures (the fused walker's banks,
+<code>host_fields</code>' caches, the keepalive stack) from ordinary globals, and every
+other thread keeps its threadlocal. The owner never changes, so no state
+migrates between the two storages — a thread reads the same object for the
+process's life. A binary that never claims an owner (the test harnesses) behaves
+exactly as before.</p>
+<p>Two things to know before extending it:</p>
+<ul>
+<li>It is NOT a win everywhere. The evaluator's own <code>EvalTls</code> is read on the JIT's
+  per-call seam, where the compare that replaces the call costs more than the
+  call did; it is deliberately left a plain threadlocal, and the comment at its
+  declaration says so with the numbers.</li>
+<li>Grouping threadlocals into one struct does nothing on its own. The compiler
+  already reuses a repeated access within a function; the cost is one resolution
+  per hot helper CALL, so only removing the resolution helps.</li>
+</ul>
 <h2 id="measuring-peak-rss-and-the-spin-loop-trap">Measuring peak RSS (and the spin-loop trap)<a class="headerlink" href="#measuring-peak-rss-and-the-spin-loop-trap" title="Permanent link">&para;</a></h2>
 <p>Use <code>scripts/measure-rss.sh -- &lt;cmd&gt;</code>; it prints <code>PEAK_KB=&lt;n&gt; RC=&lt;rc&gt;
 WALL=&lt;s&gt;</code>. For <code>zig build itest-*</code> you usually do not need it at all — the
