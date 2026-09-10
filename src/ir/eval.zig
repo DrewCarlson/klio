@@ -6840,6 +6840,39 @@ fn LoopTramp(comptime H: type) type {
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.plainStoredScalarFieldNN(lc.allocator, receiver, name);
         }
+
+        /// What the four compile-time resolvers above actually read: the host and
+        /// the allocator, never the frame. The fused walker has no frame until it
+        /// materializes one, and it has to know whether the loop compiles BEFORE
+        /// paying for that, so it answers with this instead of a `Ctx`.
+        pub const ResolveCtx = struct {
+            host: *H,
+            allocator: Allocator,
+        };
+
+        pub fn preMember(user: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value) ?FuncId {
+            if (comptime !@hasDecl(H, "resolveMemberFuncId")) return null;
+            const rc: *ResolveCtx = @ptrCast(@alignCast(user));
+            return rc.host.resolveMemberFuncId(rc.allocator, receiver, name, args);
+        }
+
+        pub fn preVirtual(user: *anyopaque, receiver: *const Value, slot: u32) ?FuncId {
+            if (comptime !@hasDecl(H, "resolveVirtualFuncId")) return null;
+            const rc: *ResolveCtx = @ptrCast(@alignCast(user));
+            return rc.host.resolveVirtualFuncId(receiver, ir.MethodSlotId.from(slot));
+        }
+
+        pub fn preField(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
+            if (comptime !@hasDecl(H, "plainStoredFieldIndex")) return null;
+            const rc: *ResolveCtx = @ptrCast(@alignCast(user));
+            return rc.host.plainStoredFieldIndex(rc.allocator, receiver, name);
+        }
+
+        pub fn preFieldNN(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
+            if (comptime !@hasDecl(H, "plainStoredScalarFieldNN")) return null;
+            const rc: *ResolveCtx = @ptrCast(@alignCast(user));
+            return rc.host.plainStoredScalarFieldNN(rc.allocator, receiver, name);
+        }
     };
 }
 
@@ -12911,10 +12944,20 @@ fn fusedRun(
                 }
                 // Leaving the bank for a frame is one-way, so commit only to
                 // compiled code: compile FIRST and stay on the walk when the
-                // tier refuses. (Resolvers are the framed path's; without a
-                // frame there is no trampoline context to offer, so a loop that
-                // needs one to type its members simply keeps walking.)
-                if (!jit_loop.compileHotLoopFor(module, func, cur, regs, null, null, null, null, null)) {
+                // tier refuses. The compile-time resolvers need no frame, so
+                // they are offered here too: without them a loop that reads a
+                // field cannot be typed at all, and every such loop stayed on
+                // the walk.
+                var rctx: LoopTramp(H).ResolveCtx = .{ .host = host, .allocator = allocator };
+                const pre_member: ?jit_loop.MemberResolver =
+                    if (comptime @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).preMember else null;
+                const pre_virtual: ?jit_loop.VirtResolver =
+                    if (comptime @hasDecl(H, "resolveVirtualFuncId")) &LoopTramp(H).preVirtual else null;
+                const pre_field: ?jit_loop.FieldResolver =
+                    if (comptime @hasDecl(H, "plainStoredFieldIndex")) &LoopTramp(H).preField else null;
+                const pre_field_nn: ?jit_loop.FieldResolver =
+                    if (comptime @hasDecl(H, "plainStoredScalarFieldNN")) &LoopTramp(H).preFieldNN else null;
+                if (!jit_loop.compileHotLoopFor(module, func, cur, regs, pre_member, pre_virtual, pre_field, pre_field_nn, @ptrCast(&rctx))) {
                     back_edges = 0;
                     continue :walk;
                 }

@@ -43,7 +43,9 @@ const FIELD_VALUE_OFF: u32 = @offsetOf(runtime.InstanceData.Field, "value");
 /// carries automatically.
 const InstCell = runtime.ObjRef(runtime.InstanceData).Cell;
 const VALUE_SIZE: u32 = @sizeOf(Value);
-/// Slot-file capacity, matching the interpreter's per-frame `stack_slots` array.
+/// The per-activation stack slot buffer's capacity. A loop needing more still
+/// runs, on a heap buffer; only a direct call's callee window has to fit, since
+/// that window is addressed as a fixed offset inside the caller's slots.
 const MAX_SLOTS: u32 = 192;
 const CELL_DATA_OFF: u32 = @offsetOf(InstCell, "data");
 const INST_CLASS_OFF: u32 = CELL_DATA_OFF + @offsetOf(runtime.InstanceData, "class");
@@ -338,6 +340,11 @@ pub fn memberICKey(recv: *const Value, args: []const Value) u64 {
 pub const FieldBase = struct {
     recv_reg: u32,
     ptr_slot: u32,
+    /// The class the cached field indices were resolved against. Entry proves the
+    /// receiver still has it: a field index means nothing on another class, and
+    /// the register is only guaranteed not to be rewritten INSIDE the loop —
+    /// between entries it can hold anything.
+    recv_class: usize,
 };
 
 pub const CompiledLoop = struct {
@@ -897,26 +904,17 @@ fn argTagSourceReg(insts: []const Inst, call_idx: usize, reg: u32) u32 {
     return r;
 }
 
+/// The register an instruction defines, for every instruction that defines one.
+/// Read structurally, not from a hand-kept list: callers use this to prove a
+/// register is NOT written in a loop, so an instruction missing from the list
+/// reports invariance that is not there. Anything carrying a `dst` is covered.
 fn instAnyDst(inst: *const Inst) ?Reg {
     return switch (inst.*) {
-        .Const => |x| x.dst,
-        .Move => |x| x.dst,
-        .BinOp => |x| x.dst,
-        .Not => |x| x.dst,
-        .UnOp => |x| x.dst,
-        .LoadParam => |x| x.dst,
-        .LoadCapture => |x| x.dst,
-        .LoadGlobal => |x| x.dst,
-        .GetField => |x| x.dst,
-        .Index => |x| x.dst,
-        .CallMember => |x| x.dst,
-        .Call => |x| x.dst,
-        .CallValue => |x| x.dst,
-        .CellGet => |x| x.dst,
-        .MakeCell => |x| x.dst,
-        .NewInstance => |x| x.dst,
-        .NewList => |x| x.dst,
-        else => null,
+        inline else => |x| blk: {
+            const T = @TypeOf(x);
+            if (@typeInfo(T) != .@"struct" or !@hasField(T, "dst")) break :blk null;
+            break :blk x.dst;
+        },
     };
 }
 
@@ -4337,13 +4335,11 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
             } else if (is_field) {
                 const fld = trampolinableFieldOf(module, inst).?;
                 if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len or regs[fld.recv.int()] != .Instance) return null;
-                // A loop-invariant receiver is covered by the entry class guard; a
-                // boxed receiver that varies (a chain intermediate) re-checks its
-                // class on every read.
-                // A receiver typed `.object` is a boxed register that may be
-                // reassigned in the loop (a chain cursor); re-check its class on
-                // every read. A loop-invariant receiver is covered by the entry guard.
-                const recv_varies = typeAt(types, fld.recv) == .object;
+                // A receiver the loop REASSIGNS (a chain cursor) re-checks its
+                // class on every read and reads through the callback. One the
+                // loop only reads is covered by the entry class guard, so its
+                // field buffer is cached at entry and read directly.
+                const recv_varies = regWrittenInBody(func, body, fld.recv);
                 const rrt = member_ret[fld.dst.int()];
                 if (rrt == .unknown or fld.dst.int() >= n_regs or types[fld.dst.int()] != rrt) return null;
                 call_sites.append(a, .{
@@ -4370,7 +4366,7 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
                 if (fs.value.int() >= n_regs or !(isScalarRt(typeAt(types, fs.value)) or typeAt(types, fs.value) == .object or typeAt(types, fs.value) == .null_)) return null;
                 if (field_resolver == null) return null;
                 const idx = field_resolver.?(resolver_user.?, &regs[fs.recv.int()], fs.name) orelse return null;
-                const recv_varies = typeAt(types, fs.recv) == .object;
+                const recv_varies = regWrittenInBody(func, body, fs.recv);
                 call_sites.append(a, .{
                     .dst_reg = 0,
                     .src_reg = fs.value.int(),
@@ -4507,7 +4503,7 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
         if (!site.is_member) continue;
         site.field_site_base = @intCast(call_sites.items.len);
         var nf: u32 = 0;
-        const recv_varies = typeAt(types, Reg.from(site.recv_reg)) == .object;
+        const recv_varies = regWrittenInBody(func, body, Reg.from(site.recv_reg));
         const recv_class = instanceClassIdentity(regs[site.recv_reg]);
         for (site.callee.blocks[0].insts) |*ci| {
             if (trampolinableFieldOf(module, ci)) |fld| {
@@ -4597,14 +4593,17 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
         }
         if (!found) {
             ptr_slot = nullable_end + @as(u32, @intCast(field_bases.items.len));
-            field_bases.append(a, .{ .recv_reg = site.recv_reg, .ptr_slot = ptr_slot }) catch return null;
+            field_bases.append(a, .{
+                .recv_reg = site.recv_reg,
+                .ptr_slot = ptr_slot,
+                .recv_class = instanceClassIdentity(regs[site.recv_reg]),
+            }) catch return null;
         }
         site.native = true;
         site.fbase_slot = ptr_slot;
         site.tag = tag;
     }
     var n_slots: u32 = nullable_end + @as(u32, @intCast(field_bases.items.len));
-    if (n_slots > MAX_SLOTS) return null;
     if (debugEnabled() and field_bases.items.len != 0) std.debug.print("[jit]   native field access on {d} receiver(s) in {s}\n", .{ field_bases.items.len, func.name });
 
     // Point every guarded arm at the trampoline site its final miss falls to.
@@ -4670,7 +4669,11 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
         }
         if (!have_base) {
             base_slot = n_slots;
-            field_bases.append(a, .{ .recv_reg = pre.recv_reg, .ptr_slot = base_slot }) catch return null;
+            field_bases.append(a, .{
+                .recv_reg = pre.recv_reg,
+                .ptr_slot = base_slot,
+                .recv_class = instanceClassIdentity(regs[pre.recv_reg]),
+            }) catch return null;
             n_slots += 1;
         }
         direct_sites.append(a, .{
@@ -4727,7 +4730,11 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
             }
             if (!have_base) {
                 base_slot = n_slots;
-                field_bases.append(a, .{ .recv_reg = site.recv_reg, .ptr_slot = base_slot }) catch return null;
+                field_bases.append(a, .{
+                    .recv_reg = site.recv_reg,
+                    .ptr_slot = base_slot,
+                    .recv_class = instanceClassIdentity(regs[site.recv_reg]),
+                }) catch return null;
                 n_slots += 1;
             }
             direct_sites.append(a, .{
@@ -4991,6 +4998,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
         if (self.regs_ptr_slot != 0) slots[self.regs_ptr_slot] = @bitCast(@intFromPtr(regs.ptr));
         for (self.field_bases) |fb| {
             if (fb.recv_reg >= regs.len or regs[fb.recv_reg] != .Instance) return .bail;
+            if (instanceClassIdentity(regs[fb.recv_reg]) != fb.recv_class) return .bail;
             const g = regs[fb.recv_reg].Instance.borrow();
             slots[fb.ptr_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
             g.deinit();
