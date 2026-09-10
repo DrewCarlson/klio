@@ -59,6 +59,15 @@ pub const Emitter = switch (builtin.cpu.arch) {
 extern "c" fn pthread_jit_write_protect_np(enabled: c_int) void;
 extern "c" fn sys_icache_invalidate(start: *anyopaque, len: usize) void;
 
+/// Whether this target can map executable pages at all. The emitters compile
+/// everywhere, but only these platforms have the mapping calls: Windows has no
+/// `std.posix.mmap` and its POSIX flag types are `void`, so the mapping paths
+/// below must not even be ANALYZED there. Every branch that reaches one is
+/// therefore a `comptime` if/else — an early `return` does not stop the
+/// statements after it from being analyzed.
+pub const pages_supported = (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64) and
+    builtin.os.tag != .windows;
+
 /// A finalized block of executable machine code. Holds its own W^X page(s);
 /// `deinit` unmaps them. `call` reinterprets the entry as a function pointer.
 pub const ExecBuf = struct {
@@ -66,7 +75,9 @@ pub const ExecBuf = struct {
     len: usize,
 
     pub fn deinit(self: *ExecBuf) void {
-        std.posix.munmap(self.mem);
+        if (comptime pages_supported) {
+            std.posix.munmap(self.mem);
+        }
         self.* = undefined;
     }
 
@@ -82,10 +93,13 @@ pub const ExecBuf = struct {
 /// (W^X: written while writable, then sealed before execution — never
 /// simultaneously writable and executable).
 pub fn finalize(code: []const u8) JitError!ExecBuf {
-    const arch = builtin.cpu.arch;
-    if (comptime arch != .x86_64 and arch != .aarch64) return JitError.Unsupported;
-    if (comptime builtin.os.tag.isDarwin()) return finalizeDarwin(code);
-    return finalizePosix(code);
+    if (comptime !pages_supported) {
+        return JitError.Unsupported;
+    } else if (comptime builtin.os.tag.isDarwin()) {
+        return finalizeDarwin(code);
+    } else {
+        return finalizePosix(code);
+    }
 }
 
 /// Linux/Android: allocate writable, copy, seal as read+execute, then sync the
