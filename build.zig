@@ -1017,6 +1017,13 @@ const ItestShards = struct {
             }
         }.lt);
 
+        // Every suite in a bin also costs a whole-program COMPILE of its test
+        // binary (~1 minute on the CI runner, since each links the entire
+        // interpreter), and `weight` measures only the run. Without this term
+        // the packer treats one 25-minute suite and eleven one-minute ones as
+        // interchangeable: measured, the eleven-suite bins ran 28-31m against
+        // 26m for the single heavy one they were supposedly heavier than.
+        const compile_weight: u64 = 6;
         const bin_totals = b.allocator.alloc(u64, n) catch @panic("oom");
         @memset(bin_totals, 0);
         var selected = std.StringHashMap(void).init(b.allocator);
@@ -1025,7 +1032,7 @@ const ItestShards = struct {
             for (bin_totals, 0..) |w, i| {
                 if (w < bin_totals[lightest]) lightest = i;
             }
-            bin_totals[lightest] += s.weight;
+            bin_totals[lightest] += @as(u64, s.weight) + compile_weight;
             if (lightest == k) selected.put(s.name, {}) catch @panic("oom");
         }
         return .{ .selected = selected };

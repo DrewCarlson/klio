@@ -13,34 +13,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The harness universe every shard needs: the ReleaseSafe and ReleaseFast
-  # `klio` binaries the child-spawning suites run, and the parity base images
-  # the in-process ones load. Eight per-shard cache lineages meant eight
-  # separate lotteries over whether the current harness was already banked —
-  # one green run had shard 0 hit it (59ms) while shard 2 rebuilt for 19
-  # minutes, which was the whole difference between a 29m and a 38m shard.
-  # Building it once into ONE lineage every shard restores makes that cost
-  # deterministic instead of luck, and pays it a single time.
-  artifacts:
-    name: shared artifacts
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: ./.github/actions/klio-env
-        with:
-          cache-key: shared
-      - name: zig build klio-harness klio-harness-fast parity-base
-        run: zig build klio-harness klio-harness-fast parity-base -Dharness-optimize=ReleaseSafe --summary all
-      - name: save zig build + test state
-        if: always()
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
-        with:
-          path: |
-            ~/.cache/zig
-            .zig-cache
-          key: zig-0.16.0-safe-${{ hashFiles('build.zig.zon') }}-shared-${{ github.sha }}
-
   # Fast signal (~2 minutes), and the gate for everything below it: a broken
   # build used to burn eight 30-minute shards before anyone saw the two-minute
   # failure that explained them.
@@ -65,13 +37,11 @@ jobs:
           key: zig-0.16.0-safe-${{ hashFiles('build.zig.zon') }}-unit-${{ github.sha }}
 
   # The integration suite fans across weight-balanced shards (see -Ditest-shard
-  # in build.zig; weights are CI-runner-scaled). Shards restore the lineage the
-  # producer banked and do not save: one writer keeps concurrent saves off a
-  # single key, and a shard's own test binaries are ~27s each — cheaper to
-  # rebuild than to store and ship eight times over.
+  # in build.zig; weights are CI-runner-scaled). Each shard restores and banks
+  # its own cache lineage — the shard suffix keeps concurrent saves off one key.
   itest:
     name: ${{ matrix.name }}
-    needs: [unit, artifacts]
+    needs: unit
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
@@ -80,24 +50,40 @@ jobs:
         include:
           - name: itest shard 0
             step: itest -Ditest-shard=0/8
+            shard: itest0
           - name: itest shard 1
             step: itest -Ditest-shard=1/8
+            shard: itest1
           - name: itest shard 2
             step: itest -Ditest-shard=2/8
+            shard: itest2
           - name: itest shard 3
             step: itest -Ditest-shard=3/8
+            shard: itest3
           - name: itest shard 4
             step: itest -Ditest-shard=4/8
+            shard: itest4
           - name: itest shard 5
             step: itest -Ditest-shard=5/8
+            shard: itest5
           - name: itest shard 6
             step: itest -Ditest-shard=6/8
+            shard: itest6
           - name: itest shard 7
             step: itest -Ditest-shard=7/8
+            shard: itest7
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: ./.github/actions/klio-env
         with:
-          cache-key: shared
+          cache-key: ${{ matrix.shard }}
       - name: zig build ${{ matrix.step }}
         run: zig build ${{ matrix.step }} -Dharness-optimize=ReleaseSafe --summary all
+      - name: save zig build + test state
+        if: always()
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: zig-0.16.0-safe-${{ hashFiles('build.zig.zon') }}-${{ matrix.shard }}-${{ github.sha }}
