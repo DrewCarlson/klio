@@ -962,6 +962,11 @@ pub fn build(b: *std.Build) void {
                     b.fmt("{s}#{d}", .{ spec.name, slice_i })
                 else
                     spec.name;
+                // Name the run step after its suite. `--summary all` otherwise
+                // prints every one as a bare `run test`, so a CI log shows which
+                // suites a shard ran and how long each took, but not which time
+                // belongs to which suite — and `weight` is meant to BE that time.
+                run_t.step.name = b.fmt("run itest {s}", .{slice_name});
                 if (!foldedIntoGroup(spec.name) and shards.includes(slice_name)) {
                     // Serialize only under an explicit shard (CI): chaining the
                     // run steps otherwise leaks into the targeted `itest-<name>`
