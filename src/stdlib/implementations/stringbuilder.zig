@@ -446,7 +446,7 @@ pub fn string_ctor(ctx: *CallCtx) Allocator.Error!EvalResult {
         // yield a Value.List of chars — accept either.
         .Array, .List => {
             const prim_is_byte: bool = switch (ctx.args[0]) {
-                .Array => |arr| if (arr.prim) |p| (p == .Byte or p == .UByte) else false,
+                .Array => |arr| if (arr.primKind()) |p| (p == .Byte or p == .UByte) else false,
                 else => false,
             };
             const elems: []Value = switch (ctx.args[0]) {

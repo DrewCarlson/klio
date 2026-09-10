@@ -3349,7 +3349,7 @@ fn argsRelaxedAdjudicable(args: []const Value) bool {
         switch (a.*) {
             .Int, .Long, .Double, .Float, .Short, .Byte, .Char, .Bool, .UInt, .ULong, .UShort, .UByte, .Instance, .String, .Unit, .IrClosure, .Null, .Result, .List, .Set, .Map => {},
             .Array => |arr| {
-                if (arr.prim == null) return false;
+                if (arr.primKind() == null) return false;
             },
             else => return false,
         }
@@ -10661,7 +10661,7 @@ fn methodArgSigRelaxed(self: *VmHost, args: []const Value) u64 {
                 }
             },
             .Array => |arr| {
-                const pk: u8 = if (arr.prim) |p| @as(u8, @intFromEnum(p)) + 1 else 0;
+                const pk: u8 = if (arr.primKind()) |p| @as(u8, @intFromEnum(p)) + 1 else 0;
                 h.update((&pk)[0..1]);
             },
             else => {},
@@ -10754,7 +10754,7 @@ fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
                 h.update(std.mem.asBytes(&id));
             },
             .Array => |arr| {
-                const pk: u8 = if (arr.prim) |p| @as(u8, @intFromEnum(p)) + 1 else return null;
+                const pk: u8 = if (arr.primKind()) |p| @as(u8, @intFromEnum(p)) + 1 else return null;
                 h.update((&pk)[0..1]);
             },
             .IrClosure => |c| {
@@ -10814,7 +10814,7 @@ fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const 
         // arrays, kind + step-refinement for ranges). Identities are forced
         // ODD so they never collide with an aligned class-cell pointer.
         .Array => |arr| blk: {
-            const k: usize = if (arr.prim) |pk| @as(usize, @intFromEnum(pk)) + 1 else 0;
+            const k: usize = if (arr.primKind()) |pk| @as(usize, @intFromEnum(pk)) + 1 else 0;
             break :blk (0xA100 + (k << 8)) | 1;
         },
         .Int => 0xA401 | 1,
@@ -13148,7 +13148,7 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
         .Array => |arr| {
             for (unsigned_arrays) |ua| {
                 if (std.mem.eql(u8, declared, ua)) {
-                    const view = arr.prim orelse return true;
+                    const view = arr.primKind() orelse return true;
                     // Compare against the ARRAY type name: the kind's
                     // simpleName is the element ("UByte"), never the
                     // declared receiver ("UByteArray").

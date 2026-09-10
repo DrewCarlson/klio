@@ -217,7 +217,7 @@ fn readStack(recv: *const Value) ?Stack {
     const inst = g.get();
     const slots_v = inst.getCached(&fn_slots, "slots") orelse return null;
     if (slots_v != .Array) return null;
-    if (slots_v.Array.prim != .Int) return null;
+    if (slots_v.Array.primKind() != .Int) return null;
     const tos_v = inst.getCached(&fn_tos, "tos") orelse return null;
     const tos = asI32(&tos_v) orelse return null;
     return .{ .slots = slots_v.Array, .tos = tos, .len = slots_v.Array.len() };
@@ -349,17 +349,17 @@ pub fn servePushOp(allocator: std.mem.Allocator, args: []const Value) ?Value {
             if (tr) std.debug.print("[cf] pushOp DECLINE opCodes-missing\n", .{});
             return null;
         };
-        if (codes_v != .Array or codes_v.Array.prim != null) {
+        if (codes_v != .Array or codes_v.Array.primKind() != null) {
             if (tr) std.debug.print("[cf] pushOp DECLINE opCodes-shape {s}\n", .{@tagName(std.meta.activeTag(codes_v))});
             return null;
         }
         const int_args_v = inst.getCached(&fn_int_args, "intArgs") orelse return null;
-        if (int_args_v != .Array or int_args_v.Array.prim != .Int) {
+        if (int_args_v != .Array or int_args_v.Array.primKind() != .Int) {
             if (tr) std.debug.print("[cf] pushOp DECLINE intArgs-shape\n", .{});
             return null;
         }
         const obj_args_v = inst.getCached(&fn_obj_args, "objectArgs") orelse return null;
-        if (obj_args_v != .Array or obj_args_v.Array.prim != null) {
+        if (obj_args_v != .Array or obj_args_v.Array.primKind() != null) {
             if (tr) std.debug.print("[cf] pushOp DECLINE objArgs-shape\n", .{});
             return null;
         }
@@ -433,7 +433,7 @@ fn topSlot(stack: *const Value, parameter: i32, comptime objects: bool) ?TopArgs
     defer g.deinit();
     const inst = g.get();
     const codes_v = inst.getCached(&fn_opcodes, "opCodes") orelse return null;
-    if (codes_v != .Array or codes_v.Array.prim != null) return null;
+    if (codes_v != .Array or codes_v.Array.primKind() != null) return null;
     const os = inst.getCached(&fn_opcodes_size, "opCodesSize") orelse return null;
     const op_size = asI32(&os) orelse return null;
     if (op_size <= 0 or @as(usize, @intCast(op_size)) > codes_v.Array.len()) return null;
@@ -446,9 +446,9 @@ fn topSlot(stack: *const Value, parameter: i32, comptime objects: bool) ?TopArgs
     ) orelse return null;
     if (arr_v != .Array) return null;
     if (objects) {
-        if (arr_v.Array.prim != null) return null;
+        if (arr_v.Array.primKind() != null) return null;
     } else {
-        if (arr_v.Array.prim != .Int) return null;
+        if (arr_v.Array.primKind() != .Int) return null;
     }
     const sv = inst.getCached(
         if (objects) &fn_obj_args_size else &fn_int_args_size,
@@ -509,7 +509,7 @@ pub fn servePushOpLink(allocator: std.mem.Allocator, args: []const Value) ?Value
 pub fn serveSlotAnchor(args: []const Value) ?Value {
     if (args[0] != .Array) return null;
     const arr = args[0].Array;
-    if (arr.prim != .Int) return null;
+    if (arr.primKind() != .Int) return null;
     const address = asI32(&args[1]) orelse return null;
     if (address < 0) return null;
     const slot = @as(i64, address) * 5;
@@ -718,13 +718,13 @@ fn intField(inst: anytype, slot: *std.atomic.Value(?[*]const u8), name: []const 
 
 fn intArrayField(inst: anytype, slot: *std.atomic.Value(?[*]const u8), name: []const u8) ?runtime.ArrayData {
     const v = inst.getCached(slot, name) orelse return null;
-    if (v != .Array or v.Array.prim != .Int) return null;
+    if (v != .Array or v.Array.primKind() != .Int) return null;
     return v.Array;
 }
 
 fn objArrayField(inst: anytype, slot: *std.atomic.Value(?[*]const u8), name: []const u8) ?runtime.ArrayData {
     const v = inst.getCached(slot, name) orelse return null;
-    if (v != .Array or v.Array.prim != null) return null;
+    if (v != .Array or v.Array.primKind() != null) return null;
     return v.Array;
 }
 
@@ -815,7 +815,7 @@ pub fn serveSlotReaderNodeCountAt(args: []const Value) ?Value {
 
 pub fn serveGapParentAnchor(args: []const Value) ?Value {
     if (args[0] != .Array) return null;
-    if (args[0].Array.prim != .Int) return null;
+    if (args[0].Array.primKind() != .Int) return null;
     const address = asI32(&args[1]) orelse return null;
     const v = groupField(args[0].Array, address, PARENT_ANCHOR_OFF) orelse return null;
     return .{ .Int = v };
@@ -860,7 +860,7 @@ fn extOwner() ?Value {
 }
 
 fn serveSlotWriterDataIndexExt(args: []const Value) ?Value {
-    if (args[0].Array.prim != .Int) return null;
+    if (args[0].Array.primKind() != .Int) return null;
     const address = asI32(&args[1]) orelse return null;
     const owner = extOwner() orelse return null;
     const g = owner.Instance.borrow();
@@ -882,7 +882,7 @@ fn serveSlotWriterDataIndexExt(args: []const Value) ?Value {
 /// `slotIndex(address)`: `dataAnchorToDataIndex(slotAnchor(address), ...)`
 /// against the owner's gaps; past-capacity addresses answer the slot end.
 pub fn serveSlotWriterSlotIndex(args: []const Value) ?Value {
-    if (args[0] != .Array or args[0].Array.prim != .Int) return null;
+    if (args[0] != .Array or args[0].Array.primKind() != .Int) return null;
     const address = asI32(&args[1]) orelse return null;
     const owner = extOwner() orelse return null;
     const g = owner.Instance.borrow();
@@ -917,7 +917,7 @@ fn objectKeyFrom(groups: runtime.ArrayData, slots: runtime.ArrayData, index: i32
 /// The IntArray member-extension form: the receiver IS the reader's group
 /// table, `slots` comes from the owner on the chain.
 pub fn serveSlotReaderObjectKey(args: []const Value) ?Value {
-    if (args[0] != .Array or args[0].Array.prim != .Int) return null;
+    if (args[0] != .Array or args[0].Array.primKind() != .Int) return null;
     const index = asI32(&args[1]) orelse return null;
     const owner = extOwner() orelse return null;
     const g = owner.Instance.borrow();

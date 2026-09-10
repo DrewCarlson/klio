@@ -3875,7 +3875,7 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
                 // View-aware: an unsigned array over signed backing
                 // (`UIntArray(intArray)`) tags elements by `arr.prim`,
                 // not the buffer's storage kind.
-                return g.get().getAs(ui, arr.prim orelse g.get().kind); // fresh scalar
+                return g.get().getAs(ui, arr.primKind() orelse g.get().kind); // fresh scalar
             },
             .boxed => |vl| {
                 const g = vl.borrow();
@@ -3938,7 +3938,7 @@ pub inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *con
                 const g = pb.borrowMut();
                 defer g.deinit();
                 if (ui >= g.get().len()) return null;
-                g.get().setAs(ui, new_val, arr.prim orelse g.get().kind);
+                g.get().setAs(ui, new_val, arr.primKind() orelse g.get().kind);
                 return Value.Unit;
             },
             .boxed => |vl| {

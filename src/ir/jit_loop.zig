@@ -36,6 +36,24 @@ const E = jit.Reg;
 const FIELD_STRIDE: u32 = @sizeOf(runtime.InstanceData.Field);
 const FIELD_VALUE_OFF: u32 = @offsetOf(runtime.InstanceData.Field, "value");
 
+/// Offsets a native receiver guard walks: from a frame `Value` to the instance
+/// cell, and from there to the class cell. `ObjRef.identity` is the address of
+/// a cell's `data`, so comparing classes is comparing pointers — no borrow.
+/// Derived from the live types, like `valuePayloadOffset`, so a layout change
+/// carries automatically.
+const InstCell = runtime.ObjRef(runtime.InstanceData).Cell;
+const VALUE_SIZE: u32 = @sizeOf(Value);
+/// The per-activation stack slot buffer's capacity. A loop needing more still
+/// runs, on a heap buffer; only a direct call's callee window has to fit, since
+/// that window is addressed as a fixed offset inside the caller's slots.
+const MAX_SLOTS: u32 = 192;
+const CELL_DATA_OFF: u32 = @offsetOf(InstCell, "data");
+const INST_CLASS_OFF: u32 = CELL_DATA_OFF + @offsetOf(runtime.InstanceData, "class");
+
+fn instanceTagValue() u8 {
+    return @intFromEnum(@as(std.meta.Tag(Value), .Instance));
+}
+
 fn valuePayloadOffset() u32 {
     var v: Value = .{ .Long = 0 };
     return @intCast(@intFromPtr(&v.Long) - @intFromPtr(&v));
@@ -251,6 +269,8 @@ pub const ArrayUnbox = struct {
     kind: runtime.PrimitiveArrayKind,
     ptr_slot: u32,
     len_slot: u32,
+    /// Seed from a `List`'s element buffer instead of a packed array's bytes.
+    boxed: bool = false,
 };
 
 /// One capture cell a compiled loop reads/writes: the register holding the
@@ -320,6 +340,11 @@ pub fn memberICKey(recv: *const Value, args: []const Value) u64 {
 pub const FieldBase = struct {
     recv_reg: u32,
     ptr_slot: u32,
+    /// The class the cached field indices were resolved against. Entry proves the
+    /// receiver still has it: a field index means nothing on another class, and
+    /// the register is only guaranteed not to be rewritten INSIDE the loop —
+    /// between entries it can hold anything.
+    recv_class: usize,
 };
 
 pub const CompiledLoop = struct {
@@ -411,6 +436,9 @@ pub const CompiledLoop = struct {
     /// `Return` emit; `maxInt(u32)` there means the scalar `result_slot`
     /// (or Unit) carries the value instead.
     result_reg_slot: u32 = 0,
+    /// Slot holding the FRAME register base. A guarded arm reads its receiver's
+    /// `Value` from there, because object registers are not slot-backed.
+    regs_ptr_slot: u32 = 0,
     /// Calls that go STRAIGHT into another compiled unit's native code. The
     /// callee is a deopt-free method body over the same receiver, so it needs
     /// no frame, no trampoline and no resume machinery: this unit seeds the
@@ -465,6 +493,15 @@ pub const DirectSite = struct {
     may_deopt: bool = false,
     /// Where that re-run resumes: the receiver `Move` this call removed.
     resume_at: BodyInstPos,
+    /// The receiver register, so loop entry can prove the callee's field layout
+    /// against the instance it will read. Unused by the function tier, whose
+    /// receiver is the caller's own `this`.
+    recv_reg: u32 = 0,
+    /// The slot holding the RECEIVER's field-buffer pointer, which the callee
+    /// reads as its own `this`. In the function tier that is the caller's entry
+    /// base (a self call shares the receiver); in the loop tier it is the base
+    /// cached at loop entry for a loop-invariant receiver.
+    fbase_slot: u32 = 0,
 };
 
 // --- supported-shape predicates ---------------------------------------------
@@ -524,6 +561,36 @@ fn cellScalarType(v: Value) ?RegType {
     };
 }
 
+/// The element buffer behind a `List` or a reference `Array<T>`, or null when the
+/// value is neither. A live view (`subList`, a map `values` view, `asList`) is
+/// excluded: its `items` is a window cache refreshed from the source on access,
+/// not the storage the source writes through.
+fn boxedElemsOf(v: Value) ?runtime.ValueList {
+    return switch (v) {
+        .List => |l| if (l.backing != null) null else l.items,
+        .Array => |ad| if (ad.primKind() != null) null else ad.storage().boxed,
+        else => null,
+    };
+}
+
+/// How many elements of a boxed buffer are sampled to pick its scalar kind. The
+/// per-read tag guard is what makes the compiled code correct, so the sample only
+/// has to name the kind the loop will actually see; a wrong guess deopts.
+const BOXED_ELEM_SAMPLE: usize = 32;
+
+fn boxedElemShape(vl: runtime.ValueList) ?struct { rt: RegType, tag: u8 } {
+    const g = vl.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    if (items.len == 0) return null;
+    const rt = cellScalarType(items[0]) orelse return null;
+    const tag = tagForRt(rt) orelse return null;
+    for (items[0..@min(items.len, BOXED_ELEM_SAMPLE)]) |e| {
+        if (@intFromEnum(std.meta.activeTag(e)) != tag) return null;
+    }
+    return .{ .rt = rt, .tag = tag };
+}
+
 fn isArithBinOp(op: ir.BinOp) bool {
     return switch (op) {
         .Add, .Sub, .Mul => true,
@@ -573,6 +640,19 @@ fn arrayOpOf(module: *const Module, inst: *const Inst) ?ArrayOp {
         },
         else => return null,
     }
+}
+
+/// Whether any subscript in the body STORES through `recv`. A boxed element store
+/// would have to release the element it overwrites and retag the slot, so those
+/// receivers keep the interpreted subscript.
+fn bodyStoresInto(module: *const Module, func: *const Func, body: []const BlockId, recv: Reg) bool {
+    for (body) |bid| {
+        for (func.blocks[bid.int()].insts) |*inst| {
+            const op = arrayOpOf(module, inst) orelse continue;
+            if (op.is_set and op.recv.int() == recv.int()) return true;
+        }
+    }
+    return false;
 }
 
 /// A zero-arg numeric conversion (`x.toDouble()`/`toLong()`/`toInt()`), which
@@ -786,6 +866,14 @@ const InlineSite = struct {
     /// splice removed. Null for a top-level inline, which removes nothing, so
     /// the call's own position is right.
     resume_at: ?BodyInstPos = null,
+    /// One arm of a per-iteration receiver guard: run this body only when the
+    /// receiver's class matches `guard_class`. Arms at the same position are
+    /// emitted as a chain, and the last miss falls through to `fallback_site`,
+    /// the trampoline the call registered. The guard is what makes the arm
+    /// SOUND — the class set that chose the arms is only a heuristic.
+    guarded: bool = false,
+    guard_class: usize = 0,
+    fallback_site: u32 = 0,
 };
 
 /// The destination register an instruction writes, if any (covering every shape
@@ -816,26 +904,17 @@ fn argTagSourceReg(insts: []const Inst, call_idx: usize, reg: u32) u32 {
     return r;
 }
 
+/// The register an instruction defines, for every instruction that defines one.
+/// Read structurally, not from a hand-kept list: callers use this to prove a
+/// register is NOT written in a loop, so an instruction missing from the list
+/// reports invariance that is not there. Anything carrying a `dst` is covered.
 fn instAnyDst(inst: *const Inst) ?Reg {
     return switch (inst.*) {
-        .Const => |x| x.dst,
-        .Move => |x| x.dst,
-        .BinOp => |x| x.dst,
-        .Not => |x| x.dst,
-        .UnOp => |x| x.dst,
-        .LoadParam => |x| x.dst,
-        .LoadCapture => |x| x.dst,
-        .LoadGlobal => |x| x.dst,
-        .GetField => |x| x.dst,
-        .Index => |x| x.dst,
-        .CallMember => |x| x.dst,
-        .Call => |x| x.dst,
-        .CallValue => |x| x.dst,
-        .CellGet => |x| x.dst,
-        .MakeCell => |x| x.dst,
-        .NewInstance => |x| x.dst,
-        .NewList => |x| x.dst,
-        else => null,
+        inline else => |x| blk: {
+            const T = @TypeOf(x);
+            if (@typeInfo(T) != .@"struct" or !@hasField(T, "dst")) break :blk null;
+            break :blk x.dst;
+        },
     };
 }
 
@@ -1059,7 +1138,10 @@ fn directCallTarget(
     // wants more than its receiver boxed is out of scope.
     if (cl.capture_loads.len != 0 or cl.obj_param_loads.len > 1) return null;
     if (cl.guard_class != instanceClassIdentity(recv.*)) return null;
-    if (!isScalarRt(cl.result_rt) and cl.result_rt != .unit) return null;
+    // The result KIND is the caller's concern: each tier compares `result_rt`
+    // against its destination register, and only when it wants the value. A
+    // `Unit` method whose return type was never recorded reads as `.unknown`,
+    // and demanding scalar-or-unit here refused every one of them.
     return cl;
 }
 
@@ -1081,6 +1163,122 @@ fn nativeScalarCallShape(module: *const Module, inst: *const Inst, types: []cons
             isScalarRt(typeAt(types, bo.lhs)) and isScalarRt(typeAt(types, bo.rhs));
     }
     return false;
+}
+
+/// The object register a receiver argument is Moved from, with the position of
+/// that Move.
+const LoopRecvSource = struct { src: u32, mv: BodyInstPos };
+
+/// The object register a call's receiver argument is Moved from, when that Move
+/// is the ONLY thing writing the argument register and nothing else reads it.
+/// This is the loop-tier analogue of `soleReceiverMove`: the receiver is a local
+/// (`val c = Counter()` above the loop) or a cursor the loop rebinds, not the
+/// caller's `this`, so it is identified by the Move that feeds arg 0.
+///
+/// Whether the source must be loop-INVARIANT is the caller's call: a direct call
+/// caches a field base at entry and needs invariance, a spliced member body reads
+/// the receiver afresh each iteration and does not. `types` is optional because
+/// the splice is chosen before whole-function inference runs.
+fn loopReceiverSource(
+    func: *const Func,
+    body: []const BlockId,
+    arg0: u32,
+    call_b: u32,
+    call_i: u32,
+    types: ?[]const RegType,
+    n_regs: u32,
+) ?LoopRecvSource {
+    var found: ?LoopRecvSource = null;
+    var other_refs: usize = 0;
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        for (blk.insts, 0..) |*inst, ii| {
+            if (bid.int() == call_b and ii == call_i) continue; // the call itself
+            if (inst.* == .Move and inst.Move.dst.int() == arg0) {
+                if (found != null) return null; // more than one writer
+                const src = inst.Move.src.int();
+                if (src >= n_regs) return null;
+                if (types) |ts| if (typeAt(ts, Reg.from(src)) != .object) return null;
+                found = .{ .src = src, .mv = .{ .b = bid.int(), .i = @intCast(ii) } };
+                continue;
+            }
+            const Ctx = struct { r: u32, n: *usize };
+            var cx = Ctx{ .r = arg0, .n = &other_refs };
+            ir.visitInstRegs(inst, &cx, struct {
+                fn f(c: *Ctx, rr: Reg, _: bool) void {
+                    if (rr.int() == c.r) c.n.* += 1;
+                }
+            }.f);
+        }
+        const Ctx2 = struct { r: u32, n: *usize };
+        var cx2 = Ctx2{ .r = arg0, .n = &other_refs };
+        ir.visitTerminatorRegs(&blk.terminator, &cx2, struct {
+            fn f(c: *Ctx2, rr: Reg, _: bool) void {
+                if (rr.int() == c.r) c.n.* += 1;
+            }
+        }.f);
+    }
+    if (other_refs != 0) return null;
+    const got = found orelse return null;
+    if (got.mv.b != call_b or got.mv.i >= call_i) return null;
+    return got;
+}
+
+const MAX_RECV_CLASSES: usize = 4;
+
+/// The distinct classes a per-iteration receiver can hold, when it is produced
+/// inside the loop by a read from a LOOP-INVARIANT collection. Enumerating the
+/// container is what lets a polymorphic site be specialized without guessing a
+/// class: the guard chain covers exactly what is there.
+///
+/// This is a performance heuristic, never a correctness one — each emitted arm
+/// re-checks the receiver's class at run time and a miss falls through to the
+/// trampoline, so a stale or partial enumeration costs speed and nothing else.
+fn receiverClassSet(
+    func: *const Func,
+    body: []const BlockId,
+    recv_reg: u32,
+    regs: []const Value,
+    out: *[MAX_RECV_CLASSES]Value,
+) ?[]const Value {
+    // The receiver must have exactly one producer in the loop, and that
+    // producer must read from a container the loop never rewrites.
+    var producer: ?*const Inst = null;
+    for (body) |bid| {
+        for (func.blocks[bid.int()].insts) |*inst| {
+            const d = instAnyDst(inst) orelse continue;
+            if (d.int() != recv_reg) continue;
+            if (producer != null) return null;
+            producer = inst;
+        }
+    }
+    const p = producer orelse return null;
+    const container: Reg = switch (p.*) {
+        .CallMember => |cm| cm.receiver,
+        .Index => |ix| ix.receiver,
+        else => return null,
+    };
+    if (container.int() >= regs.len) return null;
+    if (regWrittenInBody(func, body, container)) return null;
+    const cv = regs[container.int()];
+    if (cv != .List and cv != .Array) return null;
+    var n: usize = 0;
+    var i: i64 = 0;
+    while (i < 1024) : (i += 1) {
+        const elem = liveElementAt(cv, i) orelse break;
+        if (elem != .Instance) return null;
+        const id = instanceClassIdentity(elem);
+        var seen = false;
+        for (out[0..n]) |x| {
+            if (instanceClassIdentity(x) == id) seen = true;
+        }
+        if (seen) continue;
+        if (n == MAX_RECV_CLASSES) return null; // too many shapes to be worth arms
+        out[n] = elem;
+        n += 1;
+    }
+    if (n == 0) return null;
+    return out[0..n];
 }
 
 /// A (block, instruction) position inside a compiled body.
@@ -1653,7 +1851,7 @@ pub fn liveElementAt(recv: Value, idx: i64) ?Value {
             const items = g.get().items;
             return if (u < items.len) items[u] else null;
         },
-        .Array => |arr| return if (arr.prim == null and u < arr.len()) arr.get(u) else null,
+        .Array => |arr| return if (arr.primKind() == null and u < arr.len()) arr.get(u) else null,
         else => return null,
     }
 }
@@ -1695,6 +1893,13 @@ const ArrayInfo = struct {
     esize: u8,
     ptr_slot: u32,
     len_slot: u32,
+    /// A `List`/reference `Array` whose elements are boxed `Value`s rather than
+    /// packed scalars: the stride is a whole `Value` and the payload sits
+    /// behind a tag, so a read guards the tag exactly as a field read does.
+    /// A packed array needs neither and keeps its single scaled load.
+    boxed: bool = false,
+    /// Expected element tag for a boxed read; a mismatch deopts.
+    tag: u8 = 0,
 };
 
 // --- whole-function static type inference -----------------------------------
@@ -1722,7 +1927,13 @@ fn inferTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u3
         var p: usize = 0;
         while (p < n_regs and p < regs.len) : (p += 1) {
             if (array_info[p] != null or cell_info[p] != null) continue;
-            if (cellScalarType(regs[p])) |rt| types[p] = rt;
+            // Objects too, not just scalars: a loop reading an instance built
+            // OUTSIDE it (`val c = Counter()` above a `c.bump(1)` loop) had no
+            // in-body instruction to infer that register from, so it stayed
+            // unknown and the loop bailed entirely. An `.object` register is
+            // excluded from the scalar unbox/rebox sets below and reaches the
+            // body only through the site machinery, which guards its class.
+            if (liveValueRegType(regs[p])) |rt| types[p] = rt;
         }
     }
     var changed = true;
@@ -2248,6 +2459,11 @@ const Compiler = struct {
     call_sites: []const CallSite,
     inline_sites: []const InlineSite,
     direct_sites: []const DirectSite = &.{},
+    /// Frame register base slot, read by a guarded arm to reach its receiver.
+    regs_ptr_slot: u32 = 0,
+    /// Instructions a direct call consumed (the receiver Move), which must not
+    /// be emitted.
+    skip_insts: []const BodyInstPos = &.{},
     /// Per-register: is this a nullable-scalar register, and its null-flag slot.
     nullable: []const bool,
     null_flag_slot: []const u32,
@@ -2578,6 +2794,46 @@ const Compiler = struct {
         try self.em.loadMem(T1, REGS, @intCast(@as(u64, ai.ptr_slot) * 8)); // rcx = ptr
     }
 
+    /// Read one boxed element (a `List` / reference `Array` of a uniform scalar
+    /// kind) into the destination's scalar slot. The stride is a whole `Value`,
+    /// which no SIB scale reaches, so the element address is computed; the
+    /// element's tag is guarded exactly as a native field read guards a field's,
+    /// and a mismatch deopts to re-run the subscript interpreted.
+    fn emitBoxedGet(self: *Compiler, ai: ArrayInfo, op: ArrayOp) !void {
+        try self.emitBoundsAndPtr(ai, op.index); // rax=index, rcx=ptr
+        var stride: u32 = VALUE_SIZE;
+        while (stride > 1) : (stride >>= 1) try self.em.addReg(T0, T0);
+        try self.em.addReg(T1, T0); // rcx = &items[index]
+        try self.em.loadMemB(T0, T1, @intCast(self.val_tag_off));
+        try self.em.cmpImm32(T0, ai.tag);
+        try self.em.jcc(.ne, try self.deoptLabel());
+        const payload: i32 = @intCast(self.val_payload_off);
+        switch (ai.rt) {
+            .f64 => {
+                try self.em.movsdLoad(X0, T1, payload);
+                try self.storeF64Slot(op.dst, X0);
+            },
+            .f32 => {
+                try self.em.movssLoad(X0, T1, payload);
+                try self.storeF32Slot(op.dst, X0);
+            },
+            .boolean => {
+                try self.em.loadMemB(T0, T1, payload);
+                try self.storeSlot(op.dst, T0);
+            },
+            .i32 => {
+                try self.em.loadMem(T0, T1, payload);
+                try self.em.movsxd(T0, T0);
+                try self.storeSlot(op.dst, T0);
+            },
+            .i64 => {
+                try self.em.loadMem(T0, T1, payload);
+                try self.storeSlot(op.dst, T0);
+            },
+            else => return jit.JitError.Unsupported,
+        }
+    }
+
     /// Signed divide/remainder of T0 (dividend) by T1 (divisor), result in T0.
     /// Divide-by-zero deopts to the current instruction (the interpreter throws
     /// the same `ArithmeticException`). Divisor == -1 is special-cased to avoid
@@ -2612,7 +2868,54 @@ const Compiler = struct {
     /// Emit an inlined call: copy each scalar arg into the callee's (remapped)
     /// parameter slot, emit the callee's single block remapped into the caller's
     /// extended register space, then copy the (remapped) return value to the dst.
-    fn emitInlinedCall(self: *Compiler, site: *const InlineSite) !void {
+    /// Prove the per-iteration receiver's class, jumping to `miss` otherwise.
+    /// The receiver lives in a FRAME register (objects are not slot-backed), so
+    /// this reads its `Value` through the frame base. `identity` is the address
+    /// of the class cell's data, which is what `instanceClassIdentity` returns.
+    fn emitReceiverGuard(self: *Compiler, recv_reg: u32, class: usize, miss: jit.Label) !void {
+        try self.em.loadMem(T1, REGS, slotBytes(self.regs_ptr_slot));
+        try self.em.addImm32(T1, @intCast(recv_reg * VALUE_SIZE));
+        try self.em.loadMemB(T0, T1, @intCast(self.val_tag_off));
+        try self.em.cmpImm32(T0, instanceTagValue());
+        try self.em.jcc(.ne, miss);
+        try self.em.loadMem(T1, T1, @intCast(self.val_payload_off));
+        try self.em.loadMem(T0, T1, @intCast(INST_CLASS_OFF));
+        try self.em.addImm32(T0, @intCast(CELL_DATA_OFF));
+        try self.em.movImm64(T2, class);
+        try self.em.cmpReg(T0, T2);
+        try self.em.jcc(.ne, miss);
+    }
+
+    /// Every inline site at the current position. A single unguarded site is
+    /// spliced outright; guarded arms form a chain ending in the trampoline.
+    fn emitInlinedChain(self: *Compiler) !void {
+        var first: ?*const InlineSite = null;
+        var n_arms: usize = 0;
+        for (self.inline_sites) |*s| {
+            if (s.block.int() != self.cur_block.int() or s.inst != self.cur_inst) continue;
+            if (first == null) first = s;
+            n_arms += 1;
+        }
+        const head = first orelse return;
+        if (!head.guarded) {
+            try self.emitInlinedBody(head);
+            return;
+        }
+        const done = try self.em.newLabel();
+        for (self.inline_sites) |*s| {
+            if (s.block.int() != self.cur_block.int() or s.inst != self.cur_inst) continue;
+            const miss = try self.em.newLabel();
+            try self.emitReceiverGuard(s.recv_reg, s.guard_class, miss);
+            try self.emitInlinedBody(s);
+            try self.em.jmp(done);
+            try self.em.bind(miss);
+        }
+        // Every arm missed: the class is one this loop was not specialized for.
+        try self.emitCallSite(head.fallback_site);
+        try self.em.bind(done);
+    }
+
+    fn emitInlinedBody(self: *Compiler, site: *const InlineSite) !void {
         const saved = self.deopt_override;
         self.deopt_override = site.resume_at;
         defer self.deopt_override = saved;
@@ -2703,7 +3006,7 @@ const Compiler = struct {
             try self.loadSlot(T0, Reg.from(site.args_reg + i));
             try self.em.storeMem(REGS, slotBytes(site.slot_base + cal.param_slot_base + i), T0);
         }
-        try self.em.loadMem(T0, REGS, slotBytes(self.entry_fbase_slot));
+        try self.em.loadMem(T0, REGS, slotBytes(site.fbase_slot));
         try self.em.storeMem(REGS, slotBytes(site.slot_base + cal.entry_fbase_slot), T0);
         try self.em.movReg(.rdi, REGS);
         try self.em.addImm32(.rdi, slotBytes(site.slot_base));
@@ -2808,13 +3111,18 @@ const Compiler = struct {
         // remapped callee instructions, copy the return value to the call's dst.
         // `cur_inst` stays the call's instruction, so any deopt inside the body
         // resumes there and the interpreter re-runs the (pure) call.
-        if (self.inlineSiteAt()) |site| {
-            try self.emitInlinedCall(site);
+        if (self.inlineSiteAt()) |_| {
+            try self.emitInlinedChain();
             return;
         }
         if (self.directSiteAt()) |site| {
             try self.emitDirectCall(site);
             return;
+        }
+        // The receiver Move a direct call consumed: its destination is an object
+        // register nothing else reads, and copying its slot would move garbage.
+        for (self.skip_insts) |p| {
+            if (p.b == self.cur_block.int() and p.i == self.cur_inst) return;
         }
         // A trampolined site (call / member / field / object op / subscript) is a
         // host callback; checked first so an object-collection subscript is not
@@ -2835,6 +3143,11 @@ const Compiler = struct {
     fn emitInstBody(self: *Compiler, inst: *const Inst) !void {
         if (arrayOpOf(self.module, inst)) |op| {
             const ai = try self.arrayOf(op.recv);
+            if (ai.boxed) {
+                if (op.is_set) return jit.JitError.Unsupported;
+                try self.emitBoxedGet(ai, op);
+                return;
+            }
             try self.emitBoundsAndPtr(ai, op.index); // rax=index, rcx=ptr
             if (op.is_set) {
                 try self.loadSlot(T2, op.value);
@@ -3128,10 +3441,20 @@ const Compiler = struct {
     }
 };
 
+/// Compile the loop, preferring the native boxed-element subscript. Typing a
+/// `List` read as its element's scalar kind constrains every register downstream
+/// of it, so a body that will not compile under that typing is compiled again
+/// with boxed receivers left to the interpreted subscript, rather than losing the
+/// loop entirely.
+pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
+    if (try tryCompileWith(a, module, func, header, regs, resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user, transient, true)) |c| return c;
+    return tryCompileWith(a, module, func, header, regs, resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user, transient, false);
+}
+
 /// Try to compile the natural loop whose header is `header`, specializing array
 /// accesses on the kinds observed in `regs` (the live frame). Returns a compiled
 /// loop, or null if the loop is not a supported shape.
-pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
+fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool, allow_boxed: bool) Allocator.Error!?CompiledLoop {
     const body = (try collectLoop(a, func, header)) orelse return null;
     defer a.free(body);
 
@@ -3183,16 +3506,34 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (rr.int() >= n_regs or rr.int() >= regs.len) return null;
             if (array_info[rr.int()] != null) continue;
             const v = regs[rr.int()];
-            // Only a packed primitive array gets the native indexed path. A
-            // non-packed receiver (a `List`/reference `Array` of objects, or a
-            // `Map`) is left for the object-subscript / map paths; a non-packed
-            // `set` is compilable only for a `Map`.
-            const packed_ok = v == .Array and v.Array.prim != null and v.Array.storage() == .scalars;
+            // A packed primitive array is indexed at its element width. A
+            // receiver holding objects, and a `Map`, are left for the
+            // object-subscript / map paths; a non-packed `set` is compilable
+            // only for a `Map`.
+            const packed_ok = v == .Array and v.Array.primKind() != null and v.Array.storage() == .scalars;
             if (!packed_ok) {
+                // A `List` / reference `Array` of a uniform scalar kind is read
+                // natively too, at a whole-`Value` stride behind a tag guard.
+                if (allow_boxed and !op.is_set and !bodyStoresInto(module, func, body, rr)) {
+                    if (boxedElemsOf(v)) |vl| if (boxedElemShape(vl)) |shape| {
+                        const bk: u32 = @intCast(arrays.items.len);
+                        array_info[rr.int()] = .{
+                            .rt = shape.rt,
+                            .w = .b64,
+                            .esize = @intCast(VALUE_SIZE),
+                            .ptr_slot = n_regs + 2 * bk,
+                            .len_slot = n_regs + 2 * bk + 1,
+                            .boxed = true,
+                            .tag = shape.tag,
+                        };
+                        arrays.append(a, .{ .reg = rr, .kind = .Int, .ptr_slot = n_regs + 2 * bk, .len_slot = n_regs + 2 * bk + 1, .boxed = true }) catch return null;
+                        continue;
+                    };
+                }
                 if (op.is_set and v != .Map) return null;
                 continue;
             }
-            const kind = v.Array.prim.?;
+            const kind = v.Array.primKind().?;
             const shape = arrayElemShape(kind) orelse return null;
             const k: u32 = @intCast(arrays.items.len);
             array_info[rr.int()] = .{
@@ -3208,29 +3549,67 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
 
     // Inline small pure-scalar top-level callees: their single block is spliced in
     // place of the call, with registers shifted into an extended register space
-    // [n_regs .. total_regs). Restricted to array-free loops so the slot layout
-    // stays a simple register range followed by the call/nullable slots.
+    // [n_regs .. total_regs).
     var inline_sites: std.ArrayListUnmanaged(InlineSite) = .empty;
     defer inline_sites.deinit(a);
+    // Receiver `Move`s a member splice consumed: the splice reads the receiver
+    // from the register the Move copies FROM, so the Move itself must not also
+    // register as an object-move callback.
+    var recv_move_skips: std.ArrayListUnmanaged(BodyInstPos) = .empty;
+    defer recv_move_skips.deinit(a);
     var total_regs: u32 = n_regs;
-    if (arrays.items.len == 0) {
+    {
         for (body) |bid| {
             for (func.blocks[bid.int()].insts, 0..) |*inst, ii| {
                 if (trampolinableCallOf(inst)) |tc| {
                     const callee = module.funcById(tc.func) orelse continue;
-                    if (!inlinableCallee(module, callee)) continue;
-                    if (callee.params.len != tc.n_args) continue;
-                    inline_sites.append(a, .{
-                        .block = bid,
-                        .inst = @intCast(ii),
-                        .callee = callee,
-                        .base = total_regs,
-                        .args_reg = tc.args_reg,
-                        .n_args = tc.n_args,
-                        .dst = tc.dst,
-                    }) catch return null;
-                    total_regs += callee.n_locals;
-                    if (total_regs > 4096) return null;
+                    if (inlinableCallee(module, callee) and callee.params.len == tc.n_args) {
+                        inline_sites.append(a, .{
+                            .block = bid,
+                            .inst = @intCast(ii),
+                            .callee = callee,
+                            .base = total_regs,
+                            .args_reg = tc.args_reg,
+                            .n_args = tc.n_args,
+                            .dst = tc.dst,
+                        }) catch return null;
+                        total_regs += callee.n_locals;
+                        if (total_regs > 4096) return null;
+                        continue;
+                    }
+                    // `node.m()` on a receiver the loop REBINDS each iteration
+                    // lowers to a static call with the receiver moved into arg 0.
+                    // Lowering already chose the body, so the splice needs no
+                    // dispatch guard; its `this`-field accesses ride whatever the
+                    // receiver register holds on the iteration that runs them.
+                    // Without this the call is a plain trampoline the callee
+                    // clause refuses outright, and the whole loop goes with it.
+                    if (field_resolver != null and tc.n_args >= 1) blk2: {
+                        var this_reg: u32 = 0;
+                        if (!inlinableMemberCallee(module, callee, &this_reg)) break :blk2;
+                        if (callee.params.len != tc.n_args) break :blk2;
+                        const rs = loopReceiverSource(func, body, tc.args_reg, bid.int(), @intCast(ii), null, n_regs) orelse break :blk2;
+                        if (rs.src >= regs.len or regs[rs.src] != .Instance) break :blk2;
+                        inline_sites.append(a, .{
+                            .block = bid,
+                            .inst = @intCast(ii),
+                            .callee = callee,
+                            .base = total_regs,
+                            .args_reg = tc.args_reg + 1,
+                            .n_args = tc.n_args - 1,
+                            .dst = tc.dst,
+                            .is_member = true,
+                            .recv_reg = rs.src,
+                            .this_reg = this_reg,
+                            .has_result = callee.blocks[0].terminator.Return != null,
+                            .resume_at = rs.mv,
+                        }) catch return null;
+                        recv_move_skips.append(a, rs.mv) catch return null;
+                        total_regs += callee.n_locals;
+                        if (total_regs > 4096) return null;
+                        if (debugEnabled()) std.debug.print("[jit]   splicing member {s} on a rebound receiver in {s}\n", .{ callee.name, func.name });
+                        continue;
+                    }
                     continue;
                 }
                 // A loop-invariant VIRTUAL call resolves its monomorphic slot
@@ -3240,7 +3619,49 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 if (trampolinableVirtualOf(inst)) |vc| blk: {
                     if (virt_resolver == null or field_resolver == null) break :blk;
                     if (vc.recv.int() >= regs.len or regs[vc.recv.int()] != .Instance) break :blk;
-                    if (regWrittenInBody(func, body, vc.recv)) break :blk;
+                    // A receiver the loop REWRITES each iteration is specialized
+                    // per class instead: enumerate what its container holds and
+                    // give each class an arm, guarded at run time. The call still
+                    // registers its trampoline site, which the final miss uses.
+                    if (regWrittenInBody(func, body, vc.recv)) {
+                        var reps_buf: [MAX_RECV_CLASSES]Value = undefined;
+                        const reps = receiverClassSet(func, body, vc.recv.int(), regs, &reps_buf) orelse break :blk;
+                        var arms: usize = 0;
+                        for (reps) |rep| {
+                            const afid = virt_resolver.?(resolver_user.?, &rep, vc.slot) orelse break :blk;
+                            const acallee = module.funcById(afid) orelse break :blk;
+                            var athis: u32 = 0;
+                            if (!inlinableMemberCallee(module, acallee, &athis)) break :blk;
+                            if (acallee.params.len != @as(usize, vc.n_args) + 1) break :blk;
+                            // An arm that touches `this`-fields would need its
+                            // field sites rebound to the base this guard loads
+                            // per iteration; that is not built yet.
+                            for (acallee.blocks[0].insts) |*ci| {
+                                if (trampolinableFieldOf(module, ci) != null or
+                                    trampolinableFieldSetOf(module, ci) != null) break :blk;
+                            }
+                            inline_sites.append(a, .{
+                                .block = bid,
+                                .inst = @intCast(ii),
+                                .callee = acallee,
+                                .base = total_regs,
+                                .args_reg = vc.args_reg,
+                                .n_args = vc.n_args,
+                                .dst = vc.dst,
+                                .is_member = true,
+                                .recv_reg = vc.recv.int(),
+                                .this_reg = athis,
+                                .has_result = acallee.blocks[0].terminator.Return != null,
+                                .guarded = true,
+                                .guard_class = instanceClassIdentity(rep),
+                            }) catch return null;
+                            total_regs += acallee.n_locals;
+                            if (total_regs > 4096) return null;
+                            arms += 1;
+                        }
+                        if (debugEnabled()) std.debug.print("[jit]   guarded virtual dispatch: {d} arm(s) in {s}\n", .{ arms, func.name });
+                        break :blk; // falls through so the trampoline site registers
+                    }
                     const fid = virt_resolver.?(resolver_user.?, &regs[vc.recv.int()], vc.slot) orelse break :blk;
                     const callee = module.funcById(fid) orelse break :blk;
                     var this_reg: u32 = 0;
@@ -3346,6 +3767,20 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             }
         }
     }
+    // The splice claims [n_regs .. total_regs) for the inlined callees' registers,
+    // so the array caches, provisionally placed straight after the loop's own
+    // registers, move above it.
+    if (total_regs != n_regs) {
+        const shift = total_regs - n_regs;
+        for (arrays.items) |*au| {
+            au.ptr_slot += shift;
+            au.len_slot += shift;
+        }
+        for (array_info) |*slot| if (slot.*) |*ai| {
+            ai.ptr_slot += shift;
+            ai.len_slot += shift;
+        };
+    }
     const arr_slots: u32 = total_regs + 2 * @as(u32, @intCast(arrays.items.len));
 
     // Discover capture cells, specializing on the scalar kind each box holds in
@@ -3399,7 +3834,6 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     for (body) |bid| {
         for (func.blocks[bid.int()].insts) |*inst| {
             if (trampolinableMemberOf(module, inst)) |mc| {
-                if (arrays.items.len != 0) return null;
                 if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len) return null;
                 var av: [6]Value = undefined;
                 if (mc.n_args > av.len) return null;
@@ -3429,7 +3863,6 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 continue;
             }
             if (trampolinableVirtualOf(inst)) |vc| {
-                if (arrays.items.len != 0) return null;
                 if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return null;
                 // Resolve the slot's target on the live receiver for a precise
                 // return type (also what the inline path splices); fall back to
@@ -3449,7 +3882,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 continue;
             }
             if (trampolinableFieldOf(module, inst)) |fld| {
-                if (field_resolver == null or arrays.items.len != 0) return null;
+                if (field_resolver == null) return null;
                 if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len) return null;
                 if (regs[fld.recv.int()] != .Instance) {
                     // Receiver snapshot null/non-instance — retry on a later snapshot.
@@ -3716,9 +4149,71 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     // and the cached scalar lives in a slot written back only at loop exit.
     var call_sites: std.ArrayListUnmanaged(CallSite) = .empty;
     defer call_sites.deinit(a);
+    // A method call on a loop-invariant receiver, held until the slot layout
+    // exists to give its callee a window.
+    const DirectPre = struct {
+        block: BlockId,
+        inst: u32,
+        callee: FuncId,
+        recv_reg: u32,
+        args_reg: u32,
+        n_args: u32,
+        dst: Reg,
+        move: BodyInstPos,
+    };
+    var direct_pre: std.ArrayListUnmanaged(DirectPre) = .empty;
+    defer direct_pre.deinit(a);
+    var skip_call_insts: std.ArrayListUnmanaged(BodyInstPos) = .empty;
+    defer skip_call_insts.deinit(a);
+    skip_call_insts.appendSlice(a, recv_move_skips.items) catch return null;
+    // `c.bump(1)` lowers to a static call with the receiver MOVED into arg 0.
+    // When that receiver is a loop-invariant instance and the callee is a
+    // deopt-free compiled method, the loop calls straight into its code — so
+    // neither the Move nor the call may be registered as a trampoline site.
+    // Found before registration because the Move precedes the call.
+    // A direct call jumps straight into the callee's code, so nothing re-seeds the
+    // array cache on the way back; those loops keep the trampoline.
+    if (fjDirectEnabled() and arrays.items.len == 0) {
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            for (blk.insts, 0..) |*inst, i| {
+                const tc = trampolinableCallOf(inst) orelse continue;
+                if (tc.n_args == 0 or tc.n_args > 6) continue;
+                const cf = module.funcById(tc.func) orelse continue;
+                if (cf == func or cf.is_suspend or !cf.has_receiver_param or !cf.hasBody()) continue;
+                const rs = loopReceiverSource(func, body, tc.args_reg, bid.int(), @intCast(i), types, n_regs) orelse continue;
+                // A direct call seeds the callee's field base once at loop entry.
+                if (regWrittenInBody(func, body, Reg.from(rs.src))) continue;
+                if (rs.src >= regs.len or regs[rs.src] != .Instance) continue;
+                direct_pre.append(a, .{
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .callee = tc.func,
+                    .recv_reg = rs.src,
+                    .args_reg = tc.args_reg,
+                    .n_args = tc.n_args,
+                    .dst = tc.dst,
+                    .move = rs.mv,
+                }) catch return null;
+                skip_call_insts.append(a, .{ .b = bid.int(), .i = @intCast(i) }) catch return null;
+                skip_call_insts.append(a, rs.mv) catch return null;
+            }
+        }
+    }
+    const skipCallAt = struct {
+        fn f(list: []const BodyInstPos, b: u32, i: u32) bool {
+            for (list) |p| {
+                if (p.b == b and p.i == i) return true;
+            }
+            return false;
+        }
+    }.f;
     for (body) |bid| {
         const blk_insts = func.blocks[bid.int()].insts;
         for (blk_insts, 0..) |*inst, i| {
+            // Consumed by a direct call: neither the receiver Move nor the call
+            // itself reaches the host.
+            if (skipCallAt(skip_call_insts.items, bid.int(), @intCast(i))) continue;
             // Same inline forms as the function tier: registering one as a
             // member/virtual site trampolines to the host once per iteration
             // for two instructions' worth of work.
@@ -3743,10 +4238,6 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             const is_load_global = trampolinableGlobalOf(module, inst) != null;
             const is_field_set = trampolinableFieldSetOf(module, inst) != null;
             if (!is_call and !is_member and !is_virtual and !is_field and !is_field_set and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value and !is_load_global and !is_map_get and !is_map_set) continue;
-            if (arrays.items.len != 0) {
-                if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
-                return null;
-            }
             // Every scalar arg must already live in a typed slot (field reads have none).
             const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else if (is_virtual) trampolinableVirtualOf(inst).?.args_reg else if (is_call_value) trampolinableCallValueOf(inst).?.args_reg else 0;
             const n_args: u32 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else if (is_virtual) trampolinableVirtualOf(inst).?.n_args else if (is_call_value) trampolinableCallValueOf(inst).?.n_args else 0;
@@ -3890,13 +4381,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             } else if (is_field) {
                 const fld = trampolinableFieldOf(module, inst).?;
                 if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len or regs[fld.recv.int()] != .Instance) return null;
-                // A loop-invariant receiver is covered by the entry class guard; a
-                // boxed receiver that varies (a chain intermediate) re-checks its
-                // class on every read.
-                // A receiver typed `.object` is a boxed register that may be
-                // reassigned in the loop (a chain cursor); re-check its class on
-                // every read. A loop-invariant receiver is covered by the entry guard.
-                const recv_varies = typeAt(types, fld.recv) == .object;
+                // A receiver the loop REASSIGNS (a chain cursor) re-checks its
+                // class on every read and reads through the callback. One the
+                // loop only reads is covered by the entry class guard, so its
+                // field buffer is cached at entry and read directly.
+                const recv_varies = regWrittenInBody(func, body, fld.recv);
                 const rrt = member_ret[fld.dst.int()];
                 if (rrt == .unknown or fld.dst.int() >= n_regs or types[fld.dst.int()] != rrt) return null;
                 call_sites.append(a, .{
@@ -3923,7 +4412,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 if (fs.value.int() >= n_regs or !(isScalarRt(typeAt(types, fs.value)) or typeAt(types, fs.value) == .object or typeAt(types, fs.value) == .null_)) return null;
                 if (field_resolver == null) return null;
                 const idx = field_resolver.?(resolver_user.?, &regs[fs.recv.int()], fs.name) orelse return null;
-                const recv_varies = typeAt(types, fs.recv) == .object;
+                const recv_varies = regWrittenInBody(func, body, fs.recv);
                 call_sites.append(a, .{
                     .dst_reg = 0,
                     .src_reg = fs.value.int(),
@@ -3974,9 +4463,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 }) catch return null;
             } else if (is_virtual) {
                 // An inlined virtual call is emitted in place, not trampolined.
+                // Only an UNGUARDED splice consumes the call: guarded arms need
+                // this site as the fallback their final miss jumps to.
                 var inlined_v = false;
                 for (inline_sites.items) |s| {
-                    if (s.block.int() == bid.int() and s.inst == i) {
+                    if (s.block.int() == bid.int() and s.inst == i and !s.guarded) {
                         inlined_v = true;
                         break;
                     }
@@ -4058,7 +4549,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         if (!site.is_member) continue;
         site.field_site_base = @intCast(call_sites.items.len);
         var nf: u32 = 0;
-        const recv_varies = typeAt(types, Reg.from(site.recv_reg)) == .object;
+        const recv_varies = regWrittenInBody(func, body, Reg.from(site.recv_reg));
         const recv_class = instanceClassIdentity(regs[site.recv_reg]);
         for (site.callee.blocks[0].insts) |*ci| {
             if (trampolinableFieldOf(module, ci)) |fld| {
@@ -4099,7 +4590,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     }
 
     const has_calls = call_sites.items.len != 0;
-    const uc_slot: u32 = arr_slots; // arrays.len == 0 when has_calls, so == n_regs
+    const uc_slot: u32 = arr_slots;
     const tramp_slot: u32 = arr_slots + 1;
     const calls_base: u32 = arr_slots + (if (has_calls) @as(u32, 2) else 0);
     // One null-flag slot per nullable-scalar register, after the array and call slots.
@@ -4148,14 +4639,176 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         }
         if (!found) {
             ptr_slot = nullable_end + @as(u32, @intCast(field_bases.items.len));
-            field_bases.append(a, .{ .recv_reg = site.recv_reg, .ptr_slot = ptr_slot }) catch return null;
+            field_bases.append(a, .{
+                .recv_reg = site.recv_reg,
+                .ptr_slot = ptr_slot,
+                .recv_class = instanceClassIdentity(regs[site.recv_reg]),
+            }) catch return null;
         }
         site.native = true;
         site.fbase_slot = ptr_slot;
         site.tag = tag;
     }
-    const n_slots: u32 = nullable_end + @as(u32, @intCast(field_bases.items.len));
+    var n_slots: u32 = nullable_end + @as(u32, @intCast(field_bases.items.len));
     if (debugEnabled() and field_bases.items.len != 0) std.debug.print("[jit]   native field access on {d} receiver(s) in {s}\n", .{ field_bases.items.len, func.name });
+
+    // Point every guarded arm at the trampoline site its final miss falls to.
+    // An arm with no such site would have nowhere to go, so it is dropped and
+    // the call simply trampolines as before.
+    {
+        var gi: usize = 0;
+        while (gi < inline_sites.items.len) {
+            const isite = &inline_sites.items[gi];
+            if (!isite.guarded) {
+                gi += 1;
+                continue;
+            }
+            var found = false;
+            for (call_sites.items, 0..) |cs, ci| {
+                if (cs.block.int() == isite.block.int() and cs.inst == isite.inst) {
+                    isite.fallback_site = @intCast(ci);
+                    found = true;
+                    break;
+                }
+            }
+            if (found) gi += 1 else _ = inline_sites.orderedRemove(gi);
+        }
+    }
+    // A guarded arm reads its receiver's `Value` out of the FRAME (objects are
+    // not slot-backed), so it needs the frame register base in a slot.
+    var regs_ptr_slot: u32 = 0;
+    for (inline_sites.items) |*isite| {
+        if (!isite.guarded) continue;
+        regs_ptr_slot = n_slots;
+        n_slots += 1;
+        break;
+    }
+
+    // A member call on a LOOP-INVARIANT receiver whose target is a deopt-free
+    // compiled method goes straight into that method's code. Loop entry already
+    // proves the receiver's class (`recv_class`) and already caches its field
+    // buffer for native field access, so the call needs no per-iteration guard —
+    // it seeds the callee's argument slots and that cached base, and calls.
+    // Without this the loop paid a host round trip per iteration to reach a body
+    // that was already compiled.
+    var direct_sites: std.ArrayListUnmanaged(DirectSite) = .empty;
+    defer direct_sites.deinit(a);
+    for (direct_pre.items) |pre| {
+        const cf = module.funcById(pre.callee) orelse return null;
+        const cl = directCallTarget(module, cf, pre.n_args, &regs[pre.recv_reg], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse return null;
+        if (cl.guard_class != instanceClassIdentity(regs[pre.recv_reg])) return null;
+        var k: u32 = 1;
+        while (k < pre.n_args) : (k += 1) {
+            const ar = pre.args_reg + k;
+            if (ar >= n_regs or typeAt(types, Reg.from(ar)) != cl.param_rt[k]) return null;
+        }
+        const wants = pre.dst.int() < n_regs and isScalarRt(typeAt(types, pre.dst));
+        if (wants and typeAt(types, pre.dst) != cl.result_rt) return null;
+        var base_slot: u32 = 0;
+        var have_base = false;
+        for (field_bases.items) |fb| {
+            if (fb.recv_reg == pre.recv_reg) {
+                base_slot = fb.ptr_slot;
+                have_base = true;
+                break;
+            }
+        }
+        if (!have_base) {
+            base_slot = n_slots;
+            field_bases.append(a, .{
+                .recv_reg = pre.recv_reg,
+                .ptr_slot = base_slot,
+                .recv_class = instanceClassIdentity(regs[pre.recv_reg]),
+            }) catch return null;
+            n_slots += 1;
+        }
+        direct_sites.append(a, .{
+            .block = pre.block,
+            .inst = pre.inst,
+            .callee = cl,
+            .slot_base = 0,
+            .args_reg = pre.args_reg,
+            .n_args = pre.n_args,
+            .dst = pre.dst,
+            .has_result = wants,
+            .may_deopt = cl.can_deopt,
+            .resume_at = pre.move,
+            .fbase_slot = base_slot,
+            .recv_reg = pre.recv_reg,
+        }) catch return null;
+        skip_call_insts.append(a, pre.move) catch return null;
+        if (debugEnabled()) std.debug.print("[jit]   direct call {s} on a loop-invariant receiver in {s}\n", .{ cf.name, func.name });
+    }
+    if (fjDirectEnabled()) {
+        for (call_sites.items) |*site| {
+            if (!site.is_member or site.recv_varies or site.recv_class == 0) continue;
+            if (site.dispatch_recv_reg != null) continue;
+            const target = site.resolved_member orelse continue;
+            if (site.recv_reg >= regs.len or regs[site.recv_reg] != .Instance) continue;
+            const cf = module.funcById(target) orelse continue;
+            if (cf == func) continue;
+            // The emitter reads callee parameter `i` from `args_reg + i`, and a
+            // member site's arguments start at `args_reg`, so the base is biased
+            // by one — it must not wrap.
+            if (site.n_args != 0 and site.args_reg == 0) continue;
+            const cl = directCallTarget(module, cf, site.n_args + 1, &regs[site.recv_reg], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse continue;
+            if (cl.guard_class != site.recv_class) continue;
+            // Arguments live in typed scalar slots and must be the kinds the
+            // callee was specialized on; the result likewise.
+            var ok_args = true;
+            var k: u32 = 0;
+            while (k < site.n_args) : (k += 1) {
+                const ar = site.args_reg + k;
+                if (ar >= n_regs or typeAt(types, Reg.from(ar)) != cl.param_rt[k + 1]) ok_args = false;
+            }
+            if (!ok_args) continue;
+            const wants_result = site.has_result and site.dst_reg < n_regs and isScalarRt(typeAt(types, Reg.from(site.dst_reg)));
+            if (wants_result and typeAt(types, Reg.from(site.dst_reg)) != cl.result_rt) continue;
+            // Reuse (or mint) the loop-entry field base for this receiver.
+            var base_slot: u32 = 0;
+            var have_base = false;
+            for (field_bases.items) |fb| {
+                if (fb.recv_reg == site.recv_reg) {
+                    base_slot = fb.ptr_slot;
+                    have_base = true;
+                    break;
+                }
+            }
+            if (!have_base) {
+                base_slot = n_slots;
+                field_bases.append(a, .{
+                    .recv_reg = site.recv_reg,
+                    .ptr_slot = base_slot,
+                    .recv_class = instanceClassIdentity(regs[site.recv_reg]),
+                }) catch return null;
+                n_slots += 1;
+            }
+            direct_sites.append(a, .{
+                .block = site.block,
+                .inst = site.inst,
+                .callee = cl,
+                .slot_base = 0,
+                .args_reg = site.args_reg -% 1, // callee param i reads args_reg + i
+                .n_args = site.n_args + 1,
+                .dst = Reg.from(site.dst_reg),
+                .has_result = wants_result,
+                .may_deopt = cl.can_deopt,
+                .resume_at = .{ .b = site.block.int(), .i = site.inst },
+                .fbase_slot = base_slot,
+                .recv_reg = site.recv_reg,
+            }) catch return null;
+            if (debugEnabled()) std.debug.print("[jit]   direct member call {s} in {s}\n", .{ cf.name, func.name });
+        }
+        if (direct_sites.items.len != 0) {
+            var window: u32 = 0;
+            for (direct_sites.items) |*ds| {
+                ds.slot_base = n_slots;
+                if (ds.callee.n_slots > window) window = ds.callee.n_slots;
+            }
+            n_slots += window;
+            if (n_slots > MAX_SLOTS) return null;
+        }
+    }
 
     var c = Compiler{
         .a = a,
@@ -4167,6 +4820,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .cell_info = cell_info,
         .call_sites = call_sites.items,
         .inline_sites = inline_sites.items,
+        .direct_sites = direct_sites.items,
+        .skip_insts = skip_call_insts.items,
+        .regs_ptr_slot = regs_ptr_slot,
         .nullable = nullable,
         .null_flag_slot = null_flag_slot,
         .uc_slot = uc_slot,
@@ -4239,6 +4895,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .cells = cells_owned,
         .nullables = nullables_owned,
         .field_bases = fbases_owned,
+        .regs_ptr_slot = regs_ptr_slot,
+        .direct_sites = if (direct_sites.items.len != 0)
+            (a.dupe(DirectSite, direct_sites.items) catch return null)
+        else
+            &.{},
         .call_sites = sites_owned,
         .member_ics = blk: {
             const ics = a.alloc(MemberIC, sites_owned.len) catch break :blk &.{};
@@ -4260,13 +4921,55 @@ pub const RunResult = union(enum) {
     bail,
 };
 
+/// Cache each indexed array's element buffer pointer and length in its high
+/// slots. Called at loop entry and again after every host callback: the callback
+/// runs arbitrary Kotlin, which may grow the backing store (moving the buffer) or
+/// rebind the receiver register outright, and the native code reads the cache
+/// with nothing but a bounds check. Returns false when the register no longer
+/// holds the array the loop was compiled for.
+pub fn reseedArrays(self: *const CompiledLoop, regs: []const Value, slots: []i64) bool {
+    for (self.arrays) |au| {
+        if (au.reg.int() >= regs.len) return false;
+        const v = regs[au.reg.int()];
+        if (au.boxed) {
+            const vl = boxedElemsOf(v) orelse return false;
+            const g = vl.borrow();
+            const items = g.get().items;
+            g.deinit();
+            slots[au.ptr_slot] = @bitCast(@intFromPtr(items.ptr));
+            slots[au.len_slot] = @intCast(items.len);
+            continue;
+        }
+        if (v != .Array or v.Array.primKind() != au.kind or v.Array.storage() != .scalars) return false;
+        const g = v.Array.storage().scalars.borrow();
+        const pb = g.get();
+        slots[au.ptr_slot] = @bitCast(@intFromPtr(pb.bytes.items.ptr));
+        slots[au.len_slot] = @intCast(pb.len());
+        g.deinit();
+    }
+    return true;
+}
+
 pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u8, tramp: ?TrampFn, user: ?*anyopaque) RunResult {
     @memcpy(tags[0..self.n_regs], self.box_tags[0..self.n_regs]);
     var r: usize = 0;
     while (r < self.n_regs) : (r += 1) {
         slots[r] = 0;
-        if (!self.read_set[r]) continue;
-        if (r >= regs.len) return .bail;
+        // A register the loop READS must carry its live-in value or the run is
+        // simply wrong, so a kind that does not fit its slot bails to the
+        // interpreter. A register the loop only WRITES carries it too where it
+        // can: the write may sit behind a branch this run never takes, and the
+        // exit reboxes every written register — an unseeded slot then reports
+        // zero (`var ok = true` inside a loop that never clears it came back
+        // false). Its live-in value need not be recoverable, though: a register
+        // first assigned inside the loop holds `Unit` here and nothing reads the
+        // old value afterwards, so a misfit leaves the zero rather than bailing.
+        const must_seed = self.read_set[r];
+        if (!must_seed and !self.def_set[r]) continue;
+        if (r >= regs.len) {
+            if (must_seed) return .bail;
+            continue;
+        }
         const v = regs[r];
         switch (self.reg_types[r]) {
             .i32 => switch (v) {
@@ -4285,46 +4988,35 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
                     slots[r] = x;
                     if (!self.def_set[r]) tags[r] = @intFromEnum(@as(std.meta.Tag(Value), .Byte));
                 },
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
             .i64 => switch (v) {
                 .Long => |x| slots[r] = x,
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
             .f64 => switch (v) {
                 .Double => |x| slots[r] = @bitCast(x),
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
             .f32 => switch (v) {
                 .Float => |x| slots[r] = @as(u32, @bitCast(x)),
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
             .boolean => switch (v) {
                 .Bool => |b| slots[r] = if (b) 1 else 0,
-                else => return .bail,
+                else => if (must_seed) return .bail,
             },
-            .unit => if (v != .Unit) return .bail,
-            .null_ => if (v != .Null) return .bail,
+            .unit => if (v != .Unit and must_seed) return .bail,
+            .null_ => if (v != .Null and must_seed) return .bail,
             // Object registers are never slot-backed (excluded from read_set);
             // they stay in `regs`. Reaching here would be a bug, but it is safe.
             .object => {},
-            .unknown => return .bail,
+            .unknown => if (must_seed) return .bail,
         }
     }
 
     // Unbox each indexed array's buffer pointer + length into its high slots.
-    // The kind must still match; the buffer pointer is stable for the native run
-    // (no resize inside the loop, no GC safepoint).
-    for (self.arrays) |au| {
-        if (au.reg.int() >= regs.len) return .bail;
-        const v = regs[au.reg.int()];
-        if (v != .Array or v.Array.prim != au.kind or v.Array.storage() != .scalars) return .bail;
-        const g = v.Array.storage().scalars.borrow();
-        const pb = g.get();
-        slots[au.ptr_slot] = @bitCast(@intFromPtr(pb.bytes.items.ptr));
-        slots[au.len_slot] = @intCast(pb.len());
-        g.deinit();
-    }
+    if (!reseedArrays(self, regs, slots)) return .bail;
 
     // Unbox each capture cell's scalar into the cell register's own slot. No
     // calls or GC run inside the loop, so the box is unobserved by anyone else;
@@ -4358,6 +5050,35 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     // one holds the `*TrampCtx` the native call sites load into rdi, the other the
     // host callback. `tctx` is a stack local live across the whole native run.
     var tctx: TrampCtx = undefined;
+    // Field bases and direct callees are seeded whether or not this loop has any
+    // TRAMPOLINE site left: a direct call consumes the only call site a loop may
+    // have had, and its receiver's field base still has to be cached.
+    {
+        if (self.regs_ptr_slot != 0) slots[self.regs_ptr_slot] = @bitCast(@intFromPtr(regs.ptr));
+        for (self.field_bases) |fb| {
+            if (fb.recv_reg >= regs.len or regs[fb.recv_reg] != .Instance) return .bail;
+            if (instanceClassIdentity(regs[fb.recv_reg]) != fb.recv_class) return .bail;
+            const g = regs[fb.recv_reg].Instance.borrow();
+            slots[fb.ptr_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
+            g.deinit();
+        }
+        // A direct call reaches its callee's body WITHOUT the callee's own entry
+        // guard, so this entry proves the layout that body was compiled against
+        // still holds on the receiver it will read.
+        for (self.direct_sites) |ds| {
+            const rr = ds.recv_reg;
+            if (rr >= regs.len or regs[rr] != .Instance) return .bail;
+            if (instanceClassIdentity(regs[rr]) != ds.callee.guard_class) return .bail;
+            if (ds.callee.method_fields.len == 0) continue;
+            const g = regs[rr].Instance.borrow();
+            defer g.deinit();
+            const items = g.get().fields.items;
+            for (ds.callee.method_fields) |mf| {
+                if (mf.idx >= items.len or
+                    !(items[mf.idx].name.ptr == mf.name.ptr or std.mem.eql(u8, items[mf.idx].name, mf.name))) return .bail;
+            }
+        }
+    }
     if (self.call_sites.len != 0) {
         if (tramp == null or user == null) return .bail;
         // Each member call's receiver must still be an Instance of the class the
@@ -4374,12 +5095,6 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
         // Cache each native-field receiver's field buffer pointer. The receiver is
         // an already-validated loop-invariant Instance; the buffer does not move or
         // resize inside the native run, so the pointer stays valid throughout.
-        for (self.field_bases) |fb| {
-            if (fb.recv_reg >= regs.len or regs[fb.recv_reg] != .Instance) return .bail;
-            const g = regs[fb.recv_reg].Instance.borrow();
-            slots[fb.ptr_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
-            g.deinit();
-        }
         tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.?, .tags = tags.ptr };
         slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
         slots[self.tramp_slot] = @bitCast(@intFromPtr(tramp.?));
@@ -5021,6 +5736,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     .has_result = false, // set once the caller's register types are known
                     .may_deopt = cl.can_deopt,
                     .resume_at = .{ .b = mv.b, .i = mv.i },
+                    .fbase_slot = 0, // the caller's entry base, assigned with the slot layout
                 }) catch return null;
                 skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
                 if (debugEnabled()) std.debug.print("[jit]   direct call {s} from {s} at b{d}:{d} (move b{d}:{d})\n", .{ cf.name, func.name, bid.int(), ii, mv.b, mv.i });
@@ -5914,12 +6630,13 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         var window: u32 = 0;
         for (direct_sites.items) |*ds| {
             ds.slot_base = n_slots;
+            ds.fbase_slot = fbase_slot;
             if (ds.callee.n_slots > window) window = ds.callee.n_slots;
         }
         n_slots += window;
         // 192 is the seam's per-depth slot bank: a body that outgrows it falls
         // off the frameless path, which costs more than the call it saves.
-        if (n_slots > 192) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-slots\n", .{func.name}); return null; }
+        if (n_slots > MAX_SLOTS) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-slots\n", .{func.name}); return null; }
     }
     for (call_sites.items[field_sites_base..]) |*site| site.fbase_slot = fbase_slot;
 

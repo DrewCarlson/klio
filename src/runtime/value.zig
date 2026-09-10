@@ -1132,25 +1132,44 @@ pub const ArrayStore = union(enum) {
 /// kind (`null` for a reference `Array<T>`) and matches `storage`: `.boxed`
 /// when `prim == null`, `.scalars` when `prim != null`.
 pub const ArrayData = struct {
-    /// The storage cell: an `ObjRef(std.ArrayList(Value))` cell when
-    /// `prim == null` (a reference `Array<T>`), an `ObjRef(PrimBuf)` cell
-    /// otherwise — the invariant that lets the payload drop the union tag
-    /// and pack to (pointer, prim).
-    cell: *anyopaque,
-    prim: ?PrimitiveArrayKind,
+    /// The storage cell with its element kind TAGGED into the low four bits.
+    /// Every control block is 16-byte aligned, so the pair fits in ONE pointer
+    /// — which is what holds `Value` to 16 bytes rather than 24.
+    ///
+    /// Tag `0` is a reference `Array<T>`, whose cell is an
+    /// `ObjRef(std.ArrayList(Value))`; tag `k + 1` is an `ObjRef(PrimBuf)` of
+    /// kind `k`. Every reader goes through `cellPtr`, so the collector and the
+    /// refcount only ever see the untagged pointer.
+    tagged: usize,
+
+    const TAG_MASK: usize = 0xF;
 
     pub fn boxed(vl: ValueList) ArrayData {
-        return .{ .cell = vl.cell, .prim = null };
+        return .{ .tagged = @intFromPtr(vl.cell) };
     }
 
     pub fn scalars(pb: ObjRef(PrimBuf), kind: PrimitiveArrayKind) ArrayData {
-        return .{ .cell = pb.cell, .prim = kind };
+        return .{ .tagged = @intFromPtr(pb.cell) | (@as(usize, @intFromEnum(kind)) + 1) };
+    }
+
+    /// The cell pointer with the kind tag masked off.
+    pub inline fn cellPtr(self: ArrayData) *anyopaque {
+        return @ptrFromInt(self.tagged & ~TAG_MASK);
+    }
+
+    /// The packed element kind, or null for a reference `Array<T>`. A pure bit
+    /// extraction — no cell borrow — so the hot `is this an IntArray?` tests
+    /// cost what the old field read did.
+    pub inline fn primKind(self: ArrayData) ?PrimitiveArrayKind {
+        const t = self.tagged & TAG_MASK;
+        if (t == 0) return null;
+        return @enumFromInt(t - 1);
     }
 
     /// Rebuild the typed storage view from the packed cell pointer.
     pub fn storage(self: ArrayData) ArrayStore {
-        if (self.prim == null) return .{ .boxed = .{ .cell = @ptrCast(@alignCast(self.cell)) } };
-        return .{ .scalars = .{ .cell = @ptrCast(@alignCast(self.cell)) } };
+        if (self.primKind() == null) return .{ .boxed = .{ .cell = @ptrCast(@alignCast(self.cellPtr())) } };
+        return .{ .scalars = .{ .cell = @ptrCast(@alignCast(self.cellPtr())) } };
     }
 
     pub fn len(self: ArrayData) usize {
@@ -1181,7 +1200,7 @@ pub const ArrayData = struct {
             .scalars => |pb| {
                 const g = pb.borrow();
                 defer g.deinit();
-                return g.get().getAs(i, self.prim orelse g.get().kind);
+                return g.get().getAs(i, self.primKind() orelse g.get().kind);
             },
         }
     }
@@ -1204,7 +1223,7 @@ pub const ArrayData = struct {
             .scalars => |pb| {
                 const g = pb.borrowMut();
                 defer g.deinit();
-                g.get().setAs(i, v, self.prim orelse g.get().kind);
+                g.get().setAs(i, v, self.primKind() orelse g.get().kind);
             },
         }
     }
@@ -1233,7 +1252,7 @@ pub const ArrayData = struct {
             .scalars => |pb| {
                 const g = pb.borrow();
                 defer g.deinit();
-                const view_kind = self.prim orelse g.get().kind;
+                const view_kind = self.primKind() orelse g.get().kind;
                 const n = g.get().len();
                 const lo = @min(start, n);
                 const hi = @max(lo, @min(end, n));
@@ -2756,7 +2775,7 @@ pub const Value = union(enum) {
             .IrClosure, .Intrinsic, .BoundMethod => "kotlin.Function",
             .Exception => "kotlin.Throwable",
             .List => |l| if (l.mutable) "kotlin.collections.MutableList" else "kotlin.collections.List",
-            .Array => |a| if (a.prim) |k| k.typeFqn() else "kotlin.Array",
+            .Array => |a| if (a.primKind()) |k| k.typeFqn() else "kotlin.Array",
             .Set => |s| if (s.mutable) "kotlin.collections.MutableSet" else "kotlin.collections.Set",
             .Map => |m| if (m.mutable) "kotlin.collections.MutableMap" else "kotlin.collections.Map",
             .Pair => "kotlin.Pair",
@@ -2981,7 +3000,7 @@ pub const Value = union(enum) {
             .PropertyRef => matchesAny(name, &.{ "KProperty", "KProperty0", "KProperty1", "KCallable", "kotlin.reflect.KProperty", "kotlin.reflect.KProperty0", "kotlin.reflect.KProperty1", "kotlin.reflect.KCallable", "Any" }),
             .Array => |a| blk: {
                 if (std.mem.eql(u8, name, "Any")) break :blk true;
-                break :blk if (a.prim) |p| switch (p) {
+                break :blk if (a.primKind()) |p| switch (p) {
                     .Int => std.mem.eql(u8, name, "IntArray"),
                     .Long => std.mem.eql(u8, name, "LongArray"),
                     .Double => std.mem.eql(u8, name, "DoubleArray"),
@@ -3339,7 +3358,7 @@ pub const Value = union(enum) {
             },
             .Set => |coll| try writeElements(writer, coll.items, &self),
             .Array => |a| {
-                const tag = if (a.prim) |k| k.typeFqn() else "kotlin.Array";
+                const tag = if (a.primKind()) |k| k.typeFqn() else "kotlin.Array";
                 try writer.print("{s}@<…>", .{tag});
             },
             .Map => |m| {
@@ -4049,3 +4068,5 @@ test "value layout census" {
         if (@sizeOf(f.type) > 8) std.debug.print("  {s}: {d}\n", .{ f.name, @sizeOf(f.type) });
     }
 }
+
+

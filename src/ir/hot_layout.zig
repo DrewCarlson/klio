@@ -230,7 +230,7 @@ pub fn fillLayout(out: *HotLayout) void {
     @memset(std.mem.asBytes(&vinst), 0);
     vinst = .{ .Instance = undefined };
     @memset(std.mem.asBytes(&vai), 0);
-    vai = .{ .Array = .{ .cell = @ptrFromInt(0x1000), .prim = .Int } };
+    vai = .{ .Array = runtime.ArrayData.scalars(.{ .cell = @ptrFromInt(0x1000) }, .Int) };
     vi = .{ .Int = 0 };
     vl = .{ .Long = 0 };
     vb = .{ .Bool = false };
@@ -268,9 +268,12 @@ pub fn fillLayout(out: *HotLayout) void {
         .field_stride = @sizeOf(runtime.InstanceData.Field),
         .field_value_off = @offsetOf(runtime.InstanceData.Field, "value"),
         .tag_array = @intFromEnum(@as(std.meta.Tag(runtime.Value), .Array)),
-        .arr_cell_off = @intCast(@intFromPtr(&vai.Array.cell) - @intFromPtr(&vai)),
-        .arr_prim_off = @intCast(@intFromPtr(&vai.Array.prim) - @intFromPtr(&vai)),
-        .arr_prim_int_word = readWord(&vai, @intCast(@intFromPtr(&vai.Array.prim) - @intFromPtr(&vai))),
+        // The cell pointer and its element-kind tag share one word: the
+        // pointer is the word with the low four bits masked off, and the tag
+        // is `kind + 1` (0 = a reference `Array<T>`).
+        .arr_cell_off = @intCast(@intFromPtr(&vai.Array.tagged) - @intFromPtr(&vai)),
+        .arr_prim_off = @intCast(@intFromPtr(&vai.Array.tagged) - @intFromPtr(&vai)),
+        .arr_prim_int_word = readWord(&vai, @intCast(@intFromPtr(&vai.Array.tagged) - @intFromPtr(&vai))),
         .primbuf_ptr_off = @offsetOf(PrimBufCell, "data") + @offsetOf(runtime.PrimBuf, "bytes") + SLICE_PTR_OFF,
         .primbuf_len_off = @offsetOf(PrimBufCell, "data") + @offsetOf(runtime.PrimBuf, "bytes") + SLICE_LEN_OFF,
     };

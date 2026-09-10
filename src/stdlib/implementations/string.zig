@@ -3944,7 +3944,7 @@ test "toCharArray and toList" {
     {
         var ctx = ctxFor(a, &.{try strVal(a, "ab")});
         const r = try string_to_char_array(&ctx);
-        try testing.expect(r.ok == .Array and r.ok.Array.prim.? == .Char);
+        try testing.expect(r.ok == .Array and r.ok.Array.primKind().? == .Char);
         try testing.expectEqual(@as(usize, 2), r.ok.Array.len());
     }
     {
