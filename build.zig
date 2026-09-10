@@ -600,6 +600,11 @@ pub fn build(b: *std.Build) void {
         .install_subdir = "parity-base",
     });
     const base_images_path = b.getInstallPath(.prefix, "parity-base");
+    // Nameable so a CI producer job can build the base images (and the harness
+    // universe they share) once and bank the cache every shard restores,
+    // instead of each shard regenerating them.
+    const base_images_step = b.step("parity-base", "Build+install the parity base images");
+    base_images_step.dependOn(&base_images_install.step);
 
     // Install the compiled static library to zig-out/lib/libzstd.a so
     // per-module verification (scripts/zigcheck.py) can link the extern
