@@ -38,6 +38,7 @@ const RuntimeError = runtime.RuntimeError;
 const CallCtx = runtime.CallCtx;
 const StdlibFn = runtime.StdlibFn;
 const ValueSlice = runtime.ValueSlice;
+const IrClosureRef = runtime.IrClosureRef;
 
 const Module = ir.Module;
 const FuncId = ir.FuncId;
@@ -1288,8 +1289,8 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
             .capture_names = &.{},
             .captures = caps,
         }) catch return null;
-        const empty = ValueSlice.init(allocator, &.{}) catch return null;
-        return .{ .IrClosure = .{ .id = id, .captures = empty } };
+        const empty = IrClosureRef.init(allocator, .{ .id = id, .captures = &.{} }) catch return null;
+        return .{ .IrClosure = empty };
     }
     const linked: ?StdlibFn = blk: {
         const pg = self.prog.borrow();

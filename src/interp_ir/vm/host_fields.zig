@@ -1940,7 +1940,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     }
     // KFunction reflection: `::main.name`, `::main.parameters`.
     if (receiver.* == .IrClosure) {
-        const id = receiver.IrClosure.id;
+        const id = receiver.IrClosure.asPtr().id;
         if (self.closures.get(@intCast(id))) |info| {
             const mptr: *const Module = info.module orelse self.module.asPtr();
             if (mptr.funcById(info.body_func)) |f| {

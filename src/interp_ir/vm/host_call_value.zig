@@ -30,6 +30,7 @@ const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const ValueList = runtime.ValueList;
 const ValueSlice = runtime.ValueSlice;
+const IrClosureRef = runtime.IrClosureRef;
 const InstanceData = runtime.InstanceData;
 const StdlibFn = runtime.StdlibFn;
 const CallCtx = runtime.CallCtx;
@@ -146,7 +147,7 @@ fn boundReferenceFunc(callee: *const Value) ?FuncId {
 /// `evalWithCapturesChained` terminal, including the ambient-composer push,
 /// which the flat activation's teardown undoes via `flatCallClosed`.
 pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
-    return prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.id, callee.IrClosure.captures, null, args);
+    return prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.asPtr().id, callee.IrClosure, null, args);
 }
 
 /// JIT call-out fast path. A trampoline's loop-invariant `CallValue` site
@@ -158,7 +159,7 @@ pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *cons
 /// back to `callValue`, which owns every special case.
 pub fn callClosureFast(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!?EvalResult {
     if (callee.* != .IrClosure) return null;
-    const prep = (try prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.id, callee.IrClosure.captures, null, args)) orelse return null;
+    const prep = (try prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.asPtr().id, callee.IrClosure, null, args)) orelse return null;
     defer if (prep.composer_pushed) compose.popComposer();
     // `prepareClosureFlatCallSlots` always resolves and records the body's
     // module in the request.
@@ -181,7 +182,7 @@ fn callValueTraceOn() bool {
     return on;
 }
 
-fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, captures: ValueSlice, this_override: ?ThisOverride, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
+fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, captures: IrClosureRef, this_override: ?ThisOverride, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     const info = self.closures.get(@intCast(id)) orelse return null;
     if (args.len != info.n_params) return null;
     const module: *const Module = blk: {
@@ -213,7 +214,7 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
     {
         const g = captures.borrow();
         defer g.deinit();
-        const src = g.get().*;
+        const src = g.get().captures;
         capture_values = try ir.eval.acquireArgsCap(allocator, src.len);
         if (capture_values.capacity >= src.len) capture_values.appendSliceAssumeCapacity(src) else try capture_values.appendSlice(allocator, src);
     }
@@ -262,8 +263,8 @@ pub fn flatCallClosed(self: *VmHost) void {
 /// path.
 pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     if (callee.* != .IrClosure) return null;
-    const id = callee.IrClosure.id;
-    const captures = callee.IrClosure.captures;
+    const id = callee.IrClosure.asPtr().id;
+    const captures = callee.IrClosure;
     const info = self.closures.get(@intCast(id)) orelse return null;
     if (args.len != info.n_params) return null;
     var selected_this = this_value_in.*;
@@ -309,7 +310,7 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
         const ti = this_idx orelse break :blk null;
         const g = captures.borrow();
         defer g.deinit();
-        const slice = g.get().*;
+        const slice = g.get().captures;
         if (ti < slice.len) break :blk slice[ti];
         break :blk null;
     };
@@ -375,8 +376,8 @@ pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, mod
     const scope_v = args[0];
     const block = args[1];
     if (block != .IrClosure) return null;
-    const id = block.IrClosure.id;
-    const captures = block.IrClosure.captures;
+    const id = block.IrClosure.asPtr().id;
+    const captures = block.IrClosure;
     const info = self.closures.get(@intCast(id)) orelse return null;
     if (info.n_params != 0) return null;
     // `evalClosureRaw` falls back to the ClosureInfo cell when the live
@@ -384,7 +385,7 @@ pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, mod
     {
         const g = captures.borrow();
         defer g.deinit();
-        if (g.get().*.len != info.capture_names.len) return null;
+        if (g.get().captures.len != info.capture_names.len) return null;
     }
     // `evalClosureRaw` overrides EVERY capture named `this`; the slot
     // override binds one, so a multi-`this` shape declines.
@@ -472,7 +473,7 @@ pub fn undispatchedScopeLeave(self: *VmHost, ident: usize) void {
 pub fn prepareValueRecvCtxFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, recv: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     if (callee.* != .IrClosure) return null;
     if (recv.* == .Instance) {
-        if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+        if (self.closures.get(@intCast(callee.IrClosure.asPtr().id))) |info| {
             var has_this = false;
             for (info.capture_names) |n| {
                 if (std.mem.eql(u8, n, "this")) {
@@ -1065,8 +1066,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         }
     }
     if (callee.* == .IrClosure) {
-        const id = callee.IrClosure.id;
-        const captures = callee.IrClosure.captures;
+        const id = callee.IrClosure.asPtr().id;
+        const captures = callee.IrClosure;
         // Closure id indexes the closure table.
         const info = self.closures.get(@intCast(id)) orelse {
             const msg = try std.fmt.allocPrint(allocator, "unknown IrClosure id {d}", .{id});
@@ -1333,7 +1334,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             const prior_this: ?Value = blk: {
                 const g = captures.borrow();
                 defer g.deinit();
-                const slice = g.get().*;
+                const slice = g.get().captures;
                 if (this_idx < slice.len) break :blk slice[this_idx];
                 break :blk null;
             };
@@ -1342,7 +1343,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 {
                     const g = captures.borrow();
                     defer g.deinit();
-                    try new_caps.appendSlice(allocator, g.get().*);
+                    try new_caps.appendSlice(allocator, g.get().captures);
                 }
                 if (this_idx >= new_caps.items.len) {
                     try new_caps.appendNTimes(allocator, Value.Null, this_idx + 1 - new_caps.items.len);
@@ -1353,8 +1354,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 // are borrows, so retain. No-op under the arena fast path.
                 if (runtime.reclaimEnabled()) for (new_caps.items) |c| c.retain();
                 const slice = try new_caps.toOwnedSlice(allocator);
-                const caps_ref = try ValueSlice.init(allocator, slice);
-                break :bnd Value{ .IrClosure = .{ .id = id, .captures = caps_ref } };
+                const caps_ref = try IrClosureRef.init(allocator, .{ .id = id, .captures = slice });
+                break :bnd Value{ .IrClosure = caps_ref };
             };
             const rest = args[1..];
             const pushed_outer = po: {
@@ -1506,7 +1507,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         {
             const g = captures.borrow();
             defer g.deinit();
-            try capture_values.appendSlice(allocator, g.get().*);
+            try capture_values.appendSlice(allocator, g.get().captures);
         }
         vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
         // A pass-threaded composable invoked as a value (a restart-scope
@@ -1581,7 +1582,7 @@ pub fn callValueNamedTyped(self: *VmHost, allocator: Allocator, callee: *const V
 /// binding changes; every other callee shape dispatches as before.
 pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const Value, recv: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     if (callee.* == .IrClosure and recv.* == .Instance) {
-        if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+        if (self.closures.get(@intCast(callee.IrClosure.asPtr().id))) |info| {
             var has_this = false;
             for (info.capture_names) |n| {
                 if (std.mem.eql(u8, n, "this")) {
@@ -1612,7 +1613,7 @@ pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const
                         defer cg.deinit();
                         break :blk cg.get().name;
                     };
-                    std.debug.print("[cvnrc] id={d} recv={s}\n", .{ callee.IrClosure.id, tn });
+                    std.debug.print("[cvnrc] id={d} recv={s}\n", .{ callee.IrClosure.asPtr().id, tn });
                 }
                 return callValueWithThis(self, allocator, callee, recv, args, arg_names);
             }
@@ -1743,7 +1744,7 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
             }
         }
         if (any_named) {
-            if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+            if (self.closures.get(@intCast(callee.IrClosure.asPtr().id))) |info| {
                 const module_ref = self.module.clone();
                 defer module_ref.deinit();
                 const module = info.module orelse module_ref.asPtr();
@@ -1868,7 +1869,7 @@ pub fn closureParamsDisproven(self: *VmHost, callee: *const Value, args: []const
         cg.deinit();
     }
     if (v != .IrClosure) return false;
-    const info = self.closures.get(@intCast(v.IrClosure.id)) orelse return false;
+    const info = self.closures.get(@intCast(v.IrClosure.asPtr().id)) orelse return false;
     const module_ref = self.module.clone();
     defer module_ref.deinit();
     const module = info.module orelse module_ref.asPtr();
@@ -1921,7 +1922,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
     _ = arg_names;
     var selected_this = this_value_in.*;
     if (allow_resel and callee.* == .IrClosure) {
-        const id = callee.IrClosure.id;
+        const id = callee.IrClosure.asPtr().id;
         if (self.closures.get(@intCast(id))) |info| {
             const module_g = self.module.borrow();
             defer module_g.deinit();
@@ -1958,8 +1959,8 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
     // resolves against the receiver only when it reaches the body as the
     // closure's `this`).
     if (callee.* == .IrClosure) {
-        const id = callee.IrClosure.id;
-        const captures = callee.IrClosure.captures;
+        const id = callee.IrClosure.asPtr().id;
+        const captures = callee.IrClosure;
         if (self.closures.get(@intCast(id))) |info| {
             if (callValueTraceOn()) {
                 const module_g = self.module.borrow();
@@ -1973,7 +1974,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                     has_this_capture = true;
                     const captures_g = captures.borrow();
                     defer captures_g.deinit();
-                    if (i < captures_g.get().*.len) prior_this = captures_g.get().*[i];
+                    if (i < captures_g.get().captures.len) prior_this = captures_g.get().captures[i];
                     break;
                 }
                 const prior_name = if (prior_this) |*v| host_call_member.debugClassNameOf(self, v) else "-";
@@ -2140,7 +2141,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 {
                     const g = captures.borrow();
                     defer g.deinit();
-                    try new_caps.appendSlice(allocator, g.get().*);
+                    try new_caps.appendSlice(allocator, g.get().captures);
                 }
                 const prior_this: ?Value = if (idx < new_caps.items.len) new_caps.items[idx] else null;
                 if (idx >= new_caps.items.len) {
@@ -2152,8 +2153,8 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 // are borrows, so retain. No-op under the arena fast path.
                 if (runtime.reclaimEnabled()) for (new_caps.items) |c| c.retain();
                 const slice = try new_caps.toOwnedSlice(allocator);
-                const caps_ref = try ValueSlice.init(allocator, slice);
-                const bound = Value{ .IrClosure = .{ .id = id, .captures = caps_ref } };
+                const caps_ref = try IrClosureRef.init(allocator, .{ .id = id, .captures = slice });
+                const bound = Value{ .IrClosure = caps_ref };
 
                 // Keep the displaced prior `this` reachable as an outer
                 // implicit receiver, and push the new receiver so a body
@@ -2333,7 +2334,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
 /// lambdas keep the receiver-binding path.
 pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     if (callee.* == .IrClosure) {
-        if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+        if (self.closures.get(@intCast(callee.IrClosure.asPtr().id))) |info| {
             // Shape UNKNOWN (a lambda stored through a generic-typed slot —
             // ktor's `plugins[key] = { scope -> … }` map keeps no function
             // shape) falls back to the declared arity: a body declaring
@@ -2440,8 +2441,8 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
     // The IrClosure owns one ref to each capture (its `release` recursively
     // frees them); the registry `cell` above is a non-owning view.
     if (runtime.reclaimEnabled()) for (captures) |c| c.retain();
-    const caps_ref = try ValueSlice.init(allocator, try allocator.dupe(Value, captures));
-    return .{ .ok = .{ .IrClosure = .{ .id = id, .captures = caps_ref } } };
+    const caps_ref = try IrClosureRef.init(allocator, .{ .id = id, .captures = try allocator.dupe(Value, captures) });
+    return .{ .ok = .{ .IrClosure = caps_ref } };
 }
 
 pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, module: *const Module, params: []const []const u8, body: *const ast.Block, captured_names: []const []const u8, captures: []const Value, absorb_return: bool, body_func: ?FuncId) Allocator.Error!EvalResult {
@@ -2484,8 +2485,8 @@ pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, module:
         .chain = chain,
     });
     if (runtime.reclaimEnabled()) for (captures) |c| c.retain();
-    const caps_ref = try ValueSlice.init(allocator, try allocator.dupe(Value, captures));
-    return .{ .ok = .{ .IrClosure = .{ .id = id, .captures = caps_ref } } };
+    const caps_ref = try IrClosureRef.init(allocator, .{ .id = id, .captures = try allocator.dupe(Value, captures) });
+    return .{ .ok = .{ .IrClosure = caps_ref } };
 }
 
 pub fn callableReceiverShape(self: *VmHost, v: *const Value) ?ReceiverShape {
@@ -2503,7 +2504,7 @@ pub fn callableReceiverShape(self: *VmHost, v: *const Value) ?ReceiverShape {
 pub fn callableAcceptsArgs(self: *VmHost, v: *const Value, n_args: usize) ?bool {
     switch (v.*) {
         .IrClosure => |c| {
-            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            const info = self.closures.get(@intCast(c.asPtr().id)) orelse return null;
             // A local FUNCTION lowers as a closure too and may carry
             // defaults or a vararg; its body func's declared arity is
             // authoritative (`String.endsWithCs(suffix, ignoreCase =
@@ -2551,7 +2552,7 @@ fn nonNullDeclared(t: ir.TypeRef) bool {
 pub fn callableAcceptsCall(self: *VmHost, v: *const Value, recv: *const Value, args: []const Value, arg_names: []const ?[]const u8) ?bool {
     switch (v.*) {
         .IrClosure => |c| {
-            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            const info = self.closures.get(@intCast(c.asPtr().id)) orelse return null;
             var required: usize = info.n_params;
             var total: usize = info.n_params;
             var has_vararg = false;
@@ -2647,9 +2648,9 @@ pub fn callableAcceptsCall(self: *VmHost, v: *const Value, recv: *const Value, a
 /// dispatcher queues onto the very scheduler only that runner pumps.
 pub fn closureNeedsThisCapture(self: *VmHost, v: *const Value) bool {
     if (v.* != .IrClosure) return false;
-    const info = self.closures.get(@intCast(v.IrClosure.id)) orelse return false;
+    const info = self.closures.get(@intCast(v.IrClosure.asPtr().id)) orelse return false;
     if (callValueTraceOn()) {
-        std.debug.print("[needs-this] id={d} has_recv={} caps={d}\n", .{ v.IrClosure.id, info.has_receiver, info.capture_names.len });
+        std.debug.print("[needs-this] id={d} has_recv={} caps={d}\n", .{ v.IrClosure.asPtr().id, info.has_receiver, info.capture_names.len });
     }
     if (!info.has_receiver) return false;
     for (info.capture_names) |n| {
@@ -2665,7 +2666,7 @@ pub fn closureNeedsThisCapture(self: *VmHost, v: *const Value) bool {
 /// receiver-split paths use.
 pub fn overrideClosureThis(self: *VmHost, v: *const Value, new_this: *const Value) void {
     if (v.* != .IrClosure) return;
-    const info = self.closures.get(@intCast(v.IrClosure.id)) orelse return;
+    const info = self.closures.get(@intCast(v.IrClosure.asPtr().id)) orelse return;
     var this_idx: ?usize = null;
     for (info.capture_names, 0..) |n, i| {
         if (std.mem.eql(u8, n, "this")) {
@@ -2674,9 +2675,9 @@ pub fn overrideClosureThis(self: *VmHost, v: *const Value, new_this: *const Valu
         }
     }
     const ti = this_idx orelse return;
-    const g = v.IrClosure.captures.borrowMut();
+    const g = v.IrClosure.borrowMut();
     defer g.deinit();
-    const slice = g.get().*;
+    const slice = g.get().captures;
     if (ti < slice.len) {
         if (runtime.reclaimEnabled()) {
             new_this.retain();

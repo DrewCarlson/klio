@@ -725,7 +725,7 @@ pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: 
     const callee_v = frame.read(cv.callee);
     if (runtime.envOnce("KLIO_TRACE_PATH") != null) {
         if (callee_v == .IrClosure) {
-            std.debug.print("[cv-callee] in={s} kind=IrClosure id={d}\n", .{ frame.func.name, callee_v.IrClosure.id });
+            std.debug.print("[cv-callee] in={s} kind=IrClosure id={d}\n", .{ frame.func.name, callee_v.IrClosure.asPtr().id });
         } else {
             std.debug.print("[cv-callee] in={s} kind={s}\n", .{ frame.func.name, @tagName(std.meta.activeTag(callee_v)) });
         }
