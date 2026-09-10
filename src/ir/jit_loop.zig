@@ -465,6 +465,15 @@ pub const DirectSite = struct {
     may_deopt: bool = false,
     /// Where that re-run resumes: the receiver `Move` this call removed.
     resume_at: BodyInstPos,
+    /// The receiver register, so loop entry can prove the callee's field layout
+    /// against the instance it will read. Unused by the function tier, whose
+    /// receiver is the caller's own `this`.
+    recv_reg: u32 = 0,
+    /// The slot holding the RECEIVER's field-buffer pointer, which the callee
+    /// reads as its own `this`. In the function tier that is the caller's entry
+    /// base (a self call shares the receiver); in the loop tier it is the base
+    /// cached at loop entry for a loop-invariant receiver.
+    fbase_slot: u32 = 0,
 };
 
 // --- supported-shape predicates ---------------------------------------------
@@ -1059,7 +1068,10 @@ fn directCallTarget(
     // wants more than its receiver boxed is out of scope.
     if (cl.capture_loads.len != 0 or cl.obj_param_loads.len > 1) return null;
     if (cl.guard_class != instanceClassIdentity(recv.*)) return null;
-    if (!isScalarRt(cl.result_rt) and cl.result_rt != .unit) return null;
+    // The result KIND is the caller's concern: each tier compares `result_rt`
+    // against its destination register, and only when it wants the value. A
+    // `Unit` method whose return type was never recorded reads as `.unknown`,
+    // and demanding scalar-or-unit here refused every one of them.
     return cl;
 }
 
@@ -1081,6 +1093,61 @@ fn nativeScalarCallShape(module: *const Module, inst: *const Inst, types: []cons
             isScalarRt(typeAt(types, bo.lhs)) and isScalarRt(typeAt(types, bo.rhs));
     }
     return false;
+}
+
+/// The loop-invariant object register a receiver argument is Moved from, with
+/// the position of that Move.
+const LoopRecvSource = struct { src: u32, mv: BodyInstPos };
+
+/// The loop-invariant object register a call's receiver argument is Moved from,
+/// when that Move is the ONLY thing writing the argument register and nothing
+/// else reads it. This is the loop-tier analogue of `soleReceiverMove`: the
+/// receiver is a local (`val c = Counter()` above the loop), not the caller's
+/// `this`, so it is identified by the Move that feeds arg 0.
+fn loopReceiverSource(
+    func: *const Func,
+    body: []const BlockId,
+    arg0: u32,
+    call_b: u32,
+    call_i: u32,
+    types: []const RegType,
+    n_regs: u32,
+) ?LoopRecvSource {
+    var found: ?LoopRecvSource = null;
+    var other_refs: usize = 0;
+    for (body) |bid| {
+        const blk = &func.blocks[bid.int()];
+        for (blk.insts, 0..) |*inst, ii| {
+            if (bid.int() == call_b and ii == call_i) continue; // the call itself
+            if (inst.* == .Move and inst.Move.dst.int() == arg0) {
+                if (found != null) return null; // more than one writer
+                const src = inst.Move.src.int();
+                if (src >= n_regs or typeAt(types, Reg.from(src)) != .object) return null;
+                found = .{ .src = src, .mv = .{ .b = bid.int(), .i = @intCast(ii) } };
+                continue;
+            }
+            const Ctx = struct { r: u32, n: *usize };
+            var cx = Ctx{ .r = arg0, .n = &other_refs };
+            ir.visitInstRegs(inst, &cx, struct {
+                fn f(c: *Ctx, rr: Reg, _: bool) void {
+                    if (rr.int() == c.r) c.n.* += 1;
+                }
+            }.f);
+        }
+        const Ctx2 = struct { r: u32, n: *usize };
+        var cx2 = Ctx2{ .r = arg0, .n = &other_refs };
+        ir.visitTerminatorRegs(&blk.terminator, &cx2, struct {
+            fn f(c: *Ctx2, rr: Reg, _: bool) void {
+                if (rr.int() == c.r) c.n.* += 1;
+            }
+        }.f);
+    }
+    if (other_refs != 0) return null;
+    const got = found orelse return null;
+    // The source must be loop-invariant: nothing in the body may write it.
+    if (regWrittenInBody(func, body, Reg.from(got.src))) return null;
+    if (got.mv.b != call_b or got.mv.i >= call_i) return null;
+    return got;
 }
 
 /// A (block, instruction) position inside a compiled body.
@@ -1722,7 +1789,13 @@ fn inferTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u3
         var p: usize = 0;
         while (p < n_regs and p < regs.len) : (p += 1) {
             if (array_info[p] != null or cell_info[p] != null) continue;
-            if (cellScalarType(regs[p])) |rt| types[p] = rt;
+            // Objects too, not just scalars: a loop reading an instance built
+            // OUTSIDE it (`val c = Counter()` above a `c.bump(1)` loop) had no
+            // in-body instruction to infer that register from, so it stayed
+            // unknown and the loop bailed entirely. An `.object` register is
+            // excluded from the scalar unbox/rebox sets below and reaches the
+            // body only through the site machinery, which guards its class.
+            if (liveValueRegType(regs[p])) |rt| types[p] = rt;
         }
     }
     var changed = true;
@@ -2248,6 +2321,9 @@ const Compiler = struct {
     call_sites: []const CallSite,
     inline_sites: []const InlineSite,
     direct_sites: []const DirectSite = &.{},
+    /// Instructions a direct call consumed (the receiver Move), which must not
+    /// be emitted.
+    skip_insts: []const BodyInstPos = &.{},
     /// Per-register: is this a nullable-scalar register, and its null-flag slot.
     nullable: []const bool,
     null_flag_slot: []const u32,
@@ -2703,7 +2779,7 @@ const Compiler = struct {
             try self.loadSlot(T0, Reg.from(site.args_reg + i));
             try self.em.storeMem(REGS, slotBytes(site.slot_base + cal.param_slot_base + i), T0);
         }
-        try self.em.loadMem(T0, REGS, slotBytes(self.entry_fbase_slot));
+        try self.em.loadMem(T0, REGS, slotBytes(site.fbase_slot));
         try self.em.storeMem(REGS, slotBytes(site.slot_base + cal.entry_fbase_slot), T0);
         try self.em.movReg(.rdi, REGS);
         try self.em.addImm32(.rdi, slotBytes(site.slot_base));
@@ -2815,6 +2891,11 @@ const Compiler = struct {
         if (self.directSiteAt()) |site| {
             try self.emitDirectCall(site);
             return;
+        }
+        // The receiver Move a direct call consumed: its destination is an object
+        // register nothing else reads, and copying its slot would move garbage.
+        for (self.skip_insts) |p| {
+            if (p.b == self.cur_block.int() and p.i == self.cur_inst) return;
         }
         // A trampolined site (call / member / field / object op / subscript) is a
         // host callback; checked first so an object-collection subscript is not
@@ -3716,9 +3797,66 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     // and the cached scalar lives in a slot written back only at loop exit.
     var call_sites: std.ArrayListUnmanaged(CallSite) = .empty;
     defer call_sites.deinit(a);
+    // A method call on a loop-invariant receiver, held until the slot layout
+    // exists to give its callee a window.
+    const DirectPre = struct {
+        block: BlockId,
+        inst: u32,
+        callee: FuncId,
+        recv_reg: u32,
+        args_reg: u32,
+        n_args: u32,
+        dst: Reg,
+        move: BodyInstPos,
+    };
+    var direct_pre: std.ArrayListUnmanaged(DirectPre) = .empty;
+    defer direct_pre.deinit(a);
+    var skip_call_insts: std.ArrayListUnmanaged(BodyInstPos) = .empty;
+    defer skip_call_insts.deinit(a);
+    // `c.bump(1)` lowers to a static call with the receiver MOVED into arg 0.
+    // When that receiver is a loop-invariant instance and the callee is a
+    // deopt-free compiled method, the loop calls straight into its code — so
+    // neither the Move nor the call may be registered as a trampoline site.
+    // Found before registration because the Move precedes the call.
+    if (fjDirectEnabled()) {
+        for (body) |bid| {
+            const blk = &func.blocks[bid.int()];
+            for (blk.insts, 0..) |*inst, i| {
+                const tc = trampolinableCallOf(inst) orelse continue;
+                if (tc.n_args == 0 or tc.n_args > 6) continue;
+                const cf = module.funcById(tc.func) orelse continue;
+                if (cf == func or cf.is_suspend or !cf.has_receiver_param or !cf.hasBody()) continue;
+                const rs = loopReceiverSource(func, body, tc.args_reg, bid.int(), @intCast(i), types, n_regs) orelse continue;
+                if (rs.src >= regs.len or regs[rs.src] != .Instance) continue;
+                direct_pre.append(a, .{
+                    .block = bid,
+                    .inst = @intCast(i),
+                    .callee = tc.func,
+                    .recv_reg = rs.src,
+                    .args_reg = tc.args_reg,
+                    .n_args = tc.n_args,
+                    .dst = tc.dst,
+                    .move = rs.mv,
+                }) catch return null;
+                skip_call_insts.append(a, .{ .b = bid.int(), .i = @intCast(i) }) catch return null;
+                skip_call_insts.append(a, rs.mv) catch return null;
+            }
+        }
+    }
+    const skipCallAt = struct {
+        fn f(list: []const BodyInstPos, b: u32, i: u32) bool {
+            for (list) |p| {
+                if (p.b == b and p.i == i) return true;
+            }
+            return false;
+        }
+    }.f;
     for (body) |bid| {
         const blk_insts = func.blocks[bid.int()].insts;
         for (blk_insts, 0..) |*inst, i| {
+            // Consumed by a direct call: neither the receiver Move nor the call
+            // itself reaches the host.
+            if (skipCallAt(skip_call_insts.items, bid.int(), @intCast(i))) continue;
             // Same inline forms as the function tier: registering one as a
             // member/virtual site trampolines to the host once per iteration
             // for two instructions' worth of work.
@@ -4154,8 +4292,126 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         site.fbase_slot = ptr_slot;
         site.tag = tag;
     }
-    const n_slots: u32 = nullable_end + @as(u32, @intCast(field_bases.items.len));
+    var n_slots: u32 = nullable_end + @as(u32, @intCast(field_bases.items.len));
     if (debugEnabled() and field_bases.items.len != 0) std.debug.print("[jit]   native field access on {d} receiver(s) in {s}\n", .{ field_bases.items.len, func.name });
+
+    // A member call on a LOOP-INVARIANT receiver whose target is a deopt-free
+    // compiled method goes straight into that method's code. Loop entry already
+    // proves the receiver's class (`recv_class`) and already caches its field
+    // buffer for native field access, so the call needs no per-iteration guard —
+    // it seeds the callee's argument slots and that cached base, and calls.
+    // Without this the loop paid a host round trip per iteration to reach a body
+    // that was already compiled.
+    var direct_sites: std.ArrayListUnmanaged(DirectSite) = .empty;
+    defer direct_sites.deinit(a);
+    for (direct_pre.items) |pre| {
+        const cf = module.funcById(pre.callee) orelse return null;
+        const cl = directCallTarget(module, cf, pre.n_args, &regs[pre.recv_reg], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse return null;
+        if (cl.guard_class != instanceClassIdentity(regs[pre.recv_reg])) return null;
+        var k: u32 = 1;
+        while (k < pre.n_args) : (k += 1) {
+            const ar = pre.args_reg + k;
+            if (ar >= n_regs or typeAt(types, Reg.from(ar)) != cl.param_rt[k]) return null;
+        }
+        const wants = pre.dst.int() < n_regs and isScalarRt(typeAt(types, pre.dst));
+        if (wants and typeAt(types, pre.dst) != cl.result_rt) return null;
+        var base_slot: u32 = 0;
+        var have_base = false;
+        for (field_bases.items) |fb| {
+            if (fb.recv_reg == pre.recv_reg) {
+                base_slot = fb.ptr_slot;
+                have_base = true;
+                break;
+            }
+        }
+        if (!have_base) {
+            base_slot = n_slots;
+            field_bases.append(a, .{ .recv_reg = pre.recv_reg, .ptr_slot = base_slot }) catch return null;
+            n_slots += 1;
+        }
+        direct_sites.append(a, .{
+            .block = pre.block,
+            .inst = pre.inst,
+            .callee = cl,
+            .slot_base = 0,
+            .args_reg = pre.args_reg,
+            .n_args = pre.n_args,
+            .dst = pre.dst,
+            .has_result = wants,
+            .may_deopt = cl.can_deopt,
+            .resume_at = pre.move,
+            .fbase_slot = base_slot,
+            .recv_reg = pre.recv_reg,
+        }) catch return null;
+        skip_call_insts.append(a, pre.move) catch return null;
+        if (debugEnabled()) std.debug.print("[jit]   direct call {s} on a loop-invariant receiver in {s}\n", .{ cf.name, func.name });
+    }
+    if (fjDirectEnabled()) {
+        for (call_sites.items) |*site| {
+            if (!site.is_member or site.recv_varies or site.recv_class == 0) continue;
+            if (site.dispatch_recv_reg != null) continue;
+            const target = site.resolved_member orelse continue;
+            if (site.recv_reg >= regs.len or regs[site.recv_reg] != .Instance) continue;
+            const cf = module.funcById(target) orelse continue;
+            if (cf == func) continue;
+            // The emitter reads callee parameter `i` from `args_reg + i`, and a
+            // member site's arguments start at `args_reg`, so the base is biased
+            // by one — it must not wrap.
+            if (site.n_args != 0 and site.args_reg == 0) continue;
+            const cl = directCallTarget(module, cf, site.n_args + 1, &regs[site.recv_reg], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse continue;
+            if (cl.guard_class != site.recv_class) continue;
+            // Arguments live in typed scalar slots and must be the kinds the
+            // callee was specialized on; the result likewise.
+            var ok_args = true;
+            var k: u32 = 0;
+            while (k < site.n_args) : (k += 1) {
+                const ar = site.args_reg + k;
+                if (ar >= n_regs or typeAt(types, Reg.from(ar)) != cl.param_rt[k + 1]) ok_args = false;
+            }
+            if (!ok_args) continue;
+            const wants_result = site.has_result and site.dst_reg < n_regs and isScalarRt(typeAt(types, Reg.from(site.dst_reg)));
+            if (wants_result and typeAt(types, Reg.from(site.dst_reg)) != cl.result_rt) continue;
+            // Reuse (or mint) the loop-entry field base for this receiver.
+            var base_slot: u32 = 0;
+            var have_base = false;
+            for (field_bases.items) |fb| {
+                if (fb.recv_reg == site.recv_reg) {
+                    base_slot = fb.ptr_slot;
+                    have_base = true;
+                    break;
+                }
+            }
+            if (!have_base) {
+                base_slot = n_slots;
+                field_bases.append(a, .{ .recv_reg = site.recv_reg, .ptr_slot = base_slot }) catch return null;
+                n_slots += 1;
+            }
+            direct_sites.append(a, .{
+                .block = site.block,
+                .inst = site.inst,
+                .callee = cl,
+                .slot_base = 0,
+                .args_reg = site.args_reg -% 1, // callee param i reads args_reg + i
+                .n_args = site.n_args + 1,
+                .dst = Reg.from(site.dst_reg),
+                .has_result = wants_result,
+                .may_deopt = cl.can_deopt,
+                .resume_at = .{ .b = site.block.int(), .i = site.inst },
+                .fbase_slot = base_slot,
+                .recv_reg = site.recv_reg,
+            }) catch return null;
+            if (debugEnabled()) std.debug.print("[jit]   direct member call {s} in {s}\n", .{ cf.name, func.name });
+        }
+        if (direct_sites.items.len != 0) {
+            var window: u32 = 0;
+            for (direct_sites.items) |*ds| {
+                ds.slot_base = n_slots;
+                if (ds.callee.n_slots > window) window = ds.callee.n_slots;
+            }
+            n_slots += window;
+            if (n_slots > 192) return null;
+        }
+    }
 
     var c = Compiler{
         .a = a,
@@ -4167,6 +4423,8 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .cell_info = cell_info,
         .call_sites = call_sites.items,
         .inline_sites = inline_sites.items,
+        .direct_sites = direct_sites.items,
+        .skip_insts = skip_call_insts.items,
         .nullable = nullable,
         .null_flag_slot = null_flag_slot,
         .uc_slot = uc_slot,
@@ -4239,6 +4497,10 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         .cells = cells_owned,
         .nullables = nullables_owned,
         .field_bases = fbases_owned,
+        .direct_sites = if (direct_sites.items.len != 0)
+            (a.dupe(DirectSite, direct_sites.items) catch return null)
+        else
+            &.{},
         .call_sites = sites_owned,
         .member_ics = blk: {
             const ics = a.alloc(MemberIC, sites_owned.len) catch break :blk &.{};
@@ -4358,6 +4620,33 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     // one holds the `*TrampCtx` the native call sites load into rdi, the other the
     // host callback. `tctx` is a stack local live across the whole native run.
     var tctx: TrampCtx = undefined;
+    // Field bases and direct callees are seeded whether or not this loop has any
+    // TRAMPOLINE site left: a direct call consumes the only call site a loop may
+    // have had, and its receiver's field base still has to be cached.
+    {
+        for (self.field_bases) |fb| {
+            if (fb.recv_reg >= regs.len or regs[fb.recv_reg] != .Instance) return .bail;
+            const g = regs[fb.recv_reg].Instance.borrow();
+            slots[fb.ptr_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
+            g.deinit();
+        }
+        // A direct call reaches its callee's body WITHOUT the callee's own entry
+        // guard, so this entry proves the layout that body was compiled against
+        // still holds on the receiver it will read.
+        for (self.direct_sites) |ds| {
+            const rr = ds.recv_reg;
+            if (rr >= regs.len or regs[rr] != .Instance) return .bail;
+            if (instanceClassIdentity(regs[rr]) != ds.callee.guard_class) return .bail;
+            if (ds.callee.method_fields.len == 0) continue;
+            const g = regs[rr].Instance.borrow();
+            defer g.deinit();
+            const items = g.get().fields.items;
+            for (ds.callee.method_fields) |mf| {
+                if (mf.idx >= items.len or
+                    !(items[mf.idx].name.ptr == mf.name.ptr or std.mem.eql(u8, items[mf.idx].name, mf.name))) return .bail;
+            }
+        }
+    }
     if (self.call_sites.len != 0) {
         if (tramp == null or user == null) return .bail;
         // Each member call's receiver must still be an Instance of the class the
@@ -4374,12 +4663,6 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
         // Cache each native-field receiver's field buffer pointer. The receiver is
         // an already-validated loop-invariant Instance; the buffer does not move or
         // resize inside the native run, so the pointer stays valid throughout.
-        for (self.field_bases) |fb| {
-            if (fb.recv_reg >= regs.len or regs[fb.recv_reg] != .Instance) return .bail;
-            const g = regs[fb.recv_reg].Instance.borrow();
-            slots[fb.ptr_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
-            g.deinit();
-        }
         tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.?, .tags = tags.ptr };
         slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
         slots[self.tramp_slot] = @bitCast(@intFromPtr(tramp.?));
@@ -5021,6 +5304,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     .has_result = false, // set once the caller's register types are known
                     .may_deopt = cl.can_deopt,
                     .resume_at = .{ .b = mv.b, .i = mv.i },
+                    .fbase_slot = 0, // the caller's entry base, assigned with the slot layout
                 }) catch return null;
                 skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
                 if (debugEnabled()) std.debug.print("[jit]   direct call {s} from {s} at b{d}:{d} (move b{d}:{d})\n", .{ cf.name, func.name, bid.int(), ii, mv.b, mv.i });
@@ -5914,6 +6198,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         var window: u32 = 0;
         for (direct_sites.items) |*ds| {
             ds.slot_base = n_slots;
+            ds.fbase_slot = fbase_slot;
             if (ds.callee.n_slots > window) window = ds.callee.n_slots;
         }
         n_slots += window;
