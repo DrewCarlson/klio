@@ -255,7 +255,11 @@ const itests_files = [_]Itest{
         "kotlin-klio/klio-kotlinx-coroutines",
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlin-test",
-    }, .weight = 150 },
+        // Sharded: the suite is ~25 minutes undivided, and its slice holding
+        // `RecomposerTests.validatePotentialDeadlock` (one test, ~9 of those
+        // minutes) sets the floor — so the weight is the heaviest slice's, not
+        // a third of the whole.
+    }, .weight = 78, .shards = 3 },
     // Each bundled library's own commonTest sources run through a child
     // `klio test` against its installed pack (see commontest_support.zig).
     .{ .name = "atomicfu_commontest", .needs_exe = true, .dirs = &.{
