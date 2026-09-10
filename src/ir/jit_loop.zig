@@ -377,6 +377,11 @@ pub const CompiledLoop = struct {
     /// (receiver fields, scalar args) and may run at the RECURSIVE CALL SEAM
     /// with no frame at all — its only outcome is RETURN.
     can_deopt: bool = true,
+    /// Whether the body stores to any `this`-field. A deopt out of a body that
+    /// has already written one cannot be answered by re-running the call — the
+    /// write would land twice — so this is what decides whether a CALLER may
+    /// reach this body through a direct call that deopts.
+    writes_fields: bool = true,
     /// Any call site that actually calls back through the trampoline (a
     /// NATIVE field site is direct memory access and needs none).
     has_tramp_sites: bool = true,
@@ -455,6 +460,11 @@ pub const DirectSite = struct {
     n_args: u32,
     dst: Reg,
     has_result: bool,
+    /// The callee can deopt, so the caller tests the returned resume code and
+    /// re-runs the whole call interpreted when it is not RETURN.
+    may_deopt: bool = false,
+    /// Where that re-run resumes: the receiver `Move` this call removed.
+    resume_at: BodyInstPos,
 };
 
 // --- supported-shape predicates ---------------------------------------------
@@ -589,6 +599,27 @@ fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
             else
                 return null;
             return .{ .dst = cm.dst, .src = cm.receiver, .to = to };
+        },
+        // The same conversion on a scalar also lowers as a VIRTUAL call
+        // (`k.toLong()` did), and the slot is rooted at its declaring
+        // function — so the name comes from there. Only the builtin
+        // declarations count: a user class's own `toLong()` is a real call.
+        .CallVirtual => |cv| {
+            if (cv.arg_names.len != 0 or cv.n_args != 0) return null;
+            if (cv.arg_params != null or cv.trailing_lambda) return null;
+            const decl = module.funcById(ir.FuncId.from(cv.slot.int())) orelse return null;
+            if (!std.mem.startsWith(u8, decl.fqn, "kotlin.")) return null;
+            const to: RegType = if (std.mem.eql(u8, decl.name, "toDouble"))
+                .f64
+            else if (std.mem.eql(u8, decl.name, "toFloat"))
+                .f32
+            else if (std.mem.eql(u8, decl.name, "toLong"))
+                .i64
+            else if (std.mem.eql(u8, decl.name, "toInt"))
+                .i32
+            else
+                return null;
+            return .{ .dst = cv.dst, .src = cv.receiver, .to = to };
         },
         else => return null,
     }
@@ -751,6 +782,10 @@ const InlineSite = struct {
     n_field_sites: u32 = 0,
     /// Has a value return (false for a `Unit` method invoked for its effect).
     has_result: bool = true,
+    /// Where a deopt inside the spliced body resumes: the receiver `Move` this
+    /// splice removed. Null for a top-level inline, which removes nothing, so
+    /// the call's own position is right.
+    resume_at: ?BodyInstPos = null,
 };
 
 /// The destination register an instruction writes, if any (covering every shape
@@ -1007,7 +1042,13 @@ fn directCallTarget(
     direct_compile_depth += 1;
     defer direct_compile_depth -= 1;
     const cl = compileCalleeForCall(module, cf, argv[0..n_args], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse return null;
-    if (!cl.func_mode or !cl.method_mode or cl.can_deopt or cl.has_tramp_sites) return null;
+    if (!cl.func_mode or !cl.method_mode or cl.has_tramp_sites) return null;
+    // A callee that CAN deopt is still reachable: the caller tests the resume
+    // code it returns and re-runs the whole call interpreted, exactly as the
+    // splice does. That answer is only correct while the callee has changed
+    // nothing observable first, so a body that stores a field must be able to
+    // reach its RETURN — a re-run would apply the store twice.
+    if (cl.can_deopt and cl.writes_fields) return null;
     if (cl.n_params != n_args or cl.param_rt.len != n_args) return null;
     if (cl.param_rt[0] != .object) return null;
     for (cl.param_rt[1..], 1..) |prt, i| {
@@ -1020,6 +1061,26 @@ fn directCallTarget(
     if (cl.guard_class != instanceClassIdentity(recv.*)) return null;
     if (!isScalarRt(cl.result_rt) and cl.result_rt != .unit) return null;
     return cl;
+}
+
+/// Whether an instruction is a call-SHAPED op the emitter lowers inline: a
+/// numeric conversion or a bitwise op over scalars. Both spell as a member or
+/// virtual call, so a site pass that does not recognize them either trampolines
+/// two instructions' worth of work through the host (the loop tier) or rejects
+/// the whole body for a non-object receiver (the function tier).
+///
+/// The operand check is what keeps it honest: the same names on a BOXED
+/// receiver (`Number.toInt()`) have no inline form, and claiming one would turn
+/// a body that trampolines correctly into one that does not compile at all.
+fn nativeScalarCallShape(module: *const Module, inst: *const Inst, types: []const RegType, n_regs: u32) bool {
+    if (numericConvOf(module, inst)) |nc| {
+        return nc.src.int() < n_regs and isScalarRt(typeAt(types, nc.src));
+    }
+    if (bitwiseOpOf(module, inst)) |bo| {
+        return bo.lhs.int() < n_regs and bo.rhs.int() < n_regs and
+            isScalarRt(typeAt(types, bo.lhs)) and isScalarRt(typeAt(types, bo.rhs));
+    }
+    return false;
 }
 
 /// A (block, instruction) position inside a compiled body.
@@ -1074,6 +1135,22 @@ fn soleReceiverMove(
         }.f);
     }
     if (other_refs != 0) return null;
+    // A deopt out of the spliced body re-runs the whole call from the
+    // interpreter, and the Move being removed here is what fills the call's
+    // receiver argument — so the interpreter has to resume AT the Move, not at
+    // the call. That is only sound while the instructions it would re-run in
+    // between are idempotent, which for the lowered call shape (the remaining
+    // argument moves) they are.
+    const mv = found orelse return null;
+    if (mv.b != call_b or mv.i >= call_i) return null;
+    const blk = &func.blocks[call_b];
+    var k: u32 = mv.i + 1;
+    while (k < call_i) : (k += 1) {
+        switch (blk.insts[k]) {
+            .Move, .Const, .Trace => {},
+            else => return null,
+        }
+    }
     return found;
 }
 
@@ -2204,6 +2281,10 @@ const Compiler = struct {
     epilogue: jit.Label,
     cur_block: BlockId = undefined,
     cur_inst: u32 = 0,
+    /// While a spliced or direct call is emitted, where a deopt must resume:
+    /// the receiver `Move` the compiler removed, so the interpreter re-runs
+    /// from the point that fills the argument register native code never wrote.
+    deopt_override: ?BodyInstPos = null,
 
     fn inBody(self: *Compiler, b: BlockId) bool {
         for (self.body) |x| if (x.int() == b.int()) return true;
@@ -2464,7 +2545,10 @@ const Compiler = struct {
 
     /// A deopt stub for resuming the interpreter at the current instruction.
     fn deoptLabel(self: *Compiler) !jit.Label {
-        const code = encodeResume(self.cur_block, self.cur_inst);
+        const code = if (self.deopt_override) |p|
+            encodeResume(BlockId.from(p.b), p.i)
+        else
+            encodeResume(self.cur_block, self.cur_inst);
         for (self.deopt_codes.items, 0..) |c, i| {
             if (c == code) return self.deopt_labels.items[i];
         }
@@ -2529,6 +2613,9 @@ const Compiler = struct {
     /// parameter slot, emit the callee's single block remapped into the caller's
     /// extended register space, then copy the (remapped) return value to the dst.
     fn emitInlinedCall(self: *Compiler, site: *const InlineSite) !void {
+        const saved = self.deopt_override;
+        self.deopt_override = site.resume_at;
+        defer self.deopt_override = saved;
         var order_buf: [INLINE_MAX_BLOCKS]u32 = undefined;
         const order = calleeBlockOrder(site.callee, &order_buf) orelse return jit.JitError.Unsupported;
         if (order.len == 1) {
@@ -2607,6 +2694,9 @@ const Compiler = struct {
     /// there is no resume code to interpret and no register to rebox; the
     /// result comes back out of the callee's own result slot.
     fn emitDirectCall(self: *Compiler, site: *const DirectSite) !void {
+        const saved = self.deopt_override;
+        self.deopt_override = site.resume_at;
+        defer self.deopt_override = saved;
         const cal = site.callee;
         var i: u32 = 1;
         while (i < cal.n_params) : (i += 1) {
@@ -2619,6 +2709,15 @@ const Compiler = struct {
         try self.em.addImm32(.rdi, slotBytes(site.slot_base));
         try self.em.movImm64(.rax, @intFromPtr(cal.exec.mem.ptr));
         try self.em.callReg(.rax);
+        if (site.may_deopt) {
+            // The callee hands back its own resume code. RETURN is the only one
+            // this frame can continue from; anything else re-runs the call in
+            // the interpreter, which is where the real throw is raised. The
+            // callee wrote no field, so re-running repeats nothing.
+            try self.em.movImm64(T1, returnCode());
+            try self.em.cmpReg(T0, T1);
+            try self.em.jcc(.ne, try self.deoptLabel());
+        }
         if (site.has_result) {
             try self.em.loadMem(T0, REGS, slotBytes(site.slot_base + cal.result_slot));
             try self.storeSlot(site.dst, T0);
@@ -3620,6 +3719,10 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     for (body) |bid| {
         const blk_insts = func.blocks[bid.int()].insts;
         for (blk_insts, 0..) |*inst, i| {
+            // Same inline forms as the function tier: registering one as a
+            // member/virtual site trampolines to the host once per iteration
+            // for two instructions' worth of work.
+            if (nativeScalarCallShape(module, inst, types, n_regs)) continue;
             const is_call = trampolinableCallOf(inst) != null;
             const is_member = trampolinableMemberOf(module, inst) != null;
             const is_virtual = trampolinableVirtualOf(inst) != null;
@@ -4871,6 +4974,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     .field_site_base = 0,
                     .n_field_sites = 0,
                     .has_result = calleeReturnsValue(cf),
+                    .resume_at = .{ .b = mv.b, .i = mv.i },
                 }) catch return null;
                 skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
                 total_regs += cf.n_locals;
@@ -4915,6 +5019,8 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                     .n_args = tc.n_args,
                     .dst = tc.dst,
                     .has_result = false, // set once the caller's register types are known
+                    .may_deopt = cl.can_deopt,
+                    .resume_at = .{ .b = mv.b, .i = mv.i },
                 }) catch return null;
                 skip_insts.append(a, .{ .b = mv.b, .i = mv.i }) catch return null;
                 if (debugEnabled()) std.debug.print("[jit]   direct call {s} from {s} at b{d}:{d} (move b{d}:{d})\n", .{ cf.name, func.name, bid.int(), ii, mv.b, mv.i });
@@ -5563,6 +5669,12 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
                 }
                 continue;
             }
+            // A numeric conversion or a bitwise op spells as a member or
+            // virtual call on a SCALAR receiver, and the emitter lowers both
+            // inline. Reaching the member branch rejected the whole body for a
+            // non-object receiver, so a method doing `k.toLong()` or `x shl 3`
+            // never compiled.
+            if (nativeScalarCallShape(module, inst, types, n_regs)) continue;
             const kind: enum { member, virt } = if (trampolinableMemberOf(module, inst) != null) .member else if (trampolinableVirtualOf(inst) != null) .virt else continue;
             // The receiver register must be object-typed: the handler reads
             // its value from the FRAME, which holds every object def (handler
@@ -5763,7 +5875,19 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     for (field_pres.items) |fp| {
         if (!fp.is_set and !fp.nn) all_reads_nn = false;
     }
-    const can_deopt = !(is_method and field_sites_base == 0 and !has_div and all_reads_nn);
+    var writes_fields = false;
+    for (field_pres.items) |fp| {
+        if (fp.is_set) writes_fields = true;
+    }
+    // A direct call into a callee that can deopt gives THIS body a deopt edge
+    // of its own: the site re-runs the call from the interpreter, which needs a
+    // frame to resume into, so the body no longer qualifies for the frameless
+    // seam.
+    var direct_may_deopt = false;
+    for (direct_sites.items) |*ds| {
+        if (ds.may_deopt) direct_may_deopt = true;
+    }
+    const can_deopt = direct_may_deopt or !(is_method and field_sites_base == 0 and !has_div and all_reads_nn);
     if (can_deopt and is_method and debugEnabled()) {
         // Which condition refused this method the seam — the histogram that says
         // where the next widening belongs.
@@ -5939,6 +6063,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         .entry_fbase_slot = fbase_slot,
         .no_native_recurse = is_method,
         .can_deopt = can_deopt,
+        .writes_fields = writes_fields,
         .has_tramp_sites = field_sites_base != 0,
         .obj_param_loads = obj_loads_owned,
         .capture_loads = cap_loads_owned,
