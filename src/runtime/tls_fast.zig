@@ -22,10 +22,22 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// This thread's unique pointer, in one instruction. `TPIDRRO_EL0` on aarch64
-/// is the thread pointer Darwin's own TLS lowering reads; on x86_64 the same
-/// value sits at `%gs:0`.
+/// This thread's unique pointer, in one instruction — DARWIN ONLY, because the
+/// register holding it is per-platform and this reads it directly:
+/// `TPIDRRO_EL0` is the thread pointer Darwin's own aarch64 TLS lowering reads,
+/// and on x86_64 the same value sits at `%gs:0`.
+///
+/// Linux disagrees on BOTH: its x86_64 thread pointer is in `%fs` (`%gs` is the
+/// kernel's and reads zero in userspace, so this aborted), and its aarch64 one
+/// is `TPIDR_EL0`, not the read-only twin. Reading the wrong one is not a slow
+/// answer, it is a wrong or trapping one.
+///
+/// Scoping this to Darwin costs nothing, because the cost it exists to dodge is
+/// Darwin's alone: a `threadlocal` there resolves through a `_tlv_get_addr`
+/// CALL, while Linux lowers the same access to a register-relative load with no
+/// call to remove.
 pub inline fn threadPtr() usize {
+    if (comptime !supported()) return 0;
     return switch (builtin.cpu.arch) {
         .aarch64 => asm volatile ("mrs %[o], TPIDRRO_EL0"
             : [o] "=r" (-> usize),
@@ -48,8 +60,12 @@ pub fn claimOwner() void {
     @atomicStore(usize, &owner, threadPtr(), .release);
 }
 
+/// Where the thread-pointer register and its convention are both known here.
+/// Anywhere else every thread keeps its `threadlocal`, which is what this
+/// existed to avoid only on Darwin — so the fallback loses nothing.
 pub inline fn supported() bool {
-    return builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .x86_64;
+    return builtin.os.tag.isDarwin() and
+        (builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .x86_64);
 }
 
 /// Whether the calling thread reads the global copy. False for every thread but
