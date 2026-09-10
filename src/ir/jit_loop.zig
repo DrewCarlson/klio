@@ -1165,22 +1165,27 @@ fn nativeScalarCallShape(module: *const Module, inst: *const Inst, types: []cons
     return false;
 }
 
-/// The loop-invariant object register a receiver argument is Moved from, with
-/// the position of that Move.
+/// The object register a receiver argument is Moved from, with the position of
+/// that Move.
 const LoopRecvSource = struct { src: u32, mv: BodyInstPos };
 
-/// The loop-invariant object register a call's receiver argument is Moved from,
-/// when that Move is the ONLY thing writing the argument register and nothing
-/// else reads it. This is the loop-tier analogue of `soleReceiverMove`: the
-/// receiver is a local (`val c = Counter()` above the loop), not the caller's
-/// `this`, so it is identified by the Move that feeds arg 0.
+/// The object register a call's receiver argument is Moved from, when that Move
+/// is the ONLY thing writing the argument register and nothing else reads it.
+/// This is the loop-tier analogue of `soleReceiverMove`: the receiver is a local
+/// (`val c = Counter()` above the loop) or a cursor the loop rebinds, not the
+/// caller's `this`, so it is identified by the Move that feeds arg 0.
+///
+/// Whether the source must be loop-INVARIANT is the caller's call: a direct call
+/// caches a field base at entry and needs invariance, a spliced member body reads
+/// the receiver afresh each iteration and does not. `types` is optional because
+/// the splice is chosen before whole-function inference runs.
 fn loopReceiverSource(
     func: *const Func,
     body: []const BlockId,
     arg0: u32,
     call_b: u32,
     call_i: u32,
-    types: []const RegType,
+    types: ?[]const RegType,
     n_regs: u32,
 ) ?LoopRecvSource {
     var found: ?LoopRecvSource = null;
@@ -1192,7 +1197,8 @@ fn loopReceiverSource(
             if (inst.* == .Move and inst.Move.dst.int() == arg0) {
                 if (found != null) return null; // more than one writer
                 const src = inst.Move.src.int();
-                if (src >= n_regs or typeAt(types, Reg.from(src)) != .object) return null;
+                if (src >= n_regs) return null;
+                if (types) |ts| if (typeAt(ts, Reg.from(src)) != .object) return null;
                 found = .{ .src = src, .mv = .{ .b = bid.int(), .i = @intCast(ii) } };
                 continue;
             }
@@ -1214,8 +1220,6 @@ fn loopReceiverSource(
     }
     if (other_refs != 0) return null;
     const got = found orelse return null;
-    // The source must be loop-invariant: nothing in the body may write it.
-    if (regWrittenInBody(func, body, Reg.from(got.src))) return null;
     if (got.mv.b != call_b or got.mv.i >= call_i) return null;
     return got;
 }
@@ -3548,25 +3552,64 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
     // [n_regs .. total_regs).
     var inline_sites: std.ArrayListUnmanaged(InlineSite) = .empty;
     defer inline_sites.deinit(a);
+    // Receiver `Move`s a member splice consumed: the splice reads the receiver
+    // from the register the Move copies FROM, so the Move itself must not also
+    // register as an object-move callback.
+    var recv_move_skips: std.ArrayListUnmanaged(BodyInstPos) = .empty;
+    defer recv_move_skips.deinit(a);
     var total_regs: u32 = n_regs;
     {
         for (body) |bid| {
             for (func.blocks[bid.int()].insts, 0..) |*inst, ii| {
                 if (trampolinableCallOf(inst)) |tc| {
                     const callee = module.funcById(tc.func) orelse continue;
-                    if (!inlinableCallee(module, callee)) continue;
-                    if (callee.params.len != tc.n_args) continue;
-                    inline_sites.append(a, .{
-                        .block = bid,
-                        .inst = @intCast(ii),
-                        .callee = callee,
-                        .base = total_regs,
-                        .args_reg = tc.args_reg,
-                        .n_args = tc.n_args,
-                        .dst = tc.dst,
-                    }) catch return null;
-                    total_regs += callee.n_locals;
-                    if (total_regs > 4096) return null;
+                    if (inlinableCallee(module, callee) and callee.params.len == tc.n_args) {
+                        inline_sites.append(a, .{
+                            .block = bid,
+                            .inst = @intCast(ii),
+                            .callee = callee,
+                            .base = total_regs,
+                            .args_reg = tc.args_reg,
+                            .n_args = tc.n_args,
+                            .dst = tc.dst,
+                        }) catch return null;
+                        total_regs += callee.n_locals;
+                        if (total_regs > 4096) return null;
+                        continue;
+                    }
+                    // `node.m()` on a receiver the loop REBINDS each iteration
+                    // lowers to a static call with the receiver moved into arg 0.
+                    // Lowering already chose the body, so the splice needs no
+                    // dispatch guard; its `this`-field accesses ride whatever the
+                    // receiver register holds on the iteration that runs them.
+                    // Without this the call is a plain trampoline the callee
+                    // clause refuses outright, and the whole loop goes with it.
+                    if (field_resolver != null and tc.n_args >= 1) blk2: {
+                        var this_reg: u32 = 0;
+                        if (!inlinableMemberCallee(module, callee, &this_reg)) break :blk2;
+                        if (callee.params.len != tc.n_args) break :blk2;
+                        const rs = loopReceiverSource(func, body, tc.args_reg, bid.int(), @intCast(ii), null, n_regs) orelse break :blk2;
+                        if (rs.src >= regs.len or regs[rs.src] != .Instance) break :blk2;
+                        inline_sites.append(a, .{
+                            .block = bid,
+                            .inst = @intCast(ii),
+                            .callee = callee,
+                            .base = total_regs,
+                            .args_reg = tc.args_reg + 1,
+                            .n_args = tc.n_args - 1,
+                            .dst = tc.dst,
+                            .is_member = true,
+                            .recv_reg = rs.src,
+                            .this_reg = this_reg,
+                            .has_result = callee.blocks[0].terminator.Return != null,
+                            .resume_at = rs.mv,
+                        }) catch return null;
+                        recv_move_skips.append(a, rs.mv) catch return null;
+                        total_regs += callee.n_locals;
+                        if (total_regs > 4096) return null;
+                        if (debugEnabled()) std.debug.print("[jit]   splicing member {s} on a rebound receiver in {s}\n", .{ callee.name, func.name });
+                        continue;
+                    }
                     continue;
                 }
                 // A loop-invariant VIRTUAL call resolves its monomorphic slot
@@ -4122,6 +4165,7 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
     defer direct_pre.deinit(a);
     var skip_call_insts: std.ArrayListUnmanaged(BodyInstPos) = .empty;
     defer skip_call_insts.deinit(a);
+    skip_call_insts.appendSlice(a, recv_move_skips.items) catch return null;
     // `c.bump(1)` lowers to a static call with the receiver MOVED into arg 0.
     // When that receiver is a loop-invariant instance and the callee is a
     // deopt-free compiled method, the loop calls straight into its code — so
@@ -4138,6 +4182,8 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
                 const cf = module.funcById(tc.func) orelse continue;
                 if (cf == func or cf.is_suspend or !cf.has_receiver_param or !cf.hasBody()) continue;
                 const rs = loopReceiverSource(func, body, tc.args_reg, bid.int(), @intCast(i), types, n_regs) orelse continue;
+                // A direct call seeds the callee's field base once at loop entry.
+                if (regWrittenInBody(func, body, Reg.from(rs.src))) continue;
                 if (rs.src >= regs.len or regs[rs.src] != .Instance) continue;
                 direct_pre.append(a, .{
                     .block = bid,
