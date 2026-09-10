@@ -632,7 +632,7 @@ fn ivPersist(ctx: *anyopaque) IntrinsicHost {
 fn ivCallableReturnTy(ctx: *anyopaque, callable: *const Value) ?[]const u8 {
     const self = ip(ctx);
     if (callable.* != .IrClosure) return null;
-    const info = self.closures.get(@intCast(callable.IrClosure.id)) orelse return null;
+    const info = self.closures.get(@intCast(callable.IrClosure.asPtr().id)) orelse return null;
     const module_ref = self.module.clone();
     defer module_ref.deinit();
     const module = info.module orelse module_ref.asPtr();

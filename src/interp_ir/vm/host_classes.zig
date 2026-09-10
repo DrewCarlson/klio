@@ -301,7 +301,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                     // sees it. A suspend closure is `SuspendFunctionN` and,
                     // carrying its continuation, `Function(N+1)`.
                     const want = std.fmt.parseInt(usize, rest, 10) catch return true;
-                    const info = self.closures.get(c.id) orelse return true;
+                    const info = self.closures.get(c.asPtr().id) orelse return true;
                     var have = info.n_params + @as(usize, @intFromBool(info.has_receiver));
                     if (info.n_params == 1 and closureItUnconstrained(self, info.body_func, info.module)) have -= 1;
                     const suspend_body = closureIsSuspend(self, info.body_func, info.module);

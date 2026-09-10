@@ -1001,7 +1001,7 @@ pub fn composableLambdaBlockArity(self: *VmHost, v: *const Value) ?struct { n: u
     }
     const blk = g.get().get("_block") orelse return null;
     if (blk != .IrClosure) return null;
-    const info = self.closures.get(@intCast(blk.IrClosure.id)) orelse return null;
+    const info = self.closures.get(@intCast(blk.IrClosure.asPtr().id)) orelse return null;
     const up = closureUserParamsChecked(self, info);
     const n = std.math.cast(u8, up.n) orelse return null;
     return .{ .n = n, .authoritative = up.stripped };
@@ -1014,7 +1014,7 @@ fn shapeOfValue(self: *VmHost, v: *const Value) applicability.ArgShape {
     var arity_authoritative = false;
     const arity: ?u8 = switch (v.*) {
         .IrClosure => |c| blk: {
-            const info = self.closures.get(c.id) orelse break :blk null;
+            const info = self.closures.get(c.asPtr().id) orelse break :blk null;
             const up = closureUserParamsChecked(self, info);
             arity_authoritative = up.stripped;
             break :blk std.math.cast(u8, up.n);
@@ -1272,7 +1272,7 @@ fn fnTypeArity(ty: *const TypeRef) ?usize {
 /// Declared parameter count of a callable VALUE, when known.
 pub fn callableDeclaredArity(self: *VmHost, v: *const Value) ?usize {
     return switch (v.*) {
-        .IrClosure => |c| if (self.closures.get(c.id)) |info| info.n_params else null,
+        .IrClosure => |c| if (self.closures.get(c.asPtr().id)) |info| info.n_params else null,
                 // A memo-wrapped composable lambda: its block's user arity.
         .Instance => if (composableLambdaBlockArity(self, v)) |cli| cli.n else null,
         else => null,
@@ -1650,7 +1650,7 @@ fn samLambdaOnTower(self: *VmHost, allocator: Allocator, module: *const Module, 
     for (entries) |e| {
         const arity: usize = switch (e.v) {
             .IrClosure => |c| blk: {
-                const info = self.closures.get(@intCast(c.id)) orelse continue;
+                const info = self.closures.get(@intCast(c.asPtr().id)) orelse continue;
                 break :blk info.n_params;
             },
             else => continue,
@@ -1848,7 +1848,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
                 const v = args_in[0];
                 break :blk switch (v) {
                     .Instance => |i| @intFromPtr(i.cell),
-                    .IrClosure => |c| @as(u64, @intCast(c.id)),
+                    .IrClosure => |c| @as(u64, @intCast(c.asPtr().id)),
                     .Int => |x| @as(u64, @bitCast(@as(i64, x))),
                     .Long => |x| @as(u64, @bitCast(x)),
                     else => @as(u64, @intFromEnum(std.meta.activeTag(v))),

@@ -1132,7 +1132,7 @@ pub fn comparatorMember(self: *VmHost, allocator: Allocator, receiver: *const Va
                 const sel = step.selector;
                 const n_params: usize = switch (sel) {
                     .IrClosure => |c| blk: {
-                        if (self.closures.get(@intCast(c.id))) |info| break :blk info.n_params;
+                        if (self.closures.get(@intCast(c.asPtr().id))) |info| break :blk info.n_params;
                         break :blk 1;
                     },
                     else => 1,
@@ -2765,24 +2765,24 @@ fn annotationHash(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData
 pub fn closureRefEquals(self: *VmHost, allocator: Allocator, a: *const Value, b: *const Value) Allocator.Error!bool {
     const ca = a.IrClosure;
     const cb = b.IrClosure;
-    if (ca.id == cb.id) return true;
+    if (ca.asPtr().id == cb.asPtr().id) return true;
     // Distinct closure records. A function value loaded from a declaration
     // (`::f`) equals every load of the same function; two forwarding
     // wrappers of the same adaptation carry the same reference key; a
     // non-capturing lambda literal is a singleton, so two evaluations of the
     // same literal are the same value. A capturing lambda literal keeps
     // identity: two evaluations are two objects.
-    const ia = self.closures.get(@intCast(ca.id)) orelse return Value.structuralEq(a, b);
-    const ib = self.closures.get(@intCast(cb.id)) orelse return Value.structuralEq(a, b);
+    const ia = self.closures.get(@intCast(ca.asPtr().id)) orelse return Value.structuralEq(a, b);
+    const ib = self.closures.get(@intCast(cb.asPtr().id)) orelse return Value.structuralEq(a, b);
     const same_body = ia.body_func == ib.body_func and
         (@intFromPtr(ia.module orelse @as(*const ir.Module, @ptrFromInt(8))) == @intFromPtr(ib.module orelse @as(*const ir.Module, @ptrFromInt(8))));
     if (ia.is_ref and ib.is_ref) return same_body;
-    const ga = ca.captures.borrow();
+    const ga = ca.borrow();
     defer ga.deinit();
-    const gb = cb.captures.borrow();
+    const gb = cb.borrow();
     defer gb.deinit();
-    const xa = ga.get().*;
-    const xb = gb.get().*;
+    const xa = ga.get().captures;
+    const xb = gb.get().captures;
     const key_eq = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -2809,7 +2809,7 @@ pub fn closureRefEquals(self: *VmHost, allocator: Allocator, a: *const Value, b:
 /// identity.
 pub fn closureRefHash(self: *VmHost, allocator: Allocator, v: *const Value) Allocator.Error!i32 {
     const c = v.IrClosure;
-    const info = self.closures.get(@intCast(c.id)) orelse return kotlinHashCode(v);
+    const info = self.closures.get(@intCast(c.asPtr().id)) orelse return kotlinHashCode(v);
     const by_body: i32 = @truncate(@as(i64, @intCast(info.body_func.int())) *% 31 +% 17);
     if (info.is_ref) return by_body;
     const key_hash: ?i32 = blk: {
@@ -2822,14 +2822,14 @@ pub fn closureRefHash(self: *VmHost, allocator: Allocator, v: *const Value) Allo
     };
     if (key_hash) |kh| {
         var h = kh;
-        const g = c.captures.borrow();
+        const g = c.borrow();
         defer g.deinit();
-        for (g.get().*) |*x| h = h *% 31 +% try hashWithDispatch(self, allocator, x);
+        for (g.get().captures) |*x| h = h *% 31 +% try hashWithDispatch(self, allocator, x);
         return h;
     }
-    const g = c.captures.borrow();
+    const g = c.borrow();
     defer g.deinit();
-    if (g.get().len == 0 and info.capture_names.len == 0) return by_body;
+    if (g.get().captures.len == 0 and info.capture_names.len == 0) return by_body;
     return kotlinHashCode(v);
 }
 

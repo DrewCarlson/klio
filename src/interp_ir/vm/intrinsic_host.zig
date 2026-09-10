@@ -241,8 +241,8 @@ pub fn evalClosureRaw(
         );
         return .{ .err = .{ .Type = msg } };
     }
-    const id = callable.IrClosure.id;
-    const live_captures = callable.IrClosure.captures;
+    const id = callable.IrClosure.asPtr().id;
+    const live_captures = callable.IrClosure;
 
     const info = self.closures.get(@intCast(id)) orelse {
         const msg = try std.fmt.allocPrint(self.allocator, "unknown IrClosure id {d}", .{id});
@@ -290,7 +290,7 @@ pub fn evalClosureRaw(
     {
         const lc_g = live_captures.borrow();
         defer lc_g.deinit();
-        const lc = lc_g.get().*;
+        const lc = lc_g.get().captures;
         if (lc.len == info.capture_names.len) {
             try capture_values.appendSlice(self.allocator, lc);
         } else {
@@ -508,7 +508,7 @@ pub fn invokeCallable(self: *VmIntrinsicHost, callable: *const Value, args: []co
     }
 
     if (callable.* == .IrClosure) {
-        const id = callable.IrClosure.id;
+        const id = callable.IrClosure.asPtr().id;
         const info = self.closures.get(@intCast(id)) orelse {
             const msg = try std.fmt.allocPrint(self.allocator, "unknown IrClosure id {d}", .{id});
             return .{ .err = .{ .Type = msg } };
@@ -644,7 +644,7 @@ pub fn invokeCallableWithThis(self: *VmIntrinsicHost, callable: *const Value, ar
     // a single param. The capture is overridden via the closure's
     // captures cell before invoke, then restored after.
     if (callable.* == .IrClosure) {
-        const id = callable.IrClosure.id;
+        const id = callable.IrClosure.asPtr().id;
         const info = self.closures.get(@intCast(id));
         if (info) |inf| {
             // Locate the captured `this` slot and snapshot its prior value.

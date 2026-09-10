@@ -189,6 +189,31 @@ pub const StackRef = ObjRef(StackTraceData);
 pub const ValueList = ObjRef(std.ArrayList(Value));
 /// `Arc<Vec<Value>>` — shared, frozen element storage.
 pub const ValueSlice = ObjRef([]Value);
+/// A closure's identity and its captured values in ONE cell, so the `Value`
+/// payload is a single pointer rather than (id, capture cell) — which is what
+/// holds `Value` to 16 bytes rather than 24. Every construction site already
+/// minted a fresh capture cell alongside the closure, so folding the id into it
+/// costs no extra allocation, and closure identity becomes cell identity.
+///
+/// `id` is immutable after construction and reads through `asPtr()` with no
+/// lock; `captures` is rebindable (a closure's `this` can be re-bound), so it
+/// keeps the cell's borrow.
+pub const IrClosureData = struct {
+    id: u64,
+    captures: []Value,
+
+    /// The collector reaches a plain struct payload ONLY through this hook —
+    /// without it the captures would read as a leaf and be swept while live.
+    pub fn gcTrace(self: *const IrClosureData, m: *objcell.gc.Marker) void {
+        for (self.captures) |*c| c.gcMark(m);
+    }
+
+    pub fn gcFinalize(self: *IrClosureData, a: std.mem.Allocator) void {
+        a.free(self.captures);
+    }
+};
+/// Shared handle to a closure's identity and captures.
+pub const IrClosureRef = ObjRef(IrClosureData);
 /// One key/value pair inside a `Map`.
 pub const MapPair = struct {
     key: Value,
@@ -2096,11 +2121,9 @@ pub const Value = union(enum) {
     /// string and the pair never dies, so copies carry one pointer and
     /// neither the refcount nor the collector ever touches it.
     Intrinsic: *const IntrinsicData,
-    /// IR-side closure handle.
-    IrClosure: struct {
-        id: u64,
-        captures: ValueSlice,
-    },
+    /// IR-side closure handle: one cell holding the closure id and its
+    /// captured values (see `IrClosureData`).
+    IrClosure: IrClosureRef,
     /// A method intrinsic bound to a specific receiver. Boxed like `Map`
     /// (see `BoundMethodData`); construct with `Value.newBoundMethod`.
     BoundMethod: *BoundMethodData,
@@ -2225,7 +2248,7 @@ pub const Value = union(enum) {
             .Match => |m| visitor.visit(m),
             .StringBuilder => |s| visitor.visit(s),
             .Cell => |c| visitor.visit(c),
-            .IrClosure => |c| visitor.visit(c.captures),
+            .IrClosure => |c| visitor.visit(c),
             .Comparator => |c| visitor.visit(comparatorRefOf(c)),
             .List => |x| visitor.visit(listRefOf(x)),
             .Set => |x| visitor.visit(setRefOf(x)),
@@ -2419,7 +2442,7 @@ pub const Value = union(enum) {
             // this closure alive (the dup'd `captures` ValueSlice is already
             // shaded by `forEachChildCell` above). A closure no live value marks
             // never reaches here, so its slot's captures go white and are swept.
-            .IrClosure => |c| if (objcell.gc.markClosureHook) |f| f(c.id, m),
+            .IrClosure => |c| if (objcell.gc.markClosureHook) |f| f(c.asPtr().id, m),
             else => {},
         }
     }
@@ -2512,9 +2535,16 @@ pub const Value = union(enum) {
             .Match => |m| m.deinit(),
             .StringBuilder => |s| s.deinit(),
             .Cell => |c| c.deinit(),
-            // `releaseSliceElems` already drops the slice handle (its tail
-            // `slice.deinit()`); do not deinit it again.
-            .IrClosure => |c| releaseSliceElems(c.captures, allocator),
+            // The closure cell owns its captures: release each element, then
+            // drop the cell (whose finalize frees the slice itself).
+            .IrClosure => |c| {
+                if (c.cell.refcount.load(.monotonic) == 1) {
+                    const g = c.borrow();
+                    for (g.get().captures) |*e| e.release(allocator);
+                    g.deinit();
+                }
+                c.deinit();
+            },
             .Comparator => |c| comparatorRefOf(c).deinit(),
             .List => |x| {
                 if (objcell.envSetOnce("KLIO_BOXDIE_TRACE") and x.backing != null and
@@ -3215,14 +3245,14 @@ pub const Value = union(enum) {
             .Class => |x| b.* == .Class and classFqnEq(x, b.Class),
             .IrClosure => |x| b.* == .IrClosure and blk: {
                 // The same materialised closure object.
-                if (x.id == b.IrClosure.id and ValueSlice.ptrEq(x.captures, b.IrClosure.captures)) break :blk true;
+                if (IrClosureRef.ptrEq(x, b.IrClosure)) break :blk true;
                 // A non-capturing lambda literal is a singleton in Kotlin: two
                 // evaluations of the same literal (which klio gives distinct
                 // closure ids) are the same value. Compare by the literal's
                 // (module, body-function) identity when neither captures.
                 if (objcell.gc.closureSingletonHook) |h| {
-                    const sa = h(x.id);
-                    if (sa != 0 and sa == h(b.IrClosure.id)) break :blk true;
+                    const sa = h(x.asPtr().id);
+                    if (sa != 0 and sa == h(b.IrClosure.asPtr().id)) break :blk true;
                 }
                 break :blk false;
             },
@@ -3337,7 +3367,7 @@ pub const Value = union(enum) {
                     try writer.print(" step {d}", .{-r.step});
                 }
             },
-            .IrClosure => |c| try writer.print("{{ir-closure#{d}}}", .{c.id}),
+            .IrClosure => |c| try writer.print("{{ir-closure#{d}}}", .{c.asPtr().id}),
             .Intrinsic => |i| try writer.print("fun {s}(...)", .{i.fqn}),
             .BoundMethod => |m| try writer.print("fun {s}(...)", .{m.fqn}),
             .Exception => |e| {
@@ -4068,5 +4098,6 @@ test "value layout census" {
         if (@sizeOf(f.type) > 8) std.debug.print("  {s}: {d}\n", .{ f.name, @sizeOf(f.type) });
     }
 }
+
 
 

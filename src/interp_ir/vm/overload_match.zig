@@ -556,7 +556,7 @@ pub fn functionShapeDelta(self: *VmHost, head: []const u8, ty_args: []const Type
     const shape = ty_args[@intFromBool(declared_suspend)..];
 
     const body = switch (arg.*) {
-        .IrClosure => |c| closureBodyFunc(self, c.id),
+        .IrClosure => |c| closureBodyFunc(self, c.asPtr().id),
         else => null,
     };
 

@@ -309,6 +309,18 @@ pub fn comparator_reverse_order(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
 
 const testing = std.testing;
 
+/// A stand-in closure value for the tests below: the id is what the selector
+/// and comparator paths read, and a real cell is what carries it.
+fn testClosure(id: u64) Value {
+    const c = runtime.IrClosureRef.init(testing.allocator, .{ .id = id, .captures = &.{} }) catch unreachable;
+    return .{ .IrClosure = c };
+}
+
+fn freeTestClosure(v: Value) void {
+    v.IrClosure.deinit();
+}
+
+
 fn makeCtx(host: runtime.IntrinsicHost, out: runtime.Output, args: []const Value) CallCtx {
     return .{
         .args = args,
@@ -441,7 +453,8 @@ test "compareValuesBy returns 0 when all selectors tie" {
     defer h.deinit();
     var cap = runtime.CaptureOutput.init(testing.allocator);
     defer cap.deinit();
-    const sel = Value{ .IrClosure = .{ .id = 0, .captures = undefined } };
+    const sel = testClosure(0);
+    defer freeTestClosure(sel);
     var ctx = makeCtx(h.host(), cap.output(), &.{ .{ .Int = 3 }, .{ .Int = 3 }, sel });
     const r = try cmp_compare_values_by(&ctx);
     try testing.expect(r == .ok);
@@ -453,7 +466,8 @@ test "compareValuesBy uses the first differing selector" {
     defer h.deinit();
     var cap = runtime.CaptureOutput.init(testing.allocator);
     defer cap.deinit();
-    const sel = Value{ .IrClosure = .{ .id = 0, .captures = undefined } };
+    const sel = testClosure(0);
+    defer freeTestClosure(sel);
     var ctx = makeCtx(h.host(), cap.output(), &.{ .{ .Int = 7 }, .{ .Int = 9 }, sel });
     const r = try cmp_compare_values_by(&ctx);
     try testing.expectEqual(@as(i32, -1), r.ok.Int);
@@ -480,7 +494,8 @@ test "Comparator SAM wraps one step" {
     defer h.deinit();
     var cap = runtime.CaptureOutput.init(testing.allocator);
     defer cap.deinit();
-    const lam = Value{ .IrClosure = .{ .id = 1, .captures = undefined } };
+    const lam = testClosure(1);
+    defer freeTestClosure(lam);
     var ctx = makeCtx(h.host(), cap.output(), &.{lam});
     const r = try cmp_comparator_sam(&ctx);
     try testing.expect(r == .ok);
@@ -513,8 +528,10 @@ test "compareBy tags steps ascending" {
     defer h.deinit();
     var cap = runtime.CaptureOutput.init(testing.allocator);
     defer cap.deinit();
-    const a = Value{ .IrClosure = .{ .id = 1, .captures = undefined } };
-    const b = Value{ .IrClosure = .{ .id = 2, .captures = undefined } };
+    const a = testClosure(1);
+    defer freeTestClosure(a);
+    const b = testClosure(2);
+    defer freeTestClosure(b);
     var ctx = makeCtx(h.host(), cap.output(), &.{ a, b });
     const r = try cmp_compare_by(&ctx);
     try testing.expect(r.ok == .Comparator);
@@ -532,7 +549,8 @@ test "compareByDescending tags steps descending" {
     defer h.deinit();
     var cap = runtime.CaptureOutput.init(testing.allocator);
     defer cap.deinit();
-    const a = Value{ .IrClosure = .{ .id = 1, .captures = undefined } };
+    const a = testClosure(1);
+    defer freeTestClosure(a);
     var ctx = makeCtx(h.host(), cap.output(), &.{a});
     const r = try cmp_compare_by_descending(&ctx);
     try testing.expect(r.ok == .Comparator);

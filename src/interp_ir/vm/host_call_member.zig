@@ -299,7 +299,7 @@ pub fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, a
     // declared params plus a `this` capture slot is that shape — bind
     // args[0] as the receiver, not as the first parameter.
     if (callee.* == .IrClosure and args.len >= 1) {
-        if (self.closures.get(@intCast(callee.IrClosure.id))) |info| {
+        if (self.closures.get(@intCast(callee.IrClosure.asPtr().id))) |info| {
             if (args.len == info.n_params + 1 or
                 (args.len + 2 == info.n_params + 1 and closurePairTailed(self, info)))
             {
@@ -1224,7 +1224,7 @@ fn receiverIsFunctionShaped(self: *VmHost, receiver: *const Value, pn: []const u
     // slot, so a stored arity of 1 also proves `Function0`.
     return switch (receiver.*) {
         .IrClosure => |c| blk: {
-            const info = self.closures.get(@intCast(c.id)) orelse break :blk true;
+            const info = self.closures.get(@intCast(c.asPtr().id)) orelse break :blk true;
             break :blk info.n_params == n or (n == 0 and info.n_params == 1);
         },
         else => true,
@@ -1285,7 +1285,7 @@ fn valueNominalFqn(v: *const Value) []const u8 {
 fn closureParamsDisproveFnParam(self: *VmHost, pty: *const TypeRef, arg: *const Value) bool {
     if (arg.* != .IrClosure) return false;
     if (!std.mem.startsWith(u8, pty.name, "Function")) return false;
-    const info = self.closures.get(@intCast(arg.IrClosure.id)) orelse return false;
+    const info = self.closures.get(@intCast(arg.IrClosure.asPtr().id)) orelse return false;
     const mg = self.module.borrow();
     defer mg.deinit();
     const module = if (info.module) |m| m else mg.get();
@@ -2292,7 +2292,7 @@ fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape {
     var arity_authoritative = false;
     const arity: ?u8 = switch (v.*) {
         .IrClosure => |c| blk: {
-            const info = self.closures.get(@intCast(c.id)) orelse break :blk null;
+            const info = self.closures.get(@intCast(c.asPtr().id)) orelse break :blk null;
             const up = host_call_func.closureUserParamsChecked(self, info);
             arity_authoritative = up.stripped;
             break :blk std.math.cast(u8, up.n);
@@ -3523,7 +3523,7 @@ fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []cons
         for (shapes, 0..) |sh, i| {
             var cn: []const u8 = "-";
             if (args[i] == .IrClosure) {
-                if (self.closures.get(@intCast(args[i].IrClosure.id))) |info| {
+                if (self.closures.get(@intCast(args[i].IrClosure.asPtr().id))) |info| {
                     { const mg2 = self.module.borrow(); defer mg2.deinit(); if (funcAt(mg2.get(), info.body_func)) |cf| cn = cf.fqn; }
                 }
             }
@@ -3819,7 +3819,7 @@ fn callMemberInner(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 pub fn callableFieldArity(self: *VmHost, v: *const Value) ?usize {
     switch (v.*) {
         .IrClosure => |c| {
-            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            const info = self.closures.get(@intCast(c.asPtr().id)) orelse return null;
             const mr = self.module.clone();
             defer mr.deinit();
             const module = info.module orelse mr.asPtr();
@@ -5836,7 +5836,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         if (field) |v| {
             if (missTraceWant(name)) {
                 const np: i64 = if (v == .IrClosure)
-                    if (self.closures.get(@intCast(v.IrClosure.id))) |info| @intCast(info.n_params) else -1
+                    if (self.closures.get(@intCast(v.IrClosure.asPtr().id))) |info| @intCast(info.n_params) else -1
                 else
                     -2;
                 std.debug.print("[fnprop] own-field hit tag={s} callable={} n_params={d} args={d}\n", .{ @tagName(v), isCallable(&v), np, args.len });
@@ -5854,7 +5854,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
                     // receiver — callValueRec binds args[0] as the receiver.
                     const first_arg_recv = blk: {
                         if (v != .IrClosure or args.len == 0) break :blk false;
-                        const info = self.closures.get(@intCast(v.IrClosure.id)) orelse break :blk false;
+                        const info = self.closures.get(@intCast(v.IrClosure.asPtr().id)) orelse break :blk false;
                         break :blk args.len == info.n_params + 1 or
                             (args.len + 2 == info.n_params + 1 and closurePairTailed(self, info));
                     };
@@ -5921,7 +5921,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }) {
         if (try topLevelPropertyGet(self, allocator, name)) |pr| {
             if (pr == .ok and pr.ok == .IrClosure) {
-                const has_recv = if (self.closures.get(@intCast(pr.ok.IrClosure.id))) |info| info.has_receiver else false;
+                const has_recv = if (self.closures.get(@intCast(pr.ok.IrClosure.asPtr().id))) |info| info.has_receiver else false;
                 if (has_recv) return try host_call_value.callValueWithThis(self, allocator, &pr.ok, receiver, args, &.{});
             }
         }
@@ -5945,7 +5945,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
     }) {
         if (host_globals.lookupGlobal(self, name)) |gv| {
             if (gv == .IrClosure) {
-                const has_recv = if (self.closures.get(@intCast(gv.IrClosure.id))) |info| info.has_receiver else false;
+                const has_recv = if (self.closures.get(@intCast(gv.IrClosure.asPtr().id))) |info| info.has_receiver else false;
                 if (has_recv) return try host_call_value.callValueWithThis(self, allocator, &gv, receiver, args, &.{});
             }
         }
@@ -5964,7 +5964,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
         // the receiver) so the body sees it, mirroring the value-call path.
         const prior_this: ?Value = blk: {
             if (v != .IrClosure) break :blk null;
-            const info = self.closures.get(@intCast(v.IrClosure.id)) orelse break :blk null;
+            const info = self.closures.get(@intCast(v.IrClosure.asPtr().id)) orelse break :blk null;
             var this_idx: ?usize = null;
             for (info.capture_names, 0..) |n, idx| {
                 if (std.mem.eql(u8, n, "this")) {
@@ -7588,7 +7588,7 @@ fn enclosingSamLambdaDispatch(self: *VmHost, allocator: Allocator, receiver: *co
     for (entries) |e| {
         const arity: usize = switch (e.v) {
             .IrClosure => |c| blk: {
-                const info = self.closures.get(@intCast(c.id)) orelse continue;
+                const info = self.closures.get(@intCast(c.asPtr().id)) orelse continue;
                 break :blk info.n_params;
             },
             else => continue,
@@ -7851,7 +7851,7 @@ fn kclassMembers(self: *VmHost, allocator: Allocator, receiver: *const Value, na
 }
 
 fn kfunctionReflection(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
-    const info = self.closures.get(@intCast(receiver.IrClosure.id)) orelse return null;
+    const info = self.closures.get(@intCast(receiver.IrClosure.asPtr().id)) orelse return null;
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = info.module orelse mg.get();
@@ -10656,7 +10656,7 @@ fn methodArgSigRelaxed(self: *VmHost, args: []const Value) u64 {
                 h.update(std.mem.asBytes(&id));
             },
             .IrClosure => |c| {
-                if (self.closures.get(@intCast(c.id))) |info| {
+                if (self.closures.get(@intCast(c.asPtr().id))) |info| {
                     h.update(std.mem.asBytes(&info.body_func));
                 }
             },
@@ -10758,7 +10758,7 @@ fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
                 h.update((&pk)[0..1]);
             },
             .IrClosure => |c| {
-                const info = self.closures.get(@intCast(c.id)) orelse return null;
+                const info = self.closures.get(@intCast(c.asPtr().id)) orelse return null;
                 h.update(std.mem.asBytes(&info.body_func));
                 const mp: usize = @intFromPtr(info.module);
                 h.update(std.mem.asBytes(&mp));
@@ -10796,7 +10796,7 @@ fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const 
     const class_identity: usize = switch (receiver.*) {
         .Instance => |inst| runtime.InstanceData.classIdentityUnlocked(inst),
         .IrClosure => |c| blk: {
-            const info = self.closures.get(@intCast(c.id)) orelse return null;
+            const info = self.closures.get(@intCast(c.asPtr().id)) orelse return null;
             var h = std.hash.Wyhash.init(0x2545f4914f6cdd1d);
             h.update(std.mem.asBytes(&info.body_func));
             const mp: usize = @intFromPtr(info.module);
