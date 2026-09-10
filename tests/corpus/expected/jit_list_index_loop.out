@@ -1,0 +1,8 @@
+ints=130000
+longs=99998
+doubles=70.25
+grow=4993 size=200
+packed=5994
+rebind=25080
+view=120000
+bounds=oob@4

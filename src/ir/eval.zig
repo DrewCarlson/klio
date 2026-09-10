@@ -6419,7 +6419,27 @@ fn LoopTramp(comptime H: type) type {
             return null;
         }
 
+        /// A compiled loop's native call site. The site's own work runs in
+        /// `callSite`; on the way back the loop's array caches are refreshed,
+        /// because the callee may have grown a backing store (moving the buffer)
+        /// or rebound the receiver register, and the native code indexes the
+        /// cache directly. A receiver that is no longer the array the loop was
+        /// compiled for deopts to the instruction AFTER the call, whose effects
+        /// have already happened.
         fn call(ctx_opaque: *anyopaque, site_idx: u64) callconv(.c) u64 {
+            const code = callSite(ctx_opaque, site_idx);
+            if (code != 0) return code;
+            const tctx: *jit_loop.TrampCtx = @ptrCast(@alignCast(ctx_opaque));
+            const cl = tctx.compiled;
+            if (cl.arrays.len == 0) return 0;
+            const lc: *Ctx = @ptrCast(@alignCast(tctx.user));
+            if (jit_loop.reseedArrays(cl, lc.frame.regs.items, tctx.slots[0..cl.n_slots])) return 0;
+            const site = cl.call_sites[@intCast(site_idx)];
+            lc.pending_deopt_inst = site.inst + 1;
+            return jit_loop.deoptCode(site.block);
+        }
+
+        fn callSite(ctx_opaque: *anyopaque, site_idx: u64) u64 {
             const tctx: *jit_loop.TrampCtx = @ptrCast(@alignCast(ctx_opaque));
             const lc: *Ctx = @ptrCast(@alignCast(tctx.user));
             const cl = tctx.compiled;

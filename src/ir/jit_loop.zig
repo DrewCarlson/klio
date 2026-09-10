@@ -43,6 +43,8 @@ const FIELD_VALUE_OFF: u32 = @offsetOf(runtime.InstanceData.Field, "value");
 /// carries automatically.
 const InstCell = runtime.ObjRef(runtime.InstanceData).Cell;
 const VALUE_SIZE: u32 = @sizeOf(Value);
+/// Slot-file capacity, matching the interpreter's per-frame `stack_slots` array.
+const MAX_SLOTS: u32 = 192;
 const CELL_DATA_OFF: u32 = @offsetOf(InstCell, "data");
 const INST_CLASS_OFF: u32 = CELL_DATA_OFF + @offsetOf(runtime.InstanceData, "class");
 
@@ -265,6 +267,8 @@ pub const ArrayUnbox = struct {
     kind: runtime.PrimitiveArrayKind,
     ptr_slot: u32,
     len_slot: u32,
+    /// Seed from a `List`'s element buffer instead of a packed array's bytes.
+    boxed: bool = false,
 };
 
 /// One capture cell a compiled loop reads/writes: the register holding the
@@ -550,6 +554,36 @@ fn cellScalarType(v: Value) ?RegType {
     };
 }
 
+/// The element buffer behind a `List` or a reference `Array<T>`, or null when the
+/// value is neither. A live view (`subList`, a map `values` view, `asList`) is
+/// excluded: its `items` is a window cache refreshed from the source on access,
+/// not the storage the source writes through.
+fn boxedElemsOf(v: Value) ?runtime.ValueList {
+    return switch (v) {
+        .List => |l| if (l.backing != null) null else l.items,
+        .Array => |ad| if (ad.primKind() != null) null else ad.storage().boxed,
+        else => null,
+    };
+}
+
+/// How many elements of a boxed buffer are sampled to pick its scalar kind. The
+/// per-read tag guard is what makes the compiled code correct, so the sample only
+/// has to name the kind the loop will actually see; a wrong guess deopts.
+const BOXED_ELEM_SAMPLE: usize = 32;
+
+fn boxedElemShape(vl: runtime.ValueList) ?struct { rt: RegType, tag: u8 } {
+    const g = vl.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    if (items.len == 0) return null;
+    const rt = cellScalarType(items[0]) orelse return null;
+    const tag = tagForRt(rt) orelse return null;
+    for (items[0..@min(items.len, BOXED_ELEM_SAMPLE)]) |e| {
+        if (@intFromEnum(std.meta.activeTag(e)) != tag) return null;
+    }
+    return .{ .rt = rt, .tag = tag };
+}
+
 fn isArithBinOp(op: ir.BinOp) bool {
     return switch (op) {
         .Add, .Sub, .Mul => true,
@@ -599,6 +633,19 @@ fn arrayOpOf(module: *const Module, inst: *const Inst) ?ArrayOp {
         },
         else => return null,
     }
+}
+
+/// Whether any subscript in the body STORES through `recv`. A boxed element store
+/// would have to release the element it overwrites and retag the slot, so those
+/// receivers keep the interpreted subscript.
+fn bodyStoresInto(module: *const Module, func: *const Func, body: []const BlockId, recv: Reg) bool {
+    for (body) |bid| {
+        for (func.blocks[bid.int()].insts) |*inst| {
+            const op = arrayOpOf(module, inst) orelse continue;
+            if (op.is_set and op.recv.int() == recv.int()) return true;
+        }
+    }
+    return false;
 }
 
 /// A zero-arg numeric conversion (`x.toDouble()`/`toLong()`/`toInt()`), which
@@ -1844,6 +1891,13 @@ const ArrayInfo = struct {
     esize: u8,
     ptr_slot: u32,
     len_slot: u32,
+    /// A `List`/reference `Array` whose elements are boxed `Value`s rather than
+    /// packed scalars: the stride is a whole `Value` and the payload sits
+    /// behind a tag, so a read guards the tag exactly as a field read does.
+    /// A packed array needs neither and keeps its single scaled load.
+    boxed: bool = false,
+    /// Expected element tag for a boxed read; a mismatch deopts.
+    tag: u8 = 0,
 };
 
 // --- whole-function static type inference -----------------------------------
@@ -2738,6 +2792,46 @@ const Compiler = struct {
         try self.em.loadMem(T1, REGS, @intCast(@as(u64, ai.ptr_slot) * 8)); // rcx = ptr
     }
 
+    /// Read one boxed element (a `List` / reference `Array` of a uniform scalar
+    /// kind) into the destination's scalar slot. The stride is a whole `Value`,
+    /// which no SIB scale reaches, so the element address is computed; the
+    /// element's tag is guarded exactly as a native field read guards a field's,
+    /// and a mismatch deopts to re-run the subscript interpreted.
+    fn emitBoxedGet(self: *Compiler, ai: ArrayInfo, op: ArrayOp) !void {
+        try self.emitBoundsAndPtr(ai, op.index); // rax=index, rcx=ptr
+        var stride: u32 = VALUE_SIZE;
+        while (stride > 1) : (stride >>= 1) try self.em.addReg(T0, T0);
+        try self.em.addReg(T1, T0); // rcx = &items[index]
+        try self.em.loadMemB(T0, T1, @intCast(self.val_tag_off));
+        try self.em.cmpImm32(T0, ai.tag);
+        try self.em.jcc(.ne, try self.deoptLabel());
+        const payload: i32 = @intCast(self.val_payload_off);
+        switch (ai.rt) {
+            .f64 => {
+                try self.em.movsdLoad(X0, T1, payload);
+                try self.storeF64Slot(op.dst, X0);
+            },
+            .f32 => {
+                try self.em.movssLoad(X0, T1, payload);
+                try self.storeF32Slot(op.dst, X0);
+            },
+            .boolean => {
+                try self.em.loadMemB(T0, T1, payload);
+                try self.storeSlot(op.dst, T0);
+            },
+            .i32 => {
+                try self.em.loadMem(T0, T1, payload);
+                try self.em.movsxd(T0, T0);
+                try self.storeSlot(op.dst, T0);
+            },
+            .i64 => {
+                try self.em.loadMem(T0, T1, payload);
+                try self.storeSlot(op.dst, T0);
+            },
+            else => return jit.JitError.Unsupported,
+        }
+    }
+
     /// Signed divide/remainder of T0 (dividend) by T1 (divisor), result in T0.
     /// Divide-by-zero deopts to the current instruction (the interpreter throws
     /// the same `ArithmeticException`). Divisor == -1 is special-cased to avoid
@@ -3047,6 +3141,11 @@ const Compiler = struct {
     fn emitInstBody(self: *Compiler, inst: *const Inst) !void {
         if (arrayOpOf(self.module, inst)) |op| {
             const ai = try self.arrayOf(op.recv);
+            if (ai.boxed) {
+                if (op.is_set) return jit.JitError.Unsupported;
+                try self.emitBoxedGet(ai, op);
+                return;
+            }
             try self.emitBoundsAndPtr(ai, op.index); // rax=index, rcx=ptr
             if (op.is_set) {
                 try self.loadSlot(T2, op.value);
@@ -3340,10 +3439,20 @@ const Compiler = struct {
     }
 };
 
+/// Compile the loop, preferring the native boxed-element subscript. Typing a
+/// `List` read as its element's scalar kind constrains every register downstream
+/// of it, so a body that will not compile under that typing is compiled again
+/// with boxed receivers left to the interpreted subscript, rather than losing the
+/// loop entirely.
+pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
+    if (try tryCompileWith(a, module, func, header, regs, resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user, transient, true)) |c| return c;
+    return tryCompileWith(a, module, func, header, regs, resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user, transient, false);
+}
+
 /// Try to compile the natural loop whose header is `header`, specializing array
 /// accesses on the kinds observed in `regs` (the live frame). Returns a compiled
 /// loop, or null if the loop is not a supported shape.
-pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
+fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool, allow_boxed: bool) Allocator.Error!?CompiledLoop {
     const body = (try collectLoop(a, func, header)) orelse return null;
     defer a.free(body);
 
@@ -3395,12 +3504,30 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             if (rr.int() >= n_regs or rr.int() >= regs.len) return null;
             if (array_info[rr.int()] != null) continue;
             const v = regs[rr.int()];
-            // Only a packed primitive array gets the native indexed path. A
-            // non-packed receiver (a `List`/reference `Array` of objects, or a
-            // `Map`) is left for the object-subscript / map paths; a non-packed
-            // `set` is compilable only for a `Map`.
+            // A packed primitive array is indexed at its element width. A
+            // receiver holding objects, and a `Map`, are left for the
+            // object-subscript / map paths; a non-packed `set` is compilable
+            // only for a `Map`.
             const packed_ok = v == .Array and v.Array.primKind() != null and v.Array.storage() == .scalars;
             if (!packed_ok) {
+                // A `List` / reference `Array` of a uniform scalar kind is read
+                // natively too, at a whole-`Value` stride behind a tag guard.
+                if (allow_boxed and !op.is_set and !bodyStoresInto(module, func, body, rr)) {
+                    if (boxedElemsOf(v)) |vl| if (boxedElemShape(vl)) |shape| {
+                        const bk: u32 = @intCast(arrays.items.len);
+                        array_info[rr.int()] = .{
+                            .rt = shape.rt,
+                            .w = .b64,
+                            .esize = @intCast(VALUE_SIZE),
+                            .ptr_slot = n_regs + 2 * bk,
+                            .len_slot = n_regs + 2 * bk + 1,
+                            .boxed = true,
+                            .tag = shape.tag,
+                        };
+                        arrays.append(a, .{ .reg = rr, .kind = .Int, .ptr_slot = n_regs + 2 * bk, .len_slot = n_regs + 2 * bk + 1, .boxed = true }) catch return null;
+                        continue;
+                    };
+                }
                 if (op.is_set and v != .Map) return null;
                 continue;
             }
@@ -3420,12 +3547,11 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
 
     // Inline small pure-scalar top-level callees: their single block is spliced in
     // place of the call, with registers shifted into an extended register space
-    // [n_regs .. total_regs). Restricted to array-free loops so the slot layout
-    // stays a simple register range followed by the call/nullable slots.
+    // [n_regs .. total_regs).
     var inline_sites: std.ArrayListUnmanaged(InlineSite) = .empty;
     defer inline_sites.deinit(a);
     var total_regs: u32 = n_regs;
-    if (arrays.items.len == 0) {
+    {
         for (body) |bid| {
             for (func.blocks[bid.int()].insts, 0..) |*inst, ii| {
                 if (trampolinableCallOf(inst)) |tc| {
@@ -3600,6 +3726,20 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             }
         }
     }
+    // The splice claims [n_regs .. total_regs) for the inlined callees' registers,
+    // so the array caches, provisionally placed straight after the loop's own
+    // registers, move above it.
+    if (total_regs != n_regs) {
+        const shift = total_regs - n_regs;
+        for (arrays.items) |*au| {
+            au.ptr_slot += shift;
+            au.len_slot += shift;
+        }
+        for (array_info) |*slot| if (slot.*) |*ai| {
+            ai.ptr_slot += shift;
+            ai.len_slot += shift;
+        };
+    }
     const arr_slots: u32 = total_regs + 2 * @as(u32, @intCast(arrays.items.len));
 
     // Discover capture cells, specializing on the scalar kind each box holds in
@@ -3653,7 +3793,6 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     for (body) |bid| {
         for (func.blocks[bid.int()].insts) |*inst| {
             if (trampolinableMemberOf(module, inst)) |mc| {
-                if (arrays.items.len != 0) return null;
                 if (mc.recv.int() >= n_regs or mc.recv.int() >= regs.len) return null;
                 var av: [6]Value = undefined;
                 if (mc.n_args > av.len) return null;
@@ -3683,7 +3822,6 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 continue;
             }
             if (trampolinableVirtualOf(inst)) |vc| {
-                if (arrays.items.len != 0) return null;
                 if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return null;
                 // Resolve the slot's target on the live receiver for a precise
                 // return type (also what the inline path splices); fall back to
@@ -3703,7 +3841,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 continue;
             }
             if (trampolinableFieldOf(module, inst)) |fld| {
-                if (field_resolver == null or arrays.items.len != 0) return null;
+                if (field_resolver == null) return null;
                 if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len) return null;
                 if (regs[fld.recv.int()] != .Instance) {
                     // Receiver snapshot null/non-instance — retry on a later snapshot.
@@ -3991,7 +4129,9 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     // deopt-free compiled method, the loop calls straight into its code — so
     // neither the Move nor the call may be registered as a trampoline site.
     // Found before registration because the Move precedes the call.
-    if (fjDirectEnabled()) {
+    // A direct call jumps straight into the callee's code, so nothing re-seeds the
+    // array cache on the way back; those loops keep the trampoline.
+    if (fjDirectEnabled() and arrays.items.len == 0) {
         for (body) |bid| {
             const blk = &func.blocks[bid.int()];
             for (blk.insts, 0..) |*inst, i| {
@@ -4054,10 +4194,6 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
             const is_load_global = trampolinableGlobalOf(module, inst) != null;
             const is_field_set = trampolinableFieldSetOf(module, inst) != null;
             if (!is_call and !is_member and !is_virtual and !is_field and !is_field_set and !is_obj_move and !is_null_check and !is_obj_index and !is_call_value and !is_load_global and !is_map_get and !is_map_set) continue;
-            if (arrays.items.len != 0) {
-                if (debugEnabled()) std.debug.print("[jit]   bail: call + {d} arrays in {s}\n", .{ arrays.items.len, func.name });
-                return null;
-            }
             // Every scalar arg must already live in a typed slot (field reads have none).
             const args_reg: u32 = if (is_call) trampolinableCallOf(inst).?.args_reg else if (is_member) trampolinableMemberOf(module, inst).?.args_reg else if (is_virtual) trampolinableVirtualOf(inst).?.args_reg else if (is_call_value) trampolinableCallValueOf(inst).?.args_reg else 0;
             const n_args: u32 = if (is_call) trampolinableCallOf(inst).?.n_args else if (is_member) trampolinableMemberOf(module, inst).?.n_args else if (is_virtual) trampolinableVirtualOf(inst).?.n_args else if (is_call_value) trampolinableCallValueOf(inst).?.n_args else 0;
@@ -4412,7 +4548,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
     }
 
     const has_calls = call_sites.items.len != 0;
-    const uc_slot: u32 = arr_slots; // arrays.len == 0 when has_calls, so == n_regs
+    const uc_slot: u32 = arr_slots;
     const tramp_slot: u32 = arr_slots + 1;
     const calls_base: u32 = arr_slots + (if (has_calls) @as(u32, 2) else 0);
     // One null-flag slot per nullable-scalar register, after the array and call slots.
@@ -4468,6 +4604,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
         site.tag = tag;
     }
     var n_slots: u32 = nullable_end + @as(u32, @intCast(field_bases.items.len));
+    if (n_slots > MAX_SLOTS) return null;
     if (debugEnabled() and field_bases.items.len != 0) std.debug.print("[jit]   native field access on {d} receiver(s) in {s}\n", .{ field_bases.items.len, func.name });
 
     // Point every guarded arm at the trampoline site its final miss falls to.
@@ -4616,7 +4753,7 @@ pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header
                 if (ds.callee.n_slots > window) window = ds.callee.n_slots;
             }
             n_slots += window;
-            if (n_slots > 192) return null;
+            if (n_slots > MAX_SLOTS) return null;
         }
     }
 
@@ -4731,6 +4868,35 @@ pub const RunResult = union(enum) {
     bail,
 };
 
+/// Cache each indexed array's element buffer pointer and length in its high
+/// slots. Called at loop entry and again after every host callback: the callback
+/// runs arbitrary Kotlin, which may grow the backing store (moving the buffer) or
+/// rebind the receiver register outright, and the native code reads the cache
+/// with nothing but a bounds check. Returns false when the register no longer
+/// holds the array the loop was compiled for.
+pub fn reseedArrays(self: *const CompiledLoop, regs: []const Value, slots: []i64) bool {
+    for (self.arrays) |au| {
+        if (au.reg.int() >= regs.len) return false;
+        const v = regs[au.reg.int()];
+        if (au.boxed) {
+            const vl = boxedElemsOf(v) orelse return false;
+            const g = vl.borrow();
+            const items = g.get().items;
+            g.deinit();
+            slots[au.ptr_slot] = @bitCast(@intFromPtr(items.ptr));
+            slots[au.len_slot] = @intCast(items.len);
+            continue;
+        }
+        if (v != .Array or v.Array.primKind() != au.kind or v.Array.storage() != .scalars) return false;
+        const g = v.Array.storage().scalars.borrow();
+        const pb = g.get();
+        slots[au.ptr_slot] = @bitCast(@intFromPtr(pb.bytes.items.ptr));
+        slots[au.len_slot] = @intCast(pb.len());
+        g.deinit();
+    }
+    return true;
+}
+
 pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u8, tramp: ?TrampFn, user: ?*anyopaque) RunResult {
     @memcpy(tags[0..self.n_regs], self.box_tags[0..self.n_regs]);
     var r: usize = 0;
@@ -4784,18 +4950,7 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     }
 
     // Unbox each indexed array's buffer pointer + length into its high slots.
-    // The kind must still match; the buffer pointer is stable for the native run
-    // (no resize inside the loop, no GC safepoint).
-    for (self.arrays) |au| {
-        if (au.reg.int() >= regs.len) return .bail;
-        const v = regs[au.reg.int()];
-        if (v != .Array or v.Array.primKind() != au.kind or v.Array.storage() != .scalars) return .bail;
-        const g = v.Array.storage().scalars.borrow();
-        const pb = g.get();
-        slots[au.ptr_slot] = @bitCast(@intFromPtr(pb.bytes.items.ptr));
-        slots[au.len_slot] = @intCast(pb.len());
-        g.deinit();
-    }
+    if (!reseedArrays(self, regs, slots)) return .bail;
 
     // Unbox each capture cell's scalar into the cell register's own slot. No
     // calls or GC run inside the loop, so the box is unobserved by anyone else;
@@ -6414,7 +6569,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
         n_slots += window;
         // 192 is the seam's per-depth slot bank: a body that outgrows it falls
         // off the frameless path, which costs more than the call it saves.
-        if (n_slots > 192) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-slots\n", .{func.name}); return null; }
+        if (n_slots > MAX_SLOTS) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-slots\n", .{func.name}); return null; }
     }
     for (call_sites.items[field_sites_base..]) |*site| site.fbase_slot = fbase_slot;
 
