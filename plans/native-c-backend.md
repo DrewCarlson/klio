@@ -143,5 +143,34 @@ calls including recursion, `Goto`/`Branch`/`Return`, and `println` of a scalar
 rendered the way the reference renderer does (shortest round-trip from two
 significant digits, scientific outside [1e-3, 1e7), `.0` on integral values).
 
-Next: classes and fields, which is where the rooted-frame split starts to
-matter — up to here nothing on the heap exists, so nothing needs rooting.
+Classes and fields run. A compiled program allocates the runtime's own
+instances, so a compiled object traces, prints and flows into collections
+exactly as an interpreted one does — there are not two object worlds. Classes
+are emitted as descriptors and registered before `main`, because a compiled
+program has no module to ask; a field is addressed by the index the emitter
+resolved, never searched by name.
+
+The rooting works as the plan said it must. A compiled frame publishes its
+reference slots through `klio_nat_enter`/`leave` and the collector walks that
+chain as a registered root provider; scalars stay in C locals and are never
+published, because nothing on the heap depends on them. Safe points sit at loop
+back edges. `examples/native_objects.kt` runs identically under
+`KLIO_GC_STRESS=1` — a collection at every safe point — which is what proves
+the live reference across its allocating loop is actually published;
+`scripts/native-c-check.sh` runs that comparison as part of the gate.
+
+Two things a compiled program has to do for itself, both found by watching a
+2M-allocation loop reach 966MB of resident memory: the collector is armed by
+the `klio_rt_run_*` entries, which compiled code never calls, and `alloc_perm`
+starts true and is cleared by `vmRun`, which it also never calls — so every
+allocation was minted program-lifetime and never swept. `klio_nat_init` arms
+the collector, and `klio_nat_begin` ends the permanent phase after the class
+descriptors are registered and before the body runs. The same loop now peaks at
+19.5MB.
+
+Methods compile too: `o.m()` lowers to a static call with the receiver moved
+into arg 0, so a method is an ordinary C function taking `this` first, and a
+property read inside its own class resolves through the synthesized accessor
+name to the same field index.
+
+Next: strings.

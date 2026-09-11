@@ -27,6 +27,10 @@ pub const Ty = enum {
     f32,
     boolean,
     unit,
+    /// A reference. It lives in the frame's published slots, never a bare C
+    /// local: the collector is precisely rooted and never scans the native
+    /// stack, so a reference it cannot see is a reference it will free.
+    object,
 
     fn cName(self: Ty) []const u8 {
         return switch (self) {
@@ -36,6 +40,7 @@ pub const Ty = enum {
             .f32 => "float",
             .boolean => "int32_t",
             .unit => "int32_t",
+            .object => "klio_value",
         };
     }
 
@@ -69,6 +74,14 @@ fn funcRetTy(f: *const Func) ?Ty {
     }
     if (!any_value) return .unit;
     return tyOf(f.return_ty);
+}
+
+/// `funcRetTy` widened to the object case, which needs the module to know
+/// whether the declared type names a class the emitter can lay out.
+fn funcRetTy2(m: *const Module, f: *const Func) ?Ty {
+    if (funcRetTy(f)) |t| return t;
+    if (classOfType(m, f.return_ty) != null) return .object;
+    return null;
 }
 
 fn constTy(c: ir.Const) ?Ty {
@@ -133,12 +146,69 @@ fn cOp(op: ir.BinOp) ?[]const u8 {
 pub const Compiled = struct {
     f: *const Func,
     types: []Ty,
+    /// The class an object register holds, where the emitter knows it. Needed
+    /// to turn a field NAME into the index the compiled code addresses.
+    cls: []?u32,
+    /// Frame slot of each object register, or -1 for a scalar in a C local.
+    slot: []i32,
+    n_slots: u32,
     ret: Ty,
 
     pub fn deinit(self: *Compiled, gpa: std.mem.Allocator) void {
         gpa.free(self.types);
+        gpa.free(self.cls);
+        gpa.free(self.slot);
     }
 };
+
+/// The instance fields of a class, in the order the runtime lays them out:
+/// the primary-constructor parameters that double as properties. A class this
+/// returns null for is one the emitter cannot lay out, and any program touching
+/// it is refused.
+fn classFields(m: *const Module, cid: ir.ClassId) ?[]const ir.Param {
+    if (cid.int() >= m.classes.items.len) return null;
+    const c = &m.classes.items[cid.int()];
+    if (c.init_block != null) return null;
+    if (c.supertypes.len != 0) return null;
+    if (c.is_abstract or c.is_inner) return null;
+    for (c.primary_params) |p| {
+        if (!p.is_property) return null;
+        if (p.default != null or p.is_vararg) return null;
+        if (tyOf(p.ty) == null) return null;
+    }
+    return c.primary_params;
+}
+
+/// A property access inside the declaring class carries a synthesized accessor
+/// name (`$sgetter$<Class><US><field>`); the stored field is the tail.
+fn plainFieldName(name: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, name, "$sgetter$") or std.mem.startsWith(u8, name, "$ssetter$")) {
+        if (std.mem.lastIndexOfScalar(u8, name, 0x1f)) |i| return name[i + 1 ..];
+    }
+    return name;
+}
+
+/// The index of a named field, which is what compiled code addresses.
+fn fieldIndex(m: *const Module, cid: u32, name: []const u8) ?u32 {
+    const fields = classFields(m, @enumFromInt(cid)) orelse return null;
+    const want = plainFieldName(name);
+    for (fields, 0..) |p, i| {
+        if (std.mem.eql(u8, p.name, want)) return @intCast(i);
+    }
+    return null;
+}
+
+/// The class a declared type names, when the program declares one.
+fn classOfType(m: *const Module, t: ir.TypeRef) ?u32 {
+    if (t.nullable) return null;
+    for (m.classes.items, 0..) |*c, i| {
+        if (std.mem.eql(u8, c.name, t.name) or std.mem.eql(u8, c.fqn, t.name)) {
+            if (classFields(m, @enumFromInt(i)) == null) return null;
+            return @intCast(i);
+        }
+    }
+    return null;
+}
 
 /// A zero-argument numeric conversion (`x.toLong()`), which lowers to a
 /// `CallMember`. Every direction is a C cast; Kotlin's `toInt()` on a floating
@@ -178,7 +248,7 @@ fn isPrintln(f: *const Func) bool {
         (std.mem.eql(u8, f.fqn, "kotlin.io.println") or std.mem.eql(u8, f.fqn, "println"));
 }
 
-pub const Error = error{ OutOfMemory, WriteFailed };
+pub const Error = error{ OutOfMemory, WriteFailed, NoSpaceLeft };
 
 /// `KLIO_CGEN_TRACE=1` names every function the subset refuses and why. The
 /// refusal list IS the backlog for widening the backend, so it has to be
@@ -200,20 +270,36 @@ fn no(f: *const Func, comptime why: []const u8) ?Compiled {
 /// Whether `f` lowers to the scalar core, and the register types if it does.
 /// Refuses rather than guesses: every register the body defines must have a
 /// scalar type, and every instruction must be one this emitter writes.
+/// The class a function's receiver parameter names, for a method compiled as an
+/// ordinary C function taking `this` first.
+fn receiverClass(m: *const Module, f: *const Func) ?u32 {
+    if (!f.has_receiver_param or f.params.len == 0) return null;
+    return classOfType(m, f.params[0].ty);
+}
+
 pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!?Compiled {
-    if (f.is_suspend or f.has_receiver_param) return no(f, "suspend/receiver");
+    if (f.is_suspend) return no(f, "suspend");
+    // A method is an ordinary function whose first parameter is the receiver;
+    // the call sites already move it into arg 0.
+    if (f.has_receiver_param and receiverClass(m, f) == null) return no(f, "receiver class");
     if (!f.hasBody() or f.blocks.len == 0) return no(f, "no body");
     if (f.n_locals == 0) return no(f, "no locals");
 
-    const ret = funcRetTy(f) orelse return no(f, "return type");
+    const ret = funcRetTy2(m, f) orelse return no(f, "return type");
     for (f.params) |p| {
         if (p.default != null or p.is_vararg) return no(f, "param default/vararg");
-        _ = tyOf(p.ty) orelse return no(f, "param type");
+        if (tyOf(p.ty) == null and classOfType(m, p.ty) == null) return no(f, "param type");
     }
 
     const types = try gpa.alloc(Ty, f.n_locals);
     errdefer gpa.free(types);
     @memset(types, .unit);
+    const cls = try gpa.alloc(?u32, f.n_locals);
+    errdefer gpa.free(cls);
+    @memset(cls, null);
+    const slot = try gpa.alloc(i32, f.n_locals);
+    errdefer gpa.free(slot);
+    @memset(slot, -1);
     const known = try gpa.alloc(bool, f.n_locals);
     defer gpa.free(known);
     @memset(known, false);
@@ -234,14 +320,21 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     known[c.dst.int()] = true;
                 },
                 .LoadParam => |lp| {
-                    if (lp.dst.int() >= f.n_locals or lp.idx >= f.params.len) return null;
-                    types[lp.dst.int()] = tyOf(f.params[lp.idx].ty).?;
+                    if (lp.dst.int() >= f.n_locals or lp.idx >= f.params.len) return no(f, "load param");
+                    const pt = f.params[lp.idx].ty;
+                    if (tyOf(pt)) |t| {
+                        types[lp.dst.int()] = t;
+                    } else {
+                        types[lp.dst.int()] = .object;
+                        cls[lp.dst.int()] = classOfType(m, pt);
+                    }
                     known[lp.dst.int()] = true;
                 },
                 .Move => |mv| {
-                    if (mv.dst.int() >= f.n_locals or mv.src.int() >= f.n_locals) return null;
-                    if (!known[mv.src.int()]) return null;
+                    if (mv.dst.int() >= f.n_locals or mv.src.int() >= f.n_locals) return no(f, "move reg");
+                    if (!known[mv.src.int()]) return no(f, "move source");
                     types[mv.dst.int()] = types[mv.src.int()];
+                    cls[mv.dst.int()] = cls[mv.src.int()];
                     known[mv.dst.int()] = true;
                 },
                 .BinOp => |b| {
@@ -310,6 +403,46 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     types[cv.dst.int()] = to;
                     known[cv.dst.int()] = true;
                 },
+                .NewInstance => |ni| {
+                    if (ni.arg_names.len != 0) return no(f, "ctor arg names");
+                    const fields = classFields(m, ni.class) orelse return no(f, "class layout");
+                    if (fields.len != ni.n_args) return no(f, "ctor arity");
+                    var k: u32 = 0;
+                    while (k < ni.n_args) : (k += 1) {
+                        const ar = ni.args.int() + k;
+                        if (ar >= f.n_locals or !known[ar]) return no(f, "ctor arg");
+                        if (types[ar] != tyOf(fields[k].ty).?) return no(f, "ctor arg type");
+                    }
+                    if (ni.dst.int() >= f.n_locals) return no(f, "ctor dst");
+                    types[ni.dst.int()] = .object;
+                    cls[ni.dst.int()] = ni.class.int();
+                    known[ni.dst.int()] = true;
+                },
+                .GetField => |gf| {
+                    if (gf.receiver.int() >= f.n_locals or !known[gf.receiver.int()]) return no(f, "field receiver");
+                    if (types[gf.receiver.int()] != .object) return no(f, "field on non-object");
+                    const rc = cls[gf.receiver.int()] orelse return no(f, "field receiver class");
+                    if (gf.field.int() >= m.consts.items.len) return no(f, "field name");
+                    const nm = m.consts.items[gf.field.int()];
+                    if (nm != .String) return no(f, "field name kind");
+                    const idx = fieldIndex(m, rc, nm.String) orelse return no(f, "field not laid out");
+                    const fields = classFields(m, @enumFromInt(rc)).?;
+                    if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
+                    types[gf.dst.int()] = tyOf(fields[idx].ty).?;
+                    known[gf.dst.int()] = true;
+                },
+                .SetField => |sf| {
+                    if (sf.receiver.int() >= f.n_locals or !known[sf.receiver.int()]) return no(f, "field receiver");
+                    if (types[sf.receiver.int()] != .object) return no(f, "field on non-object");
+                    const rc = cls[sf.receiver.int()] orelse return no(f, "field receiver class");
+                    if (sf.field.int() >= m.consts.items.len) return no(f, "field name");
+                    const nm = m.consts.items[sf.field.int()];
+                    if (nm != .String) return no(f, "field name kind");
+                    const idx = fieldIndex(m, rc, nm.String) orelse return no(f, "field not laid out");
+                    const fields = classFields(m, @enumFromInt(rc)).?;
+                    if (sf.value.int() >= f.n_locals or !known[sf.value.int()]) return no(f, "field value");
+                    if (types[sf.value.int()] != tyOf(fields[idx].ty).?) return no(f, "field value type");
+                },
                 .Call => |c| {
                     if (c.arg_names.len != 0 or c.type_args.len != 0) return no(f, "call arg names/type args");
                     if (c.dst.int() >= f.n_locals) return null;
@@ -323,8 +456,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                         known[c.dst.int()] = true;
                     } else {
                         if (callee.params.len != c.n_args) return no(f, "call arity");
-                        const rt = funcRetTy(callee) orelse return no(f, "callee return type");
+                        const rt = funcRetTy2(m, callee) orelse return no(f, "callee return type");
                         types[c.dst.int()] = rt;
+                        if (rt == .object) cls[c.dst.int()] = classOfType(m, callee.return_ty);
                         known[c.dst.int()] = true;
                     }
                     var k: u32 = 0;
@@ -349,7 +483,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
             else => return no(f, "terminator"),
         }
     }
-    return .{ .f = f, .types = types, .ret = ret };
+    var n_slots: u32 = 0;
+    var r: u32 = 0;
+    while (r < f.n_locals) : (r += 1) {
+        if (types[r] != .object) continue;
+        slot[r] = @intCast(n_slots);
+        n_slots += 1;
+    }
+    return .{ .f = f, .types = types, .cls = cls, .slot = slot, .n_slots = n_slots, .ret = ret };
 }
 
 /// A C identifier for the function. Derived from the fqn, never from the id:
@@ -366,6 +507,43 @@ fn writeSymbol(w: *std.Io.Writer, f: *const Func) !void {
     }
 }
 
+/// A scalar as a `klio_value`, for the moment it crosses into the object world.
+fn boxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
+    const fname = switch (t) {
+        .i32 => "klio_nat_box_int",
+        .i64 => "klio_nat_box_long",
+        .f64 => "klio_nat_box_double",
+        .f32 => "klio_nat_box_float",
+        .boolean => "klio_nat_box_bool",
+        .unit => return std.fmt.bufPrint(buf, "klio_nat_box_unit()", .{}) catch unreachable,
+        .object => return std.fmt.bufPrint(buf, "{s}", .{expr}) catch unreachable,
+    };
+    return std.fmt.bufPrint(buf, "{s}({s})", .{ fname, expr }) catch unreachable;
+}
+
+/// The reverse: a `klio_value` known to hold `t`, back in a C local.
+fn unboxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
+    const fname = switch (t) {
+        .i32 => "klio_nat_int",
+        .i64 => "klio_nat_long",
+        .f64 => "klio_nat_double",
+        .f32 => "klio_nat_float",
+        .boolean => "klio_nat_bool",
+        .unit => return std.fmt.bufPrint(buf, "0", .{}) catch unreachable,
+        .object => return std.fmt.bufPrint(buf, "{s}", .{expr}) catch unreachable,
+    };
+    return std.fmt.bufPrint(buf, "{s}({s})", .{ fname, expr }) catch unreachable;
+}
+
+/// Where a register lives: a C local for a scalar, a published frame slot for
+/// a reference.
+fn regName(c: *const Compiled, r: u32, buf: []u8) []const u8 {
+    if (c.types[r] == .object) {
+        return std.fmt.bufPrint(buf, "KS[{d}]", .{c.slot[r]}) catch unreachable;
+    }
+    return std.fmt.bufPrint(buf, "r{d}", .{r}) catch unreachable;
+}
+
 fn writeProto(w: *std.Io.Writer, c: *const Compiled) !void {
     try w.print("static {s} ", .{c.ret.cName()});
     try writeSymbol(w, c.f);
@@ -375,7 +553,8 @@ fn writeProto(w: *std.Io.Writer, c: *const Compiled) !void {
     } else {
         for (c.f.params, 0..) |p, i| {
             if (i != 0) try w.writeAll(", ");
-            try w.print("{s} p{d}", .{ tyOf(p.ty).?.cName(), i });
+            const pt: Ty = tyOf(p.ty) orelse .object;
+            try w.print("{s} p{d}", .{ pt.cName(), i });
         }
     }
     try w.writeByte(')');
@@ -460,7 +639,7 @@ fn reachableBlocks(gpa: std.mem.Allocator, f: *const Func) Error![]bool {
     return hit;
 }
 
-fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *const Compiled) !void {
+fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *const Compiled, uses_objects: bool) !void {
     const f = c.f;
     const live = try reachableBlocks(gpa, f);
     defer gpa.free(live);
@@ -468,13 +647,26 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
     try w.writeAll(" {\n");
     var r: u32 = 0;
     while (r < f.n_locals) : (r += 1) {
+        if (c.types[r] == .object) continue;
         try w.print("  {s} r{d} = 0;\n", .{ c.types[r].cName(), r });
     }
     // Registers the lowering allocated but this body never reads: a C compiler
     // warns on them and the emitted file should be warning-clean.
     r = 0;
-    while (r < f.n_locals) : (r += 1) try w.print("  (void)r{d};", .{r});
+    while (r < f.n_locals) : (r += 1) {
+        if (c.types[r] == .object) continue;
+        try w.print("  (void)r{d};", .{r});
+    }
     try w.writeAll("\n");
+    if (c.n_slots != 0) {
+        // The references this body holds, published to the collector for the
+        // duration of the call. Cleared first: a collection can happen before
+        // the first assignment, and a slot holding whatever was on the stack is
+        // a slot the collector will follow.
+        try w.print("  klio_value KS[{d}];\n", .{c.n_slots});
+        try w.print("  for (unsigned i = 0; i < {d}; i++) KS[i] = klio_nat_box_unit();\n", .{c.n_slots});
+        try w.print("  klio_nat_frame KF; KF.n = {d}; KF.slots = KS; klio_nat_enter(&KF);\n", .{c.n_slots});
+    }
 
     try w.writeAll("  goto B0;\n");
     for (f.blocks, 0..) |*blk, bi| {
@@ -488,8 +680,54 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
                     try writeConst(w, m.consts.items[k.value.int()]);
                     try w.writeAll(";\n");
                 },
-                .LoadParam => |lp| try w.print("  r{d} = p{d};\n", .{ lp.dst.int(), lp.idx }),
-                .Move => |mv| try w.print("  r{d} = r{d};\n", .{ mv.dst.int(), mv.src.int() }),
+                .LoadParam => |lp| {
+                    var nb: [32]u8 = undefined;
+                    try w.print("  {s} = p{d};\n", .{ regName(c, lp.dst.int(), &nb), lp.idx });
+                },
+                .Move => |mv| {
+                    var nb: [32]u8 = undefined;
+                    var sb: [32]u8 = undefined;
+                    try w.print("  {s} = {s};\n", .{ regName(c, mv.dst.int(), &nb), regName(c, mv.src.int(), &sb) });
+                },
+                .NewInstance => |ni| {
+                    var nb: [32]u8 = undefined;
+                    const dst = regName(c, ni.dst.int(), &nb);
+                    try w.print("  {s} = klio_nat_alloc_instance(KCLS_{d});\n", .{ dst, ni.class.int() });
+                    var k: u32 = 0;
+                    while (k < ni.n_args) : (k += 1) {
+                        const ar = ni.args.int() + k;
+                        var ab: [32]u8 = undefined;
+                        var bb: [96]u8 = undefined;
+                        try w.print("  klio_nat_set({s}, {d}, {s});\n", .{
+                            dst, k, boxExpr(c.types[ar], regName(c, ar, &ab), &bb),
+                        });
+                    }
+                },
+                .GetField => |gf| {
+                    const rc = c.cls[gf.receiver.int()].?;
+                    const nm = m.consts.items[gf.field.int()].String;
+                    const idx = fieldIndex(m, rc, nm).?;
+                    var nb: [32]u8 = undefined;
+                    var rb: [32]u8 = undefined;
+                    var ub: [128]u8 = undefined;
+                    const get = try std.fmt.bufPrint(&ub, "klio_nat_get({s}, {d})", .{ regName(c, gf.receiver.int(), &rb), idx });
+                    var ob: [160]u8 = undefined;
+                    try w.print("  {s} = {s};\n", .{
+                        regName(c, gf.dst.int(), &nb), unboxExpr(c.types[gf.dst.int()], get, &ob),
+                    });
+                },
+                .SetField => |sf| {
+                    const rc = c.cls[sf.receiver.int()].?;
+                    const nm = m.consts.items[sf.field.int()].String;
+                    const idx = fieldIndex(m, rc, nm).?;
+                    var rb: [32]u8 = undefined;
+                    var vb: [32]u8 = undefined;
+                    var bb: [96]u8 = undefined;
+                    try w.print("  klio_nat_set({s}, {d}, {s});\n", .{
+                        regName(c, sf.receiver.int(), &rb), idx,
+                        boxExpr(c.types[sf.value.int()], regName(c, sf.value.int(), &vb), &bb),
+                    });
+                },
                 .BinOp => |b| {
                     const dt = c.types[b.dst.int()];
                     const op = cOp(b.op).?;
@@ -558,13 +796,15 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
                             try w.print("  printf(\"{s}\\n\", r{d});\n", .{ fmt, a0 });
                         }
                     } else {
-                        try w.print("  r{d} = ", .{call.dst.int()});
+                        var db: [32]u8 = undefined;
+                        try w.print("  {s} = ", .{regName(c, call.dst.int(), &db)});
                         try writeSymbol(w, callee);
                         try w.writeByte('(');
                         var k: u32 = 0;
                         while (k < call.n_args) : (k += 1) {
                             if (k != 0) try w.writeAll(", ");
-                            try w.print("r{d}", .{call.args.int() + k});
+                            var ab: [32]u8 = undefined;
+                            try w.print("{s}", .{regName(c, call.args.int() + k, &ab)});
                         }
                         try w.writeAll(");\n");
                     }
@@ -573,13 +813,26 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
             }
         }
         switch (blk.terminator) {
-            .Goto => |g| try w.print("  goto B{d};\n", .{g.int()}),
-            .Branch => |br| try w.print("  if (r{d}) goto B{d}; else goto B{d};\n", .{
-                br.cond.int(), br.t.int(), br.f.int(),
-            }),
+            .Goto => |g| {
+                // A jump to a block at or before this one closes a loop, which
+                // is where an allocating body would otherwise run to the end of
+                // the heap before anything could collect.
+                if (uses_objects and g.int() <= bi) try w.writeAll("  klio_nat_safepoint();\n");
+                try w.print("  goto B{d};\n", .{g.int()});
+            },
+            .Branch => |br| {
+                var cb: [32]u8 = undefined;
+                try w.print("  if ({s}) goto B{d}; else goto B{d};\n", .{
+                    regName(c, br.cond.int(), &cb), br.t.int(), br.f.int(),
+                });
+            },
             .Return => |ret| {
+                if (c.n_slots != 0) try w.writeAll("  klio_nat_leave(&KF);\n");
                 if (ret) |rr| {
-                    try w.print("  return r{d};\n", .{rr.int()});
+                    var rb: [32]u8 = undefined;
+                    try w.print("  return {s};\n", .{regName(c, rr.int(), &rb)});
+                } else if (c.ret == .object) {
+                    try w.writeAll("  return klio_nat_box_unit();\n");
                 } else {
                     try w.writeAll("  return 0;\n");
                 }
@@ -641,6 +894,23 @@ pub fn emit(
 
     // Printing a floating value is the one place where C's formatting and
     // Kotlin's disagree, so the helper rides along only when it is used.
+    // Classes the program constructs or reads through. Emitted as descriptors
+    // and registered before main: a compiled program carries its own layout
+    // because there is no module to ask.
+    var used_classes: std.ArrayList(u32) = .empty;
+    defer used_classes.deinit(gpa);
+    for (accepted.items) |*c| {
+        for (c.cls) |maybe| {
+            const cid = maybe orelse continue;
+            var seen_cls = false;
+            for (used_classes.items) |u| {
+                if (u == cid) seen_cls = true;
+            }
+            if (!seen_cls) try used_classes.append(gpa, cid);
+        }
+    }
+    const uses_objects = used_classes.items.len != 0;
+
     var needs_fp = false;
     var needs_div = false;
     for (accepted.items) |*c| {
@@ -672,6 +942,29 @@ pub fn emit(
         \\#include <inttypes.h>
         \\
     , .{src_path});
+    if (uses_objects) {
+        try w.writeAll(
+            \\#include <klio_rt.h>
+            \\
+            \\
+        );
+        for (used_classes.items) |cid| try w.print("static uint32_t KCLS_{d};\n", .{cid});
+        try w.writeAll("\nstatic void klio_register_classes(void) {\n");
+        for (used_classes.items) |cid| {
+            const cdef = &m.classes.items[cid];
+            const fields = classFields(m, @enumFromInt(cid)).?;
+            try w.print("  {{ static const char *const fn[] = {{", .{});
+            for (fields, 0..) |fld, i| {
+                if (i != 0) try w.writeAll(", ");
+                try w.writeByte('"');
+                try w.writeAll(fld.name);
+                try w.writeByte('"');
+            }
+            if (fields.len == 0) try w.writeAll("0");
+            try w.print("}}; KCLS_{d} = klio_nat_class(\"{s}\", {d}, fn); }}\n", .{ cid, cdef.name, fields.len });
+        }
+        try w.writeAll("}\n\n");
+    }
     if (needs_div) try w.writeAll(
         \\/* Kotlin throws on integer division by zero; C leaves it undefined. */
         \\static void klio_arith_zero(void) {
@@ -744,9 +1037,11 @@ pub fn emit(
         try w.writeAll(";\n");
     }
     try w.writeAll("\n");
-    for (accepted.items) |*c| try writeBody(gpa, w, m, c);
+    for (accepted.items) |*c| try writeBody(gpa, w, m, c, uses_objects);
 
-    try w.writeAll("int main(void) {\n  ");
+    try w.writeAll("int main(void) {\n");
+    if (uses_objects) try w.writeAll("  klio_nat_init(0);\n  klio_register_classes();\n  klio_nat_begin();\n");
+    try w.writeAll("  ");
     try writeSymbol(w, entry);
     try w.writeAll("();\n  return 0;\n}\n");
     return true;

@@ -198,6 +198,59 @@ void    klio_op_ret(void *ctx, uint32_t has_val, uint32_t reg);
 void    klio_op_term(void *ctx, uint32_t block);
 void    klio_op_goto_exit(void *ctx, uint32_t block);
 
+/* ------------------------------------------------------------------ */
+/* The native object ABI: what a COMPILED program calls.                */
+/*                                                                      */
+/* A compiled program IS the program — there is no module to look a     */
+/* class up in — so classes arrive as emitted descriptors registered    */
+/* before main, and a field is addressed by the index the emitter       */
+/* resolved. Instances are the runtime's ordinary instances, so a       */
+/* compiled object traces, prints and flows into collections exactly as */
+/* an interpreted one does.                                             */
+
+/* A Value as C sees it. Opaque: pass it back, never read inside. */
+typedef struct { uint64_t lo, hi; } klio_value;
+
+/* Install the collector's view of compiled frames. Call before main. */
+void klio_nat_init(uint32_t reserved);
+
+/* Register an emitted class; the handle is what allocations name. */
+uint32_t klio_nat_class(const char *name, uint32_t n_fields,
+                        const char *const *field_names);
+
+/* A fresh instance with every field Unit; the compiled constructor fills it. */
+klio_value klio_nat_alloc_instance(uint32_t cls);
+klio_value klio_nat_get(klio_value recv, uint32_t idx);
+void       klio_nat_set(klio_value recv, uint32_t idx, klio_value val);
+
+/* The collector is precisely rooted and never scans the native stack, so a
+ * compiled frame publishes its OBJECT slots for the duration of the call.
+ * Scalars stay in C locals: nothing on the heap depends on them. */
+typedef struct klio_nat_frame {
+  struct klio_nat_frame *prev;
+  uint32_t n;
+  klio_value *slots;
+} klio_nat_frame;
+void klio_nat_enter(klio_nat_frame *f);
+/* Ends the program-lifetime allocation phase: call after registering classes
+ * and before the program body, or nothing the body allocates is collectable. */
+void klio_nat_begin(void);
+/* The safe point: compiled code polls at loop back edges. */
+void klio_nat_safepoint(void);
+void klio_nat_leave(klio_nat_frame *f);
+
+klio_value klio_nat_box_int(int32_t v);
+klio_value klio_nat_box_long(int64_t v);
+klio_value klio_nat_box_double(double v);
+klio_value klio_nat_box_float(float v);
+klio_value klio_nat_box_bool(int32_t v);
+klio_value klio_nat_box_unit(void);
+int32_t klio_nat_int(klio_value v);
+int64_t klio_nat_long(klio_value v);
+double  klio_nat_double(klio_value v);
+float   klio_nat_float(klio_value v);
+int32_t klio_nat_bool(klio_value v);
+
 #ifdef __cplusplus
 }
 #endif
