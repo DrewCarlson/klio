@@ -4,6 +4,13 @@
 // raises the same NullPointerException the interpreter would.
 class Box(val v: Int)
 
+// An `object` declaration is one instance, built before the program runs and
+// rooted for its whole life.
+object Registry {
+    val label = "reg"
+    var hits = 0
+}
+
 val greeting = "hi"
 var counter = 0
 val limit = 3
@@ -37,4 +44,9 @@ fun main() {
     }
     println(seen)
     println(counter)
+
+    println(Registry.label)
+    Registry.hits = Registry.hits + 2
+    Registry.hits = Registry.hits + 3
+    println(Registry.hits)
 }

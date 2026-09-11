@@ -93,9 +93,12 @@ fn funcRetTy(f: *const Func) ?Ty {
 
 /// `funcRetTy` widened to the object case, which needs the module to know
 /// whether the declared type names a class the emitter can lay out.
-fn funcRetTy2(m: *const Module, ls: Layouts, f: *const Func) ?Ty {
+/// A result only has to BE a reference for the caller to hold it; what its
+/// layout is matters at the point a field is read, not here. An interface type
+/// has no layout at all and never will.
+fn funcRetTy2(m: *const Module, f: *const Func) ?Ty {
     if (funcRetTy(f)) |t| return t;
-    if (classOfType(m, ls, f.return_ty) != null) return .object;
+    if (classIndexOfName(m, f.return_ty) != null) return .object;
     return null;
 }
 
@@ -259,8 +262,11 @@ fn classFields(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassL
     if (c.supertypes.len != 0) return layoutNo(c, "supertypes");
     if (c.is_interface) return layoutNo(c, "interface");
     if (c.is_abstract) return layoutNo(c, "abstract");
-    if (c.is_object) return layoutNo(c, "object declaration");
+
     if (c.is_enum) return layoutNo(c, "enum");
+    // An `object` declares no constructor; its fields are its body properties
+    // and its single instance is created once, before the program runs.
+    if (c.is_object and c.primary_params.len != 0) return layoutNo(c, "object with constructor params");
     if (c.is_inner) return layoutNo(c, "inner class");
 
     var out: std.ArrayList(FieldInfo) = .empty;
@@ -338,9 +344,11 @@ fn fieldIndex(ls: Layouts, cid: u32, name: []const u8) ?u32 {
 }
 
 /// The class a declared type NAMES, without asking whether its layout is one
-/// the emitter can produce. Kept separate from `classOfType` because a field
-/// only has to be a reference to be stored; needing the layout too would
-/// recurse forever on a class holding one of its own kind.
+/// A field only has to be a reference to be stored, and a value only has to be
+/// one to be passed or returned; demanding the layout as well would recurse
+/// forever on a class holding one of its own kind, and would refuse interface
+/// types outright, which have no layout and never will. The layout is demanded
+/// where a field is actually read.
 fn classIndexOfName(m: *const Module, t: ir.TypeRef) ?u32 {
     if (t.name.len == 0) return null;
     if (std.mem.eql(u8, t.name, "String") or std.mem.eql(u8, t.name, "kotlin.String")) return STRING_CLS;
@@ -349,15 +357,6 @@ fn classIndexOfName(m: *const Module, t: ir.TypeRef) ?u32 {
         if (std.mem.eql(u8, c.name, t.name) or std.mem.eql(u8, c.fqn, t.name)) return @intCast(i);
     }
     return null;
-}
-
-/// The class a declared type names AND whose layout the emitter can produce —
-/// what a register holding it needs before its fields can be addressed.
-fn classOfType(m: *const Module, ls: Layouts, t: ir.TypeRef) ?u32 {
-    const idx = classIndexOfName(m, t) orelse return null;
-    if (idx == STRING_CLS or idx == LIST_CLS) return idx;
-    if (ls.of(idx) == null) return null;
-    return idx;
 }
 
 /// The machine type of a class property: a scalar in place, or a reference.
@@ -472,6 +471,25 @@ fn globalTy(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, globals: []co
     return c.ret;
 }
 
+/// The class id of an `object` declaration with this name, when the emitter can
+/// lay it out. Such a name reads as its single instance rather than as storage.
+fn objectClassNamed(m: *const Module, ls: Layouts, name: []const u8) ?u32 {
+    for (m.classes.items, 0..) |*c, i| {
+        if (!c.is_object) continue;
+        if (!std.mem.eql(u8, c.name, name) and !std.mem.eql(u8, c.fqn, name)) continue;
+        if (ls.of(@intCast(i)) == null) return null;
+        return @intCast(i);
+    }
+    return null;
+}
+
+fn singletonSlot(singletons: []const u32, cid: u32) ?usize {
+    for (singletons, 0..) |s2, i| {
+        if (s2 == cid) return i;
+    }
+    return null;
+}
+
 fn globalIndex(globals: []const Global, name: []const u8) ?usize {
     for (globals, 0..) |g, i| {
         if (std.mem.eql(u8, g.name, name)) return i;
@@ -491,7 +509,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
     // declaration (`var counter = 0` lowers to a thunk) carries a placeholder,
     // so the authority is the register the body actually returns; the declared
     // type settles the Unit case, where there is no register to ask.
-    var ret = funcRetTy2(m, ls, f) orelse Ty.unit;
+    var ret = funcRetTy2(m, f) orelse Ty.unit;
     for (f.params) |p| {
         if (p.default != null or p.is_vararg) return no(f, "param default/vararg");
         if (tyOf(p.ty) == null and classIndexOfName(m, p.ty) == null) return no(f, "param type");
@@ -763,13 +781,20 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     if (lg.name.int() >= m.consts.items.len) return no(f, "global name");
                     const gn = m.consts.items[lg.name.int()];
                     if (gn != .String) return no(f, "global name kind");
+                    if (objectClassNamed(m, ls, gn.String)) |oc| {
+                        if (lg.dst.int() >= f.n_locals) return no(f, "singleton dst");
+                        types[lg.dst.int()] = .object;
+                        cls[lg.dst.int()] = oc;
+                        known[lg.dst.int()] = true;
+                        continue;
+                    }
                     const gi = globalIndex(globals, gn.String) orelse return no(f, "global not declared");
                     if (lg.dst.int() >= f.n_locals) return no(f, "global dst");
                     const gt = (try globalTy(gpa, m, ls, globals, gi)) orelse return no(f, "global type");
                     types[lg.dst.int()] = gt;
                     if (gt == .object) {
                         const gf = m.funcById(globals[gi].func).?;
-                        cls[lg.dst.int()] = classOfType(m, ls, gf.return_ty);
+                        cls[lg.dst.int()] = classIndexOfName(m, gf.return_ty);
                     }
                     known[lg.dst.int()] = true;
                 },
@@ -815,9 +840,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     } else {
                         if (!callee.hasBody()) return noCallee(f, callee, "no body for");
                         if (callee.params.len != c.n_args) return noCallee(f, callee, "arity of");
-                        const rt = funcRetTy2(m, ls, callee) orelse return no(f, "callee return type");
+                        const rt = funcRetTy2(m, callee) orelse return no(f, "callee return type");
                         types[c.dst.int()] = rt;
-                        if (rt == .object) cls[c.dst.int()] = classOfType(m, ls, callee.return_ty);
+                        if (rt == .object) cls[c.dst.int()] = classIndexOfName(m, callee.return_ty);
                         known[c.dst.int()] = true;
                     }
                     var k: u32 = 0;
@@ -1037,7 +1062,7 @@ fn reachableBlocks(gpa: std.mem.Allocator, f: *const Func) Error![]bool {
     return hit;
 }
 
-fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: Layouts, c: *const Compiled, uses_objects: bool, globals: []const Global) !void {
+fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: Layouts, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const u32) !void {
     const f = c.f;
     const live = try reachableBlocks(gpa, f);
     defer gpa.free(live);
@@ -1344,6 +1369,15 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                 },
                 .LoadGlobal => |lg| {
                     const gn = m.consts.items[lg.name.int()].String;
+                    if (c.cls[lg.dst.int()]) |rc| {
+                        if (!isBuiltinCls(rc) and singletonSlot(singletons, rc) != null) {
+                            var nb2: [32]u8 = undefined;
+                            try w.print("  {s} = KO[{d}];\n", .{
+                                regName(c, lg.dst.int(), &nb2), singletonSlot(singletons, rc).?,
+                            });
+                            continue;
+                        }
+                    }
                     const gi = globalIndex(globals, gn).?;
                     var nb: [32]u8 = undefined;
                     var ob: [96]u8 = undefined;
@@ -1541,6 +1575,23 @@ pub fn emit(
         try accepted.append(gpa, c);
         for (f.blocks) |*blk| {
             for (blk.insts) |*inst| {
+                if (inst.* == .LoadGlobal) {
+                    const cid3 = inst.LoadGlobal.name;
+                    if (cid3.int() < m.consts.items.len) {
+                        const gn3 = m.consts.items[cid3.int()];
+                        if (gn3 == .String) {
+                            if (objectClassNamed(m, ls, gn3.String)) |oc| {
+                                for (ls.of(oc).?) |fd| {
+                                    const ifid = fd.init orelse continue;
+                                    const ifn = m.funcById(ifid) orelse return false;
+                                    if (seen.contains(ifn.id.int())) continue;
+                                    try seen.put(ifn.id.int(), {});
+                                    try queue.append(gpa, ifn);
+                                }
+                            }
+                        }
+                    }
+                }
                 // A referenced global drags in the thunk that initializes it.
                 // Only referenced ones: the list carries every top-level
                 // property in the program AND its libraries, and pulling them
@@ -1591,11 +1642,40 @@ pub fn emit(
 
     // Printing a floating value is the one place where C's formatting and
     // Kotlin's disagree, so the helper rides along only when it is used.
+    // `object` declarations the program names. Each has ONE instance, created
+    // before the program runs and rooted for its whole life.
+    var used_singletons: std.ArrayList(u32) = .empty;
+    defer used_singletons.deinit(gpa);
+    for (accepted.items) |*c| {
+        for (c.f.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                if (inst.* != .LoadGlobal) continue;
+                const cid2 = inst.LoadGlobal.name;
+                if (cid2.int() >= m.consts.items.len) continue;
+                const gn2 = m.consts.items[cid2.int()];
+                if (gn2 != .String) continue;
+                const oc = objectClassNamed(m, ls, gn2.String) orelse continue;
+                var have2 = false;
+                for (used_singletons.items) |u| {
+                    if (u == oc) have2 = true;
+                }
+                if (!have2) try used_singletons.append(gpa, oc);
+            }
+        }
+    }
+
     // Classes the program constructs or reads through. Emitted as descriptors
     // and registered before main: a compiled program carries its own layout
     // because there is no module to ask.
     var used_classes: std.ArrayList(u32) = .empty;
     defer used_classes.deinit(gpa);
+    for (used_singletons.items) |oc| {
+        var seen_o = false;
+        for (used_classes.items) |u| {
+            if (u == oc) seen_o = true;
+        }
+        if (!seen_o) try used_classes.append(gpa, oc);
+    }
     for (accepted.items) |*c| {
         for (c.cls) |maybe| {
             const cid = maybe orelse continue;
@@ -1643,7 +1723,7 @@ pub fn emit(
             }
         }
     }
-    if (used_globals.items.len != 0) uses_objects_hint = true;
+    if (used_globals.items.len != 0 or used_singletons.items.len != 0) uses_objects_hint = true;
 
     var needs_fp = false;
     var needs_div = false;
@@ -1766,6 +1846,12 @@ pub fn emit(
         \\
     );
 
+    if (used_singletons.items.len != 0) {
+        try w.print("\n/* `object` declarations: one instance each, built before the program\n" ++
+            " * runs and rooted for its whole life. */\n", .{});
+        try w.print("static klio_value KO[{d}];\n", .{used_singletons.items.len});
+        try w.print("static klio_nat_frame KOF;\n", .{});
+    }
     if (used_globals.items.len != 0) {
         try w.print("\n/* Top-level properties. Published to the collector for the life of the\n" ++
             " * program: a global is a root, not a frame slot. */\n", .{});
@@ -1779,8 +1865,32 @@ pub fn emit(
         try w.writeAll(";\n");
     }
     try w.writeAll("\n");
-    for (accepted.items) |*c| try writeBody(gpa, w, m, ls, c, uses_objects, used_globals.items);
+    for (accepted.items) |*c| try writeBody(gpa, w, m, ls, c, uses_objects, used_globals.items, used_singletons.items);
 
+    if (used_singletons.items.len != 0) {
+        try w.writeAll("static void klio_init_singletons(void) {\n");
+        try w.print("  for (unsigned i = 0; i < {d}; i++) KO[i] = klio_nat_box_unit();\n", .{used_singletons.items.len});
+        try w.print("  KOF.n = {d}; KOF.slots = KO; klio_nat_enter(&KOF);\n", .{used_singletons.items.len});
+        for (used_singletons.items, 0..) |oc, oi| {
+            try w.print("  KO[{d}] = klio_nat_alloc_instance(KCLS_{d});\n", .{ oi, oc });
+            const fds = ls.of(oc).?;
+            for (fds, 0..) |fd, fi| {
+                const ifid = fd.init orelse continue;
+                const ifn = m.funcById(ifid).?;
+                var sym: std.Io.Writer.Allocating = .init(gpa);
+                defer sym.deinit();
+                try writeSymbol(&sym.writer, ifn);
+                var cb: [220]u8 = undefined;
+                const call = if (ifn.has_receiver_param)
+                    try std.fmt.bufPrint(&cb, "{s}(KO[{d}])", .{ sym.written(), oi })
+                else
+                    try std.fmt.bufPrint(&cb, "{s}()", .{sym.written()});
+                var bb: [300]u8 = undefined;
+                try w.print("  klio_nat_set(KO[{d}], {d}, {s});\n", .{ oi, fi, boxExpr(fd.ty, call, &bb) });
+            }
+        }
+        try w.writeAll("}\n\n");
+    }
     if (used_globals.items.len != 0) {
         try w.writeAll("static void klio_init_globals(void) {\n");
         try w.print("  for (unsigned i = 0; i < {d}; i++) KG[i] = klio_nat_box_unit();\n", .{used_globals.items.len});
@@ -1805,6 +1915,7 @@ pub fn emit(
 
     try w.writeAll("int main(void) {\n");
     if (uses_objects) try w.writeAll("  klio_nat_init(0);\n  klio_register_classes();\n");
+    if (used_singletons.items.len != 0) try w.writeAll("  klio_init_singletons();\n");
     if (used_globals.items.len != 0) {
         // Top-level properties run their initializers in declaration order,
         // which is the order the interpreter runs them in, and BEFORE the

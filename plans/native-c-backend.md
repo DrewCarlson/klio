@@ -227,8 +227,25 @@ Every class layout is resolved once into a table rather than re-derived per
 question; a parameter or receiver only has to BE a reference to be passed, and
 the layout is demanded at the point a field is actually read.
 
-Still refused, and the next work in rough order of how much it unlocks:
-lambdas, classes with supertypes or init blocks, the constant kinds that are
-not yet mapped (`Char`, the unsigned types), interfaces and virtual dispatch,
-exceptions, and coroutines. `KLIO_CGEN_TRACE=1` prints the list for any
-program, and that list is the backlog.
+`Char`, `Short` and `Byte` compile, each carrying its kind in the box because a
+Char prints as a character and arithmetic on any of them yields an `Int`. An
+`object` declaration compiles to one instance built before the program runs and
+rooted for its life, which is what a name referring to it reads.
+
+One relaxation was worth more than any feature: a value only has to BE a
+reference to be passed, returned or stored, and its layout is demanded only
+where a field is actually read. Requiring the layout everywhere refused every
+interface type — interfaces have no layout and never will. Across a 120-example
+sample that took class-layout refusals from 73 to 33 and lambda refusals from
+92 to 18, because programs stopped being rejected for types they merely
+mentioned.
+
+Still refused, most common first: classes with supertypes or init blocks,
+lambdas, names that are neither a declared global nor an object, and anonymous
+object literals. `KLIO_CGEN_TRACE=1` prints the list for any program, and
+class-layout refusals name the shape that is missing.
+
+The long tail to the goal, in dependency order: supertypes and interfaces with
+virtual dispatch, lambdas and closures, exceptions, generics and inline
+functions, then coroutines as state machines. Compose and the packs sit behind
+all of it, being Kotlin that must itself compile.
