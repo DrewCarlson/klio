@@ -692,3 +692,27 @@ fn natNpe() noreturn {
     _ = std.c.write(2, msg.ptr, msg.len);
     std.c.exit(1);
 }
+
+// --- the remaining scalar kinds --------------------------------------------
+//
+// `Char` prints as a character and `Short`/`Byte` render as themselves, so they
+// cannot simply ride in an `Int`: the box has to carry the kind.
+
+export fn klio_nat_box_char(v: u16) CValue {
+    return toC(.{ .Char = v });
+}
+export fn klio_nat_box_short(v: i16) CValue {
+    return toC(.{ .Short = v });
+}
+export fn klio_nat_box_byte(v: i8) CValue {
+    return toC(.{ .Byte = v });
+}
+export fn klio_nat_char(v: CValue) u16 {
+    return fromC(v).Char;
+}
+export fn klio_nat_short(v: CValue) i16 {
+    return fromC(v).Short;
+}
+export fn klio_nat_byte(v: CValue) i8 {
+    return fromC(v).Byte;
+}

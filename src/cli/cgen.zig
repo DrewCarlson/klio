@@ -27,6 +27,13 @@ pub const Ty = enum {
     f32,
     boolean,
     unit,
+    /// A UTF-16 code unit. Machine-wise an integer, but it prints as a
+    /// character and boxes as one, so it cannot just be an `Int`.
+    char,
+    /// Kotlin's narrow integers. They compute as `Int` and Kotlin has no
+    /// arithmetic that returns them, but they render as themselves.
+    short,
+    byte,
     /// A reference. It lives in the frame's published slots, never a bare C
     /// local: the collector is precisely rooted and never scans the native
     /// stack, so a reference it cannot see is a reference it will free.
@@ -40,6 +47,9 @@ pub const Ty = enum {
             .f32 => "float",
             .boolean => "int32_t",
             .unit => "int32_t",
+            .char => "uint16_t",
+            .short => "int16_t",
+            .byte => "int8_t",
             .object => "klio_value",
         };
     }
@@ -62,6 +72,9 @@ fn tyOf(t: ir.TypeRef) ?Ty {
     if (std.mem.eql(u8, n, "Float")) return .f32;
     if (std.mem.eql(u8, n, "Boolean")) return .boolean;
     if (std.mem.eql(u8, n, "Unit")) return .unit;
+    if (std.mem.eql(u8, n, "Char")) return .char;
+    if (std.mem.eql(u8, n, "Short")) return .short;
+    if (std.mem.eql(u8, n, "Byte")) return .byte;
     return null;
 }
 
@@ -94,6 +107,9 @@ fn constTy(c: ir.Const) ?Ty {
         .Float => .f32,
         .Bool => .boolean,
         .Unit => .unit,
+        .Char => .char,
+        .Short => .short,
+        .Byte => .byte,
         // A string literal is a reference like any other: it lives in the
         // published frame so the collector can see it.
         .String => .object,
@@ -106,7 +122,7 @@ fn constTy(c: ir.Const) ?Ty {
 /// a call, not a C cast.
 fn isNumericTy(t: Ty) bool {
     return switch (t) {
-        .i32, .i64, .f64, .f32 => true,
+        .i32, .i64, .f64, .f32, .char, .short, .byte => true,
         else => false,
     };
 }
@@ -133,9 +149,12 @@ const STRING_CLS: u32 = std.math.maxInt(u32);
 /// Kotlin's binary numeric promotion, over the kinds this subset carries.
 fn promote(a: Ty, b: Ty) ?Ty {
     if (a == .boolean or b == .boolean or a == .unit or b == .unit) return null;
+    if (a == .object or b == .object) return null;
     if (a == .f64 or b == .f64) return .f64;
     if (a == .f32 or b == .f32) return .f32;
     if (a == .i64 or b == .i64) return .i64;
+    // Kotlin has no arithmetic that returns `Char`, `Short` or `Byte`: every
+    // operator on them produces an `Int`.
     return .i32;
 }
 
@@ -234,9 +253,15 @@ const FieldInfo = struct {
 fn classFields(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassLayout, cid: ir.ClassId) Error!?[]FieldInfo {
     if (cid.int() >= m.classes.items.len) return null;
     const c = &m.classes.items[cid.int()];
-    if (c.init_block != null) return null;
-    if (c.supertypes.len != 0) return null;
-    if (c.is_abstract or c.is_inner or c.is_object or c.is_enum or c.is_interface) return null;
+    // Each reason is named: this list is the backlog for widening the backend,
+    // and "class layout" alone says nothing about which class shape is missing.
+    if (c.init_block != null) return layoutNo(c, "init block");
+    if (c.supertypes.len != 0) return layoutNo(c, "supertypes");
+    if (c.is_interface) return layoutNo(c, "interface");
+    if (c.is_abstract) return layoutNo(c, "abstract");
+    if (c.is_object) return layoutNo(c, "object declaration");
+    if (c.is_enum) return layoutNo(c, "enum");
+    if (c.is_inner) return layoutNo(c, "inner class");
 
     var out: std.ArrayList(FieldInfo) = .empty;
     errdefer out.deinit(gpa);
@@ -245,16 +270,16 @@ fn classFields(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassL
             // A constructor parameter that is not a property has nowhere to go
             // until init blocks and body initializers referencing it compile.
             out.deinit(gpa);
-            return null;
+            return layoutNo(c, "ctor param is not a property");
         }
         if (p.default != null or p.is_vararg) {
             out.deinit(gpa);
-            return null;
+            return layoutNo(c, "ctor param default/vararg");
         }
         const t = tyOf(p.ty) orelse blk: {
             if (classIndexOfName(m, p.ty) == null) {
                 out.deinit(gpa);
-                return null;
+                return layoutNo(c, "ctor param type");
             }
             break :blk Ty.object;
         };
@@ -271,12 +296,12 @@ fn classFields(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassL
         for (l.props) |bp| {
             const fid = bp.init orelse {
                 out.deinit(gpa);
-                return null;
+                return layoutNo(c, "body property without an initializer");
             };
             const t = tyOf(bp.ty) orelse blk: {
                 if (bp.ty.name.len == 0 or classIndexOfName(m, bp.ty) == null) {
                     out.deinit(gpa);
-                    return null;
+                    return layoutNo(c, "body property type");
                 }
                 break :blk Ty.object;
             };
@@ -402,6 +427,11 @@ pub const Error = error{ OutOfMemory, WriteFailed, NoSpaceLeft };
 /// readable rather than inferred from an empty output file.
 fn traceOn() bool {
     return std.c.getenv("KLIO_CGEN_TRACE") != null;
+}
+
+fn layoutNo(c: *const ir.Class, comptime why: []const u8) ?[]FieldInfo {
+    if (traceOn()) std.debug.print("[cgen] layout {s}: " ++ why ++ "\n", .{c.name});
+    return null;
 }
 
 fn instRefuse(f: *const Func, inst: *const ir.Inst) ?Compiled {
@@ -858,6 +888,9 @@ fn boxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
         .f64 => "klio_nat_box_double",
         .f32 => "klio_nat_box_float",
         .boolean => "klio_nat_box_bool",
+        .char => "klio_nat_box_char",
+        .short => "klio_nat_box_short",
+        .byte => "klio_nat_box_byte",
         .unit => return std.fmt.bufPrint(buf, "klio_nat_box_unit()", .{}) catch unreachable,
         .object => return std.fmt.bufPrint(buf, "{s}", .{expr}) catch unreachable,
     };
@@ -872,6 +905,9 @@ fn unboxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
         .f64 => "klio_nat_double",
         .f32 => "klio_nat_float",
         .boolean => "klio_nat_bool",
+        .char => "klio_nat_char",
+        .short => "klio_nat_short",
+        .byte => "klio_nat_byte",
         .unit => return std.fmt.bufPrint(buf, "0", .{}) catch unreachable,
         .object => return std.fmt.bufPrint(buf, "{s}", .{expr}) catch unreachable,
     };
@@ -908,6 +944,9 @@ fn writeConst(w: *std.Io.Writer, c: ir.Const) !void {
         .Int => |v| try w.print("INT32_C({d})", .{v}),
         .Long => |v| try w.print("INT64_C({d})", .{v}),
         .Bool => |v| try w.print("{d}", .{@intFromBool(v)}),
+        .Char => |v| try w.print("{d}u", .{v}),
+        .Short => |v| try w.print("{d}", .{v}),
+        .Byte => |v| try w.print("{d}", .{v}),
         .Unit => try w.writeAll("0"),
         .Double => |v| try writeFloatLit(w, v, false),
         .Float => |v| try writeFloatLit(w, v, true),
@@ -1357,6 +1396,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                             .i64 => "%\" PRId64 \"",
                             else => "",
                         };
+
                         // When the runtime is linked, everything prints through
                         // its renderer: two renderers would be two chances to
                         // drift, and printf's buffered stream interleaves
@@ -1573,7 +1613,10 @@ pub fn emit(
     var uses_objects = used_classes.items.len != 0;
     for (accepted.items) |*c| {
         for (c.types) |t| {
-            if (t == .object) uses_objects = true;
+            // A `Char` prints as a character and a `Short`/`Byte` as itself, so
+            // a program holding one needs the runtime's renderer even if it
+            // never touches the heap.
+            if (t == .object or t == .char or t == .short or t == .byte) uses_objects = true;
         }
     }
 
