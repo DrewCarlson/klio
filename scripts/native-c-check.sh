@@ -23,7 +23,7 @@ if [ $# -gt 0 ]; then
   progs=("$@")
   strict=0
 else
-  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt)
+  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt examples/native_throw.kt)
 fi
 
 pass=0
@@ -49,17 +49,28 @@ for kt in "${progs[@]}"; do
     head -5 "$WORK/cc.log" | sed 's/^/      /'
     continue
   fi
-  if ! diff -u <("$WORK/$name") <("$KLIO" run "$kt" 2>&1) >"$WORK/diff.log" 2>&1; then
+  # Compare stdout and the exit status. Not stderr: an uncaught throw prints a
+  # stack trace the interpreter can walk and a compiled program cannot.
+  "$WORK/$name" >"$WORK/native.out" 2>/dev/null
+  native_rc=$?
+  "$KLIO" run "$kt" >"$WORK/interp.out" 2>/dev/null
+  interp_rc=$?
+  if ! diff -u "$WORK/native.out" "$WORK/interp.out" >"$WORK/diff.log" 2>&1; then
     fail=$((fail + 1))
     echo "  FAIL $name: output differs from the interpreter"
     head -10 "$WORK/diff.log" | sed 's/^/      /'
+    continue
+  fi
+  if [ "$native_rc" -ne "$interp_rc" ]; then
+    fail=$((fail + 1))
+    echo "  FAIL $name: exit status $native_rc, interpreter $interp_rc"
     continue
   fi
   # A compiled program roots its references by publishing frames, and the
   # collector never scans the native stack: collecting at every safe point is
   # what proves a live reference is actually published.
   if [ ${#link[@]} -ne 0 ]; then
-    if ! diff -u <(KLIO_GC_STRESS=1 "$WORK/$name") <("$KLIO" run "$kt" 2>&1) >"$WORK/gc.log" 2>&1; then
+    if ! diff -u <(KLIO_GC_STRESS=1 "$WORK/$name" 2>/dev/null) "$WORK/interp.out" >"$WORK/gc.log" 2>&1; then
       fail=$((fail + 1))
       echo "  FAIL $name: differs under GC stress (a live reference is not rooted)"
       head -10 "$WORK/gc.log" | sed 's/^/      /'

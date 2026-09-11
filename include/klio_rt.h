@@ -270,6 +270,13 @@ uint32_t klio_nat_class_of(klio_value v);
 void klio_nat_no_method(const char *name);
 
 /* A `var` captured by a lambda: a shared box, so both sides see writes. */
+/* An uncaught throw: a program the backend accepts has no catch handler, so a
+ * throw always leaves it. */
+void klio_nat_throw(klio_value v);
+/* A throwable of the named type: exception classes are the runtime's own, not
+ * shapes the emitter lays out. */
+klio_value klio_nat_exception(const char *fqn, klio_value message);
+
 klio_value klio_nat_cell(klio_value v);
 klio_value klio_nat_cell_get(klio_value c);
 void       klio_nat_cell_set(klio_value c, klio_value v);
