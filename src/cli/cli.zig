@@ -169,6 +169,7 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
         defer feature_specs.deinit(gpa);
         if (std.c.getenv("KLIO_LANGUAGE")) |env_specs| applyLanguageSpecs(std.mem.span(env_specs));
         var out: ?[]const u8 = null;
+        var native = false;
         var bad = false;
         var i: usize = 0;
         while (i < rest.len) : (i += 1) {
@@ -190,6 +191,8 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
                 feature_specs.append(gpa, v) catch return 1;
             } else if (optionValue(rest[i], "--language=")) |v| {
                 applyLanguageSpecs(v);
+            } else if (std.mem.eql(u8, rest[i], "--native")) {
+                native = true;
             } else {
                 files.append(gpa, rest[i]) catch return 1;
             }
@@ -200,6 +203,7 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
         }
         var requested = parseRequestedFeatures(gpa, feature_specs.items);
         defer deinitRequestedFeatures(&requested);
+        if (native) return commands.runTranspileNative(gpa, files.items, out, &requested);
         return commands.runTranspile(gpa, files.items, out, &requested);
     }
     if (std.c.getenv("KLIO_LANGUAGE")) |env_specs| applyLanguageSpecs(std.mem.span(env_specs));

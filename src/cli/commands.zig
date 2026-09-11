@@ -33,6 +33,7 @@ const span_mod = @import("span");
 
 const ir = @import("ir");
 const interp_ir = @import("interp_ir");
+const cgen = @import("cgen.zig");
 const Vm = interp_ir.Vm;
 
 const runtime = @import("runtime");
@@ -414,6 +415,86 @@ pub fn runTranspileDump(
 /// the per-fid registration hook and a `main` that drives the program
 /// through libklio_rt. The emitted file compiles with
 /// `zig cc out.c -I<include> -L<lib> -lklio_rt -lzstd`.
+/// Emit the program as C that stands on its own: no image, no interpreter.
+/// Falls back to the launcher emission when the program is outside the subset
+/// the backend covers so far (see `plans/native-c-backend.md`).
+pub fn runTranspileNative(
+    gpa: std.mem.Allocator,
+    paths: []const []const u8,
+    out_path: ?[]const u8,
+    features: *RequestedFeatures,
+) u8 {
+    const path = paths[0];
+    const c_out = out_path orelse blk: {
+        const base = std.fs.path.basename(path);
+        const stem = if (std.mem.endsWith(u8, base, ".kt")) base[0 .. base.len - 3] else base;
+        break :blk std.fmt.allocPrint(gpa, "{s}.c", .{stem}) catch return 1;
+    };
+    // The whole-program lowering, not the lazy image: the emitter walks every
+    // function body, and an image keeps them behind a header table.
+    var map = SourceMap.init(gpa);
+    defer map.deinit();
+    const id = load(gpa, &map, path) orelse return 1;
+    const src = map.get(id).source;
+    var lx = Lexer.init(gpa, id, src) catch return 1;
+    var lexed = lx.tokenize() catch return 1;
+    defer lexed.deinit(gpa);
+    renderToStderr(gpa, &lexed.diagnostics, &map);
+    if (lexed.diagnostics.hasErrors()) return 1;
+    const p = Parser.new(gpa, id, src, lexed.tokens);
+    const file_ast = p.parseFile();
+    renderToStderr(gpa, &p.diagnostics, &map);
+    if (p.diagnostics.hasErrors()) return 1;
+
+    var user_asts: std.ArrayList(KotlinFile) = .empty;
+    defer user_asts.deinit(gpa);
+    user_asts.append(gpa, file_ast) catch return 1;
+    const loaded = loadInstalledPacks(gpa, user_asts.items, &map, features);
+    var all_asts: std.ArrayList(KotlinFile) = .empty;
+    defer all_asts.deinit(gpa);
+    all_asts.appendSlice(gpa, loaded.asts) catch return 1;
+    all_asts.appendSlice(gpa, user_asts.items) catch return 1;
+    if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    span.active_map = &map;
+    var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
+        io.printStderr(gpa, "error: lowering failed\n", .{});
+        return 1;
+    };
+    defer built.deinit();
+
+    const mg = built.module.borrow();
+    defer mg.deinit();
+    const m = mg.get();
+    var entry: ?*const ir.Func = null;
+    for (m.funcs.items) |*f| {
+        if (f.package.len == 0 and std.mem.eql(u8, f.name, "main") and f.params.len == 0) entry = f;
+    }
+    const ef = entry orelse {
+        io.printStderr(gpa, "error: no `main` to compile\n", .{});
+        return 1;
+    };
+
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const ok = cgen.emit(gpa, m, ef, &aw.writer, path) catch |e| {
+        io.printStderr(gpa, "error: native emission failed: {s}\n", .{@errorName(e)});
+        return 1;
+    };
+    if (!ok) {
+        io.printStderr(gpa, "error: program is outside the native subset; `klio transpile` without --native emits the launcher form\n", .{});
+        return 1;
+    }
+    const bytes = aw.written();
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    std.Io.Dir.cwd().writeFile(threaded.io(), .{ .sub_path = c_out, .data = bytes }) catch {
+        io.printStderr(gpa, "error: cannot write `{s}`\n", .{c_out});
+        return 1;
+    };
+    io.printStderr(gpa, "wrote {s} ({d} bytes, standalone)\n", .{ c_out, bytes.len });
+    return 0;
+}
+
 pub fn runTranspile(
     gpa: std.mem.Allocator,
     paths: []const []const u8,
