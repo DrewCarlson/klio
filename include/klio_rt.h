@@ -269,6 +269,11 @@ uint32_t klio_nat_class_of(klio_value v);
 /* A virtual call that reached a receiver no arm handles. */
 void klio_nat_no_method(const char *name);
 
+/* A `var` captured by a lambda: a shared box, so both sides see writes. */
+klio_value klio_nat_cell(klio_value v);
+klio_value klio_nat_cell_get(klio_value c);
+void       klio_nat_cell_set(klio_value c, klio_value v);
+
 klio_value klio_nat_box_char(uint16_t v);
 klio_value klio_nat_box_short(int16_t v);
 klio_value klio_nat_box_byte(int8_t v);

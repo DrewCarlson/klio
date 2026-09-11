@@ -25,4 +25,19 @@ fun main() {
         i = i + 1
     }
     println(total)
+
+    // A `var` a lambda captures moves to a shared box, so both sides see the
+    // writes the other makes.
+    var count = 0
+    val bump = { count = count + 1 }
+    bump()
+    bump()
+    bump()
+    println(count)
+
+    var acc = ""
+    val push = { s: String -> acc = acc + s }
+    push("a")
+    push("b")
+    println(acc)
 }

@@ -141,10 +141,15 @@ fn isStringReg(types: []const Ty, cls: []const ?u32, r: u32) bool {
 /// `String` they take a handle outside the class table.
 const LIST_CLS: u32 = std.math.maxInt(u32) - 1;
 
+/// A capture cell: the box a `var` moves into when a lambda captures it. Like
+/// `String` and `List` it is a runtime type, not a user class; `elem` carries
+/// what it holds.
+const CELL_CLS: u32 = std.math.maxInt(u32) - 2;
+
 /// Whether a class handle names a runtime type rather than a user class. Such
 /// a handle indexes no class table and gets no emitted descriptor.
 fn isBuiltinCls(cid: u32) bool {
-    return cid == STRING_CLS or cid == LIST_CLS;
+    return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS;
 }
 
 /// The class marker for a register the emitter knows holds a `String`. Strings
@@ -655,10 +660,32 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     if (t == .object and m.consts.items[c.value.int()] == .String) cls[c.dst.int()] = STRING_CLS;
                     known[c.dst.int()] = true;
                 },
+                .MakeCell => |mk| {
+                    if (mk.dst.int() >= f.n_locals or mk.src.int() >= f.n_locals) return no(f, "cell reg");
+                    if (!known[mk.src.int()]) return no(f, "cell source");
+                    types[mk.dst.int()] = .object;
+                    cls[mk.dst.int()] = CELL_CLS;
+                    elem[mk.dst.int()] = types[mk.src.int()];
+                    known[mk.dst.int()] = true;
+                },
+                .CellGet => |cg| {
+                    if (cg.cell.int() >= f.n_locals or !known[cg.cell.int()]) return no(f, "cell read");
+                    if (cls[cg.cell.int()] == null or cls[cg.cell.int()].? != CELL_CLS) return no(f, "cell read of a non-cell");
+                    if (cg.dst.int() >= f.n_locals) return no(f, "cell dst");
+                    types[cg.dst.int()] = elem[cg.cell.int()];
+                    known[cg.dst.int()] = true;
+                },
+                .CellSet => |cs| {
+                    if (cs.cell.int() >= f.n_locals or !known[cs.cell.int()]) return no(f, "cell write");
+                    if (cls[cs.cell.int()] == null or cls[cs.cell.int()].? != CELL_CLS) return no(f, "cell write to a non-cell");
+                    if (cs.value.int() >= f.n_locals or !known[cs.value.int()]) return no(f, "cell value");
+                    if (types[cs.value.int()] != elem[cs.cell.int()]) return no(f, "cell value type");
+                },
                 .LoadCapture => |lc| {
                     if (lc.dst.int() >= f.n_locals or lc.idx >= caps.len) return no(f, "load capture");
                     types[lc.dst.int()] = caps[lc.idx].ty;
                     cls[lc.dst.int()] = caps[lc.idx].cls;
+                    elem[lc.dst.int()] = caps[lc.idx].elem;
                     known[lc.dst.int()] = true;
                 },
                 .LoadParam => |lp| {
@@ -959,7 +986,11 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     if (cv2.callee.int() >= f.n_locals) return no(f, "value callee");
                     const li = lam[cv2.callee.int()] orelse return no(f, "value call to an unknown callee");
                     const bf = m.funcById(li.body) orelse return no(f, "lambda body missing");
-                    if (bf.params.len != cv2.n_args) return no(f, "lambda arity");
+                    // The lowering always gives a lambda an `it` slot, so a
+                    // zero-argument call leaves one parameter unsupplied. It is
+                    // unreachable in a lambda that declares none, and gets the
+                    // type's zero.
+                    if (cv2.n_args > bf.params.len) return no(f, "lambda arity");
                     var kk3: u32 = 0;
                     while (kk3 < cv2.n_args) : (kk3 += 1) {
                         const ar3 = cv2.args.int() + kk3;
@@ -971,7 +1002,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     // with, since those are part of its signature here.
                     const ct2 = try gpa.alloc(CapInfo, li.captures.len);
                     defer gpa.free(ct2);
-                    for (li.captures, 0..) |cr2, ci5| ct2[ci5] = .{ .ty = types[cr2.int()], .cls = cls[cr2.int()] };
+                    for (li.captures, 0..) |cr2, ci5| ct2[ci5] = .{ .ty = types[cr2.int()], .cls = cls[cr2.int()], .elem = elem[cr2.int()] };
                     var bc = (try eligible(gpa, m, ls, bf, globals, null, ct2)) orelse return no(f, "lambda body");
                     const rt7 = bc.ret;
                     bc.deinit(gpa);
@@ -1298,6 +1329,34 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                 .LoadCapture => |lc| {
                     var nb: [32]u8 = undefined;
                     try w.print("  {s} = k{d};\n", .{ regName(c, lc.dst.int(), &nb), lc.idx });
+                },
+                .MakeCell => |mk| {
+                    var nb: [32]u8 = undefined;
+                    var sb2: [32]u8 = undefined;
+                    var bb4: [96]u8 = undefined;
+                    try w.print("  {s} = klio_nat_cell({s});\n", .{
+                        regName(c, mk.dst.int(), &nb),
+                        boxExpr(c.types[mk.src.int()], regName(c, mk.src.int(), &sb2), &bb4),
+                    });
+                },
+                .CellGet => |cg| {
+                    var nb: [32]u8 = undefined;
+                    var cb4: [32]u8 = undefined;
+                    var gb2: [96]u8 = undefined;
+                    const g2 = try std.fmt.bufPrint(&gb2, "klio_nat_cell_get({s})", .{regName(c, cg.cell.int(), &cb4)});
+                    var ob2: [160]u8 = undefined;
+                    try w.print("  {s} = {s};\n", .{
+                        regName(c, cg.dst.int(), &nb), unboxExpr(c.types[cg.dst.int()], g2, &ob2),
+                    });
+                },
+                .CellSet => |cs| {
+                    var cb5: [32]u8 = undefined;
+                    var vb2: [32]u8 = undefined;
+                    var bb5: [96]u8 = undefined;
+                    try w.print("  klio_nat_cell_set({s}, {s});\n", .{
+                        regName(c, cs.cell.int(), &cb5),
+                        boxExpr(c.types[cs.value.int()], regName(c, cs.value.int(), &vb2), &bb5),
+                    });
                 },
                 .Move => |mv| {
                     var nb: [32]u8 = undefined;
@@ -1642,6 +1701,16 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                         var ab5: [32]u8 = undefined;
                         try w.print("{s}", .{regName(c, cv2.args.int() + aj3, &ab5)});
                     }
+                    var aj4: usize = cv2.n_args;
+                    while (aj4 < bf.params.len) : (aj4 += 1) {
+                        if (li.captures.len != 0 or aj4 != 0) try w.writeAll(", ");
+                        const pt4: Ty = tyOf(bf.params[aj4].ty) orelse .object;
+                        if (pt4 == .object) {
+                            try w.writeAll("klio_nat_box_unit()");
+                        } else {
+                            try w.writeAll("0");
+                        }
+                    }
                     try w.writeAll(");\n");
                 },
                 .Call => |call| {
@@ -1771,7 +1840,7 @@ pub const ClassLayout = struct {
 /// the point it was made.
 /// A captured value's machine type and, when it is a reference, which class it
 /// holds — a captured String is only usable as one if that travels with it.
-pub const CapInfo = struct { ty: Ty, cls: ?u32 = null };
+pub const CapInfo = struct { ty: Ty, cls: ?u32 = null, elem: Ty = .unit };
 
 pub const LambdaInfo = struct {
     body: ir.FuncId,
@@ -1896,7 +1965,7 @@ pub fn emit(
                         // The body is compiled against what this site captured:
                         // those values arrive as leading arguments.
                         const ct = try gpa.alloc(CapInfo, al2.captures.len);
-                        for (al2.captures, 0..) |cr, ci4| ct[ci4] = .{ .ty = c.types[cr.int()], .cls = c.cls[cr.int()] };
+                        for (al2.captures, 0..) |cr, ci4| ct[ci4] = .{ .ty = c.types[cr.int()], .cls = c.cls[cr.int()], .elem = c.elem[cr.int()] };
                         try cap_owned.append(gpa, ct);
                         try seen.put(bfn.id.int(), {});
                         try queue.append(gpa, .{ .f = bfn, .synth = null, .caps = ct });

@@ -743,3 +743,28 @@ export fn klio_nat_no_method(name: [*:0]const u8) noreturn {
     _ = std.c.write(2, "\n", 1);
     std.c.exit(1);
 }
+
+// --- capture cells ---------------------------------------------------------
+//
+// A `var` a lambda captures becomes a shared box: the lambda and the enclosing
+// function must see each other's writes, so the variable moves to the heap.
+
+export fn klio_nat_cell(v: CValue) CValue {
+    const a = natAlloc();
+    return toC(runtime.Value.newCell(a, fromC(v)) catch @panic("klio_nat_cell: out of memory"));
+}
+
+export fn klio_nat_cell_get(c: CValue) CValue {
+    const v = fromC(c);
+    const g = v.Cell.borrow();
+    defer g.deinit();
+    return toC(g.get().*);
+}
+
+export fn klio_nat_cell_set(c: CValue, v: CValue) void {
+    const cv = fromC(c);
+    const g = cv.Cell.borrowMut();
+    defer g.deinit();
+    g.get().* = fromC(v);
+    runtime.gc.writeBarrier(&cv.Cell.cell.hdr);
+}
