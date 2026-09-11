@@ -262,6 +262,8 @@ klio_value klio_nat_string(const char *bytes, size_t len);
 klio_value klio_nat_concat(klio_value a, klio_value b);
 int32_t    klio_nat_str_length(klio_value v);
 void       klio_nat_println(klio_value v);
+/* `print`: the same renderer, without the newline. */
+void       klio_nat_print(klio_value v);
 
 /* Lists. Data-structure work on the runtime's own types: no dispatch. */
 klio_value klio_nat_list(const klio_value *argv, uint32_t argc);
@@ -270,6 +272,17 @@ int32_t    klio_nat_list_size(klio_value v);
 klio_value klio_nat_list_get(klio_value v, int32_t idx);
 void       klio_nat_list_set(klio_value v, int32_t idx, klio_value x);
 void       klio_nat_list_add(klio_value v, klio_value x);
+
+/* Arrays. A primitive array is a packed scalar buffer, so `kind` names the
+ * element kind: 0 Int, 1 Long, 2 Double, 3 Float, 4 Short, 5 Byte, 6 Boolean,
+ * 7 Char. A reference `Array<T>` holds boxed values. */
+klio_value klio_nat_prim_array(uint32_t kind, int32_t n);
+klio_value klio_nat_prim_array_of(uint32_t kind, const klio_value *v, uint32_t n);
+klio_value klio_nat_ref_array(const klio_value *v, uint32_t n);
+klio_value klio_nat_ref_array_sized(int32_t n);
+int32_t    klio_nat_array_size(klio_value a);
+klio_value klio_nat_array_get(klio_value a, int32_t i);
+void       klio_nat_array_set(klio_value a, int32_t i, klio_value v);
 
 /* Null and reference comparison. A field access on a null receiver raises the
  * same NullPointerException the interpreter would. */

@@ -278,6 +278,108 @@ entry. Leaving a region without reaching the block that disarms it left it
 armed after the frame was gone, and the next region armed anywhere chained onto
 a `klio_try` that no longer existed.
 
+Enums compile. Each entry is one instance built before the program runs and
+rooted for its life, exactly as an `object` declaration is; every entry carries
+its own `name` and `ordinal`, which is what a comparison, a print and a `when`
+over the entries read, and the enum's constructor runs with the arguments the
+entry's declaration writes. The enum's own name is a QUALIFIER rather than
+storage: `Color.RED` is a register that names a class, typed Unit with the
+class recorded, resolved at emit time and occupying nothing at run time. That
+shape was behind most of what the backend had been calling an undeclared
+global.
+
+Default arguments compile. A default belongs to the call, not to the body: the
+callee takes every parameter like any other, and a call that omits one runs the
+thunk its declaration lowered, handed the arguments ahead of it. Each lands in
+a C local first, because a later default may read an earlier one — and the
+local's type comes from what the thunk's COMPILED body returns, not from its
+declared return type, which for a synthesized thunk is a placeholder.
+
+A member call the lowering left by name resolves here. The declaration it binds
+to is the topmost one on the receiver's chain at that name and arity, which is
+the same slot a resolved `CallVirtual` would name, so both go through one
+dispatcher and an override answers either spelling.
+
+The typing pass walks blocks in reverse postorder. Source order does not put a
+definition before its uses: a `when` writes its result in the arm blocks, which
+sit after the block that returns it, so every `when` whose value was returned
+refused as an undefined register.
+
+Arrays compile. A primitive array is a packed scalar buffer, so an `IntArray`
+holds int32 elements and an indexed read is a load rather than an unbox; the
+element kind comes from the array's own type name. A reference `Array<T>` holds
+boxed values and says what it holds in its type argument. An array is a runtime
+value rather than an instance the emitter lays out, so constructing one drags
+in no class descriptor and no initializer.
+
+Scope functions compile. `with`, `apply`, `let` and `run` splice their bodies
+inline and push their subject onto the interpreter's implicit-receiver chain,
+which exists for resolution at run time. Compiled code has no chain: the
+emitter walks the same receivers once, at emit time, and a bare name inside
+such a body becomes the field, the accessor, or the top-level property it
+actually meant. The chain instructions themselves are then nothing to emit.
+
+A property the source left unannotated takes the type its initializer computes.
+Asking the initializer needs the layouts resolved so far — including the fields
+of its own class ahead of it — so the class table is built to a fixed point
+rather than in one pass, publishing each round's partial layout for the next to
+build on. A class still missing a property at the end has no layout at all: a
+partial one would address the wrong field.
+
+A register lives in one C local, so it holds one machine type. The lowering
+declares a result register by writing Unit into it before the body that fills
+it runs; that is a placeholder rather than a second type, and the constant is
+emitted in whatever spelling the register settled on. Two genuinely different
+types in one register is refused rather than silently resolved to whichever
+write came last, which is what it had been doing.
+
+Function values compile. A lambda whose value has to exist becomes an instance
+of a class the emitter synthesizes for that body, one field per capture: the
+collector traces it like any other instance, and a call through the value finds
+the body again by its class handle, exactly as a virtual call finds an
+override. A lambda every use of which is a direct call is still never
+materialised, so the case the JIT cares about allocates nothing.
+
+Arguments and results pass boxed through a function value, because which body
+runs is a run-time answer and two bodies of the same shape need not agree on
+machine types; one adapter per body unboxes into the body's real signature. A
+lambda's own parameters carry no declared types — the source writes
+`{ x -> x + n }` — so they come from the function type the value is expected to
+have, read off where the value goes: the declaration's return type when it is
+returned, the parameter's or the constructor's when it is passed.
+
+A builtin type's name used as a qualifier resolves to the language's own
+numbers. `Int.MAX_VALUE`, `Double.NaN`, `Long.SIZE_BYTES` and the rest are
+constants of the language rather than something a pack computes, so the emitter
+writes them directly; the register naming the type carries no value at all.
+That one shape was the first refusal in 380 of the example programs, because
+the stdlib's own property initializers reach for it.
+
+Named arguments reach the callee in ITS order. A call binds positional
+arguments in order and named ones by name, and a parameter nothing binds takes
+its default — the same rule for a constructor as for a function. Type arguments
+say nothing about which body runs for a call the lowering already resolved, so
+they no longer refuse one.
+
+### What is general and what is an intrinsic
+
+Everything that decides program shape is general and applies to a pack class
+exactly as it does to a user class: layouts and the inheritance chain, virtual
+dispatch, closures, default arguments and named ones, catch intervals, the
+bare-name resolution inside an inlined receiver body, and the type each
+register settles on. None of it names a type.
+
+What is named is the set of stdlib declarations with no Kotlin body — `expect`
+or external, implemented by the platform. `println`, `print`, `max`, `min`,
+`abs`, `listOf`, `arrayOf` and its siblings, `emptyArray`, `arrayOfNulls`, the
+array constructors, `Int.MAX_VALUE` and the other language constants: there is
+no body to compile, so the emitter performs the operation. That is the same
+reason the interpreter has builtins for them. The one place this leaked into
+the general machinery was the array constructor's `(size, init)` form, which
+had grown its own scan for "is this lambda an array initializer"; it now feeds
+the ONE mechanism that answers what type a lambda is expected to have, as one
+more declared signature among the callee's own.
+
 Two rules earned their keep by being wrong first. A function's result comes
 from the register it returns — except a declaration with no body, an interface
 method, which has no register and must read its annotation. And a value only
@@ -285,13 +387,39 @@ has to BE a reference to be passed, returned or stored; demanding its layout
 everywhere refused every interface type, and relaxing it moved more programs
 than any feature did.
 
+## Correctness net
+
+`scripts/native-c-check.sh` is the gate: a fixed set of programs that must keep
+compiling warning-clean and printing what the interpreter prints, including
+under `KLIO_GC_STRESS=1`. `scripts/native-c-sweep.sh` is the wider net: it
+compiles EVERY example the backend accepts and compares it, so a program the
+backend takes and then gets wrong surfaces without having to be in the curated
+set. It found eight, and each was a real hole rather than a missing feature:
+
+- Kotlin's integer arithmetic wraps; C leaves signed overflow undefined and an
+  optimizer may assume it never happens. Add, subtract, multiply and negate now
+  run in the unsigned type of the same width, and the most negative value
+  divided by -1 is handled where C's division is undefined too.
+- A register's type is what its C local declares, and the lowering reuses one
+  register for values of both shapes, so a call's result and its arguments
+  convert at the point of use rather than assuming the declaration.
+- A class that does not override still answers a dispatcher with what it
+  inherits, from a superclass or from an interface's default body. It had been
+  answering with AbstractMethodError.
+- An override may declare parameters the call site omits; the dispatcher runs
+  their default thunks.
+- A class satisfying an interface by DELEGATION has the member and no body for
+  it. That is refused rather than compiled into a missing arm.
+- An `init { … }` block is not carried by the IR, so a class with one was being
+  constructed without running it. Refused.
+
 ## Still refused
 
 Measured across the example corpus with `KLIO_CGEN_TRACE=1`, most common
-first: names that are neither a declared global nor an object, body properties
-without an initializer or with a type the emitter cannot place, `runBlocking`
-and the rest of the coroutine surface, `CallMember`, calls with named or
-generic arguments, and anonymous object literals.
+first: `runBlocking` and the rest of the coroutine surface, calls with named or
+generic arguments, the `List` members the backend performs directly, anonymous
+object literals, `MakeCell` (a `var` a lambda captures), `finally`, and the
+companion-object side of a class name used as a qualifier.
 
 A refusal is reported against the thing that blocked a program, not against
 every candidate the emitter examined. The class-layout table is built for every

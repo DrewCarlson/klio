@@ -23,7 +23,7 @@ if [ $# -gt 0 ]; then
   progs=("$@")
   strict=0
 else
-  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt examples/native_try_catch.kt examples/native_exception_hierarchy.kt examples/native_properties.kt examples/native_enums.kt
+  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt examples/native_try_catch.kt examples/native_exception_hierarchy.kt examples/native_properties.kt examples/native_enums.kt examples/native_default_args.kt examples/native_member_dispatch.kt examples/native_math_print.kt examples/native_arrays.kt examples/native_scope_functions.kt examples/native_inferred_properties.kt examples/native_function_values.kt
     # A program whose point is to leave through an uncaught throw cannot live
     # in examples/: the corpus requires an example to exit zero.
     tests/fixtures/native_c/native_throw.kt)
@@ -46,7 +46,12 @@ for kt in "${progs[@]}"; do
   if grep -q '#include <klio_rt.h>' "$cfile"; then
     link=(-Izig-out/include -Lzig-out/lib -lklio_rt -lzstd)
   fi
-  if ! $CC -O2 -Wall -Wextra -Werror "$cfile" "${link[@]}" -o "$WORK/$name" >"$WORK/cc.log" 2>&1; then
+  # A whole-program emitter reaches a body or a dispatcher that nothing in the
+  # end calls — a lambda the lowering inlined away, a slot no constructed class
+  # answers. That is not a defect, so those two warnings are off; everything
+  # else is an error, because a warning in generated C is a bug in the emitter.
+  if ! $CC -O2 -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter \
+      "$cfile" "${link[@]}" -o "$WORK/$name" >"$WORK/cc.log" 2>&1; then
     fail=$((fail + 1))
     echo "  FAIL $name: C compile"
     head -5 "$WORK/cc.log" | sed 's/^/      /'
