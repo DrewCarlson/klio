@@ -361,12 +361,57 @@ its default — the same rule for a constructor as for a function. Type argument
 say nothing about which body runs for a call the lowering already resolved, so
 they no longer refuse one.
 
+### What is general and what is an intrinsic
+
+Everything that decides program shape is general and applies to a pack class
+exactly as it does to a user class: layouts and the inheritance chain, virtual
+dispatch, closures, default arguments and named ones, catch intervals, the
+bare-name resolution inside an inlined receiver body, and the type each
+register settles on. None of it names a type.
+
+What is named is the set of stdlib declarations with no Kotlin body — `expect`
+or external, implemented by the platform. `println`, `print`, `max`, `min`,
+`abs`, `listOf`, `arrayOf` and its siblings, `emptyArray`, `arrayOfNulls`, the
+array constructors, `Int.MAX_VALUE` and the other language constants: there is
+no body to compile, so the emitter performs the operation. That is the same
+reason the interpreter has builtins for them. The one place this leaked into
+the general machinery was the array constructor's `(size, init)` form, which
+had grown its own scan for "is this lambda an array initializer"; it now feeds
+the ONE mechanism that answers what type a lambda is expected to have, as one
+more declared signature among the callee's own.
+
 Two rules earned their keep by being wrong first. A function's result comes
 from the register it returns — except a declaration with no body, an interface
 method, which has no register and must read its annotation. And a value only
 has to BE a reference to be passed, returned or stored; demanding its layout
 everywhere refused every interface type, and relaxing it moved more programs
 than any feature did.
+
+## Correctness net
+
+`scripts/native-c-check.sh` is the gate: a fixed set of programs that must keep
+compiling warning-clean and printing what the interpreter prints, including
+under `KLIO_GC_STRESS=1`. `scripts/native-c-sweep.sh` is the wider net: it
+compiles EVERY example the backend accepts and compares it, so a program the
+backend takes and then gets wrong surfaces without having to be in the curated
+set. It found eight, and each was a real hole rather than a missing feature:
+
+- Kotlin's integer arithmetic wraps; C leaves signed overflow undefined and an
+  optimizer may assume it never happens. Add, subtract, multiply and negate now
+  run in the unsigned type of the same width, and the most negative value
+  divided by -1 is handled where C's division is undefined too.
+- A register's type is what its C local declares, and the lowering reuses one
+  register for values of both shapes, so a call's result and its arguments
+  convert at the point of use rather than assuming the declaration.
+- A class that does not override still answers a dispatcher with what it
+  inherits, from a superclass or from an interface's default body. It had been
+  answering with AbstractMethodError.
+- An override may declare parameters the call site omits; the dispatcher runs
+  their default thunks.
+- A class satisfying an interface by DELEGATION has the member and no body for
+  it. That is refused rather than compiled into a missing arm.
+- An `init { … }` block is not carried by the IR, so a class with one was being
+  constructed without running it. Refused.
 
 ## Still refused
 

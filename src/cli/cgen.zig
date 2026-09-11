@@ -521,6 +521,20 @@ fn isBitwise(op: ir.BinOp) bool {
     };
 }
 
+/// The unsigned C type of the same width, in which an integer operation is
+/// performed so that it wraps the way Kotlin's does. Null for the types where
+/// C's own semantics already match.
+fn wrapTy(t: Ty) ?[]const u8 {
+    return switch (t) {
+        .i32 => "uint32_t",
+        .i64 => "uint64_t",
+        .short => "uint16_t",
+        .byte => "uint8_t",
+        .char => "uint16_t",
+        else => null,
+    };
+}
+
 fn cOp(op: ir.BinOp) ?[]const u8 {
     return switch (op) {
         .Add => "+",
@@ -725,6 +739,9 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
     // Each reason is named: this list is the backlog for widening the backend,
     // and "class layout" alone says nothing about which class shape is missing.
     if (c.init_block != null) return layoutNo(c, "init block");
+    for (layouts) |l0| {
+        if (std.mem.eql(u8, l0.name, c.name) and l0.has_init_block) return layoutNo(c, "init block");
+    }
     // An interface contributes no fields, so implementing one changes nothing
     // about the layout. A superCLASS contributes its own, laid out ahead of
     // this class's so a field index means the same thing through either type.
@@ -990,17 +1007,43 @@ fn scalarIntrinsic(f: *const Func) ?ScalarIntrinsic {
 /// The method of `cls` that implements a virtual slot. A slot is numbered by
 /// its root declaration, so the implementation is the class's method of the
 /// same name and arity — which is what an override is.
-fn slotImpl(m: *const Module, cid: u32, slot: ir.MethodSlotId) ?*const Func {
+fn slotImpl(m: *const Module, prog: Program, cid: u32, slot: ir.MethodSlotId) ?*const Func {
     const root = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
-    if (cid >= m.classes.items.len) return null;
-    for (m.classes.items[cid].methods) |fid| {
-        const mf = m.funcById(fid) orelse continue;
-        if (!std.mem.eql(u8, mf.name, root.name)) continue;
-        if (mf.params.len != root.params.len) continue;
-        if (!mf.hasBody()) continue;
-        return mf;
+    var fallback: ?*const Func = null;
+    // A class that does not override still answers with what it inherits, so
+    // the walk goes up the chain and the nearest body wins.
+    var cur: ?u32 = cid;
+    var depth: u32 = 0;
+    while (cur) |ci| : (depth += 1) {
+        if (depth > 32 or ci >= m.classes.items.len) break;
+        for (m.classes.items[ci].methods) |fid| {
+            const mf = m.funcById(fid) orelse continue;
+            if (!std.mem.eql(u8, mf.name, root.name)) continue;
+            if (!mf.hasBody()) continue;
+            if (mf.params.len == root.params.len) return mf;
+            // An override may declare parameters the declaration does not,
+            // when they carry defaults; it still answers the slot.
+            if (mf.params.len > root.params.len and fallback == null) fallback = mf;
+        }
+        if (fallback != null) return fallback;
+        // An interface may carry a default body, which a class that does not
+        // override inherits.
+        for (m.classes.items[ci].supertypes) |sid| {
+            if (sid.int() >= m.classes.items.len) continue;
+            const sup = &m.classes.items[sid.int()];
+            if (!sup.is_interface) continue;
+            for (sup.methods) |fid2| {
+                const mf2 = m.funcById(fid2) orelse continue;
+                if (!std.mem.eql(u8, mf2.name, root.name)) continue;
+                if (!mf2.hasBody()) continue;
+                if (mf2.params.len == root.params.len) return mf2;
+                if (mf2.params.len > root.params.len and fallback == null) fallback = mf2;
+            }
+        }
+        if (fallback != null) return fallback;
+        cur = if (prog.parentOf(ci)) |pp| pp.cid else null;
     }
-    return null;
+    return fallback;
 }
 
 /// The greatest number of parameters a call the emitter binds can have. A
@@ -1121,6 +1164,37 @@ fn noReg(f: *const Func, reg: u32) ?Compiled {
     return null;
 }
 
+/// The declared type of an array constructor's initializer. `IntArray(size,
+/// init)` is declared `expect inline`, so there is no Kotlin body carrying the
+/// signature and no primary parameter to read it off; the emitter performs the
+/// construction and this is that builtin's own signature. The result is the
+/// element type, and the one parameter is the index.
+fn bareTy(name: []const u8) ir.TypeRef {
+    return .{ .name = name, .nullable = false, .args = &.{} };
+}
+
+/// `(Int) -> E` for each array element kind, in the order
+/// `klio_nat_prim_array` names them, with the reference `Array<T>` last. The
+/// argument slices are mutable because `TypeRef.args` is, and nothing writes
+/// them.
+var array_init_args = [_][2]ir.TypeRef{
+    .{ bareTy("Int"), bareTy("Int") },
+    .{ bareTy("Int"), bareTy("Long") },
+    .{ bareTy("Int"), bareTy("Double") },
+    .{ bareTy("Int"), bareTy("Float") },
+    .{ bareTy("Int"), bareTy("Short") },
+    .{ bareTy("Int"), bareTy("Byte") },
+    .{ bareTy("Int"), bareTy("Boolean") },
+    .{ bareTy("Int"), bareTy("Char") },
+    .{ bareTy("Int"), bareTy("Any") },
+};
+
+fn arrayInitFnType(class_name: []const u8) ?ir.TypeRef {
+    const slot: usize = primArrayKind(class_name) orelse
+        (if (isArrayTypeName(class_name)) array_init_args.len - 1 else return null);
+    return .{ .name = "Function1", .nullable = false, .args = array_init_args[slot][0..] };
+}
+
 /// The function type a lambda is expected to have, read off where its value
 /// goes: the declaration's return type when it is returned, the parameter's
 /// type when it is passed. A lambda's own parameters carry no declared types —
@@ -1154,6 +1228,9 @@ fn expectedFnType(m: *const Module, f: *const Func, dst: ir.Reg) ?ir.TypeRef {
                             if (k2 < cdef.primary_params.len and functionTypeArity(cdef.primary_params[k2].ty.name) != null) {
                                 return cdef.primary_params[k2].ty;
                             }
+                            if (k2 == 1 and ni.n_args == 2) {
+                                if (arrayInitFnType(cdef.name)) |t| return t;
+                            }
                         }
                     },
                     else => {},
@@ -1168,44 +1245,6 @@ fn expectedFnType(m: *const Module, f: *const Func, dst: ir.Reg) ?ir.TypeRef {
         want = moved orelse break;
     }
     return null;
-}
-
-/// Whether a lambda is an array constructor's initializer: `IntArray(n) { i ->
-/// … }` runs the body once per index, so its one parameter is that index.
-fn isArrayInitLambda(m: *const Module, f: *const Func, dst: ir.Reg) bool {
-    var want = dst;
-    var hops: u32 = 0;
-    while (hops < 8) : (hops += 1) {
-        var moved: ?ir.Reg = null;
-        for (f.blocks) |*blk| {
-            for (blk.insts) |*inst| {
-                switch (inst.*) {
-                    .Move => |mv| if (mv.src.int() == want.int()) {
-                        moved = mv.dst;
-                    },
-                    .NewInstance => |ni| {
-                        if (ni.n_args != 2) continue;
-                        if (ni.args.int() + 1 != want.int()) continue;
-                        if (ni.class.int() >= m.classes.items.len) continue;
-                        if (isArrayTypeName(m.classes.items[ni.class.int()].name)) return true;
-                    },
-                    else => {},
-                }
-            }
-        }
-        want = moved orelse break;
-    }
-    return false;
-}
-
-/// The parameter list of an array initializer: its one parameter is the index.
-fn arrayInitParams(gpa: std.mem.Allocator, body: *const Func) Error![]ir.Param {
-    const out = try gpa.alloc(ir.Param, body.params.len);
-    for (out, 0..) |*p, i| {
-        p.* = body.params[i];
-        if (i == 0) p.ty = .{ .name = "Int", .nullable = false, .args = &.{} };
-    }
-    return out;
 }
 
 /// The parameter list a lambda body compiles against, taken from the function
@@ -1328,6 +1367,35 @@ fn bareOn(
 
 /// One lambda whose value the program materialises.
 const LambdaUse = struct { body: ir.FuncId, n_caps: u32, arity: u32, ret: Ty };
+
+/// Whether a class's TYPE includes the declaration a slot is numbered by: the
+/// slot's root names its owner in its fqn, and a class whose supertypes reach
+/// that owner has the member whether or not it has a body for it. A class that
+/// has the member and no body satisfies it by delegation, which forwards to
+/// another object at run time.
+fn typeHasSlot(m: *const Module, cid: u32, root: *const Func) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, root.fqn, '.') orelse return false;
+    const owner = root.fqn[0..dot];
+    if (owner.len == 0) return false;
+    var stack: [64]u32 = undefined;
+    var n: usize = 1;
+    stack[0] = cid;
+    var steps: u32 = 0;
+    while (n != 0 and steps < 256) : (steps += 1) {
+        n -= 1;
+        const ci = stack[n];
+        if (ci >= m.classes.items.len) continue;
+        const c = &m.classes.items[ci];
+        if (std.mem.eql(u8, c.name, owner) or std.mem.eql(u8, c.fqn, owner)) return true;
+        for (c.supertypes) |sid| {
+            if (n < stack.len) {
+                stack[n] = sid.int();
+                n += 1;
+            }
+        }
+    }
+    return false;
+}
 
 /// One virtual call site's shape: the slot and how many arguments it takes.
 const SlotUse = struct { slot: u32, n_args: u32 };
@@ -2208,12 +2276,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     defer gpa.free(ct5);
                     for (al.captures, 0..) |cr5, ci6| ct5[ci6] = .{ .ty = types[cr5.int()], .cls = cls[cr5.int()], .elem = elem[cr5.int()] };
                     const fnty = expectedFnType(m, f, al.dst);
-                    const lsynth = if (fnty) |t5|
-                        try lambdaParams(gpa, bfn, t5)
-                    else if (isArrayInitLambda(m, f, al.dst))
-                        try arrayInitParams(gpa, bfn)
-                    else
-                        null;
+                    const lsynth = if (fnty) |t5| try lambdaParams(gpa, bfn, t5) else null;
                     defer if (lsynth) |ls5| gpa.free(ls5);
                     var lc = (try eligible(gpa, m, prog, bfn, globals, lsynth, ct5)) orelse return no(f, "lambda body");
                     const lret = lc.ret;
@@ -2590,6 +2653,46 @@ fn writeCtorBody(
         try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi, boxExpr(fd.ty, call.written(), &bb) });
     }
     try w.writeAll("}\n");
+}
+
+/// The runtime entry that boxes a machine type, or an empty name when the
+/// value is already a reference.
+fn boxFnName(t: Ty) []const u8 {
+    return switch (t) {
+        .i32 => "klio_nat_box_int",
+        .i64 => "klio_nat_box_long",
+        .f64 => "klio_nat_box_double",
+        .f32 => "klio_nat_box_float",
+        .boolean => "klio_nat_box_bool",
+        .char => "klio_nat_box_char",
+        .short => "klio_nat_box_short",
+        .byte => "klio_nat_box_byte",
+        .unit, .object => "",
+    };
+}
+
+/// The compiled parameter type of an accepted body, which is what its C
+/// signature declares. A synthesized thunk and a lambda compile against a
+/// signature the emitter chose, so the declaration is not the authority.
+fn acceptedParamTy(accepted: []const Compiled, f: *const Func, idx: usize) ?Ty {
+    for (accepted) |*cc| {
+        if (cc.f != f) continue;
+        if (idx >= cc.params.len) return null;
+        return tyOf(cc.params[idx].ty) orelse .object;
+    }
+    return null;
+}
+
+/// An expression of type `have` as the C type `want` needs it: a machine type
+/// boxed into a reference, a reference unboxed into a machine type. The
+/// lowering reuses one register for values of both shapes, and the register's
+/// own type is what its C local declares, so the conversion belongs at the
+/// point of use.
+fn convExpr(have: Ty, want: Ty, expr: []const u8, buf: []u8) []const u8 {
+    if (have == want) return expr;
+    if (want == .object) return boxExpr(have, expr, buf);
+    if (have == .object) return unboxExpr(want, expr, buf);
+    return expr;
 }
 
 fn boxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
@@ -3261,6 +3364,18 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     const dn = regName(c, b.dst.int(), &dnb);
                     if ((b.op == .Div or b.op == .Mod) and !dt.isFloat() and !isCmp(b.op)) {
                         try w.print("  if ({s} == 0) klio_arith_zero();\n", .{rn});
+                        // The most negative value divided by -1 overflows.
+                        // Kotlin wraps it to itself and leaves the remainder
+                        // zero; in C the division itself is undefined.
+                        if (wrapTy(dt)) |ut4| {
+                            if (b.op == .Div) {
+                                try w.print("  if ({s} == -1) {{ {s} = ({s})(0 - ({s}){s}); }} else\n", .{
+                                    rn, dn, dt.cName(), ut4, ln,
+                                });
+                            } else {
+                                try w.print("  if ({s} == -1) {{ {s} = 0; }} else\n", .{ rn, dn });
+                            }
+                        }
                     }
                     if (b.op == .UShr) {
                         const lt = c.types[b.lhs.int()];
@@ -3277,20 +3392,40 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             dn, dt.cName(), ln, op, rn,
                             @as(u32, if (lt == .i64) 63 else 31),
                         });
-                    } else {
+                    } else if ((b.op == .Add or b.op == .Sub or b.op == .Mul) and wrapTy(dt) != null) {
+                        // Kotlin's integer arithmetic WRAPS. C leaves signed
+                        // overflow undefined, and an optimizer is entitled to
+                        // assume it never happens, so the operation runs in the
+                        // unsigned type of the same width and converts back.
+                        // Only these three can overflow that way: division has
+                        // its own case above, and the bitwise operations have
+                        // no overflow to speak of.
+                        const ut2 = wrapTy(dt).?;
                         try w.print("  {s} = ({s})(({s}){s} {s} ({s}){s});\n", .{
-                            dn,  dt.cName(),
-                            if (isCmp(b.op)) promote(c.types[b.lhs.int()], c.types[b.rhs.int()]).?.cName() else dt.cName(),
-                            ln,  op,
-                            if (isCmp(b.op)) promote(c.types[b.lhs.int()], c.types[b.rhs.int()]).?.cName() else dt.cName(),
-                            rn,
+                            dn, dt.cName(), ut2, ln, op, ut2, rn,
+                        });
+                    } else {
+                        const pt10: []const u8 = if (isCmp(b.op))
+                            promote(c.types[b.lhs.int()], c.types[b.rhs.int()]).?.cName()
+                        else
+                            dt.cName();
+                        try w.print("  {s} = ({s})(({s}){s} {s} ({s}){s});\n", .{
+                            dn, dt.cName(), pt10, ln, op, pt10, rn,
                         });
                     }
                 },
                 .UnOp => |u| {
                     const t = c.types[u.dst.int()];
                     switch (u.op) {
-                        .Neg => try w.print("  r{d} = ({s})(-r{d});\n", .{ u.dst.int(), t.cName(), u.operand.int() }),
+                        // Negating the most negative value overflows, which
+                        // Kotlin wraps and C leaves undefined.
+                        .Neg => if (wrapTy(t)) |ut3| {
+                            try w.print("  r{d} = ({s})(0{s} - ({s})r{d});\n", .{
+                                u.dst.int(), t.cName(), if (t == .i64) "u" else "u", ut3, u.operand.int(),
+                            });
+                        } else {
+                            try w.print("  r{d} = ({s})(-r{d});\n", .{ u.dst.int(), t.cName(), u.operand.int() });
+                        },
                         .Plus => try w.print("  r{d} = r{d};\n", .{ u.dst.int(), u.operand.int() }),
                         else => unreachable,
                     }
@@ -3730,8 +3865,15 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             }
                             try w.writeAll(");\n");
                         }
+                        // The register the result lands in may hold a
+                        // reference where the callee returns a machine type:
+                        // the lowering reuses one register for both, and the
+                        // register's own type is what the C local declares.
+                        const cret = acceptedRet(accepted, callee) orelse funcRetTy2(m, callee) orelse .unit;
+                        const dwant = c.types[call.dst.int()];
                         var db: [32]u8 = undefined;
                         try w.print("  {s} = ", .{regName(c, call.dst.int(), &db)});
+                        if (dwant == .object and cret != .object) try w.print("{s}(", .{boxFnName(cret)});
                         try writeSymbol(w, callee);
                         try w.writeByte('(');
                         var k: u32 = 0;
@@ -3739,7 +3881,12 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             if (k != 0) try w.writeAll(", ");
                             if (bnd2.regs[k]) |br2| {
                                 var ab: [32]u8 = undefined;
-                                try w.print("{s}", .{regName(c, br2, &ab)});
+                                var cb14: [96]u8 = undefined;
+                                const pwant = acceptedParamTy(accepted, callee, k) orelse
+                                    (tyOf(callee.params[k].ty) orelse .object);
+                                try w.print("{s}", .{
+                                    convExpr(c.types[br2], pwant, regName(c, br2, &ab), &cb14),
+                                });
                                 continue;
                             }
                             // The parameter's own type decides: a thunk that
@@ -3757,7 +3904,9 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                                 try w.print("{s}", .{tn4});
                             }
                         }
-                        try w.writeAll(");\n");
+                        try w.writeAll(")");
+                        if (dwant == .object and cret != .object) try w.writeAll(")");
+                        try w.writeAll(";\n");
                     }
                 },
                 else => unreachable,
@@ -3847,6 +3996,10 @@ pub const ClassLayout = struct {
     /// An `enum class`'s entries in declaration order, which is also their
     /// ordinal order.
     entries: []const EnumEntryInfo = &.{},
+    /// True when the class declares an `init { … }` block. The IR does not
+    /// carry those — the Vm runs them from the AST — so a class with one is
+    /// refused rather than constructed without running it.
+    has_init_block: bool = false,
 };
 
 /// A lambda a register holds: the body to run and the registers captured at
@@ -4058,8 +4211,6 @@ pub fn emit(
                         var lsyn: ?[]ir.Param = null;
                         if (expectedFnType(m, c.f, al2.dst)) |t6| {
                             lsyn = try lambdaParams(gpa, bfn, t6);
-                        } else if (isArrayInitLambda(m, c.f, al2.dst)) {
-                            lsyn = try arrayInitParams(gpa, bfn);
                         }
                         if (lsyn) |ls6| try synth_owned.append(gpa, ls6);
                         try seen.put(bfn.id.int(), {});
@@ -4267,7 +4418,35 @@ pub fn emit(
         var grew_reach = false;
         for (vsites.items) |slot| {
             for (constructed.items) |cid| {
-                const impl = slotImpl(m, cid, slot) orelse continue;
+                const impl = slotImpl(m, prog, cid, slot) orelse {
+                    // The class has the member in its type but no body for it:
+                    // it satisfies the interface by DELEGATION, which forwards
+                    // to another object at run time. Refusing keeps that a
+                    // refusal rather than an AbstractMethodError in a compiled
+                    // program.
+                    const root9 = m.funcById(ir.FuncId.from(slot.int())) orelse continue;
+                    if (typeHasSlot(m, cid, root9)) {
+                        if (traceOn()) {
+                            std.debug.print("[cgen] refuse {s}: `{s}` is satisfied by delegation\n", .{
+                                m.classes.items[cid].name, root9.name,
+                            });
+                        }
+                        return false;
+                    }
+                    continue;
+                };
+                // An override declaring more parameters than the site supplies
+                // fills them from its own default thunks, so those are
+                // reachable wherever the dispatcher is.
+                var vk: u32 = 1;
+                while (vk < impl.params.len) : (vk += 1) {
+                    const vfid = prog.defaultThunk(impl.id, vk) orelse continue;
+                    const vfn = m.funcById(vfid) orelse return false;
+                    if (seen.contains(vfn.id.int())) continue;
+                    try seen.put(vfn.id.int(), {});
+                    try queue.append(gpa, .{ .f = vfn, .synth = impl.params[0..vk] });
+                    grew_reach = true;
+                }
                 if (seen.contains(impl.id.int())) continue;
                 try seen.put(impl.id.int(), {});
                 try queue.append(gpa, .{ .f = impl, .synth = null });
@@ -4719,20 +4898,58 @@ pub fn emit(
             const pt2: Ty = if (ai + 1 < root.params.len) (tyOf(root.params[ai + 1].ty) orelse .object) else .object;
             try w.print(", {s} a{d}", .{ pt2.cName(), ai });
         }
-        try w.writeAll(") {\n  uint32_t k = klio_nat_class_of(recv);\n");
+        // A slot no constructed class answers still needs a body: the call
+        // site is reachable, and reaching it means no receiver implements the
+        // method.
+        try w.writeAll(") {\n  uint32_t k = klio_nat_class_of(recv);\n  (void)k;\n");
         for (used_classes.items) |cid| {
-            const impl = slotImpl(m, cid, ir.MethodSlotId.from(su.slot)) orelse continue;
+            const impl = slotImpl(m, prog, cid, ir.MethodSlotId.from(su.slot)) orelse continue;
             var in_set = false;
             for (accepted.items) |*cc| {
                 if (cc.f == impl) in_set = true;
             }
             if (!in_set) continue;
-            try w.print("  if (k == KCLS_{d}) return ", .{cid});
+            // The implementation may declare more parameters than the call
+            // site supplies: an override can carry defaults the site omits.
+            // Those run their thunks here, handed what came before them.
+            try w.print("  if (k == KCLS_{d}) {{\n", .{cid});
+            var dk9: u32 = su.n_args + 1;
+            while (dk9 < impl.params.len) : (dk9 += 1) {
+                const dfid9 = prog.defaultThunk(impl.id, dk9) orelse break;
+                const dfn9 = m.funcById(dfid9) orelse break;
+                const dt9 = acceptedRet(accepted.items, dfn9) orelse funcRetTy2(m, dfn9) orelse .unit;
+                var dsym9: std.Io.Writer.Allocating = .init(gpa);
+                defer dsym9.deinit();
+                try writeSymbol(&dsym9.writer, dfn9);
+                try w.print("    {s} vd{d} = {s}(recv", .{ dt9.cName(), dk9, dsym9.written() });
+                var pk9: u32 = 1;
+                while (pk9 < dk9) : (pk9 += 1) {
+                    if (pk9 <= su.n_args) {
+                        try w.print(", a{d}", .{pk9 - 1});
+                    } else {
+                        try w.print(", vd{d}", .{pk9});
+                    }
+                }
+                try w.writeAll(");\n");
+            }
+            if (dk9 != impl.params.len) {
+                // A parameter with no default and no argument: nothing can
+                // fill it, so this receiver cannot answer here.
+                try w.writeAll("  }\n");
+                continue;
+            }
+            try w.writeAll("    return ");
             try writeSymbol(w, impl);
             try w.writeAll("(recv");
-            var aj: u32 = 0;
-            while (aj < su.n_args) : (aj += 1) try w.print(", a{d}", .{aj});
-            try w.writeAll(");\n");
+            var aj: u32 = 1;
+            while (aj < impl.params.len) : (aj += 1) {
+                if (aj <= su.n_args) {
+                    try w.print(", a{d}", .{aj - 1});
+                } else {
+                    try w.print(", vd{d}", .{aj});
+                }
+            }
+            try w.writeAll(");\n  }\n");
         }
         try w.print("  klio_nat_no_method(\"{s}\");\n", .{root.name});
         // `klio_nat_no_method` does not return, but C does not know that from
@@ -4759,6 +4976,10 @@ pub fn emit(
         while (ai9 < lu.arity) : (ai9 += 1) try w.print(", klio_value a{d}", .{ai9});
         try w.writeAll(") {\n");
         if (lu.n_caps == 0) try w.writeAll("  (void)self;\n");
+        // The lowering always gives a lambda an `it` slot, so a body can
+        // declare fewer parameters than its type takes.
+        var av9: u32 = 0;
+        while (av9 < lu.arity) : (av9 += 1) try w.print("  (void)a{d};\n", .{av9});
         var call9: std.Io.Writer.Allocating = .init(gpa);
         defer call9.deinit();
         try writeSymbol(&call9.writer, bc2.f);
@@ -4796,7 +5017,7 @@ pub fn emit(
             try w.print("static klio_value klam_call_{d}(klio_value f", .{lu.arity});
             var ai10: u32 = 0;
             while (ai10 < lu.arity) : (ai10 += 1) try w.print(", klio_value a{d}", .{ai10});
-            try w.writeAll(") {\n  uint32_t k = klio_nat_class_of(f);\n");
+            try w.writeAll(") {\n  uint32_t k = klio_nat_class_of(f);\n  (void)k;\n");
             for (used_lambdas.items) |lu2| {
                 if (lu2.arity != lu.arity) continue;
                 try w.print("  if (k == KLAM_{d}) return klam_{d}(f", .{ lu2.body.int(), lu2.body.int() });

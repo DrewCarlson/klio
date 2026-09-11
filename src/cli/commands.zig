@@ -517,6 +517,7 @@ pub fn runTranspileNative(
             }
             // An enum's entries in declaration order, each with the thunks
             // the declaration writes for its constructor arguments.
+            const has_init = cg.get().init_blocks.len != 0;
             const ents = cg.get().enum_entries;
             const entries = gpa.alloc(cgen.EnumEntryInfo, ents.len) catch {
                 cg.deinit();
@@ -536,7 +537,13 @@ pub fn runTranspileNative(
             }
             cg.deinit();
             const pargs: []const ir.FuncId = built.parent_ctor_args.get(e.key_ptr.*) orelse &.{};
-            layouts.append(gpa, .{ .name = e.key_ptr.*, .props = props, .parent_args = pargs, .entries = entries }) catch return 1;
+            layouts.append(gpa, .{
+                .name = e.key_ptr.*,
+                .props = props,
+                .parent_args = pargs,
+                .entries = entries,
+                .has_init_block = has_init,
+            }) catch return 1;
         }
     }
     // Default-argument thunks, keyed by the function whose call sites need

@@ -46,7 +46,12 @@ for kt in "${progs[@]}"; do
   if grep -q '#include <klio_rt.h>' "$cfile"; then
     link=(-Izig-out/include -Lzig-out/lib -lklio_rt -lzstd)
   fi
-  if ! $CC -O2 -Wall -Wextra -Werror "$cfile" "${link[@]}" -o "$WORK/$name" >"$WORK/cc.log" 2>&1; then
+  # A whole-program emitter reaches a body or a dispatcher that nothing in the
+  # end calls — a lambda the lowering inlined away, a slot no constructed class
+  # answers. That is not a defect, so those two warnings are off; everything
+  # else is an error, because a warning in generated C is a bug in the emitter.
+  if ! $CC -O2 -Wall -Wextra -Werror -Wno-unused-function -Wno-unused-parameter \
+      "$cfile" "${link[@]}" -o "$WORK/$name" >"$WORK/cc.log" 2>&1; then
     fail=$((fail + 1))
     echo "  FAIL $name: C compile"
     head -5 "$WORK/cc.log" | sed 's/^/      /'
