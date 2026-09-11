@@ -278,8 +278,76 @@ const CELL_CLS: u32 = std.math.maxInt(u32) - 2;
 
 /// Whether a class handle names a runtime type rather than a user class. Such
 /// a handle indexes no class table and gets no emitted descriptor.
+/// An `Array<T>` or one of the primitive arrays. Like `String` and `List` it is
+/// a runtime type rather than a user class, so it takes a handle outside the
+/// class table; `elem` carries what it holds.
+const ARRAY_CLS: u32 = std.math.maxInt(u32) - 4;
+
 fn isBuiltinCls(cid: u32) bool {
-    return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS or cid == THROWABLE_CLS;
+    return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS or cid == THROWABLE_CLS or cid == ARRAY_CLS;
+}
+
+/// The element kind of a named array type, in the order the runtime's
+/// `klio_nat_prim_array` names them. Null for a reference `Array<T>`.
+fn primArrayKind(name: []const u8) ?u32 {
+    const tail = simpleName(name);
+    if (std.mem.eql(u8, tail, "IntArray")) return 0;
+    if (std.mem.eql(u8, tail, "LongArray")) return 1;
+    if (std.mem.eql(u8, tail, "DoubleArray")) return 2;
+    if (std.mem.eql(u8, tail, "FloatArray")) return 3;
+    if (std.mem.eql(u8, tail, "ShortArray")) return 4;
+    if (std.mem.eql(u8, tail, "ByteArray")) return 5;
+    if (std.mem.eql(u8, tail, "BooleanArray")) return 6;
+    if (std.mem.eql(u8, tail, "CharArray")) return 7;
+    return null;
+}
+
+/// The element type a primitive array holds.
+fn primArrayElem(kind: u32) Ty {
+    return switch (kind) {
+        0 => .i32,
+        1 => .i64,
+        2 => .f64,
+        3 => .f32,
+        4 => .short,
+        5 => .byte,
+        6 => .boolean,
+        7 => .char,
+        else => .unit,
+    };
+}
+
+fn isArrayTypeName(name: []const u8) bool {
+    const tail = simpleName(name);
+    return primArrayKind(name) != null or std.mem.eql(u8, tail, "Array");
+}
+
+/// What an array type's elements are: a primitive array says so in its own
+/// name, and an `Array<T>` in its type argument. Unit when nothing says.
+fn arrayElemOf(t: ir.TypeRef) Ty {
+    if (primArrayKind(t.name)) |k| return primArrayElem(k);
+    if (t.args.len == 1) {
+        if (tyOf(t.args[0])) |et| return et;
+    }
+    return .unit;
+}
+
+/// An array constructor spelled as a stdlib call: `intArrayOf(1, 2)`. The
+/// element kind is the call's own, so nothing has to be inferred.
+fn arrayOfIntrinsic(f: *const Func) ??u32 {
+    if (!std.mem.startsWith(u8, f.fqn, "kotlin.")) return null;
+    if (!std.mem.endsWith(u8, f.name, "ArrayOf")) {
+        if (!std.mem.eql(u8, f.name, "arrayOf")) return null;
+        // A reference array, whose elements stay boxed.
+        return @as(?u32, null);
+    }
+    var buf: [32]u8 = undefined;
+    const head = f.name[0 .. f.name.len - "ArrayOf".len];
+    if (head.len == 0 or head.len + 5 > buf.len) return null;
+    buf[0] = std.ascii.toUpper(head[0]);
+    @memcpy(buf[1 .. head.len], head[1..]);
+    @memcpy(buf[head.len .. head.len + 5], "Array");
+    return primArrayKind(buf[0 .. head.len + 5]) orelse return null;
 }
 
 /// The class marker for a register the emitter knows holds a `String`. Strings
@@ -633,6 +701,7 @@ fn classIndexOfName(m: *const Module, t: ir.TypeRef) ?u32 {
     if (t.name.len == 0) return null;
     if (std.mem.eql(u8, t.name, "String") or std.mem.eql(u8, t.name, "kotlin.String")) return STRING_CLS;
     if (std.mem.eql(u8, t.name, "List") or std.mem.eql(u8, t.name, "MutableList")) return LIST_CLS;
+    if (isArrayTypeName(t.name)) return ARRAY_CLS;
     for (m.classes.items, 0..) |*c, i| {
         if (std.mem.eql(u8, c.name, t.name) or std.mem.eql(u8, c.fqn, t.name)) return @intCast(i);
     }
@@ -1033,11 +1102,13 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         types[lp.dst.int()] = .object;
                         cls[lp.dst.int()] = classIndexOfName(m, pt);
                         // `List<Int>` says what its elements are; a list whose
-                        // element type is written down needs no inference.
+                        // element type is written down needs no inference. An
+                        // array says so in its own name.
                         if (cls[lp.dst.int()]) |rc| {
                             if (rc == LIST_CLS and pt.args.len == 1) {
                                 if (tyOf(pt.args[0])) |et| elem[lp.dst.int()] = et;
                             }
+                            if (rc == ARRAY_CLS) elem[lp.dst.int()] = arrayElemOf(pt);
                         }
                     }
                     known[lp.dst.int()] = true;
@@ -1117,6 +1188,32 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     known[n.dst.int()] = true;
                 },
                 .CallMember => |cm| {
+                    if (cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
+                        types[cm.receiver.int()] == .object and cls[cm.receiver.int()] != null and
+                        cls[cm.receiver.int()].? == ARRAY_CLS)
+                    {
+                        if (cm.name.int() >= m.consts.items.len) return no(f, "member name");
+                        const an = m.consts.items[cm.name.int()];
+                        if (an != .String) return no(f, "member name kind");
+                        const aa = cm.args.int();
+                        var ka: u32 = 0;
+                        while (ka < cm.n_args) : (ka += 1) {
+                            if (aa + ka >= f.n_locals or !known[aa + ka]) return no(f, "array arg");
+                        }
+                        if (cm.dst.int() >= f.n_locals) return no(f, "array dst");
+                        const aet = elem[cm.receiver.int()];
+                        if (std.mem.eql(u8, an.String, "get") and cm.n_args == 1) {
+                            if (types[aa] != .i32) return no(f, "array index type");
+                            types[cm.dst.int()] = if (aet == .unit) .object else aet;
+                            cls[cm.dst.int()] = null;
+                        } else if (std.mem.eql(u8, an.String, "set") and cm.n_args == 2) {
+                            if (types[aa] != .i32) return no(f, "array index type");
+                            if (aet != .unit and types[aa + 1] != aet) return no(f, "array element type");
+                            types[cm.dst.int()] = .unit;
+                        } else return noName(f, "array member", an.String);
+                        known[cm.dst.int()] = true;
+                        continue;
+                    }
                     if (cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
                         types[cm.receiver.int()] == .object and cls[cm.receiver.int()] != null and
                         cls[cm.receiver.int()].? == LIST_CLS)
@@ -1250,6 +1347,26 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                 },
                 .NewInstance => |ni| {
                     if (ni.arg_names.len != 0) return no(f, "ctor arg names");
+                    if (ni.class.int() < m.classes.items.len and
+                        isArrayTypeName(m.classes.items[ni.class.int()].name))
+                    {
+                        // `IntArray(n)` is a sized array, not an instance with
+                        // fields. The form taking an initializer lambda runs a
+                        // body per element and is a different shape.
+                        if (ni.n_args != 1) return no(f, "array ctor arity");
+                        const nr = ni.args.int();
+                        if (nr >= f.n_locals or !known[nr]) return no(f, "array size");
+                        if (types[nr] != .i32) return no(f, "array size type");
+                        if (ni.dst.int() >= f.n_locals) return no(f, "array dst");
+                        types[ni.dst.int()] = .object;
+                        cls[ni.dst.int()] = ARRAY_CLS;
+                        elem[ni.dst.int()] = if (primArrayKind(m.classes.items[ni.class.int()].name)) |k|
+                            primArrayElem(k)
+                        else
+                            .unit;
+                        known[ni.dst.int()] = true;
+                        continue;
+                    }
                     if (isThrowableClass(m, ni.class.int())) {
                         if (ni.n_args > 1) return no(f, "throwable ctor arity");
                         if (ni.n_args == 1) {
@@ -1297,7 +1414,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     }
                     if (types[gf.receiver.int()] != .object) return no(f, "field on non-object");
                     const rc = cls[gf.receiver.int()] orelse return no(f, "field receiver class");
-                    if (rc == STRING_CLS or rc == LIST_CLS) {
+                    if (rc == STRING_CLS or rc == LIST_CLS or rc == ARRAY_CLS) {
                         const snm = m.consts.items[gf.field.int()];
                         if (snm != .String) return no(f, "builtin member name");
                         const want: []const u8 = if (rc == STRING_CLS) "length" else "size";
@@ -1313,7 +1430,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     const idx = fieldIndex(prog, rc, nm.String) orelse {
                         // No storage: a computed property reads through the
                         // getter it declares, which is an ordinary method.
-                        const g = prog.accessor(m, rc, nm.String, .get) orelse return no(f, "field not laid out");
+                        const g = prog.accessor(m, rc, nm.String, .get) orelse return noName(f, "field not laid out", nm.String);
                         const gfn = m.funcById(g) orelse return no(f, "getter body");
                         const gt = funcRetTy2(m, gfn) orelse return no(f, "getter return type");
                         if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
@@ -1336,7 +1453,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     const nm = m.consts.items[sf.field.int()];
                     if (nm != .String) return no(f, "field name kind");
                     const idx = fieldIndex(prog, rc, nm.String) orelse {
-                        const st = prog.accessor(m, rc, nm.String, .set) orelse return no(f, "field not laid out");
+                        const st = prog.accessor(m, rc, nm.String, .set) orelse return noName(f, "field not laid out", nm.String);
                         const sfn = m.funcById(st) orelse return no(f, "setter body");
                         if (sf.value.int() >= f.n_locals or !known[sf.value.int()]) return no(f, "field value");
                         // The setter's own parameter decides what it is handed.
@@ -1439,6 +1556,26 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (c.arg_names.len != 0 or c.type_args.len != 0) return no(f, "call arg names/type args");
                     if (c.dst.int() >= f.n_locals) return null;
                     const callee = m.funcById(c.func) orelse return no(f, "call target missing");
+                    if (arrayOfIntrinsic(callee)) |maybe_kind| {
+                        const aa2 = c.args.int();
+                        var ka2: u32 = 0;
+                        while (ka2 < c.n_args) : (ka2 += 1) {
+                            if (aa2 + ka2 >= f.n_locals or !known[aa2 + ka2]) return no(f, "array arg");
+                        }
+                        if (c.dst.int() >= f.n_locals) return no(f, "array dst");
+                        types[c.dst.int()] = .object;
+                        cls[c.dst.int()] = ARRAY_CLS;
+                        if (maybe_kind) |k2| {
+                            const et2 = primArrayElem(k2);
+                            var ka3: u32 = 0;
+                            while (ka3 < c.n_args) : (ka3 += 1) {
+                                if (types[aa2 + ka3] != et2) return no(f, "array element type");
+                            }
+                            elem[c.dst.int()] = et2;
+                        }
+                        known[c.dst.int()] = true;
+                        continue;
+                    }
                     if (listIntrinsic(callee)) |_| {
                         var et: ?Ty = null;
                         var k: u32 = 0;
@@ -2078,6 +2215,16 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         try w.print(", {d});\n", .{if (tid) |t| t.lo else 0});
                         continue;
                     }
+                    if (isArrayTypeName(m.classes.items[ni.class.int()].name)) {
+                        var sb7: [32]u8 = undefined;
+                        const nsz = regName(c, ni.args.int(), &sb7);
+                        if (primArrayKind(m.classes.items[ni.class.int()].name)) |k7| {
+                            try w.print("  {s} = klio_nat_prim_array({d}, {s});\n", .{ dst, k7, nsz });
+                        } else {
+                            try w.print("  {s} = klio_nat_ref_array_sized({s});\n", .{ dst, nsz });
+                        }
+                        continue;
+                    }
                     try w.print("  {s} = klio_nat_alloc_instance(KCLS_{d});\n", .{ dst, ni.class.int() });
                     // The class's own initializer fills it, which is what lets
                     // a subclass hand the same instance up to its superclass's.
@@ -2112,12 +2259,16 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         });
                         continue;
                     }
-                    if (rc == STRING_CLS or rc == LIST_CLS) {
+                    if (rc == STRING_CLS or rc == LIST_CLS or rc == ARRAY_CLS) {
                         var nb: [32]u8 = undefined;
                         var rb: [32]u8 = undefined;
                         try w.print("  {s} = {s}({s});\n", .{
                             regName(c, gf.dst.int(), &nb),
-                            if (rc == STRING_CLS) "klio_nat_str_length" else "klio_nat_list_size",
+                            switch (rc) {
+                                STRING_CLS => "klio_nat_str_length",
+                                ARRAY_CLS => "klio_nat_array_size",
+                                else => "klio_nat_list_size",
+                            },
                             regName(c, gf.receiver.int(), &rb),
                         });
                         continue;
@@ -2255,6 +2406,27 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     var rb: [32]u8 = undefined;
                     const recv = regName(c, cm.receiver.int(), &rb);
                     if (c.cls[cm.receiver.int()]) |rc| {
+                        if (rc == ARRAY_CLS) {
+                            const an2 = m.consts.items[cm.name.int()].String;
+                            const aa4 = cm.args.int();
+                            var ab7: [32]u8 = undefined;
+                            if (std.mem.eql(u8, an2, "get")) {
+                                var gb7: [160]u8 = undefined;
+                                const g7 = try std.fmt.bufPrint(&gb7, "klio_nat_array_get({s}, {s})", .{ recv, regName(c, aa4, &ab7) });
+                                var ob7: [220]u8 = undefined;
+                                try w.print("  {s} = {s};\n", .{
+                                    regName(c, cm.dst.int(), &nb), unboxExpr(c.types[cm.dst.int()], g7, &ob7),
+                                });
+                            } else {
+                                var vb7: [32]u8 = undefined;
+                                var bb7: [96]u8 = undefined;
+                                try w.print("  klio_nat_array_set({s}, {s}, {s});\n", .{
+                                    recv, regName(c, aa4, &ab7),
+                                    boxExpr(c.types[aa4 + 1], regName(c, aa4 + 1, &vb7), &bb7),
+                                });
+                            }
+                            continue;
+                        }
                         if (rc == LIST_CLS) {
                             const mn = m.consts.items[cm.name.int()].String;
                             const a0 = cm.args.int();
@@ -2454,6 +2626,34 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                                 if (c.types[sa] == .i64) "uint64_t" else "uint32_t",
                                 x1, x1,
                             }),
+                        }
+                        continue;
+                    }
+                    if (arrayOfIntrinsic(callee)) |maybe_kind| {
+                        var db3: [32]u8 = undefined;
+                        const adst = regName(c, call.dst.int(), &db3);
+                        if (call.n_args == 0) {
+                            if (maybe_kind) |k3| {
+                                try w.print("  {s} = klio_nat_prim_array({d}, 0);\n", .{ adst, k3 });
+                            } else {
+                                try w.print("  {s} = klio_nat_ref_array(0, 0);\n", .{adst});
+                            }
+                            continue;
+                        }
+                        try w.print("  {{ klio_value av[{d}];\n", .{call.n_args});
+                        var ka4: u32 = 0;
+                        while (ka4 < call.n_args) : (ka4 += 1) {
+                            const ar4 = call.args.int() + ka4;
+                            var ab8: [32]u8 = undefined;
+                            var bb8: [96]u8 = undefined;
+                            try w.print("    av[{d}] = {s};\n", .{
+                                ka4, boxExpr(c.types[ar4], regName(c, ar4, &ab8), &bb8),
+                            });
+                        }
+                        if (maybe_kind) |k4| {
+                            try w.print("    {s} = klio_nat_prim_array_of({d}, av, {d}); }}\n", .{ adst, k4, call.n_args });
+                        } else {
+                            try w.print("    {s} = klio_nat_ref_array(av, {d}); }}\n", .{ adst, call.n_args });
                         }
                         continue;
                     }
@@ -2917,6 +3117,8 @@ pub fn emit(
                     continue;
                 }
                 if (inst.* == .NewInstance) {
+                    if (inst.NewInstance.class.int() < m.classes.items.len and
+                        isArrayTypeName(m.classes.items[inst.NewInstance.class.int()].name)) continue;
                     {
                         const nc2 = inst.NewInstance.class.int();
                         var have_c = false;
@@ -2959,7 +3161,7 @@ pub fn emit(
                 }
                 if (inst.* != .Call) continue;
                 const callee = m.funcById(inst.Call.func) orelse return false;
-                if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null) continue;
+                if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or arrayOfIntrinsic(callee) != null) continue;
                 // A call that omits an argument runs the thunk for it.
                 var dq = inst.Call.n_args;
                 while (dq < callee.params.len) : (dq += 1) {
@@ -3117,6 +3319,9 @@ pub fn emit(
                     if (inst.* != .NewInstance) continue;
                     const nc = inst.NewInstance.class.int();
                     if (isThrowableClass(m, nc)) continue;
+                    // An array is a runtime value, not an instance the emitter
+                    // lays out or initializes.
+                    if (nc < m.classes.items.len and isArrayTypeName(m.classes.items[nc].name)) continue;
                     try want.append(gpa, nc);
                 }
             }

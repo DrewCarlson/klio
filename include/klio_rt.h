@@ -273,6 +273,17 @@ klio_value klio_nat_list_get(klio_value v, int32_t idx);
 void       klio_nat_list_set(klio_value v, int32_t idx, klio_value x);
 void       klio_nat_list_add(klio_value v, klio_value x);
 
+/* Arrays. A primitive array is a packed scalar buffer, so `kind` names the
+ * element kind: 0 Int, 1 Long, 2 Double, 3 Float, 4 Short, 5 Byte, 6 Boolean,
+ * 7 Char. A reference `Array<T>` holds boxed values. */
+klio_value klio_nat_prim_array(uint32_t kind, int32_t n);
+klio_value klio_nat_prim_array_of(uint32_t kind, const klio_value *v, uint32_t n);
+klio_value klio_nat_ref_array(const klio_value *v, uint32_t n);
+klio_value klio_nat_ref_array_sized(int32_t n);
+int32_t    klio_nat_array_size(klio_value a);
+klio_value klio_nat_array_get(klio_value a, int32_t i);
+void       klio_nat_array_set(klio_value a, int32_t i, klio_value v);
+
 /* Null and reference comparison. A field access on a null receiver raises the
  * same NullPointerException the interpreter would. */
 klio_value klio_nat_null(void);
