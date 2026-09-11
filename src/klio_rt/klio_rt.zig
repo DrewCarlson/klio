@@ -421,6 +421,7 @@ export fn klio_nat_alloc_instance(cls: u32) CValue {
 
 export fn klio_nat_get(recv: CValue, idx: u32) CValue {
     const v = fromC(recv);
+    if (v != .Instance) natNpe();
     const g = v.Instance.borrow();
     defer g.deinit();
     return toC(g.get().fields.items[idx].value);
@@ -428,6 +429,7 @@ export fn klio_nat_get(recv: CValue, idx: u32) CValue {
 
 export fn klio_nat_set(recv: CValue, idx: u32, val: CValue) void {
     const v = fromC(recv);
+    if (v != .Instance) natNpe();
     const g = v.Instance.borrowMut();
     defer g.deinit();
     const slot = &g.get().fields.items[idx];
@@ -663,6 +665,30 @@ fn natIndexOob(idx: i32, len: usize) noreturn {
         "Exception in thread \"main\" java.lang.IndexOutOfBoundsException: Index {d} out of bounds for length {d}\n",
         .{ idx, len },
     ) catch "Exception in thread \"main\" java.lang.IndexOutOfBoundsException\n";
+    _ = std.c.write(2, msg.ptr, msg.len);
+    std.c.exit(1);
+}
+
+// --- null and reference comparison -----------------------------------------
+
+export fn klio_nat_null() CValue {
+    return toC(.Null);
+}
+
+export fn klio_nat_is_null(v: CValue) i32 {
+    return if (fromC(v) == .Null) 1 else 0;
+}
+
+/// Kotlin's `==` on references: structural equality, which for a null operand
+/// is a null test and otherwise is the runtime's own comparison.
+export fn klio_nat_value_eq(av: CValue, bv: CValue) i32 {
+    const a = fromC(av);
+    const b = fromC(bv);
+    return if (a.structuralEq(&b)) 1 else 0;
+}
+
+fn natNpe() noreturn {
+    const msg = "Exception in thread \"main\" java.lang.NullPointerException\n";
     _ = std.c.write(2, msg.ptr, msg.len);
     std.c.exit(1);
 }

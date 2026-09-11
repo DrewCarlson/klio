@@ -476,7 +476,14 @@ pub fn runTranspileNative(
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
-    const ok = cgen.emit(gpa, m, ef, &aw.writer, path) catch |e| {
+    // Top-level properties and the thunks that initialize them, in the order
+    // the interpreter runs them.
+    var globals: std.ArrayList(cgen.Global) = .empty;
+    defer globals.deinit(gpa);
+    for (built.top_level_props.items) |tp| {
+        globals.append(gpa, .{ .name = tp.name, .func = tp.func }) catch return 1;
+    }
+    const ok = cgen.emit(gpa, m, ef, globals.items, &aw.writer, path) catch |e| {
         io.printStderr(gpa, "error: native emission failed: {s}\n", .{@errorName(e)});
         return 1;
     };
