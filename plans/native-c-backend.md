@@ -215,6 +215,20 @@ first: class layout (bodies with properties, supertypes, init blocks), lambdas,
 constant kinds it has not mapped (`Char`, the unsigned types), and callee
 return types. `KLIO_CGEN_TRACE=1` prints that list for any program.
 
-Next: class layout — the IR does not carry body properties (the Vm builds them
-from the AST), so this needs the lowering to record them. Then lambdas,
-interfaces, exceptions, and coroutines.
+Body properties compile. The IR carries only a class's constructor parameters
+— the Vm builds the rest from the AST — but the BUILT module already holds the
+full `ClassDef` per class and the initializer thunk for each body property, so
+the layout arrives from there and the lowering needs no change. A class's
+fields are its constructor properties followed by its body properties, and each
+body property's thunk runs at construction, handed the instance and the
+constructor's arguments, which is what the interpreter hands it.
+
+Every class layout is resolved once into a table rather than re-derived per
+question; a parameter or receiver only has to BE a reference to be passed, and
+the layout is demanded at the point a field is actually read.
+
+Still refused, and the next work in rough order of how much it unlocks:
+lambdas, classes with supertypes or init blocks, the constant kinds that are
+not yet mapped (`Char`, the unsigned types), interfaces and virtual dispatch,
+exceptions, and coroutines. `KLIO_CGEN_TRACE=1` prints the list for any
+program, and that list is the backlog.

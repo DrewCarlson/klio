@@ -483,7 +483,34 @@ pub fn runTranspileNative(
     for (built.top_level_props.items) |tp| {
         globals.append(gpa, .{ .name = tp.name, .func = tp.func }) catch return 1;
     }
-    const ok = cgen.emit(gpa, m, ef, globals.items, &aw.writer, path) catch |e| {
+    // Body properties and their initializer thunks: the IR carries neither, so
+    // they come from the built module's class table.
+    var layouts: std.ArrayList(cgen.ClassLayout) = .empty;
+    defer {
+        for (layouts.items) |l| gpa.free(l.props);
+        layouts.deinit(gpa);
+    }
+    {
+        var it = built.classes.iterator();
+        while (it.next()) |e| {
+            const cg = e.value_ptr.borrow();
+            const bps = cg.get().body_properties;
+            const props = gpa.alloc(cgen.BodyProp, bps.len) catch {
+                cg.deinit();
+                return 1;
+            };
+            for (bps, 0..) |bp, i| {
+                props[i] = .{
+                    .name = bp.name,
+                    .ty = .{ .name = bp.type_head orelse "", .nullable = false, .args = &.{} },
+                    .init = built.body_prop_inits.get(.{ .a = e.key_ptr.*, .b = bp.name }),
+                };
+            }
+            cg.deinit();
+            layouts.append(gpa, .{ .name = e.key_ptr.*, .props = props }) catch return 1;
+        }
+    }
+    const ok = cgen.emit(gpa, m, ef, globals.items, layouts.items, &aw.writer, path) catch |e| {
         io.printStderr(gpa, "error: native emission failed: {s}\n", .{@errorName(e)});
         return 1;
     };

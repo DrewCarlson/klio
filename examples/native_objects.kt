@@ -12,6 +12,16 @@ class Counter(var n: Int, val step: Int) {
     fun doubled(): Int = n * 2
 }
 
+// A property declared in the class body, initialized by its own thunk at
+// construction the way the interpreter initializes it.
+class Running(val step: Int) {
+    var total: Int = 0
+    var label: String = "run"
+    fun add() {
+        total = total + step
+    }
+}
+
 class Vec(val x: Int, val y: Int) {
     fun len2(): Int = x * x + y * y
     fun scaled(k: Int): Vec = Vec(x * k, y * k)
@@ -31,6 +41,13 @@ fun main() {
     }
     println(c.n)
     println(c.doubled())
+
+    val r = Running(4)
+    r.add()
+    r.add()
+    r.add()
+    println(r.total)
+    println(r.label)
 
     val v = Vec(3, 4)
     println(v.len2())
