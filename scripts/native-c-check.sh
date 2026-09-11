@@ -23,7 +23,10 @@ if [ $# -gt 0 ]; then
   progs=("$@")
   strict=0
 else
-  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt examples/native_throw.kt)
+  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt
+    # A program whose point is to leave through an uncaught throw cannot live
+    # in examples/: the corpus requires an example to exit zero.
+    tests/fixtures/native_c/native_throw.kt)
 fi
 
 pass=0

@@ -1,5 +1,0 @@
-10
-42
-runtime error: uncaught kotlin.IllegalArgumentException: negative: -1
-    at checked (examples/native_throw.kt:7)
-    at main (examples/native_throw.kt:14)
