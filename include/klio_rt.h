@@ -233,6 +233,10 @@ typedef struct klio_nat_frame {
   klio_value *slots;
 } klio_nat_frame;
 void klio_nat_enter(klio_nat_frame *f);
+/* A `longjmp` to a handler skips the `klio_nat_leave` of every frame between
+ * the throw and the catch, so the landing pad restores the chain itself. */
+klio_nat_frame *klio_nat_frame_mark(void);
+void klio_nat_frame_restore(klio_nat_frame *mark);
 /* Ends the program-lifetime allocation phase: call after registering classes
  * and before the program body, or nothing the body allocates is collectable. */
 void klio_nat_begin(void);
@@ -276,6 +280,8 @@ void klio_nat_throw(klio_value v);
 /* A throwable of the named type: exception classes are the runtime's own, not
  * shapes the emitter lays out. */
 klio_value klio_nat_exception(const char *fqn, klio_value message);
+/* Whether a thrown value is caught by a handler for `fqn`. */
+int32_t klio_nat_catches(klio_value v, const char *fqn);
 
 klio_value klio_nat_cell(klio_value v);
 klio_value klio_nat_cell_get(klio_value c);
