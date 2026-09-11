@@ -718,6 +718,11 @@ pub const ExceptionData = struct {
     /// exceptions built outside that path. Stored as `?*ValueList.Cell`;
     /// reconstructed as `ValueList` at use.
     suppressed: ?*ValueList.Cell = null,
+    /// This throwable's position in a compiled program's throwable hierarchy:
+    /// the preorder number of its type. A handler carries the interval its own
+    /// type spans, so `catch` is two comparisons rather than a name walk. Zero
+    /// when nothing assigned one, which is every value the interpreter makes.
+    type_id: u32 = 0,
 
     pub fn deinit(self: *ExceptionData, allocator: std.mem.Allocator) void {
         _ = allocator;

@@ -292,7 +292,7 @@ pub fn lowerExprAsParamThunkScopedEnclosing(
     // the receiver walk. Other param thunks keep the empty metadata their
     // callers expect.
     if (leadsWithThis(params)) {
-        func.params = try accessorParams(allocator, params);
+        func.params = try accessorParams(allocator, params, owner_class orelse "", null);
     }
     func.has_receiver_param = leadsWithThis(params);
     return pushFuncSpanned(module, func, expr.span());
@@ -337,7 +337,7 @@ pub fn lowerInitBlockWithParams(
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
-    func.params = try accessorParams(allocator, params);
+    func.params = try accessorParams(allocator, params, owner_class, null);
     func.has_receiver_param = leadsWithThis(params);
     return pushFuncSpanned(module, func, block.span);
 }
@@ -506,7 +506,7 @@ fn lowerAccessorExprFull(
     b.restoreExpected(prev);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, try accessorReturnTy(allocator, expected));
-    func.params = try accessorParams(allocator, params);
+    func.params = try accessorParams(allocator, params, owner_class, declared_params);
     func.has_receiver_param = leadsWithThis(params);
     const fid = try pushFunc(module, func);
     // A synthesized accessor/initializer carries its declaring file: the
@@ -531,13 +531,35 @@ fn accessorReturnTy(allocator: Allocator, expected: ?TypeRef) Allocator.Error!ir
 }
 
 /// Record the accessor's bound parameters as `Func.params` so the eval
-/// `this`-parameter fallback can recover the receiver.
-fn accessorParams(allocator: Allocator, params: []const []const u8) Allocator.Error![]Param {
+/// `this`-parameter fallback can recover the receiver. Each one carries the
+/// type it was declared with where that is known: a body-property initializer
+/// reading `side * 2` off an `Int` constructor parameter is an integer
+/// multiply, and a caller that only sees `Unit` cannot tell.
+fn accessorParams(
+    allocator: Allocator,
+    params: []const []const u8,
+    owner_class: []const u8,
+    declared: ?[]const Param,
+) Allocator.Error![]Param {
     const out = try allocator.alloc(Param, params.len);
-    for (params, out) |n, *slot| {
+    for (params, out, 0..) |n, *slot, i| {
+        var ty = build.typeUnit();
+        if (i == 0 and std.mem.eql(u8, n, "this") and owner_class.len != 0) {
+            ty = .{ .name = owner_class, .nullable = false, .args = &.{} };
+        } else if (declared) |typed| {
+            for (typed) |d| {
+                if (!std.mem.eql(u8, d.name, n)) continue;
+                // A `vararg` parameter's VALUE is an Array, not one element.
+                ty = if (d.is_vararg)
+                    .{ .name = "Array", .nullable = false, .args = &.{} }
+                else
+                    d.ty;
+                break;
+            }
+        }
         slot.* = .{
             .name = n,
-            .ty = build.typeUnit(),
+            .ty = ty,
             .default = null,
             .is_property = false,
             .is_vararg = false,
@@ -596,7 +618,7 @@ pub fn lowerAccessorBlockRet(
     // an inner class's accessor calling the OUTER class's member died as
     // `unresolved global` (the receiver walk never ran, so it never
     // followed the `outer` link).
-    func.params = try accessorParams(allocator, params);
+    func.params = try accessorParams(allocator, params, owner_class, null);
     func.has_receiver_param = leadsWithThis(params);
     const fid = try pushFunc(module, func);
     // Same declaring-file stamp as the expression form above.
@@ -634,7 +656,7 @@ pub fn lowerSetterBlockTyped(
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
-    func.params = try accessorParams(allocator, params);
+    func.params = try accessorParams(allocator, params, owner_class, null);
     func.has_receiver_param = leadsWithThis(params);
     return pushFuncSpanned(module, func, block.span);
 }
@@ -664,7 +686,7 @@ pub fn lowerSetterExprTyped(
     const v = try lowerExpr(&b, expr);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
-    func.params = try accessorParams(allocator, params);
+    func.params = try accessorParams(allocator, params, owner_class, null);
     func.has_receiver_param = leadsWithThis(params);
     return pushFuncSpanned(module, func, expr.span());
 }

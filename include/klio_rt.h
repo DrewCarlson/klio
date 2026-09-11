@@ -7,6 +7,18 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* A call that never comes back. Spelled per toolchain so the generated C
+ * compiles warning-clean wherever it is built. */
+#if defined(_MSC_VER)
+#define KLIO_NORETURN __declspec(noreturn)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define KLIO_NORETURN _Noreturn
+#elif defined(__GNUC__) || defined(__clang__)
+#define KLIO_NORETURN __attribute__((noreturn))
+#else
+#define KLIO_NORETURN
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -271,17 +283,20 @@ int32_t    klio_nat_value_eq(klio_value a, klio_value b);
  * switches on. maxint means "not an instance of a class this program knows". */
 uint32_t klio_nat_class_of(klio_value v);
 /* A virtual call that reached a receiver no arm handles. */
-void klio_nat_no_method(const char *name);
+KLIO_NORETURN void klio_nat_no_method(const char *name);
 
 /* A `var` captured by a lambda: a shared box, so both sides see writes. */
 /* An uncaught throw: a program the backend accepts has no catch handler, so a
  * throw always leaves it. */
-void klio_nat_throw(klio_value v);
+KLIO_NORETURN void klio_nat_throw(klio_value v);
 /* A throwable of the named type: exception classes are the runtime's own, not
- * shapes the emitter lays out. */
-klio_value klio_nat_exception(const char *fqn, klio_value message);
-/* Whether a thrown value is caught by a handler for `fqn`. */
-int32_t klio_nat_catches(klio_value v, const char *fqn);
+ * shapes the emitter lays out. `type_id` is the type's preorder number in the
+ * program's throwable hierarchy. */
+klio_value klio_nat_exception(const char *fqn, klio_value message, uint32_t type_id);
+/* Whether a thrown value is caught by a handler for the type spanning
+ * [lo, hi). The hierarchy is numbered in preorder, so a type's subtree is one
+ * contiguous interval and the test is two comparisons. */
+int32_t klio_nat_catches(klio_value v, uint32_t lo, uint32_t hi);
 
 klio_value klio_nat_cell(klio_value v);
 klio_value klio_nat_cell_get(klio_value c);

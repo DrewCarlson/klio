@@ -788,8 +788,10 @@ export fn klio_nat_throw(v: CValue) noreturn {
 
 /// A throwable of the named type. The exception classes are the runtime's own,
 /// not shapes the emitter lays out, so a compiled program builds one through
-/// here rather than as an instance with fields.
-export fn klio_nat_exception(fqn: [*:0]const u8, message: CValue) CValue {
+/// here rather than as an instance with fields. `type_id` is the type's
+/// preorder number in the program's throwable hierarchy, which is what a
+/// handler tests against.
+export fn klio_nat_exception(fqn: [*:0]const u8, message: CValue, type_id: u32) CValue {
     const a = natAlloc();
     const name = runtime.strInit(a, std.mem.span(fqn)) catch @panic("klio_nat_exception: out of memory");
     var msg: runtime.OptRef(runtime.StringData) = .{};
@@ -799,36 +801,20 @@ export fn klio_nat_exception(fqn: [*:0]const u8, message: CValue) CValue {
         .fqn = name,
         .message = msg,
         .cause = null,
+        .type_id = type_id,
     }) catch @panic("klio_nat_exception: out of memory"));
 }
 
-/// Whether a thrown value is caught by a handler for `fqn`. Type matching
-/// walks the throwable's own hierarchy, which is the runtime's to know.
-export fn klio_nat_catches(v: CValue, fqn: [*:0]const u8) i32 {
+/// Whether a thrown value is caught by a handler for the type spanning
+/// `[lo, hi)`. The emitter numbers the throwable hierarchy in preorder, so a
+/// type's subtree is one contiguous interval and a subtype test is two
+/// comparisons: no name matching, no walk, and a `catch (e: AppError)` sees
+/// every type under `AppError` however deep.
+export fn klio_nat_catches(v: CValue, lo: u32, hi: u32) i32 {
     const val = fromC(v);
     if (val != .Exception) return 0;
-    const want = std.mem.span(fqn);
-    const g = val.Exception.fqn.borrow();
-    defer g.deinit();
-    const actual = g.get().bytes;
-    // Matching is by NAME: a thrown value carries its type's spelling, not a
-    // class, so the two roots of the hierarchy are recognised directly.
-    // `Throwable` catches anything; `Exception` catches anything that is not an
-    // `Error`, which is the one split that matters in practice. A deeper
-    // relation between two named types is not visible from here.
-    if (std.mem.eql(u8, want, "Throwable") or std.mem.endsWith(u8, want, ".Throwable")) return 1;
-    if (std.mem.eql(u8, want, "Exception") or std.mem.endsWith(u8, want, ".Exception")) {
-        return if (std.mem.endsWith(u8, actual, "Error")) 0 else 1;
-    }
-    if (std.mem.eql(u8, actual, want)) return 1;
-    // A simple name on either side matches the other's tail.
-    if (std.mem.lastIndexOfScalar(u8, actual, '.')) |i| {
-        if (std.mem.eql(u8, actual[i + 1 ..], want)) return 1;
-    }
-    if (std.mem.lastIndexOfScalar(u8, want, '.')) |i| {
-        if (std.mem.eql(u8, want[i + 1 ..], actual)) return 1;
-    }
-    return 0;
+    const id = val.Exception.type_id;
+    return @intFromBool(id >= lo and id < hi);
 }
 
 /// The current top of the published-frame chain, and a way back to it. A
