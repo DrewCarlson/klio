@@ -263,6 +263,12 @@ int32_t    klio_nat_value_eq(klio_value a, klio_value b);
 
 /* Char prints as a character, and Short/Byte render as themselves, so the box
  * carries the kind rather than widening them all to Int. */
+/* The registered class handle of an instance: what a compiled dispatcher
+ * switches on. maxint means "not an instance of a class this program knows". */
+uint32_t klio_nat_class_of(klio_value v);
+/* A virtual call that reached a receiver no arm handles. */
+void klio_nat_no_method(const char *name);
+
 klio_value klio_nat_box_char(uint16_t v);
 klio_value klio_nat_box_short(int16_t v);
 klio_value klio_nat_box_byte(int8_t v);

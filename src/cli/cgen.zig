@@ -83,6 +83,9 @@ fn tyOf(t: ir.TypeRef) ?Ty {
 /// body: every terminator returning no value means the result is Unit,
 /// whatever the placeholder says.
 fn funcRetTy(f: *const Func) ?Ty {
+    // A declaration with no body — an interface method, an abstract one — has
+    // no register to read the answer from, so its annotation is all there is.
+    if (f.blocks.len == 0) return tyOf(f.return_ty);
     var any_value = false;
     for (f.blocks) |*blk| {
         if (blk.terminator == .Return and blk.terminator.Return != null) any_value = true;
@@ -259,7 +262,13 @@ fn classFields(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassL
     // Each reason is named: this list is the backlog for widening the backend,
     // and "class layout" alone says nothing about which class shape is missing.
     if (c.init_block != null) return layoutNo(c, "init block");
-    if (c.supertypes.len != 0) return layoutNo(c, "supertypes");
+    // An interface contributes no fields, so implementing one changes nothing
+    // about the layout. A superCLASS does, and its constructor arguments live
+    // in the AST rather than the IR, so that shape waits.
+    for (c.supertypes) |sid| {
+        if (sid.int() >= m.classes.items.len) return layoutNo(c, "unknown supertype");
+        if (!m.classes.items[sid.int()].is_interface) return layoutNo(c, "superclass");
+    }
     if (c.is_interface) return layoutNo(c, "interface");
     if (c.is_abstract) return layoutNo(c, "abstract");
 
@@ -409,6 +418,25 @@ fn listIntrinsic(f: *const Func) ?ListIntrinsic {
 
 /// The member name a virtual slot dispatches to, for the builtin receivers
 /// whose members the backend performs directly.
+/// The method of `cls` that implements a virtual slot. A slot is numbered by
+/// its root declaration, so the implementation is the class's method of the
+/// same name and arity — which is what an override is.
+fn slotImpl(m: *const Module, cid: u32, slot: ir.MethodSlotId) ?*const Func {
+    const root = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
+    if (cid >= m.classes.items.len) return null;
+    for (m.classes.items[cid].methods) |fid| {
+        const mf = m.funcById(fid) orelse continue;
+        if (!std.mem.eql(u8, mf.name, root.name)) continue;
+        if (mf.params.len != root.params.len) continue;
+        if (!mf.hasBody()) continue;
+        return mf;
+    }
+    return null;
+}
+
+/// One virtual call site's shape: the slot and how many arguments it takes.
+const SlotUse = struct { slot: u32, n_args: u32 };
+
 fn listMemberName(m: *const Module, slot: ir.MethodSlotId) ?[]const u8 {
     const decl = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
     return decl.name;
@@ -481,6 +509,13 @@ fn objectClassNamed(m: *const Module, ls: Layouts, name: []const u8) ?u32 {
         return @intCast(i);
     }
     return null;
+}
+
+fn isDispatched(slots: []const SlotUse, slot: u32) bool {
+    for (slots) |u| {
+        if (u.slot == slot) return true;
+    }
+    return false;
 }
 
 fn singletonSlot(singletons: []const u32, cid: u32) ?usize {
@@ -712,6 +747,28 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                         } else return no(f, "list virtual member");
                         known[cv.dst.int()] = true;
                         continue;
+                    }
+                    if (cv.arg_names.len == 0 and cv.receiver.int() < f.n_locals and
+                        known[cv.receiver.int()] and types[cv.receiver.int()] == .object)
+                    {
+                        if (m.funcById(ir.FuncId.from(cv.slot.int()))) |root| {
+                            if (root.hasBody() or root.params.len != 0) {
+                                // The slot's root declaration gives the result
+                                // type and the argument shape; which body runs
+                                // is decided at run time by the receiver.
+                                const rt4 = funcRetTy2(m, root) orelse return no(f, "virtual return type");
+                                var kk2: u32 = 0;
+                                while (kk2 < cv.n_args) : (kk2 += 1) {
+                                    const ar2 = cv.args.int() + kk2;
+                                    if (ar2 >= f.n_locals or !known[ar2]) return no(f, "virtual arg");
+                                }
+                                if (cv.dst.int() >= f.n_locals) return no(f, "virtual dst");
+                                types[cv.dst.int()] = rt4;
+                                if (rt4 == .object) cls[cv.dst.int()] = classIndexOfName(m, root.return_ty);
+                                known[cv.dst.int()] = true;
+                                continue;
+                            }
+                        }
                     }
                     const to = numConvVirtual(m, cv) orelse return instRefuse(f, inst);
                     if (cv.receiver.int() >= f.n_locals or !known[cv.receiver.int()]) return no(f, "conv receiver");
@@ -1062,7 +1119,7 @@ fn reachableBlocks(gpa: std.mem.Allocator, f: *const Func) Error![]bool {
     return hit;
 }
 
-fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: Layouts, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const u32) !void {
+fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: Layouts, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const u32, slots: []const SlotUse) !void {
     const f = c.f;
     const live = try reachableBlocks(gpa, f);
     defer gpa.free(live);
@@ -1334,6 +1391,18 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                     var nb: [32]u8 = undefined;
                     var rb: [32]u8 = undefined;
                     const recv = regName(c, cv.receiver.int(), &rb);
+                    if (isDispatched(slots, cv.slot.int())) {
+                        try w.print("  {s} = kvirt_{d}({s}", .{
+                            regName(c, cv.dst.int(), &nb), cv.slot.int(), recv,
+                        });
+                        var aj2: u32 = 0;
+                        while (aj2 < cv.n_args) : (aj2 += 1) {
+                            var ab3: [32]u8 = undefined;
+                            try w.print(", {s}", .{regName(c, cv.args.int() + aj2, &ab3)});
+                        }
+                        try w.writeAll(");\n");
+                        continue;
+                    }
                     if (c.cls[cv.receiver.int()]) |rc| {
                         if (rc == LIST_CLS) {
                             const mn = listMemberName(m, cv.slot).?;
@@ -1618,6 +1687,21 @@ pub fn emit(
                 }
                 // Constructing a class runs the thunks that initialize its body
                 // properties, so those are reachable too.
+                if (inst.* == .CallVirtual) {
+                    const cv2 = inst.CallVirtual;
+                    if (numConvVirtual(m, cv2) == null) {
+                        // Any class the program can construct may answer this
+                        // slot, so every implementation is reachable.
+                        var ci2: u32 = 0;
+                        while (ci2 < m.classes.items.len) : (ci2 += 1) {
+                            if (ls.of(ci2) == null) continue;
+                            const impl = slotImpl(m, ci2, cv2.slot) orelse continue;
+                            if (seen.contains(impl.id.int())) continue;
+                            try seen.put(impl.id.int(), {});
+                            try queue.append(gpa, impl);
+                        }
+                    }
+                }
                 if (inst.* == .NewInstance) {
                     if (ls.of(inst.NewInstance.class.int())) |fds| {
                         for (fds) |fd| {
@@ -1642,6 +1726,28 @@ pub fn emit(
 
     // Printing a floating value is the one place where C's formatting and
     // Kotlin's disagree, so the helper rides along only when it is used.
+    // Virtual call sites: each distinct slot gets one dispatcher, switching on
+    // the receiver's class.
+    var used_slots: std.ArrayList(SlotUse) = .empty;
+    defer used_slots.deinit(gpa);
+    for (accepted.items) |*c| {
+        for (c.f.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                if (inst.* != .CallVirtual) continue;
+                const cv = inst.CallVirtual;
+                if (c.cls[cv.receiver.int()]) |rc| {
+                    if (rc == LIST_CLS) continue;
+                }
+                if (numConvVirtual(m, cv) != null) continue;
+                var have3 = false;
+                for (used_slots.items) |u| {
+                    if (u.slot == cv.slot.int()) have3 = true;
+                }
+                if (!have3) try used_slots.append(gpa, .{ .slot = cv.slot.int(), .n_args = cv.n_args });
+            }
+        }
+    }
+
     // `object` declarations the program names. Each has ONE instance, created
     // before the program runs and rooted for its whole life.
     var used_singletons: std.ArrayList(u32) = .empty;
@@ -1723,7 +1829,7 @@ pub fn emit(
             }
         }
     }
-    if (used_globals.items.len != 0 or used_singletons.items.len != 0) uses_objects_hint = true;
+    if (used_globals.items.len != 0 or used_singletons.items.len != 0 or used_slots.items.len != 0) uses_objects_hint = true;
 
     var needs_fp = false;
     var needs_div = false;
@@ -1859,14 +1965,63 @@ pub fn emit(
         try w.print("static klio_nat_frame KGF;\n", .{});
     }
 
-    // Prototypes first: the call graph has cycles (recursion, mutual calls).
+    // Prototypes first: the call graph has cycles (recursion, mutual calls),
+    // and a dispatcher is defined after the bodies it selects between.
     for (accepted.items) |*c| {
         try writeProto(w, c);
         try w.writeAll(";\n");
     }
+    for (used_slots.items) |su| {
+        const root = m.funcById(ir.FuncId.from(su.slot)).?;
+        const rt6 = funcRetTy2(m, root) orelse .unit;
+        try w.print("static {s} kvirt_{d}(klio_value recv", .{ rt6.cName(), su.slot });
+        var ai3: u32 = 0;
+        while (ai3 < su.n_args) : (ai3 += 1) {
+            const pt3: Ty = if (ai3 + 1 < root.params.len) (tyOf(root.params[ai3 + 1].ty) orelse .object) else .object;
+            try w.print(", {s} a{d}", .{ pt3.cName(), ai3 });
+        }
+        try w.writeAll(");\n");
+    }
     try w.writeAll("\n");
-    for (accepted.items) |*c| try writeBody(gpa, w, m, ls, c, uses_objects, used_globals.items, used_singletons.items);
+    for (accepted.items) |*c| try writeBody(gpa, w, m, ls, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items);
 
+    for (used_slots.items) |su| {
+        const root = m.funcById(ir.FuncId.from(su.slot)).?;
+        const rt5 = funcRetTy2(m, root) orelse .unit;
+        try w.print("\n/* Virtual dispatch for `{s}`. Which body runs is the receiver's\n" ++
+            " * class, compared here against the handles registered at startup —\n" ++
+            " * they are runtime values, so this is a chain and not a switch. */\n", .{root.name});
+        try w.print("static {s} kvirt_{d}(klio_value recv", .{ rt5.cName(), su.slot });
+        var ai: u32 = 0;
+        while (ai < su.n_args) : (ai += 1) {
+            const pt2: Ty = if (ai + 1 < root.params.len) (tyOf(root.params[ai + 1].ty) orelse .object) else .object;
+            try w.print(", {s} a{d}", .{ pt2.cName(), ai });
+        }
+        try w.writeAll(") {\n  uint32_t k = klio_nat_class_of(recv);\n");
+        for (used_classes.items) |cid| {
+            const impl = slotImpl(m, cid, ir.MethodSlotId.from(su.slot)) orelse continue;
+            var in_set = false;
+            for (accepted.items) |*cc| {
+                if (cc.f == impl) in_set = true;
+            }
+            if (!in_set) continue;
+            try w.print("  if (k == KCLS_{d}) return ", .{cid});
+            try writeSymbol(w, impl);
+            try w.writeAll("(recv");
+            var aj: u32 = 0;
+            while (aj < su.n_args) : (aj += 1) try w.print(", a{d}", .{aj});
+            try w.writeAll(");\n");
+        }
+        try w.print("  klio_nat_no_method(\"{s}\");\n", .{root.name});
+        // `klio_nat_no_method` does not return, but C does not know that from
+        // the declaration alone, so give the function a value to fall off with.
+        if (rt5 == .object) {
+            try w.writeAll("  return klio_nat_box_unit();\n");
+        } else {
+            try w.writeAll("  return 0;\n");
+        }
+        try w.writeAll("}\n");
+    }
     if (used_singletons.items.len != 0) {
         try w.writeAll("static void klio_init_singletons(void) {\n");
         try w.print("  for (unsigned i = 0; i < {d}; i++) KO[i] = klio_nat_box_unit();\n", .{used_singletons.items.len});

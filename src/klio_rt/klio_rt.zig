@@ -716,3 +716,30 @@ export fn klio_nat_short(v: CValue) i16 {
 export fn klio_nat_byte(v: CValue) i8 {
     return fromC(v).Byte;
 }
+
+/// The registered class handle of an instance, which is what a compiled
+/// dispatcher switches on. A value that is not an instance, or an instance of a
+/// class this program did not register, reports no class.
+export fn klio_nat_class_of(v: CValue) u32 {
+    const val = fromC(v);
+    if (val != .Instance) return std.math.maxInt(u32);
+    const g = val.Instance.borrow();
+    const cls = g.get().class;
+    g.deinit();
+    for (nat_classes.items, 0..) |c, i| {
+        if (c.cell == cls.cell) return @intCast(i);
+    }
+    return std.math.maxInt(u32);
+}
+
+/// A virtual call that reached a receiver no arm handles. The interpreter would
+/// raise a dispatch failure; a compiled program has no interpreter to fall into,
+/// so it says so and stops rather than running the wrong body.
+export fn klio_nat_no_method(name: [*:0]const u8) noreturn {
+    const nm = std.mem.span(name);
+    const pre = "Exception in thread \"main\" java.lang.AbstractMethodError: no implementation of ";
+    _ = std.c.write(2, pre.ptr, pre.len);
+    _ = std.c.write(2, nm.ptr, nm.len);
+    _ = std.c.write(2, "\n", 1);
+    std.c.exit(1);
+}
