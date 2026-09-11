@@ -504,6 +504,12 @@ pub fn runTranspileNative(
                     .name = bp.name,
                     .ty = .{ .name = bp.type_head orelse "", .nullable = false, .args = &.{} },
                     .init = built.body_prop_inits.get(.{ .a = e.key_ptr.*, .b = bp.name }),
+                    .has_backing = bp.has_backing,
+                    .is_abstract = bp.is_abstract,
+                    .is_lateinit = bp.is_lateinit,
+                    .zero_init = bp.primitive_zero != null,
+                    .getter = built.instance_prop_getters.get(.{ .a = e.key_ptr.*, .b = bp.name }),
+                    .setter = built.instance_prop_setters.get(.{ .a = e.key_ptr.*, .b = bp.name }),
                 };
             }
             cg.deinit();

@@ -250,6 +250,34 @@ method rather than running the wrong body. A lambda whose call site can see
 which body it holds is called directly with its captures as leading arguments,
 so nothing is allocated and nothing is dispatched.
 
+Inheritance chains compile. A class is initialized by its own emitted
+initializer, which fills an instance the caller allocated and hands that same
+instance up to its superclass's; the layout is the flattened chain, superclass
+fields first, so a field index means the same thing read through any type in
+it. The one-level model this replaced spliced a superclass's argument thunks
+into the construction site, which could not compose one class's thunks through
+another's — so a grandparent was refused — and could not lay out an abstract
+base at all, though only its subclasses are ever constructed.
+
+That work also fixed a typing hole under it: a synthesized accessor's
+parameters were all typed Unit, so a body-property initializer reading
+`side * 2` off an `Int` constructor parameter was an operation on two unknowns.
+They now carry the types they were declared with.
+
+Exceptions match by type, not by name. The program's throwable types are
+numbered in preorder from the module's own class table — user types and the
+ones the stdlib pack declares alike — so every subtype of a type occupies one
+contiguous interval. A thrown value carries its own number and a handler
+compares it against two integers, which makes `catch (e: AppError)` see an
+AppError subtype however deep it sits at the same cost as catching the exact
+type. Nothing about the hierarchy is written into the emitter: a name the
+lowering did not declare is refused rather than assumed.
+
+A `return` out of an armed try region restores the handler stack it found on
+entry. Leaving a region without reaching the block that disarms it left it
+armed after the frame was gone, and the next region armed anywhere chained onto
+a `klio_try` that no longer existed.
+
 Two rules earned their keep by being wrong first. A function's result comes
 from the register it returns — except a declaration with no body, an interface
 method, which has no register and must read its annotation. And a value only
@@ -260,10 +288,16 @@ than any feature did.
 ## Still refused
 
 Measured across the example corpus with `KLIO_CGEN_TRACE=1`, most common
-first: classes the emitter cannot lay out (enums, abstract classes,
-grandparents, init blocks), lambdas that escape into a value, names that are
-neither a declared global nor an object, anonymous object literals, `MakeCell`
-(a `var` captured by a lambda), and calls with named or generic arguments.
+first: names that are neither a declared global nor an object, body properties
+without an initializer or with a type the emitter cannot place, `runBlocking`
+and the rest of the coroutine surface, `CallMember`, calls with named or
+generic arguments, and anonymous object literals.
+
+A refusal is reported against the thing that blocked a program, not against
+every candidate the emitter examined. The class-layout table is built for every
+class in the module, so reporting during the build named classes nothing ever
+asked about — mostly library interfaces, which have no layout by their nature,
+and which made up 93 of 125 layout refusals in one sweep.
 
 The distance to the goal is honest: a compiled program must contain every
 function it reaches, and compose and the packs are Kotlin that must therefore

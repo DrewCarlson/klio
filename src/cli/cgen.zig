@@ -403,6 +403,31 @@ pub const Layouts = struct {
         if (cid >= self.parents.len) return null;
         return self.parents[cid];
     }
+
+    /// The accessor a class declares for a property that has no storage of its
+    /// own. Walks the superclass chain, because a computed property is
+    /// inherited exactly as a stored one is.
+    fn accessor(self: Layouts, m: *const Module, cid: u32, name: []const u8, comptime which: enum { get, set }) ?ir.FuncId {
+        const want = plainFieldName(name);
+        var cur: ?u32 = cid;
+        var depth: u32 = 0;
+        while (cur) |c| : (depth += 1) {
+            if (depth > 32 or c >= m.classes.items.len) return null;
+            const cn = m.classes.items[c].name;
+            for (self.layouts) |l| {
+                if (!std.mem.eql(u8, l.name, cn)) continue;
+                for (l.props) |bp| {
+                    if (!std.mem.eql(u8, bp.name, want)) continue;
+                    return switch (which) {
+                        .get => bp.getter,
+                        .set => bp.setter,
+                    };
+                }
+            }
+            cur = if (self.parentOf(c)) |pp| pp.cid else null;
+        }
+        return null;
+    }
 };
 
 /// The superclass a class extends: which class, and the one thunk per
@@ -421,6 +446,10 @@ const FieldInfo = struct {
     /// True when a superclass declares this field. The superclass's own
     /// initializer fills it, so this class's does not.
     from_parent: bool = false,
+    /// True when whoever builds the instance fills this field rather than the
+    /// class's initializer: an enum entry's `name` and `ordinal` belong to the
+    /// entry, not to the enum's constructor.
+    preset: bool = false,
 };
 
 /// A class's flattened fields plus the superclass link used to initialize them.
@@ -520,10 +549,20 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
     for (layouts) |l| {
         if (!std.mem.eql(u8, l.name, c.name)) continue;
         for (l.props) |bp| {
-            const fid = bp.init orelse {
+            // A property that stores nothing is not a field: a computed `val x
+            // get() = ...` reads through its getter, and an abstract one is
+            // storage only in whichever subclass declares it.
+            if (!bp.has_backing or bp.is_abstract) continue;
+            // A `lateinit var` reads as a thrown error until it is assigned,
+            // which needs the unset marker the interpreter carries.
+            if (bp.is_lateinit) {
+                out.deinit(gpa);
+                return layoutNo(c, "lateinit property");
+            }
+            if (bp.init == null and !bp.zero_init) {
                 out.deinit(gpa);
                 return layoutNo(c, "body property without an initializer");
-            };
+            }
             const t = tyOf(bp.ty) orelse blk: {
                 if (bp.ty.name.len == 0 or classIndexOfName(m, bp.ty) == null) {
                     out.deinit(gpa);
@@ -536,7 +575,7 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
                 .ty = t,
                 .cls = if (t == .object) classIndexOfName(m, bp.ty) else null,
                 .arg = null,
-                .init = fid,
+                .init = bp.init,
             });
         }
         break;
@@ -1107,7 +1146,18 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     if (gf.field.int() >= m.consts.items.len) return no(f, "field name");
                     const nm = m.consts.items[gf.field.int()];
                     if (nm != .String) return no(f, "field name kind");
-                    const idx = fieldIndex(ls, rc, nm.String) orelse return no(f, "field not laid out");
+                    const idx = fieldIndex(ls, rc, nm.String) orelse {
+                        // No storage: a computed property reads through the
+                        // getter it declares, which is an ordinary method.
+                        const g = ls.accessor(m, rc, nm.String, .get) orelse return no(f, "field not laid out");
+                        const gfn = m.funcById(g) orelse return no(f, "getter body");
+                        const gt = funcRetTy2(m, gfn) orelse return no(f, "getter return type");
+                        if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
+                        types[gf.dst.int()] = gt;
+                        if (gt == .object) cls[gf.dst.int()] = classIndexOfName(m, gfn.return_ty);
+                        known[gf.dst.int()] = true;
+                        continue;
+                    };
                     const fields = ls.of(rc).?;
                     if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
                     types[gf.dst.int()] = fields[idx].ty;
@@ -1121,7 +1171,18 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     if (sf.field.int() >= m.consts.items.len) return no(f, "field name");
                     const nm = m.consts.items[sf.field.int()];
                     if (nm != .String) return no(f, "field name kind");
-                    const idx = fieldIndex(ls, rc, nm.String) orelse return no(f, "field not laid out");
+                    const idx = fieldIndex(ls, rc, nm.String) orelse {
+                        const st = ls.accessor(m, rc, nm.String, .set) orelse return no(f, "field not laid out");
+                        const sfn = m.funcById(st) orelse return no(f, "setter body");
+                        if (sf.value.int() >= f.n_locals or !known[sf.value.int()]) return no(f, "field value");
+                        // The setter's own parameter decides what it is handed.
+                        const want: Ty = if (sfn.params.len >= 2)
+                            (tyOf(sfn.params[1].ty) orelse .object)
+                        else
+                            return no(f, "setter arity");
+                        if (want != .object and types[sf.value.int()] != want) return no(f, "setter value type");
+                        continue;
+                    };
                     const fields = ls.of(rc).?;
                     if (sf.value.int() >= f.n_locals or !known[sf.value.int()]) return no(f, "field value");
                     if (types[sf.value.int()] != fields[idx].ty) return no(f, "field value type");
@@ -1405,7 +1466,14 @@ fn writeCtorBody(
             try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi, boxExpr(fd.ty, arg, &bb) });
             continue;
         }
-        const ifn = m.funcById(fd.init.?).?;
+        const ifid = fd.init orelse {
+            // A declared non-nullable primitive with no initializer starts at
+            // its type's zero, which is what the interpreter stores.
+            const z = if (fd.ty == .object) "klio_nat_null()" else boxExpr(fd.ty, "0", &bb);
+            try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi, z });
+            continue;
+        };
+        const ifn = m.funcById(ifid).?;
         var call: std.Io.Writer.Allocating = .init(gpa);
         defer call.deinit();
         try writeThunkCall(gpa, &call.writer, c, ifn);
@@ -1766,7 +1834,20 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                         continue;
                     }
                     const nm = m.consts.items[gf.field.int()].String;
-                    const idx = fieldIndex(ls, rc, nm).?;
+                    const idx = fieldIndex(ls, rc, nm) orelse {
+                        // Computed: the value comes from the getter, called
+                        // like any other method with the receiver first.
+                        const gfn = m.funcById(ls.accessor(m, rc, nm, .get).?).?;
+                        var nb2: [32]u8 = undefined;
+                        var rb2: [32]u8 = undefined;
+                        var sym2: std.Io.Writer.Allocating = .init(gpa);
+                        defer sym2.deinit();
+                        try writeSymbol(&sym2.writer, gfn);
+                        try w.print("  {s} = {s}({s});\n", .{
+                            regName(c, gf.dst.int(), &nb2), sym2.written(), regName(c, gf.receiver.int(), &rb2),
+                        });
+                        continue;
+                    };
                     var nb: [32]u8 = undefined;
                     var rb: [32]u8 = undefined;
                     var ub: [128]u8 = undefined;
@@ -1779,7 +1860,22 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                 .SetField => |sf| {
                     const rc = c.cls[sf.receiver.int()].?;
                     const nm = m.consts.items[sf.field.int()].String;
-                    const idx = fieldIndex(ls, rc, nm).?;
+                    const idx = fieldIndex(ls, rc, nm) orelse {
+                        const sfn = m.funcById(ls.accessor(m, rc, nm, .set).?).?;
+                        var rb3: [32]u8 = undefined;
+                        var vb3: [32]u8 = undefined;
+                        var bx3: [96]u8 = undefined;
+                        var sym3: std.Io.Writer.Allocating = .init(gpa);
+                        defer sym3.deinit();
+                        try writeSymbol(&sym3.writer, sfn);
+                        const want3: Ty = if (sfn.params.len >= 2) (tyOf(sfn.params[1].ty) orelse .object) else .object;
+                        const arg3 = if (want3 == .object and c.types[sf.value.int()] != .object)
+                            boxExpr(c.types[sf.value.int()], regName(c, sf.value.int(), &vb3), &bx3)
+                        else
+                            regName(c, sf.value.int(), &vb3);
+                        try w.print("  {s}({s}, {s});\n", .{ sym3.written(), regName(c, sf.receiver.int(), &rb3), arg3 });
+                        continue;
+                    };
                     var rb: [32]u8 = undefined;
                     var vb: [32]u8 = undefined;
                     var bb: [96]u8 = undefined;
@@ -2135,6 +2231,26 @@ pub const BodyProp = struct {
     name: []const u8,
     ty: ir.TypeRef,
     init: ?ir.FuncId,
+    /// False for a property that stores nothing: a computed `val x get() = ...`
+    /// is a getter, not a field, and must not take a slot in the layout.
+    has_backing: bool = true,
+    is_abstract: bool = false,
+    is_lateinit: bool = false,
+    /// A declared non-nullable primitive with no initializer, which starts at
+    /// its type's zero rather than at a value a thunk computes.
+    zero_init: bool = false,
+    /// The accessors a property declares. A computed property has no storage,
+    /// so reading it is a call to its getter and writing it a call to its
+    /// setter.
+    getter: ?ir.FuncId = null,
+    setter: ?ir.FuncId = null,
+};
+
+/// One entry of an `enum class`: its name, and the thunk per constructor
+/// argument the declaration writes for it.
+pub const EnumEntryInfo = struct {
+    name: []const u8,
+    args: []const ir.FuncId = &.{},
 };
 
 pub const ClassLayout = struct {
@@ -2226,9 +2342,18 @@ pub fn emit(
     // of thousands of C functions.
     try queue.append(gpa, .{ .f = entry, .synth = null });
     try seen.put(entry.id.int(), {});
+    // Only a class the program CONSTRUCTS can answer a virtual call, so the
+    // two sets grow together: draining the queue discovers constructions and
+    // call sites, and pairing them can queue more bodies, which can construct
+    // more classes. The walk runs until neither set grows.
+    var constructed: std.ArrayList(u32) = .empty;
+    defer constructed.deinit(gpa);
+    var vsites: std.ArrayList(ir.MethodSlotId) = .empty;
+    defer vsites.deinit(gpa);
     // A single refusal anywhere in the reachable set fails the whole emission:
     // a compiled program has no interpreter to fall back INTO, so a body it
     // cannot call is not a slow path, it is a missing one.
+    while (true) {
     while (queue.pop()) |pending| {
         const f = pending.f;
         const c = (try eligible(gpa, m, ls, f, globals, pending.synth, pending.caps)) orelse return false;
@@ -2241,6 +2366,11 @@ pub fn emit(
                         const gn3 = m.consts.items[cid3.int()];
                         if (gn3 == .String) {
                             if (objectClassNamed(m, ls, gn3.String)) |oc| {
+                                var have_o = false;
+                                for (constructed.items) |uo| {
+                                    if (uo == oc) have_o = true;
+                                }
+                                if (!have_o) try constructed.append(gpa, oc);
                                 for (ls.of(oc).?) |fd| {
                                     const ifid = fd.init orelse continue;
                                     const ifn = m.funcById(ifid) orelse return false;
@@ -2296,19 +2426,54 @@ pub fn emit(
                 if (inst.* == .CallVirtual) {
                     const cv2 = inst.CallVirtual;
                     if (numConvVirtual(m, cv2) == null) {
-                        // Any class the program can construct may answer this
-                        // slot, so every implementation is reachable.
-                        var ci2: u32 = 0;
-                        while (ci2 < m.classes.items.len) : (ci2 += 1) {
-                            if (ls.of(ci2) == null) continue;
-                            const impl = slotImpl(m, ci2, cv2.slot) orelse continue;
-                            if (seen.contains(impl.id.int())) continue;
-                            try seen.put(impl.id.int(), {});
-                            try queue.append(gpa, .{ .f = impl, .synth = null });
+                        var have_site = false;
+                        for (vsites.items) |sv| {
+                            if (sv == cv2.slot) have_site = true;
                         }
+                        if (!have_site) try vsites.append(gpa, cv2.slot);
                     }
                 }
+                // A computed property reads and writes through its accessors,
+                // so those are reachable wherever the property is touched.
+                const acc: ?struct { rc: u32, name: ir.ConstId, set: bool } = switch (inst.*) {
+                    .GetField => |gf2| blk3: {
+                        const rcx = c.cls[gf2.receiver.int()] orelse break :blk3 null;
+                        break :blk3 .{ .rc = rcx, .name = gf2.field, .set = false };
+                    },
+                    .SetField => |sf2| blk4: {
+                        const rcx = c.cls[sf2.receiver.int()] orelse break :blk4 null;
+                        break :blk4 .{ .rc = rcx, .name = sf2.field, .set = true };
+                    },
+                    else => null,
+                };
+                if (acc) |a2| {
+                    if (!isBuiltinCls(a2.rc) and a2.name.int() < m.consts.items.len) {
+                        const anm = m.consts.items[a2.name.int()];
+                        if (anm == .String and fieldIndex(ls, a2.rc, anm.String) == null) {
+                            const fid2 = if (a2.set)
+                                ls.accessor(m, a2.rc, anm.String, .set)
+                            else
+                                ls.accessor(m, a2.rc, anm.String, .get);
+                            if (fid2) |fid3| {
+                                const afn = m.funcById(fid3) orelse return false;
+                                if (!seen.contains(afn.id.int())) {
+                                    try seen.put(afn.id.int(), {});
+                                    try queue.append(gpa, .{ .f = afn, .synth = null });
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if (inst.* == .NewInstance) {
+                    {
+                        const nc2 = inst.NewInstance.class.int();
+                        var have_c = false;
+                        for (constructed.items) |uc| {
+                            if (uc == nc2) have_c = true;
+                        }
+                        if (!have_c) try constructed.append(gpa, nc2);
+                    }
                     // Constructing a class runs every initializer in its chain:
                     // each class's body-property thunks, and the thunks it
                     // passes to its superclass's constructor.
@@ -2349,6 +2514,21 @@ pub fn emit(
                 try queue.append(gpa, .{ .f = callee, .synth = null });
             }
         }
+    }
+        // Every construction the walk found, against every virtual call site
+        // it found. A class the program never builds answers nothing, which is
+        // what keeps an abstract library base out of the compile.
+        var grew_reach = false;
+        for (vsites.items) |slot| {
+            for (constructed.items) |cid| {
+                const impl = slotImpl(m, cid, slot) orelse continue;
+                if (seen.contains(impl.id.int())) continue;
+                try seen.put(impl.id.int(), {});
+                try queue.append(gpa, .{ .f = impl, .synth = null });
+                grew_reach = true;
+            }
+        }
+        if (!grew_reach) break;
     }
 
     // Printing a floating value is the one place where C's formatting and
