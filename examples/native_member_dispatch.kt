@@ -19,6 +19,9 @@ class Square(val side: Int) : Rect(side, side) {
 fun report(s: Shape): String = s.describe()
 
 fun main() {
+    // Named arguments reach the constructor in ITS order.
+    val named = Rect(h = 3, w = 2)
+    println(named.area())
     val r = Rect(2, 3)
     val q = Square(4)
     println(r.area())

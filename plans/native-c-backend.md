@@ -348,6 +348,19 @@ lambda's own parameters carry no declared types — the source writes
 have, read off where the value goes: the declaration's return type when it is
 returned, the parameter's or the constructor's when it is passed.
 
+A builtin type's name used as a qualifier resolves to the language's own
+numbers. `Int.MAX_VALUE`, `Double.NaN`, `Long.SIZE_BYTES` and the rest are
+constants of the language rather than something a pack computes, so the emitter
+writes them directly; the register naming the type carries no value at all.
+That one shape was the first refusal in 380 of the example programs, because
+the stdlib's own property initializers reach for it.
+
+Named arguments reach the callee in ITS order. A call binds positional
+arguments in order and named ones by name, and a parameter nothing binds takes
+its default — the same rule for a constructor as for a function. Type arguments
+say nothing about which body runs for a call the lowering already resolved, so
+they no longer refuse one.
+
 Two rules earned their keep by being wrong first. A function's result comes
 from the register it returns — except a declaration with no body, an interface
 method, which has no register and must read its annotation. And a value only

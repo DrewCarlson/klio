@@ -283,6 +283,93 @@ const CELL_CLS: u32 = std.math.maxInt(u32) - 2;
 /// class table; `elem` carries what it holds.
 const ARRAY_CLS: u32 = std.math.maxInt(u32) - 4;
 
+/// A builtin type's name used as a QUALIFIER: `Int` in `Int.MAX_VALUE`. Such
+/// a register names a type rather than holding a value, so like a lambda's it
+/// is typed Unit with the type recorded and occupies nothing at run time.
+const NUMCLS_BASE: u32 = std.math.maxInt(u32) - 40;
+
+fn numCls(t: Ty) u32 {
+    return NUMCLS_BASE + @intFromEnum(t);
+}
+
+fn numClsTy(cid: u32) ?Ty {
+    if (cid < NUMCLS_BASE or cid > NUMCLS_BASE + 10) return null;
+    return @enumFromInt(cid - NUMCLS_BASE);
+}
+
+/// The builtin type a bare name denotes when it is used as a qualifier.
+fn builtinQualifier(name: []const u8) ?Ty {
+    return tyOf(.{ .name = simpleName(name), .nullable = false, .args = &.{} });
+}
+
+/// One constant a builtin type's companion publishes, with the C spelling of
+/// its value. These are the language's own numbers, not something the stdlib
+/// pack computes, so the emitter writes them directly.
+const BuiltinConst = struct { ty: Ty, text: []const u8 };
+
+fn builtinConst(t: Ty, name: []const u8) ?BuiltinConst {
+    const eq = std.mem.eql;
+    if (eq(u8, name, "SIZE_BITS")) return switch (t) {
+        .i32 => .{ .ty = .i32, .text = "INT32_C(32)" },
+        .i64 => .{ .ty = .i32, .text = "INT32_C(64)" },
+        .short, .char => .{ .ty = .i32, .text = "INT32_C(16)" },
+        .byte => .{ .ty = .i32, .text = "INT32_C(8)" },
+        .f64 => .{ .ty = .i32, .text = "INT32_C(64)" },
+        .f32 => .{ .ty = .i32, .text = "INT32_C(32)" },
+        else => null,
+    };
+    if (eq(u8, name, "SIZE_BYTES")) return switch (t) {
+        .i32 => .{ .ty = .i32, .text = "INT32_C(4)" },
+        .i64 => .{ .ty = .i32, .text = "INT32_C(8)" },
+        .short, .char => .{ .ty = .i32, .text = "INT32_C(2)" },
+        .byte => .{ .ty = .i32, .text = "INT32_C(1)" },
+        .f64 => .{ .ty = .i32, .text = "INT32_C(8)" },
+        .f32 => .{ .ty = .i32, .text = "INT32_C(4)" },
+        else => null,
+    };
+    if (eq(u8, name, "MAX_VALUE")) return switch (t) {
+        .i32 => .{ .ty = .i32, .text = "INT32_C(2147483647)" },
+        .i64 => .{ .ty = .i64, .text = "INT64_C(9223372036854775807)" },
+        .short => .{ .ty = .short, .text = "((int16_t)32767)" },
+        .byte => .{ .ty = .byte, .text = "((int8_t)127)" },
+        .char => .{ .ty = .char, .text = "((uint16_t)0xFFFF)" },
+        // The largest finite value of each floating type.
+        .f64 => .{ .ty = .f64, .text = "1.7976931348623157e308" },
+        .f32 => .{ .ty = .f32, .text = "3.4028234663852886e38f" },
+        else => null,
+    };
+    if (eq(u8, name, "MIN_VALUE")) return switch (t) {
+        // Written as a subtraction: C has no negative literals, and the
+        // magnitude alone does not fit the type.
+        .i32 => .{ .ty = .i32, .text = "(-INT32_C(2147483647) - 1)" },
+        .i64 => .{ .ty = .i64, .text = "(-INT64_C(9223372036854775807) - 1)" },
+        .short => .{ .ty = .short, .text = "((int16_t)(-32768))" },
+        .byte => .{ .ty = .byte, .text = "((int8_t)(-128))" },
+        .char => .{ .ty = .char, .text = "((uint16_t)0)" },
+        // Kotlin's floating MIN_VALUE is the smallest POSITIVE value, which is
+        // denormal; a hex float names it exactly.
+        .f64 => .{ .ty = .f64, .text = "0x1p-1074" },
+        .f32 => .{ .ty = .f32, .text = "0x1p-149f" },
+        else => null,
+    };
+    if (eq(u8, name, "POSITIVE_INFINITY")) return switch (t) {
+        .f64 => .{ .ty = .f64, .text = "((double)INFINITY)" },
+        .f32 => .{ .ty = .f32, .text = "((float)INFINITY)" },
+        else => null,
+    };
+    if (eq(u8, name, "NEGATIVE_INFINITY")) return switch (t) {
+        .f64 => .{ .ty = .f64, .text = "(-(double)INFINITY)" },
+        .f32 => .{ .ty = .f32, .text = "(-(float)INFINITY)" },
+        else => null,
+    };
+    if (eq(u8, name, "NaN")) return switch (t) {
+        .f64 => .{ .ty = .f64, .text = "((double)NAN)" },
+        .f32 => .{ .ty = .f32, .text = "((float)NAN)" },
+        else => null,
+    };
+    return null;
+}
+
 /// A function value of a given arity: `(Int) -> Int` is `FUNC_CLS_BASE + 1`.
 /// Like `String` and `List` these are runtime types rather than user classes,
 /// so they take handles outside the class table; `elem` carries what calling
@@ -336,7 +423,7 @@ fn functionResultTy(t: ir.TypeRef) Ty {
 
 fn isBuiltinCls(cid: u32) bool {
     return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS or cid == THROWABLE_CLS or
-        cid == ARRAY_CLS or funcClsArity(cid) != null;
+        cid == ARRAY_CLS or funcClsArity(cid) != null or numClsTy(cid) != null;
 }
 
 /// The element kind of a named array type, in the order the runtime's
@@ -908,6 +995,56 @@ fn slotImpl(m: *const Module, cid: u32, slot: ir.MethodSlotId) ?*const Func {
     return null;
 }
 
+/// The greatest number of parameters a call the emitter binds can have. A
+/// signature past this is refused rather than truncated.
+const MAX_CALL_PARAMS: u32 = 32;
+
+/// Which argument fills each declared parameter. Kotlin binds positional
+/// arguments in order and named ones by name, so the emitted call has to
+/// reorder them into the callee's own order; a parameter nothing binds takes
+/// its default.
+const ArgBinding = struct {
+    regs: [MAX_CALL_PARAMS]?u32 = @splat(null),
+    n: u32 = 0,
+};
+
+fn bindCallArgs(
+    m: *const Module,
+    params: []const ir.Param,
+    args_base: u32,
+    n_args: u32,
+    arg_names: []const ?ir.ConstId,
+) ?ArgBinding {
+    if (params.len > MAX_CALL_PARAMS) return null;
+    var b: ArgBinding = .{ .n = @intCast(params.len) };
+    var next: u32 = 0;
+    var i: u32 = 0;
+    while (i < n_args) : (i += 1) {
+        const reg = args_base + i;
+        const named: ?ir.ConstId = if (i < arg_names.len) arg_names[i] else null;
+        if (named) |cid| {
+            if (cid.int() >= m.consts.items.len) return null;
+            const nm = m.consts.items[cid.int()];
+            if (nm != .String) return null;
+            var found = false;
+            for (params, 0..) |p, pi| {
+                if (!std.mem.eql(u8, p.name, nm.String)) continue;
+                if (b.regs[pi] != null) return null;
+                b.regs[pi] = reg;
+                found = true;
+                break;
+            }
+            if (!found) return null;
+            continue;
+        }
+        while (next < params.len and b.regs[next] != null) next += 1;
+        if (next >= params.len) return null;
+        b.regs[next] = reg;
+        next += 1;
+    }
+    return b;
+}
+
 /// The declaration a member call binds to: the TOPMOST class on the receiver's
 /// chain that declares this name at this arity. Every class that overrides it
 /// answers the same dispatcher, so a call resolved here dispatches exactly as
@@ -1073,6 +1210,12 @@ fn instReadsReg(inst: *const ir.Inst, r: ir.Reg) bool {
         if (inst.* == @field(std.meta.Tag(ir.Inst), uf.name)) {
             const payload = @field(inst.*, uf.name);
             if (@typeInfo(@TypeOf(payload)) == .@"struct") {
+                // An argument list is a BASE register plus a count, so a use
+                // as any argument but the first is invisible field by field.
+                if (@hasField(@TypeOf(payload), "args") and @hasField(@TypeOf(payload), "n_args")) {
+                    const base = payload.args.int();
+                    if (r.int() >= base and r.int() < base + payload.n_args) return true;
+                }
                 inline for (@typeInfo(@TypeOf(payload)).@"struct".fields) |pf| {
                     if (pf.type == ir.Reg) {
                         if (@field(payload, pf.name).int() == r.int()) return true;
@@ -1466,7 +1609,27 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (!known[mk.src.int()]) return no(f, "cell source");
                     types[mk.dst.int()] = .object;
                     cls[mk.dst.int()] = CELL_CLS;
-                    elem[mk.dst.int()] = types[mk.src.int()];
+                    // A cell holds one machine type for its whole life, so it
+                    // is the one every write agrees on. The lowering seeds a
+                    // `var` with a Unit placeholder where the declaration has
+                    // no initializer, which says nothing; writes that disagree
+                    // leave the cell holding boxed values.
+                    var cet = types[mk.src.int()];
+                    for (f.blocks) |*b2| {
+                        for (b2.insts) |*ci| {
+                            if (ci.* != .CellSet) continue;
+                            if (ci.CellSet.cell.int() != mk.dst.int()) continue;
+                            const vr = ci.CellSet.value.int();
+                            if (vr >= f.n_locals or !known[vr]) continue;
+                            if (types[vr] == .unit) continue;
+                            if (cet == .unit) {
+                                cet = types[vr];
+                            } else if (cet != types[vr]) {
+                                cet = .object;
+                            }
+                        }
+                    }
+                    elem[mk.dst.int()] = cet;
                     known[mk.dst.int()] = true;
                 },
                 .CellGet => |cg| {
@@ -1480,7 +1643,11 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (cs.cell.int() >= f.n_locals or !known[cs.cell.int()]) return no(f, "cell write");
                     if (cls[cs.cell.int()] == null or cls[cs.cell.int()].? != CELL_CLS) return no(f, "cell write to a non-cell");
                     if (cs.value.int() >= f.n_locals or !known[cs.value.int()]) return no(f, "cell value");
-                    if (types[cs.value.int()] != elem[cs.cell.int()]) return no(f, "cell value type");
+                    // A cell of boxed values takes anything; one of a machine
+                    // type takes that type.
+                    if (elem[cs.cell.int()] != .object and types[cs.value.int()] != elem[cs.cell.int()]) {
+                        return no(f, "cell value type");
+                    }
                 },
                 .LoadCapture => |lc| {
                     if (lc.dst.int() >= f.n_locals or lc.idx >= caps.len) return no(f, "load capture");
@@ -1764,7 +1931,6 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     known[cv.dst.int()] = true;
                 },
                 .NewInstance => |ni| {
-                    if (ni.arg_names.len != 0) return no(f, "ctor arg names");
                     if (ni.class.int() < m.classes.items.len and
                         isArrayTypeName(m.classes.items[ni.class.int()].name))
                     {
@@ -1805,10 +1971,15 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         }
                         return no(f, "class layout");
                     };
-                    if (m.classes.items[ni.class.int()].primary_params.len != ni.n_args) return no(f, "ctor arity");
+                    const cdef3 = &m.classes.items[ni.class.int()];
+                    if (cdef3.primary_params.len != ni.n_args) return no(f, "ctor arity");
+                    // A constructor takes its arguments in ITS order, whatever
+                    // order the call writes them in.
+                    const cb3 = bindCallArgs(m, cdef3.primary_params, ni.args.int(), ni.n_args, ni.arg_names) orelse
+                        return no(f, "ctor argument binding");
                     for (fields) |fd| {
                         const ai = fd.arg orelse continue;
-                        const ar = ni.args.int() + ai;
+                        const ar = cb3.regs[ai] orelse return no(f, "ctor arg");
                         if (ar >= f.n_locals or !known[ar]) return no(f, "ctor arg");
                         if (types[ar] != fd.ty) return no(f, "ctor arg type");
                     }
@@ -1823,6 +1994,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         if (gf.field.int() >= m.consts.items.len) return no(f, "field name");
                         const enm = m.consts.items[gf.field.int()];
                         if (enm != .String) return no(f, "field name kind");
+                        if (numClsTy(sc)) |bt2| {
+                            const bc3 = builtinConst(bt2, plainFieldName(enm.String)) orelse
+                                return noName(f, "builtin constant", enm.String);
+                            if (gf.dst.int() >= f.n_locals) return no(f, "constant dst");
+                            types[gf.dst.int()] = bc3.ty;
+                            known[gf.dst.int()] = true;
+                            continue;
+                        }
                         if (enumEntryIndex(m, prog, sc, plainFieldName(enm.String)) == null) return noName(f, "enum member", enm.String);
                         if (gf.dst.int() >= f.n_locals) return no(f, "entry dst");
                         types[gf.dst.int()] = .object;
@@ -1898,6 +2077,18 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         cls[lg.dst.int()] = oc;
                         known[lg.dst.int()] = true;
                         continue;
+                    }
+                    // A builtin type's name is a qualifier too: `Int` in
+                    // `Int.MAX_VALUE` names the type, and the constant read
+                    // off it is the language's own number.
+                    if (builtinQualifier(gn.String)) |bt| {
+                        if (globalIndex(globals, gn.String) == null) {
+                            if (lg.dst.int() >= f.n_locals) return no(f, "qualifier dst");
+                            types[lg.dst.int()] = .unit;
+                            cls[lg.dst.int()] = numCls(bt);
+                            known[lg.dst.int()] = true;
+                            continue;
+                        }
                     }
                     // An enum's own name is a qualifier: it carries no value,
                     // and the member read off it resolves at emit time.
@@ -2033,7 +2224,8 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     known[cv2.dst.int()] = true;
                 },
                 .Call => |c| {
-                    if (c.arg_names.len != 0 or c.type_args.len != 0) return no(f, "call arg names/type args");
+                    // Type arguments say nothing about which body runs for a
+                    // call the lowering already resolved.
                     if (c.dst.int() >= f.n_locals) return null;
                     const callee = m.funcById(c.func) orelse return no(f, "call target missing");
                     if (arrayOfIntrinsic(callee)) |maybe_kind| {
@@ -2113,11 +2305,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     } else {
                         if (!callee.hasBody()) return noCallee(f, callee, "no body for");
                         if (callee.params.len < c.n_args) return noCallee(f, callee, "arity of");
-                        // An omitted parameter is filled by the thunk the
+                        const bnd = bindCallArgs(m, callee.params, c.args.int(), c.n_args, c.arg_names) orelse
+                            return noCallee(f, callee, "argument binding of");
+                        // A parameter nothing binds is filled by the thunk the
                         // declaration lowered for it, run with the arguments
                         // ahead of it.
-                        var di = c.n_args;
-                        while (di < callee.params.len) : (di += 1) {
+                        var di: u32 = 0;
+                        while (di < bnd.n) : (di += 1) {
+                            if (bnd.regs[di] != null) continue;
                             const dfid = prog.defaultThunk(callee.id, di) orelse return noCallee(f, callee, "arity of");
                             const dfn = m.funcById(dfid) orelse return no(f, "default thunk");
                             if (funcRetTy2(m, dfn) == null) return no(f, "default thunk type");
@@ -2805,15 +3000,13 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     // a subclass hand the same instance up to its superclass's.
                     try w.print("  kinit_{d}({s}", .{ ni.class.int(), dst });
                     const cdef2 = &m.classes.items[ni.class.int()];
+                    const cb4 = bindCallArgs(m, cdef2.primary_params, ni.args.int(), ni.n_args, ni.arg_names).?;
                     var pi3: u32 = 0;
-                    while (pi3 < ni.n_args) : (pi3 += 1) {
+                    while (pi3 < cb4.n) : (pi3 += 1) {
                         try w.writeAll(", ");
-                        const areg3 = ni.args.int() + pi3;
+                        const areg3 = cb4.regs[pi3].?;
                         var ab5: [32]u8 = undefined;
-                        const want3: Ty = if (pi3 < cdef2.primary_params.len)
-                            ctorParamTy(cdef2, pi3)
-                        else
-                            c.types[areg3];
+                        const want3: Ty = ctorParamTy(cdef2, pi3);
                         if (want3 == .object and c.types[areg3] != .object) {
                             var bx3: [96]u8 = undefined;
                             try w.print("{s}", .{boxExpr(c.types[areg3], regName(c, areg3, &ab5), &bx3)});
@@ -2827,6 +3020,14 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     const rc = c.cls[gf.receiver.int()].?;
                     if (staticClassOf(c.types, c.cls, gf.receiver.int())) |sc| {
                         const enm = m.consts.items[gf.field.int()].String;
+                        if (numClsTy(sc)) |bt3| {
+                            var nb15: [32]u8 = undefined;
+                            try w.print("  {s} = {s};\n", .{
+                                regName(c, gf.dst.int(), &nb15),
+                                builtinConst(bt3, plainFieldName(enm)).?.text,
+                            });
+                            continue;
+                        }
                         const ei2 = enumEntryIndex(m, prog, sc, plainFieldName(enm)).?;
                         var nb3: [32]u8 = undefined;
                         try w.print("  {s} = KO[{d}];\n", .{
@@ -3374,27 +3575,30 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             try w.print("  printf(\"{s}\\n\", r{d});\n", .{ fmt, a0 });
                         }
                     } else {
-                        // An omitted argument runs the thunk for its
-                        // parameter, handed the arguments ahead of it. Each
-                        // lands in a local first, because a later default may
-                        // read an earlier one.
-                        var dtmp: u32 = 0;
-                        while (call.n_args + dtmp < callee.params.len) : (dtmp += 1) {
-                            const di2 = call.n_args + dtmp;
+                        // Arguments go to the callee in ITS order: positional
+                        // ones bind in order and named ones by name. A
+                        // parameter nothing binds runs the thunk for it, handed
+                        // the arguments ahead of it; each lands in a local
+                        // first, because a later default may read an earlier
+                        // one.
+                        const bnd2 = bindCallArgs(m, callee.params, call.args.int(), call.n_args, call.arg_names).?;
+                        var di2: u32 = 0;
+                        while (di2 < bnd2.n) : (di2 += 1) {
+                            if (bnd2.regs[di2] != null) continue;
                             const dfn = m.funcById(prog.defaultThunk(callee.id, di2).?).?;
                             const dt2 = acceptedRet(accepted, dfn) orelse funcRetTy2(m, dfn).?;
                             var dsym: std.Io.Writer.Allocating = .init(gpa);
                             defer dsym.deinit();
                             try writeSymbol(&dsym.writer, dfn);
-                            try w.print("  {s} kd{d}_{d} = {s}(", .{ dt2.cName(), call.dst.int(), dtmp, dsym.written() });
+                            try w.print("  {s} kd{d}_{d} = {s}(", .{ dt2.cName(), call.dst.int(), di2, dsym.written() });
                             var dk: u32 = 0;
                             while (dk < di2) : (dk += 1) {
                                 if (dk != 0) try w.writeAll(", ");
-                                if (dk < call.n_args) {
+                                if (bnd2.regs[dk]) |br| {
                                     var ab3: [32]u8 = undefined;
-                                    try w.print("{s}", .{regName(c, call.args.int() + dk, &ab3)});
+                                    try w.print("{s}", .{regName(c, br, &ab3)});
                                 } else {
-                                    try w.print("kd{d}_{d}", .{ call.dst.int(), dk - call.n_args });
+                                    try w.print("kd{d}_{d}", .{ call.dst.int(), dk });
                                 }
                             }
                             try w.writeAll(");\n");
@@ -3404,26 +3608,26 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         try writeSymbol(w, callee);
                         try w.writeByte('(');
                         var k: u32 = 0;
-                        while (k < callee.params.len) : (k += 1) {
+                        while (k < bnd2.n) : (k += 1) {
                             if (k != 0) try w.writeAll(", ");
-                            if (k < call.n_args) {
+                            if (bnd2.regs[k]) |br2| {
                                 var ab: [32]u8 = undefined;
-                                try w.print("{s}", .{regName(c, call.args.int() + k, &ab)});
+                                try w.print("{s}", .{regName(c, br2, &ab)});
+                                continue;
+                            }
+                            // The parameter's own type decides: a thunk that
+                            // computed a scalar arrives boxed where the
+                            // parameter is a reference.
+                            const want4: Ty = tyOf(callee.params[k].ty) orelse .object;
+                            const dfn4 = m.funcById(prog.defaultThunk(callee.id, k).?).?;
+                            const have4 = acceptedRet(accepted, dfn4) orelse funcRetTy2(m, dfn4).?;
+                            var tb4: [48]u8 = undefined;
+                            const tn4 = try std.fmt.bufPrint(&tb4, "kd{d}_{d}", .{ call.dst.int(), k });
+                            var bx4: [96]u8 = undefined;
+                            if (want4 == .object and have4 != .object) {
+                                try w.print("{s}", .{boxExpr(have4, tn4, &bx4)});
                             } else {
-                                // The parameter's own type decides: a thunk
-                                // that computed a scalar arrives boxed where
-                                // the parameter is a reference.
-                                const want4: Ty = tyOf(callee.params[k].ty) orelse .object;
-                                const dfn4 = m.funcById(prog.defaultThunk(callee.id, k).?).?;
-                                const have4 = acceptedRet(accepted, dfn4) orelse funcRetTy2(m, dfn4).?;
-                                var tb4: [48]u8 = undefined;
-                                const tn4 = try std.fmt.bufPrint(&tb4, "kd{d}_{d}", .{ call.dst.int(), k - call.n_args });
-                                var bx4: [96]u8 = undefined;
-                                if (want4 == .object and have4 != .object) {
-                                    try w.print("{s}", .{boxExpr(have4, tn4, &bx4)});
-                                } else {
-                                    try w.print("{s}", .{tn4});
-                                }
+                                try w.print("{s}", .{tn4});
                             }
                         }
                         try w.writeAll(");\n");
@@ -3906,9 +4110,12 @@ pub fn emit(
                 if (inst.* != .Call) continue;
                 const callee = m.funcById(inst.Call.func) orelse return false;
                 if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or arrayOfIntrinsic(callee) != null) continue;
-                // A call that omits an argument runs the thunk for it.
-                var dq = inst.Call.n_args;
-                while (dq < callee.params.len) : (dq += 1) {
+                // A call that leaves a parameter unbound runs the thunk for it.
+                const bnd3 = bindCallArgs(m, callee.params, inst.Call.args.int(), inst.Call.n_args, inst.Call.arg_names) orelse
+                    return false;
+                var dq: u32 = 0;
+                while (dq < bnd3.n) : (dq += 1) {
+                    if (bnd3.regs[dq] != null) continue;
                     const dfid2 = prog.defaultThunk(callee.id, dq) orelse break;
                     const dfn2 = m.funcById(dfid2) orelse return false;
                     if (seen.contains(dfn2.id.int())) continue;

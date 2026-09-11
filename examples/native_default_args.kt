@@ -19,6 +19,11 @@ class Scale(val base: Int) {
 }
 
 fun main() {
+    // Named arguments go to the callee in ITS order, whatever order the call
+    // writes them in, and a parameter nothing binds still takes its default.
+    println(banner(fill = "*", text = "y"))
+    println(banner(width = 1, text = "z"))
+
     println(banner("x"))
     println(banner("x", "="))
     println(banner("x", "=", 2))
