@@ -255,6 +255,12 @@ klio_value klio_nat_list_get(klio_value v, int32_t idx);
 void       klio_nat_list_set(klio_value v, int32_t idx, klio_value x);
 void       klio_nat_list_add(klio_value v, klio_value x);
 
+/* Null and reference comparison. A field access on a null receiver raises the
+ * same NullPointerException the interpreter would. */
+klio_value klio_nat_null(void);
+int32_t    klio_nat_is_null(klio_value v);
+int32_t    klio_nat_value_eq(klio_value a, klio_value b);
+
 klio_value klio_nat_box_int(int32_t v);
 klio_value klio_nat_box_long(int64_t v);
 klio_value klio_nat_box_double(double v);
