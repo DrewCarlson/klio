@@ -5,6 +5,7 @@
 #define KLIO_RT_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -238,6 +239,13 @@ void klio_nat_begin(void);
 /* The safe point: compiled code polls at loop back edges. */
 void klio_nat_safepoint(void);
 void klio_nat_leave(klio_nat_frame *f);
+
+/* Strings and rendering. `klio_nat_println` renders through the interpreter's
+ * own renderer, so compiled output cannot drift from interpreted output. */
+klio_value klio_nat_string(const char *bytes, size_t len);
+klio_value klio_nat_concat(klio_value a, klio_value b);
+int32_t    klio_nat_str_length(klio_value v);
+void       klio_nat_println(klio_value v);
 
 klio_value klio_nat_box_int(int32_t v);
 klio_value klio_nat_box_long(int64_t v);
