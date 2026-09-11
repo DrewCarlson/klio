@@ -672,7 +672,15 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
     // before every use, and a loop-carried register is defined ahead of the
     // back edge by the same rule.
     for (f.blocks) |*blk| {
-        if (blk.catches.len != 0 or blk.finally != null) return no(f, "try/finally");
+        // A `finally` has to run on every exit from its region, including a
+        // throw passing through; that is a separate shape from a handler.
+        if (blk.finally != null) return no(f, "finally");
+        for (blk.catches) |h| {
+            if (h.exception_reg.int() >= f.n_locals) return no(f, "catch register");
+            types[h.exception_reg.int()] = .object;
+            cls[h.exception_reg.int()] = THROWABLE_CLS;
+            known[h.exception_reg.int()] = true;
+        }
         for (blk.insts) |*inst| {
             switch (inst.*) {
                 .Trace => {},
@@ -1291,6 +1299,14 @@ fn reachableBlocks(gpa: std.mem.Allocator, f: *const Func) Error![]bool {
         grew = false;
         for (f.blocks, 0..) |*blk, bi| {
             if (!hit[bi]) continue;
+            // A handler is reached by a throw, not by any terminator: without
+            // this edge the block it jumps to looks dead and is dropped.
+            for (blk.catches) |h| {
+                if (h.handler.int() < hit.len and !hit[h.handler.int()]) {
+                    hit[h.handler.int()] = true;
+                    grew = true;
+                }
+            }
             switch (blk.terminator) {
                 .Goto => |g| {
                     if (g.int() < hit.len and !hit[g.int()]) {
@@ -1313,16 +1329,23 @@ fn reachableBlocks(gpa: std.mem.Allocator, f: *const Func) Error![]bool {
     return hit;
 }
 
-fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: Layouts, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const u32, slots: []const SlotUse) !void {
+fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: Layouts, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const u32, slots: []const SlotUse, uses_try: bool) !void {
     const f = c.f;
     const live = try reachableBlocks(gpa, f);
     defer gpa.free(live);
     try writeProto(w, c);
     try w.writeAll(" {\n");
+    var has_catch = false;
+    for (f.blocks) |*blk| {
+        if (blk.catches.len != 0) has_catch = true;
+    }
     var r: u32 = 0;
     while (r < f.n_locals) : (r += 1) {
         if (c.types[r] == .object) continue;
-        try w.print("  {s} r{d} = 0;\n", .{ c.types[r].cName(), r });
+        // A local written after `setjmp` and read after the jump back is
+        // indeterminate unless it is volatile. The object slots live in an
+        // array, which is memory already.
+        try w.print("  {s}{s} r{d} = 0;\n", .{ if (has_catch) "volatile " else "", c.types[r].cName(), r });
     }
     // Registers the lowering allocated but this body never reads: a C compiler
     // warns on them and the emitted file should be warning-clean.
@@ -1346,6 +1369,27 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
     for (f.blocks, 0..) |*blk, bi| {
         if (!live[bi]) continue;
         try w.print("B{d}:;\n", .{bi});
+        if (blk.catch_done_for != null) try w.writeAll("  klio_try_disarm();\n");
+        if (blk.catches.len != 0) {
+            // Arm before the region's body. A throw inside it lands back here
+            // with the value in flight, and each handler is tried in order.
+            try w.print("  klio_try KT{d};\n", .{bi});
+            // The published-frame chain at the moment of arming. A throw
+            // reaching here skipped every frame's `leave` on the way, so the
+            // landing pad puts the chain back before anything else runs.
+            try w.print("  klio_nat_frame *KM{d} = klio_nat_frame_mark();\n", .{bi});
+            try w.print("  klio_try_arm(&KT{d});\n", .{bi});
+            try w.print("  if (setjmp(KT{d}.jb) != 0) {{\n", .{bi});
+            try w.print("    klio_nat_frame_restore(KM{d});\n", .{bi});
+            try w.writeAll("    klio_try_disarm();\n");
+            for (blk.catches) |h| {
+                var eb: [32]u8 = undefined;
+                try w.print("    if (klio_nat_catches(klio_in_flight, \"{s}\")) {{ {s} = klio_in_flight; goto B{d}; }}\n", .{
+                    h.type_name, regName(c, h.exception_reg.int(), &eb), h.handler.int(),
+                });
+            }
+            try w.writeAll("    klio_do_throw(klio_in_flight);\n  }\n");
+        }
         for (blk.insts) |*inst| {
             switch (inst.*) {
                 .Trace => {},
@@ -1857,7 +1901,8 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
             .Throw => |t| {
                 var tb: [32]u8 = undefined;
                 var bb6: [96]u8 = undefined;
-                try w.print("  klio_nat_throw({s});\n", .{
+                try w.print("  {s}({s});\n", .{
+                    if (uses_try) "klio_do_throw" else "klio_nat_throw",
                     boxExpr(c.types[t.int()], regName(c, t.int(), &tb), &bb6),
                 });
             },
@@ -2082,6 +2127,15 @@ pub fn emit(
 
     // Printing a floating value is the one place where C's formatting and
     // Kotlin's disagree, so the helper rides along only when it is used.
+    // A program with any handler carries the try machinery, and its throws go
+    // through it rather than straight out.
+    var uses_try = false;
+    for (accepted.items) |*c| {
+        for (c.f.blocks) |*blk| {
+            if (blk.catches.len != 0) uses_try = true;
+        }
+    }
+
     // Virtual call sites: each distinct slot gets one dispatcher, switching on
     // the receiver's class.
     var used_slots: std.ArrayList(SlotUse) = .empty;
@@ -2185,7 +2239,7 @@ pub fn emit(
             }
         }
     }
-    if (used_globals.items.len != 0 or used_singletons.items.len != 0 or used_slots.items.len != 0) uses_objects_hint = true;
+    if (used_globals.items.len != 0 or used_singletons.items.len != 0 or used_slots.items.len != 0 or uses_try) uses_objects_hint = true;
 
     var needs_fp = false;
     var needs_div = false;
@@ -2216,6 +2270,7 @@ pub fn emit(
         \\#include <stdlib.h>
         \\#include <math.h>
         \\#include <inttypes.h>
+        \\#include <setjmp.h>
         \\
     , .{src_path});
     if (uses_objects) {
@@ -2242,6 +2297,24 @@ pub fn emit(
         try w.writeAll("}\n\n");
     }
     if (uses_objects_hint) uses_objects = true;
+    if (uses_try) try w.writeAll(
+        \\/* A try region. The handler stack and the in-flight value live here rather
+        \\ * than in the runtime: `setjmp` has to be called in the frame that catches,
+        \\ * so it cannot hide behind a function. Single-threaded, like the programs
+        \\ * this backend accepts so far. */
+        \\typedef struct klio_try { struct klio_try *prev; jmp_buf jb; } klio_try;
+        \\static klio_try *klio_try_top = 0;
+        \\static klio_value klio_in_flight;
+        \\static klio_nat_frame klio_in_flight_frame;
+        \\static void klio_try_arm(klio_try *t) { t->prev = klio_try_top; klio_try_top = t; }
+        \\static void klio_try_disarm(void) { if (klio_try_top) klio_try_top = klio_try_top->prev; }
+        \\static void klio_do_throw(klio_value e) {
+        \\  if (klio_try_top) { klio_in_flight = e; longjmp(klio_try_top->jb, 1); }
+        \\  klio_nat_throw(e);
+        \\}
+        \\
+        \\
+    );
     if (needs_div) try w.writeAll(
         \\/* Kotlin throws on integer division by zero; C leaves it undefined. */
         \\static void klio_arith_zero(void) {
@@ -2339,7 +2412,7 @@ pub fn emit(
         try w.writeAll(");\n");
     }
     try w.writeAll("\n");
-    for (accepted.items) |*c| try writeBody(gpa, w, m, ls, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items);
+    for (accepted.items) |*c| try writeBody(gpa, w, m, ls, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try);
 
     for (used_slots.items) |su| {
         const root = m.funcById(ir.FuncId.from(su.slot)).?;
@@ -2426,6 +2499,11 @@ pub fn emit(
 
     try w.writeAll("int main(void) {\n");
     if (uses_objects) try w.writeAll("  klio_nat_init(0);\n  klio_register_classes();\n");
+    if (uses_try) try w.writeAll(
+        "  klio_in_flight = klio_nat_box_unit();\n" ++
+        "  klio_in_flight_frame.n = 1; klio_in_flight_frame.slots = &klio_in_flight;\n" ++
+        "  klio_nat_enter(&klio_in_flight_frame);\n",
+    );
     if (used_singletons.items.len != 0) try w.writeAll("  klio_init_singletons();\n");
     if (used_globals.items.len != 0) {
         // Top-level properties run their initializers in declaration order,

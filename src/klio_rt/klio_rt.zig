@@ -801,3 +801,44 @@ export fn klio_nat_exception(fqn: [*:0]const u8, message: CValue) CValue {
         .cause = null,
     }) catch @panic("klio_nat_exception: out of memory"));
 }
+
+/// Whether a thrown value is caught by a handler for `fqn`. Type matching
+/// walks the throwable's own hierarchy, which is the runtime's to know.
+export fn klio_nat_catches(v: CValue, fqn: [*:0]const u8) i32 {
+    const val = fromC(v);
+    if (val != .Exception) return 0;
+    const want = std.mem.span(fqn);
+    const g = val.Exception.fqn.borrow();
+    defer g.deinit();
+    const actual = g.get().bytes;
+    // Matching is by NAME: a thrown value carries its type's spelling, not a
+    // class, so the two roots of the hierarchy are recognised directly.
+    // `Throwable` catches anything; `Exception` catches anything that is not an
+    // `Error`, which is the one split that matters in practice. A deeper
+    // relation between two named types is not visible from here.
+    if (std.mem.eql(u8, want, "Throwable") or std.mem.endsWith(u8, want, ".Throwable")) return 1;
+    if (std.mem.eql(u8, want, "Exception") or std.mem.endsWith(u8, want, ".Exception")) {
+        return if (std.mem.endsWith(u8, actual, "Error")) 0 else 1;
+    }
+    if (std.mem.eql(u8, actual, want)) return 1;
+    // A simple name on either side matches the other's tail.
+    if (std.mem.lastIndexOfScalar(u8, actual, '.')) |i| {
+        if (std.mem.eql(u8, actual[i + 1 ..], want)) return 1;
+    }
+    if (std.mem.lastIndexOfScalar(u8, want, '.')) |i| {
+        if (std.mem.eql(u8, want[i + 1 ..], actual)) return 1;
+    }
+    return 0;
+}
+
+/// The current top of the published-frame chain, and a way back to it. A
+/// `longjmp` to a handler skips every `klio_nat_leave` between the throw and
+/// the catch, so without restoring this the collector would keep walking frames
+/// whose C stack is gone.
+export fn klio_nat_frame_mark() ?*NatFrame {
+    return nat_top;
+}
+
+export fn klio_nat_frame_restore(mark: ?*NatFrame) void {
+    nat_top = mark;
+}
