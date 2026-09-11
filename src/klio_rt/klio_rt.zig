@@ -593,6 +593,14 @@ export fn klio_nat_println(v: CValue) void {
     natWrite("\n");
 }
 
+export fn klio_nat_print(v: CValue) void {
+    const a = natAlloc();
+    const val = fromC(v);
+    const txt = val.display(a) catch @panic("klio_nat_print: out of memory");
+    defer a.free(txt);
+    natWrite(txt);
+}
+
 // --- lists -----------------------------------------------------------------
 //
 // Collection operations are data-structure work on the runtime's own types, so
@@ -656,6 +664,106 @@ export fn klio_nat_list_add(v: CValue, x: CValue) void {
     defer g.deinit();
     g.get().append(a, fromC(x)) catch @panic("klio_nat_list_add: out of memory");
     runtime.gc.writeBarrier(&l.List.items.cell.hdr);
+}
+
+// --- arrays ----------------------------------------------------------------
+//
+// A primitive array is a packed scalar buffer, so an `IntArray` holds int32
+// elements rather than boxed values. The emitter knows the element kind
+// statically and names it here, which is what keeps an indexed read a load
+// rather than an unbox.
+
+fn primKindOf(kind: u32) runtime.PrimitiveArrayKind {
+    return switch (kind) {
+        0 => .Int,
+        1 => .Long,
+        2 => .Double,
+        3 => .Float,
+        4 => .Short,
+        5 => .Byte,
+        6 => .Boolean,
+        7 => .Char,
+        else => .Int,
+    };
+}
+
+/// A zero-filled primitive array of `n` elements. `kind` is the element kind,
+/// in the order the emitter's `Ty` names them.
+export fn klio_nat_prim_array(kind: u32, n: i32) CValue {
+    const a = natAlloc();
+    if (n < 0) natNegativeSize(n);
+    const k = primKindOf(kind);
+    var pb = runtime.PrimBuf{ .kind = k };
+    pb.bytes.appendNTimes(a, 0, @as(usize, @intCast(n)) * k.elemSize()) catch
+        @panic("klio_nat_prim_array: out of memory");
+    const cell = runtime.ObjRef(runtime.PrimBuf).initOwned(a, pb) catch
+        @panic("klio_nat_prim_array: out of memory");
+    return toC(.{ .Array = runtime.ArrayData.scalars(cell, k) });
+}
+
+/// A primitive array holding the given elements.
+export fn klio_nat_prim_array_of(kind: u32, argv: [*]const CValue, argc: u32) CValue {
+    const a = natAlloc();
+    const items = a.alloc(runtime.Value, argc) catch @panic("klio_nat_prim_array_of: out of memory");
+    defer a.free(items);
+    var i: u32 = 0;
+    while (i < argc) : (i += 1) items[i] = fromC(argv[i]);
+    return toC(runtime.ArrayData.initPacked(a, primKindOf(kind), items) catch
+        @panic("klio_nat_prim_array_of: out of memory"));
+}
+
+/// A reference `Array<T>` holding the given elements.
+export fn klio_nat_ref_array(argv: [*]const CValue, argc: u32) CValue {
+    const a = natAlloc();
+    var items: std.ArrayList(runtime.Value) = .empty;
+    items.ensureTotalCapacity(a, argc) catch @panic("klio_nat_ref_array: out of memory");
+    var i: u32 = 0;
+    while (i < argc) : (i += 1) items.appendAssumeCapacity(fromC(argv[i]));
+    const vl = runtime.ValueList.initOwned(a, items) catch @panic("klio_nat_ref_array: out of memory");
+    return toC(runtime.ArrayData.fromBoxedList(vl));
+}
+
+/// A reference `Array<T>` of `n` nulls.
+export fn klio_nat_ref_array_sized(n: i32) CValue {
+    const a = natAlloc();
+    if (n < 0) natNegativeSize(n);
+    var items: std.ArrayList(runtime.Value) = .empty;
+    items.appendNTimes(a, .Null, @intCast(n)) catch @panic("klio_nat_ref_array_sized: out of memory");
+    const vl = runtime.ValueList.initOwned(a, items) catch @panic("klio_nat_ref_array_sized: out of memory");
+    return toC(runtime.ArrayData.fromBoxedList(vl));
+}
+
+export fn klio_nat_array_size(v: CValue) i32 {
+    return @intCast(fromC(v).Array.len());
+}
+
+export fn klio_nat_array_get(v: CValue, idx: i32) CValue {
+    const arr = fromC(v).Array;
+    const n = arr.len();
+    if (idx < 0 or @as(usize, @intCast(idx)) >= n) natIndexOob(idx, n);
+    return toC(arr.get(@intCast(idx)));
+}
+
+export fn klio_nat_array_set(v: CValue, idx: i32, x: CValue) void {
+    const arr = fromC(v).Array;
+    const n = arr.len();
+    if (idx < 0 or @as(usize, @intCast(idx)) >= n) natIndexOob(idx, n);
+    arr.set(natAlloc(), @intCast(idx), fromC(x));
+    switch (arr.storage()) {
+        .boxed => |vl| runtime.gc.writeBarrier(&vl.cell.hdr),
+        .scalars => {},
+    }
+}
+
+fn natNegativeSize(n: i32) noreturn {
+    var buf: [128]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "Exception in thread \"main\" java.lang.NegativeArraySizeException: {d}\n",
+        .{n},
+    ) catch "Exception in thread \"main\" java.lang.NegativeArraySizeException\n";
+    _ = std.c.write(2, msg.ptr, msg.len);
+    std.c.exit(1);
 }
 
 fn natIndexOob(idx: i32, len: usize) noreturn {

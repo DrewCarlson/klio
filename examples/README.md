@@ -312,6 +312,7 @@ Run any program with:
 | `native_enums.kt`          | `enum class` compiled to C: each entry is one instance built before the program runs and rooted for its life, and the enum's own name is a qualifier the emitter resolves rather than a value it loads. |
 | `native_default_args.kt`   | Default arguments compiled to C: a default belongs to the call, so an omitted argument runs the thunk its declaration lowered, handed the arguments ahead of it. |
 | `native_member_dispatch.kt` | Member calls compiled to C: a call left by name resolves to the topmost declaration on the receiver's chain, so it and a resolved virtual call share one dispatcher. |
+| `native_math_print.kt`     | Bodyless stdlib functions compiled to C: `max`, `min`, `abs` and `print` are performed directly, with `abs` wrapping at the most negative value as Kotlin does. |
 | `native_lambdas.kt`        | Lambdas compiled to C: a lambda whose call site can see which body it holds is called directly with its captures as leading arguments, so no closure object is allocated and no dispatch happens. |
 | `native_interfaces.kt`     | Interfaces and virtual dispatch compiled to C: an interface adds no fields, and which body a call reaches is the receiver's class compared against the handles registered at startup. |
 | `native_char_sized.kt`     | `Char` and the narrow integer kinds compiled to C: integers in the machine but each carrying its kind in the box, since a Char prints as a character and arithmetic on any of them produces an Int. |

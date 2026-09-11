@@ -687,6 +687,20 @@ fn listIntrinsic(f: *const Func) ?ListIntrinsic {
     return null;
 }
 
+/// A stdlib function with no Kotlin body, because the implementation is the
+/// platform's. The backend performs it directly rather than compiling a
+/// declaration that has nothing to compile.
+const ScalarIntrinsic = enum { max, min, abs, print };
+
+fn scalarIntrinsic(f: *const Func) ?ScalarIntrinsic {
+    if (f.hasBody()) return null;
+    if (f.params.len == 2 and std.mem.eql(u8, f.fqn, "kotlin.math.max")) return .max;
+    if (f.params.len == 2 and std.mem.eql(u8, f.fqn, "kotlin.math.min")) return .min;
+    if (f.params.len == 1 and std.mem.eql(u8, f.fqn, "kotlin.math.abs")) return .abs;
+    if (f.params.len == 1 and (std.mem.eql(u8, f.fqn, "kotlin.io.print") or std.mem.eql(u8, f.fqn, "print"))) return .print;
+    return null;
+}
+
 /// The member name a virtual slot dispatches to, for the builtin receivers
 /// whose members the backend performs directly.
 /// The method of `cls` that implements a virtual slot. A slot is numbered by
@@ -1438,6 +1452,37 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         types[c.dst.int()] = .object;
                         cls[c.dst.int()] = LIST_CLS;
                         elem[c.dst.int()] = if (et) |t| (if (t == .object) .unit else t) else .unit;
+                        known[c.dst.int()] = true;
+                        continue;
+                    }
+                    if (scalarIntrinsic(callee)) |si| {
+                        const sa = c.args.int();
+                        var ks: u32 = 0;
+                        while (ks < c.n_args) : (ks += 1) {
+                            if (sa + ks >= f.n_locals or !known[sa + ks]) return no(f, "intrinsic arg");
+                        }
+                        if (c.dst.int() >= f.n_locals) return no(f, "intrinsic dst");
+                        switch (si) {
+                            .print => {
+                                if (c.n_args != 1) return no(f, "print arity");
+                                if (types[sa] == .unit) return no(f, "print of Unit");
+                                types[c.dst.int()] = .unit;
+                            },
+                            // The floating forms differ from C's: Kotlin's
+                            // `max` propagates NaN and orders -0.0 below 0.0,
+                            // where `fmax` does neither.
+                            .max, .min => {
+                                if (c.n_args != 2) return no(f, "intrinsic arity");
+                                if (types[sa] != types[sa + 1]) return no(f, "intrinsic operand types");
+                                if (types[sa] != .i32 and types[sa] != .i64) return no(f, "intrinsic operand type");
+                                types[c.dst.int()] = types[sa];
+                            },
+                            .abs => {
+                                if (c.n_args != 1) return no(f, "intrinsic arity");
+                                if (types[sa] != .i32 and types[sa] != .i64) return no(f, "intrinsic operand type");
+                                types[c.dst.int()] = types[sa];
+                            },
+                        }
                         known[c.dst.int()] = true;
                         continue;
                     }
@@ -2374,6 +2419,44 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                 },
                 .Call => |call| {
                     const callee = m.funcById(call.func).?;
+                    if (scalarIntrinsic(callee)) |si| {
+                        var db2: [32]u8 = undefined;
+                        var a1b: [32]u8 = undefined;
+                        var a2b: [32]u8 = undefined;
+                        const sa = call.args.int();
+                        const sdst = regName(c, call.dst.int(), &db2);
+                        const x1 = regName(c, sa, &a1b);
+                        switch (si) {
+                            .print => {
+                                var bx6: [96]u8 = undefined;
+                                if (uses_objects) {
+                                    try w.print("  klio_nat_print({s});\n", .{boxExpr(c.types[sa], x1, &bx6)});
+                                } else if (c.types[sa] == .boolean) {
+                                    try w.print("  printf(\"%s\", {s} ? \"true\" : \"false\");\n", .{x1});
+                                } else if (c.types[sa] == .i64) {
+                                    try w.print("  printf(\"%\" PRId64 \"\", {s});\n", .{x1});
+                                } else {
+                                    try w.print("  printf(\"%\" PRId32 \"\", {s});\n", .{x1});
+                                }
+                            },
+                            .max, .min => {
+                                const x2 = regName(c, sa + 1, &a2b);
+                                try w.print("  {s} = ({s} {s} {s}) ? {s} : {s};\n", .{
+                                    sdst, x1, if (si == .max) ">" else "<", x2, x1, x2,
+                                });
+                            },
+                            // Kotlin's `abs` on the most negative value returns
+                            // it unchanged; negating it in C is undefined, so
+                            // the negation runs unsigned and wraps.
+                            .abs => try w.print("  {s} = ({s} < 0) ? ({s})(0u{s} - ({s}){s}) : {s};\n", .{
+                                sdst, x1, c.types[sa].cName(),
+                                if (c.types[sa] == .i64) "ll" else "",
+                                if (c.types[sa] == .i64) "uint64_t" else "uint32_t",
+                                x1, x1,
+                            }),
+                        }
+                        continue;
+                    }
                     if (listIntrinsic(callee)) |kind| {
                         var db: [32]u8 = undefined;
                         const dst = regName(c, call.dst.int(), &db);
@@ -2876,7 +2959,7 @@ pub fn emit(
                 }
                 if (inst.* != .Call) continue;
                 const callee = m.funcById(inst.Call.func) orelse return false;
-                if (isPrintln(callee) or listIntrinsic(callee) != null) continue;
+                if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null) continue;
                 // A call that omits an argument runs the thunk for it.
                 var dq = inst.Call.n_args;
                 while (dq < callee.params.len) : (dq += 1) {

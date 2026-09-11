@@ -262,6 +262,8 @@ klio_value klio_nat_string(const char *bytes, size_t len);
 klio_value klio_nat_concat(klio_value a, klio_value b);
 int32_t    klio_nat_str_length(klio_value v);
 void       klio_nat_println(klio_value v);
+/* `print`: the same renderer, without the newline. */
+void       klio_nat_print(klio_value v);
 
 /* Lists. Data-structure work on the runtime's own types: no dispatch. */
 klio_value klio_nat_list(const klio_value *argv, uint32_t argc);
