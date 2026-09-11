@@ -261,6 +261,15 @@ klio_value klio_nat_null(void);
 int32_t    klio_nat_is_null(klio_value v);
 int32_t    klio_nat_value_eq(klio_value a, klio_value b);
 
+/* Char prints as a character, and Short/Byte render as themselves, so the box
+ * carries the kind rather than widening them all to Int. */
+klio_value klio_nat_box_char(uint16_t v);
+klio_value klio_nat_box_short(int16_t v);
+klio_value klio_nat_box_byte(int8_t v);
+uint16_t klio_nat_char(klio_value v);
+int16_t  klio_nat_short(klio_value v);
+int8_t   klio_nat_byte(klio_value v);
+
 klio_value klio_nat_box_int(int32_t v);
 klio_value klio_nat_box_long(int64_t v);
 klio_value klio_nat_box_double(double v);
