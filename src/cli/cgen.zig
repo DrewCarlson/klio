@@ -1365,6 +1365,11 @@ fn bareOn(
     return null;
 }
 
+/// One property read through a type that declares it without storage. Which
+/// class answers may STORE it rather than compute it, so an arm is either a
+/// getter call or a field read.
+const PropUse = struct { name: []const u8, cid: u32, ret: Ty };
+
 /// One lambda whose value the program materialises.
 const LambdaUse = struct { body: ir.FuncId, n_caps: u32, arity: u32, ret: Ty };
 
@@ -1395,6 +1400,80 @@ fn typeHasSlot(m: *const Module, cid: u32, root: *const Func) bool {
         }
     }
     return false;
+}
+
+/// A property read through a type that declares it without storage: an
+/// interface's `val`, or an abstract one. Which getter runs is the receiver's
+/// class, exactly as for a method.
+const VirtualProp = struct { ret: Ty, cls: ?u32, elem: Ty };
+
+/// Whether `sub`'s type includes `base`: it IS that class, extends it, or
+/// implements it.
+fn typeReaches(m: *const Module, sub: u32, base: u32) bool {
+    var stack: [64]u32 = undefined;
+    var n: usize = 1;
+    stack[0] = sub;
+    var steps: u32 = 0;
+    while (n != 0 and steps < 256) : (steps += 1) {
+        n -= 1;
+        const ci = stack[n];
+        if (ci == base) return true;
+        if (ci >= m.classes.items.len) continue;
+        for (m.classes.items[ci].supertypes) |sid| {
+            if (n < stack.len) {
+                stack[n] = sid.int();
+                n += 1;
+            }
+        }
+    }
+    return false;
+}
+
+/// The result of reading `name` off a receiver of class `rc`, when no class in
+/// that position stores it but some class beneath it computes it. Null when
+/// nothing does, or when the candidates disagree on what they return — the
+/// dispatcher has one C signature, so they have to agree.
+fn virtualProp(m: *const Module, prog: Program, rc: u32, name: []const u8) ?VirtualProp {
+    var found: ?VirtualProp = null;
+    var ci: u32 = 0;
+    while (ci < m.classes.items.len) : (ci += 1) {
+        if (prog.of(ci) == null) continue;
+        if (!typeReaches(m, ci, rc)) continue;
+        var gt: Ty = undefined;
+        var gc: ?u32 = null;
+        var ge: Ty = .unit;
+        if (prog.accessor(m, ci, name, .get)) |g| {
+            const gfn = m.funcById(g) orelse return null;
+            gt = funcRetTy2(m, gfn) orelse return null;
+            gc = if (gt == .object) classIndexOfName(m, gfn.return_ty) else null;
+            ge = if (refElemOf(gc, gfn.return_ty)) |e| e else .unit;
+        } else if (fieldIndex(prog, ci, name)) |fi5| {
+            // An override that STORES the property answers with the field.
+            const fds5 = prog.of(ci).?;
+            gt = fds5[fi5].ty;
+            gc = fds5[fi5].cls;
+            ge = fds5[fi5].elem;
+        } else continue;
+        if (found) |prev| {
+            if (prev.ret != gt) return null;
+        } else {
+            found = .{ .ret = gt, .cls = gc, .elem = ge };
+        }
+    }
+    return found;
+}
+
+/// The `toString` a value of this class answers with, when its own type
+/// declares one. Kotlin renders a value by calling it, so a compiled program
+/// has to call it too rather than hand the value to the runtime's renderer —
+/// which knows the shape of the class but not what the program wrote for it.
+fn toStringOf(m: *const Module, prog: Program, rc: u32) ?*const Func {
+    if (isBuiltinCls(rc)) return null;
+    const root = memberRoot(m, prog, rc, "toString", 0) orelse return null;
+    // A declaration with no body anywhere below is the universal one, which
+    // is what the renderer already does.
+    if (slotImpl(m, prog, rc, ir.MethodSlotId.from(root.id.int())) == null) return null;
+    return root;
 }
 
 /// One virtual call site's shape: the slot and how many arguments it takes.
@@ -2111,6 +2190,19 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         const ar = cb3.regs[ai] orelse return no(f, "ctor arg");
                         if (ar >= f.n_locals or !known[ar]) return no(f, "ctor arg");
                         if (types[ar] != fd.ty) return no(f, "ctor arg type");
+                        // An argument whose class is not the field's is a call
+                        // to a SECONDARY constructor, which runs a body the
+                        // emitter does not have. Matching arity alone made it
+                        // look like the primary and stored the argument as it
+                        // came.
+                        if (fd.ty == .object) {
+                            if (fd.cls) |want_c| {
+                                const got_c = cls[ar] orelse return no(f, "ctor arg class");
+                                if (got_c != want_c and !typeReaches(m, got_c, want_c)) {
+                                    return no(f, "ctor arg class");
+                                }
+                            }
+                        }
                     }
                     if (ni.dst.int() >= f.n_locals) return no(f, "ctor dst");
                     types[ni.dst.int()] = .object;
@@ -2156,7 +2248,19 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     const idx = fieldIndex(prog, rc, nm.String) orelse {
                         // No storage: a computed property reads through the
                         // getter it declares, which is an ordinary method.
-                        const g = prog.accessor(m, rc, nm.String, .get) orelse return noName(f, "field not laid out", nm.String);
+                        const g = prog.accessor(m, rc, nm.String, .get) orelse {
+                            // Declared without storage where the receiver
+                            // stands — an interface's `val` — and computed by
+                            // whatever class answers at run time.
+                            const vp = virtualProp(m, prog, rc, nm.String) orelse
+                                return noName(f, "field not laid out", nm.String);
+                            if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
+                            types[gf.dst.int()] = vp.ret;
+                            cls[gf.dst.int()] = vp.cls;
+                            elem[gf.dst.int()] = vp.elem;
+                            known[gf.dst.int()] = true;
+                            continue;
+                        };
                         const gfn = m.funcById(g) orelse return no(f, "getter body");
                         const gt = funcRetTy2(m, gfn) orelse return no(f, "getter return type");
                         if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
@@ -2521,6 +2625,24 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
 /// A C identifier for the function. Derived from the fqn, never from the id:
 /// ids are not stable across bakes, and a name that moves between builds would
 /// silently link the wrong body.
+/// A name as a C identifier fragment: the same escaping `writeSymbol` uses,
+/// so two names that differ anywhere differ here too.
+fn mangleName(name: []const u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    for (name) |ch| {
+        if (std.ascii.isAlphanumeric(ch)) {
+            if (n + 1 > buf.len) break;
+            buf[n] = ch;
+            n += 1;
+        } else {
+            if (n + 3 > buf.len) break;
+            _ = std.fmt.bufPrint(buf[n..], "_{x:0>2}", .{ch}) catch break;
+            n += 3;
+        }
+    }
+    return buf[0..n];
+}
+
 fn writeSymbol(w: *std.Io.Writer, f: *const Func) !void {
     try w.writeAll("kc_");
     for (f.fqn) |ch| {
@@ -2655,6 +2777,32 @@ fn writeCtorBody(
     try w.writeAll("}\n");
 }
 
+/// A register as a `klio_value` ready to be rendered: a value whose class
+/// declares `toString` renders as what that returns, which is what Kotlin
+/// means by printing it.
+fn renderExpr(
+    gpa: std.mem.Allocator,
+    m: *const Module,
+    prog: Program,
+    c: *const Compiled,
+    reg: u32,
+    out: *std.Io.Writer.Allocating,
+) !void {
+    var rb: [32]u8 = undefined;
+    const name = regName(c, reg, &rb);
+    if (c.types[reg] == .object) {
+        if (c.cls[reg]) |rc| {
+            if (toStringOf(m, prog, rc)) |ts| {
+                try out.writer.print("kvirt_{d}({s})", .{ ts.id.int(), name });
+                return;
+            }
+        }
+    }
+    var bb: [96]u8 = undefined;
+    try out.writer.print("{s}", .{boxExpr(c.types[reg], name, &bb)});
+    _ = gpa;
+}
+
 /// The runtime entry that boxes a machine type, or an empty name when the
 /// value is already a reference.
 fn boxFnName(t: Ty) []const u8 {
@@ -2705,7 +2853,10 @@ fn boxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
         .char => "klio_nat_box_char",
         .short => "klio_nat_box_short",
         .byte => "klio_nat_box_byte",
-        .unit => return std.fmt.bufPrint(buf, "klio_nat_box_unit()", .{}) catch unreachable,
+        // Boxing a Unit result must still run what produced it: the comma
+        // keeps the expression and yields the Unit value. Returning a bare
+        // `klio_nat_box_unit()` dropped the call.
+        .unit => return std.fmt.bufPrint(buf, "((void)({s}), klio_nat_box_unit())", .{expr}) catch unreachable,
         .object => return std.fmt.bufPrint(buf, "{s}", .{expr}) catch unreachable,
     };
     return std.fmt.bufPrint(buf, "{s}({s})", .{ fname, expr }) catch unreachable;
@@ -2722,7 +2873,10 @@ fn unboxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
         .char => "klio_nat_char",
         .short => "klio_nat_short",
         .byte => "klio_nat_byte",
-        .unit => return std.fmt.bufPrint(buf, "0", .{}) catch unreachable,
+        // A Unit result is still a result: the expression that produced it
+        // has to run. The comma keeps the call and yields the Unit register's
+        // zero, where returning a bare `0` dropped the call entirely.
+        .unit => return std.fmt.bufPrint(buf, "((void)({s}), 0)", .{expr}) catch unreachable,
         .object => return std.fmt.bufPrint(buf, "{s}", .{expr}) catch unreachable,
     };
     return std.fmt.bufPrint(buf, "{s}({s})", .{ fname, expr }) catch unreachable;
@@ -3275,7 +3429,17 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     const idx = fieldIndex(prog, rc, nm) orelse {
                         // Computed: the value comes from the getter, called
                         // like any other method with the receiver first.
-                        const gfn = m.funcById(prog.accessor(m, rc, nm, .get).?).?;
+                        const gacc = prog.accessor(m, rc, nm, .get) orelse {
+                            var nb17: [32]u8 = undefined;
+                            var rb17: [32]u8 = undefined;
+                            var mangled: [96]u8 = undefined;
+                            try w.print("  {s} = kprop_{d}_{s}({s});\n", .{
+                                regName(c, gf.dst.int(), &nb17), rc,
+                                mangleName(nm, &mangled), regName(c, gf.receiver.int(), &rb17),
+                            });
+                            continue;
+                        };
+                        const gfn = m.funcById(gacc).?;
                         var nb2: [32]u8 = undefined;
                         var rb2: [32]u8 = undefined;
                         var sym2: std.Io.Writer.Allocating = .init(gpa);
@@ -3348,10 +3512,18 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         var rb: [32]u8 = undefined;
                         var l1: [96]u8 = undefined;
                         var r1: [96]u8 = undefined;
+                        var lex: std.Io.Writer.Allocating = .init(gpa);
+                        defer lex.deinit();
+                        var rex2: std.Io.Writer.Allocating = .init(gpa);
+                        defer rex2.deinit();
+                        try renderExpr(gpa, m, prog, c, b.lhs.int(), &lex);
+                        try renderExpr(gpa, m, prog, c, b.rhs.int(), &rex2);
+                        _ = &lb;
+                        _ = &rb;
+                        _ = &l1;
+                        _ = &r1;
                         try w.print("  {s} = klio_nat_concat({s}, {s});\n", .{
-                            regName(c, b.dst.int(), &db),
-                            boxExpr(c.types[b.lhs.int()], regName(c, b.lhs.int(), &lb), &l1),
-                            boxExpr(c.types[b.rhs.int()], regName(c, b.rhs.int(), &rb), &r1),
+                            regName(c, b.dst.int(), &db), lex.written(), rex2.written(),
                         });
                         continue;
                     }
@@ -3824,11 +3996,10 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         // drift, and printf's buffered stream interleaves
                         // wrongly with the runtime's own writes.
                         if (uses_objects) {
-                            var ab2: [32]u8 = undefined;
-                            var bx: [96]u8 = undefined;
-                            try w.print("  klio_nat_println({s});\n", .{
-                                boxExpr(at, regName(c, a0, &ab2), &bx),
-                            });
+                            var rex: std.Io.Writer.Allocating = .init(gpa);
+                            defer rex.deinit();
+                            try renderExpr(gpa, m, prog, c, a0, &rex);
+                            try w.print("  klio_nat_println({s});\n", .{rex.written()});
                         } else if (at == .boolean) {
                             try w.print("  printf(\"%s\\n\", r{d} ? \"true\" : \"false\");\n", .{a0});
                         } else if (at.isFloat()) {
@@ -4000,6 +4171,9 @@ pub const ClassLayout = struct {
     /// carry those — the Vm runs them from the AST — so a class with one is
     /// refused rather than constructed without running it.
     has_init_block: bool = false,
+    /// A `data class` renders and compares by its primary constructor's
+    /// properties, which the runtime's own renderer does once it is told.
+    is_data: bool = false,
 };
 
 /// A lambda a register holds: the body to run and the registers captured at
@@ -4236,6 +4410,45 @@ pub fn emit(
                     };
                     continue;
                 }
+                // Rendering a value calls its `toString`, so that slot is a
+                // call site like any other.
+                {
+                    const rendered: ?u32 = switch (inst.*) {
+                        .BinOp => |b3| if (b3.op == .StringConcat or c.types[b3.dst.int()] == .object) b3.lhs.int() else null,
+                        else => null,
+                    };
+                    if (rendered) |rr4| {
+                        for ([_]u32{ rr4, inst.BinOp.rhs.int() }) |reg4| {
+                            if (c.types[reg4] != .object) continue;
+                            const rc4b = c.cls[reg4] orelse continue;
+                            const ts4 = toStringOf(m, prog, rc4b) orelse continue;
+                            var have4b = false;
+                            for (vsites.items) |sv4| {
+                                if (sv4.int() == ts4.id.int()) have4b = true;
+                            }
+                            if (!have4b) try vsites.append(gpa, ir.MethodSlotId.from(ts4.id.int()));
+                        }
+                    }
+                }
+                if (inst.* == .Call) {
+                    const pc4 = m.funcById(inst.Call.func);
+                    if (pc4) |pf4| {
+                        if ((isPrintln(pf4) or scalarIntrinsic(pf4) == .print) and inst.Call.n_args == 1) {
+                            const a4 = inst.Call.args.int();
+                            if (c.types[a4] == .object) {
+                                if (c.cls[a4]) |rc4c| {
+                                    if (toStringOf(m, prog, rc4c)) |ts4b| {
+                                        var have4c = false;
+                                        for (vsites.items) |sv5| {
+                                            if (sv5.int() == ts4b.id.int()) have4c = true;
+                                        }
+                                        if (!have4c) try vsites.append(gpa, ir.MethodSlotId.from(ts4b.id.int()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if (inst.* == .CallVirtual) {
                     const cv2 = inst.CallVirtual;
                     if (numConvVirtual(m, cv2) == null) {
@@ -4333,6 +4546,21 @@ pub fn emit(
                                 prog.accessor(m, a2.rc, anm.String, .set)
                             else
                                 prog.accessor(m, a2.rc, anm.String, .get);
+                            if (fid2 == null and !a2.set) {
+                                // Read through a type that declares it without
+                                // storage: every class beneath that type may
+                                // answer, so every getter is reachable.
+                                var pc: u32 = 0;
+                                while (pc < m.classes.items.len) : (pc += 1) {
+                                    if (prog.of(pc) == null) continue;
+                                    if (!typeReaches(m, pc, a2.rc)) continue;
+                                    const pg = prog.accessor(m, pc, anm.String, .get) orelse continue;
+                                    const pfn = m.funcById(pg) orelse return false;
+                                    if (seen.contains(pfn.id.int())) continue;
+                                    try seen.put(pfn.id.int(), {});
+                                    try queue.append(gpa, .{ .f = pfn, .synth = null });
+                                }
+                            }
                             if (fid2) |fid3| {
                                 const afn = m.funcById(fid3) orelse return false;
                                 if (!seen.contains(afn.id.int())) {
@@ -4438,9 +4666,11 @@ pub fn emit(
                 // An override declaring more parameters than the site supplies
                 // fills them from its own default thunks, so those are
                 // reachable wherever the dispatcher is.
+                const vroot = m.funcById(ir.FuncId.from(slot.int()));
                 var vk: u32 = 1;
                 while (vk < impl.params.len) : (vk += 1) {
-                    const vfid = prog.defaultThunk(impl.id, vk) orelse continue;
+                    const vfid = prog.defaultThunk(impl.id, vk) orelse
+                        (if (vroot) |vr| prog.defaultThunk(vr.id, vk) else null) orelse continue;
                     const vfn = m.funcById(vfid) orelse return false;
                     if (seen.contains(vfn.id.int())) continue;
                     try seen.put(vfn.id.int(), {});
@@ -4487,6 +4717,37 @@ pub fn emit(
                     }
                     if (!have7) try used_slots.append(gpa, .{ .slot = root7.id.int(), .n_args = cm2.n_args });
                     continue;
+                }
+                {
+                    var regs4: [2]?u32 = .{ null, null };
+                    switch (inst.*) {
+                        .BinOp => |b5| {
+                            if (c.types[b5.dst.int()] == .object) {
+                                regs4[0] = b5.lhs.int();
+                                regs4[1] = b5.rhs.int();
+                            }
+                        },
+                        .Call => |cl5| {
+                            const pf5 = m.funcById(cl5.func);
+                            if (pf5) |p5| {
+                                if ((isPrintln(p5) or scalarIntrinsic(p5) == .print) and cl5.n_args == 1) {
+                                    regs4[0] = cl5.args.int();
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                    for (regs4) |maybe_r| {
+                        const r5 = maybe_r orelse continue;
+                        if (c.types[r5] != .object) continue;
+                        const rc5b = c.cls[r5] orelse continue;
+                        const ts5 = toStringOf(m, prog, rc5b) orelse continue;
+                        var have5 = false;
+                        for (used_slots.items) |us5| {
+                            if (us5.slot == ts5.id.int()) have5 = true;
+                        }
+                        if (!have5) try used_slots.append(gpa, .{ .slot = ts5.id.int(), .n_args = 0 });
+                    }
                 }
                 if (inst.* != .CallVirtual) continue;
                 const cv = inst.CallVirtual;
@@ -4539,6 +4800,33 @@ pub fn emit(
                     if (u.cid == oc and u.entry == null) have2 = true;
                 }
                 if (!have2) try used_singletons.append(gpa, .{ .cid = oc });
+            }
+        }
+    }
+
+    // Properties read through a type that declares them without storage. One
+    // dispatcher per (receiver type, name): which getter runs is the
+    // receiver's class, exactly as for a method.
+    var used_props: std.ArrayList(PropUse) = .empty;
+    defer used_props.deinit(gpa);
+    for (accepted.items) |*c| {
+        for (c.f.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                if (inst.* != .GetField) continue;
+                const gf4 = inst.GetField;
+                const rc4 = c.cls[gf4.receiver.int()] orelse continue;
+                if (isBuiltinCls(rc4)) continue;
+                if (staticClassOf(c.types, c.cls, gf4.receiver.int()) != null) continue;
+                const nm4 = m.consts.items[gf4.field.int()];
+                if (nm4 != .String) continue;
+                if (fieldIndex(prog, rc4, nm4.String) != null) continue;
+                if (prog.accessor(m, rc4, nm4.String, .get) != null) continue;
+                const vp4 = virtualProp(m, prog, rc4, nm4.String) orelse continue;
+                var have_p = false;
+                for (used_props.items) |u| {
+                    if (u.cid == rc4 and std.mem.eql(u8, u.name, nm4.String)) have_p = true;
+                }
+                if (!have_p) try used_props.append(gpa, .{ .name = nm4.String, .cid = rc4, .ret = vp4.ret });
             }
         }
     }
@@ -4729,7 +5017,25 @@ pub fn emit(
                 try w.writeByte('"');
             }
             if (fields.len == 0) try w.writeAll("0");
-            try w.print("}}; KCLS_{d} = klio_nat_class(\"{s}\", {d}, fn); }}\n", .{ cid, cdef.name, fields.len });
+            // The primary constructor's properties are the fields this class
+            // contributes from its own arguments: the parent's come first and
+            // belong to the parent.
+            var plo: u32 = 0;
+            var phi: u32 = 0;
+            for (fields, 0..) |fld2, fi2| {
+                if (fld2.from_parent or fld2.arg == null) continue;
+                if (phi == 0) plo = @intCast(fi2);
+                phi = @intCast(fi2 + 1);
+            }
+            var flags: u32 = 0;
+            for (prog.layouts) |l2| {
+                if (std.mem.eql(u8, l2.name, cdef.name) and l2.is_data) flags |= 1;
+            }
+            if (cdef.is_enum) flags |= 2;
+            if (cdef.is_object) flags |= 4;
+            try w.print("}}; KCLS_{d} = klio_nat_class(\"{s}\", {d}, fn, {d}, {d}, {d}); }}\n", .{
+                cid, cdef.name, fields.len, plo, phi, flags,
+            });
         }
         for (used_lambdas.items) |lu| {
             try w.print("  {{ static const char *const fn[] = {{", .{});
@@ -4739,7 +5045,7 @@ pub fn emit(
                 try w.print("\"k{d}\"", .{ci7});
             }
             if (lu.n_caps == 0) try w.writeAll("0");
-            try w.print("}}; KLAM_{d} = klio_nat_class(\"Function{d}\", {d}, fn); }}\n", .{ lu.body.int(), lu.arity, lu.n_caps });
+            try w.print("}}; KLAM_{d} = klio_nat_class(\"Function{d}\", {d}, fn, 0, 0, 0); }}\n", .{ lu.body.int(), lu.arity, lu.n_caps });
         }
         try w.writeAll("}\n\n");
     }
@@ -4862,6 +5168,12 @@ pub fn emit(
         try writeCtorProto(w, m, cid);
         try w.writeAll(";\n");
     }
+    for (used_props.items) |pu| {
+        var mb: [96]u8 = undefined;
+        try w.print("static {s} kprop_{d}_{s}(klio_value recv);\n", .{
+            pu.ret.cName(), pu.cid, mangleName(pu.name, &mb),
+        });
+    }
     // One adapter per materialised lambda, and one dispatcher per arity called
     // through a value. A function value's arguments and result pass boxed,
     // because which body runs is a run-time answer and two bodies of the same
@@ -4915,7 +5227,11 @@ pub fn emit(
             try w.print("  if (k == KCLS_{d}) {{\n", .{cid});
             var dk9: u32 = su.n_args + 1;
             while (dk9 < impl.params.len) : (dk9 += 1) {
-                const dfid9 = prog.defaultThunk(impl.id, dk9) orelse break;
+                // The default may be declared where the method is DECLARED
+                // rather than where its body is: an interface can carry the
+                // default for a method a superclass implements.
+                const dfid9 = prog.defaultThunk(impl.id, dk9) orelse
+                    prog.defaultThunk(root.id, dk9) orelse break;
                 const dfn9 = m.funcById(dfid9) orelse break;
                 const dt9 = acceptedRet(accepted.items, dfn9) orelse funcRetTy2(m, dfn9) orelse .unit;
                 var dsym9: std.Io.Writer.Allocating = .init(gpa);
@@ -5026,6 +5342,38 @@ pub fn emit(
                 try w.writeAll(");\n");
             }
             try w.writeAll("  klio_nat_no_method(\"invoke\");\n  return klio_nat_box_unit();\n}\n");
+        }
+    }
+    for (used_props.items) |pu| {
+        var mb2: [96]u8 = undefined;
+        try w.print("static {s} kprop_{d}_{s}(klio_value recv) {{\n  uint32_t k = klio_nat_class_of(recv);\n  (void)k;\n", .{
+            pu.ret.cName(), pu.cid, mangleName(pu.name, &mb2),
+        });
+        for (used_classes.items) |cid2| {
+            if (!typeReaches(m, cid2, pu.cid)) continue;
+            if (prog.accessor(m, cid2, pu.name, .get)) |g2| {
+                const gfn2 = m.funcById(g2) orelse continue;
+                var in_set2 = false;
+                for (accepted.items) |*cc2| {
+                    if (cc2.f == gfn2) in_set2 = true;
+                }
+                if (!in_set2) continue;
+                try w.print("  if (k == KCLS_{d}) return ", .{cid2});
+                try writeSymbol(w, gfn2);
+                try w.writeAll("(recv);\n");
+                continue;
+            }
+            const fi6 = fieldIndex(prog, cid2, pu.name) orelse continue;
+            var gb6: [96]u8 = undefined;
+            const g6 = try std.fmt.bufPrint(&gb6, "klio_nat_get(recv, {d})", .{fi6});
+            var ob6: [160]u8 = undefined;
+            try w.print("  if (k == KCLS_{d}) return {s};\n", .{ cid2, unboxExpr(pu.ret, g6, &ob6) });
+        }
+        try w.print("  klio_nat_no_method(\"{s}\");\n", .{pu.name});
+        if (pu.ret == .object) {
+            try w.writeAll("  return klio_nat_box_unit();\n}\n");
+        } else {
+            try w.writeAll("  return 0;\n}\n");
         }
     }
     if (used_lambdas.items.len != 0) try w.writeAll("\n");

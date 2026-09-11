@@ -338,7 +338,25 @@ fn nextNatIdentity() u64 {
 
 /// Register an emitted class and return the handle its allocations use. Called
 /// once per class before `main` runs.
-export fn klio_nat_class(name: [*:0]const u8, n_fields: u32, field_names: [*]const [*:0]const u8) u32 {
+/// Class shape bits, matching the header's. A data class renders and compares
+/// by its primary constructor's properties, an enum entry by its name, and an
+/// object by the declaration's.
+const KLIO_CLASS_DATA: u32 = 1;
+const KLIO_CLASS_ENUM: u32 = 2;
+const KLIO_CLASS_OBJECT: u32 = 4;
+
+/// Register a class the emitter laid out. `primary_lo`/`primary_hi` name the
+/// slice of `field_names` that is the primary constructor's properties, in
+/// declaration order: a data class renders and compares by exactly those, so
+/// they have to be recorded rather than inferred from the field list.
+export fn klio_nat_class(
+    name: [*:0]const u8,
+    n_fields: u32,
+    field_names: [*]const [*:0]const u8,
+    primary_lo: u32,
+    primary_hi: u32,
+    flags: u32,
+) u32 {
     const a = natAlloc();
     const nm = std.mem.span(name);
     const props = a.alloc(runtime.PropertyDef, n_fields) catch @panic("klio_nat_class: out of memory");
@@ -360,15 +378,30 @@ export fn klio_nat_class(name: [*:0]const u8, n_fields: u32, field_names: [*]con
         .name = nm,
         .fqn = nm,
         .annotation_names = &.{},
-        .primary_params = &.{},
+        .primary_params = blk: {
+            if (primary_hi <= primary_lo or primary_hi > n_fields) break :blk &.{};
+            const n = primary_hi - primary_lo;
+            const ps = a.alloc(runtime.ClassParamDef, n) catch @panic("klio_nat_class: out of memory");
+            var pi: u32 = 0;
+            while (pi < n) : (pi += 1) {
+                ps[pi] = .{
+                    .property = true,
+                    .name = std.mem.span(field_names[primary_lo + pi]),
+                    .default = null,
+                    .declared_type = null,
+                    .declared_shape = null,
+                };
+            }
+            break :blk ps;
+        },
         .methods = &.{},
         .body_properties = props,
         .init_blocks = &.{},
         .init_block_property_positions = &.{},
-        .is_data = false,
+        .is_data = (flags & KLIO_CLASS_DATA) != 0,
         .is_value = false,
-        .is_object = false,
-        .is_enum = false,
+        .is_object = (flags & KLIO_CLASS_OBJECT) != 0,
+        .is_enum = (flags & KLIO_CLASS_ENUM) != 0,
         .is_sealed = false,
         .supertype_names = &.{},
         .parent = null,

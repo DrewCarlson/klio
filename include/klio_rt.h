@@ -227,9 +227,17 @@ typedef struct { uint64_t lo, hi; } klio_value;
 /* Install the collector's view of compiled frames. Call before main. */
 void klio_nat_init(uint32_t reserved);
 
-/* Register an emitted class; the handle is what allocations name. */
+/* Register an emitted class; the handle is what allocations name.
+ * `primary_lo`/`primary_hi` name the slice of `field_names` that is the
+ * primary constructor's properties, in declaration order: a data class renders
+ * and compares by exactly those. */
+#define KLIO_CLASS_DATA   1u
+#define KLIO_CLASS_ENUM   2u
+#define KLIO_CLASS_OBJECT 4u
 uint32_t klio_nat_class(const char *name, uint32_t n_fields,
-                        const char *const *field_names);
+                        const char *const *field_names,
+                        uint32_t primary_lo, uint32_t primary_hi,
+                        uint32_t flags);
 
 /* A fresh instance with every field Unit; the compiled constructor fills it. */
 klio_value klio_nat_alloc_instance(uint32_t cls);
