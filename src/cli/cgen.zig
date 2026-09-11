@@ -432,6 +432,17 @@ pub const Compiled = struct {
     slot: []i32,
     n_slots: u32,
     ret: Ty,
+    /// The class and element type of the returned register, where the body
+    /// returns a reference. The DECLARED return type cannot say this for an
+    /// inferred one — `val doubled = side * 2` lowers to a thunk carrying a
+    /// placeholder — so it comes from what the body actually returns.
+    ret_cls: ?u32 = null,
+    ret_elem: Ty = .unit,
+    /// How each bare-name read or write inside an inlined receiver body
+    /// resolved. The interpreter searches its implicit receivers at run time;
+    /// the emitter does that search once, and the answer belongs to the
+    /// instruction rather than to a register.
+    bare: std.AutoHashMapUnmanaged(*const ir.Inst, BareResolution) = .empty,
 
     pub fn deinit(self: *Compiled, gpa: std.mem.Allocator) void {
         gpa.free(self.types);
@@ -439,7 +450,21 @@ pub const Compiled = struct {
         gpa.free(self.elem);
         gpa.free(self.lam);
         gpa.free(self.slot);
+        self.bare.deinit(gpa);
     }
+};
+
+/// Where a bare name inside an inlined receiver body actually lives.
+pub const BareResolution = union(enum) {
+    /// A field of one of the implicit receivers, at the index resolved here.
+    field: struct { recv: u32, idx: u32 },
+    /// A computed property of one of them, read or written through its
+    /// accessor.
+    accessor: struct { recv: u32, func: ir.FuncId },
+    /// Nothing owned the name, so it is the top-level property it falls back
+    /// to, looked up by name where the emission knows which globals the
+    /// program kept.
+    global,
 };
 
 /// The instance fields of a class, in the order the runtime lays them out:
@@ -536,16 +561,19 @@ const FieldInfo = struct {
 };
 
 /// A class's flattened fields plus the superclass link used to initialize them.
-const Laid = struct { fields: []FieldInfo, parent: ?Parent };
+/// `complete` is false while a body property's type is still unresolved: the
+/// fields ahead of it are correct and can type an initializer, but the class
+/// is not laid out until every property it declares has a place.
+const Laid = struct { fields: []FieldInfo, parent: ?Parent, complete: bool = true };
 
 /// A class's instance fields in layout order: the constructor properties first,
 /// then the properties declared in the body. A class this returns null for is
 /// one the emitter cannot lay out, and any program touching it is refused.
-fn classFields(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassLayout, cid: ir.ClassId) Error!?Laid {
-    return classFieldsAt(gpa, m, layouts, cid, 0);
+fn classFields(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassLayout, cid: ir.ClassId, prev: ?*const Program, globals: []const Global, last: bool) Error!?Laid {
+    return classFieldsAt(gpa, m, layouts, cid, 0, prev, globals, last);
 }
 
-fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassLayout, cid: ir.ClassId, depth: u32) Error!?Laid {
+fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassLayout, cid: ir.ClassId, depth: u32, prev: ?*const Program, globals: []const Global, last: bool) Error!?Laid {
     if (cid.int() >= m.classes.items.len) return null;
     const c = &m.classes.items[cid.int()];
     // A class table with a cycle in it would recurse forever; a real hierarchy
@@ -586,7 +614,7 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
         // field read through the base type and through this one address the
         // same slot. Its initializer fills them, handed the arguments this
         // class's thunks compute.
-        const up = (try classFieldsAt(gpa, m, layouts, sid, depth + 1)) orelse {
+        const up = (try classFieldsAt(gpa, m, layouts, sid, depth + 1, prev, globals, last)) orelse {
             out.deinit(gpa);
             return layoutNo(c, "superclass layout");
         };
@@ -635,9 +663,11 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
             .init = null,
         });
     }
+    var complete = true;
     for (layouts) |l| {
         if (!std.mem.eql(u8, l.name, c.name)) continue;
-        for (l.props) |bp| {
+        complete = false;
+        inc: for (l.props) |bp| {
             // A property that stores nothing is not a field: a computed `val x
             // get() = ...` reads through its getter, and an abstract one is
             // storage only in whichever subclass declares it.
@@ -652,24 +682,53 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
                 out.deinit(gpa);
                 return layoutNo(c, "body property without an initializer");
             }
+            var fcls: ?u32 = null;
             const t = tyOf(bp.ty) orelse blk: {
-                if (bp.ty.name.len == 0 or classIndexOfName(m, bp.ty) == null) {
+                if (bp.ty.name.len != 0) {
+                    if (classIndexOfName(m, bp.ty)) |ci| {
+                        fcls = ci;
+                        break :blk Ty.object;
+                    }
                     out.deinit(gpa);
                     return layoutNoTy(c, "body property type", bp.ty);
                 }
-                break :blk Ty.object;
+                // The source annotated no type, so the property's type is
+                // whatever its initializer computes. Asking the initializer
+                // needs the layouts resolved so far — including the fields of
+                // this very class ahead of this one — which is why the table is
+                // built to a fixed point rather than in one pass. Stopping here
+                // keeps the fields already placed at the indices they will
+                // keep; the next pass resumes with more resolved.
+                if (last and prev == null) {
+                    out.deinit(gpa);
+                    return layoutNoTy(c, "body property type", bp.ty);
+                }
+                const pv = prev orelse break :inc;
+                const ifn = m.funcById(bp.init orelse break :inc) orelse break :inc;
+                var ic = (try eligible(gpa, m, pv.*, ifn, globals, null, &.{})) orelse {
+                    if (!last) break :inc;
+                    out.deinit(gpa);
+                    return layoutNoTy(c, "body property type", bp.ty);
+                };
+                defer ic.deinit(gpa);
+                fcls = ic.ret_cls;
+                break :blk ic.ret;
             };
             try out.append(gpa, .{
                 .name = bp.name,
                 .ty = t,
-                .cls = if (t == .object) classIndexOfName(m, bp.ty) else null,
+                .cls = if (t == .object) (fcls orelse classIndexOfName(m, bp.ty)) else null,
                 .arg = null,
                 .init = bp.init,
             });
+            continue;
+        } else {
+            // The loop ran to the end, so every property found a place.
+            complete = true;
         }
         break;
     }
-    return .{ .fields = try out.toOwnedSlice(gpa), .parent = parent };
+    return .{ .fields = try out.toOwnedSlice(gpa), .parent = parent, .complete = complete };
 }
 
 /// A property access inside the declaring class carries a synthesized accessor
@@ -820,6 +879,81 @@ fn memberRoot(m: *const Module, prog: Program, cid: u32, name: []const u8, n_arg
         cur = if (prog.parentOf(ci)) |pp| pp.cid else null;
     }
     return found;
+}
+
+/// The implicit receiver that owns a bare name, innermost first. `pref` is the
+/// receiver the lowering already knows (an inline extension binds its receiver
+/// as an ordinary register of the caller's frame, so the capture slot never
+/// holds it). Null when nothing owns it, which makes the name a global.
+/// Reconcile each register's type with the one it settled on. Returns the
+/// register that took a second, different type, which cannot share one C local.
+fn settleTypes(types: []Ty, known: []const bool, settled: []Ty, has_settled: []bool) ?u32 {
+    for (types, 0..) |*t, r| {
+        if (!known[r]) continue;
+        if (!has_settled[r]) {
+            has_settled[r] = true;
+            settled[r] = t.*;
+            continue;
+        }
+        if (settled[r] == t.*) continue;
+        // Unit on either side is the placeholder, not a type of its own.
+        if (settled[r] == .unit) {
+            settled[r] = t.*;
+            continue;
+        }
+        if (t.* == .unit) {
+            t.* = settled[r];
+            continue;
+        }
+        return @intCast(r);
+    }
+    return null;
+}
+
+fn noReg(f: *const Func, reg: u32) ?Compiled {
+    if (traceOn()) std.debug.print("[cgen] refuse {s}: register type varies r{d}\n", .{ f.name, reg });
+    return null;
+}
+
+fn resolveBare(
+    m: *const Module,
+    prog: Program,
+    types: []const Ty,
+    cls: []const ?u32,
+    known: []const bool,
+    encl: []const u32,
+    pref: ?u32,
+    name: []const u8,
+    set: bool,
+) ?BareResolution {
+    if (pref) |r| {
+        if (bareOn(m, prog, types, cls, known, r, name, set)) |res| return res;
+    }
+    var i: usize = encl.len;
+    while (i > 0) {
+        i -= 1;
+        if (bareOn(m, prog, types, cls, known, encl[i], name, set)) |res| return res;
+    }
+    return null;
+}
+
+fn bareOn(
+    m: *const Module,
+    prog: Program,
+    types: []const Ty,
+    cls: []const ?u32,
+    known: []const bool,
+    r: u32,
+    name: []const u8,
+    set: bool,
+) ?BareResolution {
+    if (r >= types.len or !known[r] or types[r] != .object) return null;
+    const rc = cls[r] orelse return null;
+    if (isBuiltinCls(rc)) return null;
+    if (fieldIndex(prog, rc, name)) |idx| return .{ .field = .{ .recv = r, .idx = idx } };
+    const acc = if (set) prog.accessor(m, rc, name, .set) else prog.accessor(m, rc, name, .get);
+    if (acc) |g| return .{ .accessor = .{ .recv = r, .func = g } };
+    return null;
 }
 
 /// One virtual call site's shape: the slot and how many arguments it takes.
@@ -1036,6 +1170,15 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     // puts the definition ahead of the edge. Source order does not have that
     // property: a `when` writes its result in the arm blocks, which sit after
     // the block that returns it.
+    // Where each bare name inside an inlined receiver body resolved. Owned by
+    // the Compiled this returns; freed on refusal.
+    var bare: std.AutoHashMapUnmanaged(*const ir.Inst, BareResolution) = .empty;
+    errdefer bare.deinit(gpa);
+    // The implicit receivers in scope, innermost last. `with(x) { … }` and
+    // `apply` splice their bodies inline and push the subject here.
+    var encl: std.ArrayList(u32) = .empty;
+    defer encl.deinit(gpa);
+
     const order = try blockOrder(gpa, f);
     defer gpa.free(order);
     for (order) |bi| {
@@ -1055,6 +1198,81 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
         for (blk.insts) |*inst| {
             switch (inst.*) {
                 .Trace => {},
+                // The enclosing-subject chain exists for the interpreter's
+                // dynamic resolution: a bare name or a member the lowering
+                // could not bind consults it while a inlined body runs.
+                // Compiled code resolves every one of those statically or
+                // refuses, so there is nothing for the chain to answer.
+                .EnclosingPush => |ep| {
+                    if (ep.src.int() >= f.n_locals) return no(f, "enclosing src");
+                    try encl.append(gpa, ep.src.int());
+                },
+                .EnclosingPop => {
+                    if (encl.items.len != 0) _ = encl.pop();
+                },
+                // A bare name inside such a body: the interpreter searches the
+                // implicit receivers innermost first and falls back to the
+                // global. The emitter does that search once, here.
+                .LoadFromThisOrGlobal => |lt| {
+                    if (lt.name.int() >= m.consts.items.len) return no(f, "bare name");
+                    const bn = m.consts.items[lt.name.int()];
+                    if (bn != .String) return no(f, "bare name kind");
+                    if (lt.dst.int() >= f.n_locals) return no(f, "bare dst");
+                    if (resolveBare(m, prog, types, cls, known, encl.items, null, bn.String, false)) |res| {
+                        try bare.put(gpa, inst, res);
+                        switch (res) {
+                            .field => |fl| {
+                                const fds = prog.of(cls[fl.recv].?).?;
+                                types[lt.dst.int()] = fds[fl.idx].ty;
+                                cls[lt.dst.int()] = fds[fl.idx].cls;
+                            },
+                            .accessor => |ac| {
+                                const gfn = m.funcById(ac.func) orelse return no(f, "bare getter");
+                                const gt = funcRetTy2(m, gfn) orelse return no(f, "bare getter type");
+                                types[lt.dst.int()] = gt;
+                                if (gt == .object) cls[lt.dst.int()] = classIndexOfName(m, gfn.return_ty);
+                            },
+                            .global => unreachable,
+                        }
+                        known[lt.dst.int()] = true;
+                        continue;
+                    }
+                    const gi5 = globalIndex(globals, bn.String) orelse return noName(f, "bare name", bn.String);
+                    try bare.put(gpa, inst, .global);
+                    const gt5 = (try globalTy(gpa, m, prog, globals, gi5)) orelse return no(f, "global type");
+                    types[lt.dst.int()] = gt5;
+                    if (gt5 == .object) {
+                        const gf5 = m.funcById(globals[gi5].func).?;
+                        cls[lt.dst.int()] = classIndexOfName(m, gf5.return_ty);
+                    }
+                    known[lt.dst.int()] = true;
+                },
+                .StoreToThisOrGlobal => |st| {
+                    if (st.name.int() >= m.consts.items.len) return no(f, "bare name");
+                    const bn2 = m.consts.items[st.name.int()];
+                    if (bn2 != .String) return no(f, "bare name kind");
+                    if (st.value.int() >= f.n_locals or !known[st.value.int()]) return no(f, "bare value");
+                    const pref: ?u32 = if (st.recv) |rv| rv.int() else null;
+                    if (resolveBare(m, prog, types, cls, known, encl.items, pref, bn2.String, true)) |res| {
+                        try bare.put(gpa, inst, res);
+                        switch (res) {
+                            .field => |fl| {
+                                const fds = prog.of(cls[fl.recv].?).?;
+                                if (types[st.value.int()] != fds[fl.idx].ty) return no(f, "bare value type");
+                            },
+                            .accessor => |ac| {
+                                const sfn = m.funcById(ac.func) orelse return no(f, "bare setter");
+                                const want6: Ty = if (sfn.params.len >= 2) (tyOf(sfn.params[1].ty) orelse .object) else return no(f, "bare setter arity");
+                                if (want6 != .object and types[st.value.int()] != want6) return no(f, "bare value type");
+                            },
+                            .global => unreachable,
+                        }
+                        continue;
+                    }
+                    const gi6 = globalIndex(globals, bn2.String) orelse return noName(f, "bare name", bn2.String);
+                    _ = gi6;
+                    try bare.put(gpa, inst, .global);
+                },
                 .Const => |c| {
                     if (c.dst.int() >= f.n_locals) return no(f, "const dst");
                     if (c.value.int() >= m.consts.items.len) return no(f, "const id");
@@ -1382,7 +1600,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     const fields = prog.of(ni.class.int()) orelse {
                         if (traceOn() and ni.class.int() < m.classes.items.len) {
                             layout_quiet = false;
-                            if (try classFields(gpa, m, prog.layouts, ni.class)) |junk| gpa.free(junk.fields);
+                            if (try classFields(gpa, m, prog.layouts, ni.class, &prog, globals, true)) |junk| gpa.free(junk.fields);
                             layout_quiet = true;
                         }
                         return no(f, "class layout");
@@ -1678,12 +1896,16 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     // Resolve the result from the returned registers, which the body pass has
     // now typed. Disagreeing returns mean the emitter cannot name one C type.
     var saw_ret = false;
+    var ret_cls: ?u32 = null;
+    var ret_elem: Ty = .unit;
     for (f.blocks) |*blk| {
         if (blk.terminator != .Return) continue;
         const rr = blk.terminator.Return orelse continue;
         if (rr.int() >= f.n_locals or !known[rr.int()]) return no(f, "return register");
         if (!saw_ret) {
             ret = types[rr.int()];
+            ret_cls = cls[rr.int()];
+            ret_elem = elem[rr.int()];
             saw_ret = true;
         } else if (ret != types[rr.int()]) return no(f, "returns differ");
     }
@@ -1696,7 +1918,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
         slot[r] = @intCast(n_slots);
         n_slots += 1;
     }
-    return .{ .f = f, .caps = caps, .params = params, .types = types, .cls = cls, .elem = elem, .lam = lam, .slot = slot, .n_slots = n_slots, .ret = ret };
+    return .{ .f = f, .caps = caps, .params = params, .types = types, .cls = cls, .elem = elem, .lam = lam, .slot = slot, .n_slots = n_slots, .ret = ret, .ret_cls = ret_cls, .ret_elem = ret_elem, .bare = bare };
 }
 
 /// A C identifier for the function. Derived from the fqn, never from the id:
@@ -2139,6 +2361,70 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
         for (blk.insts) |*inst| {
             switch (inst.*) {
                 .Trace => {},
+                .EnclosingPush, .EnclosingPop => {},
+                .LoadFromThisOrGlobal => |lt| {
+                    var nb8: [32]u8 = undefined;
+                    const dst8 = regName(c, lt.dst.int(), &nb8);
+                    switch (c.bare.get(inst).?) {
+                        .field => |fl| {
+                            var rb8: [32]u8 = undefined;
+                            var gb8: [128]u8 = undefined;
+                            const g8 = try std.fmt.bufPrint(&gb8, "klio_nat_get({s}, {d})", .{ regName(c, fl.recv, &rb8), fl.idx });
+                            var ob8: [200]u8 = undefined;
+                            try w.print("  {s} = {s};\n", .{ dst8, unboxExpr(c.types[lt.dst.int()], g8, &ob8) });
+                        },
+                        .accessor => |ac| {
+                            var rb9: [32]u8 = undefined;
+                            var sym8: std.Io.Writer.Allocating = .init(gpa);
+                            defer sym8.deinit();
+                            try writeSymbol(&sym8.writer, m.funcById(ac.func).?);
+                            try w.print("  {s} = {s}({s});\n", .{ dst8, sym8.written(), regName(c, ac.recv, &rb9) });
+                        },
+                        .global => {
+                            const gi8 = globalIndex(globals, m.consts.items[lt.name.int()].String).?;
+                            var ob9: [96]u8 = undefined;
+                            var src9: [32]u8 = undefined;
+                            const from9 = try std.fmt.bufPrint(&src9, "KG[{d}]", .{gi8});
+                            try w.print("  {s} = {s};\n", .{ dst8, unboxExpr(c.types[lt.dst.int()], from9, &ob9) });
+                        },
+                    }
+                },
+                .StoreToThisOrGlobal => |st| {
+                    switch (c.bare.get(inst).?) {
+                        .field => |fl| {
+                            var rb10: [32]u8 = undefined;
+                            var vb10: [32]u8 = undefined;
+                            var bb10: [96]u8 = undefined;
+                            try w.print("  klio_nat_set({s}, {d}, {s});\n", .{
+                                regName(c, fl.recv, &rb10), fl.idx,
+                                boxExpr(c.types[st.value.int()], regName(c, st.value.int(), &vb10), &bb10),
+                            });
+                        },
+                        .accessor => |ac| {
+                            var rb11: [32]u8 = undefined;
+                            var vb11: [32]u8 = undefined;
+                            var bb11: [96]u8 = undefined;
+                            const sfn = m.funcById(ac.func).?;
+                            var sym9: std.Io.Writer.Allocating = .init(gpa);
+                            defer sym9.deinit();
+                            try writeSymbol(&sym9.writer, sfn);
+                            const want9: Ty = if (sfn.params.len >= 2) (tyOf(sfn.params[1].ty) orelse .object) else .object;
+                            const arg9 = if (want9 == .object and c.types[st.value.int()] != .object)
+                                boxExpr(c.types[st.value.int()], regName(c, st.value.int(), &vb11), &bb11)
+                            else
+                                regName(c, st.value.int(), &vb11);
+                            try w.print("  {s}({s}, {s});\n", .{ sym9.written(), regName(c, ac.recv, &rb11), arg9 });
+                        },
+                        .global => {
+                            const gi9 = globalIndex(globals, m.consts.items[st.name.int()].String).?;
+                            var vb12: [32]u8 = undefined;
+                            var bb12: [96]u8 = undefined;
+                            try w.print("  KG[{d}] = {s};\n", .{
+                                gi9, boxExpr(c.types[st.value.int()], regName(c, st.value.int(), &vb12), &bb12),
+                            });
+                        },
+                    }
+                },
                 .Const => |k| {
                     const kv = m.consts.items[k.value.int()];
                     var nb: [32]u8 = undefined;
@@ -2150,6 +2436,22 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         try w.print("  {s} = klio_nat_string(", .{regName(c, k.dst.int(), &nb)});
                         try emitCLiteral(w, kv.String);
                         try w.print(", {d});\n", .{kv.String.len});
+                        continue;
+                    }
+                    // The lowering declares a result register by writing Unit
+                    // into it before the body that fills it runs, so a register
+                    // that ends up holding a reference can still be assigned a
+                    // scalar constant. The value is the same either way; the
+                    // spelling is the register's.
+                    if (c.types[k.dst.int()] == .object) {
+                        var kb: [48]u8 = undefined;
+                        var kw: std.Io.Writer = .fixed(&kb);
+                        try writeConst(&kw, kv);
+                        var bb13: [96]u8 = undefined;
+                        try w.print("  {s} = {s};\n", .{
+                            regName(c, k.dst.int(), &nb),
+                            boxExpr(constTy(kv) orelse .unit, kw.buffered(), &bb13),
+                        });
                         continue;
                     }
                     try w.print("  {s} = ", .{regName(c, k.dst.int(), &nb)});
@@ -2195,7 +2497,17 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                 .Move => |mv| {
                     var nb: [32]u8 = undefined;
                     var sb: [32]u8 = undefined;
-                    try w.print("  {s} = {s};\n", .{ regName(c, mv.dst.int(), &nb), regName(c, mv.src.int(), &sb) });
+                    const dt2 = c.types[mv.dst.int()];
+                    const st2 = c.types[mv.src.int()];
+                    const src2 = regName(c, mv.src.int(), &sb);
+                    var bb14: [96]u8 = undefined;
+                    const val2 = if (dt2 == .object and st2 != .object)
+                        boxExpr(st2, src2, &bb14)
+                    else if (dt2 != .object and st2 == .object)
+                        unboxExpr(dt2, src2, &bb14)
+                    else
+                        src2;
+                    try w.print("  {s} = {s};\n", .{ regName(c, mv.dst.int(), &nb), val2 });
                 },
                 .NewInstance => |ni| {
                     var nb: [32]u8 = undefined;
@@ -2895,8 +3207,16 @@ pub fn emit(
     w: *std.Io.Writer,
     src_path: []const u8,
 ) Error!bool {
-    // Resolve every class's layout once: the emitter asks about the same
-    // classes repeatedly, and resolving walks the class table each time.
+    var throws = try buildThrowTable(gpa, m);
+    defer throws.deinit(gpa);
+
+    // Resolve every class's layout: the emitter asks about the same classes
+    // repeatedly, and resolving walks the class table each time. A property
+    // the source left unannotated takes the type its initializer computes, and
+    // asking the initializer needs the layouts resolved so far — so the table
+    // is built to a fixed point rather than in one pass. The passes only ever
+    // ADD fields, so it settles in as many rounds as an initializer chain is
+    // deep.
     const table = try gpa.alloc(?[]const FieldInfo, m.classes.items.len);
     defer {
         for (table) |maybe| {
@@ -2906,19 +3226,44 @@ pub fn emit(
     }
     const parent_table = try gpa.alloc(?Parent, m.classes.items.len);
     defer gpa.free(parent_table);
-    for (table, 0..) |*slot_p, i| {
-        if (try classFields(gpa, m, layouts, @enumFromInt(i))) |laid| {
-            slot_p.* = laid.fields;
-            parent_table[i] = laid.parent;
-        } else {
+    @memset(table, null);
+    @memset(parent_table, null);
+    var prog: Program = .{ .fields = table, .parents = parent_table, .layouts = layouts, .throws = throws, .defaults = defaults };
+    const complete_table = try gpa.alloc(bool, m.classes.items.len);
+    defer gpa.free(complete_table);
+    @memset(complete_table, false);
+    {
+        const MAX_PASSES: u32 = 8;
+        var pass: u32 = 0;
+        while (pass < MAX_PASSES) : (pass += 1) {
+            var grew_layout = false;
+            const last = pass + 1 == MAX_PASSES;
+            for (table, 0..) |*slot_p, i| {
+                if (complete_table[i]) continue;
+                const prev: ?*const Program = if (pass == 0) null else &prog;
+                const laid = (try classFields(gpa, m, layouts, @enumFromInt(i), prev, globals, last)) orelse continue;
+                const before: usize = if (slot_p.*) |old_fs| old_fs.len else std.math.maxInt(usize);
+                complete_table[i] = laid.complete;
+                if (before == laid.fields.len and !laid.complete) {
+                    gpa.free(laid.fields);
+                    continue;
+                }
+                if (slot_p.*) |old_fs| gpa.free(old_fs);
+                slot_p.* = laid.fields;
+                parent_table[i] = laid.parent;
+                grew_layout = true;
+            }
+            if (!grew_layout) break;
+        }
+        // A class still missing a property has no usable layout: handing out a
+        // partial one would address the wrong field.
+        for (table, 0..) |*slot_p, i| {
+            if (complete_table[i]) continue;
+            if (slot_p.*) |old_fs| gpa.free(old_fs);
             slot_p.* = null;
             parent_table[i] = null;
         }
     }
-
-    var throws = try buildThrowTable(gpa, m);
-    defer throws.deinit(gpa);
-    const prog: Program = .{ .fields = table, .parents = parent_table, .layouts = layouts, .throws = throws, .defaults = defaults };
     var accepted: std.ArrayList(Compiled) = .empty;
     defer {
         for (accepted.items) |*c| c.deinit(gpa);
@@ -3083,6 +3428,38 @@ pub fn emit(
                             }
                         }
                     }
+                }
+                // A bare name inside an inlined receiver body resolved to a
+                // computed property or to a top-level one; either way what it
+                // resolved to has to be compiled.
+                if (c.bare.get(inst)) |res| {
+                    switch (res) {
+                        .field => {},
+                        .accessor => |ac| {
+                            const afn3 = m.funcById(ac.func) orelse return false;
+                            if (!seen.contains(afn3.id.int())) {
+                                try seen.put(afn3.id.int(), {});
+                                try queue.append(gpa, .{ .f = afn3, .synth = null });
+                            }
+                        },
+                        .global => {
+                            const bname: ?[]const u8 = switch (inst.*) {
+                                .LoadFromThisOrGlobal => |l3| m.consts.items[l3.name.int()].String,
+                                .StoreToThisOrGlobal => |s3| m.consts.items[s3.name.int()].String,
+                                else => null,
+                            };
+                            if (bname) |bn3| {
+                                if (globalIndex(globals, bn3)) |gi3| {
+                                    const gfn3 = m.funcById(globals[gi3].func) orelse return false;
+                                    if (!seen.contains(gfn3.id.int())) {
+                                        try seen.put(gfn3.id.int(), {});
+                                        try queue.append(gpa, .{ .f = gfn3, .synth = null });
+                                    }
+                                }
+                            }
+                        },
+                    }
+                    continue;
                 }
                 // A computed property reads and writes through its accessors,
                 // so those are reachable wherever the property is touched.
@@ -3362,6 +3739,16 @@ pub fn emit(
                 const nm: ?ir.ConstId = switch (inst.*) {
                     .LoadGlobal => |lg| lg.name,
                     .StoreGlobal => |sg| sg.name,
+                    // A bare name that resolved to no implicit receiver is the
+                    // top-level property it falls back to.
+                    .LoadFromThisOrGlobal => |lt2| if (c.bare.get(inst)) |r2|
+                        (if (r2 == .global) lt2.name else null)
+                    else
+                        null,
+                    .StoreToThisOrGlobal => |st2| if (c.bare.get(inst)) |r3|
+                        (if (r3 == .global) st2.name else null)
+                    else
+                        null,
                     else => null,
                 };
                 const cid = nm orelse continue;

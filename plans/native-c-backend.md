@@ -305,6 +305,34 @@ definition before its uses: a `when` writes its result in the arm blocks, which
 sit after the block that returns it, so every `when` whose value was returned
 refused as an undefined register.
 
+Arrays compile. A primitive array is a packed scalar buffer, so an `IntArray`
+holds int32 elements and an indexed read is a load rather than an unbox; the
+element kind comes from the array's own type name. A reference `Array<T>` holds
+boxed values and says what it holds in its type argument. An array is a runtime
+value rather than an instance the emitter lays out, so constructing one drags
+in no class descriptor and no initializer.
+
+Scope functions compile. `with`, `apply`, `let` and `run` splice their bodies
+inline and push their subject onto the interpreter's implicit-receiver chain,
+which exists for resolution at run time. Compiled code has no chain: the
+emitter walks the same receivers once, at emit time, and a bare name inside
+such a body becomes the field, the accessor, or the top-level property it
+actually meant. The chain instructions themselves are then nothing to emit.
+
+A property the source left unannotated takes the type its initializer computes.
+Asking the initializer needs the layouts resolved so far — including the fields
+of its own class ahead of it — so the class table is built to a fixed point
+rather than in one pass, publishing each round's partial layout for the next to
+build on. A class still missing a property at the end has no layout at all: a
+partial one would address the wrong field.
+
+A register lives in one C local, so it holds one machine type. The lowering
+declares a result register by writing Unit into it before the body that fills
+it runs; that is a placeholder rather than a second type, and the constant is
+emitted in whatever spelling the register settled on. Two genuinely different
+types in one register is refused rather than silently resolved to whichever
+write came last, which is what it had been doing.
+
 Two rules earned their keep by being wrong first. A function's result comes
 from the register it returns — except a declaration with no body, an interface
 method, which has no register and must read its annotation. And a value only

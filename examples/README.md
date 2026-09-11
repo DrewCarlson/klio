@@ -314,6 +314,8 @@ Run any program with:
 | `native_member_dispatch.kt` | Member calls compiled to C: a call left by name resolves to the topmost declaration on the receiver's chain, so it and a resolved virtual call share one dispatcher. |
 | `native_math_print.kt`     | Bodyless stdlib functions compiled to C: `max`, `min`, `abs` and `print` are performed directly, with `abs` wrapping at the most negative value as Kotlin does. |
 | `native_arrays.kt`         | Arrays compiled to C: a primitive array is a packed scalar buffer whose element kind the emitter reads off the type name, so an indexed read is a load rather than an unbox. |
+| `native_scope_functions.kt` | `with`/`apply`/`let`/`run` compiled to C: a bare name inside an inlined receiver body resolves at emit time to the field, accessor or top-level property it meant, since compiled code has no implicit-receiver chain. |
+| `native_inferred_properties.kt` | Unannotated properties compiled to C: a property's type is what its initializer computes, so the class table is built to a fixed point. |
 | `native_lambdas.kt`        | Lambdas compiled to C: a lambda whose call site can see which body it holds is called directly with its captures as leading arguments, so no closure object is allocated and no dispatch happens. |
 | `native_interfaces.kt`     | Interfaces and virtual dispatch compiled to C: an interface adds no fields, and which body a call reaches is the receiver's class compared against the handles registered at startup. |
 | `native_char_sized.kt`     | `Char` and the narrow integer kinds compiled to C: integers in the machine but each carrying its kind in the box, since a Char prints as a character and arithmetic on any of them produces an Int. |
