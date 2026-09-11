@@ -412,6 +412,33 @@ set. It found eight, and each was a real hole rather than a missing feature:
   it. That is refused rather than compiled into a missing arm.
 - An `init { … }` block is not carried by the IR, so a class with one was being
   constructed without running it. Refused.
+- A Unit result is still a result. Boxing or unboxing one returned a bare
+  constant and DROPPED the expression that produced it, so a call whose value
+  is Unit — which is most calls — never happened when it went through either.
+- Kotlin renders a value by calling its `toString`, so a compiled program calls
+  it too rather than handing the value to the runtime's renderer, which knows
+  the shape of a class but not what the program wrote for it. The descriptor
+  the emitter registers now records whether a class is data, an enum or an
+  object, so the renderer answers the same way for the shapes with no override.
+- A constructor argument whose class is not the field's is a call to a
+  SECONDARY constructor, which runs a body the emitter does not have. Matching
+  arity alone made it look like the primary and stored the argument as it came.
+  Refused.
+- A property declared without storage where the receiver stands — an
+  interface's `val` — reads through a dispatcher on the receiver's class, and
+  an override that STORES it answers with the field.
+- A property with a declared getter is READ through it even when it also has a
+  backing field; only a `field` access inside the accessor reaches the storage.
+  Reading the field directly skipped every custom accessor in the program.
+- A condition is a Boolean in Kotlin even when it arrives boxed, so it unboxes
+  at the branch rather than being tested as a reference.
+
+ONE place decides how a property is accessed — field, accessor, or dispatcher —
+because the typing pass, the emission, the reachable set and the dispatcher
+list all have to give the same answer, and they had drifted: the emitter called
+a dispatcher the collector had decided not to emit.
+
+The sweep now reports every accepted program matching the interpreter.
 
 ## Still refused
 

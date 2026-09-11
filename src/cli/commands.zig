@@ -518,6 +518,7 @@ pub fn runTranspileNative(
             // An enum's entries in declaration order, each with the thunks
             // the declaration writes for its constructor arguments.
             const has_init = cg.get().init_blocks.len != 0;
+            const is_data_cls = cg.get().is_data or cg.get().is_value;
             const ents = cg.get().enum_entries;
             const entries = gpa.alloc(cgen.EnumEntryInfo, ents.len) catch {
                 cg.deinit();
@@ -543,6 +544,7 @@ pub fn runTranspileNative(
                 .parent_args = pargs,
                 .entries = entries,
                 .has_init_block = has_init,
+                .is_data = is_data_cls,
             }) catch return 1;
         }
     }
