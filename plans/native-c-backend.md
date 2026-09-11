@@ -184,5 +184,16 @@ stream: `printf` is stdio-buffered while the runtime writes the descriptor, so
 mixing them printed correct lines in the wrong order. The scalar core still
 uses `printf` because it links nothing at all.
 
-Next: collections, then control flow that escapes (exceptions), closures, and
-coroutines.
+Lists run. `listOf`/`mutableListOf`, `size`, indexing, `set` and `add` are
+performed directly against the runtime's own list, reached through whichever
+spelling the lowering picked — a member call or a virtual one. A compiled list
+IS a runtime list, so it traces and prints like any other.
+
+Element types are carried where they can be known: written down in
+`List<Int>`, or inferred from a literal whose elements are one scalar kind.
+That is what lets `s + xs[i]` compile to an addition rather than a dynamic
+unbox, and a list whose element type is unknown yields an untyped reference
+that arithmetic refuses rather than guesses at.
+
+Next: nullability, then control flow that escapes (exceptions), closures,
+interfaces, and coroutines.
