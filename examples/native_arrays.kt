@@ -22,6 +22,16 @@ fun scale(a: DoubleArray, k: Double) {
 }
 
 fun main() {
+    // An array built from an initializer runs the body once per index, which
+    // is a loop here rather than the per-element dispatch the interpreter runs.
+    val squares = IntArray(5) { i -> i * i }
+    println(squares[3])
+    println(sum(squares))
+    val names0 = Array(3) { i -> "n" + i }
+    println(names0[2])
+    println(emptyArray<String>().size)
+    println(arrayOfNulls<String>(2).size)
+
     val a = IntArray(4)
     a[0] = 10
     a[1] = 20

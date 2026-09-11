@@ -476,8 +476,9 @@ fn arrayElemOf(t: ir.TypeRef) Ty {
 fn arrayOfIntrinsic(f: *const Func) ??u32 {
     if (!std.mem.startsWith(u8, f.fqn, "kotlin.")) return null;
     if (!std.mem.endsWith(u8, f.name, "ArrayOf")) {
-        if (!std.mem.eql(u8, f.name, "arrayOf")) return null;
-        // A reference array, whose elements stay boxed.
+        // `arrayOf` and `emptyArray` both build a reference array, whose
+        // elements stay boxed; `emptyArray` just takes none.
+        if (!std.mem.eql(u8, f.name, "arrayOf") and !std.mem.eql(u8, f.name, "emptyArray")) return null;
         return @as(?u32, null);
     }
     var buf: [32]u8 = undefined;
@@ -963,6 +964,13 @@ fn listIntrinsic(f: *const Func) ?ListIntrinsic {
     return null;
 }
 
+/// `arrayOfNulls<T>(n)`: a reference array of `n` nulls. Sized rather than
+/// built from elements, so it is not the `arrayOf` shape.
+fn isArrayOfNulls(f: *const Func) bool {
+    return f.params.len == 1 and std.mem.startsWith(u8, f.fqn, "kotlin.") and
+        std.mem.eql(u8, f.name, "arrayOfNulls");
+}
+
 /// A stdlib function with no Kotlin body, because the implementation is the
 /// platform's. The backend performs it directly rather than compiling a
 /// declaration that has nothing to compile.
@@ -1162,6 +1170,44 @@ fn expectedFnType(m: *const Module, f: *const Func, dst: ir.Reg) ?ir.TypeRef {
     return null;
 }
 
+/// Whether a lambda is an array constructor's initializer: `IntArray(n) { i ->
+/// … }` runs the body once per index, so its one parameter is that index.
+fn isArrayInitLambda(m: *const Module, f: *const Func, dst: ir.Reg) bool {
+    var want = dst;
+    var hops: u32 = 0;
+    while (hops < 8) : (hops += 1) {
+        var moved: ?ir.Reg = null;
+        for (f.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                switch (inst.*) {
+                    .Move => |mv| if (mv.src.int() == want.int()) {
+                        moved = mv.dst;
+                    },
+                    .NewInstance => |ni| {
+                        if (ni.n_args != 2) continue;
+                        if (ni.args.int() + 1 != want.int()) continue;
+                        if (ni.class.int() >= m.classes.items.len) continue;
+                        if (isArrayTypeName(m.classes.items[ni.class.int()].name)) return true;
+                    },
+                    else => {},
+                }
+            }
+        }
+        want = moved orelse break;
+    }
+    return false;
+}
+
+/// The parameter list of an array initializer: its one parameter is the index.
+fn arrayInitParams(gpa: std.mem.Allocator, body: *const Func) Error![]ir.Param {
+    const out = try gpa.alloc(ir.Param, body.params.len);
+    for (out, 0..) |*p, i| {
+        p.* = body.params[i];
+        if (i == 0) p.ty = .{ .name = "Int", .nullable = false, .args = &.{} };
+    }
+    return out;
+}
+
 /// The parameter list a lambda body compiles against, taken from the function
 /// type its value is expected to have. The type's arguments end with the
 /// result, and a receiver or a `#suspend` marker rides ahead of the parameters,
@@ -1182,11 +1228,19 @@ fn lambdaParams(gpa: std.mem.Allocator, body: *const Func, t: ir.TypeRef) Error!
 /// direct call. Such a use needs the value to exist, which means a closure
 /// object; while every use is a direct call the call site passes the captures
 /// itself and nothing is allocated.
-fn lambdaEscapes(f: *const Func, dst: ir.Reg) bool {
+fn lambdaEscapes(m: *const Module, f: *const Func, dst: ir.Reg) bool {
     for (f.blocks) |*blk| {
         for (blk.insts) |*inst| {
             if (inst.* == .CallValue and inst.CallValue.callee.int() == dst.int()) continue;
             if (inst.* == .AstLambda and inst.AstLambda.dst.int() == dst.int()) continue;
+            // An array constructor's initializer is called once per index, not
+            // kept: the emitted loop calls the body directly.
+            if (inst.* == .NewInstance) {
+                const ni2 = inst.NewInstance;
+                if (ni2.n_args == 2 and ni2.args.int() + 1 == dst.int() and
+                    ni2.class.int() < m.classes.items.len and
+                    isArrayTypeName(m.classes.items[ni2.class.int()].name)) continue;
+            }
             if (instReadsReg(inst, dst)) return true;
         }
         switch (blk.terminator) {
@@ -1935,12 +1989,19 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         isArrayTypeName(m.classes.items[ni.class.int()].name))
                     {
                         // `IntArray(n)` is a sized array, not an instance with
-                        // fields. The form taking an initializer lambda runs a
-                        // body per element and is a different shape.
-                        if (ni.n_args != 1) return no(f, "array ctor arity");
+                        // fields. `IntArray(n) { i -> … }` runs a body per
+                        // element, which is a loop rather than an allocation.
+                        if (ni.n_args != 1 and ni.n_args != 2) return no(f, "array ctor arity");
                         const nr = ni.args.int();
                         if (nr >= f.n_locals or !known[nr]) return no(f, "array size");
                         if (types[nr] != .i32) return no(f, "array size type");
+                        if (ni.n_args == 2) {
+                            const lr = ni.args.int() + 1;
+                            if (lr >= f.n_locals or !known[lr]) return no(f, "array initializer");
+                            if (lam[lr] == null and funcClsArity(cls[lr] orelse 0) != @as(u32, 1)) {
+                                return no(f, "array initializer shape");
+                            }
+                        }
                         if (ni.dst.int() >= f.n_locals) return no(f, "array dst");
                         types[ni.dst.int()] = .object;
                         cls[ni.dst.int()] = ARRAY_CLS;
@@ -2130,7 +2191,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     }
                     lam[al.dst.int()] = .{ .body = body, .captures = al.captures };
                     known[al.dst.int()] = true;
-                    if (!lambdaEscapes(f, al.dst)) {
+                    if (!lambdaEscapes(m, f, al.dst)) {
                         // Never materialised: every use is a direct call, so
                         // the call site passes the captures itself.
                         types[al.dst.int()] = .unit;
@@ -2147,7 +2208,12 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     defer gpa.free(ct5);
                     for (al.captures, 0..) |cr5, ci6| ct5[ci6] = .{ .ty = types[cr5.int()], .cls = cls[cr5.int()], .elem = elem[cr5.int()] };
                     const fnty = expectedFnType(m, f, al.dst);
-                    const lsynth = if (fnty) |t5| try lambdaParams(gpa, bfn, t5) else null;
+                    const lsynth = if (fnty) |t5|
+                        try lambdaParams(gpa, bfn, t5)
+                    else if (isArrayInitLambda(m, f, al.dst))
+                        try arrayInitParams(gpa, bfn)
+                    else
+                        null;
                     defer if (lsynth) |ls5| gpa.free(ls5);
                     var lc = (try eligible(gpa, m, prog, bfn, globals, lsynth, ct5)) orelse return no(f, "lambda body");
                     const lret = lc.ret;
@@ -2228,6 +2294,16 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     // call the lowering already resolved.
                     if (c.dst.int() >= f.n_locals) return null;
                     const callee = m.funcById(c.func) orelse return no(f, "call target missing");
+                    if (isArrayOfNulls(callee)) {
+                        const nr3 = c.args.int();
+                        if (c.n_args != 1 or nr3 >= f.n_locals or !known[nr3]) return no(f, "array size");
+                        if (types[nr3] != .i32) return no(f, "array size type");
+                        if (c.dst.int() >= f.n_locals) return no(f, "array dst");
+                        types[c.dst.int()] = .object;
+                        cls[c.dst.int()] = ARRAY_CLS;
+                        known[c.dst.int()] = true;
+                        continue;
+                    }
                     if (arrayOfIntrinsic(callee)) |maybe_kind| {
                         const aa2 = c.args.int();
                         var ka2: u32 = 0;
@@ -2993,6 +3069,49 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         } else {
                             try w.print("  {s} = klio_nat_ref_array_sized({s});\n", .{ dst, nsz });
                         }
+                        if (ni.n_args == 2) {
+                            // Each element is what the initializer returns for
+                            // its index, which is a loop here rather than the
+                            // per-element dispatch the interpreter runs.
+                            const lr2 = ni.args.int() + 1;
+                            var elem_call: std.Io.Writer.Allocating = .init(gpa);
+                            defer elem_call.deinit();
+                            var ety: Ty = .object;
+                            if (c.lam[lr2]) |li2| {
+                                const bf2 = m.funcById(li2.body).?;
+                                ety = acceptedRet(accepted, bf2) orelse .object;
+                                try writeSymbol(&elem_call.writer, bf2);
+                                try elem_call.writer.writeByte('(');
+                                for (li2.captures, 0..) |cr13, ci13| {
+                                    if (ci13 != 0) try elem_call.writer.writeAll(", ");
+                                    var cb13: [32]u8 = undefined;
+                                    try elem_call.writer.print("{s}", .{regName(c, cr13.int(), &cb13)});
+                                }
+                                var pj: u32 = 0;
+                                while (pj < bf2.params.len) : (pj += 1) {
+                                    if (pj != 0 or li2.captures.len != 0) try elem_call.writer.writeAll(", ");
+                                    if (pj == 0) {
+                                        try elem_call.writer.print("ki{d}", .{ni.dst.int()});
+                                    } else {
+                                        try elem_call.writer.writeAll("0");
+                                    }
+                                }
+                                try elem_call.writer.writeByte(')');
+                            } else {
+                                var fb16: [32]u8 = undefined;
+                                ety = c.elem[lr2];
+                                try elem_call.writer.print("klam_call_1({s}, klio_nat_box_int(ki{d}))", .{
+                                    regName(c, lr2, &fb16), ni.dst.int(),
+                                });
+                                // The dispatcher already answers a boxed value.
+                                ety = .object;
+                            }
+                            var bb20: [420]u8 = undefined;
+                            try w.print(
+                                "  for (int32_t ki{d} = 0; ki{d} < {s}; ki{d}++) klio_nat_array_set({s}, ki{d}, {s});\n",
+                                .{ ni.dst.int(), ni.dst.int(), nsz, ni.dst.int(), dst, ni.dst.int(), boxExpr(ety, elem_call.written(), &bb20) },
+                            );
+                        }
                         continue;
                     }
                     try w.print("  {s} = klio_nat_alloc_instance(KCLS_{d});\n", .{ dst, ni.class.int() });
@@ -3496,6 +3615,14 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         }
                         continue;
                     }
+                    if (isArrayOfNulls(callee)) {
+                        var db4: [32]u8 = undefined;
+                        var nb16: [32]u8 = undefined;
+                        try w.print("  {s} = klio_nat_ref_array_sized({s});\n", .{
+                            regName(c, call.dst.int(), &db4), regName(c, call.args.int(), &nb16),
+                        });
+                        continue;
+                    }
                     if (arrayOfIntrinsic(callee)) |maybe_kind| {
                         var db3: [32]u8 = undefined;
                         const adst = regName(c, call.dst.int(), &db3);
@@ -3931,8 +4058,10 @@ pub fn emit(
                         var lsyn: ?[]ir.Param = null;
                         if (expectedFnType(m, c.f, al2.dst)) |t6| {
                             lsyn = try lambdaParams(gpa, bfn, t6);
-                            if (lsyn) |ls6| try synth_owned.append(gpa, ls6);
+                        } else if (isArrayInitLambda(m, c.f, al2.dst)) {
+                            lsyn = try arrayInitParams(gpa, bfn);
                         }
+                        if (lsyn) |ls6| try synth_owned.append(gpa, ls6);
                         try seen.put(bfn.id.int(), {});
                         try queue.append(gpa, .{ .f = bfn, .synth = lsyn, .caps = ct });
                     }
@@ -4109,7 +4238,8 @@ pub fn emit(
                 }
                 if (inst.* != .Call) continue;
                 const callee = m.funcById(inst.Call.func) orelse return false;
-                if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or arrayOfIntrinsic(callee) != null) continue;
+                if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or
+                    arrayOfIntrinsic(callee) != null or isArrayOfNulls(callee)) continue;
                 // A call that leaves a parameter unbound runs the thunk for it.
                 const bnd3 = bindCallArgs(m, callee.params, inst.Call.args.int(), inst.Call.n_args, inst.Call.arg_names) orelse
                     return false;
