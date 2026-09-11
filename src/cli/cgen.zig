@@ -204,6 +204,10 @@ fn cOp(op: ir.BinOp) ?[]const u8 {
 /// register its body defines.
 pub const Compiled = struct {
     f: *const Func,
+    /// The values a lambda body receives ahead of its own parameters: what it
+    /// captured, passed as arguments because the call site knows them. Empty
+    /// for an ordinary function.
+    caps: []const CapInfo,
     /// The parameters this body is compiled against. Usually the function's
     /// own, but a synthesized thunk declares none and reads its caller's
     /// positionally, so it is compiled against the signature it is handed.
@@ -212,6 +216,11 @@ pub const Compiled = struct {
     /// The class an object register holds, where the emitter knows it. Needed
     /// to turn a field NAME into the index the compiled code addresses.
     cls: []?u32,
+    /// For a register holding a lambda, the body it will run and the registers
+    /// it captured. A lambda whose call site can see which body it holds is
+    /// called directly, with its captures passed as leading arguments — no
+    /// closure object, no dispatch.
+    lam: []?LambdaInfo,
     /// For a `List` register, the machine type of its elements where the
     /// emitter knows it — a list built from a literal of one scalar kind. Unit
     /// means unknown, and reading such a list yields an untyped reference.
@@ -225,6 +234,7 @@ pub const Compiled = struct {
         gpa.free(self.types);
         gpa.free(self.cls);
         gpa.free(self.elem);
+        gpa.free(self.lam);
         gpa.free(self.slot);
     }
 };
@@ -549,7 +559,7 @@ fn receiverClass(m: *const Module, f: *const Func) ?u32 {
 /// is the answer.
 fn globalTy(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, globals: []const Global, idx: usize) Error!?Ty {
     const gf = m.funcById(globals[idx].func) orelse return null;
-    var c = (try eligible(gpa, m, ls, gf, globals, null)) orelse return null;
+    var c = (try eligible(gpa, m, ls, gf, globals, null, &.{})) orelse return null;
     defer c.deinit(gpa);
     return c.ret;
 }
@@ -587,7 +597,7 @@ fn globalIndex(globals: []const Global, name: []const u8) ?usize {
     return null;
 }
 
-pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const Func, globals: []const Global, synth: ?[]const ir.Param) Error!?Compiled {
+pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const Func, globals: []const Global, synth: ?[]const ir.Param, caps: []const CapInfo) Error!?Compiled {
     // A synthesized thunk declares no parameters and reads its caller's
     // positionally, so it is compiled against the signature it will be handed.
     const params: []const ir.Param = synth orelse f.params;
@@ -617,6 +627,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
     const elem = try gpa.alloc(Ty, f.n_locals);
     errdefer gpa.free(elem);
     @memset(elem, .unit);
+    const lam = try gpa.alloc(?LambdaInfo, f.n_locals);
+    errdefer gpa.free(lam);
+    @memset(lam, null);
     const slot = try gpa.alloc(i32, f.n_locals);
     errdefer gpa.free(slot);
     @memset(slot, -1);
@@ -642,6 +655,12 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     if (t == .object and m.consts.items[c.value.int()] == .String) cls[c.dst.int()] = STRING_CLS;
                     known[c.dst.int()] = true;
                 },
+                .LoadCapture => |lc| {
+                    if (lc.dst.int() >= f.n_locals or lc.idx >= caps.len) return no(f, "load capture");
+                    types[lc.dst.int()] = caps[lc.idx].ty;
+                    cls[lc.dst.int()] = caps[lc.idx].cls;
+                    known[lc.dst.int()] = true;
+                },
                 .LoadParam => |lp| {
                     if (lp.dst.int() >= f.n_locals or lp.idx >= params.len) return no(f, "load param");
                     const pt = params[lp.idx].ty;
@@ -666,6 +685,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     types[mv.dst.int()] = types[mv.src.int()];
                     cls[mv.dst.int()] = cls[mv.src.int()];
                     elem[mv.dst.int()] = elem[mv.src.int()];
+                    lam[mv.dst.int()] = lam[mv.src.int()];
                     known[mv.dst.int()] = true;
                 },
                 .BinOp => |b| {
@@ -921,6 +941,44 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                         return no(f, "global value type");
                     }
                 },
+                .AstLambda => |al| {
+                    const body = al.body_func orelse return no(f, "lambda without a lowered body");
+                    if (al.dst.int() >= f.n_locals) return no(f, "lambda dst");
+                    for (al.captures) |cr| {
+                        if (cr.int() >= f.n_locals or !known[cr.int()]) return no(f, "lambda capture");
+                    }
+                    // The value itself is never materialised while every use is
+                    // a direct call; a lambda that escapes into a value is
+                    // refused rather than silently losing its captures.
+                    types[al.dst.int()] = .unit;
+                    lam[al.dst.int()] = .{ .body = body, .captures = al.captures };
+                    known[al.dst.int()] = true;
+                },
+                .CallValue => |cv2| {
+                    if (cv2.arg_names.len != 0 or cv2.type_args.len != 0) return no(f, "value call names/type args");
+                    if (cv2.callee.int() >= f.n_locals) return no(f, "value callee");
+                    const li = lam[cv2.callee.int()] orelse return no(f, "value call to an unknown callee");
+                    const bf = m.funcById(li.body) orelse return no(f, "lambda body missing");
+                    if (bf.params.len != cv2.n_args) return no(f, "lambda arity");
+                    var kk3: u32 = 0;
+                    while (kk3 < cv2.n_args) : (kk3 += 1) {
+                        const ar3 = cv2.args.int() + kk3;
+                        if (ar3 >= f.n_locals or !known[ar3]) return no(f, "lambda arg");
+                    }
+                    if (cv2.dst.int() >= f.n_locals) return no(f, "lambda dst");
+                    // A lambda declares no return type, so the answer is what
+                    // its body compiles to — with the captures it was made
+                    // with, since those are part of its signature here.
+                    const ct2 = try gpa.alloc(CapInfo, li.captures.len);
+                    defer gpa.free(ct2);
+                    for (li.captures, 0..) |cr2, ci5| ct2[ci5] = .{ .ty = types[cr2.int()], .cls = cls[cr2.int()] };
+                    var bc = (try eligible(gpa, m, ls, bf, globals, null, ct2)) orelse return no(f, "lambda body");
+                    const rt7 = bc.ret;
+                    bc.deinit(gpa);
+                    types[cv2.dst.int()] = rt7;
+                    if (rt7 == .object) cls[cv2.dst.int()] = classIndexOfName(m, bf.return_ty);
+                    known[cv2.dst.int()] = true;
+                },
                 .Call => |c| {
                     if (c.arg_names.len != 0 or c.type_args.len != 0) return no(f, "call arg names/type args");
                     if (c.dst.int() >= f.n_locals) return null;
@@ -999,7 +1057,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
         slot[r] = @intCast(n_slots);
         n_slots += 1;
     }
-    return .{ .f = f, .params = params, .types = types, .cls = cls, .elem = elem, .slot = slot, .n_slots = n_slots, .ret = ret };
+    return .{ .f = f, .caps = caps, .params = params, .types = types, .cls = cls, .elem = elem, .lam = lam, .slot = slot, .n_slots = n_slots, .ret = ret };
 }
 
 /// A C identifier for the function. Derived from the fqn, never from the id:
@@ -1014,6 +1072,9 @@ fn writeSymbol(w: *std.Io.Writer, f: *const Func) !void {
             try w.print("_{x:0>2}", .{ch});
         }
     }
+    // The fqn alone is not unique: every lambda is named `<lambda>`. The id
+    // distinguishes them, and only has to hold within this one file.
+    try w.print("_{d}", .{f.id.int()});
 }
 
 /// A scalar as a `klio_value`, for the moment it crosses into the object world.
@@ -1063,11 +1124,15 @@ fn writeProto(w: *std.Io.Writer, c: *const Compiled) !void {
     try w.print("static {s} ", .{c.ret.cName()});
     try writeSymbol(w, c.f);
     try w.writeByte('(');
-    if (c.params.len == 0) {
+    if (c.params.len == 0 and c.caps.len == 0) {
         try w.writeAll("void");
     } else {
-        for (c.params, 0..) |p, i| {
+        for (c.caps, 0..) |ct, i| {
             if (i != 0) try w.writeAll(", ");
+            try w.print("{s} k{d}", .{ ct.ty.cName(), i });
+        }
+        for (c.params, 0..) |p, i| {
+            if (i != 0 or c.caps.len != 0) try w.writeAll(", ");
             const pt: Ty = tyOf(p.ty) orelse .object;
             try w.print("{s} p{d}", .{ pt.cName(), i });
         }
@@ -1229,6 +1294,10 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                 .LoadParam => |lp| {
                     var nb: [32]u8 = undefined;
                     try w.print("  {s} = p{d};\n", .{ regName(c, lp.dst.int(), &nb), lp.idx });
+                },
+                .LoadCapture => |lc| {
+                    var nb: [32]u8 = undefined;
+                    try w.print("  {s} = k{d};\n", .{ regName(c, lc.dst.int(), &nb), lc.idx });
                 },
                 .Move => |mv| {
                     var nb: [32]u8 = undefined;
@@ -1551,6 +1620,30 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                         gi, boxExpr(c.types[sg.value.int()], regName(c, sg.value.int(), &vb), &bb),
                     });
                 },
+                .AstLambda => {
+                    // Nothing to materialise: the call site knows the body and
+                    // passes the captures itself.
+                },
+                .CallValue => |cv2| {
+                    const li = c.lam[cv2.callee.int()].?;
+                    const bf = m.funcById(li.body).?;
+                    var nb3: [32]u8 = undefined;
+                    try w.print("  {s} = ", .{regName(c, cv2.dst.int(), &nb3)});
+                    try writeSymbol(w, bf);
+                    try w.writeByte('(');
+                    for (li.captures, 0..) |cr, ci3| {
+                        if (ci3 != 0) try w.writeAll(", ");
+                        var cb3: [32]u8 = undefined;
+                        try w.print("{s}", .{regName(c, cr.int(), &cb3)});
+                    }
+                    var aj3: u32 = 0;
+                    while (aj3 < cv2.n_args) : (aj3 += 1) {
+                        if (li.captures.len != 0 or aj3 != 0) try w.writeAll(", ");
+                        var ab5: [32]u8 = undefined;
+                        try w.print("{s}", .{regName(c, cv2.args.int() + aj3, &ab5)});
+                    }
+                    try w.writeAll(");\n");
+                },
                 .Call => |call| {
                     const callee = m.funcById(call.func).?;
                     if (listIntrinsic(callee)) |kind| {
@@ -1674,6 +1767,17 @@ pub const ClassLayout = struct {
     parent_args: []const ir.FuncId = &.{},
 };
 
+/// A lambda a register holds: the body to run and the registers captured at
+/// the point it was made.
+/// A captured value's machine type and, when it is a reference, which class it
+/// holds — a captured String is only usable as one if that travels with it.
+pub const CapInfo = struct { ty: Ty, cls: ?u32 = null };
+
+pub const LambdaInfo = struct {
+    body: ir.FuncId,
+    captures: []const Reg,
+};
+
 pub const Global = struct {
     name: []const u8,
     func: ir.FuncId,
@@ -1717,7 +1821,13 @@ pub fn emit(
     }
     var seen = std.AutoHashMap(u32, void).init(gpa);
     defer seen.deinit();
-    const Pending = struct { f: *const Func, synth: ?[]const ir.Param };
+    const Pending = struct { f: *const Func, synth: ?[]const ir.Param, caps: []const CapInfo = &.{} };
+    // Capture signatures outlive the queue entry that carried them.
+    var cap_owned: std.ArrayList([]CapInfo) = .empty;
+    defer {
+        for (cap_owned.items) |ct| gpa.free(ct);
+        cap_owned.deinit(gpa);
+    }
     var queue: std.ArrayList(Pending) = .empty;
     defer queue.deinit(gpa);
 
@@ -1731,7 +1841,7 @@ pub fn emit(
     // cannot call is not a slow path, it is a missing one.
     while (queue.pop()) |pending| {
         const f = pending.f;
-        const c = (try eligible(gpa, m, ls, f, globals, pending.synth)) orelse return false;
+        const c = (try eligible(gpa, m, ls, f, globals, pending.synth, pending.caps)) orelse return false;
         try accepted.append(gpa, c);
         for (f.blocks) |*blk| {
             for (blk.insts) |*inst| {
@@ -1778,6 +1888,21 @@ pub fn emit(
                 }
                 // Constructing a class runs the thunks that initialize its body
                 // properties, so those are reachable too.
+                if (inst.* == .AstLambda) {
+                    const al2 = inst.AstLambda;
+                    const bfid = al2.body_func orelse return false;
+                    const bfn = m.funcById(bfid) orelse return false;
+                    if (!seen.contains(bfn.id.int())) {
+                        // The body is compiled against what this site captured:
+                        // those values arrive as leading arguments.
+                        const ct = try gpa.alloc(CapInfo, al2.captures.len);
+                        for (al2.captures, 0..) |cr, ci4| ct[ci4] = .{ .ty = c.types[cr.int()], .cls = c.cls[cr.int()] };
+                        try cap_owned.append(gpa, ct);
+                        try seen.put(bfn.id.int(), {});
+                        try queue.append(gpa, .{ .f = bfn, .synth = null, .caps = ct });
+                    }
+                    continue;
+                }
                 if (inst.* == .CallVirtual) {
                     const cv2 = inst.CallVirtual;
                     if (numConvVirtual(m, cv2) == null) {
