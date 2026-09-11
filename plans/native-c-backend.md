@@ -278,6 +278,33 @@ entry. Leaving a region without reaching the block that disarms it left it
 armed after the frame was gone, and the next region armed anywhere chained onto
 a `klio_try` that no longer existed.
 
+Enums compile. Each entry is one instance built before the program runs and
+rooted for its life, exactly as an `object` declaration is; every entry carries
+its own `name` and `ordinal`, which is what a comparison, a print and a `when`
+over the entries read, and the enum's constructor runs with the arguments the
+entry's declaration writes. The enum's own name is a QUALIFIER rather than
+storage: `Color.RED` is a register that names a class, typed Unit with the
+class recorded, resolved at emit time and occupying nothing at run time. That
+shape was behind most of what the backend had been calling an undeclared
+global.
+
+Default arguments compile. A default belongs to the call, not to the body: the
+callee takes every parameter like any other, and a call that omits one runs the
+thunk its declaration lowered, handed the arguments ahead of it. Each lands in
+a C local first, because a later default may read an earlier one — and the
+local's type comes from what the thunk's COMPILED body returns, not from its
+declared return type, which for a synthesized thunk is a placeholder.
+
+A member call the lowering left by name resolves here. The declaration it binds
+to is the topmost one on the receiver's chain at that name and arity, which is
+the same slot a resolved `CallVirtual` would name, so both go through one
+dispatcher and an override answers either spelling.
+
+The typing pass walks blocks in reverse postorder. Source order does not put a
+definition before its uses: a `when` writes its result in the arm blocks, which
+sit after the block that returns it, so every `when` whose value was returned
+refused as an undefined register.
+
 Two rules earned their keep by being wrong first. A function's result comes
 from the register it returns — except a declaration with no body, an interface
 method, which has no register and must read its annotation. And a value only

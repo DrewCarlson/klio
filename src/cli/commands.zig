@@ -539,7 +539,17 @@ pub fn runTranspileNative(
             layouts.append(gpa, .{ .name = e.key_ptr.*, .props = props, .parent_args = pargs, .entries = entries }) catch return 1;
         }
     }
-    const ok = cgen.emit(gpa, m, ef, globals.items, layouts.items, &aw.writer, path) catch |e| {
+    // Default-argument thunks, keyed by the function whose call sites need
+    // them: a call that omits a parameter fills it by running its thunk.
+    var defaults: std.ArrayList(cgen.FuncDefaults) = .empty;
+    defer defaults.deinit(gpa);
+    {
+        var it = built.func_defaults.iterator();
+        while (it.next()) |e| {
+            defaults.append(gpa, .{ .func = ir.FuncId.from(e.key_ptr.*), .slots = e.value_ptr.* }) catch return 1;
+        }
+    }
+    const ok = cgen.emit(gpa, m, ef, globals.items, layouts.items, defaults.items, &aw.writer, path) catch |e| {
         io.printStderr(gpa, "error: native emission failed: {s}\n", .{@errorName(e)});
         return 1;
     };

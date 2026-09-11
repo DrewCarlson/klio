@@ -395,6 +395,8 @@ pub const Program = struct {
     /// The program's throwable hierarchy, numbered so a catch is an interval
     /// test rather than a name match.
     throws: ThrowTable = .{ .types = &.{} },
+    /// Default-argument thunks per function.
+    defaults: []const FuncDefaults = &.{},
 
     fn of(self: Program, cid: u32) ?[]const FieldInfo {
         if (cid >= self.fields.len) return null;
@@ -404,6 +406,17 @@ pub const Program = struct {
     fn parentOf(self: Program, cid: u32) ?Parent {
         if (cid >= self.parents.len) return null;
         return self.parents[cid];
+    }
+
+    /// The thunk that fills parameter `idx` of this function when a call omits
+    /// it, or null when the parameter has no default.
+    fn defaultThunk(self: Program, func: ir.FuncId, idx: usize) ?ir.FuncId {
+        for (self.defaults) |d| {
+            if (d.func != func) continue;
+            if (idx >= d.slots.len) return null;
+            return d.slots[idx];
+        }
+        return null;
     }
 
     /// The accessor a class declares for a property that has no storage of its
@@ -692,6 +705,40 @@ fn slotImpl(m: *const Module, cid: u32, slot: ir.MethodSlotId) ?*const Func {
     return null;
 }
 
+/// The declaration a member call binds to: the TOPMOST class on the receiver's
+/// chain that declares this name at this arity. Every class that overrides it
+/// answers the same dispatcher, so a call resolved here dispatches exactly as
+/// a `CallVirtual` on that slot does.
+fn memberRoot(m: *const Module, prog: Program, cid: u32, name: []const u8, n_args: u32) ?*const Func {
+    var found: ?*const Func = null;
+    var cur: ?u32 = cid;
+    var depth: u32 = 0;
+    while (cur) |ci| : (depth += 1) {
+        if (depth > 32 or ci >= m.classes.items.len) break;
+        for (m.classes.items[ci].methods) |fid| {
+            const mf = m.funcById(fid) orelse continue;
+            if (!std.mem.eql(u8, mf.name, name)) continue;
+            if (!mf.has_receiver_param or mf.params.len != n_args + 1) continue;
+            found = mf;
+        }
+        // An interface a class implements declares the member too, and that
+        // declaration is the root when it exists.
+        for (m.classes.items[ci].supertypes) |sid| {
+            if (sid.int() >= m.classes.items.len) continue;
+            const sup = &m.classes.items[sid.int()];
+            if (!sup.is_interface) continue;
+            for (sup.methods) |fid2| {
+                const mf2 = m.funcById(fid2) orelse continue;
+                if (!std.mem.eql(u8, mf2.name, name)) continue;
+                if (!mf2.has_receiver_param or mf2.params.len != n_args + 1) continue;
+                found = mf2;
+            }
+        }
+        cur = if (prog.parentOf(ci)) |pp| pp.cid else null;
+    }
+    return found;
+}
+
 /// One virtual call site's shape: the slot and how many arguments it takes.
 const SlotUse = struct { slot: u32, n_args: u32 };
 
@@ -876,8 +923,10 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     // type settles the Unit case, where there is no register to ask.
     var ret = funcRetTy2(m, f) orelse Ty.unit;
     for (params) |p| {
-        if (p.default != null or p.is_vararg) return no(f, "param default/vararg");
-        if (tyOf(p.ty) == null and classIndexOfName(m, p.ty) == null) return no(f, "param type");
+        // A default is the CALLER's business: the callee takes the parameter
+        // like any other, and a call that omits it runs the thunk.
+        if (p.is_vararg) return no(f, "param vararg");
+        if (tyOf(p.ty) == null and classIndexOfName(m, p.ty) == null) return noName(f, "param type", p.ty.name);
     }
 
     const types = try gpa.alloc(Ty, f.n_locals);
@@ -1088,6 +1137,34 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             continue;
                         }
                         return no(f, "list member");
+                    }
+                    // A member call on a user class the lowering left by
+                    // name. The declaration it binds to is decided here, and
+                    // dispatch then runs exactly as it does for a slot the
+                    // lowering resolved.
+                    if (numConv(m, cm) == null and cm.arg_names.len == 0 and
+                        cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
+                        types[cm.receiver.int()] == .object)
+                    {
+                        if (cls[cm.receiver.int()]) |rc5| {
+                            if (!isBuiltinCls(rc5) and cm.name.int() < m.consts.items.len) {
+                                const mnm = m.consts.items[cm.name.int()];
+                                if (mnm != .String) return no(f, "member name kind");
+                                const root5 = memberRoot(m, prog, rc5, plainFieldName(mnm.String), cm.n_args) orelse
+                                    return noName(f, "member", mnm.String);
+                                const mrt = funcRetTy2(m, root5) orelse return no(f, "member return type");
+                                var kk5: u32 = 0;
+                                while (kk5 < cm.n_args) : (kk5 += 1) {
+                                    const ar5 = cm.args.int() + kk5;
+                                    if (ar5 >= f.n_locals or !known[ar5]) return no(f, "member arg");
+                                }
+                                if (cm.dst.int() >= f.n_locals) return no(f, "member dst");
+                                types[cm.dst.int()] = mrt;
+                                if (mrt == .object) cls[cm.dst.int()] = classIndexOfName(m, root5.return_ty);
+                                known[cm.dst.int()] = true;
+                                continue;
+                            }
+                        }
                     }
                     const to = numConv(m, cm) orelse return instRefuse(f, inst);
                     if (cm.receiver.int() >= f.n_locals or !known[cm.receiver.int()]) return no(f, "conv receiver");
@@ -1373,7 +1450,16 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         known[c.dst.int()] = true;
                     } else {
                         if (!callee.hasBody()) return noCallee(f, callee, "no body for");
-                        if (callee.params.len != c.n_args) return noCallee(f, callee, "arity of");
+                        if (callee.params.len < c.n_args) return noCallee(f, callee, "arity of");
+                        // An omitted parameter is filled by the thunk the
+                        // declaration lowered for it, run with the arguments
+                        // ahead of it.
+                        var di = c.n_args;
+                        while (di < callee.params.len) : (di += 1) {
+                            const dfid = prog.defaultThunk(callee.id, di) orelse return noCallee(f, callee, "arity of");
+                            const dfn = m.funcById(dfid) orelse return no(f, "default thunk");
+                            if (funcRetTy2(m, dfn) == null) return no(f, "default thunk type");
+                        }
                         const rt = funcRetTy2(m, callee) orelse return no(f, "callee return type");
                         types[c.dst.int()] = rt;
                         if (rt == .object) cls[c.dst.int()] = classIndexOfName(m, callee.return_ty);
@@ -1789,7 +1875,17 @@ fn reachableBlocks(gpa: std.mem.Allocator, f: *const Func) Error![]bool {
     return hit;
 }
 
-fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: Program, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const SingletonUse, slots: []const SlotUse, uses_try: bool) !void {
+/// The type a body the emitter accepted actually returns, which is what its C
+/// signature says. The DECLARED return type is not the authority: a thunk the
+/// lowering synthesized carries a placeholder.
+fn acceptedRet(accepted: []const Compiled, f: *const Func) ?Ty {
+    for (accepted) |*cc| {
+        if (cc.f == f) return cc.ret;
+    }
+    return null;
+}
+
+fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: Program, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const SingletonUse, slots: []const SlotUse, uses_try: bool, accepted: []const Compiled) !void {
     const f = c.f;
     const live = try reachableBlocks(gpa, f);
     defer gpa.free(live);
@@ -2142,6 +2238,21 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             continue;
                         }
                     }
+                    if (numConv(m, cm) == null and c.cls[cm.receiver.int()] != null and
+                        !isBuiltinCls(c.cls[cm.receiver.int()].?))
+                    {
+                        const root6 = memberRoot(m, prog, c.cls[cm.receiver.int()].?, plainFieldName(m.consts.items[cm.name.int()].String), cm.n_args).?;
+                        try w.print("  {s} = kvirt_{d}({s}", .{
+                            regName(c, cm.dst.int(), &nb), root6.id.int(), recv,
+                        });
+                        var aj5: u32 = 0;
+                        while (aj5 < cm.n_args) : (aj5 += 1) {
+                            var ab5: [32]u8 = undefined;
+                            try w.print(", {s}", .{regName(c, cm.args.int() + aj5, &ab5)});
+                        }
+                        try w.writeAll(");\n");
+                        continue;
+                    }
                     try w.print("  {s} = ({s}){s};\n", .{
                         regName(c, cm.dst.int(), &nb), c.types[cm.dst.int()].cName(), recv,
                     });
@@ -2314,15 +2425,57 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             try w.print("  printf(\"{s}\\n\", r{d});\n", .{ fmt, a0 });
                         }
                     } else {
+                        // An omitted argument runs the thunk for its
+                        // parameter, handed the arguments ahead of it. Each
+                        // lands in a local first, because a later default may
+                        // read an earlier one.
+                        var dtmp: u32 = 0;
+                        while (call.n_args + dtmp < callee.params.len) : (dtmp += 1) {
+                            const di2 = call.n_args + dtmp;
+                            const dfn = m.funcById(prog.defaultThunk(callee.id, di2).?).?;
+                            const dt2 = acceptedRet(accepted, dfn) orelse funcRetTy2(m, dfn).?;
+                            var dsym: std.Io.Writer.Allocating = .init(gpa);
+                            defer dsym.deinit();
+                            try writeSymbol(&dsym.writer, dfn);
+                            try w.print("  {s} kd{d}_{d} = {s}(", .{ dt2.cName(), call.dst.int(), dtmp, dsym.written() });
+                            var dk: u32 = 0;
+                            while (dk < di2) : (dk += 1) {
+                                if (dk != 0) try w.writeAll(", ");
+                                if (dk < call.n_args) {
+                                    var ab3: [32]u8 = undefined;
+                                    try w.print("{s}", .{regName(c, call.args.int() + dk, &ab3)});
+                                } else {
+                                    try w.print("kd{d}_{d}", .{ call.dst.int(), dk - call.n_args });
+                                }
+                            }
+                            try w.writeAll(");\n");
+                        }
                         var db: [32]u8 = undefined;
                         try w.print("  {s} = ", .{regName(c, call.dst.int(), &db)});
                         try writeSymbol(w, callee);
                         try w.writeByte('(');
                         var k: u32 = 0;
-                        while (k < call.n_args) : (k += 1) {
+                        while (k < callee.params.len) : (k += 1) {
                             if (k != 0) try w.writeAll(", ");
-                            var ab: [32]u8 = undefined;
-                            try w.print("{s}", .{regName(c, call.args.int() + k, &ab)});
+                            if (k < call.n_args) {
+                                var ab: [32]u8 = undefined;
+                                try w.print("{s}", .{regName(c, call.args.int() + k, &ab)});
+                            } else {
+                                // The parameter's own type decides: a thunk
+                                // that computed a scalar arrives boxed where
+                                // the parameter is a reference.
+                                const want4: Ty = tyOf(callee.params[k].ty) orelse .object;
+                                const dfn4 = m.funcById(prog.defaultThunk(callee.id, k).?).?;
+                                const have4 = acceptedRet(accepted, dfn4) orelse funcRetTy2(m, dfn4).?;
+                                var tb4: [48]u8 = undefined;
+                                const tn4 = try std.fmt.bufPrint(&tb4, "kd{d}_{d}", .{ call.dst.int(), k - call.n_args });
+                                var bx4: [96]u8 = undefined;
+                                if (want4 == .object and have4 != .object) {
+                                    try w.print("{s}", .{boxExpr(have4, tn4, &bx4)});
+                                } else {
+                                    try w.print("{s}", .{tn4});
+                                }
+                            }
                         }
                         try w.writeAll(");\n");
                     }
@@ -2432,6 +2585,14 @@ pub const Global = struct {
     func: ir.FuncId,
 };
 
+/// The default-argument thunks of one function, indexed by the parameter each
+/// fills. A thunk takes the parameters ahead of its own, so a default that
+/// reads an earlier argument compiles to a call with that argument in hand.
+pub const FuncDefaults = struct {
+    func: ir.FuncId,
+    slots: []const ?ir.FuncId,
+};
+
 /// The accepted bodies of one emission, entry last so a body is always
 /// declared before the definition that calls it.
 pub const Accepted = struct {
@@ -2447,6 +2608,7 @@ pub fn emit(
     entry: *const Func,
     globals: []const Global,
     layouts: []const ClassLayout,
+    defaults: []const FuncDefaults,
     w: *std.Io.Writer,
     src_path: []const u8,
 ) Error!bool {
@@ -2473,7 +2635,7 @@ pub fn emit(
 
     var throws = try buildThrowTable(gpa, m);
     defer throws.deinit(gpa);
-    const prog: Program = .{ .fields = table, .parents = parent_table, .layouts = layouts, .throws = throws };
+    const prog: Program = .{ .fields = table, .parents = parent_table, .layouts = layouts, .throws = throws, .defaults = defaults };
     var accepted: std.ArrayList(Compiled) = .empty;
     defer {
         for (accepted.items) |*c| c.deinit(gpa);
@@ -2575,6 +2737,24 @@ pub fn emit(
                         try seen.put(bfn.id.int(), {});
                         try queue.append(gpa, .{ .f = bfn, .synth = null, .caps = ct });
                     }
+                    continue;
+                }
+                if (inst.* == .CallMember) {
+                    const cm3 = inst.CallMember;
+                    if (numConv(m, cm3) == null) if (c.cls[cm3.receiver.int()]) |rc8| {
+                        if (!isBuiltinCls(rc8) and cm3.name.int() < m.consts.items.len) {
+                            const nmc = m.consts.items[cm3.name.int()];
+                            if (nmc == .String) {
+                                if (memberRoot(m, prog, rc8, plainFieldName(nmc.String), cm3.n_args)) |root8| {
+                                    var have8 = false;
+                                    for (vsites.items) |sv2| {
+                                        if (sv2.int() == root8.id.int()) have8 = true;
+                                    }
+                                    if (!have8) try vsites.append(gpa, ir.MethodSlotId.from(root8.id.int()));
+                                }
+                            }
+                        }
+                    };
                     continue;
                 }
                 if (inst.* == .CallVirtual) {
@@ -2697,6 +2877,18 @@ pub fn emit(
                 if (inst.* != .Call) continue;
                 const callee = m.funcById(inst.Call.func) orelse return false;
                 if (isPrintln(callee) or listIntrinsic(callee) != null) continue;
+                // A call that omits an argument runs the thunk for it.
+                var dq = inst.Call.n_args;
+                while (dq < callee.params.len) : (dq += 1) {
+                    const dfid2 = prog.defaultThunk(callee.id, dq) orelse break;
+                    const dfn2 = m.funcById(dfid2) orelse return false;
+                    if (seen.contains(dfn2.id.int())) continue;
+                    try seen.put(dfn2.id.int(), {});
+                    // The thunk reads the parameters ahead of its own
+                    // positionally, so it compiles against the callee's
+                    // signature up to that point.
+                    try queue.append(gpa, .{ .f = dfn2, .synth = callee.params[0..dq] });
+                }
                 if (seen.contains(callee.id.int())) continue;
                 try seen.put(callee.id.int(), {});
                 try queue.append(gpa, .{ .f = callee, .synth = null });
@@ -2737,6 +2929,19 @@ pub fn emit(
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
+                if (inst.* == .CallMember) {
+                    const cm2 = inst.CallMember;
+                    if (numConv(m, cm2) != null) continue;
+                    const rc7 = c.cls[cm2.receiver.int()] orelse continue;
+                    if (isBuiltinCls(rc7)) continue;
+                    const root7 = memberRoot(m, prog, rc7, plainFieldName(m.consts.items[cm2.name.int()].String), cm2.n_args) orelse continue;
+                    var have7 = false;
+                    for (used_slots.items) |u| {
+                        if (u.slot == root7.id.int()) have7 = true;
+                    }
+                    if (!have7) try used_slots.append(gpa, .{ .slot = root7.id.int(), .n_args = cm2.n_args });
+                    continue;
+                }
                 if (inst.* != .CallVirtual) continue;
                 const cv = inst.CallVirtual;
                 if (c.cls[cv.receiver.int()]) |rc| {
@@ -3060,7 +3265,7 @@ pub fn emit(
         try w.writeAll(";\n");
     }
     try w.writeAll("\n");
-    for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try);
+    for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try, accepted.items);
 
     for (used_slots.items) |su| {
         const root = m.funcById(ir.FuncId.from(su.slot)).?;
