@@ -17,7 +17,19 @@ class Square(val s: Int) : Shape {
     override fun name(): String = "square"
 }
 
+// A superclass contributes its own fields, filled by the arguments this class
+// passes up to its constructor.
+open class Tagged(val tag: String) {
+    open fun label(): String = tag
+}
+
+class Named(t: String, val n: Int) : Tagged(t) {
+    override fun label(): String = tag + "#" + n
+}
+
 fun describe(s: Shape): String = s.name() + "=" + s.area()
+
+fun labelOf(t: Tagged): String = t.label()
 
 fun total(a: Shape, b: Shape): Int = a.area() + b.area()
 
@@ -38,4 +50,13 @@ fun main() {
         i = i + 1
     }
     println(sum)
+
+    val plain = Tagged("plain")
+    val named = Named("item", 7)
+    println(plain.label())
+    println(named.label())
+    println(labelOf(plain))
+    println(labelOf(named))
+    println(named.tag)
+    println(named.n)
 }

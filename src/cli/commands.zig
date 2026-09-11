@@ -507,7 +507,8 @@ pub fn runTranspileNative(
                 };
             }
             cg.deinit();
-            layouts.append(gpa, .{ .name = e.key_ptr.*, .props = props }) catch return 1;
+            const pargs: []const ir.FuncId = built.parent_ctor_args.get(e.key_ptr.*) orelse &.{};
+            layouts.append(gpa, .{ .name = e.key_ptr.*, .props = props, .parent_args = pargs }) catch return 1;
         }
     }
     const ok = cgen.emit(gpa, m, ef, globals.items, layouts.items, &aw.writer, path) catch |e| {

@@ -204,6 +204,10 @@ fn cOp(op: ir.BinOp) ?[]const u8 {
 /// register its body defines.
 pub const Compiled = struct {
     f: *const Func,
+    /// The parameters this body is compiled against. Usually the function's
+    /// own, but a synthesized thunk declares none and reads its caller's
+    /// positionally, so it is compiled against the signature it is handed.
+    params: []const ir.Param,
     types: []Ty,
     /// The class an object register holds, where the emitter knows it. Needed
     /// to turn a field NAME into the index the compiled code addresses.
@@ -247,10 +251,12 @@ const FieldInfo = struct {
     name: []const u8,
     ty: Ty,
     cls: ?u32,
-    /// The constructor argument that fills it, or null for a body property,
-    /// which its own thunk fills.
+    /// The constructor argument that fills it, or null when a thunk does.
     arg: ?u32,
     init: ?ir.FuncId,
+    /// True when `init` is a superclass-constructor argument thunk, which takes
+    /// this class's constructor arguments rather than the instance.
+    from_parent: bool = false,
 };
 
 /// A class's instance fields in layout order: the constructor properties first,
@@ -263,11 +269,15 @@ fn classFields(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassL
     // and "class layout" alone says nothing about which class shape is missing.
     if (c.init_block != null) return layoutNo(c, "init block");
     // An interface contributes no fields, so implementing one changes nothing
-    // about the layout. A superCLASS does, and its constructor arguments live
-    // in the AST rather than the IR, so that shape waits.
+    // about the layout. A superCLASS contributes its own, filled by the thunks
+    // this class passes to the super constructor.
+    var parent: ?*const ir.Class = null;
     for (c.supertypes) |sid| {
         if (sid.int() >= m.classes.items.len) return layoutNo(c, "unknown supertype");
-        if (!m.classes.items[sid.int()].is_interface) return layoutNo(c, "superclass");
+        const sup = &m.classes.items[sid.int()];
+        if (sup.is_interface) continue;
+        if (parent != null) return layoutNo(c, "several superclasses");
+        parent = sup;
     }
     if (c.is_interface) return layoutNo(c, "interface");
     if (c.is_abstract) return layoutNo(c, "abstract");
@@ -280,13 +290,58 @@ fn classFields(gpa: std.mem.Allocator, m: *const Module, layouts: []const ClassL
 
     var out: std.ArrayList(FieldInfo) = .empty;
     errdefer out.deinit(gpa);
-    for (c.primary_params, 0..) |p, i| {
-        if (!p.is_property) {
-            // A constructor parameter that is not a property has nowhere to go
-            // until init blocks and body initializers referencing it compile.
-            out.deinit(gpa);
-            return layoutNo(c, "ctor param is not a property");
+    if (parent) |sup| {
+        // The parent's fields come first, each filled by the thunk this class
+        // passes for that constructor parameter. A grandparent would mean
+        // composing one class's thunks through another's, which is a chain this
+        // does not build yet.
+        for (sup.supertypes) |gid| {
+            if (gid.int() >= m.classes.items.len or !m.classes.items[gid.int()].is_interface) {
+                out.deinit(gpa);
+                return layoutNo(c, "grandparent");
+            }
         }
+        var pargs: []const ir.FuncId = &.{};
+        for (layouts) |l| {
+            if (std.mem.eql(u8, l.name, c.name)) pargs = l.parent_args;
+        }
+        for (layouts) |l| {
+            if (!std.mem.eql(u8, l.name, sup.name)) continue;
+            if (l.props.len != 0) {
+                out.deinit(gpa);
+                return layoutNo(c, "superclass body properties");
+            }
+        }
+        if (pargs.len != sup.primary_params.len) {
+            out.deinit(gpa);
+            return layoutNo(c, "super constructor arity");
+        }
+        for (sup.primary_params, 0..) |pp, pi| {
+            if (!pp.is_property) {
+                out.deinit(gpa);
+                return layoutNo(c, "superclass ctor param is not a property");
+            }
+            const pt = tyOf(pp.ty) orelse blk2: {
+                if (classIndexOfName(m, pp.ty) == null) {
+                    out.deinit(gpa);
+                    return layoutNo(c, "superclass ctor param type");
+                }
+                break :blk2 Ty.object;
+            };
+            try out.append(gpa, .{
+                .name = pp.name,
+                .ty = pt,
+                .cls = if (pt == .object) classIndexOfName(m, pp.ty) else null,
+                .arg = null,
+                .init = pargs[pi],
+                .from_parent = true,
+            });
+        }
+    }
+    for (c.primary_params, 0..) |p, i| {
+        // A constructor parameter that is not a property is an input, not a
+        // field: it feeds the superclass call or a body initializer.
+        if (!p.is_property) continue;
         if (p.default != null or p.is_vararg) {
             out.deinit(gpa);
             return layoutNo(c, "ctor param default/vararg");
@@ -494,7 +549,7 @@ fn receiverClass(m: *const Module, f: *const Func) ?u32 {
 /// is the answer.
 fn globalTy(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, globals: []const Global, idx: usize) Error!?Ty {
     const gf = m.funcById(globals[idx].func) orelse return null;
-    var c = (try eligible(gpa, m, ls, gf, globals)) orelse return null;
+    var c = (try eligible(gpa, m, ls, gf, globals, null)) orelse return null;
     defer c.deinit(gpa);
     return c.ret;
 }
@@ -532,7 +587,10 @@ fn globalIndex(globals: []const Global, name: []const u8) ?usize {
     return null;
 }
 
-pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const Func, globals: []const Global) Error!?Compiled {
+pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const Func, globals: []const Global, synth: ?[]const ir.Param) Error!?Compiled {
+    // A synthesized thunk declares no parameters and reads its caller's
+    // positionally, so it is compiled against the signature it will be handed.
+    const params: []const ir.Param = synth orelse f.params;
     if (f.is_suspend) return no(f, "suspend");
     // A method is an ordinary function whose first parameter is the receiver;
     // the call sites already move it into arg 0.
@@ -545,7 +603,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
     // so the authority is the register the body actually returns; the declared
     // type settles the Unit case, where there is no register to ask.
     var ret = funcRetTy2(m, f) orelse Ty.unit;
-    for (f.params) |p| {
+    for (params) |p| {
         if (p.default != null or p.is_vararg) return no(f, "param default/vararg");
         if (tyOf(p.ty) == null and classIndexOfName(m, p.ty) == null) return no(f, "param type");
     }
@@ -585,8 +643,8 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                     known[c.dst.int()] = true;
                 },
                 .LoadParam => |lp| {
-                    if (lp.dst.int() >= f.n_locals or lp.idx >= f.params.len) return no(f, "load param");
-                    const pt = f.params[lp.idx].ty;
+                    if (lp.dst.int() >= f.n_locals or lp.idx >= params.len) return no(f, "load param");
+                    const pt = params[lp.idx].ty;
                     if (tyOf(pt)) |t| {
                         types[lp.dst.int()] = t;
                     } else {
@@ -782,11 +840,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                 .NewInstance => |ni| {
                     if (ni.arg_names.len != 0) return no(f, "ctor arg names");
                     const fields = ls.of(ni.class.int()) orelse return no(f, "class layout");
-                    var n_ctor: u32 = 0;
-                    for (fields) |fd| {
-                        if (fd.arg != null) n_ctor += 1;
-                    }
-                    if (n_ctor != ni.n_args) return no(f, "ctor arity");
+                    if (m.classes.items[ni.class.int()].primary_params.len != ni.n_args) return no(f, "ctor arity");
                     for (fields) |fd| {
                         const ai = fd.arg orelse continue;
                         const ar = ni.args.int() + ai;
@@ -945,7 +999,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
         slot[r] = @intCast(n_slots);
         n_slots += 1;
     }
-    return .{ .f = f, .types = types, .cls = cls, .elem = elem, .slot = slot, .n_slots = n_slots, .ret = ret };
+    return .{ .f = f, .params = params, .types = types, .cls = cls, .elem = elem, .slot = slot, .n_slots = n_slots, .ret = ret };
 }
 
 /// A C identifier for the function. Derived from the fqn, never from the id:
@@ -1009,10 +1063,10 @@ fn writeProto(w: *std.Io.Writer, c: *const Compiled) !void {
     try w.print("static {s} ", .{c.ret.cName()});
     try writeSymbol(w, c.f);
     try w.writeByte('(');
-    if (c.f.params.len == 0) {
+    if (c.params.len == 0) {
         try w.writeAll("void");
     } else {
-        for (c.f.params, 0..) |p, i| {
+        for (c.params, 0..) |p, i| {
             if (i != 0) try w.writeAll(", ");
             const pt: Ty = tyOf(p.ty) orelse .object;
             try w.print("{s} p{d}", .{ pt.cName(), i });
@@ -1193,6 +1247,38 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                             var ab: [32]u8 = undefined;
                             try w.print("  klio_nat_set({s}, {d}, {s});\n", .{
                                 dst, fi, boxExpr(c.types[ar], regName(c, ar, &ab), &bb),
+                            });
+                        } else if (fd.from_parent) {
+                            // A field the superclass declares: its value is the
+                            // argument this class passes up, computed from this
+                            // constructor's own arguments.
+                            const ifid = fd.init.?;
+                            const ifn = m.funcById(ifid).?;
+                            var sym: std.Io.Writer.Allocating = .init(gpa);
+                            defer sym.deinit();
+                            try writeSymbol(&sym.writer, ifn);
+                            var cb2: std.Io.Writer.Allocating = .init(gpa);
+                            defer cb2.deinit();
+                            try cb2.writer.print("{s}(", .{sym.written()});
+                            var pi2: u32 = 0;
+                            while (pi2 < ni.n_args) : (pi2 += 1) {
+                                if (pi2 != 0) try cb2.writer.writeAll(", ");
+                                var ab4: [32]u8 = undefined;
+                                const areg2 = ni.args.int() + pi2;
+                                const want2: Ty = if (pi2 < ifn.params.len)
+                                    (tyOf(ifn.params[pi2].ty) orelse .object)
+                                else
+                                    c.types[areg2];
+                                if (want2 == .object and c.types[areg2] != .object) {
+                                    var bx2: [96]u8 = undefined;
+                                    try cb2.writer.print("{s}", .{boxExpr(c.types[areg2], regName(c, areg2, &ab4), &bx2)});
+                                } else {
+                                    try cb2.writer.print("{s}", .{regName(c, areg2, &ab4)});
+                                }
+                            }
+                            try cb2.writer.writeAll(")");
+                            try w.print("  klio_nat_set({s}, {d}, {s});\n", .{
+                                dst, fi, boxExpr(fd.ty, cb2.written(), &bb),
                             });
                         } else {
                             // A body property's value comes from its own thunk,
@@ -1583,6 +1669,9 @@ pub const ClassLayout = struct {
     /// Simple class name, matching the IR class it describes.
     name: []const u8,
     props: []const BodyProp,
+    /// One thunk per argument this class passes to its superclass constructor,
+    /// each taking this class's own constructor arguments.
+    parent_args: []const ir.FuncId = &.{},
 };
 
 pub const Global = struct {
@@ -1628,19 +1717,21 @@ pub fn emit(
     }
     var seen = std.AutoHashMap(u32, void).init(gpa);
     defer seen.deinit();
-    var queue: std.ArrayList(*const Func) = .empty;
+    const Pending = struct { f: *const Func, synth: ?[]const ir.Param };
+    var queue: std.ArrayList(Pending) = .empty;
     defer queue.deinit(gpa);
 
     // Reachable closure from the entry: only what the program can call is
     // emitted, which is what keeps a whole-stdlib lowering from becoming tens
     // of thousands of C functions.
-    try queue.append(gpa, entry);
+    try queue.append(gpa, .{ .f = entry, .synth = null });
     try seen.put(entry.id.int(), {});
     // A single refusal anywhere in the reachable set fails the whole emission:
     // a compiled program has no interpreter to fall back INTO, so a body it
     // cannot call is not a slow path, it is a missing one.
-    while (queue.pop()) |f| {
-        const c = (try eligible(gpa, m, ls, f, globals)) orelse return false;
+    while (queue.pop()) |pending| {
+        const f = pending.f;
+        const c = (try eligible(gpa, m, ls, f, globals, pending.synth)) orelse return false;
         try accepted.append(gpa, c);
         for (f.blocks) |*blk| {
             for (blk.insts) |*inst| {
@@ -1655,7 +1746,7 @@ pub fn emit(
                                     const ifn = m.funcById(ifid) orelse return false;
                                     if (seen.contains(ifn.id.int())) continue;
                                     try seen.put(ifn.id.int(), {});
-                                    try queue.append(gpa, ifn);
+                                    try queue.append(gpa, .{ .f = ifn, .synth = null });
                                 }
                             }
                         }
@@ -1678,7 +1769,7 @@ pub fn emit(
                                 const gf = m.funcById(globals[gi].func) orelse return false;
                                 if (!seen.contains(gf.id.int())) {
                                     try seen.put(gf.id.int(), {});
-                                    try queue.append(gpa, gf);
+                                    try queue.append(gpa, .{ .f = gf, .synth = null });
                                 }
                             }
                         }
@@ -1698,7 +1789,7 @@ pub fn emit(
                             const impl = slotImpl(m, ci2, cv2.slot) orelse continue;
                             if (seen.contains(impl.id.int())) continue;
                             try seen.put(impl.id.int(), {});
-                            try queue.append(gpa, impl);
+                            try queue.append(gpa, .{ .f = impl, .synth = null });
                         }
                     }
                 }
@@ -1709,7 +1800,13 @@ pub fn emit(
                             const ifn = m.funcById(ifid) orelse return false;
                             if (seen.contains(ifn.id.int())) continue;
                             try seen.put(ifn.id.int(), {});
-                            try queue.append(gpa, ifn);
+                            // A superclass-argument thunk declares no
+                            // parameters and reads this constructor's
+                            // positionally, so it compiles against them.
+                            try queue.append(gpa, .{
+                                .f = ifn,
+                                .synth = if (fd.from_parent) m.classes.items[inst.NewInstance.class.int()].primary_params else null,
+                            });
                         }
                     }
                     continue;
@@ -1719,7 +1816,7 @@ pub fn emit(
                 if (isPrintln(callee) or listIntrinsic(callee) != null) continue;
                 if (seen.contains(callee.id.int())) continue;
                 try seen.put(callee.id.int(), {});
-                try queue.append(gpa, callee);
+                try queue.append(gpa, .{ .f = callee, .synth = null });
             }
         }
     }
