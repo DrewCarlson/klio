@@ -333,6 +333,21 @@ emitted in whatever spelling the register settled on. Two genuinely different
 types in one register is refused rather than silently resolved to whichever
 write came last, which is what it had been doing.
 
+Function values compile. A lambda whose value has to exist becomes an instance
+of a class the emitter synthesizes for that body, one field per capture: the
+collector traces it like any other instance, and a call through the value finds
+the body again by its class handle, exactly as a virtual call finds an
+override. A lambda every use of which is a direct call is still never
+materialised, so the case the JIT cares about allocates nothing.
+
+Arguments and results pass boxed through a function value, because which body
+runs is a run-time answer and two bodies of the same shape need not agree on
+machine types; one adapter per body unboxes into the body's real signature. A
+lambda's own parameters carry no declared types — the source writes
+`{ x -> x + n }` — so they come from the function type the value is expected to
+have, read off where the value goes: the declaration's return type when it is
+returned, the parameter's or the constructor's when it is passed.
+
 Two rules earned their keep by being wrong first. A function's result comes
 from the register it returns — except a declaration with no body, an interface
 method, which has no register and must read its annotation. And a value only
@@ -343,10 +358,10 @@ than any feature did.
 ## Still refused
 
 Measured across the example corpus with `KLIO_CGEN_TRACE=1`, most common
-first: names that are neither a declared global nor an object, body properties
-without an initializer or with a type the emitter cannot place, `runBlocking`
-and the rest of the coroutine surface, `CallMember`, calls with named or
-generic arguments, and anonymous object literals.
+first: `runBlocking` and the rest of the coroutine surface, calls with named or
+generic arguments, the `List` members the backend performs directly, anonymous
+object literals, `MakeCell` (a `var` a lambda captures), `finally`, and the
+companion-object side of a class name used as a qualifier.
 
 A refusal is reported against the thing that blocked a program, not against
 every candidate the emitter examined. The class-layout table is built for every

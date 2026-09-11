@@ -283,8 +283,60 @@ const CELL_CLS: u32 = std.math.maxInt(u32) - 2;
 /// class table; `elem` carries what it holds.
 const ARRAY_CLS: u32 = std.math.maxInt(u32) - 4;
 
+/// A function value of a given arity: `(Int) -> Int` is `FUNC_CLS_BASE + 1`.
+/// Like `String` and `List` these are runtime types rather than user classes,
+/// so they take handles outside the class table; `elem` carries what calling
+/// one yields.
+const FUNC_CLS_BASE: u32 = std.math.maxInt(u32) - 20;
+const FUNC_MAX_ARITY: u32 = 15;
+
+fn funcCls(arity: u32) u32 {
+    return FUNC_CLS_BASE + arity;
+}
+
+fn funcClsArity(cid: u32) ?u32 {
+    if (cid < FUNC_CLS_BASE or cid > FUNC_CLS_BASE + FUNC_MAX_ARITY) return null;
+    return cid - FUNC_CLS_BASE;
+}
+
+/// The value-parameter count a `FunctionN` type names, and the type calling it
+/// yields. A receiver or a `#suspend` marker rides in the type arguments ahead
+/// of the parameters, so the count comes from the NAME and the result from the
+/// last argument.
+fn functionTypeArity(name: []const u8) ?u32 {
+    const tail = simpleName(name);
+    if (!std.mem.startsWith(u8, tail, "Function")) return null;
+    const digits = tail["Function".len..];
+    if (digits.len == 0) return null;
+    const n = std.fmt.parseInt(u32, digits, 10) catch return null;
+    if (n > FUNC_MAX_ARITY) return null;
+    return n;
+}
+
+/// What a reference of this declared type yields when it is read through: the
+/// result of calling a function value, the element of a list or an array. Null
+/// when the type says nothing, which leaves whatever was already inferred.
+fn refElemOf(c: ?u32, t: ir.TypeRef) ?Ty {
+    const cid = c orelse return null;
+    if (funcClsArity(cid) != null) return functionResultTy(t);
+    if (cid == LIST_CLS and t.args.len == 1) return tyOf(t.args[0]);
+    if (cid == ARRAY_CLS) {
+        const ae = arrayElemOf(t);
+        return if (ae == .unit) null else ae;
+    }
+    return null;
+}
+
+/// What calling a function value yields, read off the last type argument. A
+/// type that records none says nothing, so the result passes as a reference.
+fn functionResultTy(t: ir.TypeRef) Ty {
+    if (t.args.len == 0) return .object;
+    return tyOf(t.args[t.args.len - 1]) orelse .object;
+}
+
 fn isBuiltinCls(cid: u32) bool {
-    return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS or cid == THROWABLE_CLS or cid == ARRAY_CLS;
+    return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS or cid == THROWABLE_CLS or
+        cid == ARRAY_CLS or funcClsArity(cid) != null;
 }
 
 /// The element kind of a named array type, in the order the runtime's
@@ -548,6 +600,9 @@ const FieldInfo = struct {
     name: []const u8,
     ty: Ty,
     cls: ?u32,
+    /// What reading THROUGH this field yields: a list's element, an array's
+    /// element, the result of calling a function value.
+    elem: Ty = .unit,
     /// The constructor argument that fills it, or null when a thunk does.
     arg: ?u32,
     init: ?ir.FuncId,
@@ -633,6 +688,7 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
                 .name = fd.name,
                 .ty = fd.ty,
                 .cls = fd.cls,
+                .elem = fd.elem,
                 .arg = null,
                 .init = null,
                 .from_parent = true,
@@ -659,6 +715,7 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
             .name = p.name,
             .ty = t,
             .cls = if (t == .object) classIndexOfName(m, p.ty) else null,
+            .elem = if (t == .object) (refElemOf(classIndexOfName(m, p.ty), p.ty) orelse .unit) else .unit,
             .arg = @intCast(i),
             .init = null,
         });
@@ -683,6 +740,7 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
                 return layoutNo(c, "body property without an initializer");
             }
             var fcls: ?u32 = null;
+            var felem: Ty = .unit;
             const t = tyOf(bp.ty) orelse blk: {
                 if (bp.ty.name.len != 0) {
                     if (classIndexOfName(m, bp.ty)) |ci| {
@@ -712,12 +770,14 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
                 };
                 defer ic.deinit(gpa);
                 fcls = ic.ret_cls;
+                felem = ic.ret_elem;
                 break :blk ic.ret;
             };
             try out.append(gpa, .{
                 .name = bp.name,
                 .ty = t,
                 .cls = if (t == .object) (fcls orelse classIndexOfName(m, bp.ty)) else null,
+                .elem = if (t == .object) (refElemOf(fcls orelse classIndexOfName(m, bp.ty), bp.ty) orelse felem) else .unit,
                 .arg = null,
                 .init = bp.init,
             });
@@ -761,6 +821,7 @@ fn classIndexOfName(m: *const Module, t: ir.TypeRef) ?u32 {
     if (std.mem.eql(u8, t.name, "String") or std.mem.eql(u8, t.name, "kotlin.String")) return STRING_CLS;
     if (std.mem.eql(u8, t.name, "List") or std.mem.eql(u8, t.name, "MutableList")) return LIST_CLS;
     if (isArrayTypeName(t.name)) return ARRAY_CLS;
+    if (functionTypeArity(t.name)) |ar| return funcCls(ar);
     for (m.classes.items, 0..) |*c, i| {
         if (std.mem.eql(u8, c.name, t.name) or std.mem.eql(u8, c.fqn, t.name)) return @intCast(i);
     }
@@ -915,6 +976,118 @@ fn noReg(f: *const Func, reg: u32) ?Compiled {
     return null;
 }
 
+/// The function type a lambda is expected to have, read off where its value
+/// goes: the declaration's return type when it is returned, the parameter's
+/// type when it is passed. A lambda's own parameters carry no declared types —
+/// the source writes `{ x -> x + n }` — so this is where they come from.
+fn expectedFnType(m: *const Module, f: *const Func, dst: ir.Reg) ?ir.TypeRef {
+    var want = dst;
+    var hops: u32 = 0;
+    while (hops < 8) : (hops += 1) {
+        var moved: ?ir.Reg = null;
+        for (f.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                switch (inst.*) {
+                    .Move => |mv| if (mv.src.int() == want.int()) {
+                        moved = mv.dst;
+                    },
+                    .Call => |cl| {
+                        const callee = m.funcById(cl.func) orelse continue;
+                        var k: u32 = 0;
+                        while (k < cl.n_args) : (k += 1) {
+                            if (cl.args.int() + k != want.int()) continue;
+                            if (k < callee.params.len and functionTypeArity(callee.params[k].ty.name) != null) {
+                                return callee.params[k].ty;
+                            }
+                        }
+                    },
+                    .NewInstance => |ni| {
+                        const cdef = if (ni.class.int() < m.classes.items.len) &m.classes.items[ni.class.int()] else continue;
+                        var k2: u32 = 0;
+                        while (k2 < ni.n_args) : (k2 += 1) {
+                            if (ni.args.int() + k2 != want.int()) continue;
+                            if (k2 < cdef.primary_params.len and functionTypeArity(cdef.primary_params[k2].ty.name) != null) {
+                                return cdef.primary_params[k2].ty;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+            if (blk.terminator == .Return) {
+                if (blk.terminator.Return) |rr| {
+                    if (rr.int() == want.int() and functionTypeArity(f.return_ty.name) != null) return f.return_ty;
+                }
+            }
+        }
+        want = moved orelse break;
+    }
+    return null;
+}
+
+/// The parameter list a lambda body compiles against, taken from the function
+/// type its value is expected to have. The type's arguments end with the
+/// result, and a receiver or a `#suspend` marker rides ahead of the parameters,
+/// so the value parameters are the last `arity` before it.
+fn lambdaParams(gpa: std.mem.Allocator, body: *const Func, t: ir.TypeRef) Error!?[]ir.Param {
+    const arity = functionTypeArity(t.name) orelse return null;
+    if (t.args.len < arity + 1) return null;
+    const first = t.args.len - arity - 1;
+    const out = try gpa.alloc(ir.Param, body.params.len);
+    for (out, 0..) |*p, i| {
+        p.* = body.params[i];
+        if (i < arity) p.ty = t.args[first + i];
+    }
+    return out;
+}
+
+/// Whether a lambda register is ever used as anything but the callee of a
+/// direct call. Such a use needs the value to exist, which means a closure
+/// object; while every use is a direct call the call site passes the captures
+/// itself and nothing is allocated.
+fn lambdaEscapes(f: *const Func, dst: ir.Reg) bool {
+    for (f.blocks) |*blk| {
+        for (blk.insts) |*inst| {
+            if (inst.* == .CallValue and inst.CallValue.callee.int() == dst.int()) continue;
+            if (inst.* == .AstLambda and inst.AstLambda.dst.int() == dst.int()) continue;
+            if (instReadsReg(inst, dst)) return true;
+        }
+        switch (blk.terminator) {
+            .Return => |r| if (r) |rr| {
+                if (rr.int() == dst.int()) return true;
+            },
+            .Throw => |t| if (t.int() == dst.int()) return true,
+            .Branch => |br| if (br.cond.int() == dst.int()) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+/// Whether an instruction names this register anywhere: the check behind the
+/// escape question, so a shape the emitter has not enumerated reads as a use
+/// rather than as an absence.
+fn instReadsReg(inst: *const ir.Inst, r: ir.Reg) bool {
+    const info = @typeInfo(ir.Inst).@"union";
+    inline for (info.fields) |uf| {
+        if (inst.* == @field(std.meta.Tag(ir.Inst), uf.name)) {
+            const payload = @field(inst.*, uf.name);
+            if (@typeInfo(@TypeOf(payload)) == .@"struct") {
+                inline for (@typeInfo(@TypeOf(payload)).@"struct".fields) |pf| {
+                    if (pf.type == ir.Reg) {
+                        if (@field(payload, pf.name).int() == r.int()) return true;
+                    } else if (pf.type == []ir.Reg or pf.type == []const ir.Reg) {
+                        for (@field(payload, pf.name)) |rr| {
+                            if (rr.int() == r.int()) return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return false;
+}
+
 fn resolveBare(
     m: *const Module,
     prog: Program,
@@ -955,6 +1128,9 @@ fn bareOn(
     if (acc) |g| return .{ .accessor = .{ .recv = r, .func = g } };
     return null;
 }
+
+/// One lambda whose value the program materialises.
+const LambdaUse = struct { body: ir.FuncId, n_caps: u32, arity: u32, ret: Ty };
 
 /// One virtual call site's shape: the slot and how many arguments it takes.
 const SlotUse = struct { slot: u32, n_args: u32 };
@@ -1231,6 +1407,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 const gt = funcRetTy2(m, gfn) orelse return no(f, "bare getter type");
                                 types[lt.dst.int()] = gt;
                                 if (gt == .object) cls[lt.dst.int()] = classIndexOfName(m, gfn.return_ty);
+ if (refElemOf(cls[lt.dst.int()], gfn.return_ty)) |re_| elem[lt.dst.int()] = re_;
                             },
                             .global => unreachable,
                         }
@@ -1244,6 +1421,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (gt5 == .object) {
                         const gf5 = m.funcById(globals[gi5].func).?;
                         cls[lt.dst.int()] = classIndexOfName(m, gf5.return_ty);
+                        if (refElemOf(cls[lt.dst.int()], gf5.return_ty)) |re_| elem[lt.dst.int()] = re_;
                     }
                     known[lt.dst.int()] = true;
                 },
@@ -1319,6 +1497,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     } else {
                         types[lp.dst.int()] = .object;
                         cls[lp.dst.int()] = classIndexOfName(m, pt);
+                        if (refElemOf(cls[lp.dst.int()], pt)) |re_| elem[lp.dst.int()] = re_;
                         // `List<Int>` says what its elements are; a list whose
                         // element type is written down needs no inference. An
                         // array says so in its own name.
@@ -1327,6 +1506,8 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 if (tyOf(pt.args[0])) |et| elem[lp.dst.int()] = et;
                             }
                             if (rc == ARRAY_CLS) elem[lp.dst.int()] = arrayElemOf(pt);
+                            // A function type's last argument is its result.
+                            if (funcClsArity(rc) != null) elem[lp.dst.int()] = functionResultTy(pt);
                         }
                     }
                     known[lp.dst.int()] = true;
@@ -1479,6 +1660,23 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             if (!isBuiltinCls(rc5) and cm.name.int() < m.consts.items.len) {
                                 const mnm = m.consts.items[cm.name.int()];
                                 if (mnm != .String) return no(f, "member name kind");
+                                // A property holding a function, called by its
+                                // name: read the property, then invoke what it
+                                // holds.
+                                if (fieldIndex(prog, rc5, mnm.String)) |fidx| {
+                                    const fds5 = prog.of(rc5).?;
+                                    const far = funcClsArity(fds5[fidx].cls orelse 0) orelse return noName(f, "member", mnm.String);
+                                    if (far != cm.n_args) return no(f, "invoke arity");
+                                    var kk7: u32 = 0;
+                                    while (kk7 < cm.n_args) : (kk7 += 1) {
+                                        const a7 = cm.args.int() + kk7;
+                                        if (a7 >= f.n_locals or !known[a7]) return no(f, "invoke arg");
+                                    }
+                                    if (cm.dst.int() >= f.n_locals) return no(f, "invoke dst");
+                                    types[cm.dst.int()] = fds5[fidx].elem;
+                                    known[cm.dst.int()] = true;
+                                    continue;
+                                }
                                 const root5 = memberRoot(m, prog, rc5, plainFieldName(mnm.String), cm.n_args) orelse
                                     return noName(f, "member", mnm.String);
                                 const mrt = funcRetTy2(m, root5) orelse return no(f, "member return type");
@@ -1490,6 +1688,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 if (cm.dst.int() >= f.n_locals) return no(f, "member dst");
                                 types[cm.dst.int()] = mrt;
                                 if (mrt == .object) cls[cm.dst.int()] = classIndexOfName(m, root5.return_ty);
+ if (refElemOf(cls[cm.dst.int()], root5.return_ty)) |re_| elem[cm.dst.int()] = re_;
                                 known[cm.dst.int()] = true;
                                 continue;
                             }
@@ -1549,6 +1748,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 if (cv.dst.int() >= f.n_locals) return no(f, "virtual dst");
                                 types[cv.dst.int()] = rt4;
                                 if (rt4 == .object) cls[cv.dst.int()] = classIndexOfName(m, root.return_ty);
+ if (refElemOf(cls[cv.dst.int()], root.return_ty)) |re_| elem[cv.dst.int()] = re_;
                                 known[cv.dst.int()] = true;
                                 continue;
                             }
@@ -1654,6 +1854,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
                         types[gf.dst.int()] = gt;
                         if (gt == .object) cls[gf.dst.int()] = classIndexOfName(m, gfn.return_ty);
+ if (refElemOf(cls[gf.dst.int()], gfn.return_ty)) |re_| elem[gf.dst.int()] = re_;
                         known[gf.dst.int()] = true;
                         continue;
                     };
@@ -1661,6 +1862,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
                     types[gf.dst.int()] = fields[idx].ty;
                     cls[gf.dst.int()] = fields[idx].cls;
+                    elem[gf.dst.int()] = fields[idx].elem;
                     known[gf.dst.int()] = true;
                 },
                 .SetField => |sf| {
@@ -1713,6 +1915,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (gt == .object) {
                         const gf = m.funcById(globals[gi].func).?;
                         cls[lg.dst.int()] = classIndexOfName(m, gf.return_ty);
+                        if (refElemOf(cls[lg.dst.int()], gf.return_ty)) |re_| elem[lg.dst.int()] = re_;
                     }
                     known[lg.dst.int()] = true;
                 },
@@ -1734,16 +1937,74 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     for (al.captures) |cr| {
                         if (cr.int() >= f.n_locals or !known[cr.int()]) return no(f, "lambda capture");
                     }
-                    // The value itself is never materialised while every use is
-                    // a direct call; a lambda that escapes into a value is
-                    // refused rather than silently losing its captures.
-                    types[al.dst.int()] = .unit;
                     lam[al.dst.int()] = .{ .body = body, .captures = al.captures };
                     known[al.dst.int()] = true;
+                    if (!lambdaEscapes(f, al.dst)) {
+                        // Never materialised: every use is a direct call, so
+                        // the call site passes the captures itself.
+                        types[al.dst.int()] = .unit;
+                        continue;
+                    }
+                    // The value has to exist. It becomes an instance of a
+                    // class the emitter synthesizes for this body, one field
+                    // per capture, which is what lets the collector trace it
+                    // and a call through it find the body again.
+                    const bfn = m.funcById(body) orelse return no(f, "lambda body missing");
+                    const arity = bfn.params.len;
+                    if (arity > FUNC_MAX_ARITY) return no(f, "lambda arity");
+                    const ct5 = try gpa.alloc(CapInfo, al.captures.len);
+                    defer gpa.free(ct5);
+                    for (al.captures, 0..) |cr5, ci6| ct5[ci6] = .{ .ty = types[cr5.int()], .cls = cls[cr5.int()], .elem = elem[cr5.int()] };
+                    const fnty = expectedFnType(m, f, al.dst);
+                    const lsynth = if (fnty) |t5| try lambdaParams(gpa, bfn, t5) else null;
+                    defer if (lsynth) |ls5| gpa.free(ls5);
+                    var lc = (try eligible(gpa, m, prog, bfn, globals, lsynth, ct5)) orelse return no(f, "lambda body");
+                    const lret = lc.ret;
+                    lc.deinit(gpa);
+                    types[al.dst.int()] = .object;
+                    cls[al.dst.int()] = funcCls(@intCast(arity));
+                    elem[al.dst.int()] = lret;
+                },
+                // A bare call whose name is both a callable in scope and
+                // possibly a member of the receiver. When the local is a
+                // function value the local wins, which is what the interpreter
+                // decides at run time by finding it first.
+                .CallValueOrMember => |cvm| {
+                    if (cvm.arg_names.len != 0) return no(f, "value call names");
+                    if (cvm.callee.int() >= f.n_locals or !known[cvm.callee.int()]) return no(f, "value callee");
+                    if (types[cvm.callee.int()] != .object) return instRefuse(f, inst);
+                    const fc2 = cls[cvm.callee.int()] orelse return instRefuse(f, inst);
+                    const ar7 = funcClsArity(fc2) orelse return instRefuse(f, inst);
+                    if (cvm.n_args != ar7) return no(f, "value call arity");
+                    var kk8: u32 = 0;
+                    while (kk8 < cvm.n_args) : (kk8 += 1) {
+                        const a8 = cvm.args.int() + kk8;
+                        if (a8 >= f.n_locals or !known[a8]) return no(f, "value call arg");
+                    }
+                    if (cvm.dst.int() >= f.n_locals) return no(f, "value call dst");
+                    types[cvm.dst.int()] = elem[cvm.callee.int()];
+                    known[cvm.dst.int()] = true;
                 },
                 .CallValue => |cv2| {
                     if (cv2.arg_names.len != 0 or cv2.type_args.len != 0) return no(f, "value call names/type args");
                     if (cv2.callee.int() >= f.n_locals) return no(f, "value callee");
+                    if (types[cv2.callee.int()] == .object) {
+                        // A call through a function VALUE: the body is decided
+                        // at run time by which closure the value is, so the
+                        // arguments and the result pass boxed.
+                        const fc = cls[cv2.callee.int()] orelse return no(f, "value callee class");
+                        const ar6 = funcClsArity(fc) orelse return no(f, "value callee is not callable");
+                        if (cv2.n_args != ar6) return no(f, "value call arity");
+                        var kk6: u32 = 0;
+                        while (kk6 < cv2.n_args) : (kk6 += 1) {
+                            const a6 = cv2.args.int() + kk6;
+                            if (a6 >= f.n_locals or !known[a6]) return no(f, "value call arg");
+                        }
+                        if (cv2.dst.int() >= f.n_locals) return no(f, "value call dst");
+                        types[cv2.dst.int()] = elem[cv2.callee.int()];
+                        known[cv2.dst.int()] = true;
+                        continue;
+                    }
                     const li = lam[cv2.callee.int()] orelse return no(f, "value call to an unknown callee");
                     const bf = m.funcById(li.body) orelse return no(f, "lambda body missing");
                     // The lowering always gives a lambda an `it` slot, so a
@@ -1768,6 +2029,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     bc.deinit(gpa);
                     types[cv2.dst.int()] = rt7;
                     if (rt7 == .object) cls[cv2.dst.int()] = classIndexOfName(m, bf.return_ty);
+ if (refElemOf(cls[cv2.dst.int()], bf.return_ty)) |re_| elem[cv2.dst.int()] = re_;
                     known[cv2.dst.int()] = true;
                 },
                 .Call => |c| {
@@ -1863,6 +2125,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         const rt = funcRetTy2(m, callee) orelse return no(f, "callee return type");
                         types[c.dst.int()] = rt;
                         if (rt == .object) cls[c.dst.int()] = classIndexOfName(m, callee.return_ty);
+ if (refElemOf(cls[c.dst.int()], callee.return_ty)) |re_| elem[c.dst.int()] = re_;
                         known[c.dst.int()] = true;
                     }
                     var k: u32 = 0;
@@ -2770,7 +3033,33 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     if (numConv(m, cm) == null and c.cls[cm.receiver.int()] != null and
                         !isBuiltinCls(c.cls[cm.receiver.int()].?))
                     {
-                        const root6 = memberRoot(m, prog, c.cls[cm.receiver.int()].?, plainFieldName(m.consts.items[cm.name.int()].String), cm.n_args).?;
+                        const rc9 = c.cls[cm.receiver.int()].?;
+                        const mn9 = m.consts.items[cm.name.int()].String;
+                        if (fieldIndex(prog, rc9, mn9)) |fidx9| {
+                            const fds9 = prog.of(rc9).?;
+                            var call14: std.Io.Writer.Allocating = .init(gpa);
+                            defer call14.deinit();
+                            try call14.writer.print("klam_call_{d}(klio_nat_get({s}, {d})", .{
+                                funcClsArity(fds9[fidx9].cls.?).?, recv, fidx9,
+                            });
+                            var aj14: u32 = 0;
+                            while (aj14 < cm.n_args) : (aj14 += 1) {
+                                const ar14 = cm.args.int() + aj14;
+                                var ab14: [32]u8 = undefined;
+                                var bb18: [96]u8 = undefined;
+                                try call14.writer.print(", {s}", .{
+                                    boxExpr(c.types[ar14], regName(c, ar14, &ab14), &bb18),
+                                });
+                            }
+                            try call14.writer.writeByte(')');
+                            var ob14: [400]u8 = undefined;
+                            try w.print("  {s} = {s};\n", .{
+                                regName(c, cm.dst.int(), &nb),
+                                unboxExpr(c.types[cm.dst.int()], call14.written(), &ob14),
+                            });
+                            continue;
+                        }
+                        const root6 = memberRoot(m, prog, rc9, plainFieldName(mn9), cm.n_args).?;
                         try w.print("  {s} = kvirt_{d}({s}", .{
                             regName(c, cm.dst.int(), &nb), root6.id.int(), recv,
                         });
@@ -2867,11 +3156,76 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         gi, boxExpr(c.types[sg.value.int()], regName(c, sg.value.int(), &vb), &bb),
                     });
                 },
-                .AstLambda => {
-                    // Nothing to materialise: the call site knows the body and
-                    // passes the captures itself.
+                .AstLambda => |al3| {
+                    if (c.types[al3.dst.int()] != .object) {
+                        // Nothing to materialise: every use is a direct call,
+                        // so the call site passes the captures itself.
+                        continue;
+                    }
+                    var nb12: [32]u8 = undefined;
+                    const ldst = regName(c, al3.dst.int(), &nb12);
+                    try w.print("  {s} = klio_nat_alloc_instance(KLAM_{d});\n", .{ ldst, al3.body_func.?.int() });
+                    for (al3.captures, 0..) |cr12, ci12| {
+                        var cb12: [32]u8 = undefined;
+                        var bb16: [96]u8 = undefined;
+                        try w.print("  klio_nat_set({s}, {d}, {s});\n", .{
+                            ldst, ci12,
+                            boxExpr(c.types[cr12.int()], regName(c, cr12.int(), &cb12), &bb16),
+                        });
+                    }
+                },
+                .CallValueOrMember => |cvm| {
+                    var nb14: [32]u8 = undefined;
+                    var fb14: [32]u8 = undefined;
+                    var call15: std.Io.Writer.Allocating = .init(gpa);
+                    defer call15.deinit();
+                    try call15.writer.print("klam_call_{d}({s}", .{
+                        funcClsArity(c.cls[cvm.callee.int()].?).?,
+                        regName(c, cvm.callee.int(), &fb14),
+                    });
+                    var aj15: u32 = 0;
+                    while (aj15 < cvm.n_args) : (aj15 += 1) {
+                        const ar15 = cvm.args.int() + aj15;
+                        var ab15: [32]u8 = undefined;
+                        var bb19: [96]u8 = undefined;
+                        try call15.writer.print(", {s}", .{
+                            boxExpr(c.types[ar15], regName(c, ar15, &ab15), &bb19),
+                        });
+                    }
+                    try call15.writer.writeByte(')');
+                    var ob15: [400]u8 = undefined;
+                    try w.print("  {s} = {s};\n", .{
+                        regName(c, cvm.dst.int(), &nb14),
+                        unboxExpr(c.types[cvm.dst.int()], call15.written(), &ob15),
+                    });
                 },
                 .CallValue => |cv2| {
+                    if (c.types[cv2.callee.int()] == .object) {
+                        var nb13: [32]u8 = undefined;
+                        var fb13: [32]u8 = undefined;
+                        var call13: std.Io.Writer.Allocating = .init(gpa);
+                        defer call13.deinit();
+                        try call13.writer.print("klam_call_{d}({s}", .{
+                            funcClsArity(c.cls[cv2.callee.int()].?).?,
+                            regName(c, cv2.callee.int(), &fb13),
+                        });
+                        var aj13: u32 = 0;
+                        while (aj13 < cv2.n_args) : (aj13 += 1) {
+                            const ar13 = cv2.args.int() + aj13;
+                            var ab13: [32]u8 = undefined;
+                            var bb17: [96]u8 = undefined;
+                            try call13.writer.print(", {s}", .{
+                                boxExpr(c.types[ar13], regName(c, ar13, &ab13), &bb17),
+                            });
+                        }
+                        try call13.writer.writeByte(')');
+                        var ob13: [400]u8 = undefined;
+                        try w.print("  {s} = {s};\n", .{
+                            regName(c, cv2.dst.int(), &nb13),
+                            unboxExpr(c.types[cv2.dst.int()], call13.written(), &ob13),
+                        });
+                        continue;
+                    }
                     const li = c.lam[cv2.callee.int()].?;
                     const bf = m.funcById(li.body).?;
                     var nb3: [32]u8 = undefined;
@@ -3273,6 +3627,11 @@ pub fn emit(
     defer seen.deinit();
     const Pending = struct { f: *const Func, synth: ?[]const ir.Param, caps: []const CapInfo = &.{} };
     // Capture signatures outlive the queue entry that carried them.
+    var synth_owned: std.ArrayList([]ir.Param) = .empty;
+    defer {
+        for (synth_owned.items) |sp| gpa.free(sp);
+        synth_owned.deinit(gpa);
+    }
     var cap_owned: std.ArrayList([]CapInfo) = .empty;
     defer {
         for (cap_owned.items) |ct| gpa.free(ct);
@@ -3358,12 +3717,20 @@ pub fn emit(
                     const bfn = m.funcById(bfid) orelse return false;
                     if (!seen.contains(bfn.id.int())) {
                         // The body is compiled against what this site captured:
-                        // those values arrive as leading arguments.
+                        // those values arrive as leading arguments. Its own
+                        // parameters carry no declared types, so they come from
+                        // the function type the value is expected to have —
+                        // the same signature `eligible` typed it against.
                         const ct = try gpa.alloc(CapInfo, al2.captures.len);
                         for (al2.captures, 0..) |cr, ci4| ct[ci4] = .{ .ty = c.types[cr.int()], .cls = c.cls[cr.int()], .elem = c.elem[cr.int()] };
                         try cap_owned.append(gpa, ct);
+                        var lsyn: ?[]ir.Param = null;
+                        if (expectedFnType(m, c.f, al2.dst)) |t6| {
+                            lsyn = try lambdaParams(gpa, bfn, t6);
+                            if (lsyn) |ls6| try synth_owned.append(gpa, ls6);
+                        }
                         try seen.put(bfn.id.int(), {});
-                        try queue.append(gpa, .{ .f = bfn, .synth = null, .caps = ct });
+                        try queue.append(gpa, .{ .f = bfn, .synth = lsyn, .caps = ct });
                     }
                     continue;
                 }
@@ -3372,7 +3739,7 @@ pub fn emit(
                     if (numConv(m, cm3) == null) if (c.cls[cm3.receiver.int()]) |rc8| {
                         if (!isBuiltinCls(rc8) and cm3.name.int() < m.consts.items.len) {
                             const nmc = m.consts.items[cm3.name.int()];
-                            if (nmc == .String) {
+                            if (nmc == .String and fieldIndex(prog, rc8, nmc.String) == null) {
                                 if (memberRoot(m, prog, rc8, plainFieldName(nmc.String), cm3.n_args)) |root8| {
                                     var have8 = false;
                                     for (vsites.items) |sv2| {
@@ -3596,6 +3963,7 @@ pub fn emit(
                     if (numConv(m, cm2) != null) continue;
                     const rc7 = c.cls[cm2.receiver.int()] orelse continue;
                     if (isBuiltinCls(rc7)) continue;
+                    if (fieldIndex(prog, rc7, m.consts.items[cm2.name.int()].String) != null) continue;
                     const root7 = memberRoot(m, prog, rc7, plainFieldName(m.consts.items[cm2.name.int()].String), cm2.n_args) orelse continue;
                     var have7 = false;
                     for (used_slots.items) |u| {
@@ -3655,6 +4023,34 @@ pub fn emit(
                     if (u.cid == oc and u.entry == null) have2 = true;
                 }
                 if (!have2) try used_singletons.append(gpa, .{ .cid = oc });
+            }
+        }
+    }
+
+    // Lambdas whose value has to exist. Each becomes a class the emitter
+    // synthesizes for that body, one field per capture: the collector traces
+    // it like any instance, and a call through the value finds the body again
+    // by its class handle.
+    var used_lambdas: std.ArrayList(LambdaUse) = .empty;
+    defer used_lambdas.deinit(gpa);
+    for (accepted.items) |*c| {
+        for (c.f.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                if (inst.* != .AstLambda) continue;
+                const al2 = inst.AstLambda;
+                if (c.types[al2.dst.int()] != .object) continue;
+                const bfid = al2.body_func orelse continue;
+                var have_l = false;
+                for (used_lambdas.items) |u| {
+                    if (u.body == bfid) have_l = true;
+                }
+                if (have_l) continue;
+                try used_lambdas.append(gpa, .{
+                    .body = bfid,
+                    .n_caps = @intCast(al2.captures.len),
+                    .arity = funcClsArity(c.cls[al2.dst.int()].?).?,
+                    .ret = c.elem[al2.dst.int()],
+                });
             }
         }
     }
@@ -3804,6 +4200,7 @@ pub fn emit(
             \\
         );
         for (used_classes.items) |cid| try w.print("static uint32_t KCLS_{d};\n", .{cid});
+        for (used_lambdas.items) |lu| try w.print("static uint32_t KLAM_{d};\n", .{lu.body.int()});
         try w.writeAll("\nstatic void klio_register_classes(void) {\n");
         for (used_classes.items) |cid| {
             const cdef = &m.classes.items[cid];
@@ -3817,6 +4214,16 @@ pub fn emit(
             }
             if (fields.len == 0) try w.writeAll("0");
             try w.print("}}; KCLS_{d} = klio_nat_class(\"{s}\", {d}, fn); }}\n", .{ cid, cdef.name, fields.len });
+        }
+        for (used_lambdas.items) |lu| {
+            try w.print("  {{ static const char *const fn[] = {{", .{});
+            var ci7: u32 = 0;
+            while (ci7 < lu.n_caps) : (ci7 += 1) {
+                if (ci7 != 0) try w.writeAll(", ");
+                try w.print("\"k{d}\"", .{ci7});
+            }
+            if (lu.n_caps == 0) try w.writeAll("0");
+            try w.print("}}; KLAM_{d} = klio_nat_class(\"Function{d}\", {d}, fn); }}\n", .{ lu.body.int(), lu.arity, lu.n_caps });
         }
         try w.writeAll("}\n\n");
     }
@@ -3939,6 +4346,27 @@ pub fn emit(
         try writeCtorProto(w, m, cid);
         try w.writeAll(";\n");
     }
+    // One adapter per materialised lambda, and one dispatcher per arity called
+    // through a value. A function value's arguments and result pass boxed,
+    // because which body runs is a run-time answer and two bodies of the same
+    // arity need not agree on machine types.
+    for (used_lambdas.items) |lu| {
+        try w.print("static klio_value klam_{d}(klio_value self", .{lu.body.int()});
+        var ai7: u32 = 0;
+        while (ai7 < lu.arity) : (ai7 += 1) try w.print(", klio_value a{d}", .{ai7});
+        try w.writeAll(");\n");
+    }
+    {
+        var seen_ar: [FUNC_MAX_ARITY + 1]bool = @splat(false);
+        for (used_lambdas.items) |lu| {
+            if (seen_ar[lu.arity]) continue;
+            seen_ar[lu.arity] = true;
+            try w.print("static klio_value klam_call_{d}(klio_value f", .{lu.arity});
+            var ai8: u32 = 0;
+            while (ai8 < lu.arity) : (ai8 += 1) try w.print(", klio_value a{d}", .{ai8});
+            try w.writeAll(");\n");
+        }
+    }
     try w.writeAll("\n");
     for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try, accepted.items);
 
@@ -3982,6 +4410,67 @@ pub fn emit(
     if (ctor_classes.items.len != 0) try w.writeAll("\n");
     for (ctor_classes.items) |cid| try writeCtorBody(gpa, w, m, prog, cid);
     if (ctor_classes.items.len != 0) try w.writeAll("\n");
+    for (used_lambdas.items) |lu| {
+        const bc2 = blk9: {
+            for (accepted.items) |*cc| {
+                if (cc.f.id == lu.body) break :blk9 cc;
+            }
+            return false;
+        };
+        try w.print("static klio_value klam_{d}(klio_value self", .{lu.body.int()});
+        var ai9: u32 = 0;
+        while (ai9 < lu.arity) : (ai9 += 1) try w.print(", klio_value a{d}", .{ai9});
+        try w.writeAll(") {\n");
+        if (lu.n_caps == 0) try w.writeAll("  (void)self;\n");
+        var call9: std.Io.Writer.Allocating = .init(gpa);
+        defer call9.deinit();
+        try writeSymbol(&call9.writer, bc2.f);
+        try call9.writer.writeByte('(');
+        for (bc2.caps, 0..) |ct9, ci9| {
+            if (ci9 != 0) try call9.writer.writeAll(", ");
+            var gb9: [96]u8 = undefined;
+            const g9 = try std.fmt.bufPrint(&gb9, "klio_nat_get(self, {d})", .{ci9});
+            var ob10: [200]u8 = undefined;
+            try call9.writer.print("{s}", .{unboxExpr(ct9.ty, g9, &ob10)});
+        }
+        for (bc2.params, 0..) |p9, pi9| {
+            if (pi9 != 0 or bc2.caps.len != 0) try call9.writer.writeAll(", ");
+            const pt9: Ty = tyOf(p9.ty) orelse .object;
+            var ab10: [16]u8 = undefined;
+            // The lowering always gives a lambda an `it` slot, so a body may
+            // declare a parameter the call never supplies; it gets the type's
+            // zero, which is unreachable in a lambda that declares none.
+            const src10 = if (pi9 < lu.arity)
+                try std.fmt.bufPrint(&ab10, "a{d}", .{pi9})
+            else
+                "klio_nat_box_unit()";
+            var ob11: [200]u8 = undefined;
+            try call9.writer.print("{s}", .{unboxExpr(pt9, src10, &ob11)});
+        }
+        try call9.writer.writeByte(')');
+        var bb15: [400]u8 = undefined;
+        try w.print("  return {s};\n}}\n", .{boxExpr(bc2.ret, call9.written(), &bb15)});
+    }
+    {
+        var seen_ar2: [FUNC_MAX_ARITY + 1]bool = @splat(false);
+        for (used_lambdas.items) |lu| {
+            if (seen_ar2[lu.arity]) continue;
+            seen_ar2[lu.arity] = true;
+            try w.print("static klio_value klam_call_{d}(klio_value f", .{lu.arity});
+            var ai10: u32 = 0;
+            while (ai10 < lu.arity) : (ai10 += 1) try w.print(", klio_value a{d}", .{ai10});
+            try w.writeAll(") {\n  uint32_t k = klio_nat_class_of(f);\n");
+            for (used_lambdas.items) |lu2| {
+                if (lu2.arity != lu.arity) continue;
+                try w.print("  if (k == KLAM_{d}) return klam_{d}(f", .{ lu2.body.int(), lu2.body.int() });
+                var aj10: u32 = 0;
+                while (aj10 < lu.arity) : (aj10 += 1) try w.print(", a{d}", .{aj10});
+                try w.writeAll(");\n");
+            }
+            try w.writeAll("  klio_nat_no_method(\"invoke\");\n  return klio_nat_box_unit();\n}\n");
+        }
+    }
+    if (used_lambdas.items.len != 0) try w.writeAll("\n");
     if (used_singletons.items.len != 0) {
         try w.writeAll("static void klio_init_singletons(void) {\n");
         try w.print("  for (unsigned i = 0; i < {d}; i++) KO[i] = klio_nat_box_unit();\n", .{used_singletons.items.len});
