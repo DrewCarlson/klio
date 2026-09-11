@@ -9,6 +9,7 @@ const cli = @import("cli");
 const runtime = @import("runtime");
 const ir = @import("ir");
 const eval = ir.eval;
+const stdlib = @import("stdlib");
 
 /// Generated code registers its layout globals here; the run entries
 /// fill them AFTER the performance profile (and so the reclaim mode) is
@@ -535,4 +536,57 @@ export fn klio_nat_float(v: CValue) f32 {
 }
 export fn klio_nat_bool(v: CValue) i32 {
     return if (fromC(v).Bool) 1 else 0;
+}
+
+// --- strings ---------------------------------------------------------------
+
+/// A string literal, materialised once per evaluation of its `Const`.
+export fn klio_nat_string(bytes: [*]const u8, len: usize) CValue {
+    const a = natAlloc();
+    const s = runtime.strInit(a, bytes[0..len]) catch @panic("klio_nat_string: out of memory");
+    return toC(.{ .String = s });
+}
+
+/// `a + b` where either side is a string. Kotlin renders the other operand
+/// through its own `toString`, which is what `Value.display` is.
+export fn klio_nat_concat(av: CValue, bv: CValue) CValue {
+    const a = natAlloc();
+    const x = fromC(av);
+    const y = fromC(bv);
+    const xs = x.display(a) catch @panic("klio_nat_concat: out of memory");
+    defer a.free(xs);
+    const ys = y.display(a) catch @panic("klio_nat_concat: out of memory");
+    defer a.free(ys);
+    const joined = std.mem.concat(a, u8, &.{ xs, ys }) catch @panic("klio_nat_concat: out of memory");
+    const s = runtime.strInitOwned(a, joined) catch @panic("klio_nat_concat: out of memory");
+    return toC(.{ .String = s });
+}
+
+/// Kotlin's `length` counts UTF-16 code units, which is not the byte count.
+export fn klio_nat_str_length(v: CValue) i32 {
+    const s = fromC(v);
+    const g = s.String.borrow();
+    defer g.deinit();
+    return @intCast(stdlib.text.utf16Len(g.get().bytes));
+}
+
+fn natWrite(bytes: []const u8) void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = std.c.write(1, bytes.ptr + off, bytes.len - off);
+        if (n <= 0) return;
+        off += @intCast(n);
+    }
+}
+
+/// Print a value the way the interpreter prints it. Compiled code uses this
+/// for anything but a plain scalar, so rendering never drifts from the
+/// interpreter's.
+export fn klio_nat_println(v: CValue) void {
+    const a = natAlloc();
+    const val = fromC(v);
+    const txt = val.display(a) catch @panic("klio_nat_println: out of memory");
+    defer a.free(txt);
+    natWrite(txt);
+    natWrite("\n");
 }

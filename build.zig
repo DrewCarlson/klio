@@ -741,6 +741,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "cli", .module = harness_mods.get("cli").? },
                 .{ .name = "runtime", .module = harness_mods.get("runtime").? },
                 .{ .name = "ir", .module = harness_mods.get("ir").? },
+                .{ .name = "stdlib", .module = harness_mods.get("stdlib").? },
             },
         }),
     });

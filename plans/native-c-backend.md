@@ -173,4 +173,16 @@ into arg 0, so a method is an ordinary C function taking `this` first, and a
 property read inside its own class resolves through the synthesized accessor
 name to the same field index.
 
-Next: strings.
+Strings run. A string is a reference like any other and lives in the published
+frame; literals, concatenation (either spelled as itself or as `+` with a
+string on one side, which renders the other operand as Kotlin does), `length`
+in UTF-16 code units, and strings as class fields all compile.
+
+Once the runtime is linked, EVERYTHING prints through its renderer rather than
+`printf`. Two renderers is two chances to drift, and they cannot even share a
+stream: `printf` is stdio-buffered while the runtime writes the descriptor, so
+mixing them printed correct lines in the wrong order. The scalar core still
+uses `printf` because it links nothing at all.
+
+Next: collections, then control flow that escapes (exceptions), closures, and
+coroutines.

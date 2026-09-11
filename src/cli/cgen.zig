@@ -92,9 +92,21 @@ fn constTy(c: ir.Const) ?Ty {
         .Float => .f32,
         .Bool => .boolean,
         .Unit => .unit,
+        // A string literal is a reference like any other: it lives in the
+        // published frame so the collector can see it.
+        .String => .object,
         else => null,
     };
 }
+
+fn isStringReg(types: []const Ty, cls: []const ?u32, r: u32) bool {
+    return types[r] == .object and cls[r] != null and cls[r].? == STRING_CLS;
+}
+
+/// The class marker for a register the emitter knows holds a `String`. Strings
+/// are not user classes, so they take a handle outside the class table rather
+/// than a `ClassId`.
+const STRING_CLS: u32 = std.math.maxInt(u32);
 
 /// Kotlin's binary numeric promotion, over the kinds this subset carries.
 fn promote(a: Ty, b: Ty) ?Ty {
@@ -174,7 +186,7 @@ fn classFields(m: *const Module, cid: ir.ClassId) ?[]const ir.Param {
     for (c.primary_params) |p| {
         if (!p.is_property) return null;
         if (p.default != null or p.is_vararg) return null;
-        if (tyOf(p.ty) == null) return null;
+        if (tyOf(p.ty) == null and classIndexOfName(m, p.ty) == null) return null;
     }
     return c.primary_params;
 }
@@ -198,15 +210,32 @@ fn fieldIndex(m: *const Module, cid: u32, name: []const u8) ?u32 {
     return null;
 }
 
-/// The class a declared type names, when the program declares one.
-fn classOfType(m: *const Module, t: ir.TypeRef) ?u32 {
+/// The class a declared type NAMES, without asking whether its layout is one
+/// the emitter can produce. Kept separate from `classOfType` because a field
+/// only has to be a reference to be stored; needing the layout too would
+/// recurse forever on a class holding one of its own kind.
+fn classIndexOfName(m: *const Module, t: ir.TypeRef) ?u32 {
     if (t.nullable) return null;
+    if (std.mem.eql(u8, t.name, "String") or std.mem.eql(u8, t.name, "kotlin.String")) return STRING_CLS;
     for (m.classes.items, 0..) |*c, i| {
-        if (std.mem.eql(u8, c.name, t.name) or std.mem.eql(u8, c.fqn, t.name)) {
-            if (classFields(m, @enumFromInt(i)) == null) return null;
-            return @intCast(i);
-        }
+        if (std.mem.eql(u8, c.name, t.name) or std.mem.eql(u8, c.fqn, t.name)) return @intCast(i);
     }
+    return null;
+}
+
+/// The class a declared type names AND whose layout the emitter can produce —
+/// what a register holding it needs before its fields can be addressed.
+fn classOfType(m: *const Module, t: ir.TypeRef) ?u32 {
+    const idx = classIndexOfName(m, t) orelse return null;
+    if (idx == STRING_CLS) return idx;
+    if (classFields(m, @enumFromInt(idx)) == null) return null;
+    return idx;
+}
+
+/// The machine type of a class property: a scalar in place, or a reference.
+fn fieldTy(m: *const Module, p: ir.Param) ?Ty {
+    if (tyOf(p.ty)) |t| return t;
+    if (classIndexOfName(m, p.ty) != null) return .object;
     return null;
 }
 
@@ -313,10 +342,11 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
             switch (inst.*) {
                 .Trace => {},
                 .Const => |c| {
-                    if (c.dst.int() >= f.n_locals) return null;
-                    if (c.value.int() >= m.consts.items.len) return null;
+                    if (c.dst.int() >= f.n_locals) return no(f, "const dst");
+                    if (c.value.int() >= m.consts.items.len) return no(f, "const id");
                     const t = constTy(m.consts.items[c.value.int()]) orelse return no(f, "const kind");
                     types[c.dst.int()] = t;
+                    if (t == .object) cls[c.dst.int()] = STRING_CLS;
                     known[c.dst.int()] = true;
                 },
                 .LoadParam => |lp| {
@@ -342,6 +372,18 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     if (!known[b.lhs.int()] or !known[b.rhs.int()]) return null;
                     const lt = types[b.lhs.int()];
                     const rt = types[b.rhs.int()];
+                    // Concatenation, either spelled as itself or as `+` with a
+                    // string on one side. Kotlin renders the other operand
+                    // through its own `toString`, so anything may be joined.
+                    const str_join = b.op == .StringConcat or
+                        (b.op == .Add and (isStringReg(types, cls, b.lhs.int()) or isStringReg(types, cls, b.rhs.int())));
+                    if (str_join) {
+                        if (b.dst.int() >= f.n_locals) return no(f, "concat dst");
+                        types[b.dst.int()] = .object;
+                        cls[b.dst.int()] = STRING_CLS;
+                        known[b.dst.int()] = true;
+                        continue;
+                    }
                     // `ushr` has no C spelling of its own — it is a cast to
                     // unsigned around `>>` — so it is admitted here and written
                     // out below rather than looked up.
@@ -411,7 +453,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     while (k < ni.n_args) : (k += 1) {
                         const ar = ni.args.int() + k;
                         if (ar >= f.n_locals or !known[ar]) return no(f, "ctor arg");
-                        if (types[ar] != tyOf(fields[k].ty).?) return no(f, "ctor arg type");
+                        if (types[ar] != (fieldTy(m, fields[k]) orelse return no(f, "ctor field type"))) return no(f, "ctor arg type");
                     }
                     if (ni.dst.int() >= f.n_locals) return no(f, "ctor dst");
                     types[ni.dst.int()] = .object;
@@ -422,13 +464,22 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     if (gf.receiver.int() >= f.n_locals or !known[gf.receiver.int()]) return no(f, "field receiver");
                     if (types[gf.receiver.int()] != .object) return no(f, "field on non-object");
                     const rc = cls[gf.receiver.int()] orelse return no(f, "field receiver class");
+                    if (rc == STRING_CLS) {
+                        const snm = m.consts.items[gf.field.int()];
+                        if (snm != .String or !std.mem.eql(u8, plainFieldName(snm.String), "length")) return no(f, "string member");
+                        if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
+                        types[gf.dst.int()] = .i32;
+                        known[gf.dst.int()] = true;
+                        continue;
+                    }
                     if (gf.field.int() >= m.consts.items.len) return no(f, "field name");
                     const nm = m.consts.items[gf.field.int()];
                     if (nm != .String) return no(f, "field name kind");
                     const idx = fieldIndex(m, rc, nm.String) orelse return no(f, "field not laid out");
                     const fields = classFields(m, @enumFromInt(rc)).?;
                     if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
-                    types[gf.dst.int()] = tyOf(fields[idx].ty).?;
+                    types[gf.dst.int()] = fieldTy(m, fields[idx]) orelse return no(f, "field type");
+                    if (types[gf.dst.int()] == .object) cls[gf.dst.int()] = classIndexOfName(m, fields[idx].ty);
                     known[gf.dst.int()] = true;
                 },
                 .SetField => |sf| {
@@ -441,7 +492,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     const idx = fieldIndex(m, rc, nm.String) orelse return no(f, "field not laid out");
                     const fields = classFields(m, @enumFromInt(rc)).?;
                     if (sf.value.int() >= f.n_locals or !known[sf.value.int()]) return no(f, "field value");
-                    if (types[sf.value.int()] != tyOf(fields[idx].ty).?) return no(f, "field value type");
+                    if (types[sf.value.int()] != (fieldTy(m, fields[idx]) orelse return no(f, "field type"))) return no(f, "field value type");
                 },
                 .Call => |c| {
                     if (c.arg_names.len != 0 or c.type_args.len != 0) return no(f, "call arg names/type args");
@@ -572,6 +623,22 @@ fn writeConst(w: *std.Io.Writer, c: ir.Const) !void {
     }
 }
 
+/// A C string literal for arbitrary bytes. The source may hold anything,
+/// including embedded NULs and invalid UTF-8, so every byte outside the plain
+/// printable range is escaped numerically rather than passed through.
+fn emitCLiteral(w: *std.Io.Writer, bytes: []const u8) !void {
+    try w.writeByte('"');
+    for (bytes) |ch| {
+        switch (ch) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            0x20...0x21, 0x23...0x5B, 0x5D...0x7E => try w.writeByte(ch),
+            else => try w.print("\\{o:0>3}", .{ch}),
+        }
+    }
+    try w.writeByte('"');
+}
+
 /// A C floating literal for `v`. The shortest round-trip decimal is exact, but
 /// it can come out with no decimal point at all (1e20 formats as
 /// "100000000000000000000"), which C reads as an integer literal too large for
@@ -676,8 +743,16 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
             switch (inst.*) {
                 .Trace => {},
                 .Const => |k| {
-                    try w.print("  r{d} = ", .{k.dst.int()});
-                    try writeConst(w, m.consts.items[k.value.int()]);
+                    const kv = m.consts.items[k.value.int()];
+                    var nb: [32]u8 = undefined;
+                    if (kv == .String) {
+                        try w.print("  {s} = klio_nat_string(", .{regName(c, k.dst.int(), &nb)});
+                        try emitCLiteral(w, kv.String);
+                        try w.print(", {d});\n", .{kv.String.len});
+                        continue;
+                    }
+                    try w.print("  {s} = ", .{regName(c, k.dst.int(), &nb)});
+                    try writeConst(w, kv);
                     try w.writeAll(";\n");
                 },
                 .LoadParam => |lp| {
@@ -705,6 +780,14 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
                 },
                 .GetField => |gf| {
                     const rc = c.cls[gf.receiver.int()].?;
+                    if (rc == STRING_CLS) {
+                        var nb: [32]u8 = undefined;
+                        var rb: [32]u8 = undefined;
+                        try w.print("  {s} = klio_nat_str_length({s});\n", .{
+                            regName(c, gf.dst.int(), &nb), regName(c, gf.receiver.int(), &rb),
+                        });
+                        continue;
+                    }
                     const nm = m.consts.items[gf.field.int()].String;
                     const idx = fieldIndex(m, rc, nm).?;
                     var nb: [32]u8 = undefined;
@@ -730,6 +813,21 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
                 },
                 .BinOp => |b| {
                     const dt = c.types[b.dst.int()];
+                    if (dt == .object) {
+                        // Concatenation: either operand may be any value, and
+                        // the runtime renders it as Kotlin would.
+                        var db: [32]u8 = undefined;
+                        var lb: [32]u8 = undefined;
+                        var rb: [32]u8 = undefined;
+                        var l1: [96]u8 = undefined;
+                        var r1: [96]u8 = undefined;
+                        try w.print("  {s} = klio_nat_concat({s}, {s});\n", .{
+                            regName(c, b.dst.int(), &db),
+                            boxExpr(c.types[b.lhs.int()], regName(c, b.lhs.int(), &lb), &l1),
+                            boxExpr(c.types[b.rhs.int()], regName(c, b.rhs.int(), &rb), &r1),
+                        });
+                        continue;
+                    }
                     const op = cOp(b.op).?;
                     if ((b.op == .Div or b.op == .Mod) and !dt.isFloat() and !isCmp(b.op)) {
                         try writeDivGuard(w, b.rhs.int());
@@ -788,7 +886,17 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
                             .i64 => "%\" PRId64 \"",
                             else => "",
                         };
-                        if (at == .boolean) {
+                        // When the runtime is linked, everything prints through
+                        // its renderer: two renderers would be two chances to
+                        // drift, and printf's buffered stream interleaves
+                        // wrongly with the runtime's own writes.
+                        if (uses_objects) {
+                            var ab2: [32]u8 = undefined;
+                            var bx: [96]u8 = undefined;
+                            try w.print("  klio_nat_println({s});\n", .{
+                                boxExpr(at, regName(c, a0, &ab2), &bx),
+                            });
+                        } else if (at == .boolean) {
                             try w.print("  printf(\"%s\\n\", r{d} ? \"true\" : \"false\");\n", .{a0});
                         } else if (at.isFloat()) {
                             try w.print("  klio_print_fp((double)r{d}, {d});\n", .{ a0, @intFromBool(at == .f32) });
@@ -902,6 +1010,7 @@ pub fn emit(
     for (accepted.items) |*c| {
         for (c.cls) |maybe| {
             const cid = maybe orelse continue;
+            if (cid == STRING_CLS) continue;
             var seen_cls = false;
             for (used_classes.items) |u| {
                 if (u == cid) seen_cls = true;
@@ -909,7 +1018,14 @@ pub fn emit(
             if (!seen_cls) try used_classes.append(gpa, cid);
         }
     }
-    const uses_objects = used_classes.items.len != 0;
+    // A string is a reference too: a program that only concatenates still needs
+    // the runtime for its collector and renderer.
+    var uses_objects = used_classes.items.len != 0;
+    for (accepted.items) |*c| {
+        for (c.types) |t| {
+            if (t == .object) uses_objects = true;
+        }
+    }
 
     var needs_fp = false;
     var needs_div = false;
@@ -974,7 +1090,7 @@ pub fn emit(
         \\
         \\
     );
-    if (needs_fp) try w.writeAll(
+    if (needs_fp and !uses_objects) try w.writeAll(
         \\/* Kotlin renders a floating value as the SHORTEST decimal that reads
         \\ * back as the same double, always with a fractional part, and switches
         \\ * to scientific form outside [1e-3, 1e7). printf("%g") agrees with none
