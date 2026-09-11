@@ -282,3 +282,257 @@ export fn klio_op_term(ctx: *anyopaque, block: u32) void {
 export fn klio_op_goto_exit(ctx: *anyopaque, block: u32) void {
     eval.nativeOpGotoExit(ctxOf(ctx), block);
 }
+
+// ---------------------------------------------------------------------------
+// The native object ABI: what a COMPILED program calls.
+//
+// Compiled code is the program — there is no module to look a class up in — so
+// a class arrives as an emitted descriptor and is built here at startup. From
+// then on a field is addressed by its index, resolved when the C was written,
+// so nothing on this path searches by name.
+//
+// Instances are ordinary `InstanceData` cells, which is what lets a compiled
+// object flow into runtime collections, print through the runtime's renderer,
+// and be traced by the collector exactly as an interpreted one is.
+// ---------------------------------------------------------------------------
+
+/// A `Value` as C sees it: two words, no tag union. Compiled code never reads
+/// the inside; it hands them back to the entry points below.
+pub const CValue = extern struct { lo: u64, hi: u64 };
+
+comptime {
+    if (@sizeOf(runtime.Value) != @sizeOf(CValue)) {
+        @compileError("the native ABI passes a Value as two words; it is no longer that size");
+    }
+}
+
+// A tagged union has no guaranteed layout, so the conversion is a byte copy
+// rather than a bitcast. The sizes are asserted equal above; compiled code
+// treats the result as opaque and only ever hands it back.
+inline fn toC(v: runtime.Value) CValue {
+    var tmp = v;
+    var out: CValue = undefined;
+    @memcpy(std.mem.asBytes(&out), std.mem.asBytes(&tmp));
+    return out;
+}
+inline fn fromC(v: CValue) runtime.Value {
+    var tmp = v;
+    var out: runtime.Value = undefined;
+    @memcpy(std.mem.asBytes(&out), std.mem.asBytes(&tmp));
+    return out;
+}
+
+fn natAlloc() std.mem.Allocator {
+    return std.heap.c_allocator;
+}
+
+var nat_classes: std.ArrayListUnmanaged(runtime.ObjRef(runtime.ClassDef)) = .empty;
+
+/// Per-instance identity, the same monotonic counter the interpreter keeps.
+var nat_identity = std.atomic.Value(u64).init(1);
+
+fn nextNatIdentity() u64 {
+    return nat_identity.fetchAdd(1, .monotonic);
+}
+
+/// Register an emitted class and return the handle its allocations use. Called
+/// once per class before `main` runs.
+export fn klio_nat_class(name: [*:0]const u8, n_fields: u32, field_names: [*]const [*:0]const u8) u32 {
+    const a = natAlloc();
+    const nm = std.mem.span(name);
+    const props = a.alloc(runtime.PropertyDef, n_fields) catch @panic("klio_nat_class: out of memory");
+    var i: u32 = 0;
+    while (i < n_fields) : (i += 1) {
+        props[i] = .{
+            .name = std.mem.span(field_names[i]),
+            .mutable = true,
+            .init = null,
+            .getter = null,
+            .setter = null,
+            .delegate = null,
+            .is_abstract = false,
+            .is_lateinit = false,
+            .primitive_zero = null,
+        };
+    }
+    const cls = runtime.ObjRef(runtime.ClassDef).init(a, .{
+        .name = nm,
+        .fqn = nm,
+        .annotation_names = &.{},
+        .primary_params = &.{},
+        .methods = &.{},
+        .body_properties = props,
+        .init_blocks = &.{},
+        .init_block_property_positions = &.{},
+        .is_data = false,
+        .is_value = false,
+        .is_object = false,
+        .is_enum = false,
+        .is_sealed = false,
+        .supertype_names = &.{},
+        .parent = null,
+        .interfaces = &.{},
+        .is_interface = false,
+        .is_fun_interface = false,
+        .parent_ctor_args = &.{},
+        .is_open = false,
+        .is_abstract = false,
+        .is_inner = false,
+        .is_anonymous = false,
+        .secondary_ctors = &.{},
+        .enum_entries = &.{},
+        .companion = runtime.ObjRef(?runtime.ObjRef(runtime.InstanceData)).init(a, null) catch @panic("oom"),
+        .enclosing_class = runtime.ObjRef(?runtime.ObjRef(runtime.ClassDef)).init(a, null) catch @panic("oom"),
+        .nested_classes = &.{},
+        .captured_env = runtime.ObjRef(runtime.Env).init(a, runtime.Env.init(a)) catch @panic("oom"),
+        .supertype_delegates = &.{},
+        .delegate_forwarders = &.{},
+        .object_singleton = runtime.ObjRef(?runtime.ObjRef(runtime.InstanceData)).init(a, null) catch @panic("oom"),
+    }) catch @panic("klio_nat_class: out of memory");
+    nat_classes.append(a, cls) catch @panic("klio_nat_class: out of memory");
+    return @intCast(nat_classes.items.len - 1);
+}
+
+/// A fresh instance of a registered class, every field Unit. The compiled
+/// constructor stores the real values through `klio_nat_set`.
+export fn klio_nat_alloc_instance(cls: u32) CValue {
+    const a = natAlloc();
+    const def = nat_classes.items[cls];
+    const g = def.borrow();
+    const n = g.get().body_properties.len;
+    const names = g.get().body_properties;
+    var fields: std.ArrayList(runtime.InstanceData.Field) = .empty;
+    fields.ensureTotalCapacity(a, n) catch @panic("klio_nat_alloc_instance: out of memory");
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        fields.appendAssumeCapacity(.{ .name = names[i].name, .value = .Unit });
+    }
+    g.deinit();
+    const inst = runtime.ObjRef(runtime.InstanceData).init(a, .{
+        .class = def.clone(),
+        .fields = fields,
+        .outer = null,
+        .identity = nextNatIdentity(),
+        .native_state = null,
+    }) catch @panic("klio_nat_alloc_instance: out of memory");
+    return toC(.{ .Instance = inst });
+}
+
+export fn klio_nat_get(recv: CValue, idx: u32) CValue {
+    const v = fromC(recv);
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    return toC(g.get().fields.items[idx].value);
+}
+
+export fn klio_nat_set(recv: CValue, idx: u32, val: CValue) void {
+    const v = fromC(recv);
+    const g = v.Instance.borrowMut();
+    defer g.deinit();
+    const slot = &g.get().fields.items[idx];
+    slot.value = fromC(val);
+    runtime.gc.writeBarrier(&v.Instance.cell.hdr);
+}
+
+// --- roots -----------------------------------------------------------------
+//
+// The collector is precisely rooted and never scans the native stack, so a
+// compiled frame publishes its object slots here. Scalars stay in C locals and
+// are not published: nothing on the heap depends on them.
+
+pub const NatFrame = extern struct {
+    prev: ?*NatFrame,
+    n: u32,
+    slots: [*]CValue,
+};
+
+threadlocal var nat_top: ?*NatFrame = null;
+
+export fn klio_nat_enter(f: *NatFrame) void {
+    f.prev = nat_top;
+    nat_top = f;
+}
+
+export fn klio_nat_leave(f: *NatFrame) void {
+    nat_top = f.prev;
+}
+
+fn markNatFrames(m: *runtime.gc.Marker) void {
+    var cur = nat_top;
+    while (cur) |f| : (cur = f.prev) {
+        var i: u32 = 0;
+        while (i < f.n) : (i += 1) {
+            var v = fromC(f.slots[i]);
+            v.gcMark(m);
+        }
+    }
+}
+
+var nat_roots_registered = false;
+
+/// Called once by generated code before `main`. Turns the collector on and
+/// installs its view of compiled frames. Without this a compiled program never
+/// collects: the GC is normally armed by the `klio_rt_run_*` entries, and a
+/// compiled program calls none of them.
+export fn klio_nat_init(void_arg: u32) void {
+    _ = void_arg;
+    if (nat_roots_registered) return;
+    nat_roots_registered = true;
+    runtime.gc.registerRoot(markNatFrames);
+    runtime.backing.configureGcFromEnv();
+}
+
+/// Called after the emitted class descriptors are registered and before the
+/// program body runs. Cells minted up to here are program-lifetime (the class
+/// graph) and stay off the sweep registry; everything the body allocates is
+/// collectable. The interpreter flips the same switch in `vmRun`, which a
+/// compiled program never reaches — without this every allocation is minted
+/// permanent and the heap only grows.
+export fn klio_nat_begin() void {
+    runtime.gc.alloc_perm = false;
+}
+
+/// The safe point. Compiled code polls at loop back edges, which is where an
+/// allocating loop would otherwise run to the end of the heap: every slot the
+/// collector may follow is in a published frame at that moment, and nothing
+/// holds a borrow across it.
+export fn klio_nat_safepoint() void {
+    if (!runtime.gc.pending()) return;
+    runtime.gc.collect();
+}
+
+// --- boxing ----------------------------------------------------------------
+
+export fn klio_nat_box_int(v: i32) CValue {
+    return toC(.{ .Int = v });
+}
+export fn klio_nat_box_long(v: i64) CValue {
+    return toC(.{ .Long = v });
+}
+export fn klio_nat_box_double(v: f64) CValue {
+    return toC(.{ .Double = v });
+}
+export fn klio_nat_box_float(v: f32) CValue {
+    return toC(.{ .Float = v });
+}
+export fn klio_nat_box_bool(v: i32) CValue {
+    return toC(.{ .Bool = v != 0 });
+}
+export fn klio_nat_box_unit() CValue {
+    return toC(.Unit);
+}
+export fn klio_nat_int(v: CValue) i32 {
+    return fromC(v).Int;
+}
+export fn klio_nat_long(v: CValue) i64 {
+    return fromC(v).Long;
+}
+export fn klio_nat_double(v: CValue) f64 {
+    return fromC(v).Double;
+}
+export fn klio_nat_float(v: CValue) f32 {
+    return fromC(v).Float;
+}
+export fn klio_nat_bool(v: CValue) i32 {
+    return if (fromC(v).Bool) 1 else 0;
+}
