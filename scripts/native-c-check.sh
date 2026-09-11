@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Gate for `klio transpile --native`: every program the backend accepts must
+# compile warning-clean and print exactly what the interpreter prints. A
+# compiled program has no interpreter to fall back into, so a divergence here is
+# a wrong answer, not a slow path.
+#
+#   scripts/native-c-check.sh [program.kt ...]
+#
+# With no arguments it checks every example the backend accepts, and reports the
+# ones it refuses (that list is the backlog for widening it).
+set -uo pipefail
+cd "$(dirname "$0")/.."
+KLIO=${KLIO:-zig-out/bin/klio}
+CC=${CC:-zig cc}
+WORK=${WORK:-$(mktemp -d)}
+trap 'rm -rf "$WORK"' EXIT
+
+if [ $# -gt 0 ]; then
+  progs=("$@")
+else
+  progs=(examples/native_scalar_core.kt)
+fi
+
+pass=0
+fail=0
+refused=0
+for kt in "${progs[@]}"; do
+  name=$(basename "$kt" .kt)
+  cfile="$WORK/$name.c"
+  if ! "$KLIO" transpile --native "$kt" -o "$cfile" >"$WORK/emit.log" 2>&1; then
+    refused=$((refused + 1))
+    echo "  REFUSED $name: $(grep -m1 -oE 'refuse .*' "$WORK/emit.log" || tail -1 "$WORK/emit.log")"
+    continue
+  fi
+  if ! $CC -O2 -Wall -Wextra -Werror "$cfile" -o "$WORK/$name" >"$WORK/cc.log" 2>&1; then
+    fail=$((fail + 1))
+    echo "  FAIL $name: C compile"
+    head -5 "$WORK/cc.log" | sed 's/^/      /'
+    continue
+  fi
+  if diff -u <("$WORK/$name") <("$KLIO" run "$kt" 2>&1) >"$WORK/diff.log" 2>&1; then
+    pass=$((pass + 1))
+  else
+    fail=$((fail + 1))
+    echo "  FAIL $name: output differs from the interpreter"
+    head -10 "$WORK/diff.log" | sed 's/^/      /'
+  fi
+done
+
+echo "NATIVE C: $pass passed, $fail failed, $refused refused"
+[ "$fail" -eq 0 ]
