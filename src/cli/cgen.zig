@@ -137,6 +137,32 @@ fn isStringReg(types: []const Ty, cls: []const ?u32, r: u32) bool {
     return types[r] == .object and cls[r] != null and cls[r].? == STRING_CLS;
 }
 
+/// A throwable. Exception classes are the runtime's own — they carry a message
+/// and a stack, not fields the emitter lays out — so constructing one goes
+/// through the runtime.
+const THROWABLE_CLS: u32 = std.math.maxInt(u32) - 3;
+
+/// Whether a class is one of the runtime's throwables rather than a shape the
+/// emitter lays out. Recognised by the supertype chain ending at `Throwable`,
+/// which is what makes a class throwable in the first place.
+fn isThrowableClass(m: *const Module, cid: u32) bool {
+    if (cid >= m.classes.items.len) return false;
+    var cur = cid;
+    var depth: u32 = 0;
+    while (depth < 16) : (depth += 1) {
+        const c = &m.classes.items[cur];
+        if (std.mem.eql(u8, c.name, "Throwable")) return true;
+        var next: ?u32 = null;
+        for (c.supertypes) |sid| {
+            if (sid.int() >= m.classes.items.len) continue;
+            if (m.classes.items[sid.int()].is_interface) continue;
+            next = sid.int();
+        }
+        cur = next orelse return false;
+    }
+    return false;
+}
+
 /// A `List` register. Lists are runtime values, not user classes, so like
 /// `String` they take a handle outside the class table.
 const LIST_CLS: u32 = std.math.maxInt(u32) - 1;
@@ -149,7 +175,7 @@ const CELL_CLS: u32 = std.math.maxInt(u32) - 2;
 /// Whether a class handle names a runtime type rather than a user class. Such
 /// a handle indexes no class table and gets no emitted descriptor.
 fn isBuiltinCls(cid: u32) bool {
-    return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS;
+    return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS or cid == THROWABLE_CLS;
 }
 
 /// The class marker for a register the emitter knows holds a `String`. Strings
@@ -886,6 +912,18 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
                 },
                 .NewInstance => |ni| {
                     if (ni.arg_names.len != 0) return no(f, "ctor arg names");
+                    if (isThrowableClass(m, ni.class.int())) {
+                        if (ni.n_args > 1) return no(f, "throwable ctor arity");
+                        if (ni.n_args == 1) {
+                            const ar4 = ni.args.int();
+                            if (ar4 >= f.n_locals or !known[ar4]) return no(f, "throwable message");
+                        }
+                        if (ni.dst.int() >= f.n_locals) return no(f, "throwable dst");
+                        types[ni.dst.int()] = .object;
+                        cls[ni.dst.int()] = THROWABLE_CLS;
+                        known[ni.dst.int()] = true;
+                        continue;
+                    }
                     const fields = ls.of(ni.class.int()) orelse return no(f, "class layout");
                     if (m.classes.items[ni.class.int()].primary_params.len != ni.n_args) return no(f, "ctor arity");
                     for (fields) |fd| {
@@ -1061,8 +1099,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, ls: Layouts, f: *const
             },
             .Return => |r| {
                 if (r) |rr| {
-                    if (rr.int() >= f.n_locals or !known[rr.int()]) return null;
+                    if (rr.int() >= f.n_locals or !known[rr.int()]) return no(f, "return value");
                 }
+            },
+            // A block carrying a catch handler is refused above, so a program
+            // that compiles has no handler anywhere and a throw always leaves
+            // it. That is what makes an uncaught throw the whole story here.
+            .Throw => |t| {
+                if (t.int() >= f.n_locals or !known[t.int()]) return no(f, "throw value");
             },
             else => return no(f, "terminator"),
         }
@@ -1366,6 +1410,20 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                 .NewInstance => |ni| {
                     var nb: [32]u8 = undefined;
                     const dst = regName(c, ni.dst.int(), &nb);
+                    if (isThrowableClass(m, ni.class.int())) {
+                        const cn = m.classes.items[ni.class.int()];
+                        try w.print("  {s} = klio_nat_exception(\"{s}\", ", .{ dst, cn.fqn });
+                        if (ni.n_args == 1) {
+                            var ab6: [32]u8 = undefined;
+                            var bb7: [96]u8 = undefined;
+                            const ar5 = ni.args.int();
+                            try w.print("{s}", .{boxExpr(c.types[ar5], regName(c, ar5, &ab6), &bb7)});
+                        } else {
+                            try w.writeAll("klio_nat_box_unit()");
+                        }
+                        try w.writeAll(");\n");
+                        continue;
+                    }
                     try w.print("  {s} = klio_nat_alloc_instance(KCLS_{d});\n", .{ dst, ni.class.int() });
                     const fields = ls.of(ni.class.int()).?;
                     for (fields, 0..) |fd, fi| {
@@ -1794,6 +1852,13 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, ls: La
                 var cb: [32]u8 = undefined;
                 try w.print("  if ({s}) goto B{d}; else goto B{d};\n", .{
                     regName(c, br.cond.int(), &cb), br.t.int(), br.f.int(),
+                });
+            },
+            .Throw => |t| {
+                var tb: [32]u8 = undefined;
+                var bb6: [96]u8 = undefined;
+                try w.print("  klio_nat_throw({s});\n", .{
+                    boxExpr(c.types[t.int()], regName(c, t.int(), &tb), &bb6),
                 });
             },
             .Return => |ret| {

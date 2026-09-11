@@ -768,3 +768,36 @@ export fn klio_nat_cell_set(c: CValue, v: CValue) void {
     g.get().* = fromC(v);
     runtime.gc.writeBarrier(&cv.Cell.cell.hdr);
 }
+
+/// An uncaught throw. A program the backend accepts has no catch handler
+/// anywhere — any block carrying one is refused — so a throw always leaves the
+/// program, and this reports it the way an uncaught exception is reported.
+export fn klio_nat_throw(v: CValue) noreturn {
+    const a = natAlloc();
+    const val = fromC(v);
+    const txt = val.display(a) catch "exception";
+    // The interpreter's wording, so a compiled program reports an uncaught
+    // throw the way the same program reports it interpreted. The stack trace
+    // it prints below this line has no compiled equivalent.
+    const pre = "runtime error: uncaught ";
+    _ = std.c.write(2, pre.ptr, pre.len);
+    _ = std.c.write(2, txt.ptr, txt.len);
+    _ = std.c.write(2, "\n", 1);
+    std.c.exit(1);
+}
+
+/// A throwable of the named type. The exception classes are the runtime's own,
+/// not shapes the emitter lays out, so a compiled program builds one through
+/// here rather than as an instance with fields.
+export fn klio_nat_exception(fqn: [*:0]const u8, message: CValue) CValue {
+    const a = natAlloc();
+    const name = runtime.strInit(a, std.mem.span(fqn)) catch @panic("klio_nat_exception: out of memory");
+    var msg: runtime.OptRef(runtime.StringData) = .{};
+    const mv = fromC(message);
+    if (mv == .String) msg = .{ .cell = mv.String.cell };
+    return toC(runtime.Value.newException(a, .{
+        .fqn = name,
+        .message = msg,
+        .cause = null,
+    }) catch @panic("klio_nat_exception: out of memory"));
+}
