@@ -240,12 +240,34 @@ sample that took class-layout refusals from 73 to 33 and lambda refusals from
 92 to 18, because programs stopped being rejected for types they merely
 mentioned.
 
-Still refused, most common first: classes with supertypes or init blocks,
-lambdas, names that are neither a declared global nor an object, and anonymous
-object literals. `KLIO_CGEN_TRACE=1` prints the list for any program, and
-class-layout refusals name the shape that is missing.
+Interfaces, virtual dispatch, superclasses and lambdas compile. An interface
+adds no fields, so implementing one leaves a layout alone; a superclass adds its
+own, filled by the argument thunks this class passes up. A virtual call becomes
+a dispatcher per slot that compares the receiver's class against the handles
+registered at startup — they are runtime values, so a chain rather than a
+switch — and a receiver no arm answers raises an AbstractMethodError naming the
+method rather than running the wrong body. A lambda whose call site can see
+which body it holds is called directly with its captures as leading arguments,
+so nothing is allocated and nothing is dispatched.
 
-The long tail to the goal, in dependency order: supertypes and interfaces with
-virtual dispatch, lambdas and closures, exceptions, generics and inline
-functions, then coroutines as state machines. Compose and the packs sit behind
-all of it, being Kotlin that must itself compile.
+Two rules earned their keep by being wrong first. A function's result comes
+from the register it returns — except a declaration with no body, an interface
+method, which has no register and must read its annotation. And a value only
+has to BE a reference to be passed, returned or stored; demanding its layout
+everywhere refused every interface type, and relaxing it moved more programs
+than any feature did.
+
+## Still refused
+
+Measured across the example corpus with `KLIO_CGEN_TRACE=1`, most common
+first: classes the emitter cannot lay out (enums, abstract classes,
+grandparents, init blocks), lambdas that escape into a value, names that are
+neither a declared global nor an object, anonymous object literals, `MakeCell`
+(a `var` captured by a lambda), and calls with named or generic arguments.
+
+The distance to the goal is honest: a compiled program must contain every
+function it reaches, and compose and the packs are Kotlin that must therefore
+compile too. Between here and there sit closures that escape, exceptions,
+generics and inline functions, and coroutines as state machines. Each is a
+stage of the same shape as the ones above — widen what compiles, verify against
+the interpreter, keep refusal total so a gap is never a wrong answer.
