@@ -487,7 +487,10 @@ pub fn runTranspileNative(
     // they come from the built module's class table.
     var layouts: std.ArrayList(cgen.ClassLayout) = .empty;
     defer {
-        for (layouts.items) |l| gpa.free(l.props);
+        for (layouts.items) |l| {
+            gpa.free(l.props);
+            gpa.free(l.entries);
+        }
         layouts.deinit(gpa);
     }
     {
@@ -512,9 +515,28 @@ pub fn runTranspileNative(
                     .setter = built.instance_prop_setters.get(.{ .a = e.key_ptr.*, .b = bp.name }),
                 };
             }
+            // An enum's entries in declaration order, each with the thunks
+            // the declaration writes for its constructor arguments.
+            const ents = cg.get().enum_entries;
+            const entries = gpa.alloc(cgen.EnumEntryInfo, ents.len) catch {
+                cg.deinit();
+                return 1;
+            };
+            for (ents, 0..) |ent, ei| {
+                var args: []const ir.FuncId = &.{};
+                for (built.enum_entry_arg_inits.items) |ea| {
+                    if (std.mem.eql(u8, ea.entry_name, ent.name) and
+                        (std.mem.eql(u8, ea.class_name, e.key_ptr.*) or
+                            std.mem.endsWith(u8, e.key_ptr.*, ea.class_name)))
+                    {
+                        args = ea.funcs;
+                    }
+                }
+                entries[ei] = .{ .name = ent.name, .args = args };
+            }
             cg.deinit();
             const pargs: []const ir.FuncId = built.parent_ctor_args.get(e.key_ptr.*) orelse &.{};
-            layouts.append(gpa, .{ .name = e.key_ptr.*, .props = props, .parent_args = pargs }) catch return 1;
+            layouts.append(gpa, .{ .name = e.key_ptr.*, .props = props, .parent_args = pargs, .entries = entries }) catch return 1;
         }
     }
     const ok = cgen.emit(gpa, m, ef, globals.items, layouts.items, &aw.writer, path) catch |e| {
