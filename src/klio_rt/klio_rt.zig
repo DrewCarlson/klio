@@ -716,3 +716,55 @@ export fn klio_nat_short(v: CValue) i16 {
 export fn klio_nat_byte(v: CValue) i8 {
     return fromC(v).Byte;
 }
+
+/// The registered class handle of an instance, which is what a compiled
+/// dispatcher switches on. A value that is not an instance, or an instance of a
+/// class this program did not register, reports no class.
+export fn klio_nat_class_of(v: CValue) u32 {
+    const val = fromC(v);
+    if (val != .Instance) return std.math.maxInt(u32);
+    const g = val.Instance.borrow();
+    const cls = g.get().class;
+    g.deinit();
+    for (nat_classes.items, 0..) |c, i| {
+        if (c.cell == cls.cell) return @intCast(i);
+    }
+    return std.math.maxInt(u32);
+}
+
+/// A virtual call that reached a receiver no arm handles. The interpreter would
+/// raise a dispatch failure; a compiled program has no interpreter to fall into,
+/// so it says so and stops rather than running the wrong body.
+export fn klio_nat_no_method(name: [*:0]const u8) noreturn {
+    const nm = std.mem.span(name);
+    const pre = "Exception in thread \"main\" java.lang.AbstractMethodError: no implementation of ";
+    _ = std.c.write(2, pre.ptr, pre.len);
+    _ = std.c.write(2, nm.ptr, nm.len);
+    _ = std.c.write(2, "\n", 1);
+    std.c.exit(1);
+}
+
+// --- capture cells ---------------------------------------------------------
+//
+// A `var` a lambda captures becomes a shared box: the lambda and the enclosing
+// function must see each other's writes, so the variable moves to the heap.
+
+export fn klio_nat_cell(v: CValue) CValue {
+    const a = natAlloc();
+    return toC(runtime.Value.newCell(a, fromC(v)) catch @panic("klio_nat_cell: out of memory"));
+}
+
+export fn klio_nat_cell_get(c: CValue) CValue {
+    const v = fromC(c);
+    const g = v.Cell.borrow();
+    defer g.deinit();
+    return toC(g.get().*);
+}
+
+export fn klio_nat_cell_set(c: CValue, v: CValue) void {
+    const cv = fromC(c);
+    const g = cv.Cell.borrowMut();
+    defer g.deinit();
+    g.get().* = fromC(v);
+    runtime.gc.writeBarrier(&cv.Cell.cell.hdr);
+}
