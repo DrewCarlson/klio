@@ -99,8 +99,27 @@ fn constTy(c: ir.Const) ?Ty {
     };
 }
 
+/// A conversion's receiver has to be a number: `x.toLong()` on a reference is
+/// a call, not a C cast.
+fn isNumericTy(t: Ty) bool {
+    return switch (t) {
+        .i32, .i64, .f64, .f32 => true,
+        else => false,
+    };
+}
+
 fn isStringReg(types: []const Ty, cls: []const ?u32, r: u32) bool {
     return types[r] == .object and cls[r] != null and cls[r].? == STRING_CLS;
+}
+
+/// A `List` register. Lists are runtime values, not user classes, so like
+/// `String` they take a handle outside the class table.
+const LIST_CLS: u32 = std.math.maxInt(u32) - 1;
+
+/// Whether a class handle names a runtime type rather than a user class. Such
+/// a handle indexes no class table and gets no emitted descriptor.
+fn isBuiltinCls(cid: u32) bool {
+    return cid == STRING_CLS or cid == LIST_CLS;
 }
 
 /// The class marker for a register the emitter knows holds a `String`. Strings
@@ -161,6 +180,10 @@ pub const Compiled = struct {
     /// The class an object register holds, where the emitter knows it. Needed
     /// to turn a field NAME into the index the compiled code addresses.
     cls: []?u32,
+    /// For a `List` register, the machine type of its elements where the
+    /// emitter knows it — a list built from a literal of one scalar kind. Unit
+    /// means unknown, and reading such a list yields an untyped reference.
+    elem: []Ty,
     /// Frame slot of each object register, or -1 for a scalar in a C local.
     slot: []i32,
     n_slots: u32,
@@ -169,6 +192,7 @@ pub const Compiled = struct {
     pub fn deinit(self: *Compiled, gpa: std.mem.Allocator) void {
         gpa.free(self.types);
         gpa.free(self.cls);
+        gpa.free(self.elem);
         gpa.free(self.slot);
     }
 };
@@ -217,6 +241,7 @@ fn fieldIndex(m: *const Module, cid: u32, name: []const u8) ?u32 {
 fn classIndexOfName(m: *const Module, t: ir.TypeRef) ?u32 {
     if (t.nullable) return null;
     if (std.mem.eql(u8, t.name, "String") or std.mem.eql(u8, t.name, "kotlin.String")) return STRING_CLS;
+    if (std.mem.eql(u8, t.name, "List") or std.mem.eql(u8, t.name, "MutableList")) return LIST_CLS;
     for (m.classes.items, 0..) |*c, i| {
         if (std.mem.eql(u8, c.name, t.name) or std.mem.eql(u8, c.fqn, t.name)) return @intCast(i);
     }
@@ -227,7 +252,7 @@ fn classIndexOfName(m: *const Module, t: ir.TypeRef) ?u32 {
 /// what a register holding it needs before its fields can be addressed.
 fn classOfType(m: *const Module, t: ir.TypeRef) ?u32 {
     const idx = classIndexOfName(m, t) orelse return null;
-    if (idx == STRING_CLS) return idx;
+    if (idx == STRING_CLS or idx == LIST_CLS) return idx;
     if (classFields(m, @enumFromInt(idx)) == null) return null;
     return idx;
 }
@@ -272,6 +297,25 @@ fn numConvVirtual(m: *const Module, cv: anytype) ?Ty {
 /// scalar is a `printf`. It is recognised by name, and the format comes from
 /// the ARGUMENT's static type rather than the parameter's: the resolved
 /// overload takes `Any?`, so the parameter says nothing about what is printed.
+/// Stdlib entry points the backend performs directly against the runtime's
+/// own data structures. Recognised by name, like `println`: their Kotlin
+/// bodies are generic and variadic, and compiling those is a different piece
+/// of work from performing the operation.
+const ListIntrinsic = enum { list_of, mutable_list_of };
+
+fn listIntrinsic(f: *const Func) ?ListIntrinsic {
+    if (std.mem.eql(u8, f.fqn, "kotlin.collections.listOf")) return .list_of;
+    if (std.mem.eql(u8, f.fqn, "kotlin.collections.mutableListOf")) return .mutable_list_of;
+    return null;
+}
+
+/// The member name a virtual slot dispatches to, for the builtin receivers
+/// whose members the backend performs directly.
+fn listMemberName(m: *const Module, slot: ir.MethodSlotId) ?[]const u8 {
+    const decl = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
+    return decl.name;
+}
+
 fn isPrintln(f: *const Func) bool {
     return f.params.len == 1 and
         (std.mem.eql(u8, f.fqn, "kotlin.io.println") or std.mem.eql(u8, f.fqn, "println"));
@@ -288,6 +332,13 @@ fn traceOn() bool {
 
 fn instRefuse(f: *const Func, inst: *const ir.Inst) ?Compiled {
     if (traceOn()) std.debug.print("[cgen] refuse {s}: inst {s}\n", .{ f.fqn, @tagName(inst.*) });
+    return null;
+}
+
+/// A refusal that names the callee, so the trace says which function to teach
+/// the backend next rather than only that some call was not compilable.
+fn noCallee(f: *const Func, callee: *const Func, comptime why: []const u8) ?Compiled {
+    if (traceOn()) std.debug.print("[cgen] refuse {s}: " ++ why ++ " `{s}`\n", .{ f.fqn, callee.fqn });
     return null;
 }
 
@@ -326,6 +377,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
     const cls = try gpa.alloc(?u32, f.n_locals);
     errdefer gpa.free(cls);
     @memset(cls, null);
+    const elem = try gpa.alloc(Ty, f.n_locals);
+    errdefer gpa.free(elem);
+    @memset(elem, .unit);
     const slot = try gpa.alloc(i32, f.n_locals);
     errdefer gpa.free(slot);
     @memset(slot, -1);
@@ -357,6 +411,13 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     } else {
                         types[lp.dst.int()] = .object;
                         cls[lp.dst.int()] = classOfType(m, pt);
+                        // `List<Int>` says what its elements are; a list whose
+                        // element type is written down needs no inference.
+                        if (cls[lp.dst.int()]) |rc| {
+                            if (rc == LIST_CLS and pt.args.len == 1) {
+                                if (tyOf(pt.args[0])) |et| elem[lp.dst.int()] = et;
+                            }
+                        }
                     }
                     known[lp.dst.int()] = true;
                 },
@@ -365,6 +426,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     if (!known[mv.src.int()]) return no(f, "move source");
                     types[mv.dst.int()] = types[mv.src.int()];
                     cls[mv.dst.int()] = cls[mv.src.int()];
+                    elem[mv.dst.int()] = elem[mv.src.int()];
                     known[mv.dst.int()] = true;
                 },
                 .BinOp => |b| {
@@ -424,10 +486,45 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     known[n.dst.int()] = true;
                 },
                 .CallMember => |cm| {
+                    if (cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
+                        types[cm.receiver.int()] == .object and cls[cm.receiver.int()] != null and
+                        cls[cm.receiver.int()].? == LIST_CLS)
+                    {
+                        if (cm.name.int() >= m.consts.items.len) return no(f, "member name");
+                        const mn = m.consts.items[cm.name.int()];
+                        if (mn != .String) return no(f, "member name kind");
+                        const a0 = cm.args.int();
+                        var kk: u32 = 0;
+                        while (kk < cm.n_args) : (kk += 1) {
+                            if (a0 + kk >= f.n_locals or !known[a0 + kk]) return no(f, "list arg");
+                        }
+                        if (cm.dst.int() >= f.n_locals) return no(f, "list dst");
+                        if (std.mem.eql(u8, mn.String, "get") and cm.n_args == 1) {
+                            if (types[a0] != .i32) return no(f, "list index type");
+                            const et = elem[cm.receiver.int()];
+                            types[cm.dst.int()] = if (et == .unit) .object else et;
+                            cls[cm.dst.int()] = null;
+                            known[cm.dst.int()] = true;
+                            continue;
+                        }
+                        if (std.mem.eql(u8, mn.String, "add") and cm.n_args == 1) {
+                            types[cm.dst.int()] = .boolean;
+                            known[cm.dst.int()] = true;
+                            continue;
+                        }
+                        if (std.mem.eql(u8, mn.String, "set") and cm.n_args == 2) {
+                            if (types[a0] != .i32) return no(f, "list index type");
+                            types[cm.dst.int()] = .object;
+                            cls[cm.dst.int()] = null;
+                            known[cm.dst.int()] = true;
+                            continue;
+                        }
+                        return no(f, "list member");
+                    }
                     const to = numConv(m, cm) orelse return instRefuse(f, inst);
                     if (cm.receiver.int() >= f.n_locals or !known[cm.receiver.int()]) return no(f, "conv receiver");
                     const rt2 = types[cm.receiver.int()];
-                    if (rt2 == .boolean or rt2 == .unit) return no(f, "conv receiver type");
+                    if (!isNumericTy(rt2)) return no(f, "conv receiver type");
                     if (cm.dst.int() >= f.n_locals) return no(f, "conv dst");
                     // Kotlin saturates a floating value to Int.MIN/MAX and maps
                     // NaN to 0; a C cast leaves all three undefined.
@@ -436,10 +533,35 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     known[cm.dst.int()] = true;
                 },
                 .CallVirtual => |cv| {
+                    if (cv.receiver.int() < f.n_locals and known[cv.receiver.int()] and
+                        cls[cv.receiver.int()] != null and cls[cv.receiver.int()].? == LIST_CLS)
+                    {
+                        const mn = listMemberName(m, cv.slot) orelse return no(f, "list virtual member");
+                        const a0 = cv.args.int();
+                        var kk: u32 = 0;
+                        while (kk < cv.n_args) : (kk += 1) {
+                            if (a0 + kk >= f.n_locals or !known[a0 + kk]) return no(f, "list arg");
+                        }
+                        if (cv.dst.int() >= f.n_locals) return no(f, "list dst");
+                        if (std.mem.eql(u8, mn, "get") and cv.n_args == 1) {
+                            if (types[a0] != .i32) return no(f, "list index type");
+                            const et = elem[cv.receiver.int()];
+                            types[cv.dst.int()] = if (et == .unit) .object else et;
+                            cls[cv.dst.int()] = null;
+                        } else if (std.mem.eql(u8, mn, "add") and cv.n_args == 1) {
+                            types[cv.dst.int()] = .boolean;
+                        } else if (std.mem.eql(u8, mn, "set") and cv.n_args == 2) {
+                            if (types[a0] != .i32) return no(f, "list index type");
+                            types[cv.dst.int()] = .object;
+                            cls[cv.dst.int()] = null;
+                        } else return no(f, "list virtual member");
+                        known[cv.dst.int()] = true;
+                        continue;
+                    }
                     const to = numConvVirtual(m, cv) orelse return instRefuse(f, inst);
                     if (cv.receiver.int() >= f.n_locals or !known[cv.receiver.int()]) return no(f, "conv receiver");
                     const rt3 = types[cv.receiver.int()];
-                    if (rt3 == .boolean or rt3 == .unit) return no(f, "conv receiver type");
+                    if (!isNumericTy(rt3)) return no(f, "conv receiver type");
                     if (cv.dst.int() >= f.n_locals) return no(f, "conv dst");
                     if (rt3.isFloat() and (to == .i32 or to == .i64)) return no(f, "float to int");
                     types[cv.dst.int()] = to;
@@ -464,9 +586,11 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     if (gf.receiver.int() >= f.n_locals or !known[gf.receiver.int()]) return no(f, "field receiver");
                     if (types[gf.receiver.int()] != .object) return no(f, "field on non-object");
                     const rc = cls[gf.receiver.int()] orelse return no(f, "field receiver class");
-                    if (rc == STRING_CLS) {
+                    if (rc == STRING_CLS or rc == LIST_CLS) {
                         const snm = m.consts.items[gf.field.int()];
-                        if (snm != .String or !std.mem.eql(u8, plainFieldName(snm.String), "length")) return no(f, "string member");
+                        if (snm != .String) return no(f, "builtin member name");
+                        const want: []const u8 = if (rc == STRING_CLS) "length" else "size";
+                        if (!std.mem.eql(u8, plainFieldName(snm.String), want)) return no(f, "builtin member");
                         if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
                         types[gf.dst.int()] = .i32;
                         known[gf.dst.int()] = true;
@@ -498,6 +622,22 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                     if (c.arg_names.len != 0 or c.type_args.len != 0) return no(f, "call arg names/type args");
                     if (c.dst.int() >= f.n_locals) return null;
                     const callee = m.funcById(c.func) orelse return no(f, "call target missing");
+                    if (listIntrinsic(callee)) |_| {
+                        var et: ?Ty = null;
+                        var k: u32 = 0;
+                        while (k < c.n_args) : (k += 1) {
+                            const ar = c.args.int() + k;
+                            if (ar >= f.n_locals or !known[ar]) return no(f, "list element");
+                            if (k == 0) et = types[ar] else if (et.? != types[ar]) et = null;
+                            if (et == null) break;
+                        }
+                        if (c.dst.int() >= f.n_locals) return no(f, "list dst");
+                        types[c.dst.int()] = .object;
+                        cls[c.dst.int()] = LIST_CLS;
+                        elem[c.dst.int()] = if (et) |t| (if (t == .object) .unit else t) else .unit;
+                        known[c.dst.int()] = true;
+                        continue;
+                    }
                     if (isPrintln(callee)) {
                         if (c.n_args != 1) return no(f, "println arity");
                         const a0 = c.args.int();
@@ -506,7 +646,8 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
                         types[c.dst.int()] = .unit;
                         known[c.dst.int()] = true;
                     } else {
-                        if (callee.params.len != c.n_args) return no(f, "call arity");
+                        if (!callee.hasBody()) return noCallee(f, callee, "no body for");
+                        if (callee.params.len != c.n_args) return noCallee(f, callee, "arity of");
                         const rt = funcRetTy2(m, callee) orelse return no(f, "callee return type");
                         types[c.dst.int()] = rt;
                         if (rt == .object) cls[c.dst.int()] = classOfType(m, callee.return_ty);
@@ -541,7 +682,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, f: *const Func) Error!
         slot[r] = @intCast(n_slots);
         n_slots += 1;
     }
-    return .{ .f = f, .types = types, .cls = cls, .slot = slot, .n_slots = n_slots, .ret = ret };
+    return .{ .f = f, .types = types, .cls = cls, .elem = elem, .slot = slot, .n_slots = n_slots, .ret = ret };
 }
 
 /// A C identifier for the function. Derived from the fqn, never from the id:
@@ -780,11 +921,13 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
                 },
                 .GetField => |gf| {
                     const rc = c.cls[gf.receiver.int()].?;
-                    if (rc == STRING_CLS) {
+                    if (rc == STRING_CLS or rc == LIST_CLS) {
                         var nb: [32]u8 = undefined;
                         var rb: [32]u8 = undefined;
-                        try w.print("  {s} = klio_nat_str_length({s});\n", .{
-                            regName(c, gf.dst.int(), &nb), regName(c, gf.receiver.int(), &rb),
+                        try w.print("  {s} = {s}({s});\n", .{
+                            regName(c, gf.dst.int(), &nb),
+                            if (rc == STRING_CLS) "klio_nat_str_length" else "klio_nat_list_size",
+                            regName(c, gf.receiver.int(), &rb),
                         });
                         continue;
                     }
@@ -829,31 +972,37 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
                         continue;
                     }
                     const op = cOp(b.op).?;
+                    var lnb: [32]u8 = undefined;
+                    var rnb: [32]u8 = undefined;
+                    var dnb: [32]u8 = undefined;
+                    const ln = regName(c, b.lhs.int(), &lnb);
+                    const rn = regName(c, b.rhs.int(), &rnb);
+                    const dn = regName(c, b.dst.int(), &dnb);
                     if ((b.op == .Div or b.op == .Mod) and !dt.isFloat() and !isCmp(b.op)) {
-                        try writeDivGuard(w, b.rhs.int());
+                        try w.print("  if ({s} == 0) klio_arith_zero();\n", .{rn});
                     }
                     if (b.op == .UShr) {
                         const lt = c.types[b.lhs.int()];
                         const ut: []const u8 = if (lt == .i64) "uint64_t" else "uint32_t";
-                        try w.print("  r{d} = ({s})(({s})r{d} >> (r{d} & {d}));\n", .{
-                            b.dst.int(), dt.cName(), ut, b.lhs.int(), b.rhs.int(),
+                        try w.print("  {s} = ({s})(({s}){s} >> ({s} & {d}));\n", .{
+                            dn, dt.cName(), ut, ln, rn,
                             @as(u32, if (lt == .i64) 63 else 31),
                         });
                     } else if (b.op == .Shl or b.op == .Shr) {
                         // Kotlin masks the shift count; C leaves an over-wide
                         // shift undefined.
                         const lt = c.types[b.lhs.int()];
-                        try w.print("  r{d} = ({s})(r{d} {s} (r{d} & {d}));\n", .{
-                            b.dst.int(), dt.cName(), b.lhs.int(), op, b.rhs.int(),
+                        try w.print("  {s} = ({s})({s} {s} ({s} & {d}));\n", .{
+                            dn, dt.cName(), ln, op, rn,
                             @as(u32, if (lt == .i64) 63 else 31),
                         });
                     } else {
-                        try w.print("  r{d} = ({s})(({s})r{d} {s} ({s})r{d});\n", .{
-                            b.dst.int(),   dt.cName(),
+                        try w.print("  {s} = ({s})(({s}){s} {s} ({s}){s});\n", .{
+                            dn,  dt.cName(),
                             if (isCmp(b.op)) promote(c.types[b.lhs.int()], c.types[b.rhs.int()]).?.cName() else dt.cName(),
-                            b.lhs.int(),   op,
+                            ln,  op,
                             if (isCmp(b.op)) promote(c.types[b.lhs.int()], c.types[b.rhs.int()]).?.cName() else dt.cName(),
-                            b.rhs.int(),
+                            rn,
                         });
                     }
                 },
@@ -867,17 +1016,105 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, c: *co
                 },
                 .Not => |n| try w.print("  r{d} = !r{d};\n", .{ n.dst.int(), n.src.int() }),
                 .CallMember => |cm| {
-                    const t = c.types[cm.dst.int()];
-                    const from = c.types[cm.receiver.int()];
-                    if (t == .i32 and from.isFloat()) unreachable;
-                    try w.print("  r{d} = ({s})r{d};\n", .{ cm.dst.int(), t.cName(), cm.receiver.int() });
+                    var nb: [32]u8 = undefined;
+                    var rb: [32]u8 = undefined;
+                    const recv = regName(c, cm.receiver.int(), &rb);
+                    if (c.cls[cm.receiver.int()]) |rc| {
+                        if (rc == LIST_CLS) {
+                            const mn = m.consts.items[cm.name.int()].String;
+                            const a0 = cm.args.int();
+                            var ab: [32]u8 = undefined;
+                            var bb: [96]u8 = undefined;
+                            if (std.mem.eql(u8, mn, "get")) {
+                                var gb: [160]u8 = undefined;
+                                const g = try std.fmt.bufPrint(&gb, "klio_nat_list_get({s}, {s})", .{ recv, regName(c, a0, &ab) });
+                                var ob: [220]u8 = undefined;
+                                try w.print("  {s} = {s};\n", .{
+                                    regName(c, cm.dst.int(), &nb), unboxExpr(c.types[cm.dst.int()], g, &ob),
+                                });
+                            } else if (std.mem.eql(u8, mn, "add")) {
+                                try w.print("  klio_nat_list_add({s}, {s});\n", .{
+                                    recv, boxExpr(c.types[a0], regName(c, a0, &ab), &bb),
+                                });
+                                try w.print("  {s} = 1;\n", .{regName(c, cm.dst.int(), &nb)});
+                            } else {
+                                var vb: [32]u8 = undefined;
+                                try w.print("  klio_nat_list_set({s}, {s}, {s});\n", .{
+                                    recv, regName(c, a0, &ab),
+                                    boxExpr(c.types[a0 + 1], regName(c, a0 + 1, &vb), &bb),
+                                });
+                                try w.print("  {s} = klio_nat_box_unit();\n", .{regName(c, cm.dst.int(), &nb)});
+                            }
+                            continue;
+                        }
+                    }
+                    try w.print("  {s} = ({s}){s};\n", .{
+                        regName(c, cm.dst.int(), &nb), c.types[cm.dst.int()].cName(), recv,
+                    });
                 },
                 .CallVirtual => |cv| {
-                    const t = c.types[cv.dst.int()];
-                    try w.print("  r{d} = ({s})r{d};\n", .{ cv.dst.int(), t.cName(), cv.receiver.int() });
+                    var nb: [32]u8 = undefined;
+                    var rb: [32]u8 = undefined;
+                    const recv = regName(c, cv.receiver.int(), &rb);
+                    if (c.cls[cv.receiver.int()]) |rc| {
+                        if (rc == LIST_CLS) {
+                            const mn = listMemberName(m, cv.slot).?;
+                            const a0 = cv.args.int();
+                            var ab: [32]u8 = undefined;
+                            var bb: [96]u8 = undefined;
+                            if (std.mem.eql(u8, mn, "get")) {
+                                var gb: [160]u8 = undefined;
+                                const g = try std.fmt.bufPrint(&gb, "klio_nat_list_get({s}, {s})", .{ recv, regName(c, a0, &ab) });
+                                var ob: [220]u8 = undefined;
+                                try w.print("  {s} = {s};\n", .{
+                                    regName(c, cv.dst.int(), &nb), unboxExpr(c.types[cv.dst.int()], g, &ob),
+                                });
+                            } else if (std.mem.eql(u8, mn, "add")) {
+                                try w.print("  klio_nat_list_add({s}, {s});\n", .{
+                                    recv, boxExpr(c.types[a0], regName(c, a0, &ab), &bb),
+                                });
+                                try w.print("  {s} = 1;\n", .{regName(c, cv.dst.int(), &nb)});
+                            } else {
+                                var vb: [32]u8 = undefined;
+                                try w.print("  klio_nat_list_set({s}, {s}, {s});\n", .{
+                                    recv, regName(c, a0, &ab),
+                                    boxExpr(c.types[a0 + 1], regName(c, a0 + 1, &vb), &bb),
+                                });
+                                try w.print("  {s} = klio_nat_box_unit();\n", .{regName(c, cv.dst.int(), &nb)});
+                            }
+                            continue;
+                        }
+                    }
+                    try w.print("  {s} = ({s}){s};\n", .{
+                        regName(c, cv.dst.int(), &nb), c.types[cv.dst.int()].cName(), recv,
+                    });
                 },
                 .Call => |call| {
                     const callee = m.funcById(call.func).?;
+                    if (listIntrinsic(callee)) |kind| {
+                        var db: [32]u8 = undefined;
+                        const dst = regName(c, call.dst.int(), &db);
+                        if (call.n_args == 0) {
+                            try w.print("  {s} = {s}(0, 0);\n", .{
+                                dst, if (kind == .list_of) "klio_nat_list" else "klio_nat_mutable_list",
+                            });
+                            continue;
+                        }
+                        try w.print("  {{ klio_value ev[{d}];\n", .{call.n_args});
+                        var k: u32 = 0;
+                        while (k < call.n_args) : (k += 1) {
+                            const ar = call.args.int() + k;
+                            var ab: [32]u8 = undefined;
+                            var bb: [96]u8 = undefined;
+                            try w.print("    ev[{d}] = {s};\n", .{
+                                k, boxExpr(c.types[ar], regName(c, ar, &ab), &bb),
+                            });
+                        }
+                        try w.print("    {s} = {s}(ev, {d}); }}\n", .{
+                            dst, if (kind == .list_of) "klio_nat_list" else "klio_nat_mutable_list", call.n_args,
+                        });
+                        continue;
+                    }
                     if (isPrintln(callee)) {
                         const a0 = call.args.int();
                         const at = c.types[a0];
@@ -992,7 +1229,7 @@ pub fn emit(
             for (blk.insts) |*inst| {
                 if (inst.* != .Call) continue;
                 const callee = m.funcById(inst.Call.func) orelse return false;
-                if (isPrintln(callee)) continue;
+                if (isPrintln(callee) or listIntrinsic(callee) != null) continue;
                 if (seen.contains(callee.id.int())) continue;
                 try seen.put(callee.id.int(), {});
                 try queue.append(gpa, callee);
@@ -1010,7 +1247,7 @@ pub fn emit(
     for (accepted.items) |*c| {
         for (c.cls) |maybe| {
             const cid = maybe orelse continue;
-            if (cid == STRING_CLS) continue;
+            if (isBuiltinCls(cid)) continue;
             var seen_cls = false;
             for (used_classes.items) |u| {
                 if (u == cid) seen_cls = true;

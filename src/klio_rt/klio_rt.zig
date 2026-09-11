@@ -590,3 +590,79 @@ export fn klio_nat_println(v: CValue) void {
     natWrite(txt);
     natWrite("\n");
 }
+
+// --- lists -----------------------------------------------------------------
+//
+// Collection operations are data-structure work on the runtime's own types, so
+// a compiled program performs them directly rather than through any dispatch.
+// The emitter recognises the stdlib entry points by name and calls these.
+
+fn newValueList(argv: [*]const CValue, argc: u32, mutable: bool) CValue {
+    const a = natAlloc();
+    var items: std.ArrayList(runtime.Value) = .empty;
+    items.ensureTotalCapacity(a, argc) catch @panic("klio_nat_list: out of memory");
+    var i: u32 = 0;
+    while (i < argc) : (i += 1) items.appendAssumeCapacity(fromC(argv[i]));
+    const vl = runtime.ValueList.initOwned(a, items) catch @panic("klio_nat_list: out of memory");
+    const v = runtime.Value.newList(a, .{
+        .items = vl,
+        .mutable = mutable,
+        .backing = null,
+    }) catch @panic("klio_nat_list: out of memory");
+    return toC(v);
+}
+
+export fn klio_nat_list(argv: [*]const CValue, argc: u32) CValue {
+    return newValueList(argv, argc, false);
+}
+
+export fn klio_nat_mutable_list(argv: [*]const CValue, argc: u32) CValue {
+    return newValueList(argv, argc, true);
+}
+
+export fn klio_nat_list_size(v: CValue) i32 {
+    const l = fromC(v);
+    const g = l.List.items.borrow();
+    defer g.deinit();
+    return @intCast(g.get().items.len);
+}
+
+/// Kotlin throws on an out-of-range index; C would read past the end.
+export fn klio_nat_list_get(v: CValue, idx: i32) CValue {
+    const l = fromC(v);
+    const g = l.List.items.borrow();
+    defer g.deinit();
+    const items = g.get().items;
+    if (idx < 0 or @as(usize, @intCast(idx)) >= items.len) natIndexOob(idx, items.len);
+    return toC(items[@intCast(idx)]);
+}
+
+export fn klio_nat_list_set(v: CValue, idx: i32, x: CValue) void {
+    const l = fromC(v);
+    const g = l.List.items.borrowMut();
+    defer g.deinit();
+    const items = g.get().items;
+    if (idx < 0 or @as(usize, @intCast(idx)) >= items.len) natIndexOob(idx, items.len);
+    items[@intCast(idx)] = fromC(x);
+    runtime.gc.writeBarrier(&l.List.items.cell.hdr);
+}
+
+export fn klio_nat_list_add(v: CValue, x: CValue) void {
+    const a = natAlloc();
+    const l = fromC(v);
+    const g = l.List.items.borrowMut();
+    defer g.deinit();
+    g.get().append(a, fromC(x)) catch @panic("klio_nat_list_add: out of memory");
+    runtime.gc.writeBarrier(&l.List.items.cell.hdr);
+}
+
+fn natIndexOob(idx: i32, len: usize) noreturn {
+    var buf: [160]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &buf,
+        "Exception in thread \"main\" java.lang.IndexOutOfBoundsException: Index {d} out of bounds for length {d}\n",
+        .{ idx, len },
+    ) catch "Exception in thread \"main\" java.lang.IndexOutOfBoundsException\n";
+    _ = std.c.write(2, msg.ptr, msg.len);
+    std.c.exit(1);
+}

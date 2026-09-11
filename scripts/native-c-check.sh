@@ -23,7 +23,7 @@ if [ $# -gt 0 ]; then
   progs=("$@")
   strict=0
 else
-  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt)
+  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt)
 fi
 
 pass=0

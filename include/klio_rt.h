@@ -247,6 +247,14 @@ klio_value klio_nat_concat(klio_value a, klio_value b);
 int32_t    klio_nat_str_length(klio_value v);
 void       klio_nat_println(klio_value v);
 
+/* Lists. Data-structure work on the runtime's own types: no dispatch. */
+klio_value klio_nat_list(const klio_value *argv, uint32_t argc);
+klio_value klio_nat_mutable_list(const klio_value *argv, uint32_t argc);
+int32_t    klio_nat_list_size(klio_value v);
+klio_value klio_nat_list_get(klio_value v, int32_t idx);
+void       klio_nat_list_set(klio_value v, int32_t idx, klio_value x);
+void       klio_nat_list_add(klio_value v, klio_value x);
+
 klio_value klio_nat_box_int(int32_t v);
 klio_value klio_nat_box_long(int64_t v);
 klio_value klio_nat_box_double(double v);
