@@ -725,6 +725,10 @@ fn zeroOfKind(k: u8) ?runtime.Value {
         6 => .{ .Char = 0 },
         7 => .{ .Short = 0 },
         8 => .{ .Byte = 0 },
+        9 => .{ .UInt = 0 },
+        10 => .{ .ULong = 0 },
+        11 => .{ .UShort = 0 },
+        12 => .{ .UByte = 0 },
         else => null,
     };
 }
@@ -879,6 +883,34 @@ export fn klio_nat_short(v: CValue) i16 {
 }
 export fn klio_nat_byte(v: CValue) i8 {
     return fromC(v).Byte;
+}
+
+// Kotlin's unsigned integers are value classes over the signed widths: the
+// bits are the same, and only the box's kind and the operations differ.
+
+export fn klio_nat_box_uint(v: u32) CValue {
+    return toC(.{ .UInt = v });
+}
+export fn klio_nat_box_ulong(v: u64) CValue {
+    return toC(.{ .ULong = v });
+}
+export fn klio_nat_box_ushort(v: u16) CValue {
+    return toC(.{ .UShort = v });
+}
+export fn klio_nat_box_ubyte(v: u8) CValue {
+    return toC(.{ .UByte = v });
+}
+export fn klio_nat_uint(v: CValue) u32 {
+    return fromC(v).UInt;
+}
+export fn klio_nat_ulong(v: CValue) u64 {
+    return fromC(v).ULong;
+}
+export fn klio_nat_ushort(v: CValue) u16 {
+    return fromC(v).UShort;
+}
+export fn klio_nat_ubyte(v: CValue) u8 {
+    return fromC(v).UByte;
 }
 
 /// The registered class handle of an instance, which is what a compiled

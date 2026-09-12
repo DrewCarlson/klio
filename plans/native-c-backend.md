@@ -361,6 +361,27 @@ its default — the same rule for a constructor as for a function. Type argument
 say nothing about which body runs for a call the lowering already resolved, so
 they no longer refuse one.
 
+### One implementation, not two
+
+`libklio_rt` is built from the interpreter's own modules, so a `klio_nat_*`
+entry is a C-ABI shim over the same code the interpreter runs: the collector,
+the object model, strings, lists, arrays, maps, exceptions, structural
+equality, and the value RENDERER. 96 of the 97 entries delegate; none
+reimplements.
+
+The emitter had one real duplicate: 44 lines of C reproducing Kotlin's float
+rendering, for programs that linked nothing at all. That is gone — everything
+prints through `klio_nat_println`, so how Kotlin renders a value is stated once
+— and division by zero now raises a real throwable rather than printing its own
+copy of the message.
+
+What remains in the emitter is code GENERATION, not runtime code: the
+arithmetic expressions themselves (wrapping add, masked shifts), the `setjmp`
+machinery for `try` — which cannot move into a library, because `setjmp` has to
+be called in the frame that catches — and the frame/dispatch glue. The
+arithmetic rules are stated in two places and could drift, which is exactly
+what `native-c-sweep.sh` exists to catch: it found the overflow bug.
+
 ### What is general and what is an intrinsic
 
 Everything that decides program shape is general and applies to a pack class
@@ -452,6 +473,19 @@ field holds its type's zero from ALLOCATION rather than from its initializer —
 the class descriptor names each field's zero — so a superclass constructor that
 calls an overridden method sees the subclass's field as 0/false/null, exactly
 as on the JVM.
+
+Unsigned integers compile. Kotlin's are VALUE classes over the signed widths,
+so they hold the same bits and constructing one — which is what `n.toUInt()`
+does — reinterprets rather than allocates; only comparison, division and the
+right shift read them differently, which is exactly what C's unsigned types
+give. An unsigned type mixes only with its own kind, because Kotlin has no
+implicit conversion between a signed and an unsigned integer.
+
+A class answers a virtual slot only if its TYPE includes the declaration. Name
+and arity alone made every same-named method across the stdlib look like an
+override, so one `next()` call pulled whole families of unrelated iterators
+into the compile and the program refused on one of them. With that and the
+unsigned types, a `for` over a range compiles.
 
 The sweep now reports every accepted program matching the interpreter.
 

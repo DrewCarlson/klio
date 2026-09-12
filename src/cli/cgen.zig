@@ -34,6 +34,14 @@ pub const Ty = enum {
     /// arithmetic that returns them, but they render as themselves.
     short,
     byte,
+    /// Kotlin's unsigned integers. They are value classes over the signed
+    /// widths, so they hold the same bits; only comparison, division and the
+    /// right shift read them differently, which is exactly what C's unsigned
+    /// types give.
+    u32,
+    u64,
+    u16,
+    u8,
     /// A reference. It lives in the frame's published slots, never a bare C
     /// local: the collector is precisely rooted and never scans the native
     /// stack, so a reference it cannot see is a reference it will free.
@@ -50,6 +58,10 @@ pub const Ty = enum {
             .char => "uint16_t",
             .short => "int16_t",
             .byte => "int8_t",
+            .u32 => "uint32_t",
+            .u64 => "uint64_t",
+            .u16 => "uint16_t",
+            .u8 => "uint8_t",
             .object => "klio_value",
         };
     }
@@ -75,6 +87,10 @@ fn tyOf(t: ir.TypeRef) ?Ty {
     if (std.mem.eql(u8, n, "Char")) return .char;
     if (std.mem.eql(u8, n, "Short")) return .short;
     if (std.mem.eql(u8, n, "Byte")) return .byte;
+    if (std.mem.eql(u8, n, "UInt")) return .u32;
+    if (std.mem.eql(u8, n, "ULong")) return .u64;
+    if (std.mem.eql(u8, n, "UShort")) return .u16;
+    if (std.mem.eql(u8, n, "UByte")) return .u8;
     return null;
 }
 
@@ -116,11 +132,14 @@ fn constTy(c: ir.Const) ?Ty {
         .Char => .char,
         .Short => .short,
         .Byte => .byte,
+        .UInt => .u32,
+        .ULong => .u64,
+        .UShort => .u16,
+        .UByte => .u8,
         // A string literal is a reference like any other: it lives in the
         // published frame so the collector can see it.
         .String => .object,
         .Null => .object,
-        else => null,
     };
 }
 
@@ -128,7 +147,7 @@ fn constTy(c: ir.Const) ?Ty {
 /// a call, not a C cast.
 fn isNumericTy(t: Ty) bool {
     return switch (t) {
-        .i32, .i64, .f64, .f32, .char, .short, .byte => true,
+        .i32, .i64, .f64, .f32, .char, .short, .byte, .u32, .u64, .u16, .u8 => true,
         else => false,
     };
 }
@@ -456,6 +475,18 @@ fn primArrayElem(kind: u32) Ty {
     };
 }
 
+/// The unsigned type a name denotes. Kotlin's unsigned integers are VALUE
+/// classes, so `n.toUInt()` constructs one — which is a reinterpretation of the
+/// same bits, not an allocation.
+fn unsignedTypeOf(name: []const u8) ?Ty {
+    const tail = simpleName(name);
+    if (std.mem.eql(u8, tail, "UInt")) return .u32;
+    if (std.mem.eql(u8, tail, "ULong")) return .u64;
+    if (std.mem.eql(u8, tail, "UShort")) return .u16;
+    if (std.mem.eql(u8, tail, "UByte")) return .u8;
+    return null;
+}
+
 fn isArrayTypeName(name: []const u8) bool {
     const tail = simpleName(name);
     return primArrayKind(name) != null or std.mem.eql(u8, tail, "Array");
@@ -501,6 +532,15 @@ fn promote(a: Ty, b: Ty) ?Ty {
     if (a == .object or b == .object) return null;
     if (a == .f64 or b == .f64) return .f64;
     if (a == .f32 or b == .f32) return .f32;
+    // An unsigned type mixes only with its own kind: Kotlin has no implicit
+    // conversion between a signed and an unsigned integer.
+    const a_u = a == .u32 or a == .u64 or a == .u16 or a == .u8;
+    const b_u = b == .u32 or b == .u64 or b == .u16 or b == .u8;
+    if (a_u != b_u) return null;
+    if (a_u) {
+        if (a == .u64 or b == .u64) return .u64;
+        return .u32;
+    }
     if (a == .i64 or b == .i64) return .i64;
     // Kotlin has no arithmetic that returns `Char`, `Short` or `Byte`: every
     // operator on them produces an `Int`.
@@ -531,6 +571,8 @@ fn wrapTy(t: Ty) ?[]const u8 {
         .short => "uint16_t",
         .byte => "uint8_t",
         .char => "uint16_t",
+        // Already unsigned: C wraps these by definition.
+        .u32, .u64, .u16, .u8 => null,
         else => null,
     };
 }
@@ -867,6 +909,9 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
                 const pv = prev orelse break :inc;
                 const ifn = m.funcById(bp.init orelse break :inc) orelse break :inc;
                 var ic = (try eligible(gpa, m, pv.*, ifn, globals, null, &.{})) orelse {
+                    if (traceOn() and last) {
+                        std.debug.print("[cgen] layout {s}: property `{s}` has no compilable initializer\n", .{ c.name, bp.name });
+                    }
                     if (!last) break :inc;
                     out.deinit(gpa);
                     return layoutNoTy(c, "body property type", bp.ty);
@@ -956,6 +1001,12 @@ fn numConv(m: *const Module, cm: anytype) ?Ty {
     if (std.mem.eql(u8, nm.String, "toLong")) return .i64;
     if (std.mem.eql(u8, nm.String, "toDouble")) return .f64;
     if (std.mem.eql(u8, nm.String, "toFloat")) return .f32;
+    if (std.mem.eql(u8, nm.String, "toUInt")) return .u32;
+    if (std.mem.eql(u8, nm.String, "toULong")) return .u64;
+    if (std.mem.eql(u8, nm.String, "toUShort")) return .u16;
+    if (std.mem.eql(u8, nm.String, "toUByte")) return .u8;
+    if (std.mem.eql(u8, nm.String, "toShort")) return .short;
+    if (std.mem.eql(u8, nm.String, "toByte")) return .byte;
     return null;
 }
 
@@ -970,6 +1021,12 @@ fn numConvVirtual(m: *const Module, cv: anytype) ?Ty {
     if (std.mem.eql(u8, decl.name, "toLong")) return .i64;
     if (std.mem.eql(u8, decl.name, "toDouble")) return .f64;
     if (std.mem.eql(u8, decl.name, "toFloat")) return .f32;
+    if (std.mem.eql(u8, decl.name, "toUInt")) return .u32;
+    if (std.mem.eql(u8, decl.name, "toULong")) return .u64;
+    if (std.mem.eql(u8, decl.name, "toUShort")) return .u16;
+    if (std.mem.eql(u8, decl.name, "toUByte")) return .u8;
+    if (std.mem.eql(u8, decl.name, "toShort")) return .short;
+    if (std.mem.eql(u8, decl.name, "toByte")) return .byte;
     return null;
 }
 
@@ -2220,6 +2277,20 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     known[cv.dst.int()] = true;
                 },
                 .NewInstance => |ni| {
+                    // An unsigned integer is a value class: constructing one
+                    // reinterprets the same bits.
+                    if (ni.class.int() < m.classes.items.len) {
+                        if (unsignedTypeOf(m.classes.items[ni.class.int()].name)) |ut| {
+                            if (ni.n_args != 1) return no(f, "unsigned ctor arity");
+                            const ur = ni.args.int();
+                            if (ur >= f.n_locals or !known[ur]) return no(f, "unsigned value");
+                            if (!isNumericTy(types[ur])) return no(f, "unsigned value type");
+                            if (ni.dst.int() >= f.n_locals) return no(f, "unsigned dst");
+                            types[ni.dst.int()] = ut;
+                            known[ni.dst.int()] = true;
+                            continue;
+                        }
+                    }
                     if (ni.class.int() < m.classes.items.len and
                         isArrayTypeName(m.classes.items[ni.class.int()].name))
                     {
@@ -2343,13 +2414,6 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                     gpa.free(junk2.fields);
                                 }
                                 layout_quiet = true;
-                            }
-                            if (traceOn()) {
-                                std.debug.print("[cgen]   class {s} fields:", .{m.classes.items[rc].name});
-                                if (prog.of(rc)) |fl9| {
-                                    for (fl9) |x9| std.debug.print(" {s}", .{x9.name});
-                                } else std.debug.print(" (none)", .{});
-                                std.debug.print("\n", .{});
                             }
                             return noName(f, "field not laid out", nm.String);
                         },
@@ -2709,7 +2773,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     var saw_ret = false;
     var ret_cls: ?u32 = null;
     var ret_elem: Ty = .unit;
-    for (f.blocks) |*blk| {
+    // Only the blocks the body can reach: an unreachable one was never typed,
+    // and its terminator names a register nothing defined.
+    const live_ret = try gpa.alloc(bool, f.blocks.len);
+    defer gpa.free(live_ret);
+    @memset(live_ret, false);
+    for (order) |bi| live_ret[bi] = true;
+    for (f.blocks, 0..) |*blk, bi2| {
+        if (!live_ret[bi2]) continue;
         if (blk.terminator != .Return) continue;
         const rr = blk.terminator.Return orelse continue;
         if (rr.int() >= f.n_locals or !known[rr.int()]) return no(f, "return register");
@@ -2978,6 +3049,10 @@ fn zeroKindOf(t: Ty) u8 {
         .char => 6,
         .short => 7,
         .byte => 8,
+        .u32 => 9,
+        .u64 => 10,
+        .u16 => 11,
+        .u8 => 12,
     };
 }
 
@@ -2991,6 +3066,10 @@ fn boxFnName(t: Ty) []const u8 {
         .char => "klio_nat_box_char",
         .short => "klio_nat_box_short",
         .byte => "klio_nat_box_byte",
+        .u32 => "klio_nat_box_uint",
+        .u64 => "klio_nat_box_ulong",
+        .u16 => "klio_nat_box_ushort",
+        .u8 => "klio_nat_box_ubyte",
         .unit, .object => "",
     };
 }
@@ -3029,6 +3108,10 @@ fn boxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
         .char => "klio_nat_box_char",
         .short => "klio_nat_box_short",
         .byte => "klio_nat_box_byte",
+        .u32 => "klio_nat_box_uint",
+        .u64 => "klio_nat_box_ulong",
+        .u16 => "klio_nat_box_ushort",
+        .u8 => "klio_nat_box_ubyte",
         // Boxing a Unit result must still run what produced it: the comma
         // keeps the expression and yields the Unit value. Returning a bare
         // `klio_nat_box_unit()` dropped the call.
@@ -3049,6 +3132,10 @@ fn unboxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
         .char => "klio_nat_char",
         .short => "klio_nat_short",
         .byte => "klio_nat_byte",
+        .u32 => "klio_nat_uint",
+        .u64 => "klio_nat_ulong",
+        .u16 => "klio_nat_ushort",
+        .u8 => "klio_nat_ubyte",
         // A Unit result is still a result: the expression that produced it
         // has to run. The comma keeps the call and yields the Unit register's
         // zero, where returning a bare `0` dropped the call entirely.
@@ -3095,6 +3182,10 @@ fn writeConst(w: *std.Io.Writer, c: ir.Const) !void {
         .Char => |v| try w.print("{d}u", .{v}),
         .Short => |v| try w.print("{d}", .{v}),
         .Byte => |v| try w.print("{d}", .{v}),
+        .UInt => |v| try w.print("UINT32_C({d})", .{v}),
+        .ULong => |v| try w.print("UINT64_C({d})", .{v}),
+        .UShort => |v| try w.print("((uint16_t){d}u)", .{v}),
+        .UByte => |v| try w.print("((uint8_t){d}u)", .{v}),
         .Unit => try w.writeAll("0"),
         .Double => |v| try writeFloatLit(w, v, false),
         .Float => |v| try writeFloatLit(w, v, true),
@@ -3528,6 +3619,13 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             try w.writeAll("klio_nat_box_unit()");
                         }
                         try w.print(", {d});\n", .{if (tid) |t| t.lo else 0});
+                        continue;
+                    }
+                    if (unsignedTypeOf(m.classes.items[ni.class.int()].name)) |ut2| {
+                        var ub9: [32]u8 = undefined;
+                        try w.print("  {s} = ({s}){s};\n", .{
+                            dst, ut2.cName(), regName(c, ni.args.int(), &ub9),
+                        });
                         continue;
                     }
                     if (isArrayTypeName(m.classes.items[ni.class.int()].name)) {
@@ -4108,15 +4206,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         switch (si) {
                             .print => {
                                 var bx6: [96]u8 = undefined;
-                                if (uses_objects) {
-                                    try w.print("  klio_nat_print({s});\n", .{boxExpr(c.types[sa], x1, &bx6)});
-                                } else if (c.types[sa] == .boolean) {
-                                    try w.print("  printf(\"%s\", {s} ? \"true\" : \"false\");\n", .{x1});
-                                } else if (c.types[sa] == .i64) {
-                                    try w.print("  printf(\"%\" PRId64 \"\", {s});\n", .{x1});
-                                } else {
-                                    try w.print("  printf(\"%\" PRId32 \"\", {s});\n", .{x1});
-                                }
+                                try w.print("  klio_nat_print({s});\n", .{boxExpr(c.types[sa], x1, &bx6)});
                             },
                             .max, .min => {
                                 const x2 = regName(c, sa + 1, &a2b);
@@ -4199,28 +4289,18 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     if (isPrintln(callee)) {
                         const a0 = call.args.int();
                         const at = c.types[a0];
-                        const fmt: []const u8 = switch (at) {
-                            .i32 => "%\" PRId32 \"",
-                            .i64 => "%\" PRId64 \"",
-                            else => "",
-                        };
-
-                        // When the runtime is linked, everything prints through
-                        // its renderer: two renderers would be two chances to
-                        // drift, and printf's buffered stream interleaves
-                        // wrongly with the runtime's own writes.
-                        if (uses_objects) {
-                            var rex: std.Io.Writer.Allocating = .init(gpa);
-                            defer rex.deinit();
-                            try renderExpr(gpa, m, prog, c, a0, &rex);
-                            try w.print("  klio_nat_println({s});\n", .{rex.written()});
-                        } else if (at == .boolean) {
-                            try w.print("  printf(\"%s\\n\", r{d} ? \"true\" : \"false\");\n", .{a0});
-                        } else if (at.isFloat()) {
-                            try w.print("  klio_print_fp((double)r{d}, {d});\n", .{ a0, @intFromBool(at == .f32) });
-                        } else {
-                            try w.print("  printf(\"{s}\\n\", r{d});\n", .{ fmt, a0 });
-                        }
+                        // EVERYTHING prints through the runtime's renderer.
+                        // How Kotlin renders a value — the shortest
+                        // round-tripping decimal, `true`/`false`, a data class
+                        // by its properties — is the interpreter's own code,
+                        // and a second copy of it in emitted C is a second
+                        // thing to keep in agreement. printf's buffered stream
+                        // also interleaves wrongly with the runtime's writes.
+                        _ = at;
+                        var rex: std.Io.Writer.Allocating = .init(gpa);
+                        defer rex.deinit();
+                        try renderExpr(gpa, m, prog, c, a0, &rex);
+                        try w.print("  klio_nat_println({s});\n", .{rex.written()});
                     } else {
                         // Arguments go to the callee in ITS order: positional
                         // ones bind in order and named ones by name. A
@@ -4808,7 +4888,8 @@ pub fn emit(
                 }
                 if (inst.* == .NewInstance) {
                     if (inst.NewInstance.class.int() < m.classes.items.len and
-                        isArrayTypeName(m.classes.items[inst.NewInstance.class.int()].name)) continue;
+                        (isArrayTypeName(m.classes.items[inst.NewInstance.class.int()].name) or
+                            unsignedTypeOf(m.classes.items[inst.NewInstance.class.int()].name) != null)) continue;
                     {
                         const nc2 = inst.NewInstance.class.int();
                         var have_c = false;
@@ -5156,7 +5237,8 @@ pub fn emit(
                     if (isThrowableClass(m, nc)) continue;
                     // An array is a runtime value, not an instance the emitter
                     // lays out or initializes.
-                    if (nc < m.classes.items.len and isArrayTypeName(m.classes.items[nc].name)) continue;
+                    if (nc < m.classes.items.len and
+                        (isArrayTypeName(m.classes.items[nc].name) or unsignedTypeOf(m.classes.items[nc].name) != null)) continue;
                     try want.append(gpa, nc);
                 }
             }
@@ -5181,10 +5263,13 @@ pub fn emit(
     var uses_objects = used_classes.items.len != 0;
     for (accepted.items) |*c| {
         for (c.types) |t| {
-            // A `Char` prints as a character and a `Short`/`Byte` as itself, so
-            // a program holding one needs the runtime's renderer even if it
-            // never touches the heap.
-            if (t == .object or t == .char or t == .short or t == .byte) uses_objects = true;
+            // A `Char` prints as a character, a `Short`/`Byte` as itself, and
+            // an unsigned value as unsigned, so a program holding one needs the
+            // runtime's renderer even if it never touches the heap.
+            switch (t) {
+                .object, .char, .short, .byte, .u32, .u64, .u16, .u8 => uses_objects = true,
+                else => {},
+            }
         }
     }
 
@@ -5223,7 +5308,6 @@ pub fn emit(
     }
     if (used_globals.items.len != 0 or used_singletons.items.len != 0 or used_slots.items.len != 0 or uses_try) uses_objects_hint = true;
 
-    var needs_fp = false;
     var needs_div = false;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
@@ -5232,10 +5316,11 @@ pub fn emit(
                     .BinOp => |b| {
                         if ((b.op == .Div or b.op == .Mod) and !c.types[b.dst.int()].isFloat()) needs_div = true;
                     },
+                    // Printing goes through the runtime's renderer, so a
+                    // program that prints anything links it.
                     .Call => |call| {
                         const callee = m.funcById(call.func) orelse continue;
-                        if (!isPrintln(callee)) continue;
-                        if (c.types[call.args.int()].isFloat()) needs_fp = true;
+                        if (isPrintln(callee) or scalarIntrinsic(callee) == .print) uses_objects_hint = true;
                     },
                     else => {},
                 }
@@ -5255,6 +5340,10 @@ pub fn emit(
         \\#include <setjmp.h>
         \\
     , .{src_path});
+    // Every hint is in: a program that prints, throws, holds a global or
+    // dispatches needs the runtime, and the header has to say so before the
+    // first declaration that uses it.
+    if (uses_objects_hint) uses_objects = true;
     if (uses_objects) {
         try w.writeAll(
             \\#include <klio_rt.h>
@@ -5314,7 +5403,6 @@ pub fn emit(
         }
         try w.writeAll("}\n\n");
     }
-    if (uses_objects_hint) uses_objects = true;
     if (uses_try) try w.writeAll(
         \\/* A try region. The handler stack and the in-flight value live here rather
         \\ * than in the runtime: `setjmp` has to be called in the frame that catches,
@@ -5333,71 +5421,22 @@ pub fn emit(
         \\
         \\
     );
-    if (needs_div) try w.writeAll(
-        \\/* Kotlin throws on integer division by zero; C leaves it undefined. */
-        \\static void klio_arith_zero(void) {
-        \\  fprintf(stderr, "Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n");
-        \\  exit(1);
-        \\}
-        \\
-        \\
-    );
-    if (needs_fp and !uses_objects) try w.writeAll(
-        \\/* Kotlin renders a floating value as the SHORTEST decimal that reads
-        \\ * back as the same double, always with a fractional part, and switches
-        \\ * to scientific form outside [1e-3, 1e7). printf("%g") agrees with none
-        \\ * of that: it would print 17.0 as "17". The search starts at two
-        \\ * significant digits because the reference renderer does: the smallest
-        \\ * subnormal prints as 4.9E-324, though 5E-324 reads back as the same
-        \\ * value. Trailing zeros are trimmed, so a value that needs one digit
-        \\ * still prints as one. */
-        \\static void klio_print_fp(double d, int is_float) {
-        \\  if (d != d) { printf("NaN\n"); return; }
-        \\  if (d > 1.7976931348623157e308) { printf("Infinity\n"); return; }
-        \\  if (d < -1.7976931348623157e308) { printf("-Infinity\n"); return; }
-        \\  char buf[64];
-        \\  int prec;
-        \\  int max = is_float ? 9 : 17;
-        \\  for (prec = 2; prec < max; prec++) {
-        \\    snprintf(buf, sizeof buf, "%.*e", prec - 1, d);
-        \\    double back = strtod(buf, NULL);
-        \\    if (is_float ? ((float)back == (float)d) : (back == d)) break;
-        \\  }
-        \\  snprintf(buf, sizeof buf, "%.*e", prec - 1, d);
-        \\  /* Split the mantissa digits from the exponent. */
-        \\  char digits[32];
-        \\  int neg = 0, nd = 0, exp10 = 0;
-        \\  const char *p = buf;
-        \\  if (*p == '-') { neg = 1; p++; }
-        \\  for (; *p && *p != 'e' && *p != 'E'; p++) {
-        \\    if (*p >= '0' && *p <= '9' && nd < (int)sizeof digits) digits[nd++] = *p;
-        \\  }
-        \\  if (*p) exp10 = atoi(p + 1);
-        \\  while (nd > 1 && digits[nd - 1] == '0') nd--;
-        \\  if (neg) putchar('-');
-        \\  if (exp10 >= -3 && exp10 < 7) {
-        \\    if (exp10 >= 0) {
-        \\      for (int i = 0; i <= exp10; i++) putchar(i < nd ? digits[i] : '0');
-        \\      putchar('.');
-        \\      if (nd > exp10 + 1) { for (int i = exp10 + 1; i < nd; i++) putchar(digits[i]); }
-        \\      else putchar('0');
-        \\    } else {
-        \\      printf("0.");
-        \\      for (int i = 0; i < -exp10 - 1; i++) putchar('0');
-        \\      for (int i = 0; i < nd; i++) putchar(digits[i]);
-        \\    }
-        \\  } else {
-        \\    putchar(digits[0]);
-        \\    putchar('.');
-        \\    if (nd > 1) { for (int i = 1; i < nd; i++) putchar(digits[i]); }
-        \\    else putchar('0');
-        \\    printf("E%d", exp10);
-        \\  }
-        \\  putchar('\n');
-        \\}
-        \\
-        \\
-    );
+    if (needs_div) {
+        // Kotlin THROWS on integer division by zero; C leaves it undefined.
+        // It is a real throwable, so a `catch` in compiled code sees it and
+        // an uncaught one is reported by the runtime, in the one place that
+        // knows how a throwable reads.
+        const az = prog.throws.find("ArithmeticException");
+        try w.print(
+            \\KLIO_NORETURN static void klio_arith_zero(void) {{
+            \\  {s}(klio_nat_exception("kotlin.ArithmeticException",
+            \\      klio_nat_string("/ by zero", 9), {d}));
+            \\}}
+            \\
+            \\
+        , .{ if (uses_try) "klio_do_throw" else "klio_nat_throw", if (az) |t| t.lo else 0 });
+    }
+
 
     if (used_singletons.items.len != 0) {
         try w.print("\n/* `object` declarations: one instance each, built before the program\n" ++
