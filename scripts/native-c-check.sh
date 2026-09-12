@@ -23,7 +23,7 @@ if [ $# -gt 0 ]; then
   progs=("$@")
   strict=0
 else
-  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt examples/native_try_catch.kt examples/native_exception_hierarchy.kt examples/native_properties.kt examples/native_enums.kt examples/native_default_args.kt examples/native_member_dispatch.kt examples/native_math_print.kt examples/native_arrays.kt examples/native_scope_functions.kt examples/native_inferred_properties.kt examples/native_function_values.kt examples/native_data_and_virtual_props.kt examples/field_zero_before_init.kt examples/backing_field_in_nested_scope.kt examples/native_ranges_and_bare_calls.kt examples/native_unsigned.kt examples/native_divide_by_zero.kt examples/native_coroutines.kt examples/native_stdlib_calls.kt
+  progs=(examples/native_scalar_core.kt examples/native_objects.kt examples/native_strings.kt examples/native_collections.kt examples/native_globals_nullable.kt examples/native_char_sized.kt examples/native_interfaces.kt examples/native_lambdas.kt examples/native_try_catch.kt examples/native_exception_hierarchy.kt examples/native_properties.kt examples/native_enums.kt examples/native_default_args.kt examples/native_member_dispatch.kt examples/native_math_print.kt examples/native_arrays.kt examples/native_scope_functions.kt examples/native_inferred_properties.kt examples/native_function_values.kt examples/native_data_and_virtual_props.kt examples/field_zero_before_init.kt examples/backing_field_in_nested_scope.kt examples/native_ranges_and_bare_calls.kt examples/native_unsigned.kt examples/native_divide_by_zero.kt examples/native_coroutines.kt examples/native_stdlib_calls.kt examples/native_iteration.kt
     # A program whose point is to leave through an uncaught throw cannot live
     # in examples/: the corpus requires an example to exit zero.
     tests/fixtures/native_c/native_throw.kt)
@@ -35,7 +35,17 @@ refused=0
 for kt in "${progs[@]}"; do
   name=$(basename "$kt" .kt)
   cfile="$WORK/$name.c"
-  if ! "$KLIO" transpile --native "$kt" -o "$cfile" >"$WORK/emit.log" 2>&1; then
+  "$KLIO" transpile --native "$kt" -o "$cfile" >"$WORK/emit.log" 2>&1
+  emit_rc=$?
+  # A refusal exits 1 and says why. Anything else is the emitter falling over,
+  # which is a defect in it rather than a program outside the subset.
+  if [ "$emit_rc" -gt 1 ]; then
+    fail=$((fail + 1))
+    echo "  FAIL $name: the emitter crashed (exit $emit_rc)"
+    head -3 "$WORK/emit.log" | sed 's/^/      /'
+    continue
+  fi
+  if [ "$emit_rc" -ne 0 ]; then
     refused=$((refused + 1))
     echo "  REFUSED $name: $(grep -m1 -oE 'refuse .*' "$WORK/emit.log" || tail -1 "$WORK/emit.log")"
     continue

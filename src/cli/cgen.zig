@@ -14,6 +14,10 @@ const std = @import("std");
 /// directly is not a gap to fill here: the operation already exists, named, and
 /// compiled code calls the same entry the interpreter does.
 const stdlib = @import("stdlib");
+/// The interpreter's member dispatch. Which builtin member calls the runtime
+/// can serve is its classification, read here at compile time so the backend
+/// keeps no second table of the same names.
+const member_dispatch = @import("interp_ir").member_dispatch;
 const ir = @import("ir");
 
 const Reg = ir.Reg;
@@ -306,6 +310,11 @@ const CELL_CLS: u32 = std.math.maxInt(u32) - 2;
 /// class table; `elem` carries what it holds.
 const ARRAY_CLS: u32 = std.math.maxInt(u32) - 4;
 
+/// An iterator over a builtin container. Like the container itself it is a
+/// runtime value the interpreter already knows how to step, so the handle sits
+/// outside the class table and `elem` carries what the iteration yields.
+const ITER_CLS: u32 = std.math.maxInt(u32) - 5;
+
 /// A builtin type's name used as a QUALIFIER: `Int` in `Int.MAX_VALUE`. Such
 /// a register names a type rather than holding a value, so like a lambda's it
 /// is typed Unit with the type recorded and occupies nothing at run time.
@@ -446,7 +455,7 @@ fn functionResultTy(t: ir.TypeRef) Ty {
 
 fn isBuiltinCls(cid: u32) bool {
     return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS or cid == THROWABLE_CLS or
-        cid == ARRAY_CLS or funcClsArity(cid) != null or numClsTy(cid) != null;
+        cid == ARRAY_CLS or cid == ITER_CLS or funcClsArity(cid) != null or numClsTy(cid) != null;
 }
 
 /// The element kind of a named array type, in the order the runtime's
@@ -1057,6 +1066,21 @@ fn listIntrinsic(f: *const Func) ?ListIntrinsic {
 /// The stdlib entry that implements a declaration, if the interpreter has one.
 /// A member the backend does not perform directly is not a gap: the operation
 /// exists, named, and compiled code calls the same entry.
+/// The member calls a compiled program hands back to the runtime. The
+/// interpreter classifies a slot's declaration into a host operation served
+/// from the receiver's own representation; the ones with no interpreter behind
+/// them are exactly what a compiled program can run, so that classification is
+/// the answer rather than a list of names kept here.
+fn hostMemberOp(decl: *const Func) ?member_dispatch.HostSlotOp {
+    const op = member_dispatch.hostSlotOpOfFqn(decl.fqn) orelse return null;
+    return switch (op) {
+        // The iteration protocol reads the container and the iterator, nothing
+        // else. The remaining ops need a live module to dispatch through.
+        .iterator_protocol, .collection_iterator => op,
+        else => null,
+    };
+}
+
 fn stdlibEntry(f: *const Func) ?[]const u8 {
     if (f.fqn.len == 0) return null;
     if (stdlib.implementations.lookup(f.fqn) != null) return f.fqn;
@@ -2302,6 +2326,44 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     known[cm.dst.int()] = true;
                 },
                 .CallVirtual => |cv| {
+                    // A member the runtime serves from the receiver's own
+                    // representation. The receiver has to be a runtime value
+                    // rather than a compiled class: a user class that
+                    // implements the same interface dispatches to its body.
+                    if (cv.receiver.int() < f.n_locals and known[cv.receiver.int()] and
+                        types[cv.receiver.int()] == .object and cls[cv.receiver.int()] != null and
+                        isBuiltinCls(cls[cv.receiver.int()].?))
+                    {
+                        if (m.funcById(ir.FuncId.from(cv.slot.int()))) |decl| host: {
+                            const op = hostMemberOp(decl) orelse break :host;
+                            var kh: u32 = 0;
+                            while (kh < cv.n_args) : (kh += 1) {
+                                const ah = cv.args.int() + kh;
+                                if (ah >= f.n_locals or !known[ah]) return no(f, "host member arg");
+                            }
+                            if (cv.dst.int() >= f.n_locals) return no(f, "host member dst");
+                            if (op == .collection_iterator) {
+                                types[cv.dst.int()] = .object;
+                                cls[cv.dst.int()] = ITER_CLS;
+                                elem[cv.dst.int()] = elem[cv.receiver.int()];
+                                known[cv.dst.int()] = true;
+                                continue;
+                            }
+                            // The declaration says what the step answers. A
+                            // return type that names neither a machine type
+                            // nor a compiled class is the container's own
+                            // element type, which the receiver carries.
+                            const hrt = tyOf(decl.return_ty) orelse blk: {
+                                if (classIndexOfName(m, decl.return_ty) == null and
+                                    elem[cv.receiver.int()] != .unit) break :blk elem[cv.receiver.int()];
+                                break :blk Ty.object;
+                            };
+                            types[cv.dst.int()] = hrt;
+                            if (hrt == .object) cls[cv.dst.int()] = classIndexOfName(m, decl.return_ty);
+                            known[cv.dst.int()] = true;
+                            continue;
+                        }
+                    }
                     if (cv.receiver.int() < f.n_locals and known[cv.receiver.int()] and
                         cls[cv.receiver.int()] != null and cls[cv.receiver.int()].? == LIST_CLS)
                     {
@@ -2350,6 +2412,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 // type and the argument shape; which body runs
                                 // is decided at run time by the receiver.
                                 const rt4 = funcRetTy2(m, root) orelse return no(f, "virtual return type");
+                                // The dispatcher forwards what the site passes
+                                // straight into the body it picks, so the site
+                                // has to supply the declaration's parameters
+                                // positionally. A site that omits one — a
+                                // default, or a named argument the lowering
+                                // reordered — needs the missing value computed
+                                // HERE, before the receiver is known.
+                                if (cv.n_args + 1 != root.params.len) return noCallee(f, root, "virtual call arity");
                                 var kk2: u32 = 0;
                                 while (kk2 < cv.n_args) : (kk2 += 1) {
                                     const ar2 = cv.args.int() + kk2;
@@ -2492,7 +2562,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         const snm = m.consts.items[gf.field.int()];
                         if (snm != .String) return no(f, "builtin member name");
                         const want: []const u8 = if (rc == STRING_CLS) "length" else "size";
-                        if (!std.mem.eql(u8, plainFieldName(snm.String), want)) return no(f, "builtin member");
+                        if (!std.mem.eql(u8, plainFieldName(snm.String), want)) return noName(f, "builtin member", snm.String);
                         if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
                         types[gf.dst.int()] = .i32;
                         known[gf.dst.int()] = true;
@@ -4130,13 +4200,26 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         });
                         continue;
                     }
-                    const op = cOp(b.op).?;
                     var lnb: [32]u8 = undefined;
                     var rnb: [32]u8 = undefined;
                     var dnb: [32]u8 = undefined;
                     const ln = regName(c, b.lhs.int(), &lnb);
                     const rn = regName(c, b.rhs.int(), &rnb);
                     const dn = regName(c, b.dst.int(), &dnb);
+                    if (b.op == .UShr) {
+                        // C has no unsigned right shift of a signed value, so
+                        // it runs in the unsigned type of the same width;
+                        // Kotlin masks the shift count where C leaves an
+                        // over-wide shift undefined.
+                        const lt5 = c.types[b.lhs.int()];
+                        const ut5: []const u8 = if (lt5 == .i64) "uint64_t" else "uint32_t";
+                        try w.print("  {s} = ({s})(({s}){s} >> ({s} & {d}));\n", .{
+                            dn, dt.cName(), ut5, ln, rn,
+                            @as(u32, if (lt5 == .i64) 63 else 31),
+                        });
+                        continue;
+                    }
+                    const op = cOp(b.op).?;
                     if ((b.op == .Div or b.op == .Mod) and !dt.isFloat() and !isCmp(b.op)) {
                         try w.print("  if ({s} == 0) klio_arith_zero();\n", .{rn});
                         // The most negative value divided by -1 overflows.
@@ -4152,14 +4235,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             }
                         }
                     }
-                    if (b.op == .UShr) {
-                        const lt = c.types[b.lhs.int()];
-                        const ut: []const u8 = if (lt == .i64) "uint64_t" else "uint32_t";
-                        try w.print("  {s} = ({s})(({s}){s} >> ({s} & {d}));\n", .{
-                            dn, dt.cName(), ut, ln, rn,
-                            @as(u32, if (lt == .i64) 63 else 31),
-                        });
-                    } else if (b.op == .Shl or b.op == .Shr) {
+                    if (b.op == .Shl or b.op == .Shr) {
                         // Kotlin masks the shift count; C leaves an over-wide
                         // shift undefined.
                         const lt = c.types[b.lhs.int()];
@@ -4309,6 +4385,33 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     var nb: [32]u8 = undefined;
                     var rb: [32]u8 = undefined;
                     const recv = regName(c, cv.receiver.int(), &rb);
+                    if (c.cls[cv.receiver.int()]) |rc0| {
+                        if (isBuiltinCls(rc0)) host: {
+                            const decl0 = m.funcById(ir.FuncId.from(cv.slot.int())) orelse break :host;
+                            if (hostMemberOp(decl0) == null) break :host;
+                            // The runtime reads the declaration's name to pick
+                            // the same operation the emitter classified, and
+                            // takes the receiver as the first argument.
+                            try w.print("  {{ klio_value ma[{d}];\n    ma[0] = {s};\n", .{ cv.n_args + 1, recv });
+                            var kh: u32 = 0;
+                            while (kh < cv.n_args) : (kh += 1) {
+                                const ah = cv.args.int() + kh;
+                                var ahb: [32]u8 = undefined;
+                                var bhb: [96]u8 = undefined;
+                                try w.print("    ma[{d}] = {s};\n", .{
+                                    kh + 1, boxExpr(c.types[ah], regName(c, ah, &ahb), &bhb),
+                                });
+                            }
+                            var hb: [320]u8 = undefined;
+                            var hob: [400]u8 = undefined;
+                            const hcall = try std.fmt.bufPrint(&hb, "klio_nat_member(\"{s}\", ma, {d})", .{ decl0.fqn, cv.n_args + 1 });
+                            try w.print("    {s} = {s}; }}\n", .{
+                                regName(c, cv.dst.int(), &nb),
+                                unboxExpr(c.types[cv.dst.int()], hcall, &hob),
+                            });
+                            continue;
+                        }
+                    }
                     if (isDispatched(slots, cv.slot.int())) {
                         try w.print("  {s} = kvirt_{d}({s}", .{
                             regName(c, cv.dst.int(), &nb), cv.slot.int(), recv,
@@ -5675,6 +5778,11 @@ pub fn emit(
         for (c.cls) |maybe| {
             const cid = maybe orelse continue;
             if (isBuiltinCls(cid)) continue;
+            // A class the program never laid out has no descriptor to
+            // register: an interface, or a library type a value merely passes
+            // through. Nothing constructs one, and every read that would need
+            // its fields is refused before it reaches here.
+            if (prog.of(cid) == null) continue;
             var seen_cls = false;
             for (used_classes.items) |u| {
                 if (u == cid) seen_cls = true;
@@ -6047,9 +6155,12 @@ pub fn emit(
             }
             if (dk9 != impl.params.len) {
                 // A parameter with no default and no argument: nothing can
-                // fill it, so this receiver cannot answer here.
-                try w.writeAll("  }\n");
-                continue;
+                // fill it, so this receiver cannot answer at all. Leaving the
+                // arm empty would let the call fall through to the
+                // no-implementation tail at run time, which is a wrong answer
+                // rather than a refusal.
+                if (traceOn()) std.debug.print("[cgen] refuse {s}: dispatcher arm cannot fill a parameter of `{s}`\n", .{ root.name, impl.fqn });
+                return false;
             }
             try w.writeAll("    return ");
             try writeSymbol(w, impl);
