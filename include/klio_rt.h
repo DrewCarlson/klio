@@ -331,6 +331,13 @@ int32_t klio_nat_catches(klio_value v, uint32_t lo, uint32_t hi);
  * park, so the scheduler, the virtual clock and the Job graph are shared with
  * the interpreter rather than written twice. */
 typedef klio_value (*klio_resume_fn)(void *frame, klio_value resumed);
+/* A suspend body's frame: its registers, live across a suspension. Allocated
+ * here rather than on the C stack because the body returns in the middle of
+ * itself, and rooted for as long as it exists because the collector never
+ * scans the native stack. */
+void *klio_nat_coro_frame(size_t size, size_t gcf_off, size_t slots_off,
+                          uint32_t n_slots);
+void  klio_nat_coro_free(void *frame);
 klio_value klio_nat_suspended(void);
 int32_t    klio_nat_is_suspended(klio_value v);
 /* Record this frame's continuation and answer SUSPENDED. Each emitted frame
