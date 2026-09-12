@@ -299,28 +299,17 @@ export fn klio_op_goto_exit(ctx: *anyopaque, block: u32) void {
 
 /// A `Value` as C sees it: two words, no tag union. Compiled code never reads
 /// the inside; it hands them back to the entry points below.
-pub const CValue = extern struct { lo: u64, hi: u64 };
+/// The C-ABI shape of a `Value`, and the conversions, live in the runtime: the
+/// coroutine driver resumes NATIVE continuations through the same form, so one
+/// definition serves both.
+pub const CValue = runtime.CValue;
+const toC = runtime.toC;
+const fromC = runtime.fromC;
 
 comptime {
     if (@sizeOf(runtime.Value) != @sizeOf(CValue)) {
         @compileError("the native ABI passes a Value as two words; it is no longer that size");
     }
-}
-
-// A tagged union has no guaranteed layout, so the conversion is a byte copy
-// rather than a bitcast. The sizes are asserted equal above; compiled code
-// treats the result as opaque and only ever hands it back.
-inline fn toC(v: runtime.Value) CValue {
-    var tmp = v;
-    var out: CValue = undefined;
-    @memcpy(std.mem.asBytes(&out), std.mem.asBytes(&tmp));
-    return out;
-}
-inline fn fromC(v: CValue) runtime.Value {
-    var tmp = v;
-    var out: runtime.Value = undefined;
-    @memcpy(std.mem.asBytes(&out), std.mem.asBytes(&tmp));
-    return out;
 }
 
 fn natAlloc() std.mem.Allocator {
@@ -824,6 +813,125 @@ fn natNegativeSize(n: i32) noreturn {
     ) catch "Exception in thread \"main\" java.lang.NegativeArraySizeException\n";
     _ = std.c.write(2, msg.ptr, msg.len);
     std.c.exit(1);
+}
+
+// --- coroutines ------------------------------------------------------------
+//
+// A compiled suspend function keeps its registers in a heap frame and answers
+// either its result or COROUTINE_SUSPENDED. When it suspends it pushes its own
+// continuation — the emitted resume function plus that frame — onto the
+// suspension the interpreter's coroutine driver already knows how to park.
+// Everything above that point is shared: the scheduler, the virtual clock, the
+// Job graph, `delay`, `runBlocking`.
+
+/// What the coroutine driver needs from a COMPILED program. The driver is the
+/// interpreter's own — the scheduler, the virtual clock, the Job graph, the
+/// park and resume order — and it asks its host for exactly two things: start a
+/// queued block, and resume a parked continuation. In a compiled program both
+/// are native calls, so the whole driver is shared rather than written twice.
+const NativeCoroHost = struct {
+    allocator: std.mem.Allocator,
+    launched: u32 = 0,
+
+    /// A queued child. In a compiled program every closure is one of the
+    /// emitted lambda classes, dispatched through the value protocol.
+    pub fn evalClosureRaw(
+        self: *NativeCoroHost,
+        block: *const runtime.Value,
+        args: []const runtime.Value,
+        scope: ?*const runtime.Value,
+        out: runtime.Output,
+    ) std.mem.Allocator.Error!ir.eval.EvalResult {
+        _ = self;
+        _ = args;
+        _ = scope;
+        _ = out;
+        _ = block;
+        return .{ .err = .{ .Type = "a compiled program cannot start a closure child yet" } };
+    }
+
+    pub fn resumeRaw(
+        self: *NativeCoroHost,
+        state: *ir.eval.SuspendState,
+        value: runtime.Value,
+        out: runtime.Output,
+    ) std.mem.Allocator.Error!ir.eval.EvalResult {
+        _ = out;
+        // Every snapshot in a compiled program's suspension is native, so the
+        // replay is a sequence of calls: no module, no frame rebuild, and no
+        // need to instantiate the evaluator against a stub host.
+        return ir.eval.resumeNativeContinuation(self.allocator, state, value);
+    }
+};
+
+/// Where the driver's own writes go in a compiled program: the same descriptor
+/// every other emitted print uses, so ordering is one stream.
+const nat_out_vtable: runtime.Output.VTable = .{
+    .writeln = struct {
+        fn f(ctx: *anyopaque, str: []const u8) void {
+            _ = ctx;
+            natWrite(str);
+            natWrite("\n");
+        }
+    }.f,
+    .write = struct {
+        fn f(ctx: *anyopaque, str: []const u8) void {
+            _ = ctx;
+            natWrite(str);
+        }
+    }.f,
+};
+var nat_out_ctx: u8 = 0;
+
+fn natOutput() runtime.Output {
+    return .{ .ctx = @ptrCast(&nat_out_ctx), .vtable = &nat_out_vtable };
+}
+
+/// Run a compiled `runBlocking { … }` body to completion on the shared driver.
+export fn klio_nat_run_blocking(
+    call: *const fn (?*anyopaque, CValue) callconv(.c) CValue,
+    frame: ?*anyopaque,
+) CValue {
+    var host: NativeCoroHost = .{ .allocator = natAlloc() };
+    const res = cli.interp_ir.coroutines_diag.driveRootNative(&host, call, frame, natOutput()) catch
+        @panic("klio_nat_run_blocking: out of memory");
+    return switch (res) {
+        .ok => |v| toC(v),
+        .err => toC(.Unit),
+    };
+}
+
+/// The value a suspending call answers with when it did not produce a result.
+export fn klio_nat_suspended() CValue {
+    return toC(.CoroutineSuspended);
+}
+
+export fn klio_nat_is_suspended(v: CValue) i32 {
+    return @intFromBool(fromC(v) == .CoroutineSuspended);
+}
+
+/// Park the calling frame: record its continuation and answer SUSPENDED. Each
+/// emitted frame calls this as it unwinds, innermost first, which is the order
+/// the driver replays them in.
+export fn klio_nat_coro_park(
+    call: *const fn (?*anyopaque, CValue) callconv(.c) CValue,
+    frame: ?*anyopaque,
+) CValue {
+    ir.eval.pushNativePark(natAlloc(), call, frame, 0) catch
+        @panic("klio_nat_coro_park: out of memory");
+    return toC(.CoroutineSuspended);
+}
+
+/// `delay(millis)`: ask the driver to resume after that much virtual time. The
+/// caller parks itself on the way out like any other suspension.
+export fn klio_nat_coro_delay(
+    millis: i64,
+    call: *const fn (?*anyopaque, CValue) callconv(.c) CValue,
+    frame: ?*anyopaque,
+) CValue {
+    ir.eval.pushNativePark(natAlloc(), call, frame, millis) catch
+        @panic("klio_nat_coro_delay: out of memory");
+    return toC(.CoroutineSuspended);
 }
 
 fn natIndexOob(idx: i32, len: usize) noreturn {

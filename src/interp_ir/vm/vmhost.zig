@@ -456,6 +456,19 @@ pub const VmHost = struct {
 /// (`map`, `forEach`, scope fns, …) reach back through this adapter to
 /// invoke the lambda they were passed.
 pub const VmIntrinsicHost = struct {
+    /// The two operations the coroutine driver needs from whoever it is
+    /// driving: start a queued closure, and resume a parked continuation. They
+    /// are methods so a COMPILED program can present its own host to the same
+    /// driver — the scheduler, the clock and the Job graph are then shared
+    /// rather than written twice.
+    pub fn evalClosureRaw(self: *VmIntrinsicHost, block: *const Value, args: []const Value, scope: ?*const Value, out: Output) Allocator.Error!intrinsic_host.RawResult {
+        return intrinsic_host.evalClosureRaw(self, block, args, scope, out);
+    }
+
+    pub fn resumeRaw(self: *VmIntrinsicHost, state: *ir.eval.SuspendState, value: Value, out: Output) Allocator.Error!intrinsic_host.RawResult {
+        return intrinsic_host.resumeRaw(self, state, value, out);
+    }
+
     module: ObjRef(Module),
     closures: SharedClosures,
     globals: ObjRef(Env),

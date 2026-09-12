@@ -209,6 +209,11 @@ const EvalTls = struct {
     active_chain: ?*std.ArrayList(EnclosingEntry) = null,
     /// Length of the active chain's seeded (frame-entry) prefix.
     active_chain_base: usize = 0,
+    /// The suspension a COMPILED body is building as it unwinds. Compiled code
+    /// cannot return a Zig error union, so it answers `CoroutineSuspended` and
+    /// leaves the state here; each frame on the way out appends its own
+    /// continuation, and whoever called into the compiled code takes it.
+    in_flight_suspend: ?*SuspendState = null,
     /// Innermost-first chain of active interpreter frames (GC root seed).
     frame_chain: ?*Frame = null,
     /// Innermost in-flight resume node chain (GC root seed).
@@ -2865,6 +2870,13 @@ pub const FrameSnapshot = struct {
     /// `block`/`inst_idx`/`resume_reg` describe the resume point; the entry
     /// resumes through `resumeLiveActivation` instead of a frame rebuild.
     live: ?*Activation = null,
+    /// A COMPILED continuation: the emitted resume function and the heap frame
+    /// it resumes into. A compiled program has no interpreter frames, so when
+    /// one of its suspend functions parks it pushes this instead. Resuming it
+    /// calls the function; the answer is the result or `CoroutineSuspended`
+    /// when it suspended again. Everything above — the driver, the scheduler,
+    /// the clock, the Job graph — is shared with the interpreter.
+    native: ?runtime.NativeResume = null,
 };
 
 const SavedReg = struct {
@@ -3225,6 +3237,10 @@ pub const SuspendState = struct {
     /// activation outright (it owns its register references), or release
     /// and free a copied snapshot.
     fn dropSnapshot(snap: FrameSnapshot, allocator: Allocator) void {
+        // A compiled continuation owns nothing the interpreter allocated: its
+        // frame is the native runtime's, released when the park registry drops
+        // it.
+        if (snap.native != null) return;
         if (snap.live) |act| {
             destroyParkedActivation(allocator, act);
             return;
@@ -5050,6 +5066,74 @@ fn frameBoundary(func: *const Func, result_in: EvalResult) EvalResult {
 /// innermost frame's resume register, then that frame runs to
 /// completion (or re-suspends). When it returns, its value feeds the
 /// next-outer frame's resume register, and so on up the stack.
+/// Start or extend the suspension a compiled body is building. Called by the
+/// native runtime as each emitted frame unwinds, innermost first, which is the
+/// order the driver replays them in.
+pub fn pushNativePark(
+    allocator: Allocator,
+    call: *const fn (?*anyopaque, runtime.CValue) callconv(.c) runtime.CValue,
+    frame: ?*anyopaque,
+    wake_in_millis: i64,
+) Allocator.Error!void {
+    const state = evtls.in_flight_suspend orelse blk: {
+        const st = try allocator.create(SuspendState);
+        st.* = .{ .token = 0, .frames = .empty, .wake_in_millis = wake_in_millis, .pending_resume_reg = null };
+        evtls.in_flight_suspend = st;
+        break :blk st;
+    };
+    if (wake_in_millis != 0) state.wake_in_millis = wake_in_millis;
+    try state.frames.append(allocator, .{
+        .func = FuncId.from(0),
+        .module = null,
+        .block = BlockId.from(0),
+        .inst_idx = 0,
+        .regs = .{ .dense = &.{} },
+        .params = &.{},
+        .captures = &.{},
+        .enclosing_this = &.{},
+        .try_stack = &.{},
+        .is_lambda = false,
+        .resume_reg = null,
+        .native = .{ .call = call, .frame = frame },
+    });
+}
+
+/// Take the suspension a compiled body left behind, if any.
+pub fn takeInFlightSuspend(allocator: Allocator) ?*SuspendState {
+    _ = allocator;
+    const st = evtls.in_flight_suspend;
+    evtls.in_flight_suspend = null;
+    return st;
+}
+
+/// Replay a suspension whose frames are ALL compiled continuations. It needs no
+/// host: there is no frame to rebuild, no module to resolve a FuncId against,
+/// and no interpreted body to re-enter — each entry is a call. A compiled
+/// program's suspensions are only ever this shape, so it drives the shared
+/// scheduler without instantiating the evaluator against a stub host.
+pub fn resumeNativeContinuation(
+    allocator: Allocator,
+    state: *SuspendState,
+    resume_value: Value,
+) Allocator.Error!EvalResult {
+    var carry = resume_value;
+    var frames = state.frames;
+    state.frames = .empty;
+    defer frames.deinit(allocator);
+    state.gc_quiesced = false;
+    for (frames.items) |snap| {
+        const nr = snap.native orelse return errResult(.{ .Type = "interpreted frame in a compiled suspension" });
+        const produced = runtime.fromC(nr.call(nr.frame, runtime.toC(carry)));
+        if (produced == .CoroutineSuspended) {
+            const st = takeInFlightSuspend(allocator) orelse
+                return errResult(.{ .Type = "compiled body suspended without a continuation" });
+            return errResult(.{ .Suspended = st });
+        }
+        carry = produced;
+    }
+    return ok(carry);
+}
+
 pub fn resumeContinuation(
     comptime H: type,
     allocator: Allocator,
@@ -5127,6 +5211,18 @@ pub fn resumeContinuation(
         }
         const snap = frames.items[head];
         head += 1;
+        // A COMPILED continuation resumes by calling it: there is no frame to
+        // rebuild, because the emitted body keeps its own on the heap. It
+        // answers with the result, or suspends again — in which case it has
+        // already pushed its next continuation onto the in-flight state, which
+        // the caller parks exactly as it parks an interpreted one.
+        if (snap.native) |nr| {
+            const produced = runtime.fromC(nr.call(nr.frame, runtime.toC(carry)));
+            if (produced == .CoroutineSuspended) return .{ .err = .{ .Suspended = takeInFlightSuspend(allocator) orelse state } };
+            carry = produced;
+            first = false;
+            continue;
+        }
         // A live-parked flat activation resumes by reinstalling the intact
         // frame — no rebuild, no copies. Its result routes exactly like a
         // rebuilt frame's.

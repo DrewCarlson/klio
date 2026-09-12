@@ -324,6 +324,23 @@ klio_value klio_nat_exception(const char *fqn, klio_value message, uint32_t type
  * contiguous interval and the test is two comparisons. */
 int32_t klio_nat_catches(klio_value v, uint32_t lo, uint32_t hi);
 
+/* Coroutines. A compiled suspend function keeps its registers in a heap frame
+ * and answers either its result or the SUSPENDED marker. When it suspends it
+ * pushes its own continuation — the emitted resume function plus that frame —
+ * onto the suspension the interpreter's coroutine driver already knows how to
+ * park, so the scheduler, the virtual clock and the Job graph are shared with
+ * the interpreter rather than written twice. */
+typedef klio_value (*klio_resume_fn)(void *frame, klio_value resumed);
+klio_value klio_nat_suspended(void);
+int32_t    klio_nat_is_suspended(klio_value v);
+/* Record this frame's continuation and answer SUSPENDED. Each emitted frame
+ * calls it as it unwinds, innermost first — the order the driver replays. */
+klio_value klio_nat_coro_park(klio_resume_fn call, void *frame);
+/* `delay(millis)`: resume after that much virtual time. */
+klio_value klio_nat_coro_delay(int64_t millis, klio_resume_fn call, void *frame);
+/* Run a compiled `runBlocking { … }` body to completion on the shared driver. */
+klio_value klio_nat_run_blocking(klio_resume_fn call, void *frame);
+
 klio_value klio_nat_cell(klio_value v);
 klio_value klio_nat_cell_get(klio_value c);
 void       klio_nat_cell_set(klio_value c, klio_value v);

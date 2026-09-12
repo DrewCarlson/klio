@@ -48,7 +48,7 @@ const ThreadEntry = root.ThreadEntry;
 const ThreadResult = root.ThreadResult;
 
 /// `Result<Value, EvalError>` for the raw coroutine-facing helpers.
-const RawResult = EvalResult;
+pub const RawResult = EvalResult;
 
 // -------------------------------------------------------------------------
 // Transient hosts over the shared state.

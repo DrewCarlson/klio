@@ -11,7 +11,10 @@ const std = @import("std");
 const parser = @import("parser");
 
 const ir = @import("ir");
-const interp_ir = @import("interp_ir");
+/// The interpreter's own modules, re-exported so the native runtime shim can
+/// reach the coroutine driver: a compiled program drives coroutines on the
+/// SAME scheduler rather than on a second one.
+pub const interp_ir = @import("interp_ir");
 const runtime = @import("runtime");
 
 const io = @import("io.zig");

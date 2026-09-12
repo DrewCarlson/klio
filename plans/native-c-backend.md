@@ -408,6 +408,35 @@ has to BE a reference to be passed, returned or stored; demanding its layout
 everywhere refused every interface type, and relaxing it moved more programs
 than any feature did.
 
+## Coroutines: one driver, two kinds of frame
+
+The coroutine driver — the scheduler, the virtual clock, the Job graph, the
+park/resume order, `delay`, `runBlocking` — is 3800 lines of the interpreter's
+most delicate code. A compiled program must not get a second one: two
+schedulers would drift on exactly the ordering questions that are hardest to
+get right.
+
+So the driver is now host-generic, and a compiled program presents its own
+host. It asks for two things — start a queued block, resume a parked
+continuation — and in a compiled program both are native calls. A parked
+activation is a `FrameSnapshot` as before, with one new shape: a COMPILED
+continuation, the emitted resume function plus the heap frame it resumes into.
+Replaying one is a call rather than a frame rebuild, so a purely-compiled
+suspension needs no module, no register file to rebuild, and no evaluator
+instantiated against a stub host.
+
+The protocol compiled code follows:
+
+- a suspending call answers its result or `klio_nat_suspended()`;
+- a frame that sees SUSPENDED saves its resume label and calls
+  `klio_nat_coro_park(resume_fn, frame)`, which appends its continuation to the
+  suspension being built and answers SUSPENDED in turn — so the state is built
+  innermost-first as the C stack unwinds, which is the order the driver
+  replays;
+- `delay` is the same with a wake time;
+- `runBlocking` enters `driveRootNative`, which is `driveRoot` with the start
+  replaced by a native call and everything after it identical.
+
 ## Correctness net
 
 `scripts/native-c-check.sh` is the gate: a fixed set of programs that must keep
