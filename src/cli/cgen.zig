@@ -2323,7 +2323,21 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             if (types[a0] != .i32) return no(f, "list index type");
                             types[cv.dst.int()] = .object;
                             cls[cv.dst.int()] = null;
-                        } else return no(f, "list virtual member");
+                        } else {
+                            // Any other member of a builtin receiver is an
+                            // operation the interpreter already implements.
+                            const decl = m.funcById(ir.FuncId.from(cv.slot.int())) orelse return no(f, "list virtual member");
+                            const sym = stdlibEntry(decl) orelse return noName(f, "list virtual member", decl.fqn);
+                            _ = sym;
+                            const vrt = tyOf(decl.return_ty) orelse Ty.object;
+                            types[cv.dst.int()] = vrt;
+                            if (vrt == .object) {
+                                cls[cv.dst.int()] = classIndexOfName(m, decl.return_ty);
+                                if (refElemOf(cls[cv.dst.int()], decl.return_ty)) |re12| elem[cv.dst.int()] = re12;
+                            }
+                            known[cv.dst.int()] = true;
+                            continue;
+                        }
                         known[cv.dst.int()] = true;
                         continue;
                     }
@@ -4320,18 +4334,39 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                                 try w.print("  {s} = {s};\n", .{
                                     regName(c, cv.dst.int(), &nb), unboxExpr(c.types[cv.dst.int()], g, &ob),
                                 });
-                            } else if (std.mem.eql(u8, mn, "add")) {
+                            } else if (std.mem.eql(u8, mn, "add") and cv.n_args == 1) {
                                 try w.print("  klio_nat_list_add({s}, {s});\n", .{
                                     recv, boxExpr(c.types[a0], regName(c, a0, &ab), &bb),
                                 });
                                 try w.print("  {s} = 1;\n", .{regName(c, cv.dst.int(), &nb)});
-                            } else {
+                            } else if (std.mem.eql(u8, mn, "set") and cv.n_args == 2) {
                                 var vb: [32]u8 = undefined;
                                 try w.print("  klio_nat_list_set({s}, {s}, {s});\n", .{
                                     recv, regName(c, a0, &ab),
                                     boxExpr(c.types[a0 + 1], regName(c, a0 + 1, &vb), &bb),
                                 });
                                 try w.print("  {s} = klio_nat_box_unit();\n", .{regName(c, cv.dst.int(), &nb)});
+                            } else {
+                                // The interpreter's own entry, receiver first.
+                                const decl2 = m.funcById(ir.FuncId.from(cv.slot.int())).?;
+                                const sym2 = stdlibEntry(decl2).?;
+                                try w.print("  {{ klio_value sa[{d}];\n    sa[0] = {s};\n", .{ cv.n_args + 1, recv });
+                                var kv2: u32 = 0;
+                                while (kv2 < cv.n_args) : (kv2 += 1) {
+                                    const ar12 = cv.args.int() + kv2;
+                                    var ab12: [32]u8 = undefined;
+                                    var bb12: [96]u8 = undefined;
+                                    try w.print("    sa[{d}] = {s};\n", .{
+                                        kv2 + 1, boxExpr(c.types[ar12], regName(c, ar12, &ab12), &bb12),
+                                    });
+                                }
+                                var ob15: [300]u8 = undefined;
+                                var sb15: [260]u8 = undefined;
+                                const sc15 = try std.fmt.bufPrint(&sb15, "klio_nat_stdlib(\"{s}\", sa, {d})", .{ sym2, cv.n_args + 1 });
+                                try w.print("    {s} = {s}; }}\n", .{
+                                    regName(c, cv.dst.int(), &nb),
+                                    unboxExpr(c.types[cv.dst.int()], sc15, &ob15),
+                                });
                             }
                             continue;
                         }
