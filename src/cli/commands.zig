@@ -430,8 +430,14 @@ pub fn runTranspileNative(
         const stem = if (std.mem.endsWith(u8, base, ".kt")) base[0 .. base.len - 3] else base;
         break :blk std.fmt.allocPrint(gpa, "{s}.c", .{stem}) catch return 1;
     };
-    // The whole-program lowering, not the lazy image: the emitter walks every
-    // function body, and an image keeps them behind a header table.
+    // The module `run` executes, assembled the way `run` assembles it: the
+    // stdlib and every pack come from the cached image instead of being
+    // re-lowered from source, which cost more than the emission itself. Bodies
+    // arrive deferred; the emitter materialises the ones it reaches.
+    if (stdlib_image.tryPrepare(gpa, paths, features)) |prepared| {
+        var built = prepared.built;
+        return transpileNativeEmit(gpa, &built, path, c_out);
+    }
     var map = SourceMap.init(gpa);
     defer map.deinit();
     const id = load(gpa, &map, path) orelse return 1;
@@ -454,14 +460,26 @@ pub fn runTranspileNative(
     defer all_asts.deinit(gpa);
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
-    if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
+    // Eager call binding over the PROGRAM's own sources. Running the checker
+    // over every pack source as well costs more than the whole emission and
+    // binds call sites in library bodies the program never reaches.
+    if (computeEagerCalls(gpa, user_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
     span.active_map = &map;
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
         io.printStderr(gpa, "error: lowering failed\n", .{});
         return 1;
     };
     defer built.deinit();
+    return transpileNativeEmit(gpa, &built, path, c_out);
+}
 
+/// Emit one assembled module as a standalone C program.
+fn transpileNativeEmit(
+    gpa: std.mem.Allocator,
+    built: *interp_ir.build.BuiltModule,
+    path: []const u8,
+    c_out: []const u8,
+) u8 {
     const mg = built.module.borrow();
     defer mg.deinit();
     const m = mg.get();
