@@ -833,6 +833,96 @@ fn natNegativeSize(n: i32) noreturn {
 // Everything above that point is shared: the scheduler, the virtual clock, the
 // Job graph, `delay`, `runBlocking`.
 
+// --- the stdlib, called directly -------------------------------------------
+//
+// Every stdlib operation the interpreter performs is a named entry in one
+// table. A compiled program calls the SAME entries rather than growing its own
+// copy of `List`, `Map`, `Set` and `String`: the emitter names the declaration,
+// the runtime looks it up and runs it. What a compiled program has to supply
+// is the one thing the table needs from its caller — how to invoke a closure,
+// since a higher-order operation like `forEach` calls back.
+
+/// The emitted dispatcher for a closure of a given arity, in the uniform shape
+/// an intrinsic needs.
+const LambdaInvoker = struct {
+    arity: u32,
+    call: *const fn (CValue, [*]const CValue) callconv(.c) CValue,
+};
+var lambda_invokers: std.ArrayList(LambdaInvoker) = .empty;
+
+export fn klio_nat_lambda_invoker(arity: u32, call: *const fn (CValue, [*]const CValue) callconv(.c) CValue) void {
+    lambda_invokers.append(natAlloc(), .{ .arity = arity, .call = call }) catch
+        @panic("klio_nat_lambda_invoker: out of memory");
+}
+
+fn natInvokeCallable(ctx: *anyopaque, callable: *const runtime.Value, args: []const runtime.Value, out: runtime.Output) std.mem.Allocator.Error!runtime.EvalResult {
+    _ = ctx;
+    _ = out;
+    var buf: [8]CValue = undefined;
+    if (args.len > buf.len) return .{ .err = .{ .Type = "too many arguments for a compiled closure" } };
+    for (args, 0..) |a, i| buf[i] = toC(a);
+    for (lambda_invokers.items) |inv| {
+        if (inv.arity != args.len) continue;
+        return .{ .ok = fromC(inv.call(toC(callable.*), &buf)) };
+    }
+    return .{ .err = .{ .Type = "no compiled closure dispatcher of this arity" } };
+}
+
+fn natInvokeCallableWithThis(ctx: *anyopaque, callable: *const runtime.Value, args: []const runtime.Value, this_value: *const runtime.Value, out: runtime.Output) std.mem.Allocator.Error!runtime.EvalResult {
+    _ = this_value;
+    return natInvokeCallable(ctx, callable, args, out);
+}
+
+const nat_intrinsic_vtable: runtime.IntrinsicHost.VTable = .{
+    .invoke_callable = natInvokeCallable,
+    .invoke_callable_with_this = natInvokeCallableWithThis,
+};
+var nat_intrinsic_ctx: u8 = 0;
+
+fn natIntrinsicHost() runtime.IntrinsicHost {
+    return .{ .ctx = @ptrCast(&nat_intrinsic_ctx), .vtable = &nat_intrinsic_vtable };
+}
+
+/// Run one stdlib declaration by name. The receiver, when there is one, is the
+/// first argument — exactly as the table's own entries expect it.
+export fn klio_nat_stdlib(fqn: [*:0]const u8, argv: [*]const CValue, argc: u32) CValue {
+    const a = natAlloc();
+    const name = std.mem.span(fqn);
+    const impl = stdlib.implementations.lookup(name) orelse natNoStdlib(name);
+    const args = a.alloc(runtime.Value, argc) catch @panic("klio_nat_stdlib: out of memory");
+    defer a.free(args);
+    var i: u32 = 0;
+    while (i < argc) : (i += 1) args[i] = fromC(argv[i]);
+    var ctx: runtime.CallCtx = .{
+        .args = args,
+        .out = natOutput(),
+        .host = natIntrinsicHost(),
+        .allocator = a,
+    };
+    const r = impl(&ctx) catch @panic("klio_nat_stdlib: out of memory");
+    return switch (r) {
+        .ok => |v| toC(v),
+        .err => |e| natStdlibFailed(name, e),
+    };
+}
+
+fn natNoStdlib(name: []const u8) noreturn {
+    const pre = "runtime error: no implementation of ";
+    _ = std.c.write(2, pre.ptr, pre.len);
+    _ = std.c.write(2, name.ptr, name.len);
+    _ = std.c.write(2, "\n", 1);
+    std.c.exit(1);
+}
+
+fn natStdlibFailed(name: []const u8, e: runtime.RuntimeError) noreturn {
+    _ = e;
+    const pre = "runtime error: ";
+    _ = std.c.write(2, pre.ptr, pre.len);
+    _ = std.c.write(2, name.ptr, name.len);
+    _ = std.c.write(2, " failed\n", 8);
+    std.c.exit(1);
+}
+
 /// How to START a compiled lambda that suspends: the emitted entry that
 /// unpacks the closure's captures and runs its body. Registered per lambda
 /// class before `main`, which is how the driver — handed a closure VALUE by

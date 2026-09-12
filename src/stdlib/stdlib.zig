@@ -546,6 +546,46 @@ pub const Coverage = struct {
     }
 };
 
+/// How many hand-written intrinsic entries name a declaration the mined index
+/// knows, and how many do not. A name in the table that matches nothing
+/// upstream is either a klio-internal entry or a typo nothing will ever reach;
+/// the split is what tells them apart.
+pub const TableAudit = struct { matched: usize, unmatched: usize, internal: usize, receiver_form: usize };
+
+pub fn auditImplementationTable() TableAudit {
+    var out: TableAudit = .{ .matched = 0, .unmatched = 0, .internal = 0, .receiver_form = 0 };
+    var it = implementations.allFqns();
+    while (it.next()) |fqn| {
+        if (std.mem.indexOf(u8, fqn, "__klio") != null) {
+            out.internal += 1;
+            continue;
+        }
+        if (lookup(fqn) != null) {
+            out.matched += 1;
+            continue;
+        }
+        // The table may name a declaration in its RECEIVER-QUALIFIED form
+        // (`kotlin.Double.roundToInt`) where upstream declares the same thing
+        // as an extension (`kotlin.math.roundToInt` on a `Double`). Same
+        // declaration, different spelling.
+        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse {
+            out.unmatched += 1;
+            continue;
+        };
+        const simple = fqn[dot + 1 ..];
+        var by_receiver = false;
+        for (generated.stdlibSymbols()) |*e| {
+            if (!std.mem.endsWith(u8, e.fqn, simple)) continue;
+            if (e.fqn.len <= simple.len) continue;
+            if (e.fqn[e.fqn.len - simple.len - 1] != '.') continue;
+            by_receiver = true;
+            break;
+        }
+        if (by_receiver) out.receiver_form += 1 else out.unmatched += 1;
+    }
+    return out;
+}
+
 pub fn coverage() Coverage {
     const syms = generated.stdlibSymbols();
     var registry_count: usize = 0;
@@ -859,4 +899,30 @@ test "binary math functions are not property accessors" {
     try testing.expect(!isBinaryMathFunction("sign"));
     try testing.expect(!isBinaryMathFunction("minOf"));
     try testing.expect(!isBinaryMathFunction("length"));
+}
+
+test "every hand-written intrinsic is accounted for against the mined index" {
+    const a = auditImplementationTable();
+    // Four ways an entry is accounted for:
+    //   by-fqn          upstream declares exactly this name
+    //   by-receiver-form the same declaration, spelled receiver-qualified
+    //                   (`kotlin.Double.roundToInt` for `kotlin.math.roundToInt`)
+    //   klio-owned      a `__klio` entry with no upstream counterpart by design
+    //   unknown         neither — a JVM-only declaration (`exitProcess`,
+    //                   `readLine`), a platform helper (`nativeIndexOf`), or a
+    //                   declaration in a stdlib source the sparse checkout does
+    //                   not include
+    //
+    // The last bucket is the one to watch. It is a RATCHET rather than zero:
+    // the mined index is built from whatever upstream sources are present, so
+    // some legitimate entries land there. What must not happen is it growing.
+    const UNKNOWN_CEILING: usize = 141;
+    if (a.unmatched > UNKNOWN_CEILING) {
+        std.debug.print(
+            "\n[stdlib-table] {d} intrinsics name nothing the mined index knows (was {d})\n",
+            .{ a.unmatched, UNKNOWN_CEILING },
+        );
+        return error.UnbackedIntrinsic;
+    }
+    try std.testing.expect(a.matched + a.receiver_form > 1000);
 }

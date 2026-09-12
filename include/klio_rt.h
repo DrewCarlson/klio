@@ -356,6 +356,15 @@ void klio_nat_coro_starter(uint32_t cls, klio_start_fn start);
 /* Queue a compiled `launch { … }` child on the driver that is running. */
 klio_value klio_nat_coro_launch(klio_value block);
 
+/* Every stdlib operation the interpreter performs is a named entry in one
+ * table; a compiled program calls the SAME entries rather than growing its own
+ * copy of `List`, `Map`, `Set` and `String`. The receiver, when there is one,
+ * is the first argument. A higher-order entry calls back through the closure
+ * dispatcher registered for its arity. */
+klio_value klio_nat_stdlib(const char *fqn, const klio_value *argv, uint32_t argc);
+typedef klio_value (*klio_invoke_fn)(klio_value f, const klio_value *argv);
+void klio_nat_lambda_invoker(uint32_t arity, klio_invoke_fn call);
+
 klio_value klio_nat_cell(klio_value v);
 klio_value klio_nat_cell_get(klio_value c);
 void       klio_nat_cell_set(klio_value c, klio_value v);

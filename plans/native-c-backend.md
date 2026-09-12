@@ -382,6 +382,33 @@ be called in the frame that catches — and the frame/dispatch glue. The
 arithmetic rules are stated in two places and could drift, which is exactly
 what `native-c-sweep.sh` exists to catch: it found the overflow bug.
 
+### The stdlib is called, not reimplemented
+
+Every stdlib operation the interpreter performs is a named entry in one table:
+1615 declarations bound to the Zig that implements them. A declaration with no
+Kotlin body is therefore not a gap for the emitter to fill — `klio_nat_stdlib`
+looks the name up and runs the same entry the interpreter runs, so `List`,
+`Map`, `Set` and `String` need no second implementation here.
+
+What a compiled program has to supply is the one thing the table asks of its
+caller: how to invoke a closure, since a higher-order entry like `forEach`
+calls back. The emitted per-arity dispatcher is registered for that.
+
+A declaration reached through a receiver is registered under the
+receiver-qualified form — `substring` is declared in `kotlin.text` and
+implemented as `kotlin.String.substring` — and the receiver is the first
+parameter whether or not the declaration carries the flag. The declaration's
+own return type decides whether the answer comes back as a machine type or
+stays a value, which is what keeps `"42".toInt() + 1` an integer addition.
+
+That table is hand-written because the implementations are; the DECLARATIONS it
+names are generated from upstream Kotlin. A test now audits one against the
+other: 276 entries match by name, 1052 by receiver-qualified form, 25 are
+klio's own, and 141 name declarations the mined index does not carry — JVM-only
+ones (`exitProcess`, `readLine`), platform helpers (`nativeIndexOf`), and
+declarations from stdlib sources a sparse checkout omits. That last count is a
+ratchet, so a new unbacked entry fails the build.
+
 ### What is general and what is an intrinsic
 
 Everything that decides program shape is general and applies to a pack class

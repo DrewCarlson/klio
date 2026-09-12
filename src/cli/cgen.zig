@@ -10,6 +10,10 @@
 //! caller falls back, so the set can widen without a correctness cliff. See
 //! `plans/native-c-backend.md`.
 const std = @import("std");
+/// The interpreter's own stdlib table. A member the backend does not perform
+/// directly is not a gap to fill here: the operation already exists, named, and
+/// compiled code calls the same entry the interpreter does.
+const stdlib = @import("stdlib");
 const ir = @import("ir");
 
 const Reg = ir.Reg;
@@ -1047,6 +1051,38 @@ const ListIntrinsic = enum { list_of, mutable_list_of };
 fn listIntrinsic(f: *const Func) ?ListIntrinsic {
     if (std.mem.eql(u8, f.fqn, "kotlin.collections.listOf")) return .list_of;
     if (std.mem.eql(u8, f.fqn, "kotlin.collections.mutableListOf")) return .mutable_list_of;
+    return null;
+}
+
+/// The stdlib entry that implements a declaration, if the interpreter has one.
+/// A member the backend does not perform directly is not a gap: the operation
+/// exists, named, and compiled code calls the same entry.
+fn stdlibEntry(f: *const Func) ?[]const u8 {
+    if (f.fqn.len == 0) return null;
+    if (stdlib.implementations.lookup(f.fqn) != null) return f.fqn;
+    // A declaration reached through a receiver is registered under the
+    // RECEIVER-QUALIFIED form rather than its own package: `substring` is
+    // declared in `kotlin.text` and implemented as `kotlin.String.substring`.
+    // The receiver of an extension is its first parameter whether or not the
+    // declaration is FLAGGED as having one: `kotlin.text.substring` takes its
+    // String first and carries no receiver flag.
+    const recv: ?[]const u8 = if (f.params.len != 0 and f.params[0].ty.name.len != 0)
+        simpleName(f.params[0].ty.name)
+    else
+        null;
+    if (stdlib.implementations.declarationHostSymbol(f.fqn, recv, f.name)) |sym| return sym;
+    if (recv) |rn| {
+        var buf: [160]u8 = undefined;
+        const qualified = std.fmt.bufPrint(&buf, "kotlin.{s}.{s}", .{ rn, f.name }) catch return null;
+        if (stdlib.implementations.lookup(qualified)) |_| {
+            // The borrowed buffer dies with this call, so hand back the
+            // table's own copy of the name.
+            var it = stdlib.implementations.allFqns();
+            while (it.next()) |cand| {
+                if (std.mem.eql(u8, cand, qualified)) return cand;
+            }
+        }
+    }
     return null;
 }
 
@@ -2800,7 +2836,31 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         types[c.dst.int()] = .unit;
                         known[c.dst.int()] = true;
                     } else {
-                        if (!callee.hasBody()) return noCallee(f, callee, "no body for");
+                        if (!callee.hasBody()) {
+                            // No Kotlin body, but the interpreter implements
+                            // it: compiled code runs the same entry.
+                            if (stdlibEntry(callee) != null) {
+                                var ks9: u32 = 0;
+                                while (ks9 < c.n_args) : (ks9 += 1) {
+                                    const a9 = c.args.int() + ks9;
+                                    if (a9 >= f.n_locals or !known[a9]) return no(f, "stdlib arg");
+                                }
+                                if (c.dst.int() >= f.n_locals) return no(f, "stdlib dst");
+                                // The table answers a value; the DECLARATION
+                                // says what kind, so a result that is a machine
+                                // type comes back as one rather than staying
+                                // boxed and refusing the next `+`.
+                                const srt = tyOf(callee.return_ty) orelse Ty.object;
+                                types[c.dst.int()] = srt;
+                                if (srt == .object) {
+                                    cls[c.dst.int()] = classIndexOfName(m, callee.return_ty);
+                                    if (refElemOf(cls[c.dst.int()], callee.return_ty)) |re11| elem[c.dst.int()] = re11;
+                                }
+                                known[c.dst.int()] = true;
+                                continue;
+                            }
+                            return noCallee(f, callee, "no body for");
+                        }
                         if (callee.params.len < c.n_args) return noCallee(f, callee, "arity of");
                         const bnd = bindCallArgs(m, callee.params, c.args.int(), c.n_args, c.arg_names) orelse
                             return noCallee(f, callee, "argument binding of");
@@ -4552,6 +4612,39 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         defer rex.deinit();
                         try renderExpr(gpa, m, prog, c, a0, &rex);
                         try w.print("  klio_nat_println({s});\n", .{rex.written()});
+                    } else if (!callee.hasBody()) {
+                        // The interpreter's own entry, called by name with the
+                        // arguments boxed: the table is typed in Kotlin.
+                        const sym = stdlibEntry(callee).?;
+                        var db11: [32]u8 = undefined;
+                        if (call.n_args == 0) {
+                            var ob13: [200]u8 = undefined;
+                            var sb13: [220]u8 = undefined;
+                            const sc13 = try std.fmt.bufPrint(&sb13, "klio_nat_stdlib(\"{s}\", 0, 0)", .{sym});
+                            try w.print("  {s} = {s};\n", .{
+                                regName(c, call.dst.int(), &db11),
+                                unboxExpr(c.types[call.dst.int()], sc13, &ob13),
+                            });
+                            continue;
+                        }
+                        try w.print("  {{ klio_value sa[{d}];\n", .{call.n_args});
+                        var ks11: u32 = 0;
+                        while (ks11 < call.n_args) : (ks11 += 1) {
+                            const ar11 = call.args.int() + ks11;
+                            var ab11: [32]u8 = undefined;
+                            var bb11: [96]u8 = undefined;
+                            try w.print("    sa[{d}] = {s};\n", .{
+                                ks11, boxExpr(c.types[ar11], regName(c, ar11, &ab11), &bb11),
+                            });
+                        }
+                        var ob14: [300]u8 = undefined;
+                        var sb14: [260]u8 = undefined;
+                        const sc14 = try std.fmt.bufPrint(&sb14, "klio_nat_stdlib(\"{s}\", sa, {d})", .{ sym, call.n_args });
+                        try w.print("    {s} = {s}; }}\n", .{
+                            regName(c, call.dst.int(), &db11),
+                            unboxExpr(c.types[call.dst.int()], sc14, &ob14),
+                        });
+                        continue;
                     } else {
                         // Arguments go to the callee in ITS order: positional
                         // ones bind in order and named ones by name. A
@@ -5272,6 +5365,10 @@ pub fn emit(
                 if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or
                     arrayOfIntrinsic(callee) != null or isArrayOfNulls(callee) or isRunBlocking(callee) or
                     isDelay(callee) or isLaunch(callee)) continue;
+                // A declaration the interpreter implements has no body to
+                // compile: the call reaches the same entry the interpreter
+                // reaches.
+                if (!callee.hasBody() and stdlibEntry(callee) != null) continue;
                 // A call that leaves a parameter unbound runs the thunk for it.
                 const bnd3 = bindCallArgs(m, callee.params, inst.Call.args.int(), inst.Call.n_args, inst.Call.arg_names) orelse
                     return false;
@@ -6035,6 +6132,13 @@ pub fn emit(
                 try w.writeAll(");\n");
             }
             try w.writeAll("  klio_nat_no_method(\"invoke\");\n  return klio_nat_box_unit();\n}\n");
+            // The same dispatcher in the uniform shape a stdlib entry calls
+            // back through: `forEach` and its kind hand the runtime a closure
+            // VALUE and an argument array.
+            try w.print("static klio_value klam_inv_{d}(klio_value f, const klio_value *a) {{\n  (void)a;\n  return klam_call_{d}(f", .{ lu.arity, lu.arity });
+            var ai11: u32 = 0;
+            while (ai11 < lu.arity) : (ai11 += 1) try w.print(", a[{d}]", .{ai11});
+            try w.writeAll(");\n}\n");
         }
     }
     for (used_props.items) |pu| {
@@ -6144,6 +6248,16 @@ pub fn emit(
         "  klio_in_flight_frame.n = 1; klio_in_flight_frame.slots = &klio_in_flight;\n" ++
         "  klio_nat_enter(&klio_in_flight_frame);\n",
     );
+    {
+        // Every arity a closure can be called through, registered so a stdlib
+        // entry that takes a lambda can reach compiled code.
+        var seen_ar3: [FUNC_MAX_ARITY + 1]bool = @splat(false);
+        for (used_lambdas.items) |lu| {
+            if (seen_ar3[lu.arity]) continue;
+            seen_ar3[lu.arity] = true;
+            try w.print("  klio_nat_lambda_invoker({d}, klam_inv_{d});\n", .{ lu.arity, lu.arity });
+        }
+    }
     if (used_singletons.items.len != 0) try w.writeAll("  klio_init_singletons();\n");
     if (used_globals.items.len != 0) {
         // Top-level properties run their initializers in declaration order,
