@@ -438,6 +438,21 @@ because the typing pass, the emission, the reachable set and the dispatcher
 list all have to give the same answer, and they had drifted: the emitter called
 a dispatcher the collector had decided not to emit.
 
+`$sgetter$<owner>` is NOT a backing-field access. It is an ordinary property
+read that names the owner it was written against and resolves to whatever the
+receiver's own class declares; only `__klio_field__` bypasses the accessor.
+Reading the first as the second refused 381 of the example programs at once,
+which is how obvious it was.
+
+Init blocks run. They were already lowered as thunks taking the instance and
+the constructor's arguments, so the layout carries them with the body-property
+index each one runs BEFORE, and a class's own declarations run in source order:
+an init block sits between the properties it was written between. A backing
+field holds its type's zero from ALLOCATION rather than from its initializer —
+the class descriptor names each field's zero — so a superclass constructor that
+calls an overridden method sees the subclass's field as 0/false/null, exactly
+as on the JVM.
+
 The sweep now reports every accepted program matching the interpreter.
 
 ## Still refused

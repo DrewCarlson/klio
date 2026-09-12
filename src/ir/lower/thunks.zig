@@ -316,6 +316,7 @@ pub fn lowerInitBlockWithParams(
     owner_class: []const u8,
     own_members: *const StringSet,
     params: []const []const u8,
+    declared_params: []const Param,
     block: *const ast.Block,
     name: []const u8,
 ) Allocator.Error!FuncId {
@@ -337,7 +338,7 @@ pub fn lowerInitBlockWithParams(
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
-    func.params = try accessorParams(allocator, params, owner_class, null);
+    func.params = try accessorParams(allocator, params, owner_class, declared_params);
     func.has_receiver_param = leadsWithThis(params);
     return pushFuncSpanned(module, func, block.span);
 }
