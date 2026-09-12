@@ -939,6 +939,20 @@ export fn klio_nat_member(fqn: [*:0]const u8, argv: [*]const CValue, argc: u32) 
     };
 }
 
+/// `x is T` for a value whose own representation answers the question: every
+/// builtin shape knows the names it satisfies. A compiled instance is tested by
+/// its class handle at the call site, where the emitter knows the hierarchy;
+/// this is the rest of the answer.
+export fn klio_nat_is_type(v: CValue, name: [*:0]const u8, nullable: i32) i32 {
+    const val = fromC(v);
+    // `null is T?` holds for any nullable type; `null is T` never does.
+    if (val == .Null) return nullable;
+    const nm = std.mem.span(name);
+    // `Any` is the universal supertype of every non-null value.
+    if (std.mem.eql(u8, nm, "Any")) return 1;
+    return @intFromBool(val.isRuntimeType(nm));
+}
+
 /// One property of a builtin receiver, read from its own representation: a
 /// progression's `first`, `last` and `step`. The interpreter reads them the
 /// same way, through the same function.

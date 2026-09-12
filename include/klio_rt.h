@@ -376,6 +376,10 @@ klio_value klio_nat_range(uint32_t kind, klio_value lhs, klio_value rhs);
 /* One property a builtin receiver answers from its own representation: a
  * progression's `first`, `last` and `step`. */
 klio_value klio_nat_builtin_prop(const char *name, klio_value recv);
+
+/* `x is T` for a value that answers from its own representation. A compiled
+ * instance is tested by its class handle at the call site. */
+int32_t klio_nat_is_type(klio_value v, const char *name, int32_t nullable);
 typedef klio_value (*klio_invoke_fn)(klio_value f, const klio_value *argv);
 void klio_nat_lambda_invoker(uint32_t arity, klio_invoke_fn call);
 

@@ -2236,6 +2236,34 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     elem[lc.dst.int()] = caps[lc.idx].elem;
                     known[lc.dst.int()] = true;
                 },
+                // `x as T`. The value passes through unchanged when the test
+                // holds; otherwise a `ClassCastException`, or null for `as?`.
+                // The named type is what the result register carries, which is
+                // the point of writing the cast.
+                .Cast => |ca| {
+                    if (ca.src.int() >= f.n_locals or !known[ca.src.int()]) return no(f, "cast operand");
+                    if (ca.dst.int() >= f.n_locals) return no(f, "cast dst");
+                    // `as?` and `as T?` admit null, so the result is a
+                    // reference whatever the named type is.
+                    const scalar = if (ca.safe or ca.ty.nullable) null else tyOf(ca.ty);
+                    if (scalar) |t| {
+                        types[ca.dst.int()] = t;
+                    } else {
+                        types[ca.dst.int()] = .object;
+                        cls[ca.dst.int()] = classIndexOfName(m, ca.ty);
+                        if (refElemOf(cls[ca.dst.int()], ca.ty)) |re13| elem[ca.dst.int()] = re13;
+                    }
+                    known[ca.dst.int()] = true;
+                },
+                // `x is T`. Which classes answer it is decided at emit time
+                // from the hierarchy the program compiled; a value that is not
+                // a compiled instance answers from its own representation.
+                .InstanceOf => |io| {
+                    if (io.src.int() >= f.n_locals or !known[io.src.int()]) return no(f, "is operand");
+                    if (io.dst.int() >= f.n_locals) return no(f, "is dst");
+                    types[io.dst.int()] = .boolean;
+                    known[io.dst.int()] = true;
+                },
                 .LoadParam => |lp| {
                     if (lp.dst.int() >= f.n_locals or lp.idx >= params.len) return no(f, "load param");
                     const pt = params[lp.idx].ty;
@@ -3917,7 +3945,7 @@ fn suspendIndex(points: []const *const ir.Inst, inst: *const ir.Inst) ?u32 {
     return null;
 }
 
-fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: Program, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const SingletonUse, slots: []const SlotUse, uses_try: bool, accepted: []const Compiled) !void {
+fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: Program, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const SingletonUse, slots: []const SlotUse, uses_try: bool, accepted: []const Compiled, registered: []const u32) !void {
     const f = c.f;
     const live = try reachableBlocks(gpa, f);
     defer gpa.free(live);
@@ -4628,6 +4656,61 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     }
                 },
                 .Not => |n| try w.print("  r{d} = !r{d};\n", .{ n.dst.int(), n.src.int() }),
+                .Cast => |ca| {
+                    var nb20: [32]u8 = undefined;
+                    var rb20: [32]u8 = undefined;
+                    var bx20: [96]u8 = undefined;
+                    const sn = regName(c, ca.src.int(), &rb20);
+                    // The test is asked of a VALUE; a register holding a
+                    // machine type is boxed for it.
+                    const sv = boxExpr(c.types[ca.src.int()], sn, &bx20);
+                    const dn20 = regName(c, ca.dst.int(), &nb20);
+                    const tname = simpleName(ca.ty.name);
+                    try w.print("  {{ klio_value kc = {s};\n    uint32_t kt = klio_nat_class_of(kc);\n    (void)kt;\n    int32_t kok = ", .{sv});
+                    if (classIndexOfName(m, ca.ty)) |tc2| {
+                        if (!isBuiltinCls(tc2)) {
+                            for (registered) |cid| {
+                                if (!typeReaches(m, cid, tc2)) continue;
+                                try w.print("(kt == KCLS_{d}) || ", .{cid});
+                            }
+                        }
+                    }
+                    try w.print("klio_nat_is_type(kc, \"{s}\", 1);\n", .{tname});
+                    var ob20: [220]u8 = undefined;
+                    const dv = convExpr(.object, c.types[ca.dst.int()], "kc", &ob20);
+                    if (ca.safe) {
+                        try w.print("    {s} = kok ? {s} : klio_nat_null(); }}\n", .{ dn20, dv });
+                    } else {
+                        try w.print("    if (!kok) klio_cast_fail(\"{s}\", {d});\n    {s} = {s}; }}\n", .{
+                            tname, tname.len, dn20, dv,
+                        });
+                    }
+                },
+                .InstanceOf => |io| {
+                    // The classes the program registered whose type includes
+                    // the one asked about: an exact test for every compiled
+                    // instance. Anything else answers from its representation.
+                    var nb19: [32]u8 = undefined;
+                    var rb19: [32]u8 = undefined;
+                    var bx19: [96]u8 = undefined;
+                    const target = classIndexOfName(m, io.ty);
+                    const iv = boxExpr(c.types[io.src.int()], regName(c, io.src.int(), &rb19), &bx19);
+                    try w.print("  {{ klio_value kc = {s};\n    uint32_t kt = klio_nat_class_of(kc);\n    (void)kt;\n    {s} = ", .{
+                        iv, regName(c, io.dst.int(), &nb19),
+                    });
+                    if (target) |tc| {
+                        if (!isBuiltinCls(tc)) {
+                            for (registered) |cid| {
+                                if (!typeReaches(m, cid, tc)) continue;
+                                try w.print("(kt == KCLS_{d}) || ", .{cid});
+                            }
+                        }
+                    }
+                    try w.print("klio_nat_is_type(kc, \"{s}\", {d}); }}\n", .{
+                        simpleName(io.ty.name),
+                        @as(u32, if (io.ty.nullable) 1 else 0),
+                    });
+                },
                 .CallMember => |cm| {
                     var nb: [32]u8 = undefined;
                     var rb: [32]u8 = undefined;
@@ -6366,10 +6449,16 @@ pub fn emit(
     if (used_globals.items.len != 0 or used_singletons.items.len != 0 or used_slots.items.len != 0 or uses_try) uses_objects_hint = true;
 
     var needs_div = false;
+    var needs_cast = false;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
                 switch (inst.*) {
+                    .Cast => |ca| {
+                        if (!ca.safe) needs_cast = true;
+                        uses_objects_hint = true;
+                    },
+                    .InstanceOf => uses_objects_hint = true,
                     .BinOp => |b| {
                         if ((b.op == .Div or b.op == .Mod) and !c.types[b.dst.int()].isFloat()) needs_div = true;
                     },
@@ -6491,6 +6580,19 @@ pub fn emit(
         \\
         \\
     );
+    if (needs_cast) {
+        // A failed `as` is a ClassCastException, a real throwable a handler in
+        // the same program can catch.
+        const cce = prog.throws.find("ClassCastException");
+        try w.print(
+            \\KLIO_NORETURN static void klio_cast_fail(const char *ty, size_t n) {{
+            \\  {s}(klio_nat_exception("kotlin.ClassCastException",
+            \\      klio_nat_string(ty, n), {d}));
+            \\}}
+            \\
+            \\
+        , .{ if (uses_try) "klio_do_throw" else "klio_nat_throw", if (cce) |t| t.lo else 0 });
+    }
     if (needs_div) {
         // Kotlin THROWS on integer division by zero; C leaves it undefined.
         // It is a real throwable, so a `catch` in compiled code sees it and
@@ -6589,7 +6691,7 @@ pub fn emit(
         }
     }
     try w.writeAll("\n");
-    for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try, accepted.items);
+    for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try, accepted.items, used_classes.items);
 
     for (used_slots.items) |su| {
         const root = m.funcById(ir.FuncId.from(su.slot)).?;
