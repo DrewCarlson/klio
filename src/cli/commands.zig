@@ -565,6 +565,7 @@ fn transpileNativeEmit(
                 .init_blocks = ib_fids,
                 .init_block_positions = ib_pos,
                 .is_data = is_data_cls,
+                .ctor_defaults = built.primary_ctor_default_thunks.get(e.key_ptr.*) orelse &.{},
             }) catch return 1;
         }
     }

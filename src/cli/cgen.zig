@@ -897,9 +897,16 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
         // A constructor parameter that is not a property is an input, not a
         // field: it feeds the superclass call or a body initializer.
         if (!p.is_property) continue;
-        if (p.default != null or p.is_vararg) {
+        // A default is the CONSTRUCTION's business, exactly as it is for a
+        // call: the field exists either way, and a construction that omits the
+        // parameter runs the thunk the declaration lowered for it.
+        if (p.is_vararg) {
             out.deinit(gpa);
-            return layoutNo(c, "ctor param default/vararg");
+            return layoutNo(c, "ctor param vararg");
+        }
+        if (p.default != null and ctorDefault(layouts, c, i) == null) {
+            out.deinit(gpa);
+            return layoutNo(c, "ctor param default without a thunk");
         }
         // A type the module has no class for is still a REFERENCE: Kotlin
         // erases generics, so a `T` parameter holds a value like any other and
@@ -2751,14 +2758,23 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         return no(f, "class layout");
                     };
                     const cdef3 = &m.classes.items[ni.class.int()];
-                    if (cdef3.primary_params.len != ni.n_args) return no(f, "ctor arity");
+                    if (cdef3.primary_params.len < ni.n_args) return no(f, "ctor arity");
                     // A constructor takes its arguments in ITS order, whatever
                     // order the call writes them in.
                     const cb3 = bindCallArgs(m, cdef3.primary_params, ni.args.int(), ni.n_args, ni.arg_names) orelse
                         return no(f, "ctor argument binding");
+                    // A parameter nothing binds runs the thunk the declaration
+                    // lowered for its default.
+                    var ci3: u32 = 0;
+                    while (ci3 < cdef3.primary_params.len) : (ci3 += 1) {
+                        if (cb3.regs[ci3] != null) continue;
+                        const cdf = ctorDefault(prog.layouts, cdef3, ci3) orelse return no(f, "ctor arity");
+                        const cdfn = m.funcById(cdf) orelse return no(f, "ctor default thunk");
+                        if (funcRetTy2(m, cdfn) == null) return no(f, "ctor default thunk type");
+                    }
                     for (fields) |fd| {
                         const ai = fd.arg orelse continue;
-                        const ar = cb3.regs[ai] orelse return no(f, "ctor arg");
+                        const ar = cb3.regs[ai] orelse continue;
                         if (ar >= f.n_locals or !known[ar]) return no(f, "ctor arg");
                         // A field that holds a REFERENCE takes any value: the
                         // call site boxes a machine type for it, which is what
@@ -2817,8 +2833,12 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             known[gf.dst.int()] = true;
                             continue;
                         }
-                        qual_recv = companionObjectNamed(m, prog, if (sc < m.classes.items.len) m.classes.items[sc].fqn else "") orelse
-                            return noName(f, "enum member", enm.String);
+                        qual_recv = companionObjectNamed(m, prog, if (sc < m.classes.items.len) m.classes.items[sc].fqn else "") orelse {
+                            if (traceOn()) std.debug.print("[cgen] refuse {s}: member `{s}` of the class `{s}`, which has no companion the program laid out\n", .{
+                                f.fqn, enm.String, if (sc < m.classes.items.len) m.classes.items[sc].fqn else "?",
+                            });
+                            return null;
+                        };
                     }
                     if (qual_recv == null and types[gf.receiver.int()] != .object) return no(f, "field on non-object");
                     var rc = qual_recv orelse (cls[gf.receiver.int()] orelse return no(f, "field receiver class"));
@@ -3387,6 +3407,13 @@ fn writeSymbol(w: *std.Io.Writer, f: *const Func) !void {
 /// declares them.
 fn ctorParamTy(c: *const ir.Class, i: usize) Ty {
     return tyOf(c.primary_params[i].ty) orelse .object;
+}
+
+/// The thunk that fills a primary-constructor parameter a construction omits.
+fn ctorDefault(layouts: []const ClassLayout, c: *const ir.Class, idx: usize) ?ir.FuncId {
+    const l = layoutFor(layouts, c) orelse return null;
+    if (idx >= l.ctor_defaults.len) return null;
+    return l.ctor_defaults[idx];
 }
 
 /// The declarations a class contributes itself: its body properties in source
@@ -4361,24 +4388,66 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         }
                         continue;
                     }
+                    const cdef2 = &m.classes.items[ni.class.int()];
+                    const cb4 = bindCallArgs(m, cdef2.primary_params, ni.args.int(), ni.n_args, ni.arg_names).?;
+                    // A parameter nothing binds runs the thunk the declaration
+                    // lowered for its default, handed the arguments ahead of
+                    // it; each lands in a local first, because a later default
+                    // may read an earlier one.
+                    var dp3: u32 = 0;
+                    while (dp3 < cb4.n) : (dp3 += 1) {
+                        if (cb4.regs[dp3] != null) continue;
+                        const cdfn2 = m.funcById(ctorDefault(prog.layouts, cdef2, dp3).?).?;
+                        const cdt = acceptedRet(accepted, cdfn2) orelse funcRetTy2(m, cdfn2).?;
+                        var csym: std.Io.Writer.Allocating = .init(gpa);
+                        defer csym.deinit();
+                        try writeSymbol(&csym.writer, cdfn2);
+                        try w.print("  {s} kcd{d}_{d} = {s}(klio_nat_null()", .{ cdt.cName(), ni.dst.int(), dp3, csym.written() });
+                        // The thunk is compiled against the whole constructor
+                        // signature; Kotlin forbids a default from reading a
+                        // parameter declared after it, so the rest go in as
+                        // whatever their C type zeroes to.
+                        var ck3: u32 = 0;
+                        while (ck3 < cb4.n) : (ck3 += 1) {
+                            try w.writeAll(", ");
+                            const cwant = ctorParamTy(cdef2, ck3);
+                            if (ck3 >= dp3) {
+                                if (cwant == .object) try w.writeAll("klio_nat_null()") else try w.writeAll("0");
+                                continue;
+                            }
+                            var bx6: [96]u8 = undefined;
+                            if (cb4.regs[ck3]) |br5| {
+                                var ab6: [32]u8 = undefined;
+                                try w.print("{s}", .{convExpr(c.types[br5], cwant, regName(c, br5, &ab6), &bx6)});
+                            } else {
+                                const pdfn = m.funcById(ctorDefault(prog.layouts, cdef2, ck3).?).?;
+                                const phave = acceptedRet(accepted, pdfn) orelse funcRetTy2(m, pdfn).?;
+                                var tb6: [48]u8 = undefined;
+                                const tn6 = try std.fmt.bufPrint(&tb6, "kcd{d}_{d}", .{ ni.dst.int(), ck3 });
+                                try w.print("{s}", .{convExpr(phave, cwant, tn6, &bx6)});
+                            }
+                        }
+                        try w.writeAll(");\n");
+                    }
                     try w.print("  {s} = klio_nat_alloc_instance(KCLS_{d});\n", .{ dst, ni.class.int() });
                     // The class's own initializer fills it, which is what lets
                     // a subclass hand the same instance up to its superclass's.
                     try w.print("  kinit_{d}({s}", .{ ni.class.int(), dst });
-                    const cdef2 = &m.classes.items[ni.class.int()];
-                    const cb4 = bindCallArgs(m, cdef2.primary_params, ni.args.int(), ni.n_args, ni.arg_names).?;
                     var pi3: u32 = 0;
                     while (pi3 < cb4.n) : (pi3 += 1) {
                         try w.writeAll(", ");
-                        const areg3 = cb4.regs[pi3].?;
-                        var ab5: [32]u8 = undefined;
                         const want3: Ty = ctorParamTy(cdef2, pi3);
-                        if (want3 == .object and c.types[areg3] != .object) {
-                            var bx3: [96]u8 = undefined;
-                            try w.print("{s}", .{boxExpr(c.types[areg3], regName(c, areg3, &ab5), &bx3)});
-                        } else {
-                            try w.print("{s}", .{regName(c, areg3, &ab5)});
+                        var ab5: [32]u8 = undefined;
+                        var bx3: [96]u8 = undefined;
+                        if (cb4.regs[pi3]) |areg3| {
+                            try w.print("{s}", .{convExpr(c.types[areg3], want3, regName(c, areg3, &ab5), &bx3)});
+                            continue;
                         }
+                        const cdfn3 = m.funcById(ctorDefault(prog.layouts, cdef2, pi3).?).?;
+                        const chave = acceptedRet(accepted, cdfn3) orelse funcRetTy2(m, cdfn3).?;
+                        var tb5: [48]u8 = undefined;
+                        const tn5 = try std.fmt.bufPrint(&tb5, "kcd{d}_{d}", .{ ni.dst.int(), pi3 });
+                        try w.print("{s}", .{convExpr(chave, want3, tn5, &bx3)});
                     }
                     try w.writeAll(");\n");
                 },
@@ -5534,6 +5603,9 @@ pub const ClassLayout = struct {
     /// A `data class` renders and compares by its primary constructor's
     /// properties, which the runtime's own renderer does once it is told.
     is_data: bool = false,
+    /// One thunk per primary-constructor parameter that declares a default,
+    /// null for the rest. A construction that omits the parameter runs it.
+    ctor_defaults: []const ?ir.FuncId = &.{},
 };
 
 /// A lambda a register holds: the body to run and the registers captured at
@@ -5996,6 +6068,31 @@ pub fn emit(
                                 if (seen.contains(ibn2.id.int())) continue;
                                 try seen.put(ibn2.id.int(), {});
                                 try queue.append(gpa, .{ .f = ibn2, .synth = null });
+                            }
+                        }
+                        // And the thunk behind every constructor parameter the
+                        // construction may omit.
+                        if (wc == inst.NewInstance.class.int()) {
+                            var dpi: usize = 0;
+                            while (dpi < wdef.primary_params.len) : (dpi += 1) {
+                                const dfd = ctorDefault(prog.layouts, wdef, dpi) orelse continue;
+                                const dfn5 = m.funcById(dfd) orelse return false;
+                                if (seen.contains(dfn5.id.int())) continue;
+                                try seen.put(dfn5.id.int(), {});
+                                // Like a superclass-argument thunk, it
+                                // declares no parameters and reads its
+                                // caller's positionally: a synthesized
+                                // receiver slot first, then the constructor
+                                // arguments AHEAD of the one it fills.
+                                const csyn = try gpa.alloc(ir.Param, 1 + wdef.primary_params.len);
+                                try synth_owned.append(gpa, csyn);
+                                csyn[0] = .{
+                                    .name = "$ctor_default_recv",
+                                    .ty = .{ .name = "", .nullable = true, .args = &.{} },
+                                    .default = null,
+                                };
+                                @memcpy(csyn[1..], wdef.primary_params);
+                                try queue.append(gpa, .{ .f = dfn5, .synth = csyn });
                             }
                         }
                         for (fds) |fd| {
