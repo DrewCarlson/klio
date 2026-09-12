@@ -4206,15 +4206,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         switch (si) {
                             .print => {
                                 var bx6: [96]u8 = undefined;
-                                if (uses_objects) {
-                                    try w.print("  klio_nat_print({s});\n", .{boxExpr(c.types[sa], x1, &bx6)});
-                                } else if (c.types[sa] == .boolean) {
-                                    try w.print("  printf(\"%s\", {s} ? \"true\" : \"false\");\n", .{x1});
-                                } else if (c.types[sa] == .i64) {
-                                    try w.print("  printf(\"%\" PRId64 \"\", {s});\n", .{x1});
-                                } else {
-                                    try w.print("  printf(\"%\" PRId32 \"\", {s});\n", .{x1});
-                                }
+                                try w.print("  klio_nat_print({s});\n", .{boxExpr(c.types[sa], x1, &bx6)});
                             },
                             .max, .min => {
                                 const x2 = regName(c, sa + 1, &a2b);
@@ -4297,28 +4289,18 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     if (isPrintln(callee)) {
                         const a0 = call.args.int();
                         const at = c.types[a0];
-                        const fmt: []const u8 = switch (at) {
-                            .i32 => "%\" PRId32 \"",
-                            .i64 => "%\" PRId64 \"",
-                            else => "",
-                        };
-
-                        // When the runtime is linked, everything prints through
-                        // its renderer: two renderers would be two chances to
-                        // drift, and printf's buffered stream interleaves
-                        // wrongly with the runtime's own writes.
-                        if (uses_objects) {
-                            var rex: std.Io.Writer.Allocating = .init(gpa);
-                            defer rex.deinit();
-                            try renderExpr(gpa, m, prog, c, a0, &rex);
-                            try w.print("  klio_nat_println({s});\n", .{rex.written()});
-                        } else if (at == .boolean) {
-                            try w.print("  printf(\"%s\\n\", r{d} ? \"true\" : \"false\");\n", .{a0});
-                        } else if (at.isFloat()) {
-                            try w.print("  klio_print_fp((double)r{d}, {d});\n", .{ a0, @intFromBool(at == .f32) });
-                        } else {
-                            try w.print("  printf(\"{s}\\n\", r{d});\n", .{ fmt, a0 });
-                        }
+                        // EVERYTHING prints through the runtime's renderer.
+                        // How Kotlin renders a value — the shortest
+                        // round-tripping decimal, `true`/`false`, a data class
+                        // by its properties — is the interpreter's own code,
+                        // and a second copy of it in emitted C is a second
+                        // thing to keep in agreement. printf's buffered stream
+                        // also interleaves wrongly with the runtime's writes.
+                        _ = at;
+                        var rex: std.Io.Writer.Allocating = .init(gpa);
+                        defer rex.deinit();
+                        try renderExpr(gpa, m, prog, c, a0, &rex);
+                        try w.print("  klio_nat_println({s});\n", .{rex.written()});
                     } else {
                         // Arguments go to the callee in ITS order: positional
                         // ones bind in order and named ones by name. A
@@ -5326,7 +5308,6 @@ pub fn emit(
     }
     if (used_globals.items.len != 0 or used_singletons.items.len != 0 or used_slots.items.len != 0 or uses_try) uses_objects_hint = true;
 
-    var needs_fp = false;
     var needs_div = false;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
@@ -5335,10 +5316,11 @@ pub fn emit(
                     .BinOp => |b| {
                         if ((b.op == .Div or b.op == .Mod) and !c.types[b.dst.int()].isFloat()) needs_div = true;
                     },
+                    // Printing goes through the runtime's renderer, so a
+                    // program that prints anything links it.
                     .Call => |call| {
                         const callee = m.funcById(call.func) orelse continue;
-                        if (!isPrintln(callee)) continue;
-                        if (c.types[call.args.int()].isFloat()) needs_fp = true;
+                        if (isPrintln(callee) or scalarIntrinsic(callee) == .print) uses_objects_hint = true;
                     },
                     else => {},
                 }
@@ -5358,6 +5340,10 @@ pub fn emit(
         \\#include <setjmp.h>
         \\
     , .{src_path});
+    // Every hint is in: a program that prints, throws, holds a global or
+    // dispatches needs the runtime, and the header has to say so before the
+    // first declaration that uses it.
+    if (uses_objects_hint) uses_objects = true;
     if (uses_objects) {
         try w.writeAll(
             \\#include <klio_rt.h>
@@ -5417,7 +5403,6 @@ pub fn emit(
         }
         try w.writeAll("}\n\n");
     }
-    if (uses_objects_hint) uses_objects = true;
     if (uses_try) try w.writeAll(
         \\/* A try region. The handler stack and the in-flight value live here rather
         \\ * than in the runtime: `setjmp` has to be called in the frame that catches,
@@ -5436,71 +5421,22 @@ pub fn emit(
         \\
         \\
     );
-    if (needs_div) try w.writeAll(
-        \\/* Kotlin throws on integer division by zero; C leaves it undefined. */
-        \\static void klio_arith_zero(void) {
-        \\  fprintf(stderr, "Exception in thread \"main\" java.lang.ArithmeticException: / by zero\n");
-        \\  exit(1);
-        \\}
-        \\
-        \\
-    );
-    if (needs_fp and !uses_objects) try w.writeAll(
-        \\/* Kotlin renders a floating value as the SHORTEST decimal that reads
-        \\ * back as the same double, always with a fractional part, and switches
-        \\ * to scientific form outside [1e-3, 1e7). printf("%g") agrees with none
-        \\ * of that: it would print 17.0 as "17". The search starts at two
-        \\ * significant digits because the reference renderer does: the smallest
-        \\ * subnormal prints as 4.9E-324, though 5E-324 reads back as the same
-        \\ * value. Trailing zeros are trimmed, so a value that needs one digit
-        \\ * still prints as one. */
-        \\static void klio_print_fp(double d, int is_float) {
-        \\  if (d != d) { printf("NaN\n"); return; }
-        \\  if (d > 1.7976931348623157e308) { printf("Infinity\n"); return; }
-        \\  if (d < -1.7976931348623157e308) { printf("-Infinity\n"); return; }
-        \\  char buf[64];
-        \\  int prec;
-        \\  int max = is_float ? 9 : 17;
-        \\  for (prec = 2; prec < max; prec++) {
-        \\    snprintf(buf, sizeof buf, "%.*e", prec - 1, d);
-        \\    double back = strtod(buf, NULL);
-        \\    if (is_float ? ((float)back == (float)d) : (back == d)) break;
-        \\  }
-        \\  snprintf(buf, sizeof buf, "%.*e", prec - 1, d);
-        \\  /* Split the mantissa digits from the exponent. */
-        \\  char digits[32];
-        \\  int neg = 0, nd = 0, exp10 = 0;
-        \\  const char *p = buf;
-        \\  if (*p == '-') { neg = 1; p++; }
-        \\  for (; *p && *p != 'e' && *p != 'E'; p++) {
-        \\    if (*p >= '0' && *p <= '9' && nd < (int)sizeof digits) digits[nd++] = *p;
-        \\  }
-        \\  if (*p) exp10 = atoi(p + 1);
-        \\  while (nd > 1 && digits[nd - 1] == '0') nd--;
-        \\  if (neg) putchar('-');
-        \\  if (exp10 >= -3 && exp10 < 7) {
-        \\    if (exp10 >= 0) {
-        \\      for (int i = 0; i <= exp10; i++) putchar(i < nd ? digits[i] : '0');
-        \\      putchar('.');
-        \\      if (nd > exp10 + 1) { for (int i = exp10 + 1; i < nd; i++) putchar(digits[i]); }
-        \\      else putchar('0');
-        \\    } else {
-        \\      printf("0.");
-        \\      for (int i = 0; i < -exp10 - 1; i++) putchar('0');
-        \\      for (int i = 0; i < nd; i++) putchar(digits[i]);
-        \\    }
-        \\  } else {
-        \\    putchar(digits[0]);
-        \\    putchar('.');
-        \\    if (nd > 1) { for (int i = 1; i < nd; i++) putchar(digits[i]); }
-        \\    else putchar('0');
-        \\    printf("E%d", exp10);
-        \\  }
-        \\  putchar('\n');
-        \\}
-        \\
-        \\
-    );
+    if (needs_div) {
+        // Kotlin THROWS on integer division by zero; C leaves it undefined.
+        // It is a real throwable, so a `catch` in compiled code sees it and
+        // an uncaught one is reported by the runtime, in the one place that
+        // knows how a throwable reads.
+        const az = prog.throws.find("ArithmeticException");
+        try w.print(
+            \\KLIO_NORETURN static void klio_arith_zero(void) {{
+            \\  {s}(klio_nat_exception("kotlin.ArithmeticException",
+            \\      klio_nat_string("/ by zero", 9), {d}));
+            \\}}
+            \\
+            \\
+        , .{ if (uses_try) "klio_do_throw" else "klio_nat_throw", if (az) |t| t.lo else 0 });
+    }
+
 
     if (used_singletons.items.len != 0) {
         try w.print("\n/* `object` declarations: one instance each, built before the program\n" ++

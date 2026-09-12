@@ -361,6 +361,27 @@ its default — the same rule for a constructor as for a function. Type argument
 say nothing about which body runs for a call the lowering already resolved, so
 they no longer refuse one.
 
+### One implementation, not two
+
+`libklio_rt` is built from the interpreter's own modules, so a `klio_nat_*`
+entry is a C-ABI shim over the same code the interpreter runs: the collector,
+the object model, strings, lists, arrays, maps, exceptions, structural
+equality, and the value RENDERER. 96 of the 97 entries delegate; none
+reimplements.
+
+The emitter had one real duplicate: 44 lines of C reproducing Kotlin's float
+rendering, for programs that linked nothing at all. That is gone — everything
+prints through `klio_nat_println`, so how Kotlin renders a value is stated once
+— and division by zero now raises a real throwable rather than printing its own
+copy of the message.
+
+What remains in the emitter is code GENERATION, not runtime code: the
+arithmetic expressions themselves (wrapping add, masked shifts), the `setjmp`
+machinery for `try` — which cannot move into a library, because `setjmp` has to
+be called in the frame that catches — and the frame/dispatch glue. The
+arithmetic rules are stated in two places and could drift, which is exactly
+what `native-c-sweep.sh` exists to catch: it found the overflow bug.
+
 ### What is general and what is an intrinsic
 
 Everything that decides program shape is general and applies to a pack class
