@@ -909,6 +909,9 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
                 const pv = prev orelse break :inc;
                 const ifn = m.funcById(bp.init orelse break :inc) orelse break :inc;
                 var ic = (try eligible(gpa, m, pv.*, ifn, globals, null, &.{})) orelse {
+                    if (traceOn() and last) {
+                        std.debug.print("[cgen] layout {s}: property `{s}` has no compilable initializer\n", .{ c.name, bp.name });
+                    }
                     if (!last) break :inc;
                     out.deinit(gpa);
                     return layoutNoTy(c, "body property type", bp.ty);
@@ -2412,13 +2415,6 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 }
                                 layout_quiet = true;
                             }
-                            if (traceOn()) {
-                                std.debug.print("[cgen]   class {s} fields:", .{m.classes.items[rc].name});
-                                if (prog.of(rc)) |fl9| {
-                                    for (fl9) |x9| std.debug.print(" {s}", .{x9.name});
-                                } else std.debug.print(" (none)", .{});
-                                std.debug.print("\n", .{});
-                            }
                             return noName(f, "field not laid out", nm.String);
                         },
                         .virtual => {
@@ -2777,7 +2773,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     var saw_ret = false;
     var ret_cls: ?u32 = null;
     var ret_elem: Ty = .unit;
-    for (f.blocks) |*blk| {
+    // Only the blocks the body can reach: an unreachable one was never typed,
+    // and its terminator names a register nothing defined.
+    const live_ret = try gpa.alloc(bool, f.blocks.len);
+    defer gpa.free(live_ret);
+    @memset(live_ret, false);
+    for (order) |bi| live_ret[bi] = true;
+    for (f.blocks, 0..) |*blk, bi2| {
+        if (!live_ret[bi2]) continue;
         if (blk.terminator != .Return) continue;
         const rr = blk.terminator.Return orelse continue;
         if (rr.int() >= f.n_locals or !known[rr.int()]) return no(f, "return register");
