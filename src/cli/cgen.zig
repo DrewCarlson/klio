@@ -619,6 +619,12 @@ pub const BareResolution = union(enum) {
     /// to, looked up by name where the emission knows which globals the
     /// program kept.
     global,
+    /// A bare CALL that bound to a member of an implicit receiver: which body
+    /// runs is the receiver's class, as for any member call.
+    member: struct { recv: u32, slot: u32 },
+    /// A bare call that bound to the top-level declaration the lowering
+    /// resolved, because no implicit receiver declares the name.
+    call: ir.FuncId,
 };
 
 /// The instance fields of a class, in the order the runtime lays them out:
@@ -675,9 +681,8 @@ pub const Program = struct {
         var depth: u32 = 0;
         while (cur) |c| : (depth += 1) {
             if (depth > 32 or c >= m.classes.items.len) return null;
-            const cn = m.classes.items[c].name;
-            for (self.layouts) |l| {
-                if (!std.mem.eql(u8, l.name, cn)) continue;
+            const cdef9 = &m.classes.items[c];
+            if (layoutFor(self.layouts, cdef9)) |l| {
                 for (l.props) |bp| {
                     if (!std.mem.eql(u8, bp.name, want)) continue;
                     return switch (which) {
@@ -777,10 +782,7 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
         };
         defer gpa.free(up.fields);
         const sup = &m.classes.items[sid.int()];
-        var pargs: []const ir.FuncId = &.{};
-        for (layouts) |l| {
-            if (std.mem.eql(u8, l.name, c.name)) pargs = l.parent_args;
-        }
+        const pargs: []const ir.FuncId = if (layoutFor(layouts, c)) |l| l.parent_args else &.{};
         if (pargs.len != sup.primary_params.len) {
             out.deinit(gpa);
             return layoutNo(c, "super constructor arity");
@@ -823,8 +825,7 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
         });
     }
     var complete = true;
-    for (layouts) |l| {
-        if (!std.mem.eql(u8, l.name, c.name)) continue;
+    if (layoutFor(layouts, c)) |l| {
         complete = false;
         inc: for (l.props) |bp| {
             // A property that stores nothing is not a field: a computed `val x
@@ -888,7 +889,6 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
             // The loop ran to the end, so every property found a place.
             complete = true;
         }
-        break;
     }
     return .{ .fields = try out.toOwnedSlice(gpa), .parent = parent, .complete = complete };
 }
@@ -1017,6 +1017,11 @@ fn scalarIntrinsic(f: *const Func) ?ScalarIntrinsic {
 /// same name and arity — which is what an override is.
 fn slotImpl(m: *const Module, prog: Program, cid: u32, slot: ir.MethodSlotId) ?*const Func {
     const root = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
+    // A class answers a slot only if its TYPE includes the declaration. Name
+    // and arity alone made every same-named method across the stdlib look like
+    // an override, which dragged whole families of unrelated classes into the
+    // compile through one `next()` call.
+    if (!typeHasSlot(m, cid, root)) return null;
     var fallback: ?*const Func = null;
     // A class that does not override still answers with what it inherits, so
     // the walk goes up the chain and the nearest body wins.
@@ -1647,9 +1652,7 @@ fn enumClassNamed(m: *const Module, prog: Program, name: []const u8) ?u32 {
 /// The declaration position of an entry, which is also its ordinal.
 fn enumEntryIndex(m: *const Module, prog: Program, cid: u32, name: []const u8) ?u32 {
     if (cid >= m.classes.items.len) return null;
-    const cn = m.classes.items[cid].name;
-    for (prog.layouts) |l| {
-        if (!std.mem.eql(u8, l.name, cn)) continue;
+    if (layoutFor(prog.layouts, &m.classes.items[cid])) |l| {
         for (l.entries, 0..) |e, i| {
             if (std.mem.eql(u8, e.name, name)) return @intCast(i);
         }
@@ -1668,10 +1671,7 @@ fn staticClassOf(types: []const Ty, cls: []const ?u32, r: u32) ?u32 {
 /// The entries of an enum the emitter laid out.
 fn enumEntries(m: *const Module, prog: Program, cid: u32) []const EnumEntryInfo {
     if (cid >= m.classes.items.len) return &.{};
-    const cn = m.classes.items[cid].name;
-    for (prog.layouts) |l| {
-        if (std.mem.eql(u8, l.name, cn)) return l.entries;
-    }
+    if (layoutFor(prog.layouts, &m.classes.items[cid])) |l| return l.entries;
     return &.{};
 }
 
@@ -1792,7 +1792,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 if (gt == .object) cls[lt.dst.int()] = classIndexOfName(m, gfn.return_ty);
  if (refElemOf(cls[lt.dst.int()], gfn.return_ty)) |re_| elem[lt.dst.int()] = re_;
                             },
-                            .global => unreachable,
+                            .global, .member, .call => unreachable,
                         }
                         known[lt.dst.int()] = true;
                         continue;
@@ -1826,13 +1826,62 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 const want6: Ty = if (sfn.params.len >= 2) (tyOf(sfn.params[1].ty) orelse .object) else return no(f, "bare setter arity");
                                 if (want6 != .object and types[st.value.int()] != want6) return no(f, "bare value type");
                             },
-                            .global => unreachable,
+                            .global, .member, .call => unreachable,
                         }
                         continue;
                     }
                     const gi6 = globalIndex(globals, bn2.String) orelse return noName(f, "bare name", bn2.String);
                     _ = gi6;
                     try bare.put(gpa, inst, .global);
+                },
+                // A bare call whose name may be a member of an implicit
+                // receiver or a top-level declaration. The interpreter decides
+                // at run time by searching the receivers; the emitter searches
+                // the same ones once, here.
+                .CallMemberOrGlobal => |cg2| {
+                    if (cg2.arg_names.len != 0) return no(f, "bare call names");
+                    if (cg2.name.int() >= m.consts.items.len) return no(f, "bare call name");
+                    const cn2 = m.consts.items[cg2.name.int()];
+                    if (cn2 != .String) return no(f, "bare call name kind");
+                    var ka9: u32 = 0;
+                    while (ka9 < cg2.n_args) : (ka9 += 1) {
+                        const a9 = cg2.args.int() + ka9;
+                        if (a9 >= f.n_locals or !known[a9]) return no(f, "bare call arg");
+                    }
+                    if (cg2.dst.int() >= f.n_locals) return no(f, "bare call dst");
+                    // The innermost implicit receiver that declares the name
+                    // wins, which is what shadows a same-named global.
+                    var mi: usize = encl.items.len;
+                    while (mi > 0) {
+                        mi -= 1;
+                        const r9 = encl.items[mi];
+                        if (r9 >= f.n_locals or !known[r9] or types[r9] != .object) continue;
+                        const rc9 = cls[r9] orelse continue;
+                        if (isBuiltinCls(rc9)) continue;
+                        const root9b = memberRoot(m, prog, rc9, cn2.String, cg2.n_args) orelse continue;
+                        const rt9 = funcRetTy2(m, root9b) orelse return no(f, "bare call return type");
+                        try bare.put(gpa, inst, .{ .member = .{ .recv = r9, .slot = root9b.id.int() } });
+                        types[cg2.dst.int()] = rt9;
+                        if (rt9 == .object) {
+                            cls[cg2.dst.int()] = classIndexOfName(m, root9b.return_ty);
+                            if (refElemOf(cls[cg2.dst.int()], root9b.return_ty)) |re9| elem[cg2.dst.int()] = re9;
+                        }
+                        known[cg2.dst.int()] = true;
+                        break;
+                    } else {
+                        const gfid = cg2.func orelse return noName(f, "bare call", cn2.String);
+                        const gfn9 = m.funcById(gfid) orelse return no(f, "bare call target");
+                        if (!gfn9.hasBody()) return noCallee(f, gfn9, "no body for");
+                        if (gfn9.params.len != cg2.n_args) return noCallee(f, gfn9, "arity of");
+                        const rt10 = funcRetTy2(m, gfn9) orelse return no(f, "bare call return type");
+                        try bare.put(gpa, inst, .{ .call = gfid });
+                        types[cg2.dst.int()] = rt10;
+                        if (rt10 == .object) {
+                            cls[cg2.dst.int()] = classIndexOfName(m, gfn9.return_ty);
+                            if (refElemOf(cls[cg2.dst.int()], gfn9.return_ty)) |re10| elem[cg2.dst.int()] = re10;
+                        }
+                        known[cg2.dst.int()] = true;
+                    }
                 },
                 .Const => |c| {
                     if (c.dst.int() >= f.n_locals) return no(f, "const dst");
@@ -2285,7 +2334,25 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     const nm = m.consts.items[gf.field.int()];
                     if (nm != .String) return no(f, "field name kind");
                     switch (accessPlan(m, prog, rc, nm.String, false)) {
-                        .none => return noName(f, "field not laid out", nm.String),
+                        .none => {
+                            // Name why the class has no layout, when that is
+                            // the reason the field is not there.
+                            if (traceOn() and prog.of(rc) == null and rc < m.classes.items.len) {
+                                layout_quiet = false;
+                                if (try classFields(gpa, m, prog.layouts, @enumFromInt(rc), &prog, globals, true)) |junk2| {
+                                    gpa.free(junk2.fields);
+                                }
+                                layout_quiet = true;
+                            }
+                            if (traceOn()) {
+                                std.debug.print("[cgen]   class {s} fields:", .{m.classes.items[rc].name});
+                                if (prog.of(rc)) |fl9| {
+                                    for (fl9) |x9| std.debug.print(" {s}", .{x9.name});
+                                } else std.debug.print(" (none)", .{});
+                                std.debug.print("\n", .{});
+                            }
+                            return noName(f, "field not laid out", nm.String);
+                        },
                         .virtual => {
                             const vp = virtualProp(m, prog, rc, plainFieldName(nm.String)).?;
                             if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
@@ -2708,10 +2775,19 @@ fn ctorParamTy(c: *const ir.Class, i: usize) Ty {
 }
 
 /// The declarations a class contributes itself: its body properties in source
-/// order and the init blocks between them.
+/// order and the init blocks between them. The table is keyed by whatever name
+/// the built module used — the FQN for a class in a package, the simple name
+/// for one without — so a lookup has to accept either.
 fn ownLayout(prog: Program, name: []const u8) ?*const ClassLayout {
     for (prog.layouts) |*l| {
         if (std.mem.eql(u8, l.name, name)) return l;
+    }
+    return null;
+}
+
+fn layoutFor(layouts: []const ClassLayout, c: *const ir.Class) ?*const ClassLayout {
+    for (layouts) |*l| {
+        if (std.mem.eql(u8, l.name, c.name) or std.mem.eql(u8, l.name, c.fqn)) return l;
     }
     return null;
 }
@@ -3253,6 +3329,40 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
             switch (inst.*) {
                 .Trace => {},
                 .EnclosingPush, .EnclosingPop => {},
+                .CallMemberOrGlobal => |cg3| {
+                    var nb18: [32]u8 = undefined;
+                    const cdst = regName(c, cg3.dst.int(), &nb18);
+                    switch (c.bare.get(inst).?) {
+                        .member => |mb2| {
+                            var rb18: [32]u8 = undefined;
+                            try w.print("  {s} = kvirt_{d}({s}", .{ cdst, mb2.slot, regName(c, mb2.recv, &rb18) });
+                            var aj18: u32 = 0;
+                            while (aj18 < cg3.n_args) : (aj18 += 1) {
+                                var ab18: [32]u8 = undefined;
+                                try w.print(", {s}", .{regName(c, cg3.args.int() + aj18, &ab18)});
+                            }
+                            try w.writeAll(");\n");
+                        },
+                        .call => |cf2| {
+                            const cfn2 = m.funcById(cf2).?;
+                            try w.print("  {s} = ", .{cdst});
+                            try writeSymbol(w, cfn2);
+                            try w.writeByte('(');
+                            var aj19: u32 = 0;
+                            while (aj19 < cg3.n_args) : (aj19 += 1) {
+                                if (aj19 != 0) try w.writeAll(", ");
+                                const ar19 = cg3.args.int() + aj19;
+                                var ab19: [32]u8 = undefined;
+                                var cb19: [96]u8 = undefined;
+                                const pw19 = acceptedParamTy(accepted, cfn2, aj19) orelse
+                                    (tyOf(cfn2.params[aj19].ty) orelse .object);
+                                try w.print("{s}", .{convExpr(c.types[ar19], pw19, regName(c, ar19, &ab19), &cb19)});
+                            }
+                            try w.writeAll(");\n");
+                        },
+                        else => unreachable,
+                    }
+                },
                 .LoadFromThisOrGlobal => |lt| {
                     var nb8: [32]u8 = undefined;
                     const dst8 = regName(c, lt.dst.int(), &nb8);
@@ -3278,6 +3388,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             const from9 = try std.fmt.bufPrint(&src9, "KG[{d}]", .{gi8});
                             try w.print("  {s} = {s};\n", .{ dst8, unboxExpr(c.types[lt.dst.int()], from9, &ob9) });
                         },
+                        .member, .call => unreachable,
                     }
                 },
                 .StoreToThisOrGlobal => |st| {
@@ -3314,6 +3425,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                                 gi9, boxExpr(c.types[st.value.int()], regName(c, st.value.int(), &vb12), &bb12),
                             });
                         },
+                        .member, .call => unreachable,
                     }
                 },
                 .Const => |k| {
@@ -4629,6 +4741,22 @@ pub fn emit(
                                 }
                             }
                         },
+                        .member => |mb| {
+                            // Every class beneath the receiver's type may
+                            // answer, which the virtual pairing then queues.
+                            var have_m = false;
+                            for (vsites.items) |sv6| {
+                                if (sv6.int() == mb.slot) have_m = true;
+                            }
+                            if (!have_m) try vsites.append(gpa, ir.MethodSlotId.from(mb.slot));
+                        },
+                        .call => |cf| {
+                            const cfn = m.funcById(cf) orelse return false;
+                            if (!seen.contains(cfn.id.int())) {
+                                try seen.put(cfn.id.int(), {});
+                                try queue.append(gpa, .{ .f = cfn, .synth = null });
+                            }
+                        },
                     }
                     continue;
                 }
@@ -4862,6 +4990,21 @@ pub fn emit(
                             if (us5.slot == ts5.id.int()) have5 = true;
                         }
                         if (!have5) try used_slots.append(gpa, .{ .slot = ts5.id.int(), .n_args = 0 });
+                    }
+                }
+                if (c.bare.get(inst)) |res2| {
+                    if (res2 == .member) {
+                        var have_s = false;
+                        for (used_slots.items) |us6| {
+                            if (us6.slot == res2.member.slot) have_s = true;
+                        }
+                        if (!have_s) {
+                            const nargs6: u32 = switch (inst.*) {
+                                .CallMemberOrGlobal => |cg6| cg6.n_args,
+                                else => 0,
+                            };
+                            try used_slots.append(gpa, .{ .slot = res2.member.slot, .n_args = nargs6 });
+                        }
                     }
                 }
                 if (inst.* != .CallVirtual) continue;
@@ -5143,8 +5286,8 @@ pub fn emit(
                 phi = @intCast(fi2 + 1);
             }
             var flags: u32 = 0;
-            for (prog.layouts) |l2| {
-                if (std.mem.eql(u8, l2.name, cdef.name) and l2.is_data) flags |= 1;
+            if (layoutFor(prog.layouts, cdef)) |l2| {
+                if (l2.is_data) flags |= 1;
             }
             if (cdef.is_enum) flags |= 2;
             if (cdef.is_object) flags |= 4;
