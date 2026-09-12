@@ -3941,10 +3941,18 @@ fn buildModuleWithOverrides(
         for (c.primary_params, 0..) |*p, i| {
             if (i + 1 < ib_types.len) ib_types[i + 1] = p.ty;
         }
+        // The same typed signature the body-property thunks compile against:
+        // an init block reads the constructor's parameters, and a consumer
+        // reading `Func.params` has nowhere else to learn their types.
+        const ib_cid = module.classIdByFqn(try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name));
+        const ib_param_types: []const ir.Param = if (ib_cid) |cid|
+            module.classes.items[cid.int()].primary_params
+        else
+            &.{};
         for (c.init_blocks, 0..) |*blk, idx| {
             const nm = try std.fmt.allocPrint(a, "__init_block_{s}_{d}", .{ c.name.name, idx });
             module.pending_param_types = ib_types;
-            fids[idx] = try ir.lower.lowerInitBlockWithParams(module, c.name.name, &own_members, local_params.items, blk, nm);
+            fids[idx] = try ir.lower.lowerInitBlockWithParams(module, c.name.name, &own_members, local_params.items, ib_param_types, blk, nm);
         }
         try init_blocks.put(c.name.name, fids);
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);

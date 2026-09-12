@@ -237,7 +237,12 @@ void klio_nat_init(uint32_t reserved);
 uint32_t klio_nat_class(const char *name, uint32_t n_fields,
                         const char *const *field_names,
                         uint32_t primary_lo, uint32_t primary_hi,
-                        uint32_t flags);
+                        uint32_t flags,
+                        /* One byte per field naming its declared type's zero:
+                         * 0 reference (null), 1 Int, 2 Long, 3 Double, 4 Float,
+                         * 5 Boolean, 6 Char, 7 Short, 8 Byte. A field holds it
+                         * from allocation, before any constructor runs. */
+                        const unsigned char *field_zeros);
 
 /* A fresh instance with every field Unit; the compiled constructor fills it. */
 klio_value klio_nat_alloc_instance(uint32_t cls);

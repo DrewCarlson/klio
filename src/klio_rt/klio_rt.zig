@@ -356,6 +356,7 @@ export fn klio_nat_class(
     primary_lo: u32,
     primary_hi: u32,
     flags: u32,
+    field_zeros: ?[*]const u8,
 ) u32 {
     const a = natAlloc();
     const nm = std.mem.span(name);
@@ -371,7 +372,10 @@ export fn klio_nat_class(
             .delegate = null,
             .is_abstract = false,
             .is_lateinit = false,
-            .primitive_zero = null,
+            // A backing field exists from allocation holding its type's zero,
+            // exactly as on the JVM: a superclass constructor that calls an
+            // overridden method sees the subclass's field as 0/false/null.
+            .primitive_zero = if (field_zeros) |fz| zeroOfKind(fz[i]) else null,
         };
     }
     const cls = runtime.ObjRef(runtime.ClassDef).init(a, .{
@@ -439,7 +443,10 @@ export fn klio_nat_alloc_instance(cls: u32) CValue {
     fields.ensureTotalCapacity(a, n) catch @panic("klio_nat_alloc_instance: out of memory");
     var i: usize = 0;
     while (i < n) : (i += 1) {
-        fields.appendAssumeCapacity(.{ .name = names[i].name, .value = .Unit });
+        fields.appendAssumeCapacity(.{
+            .name = names[i].name,
+            .value = names[i].primitive_zero orelse .Null,
+        });
     }
     g.deinit();
     const inst = runtime.ObjRef(runtime.InstanceData).init(a, .{
@@ -705,6 +712,22 @@ export fn klio_nat_list_add(v: CValue, x: CValue) void {
 // elements rather than boxed values. The emitter knows the element kind
 // statically and names it here, which is what keeps an indexed read a load
 // rather than an unbox.
+
+/// The zero of a field's declared type, in the emitter's own type order. Null
+/// is the zero of every reference type.
+fn zeroOfKind(k: u8) ?runtime.Value {
+    return switch (k) {
+        1 => runtime.Value.newInt(0),
+        2 => .{ .Long = 0 },
+        3 => .{ .Double = 0 },
+        4 => .{ .Float = 0 },
+        5 => .{ .Bool = false },
+        6 => .{ .Char = 0 },
+        7 => .{ .Short = 0 },
+        8 => .{ .Byte = 0 },
+        else => null,
+    };
+}
 
 fn primKindOf(kind: u32) runtime.PrimitiveArrayKind {
     return switch (kind) {

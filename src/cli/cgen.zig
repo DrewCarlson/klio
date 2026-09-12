@@ -739,9 +739,6 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
     // Each reason is named: this list is the backlog for widening the backend,
     // and "class layout" alone says nothing about which class shape is missing.
     if (c.init_block != null) return layoutNo(c, "init block");
-    for (layouts) |l0| {
-        if (std.mem.eql(u8, l0.name, c.name) and l0.has_init_block) return layoutNo(c, "init block");
-    }
     // An interface contributes no fields, so implementing one changes nothing
     // about the layout. A superCLASS contributes its own, laid out ahead of
     // this class's so a field index means the same thing through either type.
@@ -900,11 +897,12 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
 /// name (`$sgetter$<Class><US><field>`); the stored field is the tail.
 /// Whether this spelling names the BACKING FIELD rather than the property: the
 /// lowering marks a `field` read or write inside an accessor this way, and
-/// everything else goes through the accessor when one is declared.
+/// everything else goes through the accessor when one is declared. The
+/// `$sgetter$<owner>` form is NOT one of these: it is an ordinary property read
+/// that names the owner it was written against, and resolves to whatever the
+/// receiver's own class declares.
 fn isBackingAccess(name: []const u8) bool {
-    return std.mem.startsWith(u8, name, "$sgetter$") or
-        std.mem.startsWith(u8, name, "$ssetter$") or
-        std.mem.startsWith(u8, name, "__klio_field__");
+    return std.mem.startsWith(u8, name, "__klio_field__");
 }
 
 fn plainFieldName(name: []const u8) []const u8 {
@@ -2709,6 +2707,15 @@ fn ctorParamTy(c: *const ir.Class, i: usize) Ty {
     return tyOf(c.primary_params[i].ty) orelse .object;
 }
 
+/// The declarations a class contributes itself: its body properties in source
+/// order and the init blocks between them.
+fn ownLayout(prog: Program, name: []const u8) ?*const ClassLayout {
+    for (prog.layouts) |*l| {
+        if (std.mem.eql(u8, l.name, name)) return l;
+    }
+    return null;
+}
+
 /// The prototype of a class's initializer. It fills an instance the caller has
 /// already allocated, which is what lets a subclass hand its own instance to
 /// the superclass's initializer rather than building a second one.
@@ -2797,27 +2804,60 @@ fn writeCtorBody(
         }
         try w.writeAll(");\n");
     }
+    // The class's own declarations run in SOURCE order: an init block sits
+    // between the body properties it was written between, and Kotlin's rule is
+    // that each one sees the properties declared above it and the zeros of
+    // those below.
+    const own = ownLayout(prog, c.name);
+    const n_props: usize = if (own) |o| o.props.len else 0;
+    var prop_i: usize = 0;
+    var field_i: usize = 0;
+    // The constructor's own properties are filled before any of it runs.
     for (fields, 0..) |fd, fi| {
         if (fd.from_parent or fd.preset) continue;
-        var bb: [400]u8 = undefined;
-        if (fd.arg) |ai| {
-            var nb: [16]u8 = undefined;
-            const arg = std.fmt.bufPrint(&nb, "p{d}", .{ai}) catch unreachable;
-            try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi, boxExpr(fd.ty, arg, &bb) });
-            continue;
+        const ai = fd.arg orelse continue;
+        var bb0: [400]u8 = undefined;
+        var nb0: [16]u8 = undefined;
+        const arg0 = std.fmt.bufPrint(&nb0, "p{d}", .{ai}) catch unreachable;
+        try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi, boxExpr(fd.ty, arg0, &bb0) });
+        field_i = fi + 1;
+    }
+    while (prop_i <= n_props) : (prop_i += 1) {
+        if (own) |o| {
+            for (o.init_blocks, 0..) |ibf, ib_i| {
+                const at: usize = if (ib_i < o.init_block_positions.len) o.init_block_positions[ib_i] else n_props;
+                if (at != prop_i) continue;
+                const ibn = m.funcById(ibf) orelse continue;
+                var icall: std.Io.Writer.Allocating = .init(gpa);
+                defer icall.deinit();
+                try writeThunkCall(gpa, &icall.writer, c, ibn);
+                try w.print("  {s};\n", .{icall.written()});
+            }
         }
+        if (prop_i == n_props) break;
+        // The field this declaration contributes, when it has one.
+        const want_name = if (own) |o| o.props[prop_i].name else "";
+        var fi2: ?usize = null;
+        for (fields, 0..) |fd2, k| {
+            if (fd2.from_parent or fd2.preset or fd2.arg != null) continue;
+            if (!std.mem.eql(u8, fd2.name, want_name)) continue;
+            fi2 = k;
+        }
+        const fi3 = fi2 orelse continue;
+        const fd = fields[fi3];
+        var bb: [400]u8 = undefined;
         const ifid = fd.init orelse {
             // A declared non-nullable primitive with no initializer starts at
             // its type's zero, which is what the interpreter stores.
             const z = if (fd.ty == .object) "klio_nat_null()" else boxExpr(fd.ty, "0", &bb);
-            try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi, z });
+            try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi3, z });
             continue;
         };
         const ifn = m.funcById(ifid).?;
         var call: std.Io.Writer.Allocating = .init(gpa);
         defer call.deinit();
         try writeThunkCall(gpa, &call.writer, c, ifn);
-        try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi, boxExpr(fd.ty, call.written(), &bb) });
+        try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi3, boxExpr(fd.ty, call.written(), &bb) });
     }
     try w.writeAll("}\n");
 }
@@ -2850,6 +2890,21 @@ fn renderExpr(
 
 /// The runtime entry that boxes a machine type, or an empty name when the
 /// value is already a reference.
+/// A field's declared type as the runtime's zero-kind byte.
+fn zeroKindOf(t: Ty) u8 {
+    return switch (t) {
+        .object, .unit => 0,
+        .i32 => 1,
+        .i64 => 2,
+        .f64 => 3,
+        .f32 => 4,
+        .boolean => 5,
+        .char => 6,
+        .short => 7,
+        .byte => 8,
+    };
+}
+
 fn boxFnName(t: Ty) []const u8 {
     return switch (t) {
         .i32 => "klio_nat_box_int",
@@ -4217,10 +4272,12 @@ pub const ClassLayout = struct {
     /// An `enum class`'s entries in declaration order, which is also their
     /// ordinal order.
     entries: []const EnumEntryInfo = &.{},
-    /// True when the class declares an `init { … }` block. The IR does not
-    /// carry those — the Vm runs them from the AST — so a class with one is
-    /// refused rather than constructed without running it.
-    has_init_block: bool = false,
+    /// The `init { … }` blocks the class declares, lowered as thunks taking
+    /// the instance and the constructor's arguments, with the body-property
+    /// index each one runs BEFORE. Kotlin runs them in source order
+    /// interleaved with the property initializers.
+    init_blocks: []const ir.FuncId = &.{},
+    init_block_positions: []const usize = &.{},
     /// A `data class` renders and compares by its primary constructor's
     /// properties, which the runtime's own renderer does once it is told.
     is_data: bool = false,
@@ -4641,6 +4698,15 @@ pub fn emit(
                         if (steps > 32) break;
                         const fds = prog.of(wc) orelse break;
                         const wdef = &m.classes.items[wc];
+                        // Constructing a class runs its init blocks too.
+                        if (ownLayout(prog, wdef.name)) |ol| {
+                            for (ol.init_blocks) |ibf2| {
+                                const ibn2 = m.funcById(ibf2) orelse return false;
+                                if (seen.contains(ibn2.id.int())) continue;
+                                try seen.put(ibn2.id.int(), {});
+                                try queue.append(gpa, .{ .f = ibn2, .synth = null });
+                            }
+                        }
                         for (fds) |fd| {
                             if (fd.from_parent) continue;
                             const ifid = fd.init orelse continue;
@@ -5082,7 +5148,14 @@ pub fn emit(
             }
             if (cdef.is_enum) flags |= 2;
             if (cdef.is_object) flags |= 4;
-            try w.print("}}; KCLS_{d} = klio_nat_class(\"{s}\", {d}, fn, {d}, {d}, {d}); }}\n", .{
+            try w.writeAll("};\n    static const unsigned char fz[] = {");
+            for (fields, 0..) |fld3, fz_i| {
+                if (fz_i != 0) try w.writeAll(", ");
+                try w.print("{d}", .{zeroKindOf(fld3.ty)});
+            }
+            if (fields.len == 0) try w.writeAll("0");
+            try w.writeAll("};\n");
+            try w.print("    KCLS_{d} = klio_nat_class(\"{s}\", {d}, fn, {d}, {d}, {d}, fz); }}\n", .{
                 cid, cdef.name, fields.len, plo, phi, flags,
             });
         }
@@ -5094,7 +5167,7 @@ pub fn emit(
                 try w.print("\"k{d}\"", .{ci7});
             }
             if (lu.n_caps == 0) try w.writeAll("0");
-            try w.print("}}; KLAM_{d} = klio_nat_class(\"Function{d}\", {d}, fn, 0, 0, 0); }}\n", .{ lu.body.int(), lu.arity, lu.n_caps });
+            try w.print("}}; KLAM_{d} = klio_nat_class(\"Function{d}\", {d}, fn, 0, 0, 0, 0); }}\n", .{ lu.body.int(), lu.arity, lu.n_caps });
         }
         try w.writeAll("}\n\n");
     }
