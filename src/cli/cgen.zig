@@ -1586,6 +1586,19 @@ const PropUse = struct { name: []const u8, cid: u32, ret: Ty };
 /// One lambda whose value the program materialises.
 const LambdaUse = struct { body: ir.FuncId, n_caps: u32, arity: u32, ret: Ty };
 
+/// Where a lambda that captures nothing keeps its ONE instance. Kotlin makes
+/// such a literal a singleton, so every evaluation of it answers the same
+/// object and `===` holds across them.
+fn lambdaSingletonSlot(used: []const LambdaUse, body: ir.FuncId) ?usize {
+    var n: usize = 0;
+    for (used) |lu| {
+        if (lu.n_caps != 0) continue;
+        if (lu.body == body) return n;
+        n += 1;
+    }
+    return null;
+}
+
 /// Whether a class's TYPE includes the declaration a slot is numbered by: the
 /// slot's root names its owner in its fqn, and a class whose supertypes reach
 /// that owner has the member whether or not it has a body for it. A class that
@@ -2323,6 +2336,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         known[b.dst.int()] = true;
                         continue;
                     }
+                    // `===` is referential identity, which never dispatches a
+                    // user `equals`.
+                    if (b.op == .IdentEq or b.op == .IdentNeq) {
+                        if (b.dst.int() >= f.n_locals) return no(f, "compare dst");
+                        types[b.dst.int()] = .boolean;
+                        known[b.dst.int()] = true;
+                        continue;
+                    }
                     // Concatenation, either spelled as itself or as `+` with a
                     // string on one side. Kotlin renders the other operand
                     // through its own `toString`, so anything may be joined.
@@ -2801,6 +2822,30 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                 },
                 .GetField => |gf| {
                     if (gf.receiver.int() >= f.n_locals or !known[gf.receiver.int()]) return no(f, "field receiver");
+                    // The lowering's sentinel for a bare name in value
+                    // position: a CLASS resolves to its companion, and
+                    // anything else is itself.
+                    if (gf.field.int() < m.consts.items.len) {
+                        const sen = m.consts.items[gf.field.int()];
+                        if (sen == .String and std.mem.eql(u8, sen.String, "<class-companion-or-self>")) {
+                            if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
+                            if (staticClassOf(types, cls, gf.receiver.int())) |scq| {
+                                if (companionObjectNamed(m, prog, if (scq < m.classes.items.len) m.classes.items[scq].fqn else "")) |ccq| {
+                                    types[gf.dst.int()] = .object;
+                                    cls[gf.dst.int()] = ccq;
+                                } else {
+                                    types[gf.dst.int()] = .unit;
+                                    cls[gf.dst.int()] = scq;
+                                }
+                            } else {
+                                types[gf.dst.int()] = types[gf.receiver.int()];
+                                cls[gf.dst.int()] = cls[gf.receiver.int()];
+                                elem[gf.dst.int()] = elem[gf.receiver.int()];
+                            }
+                            known[gf.dst.int()] = true;
+                            continue;
+                        }
+                    }
                     // A read off a class NAME whose member belongs to that
                     // class's companion: the companion answers it, so the
                     // access runs against the companion singleton.
@@ -3973,7 +4018,7 @@ fn suspendIndex(points: []const *const ir.Inst, inst: *const ir.Inst) ?u32 {
     return null;
 }
 
-fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: Program, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const SingletonUse, slots: []const SlotUse, uses_try: bool, accepted: []const Compiled, registered: []const u32) !void {
+fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: Program, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const SingletonUse, slots: []const SlotUse, uses_try: bool, accepted: []const Compiled, registered: []const u32, lambdas: []const LambdaUse) !void {
     const f = c.f;
     const live = try reachableBlocks(gpa, f);
     defer gpa.free(live);
@@ -4456,6 +4501,24 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     // and leaves nothing behind, exactly as loading the name
                     // of a class does.
                     if (staticClassOf(c.types, c.cls, gf.dst.int()) != null) continue;
+                    {
+                        const sen2 = m.consts.items[gf.field.int()];
+                        if (sen2 == .String and std.mem.eql(u8, sen2.String, "<class-companion-or-self>")) {
+                            var nb21: [32]u8 = undefined;
+                            var rb21: [32]u8 = undefined;
+                            if (staticClassOf(c.types, c.cls, gf.receiver.int())) |scq2| {
+                                const ccq2 = companionObjectNamed(m, prog, m.classes.items[scq2].fqn).?;
+                                try w.print("  {s} = KO[{d}];\n", .{
+                                    regName(c, gf.dst.int(), &nb21), singletonSlot(singletons, ccq2, null).?,
+                                });
+                            } else {
+                                try w.print("  {s} = {s};\n", .{
+                                    regName(c, gf.dst.int(), &nb21), regName(c, gf.receiver.int(), &rb21),
+                                });
+                            }
+                            continue;
+                        }
+                    }
                     var rc = c.cls[gf.receiver.int()].?;
                     // Where the value is read FROM: the receiver register, or
                     // the companion singleton when the receiver is a class
@@ -4577,6 +4640,20 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                 },
                 .BinOp => |b| {
                     const dt = c.types[b.dst.int()];
+                    if (b.op == .IdentEq or b.op == .IdentNeq) {
+                        var db4: [32]u8 = undefined;
+                        var lb4: [32]u8 = undefined;
+                        var rb4: [32]u8 = undefined;
+                        var l4: [96]u8 = undefined;
+                        var r4: [96]u8 = undefined;
+                        try w.print("  {s} = {s}klio_nat_value_ident({s}, {s});\n", .{
+                            regName(c, b.dst.int(), &db4),
+                            if (b.op == .IdentNeq) "!" else "",
+                            boxExpr(c.types[b.lhs.int()], regName(c, b.lhs.int(), &lb4), &l4),
+                            boxExpr(c.types[b.rhs.int()], regName(c, b.rhs.int(), &rb4), &r4),
+                        });
+                        continue;
+                    }
                     if ((b.op == .Eq or b.op == .NotEq) and
                         (c.types[b.lhs.int()] == .object or c.types[b.rhs.int()] == .object))
                     {
@@ -5059,6 +5136,14 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     }
                     var nb12: [32]u8 = undefined;
                     const ldst = regName(c, al3.dst.int(), &nb12);
+                    if (al3.captures.len == 0) {
+                        // The literal's one instance, built before the program
+                        // runs: two evaluations of it are the same object.
+                        try w.print("  {s} = KL[{d}];\n", .{
+                            ldst, lambdaSingletonSlot(lambdas, al3.body_func.?).?,
+                        });
+                        continue;
+                    }
                     try w.print("  {s} = klio_nat_alloc_instance(KLAM_{d});\n", .{ ldst, al3.body_func.?.int() });
                     for (al3.captures, 0..) |cr12, ci12| {
                         var cb12: [32]u8 = undefined;
@@ -6714,6 +6799,20 @@ pub fn emit(
         try w.print("static klio_value KO[{d}];\n", .{used_singletons.items.len});
         try w.print("static klio_nat_frame KOF;\n", .{});
     }
+    {
+        var n_ls: usize = 0;
+        for (used_lambdas.items) |lu| {
+            if (lu.n_caps == 0) n_ls += 1;
+        }
+        if (n_ls != 0) {
+            try w.print("\n/* A lambda literal that captures nothing is a SINGLETON in Kotlin:\n" ++
+                " * every evaluation of the same literal yields the same instance, so\n" ++
+                " * `===` holds across evaluations. One instance each, rooted for the\n" ++
+                " * life of the program. */\n", .{});
+            try w.print("static klio_value KL[{d}];\n", .{n_ls});
+            try w.print("static klio_nat_frame KLF;\n", .{});
+        }
+    }
     if (used_globals.items.len != 0) {
         try w.print("\n/* Top-level properties. Published to the collector for the life of the\n" ++
             " * program: a global is a root, not a frame slot. */\n", .{});
@@ -6789,7 +6888,7 @@ pub fn emit(
         }
     }
     try w.writeAll("\n");
-    for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try, accepted.items, used_classes.items);
+    for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try, accepted.items, used_classes.items, used_lambdas.items);
 
     for (used_slots.items) |su| {
         const root = m.funcById(ir.FuncId.from(su.slot)).?;
@@ -7090,6 +7189,24 @@ pub fn emit(
             if (seen_ar3[lu.arity]) continue;
             seen_ar3[lu.arity] = true;
             try w.print("  klio_nat_lambda_invoker({d}, klam_inv_{d});\n", .{ lu.arity, lu.arity });
+        }
+    }
+    {
+        var n_ls3: usize = 0;
+        for (used_lambdas.items) |lu| {
+            if (lu.n_caps == 0) n_ls3 += 1;
+        }
+        if (n_ls3 != 0) {
+            // A lambda literal that captures nothing has ONE instance for the
+            // life of the program, built here and rooted.
+            try w.print("  for (unsigned i = 0; i < {d}; i++) KL[i] = klio_nat_box_unit();\n", .{n_ls3});
+            try w.print("  KLF.n = {d}; KLF.slots = KL; klio_nat_enter(&KLF);\n", .{n_ls3});
+            var li3: usize = 0;
+            for (used_lambdas.items) |lu| {
+                if (lu.n_caps != 0) continue;
+                try w.print("  KL[{d}] = klio_nat_alloc_instance(KLAM_{d});\n", .{ li3, lu.body.int() });
+                li3 += 1;
+            }
         }
     }
     if (used_singletons.items.len != 0) try w.writeAll("  klio_init_singletons();\n");

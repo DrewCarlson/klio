@@ -1229,6 +1229,14 @@ export fn klio_nat_value_eq(av: CValue, bv: CValue) i32 {
     return if (a.structuralEq(&b)) 1 else 0;
 }
 
+/// Kotlin's `===`: referential identity, which never dispatches a user
+/// `equals` and compares heap values by the cell behind them.
+export fn klio_nat_value_ident(av: CValue, bv: CValue) i32 {
+    const a = fromC(av);
+    const b = fromC(bv);
+    return @intFromBool(runtime.Value.referenceEq(&a, &b));
+}
+
 fn natNpe() noreturn {
     const msg = "Exception in thread \"main\" java.lang.NullPointerException\n";
     _ = std.c.write(2, msg.ptr, msg.len);

@@ -380,6 +380,9 @@ klio_value klio_nat_builtin_prop(const char *name, klio_value recv);
 /* `x is T` for a value that answers from its own representation. A compiled
  * instance is tested by its class handle at the call site. */
 int32_t klio_nat_is_type(klio_value v, const char *name, int32_t nullable);
+
+/* Kotlin's `===`: referential identity, never a user `equals`. */
+int32_t klio_nat_value_ident(klio_value a, klio_value b);
 typedef klio_value (*klio_invoke_fn)(klio_value f, const klio_value *argv);
 void klio_nat_lambda_invoker(uint32_t arity, klio_invoke_fn call);
 
