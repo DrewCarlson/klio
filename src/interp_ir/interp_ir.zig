@@ -52,6 +52,10 @@ pub const resetLenientWarned = @import("vm/host_call_member.zig").resetLenientWa
 /// the classified op through `runHostFreeSlotOp`.
 pub const member_dispatch = @import("vm/host_call_member.zig");
 
+/// Field reads, for the same reason: a compiled program reads a builtin
+/// receiver's own properties through `hostFreeProperty`.
+pub const member_fields = @import("vm/host_fields.zig");
+
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const Env = runtime.Env;

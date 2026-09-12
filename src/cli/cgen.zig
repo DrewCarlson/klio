@@ -315,6 +315,11 @@ const ARRAY_CLS: u32 = std.math.maxInt(u32) - 4;
 /// outside the class table and `elem` carries what the iteration yields.
 const ITER_CLS: u32 = std.math.maxInt(u32) - 5;
 
+/// An integer or character progression. Like a list it is a runtime value the
+/// interpreter builds and steps, so the handle sits outside the class table and
+/// `elem` carries what it counts.
+const RANGE_CLS: u32 = std.math.maxInt(u32) - 6;
+
 /// A builtin type's name used as a QUALIFIER: `Int` in `Int.MAX_VALUE`. Such
 /// a register names a type rather than holding a value, so like a lambda's it
 /// is typed Unit with the type recorded and occupies nothing at run time.
@@ -455,7 +460,8 @@ fn functionResultTy(t: ir.TypeRef) Ty {
 
 fn isBuiltinCls(cid: u32) bool {
     return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS or cid == THROWABLE_CLS or
-        cid == ARRAY_CLS or cid == ITER_CLS or funcClsArity(cid) != null or numClsTy(cid) != null;
+        cid == ARRAY_CLS or cid == ITER_CLS or cid == RANGE_CLS or
+        funcClsArity(cid) != null or numClsTy(cid) != null;
 }
 
 /// The element kind of a named array type, in the order the runtime's
@@ -1802,6 +1808,15 @@ fn companionObjectNamed(m: *const Module, prog: Program, name: []const u8) ?u32 
 /// The class a name denotes when it is read off another class: `Outer.Section`
 /// names a type rather than a value. A class NAME resolves to its companion, so
 /// the enclosing class of a companion is the one that owns the nested names.
+/// The object a call or a read written on a class NAME runs against: that
+/// class's companion. A register holding a class name carries no value, so the
+/// companion singleton is the receiver.
+fn companionReceiver(m: *const Module, prog: Program, types: []const Ty, cls: []const ?u32, r: u32) ?u32 {
+    const sc = staticClassOf(types, cls, r) orelse return null;
+    if (sc >= m.classes.items.len) return null;
+    return companionObjectNamed(m, prog, m.classes.items[sc].fqn);
+}
+
 fn classQualifierNamed(m: *const Module, name: []const u8) ?u32 {
     for (m.classes.items, 0..) |*c, i| {
         if (std.mem.eql(u8, c.name, name) or std.mem.eql(u8, c.fqn, name)) return @intCast(i);
@@ -2230,10 +2245,28 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         known[b.dst.int()] = true;
                         continue;
                     }
+                    // `a..b` and `a..<b` build a progression: a runtime value
+                    // with its own bound and step resolution, which the
+                    // interpreter performs and compiled code reuses.
+                    if (b.op == .RangeTo or b.op == .RangeUntil) {
+                        if (!isNumericTy(lt) or !isNumericTy(rt)) return no(f, "range operand types");
+                        if (b.dst.int() >= f.n_locals) return no(f, "range dst");
+                        types[b.dst.int()] = .object;
+                        cls[b.dst.int()] = RANGE_CLS;
+                        // A progression counts values of the operands' own
+                        // type: `'a'..'e'` yields Chars, where the ARITHMETIC
+                        // promotion of two Chars would be Int.
+                        elem[b.dst.int()] = if (lt == rt) lt else (promote(lt, rt) orelse lt);
+                        known[b.dst.int()] = true;
+                        continue;
+                    }
                     // `ushr` has no C spelling of its own — it is a cast to
                     // unsigned around `>>` — so it is admitted here and written
                     // out below rather than looked up.
-                    if (b.op != .UShr and cOp(b.op) == null) return no(f, "binop kind");
+                    if (b.op != .UShr and cOp(b.op) == null) {
+                        if (traceOn()) std.debug.print("[cgen] refuse {s}: binop kind `{s}`\n", .{ f.fqn, @tagName(b.op) });
+                        return null;
+                    }
                     if (isCmp(b.op)) {
                         if (lt == .unit or rt == .unit) return null;
                         types[b.dst.int()] = .boolean;
@@ -2243,6 +2276,12 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         if (lt.isFloat() or rt.isFloat() or lt == .unit or rt == .unit) return null;
                         if ((lt == .boolean) != (rt == .boolean)) return null;
                         types[b.dst.int()] = lt;
+                    } else if (lt == .char and (b.op == .Add or b.op == .Sub) and
+                        rt != .char and isNumericTy(rt) and !rt.isFloat())
+                    {
+                        // Kotlin's `Char + Int` and `Char - Int` answer a Char;
+                        // `Char - Char` answers the distance, which promotes.
+                        types[b.dst.int()] = .char;
                     } else {
                         types[b.dst.int()] = promote(lt, rt) orelse return no(f, "binop operand types");
                     }
@@ -2252,15 +2291,15 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (u.dst.int() >= f.n_locals or u.operand.int() >= f.n_locals) return no(f, "unop reg");
                     if (!known[u.operand.int()]) return no(f, "unop operand");
                     const ot = types[u.operand.int()];
-                    if (ot == .boolean or ot == .unit) return no(f, "unop operand type");
-                    switch (u.op) {
-                        .Neg, .Plus => {},
-                        // `++`/`--` on a scalar register is a read-modify-write
-                        // the lowering already splits; seeing one here means a
-                        // shape this subset has not modelled.
-                        .Inc, .Dec => return no(f, "inc/dec"),
-                    }
-                    types[u.dst.int()] = ot;
+                    if (!isNumericTy(ot)) return no(f, "unop operand type");
+                    types[u.dst.int()] = switch (u.op) {
+                        // Kotlin's unary minus and plus on a Byte or a Short
+                        // answer an Int; every other width answers itself.
+                        .Neg, .Plus => if (ot == .byte or ot == .short) Ty.i32 else ot,
+                        // `inc()`/`dec()` keep the receiver's type, and wrap
+                        // like the rest of Kotlin's integer arithmetic.
+                        .Inc, .Dec => ot,
+                    };
                     known[u.dst.int()] = true;
                 },
                 .Not => |n| {
@@ -2330,6 +2369,66 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             continue;
                         }
                         return no(f, "list member");
+                    }
+                    // The iteration protocol on a builtin receiver, written
+                    // by name rather than bound to a slot. Which members those
+                    // are, and what each answers, is the interpreter's — the
+                    // same classification the slot-bound route reads.
+                    if (cm.arg_names.len == 0 and cm.name.int() < m.consts.items.len and
+                        cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
+                        types[cm.receiver.int()] == .object and cls[cm.receiver.int()] != null and
+                        isBuiltinCls(cls[cm.receiver.int()].?))
+                    {
+                        const bmn = m.consts.items[cm.name.int()];
+                        if (bmn == .String) {
+                            if (member_dispatch.hostFreeMemberAnswer(plainFieldName(bmn.String))) |ans| {
+                                var kkb: u32 = 0;
+                                while (kkb < cm.n_args) : (kkb += 1) {
+                                    const ab = cm.args.int() + kkb;
+                                    if (ab >= f.n_locals or !known[ab]) return no(f, "host member arg");
+                                }
+                                if (cm.dst.int() >= f.n_locals) return no(f, "host member dst");
+                                const et2 = elem[cm.receiver.int()];
+                                switch (ans) {
+                                    .iterator => {
+                                        types[cm.dst.int()] = .object;
+                                        cls[cm.dst.int()] = ITER_CLS;
+                                        elem[cm.dst.int()] = et2;
+                                    },
+                                    .boolean => types[cm.dst.int()] = .boolean,
+                                    .index => types[cm.dst.int()] = .i32,
+                                    .unit => types[cm.dst.int()] = .unit,
+                                    .element => types[cm.dst.int()] = if (et2 == .unit) .object else et2,
+                                }
+                                known[cm.dst.int()] = true;
+                                continue;
+                            }
+                        }
+                    }
+                    // A member CALLED on a class name runs on that class's
+                    // companion: `Config.of(3)` is a call on the companion
+                    // object, with the companion as the receiver.
+                    if (numConv(m, cm) == null and cm.arg_names.len == 0 and cm.name.int() < m.consts.items.len) {
+                        if (companionReceiver(m, prog, types, cls, cm.receiver.int())) |cc6| {
+                            const mn6 = m.consts.items[cm.name.int()];
+                            if (mn6 != .String) return no(f, "member name kind");
+                            const root6 = memberRoot(m, prog, cc6, plainFieldName(mn6.String), cm.n_args) orelse
+                                return noName(f, "companion member", mn6.String);
+                            const mrt6 = funcRetTy2(m, root6) orelse return no(f, "member return type");
+                            var kk6: u32 = 0;
+                            while (kk6 < cm.n_args) : (kk6 += 1) {
+                                const ar6b = cm.args.int() + kk6;
+                                if (ar6b >= f.n_locals or !known[ar6b]) return no(f, "member arg");
+                            }
+                            if (cm.dst.int() >= f.n_locals) return no(f, "member dst");
+                            types[cm.dst.int()] = mrt6;
+                            if (mrt6 == .object) {
+                                cls[cm.dst.int()] = classIndexOfName(m, root6.return_ty);
+                                if (refElemOf(cls[cm.dst.int()], root6.return_ty)) |re6| elem[cm.dst.int()] = re6;
+                            }
+                            known[cm.dst.int()] = true;
+                            continue;
+                        }
                     }
                     // A member call on a user class the lowering left by
                     // name. The declaration it binds to is decided here, and
@@ -2644,6 +2743,25 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         if (!std.mem.eql(u8, plainFieldName(snm.String), want)) return noName(f, "builtin member", snm.String);
                         if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
                         types[gf.dst.int()] = .i32;
+                        known[gf.dst.int()] = true;
+                        continue;
+                    }
+                    // A progression answers its bounds and its step from its
+                    // own record; the counted loop the lowering writes for
+                    // `for (x in r)` reads exactly those three.
+                    if (rc == RANGE_CLS) {
+                        const pnm = m.consts.items[gf.field.int()];
+                        if (pnm != .String) return no(f, "builtin member name");
+                        const pn = plainFieldName(pnm.String);
+                        const et = elem[gf.receiver.int()];
+                        const pt: Ty = if (std.mem.eql(u8, pn, "step"))
+                            (if (et == .i64 or et == .u64) Ty.i64 else Ty.i32)
+                        else if (std.mem.eql(u8, pn, "first") or std.mem.eql(u8, pn, "last"))
+                            (if (et == .unit) Ty.i32 else et)
+                        else
+                            return noName(f, "builtin member", pnm.String);
+                        if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
+                        types[gf.dst.int()] = pt;
                         known[gf.dst.int()] = true;
                         continue;
                     }
@@ -4222,6 +4340,21 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         });
                         continue;
                     }
+                    if (rc == RANGE_CLS) {
+                        var nb18: [32]u8 = undefined;
+                        var rb18: [32]u8 = undefined;
+                        var pb18: [160]u8 = undefined;
+                        var ob18: [220]u8 = undefined;
+                        const call18 = try std.fmt.bufPrint(&pb18, "klio_nat_builtin_prop(\"{s}\", {s})", .{
+                            plainFieldName(m.consts.items[gf.field.int()].String),
+                            regName(c, gf.receiver.int(), &rb18),
+                        });
+                        try w.print("  {s} = {s};\n", .{
+                            regName(c, gf.dst.int(), &nb18),
+                            unboxExpr(c.types[gf.dst.int()], call18, &ob18),
+                        });
+                        continue;
+                    }
                     const nm = m.consts.items[gf.field.int()].String;
                     switch (accessPlan(m, prog, rc, nm, false)) {
                         .none => unreachable,
@@ -4297,6 +4430,20 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             if (b.op == .NotEq) "!" else "",
                             boxExpr(c.types[b.lhs.int()], regName(c, b.lhs.int(), &lb2), &l2),
                             boxExpr(c.types[b.rhs.int()], regName(c, b.rhs.int(), &rb2), &r2),
+                        });
+                        continue;
+                    }
+                    if (dt == .object and (b.op == .RangeTo or b.op == .RangeUntil)) {
+                        var db3: [32]u8 = undefined;
+                        var lb3: [32]u8 = undefined;
+                        var rb3: [32]u8 = undefined;
+                        var l3: [96]u8 = undefined;
+                        var r3: [96]u8 = undefined;
+                        try w.print("  {s} = klio_nat_range({d}, {s}, {s});\n", .{
+                            regName(c, b.dst.int(), &db3),
+                            @as(u32, if (b.op == .RangeTo) 0 else 1),
+                            boxExpr(c.types[b.lhs.int()], regName(c, b.lhs.int(), &lb3), &l3),
+                            boxExpr(c.types[b.rhs.int()], regName(c, b.rhs.int(), &rb3), &r3),
                         });
                         continue;
                     }
@@ -4400,8 +4547,22 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         } else {
                             try w.print("  r{d} = ({s})(-r{d});\n", .{ u.dst.int(), t.cName(), u.operand.int() });
                         },
-                        .Plus => try w.print("  r{d} = r{d};\n", .{ u.dst.int(), u.operand.int() }),
-                        else => unreachable,
+                        .Plus => try w.print("  r{d} = ({s})r{d};\n", .{ u.dst.int(), t.cName(), u.operand.int() }),
+                        // Kotlin's `inc`/`dec` wrap; in C a signed overflow is
+                        // undefined, so the step runs in the unsigned type of
+                        // the same width.
+                        .Inc, .Dec => {
+                            const step: []const u8 = if (u.op == .Inc) "+" else "-";
+                            if (wrapTy(t)) |ut6| {
+                                try w.print("  r{d} = ({s})(({s})r{d} {s} 1);\n", .{
+                                    u.dst.int(), t.cName(), ut6, u.operand.int(), step,
+                                });
+                            } else {
+                                try w.print("  r{d} = ({s})(r{d} {s} 1);\n", .{
+                                    u.dst.int(), t.cName(), u.operand.int(), step,
+                                });
+                            }
+                        },
                     }
                 },
                 .Not => |n| try w.print("  r{d} = !r{d};\n", .{ n.dst.int(), n.src.int() }),
@@ -4458,6 +4619,48 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             }
                             continue;
                         }
+                    }
+                    // The iteration protocol on a builtin receiver, written by
+                    // name: the runtime picks the same handler by that name.
+                    if (c.cls[cm.receiver.int()]) |brc| {
+                        if (isBuiltinCls(brc) and member_dispatch.hostFreeMemberAnswer(plainFieldName(m.consts.items[cm.name.int()].String)) != null) {
+                            try w.print("  {{ klio_value ma[{d}];\n    ma[0] = {s};\n", .{ cm.n_args + 1, recv });
+                            var khb: u32 = 0;
+                            while (khb < cm.n_args) : (khb += 1) {
+                                const ahb = cm.args.int() + khb;
+                                var abb: [32]u8 = undefined;
+                                var bbb: [96]u8 = undefined;
+                                try w.print("    ma[{d}] = {s};\n", .{
+                                    khb + 1, boxExpr(c.types[ahb], regName(c, ahb, &abb), &bbb),
+                                });
+                            }
+                            var hbb: [320]u8 = undefined;
+                            var hob: [400]u8 = undefined;
+                            const hcall2 = try std.fmt.bufPrint(&hbb, "klio_nat_member(\"{s}\", ma, {d})", .{
+                                plainFieldName(m.consts.items[cm.name.int()].String), cm.n_args + 1,
+                            });
+                            try w.print("    {s} = {s}; }}\n", .{
+                                regName(c, cm.dst.int(), &nb),
+                                unboxExpr(c.types[cm.dst.int()], hcall2, &hob),
+                            });
+                            continue;
+                        }
+                    }
+                    // A call written on a class NAME runs on that class's
+                    // companion, and the singleton is the receiver.
+                    if (companionReceiver(m, prog, c.types, c.cls, cm.receiver.int())) |cc7| {
+                        const mn7 = m.consts.items[cm.name.int()].String;
+                        const root7b = memberRoot(m, prog, cc7, plainFieldName(mn7), cm.n_args).?;
+                        try w.print("  {s} = kvirt_{d}(KO[{d}]", .{
+                            regName(c, cm.dst.int(), &nb), root7b.id.int(), singletonSlot(singletons, cc7, null).?,
+                        });
+                        var aj7: u32 = 0;
+                        while (aj7 < cm.n_args) : (aj7 += 1) {
+                            var ab7b: [32]u8 = undefined;
+                            try w.print(", {s}", .{regName(c, cm.args.int() + aj7, &ab7b)});
+                        }
+                        try w.writeAll(");\n");
+                        continue;
                     }
                     if (numConv(m, cm) == null and c.cls[cm.receiver.int()] != null and
                         !isBuiltinCls(c.cls[cm.receiver.int()].?))
@@ -5309,6 +5512,9 @@ pub fn emit(
                         break :blk4 objectClassNamed(m, prog, gn4.String) orelse
                             companionObjectNamed(m, prog, gn4.String);
                     },
+                    .CallMember => |cm4| blk6: {
+                        break :blk6 companionReceiver(m, prog, c.types, c.cls, cm4.receiver.int());
+                    },
                     .GetField => |gf4| blk5: {
                         if (gf4.field.int() >= m.consts.items.len) break :blk5 null;
                         const fn4 = m.consts.items[gf4.field.int()];
@@ -5733,6 +5939,15 @@ pub fn emit(
                 if (inst.* == .CallMember) {
                     const cm2 = inst.CallMember;
                     if (numConv(m, cm2) != null) continue;
+                    if (companionReceiver(m, prog, c.types, c.cls, cm2.receiver.int())) |cc8| {
+                        const root8 = memberRoot(m, prog, cc8, plainFieldName(m.consts.items[cm2.name.int()].String), cm2.n_args) orelse continue;
+                        var have8 = false;
+                        for (used_slots.items) |u| {
+                            if (u.slot == root8.id.int()) have8 = true;
+                        }
+                        if (!have8) try used_slots.append(gpa, .{ .slot = root8.id.int(), .n_args = cm2.n_args });
+                        continue;
+                    }
                     const rc7 = c.cls[cm2.receiver.int()] orelse continue;
                     if (isBuiltinCls(rc7)) continue;
                     if (fieldIndex(prog, rc7, m.consts.items[cm2.name.int()].String) != null) continue;
@@ -5814,6 +6029,16 @@ pub fn emit(
             for (blk.insts) |*inst| {
                 // An enum entry read off the enum's name is an instance built
                 // once, exactly like an `object` declaration's.
+                if (inst.* == .CallMember) {
+                    if (companionReceiver(m, prog, c.types, c.cls, inst.CallMember.receiver.int())) |cc9| {
+                        var have_c9 = false;
+                        for (used_singletons.items) |u| {
+                            if (u.cid == cc9 and u.entry == null) have_c9 = true;
+                        }
+                        if (!have_c9) try used_singletons.append(gpa, .{ .cid = cc9 });
+                    }
+                    continue;
+                }
                 if (inst.* == .GetField) {
                     const gf3 = inst.GetField;
                     // A property the receiver's own class does not carry is its

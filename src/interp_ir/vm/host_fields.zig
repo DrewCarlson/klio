@@ -1403,24 +1403,7 @@ fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, na
     // is always Int (Int/Char/UInt) or Long (Long/ULong) with its sign. Applies
     // to a host `Value.Range` and to a source range `Instance` (e.g.
     // `ULongRange.EMPTY`, whose `step` field would otherwise read back as Int).
-    if (std.mem.eql(u8, name, "first") or std.mem.eql(u8, name, "last") or std.mem.eql(u8, name, "step")) {
-        if (stdlib.implementations.ranges.asRangeView(receiver)) |view| {
-            if (std.mem.eql(u8, name, "step")) {
-                return ok(switch (view.kind) {
-                    .Long, .ULong => Value{ .Long = view.step },
-                    .Int, .Char, .UInt => Value{ .Int = @truncate(view.step) },
-                });
-            }
-            const v: i64 = if (std.mem.eql(u8, name, "first")) view.start else view.end;
-            return ok(switch (view.kind) {
-                .Int => .{ .Int = @truncate(v) },
-                .Long => .{ .Long = v },
-                .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
-                .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
-                .ULong => .{ .ULong = @bitCast(v) },
-            });
-        }
-    }
+    if (hostFreeProperty(receiver, name)) |v| return ok(v);
     // Reflective reads on a *bound* member reference (`this::name`):
     // `.name`/`.simpleName` yield the referenced member's name, and
     // `.isInitialized` answers the lateinit probe against the captured
@@ -5809,4 +5792,35 @@ pub fn ownerModuleForFunc(self: *VmHost, func: *const ir.Func) ?*const ir.Module
     defer mg.deinit();
     const m = mg.get();
     return if (m.funcById(func.id) == func) m else null;
+}
+
+/// A property read that answers from the receiver's own representation and
+/// consults nothing else. A compiled program has no module to dispatch through
+/// and reads these here, so there is one implementation rather than two.
+pub fn hostFreeProperty(receiver: *const Value, name: []const u8) ?Value {
+    // Progression `first`/`last`/`step` *reads* (no parens): `first`/`last`
+    // return the stored bound even when empty (the `Iterable.first()`/`last()`
+    // *functions*, dispatched as calls, still throw on empty); `step` is always
+    // Int (Int/Char/UInt) or Long (Long/ULong) with its sign. Applies to a host
+    // `Value.Range` and to a source range `Instance` (e.g. `ULongRange.EMPTY`,
+    // whose `step` field would otherwise read back as Int).
+    if (std.mem.eql(u8, name, "first") or std.mem.eql(u8, name, "last") or std.mem.eql(u8, name, "step")) {
+        if (stdlib.implementations.ranges.asRangeView(receiver)) |view| {
+            if (std.mem.eql(u8, name, "step")) {
+                return switch (view.kind) {
+                    .Long, .ULong => Value{ .Long = view.step },
+                    .Int, .Char, .UInt => Value{ .Int = @truncate(view.step) },
+                };
+            }
+            const v: i64 = if (std.mem.eql(u8, name, "first")) view.start else view.end;
+            return switch (view.kind) {
+                .Int => .{ .Int = @truncate(v) },
+                .Long => .{ .Long = v },
+                .Char => .{ .Char = @truncate(@as(u64, @bitCast(v))) },
+                .UInt => .{ .UInt = @truncate(@as(u64, @bitCast(v))) },
+                .ULong => .{ .ULong = @bitCast(v) },
+            };
+        }
+    }
+    return null;
 }

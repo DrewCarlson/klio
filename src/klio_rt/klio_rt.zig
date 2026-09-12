@@ -915,21 +915,51 @@ export fn klio_nat_member(fqn: [*:0]const u8, argv: [*]const CValue, argc: u32) 
     const a = natAlloc();
     const name = std.mem.span(fqn);
     const dispatch = cli.interp_ir.member_dispatch;
-    const op = dispatch.hostSlotOpOfFqn(name) orelse natNoMember(name);
-    const member = name[(std.mem.lastIndexOfScalar(u8, name, '.') orelse 0) + 1 ..];
+    // A bound call site names the declaration; one the lowering left by name
+    // carries the member alone, with no qualifier to strip.
+    const member = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
     if (argc == 0) natNoMember(name);
     const recv = fromC(argv[0]);
     const args = a.alloc(runtime.Value, argc - 1) catch @panic("klio_nat_member: out of memory");
     defer a.free(args);
     var i: u32 = 1;
     while (i < argc) : (i += 1) args[i - 1] = fromC(argv[i]);
-    const r = dispatch.runHostFreeSlotOp(a, op, &recv, member, args) catch
-        @panic("klio_nat_member: out of memory");
+    // A call site that bound a declaration names it; one the lowering left by
+    // name carries the member alone, which the same handlers answer.
+    const r = if (dispatch.hostSlotOpOfFqn(name)) |op|
+        dispatch.runHostFreeSlotOp(a, op, &recv, member, args) catch
+            @panic("klio_nat_member: out of memory")
+    else
+        dispatch.hostFreeMemberByName(a, &recv, member, args) catch
+            @panic("klio_nat_member: out of memory");
     const got = r orelse natNoMember(name);
     return switch (got) {
         .ok => |v| toC(v),
         .err => natMemberFailed(name),
     };
+}
+
+/// One property of a builtin receiver, read from its own representation: a
+/// progression's `first`, `last` and `step`. The interpreter reads them the
+/// same way, through the same function.
+export fn klio_nat_builtin_prop(name: [*:0]const u8, recv: CValue) CValue {
+    const nm = std.mem.span(name);
+    const v = fromC(recv);
+    const got = cli.interp_ir.member_fields.hostFreeProperty(&v, nm) orelse natNoMember(nm);
+    return toC(got);
+}
+
+/// `a..b` (kind 0) or `a..<b` (kind 1) as a value. The bound resolution and the
+/// empty-range cases are the evaluator's own, so a compiled program's ranges
+/// are the ranges the interpreter builds.
+export fn klio_nat_range(kind: u32, lhs: CValue, rhs: CValue) CValue {
+    const a = natAlloc();
+    const l = fromC(lhs);
+    const r = fromC(rhs);
+    const op: ir.BinOp = if (kind == 0) .RangeTo else .RangeUntil;
+    const v = (eval.rangeValue(a, op, &l, &r) catch @panic("klio_nat_range: out of memory")) orelse
+        natNoMember("rangeTo");
+    return toC(v);
 }
 
 fn natNoMember(name: []const u8) noreturn {

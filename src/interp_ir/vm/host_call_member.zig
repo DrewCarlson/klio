@@ -9522,6 +9522,54 @@ pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
     };
 }
 
+/// The builtin members a caller with no module can serve, selected by the
+/// receiver's own representation and the member's NAME: the iteration protocol
+/// and the collection `iterator()`. `callMemberInner` reaches the same handlers
+/// on the same receivers, so there is one implementation of each.
+pub fn hostFreeMemberByName(allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    if (std.mem.eql(u8, name, "iterator") and args.len == 0) {
+        // The self-iterator convention first, then the builtin collection or
+        // range iterator.
+        switch (receiver.*) {
+            .Iterator, .RangeIter, .SeqIter => return .{ .ok = receiver.* },
+            else => {},
+        }
+        if (try builtinIterator(allocator, receiver)) |r| return r;
+    }
+    if (receiver.* == .Iterator) {
+        if (try iteratorMember(allocator, receiver, name, args)) |r| return r;
+    }
+    if (receiver.* == .RangeIter) {
+        if (try rangeIterMember(allocator, receiver, name, args)) |r| return r;
+    }
+    return null;
+}
+
+/// What such a member answers, as a KIND rather than a runtime type: a caller
+/// that has to choose a machine type for the result reads the protocol from
+/// where it is implemented instead of keeping a second copy of it.
+pub const HostFreeAnswer = enum {
+    /// An iterator over the receiver.
+    iterator,
+    /// Whether the iteration can step again.
+    boolean,
+    /// One element of what is being iterated.
+    element,
+    /// A position within the iteration.
+    index,
+    /// Nothing: the member is performed for its effect.
+    unit,
+};
+
+pub fn hostFreeMemberAnswer(name: []const u8) ?HostFreeAnswer {
+    if (std.mem.eql(u8, name, "iterator")) return .iterator;
+    if (std.mem.eql(u8, name, "hasNext") or std.mem.eql(u8, name, "hasPrevious")) return .boolean;
+    if (std.mem.eql(u8, name, "nextIndex") or std.mem.eql(u8, name, "previousIndex")) return .index;
+    if (std.mem.eql(u8, name, "remove")) return .unit;
+    if (isIteratorNext(name) or std.mem.eql(u8, name, "previous")) return .element;
+    return null;
+}
+
 /// The host slot ops whose handlers read only the receiver's own
 /// representation, so they answer with no interpreter host behind them. A
 /// compiled program has no module to dispatch through and serves its builtin
@@ -9529,21 +9577,7 @@ pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
 /// `runHostSlotOp`, so there is one implementation rather than two.
 pub fn runHostFreeSlotOp(allocator: Allocator, op: HostSlotOp, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     switch (op) {
-        .iterator_protocol => switch (receiver.*) {
-            .Iterator => return iteratorMember(allocator, receiver, name, args),
-            .RangeIter => return rangeIterMember(allocator, receiver, name, args),
-            else => return null,
-        },
-        .collection_iterator => {
-            if (args.len != 0) return null;
-            // The self-iterator convention first, exactly as the named path
-            // applies it, then the builtin collection/range iterator.
-            switch (receiver.*) {
-                .Iterator, .RangeIter, .SeqIter => return .{ .ok = receiver.* },
-                else => {},
-            }
-            return builtinIterator(allocator, receiver);
-        },
+        .iterator_protocol, .collection_iterator => return hostFreeMemberByName(allocator, receiver, name, args),
         .array_get => {
             if (receiver.* != .Array or args.len != 1) return null;
             const idx = args[0].asI64() orelse return null;
