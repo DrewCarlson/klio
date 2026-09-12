@@ -2932,11 +2932,25 @@ pub fn coroutineLaunch(self: anytype, block: *const Value, scope: *const Value, 
         try top.enqueueLaunch(block.*);
         return null;
     }
-    // No active runBlocking — run the child eagerly.
-    const r = try intrinsic_host.invokeCallable(self, block, &.{}, out);
-    return switch (r) {
+    // No active runBlocking — run the child eagerly, through whichever host
+    // is driving: an interpreted one invokes the callable, a compiled one
+    // starts the emitted body.
+    return startChildEagerly(self, block, out);
+}
+
+/// Run a child with no enclosing pump, reporting only whether it failed.
+/// `invokeCallable` is the interpreter's entry; a host that has no such notion
+/// starts the block the way it starts a queued one.
+fn startChildEagerly(self: anytype, block: *const Value, out: Output) Allocator.Error!?RuntimeError {
+    if (@hasDecl(@TypeOf(self.*), "invokeCallable")) {
+        return switch (try self.invokeCallable(block, &.{}, out)) {
+            .ok => null,
+            .err => |e| e,
+        };
+    }
+    return switch (try self.evalClosureRaw(block, &.{}, null, out)) {
         .ok => null,
-        .err => |e| e,
+        .err => |e| mapDriverErr(self.allocator, e),
     };
 }
 
@@ -2951,11 +2965,7 @@ pub fn coroutineSpawnTimeout(self: anytype, block: *const Value, out: Output) Al
         try top.enqueueTimeout(block.*);
         return null;
     }
-    const r = try intrinsic_host.invokeCallable(self, block, &.{}, out);
-    return switch (r) {
-        .ok => null,
-        .err => |e| e,
-    };
+    return startChildEagerly(self, block, out);
 }
 
 pub fn coroutineArmSlot(self: anytype, slot: i64) void {

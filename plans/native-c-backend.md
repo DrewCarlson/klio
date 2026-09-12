@@ -463,6 +463,14 @@ not run yet: they are still waiting on the value it will eventually produce, so
 they move to the new suspension. Dropping them stranded every caller of a
 function that suspends more than once, which is what a `delay` in a loop is.
 
+`launch { … }` queues a child on the driver that is running. The driver is
+handed the closure VALUE, so a compiled program registers a STARTER per lambda
+class: the emitted entry that unpacks that closure's captures and runs its
+body. That is how the driver finds code to run when all it holds is a value.
+A child with no enclosing pump runs eagerly through whichever host is driving —
+the interpreter invokes the callable, a compiled program starts the emitted
+body.
+
 ## Correctness net
 
 `scripts/native-c-check.sh` is the gate: a fixed set of programs that must keep

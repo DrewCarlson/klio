@@ -1050,6 +1050,13 @@ fn listIntrinsic(f: *const Func) ?ListIntrinsic {
     return null;
 }
 
+/// `launch { … }`: a child coroutine queued on the driver that is running. It
+/// is not a suspension: the caller keeps going.
+fn isLaunch(f: *const Func) bool {
+    return std.mem.eql(u8, f.fqn, "kotlinx.coroutines.launch") or
+        std.mem.eql(u8, f.fqn, "kotlinx.coroutines.CoroutineScope.launch");
+}
+
 /// `delay(millis)`: the primitive suspension. It parks the CALLING frame and
 /// asks the driver to resume it after that much virtual time, so there is no
 /// callee to compile — the wait is the operation.
@@ -2675,6 +2682,16 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     // call the lowering already resolved.
                     if (c.dst.int() >= f.n_locals) return null;
                     const callee = m.funcById(c.func) orelse return no(f, "call target missing");
+                    if (isLaunch(callee)) {
+                        if (c.n_args < 1) return no(f, "launch arity");
+                        const lr5 = c.args.int() + c.n_args - 1;
+                        if (lr5 >= f.n_locals or !known[lr5]) return no(f, "launch block");
+                        if (types[lr5] != .object) return no(f, "launch block is not a value");
+                        if (c.dst.int() >= f.n_locals) return no(f, "launch dst");
+                        types[c.dst.int()] = .object;
+                        known[c.dst.int()] = true;
+                        continue;
+                    }
                     if (isRunBlocking(callee)) {
                         // The block is the root coroutine. It has to be a
                         // lambda whose body this program compiled: the driver
@@ -4426,6 +4443,15 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         }
                         continue;
                     }
+                    if (isLaunch(callee)) {
+                        const lr6 = call.args.int() + call.n_args - 1;
+                        var db7: [32]u8 = undefined;
+                        var lb7: [32]u8 = undefined;
+                        try w.print("  {s} = klio_nat_coro_launch({s});\n", .{
+                            regName(c, call.dst.int(), &db7), regName(c, lr6, &lb7),
+                        });
+                        continue;
+                    }
                     if (isRunBlocking(callee)) {
                         const br2 = call.args.int() + call.n_args - 1;
                         const li4 = c.lam[br2].?;
@@ -5245,7 +5271,7 @@ pub fn emit(
                 const callee = m.funcById(inst.Call.func) orelse return false;
                 if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or
                     arrayOfIntrinsic(callee) != null or isArrayOfNulls(callee) or isRunBlocking(callee) or
-                    isDelay(callee)) continue;
+                    isDelay(callee) or isLaunch(callee)) continue;
                 // A call that leaves a parameter unbound runs the thunk for it.
                 const bnd3 = bindCallArgs(m, callee.params, inst.Call.args.int(), inst.Call.n_args, inst.Call.arg_names) orelse
                     return false;
@@ -5655,6 +5681,14 @@ pub fn emit(
         );
         for (used_classes.items) |cid| try w.print("static uint32_t KCLS_{d};\n", .{cid});
         for (used_lambdas.items) |lu| try w.print("static uint32_t KLAM_{d};\n", .{lu.body.int()});
+        // The starter a lambda that suspends is registered under, declared
+        // before the registration that names it.
+        for (used_lambdas.items) |lu| {
+            for (accepted.items) |*cc| {
+                if (cc.f.id != lu.body or !cc.suspends) continue;
+                try w.print("static klio_value kcs_{d}(klio_value self);\n", .{lu.body.int()});
+            }
+        }
         try w.writeAll("\nstatic void klio_register_classes(void) {\n");
         for (used_classes.items) |cid| {
             const cdef = &m.classes.items[cid];
@@ -5703,6 +5737,11 @@ pub fn emit(
             }
             if (lu.n_caps == 0) try w.writeAll("0");
             try w.print("}}; KLAM_{d} = klio_nat_class(\"Function{d}\", {d}, fn, 0, 0, 0, 0); }}\n", .{ lu.body.int(), lu.arity, lu.n_caps });
+            for (accepted.items) |*cc| {
+                if (cc.f.id != lu.body) continue;
+                if (!cc.suspends) continue;
+                try w.print("  klio_nat_coro_starter(KLAM_{d}, kcs_{d});\n", .{ lu.body.int(), lu.body.int() });
+            }
         }
         try w.writeAll("}\n\n");
     }
@@ -5799,6 +5838,7 @@ pub fn emit(
             pu.ret.cName(), pu.cid, mangleName(pu.name, &mb),
         });
     }
+
     // One adapter per materialised lambda, and one dispatcher per arity called
     // through a value. A function value's arguments and result pass boxed,
     // because which body runs is a run-time answer and two bodies of the same
@@ -5905,6 +5945,34 @@ pub fn emit(
     if (ctor_classes.items.len != 0) try w.writeAll("\n");
     for (ctor_classes.items) |cid| try writeCtorBody(gpa, w, m, prog, cid);
     if (ctor_classes.items.len != 0) try w.writeAll("\n");
+    // A lambda that suspends and can be handed to `launch` needs a starter:
+    // the driver is given the closure VALUE and has to find the code.
+    for (used_lambdas.items) |lu| {
+        const sc9 = blk10: {
+            for (accepted.items) |*cc| {
+                if (cc.f.id == lu.body) break :blk10 cc;
+            }
+            return false;
+        };
+        if (!sc9.suspends) continue;
+        try w.print("static klio_value kcs_{d}(klio_value self) {{\n  return kco_{d}(kcf_{d}(", .{
+            lu.body.int(), lu.body.int(), lu.body.int(),
+        });
+        for (sc9.caps, 0..) |ct9, ci9| {
+            if (ci9 != 0) try w.writeAll(", ");
+            var gb10: [96]u8 = undefined;
+            const g10 = try std.fmt.bufPrint(&gb10, "klio_nat_get(self, {d})", .{ci9});
+            var ob12: [200]u8 = undefined;
+            try w.print("{s}", .{unboxExpr(ct9.ty, g10, &ob12)});
+        }
+        for (sc9.params, 0..) |p10, pi10| {
+            if (pi10 != 0 or sc9.caps.len != 0) try w.writeAll(", ");
+            const pt10: Ty = tyOf(p10.ty) orelse .object;
+            var zb10: [64]u8 = undefined;
+            try w.print("{s}", .{if (pt10 == .object) "klio_nat_box_unit()" else boxExpr(.unit, "0", &zb10)});
+        }
+        try w.writeAll("), klio_nat_box_unit());\n}\n");
+    }
     for (used_lambdas.items) |lu| {
         const bc2 = blk9: {
             for (accepted.items) |*cc| {
