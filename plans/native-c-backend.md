@@ -461,6 +461,29 @@ evaluation of it yields the same instance — which the emitter had been getting
 wrong by allocating one per evaluation. They are built before the program runs
 and rooted for its life, like an `object` declaration's.
 
+## Resolving a name the lowering left open
+
+The lowering records ONE candidate on a call it could not settle, and the
+interpreter re-resolves such a call from the VALUES at run time. A compiled
+program answers once, so it answers only when the declaration is unambiguous,
+by the rules Kotlin uses in the order Kotlin uses them:
+
+1. A declaration whose parameters the arguments fill outright beats one that
+   needs a default. That single rule separates `atomic(initial)` from
+   `atomic(initial, trace = None)`.
+2. Among those, the more SPECIFIC wins: a parameter naming a machine type or a
+   class is evidence, an erased type parameter is not.
+3. A class of the same name makes it constructor versus factory. The
+   constructor is a candidate only when its parameters take the arguments
+   EXACTLY — Kotlin converts nothing implicitly here, so a `Long` argument does
+   not reach a `ULong` parameter.
+4. A global property of the name, or a function-typed property of an enclosing
+   receiver, outranks a top-level function; either is a refusal.
+
+Two declarations that remain equally good is a question about scope this pass
+does not answer, and stays a refusal. When no function owns the name at all and
+a class does, the call constructs.
+
 ## Iteration, ranges, qualifiers and varargs
 
 `for (x in …)` is the iteration protocol: the container answers an iterator and
@@ -632,8 +655,27 @@ override, so one `next()` call pulled whole families of unrelated iterators
 into the compile and the program refused on one of them. With that and the
 unsigned types, a `for` over a range compiles.
 
-The sweep now reports every accepted program matching the interpreter: 112 of
+The sweep now reports every accepted program matching the interpreter: 113 of
 the 569 examples compile and print what the interpreter prints.
+
+Emitting against the cached image left every library body behind the lazy
+header table, so a property initializer from a pack read as bodyless and
+refused the program. They are decoded on first touch (`Module.ensureFuncBody`),
+and the emitter reaches only what the program can call, so exactly the bodies
+it compiles are materialised. That turned on a great deal of library code at
+once, and with it four more ways a compiled program could answer differently:
+
+- A declared `List` or `Array` result is a runtime value only when the RUNTIME
+  produces it. A Kotlin body declared to return `List` may return a class of
+  its own — the stdlib's `EmptyList` — and calling a runtime list operation on
+  that instance is a wrong answer.
+- A parameter declared as a class WITH STORAGE cannot take a runtime value: a
+  body reading its fields would address a range or a list as an instance. A
+  supertype with no storage still can, which is what `Any` is.
+- A name several declarations answer, which the arguments do not separate, was
+  frozen from the lowering's pick and compiled the wrong overload.
+- A call whose result is Unit has to RUN when its value lands in a reference
+  register, which a bare box name could not express.
 
 Four more holes the wider net found once more library bodies compiled, all of
 them wrong answers rather than missing features:
@@ -675,11 +717,11 @@ a build.
 ## Still refused
 
 Measured across the example corpus with `KLIO_CGEN_TRACE=1`, most common
-first: a reified type parameter used as a value (`T::class`), classes whose
-layout does not resolve (a body property whose initializer does not compile),
-a member the receiver's class does not carry, callable references (`::f`),
-anonymous object literals, `is`/`as`, `finally`, and the calls whose arity
-does not match a declaration for a reason other than a `vararg` or a default.
+first, counting the LAST refusal of each program that failed: a reified type
+parameter used as a value (`T::class`), a member the receiver's class does not
+carry, classes whose layout does not resolve (a body property whose initializer
+does not compile), anonymous object literals (`BuildObject`), a bare name
+inside an inlined receiver body, `finally`, and `QualifiedThis`.
 
 A refusal is reported against the thing that blocked a program, not against
 every candidate the emitter examined. The class-layout table is built for every
@@ -687,9 +729,60 @@ class in the module, so reporting during the build named classes nothing ever
 asked about — mostly library interfaces, which have no layout by their nature,
 and which made up 93 of 125 layout refusals in one sweep.
 
-The distance to the goal is honest: a compiled program must contain every
-function it reaches, and compose and the packs are Kotlin that must therefore
-compile too. Between here and there sit closures that escape, exceptions,
-generics and inline functions, and coroutines as state machines. Each is a
-stage of the same shape as the ones above — widen what compiles, verify against
-the interpreter, keep refusal total so a gap is never a wrong answer.
+Counting EVERY refusal rather than the last one per program measures the
+library surface instead of the programs, and mostly measures noise: the
+emitter tries a body only because something reachable named it, and a pack a
+program never loads contributes thousands of refusals for declarations that
+are simply not in its module. Two aggregates were chased down that way and both
+turned out to be absent packs rather than gaps. Use the per-program last
+refusal.
+
+## Where this stands, and what to pick up next
+
+`scripts/native-c-check.sh` is green at 41 programs; the sweep takes 113 of the
+569 examples and every one of them prints what the interpreter prints. The
+corpus is 569/569 and `zig build test` is green.
+
+Neither of the two programs the goal names compiles yet, and the distance is
+honest:
+
+- **compose.** `examples/compose_color.kt` is the smallest one. It compiles
+  every `Color(...)` construction — the packed-ULong value class, the factory
+  overloads, the constructor the lowering resolves instead of the factory — and
+  stops at `Color.White`, because the companion holding the palette cannot be
+  laid out until `ColorSpaces` can: the colour-science package (`Rgb`, the XYZ
+  transforms, `Adaptation`) brings in `BuildObject`, `TransferParameters` and a
+  long tail of its own. A compose UI program needs all of that plus the
+  composer, the applier and the snapshot system.
+- **ktor.** `examples/channel_segment_namesake.kt` stops at
+  `kotlinx.coroutines.test.runTest`, and behind it the `kotlinx.coroutines`
+  internals: `createCoroutineUnintercepted`, `DispatchedContinuation`,
+  `LockFreeTaskQueue`. `async`/`await`, `Job.join`, `coroutineScope` and
+  `withContext` are pack Kotlin that has to compile, not a surface the emitter
+  can shortcut — the driver is already shared, but the builders are bodies.
+
+The next moves, in the order the measurements put them:
+
+1. **`BuildObject`** — an anonymous object literal. It is a synthesized class
+   the emitter can lay out like any other, and it blocks the colour-science
+   package as well as much of compose's internals.
+2. **Smart casts.** A register narrowed by `if (x is T)` keeps its declared
+   type, so `x.member` inside the branch refuses. The typing pass is one flat
+   array per function, so this needs a per-block overlay for the narrowed
+   registers and a matching read in the emission.
+3. **Reified type parameters.** `T::class` reads the name as a global. The
+   inline splice binds it at the call site; the emitter needs the same binding.
+4. **A bare name inside an inlined receiver body** that resolves to a property
+   of an enclosing class rather than a receiver in scope.
+5. **`QualifiedThis`**, `finally`, and the `MemberRef` forms beyond a
+   top-level function name.
+
+Two things to keep in mind when resuming:
+
+- The image cache is keyed on the klio binary, so the first emission after a
+  rebuild pays one whole lowering per pack selection. That is why the heaviest
+  compose programs report as "too slow to say" in a sweep that follows a build,
+  and it is the same work `klio run` pays.
+- The sweep is the net that catches wrong answers, and every widening so far
+  has caught at least one. Run it before believing a change: the gate alone has
+  never been enough.

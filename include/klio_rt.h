@@ -368,6 +368,24 @@ klio_value klio_nat_stdlib(const char *fqn, const klio_value *argv, uint32_t arg
  * and the collection `iterator()`. Named by the declaration the call site
  * bound, with the receiver first. */
 klio_value klio_nat_member(const char *fqn, const klio_value *argv, uint32_t argc);
+
+/* `a..b` (kind 0) or `a..<b` (kind 1). A range is a runtime value with its own
+ * bound and step resolution, which the interpreter already performs. */
+klio_value klio_nat_range(uint32_t kind, klio_value lhs, klio_value rhs);
+
+/* One property a builtin receiver answers from its own representation: a
+ * progression's `first`, `last` and `step`. */
+klio_value klio_nat_builtin_prop(const char *name, klio_value recv);
+
+/* `x is T` for a value that answers from its own representation. A compiled
+ * instance is tested by its class handle at the call site. */
+int32_t klio_nat_is_type(klio_value v, const char *name, int32_t nullable);
+
+/* Kotlin's `===`: referential identity, never a user `equals`. */
+int32_t klio_nat_value_ident(klio_value a, klio_value b);
+
+/* `x.toString()` for a value with no override of its own. */
+klio_value klio_nat_to_string(klio_value v);
 typedef klio_value (*klio_invoke_fn)(klio_value f, const klio_value *argv);
 void klio_nat_lambda_invoker(uint32_t arity, klio_invoke_fn call);
 

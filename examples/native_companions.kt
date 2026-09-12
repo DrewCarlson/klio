@@ -13,6 +13,13 @@ class Config(val slots: Int) {
     fun describe(): String = Label + ":" + slots
 }
 
+class Parser(val text: String) {
+    companion object {
+        fun of(s: String): Parser = Parser(s)
+        fun width(s: String): Int = s.length
+    }
+}
+
 object Registry {
     val size = 2
 }
@@ -30,4 +37,7 @@ fun main() {
     println(Config.Label)
     println(Registry.size)
     println(Outer.Section(3).grow().width)
+    // A function called on a class name is the companion's too.
+    println(Parser.of("ab").text)
+    println(Parser.width("abcd"))
 }

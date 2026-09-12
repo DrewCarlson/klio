@@ -11682,7 +11682,9 @@ fn compareValues(op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?b
 
 /// Build a `Range` value for `..` / `..<`. Returns `null` for unhandled
 /// operand pairings.
-fn rangeValue(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?Value {
+/// `a..b` / `a..<b` as a value. Reads only its operands, so a compiled program
+/// builds its ranges through the same function the evaluator uses.
+pub fn rangeValue(allocator: Allocator, op: BinOp, l: *const Value, r: *const Value) Allocator.Error!?Value {
     // Resolve the operand pairing to (start, end-bound, kind). UByte/UShort
     // promote to a UInt range, mirroring Kotlin's `UByte.rangeTo` etc.
     var start: i64 = undefined;
