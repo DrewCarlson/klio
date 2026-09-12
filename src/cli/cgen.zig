@@ -1588,6 +1588,18 @@ fn accessPlan(m: *const Module, prog: Program, rc: u32, name: []const u8, set: b
     return .none;
 }
 
+/// Where a property access actually lands. A name the receiver's own class does
+/// not carry may belong to its COMPANION: `Label` read inside a member of
+/// `Config` names `Config.Companion.Label`, and the companion is the singleton
+/// the access runs against.
+fn accessOwner(m: *const Module, prog: Program, rc: u32, name: []const u8, set: bool) ?u32 {
+    if (std.meta.activeTag(accessPlan(m, prog, rc, name, set)) != .none) return null;
+    if (rc >= m.classes.items.len) return null;
+    const cc = companionObjectNamed(m, prog, m.classes.items[rc].fqn) orelse return null;
+    if (std.meta.activeTag(accessPlan(m, prog, cc, name, set)) == .none) return null;
+    return cc;
+}
+
 /// A property read through a type that declares it without storage: an
 /// interface's `val`, or an abstract one. Which getter runs is the receiver's
 /// class, exactly as for a method.
@@ -1709,6 +1721,18 @@ fn instRefuse(f: *const Func, inst: *const ir.Inst) ?Compiled {
     return null;
 }
 
+/// The same, naming the member a call could not bind. Which member a program
+/// needs is the backlog; the instruction tag alone does not say.
+fn instRefuseNamed(m: *const Module, f: *const Func, inst: *const ir.Inst, name_id: ir.ConstId) ?Compiled {
+    if (traceOn()) {
+        const nm = if (name_id.int() < m.consts.items.len) m.consts.items[name_id.int()] else ir.Const{ .Unit = {} };
+        std.debug.print("[cgen] refuse {s}: inst {s} `{s}`\n", .{
+            f.fqn, @tagName(inst.*), if (nm == .String) nm.String else "?",
+        });
+    }
+    return null;
+}
+
 /// A refusal that names the callee, so the trace says which function to teach
 /// the backend next rather than only that some call was not compilable.
 fn noCallee(f: *const Func, callee: *const Func, comptime why: []const u8) ?Compiled {
@@ -1757,6 +1781,45 @@ fn objectClassNamed(m: *const Module, prog: Program, name: []const u8) ?u32 {
         if (!std.mem.eql(u8, c.name, name) and !std.mem.eql(u8, c.fqn, name)) continue;
         if (prog.of(@intCast(i)) == null) return null;
         return @intCast(i);
+    }
+    return null;
+}
+
+/// The object a CLASS name denotes when it is used as a qualifier: `Config` in
+/// `Config.Default` names Config's companion, which is an object declaration
+/// like any other and carries the members the qualifier reads.
+fn companionObjectNamed(m: *const Module, prog: Program, name: []const u8) ?u32 {
+    if (name.len == 0) return null;
+    var buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&buf, "{s}.Companion", .{name})) |qualified| {
+        if (objectClassNamed(m, prog, qualified)) |oc| return oc;
+    } else |_| {}
+    var buf2: [512]u8 = undefined;
+    const simple = std.fmt.bufPrint(&buf2, "{s}.Companion", .{simpleName(name)}) catch return null;
+    return objectClassNamed(m, prog, simple);
+}
+
+/// The class a name denotes when it is read off another class: `Outer.Section`
+/// names a type rather than a value. A class NAME resolves to its companion, so
+/// the enclosing class of a companion is the one that owns the nested names.
+fn classQualifierNamed(m: *const Module, name: []const u8) ?u32 {
+    for (m.classes.items, 0..) |*c, i| {
+        if (std.mem.eql(u8, c.name, name) or std.mem.eql(u8, c.fqn, name)) return @intCast(i);
+    }
+    return null;
+}
+
+fn qualifierOwnerFqn(fqn: []const u8) []const u8 {
+    const tail = ".Companion";
+    if (std.mem.endsWith(u8, fqn, tail)) return fqn[0 .. fqn.len - tail.len];
+    return fqn;
+}
+
+fn nestedClassNamed(m: *const Module, owner_fqn: []const u8, name: []const u8) ?u32 {
+    var buf: [512]u8 = undefined;
+    const want = std.fmt.bufPrint(&buf, "{s}.{s}", .{ owner_fqn, name }) catch return null;
+    for (m.classes.items, 0..) |*c, i| {
+        if (std.mem.eql(u8, c.fqn, want)) return @intCast(i);
     }
     return null;
 }
@@ -2314,7 +2377,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             }
                         }
                     }
-                    const to = numConv(m, cm) orelse return instRefuse(f, inst);
+                    const to = numConv(m, cm) orelse return instRefuseNamed(m, f, inst, cm.name);
                     if (cm.receiver.int() >= f.n_locals or !known[cm.receiver.int()]) return no(f, "conv receiver");
                     const rt2 = types[cm.receiver.int()];
                     if (!isNumericTy(rt2)) return no(f, "conv receiver type");
@@ -2537,6 +2600,10 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                 },
                 .GetField => |gf| {
                     if (gf.receiver.int() >= f.n_locals or !known[gf.receiver.int()]) return no(f, "field receiver");
+                    // A read off a class NAME whose member belongs to that
+                    // class's companion: the companion answers it, so the
+                    // access runs against the companion singleton.
+                    var qual_recv: ?u32 = null;
                     if (staticClassOf(types, cls, gf.receiver.int())) |sc| {
                         if (gf.field.int() >= m.consts.items.len) return no(f, "field name");
                         const enm = m.consts.items[gf.field.int()];
@@ -2549,15 +2616,27 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             known[gf.dst.int()] = true;
                             continue;
                         }
-                        if (enumEntryIndex(m, prog, sc, plainFieldName(enm.String)) == null) return noName(f, "enum member", enm.String);
-                        if (gf.dst.int() >= f.n_locals) return no(f, "entry dst");
-                        types[gf.dst.int()] = .object;
-                        cls[gf.dst.int()] = sc;
-                        known[gf.dst.int()] = true;
-                        continue;
+                        if (sc < m.classes.items.len) {
+                            if (nestedClassNamed(m, qualifierOwnerFqn(m.classes.items[sc].fqn), plainFieldName(enm.String))) |nc| {
+                                if (gf.dst.int() >= f.n_locals) return no(f, "qualifier dst");
+                                types[gf.dst.int()] = .unit;
+                                cls[gf.dst.int()] = nc;
+                                known[gf.dst.int()] = true;
+                                continue;
+                            }
+                        }
+                        if (enumEntryIndex(m, prog, sc, plainFieldName(enm.String))) |_| {
+                            if (gf.dst.int() >= f.n_locals) return no(f, "entry dst");
+                            types[gf.dst.int()] = .object;
+                            cls[gf.dst.int()] = sc;
+                            known[gf.dst.int()] = true;
+                            continue;
+                        }
+                        qual_recv = companionObjectNamed(m, prog, if (sc < m.classes.items.len) m.classes.items[sc].fqn else "") orelse
+                            return noName(f, "enum member", enm.String);
                     }
-                    if (types[gf.receiver.int()] != .object) return no(f, "field on non-object");
-                    const rc = cls[gf.receiver.int()] orelse return no(f, "field receiver class");
+                    if (qual_recv == null and types[gf.receiver.int()] != .object) return no(f, "field on non-object");
+                    var rc = qual_recv orelse (cls[gf.receiver.int()] orelse return no(f, "field receiver class"));
                     if (rc == STRING_CLS or rc == LIST_CLS or rc == ARRAY_CLS) {
                         const snm = m.consts.items[gf.field.int()];
                         if (snm != .String) return no(f, "builtin member name");
@@ -2571,6 +2650,23 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (gf.field.int() >= m.consts.items.len) return no(f, "field name");
                     const nm = m.consts.items[gf.field.int()];
                     if (nm != .String) return no(f, "field name kind");
+                    // A nested class read off its outer names a type, not a
+                    // value: the register is a qualifier and holds nothing.
+                    if (rc < m.classes.items.len) {
+                        if (nestedClassNamed(m, qualifierOwnerFqn(m.classes.items[rc].fqn), plainFieldName(nm.String))) |nc| {
+                            if (gf.dst.int() >= f.n_locals) return no(f, "qualifier dst");
+                            types[gf.dst.int()] = .unit;
+                            cls[gf.dst.int()] = nc;
+                            known[gf.dst.int()] = true;
+                            continue;
+                        }
+                    }
+                    if (qual_recv == null) {
+                        if (accessOwner(m, prog, rc, nm.String, false)) |cc| {
+                            rc = cc;
+                            qual_recv = cc;
+                        }
+                    }
                     switch (accessPlan(m, prog, rc, nm.String, false)) {
                         .none => {
                             // Name why the class has no layout, when that is
@@ -2645,7 +2741,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (lg.name.int() >= m.consts.items.len) return no(f, "global name");
                     const gn = m.consts.items[lg.name.int()];
                     if (gn != .String) return no(f, "global name kind");
-                    if (objectClassNamed(m, prog, gn.String)) |oc| {
+                    if (objectClassNamed(m, prog, gn.String) orelse
+                        companionObjectNamed(m, prog, gn.String)) |oc|
+                    {
                         if (lg.dst.int() >= f.n_locals) return no(f, "singleton dst");
                         types[lg.dst.int()] = .object;
                         cls[lg.dst.int()] = oc;
@@ -2672,6 +2770,18 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         cls[lg.dst.int()] = ec;
                         known[lg.dst.int()] = true;
                         continue;
+                    }
+                    // Any other class name is a qualifier too: `Outer` in
+                    // `Outer.Section` names the type the nested name is read
+                    // off. A global of the same name is a value and wins.
+                    if (globalIndex(globals, gn.String) == null) {
+                        if (classQualifierNamed(m, gn.String)) |qc| {
+                            if (lg.dst.int() >= f.n_locals) return no(f, "qualifier dst");
+                            types[lg.dst.int()] = .unit;
+                            cls[lg.dst.int()] = qc;
+                            known[lg.dst.int()] = true;
+                            continue;
+                        }
                     }
                     const gi = globalIndex(globals, gn.String) orelse return noName(f, "global not declared", gn.String);
                     if (lg.dst.int() >= f.n_locals) return no(f, "global dst");
@@ -4064,7 +4174,16 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     try w.writeAll(");\n");
                 },
                 .GetField => |gf| {
-                    const rc = c.cls[gf.receiver.int()].?;
+                    // A read whose result NAMES a class resolves at emit time
+                    // and leaves nothing behind, exactly as loading the name
+                    // of a class does.
+                    if (staticClassOf(c.types, c.cls, gf.dst.int()) != null) continue;
+                    var rc = c.cls[gf.receiver.int()].?;
+                    // Where the value is read FROM: the receiver register, or
+                    // the companion singleton when the receiver is a class
+                    // name that answers through its companion.
+                    var qrb: [32]u8 = undefined;
+                    var recv_txt: []const u8 = regName(c, gf.receiver.int(), &qrb);
                     if (staticClassOf(c.types, c.cls, gf.receiver.int())) |sc| {
                         const enm = m.consts.items[gf.field.int()].String;
                         if (numClsTy(sc)) |bt3| {
@@ -4075,12 +4194,19 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             });
                             continue;
                         }
-                        const ei2 = enumEntryIndex(m, prog, sc, plainFieldName(enm)).?;
-                        var nb3: [32]u8 = undefined;
-                        try w.print("  {s} = KO[{d}];\n", .{
-                            regName(c, gf.dst.int(), &nb3), singletonSlot(singletons, sc, ei2).?,
-                        });
-                        continue;
+                        if (enumEntryIndex(m, prog, sc, plainFieldName(enm))) |ei2| {
+                            var nb3: [32]u8 = undefined;
+                            try w.print("  {s} = KO[{d}];\n", .{
+                                regName(c, gf.dst.int(), &nb3), singletonSlot(singletons, sc, ei2).?,
+                            });
+                            continue;
+                        }
+                        rc = companionObjectNamed(m, prog, m.classes.items[sc].fqn).?;
+                        recv_txt = try std.fmt.bufPrint(&qrb, "KO[{d}]", .{singletonSlot(singletons, rc, null).?});
+                    } else if (accessOwner(m, prog, rc, m.consts.items[gf.field.int()].String, false)) |cc| {
+                        // The name is the companion's, not the receiver's.
+                        rc = cc;
+                        recv_txt = try std.fmt.bufPrint(&qrb, "KO[{d}]", .{singletonSlot(singletons, cc, null).?});
                     }
                     if (rc == STRING_CLS or rc == LIST_CLS or rc == ARRAY_CLS) {
                         var nb: [32]u8 = undefined;
@@ -4101,29 +4227,26 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         .none => unreachable,
                         .virtual => {
                             var nb17: [32]u8 = undefined;
-                            var rb17: [32]u8 = undefined;
                             var mangled: [96]u8 = undefined;
                             try w.print("  {s} = kprop_{d}_{s}({s});\n", .{
                                 regName(c, gf.dst.int(), &nb17), rc,
-                                mangleName(plainFieldName(nm), &mangled), regName(c, gf.receiver.int(), &rb17),
+                                mangleName(plainFieldName(nm), &mangled), recv_txt,
                             });
                         },
                         .accessor => |gacc| {
                             const gfn = m.funcById(gacc).?;
                             var nb2: [32]u8 = undefined;
-                            var rb2: [32]u8 = undefined;
                             var sym2: std.Io.Writer.Allocating = .init(gpa);
                             defer sym2.deinit();
                             try writeSymbol(&sym2.writer, gfn);
                             try w.print("  {s} = {s}({s});\n", .{
-                                regName(c, gf.dst.int(), &nb2), sym2.written(), regName(c, gf.receiver.int(), &rb2),
+                                regName(c, gf.dst.int(), &nb2), sym2.written(), recv_txt,
                             });
                         },
                         .field => |idx| {
                             var nb: [32]u8 = undefined;
-                            var rb: [32]u8 = undefined;
                             var ub: [128]u8 = undefined;
-                            const get = try std.fmt.bufPrint(&ub, "klio_nat_get({s}, {d})", .{ regName(c, gf.receiver.int(), &rb), idx });
+                            const get = try std.fmt.bufPrint(&ub, "klio_nat_get({s}, {d})", .{ recv_txt, idx });
                             var ob: [160]u8 = undefined;
                             try w.print("  {s} = {s};\n", .{
                                 regName(c, gf.dst.int(), &nb), unboxExpr(c.types[gf.dst.int()], get, &ob),
@@ -5176,26 +5299,41 @@ pub fn emit(
         try accepted.append(gpa, c);
         for (f.blocks) |*blk| {
             for (blk.insts) |*inst| {
-                if (inst.* == .LoadGlobal) {
-                    const cid3 = inst.LoadGlobal.name;
-                    if (cid3.int() < m.consts.items.len) {
-                        const gn3 = m.consts.items[cid3.int()];
-                        if (gn3 == .String) {
-                            if (objectClassNamed(m, prog, gn3.String)) |oc| {
-                                var have_o = false;
-                                for (constructed.items) |uo| {
-                                    if (uo == oc) have_o = true;
-                                }
-                                if (!have_o) try constructed.append(gpa, oc);
-                                for (prog.of(oc).?) |fd| {
-                                    const ifid = fd.init orelse continue;
-                                    const ifn = m.funcById(ifid) orelse return false;
-                                    if (seen.contains(ifn.id.int())) continue;
-                                    try seen.put(ifn.id.int(), {});
-                                    try queue.append(gpa, .{ .f = ifn, .synth = null });
-                                }
-                            }
+                // The one instance an `object` declaration has, named either
+                // by its own name or through the class whose companion it is.
+                const singleton_cid: ?u32 = switch (inst.*) {
+                    .LoadGlobal => |lg4| blk4: {
+                        if (lg4.name.int() >= m.consts.items.len) break :blk4 null;
+                        const gn4 = m.consts.items[lg4.name.int()];
+                        if (gn4 != .String) break :blk4 null;
+                        break :blk4 objectClassNamed(m, prog, gn4.String) orelse
+                            companionObjectNamed(m, prog, gn4.String);
+                    },
+                    .GetField => |gf4| blk5: {
+                        if (gf4.field.int() >= m.consts.items.len) break :blk5 null;
+                        const fn4 = m.consts.items[gf4.field.int()];
+                        if (fn4 != .String) break :blk5 null;
+                        if (staticClassOf(c.types, c.cls, gf4.receiver.int())) |sc4| {
+                            if (sc4 >= m.classes.items.len) break :blk5 null;
+                            break :blk5 companionObjectNamed(m, prog, m.classes.items[sc4].fqn);
                         }
+                        const rc4 = c.cls[gf4.receiver.int()] orelse break :blk5 null;
+                        break :blk5 accessOwner(m, prog, rc4, fn4.String, false);
+                    },
+                    else => null,
+                };
+                if (singleton_cid) |oc| {
+                    var have_o = false;
+                    for (constructed.items) |uo| {
+                        if (uo == oc) have_o = true;
+                    }
+                    if (!have_o) try constructed.append(gpa, oc);
+                    for (prog.of(oc).?) |fd| {
+                        const ifid = fd.init orelse continue;
+                        const ifn = m.funcById(ifid) orelse return false;
+                        if (seen.contains(ifn.id.int())) continue;
+                        try seen.put(ifn.id.int(), {});
+                        try queue.append(gpa, .{ .f = ifn, .synth = null });
                     }
                 }
                 // A referenced global drags in the thunk that initializes it.
@@ -5678,6 +5816,24 @@ pub fn emit(
                 // once, exactly like an `object` declaration's.
                 if (inst.* == .GetField) {
                     const gf3 = inst.GetField;
+                    // A property the receiver's own class does not carry is its
+                    // companion's, and that singleton has to exist.
+                    if (staticClassOf(c.types, c.cls, gf3.receiver.int()) == null) {
+                        if (gf3.field.int() < m.consts.items.len) {
+                            const fnm3 = m.consts.items[gf3.field.int()];
+                            if (fnm3 == .String) {
+                                if (c.cls[gf3.receiver.int()]) |rc3| {
+                                    if (accessOwner(m, prog, rc3, fnm3.String, false)) |cc3| {
+                                        var have_c3 = false;
+                                        for (used_singletons.items) |u| {
+                                            if (u.cid == cc3 and u.entry == null) have_c3 = true;
+                                        }
+                                        if (!have_c3) try used_singletons.append(gpa, .{ .cid = cc3 });
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if (staticClassOf(c.types, c.cls, gf3.receiver.int())) |sc2| {
                         const enm2 = m.consts.items[gf3.field.int()];
                         if (enm2 == .String) {
@@ -5687,6 +5843,17 @@ pub fn emit(
                                     if (u.cid == sc2 and u.entry != null and u.entry.? == ei3) have_e = true;
                                 }
                                 if (!have_e) try used_singletons.append(gpa, .{ .cid = sc2, .entry = ei3 });
+                            } else if (sc2 < m.classes.items.len) {
+                                // A member read off a class name answers from
+                                // that class's companion, which is a singleton
+                                // the program has to build.
+                                if (companionObjectNamed(m, prog, m.classes.items[sc2].fqn)) |cc2| {
+                                    var have_c = false;
+                                    for (used_singletons.items) |u| {
+                                        if (u.cid == cc2 and u.entry == null) have_c = true;
+                                    }
+                                    if (!have_c) try used_singletons.append(gpa, .{ .cid = cc2 });
+                                }
                             }
                         }
                     }
@@ -5697,7 +5864,8 @@ pub fn emit(
                 if (cid2.int() >= m.consts.items.len) continue;
                 const gn2 = m.consts.items[cid2.int()];
                 if (gn2 != .String) continue;
-                const oc = objectClassNamed(m, prog, gn2.String) orelse continue;
+                const oc = objectClassNamed(m, prog, gn2.String) orelse
+                    companionObjectNamed(m, prog, gn2.String) orelse continue;
                 var have2 = false;
                 for (used_singletons.items) |u| {
                     if (u.cid == oc and u.entry == null) have2 = true;
