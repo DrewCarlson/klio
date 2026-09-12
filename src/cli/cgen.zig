@@ -898,10 +898,20 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
 
 /// A property access inside the declaring class carries a synthesized accessor
 /// name (`$sgetter$<Class><US><field>`); the stored field is the tail.
+/// Whether this spelling names the BACKING FIELD rather than the property: the
+/// lowering marks a `field` read or write inside an accessor this way, and
+/// everything else goes through the accessor when one is declared.
+fn isBackingAccess(name: []const u8) bool {
+    return std.mem.startsWith(u8, name, "$sgetter$") or
+        std.mem.startsWith(u8, name, "$ssetter$") or
+        std.mem.startsWith(u8, name, "__klio_field__");
+}
+
 fn plainFieldName(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "$sgetter$") or std.mem.startsWith(u8, name, "$ssetter$")) {
         if (std.mem.lastIndexOfScalar(u8, name, 0x1f)) |i| return name[i + 1 ..];
     }
+    if (std.mem.startsWith(u8, name, "__klio_field__")) return name["__klio_field__".len..];
     return name;
 }
 
@@ -1400,6 +1410,37 @@ fn typeHasSlot(m: *const Module, cid: u32, root: *const Func) bool {
         }
     }
     return false;
+}
+
+/// How a property read or write on a receiver of a known class is performed.
+/// One place decides, because the typing pass, the emission, the reachable set
+/// and the dispatcher list all have to agree on the answer.
+const AccessPlan = union(enum) {
+    /// Straight to the field at this index.
+    field: u32,
+    /// Through the accessor the class declares.
+    accessor: ir.FuncId,
+    /// Through a dispatcher: the type declares it without storage here, and
+    /// which class answers is a run-time question.
+    virtual,
+    none,
+};
+
+fn accessPlan(m: *const Module, prog: Program, rc: u32, name: []const u8, set: bool) AccessPlan {
+    if (isBuiltinCls(rc)) return .none;
+    // A `field` read or write inside an accessor reaches the storage; anything
+    // else goes through the accessor when the class declares one, even if the
+    // property also has a backing field.
+    if (!isBackingAccess(name)) {
+        const acc = if (set)
+            prog.accessor(m, rc, name, .set)
+        else
+            prog.accessor(m, rc, name, .get);
+        if (acc) |a| return .{ .accessor = a };
+    }
+    if (fieldIndex(prog, rc, name)) |idx| return .{ .field = idx };
+    if (!set and virtualProp(m, prog, rc, plainFieldName(name)) != null) return .virtual;
+    return .none;
 }
 
 /// A property read through a type that declares it without storage: an
@@ -2245,37 +2286,38 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (gf.field.int() >= m.consts.items.len) return no(f, "field name");
                     const nm = m.consts.items[gf.field.int()];
                     if (nm != .String) return no(f, "field name kind");
-                    const idx = fieldIndex(prog, rc, nm.String) orelse {
-                        // No storage: a computed property reads through the
-                        // getter it declares, which is an ordinary method.
-                        const g = prog.accessor(m, rc, nm.String, .get) orelse {
-                            // Declared without storage where the receiver
-                            // stands — an interface's `val` — and computed by
-                            // whatever class answers at run time.
-                            const vp = virtualProp(m, prog, rc, nm.String) orelse
-                                return noName(f, "field not laid out", nm.String);
+                    switch (accessPlan(m, prog, rc, nm.String, false)) {
+                        .none => return noName(f, "field not laid out", nm.String),
+                        .virtual => {
+                            const vp = virtualProp(m, prog, rc, plainFieldName(nm.String)).?;
                             if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
                             types[gf.dst.int()] = vp.ret;
                             cls[gf.dst.int()] = vp.cls;
                             elem[gf.dst.int()] = vp.elem;
                             known[gf.dst.int()] = true;
                             continue;
-                        };
-                        const gfn = m.funcById(g) orelse return no(f, "getter body");
-                        const gt = funcRetTy2(m, gfn) orelse return no(f, "getter return type");
-                        if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
-                        types[gf.dst.int()] = gt;
-                        if (gt == .object) cls[gf.dst.int()] = classIndexOfName(m, gfn.return_ty);
- if (refElemOf(cls[gf.dst.int()], gfn.return_ty)) |re_| elem[gf.dst.int()] = re_;
-                        known[gf.dst.int()] = true;
-                        continue;
-                    };
-                    const fields = prog.of(rc).?;
-                    if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
-                    types[gf.dst.int()] = fields[idx].ty;
-                    cls[gf.dst.int()] = fields[idx].cls;
-                    elem[gf.dst.int()] = fields[idx].elem;
-                    known[gf.dst.int()] = true;
+                        },
+                        .accessor => |g| {
+                            const gfn = m.funcById(g) orelse return no(f, "getter body");
+                            const gt = funcRetTy2(m, gfn) orelse return no(f, "getter return type");
+                            if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
+                            types[gf.dst.int()] = gt;
+                            if (gt == .object) {
+                                cls[gf.dst.int()] = classIndexOfName(m, gfn.return_ty);
+                                if (refElemOf(cls[gf.dst.int()], gfn.return_ty)) |re_| elem[gf.dst.int()] = re_;
+                            }
+                            known[gf.dst.int()] = true;
+                            continue;
+                        },
+                        .field => |idx| {
+                            const fields = prog.of(rc).?;
+                            if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
+                            types[gf.dst.int()] = fields[idx].ty;
+                            cls[gf.dst.int()] = fields[idx].cls;
+                            elem[gf.dst.int()] = fields[idx].elem;
+                            known[gf.dst.int()] = true;
+                        },
+                    }
                 },
                 .SetField => |sf| {
                     if (sf.receiver.int() >= f.n_locals or !known[sf.receiver.int()]) return no(f, "field receiver");
@@ -2284,21 +2326,24 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (sf.field.int() >= m.consts.items.len) return no(f, "field name");
                     const nm = m.consts.items[sf.field.int()];
                     if (nm != .String) return no(f, "field name kind");
-                    const idx = fieldIndex(prog, rc, nm.String) orelse {
-                        const st = prog.accessor(m, rc, nm.String, .set) orelse return noName(f, "field not laid out", nm.String);
-                        const sfn = m.funcById(st) orelse return no(f, "setter body");
-                        if (sf.value.int() >= f.n_locals or !known[sf.value.int()]) return no(f, "field value");
-                        // The setter's own parameter decides what it is handed.
-                        const want: Ty = if (sfn.params.len >= 2)
-                            (tyOf(sfn.params[1].ty) orelse .object)
-                        else
-                            return no(f, "setter arity");
-                        if (want != .object and types[sf.value.int()] != want) return no(f, "setter value type");
-                        continue;
-                    };
-                    const fields = prog.of(rc).?;
-                    if (sf.value.int() >= f.n_locals or !known[sf.value.int()]) return no(f, "field value");
-                    if (types[sf.value.int()] != fields[idx].ty) return no(f, "field value type");
+                    switch (accessPlan(m, prog, rc, nm.String, true)) {
+                        .none, .virtual => return noName(f, "field not laid out", nm.String),
+                        .accessor => |st| {
+                            const sfn = m.funcById(st) orelse return no(f, "setter body");
+                            if (sf.value.int() >= f.n_locals or !known[sf.value.int()]) return no(f, "field value");
+                            // The setter's own parameter decides what it takes.
+                            const want: Ty = if (sfn.params.len >= 2)
+                                (tyOf(sfn.params[1].ty) orelse .object)
+                            else
+                                return no(f, "setter arity");
+                            if (want != .object and types[sf.value.int()] != want) return no(f, "setter value type");
+                        },
+                        .field => |idx| {
+                            const fields = prog.of(rc).?;
+                            if (sf.value.int() >= f.n_locals or !known[sf.value.int()]) return no(f, "field value");
+                            if (types[sf.value.int()] != fields[idx].ty) return no(f, "field value type");
+                        },
+                    }
                 },
                 .LoadGlobal => |lg| {
                     if (lg.name.int() >= m.consts.items.len) return no(f, "global name");
@@ -3426,65 +3471,67 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         continue;
                     }
                     const nm = m.consts.items[gf.field.int()].String;
-                    const idx = fieldIndex(prog, rc, nm) orelse {
-                        // Computed: the value comes from the getter, called
-                        // like any other method with the receiver first.
-                        const gacc = prog.accessor(m, rc, nm, .get) orelse {
+                    switch (accessPlan(m, prog, rc, nm, false)) {
+                        .none => unreachable,
+                        .virtual => {
                             var nb17: [32]u8 = undefined;
                             var rb17: [32]u8 = undefined;
                             var mangled: [96]u8 = undefined;
                             try w.print("  {s} = kprop_{d}_{s}({s});\n", .{
                                 regName(c, gf.dst.int(), &nb17), rc,
-                                mangleName(nm, &mangled), regName(c, gf.receiver.int(), &rb17),
+                                mangleName(plainFieldName(nm), &mangled), regName(c, gf.receiver.int(), &rb17),
                             });
-                            continue;
-                        };
-                        const gfn = m.funcById(gacc).?;
-                        var nb2: [32]u8 = undefined;
-                        var rb2: [32]u8 = undefined;
-                        var sym2: std.Io.Writer.Allocating = .init(gpa);
-                        defer sym2.deinit();
-                        try writeSymbol(&sym2.writer, gfn);
-                        try w.print("  {s} = {s}({s});\n", .{
-                            regName(c, gf.dst.int(), &nb2), sym2.written(), regName(c, gf.receiver.int(), &rb2),
-                        });
-                        continue;
-                    };
-                    var nb: [32]u8 = undefined;
-                    var rb: [32]u8 = undefined;
-                    var ub: [128]u8 = undefined;
-                    const get = try std.fmt.bufPrint(&ub, "klio_nat_get({s}, {d})", .{ regName(c, gf.receiver.int(), &rb), idx });
-                    var ob: [160]u8 = undefined;
-                    try w.print("  {s} = {s};\n", .{
-                        regName(c, gf.dst.int(), &nb), unboxExpr(c.types[gf.dst.int()], get, &ob),
-                    });
+                        },
+                        .accessor => |gacc| {
+                            const gfn = m.funcById(gacc).?;
+                            var nb2: [32]u8 = undefined;
+                            var rb2: [32]u8 = undefined;
+                            var sym2: std.Io.Writer.Allocating = .init(gpa);
+                            defer sym2.deinit();
+                            try writeSymbol(&sym2.writer, gfn);
+                            try w.print("  {s} = {s}({s});\n", .{
+                                regName(c, gf.dst.int(), &nb2), sym2.written(), regName(c, gf.receiver.int(), &rb2),
+                            });
+                        },
+                        .field => |idx| {
+                            var nb: [32]u8 = undefined;
+                            var rb: [32]u8 = undefined;
+                            var ub: [128]u8 = undefined;
+                            const get = try std.fmt.bufPrint(&ub, "klio_nat_get({s}, {d})", .{ regName(c, gf.receiver.int(), &rb), idx });
+                            var ob: [160]u8 = undefined;
+                            try w.print("  {s} = {s};\n", .{
+                                regName(c, gf.dst.int(), &nb), unboxExpr(c.types[gf.dst.int()], get, &ob),
+                            });
+                        },
+                    }
                 },
                 .SetField => |sf| {
                     const rc = c.cls[sf.receiver.int()].?;
                     const nm = m.consts.items[sf.field.int()].String;
-                    const idx = fieldIndex(prog, rc, nm) orelse {
-                        const sfn = m.funcById(prog.accessor(m, rc, nm, .set).?).?;
-                        var rb3: [32]u8 = undefined;
-                        var vb3: [32]u8 = undefined;
-                        var bx3: [96]u8 = undefined;
-                        var sym3: std.Io.Writer.Allocating = .init(gpa);
-                        defer sym3.deinit();
-                        try writeSymbol(&sym3.writer, sfn);
-                        const want3: Ty = if (sfn.params.len >= 2) (tyOf(sfn.params[1].ty) orelse .object) else .object;
-                        const arg3 = if (want3 == .object and c.types[sf.value.int()] != .object)
-                            boxExpr(c.types[sf.value.int()], regName(c, sf.value.int(), &vb3), &bx3)
-                        else
-                            regName(c, sf.value.int(), &vb3);
-                        try w.print("  {s}({s}, {s});\n", .{ sym3.written(), regName(c, sf.receiver.int(), &rb3), arg3 });
-                        continue;
-                    };
-                    var rb: [32]u8 = undefined;
-                    var vb: [32]u8 = undefined;
-                    var bb: [96]u8 = undefined;
-                    try w.print("  klio_nat_set({s}, {d}, {s});\n", .{
-                        regName(c, sf.receiver.int(), &rb), idx,
-                        boxExpr(c.types[sf.value.int()], regName(c, sf.value.int(), &vb), &bb),
-                    });
+                    switch (accessPlan(m, prog, rc, nm, true)) {
+                        .none, .virtual => unreachable,
+                        .accessor => |sacc| {
+                            const sfn = m.funcById(sacc).?;
+                            var rb3: [32]u8 = undefined;
+                            var vb3: [32]u8 = undefined;
+                            var bx3: [96]u8 = undefined;
+                            var sym3: std.Io.Writer.Allocating = .init(gpa);
+                            defer sym3.deinit();
+                            try writeSymbol(&sym3.writer, sfn);
+                            const want3: Ty = if (sfn.params.len >= 2) (tyOf(sfn.params[1].ty) orelse .object) else .object;
+                            const arg3 = convExpr(c.types[sf.value.int()], want3, regName(c, sf.value.int(), &vb3), &bx3);
+                            try w.print("  {s}({s}, {s});\n", .{ sym3.written(), regName(c, sf.receiver.int(), &rb3), arg3 });
+                        },
+                        .field => |idx| {
+                            var rb: [32]u8 = undefined;
+                            var vb: [32]u8 = undefined;
+                            var bb: [96]u8 = undefined;
+                            try w.print("  klio_nat_set({s}, {d}, {s});\n", .{
+                                regName(c, sf.receiver.int(), &rb), idx,
+                                boxExpr(c.types[sf.value.int()], regName(c, sf.value.int(), &vb), &bb),
+                            });
+                        },
+                    }
                 },
                 .BinOp => |b| {
                     const dt = c.types[b.dst.int()];
@@ -4093,9 +4140,12 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
             },
             .Branch => |br| {
                 var cb: [32]u8 = undefined;
-                try w.print("  if ({s}) goto B{d}; else goto B{d};\n", .{
-                    regName(c, br.cond.int(), &cb), br.t.int(), br.f.int(),
-                });
+                var ub7: [96]u8 = undefined;
+                // A condition is a Boolean in Kotlin even when it arrives
+                // boxed — a property read through a dispatcher, say — so it
+                // unboxes here rather than being tested as a reference.
+                const cond = convExpr(c.types[br.cond.int()], .boolean, regName(c, br.cond.int(), &cb), &ub7);
+                try w.print("  if ({s}) goto B{d}; else goto B{d};\n", .{ cond, br.t.int(), br.f.int() });
             },
             .Throw => |t| {
                 var tb: [32]u8 = undefined;
@@ -4541,32 +4591,31 @@ pub fn emit(
                 if (acc) |a2| {
                     if (!isBuiltinCls(a2.rc) and a2.name.int() < m.consts.items.len) {
                         const anm = m.consts.items[a2.name.int()];
-                        if (anm == .String and fieldIndex(prog, a2.rc, anm.String) == null) {
-                            const fid2 = if (a2.set)
-                                prog.accessor(m, a2.rc, anm.String, .set)
-                            else
-                                prog.accessor(m, a2.rc, anm.String, .get);
-                            if (fid2 == null and !a2.set) {
-                                // Read through a type that declares it without
-                                // storage: every class beneath that type may
-                                // answer, so every getter is reachable.
-                                var pc: u32 = 0;
-                                while (pc < m.classes.items.len) : (pc += 1) {
-                                    if (prog.of(pc) == null) continue;
-                                    if (!typeReaches(m, pc, a2.rc)) continue;
-                                    const pg = prog.accessor(m, pc, anm.String, .get) orelse continue;
-                                    const pfn = m.funcById(pg) orelse return false;
-                                    if (seen.contains(pfn.id.int())) continue;
-                                    try seen.put(pfn.id.int(), {});
-                                    try queue.append(gpa, .{ .f = pfn, .synth = null });
-                                }
-                            }
-                            if (fid2) |fid3| {
-                                const afn = m.funcById(fid3) orelse return false;
-                                if (!seen.contains(afn.id.int())) {
-                                    try seen.put(afn.id.int(), {});
-                                    try queue.append(gpa, .{ .f = afn, .synth = null });
-                                }
+                        if (anm == .String) {
+                            switch (accessPlan(m, prog, a2.rc, anm.String, a2.set)) {
+                                .accessor => |fid3| {
+                                    const afn = m.funcById(fid3) orelse return false;
+                                    if (!seen.contains(afn.id.int())) {
+                                        try seen.put(afn.id.int(), {});
+                                        try queue.append(gpa, .{ .f = afn, .synth = null });
+                                    }
+                                },
+                                .virtual => {
+                                    // Every class beneath the receiver's type
+                                    // may answer, so every getter is reachable.
+                                    const pn = plainFieldName(anm.String);
+                                    var pc: u32 = 0;
+                                    while (pc < m.classes.items.len) : (pc += 1) {
+                                        if (prog.of(pc) == null) continue;
+                                        if (!typeReaches(m, pc, a2.rc)) continue;
+                                        const pg = prog.accessor(m, pc, pn, .get) orelse continue;
+                                        const pfn = m.funcById(pg) orelse return false;
+                                        if (seen.contains(pfn.id.int())) continue;
+                                        try seen.put(pfn.id.int(), {});
+                                        try queue.append(gpa, .{ .f = pfn, .synth = null });
+                                    }
+                                },
+                                .field, .none => {},
                             }
                         }
                     }
@@ -4819,14 +4868,14 @@ pub fn emit(
                 if (staticClassOf(c.types, c.cls, gf4.receiver.int()) != null) continue;
                 const nm4 = m.consts.items[gf4.field.int()];
                 if (nm4 != .String) continue;
-                if (fieldIndex(prog, rc4, nm4.String) != null) continue;
-                if (prog.accessor(m, rc4, nm4.String, .get) != null) continue;
-                const vp4 = virtualProp(m, prog, rc4, nm4.String) orelse continue;
+                if (accessPlan(m, prog, rc4, nm4.String, false) != .virtual) continue;
+                const pname = plainFieldName(nm4.String);
+                const vp4 = virtualProp(m, prog, rc4, pname) orelse continue;
                 var have_p = false;
                 for (used_props.items) |u| {
-                    if (u.cid == rc4 and std.mem.eql(u8, u.name, nm4.String)) have_p = true;
+                    if (u.cid == rc4 and std.mem.eql(u8, u.name, pname)) have_p = true;
                 }
-                if (!have_p) try used_props.append(gpa, .{ .name = nm4.String, .cid = rc4, .ret = vp4.ret });
+                if (!have_p) try used_props.append(gpa, .{ .name = pname, .cid = rc4, .ret = vp4.ret });
             }
         }
     }

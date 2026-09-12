@@ -657,6 +657,15 @@ pub fn lowerSetterBlockTyped(
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     func.params = try accessorParams(allocator, params, owner_class, null);
+    // The value parameter's declared type belongs on the signature too: a
+    // consumer that reads `Func.params` — the native emitter — has no other
+    // place to learn what a setter takes.
+    if (value_ty_head) |vh| {
+        for (func.params) |*fp| {
+            if (!std.mem.eql(u8, fp.name, value_name)) continue;
+            fp.ty = .{ .name = vh, .nullable = value_nullable, .args = &.{} };
+        }
+    }
     func.has_receiver_param = leadsWithThis(params);
     return pushFuncSpanned(module, func, block.span);
 }
@@ -687,6 +696,15 @@ pub fn lowerSetterExprTyped(
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     func.params = try accessorParams(allocator, params, owner_class, null);
+    // The value parameter's declared type belongs on the signature too: a
+    // consumer that reads `Func.params` — the native emitter — has no other
+    // place to learn what a setter takes.
+    if (value_ty_head) |vh| {
+        for (func.params) |*fp| {
+            if (!std.mem.eql(u8, fp.name, value_name)) continue;
+            fp.ty = .{ .name = vh, .nullable = value_nullable, .args = &.{} };
+        }
+    }
     func.has_receiver_param = leadsWithThis(params);
     return pushFuncSpanned(module, func, expr.span());
 }

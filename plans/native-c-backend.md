@@ -427,6 +427,18 @@ set. It found eight, and each was a real hole rather than a missing feature:
 - A property declared without storage where the receiver stands — an
   interface's `val` — reads through a dispatcher on the receiver's class, and
   an override that STORES it answers with the field.
+- A property with a declared getter is READ through it even when it also has a
+  backing field; only a `field` access inside the accessor reaches the storage.
+  Reading the field directly skipped every custom accessor in the program.
+- A condition is a Boolean in Kotlin even when it arrives boxed, so it unboxes
+  at the branch rather than being tested as a reference.
+
+ONE place decides how a property is accessed — field, accessor, or dispatcher —
+because the typing pass, the emission, the reachable set and the dispatcher
+list all have to give the same answer, and they had drifted: the emitter called
+a dispatcher the collector had decided not to emit.
+
+The sweep now reports every accepted program matching the interpreter.
 
 ## Still refused
 
