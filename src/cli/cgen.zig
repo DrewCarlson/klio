@@ -160,6 +160,14 @@ fn isNumericTy(t: Ty) bool {
     };
 }
 
+/// The machine type a parameter takes. A `vararg` parameter holds an ARRAY of
+/// its declared type rather than one of them: the call site collects the
+/// trailing arguments into one, exactly as the interpreter packs them.
+fn paramTy(p: ir.Param) Ty {
+    if (p.is_vararg) return .object;
+    return tyOf(p.ty) orelse .object;
+}
+
 fn isStringReg(types: []const Ty, cls: []const ?u32, r: u32) bool {
     return types[r] == .object and cls[r] != null and cls[r].? == STRING_CLS;
 }
@@ -477,6 +485,23 @@ fn primArrayKind(name: []const u8) ?u32 {
     if (std.mem.eql(u8, tail, "BooleanArray")) return 6;
     if (std.mem.eql(u8, tail, "CharArray")) return 7;
     return null;
+}
+
+/// The primitive-array kind a machine type packs into, in the order the
+/// runtime's `klio_nat_prim_array` names them. A reference element has none:
+/// it goes into an `Array<T>`.
+fn primKindOfTy(t: Ty) ?u32 {
+    return switch (t) {
+        .i32 => 0,
+        .i64 => 1,
+        .f64 => 2,
+        .f32 => 3,
+        .short => 4,
+        .byte => 5,
+        .boolean => 6,
+        .char => 7,
+        else => null,
+    };
 }
 
 /// The element type a primitive array holds.
@@ -1218,6 +1243,13 @@ const MAX_CALL_PARAMS: u32 = 32;
 const ArgBinding = struct {
     regs: [MAX_CALL_PARAMS]?u32 = @splat(null),
     n: u32 = 0,
+    /// The `vararg` parameter, when the callee declares one: the trailing
+    /// positional arguments are collected into an array rather than bound one
+    /// to a parameter each. `regs` holds nothing for it.
+    vararg_param: ?u32 = null,
+    /// The contiguous register run those arguments occupy.
+    vararg_base: u32 = 0,
+    vararg_n: u32 = 0,
 };
 
 fn bindCallArgs(
@@ -1229,6 +1261,12 @@ fn bindCallArgs(
 ) ?ArgBinding {
     if (params.len > MAX_CALL_PARAMS) return null;
     var b: ArgBinding = .{ .n = @intCast(params.len) };
+    for (params, 0..) |p, pi| {
+        if (p.is_vararg) {
+            b.vararg_param = @intCast(pi);
+            break;
+        }
+    }
     var next: u32 = 0;
     var i: u32 = 0;
     while (i < n_args) : (i += 1) {
@@ -1250,6 +1288,17 @@ fn bindCallArgs(
             continue;
         }
         while (next < params.len and b.regs[next] != null) next += 1;
+        // Every positional argument from the `vararg` parameter onward is one
+        // ELEMENT of it, not a parameter of its own; a later parameter can only
+        // be filled by name. The run is contiguous because the arguments are.
+        if (b.vararg_param) |vp| {
+            if (next == vp) {
+                if (b.vararg_n == 0) b.vararg_base = reg;
+                if (reg != b.vararg_base + b.vararg_n) return null;
+                b.vararg_n += 1;
+                continue;
+            }
+        }
         if (next >= params.len) return null;
         b.regs[next] = reg;
         next += 1;
@@ -1928,8 +1977,8 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     for (params) |p| {
         // A default is the CALLER's business: the callee takes the parameter
         // like any other, and a call that omits it runs the thunk.
-        if (p.is_vararg) return no(f, "param vararg");
-        if (tyOf(p.ty) == null and classIndexOfName(m, p.ty) == null) return noName(f, "param type", p.ty.name);
+        if (!p.is_vararg and tyOf(p.ty) == null and classIndexOfName(m, p.ty) == null)
+            return noName(f, "param type", p.ty.name);
     }
 
     const types = try gpa.alloc(Ty, f.n_locals);
@@ -2190,6 +2239,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                 .LoadParam => |lp| {
                     if (lp.dst.int() >= f.n_locals or lp.idx >= params.len) return no(f, "load param");
                     const pt = params[lp.idx].ty;
+                    if (params[lp.idx].is_vararg) {
+                        // The parameter holds the array the call site built.
+                        types[lp.dst.int()] = .object;
+                        cls[lp.dst.int()] = ARRAY_CLS;
+                        elem[lp.dst.int()] = tyOf(pt) orelse .unit;
+                        known[lp.dst.int()] = true;
+                        continue;
+                    }
                     if (tyOf(pt)) |t| {
                         types[lp.dst.int()] = t;
                     } else {
@@ -3173,7 +3230,10 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             }
                             return noCallee(f, callee, "no body for");
                         }
-                        if (callee.params.len < c.n_args) return noCallee(f, callee, "arity of");
+                        const has_vararg = for (callee.params) |p| {
+                            if (p.is_vararg) break true;
+                        } else false;
+                        if (callee.params.len < c.n_args and !has_vararg) return noCallee(f, callee, "arity of");
                         const bnd = bindCallArgs(m, callee.params, c.args.int(), c.n_args, c.arg_names) orelse
                             return noCallee(f, callee, "argument binding of");
                         // A parameter nothing binds is filled by the thunk the
@@ -3182,6 +3242,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         var di: u32 = 0;
                         while (di < bnd.n) : (di += 1) {
                             if (bnd.regs[di] != null) continue;
+                            // A `vararg` nothing filled is the empty array, not
+                            // a missing argument.
+                            if (bnd.vararg_param != null and bnd.vararg_param.? == di) continue;
                             const dfid = prog.defaultThunk(callee.id, di) orelse return noCallee(f, callee, "arity of");
                             const dfn = m.funcById(dfid) orelse return no(f, "default thunk");
                             if (funcRetTy2(m, dfn) == null) return no(f, "default thunk type");
@@ -3533,7 +3596,7 @@ fn acceptedParamTy(accepted: []const Compiled, f: *const Func, idx: usize) ?Ty {
     for (accepted) |*cc| {
         if (cc.f != f) continue;
         if (idx >= cc.params.len) return null;
-        return tyOf(cc.params[idx].ty) orelse .object;
+        return paramTy(cc.params[idx]);
     }
     return null;
 }
@@ -3630,8 +3693,7 @@ fn writeProto(w: *std.Io.Writer, c: *const Compiled) !void {
         }
         for (c.params, 0..) |p, i| {
             if (i != 0 or c.caps.len != 0) try w.writeAll(", ");
-            const pt: Ty = tyOf(p.ty) orelse .object;
-            try w.print("{s} p{d}", .{ pt.cName(), i });
+            try w.print("{s} p{d}", .{ paramTy(p).cName(), i });
         }
     }
     try w.writeByte(')');
@@ -5120,6 +5182,9 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         var di2: u32 = 0;
                         while (di2 < bnd2.n) : (di2 += 1) {
                             if (bnd2.regs[di2] != null) continue;
+                            // A `vararg` takes the array built below, not a
+                            // default thunk.
+                            if (bnd2.vararg_param != null and bnd2.vararg_param.? == di2) continue;
                             const dfn = m.funcById(prog.defaultThunk(callee.id, di2).?).?;
                             const dt2 = acceptedRet(accepted, dfn) orelse funcRetTy2(m, dfn).?;
                             var dsym: std.Io.Writer.Allocating = .init(gpa);
@@ -5207,6 +5272,33 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         // register's own type is what the C local declares.
                         const cret = acceptedRet(accepted, callee) orelse funcRetTy2(m, callee) orelse .unit;
                         const dwant = c.types[call.dst.int()];
+                        // A `vararg` parameter takes ONE array holding the
+                        // trailing arguments, which the call site builds.
+                        if (bnd2.vararg_param) |vp2| {
+                            const vt = tyOf(callee.params[vp2].ty) orelse Ty.object;
+                            const vkind = primKindOfTy(vt);
+                            try w.print("  klio_value kva{d};\n  {{ klio_value ve[{d}];\n", .{
+                                call.dst.int(), if (bnd2.vararg_n == 0) @as(u32, 1) else bnd2.vararg_n,
+                            });
+                            var vi: u32 = 0;
+                            while (vi < bnd2.vararg_n) : (vi += 1) {
+                                const vr = bnd2.vararg_base + vi;
+                                var vab: [32]u8 = undefined;
+                                var vbb: [96]u8 = undefined;
+                                try w.print("    ve[{d}] = {s};\n", .{
+                                    vi, boxExpr(c.types[vr], regName(c, vr, &vab), &vbb),
+                                });
+                            }
+                            if (vkind) |kk9| {
+                                try w.print("    kva{d} = klio_nat_prim_array_of({d}, ve, {d}); }}\n", .{
+                                    call.dst.int(), kk9, bnd2.vararg_n,
+                                });
+                            } else {
+                                try w.print("    kva{d} = klio_nat_ref_array(ve, {d}); }}\n", .{
+                                    call.dst.int(), bnd2.vararg_n,
+                                });
+                            }
+                        }
                         var db: [32]u8 = undefined;
                         try w.print("  {s} = ", .{regName(c, call.dst.int(), &db)});
                         if (dwant == .object and cret != .object) try w.print("{s}(", .{boxFnName(cret)});
@@ -5215,11 +5307,14 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         var k: u32 = 0;
                         while (k < bnd2.n) : (k += 1) {
                             if (k != 0) try w.writeAll(", ");
+                            if (bnd2.vararg_param != null and bnd2.vararg_param.? == k) {
+                                try w.print("kva{d}", .{call.dst.int()});
+                                continue;
+                            }
                             if (bnd2.regs[k]) |br2| {
                                 var ab: [32]u8 = undefined;
                                 var cb14: [96]u8 = undefined;
-                                const pwant = acceptedParamTy(accepted, callee, k) orelse
-                                    (tyOf(callee.params[k].ty) orelse .object);
+                                const pwant = acceptedParamTy(accepted, callee, k) orelse paramTy(callee.params[k]);
                                 try w.print("{s}", .{
                                     convExpr(c.types[br2], pwant, regName(c, br2, &ab), &cb14),
                                 });
@@ -5228,7 +5323,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             // The parameter's own type decides: a thunk that
                             // computed a scalar arrives boxed where the
                             // parameter is a reference.
-                            const want4: Ty = tyOf(callee.params[k].ty) orelse .object;
+                            const want4: Ty = paramTy(callee.params[k]);
                             const dfn4 = m.funcById(prog.defaultThunk(callee.id, k).?).?;
                             const have4 = acceptedRet(accepted, dfn4) orelse funcRetTy2(m, dfn4).?;
                             var tb4: [48]u8 = undefined;

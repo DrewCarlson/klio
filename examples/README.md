@@ -326,6 +326,7 @@ Run any program with:
 | `native_iteration.kt`      | `for (x in …)` compiled to C: the iteration protocol over lists, mutable lists and arrays runs on the interpreter's own iterators, and a range loop counts without one. |
 | `native_companions.kt`     | A class name as a qualifier compiled to C: `Config.Default` reads Config's companion, an `object` reads its one instance, and a nested class name holds nothing at all. |
 | `native_ranges.kt`         | A range held as a value compiled to C: a progression with a start, an inclusive end and a step, iterated through the same iterator any container gives. |
+| `native_varargs.kt`        | A `vararg` parameter compiled to C: the call site collects its trailing arguments into one array of the parameter's element type, and the callee iterates it. |
 | `native_lambdas.kt`        | Lambdas compiled to C: a lambda whose call site can see which body it holds is called directly with its captures as leading arguments, so no closure object is allocated and no dispatch happens. |
 | `native_interfaces.kt`     | Interfaces and virtual dispatch compiled to C: an interface adds no fields, and which body a call reaches is the receiver's class compared against the handles registered at startup. |
 | `native_char_sized.kt`     | `Char` and the narrow integer kinds compiled to C: integers in the machine but each carrying its kind in the box, since a Char prints as a character and arithmetic on any of them produces an Int. |
