@@ -5031,7 +5031,7 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // Built-in iterator protocol for collections + ranges.
     if (std.mem.eql(u8, name, "iterator") and args.len == 0) {
-        if (try builtinIterator(self, allocator, receiver)) |r| return r;
+        if (try builtinIterator(allocator, receiver)) |r| return r;
     }
 
     // Sequence terminal + pipeline ops.
@@ -5561,10 +5561,10 @@ fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *const V
 
     // Iterator + RangeIter protocols.
     if (receiver.* == .Iterator) {
-        if (try iteratorMember(self, allocator, receiver, name, args)) |r| return r;
+        if (try iteratorMember(allocator, receiver, name, args)) |r| return r;
     }
     if (receiver.* == .RangeIter) {
-        if (try rangeIterMember(self, allocator, receiver, name, args)) |r| return r;
+        if (try rangeIterMember(allocator, receiver, name, args)) |r| return r;
     }
     if (receiver.* == .SeqIter) {
         if (try seqIterMember(self, allocator, receiver, name, args)) |r| return r;
@@ -9433,7 +9433,7 @@ pub fn slotByNameFallbacks() u64 {
 /// The FQN comparison happens ONCE per `FuncId` per thread; every later call
 /// on that slot is an integer probe. The handlers are the existing ones — a
 /// second implementation here is exactly the duplication this avoids.
-const HostSlotOp = enum {
+pub const HostSlotOp = enum {
     iterator_protocol,
     collection_iterator,
     kclass_is_instance,
@@ -9456,7 +9456,17 @@ fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
     const map = &host_slot_ops.?;
     if (map.get(target.int())) |cached| return cached;
     const fqn = if (module.funcById(target)) |f| f.fqn else return null;
-    const op: ?HostSlotOp = blk: {
+    const op: ?HostSlotOp = hostSlotOpOfFqn(fqn);
+    map.put(std.heap.page_allocator, target.int(), op) catch return op;
+    return op;
+}
+
+/// The same classification off the declaration's name alone, so a consumer
+/// that holds the declaration rather than a live module (the native backend,
+/// deciding at compile time which member calls the runtime serves) reads the
+/// one table instead of keeping a second.
+pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
+    return blk: {
         const owner = fqn[0 .. std.mem.lastIndexOfScalar(u8, fqn, '.') orelse break :blk null];
         const name = fqn[owner.len + 1 ..];
         const iter_owner = std.mem.eql(u8, owner, "kotlin.collections.Iterator") or
@@ -9499,20 +9509,29 @@ fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
             std.mem.endsWith(u8, owner, "Array") and
             std.mem.indexOfScalar(u8, owner["kotlin.".len..], '.') == null)
             break :blk .array_get;
+        // An array iterates from its own storage, exactly as a collection
+        // does, and no native is registered under the array type either.
+        if (std.mem.eql(u8, name, "iterator") and
+            std.mem.startsWith(u8, owner, "kotlin.") and
+            std.mem.endsWith(u8, owner, "Array") and
+            std.mem.indexOfScalar(u8, owner["kotlin.".len..], '.') == null)
+            break :blk .collection_iterator;
         if (std.mem.eql(u8, owner, "kotlin.sequences.Sequence") and
             std.mem.eql(u8, name, "iterator")) break :blk .sequence_iterator;
         break :blk null;
     };
-    map.put(std.heap.page_allocator, target.int(), op) catch return op;
-    return op;
 }
 
-fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+/// The host slot ops whose handlers read only the receiver's own
+/// representation, so they answer with no interpreter host behind them. A
+/// compiled program has no module to dispatch through and serves its builtin
+/// member calls from here; the interpreter reaches the same bodies through
+/// `runHostSlotOp`, so there is one implementation rather than two.
+pub fn runHostFreeSlotOp(allocator: Allocator, op: HostSlotOp, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     switch (op) {
         .iterator_protocol => switch (receiver.*) {
-            .Iterator => return iteratorMember(self, allocator, receiver, name, args),
-            .RangeIter => return rangeIterMember(self, allocator, receiver, name, args),
-            .SeqIter => return seqIterMember(self, allocator, receiver, name, args),
+            .Iterator => return iteratorMember(allocator, receiver, name, args),
+            .RangeIter => return rangeIterMember(allocator, receiver, name, args),
             else => return null,
         },
         .collection_iterator => {
@@ -9523,21 +9542,7 @@ fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiver: 
                 .Iterator, .RangeIter, .SeqIter => return .{ .ok = receiver.* },
                 else => {},
             }
-            return builtinIterator(self, allocator, receiver);
-        },
-        .kclass_is_instance => {
-            if (receiver.* != .Class or args.len != 1) return null;
-            const cg = receiver.Class.borrow();
-            const cname = cg.get().name;
-            var hit = args[0].isRuntimeType(cname);
-            if (!hit and args[0] == .Instance) hit = receiverImplementsType(self, &args[0], cname);
-            const r = boolVal(hit);
-            cg.deinit();
-            return .{ .ok = r };
-        },
-        .comparator_member => switch (receiver.*) {
-            .Comparator => return comparatorMember(self, allocator, receiver, name, args),
-            else => return null,
+            return builtinIterator(allocator, receiver);
         },
         .array_get => {
             if (receiver.* != .Array or args.len != 1) return null;
@@ -9553,10 +9558,36 @@ fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiver: 
             defer if (runtime.freeScratch()) allocator.free(msg);
             return .{ .err = try throwExc(allocator, "kotlin.ArrayIndexOutOfBoundsException", msg) };
         },
+        else => return null,
+    }
+}
+
+fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
+    if (try runHostFreeSlotOp(allocator, op, receiver, name, args)) |r| return r;
+    switch (op) {
+        .iterator_protocol => switch (receiver.*) {
+            .SeqIter => return seqIterMember(self, allocator, receiver, name, args),
+            else => return null,
+        },
+        .kclass_is_instance => {
+            if (receiver.* != .Class or args.len != 1) return null;
+            const cg = receiver.Class.borrow();
+            const cname = cg.get().name;
+            var hit = args[0].isRuntimeType(cname);
+            if (!hit and args[0] == .Instance) hit = receiverImplementsType(self, &args[0], cname);
+            const r = boolVal(hit);
+            cg.deinit();
+            return .{ .ok = r };
+        },
+        .comparator_member => switch (receiver.*) {
+            .Comparator => return comparatorMember(self, allocator, receiver, name, args),
+            else => return null,
+        },
         .sequence_iterator => switch (receiver.*) {
             .Sequence => return sequenceMember(self, allocator, receiver, name, args),
             else => return null,
         },
+        .collection_iterator, .array_get => return null,
     }
 }
 

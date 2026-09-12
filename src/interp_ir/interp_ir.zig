@@ -46,6 +46,12 @@ pub const resetRunGlobalCaches = vmhost.resetRunGlobalCaches;
 pub const resetJitForTest = ir.jit_loop.resetForTest;
 pub const resetLenientWarned = @import("vm/host_call_member.zig").resetLenientWarned;
 
+/// Member dispatch, exposed for the consumers that hold a declaration rather
+/// than a live interpreter: the native backend classifies a call site against
+/// `hostSlotOpOfFqn` at compile time, and the compiled program's runtime runs
+/// the classified op through `runHostFreeSlotOp`.
+pub const member_dispatch = @import("vm/host_call_member.zig");
+
 const Value = runtime.Value;
 const ObjRef = runtime.ObjRef;
 const Env = runtime.Env;

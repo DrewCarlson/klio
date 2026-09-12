@@ -742,8 +742,7 @@ fn cloneArrayItems(allocator: Allocator, arr: runtime.ArrayData) Allocator.Error
     return out;
 }
 
-pub fn builtinIterator(self: *VmHost, allocator: Allocator, receiver: *const Value) Allocator.Error!?EvalResult {
-    _ = self;
+pub fn builtinIterator(allocator: Allocator, receiver: *const Value) Allocator.Error!?EvalResult {
     // An array `.asList()` view re-reads its scalar source so the iterator
     // snapshot reflects later array writes.
     receiver.refreshArrayView();
@@ -1694,8 +1693,7 @@ inline fn iterMutable(it: ObjRef(runtime.IterCursor)) bool {
     return g.get().mutable;
 }
 
-pub fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    _ = self;
+pub fn iteratorMember(allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const it = receiver.Iterator;
     if (std.mem.eql(u8, name, "hasNext") and args.len == 0) {
         const pg = it.borrow();
@@ -1879,8 +1877,7 @@ pub fn iteratorMember(self: *VmHost, allocator: Allocator, receiver: *const Valu
     return null;
 }
 
-pub fn rangeIterMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    _ = self;
+pub fn rangeIterMember(allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const ri = receiver.RangeIter;
     const snap = blk: {
         const sg = ri.borrow();
