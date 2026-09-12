@@ -696,6 +696,36 @@ pub inline fn rangeRefOf(r: *RangeData) RangeRef {
 /// Copies of the `Value` share one record, so `fillInStackTrace`,
 /// `addSuppressed`, and cause writes are visible through every copy — the
 /// JVM's reference semantics.
+/// A `Value` in the shape compiled code passes it: two opaque words. A tagged
+/// union has no guaranteed layout, so the conversion is a byte copy rather than
+/// a bitcast; compiled code treats the result as opaque and only ever hands it
+/// back. It lives here rather than in the native runtime shim because the
+/// coroutine driver resumes NATIVE continuations through the same form.
+pub const CValue = extern struct { lo: u64, hi: u64 };
+
+pub inline fn toC(v: Value) CValue {
+    var tmp = v;
+    var out: CValue = undefined;
+    @memcpy(std.mem.asBytes(&out), std.mem.asBytes(&tmp));
+    return out;
+}
+
+pub inline fn fromC(v: CValue) Value {
+    var tmp = v;
+    var out: Value = undefined;
+    @memcpy(std.mem.asBytes(&out), std.mem.asBytes(&tmp));
+    return out;
+}
+
+/// A compiled continuation: the emitted resume function and the heap frame it
+/// resumes into. Calling it with the value the suspension produced runs the
+/// body from its suspension point; the answer is either the result or
+/// `CoroutineSuspended` when it suspended again.
+pub const NativeResume = struct {
+    call: *const fn (?*anyopaque, CValue) callconv(.c) CValue,
+    frame: ?*anyopaque,
+};
+
 pub const ExceptionData = struct {
     fqn: StringRef,
     message: objcell.OptRef(StringData) = .{},
