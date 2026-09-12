@@ -451,6 +451,43 @@ fn functionTypeArity(name: []const u8) ?u32 {
 /// What a reference of this declared type yields when it is read through: the
 /// result of calling a function value, the element of a list or an array. Null
 /// when the type says nothing, which leaves whatever was already inferred.
+/// The CLASS a container's elements hold, read off the declared type: the
+/// `Shape` of a `List<Shape>`. Null when the type says nothing, which leaves a
+/// reference the emitter cannot dispatch on.
+fn refElemCls(m: *const Module, c: ?u32, t: ir.TypeRef) ?u32 {
+    const cid = c orelse return null;
+    if (cid != LIST_CLS and cid != ARRAY_CLS) return null;
+    if (t.args.len != 1) return null;
+    if (tyOf(t.args[0]) != null) return null;
+    return classIndexOfName(m, t.args[0]);
+}
+
+/// The class every one of these registers holds: the first one's, walked up
+/// its supertypes until the rest reach it. A list literal of mixed shapes
+/// answers the type they share, which is what a member call on an element
+/// dispatches through.
+fn commonCls(m: *const Module, cls: []const ?u32, base: u32, n: u32) ?u32 {
+    if (n == 0) return null;
+    var cand = cls[base] orelse return null;
+    if (isBuiltinCls(cand)) return null;
+    var steps: u32 = 0;
+    while (steps < 32) : (steps += 1) {
+        var all = true;
+        var k: u32 = 1;
+        while (k < n) : (k += 1) {
+            const oc = cls[base + k] orelse return null;
+            if (isBuiltinCls(oc)) return null;
+            if (!typeReaches(m, oc, cand)) all = false;
+        }
+        if (all) return cand;
+        if (cand >= m.classes.items.len) return null;
+        const sup = m.classes.items[cand].supertypes;
+        if (sup.len == 0) return null;
+        cand = sup[0].int();
+    }
+    return null;
+}
+
 fn refElemOf(c: ?u32, t: ir.TypeRef) ?Ty {
     const cid = c orelse return null;
     if (funcClsArity(cid) != null) return functionResultTy(t);
@@ -2094,6 +2131,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 types[lt.dst.int()] = gt;
                                 if (gt == .object) cls[lt.dst.int()] = classIndexOfName(m, gfn.return_ty);
  if (refElemOf(cls[lt.dst.int()], gfn.return_ty)) |re_| elem[lt.dst.int()] = re_;
+                    elem_cls[lt.dst.int()] = refElemCls(m, cls[lt.dst.int()], gfn.return_ty);
                             },
                             .global, .member, .call => unreachable,
                         }
@@ -2108,6 +2146,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         const gf5 = m.funcById(globals[gi5].func).?;
                         cls[lt.dst.int()] = classIndexOfName(m, gf5.return_ty);
                         if (refElemOf(cls[lt.dst.int()], gf5.return_ty)) |re_| elem[lt.dst.int()] = re_;
+                    elem_cls[lt.dst.int()] = refElemCls(m, cls[lt.dst.int()], gf5.return_ty);
                     }
                     known[lt.dst.int()] = true;
                 },
@@ -2183,6 +2222,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         if (rt9 == .object) {
                             cls[cg2.dst.int()] = classIndexOfName(m, root9b.return_ty);
                             if (refElemOf(cls[cg2.dst.int()], root9b.return_ty)) |re9| elem[cg2.dst.int()] = re9;
+                    elem_cls[cg2.dst.int()] = refElemCls(m, cls[cg2.dst.int()], root9b.return_ty);
                         }
                         known[cg2.dst.int()] = true;
                         break;
@@ -2197,6 +2237,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         if (rt10 == .object) {
                             cls[cg2.dst.int()] = classIndexOfName(m, gfn9.return_ty);
                             if (refElemOf(cls[cg2.dst.int()], gfn9.return_ty)) |re10| elem[cg2.dst.int()] = re10;
+                    elem_cls[cg2.dst.int()] = refElemCls(m, cls[cg2.dst.int()], gfn9.return_ty);
                         }
                         known[cg2.dst.int()] = true;
                     }
@@ -2279,6 +2320,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         types[ca.dst.int()] = .object;
                         cls[ca.dst.int()] = classIndexOfName(m, ca.ty);
                         if (refElemOf(cls[ca.dst.int()], ca.ty)) |re13| elem[ca.dst.int()] = re13;
+                    elem_cls[ca.dst.int()] = refElemCls(m, cls[ca.dst.int()], ca.ty);
                     }
                     known[ca.dst.int()] = true;
                 },
@@ -2308,6 +2350,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         types[lp.dst.int()] = .object;
                         cls[lp.dst.int()] = classIndexOfName(m, pt);
                         if (refElemOf(cls[lp.dst.int()], pt)) |re_| elem[lp.dst.int()] = re_;
+                    elem_cls[lp.dst.int()] = refElemCls(m, cls[lp.dst.int()], pt);
                         // `List<Int>` says what its elements are; a list whose
                         // element type is written down needs no inference. An
                         // array says so in its own name.
@@ -2512,7 +2555,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             if (types[a0] != .i32) return no(f, "list index type");
                             const et = elem[cm.receiver.int()];
                             types[cm.dst.int()] = if (et == .unit) .object else et;
-                            cls[cm.dst.int()] = null;
+                            cls[cm.dst.int()] = if (et == .unit) elem_cls[cm.receiver.int()] else null;
                             known[cm.dst.int()] = true;
                             continue;
                         }
@@ -2550,6 +2593,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             if (mrt6 == .object) {
                                 cls[cm.dst.int()] = classIndexOfName(m, root6.return_ty);
                                 if (refElemOf(cls[cm.dst.int()], root6.return_ty)) |re6| elem[cm.dst.int()] = re6;
+                    elem_cls[cm.dst.int()] = refElemCls(m, cls[cm.dst.int()], root6.return_ty);
                             }
                             known[cm.dst.int()] = true;
                             continue;
@@ -2596,6 +2640,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 types[cm.dst.int()] = mrt;
                                 if (mrt == .object) cls[cm.dst.int()] = classIndexOfName(m, root5.return_ty);
  if (refElemOf(cls[cm.dst.int()], root5.return_ty)) |re_| elem[cm.dst.int()] = re_;
+                    elem_cls[cm.dst.int()] = refElemCls(m, cls[cm.dst.int()], root5.return_ty);
                                 known[cm.dst.int()] = true;
                                 continue;
                             }
@@ -2633,6 +2678,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 types[cv.dst.int()] = .object;
                                 cls[cv.dst.int()] = ITER_CLS;
                                 elem[cv.dst.int()] = elem[cv.receiver.int()];
+                                elem_cls[cv.dst.int()] = elem_cls[cv.receiver.int()];
                                 known[cv.dst.int()] = true;
                                 continue;
                             }
@@ -2646,7 +2692,10 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 break :blk Ty.object;
                             };
                             types[cv.dst.int()] = hrt;
-                            if (hrt == .object) cls[cv.dst.int()] = classIndexOfName(m, decl.return_ty);
+                            if (hrt == .object) {
+                                cls[cv.dst.int()] = classIndexOfName(m, decl.return_ty) orelse
+                                    elem_cls[cv.receiver.int()];
+                            }
                             known[cv.dst.int()] = true;
                             continue;
                         }
@@ -2665,7 +2714,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             if (types[a0] != .i32) return no(f, "list index type");
                             const et = elem[cv.receiver.int()];
                             types[cv.dst.int()] = if (et == .unit) .object else et;
-                            cls[cv.dst.int()] = null;
+                            cls[cv.dst.int()] = if (et == .unit) elem_cls[cv.receiver.int()] else null;
                         } else if (std.mem.eql(u8, mn, "add") and cv.n_args == 1) {
                             types[cv.dst.int()] = .boolean;
                         } else if (std.mem.eql(u8, mn, "set") and cv.n_args == 2) {
@@ -2683,6 +2732,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             if (vrt == .object) {
                                 cls[cv.dst.int()] = classIndexOfName(m, decl.return_ty);
                                 if (refElemOf(cls[cv.dst.int()], decl.return_ty)) |re12| elem[cv.dst.int()] = re12;
+                    elem_cls[cv.dst.int()] = refElemCls(m, cls[cv.dst.int()], decl.return_ty);
                             }
                             known[cv.dst.int()] = true;
                             continue;
@@ -2716,6 +2766,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 types[cv.dst.int()] = rt4;
                                 if (rt4 == .object) cls[cv.dst.int()] = classIndexOfName(m, root.return_ty);
  if (refElemOf(cls[cv.dst.int()], root.return_ty)) |re_| elem[cv.dst.int()] = re_;
+                    elem_cls[cv.dst.int()] = refElemCls(m, cls[cv.dst.int()], root.return_ty);
                                 known[cv.dst.int()] = true;
                                 continue;
                             }
@@ -2992,6 +3043,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             if (gt == .object) {
                                 cls[gf.dst.int()] = classIndexOfName(m, gfn.return_ty);
                                 if (refElemOf(cls[gf.dst.int()], gfn.return_ty)) |re_| elem[gf.dst.int()] = re_;
+                    elem_cls[gf.dst.int()] = refElemCls(m, cls[gf.dst.int()], gfn.return_ty);
                             }
                             known[gf.dst.int()] = true;
                             continue;
@@ -3086,6 +3138,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         const gf = m.funcById(globals[gi].func).?;
                         cls[lg.dst.int()] = classIndexOfName(m, gf.return_ty);
                         if (refElemOf(cls[lg.dst.int()], gf.return_ty)) |re_| elem[lg.dst.int()] = re_;
+                    elem_cls[lg.dst.int()] = refElemCls(m, cls[lg.dst.int()], gf.return_ty);
                     }
                     known[lg.dst.int()] = true;
                 },
@@ -3200,6 +3253,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     types[cv2.dst.int()] = rt7;
                     if (rt7 == .object) cls[cv2.dst.int()] = classIndexOfName(m, bf.return_ty);
  if (refElemOf(cls[cv2.dst.int()], bf.return_ty)) |re_| elem[cv2.dst.int()] = re_;
+                    elem_cls[cv2.dst.int()] = refElemCls(m, cls[cv2.dst.int()], bf.return_ty);
                     known[cv2.dst.int()] = true;
                 },
                 .Call => |c| {
@@ -3275,6 +3329,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         types[c.dst.int()] = .object;
                         cls[c.dst.int()] = LIST_CLS;
                         elem[c.dst.int()] = if (et) |t| (if (t == .object) .unit else t) else .unit;
+                        if (elem[c.dst.int()] == .unit) {
+                            elem_cls[c.dst.int()] = commonCls(m, cls, c.args.int(), c.n_args);
+                        }
                         known[c.dst.int()] = true;
                         continue;
                     }
@@ -3344,6 +3401,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 if (srt == .object) {
                                     cls[c.dst.int()] = classIndexOfName(m, callee.return_ty);
                                     if (refElemOf(cls[c.dst.int()], callee.return_ty)) |re11| elem[c.dst.int()] = re11;
+                    elem_cls[c.dst.int()] = refElemCls(m, cls[c.dst.int()], callee.return_ty);
                                 }
                                 known[c.dst.int()] = true;
                                 continue;
@@ -3373,6 +3431,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         types[c.dst.int()] = rt;
                         if (rt == .object) cls[c.dst.int()] = classIndexOfName(m, callee.return_ty);
  if (refElemOf(cls[c.dst.int()], callee.return_ty)) |re_| elem[c.dst.int()] = re_;
+                    elem_cls[c.dst.int()] = refElemCls(m, cls[c.dst.int()], callee.return_ty);
                         known[c.dst.int()] = true;
                     }
                     var k: u32 = 0;
