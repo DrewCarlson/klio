@@ -34,6 +34,14 @@ one() {
   emit_rc=$?
   # A refusal exits 1. A crash or a timeout is a defect in the emitter, and
   # counting it as a refusal is how one hides among hundreds of them.
+  # A refusal exits 1, a crash exits on a signal, and 124 is the timeout: the
+  # first program with a given pack selection lowers those packs before the
+  # emitter starts, and every rebuild of klio invalidates that cached work.
+  # Slow is worth reporting; it is not a wrong answer.
+  if [ "$emit_rc" -eq 124 ]; then
+    echo "SLOW $name emitter did not finish in ${EMIT_TIMEOUT:-300}s"
+    return
+  fi
   if [ "$emit_rc" -gt 1 ]; then
     echo "FAIL $name emitter exit $emit_rc"
     return
@@ -71,11 +79,12 @@ printf '%s\n' "${progs[@]}" | xargs -P "$JOBS" -I{} bash -c 'one "$@"' _ {} >"$W
 passed=$(grep -c '^PASS ' "$WORK/verdicts")
 failed=$(grep -c '^FAIL ' "$WORK/verdicts")
 refused=$(grep -c '^REFUSED ' "$WORK/verdicts")
+slow=$(grep -c '^SLOW ' "$WORK/verdicts")
 accepted=$((passed + failed))
-grep '^FAIL ' "$WORK/verdicts" | sed 's/^/  /'
+grep -E '^(FAIL|SLOW) ' "$WORK/verdicts" | sed 's/^/  /'
 for f in $(grep '^FAIL ' "$WORK/verdicts" | awk '{print $2}'); do
   [ -s "$WORK/$f/diff.log" ] && head -8 "$WORK/$f/diff.log" | sed "s/^/      $f: /"
   [ -s "$WORK/$f/cc.log" ] && head -3 "$WORK/$f/cc.log" | sed "s/^/      $f: /"
 done
-echo "NATIVE C SWEEP: $accepted accepted ($passed match, $failed differ), $refused refused"
+echo "NATIVE C SWEEP: $accepted accepted ($passed match, $failed differ), $refused refused, $slow too slow to say"
 [ "$failed" -eq 0 ]

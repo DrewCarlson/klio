@@ -382,6 +382,33 @@ be called in the frame that catches — and the frame/dispatch glue. The
 arithmetic rules are stated in two places and could drift, which is exactly
 what `native-c-sweep.sh` exists to catch: it found the overflow bug.
 
+### The stdlib is called, not reimplemented
+
+Every stdlib operation the interpreter performs is a named entry in one table:
+1615 declarations bound to the Zig that implements them. A declaration with no
+Kotlin body is therefore not a gap for the emitter to fill — `klio_nat_stdlib`
+looks the name up and runs the same entry the interpreter runs, so `List`,
+`Map`, `Set` and `String` need no second implementation here.
+
+What a compiled program has to supply is the one thing the table asks of its
+caller: how to invoke a closure, since a higher-order entry like `forEach`
+calls back. The emitted per-arity dispatcher is registered for that.
+
+A declaration reached through a receiver is registered under the
+receiver-qualified form — `substring` is declared in `kotlin.text` and
+implemented as `kotlin.String.substring` — and the receiver is the first
+parameter whether or not the declaration carries the flag. The declaration's
+own return type decides whether the answer comes back as a machine type or
+stays a value, which is what keeps `"42".toInt() + 1` an integer addition.
+
+That table is hand-written because the implementations are; the DECLARATIONS it
+names are generated from upstream Kotlin. A test now audits one against the
+other: 276 entries match by name, 1052 by receiver-qualified form, 25 are
+klio's own, and 141 name declarations the mined index does not carry — JVM-only
+ones (`exitProcess`, `readLine`), platform helpers (`nativeIndexOf`), and
+declarations from stdlib sources a sparse checkout omits. That last count is a
+ratchet, so a new unbacked entry fails the build.
+
 ### What is general and what is an intrinsic
 
 Everything that decides program shape is general and applies to a pack class
@@ -407,6 +434,61 @@ method, which has no register and must read its annotation. And a value only
 has to BE a reference to be passed, returned or stored; demanding its layout
 everywhere refused every interface type, and relaxing it moved more programs
 than any feature did.
+
+## What the language surface now covers
+
+Beyond the scalar core, classes, strings, lists, closures, exceptions and
+coroutines above:
+
+- `for (x in …)` over lists, mutable lists, arrays and ranges, through the
+  interpreter's own iterators.
+- A range held as a value, with the bounds and step the evaluator computes.
+- A class name as a qualifier: companions, nested types, and a companion member
+  read from an instance method of the class.
+- `vararg` parameters, and constructor parameters with defaults.
+- `is` and `as`, tested against the class handles the program laid out.
+- Generic classes and functions: an erased type argument is a reference.
+- An enum's `entries`, and what a container holds — so a member call on a loop
+  variable dispatches.
+- `toString()`, dispatched when a class declares one and rendered through the
+  runtime otherwise.
+- A function's name in value position (`::f`).
+- `++`/`--`, `===`, and the Kotlin answers for `Char + Int` and for negating a
+  Byte or a Short.
+
+A lambda literal that captures nothing is a SINGLETON in Kotlin — every
+evaluation of it yields the same instance — which the emitter had been getting
+wrong by allocating one per evaluation. They are built before the program runs
+and rooted for its life, like an `object` declaration's.
+
+## Iteration, ranges, qualifiers and varargs
+
+`for (x in …)` is the iteration protocol: the container answers an iterator and
+the loop steps it with `hasNext`/`next`. An iterator over a builtin container is
+a runtime value the interpreter already knows how to step, so a compiled program
+hands those three calls back to the same code rather than growing its own
+iterators. WHICH members those are is the interpreter's own classification —
+`hostSlotOpOfFqn` for a call the lowering bound to a declaration,
+`hostFreeMemberAnswer` for one it left by name — read at compile time so the
+backend keeps no second list of them. The handlers they select needed no host
+behind them; they were only shaped as if they did.
+
+A range held as a value is a progression: a start, an inclusive end and a signed
+step, with bound resolution (`a..<b` on an empty span, the unsigned kinds) the
+evaluator already performs. Compiled code builds one through that same function
+and reads `first`/`last`/`step` through the same accessor.
+
+A class name used as a qualifier reads no field of the class. `Config.Default`
+names a property of Config's COMPANION, which is an object declaration with one
+instance like any other, and three shapes follow from that: a class name loaded
+as a qualifier, a nested class read off its outer (which names a type and holds
+nothing at all), and a companion member reached from an instance method of the
+class. All three resolve to the companion singleton the program already knows
+how to build.
+
+A `vararg` parameter takes ONE array, not one argument each: the call site
+collects its trailing positional arguments into an array of the parameter's own
+element type, and a call that passes none still passes an empty one.
 
 ## Coroutines: one driver, two kinds of frame
 
@@ -550,15 +632,54 @@ override, so one `next()` call pulled whole families of unrelated iterators
 into the compile and the program refused on one of them. With that and the
 unsigned types, a `for` over a range compiles.
 
-The sweep now reports every accepted program matching the interpreter.
+The sweep now reports every accepted program matching the interpreter: 112 of
+the 569 examples compile and print what the interpreter prints.
+
+Four more holes the wider net found once more library bodies compiled, all of
+them wrong answers rather than missing features:
+
+- A class handle on a register may name a class the program never laid out —
+  an interface, or a library type a value merely passes through. Registering a
+  descriptor for one read a null layout.
+- `ushr` looked up a C operator that does not exist before reaching the branch
+  that spells it out by hand.
+- A virtual call that omits a parameter cannot be forwarded by a dispatcher
+  that has only what the site passed. It emitted an arm that fell through to
+  the no-implementation tail, so the call answered an error at RUN time instead
+  of being refused. Both the site and the arm refuse now.
+- Kotlin's `Char + Int` and `Char - Int` answer a Char; only `Char - Char`
+  promotes to Int. A counted loop over a character range was rendering codes.
+
+The sweep itself was the other problem: it took three quarters of an hour,
+which is long enough that it stops being run, and a transpiler crash exited
+non-zero and was counted as one refusal among hundreds — which is how two
+crashes shipped. The programs are independent, so they fan out; a refusal exits
+1 and anything else is a failure; and an emitter that does not finish is
+reported as slow rather than as a wrong answer.
+
+## Emitting against the module `run` assembles
+
+`transpile --native` re-lowered the stdlib and every pack from source on every
+invocation, and typechecked them a second time for eager call binding. That
+cost more than the emission it was preparing: 8.4s for a hello-world, and two
+minutes for a compose program whose interpreter run takes five seconds. It
+takes the same cached image `klio run` takes, and binds eager calls over the
+program's own sources rather than over every pack. A hello-world emits in
+0.38s.
+
+The cache is keyed on the klio binary, so the first emission after a rebuild
+pays one whole lowering per pack selection — the same work `klio run` pays, and
+the reason the heaviest compose programs still time out in a sweep that follows
+a build.
 
 ## Still refused
 
 Measured across the example corpus with `KLIO_CGEN_TRACE=1`, most common
-first: `runBlocking` and the rest of the coroutine surface, calls with named or
-generic arguments, the `List` members the backend performs directly, anonymous
-object literals, `MakeCell` (a `var` a lambda captures), `finally`, and the
-companion-object side of a class name used as a qualifier.
+first: a reified type parameter used as a value (`T::class`), classes whose
+layout does not resolve (a body property whose initializer does not compile),
+a member the receiver's class does not carry, callable references (`::f`),
+anonymous object literals, `is`/`as`, `finally`, and the calls whose arity
+does not match a declaration for a reason other than a `vararg` or a default.
 
 A refusal is reported against the thing that blocked a program, not against
 every candidate the emitter examined. The class-layout table is built for every

@@ -10,6 +10,14 @@
 //! caller falls back, so the set can widen without a correctness cliff. See
 //! `plans/native-c-backend.md`.
 const std = @import("std");
+/// The interpreter's own stdlib table. A member the backend does not perform
+/// directly is not a gap to fill here: the operation already exists, named, and
+/// compiled code calls the same entry the interpreter does.
+const stdlib = @import("stdlib");
+/// The interpreter's member dispatch. Which builtin member calls the runtime
+/// can serve is its classification, read here at compile time so the backend
+/// keeps no second table of the same names.
+const member_dispatch = @import("interp_ir").member_dispatch;
 const ir = @import("ir");
 
 const Reg = ir.Reg;
@@ -302,6 +310,11 @@ const CELL_CLS: u32 = std.math.maxInt(u32) - 2;
 /// class table; `elem` carries what it holds.
 const ARRAY_CLS: u32 = std.math.maxInt(u32) - 4;
 
+/// An iterator over a builtin container. Like the container itself it is a
+/// runtime value the interpreter already knows how to step, so the handle sits
+/// outside the class table and `elem` carries what the iteration yields.
+const ITER_CLS: u32 = std.math.maxInt(u32) - 5;
+
 /// A builtin type's name used as a QUALIFIER: `Int` in `Int.MAX_VALUE`. Such
 /// a register names a type rather than holding a value, so like a lambda's it
 /// is typed Unit with the type recorded and occupies nothing at run time.
@@ -442,7 +455,7 @@ fn functionResultTy(t: ir.TypeRef) Ty {
 
 fn isBuiltinCls(cid: u32) bool {
     return cid == STRING_CLS or cid == LIST_CLS or cid == CELL_CLS or cid == THROWABLE_CLS or
-        cid == ARRAY_CLS or funcClsArity(cid) != null or numClsTy(cid) != null;
+        cid == ARRAY_CLS or cid == ITER_CLS or funcClsArity(cid) != null or numClsTy(cid) != null;
 }
 
 /// The element kind of a named array type, in the order the runtime's
@@ -1050,6 +1063,53 @@ fn listIntrinsic(f: *const Func) ?ListIntrinsic {
     return null;
 }
 
+/// The stdlib entry that implements a declaration, if the interpreter has one.
+/// A member the backend does not perform directly is not a gap: the operation
+/// exists, named, and compiled code calls the same entry.
+/// The member calls a compiled program hands back to the runtime. The
+/// interpreter classifies a slot's declaration into a host operation served
+/// from the receiver's own representation; the ones with no interpreter behind
+/// them are exactly what a compiled program can run, so that classification is
+/// the answer rather than a list of names kept here.
+fn hostMemberOp(decl: *const Func) ?member_dispatch.HostSlotOp {
+    const op = member_dispatch.hostSlotOpOfFqn(decl.fqn) orelse return null;
+    return switch (op) {
+        // The iteration protocol reads the container and the iterator, nothing
+        // else. The remaining ops need a live module to dispatch through.
+        .iterator_protocol, .collection_iterator => op,
+        else => null,
+    };
+}
+
+fn stdlibEntry(f: *const Func) ?[]const u8 {
+    if (f.fqn.len == 0) return null;
+    if (stdlib.implementations.lookup(f.fqn) != null) return f.fqn;
+    // A declaration reached through a receiver is registered under the
+    // RECEIVER-QUALIFIED form rather than its own package: `substring` is
+    // declared in `kotlin.text` and implemented as `kotlin.String.substring`.
+    // The receiver of an extension is its first parameter whether or not the
+    // declaration is FLAGGED as having one: `kotlin.text.substring` takes its
+    // String first and carries no receiver flag.
+    const recv: ?[]const u8 = if (f.params.len != 0 and f.params[0].ty.name.len != 0)
+        simpleName(f.params[0].ty.name)
+    else
+        null;
+    if (stdlib.implementations.declarationHostSymbol(f.fqn, recv, f.name)) |sym| return sym;
+    if (recv) |rn| {
+        var buf: [160]u8 = undefined;
+        const qualified = std.fmt.bufPrint(&buf, "kotlin.{s}.{s}", .{ rn, f.name }) catch return null;
+        if (stdlib.implementations.lookup(qualified)) |_| {
+            // The borrowed buffer dies with this call, so hand back the
+            // table's own copy of the name.
+            var it = stdlib.implementations.allFqns();
+            while (it.next()) |cand| {
+                if (std.mem.eql(u8, cand, qualified)) return cand;
+            }
+        }
+    }
+    return null;
+}
+
 /// `launch { … }`: a child coroutine queued on the driver that is running. It
 /// is not a suspension: the caller keeps going.
 fn isLaunch(f: *const Func) bool {
@@ -1528,6 +1588,18 @@ fn accessPlan(m: *const Module, prog: Program, rc: u32, name: []const u8, set: b
     return .none;
 }
 
+/// Where a property access actually lands. A name the receiver's own class does
+/// not carry may belong to its COMPANION: `Label` read inside a member of
+/// `Config` names `Config.Companion.Label`, and the companion is the singleton
+/// the access runs against.
+fn accessOwner(m: *const Module, prog: Program, rc: u32, name: []const u8, set: bool) ?u32 {
+    if (std.meta.activeTag(accessPlan(m, prog, rc, name, set)) != .none) return null;
+    if (rc >= m.classes.items.len) return null;
+    const cc = companionObjectNamed(m, prog, m.classes.items[rc].fqn) orelse return null;
+    if (std.meta.activeTag(accessPlan(m, prog, cc, name, set)) == .none) return null;
+    return cc;
+}
+
 /// A property read through a type that declares it without storage: an
 /// interface's `val`, or an abstract one. Which getter runs is the receiver's
 /// class, exactly as for a method.
@@ -1649,6 +1721,18 @@ fn instRefuse(f: *const Func, inst: *const ir.Inst) ?Compiled {
     return null;
 }
 
+/// The same, naming the member a call could not bind. Which member a program
+/// needs is the backlog; the instruction tag alone does not say.
+fn instRefuseNamed(m: *const Module, f: *const Func, inst: *const ir.Inst, name_id: ir.ConstId) ?Compiled {
+    if (traceOn()) {
+        const nm = if (name_id.int() < m.consts.items.len) m.consts.items[name_id.int()] else ir.Const{ .Unit = {} };
+        std.debug.print("[cgen] refuse {s}: inst {s} `{s}`\n", .{
+            f.fqn, @tagName(inst.*), if (nm == .String) nm.String else "?",
+        });
+    }
+    return null;
+}
+
 /// A refusal that names the callee, so the trace says which function to teach
 /// the backend next rather than only that some call was not compilable.
 fn noCallee(f: *const Func, callee: *const Func, comptime why: []const u8) ?Compiled {
@@ -1697,6 +1781,45 @@ fn objectClassNamed(m: *const Module, prog: Program, name: []const u8) ?u32 {
         if (!std.mem.eql(u8, c.name, name) and !std.mem.eql(u8, c.fqn, name)) continue;
         if (prog.of(@intCast(i)) == null) return null;
         return @intCast(i);
+    }
+    return null;
+}
+
+/// The object a CLASS name denotes when it is used as a qualifier: `Config` in
+/// `Config.Default` names Config's companion, which is an object declaration
+/// like any other and carries the members the qualifier reads.
+fn companionObjectNamed(m: *const Module, prog: Program, name: []const u8) ?u32 {
+    if (name.len == 0) return null;
+    var buf: [512]u8 = undefined;
+    if (std.fmt.bufPrint(&buf, "{s}.Companion", .{name})) |qualified| {
+        if (objectClassNamed(m, prog, qualified)) |oc| return oc;
+    } else |_| {}
+    var buf2: [512]u8 = undefined;
+    const simple = std.fmt.bufPrint(&buf2, "{s}.Companion", .{simpleName(name)}) catch return null;
+    return objectClassNamed(m, prog, simple);
+}
+
+/// The class a name denotes when it is read off another class: `Outer.Section`
+/// names a type rather than a value. A class NAME resolves to its companion, so
+/// the enclosing class of a companion is the one that owns the nested names.
+fn classQualifierNamed(m: *const Module, name: []const u8) ?u32 {
+    for (m.classes.items, 0..) |*c, i| {
+        if (std.mem.eql(u8, c.name, name) or std.mem.eql(u8, c.fqn, name)) return @intCast(i);
+    }
+    return null;
+}
+
+fn qualifierOwnerFqn(fqn: []const u8) []const u8 {
+    const tail = ".Companion";
+    if (std.mem.endsWith(u8, fqn, tail)) return fqn[0 .. fqn.len - tail.len];
+    return fqn;
+}
+
+fn nestedClassNamed(m: *const Module, owner_fqn: []const u8, name: []const u8) ?u32 {
+    var buf: [512]u8 = undefined;
+    const want = std.fmt.bufPrint(&buf, "{s}.{s}", .{ owner_fqn, name }) catch return null;
+    for (m.classes.items, 0..) |*c, i| {
+        if (std.mem.eql(u8, c.fqn, want)) return @intCast(i);
     }
     return null;
 }
@@ -2254,7 +2377,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             }
                         }
                     }
-                    const to = numConv(m, cm) orelse return instRefuse(f, inst);
+                    const to = numConv(m, cm) orelse return instRefuseNamed(m, f, inst, cm.name);
                     if (cm.receiver.int() >= f.n_locals or !known[cm.receiver.int()]) return no(f, "conv receiver");
                     const rt2 = types[cm.receiver.int()];
                     if (!isNumericTy(rt2)) return no(f, "conv receiver type");
@@ -2266,6 +2389,44 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     known[cm.dst.int()] = true;
                 },
                 .CallVirtual => |cv| {
+                    // A member the runtime serves from the receiver's own
+                    // representation. The receiver has to be a runtime value
+                    // rather than a compiled class: a user class that
+                    // implements the same interface dispatches to its body.
+                    if (cv.receiver.int() < f.n_locals and known[cv.receiver.int()] and
+                        types[cv.receiver.int()] == .object and cls[cv.receiver.int()] != null and
+                        isBuiltinCls(cls[cv.receiver.int()].?))
+                    {
+                        if (m.funcById(ir.FuncId.from(cv.slot.int()))) |decl| host: {
+                            const op = hostMemberOp(decl) orelse break :host;
+                            var kh: u32 = 0;
+                            while (kh < cv.n_args) : (kh += 1) {
+                                const ah = cv.args.int() + kh;
+                                if (ah >= f.n_locals or !known[ah]) return no(f, "host member arg");
+                            }
+                            if (cv.dst.int() >= f.n_locals) return no(f, "host member dst");
+                            if (op == .collection_iterator) {
+                                types[cv.dst.int()] = .object;
+                                cls[cv.dst.int()] = ITER_CLS;
+                                elem[cv.dst.int()] = elem[cv.receiver.int()];
+                                known[cv.dst.int()] = true;
+                                continue;
+                            }
+                            // The declaration says what the step answers. A
+                            // return type that names neither a machine type
+                            // nor a compiled class is the container's own
+                            // element type, which the receiver carries.
+                            const hrt = tyOf(decl.return_ty) orelse blk: {
+                                if (classIndexOfName(m, decl.return_ty) == null and
+                                    elem[cv.receiver.int()] != .unit) break :blk elem[cv.receiver.int()];
+                                break :blk Ty.object;
+                            };
+                            types[cv.dst.int()] = hrt;
+                            if (hrt == .object) cls[cv.dst.int()] = classIndexOfName(m, decl.return_ty);
+                            known[cv.dst.int()] = true;
+                            continue;
+                        }
+                    }
                     if (cv.receiver.int() < f.n_locals and known[cv.receiver.int()] and
                         cls[cv.receiver.int()] != null and cls[cv.receiver.int()].? == LIST_CLS)
                     {
@@ -2287,7 +2448,21 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             if (types[a0] != .i32) return no(f, "list index type");
                             types[cv.dst.int()] = .object;
                             cls[cv.dst.int()] = null;
-                        } else return no(f, "list virtual member");
+                        } else {
+                            // Any other member of a builtin receiver is an
+                            // operation the interpreter already implements.
+                            const decl = m.funcById(ir.FuncId.from(cv.slot.int())) orelse return no(f, "list virtual member");
+                            const sym = stdlibEntry(decl) orelse return noName(f, "list virtual member", decl.fqn);
+                            _ = sym;
+                            const vrt = tyOf(decl.return_ty) orelse Ty.object;
+                            types[cv.dst.int()] = vrt;
+                            if (vrt == .object) {
+                                cls[cv.dst.int()] = classIndexOfName(m, decl.return_ty);
+                                if (refElemOf(cls[cv.dst.int()], decl.return_ty)) |re12| elem[cv.dst.int()] = re12;
+                            }
+                            known[cv.dst.int()] = true;
+                            continue;
+                        }
                         known[cv.dst.int()] = true;
                         continue;
                     }
@@ -2300,6 +2475,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 // type and the argument shape; which body runs
                                 // is decided at run time by the receiver.
                                 const rt4 = funcRetTy2(m, root) orelse return no(f, "virtual return type");
+                                // The dispatcher forwards what the site passes
+                                // straight into the body it picks, so the site
+                                // has to supply the declaration's parameters
+                                // positionally. A site that omits one — a
+                                // default, or a named argument the lowering
+                                // reordered — needs the missing value computed
+                                // HERE, before the receiver is known.
+                                if (cv.n_args + 1 != root.params.len) return noCallee(f, root, "virtual call arity");
                                 var kk2: u32 = 0;
                                 while (kk2 < cv.n_args) : (kk2 += 1) {
                                     const ar2 = cv.args.int() + kk2;
@@ -2417,6 +2600,10 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                 },
                 .GetField => |gf| {
                     if (gf.receiver.int() >= f.n_locals or !known[gf.receiver.int()]) return no(f, "field receiver");
+                    // A read off a class NAME whose member belongs to that
+                    // class's companion: the companion answers it, so the
+                    // access runs against the companion singleton.
+                    var qual_recv: ?u32 = null;
                     if (staticClassOf(types, cls, gf.receiver.int())) |sc| {
                         if (gf.field.int() >= m.consts.items.len) return no(f, "field name");
                         const enm = m.consts.items[gf.field.int()];
@@ -2429,20 +2616,32 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             known[gf.dst.int()] = true;
                             continue;
                         }
-                        if (enumEntryIndex(m, prog, sc, plainFieldName(enm.String)) == null) return noName(f, "enum member", enm.String);
-                        if (gf.dst.int() >= f.n_locals) return no(f, "entry dst");
-                        types[gf.dst.int()] = .object;
-                        cls[gf.dst.int()] = sc;
-                        known[gf.dst.int()] = true;
-                        continue;
+                        if (sc < m.classes.items.len) {
+                            if (nestedClassNamed(m, qualifierOwnerFqn(m.classes.items[sc].fqn), plainFieldName(enm.String))) |nc| {
+                                if (gf.dst.int() >= f.n_locals) return no(f, "qualifier dst");
+                                types[gf.dst.int()] = .unit;
+                                cls[gf.dst.int()] = nc;
+                                known[gf.dst.int()] = true;
+                                continue;
+                            }
+                        }
+                        if (enumEntryIndex(m, prog, sc, plainFieldName(enm.String))) |_| {
+                            if (gf.dst.int() >= f.n_locals) return no(f, "entry dst");
+                            types[gf.dst.int()] = .object;
+                            cls[gf.dst.int()] = sc;
+                            known[gf.dst.int()] = true;
+                            continue;
+                        }
+                        qual_recv = companionObjectNamed(m, prog, if (sc < m.classes.items.len) m.classes.items[sc].fqn else "") orelse
+                            return noName(f, "enum member", enm.String);
                     }
-                    if (types[gf.receiver.int()] != .object) return no(f, "field on non-object");
-                    const rc = cls[gf.receiver.int()] orelse return no(f, "field receiver class");
+                    if (qual_recv == null and types[gf.receiver.int()] != .object) return no(f, "field on non-object");
+                    var rc = qual_recv orelse (cls[gf.receiver.int()] orelse return no(f, "field receiver class"));
                     if (rc == STRING_CLS or rc == LIST_CLS or rc == ARRAY_CLS) {
                         const snm = m.consts.items[gf.field.int()];
                         if (snm != .String) return no(f, "builtin member name");
                         const want: []const u8 = if (rc == STRING_CLS) "length" else "size";
-                        if (!std.mem.eql(u8, plainFieldName(snm.String), want)) return no(f, "builtin member");
+                        if (!std.mem.eql(u8, plainFieldName(snm.String), want)) return noName(f, "builtin member", snm.String);
                         if (gf.dst.int() >= f.n_locals) return no(f, "field dst");
                         types[gf.dst.int()] = .i32;
                         known[gf.dst.int()] = true;
@@ -2451,6 +2650,23 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (gf.field.int() >= m.consts.items.len) return no(f, "field name");
                     const nm = m.consts.items[gf.field.int()];
                     if (nm != .String) return no(f, "field name kind");
+                    // A nested class read off its outer names a type, not a
+                    // value: the register is a qualifier and holds nothing.
+                    if (rc < m.classes.items.len) {
+                        if (nestedClassNamed(m, qualifierOwnerFqn(m.classes.items[rc].fqn), plainFieldName(nm.String))) |nc| {
+                            if (gf.dst.int() >= f.n_locals) return no(f, "qualifier dst");
+                            types[gf.dst.int()] = .unit;
+                            cls[gf.dst.int()] = nc;
+                            known[gf.dst.int()] = true;
+                            continue;
+                        }
+                    }
+                    if (qual_recv == null) {
+                        if (accessOwner(m, prog, rc, nm.String, false)) |cc| {
+                            rc = cc;
+                            qual_recv = cc;
+                        }
+                    }
                     switch (accessPlan(m, prog, rc, nm.String, false)) {
                         .none => {
                             // Name why the class has no layout, when that is
@@ -2525,7 +2741,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (lg.name.int() >= m.consts.items.len) return no(f, "global name");
                     const gn = m.consts.items[lg.name.int()];
                     if (gn != .String) return no(f, "global name kind");
-                    if (objectClassNamed(m, prog, gn.String)) |oc| {
+                    if (objectClassNamed(m, prog, gn.String) orelse
+                        companionObjectNamed(m, prog, gn.String)) |oc|
+                    {
                         if (lg.dst.int() >= f.n_locals) return no(f, "singleton dst");
                         types[lg.dst.int()] = .object;
                         cls[lg.dst.int()] = oc;
@@ -2552,6 +2770,18 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         cls[lg.dst.int()] = ec;
                         known[lg.dst.int()] = true;
                         continue;
+                    }
+                    // Any other class name is a qualifier too: `Outer` in
+                    // `Outer.Section` names the type the nested name is read
+                    // off. A global of the same name is a value and wins.
+                    if (globalIndex(globals, gn.String) == null) {
+                        if (classQualifierNamed(m, gn.String)) |qc| {
+                            if (lg.dst.int() >= f.n_locals) return no(f, "qualifier dst");
+                            types[lg.dst.int()] = .unit;
+                            cls[lg.dst.int()] = qc;
+                            known[lg.dst.int()] = true;
+                            continue;
+                        }
                     }
                     const gi = globalIndex(globals, gn.String) orelse return noName(f, "global not declared", gn.String);
                     if (lg.dst.int() >= f.n_locals) return no(f, "global dst");
@@ -2800,7 +3030,31 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         types[c.dst.int()] = .unit;
                         known[c.dst.int()] = true;
                     } else {
-                        if (!callee.hasBody()) return noCallee(f, callee, "no body for");
+                        if (!callee.hasBody()) {
+                            // No Kotlin body, but the interpreter implements
+                            // it: compiled code runs the same entry.
+                            if (stdlibEntry(callee) != null) {
+                                var ks9: u32 = 0;
+                                while (ks9 < c.n_args) : (ks9 += 1) {
+                                    const a9 = c.args.int() + ks9;
+                                    if (a9 >= f.n_locals or !known[a9]) return no(f, "stdlib arg");
+                                }
+                                if (c.dst.int() >= f.n_locals) return no(f, "stdlib dst");
+                                // The table answers a value; the DECLARATION
+                                // says what kind, so a result that is a machine
+                                // type comes back as one rather than staying
+                                // boxed and refusing the next `+`.
+                                const srt = tyOf(callee.return_ty) orelse Ty.object;
+                                types[c.dst.int()] = srt;
+                                if (srt == .object) {
+                                    cls[c.dst.int()] = classIndexOfName(m, callee.return_ty);
+                                    if (refElemOf(cls[c.dst.int()], callee.return_ty)) |re11| elem[c.dst.int()] = re11;
+                                }
+                                known[c.dst.int()] = true;
+                                continue;
+                            }
+                            return noCallee(f, callee, "no body for");
+                        }
                         if (callee.params.len < c.n_args) return noCallee(f, callee, "arity of");
                         const bnd = bindCallArgs(m, callee.params, c.args.int(), c.n_args, c.arg_names) orelse
                             return noCallee(f, callee, "argument binding of");
@@ -3920,7 +4174,16 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     try w.writeAll(");\n");
                 },
                 .GetField => |gf| {
-                    const rc = c.cls[gf.receiver.int()].?;
+                    // A read whose result NAMES a class resolves at emit time
+                    // and leaves nothing behind, exactly as loading the name
+                    // of a class does.
+                    if (staticClassOf(c.types, c.cls, gf.dst.int()) != null) continue;
+                    var rc = c.cls[gf.receiver.int()].?;
+                    // Where the value is read FROM: the receiver register, or
+                    // the companion singleton when the receiver is a class
+                    // name that answers through its companion.
+                    var qrb: [32]u8 = undefined;
+                    var recv_txt: []const u8 = regName(c, gf.receiver.int(), &qrb);
                     if (staticClassOf(c.types, c.cls, gf.receiver.int())) |sc| {
                         const enm = m.consts.items[gf.field.int()].String;
                         if (numClsTy(sc)) |bt3| {
@@ -3931,12 +4194,19 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             });
                             continue;
                         }
-                        const ei2 = enumEntryIndex(m, prog, sc, plainFieldName(enm)).?;
-                        var nb3: [32]u8 = undefined;
-                        try w.print("  {s} = KO[{d}];\n", .{
-                            regName(c, gf.dst.int(), &nb3), singletonSlot(singletons, sc, ei2).?,
-                        });
-                        continue;
+                        if (enumEntryIndex(m, prog, sc, plainFieldName(enm))) |ei2| {
+                            var nb3: [32]u8 = undefined;
+                            try w.print("  {s} = KO[{d}];\n", .{
+                                regName(c, gf.dst.int(), &nb3), singletonSlot(singletons, sc, ei2).?,
+                            });
+                            continue;
+                        }
+                        rc = companionObjectNamed(m, prog, m.classes.items[sc].fqn).?;
+                        recv_txt = try std.fmt.bufPrint(&qrb, "KO[{d}]", .{singletonSlot(singletons, rc, null).?});
+                    } else if (accessOwner(m, prog, rc, m.consts.items[gf.field.int()].String, false)) |cc| {
+                        // The name is the companion's, not the receiver's.
+                        rc = cc;
+                        recv_txt = try std.fmt.bufPrint(&qrb, "KO[{d}]", .{singletonSlot(singletons, cc, null).?});
                     }
                     if (rc == STRING_CLS or rc == LIST_CLS or rc == ARRAY_CLS) {
                         var nb: [32]u8 = undefined;
@@ -3957,29 +4227,26 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         .none => unreachable,
                         .virtual => {
                             var nb17: [32]u8 = undefined;
-                            var rb17: [32]u8 = undefined;
                             var mangled: [96]u8 = undefined;
                             try w.print("  {s} = kprop_{d}_{s}({s});\n", .{
                                 regName(c, gf.dst.int(), &nb17), rc,
-                                mangleName(plainFieldName(nm), &mangled), regName(c, gf.receiver.int(), &rb17),
+                                mangleName(plainFieldName(nm), &mangled), recv_txt,
                             });
                         },
                         .accessor => |gacc| {
                             const gfn = m.funcById(gacc).?;
                             var nb2: [32]u8 = undefined;
-                            var rb2: [32]u8 = undefined;
                             var sym2: std.Io.Writer.Allocating = .init(gpa);
                             defer sym2.deinit();
                             try writeSymbol(&sym2.writer, gfn);
                             try w.print("  {s} = {s}({s});\n", .{
-                                regName(c, gf.dst.int(), &nb2), sym2.written(), regName(c, gf.receiver.int(), &rb2),
+                                regName(c, gf.dst.int(), &nb2), sym2.written(), recv_txt,
                             });
                         },
                         .field => |idx| {
                             var nb: [32]u8 = undefined;
-                            var rb: [32]u8 = undefined;
                             var ub: [128]u8 = undefined;
-                            const get = try std.fmt.bufPrint(&ub, "klio_nat_get({s}, {d})", .{ regName(c, gf.receiver.int(), &rb), idx });
+                            const get = try std.fmt.bufPrint(&ub, "klio_nat_get({s}, {d})", .{ recv_txt, idx });
                             var ob: [160]u8 = undefined;
                             try w.print("  {s} = {s};\n", .{
                                 regName(c, gf.dst.int(), &nb), unboxExpr(c.types[gf.dst.int()], get, &ob),
@@ -4056,13 +4323,26 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         });
                         continue;
                     }
-                    const op = cOp(b.op).?;
                     var lnb: [32]u8 = undefined;
                     var rnb: [32]u8 = undefined;
                     var dnb: [32]u8 = undefined;
                     const ln = regName(c, b.lhs.int(), &lnb);
                     const rn = regName(c, b.rhs.int(), &rnb);
                     const dn = regName(c, b.dst.int(), &dnb);
+                    if (b.op == .UShr) {
+                        // C has no unsigned right shift of a signed value, so
+                        // it runs in the unsigned type of the same width;
+                        // Kotlin masks the shift count where C leaves an
+                        // over-wide shift undefined.
+                        const lt5 = c.types[b.lhs.int()];
+                        const ut5: []const u8 = if (lt5 == .i64) "uint64_t" else "uint32_t";
+                        try w.print("  {s} = ({s})(({s}){s} >> ({s} & {d}));\n", .{
+                            dn, dt.cName(), ut5, ln, rn,
+                            @as(u32, if (lt5 == .i64) 63 else 31),
+                        });
+                        continue;
+                    }
+                    const op = cOp(b.op).?;
                     if ((b.op == .Div or b.op == .Mod) and !dt.isFloat() and !isCmp(b.op)) {
                         try w.print("  if ({s} == 0) klio_arith_zero();\n", .{rn});
                         // The most negative value divided by -1 overflows.
@@ -4078,14 +4358,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             }
                         }
                     }
-                    if (b.op == .UShr) {
-                        const lt = c.types[b.lhs.int()];
-                        const ut: []const u8 = if (lt == .i64) "uint64_t" else "uint32_t";
-                        try w.print("  {s} = ({s})(({s}){s} >> ({s} & {d}));\n", .{
-                            dn, dt.cName(), ut, ln, rn,
-                            @as(u32, if (lt == .i64) 63 else 31),
-                        });
-                    } else if (b.op == .Shl or b.op == .Shr) {
+                    if (b.op == .Shl or b.op == .Shr) {
                         // Kotlin masks the shift count; C leaves an over-wide
                         // shift undefined.
                         const lt = c.types[b.lhs.int()];
@@ -4235,6 +4508,33 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     var nb: [32]u8 = undefined;
                     var rb: [32]u8 = undefined;
                     const recv = regName(c, cv.receiver.int(), &rb);
+                    if (c.cls[cv.receiver.int()]) |rc0| {
+                        if (isBuiltinCls(rc0)) host: {
+                            const decl0 = m.funcById(ir.FuncId.from(cv.slot.int())) orelse break :host;
+                            if (hostMemberOp(decl0) == null) break :host;
+                            // The runtime reads the declaration's name to pick
+                            // the same operation the emitter classified, and
+                            // takes the receiver as the first argument.
+                            try w.print("  {{ klio_value ma[{d}];\n    ma[0] = {s};\n", .{ cv.n_args + 1, recv });
+                            var kh: u32 = 0;
+                            while (kh < cv.n_args) : (kh += 1) {
+                                const ah = cv.args.int() + kh;
+                                var ahb: [32]u8 = undefined;
+                                var bhb: [96]u8 = undefined;
+                                try w.print("    ma[{d}] = {s};\n", .{
+                                    kh + 1, boxExpr(c.types[ah], regName(c, ah, &ahb), &bhb),
+                                });
+                            }
+                            var hb: [320]u8 = undefined;
+                            var hob: [400]u8 = undefined;
+                            const hcall = try std.fmt.bufPrint(&hb, "klio_nat_member(\"{s}\", ma, {d})", .{ decl0.fqn, cv.n_args + 1 });
+                            try w.print("    {s} = {s}; }}\n", .{
+                                regName(c, cv.dst.int(), &nb),
+                                unboxExpr(c.types[cv.dst.int()], hcall, &hob),
+                            });
+                            continue;
+                        }
+                    }
                     if (isDispatched(slots, cv.slot.int())) {
                         try w.print("  {s} = kvirt_{d}({s}", .{
                             regName(c, cv.dst.int(), &nb), cv.slot.int(), recv,
@@ -4260,18 +4560,39 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                                 try w.print("  {s} = {s};\n", .{
                                     regName(c, cv.dst.int(), &nb), unboxExpr(c.types[cv.dst.int()], g, &ob),
                                 });
-                            } else if (std.mem.eql(u8, mn, "add")) {
+                            } else if (std.mem.eql(u8, mn, "add") and cv.n_args == 1) {
                                 try w.print("  klio_nat_list_add({s}, {s});\n", .{
                                     recv, boxExpr(c.types[a0], regName(c, a0, &ab), &bb),
                                 });
                                 try w.print("  {s} = 1;\n", .{regName(c, cv.dst.int(), &nb)});
-                            } else {
+                            } else if (std.mem.eql(u8, mn, "set") and cv.n_args == 2) {
                                 var vb: [32]u8 = undefined;
                                 try w.print("  klio_nat_list_set({s}, {s}, {s});\n", .{
                                     recv, regName(c, a0, &ab),
                                     boxExpr(c.types[a0 + 1], regName(c, a0 + 1, &vb), &bb),
                                 });
                                 try w.print("  {s} = klio_nat_box_unit();\n", .{regName(c, cv.dst.int(), &nb)});
+                            } else {
+                                // The interpreter's own entry, receiver first.
+                                const decl2 = m.funcById(ir.FuncId.from(cv.slot.int())).?;
+                                const sym2 = stdlibEntry(decl2).?;
+                                try w.print("  {{ klio_value sa[{d}];\n    sa[0] = {s};\n", .{ cv.n_args + 1, recv });
+                                var kv2: u32 = 0;
+                                while (kv2 < cv.n_args) : (kv2 += 1) {
+                                    const ar12 = cv.args.int() + kv2;
+                                    var ab12: [32]u8 = undefined;
+                                    var bb12: [96]u8 = undefined;
+                                    try w.print("    sa[{d}] = {s};\n", .{
+                                        kv2 + 1, boxExpr(c.types[ar12], regName(c, ar12, &ab12), &bb12),
+                                    });
+                                }
+                                var ob15: [300]u8 = undefined;
+                                var sb15: [260]u8 = undefined;
+                                const sc15 = try std.fmt.bufPrint(&sb15, "klio_nat_stdlib(\"{s}\", sa, {d})", .{ sym2, cv.n_args + 1 });
+                                try w.print("    {s} = {s}; }}\n", .{
+                                    regName(c, cv.dst.int(), &nb),
+                                    unboxExpr(c.types[cv.dst.int()], sc15, &ob15),
+                                });
                             }
                             continue;
                         }
@@ -4552,6 +4873,39 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         defer rex.deinit();
                         try renderExpr(gpa, m, prog, c, a0, &rex);
                         try w.print("  klio_nat_println({s});\n", .{rex.written()});
+                    } else if (!callee.hasBody()) {
+                        // The interpreter's own entry, called by name with the
+                        // arguments boxed: the table is typed in Kotlin.
+                        const sym = stdlibEntry(callee).?;
+                        var db11: [32]u8 = undefined;
+                        if (call.n_args == 0) {
+                            var ob13: [200]u8 = undefined;
+                            var sb13: [220]u8 = undefined;
+                            const sc13 = try std.fmt.bufPrint(&sb13, "klio_nat_stdlib(\"{s}\", 0, 0)", .{sym});
+                            try w.print("  {s} = {s};\n", .{
+                                regName(c, call.dst.int(), &db11),
+                                unboxExpr(c.types[call.dst.int()], sc13, &ob13),
+                            });
+                            continue;
+                        }
+                        try w.print("  {{ klio_value sa[{d}];\n", .{call.n_args});
+                        var ks11: u32 = 0;
+                        while (ks11 < call.n_args) : (ks11 += 1) {
+                            const ar11 = call.args.int() + ks11;
+                            var ab11: [32]u8 = undefined;
+                            var bb11: [96]u8 = undefined;
+                            try w.print("    sa[{d}] = {s};\n", .{
+                                ks11, boxExpr(c.types[ar11], regName(c, ar11, &ab11), &bb11),
+                            });
+                        }
+                        var ob14: [300]u8 = undefined;
+                        var sb14: [260]u8 = undefined;
+                        const sc14 = try std.fmt.bufPrint(&sb14, "klio_nat_stdlib(\"{s}\", sa, {d})", .{ sym, call.n_args });
+                        try w.print("    {s} = {s}; }}\n", .{
+                            regName(c, call.dst.int(), &db11),
+                            unboxExpr(c.types[call.dst.int()], sc14, &ob14),
+                        });
+                        continue;
                     } else {
                         // Arguments go to the callee in ITS order: positional
                         // ones bind in order and named ones by name. A
@@ -4945,26 +5299,41 @@ pub fn emit(
         try accepted.append(gpa, c);
         for (f.blocks) |*blk| {
             for (blk.insts) |*inst| {
-                if (inst.* == .LoadGlobal) {
-                    const cid3 = inst.LoadGlobal.name;
-                    if (cid3.int() < m.consts.items.len) {
-                        const gn3 = m.consts.items[cid3.int()];
-                        if (gn3 == .String) {
-                            if (objectClassNamed(m, prog, gn3.String)) |oc| {
-                                var have_o = false;
-                                for (constructed.items) |uo| {
-                                    if (uo == oc) have_o = true;
-                                }
-                                if (!have_o) try constructed.append(gpa, oc);
-                                for (prog.of(oc).?) |fd| {
-                                    const ifid = fd.init orelse continue;
-                                    const ifn = m.funcById(ifid) orelse return false;
-                                    if (seen.contains(ifn.id.int())) continue;
-                                    try seen.put(ifn.id.int(), {});
-                                    try queue.append(gpa, .{ .f = ifn, .synth = null });
-                                }
-                            }
+                // The one instance an `object` declaration has, named either
+                // by its own name or through the class whose companion it is.
+                const singleton_cid: ?u32 = switch (inst.*) {
+                    .LoadGlobal => |lg4| blk4: {
+                        if (lg4.name.int() >= m.consts.items.len) break :blk4 null;
+                        const gn4 = m.consts.items[lg4.name.int()];
+                        if (gn4 != .String) break :blk4 null;
+                        break :blk4 objectClassNamed(m, prog, gn4.String) orelse
+                            companionObjectNamed(m, prog, gn4.String);
+                    },
+                    .GetField => |gf4| blk5: {
+                        if (gf4.field.int() >= m.consts.items.len) break :blk5 null;
+                        const fn4 = m.consts.items[gf4.field.int()];
+                        if (fn4 != .String) break :blk5 null;
+                        if (staticClassOf(c.types, c.cls, gf4.receiver.int())) |sc4| {
+                            if (sc4 >= m.classes.items.len) break :blk5 null;
+                            break :blk5 companionObjectNamed(m, prog, m.classes.items[sc4].fqn);
                         }
+                        const rc4 = c.cls[gf4.receiver.int()] orelse break :blk5 null;
+                        break :blk5 accessOwner(m, prog, rc4, fn4.String, false);
+                    },
+                    else => null,
+                };
+                if (singleton_cid) |oc| {
+                    var have_o = false;
+                    for (constructed.items) |uo| {
+                        if (uo == oc) have_o = true;
+                    }
+                    if (!have_o) try constructed.append(gpa, oc);
+                    for (prog.of(oc).?) |fd| {
+                        const ifid = fd.init orelse continue;
+                        const ifn = m.funcById(ifid) orelse return false;
+                        if (seen.contains(ifn.id.int())) continue;
+                        try seen.put(ifn.id.int(), {});
+                        try queue.append(gpa, .{ .f = ifn, .synth = null });
                     }
                 }
                 // A referenced global drags in the thunk that initializes it.
@@ -5272,6 +5641,10 @@ pub fn emit(
                 if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or
                     arrayOfIntrinsic(callee) != null or isArrayOfNulls(callee) or isRunBlocking(callee) or
                     isDelay(callee) or isLaunch(callee)) continue;
+                // A declaration the interpreter implements has no body to
+                // compile: the call reaches the same entry the interpreter
+                // reaches.
+                if (!callee.hasBody() and stdlibEntry(callee) != null) continue;
                 // A call that leaves a parameter unbound runs the thunk for it.
                 const bnd3 = bindCallArgs(m, callee.params, inst.Call.args.int(), inst.Call.n_args, inst.Call.arg_names) orelse
                     return false;
@@ -5443,6 +5816,24 @@ pub fn emit(
                 // once, exactly like an `object` declaration's.
                 if (inst.* == .GetField) {
                     const gf3 = inst.GetField;
+                    // A property the receiver's own class does not carry is its
+                    // companion's, and that singleton has to exist.
+                    if (staticClassOf(c.types, c.cls, gf3.receiver.int()) == null) {
+                        if (gf3.field.int() < m.consts.items.len) {
+                            const fnm3 = m.consts.items[gf3.field.int()];
+                            if (fnm3 == .String) {
+                                if (c.cls[gf3.receiver.int()]) |rc3| {
+                                    if (accessOwner(m, prog, rc3, fnm3.String, false)) |cc3| {
+                                        var have_c3 = false;
+                                        for (used_singletons.items) |u| {
+                                            if (u.cid == cc3 and u.entry == null) have_c3 = true;
+                                        }
+                                        if (!have_c3) try used_singletons.append(gpa, .{ .cid = cc3 });
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if (staticClassOf(c.types, c.cls, gf3.receiver.int())) |sc2| {
                         const enm2 = m.consts.items[gf3.field.int()];
                         if (enm2 == .String) {
@@ -5452,6 +5843,17 @@ pub fn emit(
                                     if (u.cid == sc2 and u.entry != null and u.entry.? == ei3) have_e = true;
                                 }
                                 if (!have_e) try used_singletons.append(gpa, .{ .cid = sc2, .entry = ei3 });
+                            } else if (sc2 < m.classes.items.len) {
+                                // A member read off a class name answers from
+                                // that class's companion, which is a singleton
+                                // the program has to build.
+                                if (companionObjectNamed(m, prog, m.classes.items[sc2].fqn)) |cc2| {
+                                    var have_c = false;
+                                    for (used_singletons.items) |u| {
+                                        if (u.cid == cc2 and u.entry == null) have_c = true;
+                                    }
+                                    if (!have_c) try used_singletons.append(gpa, .{ .cid = cc2 });
+                                }
                             }
                         }
                     }
@@ -5462,7 +5864,8 @@ pub fn emit(
                 if (cid2.int() >= m.consts.items.len) continue;
                 const gn2 = m.consts.items[cid2.int()];
                 if (gn2 != .String) continue;
-                const oc = objectClassNamed(m, prog, gn2.String) orelse continue;
+                const oc = objectClassNamed(m, prog, gn2.String) orelse
+                    companionObjectNamed(m, prog, gn2.String) orelse continue;
                 var have2 = false;
                 for (used_singletons.items) |u| {
                     if (u.cid == oc and u.entry == null) have2 = true;
@@ -5543,6 +5946,11 @@ pub fn emit(
         for (c.cls) |maybe| {
             const cid = maybe orelse continue;
             if (isBuiltinCls(cid)) continue;
+            // A class the program never laid out has no descriptor to
+            // register: an interface, or a library type a value merely passes
+            // through. Nothing constructs one, and every read that would need
+            // its fields is refused before it reaches here.
+            if (prog.of(cid) == null) continue;
             var seen_cls = false;
             for (used_classes.items) |u| {
                 if (u == cid) seen_cls = true;
@@ -5915,9 +6323,12 @@ pub fn emit(
             }
             if (dk9 != impl.params.len) {
                 // A parameter with no default and no argument: nothing can
-                // fill it, so this receiver cannot answer here.
-                try w.writeAll("  }\n");
-                continue;
+                // fill it, so this receiver cannot answer at all. Leaving the
+                // arm empty would let the call fall through to the
+                // no-implementation tail at run time, which is a wrong answer
+                // rather than a refusal.
+                if (traceOn()) std.debug.print("[cgen] refuse {s}: dispatcher arm cannot fill a parameter of `{s}`\n", .{ root.name, impl.fqn });
+                return false;
             }
             try w.writeAll("    return ");
             try writeSymbol(w, impl);
@@ -6035,6 +6446,13 @@ pub fn emit(
                 try w.writeAll(");\n");
             }
             try w.writeAll("  klio_nat_no_method(\"invoke\");\n  return klio_nat_box_unit();\n}\n");
+            // The same dispatcher in the uniform shape a stdlib entry calls
+            // back through: `forEach` and its kind hand the runtime a closure
+            // VALUE and an argument array.
+            try w.print("static klio_value klam_inv_{d}(klio_value f, const klio_value *a) {{\n  (void)a;\n  return klam_call_{d}(f", .{ lu.arity, lu.arity });
+            var ai11: u32 = 0;
+            while (ai11 < lu.arity) : (ai11 += 1) try w.print(", a[{d}]", .{ai11});
+            try w.writeAll(");\n}\n");
         }
     }
     for (used_props.items) |pu| {
@@ -6144,6 +6562,16 @@ pub fn emit(
         "  klio_in_flight_frame.n = 1; klio_in_flight_frame.slots = &klio_in_flight;\n" ++
         "  klio_nat_enter(&klio_in_flight_frame);\n",
     );
+    {
+        // Every arity a closure can be called through, registered so a stdlib
+        // entry that takes a lambda can reach compiled code.
+        var seen_ar3: [FUNC_MAX_ARITY + 1]bool = @splat(false);
+        for (used_lambdas.items) |lu| {
+            if (seen_ar3[lu.arity]) continue;
+            seen_ar3[lu.arity] = true;
+            try w.print("  klio_nat_lambda_invoker({d}, klam_inv_{d});\n", .{ lu.arity, lu.arity });
+        }
+    }
     if (used_singletons.items.len != 0) try w.writeAll("  klio_init_singletons();\n");
     if (used_globals.items.len != 0) {
         // Top-level properties run their initializers in declaration order,
