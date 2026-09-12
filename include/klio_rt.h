@@ -333,6 +333,17 @@ klio_value klio_nat_box_short(int16_t v);
 klio_value klio_nat_box_byte(int8_t v);
 uint16_t klio_nat_char(klio_value v);
 int16_t  klio_nat_short(klio_value v);
+
+/* Kotlin's unsigned integers: value classes over the signed widths, so the
+ * bits are the same and only the box's kind and the operations differ. */
+klio_value klio_nat_box_uint(uint32_t v);
+klio_value klio_nat_box_ulong(uint64_t v);
+klio_value klio_nat_box_ushort(uint16_t v);
+klio_value klio_nat_box_ubyte(uint8_t v);
+uint32_t klio_nat_uint(klio_value v);
+uint64_t klio_nat_ulong(klio_value v);
+uint16_t klio_nat_ushort(klio_value v);
+uint8_t  klio_nat_ubyte(klio_value v);
 int8_t   klio_nat_byte(klio_value v);
 
 klio_value klio_nat_box_int(int32_t v);

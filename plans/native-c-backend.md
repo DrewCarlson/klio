@@ -453,6 +453,19 @@ the class descriptor names each field's zero — so a superclass constructor tha
 calls an overridden method sees the subclass's field as 0/false/null, exactly
 as on the JVM.
 
+Unsigned integers compile. Kotlin's are VALUE classes over the signed widths,
+so they hold the same bits and constructing one — which is what `n.toUInt()`
+does — reinterprets rather than allocates; only comparison, division and the
+right shift read them differently, which is exactly what C's unsigned types
+give. An unsigned type mixes only with its own kind, because Kotlin has no
+implicit conversion between a signed and an unsigned integer.
+
+A class answers a virtual slot only if its TYPE includes the declaration. Name
+and arity alone made every same-named method across the stdlib look like an
+override, so one `next()` call pulled whole families of unrelated iterators
+into the compile and the program refused on one of them. With that and the
+unsigned types, a `for` over a range compiles.
+
 The sweep now reports every accepted program matching the interpreter.
 
 ## Still refused
