@@ -328,6 +328,7 @@ Run any program with:
 | `native_ranges.kt`         | A range held as a value compiled to C: a progression with a start, an inclusive end and a step, iterated through the same iterator any container gives. |
 | `native_varargs.kt`        | A `vararg` parameter compiled to C: the call site collects its trailing arguments into one array of the parameter's element type, and the callee iterates it. |
 | `native_type_tests.kt`     | `is` and `as` compiled to C: a compiled instance is tested against the class handles that reach the named type, and everything else answers from its own representation. |
+| `native_generics.kt`       | Generic classes and functions compiled to C: an erased type argument is a reference like any other, so a machine type boxes on the way into one. |
 | `native_lambdas.kt`        | Lambdas compiled to C: a lambda whose call site can see which body it holds is called directly with its captures as leading arguments, so no closure object is allocated and no dispatch happens. |
 | `native_interfaces.kt`     | Interfaces and virtual dispatch compiled to C: an interface adds no fields, and which body a call reaches is the receiver's class compared against the handles registered at startup. |
 | `native_char_sized.kt`     | `Char` and the narrow integer kinds compiled to C: integers in the machine but each carrying its kind in the box, since a Char prints as a character and arithmetic on any of them produces an Int. |

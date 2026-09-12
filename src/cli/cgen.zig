@@ -125,8 +125,11 @@ fn funcRetTy(f: *const Func) ?Ty {
 /// has no layout at all and never will.
 fn funcRetTy2(m: *const Module, f: *const Func) ?Ty {
     if (funcRetTy(f)) |t| return t;
-    if (classIndexOfName(m, f.return_ty) != null) return .object;
-    return null;
+    _ = m;
+    // A return type that names nothing the module declares — an erased type
+    // parameter — is still a reference. Reading a member off it refuses where
+    // it is read; passing it on does not have to.
+    return .object;
 }
 
 fn constTy(c: ir.Const) ?Ty {
@@ -898,13 +901,10 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
             out.deinit(gpa);
             return layoutNo(c, "ctor param default/vararg");
         }
-        const t = tyOf(p.ty) orelse blk: {
-            if (classIndexOfName(m, p.ty) == null) {
-                out.deinit(gpa);
-                return layoutNoTy(c, "ctor param type", p.ty);
-            }
-            break :blk Ty.object;
-        };
+        // A type the module has no class for is still a REFERENCE: Kotlin
+        // erases generics, so a `T` parameter holds a value like any other and
+        // every use of it that needs a layout refuses on its own.
+        const t = tyOf(p.ty) orelse Ty.object;
         try out.append(gpa, .{
             .name = p.name,
             .ty = t,
@@ -936,12 +936,8 @@ fn classFieldsAt(gpa: std.mem.Allocator, m: *const Module, layouts: []const Clas
             var felem: Ty = .unit;
             const t = tyOf(bp.ty) orelse blk: {
                 if (bp.ty.name.len != 0) {
-                    if (classIndexOfName(m, bp.ty)) |ci| {
-                        fcls = ci;
-                        break :blk Ty.object;
-                    }
-                    out.deinit(gpa);
-                    return layoutNoTy(c, "body property type", bp.ty);
+                    fcls = classIndexOfName(m, bp.ty);
+                    break :blk Ty.object;
                 }
                 // The source annotated no type, so the property's type is
                 // whatever its initializer computes. Asking the initializer
@@ -1977,8 +1973,10 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     for (params) |p| {
         // A default is the CALLER's business: the callee takes the parameter
         // like any other, and a call that omits it runs the thunk.
-        if (!p.is_vararg and tyOf(p.ty) == null and classIndexOfName(m, p.ty) == null)
-            return noName(f, "param type", p.ty.name);
+        // A parameter whose type names nothing the module declares is an
+        // erased reference, not a refusal: it can be passed, returned and
+        // stored, and any use that needs its layout refuses where it is used.
+        _ = p;
     }
 
     const types = try gpa.alloc(Ty, f.n_locals);
@@ -2762,7 +2760,10 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         const ai = fd.arg orelse continue;
                         const ar = cb3.regs[ai] orelse return no(f, "ctor arg");
                         if (ar >= f.n_locals or !known[ar]) return no(f, "ctor arg");
-                        if (types[ar] != fd.ty) return no(f, "ctor arg type");
+                        // A field that holds a REFERENCE takes any value: the
+                        // call site boxes a machine type for it, which is what
+                        // an erased type parameter needs.
+                        if (types[ar] != fd.ty and fd.ty != .object) return no(f, "ctor arg type");
                         // An argument whose class is not the field's is a call
                         // to a SECONDARY constructor, which runs a body the
                         // emitter does not have. Matching arity alone made it
