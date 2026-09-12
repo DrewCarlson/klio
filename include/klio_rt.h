@@ -362,6 +362,12 @@ klio_value klio_nat_coro_launch(klio_value block);
  * is the first argument. A higher-order entry calls back through the closure
  * dispatcher registered for its arity. */
 klio_value klio_nat_stdlib(const char *fqn, const klio_value *argv, uint32_t argc);
+
+/* A builtin member the interpreter serves from the receiver's own
+ * representation rather than from a declaration body: the iteration protocol
+ * and the collection `iterator()`. Named by the declaration the call site
+ * bound, with the receiver first. */
+klio_value klio_nat_member(const char *fqn, const klio_value *argv, uint32_t argc);
 typedef klio_value (*klio_invoke_fn)(klio_value f, const klio_value *argv);
 void klio_nat_lambda_invoker(uint32_t arity, klio_invoke_fn call);
 

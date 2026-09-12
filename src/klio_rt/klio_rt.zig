@@ -906,6 +906,48 @@ export fn klio_nat_stdlib(fqn: [*:0]const u8, argv: [*]const CValue, argc: u32) 
     };
 }
 
+/// One builtin member call, named by the DECLARATION the call site bound. The
+/// interpreter classifies that name into a host operation and runs it off the
+/// receiver's own representation; a compiled program has no module to dispatch
+/// through, so it reaches the same bodies here. The receiver is the first
+/// argument, as it is for `klio_nat_stdlib`.
+export fn klio_nat_member(fqn: [*:0]const u8, argv: [*]const CValue, argc: u32) CValue {
+    const a = natAlloc();
+    const name = std.mem.span(fqn);
+    const dispatch = cli.interp_ir.member_dispatch;
+    const op = dispatch.hostSlotOpOfFqn(name) orelse natNoMember(name);
+    const member = name[(std.mem.lastIndexOfScalar(u8, name, '.') orelse 0) + 1 ..];
+    if (argc == 0) natNoMember(name);
+    const recv = fromC(argv[0]);
+    const args = a.alloc(runtime.Value, argc - 1) catch @panic("klio_nat_member: out of memory");
+    defer a.free(args);
+    var i: u32 = 1;
+    while (i < argc) : (i += 1) args[i - 1] = fromC(argv[i]);
+    const r = dispatch.runHostFreeSlotOp(a, op, &recv, member, args) catch
+        @panic("klio_nat_member: out of memory");
+    const got = r orelse natNoMember(name);
+    return switch (got) {
+        .ok => |v| toC(v),
+        .err => natMemberFailed(name),
+    };
+}
+
+fn natNoMember(name: []const u8) noreturn {
+    const pre = "runtime error: no implementation of ";
+    _ = std.c.write(2, pre.ptr, pre.len);
+    _ = std.c.write(2, name.ptr, name.len);
+    _ = std.c.write(2, "\n", 1);
+    std.c.exit(1);
+}
+
+fn natMemberFailed(name: []const u8) noreturn {
+    const pre = "runtime error: ";
+    _ = std.c.write(2, pre.ptr, pre.len);
+    _ = std.c.write(2, name.ptr, name.len);
+    _ = std.c.write(2, " failed\n", 8);
+    std.c.exit(1);
+}
+
 fn natNoStdlib(name: []const u8) noreturn {
     const pre = "runtime error: no implementation of ";
     _ = std.c.write(2, pre.ptr, pre.len);
