@@ -321,6 +321,7 @@ Run any program with:
 | `native_ranges_and_bare_calls.kt` | A `for` over a range compiled to C, and bare calls that could be a member of an implicit receiver or a top-level declaration; a class answers a virtual slot only if its type includes the declaration. |
 | `native_unsigned.kt`       | Kotlin's unsigned integers compiled to C: value classes over the signed widths, so constructing one reinterprets the same bits and only comparison, division and the right shift read them differently. |
 | `native_divide_by_zero.kt`  | Integer division by zero compiled to C: a real throwable a `catch` can see, reported by the runtime when uncaught. |
+| `native_coroutines.kt`     | Coroutines compiled to C: a `suspend` body becomes a state machine over a heap frame, and a compiled program drives it on the interpreter's own scheduler rather than a second one. |
 | `native_lambdas.kt`        | Lambdas compiled to C: a lambda whose call site can see which body it holds is called directly with its captures as leading arguments, so no closure object is allocated and no dispatch happens. |
 | `native_interfaces.kt`     | Interfaces and virtual dispatch compiled to C: an interface adds no fields, and which body a call reaches is the receiver's class compared against the handles registered at startup. |
 | `native_char_sized.kt`     | `Char` and the narrow integer kinds compiled to C: integers in the machine but each carrying its kind in the box, since a Char prints as a character and arithmetic on any of them produces an Int. |

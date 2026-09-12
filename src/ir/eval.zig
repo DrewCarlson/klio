@@ -5121,12 +5121,17 @@ pub fn resumeNativeContinuation(
     state.frames = .empty;
     defer frames.deinit(allocator);
     state.gc_quiesced = false;
-    for (frames.items) |snap| {
+    for (frames.items, 0..) |snap, i| {
         const nr = snap.native orelse return errResult(.{ .Type = "interpreted frame in a compiled suspension" });
         const produced = runtime.fromC(nr.call(nr.frame, runtime.toC(carry)));
         if (produced == .CoroutineSuspended) {
             const st = takeInFlightSuspend(allocator) orelse
                 return errResult(.{ .Type = "compiled body suspended without a continuation" });
+            // The frames OUTSIDE this one have not run yet: they are still
+            // waiting on the value it will eventually produce, so they belong
+            // to the new suspension, outermost last. Dropping them stranded
+            // every caller of a function that suspends twice.
+            for (frames.items[i + 1 ..]) |outer| try st.frames.append(allocator, outer);
             return errResult(.{ .Suspended = st });
         }
         carry = produced;

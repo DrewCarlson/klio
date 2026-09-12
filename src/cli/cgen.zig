@@ -634,6 +634,10 @@ pub const Compiled = struct {
     /// placeholder — so it comes from what the body actually returns.
     ret_cls: ?u32 = null,
     ret_elem: Ty = .unit,
+    /// True for a `suspend` body. Its registers live in a heap frame and it
+    /// answers either its result or the SUSPENDED marker, because it can
+    /// return in the middle of itself and be re-entered later.
+    suspends: bool = false,
     /// How each bare-name read or write inside an inlined receiver body
     /// resolved. The interpreter searches its implicit receivers at run time;
     /// the emitter does that search once, and the answer belongs to the
@@ -1044,6 +1048,20 @@ fn listIntrinsic(f: *const Func) ?ListIntrinsic {
     if (std.mem.eql(u8, f.fqn, "kotlin.collections.listOf")) return .list_of;
     if (std.mem.eql(u8, f.fqn, "kotlin.collections.mutableListOf")) return .mutable_list_of;
     return null;
+}
+
+/// `delay(millis)`: the primitive suspension. It parks the CALLING frame and
+/// asks the driver to resume it after that much virtual time, so there is no
+/// callee to compile — the wait is the operation.
+fn isDelay(f: *const Func) bool {
+    return std.mem.eql(u8, f.fqn, "kotlinx.coroutines.delay");
+}
+
+/// `runBlocking { … }`: the root of a coroutine tree. It drives its block to
+/// completion on the interpreter's own scheduler, so a compiled program and an
+/// interpreted one order their coroutines identically.
+fn isRunBlocking(f: *const Func) bool {
+    return std.mem.eql(u8, f.fqn, "kotlinx.coroutines.runBlocking");
 }
 
 /// `arrayOfNulls<T>(n)`: a reference array of `n` nulls. Sized rather than
@@ -1586,8 +1604,10 @@ fn listMemberName(m: *const Module, slot: ir.MethodSlotId) ?[]const u8 {
 }
 
 fn isPrintln(f: *const Func) bool {
-    return f.params.len == 1 and
-        (std.mem.eql(u8, f.fqn, "kotlin.io.println") or std.mem.eql(u8, f.fqn, "println"));
+    // Recognised by NAME. The declaration's own parameter list is not the
+    // test: a bodyless stdlib entry can carry a different one depending on
+    // where it was reached from, and the call site's arity is checked anyway.
+    return std.mem.eql(u8, f.fqn, "kotlin.io.println") or std.mem.eql(u8, f.fqn, "println");
 }
 
 pub const Error = error{ OutOfMemory, WriteFailed, NoSpaceLeft };
@@ -1743,7 +1763,12 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     // A synthesized thunk declares no parameters and reads its caller's
     // positionally, so it is compiled against the signature it will be handed.
     const params: []const ir.Param = synth orelse f.params;
-    if (f.is_suspend) return no(f, "suspend");
+    // A `suspend` body compiles to a state machine over a heap frame; the
+    // result is boxed, because it answers either the value or SUSPENDED. A
+    // lambda the lowering did not MARK suspending still needs that shape when
+    // it calls something that suspends — a `runBlocking` block is written
+    // without the keyword.
+    const suspends = bodySuspends(m, f);
     // A method is an ordinary function whose first parameter is the receiver;
     // the call sites already move it into arg 0.
     if (f.has_receiver_param and receiverClass(m, f) == null) return no(f, "receiver class");
@@ -1906,6 +1931,21 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         if (a9 >= f.n_locals or !known[a9]) return no(f, "bare call arg");
                     }
                     if (cg2.dst.int() >= f.n_locals) return no(f, "bare call dst");
+                    // A bare call to a stdlib entry the backend performs
+                    // directly is that operation, not a call to a body that
+                    // does not exist.
+                    if (cg2.func) |gfid0| {
+                        if (m.funcById(gfid0)) |gfn0| {
+                            if (isPrintln(gfn0) or scalarIntrinsic(gfn0) == .print) {
+                                if (cg2.n_args != 1) return no(f, "println arity");
+                                if (types[cg2.args.int()] == .unit) return no(f, "println of Unit");
+                                try bare.put(gpa, inst, .{ .call = gfid0 });
+                                types[cg2.dst.int()] = .unit;
+                                known[cg2.dst.int()] = true;
+                                continue;
+                            }
+                        }
+                    }
                     // The innermost implicit receiver that declares the name
                     // wins, which is what shadows a same-named global.
                     var mi: usize = encl.items.len;
@@ -2635,6 +2675,21 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     // call the lowering already resolved.
                     if (c.dst.int() >= f.n_locals) return null;
                     const callee = m.funcById(c.func) orelse return no(f, "call target missing");
+                    if (isRunBlocking(callee)) {
+                        // The block is the root coroutine. It has to be a
+                        // lambda whose body this program compiled: the driver
+                        // resumes it by calling it.
+                        if (c.n_args < 1) return no(f, "runBlocking arity");
+                        const br = c.args.int() + c.n_args - 1;
+                        if (br >= f.n_locals or !known[br]) return no(f, "runBlocking block");
+                        const li3 = lam[br] orelse return no(f, "runBlocking block is not a lambda");
+                        const bfn3 = m.funcById(li3.body) orelse return no(f, "runBlocking block body");
+                        if (!bodySuspends(m, bfn3)) return no(f, "runBlocking block is not suspending");
+                        if (c.dst.int() >= f.n_locals) return no(f, "runBlocking dst");
+                        types[c.dst.int()] = .object;
+                        known[c.dst.int()] = true;
+                        continue;
+                    }
                     if (isArrayOfNulls(callee)) {
                         const nr3 = c.args.int();
                         if (c.n_args != 1 or nr3 >= f.n_locals or !known[nr3]) return no(f, "array size");
@@ -2719,6 +2774,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         if (types[a0] == .unit) return no(f, "println of Unit");
                         types[c.dst.int()] = .unit;
                         known[c.dst.int()] = true;
+                    } else if (isDelay(callee)) {
+                        if (c.n_args < 1) return no(f, "delay arity");
+                        const mr = c.args.int();
+                        if (mr >= f.n_locals or !known[mr]) return no(f, "delay argument");
+                        if (types[mr] != .i32 and types[mr] != .i64) return no(f, "delay argument type");
+                        if (c.dst.int() >= f.n_locals) return no(f, "delay dst");
+                        types[c.dst.int()] = .unit;
+                        known[c.dst.int()] = true;
                     } else {
                         if (!callee.hasBody()) return noCallee(f, callee, "no body for");
                         if (callee.params.len < c.n_args) return noCallee(f, callee, "arity of");
@@ -2800,7 +2863,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
         slot[r] = @intCast(n_slots);
         n_slots += 1;
     }
-    return .{ .f = f, .caps = caps, .params = params, .types = types, .cls = cls, .elem = elem, .lam = lam, .slot = slot, .n_slots = n_slots, .ret = ret, .ret_cls = ret_cls, .ret_elem = ret_elem, .bare = bare };
+    return .{ .f = f, .caps = caps, .params = params, .types = types, .cls = cls, .elem = elem, .lam = lam, .slot = slot, .n_slots = n_slots, .ret = ret, .ret_cls = ret_cls, .ret_elem = ret_elem, .suspends = suspends, .bare = bare };
 }
 
 /// A C identifier for the function. Derived from the fqn, never from the id:
@@ -3148,6 +3211,15 @@ fn unboxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
 /// Where a register lives: a C local for a scalar, a published frame slot for
 /// a reference.
 fn regName(c: *const Compiled, r: u32, buf: []u8) []const u8 {
+    // A suspend function's registers live in a HEAP frame: the body can return
+    // in the middle and be re-entered later, so nothing may sit in a C local
+    // that the return would discard.
+    if (c.suspends) {
+        if (c.types[r] == .object) {
+            return std.fmt.bufPrint(buf, "fr->ks[{d}]", .{c.slot[r]}) catch unreachable;
+        }
+        return std.fmt.bufPrint(buf, "fr->r{d}", .{r}) catch unreachable;
+    }
     if (c.types[r] == .object) {
         return std.fmt.bufPrint(buf, "KS[{d}]", .{c.slot[r]}) catch unreachable;
     }
@@ -3155,7 +3227,9 @@ fn regName(c: *const Compiled, r: u32, buf: []u8) []const u8 {
 }
 
 fn writeProto(w: *std.Io.Writer, c: *const Compiled) !void {
-    try w.print("static {s} ", .{c.ret.cName()});
+    // A suspend body answers either its result or the SUSPENDED marker, so its
+    // C result is a value rather than the declared machine type.
+    try w.print("static {s} ", .{if (c.suspends) "klio_value" else c.ret.cName()});
     try writeSymbol(w, c.f);
     try w.writeByte('(');
     if (c.params.len == 0 and c.caps.len == 0) {
@@ -3347,17 +3421,130 @@ fn acceptedRet(accepted: []const Compiled, f: *const Func) ?Ty {
     return null;
 }
 
+/// The suspending calls in a body, in emission order. Each is a point the
+/// function can return from and be re-entered at, so each gets a state number
+/// and a resume label.
+fn suspendPoints(gpa: std.mem.Allocator, m: *const Module, f: *const Func, live: []const bool) Error![]const *const ir.Inst {
+    var out: std.ArrayList(*const ir.Inst) = .empty;
+    errdefer out.deinit(gpa);
+    for (f.blocks, 0..) |*blk, bi| {
+        if (!live[bi]) continue;
+        for (blk.insts) |*inst| {
+            if (!isSuspendingCall(m, inst)) continue;
+            try out.append(gpa, inst);
+        }
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Whether a body has to compile as a state machine: it is declared
+/// `suspend`, or it calls something that is.
+fn bodySuspends(m: *const Module, f: *const Func) bool {
+    if (f.is_suspend) return true;
+    for (f.blocks) |*blk| {
+        for (blk.insts) |*inst| {
+            if (isSuspendingCall(m, inst)) return true;
+        }
+    }
+    return false;
+}
+
+fn isSuspendingCall(m: *const Module, inst: *const ir.Inst) bool {
+    return switch (inst.*) {
+        .Call => |cl| blk: {
+            const callee = m.funcById(cl.func) orelse break :blk false;
+            break :blk callee.is_suspend;
+        },
+        else => false,
+    };
+}
+
+fn suspendIndex(points: []const *const ir.Inst, inst: *const ir.Inst) ?u32 {
+    for (points, 0..) |p, i| {
+        if (p == inst) return @intCast(i);
+    }
+    return null;
+}
+
 fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: Program, c: *const Compiled, uses_objects: bool, globals: []const Global, singletons: []const SingletonUse, slots: []const SlotUse, uses_try: bool, accepted: []const Compiled) !void {
     const f = c.f;
     const live = try reachableBlocks(gpa, f);
     defer gpa.free(live);
-    try writeProto(w, c);
-    try w.writeAll(" {\n");
+    const points = try suspendPoints(gpa, m, f, live);
+    defer gpa.free(points);
     var has_catch = false;
     for (f.blocks) |*blk| {
         if (blk.catches.len != 0) has_catch = true;
     }
+    if (c.suspends) {
+        // The frame a suspension leaves behind: every register, plus the
+        // resume label and the collector's view of the object slots. It is
+        // heap memory because the body returns in the middle of itself.
+        try w.print("typedef struct {{\n  uint32_t st;\n  klio_nat_frame gcf;\n  klio_value ks[{d}];\n", .{@max(c.n_slots, 1)});
+        var sr: u32 = 0;
+        while (sr < f.n_locals) : (sr += 1) {
+            if (c.types[sr] == .object) continue;
+            try w.print("  {s} r{d};\n", .{ c.types[sr].cName(), sr });
+        }
+        for (c.caps, 0..) |ct, ci| try w.print("  {s} k{d};\n", .{ ct.ty.cName(), ci });
+        for (c.params, 0..) |p, pi| {
+            const pt: Ty = tyOf(p.ty) orelse .object;
+            try w.print("  {s} p{d};\n", .{ pt.cName(), pi });
+        }
+        try w.print("}} kfr_{d};\n", .{f.id.int()});
+        // Building the frame is separate from running it: a coroutine the
+        // DRIVER starts needs the frame handed over, not a body already
+        // running.
+        try w.print("static void *kcf_{d}(", .{f.id.int()});
+        if (c.params.len == 0 and c.caps.len == 0) {
+            try w.writeAll("void");
+        } else {
+            for (c.caps, 0..) |ct, i| {
+                if (i != 0) try w.writeAll(", ");
+                try w.print("{s} k{d}", .{ ct.ty.cName(), i });
+            }
+            for (c.params, 0..) |p, i| {
+                if (i != 0 or c.caps.len != 0) try w.writeAll(", ");
+                const pt: Ty = tyOf(p.ty) orelse .object;
+                try w.print("{s} p{d}", .{ pt.cName(), i });
+            }
+        }
+        try w.writeAll(") {\n");
+        try w.print("  kfr_{d} *fr = (kfr_{d} *)klio_nat_coro_frame(sizeof(kfr_{d}), offsetof(kfr_{d}, gcf), offsetof(kfr_{d}, ks), {d});\n", .{
+            f.id.int(), f.id.int(), f.id.int(), f.id.int(), f.id.int(), c.n_slots,
+        });
+        for (c.caps, 0..) |_, ci| try w.print("  fr->k{d} = k{d};\n", .{ ci, ci });
+        for (c.params, 0..) |_, pi| try w.print("  fr->p{d} = p{d};\n", .{ pi, pi });
+        try w.writeAll("  return fr;\n}\n");
+        // The entry: build the frame, then run the body from its start.
+        try writeProto(w, c);
+        try w.writeAll(" {\n");
+        try w.print("  return kco_{d}(kcf_{d}(", .{ f.id.int(), f.id.int() });
+        for (c.caps, 0..) |_, ci| {
+            if (ci != 0) try w.writeAll(", ");
+            try w.print("k{d}", .{ci});
+        }
+        for (c.params, 0..) |_, pi| {
+            if (pi != 0 or c.caps.len != 0) try w.writeAll(", ");
+            try w.print("p{d}", .{pi});
+        }
+        try w.writeAll("), klio_nat_box_unit());\n}\n");
+        // The continuation: entered fresh, and again at each resume.
+        try w.print("static klio_value kco_{d}(void *fp, klio_value resumed) {{\n", .{f.id.int()});
+        try w.print("  kfr_{d} *fr = (kfr_{d} *)fp;\n  (void)resumed;\n", .{ f.id.int(), f.id.int() });
+        if (points.len != 0) {
+            try w.writeAll("  switch (fr->st) {\n");
+            var pi2: u32 = 0;
+            while (pi2 < points.len) : (pi2 += 1) try w.print("    case {d}: goto RS{d};\n", .{ pi2 + 1, pi2 });
+            try w.writeAll("    default: break;\n  }\n");
+        }
+        try w.writeAll("  goto B0;\n");
+    } else {
+        try writeProto(w, c);
+        try w.writeAll(" {\n");
+    }
     var r: u32 = 0;
+    if (c.suspends) r = f.n_locals;
     while (r < f.n_locals) : (r += 1) {
         if (c.types[r] == .object) continue;
         // A local written after `setjmp` and read after the jump back is
@@ -3366,14 +3553,15 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
         try w.print("  {s}{s} r{d} = 0;\n", .{ if (has_catch) "volatile " else "", c.types[r].cName(), r });
     }
     // Registers the lowering allocated but this body never reads: a C compiler
-    // warns on them and the emitted file should be warning-clean.
-    r = 0;
+    // warns on them and the emitted file should be warning-clean. A suspend
+    // body has no locals to void — its registers are frame fields.
+    r = if (c.suspends) f.n_locals else 0;
     while (r < f.n_locals) : (r += 1) {
         if (c.types[r] == .object) continue;
         try w.print("  (void)r{d};", .{r});
     }
     try w.writeAll("\n");
-    if (c.n_slots != 0) {
+    if (c.n_slots != 0 and !c.suspends) {
         // The references this body holds, published to the collector for the
         // duration of the call. Cleared first: a collection can happen before
         // the first assignment, and a slot holding whatever was on the stack is
@@ -3390,7 +3578,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
         // armed anywhere chains onto a `klio_try` in a frame that is gone.
         try w.writeAll("  klio_try *KTE = klio_try_top;\n");
     }
-    try w.writeAll("  goto B0;\n");
+    if (!c.suspends) try w.writeAll("  goto B0;\n");
     for (f.blocks, 0..) |*blk, bi| {
         if (!live[bi]) continue;
         try w.print("B{d}:;\n", .{bi});
@@ -3436,6 +3624,16 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         },
                         .call => |cf2| {
                             const cfn2 = m.funcById(cf2).?;
+                            if (isPrintln(cfn2) or scalarIntrinsic(cfn2) == .print) {
+                                var rex3: std.Io.Writer.Allocating = .init(gpa);
+                                defer rex3.deinit();
+                                try renderExpr(gpa, m, prog, c, cg3.args.int(), &rex3);
+                                try w.print("  {s}({s});\n", .{
+                                    if (isPrintln(cfn2)) "klio_nat_println" else "klio_nat_print",
+                                    rex3.written(),
+                                });
+                                continue;
+                            }
                             try w.print("  {s} = ", .{cdst});
                             try writeSymbol(w, cfn2);
                             try w.writeByte('(');
@@ -3552,13 +3750,15 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     try writeConst(w, kv);
                     try w.writeAll(";\n");
                 },
+                // A suspend body reads its parameters and captures from the
+                // frame: the C arguments are gone by the time it resumes.
                 .LoadParam => |lp| {
                     var nb: [32]u8 = undefined;
-                    try w.print("  {s} = p{d};\n", .{ regName(c, lp.dst.int(), &nb), lp.idx });
+                    try w.print("  {s} = {s}p{d};\n", .{ regName(c, lp.dst.int(), &nb), if (c.suspends) "fr->" else "", lp.idx });
                 },
                 .LoadCapture => |lc| {
                     var nb: [32]u8 = undefined;
-                    try w.print("  {s} = k{d};\n", .{ regName(c, lc.dst.int(), &nb), lc.idx });
+                    try w.print("  {s} = {s}k{d};\n", .{ regName(c, lc.dst.int(), &nb), if (c.suspends) "fr->" else "", lc.idx });
                 },
                 .MakeCell => |mk| {
                     var nb: [32]u8 = undefined;
@@ -4226,6 +4426,31 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                         }
                         continue;
                     }
+                    if (isRunBlocking(callee)) {
+                        const br2 = call.args.int() + call.n_args - 1;
+                        const li4 = c.lam[br2].?;
+                        const bfn4 = m.funcById(li4.body).?;
+                        var db6: [32]u8 = undefined;
+                        try w.print("  {s} = klio_nat_run_blocking(kco_{d}, kcf_{d}(", .{
+                            regName(c, call.dst.int(), &db6), bfn4.id.int(), bfn4.id.int(),
+                        });
+                        for (li4.captures, 0..) |cr6, ci6| {
+                            if (ci6 != 0) try w.writeAll(", ");
+                            var cb6: [32]u8 = undefined;
+                            try w.print("{s}", .{regName(c, cr6.int(), &cb6)});
+                        }
+                        // The block's own parameters (a receiver slot the
+                        // lowering always gives it) start unset.
+                        var pk6: usize = 0;
+                        while (pk6 < bfn4.params.len) : (pk6 += 1) {
+                            if (pk6 != 0 or li4.captures.len != 0) try w.writeAll(", ");
+                            const pt6: Ty = tyOf(bfn4.params[pk6].ty) orelse .object;
+                            var zb6: [64]u8 = undefined;
+                            try w.print("{s}", .{if (pt6 == .object) "klio_nat_box_unit()" else boxExpr(.unit, "0", &zb6)});
+                        }
+                        try w.writeAll("));\n");
+                        continue;
+                    }
                     if (isArrayOfNulls(callee)) {
                         var db4: [32]u8 = undefined;
                         var nb16: [32]u8 = undefined;
@@ -4330,6 +4555,69 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             }
                             try w.writeAll(");\n");
                         }
+                        // A SUSPENDING call may not come back. The state is
+                        // saved before it runs; if the callee suspends, this
+                        // frame records its own continuation and answers
+                        // SUSPENDED in turn, and the driver re-enters at the
+                        // resume label with the value the suspension produced.
+                        if (suspendIndex(points, inst)) |sp| {
+                            var db9: [32]u8 = undefined;
+                            if (isDelay(callee)) {
+                                // The wait IS the suspension: it records this
+                                // frame's continuation and answers SUSPENDED,
+                                // which this frame hands straight back.
+                                var mb9: [32]u8 = undefined;
+                                var cb10: [96]u8 = undefined;
+                                const mr9 = call.args.int();
+                                try w.print("  fr->st = {d};\n  return klio_nat_coro_delay({s}, kco_{d}, fr);\n", .{
+                                    sp + 1,
+                                    convExpr(c.types[mr9], .i64, regName(c, mr9, &mb9), &cb10),
+                                    f.id.int(),
+                                });
+                                var ob11: [200]u8 = undefined;
+                                try w.print("RS{d}:;\n  {s} = {s};\n", .{
+                                    sp,
+                                    regName(c, call.dst.int(), &db9),
+                                    unboxExpr(c.types[call.dst.int()], "resumed", &ob11),
+                                });
+                                continue;
+                            }
+                            try w.print("  fr->st = {d};\n  {{ klio_value sv = ", .{sp + 1});
+                            try writeSymbol(w, callee);
+                            try w.writeByte('(');
+                            var sk: u32 = 0;
+                            while (sk < bnd2.n) : (sk += 1) {
+                                if (sk != 0) try w.writeAll(", ");
+                                if (bnd2.regs[sk]) |br9| {
+                                    var ab9: [32]u8 = undefined;
+                                    var cb9: [96]u8 = undefined;
+                                    const pw9 = acceptedParamTy(accepted, callee, sk) orelse
+                                        (tyOf(callee.params[sk].ty) orelse .object);
+                                    try w.print("{s}", .{convExpr(c.types[br9], pw9, regName(c, br9, &ab9), &cb9)});
+                                } else {
+                                    try w.writeAll("klio_nat_box_unit()");
+                                }
+                            }
+                            try w.writeAll(");\n");
+                            try w.print("    if (klio_nat_is_suspended(sv)) return klio_nat_coro_park(kco_{d}, fr);\n", .{f.id.int()});
+                            var ob9: [200]u8 = undefined;
+                            try w.print("    {s} = {s}; }}\n", .{
+                                regName(c, call.dst.int(), &db9),
+                                unboxExpr(c.types[call.dst.int()], "sv", &ob9),
+                            });
+                            try w.print("  goto RD{d};\n", .{sp});
+                            // The resume lands here with the value the
+                            // suspension produced, and both arms converge on
+                            // the same register.
+                            try w.print("RS{d}:;\n", .{sp});
+                            var ob10: [200]u8 = undefined;
+                            try w.print("  {s} = {s};\n", .{
+                                regName(c, call.dst.int(), &db9),
+                                unboxExpr(c.types[call.dst.int()], "resumed", &ob10),
+                            });
+                            try w.print("RD{d}:;\n", .{sp});
+                            continue;
+                        }
                         // The register the result lands in may hold a
                         // reference where the callee returns a machine type:
                         // the lowering reuses one register for both, and the
@@ -4403,6 +4691,17 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                 });
             },
             .Return => |ret| {
+                if (c.suspends) {
+                    // The frame dies with the last return out of the body.
+                    var rb9: [32]u8 = undefined;
+                    var bb9: [96]u8 = undefined;
+                    const val9 = if (ret) |rr9|
+                        boxExpr(c.types[rr9.int()], regName(c, rr9.int(), &rb9), &bb9)
+                    else
+                        "klio_nat_box_unit()";
+                    try w.print("  {{ klio_value rv = {s};\n    klio_nat_coro_free(fr);\n    return rv; }}\n", .{val9});
+                    continue;
+                }
                 if (has_catch) try w.writeAll("  klio_try_top = KTE;\n");
                 if (c.n_slots != 0) try w.writeAll("  klio_nat_leave(&KF);\n");
                 if (ret) |rr| {
@@ -4796,7 +5095,7 @@ pub fn emit(
                 // computed property or to a top-level one; either way what it
                 // resolved to has to be compiled.
                 if (c.bare.get(inst)) |res| {
-                    switch (res) {
+                    blkbare: switch (res) {
                         .field => {},
                         .accessor => |ac| {
                             const afn3 = m.funcById(ac.func) orelse return false;
@@ -4832,6 +5131,9 @@ pub fn emit(
                         },
                         .call => |cf| {
                             const cfn = m.funcById(cf) orelse return false;
+                            if (isPrintln(cfn) or scalarIntrinsic(cfn) != null or
+                                listIntrinsic(cfn) != null or arrayOfIntrinsic(cfn) != null or
+                                isArrayOfNulls(cfn)) break :blkbare;
                             if (!seen.contains(cfn.id.int())) {
                                 try seen.put(cfn.id.int(), {});
                                 try queue.append(gpa, .{ .f = cfn, .synth = null });
@@ -4942,7 +5244,8 @@ pub fn emit(
                 if (inst.* != .Call) continue;
                 const callee = m.funcById(inst.Call.func) orelse return false;
                 if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or
-                    arrayOfIntrinsic(callee) != null or isArrayOfNulls(callee)) continue;
+                    arrayOfIntrinsic(callee) != null or isArrayOfNulls(callee) or isRunBlocking(callee) or
+                    isDelay(callee)) continue;
                 // A call that leaves a parameter unbound runs the thunk for it.
                 const bnd3 = bindCallArgs(m, callee.params, inst.Call.args.int(), inst.Call.n_args, inst.Call.arg_names) orelse
                     return false;
@@ -5456,6 +5759,24 @@ pub fn emit(
     for (accepted.items) |*c| {
         try writeProto(w, c);
         try w.writeAll(";\n");
+        // The continuation a suspend body is re-entered through.
+        if (c.suspends) {
+            try w.print("static klio_value kco_{d}(void *fp, klio_value resumed);\n", .{c.f.id.int()});
+            try w.print("static void *kcf_{d}(", .{c.f.id.int()});
+            if (c.params.len == 0 and c.caps.len == 0) {
+                try w.writeAll("void");
+            } else {
+                for (c.caps, 0..) |ct, i| {
+                    if (i != 0) try w.writeAll(", ");
+                    try w.print("{s}", .{ct.ty.cName()});
+                }
+                for (c.params, 0..) |p, i| {
+                    if (i != 0 or c.caps.len != 0) try w.writeAll(", ");
+                    try w.print("{s}", .{(tyOf(p.ty) orelse Ty.object).cName()});
+                }
+            }
+            try w.writeAll(");\n");
+        }
     }
     for (used_slots.items) |su| {
         const root = m.funcById(ir.FuncId.from(su.slot)).?;

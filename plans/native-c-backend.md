@@ -437,6 +437,32 @@ The protocol compiled code follows:
 - `runBlocking` enters `driveRootNative`, which is `driveRoot` with the start
   replaced by a native call and everything after it identical.
 
+### The emitted side
+
+A `suspend` body compiles to a state machine over a HEAP frame. Its registers,
+parameters and captures are frame fields rather than C locals, because the body
+returns in the middle of itself and is re-entered later — a local would not
+survive that. The frame is rooted for as long as it exists, since the collector
+never scans the native stack and a parked frame is on no thread's chain at all.
+
+Each body emits three pieces: `kfr_N`, the frame; `kcf_N`, which builds one;
+and `kco_N`, the continuation, entered fresh and again at every resume through
+a `switch` on the saved label. The declared entry builds a frame and runs it.
+
+At a suspending call the state is saved first; if the callee answers SUSPENDED
+this frame records its own continuation and answers SUSPENDED in turn. `delay`
+is the primitive: the wait IS the suspension, so it parks the calling frame
+directly rather than calling a body. `runBlocking` hands the driver a frame it
+built but did not run.
+
+A body the lowering did not MARK `suspend` still needs the shape when it calls
+something that does — a `runBlocking` block is written without the keyword.
+
+When an inner frame suspends AGAIN during a replay, the frames outside it have
+not run yet: they are still waiting on the value it will eventually produce, so
+they move to the new suspension. Dropping them stranded every caller of a
+function that suspends more than once, which is what a `delay` in a loop is.
+
 ## Correctness net
 
 `scripts/native-c-check.sh` is the gate: a fixed set of programs that must keep

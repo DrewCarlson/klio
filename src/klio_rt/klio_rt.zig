@@ -498,6 +498,15 @@ fn markNatFrames(m: *runtime.gc.Marker) void {
             v.gcMark(m);
         }
     }
+    // A suspend body's frame is NOT on the chain: it outlives the C stack that
+    // created it, and while parked no thread holds it at all.
+    for (parked_frames.items) |pf| {
+        var i: u32 = 0;
+        while (i < pf.gcf.n) : (i += 1) {
+            var v = fromC(pf.gcf.slots[i]);
+            v.gcMark(m);
+        }
+    }
 }
 
 var nat_roots_registered = false;
@@ -899,6 +908,40 @@ export fn klio_nat_run_blocking(
         .ok => |v| toC(v),
         .err => toC(.Unit),
     };
+}
+
+/// A compiled suspend body's frame: its registers, live across a suspension.
+/// Allocated here rather than on the C stack because the body returns in the
+/// middle of itself and is re-entered later, and rooted for as long as it
+/// exists because the collector never scans the native stack.
+const ParkedFrame = struct { mem: []u8, gcf: *NatFrame };
+var parked_frames: std.ArrayList(ParkedFrame) = .empty;
+
+export fn klio_nat_coro_frame(size: usize, gcf_off: usize, slots_off: usize, n_slots: u32) ?*anyopaque {
+    const a = natAlloc();
+    const mem = a.alignedAlloc(u8, .of(u64), size) catch @panic("klio_nat_coro_frame: out of memory");
+    @memset(mem, 0);
+    const gcf: *NatFrame = @ptrCast(@alignCast(mem.ptr + gcf_off));
+    const slots: [*]runtime.Value = @ptrCast(@alignCast(mem.ptr + slots_off));
+    var i: u32 = 0;
+    while (i < n_slots) : (i += 1) slots[i] = .Unit;
+    gcf.* = .{ .prev = null, .n = n_slots, .slots = @ptrCast(slots) };
+    parked_frames.append(a, .{ .mem = mem, .gcf = gcf }) catch @panic("klio_nat_coro_frame: out of memory");
+    return @ptrCast(mem.ptr);
+}
+
+export fn klio_nat_coro_free(fp: ?*anyopaque) void {
+    const p = fp orelse return;
+    const a = natAlloc();
+    var i: usize = parked_frames.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (@intFromPtr(parked_frames.items[i].mem.ptr) != @intFromPtr(p)) continue;
+        const mem = parked_frames.items[i].mem;
+        _ = parked_frames.swapRemove(i);
+        a.free(mem);
+        return;
+    }
 }
 
 /// The value a suspending call answers with when it did not produce a result.
