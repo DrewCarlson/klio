@@ -833,6 +833,47 @@ fn natNegativeSize(n: i32) noreturn {
 // Everything above that point is shared: the scheduler, the virtual clock, the
 // Job graph, `delay`, `runBlocking`.
 
+/// How to START a compiled lambda that suspends: the emitted entry that
+/// unpacks the closure's captures and runs its body. Registered per lambda
+/// class before `main`, which is how the driver — handed a closure VALUE by
+/// `launch` — finds the code to run.
+const CoroStarter = struct { cls: u32, start: *const fn (CValue) callconv(.c) CValue };
+var coro_starters: std.ArrayList(CoroStarter) = .empty;
+
+export fn klio_nat_coro_starter(cls: u32, start: *const fn (CValue) callconv(.c) CValue) void {
+    coro_starters.append(natAlloc(), .{ .cls = cls, .start = start }) catch
+        @panic("klio_nat_coro_starter: out of memory");
+}
+
+fn coroStarterFor(v: runtime.Value) ?*const fn (CValue) callconv(.c) CValue {
+    if (v != .Instance) return null;
+    const g = v.Instance.borrow();
+    defer g.deinit();
+    const cg = g.get().class.borrow();
+    defer cg.deinit();
+    const name = cg.get().name;
+    for (nat_classes.items, 0..) |def, i| {
+        const dg = def.borrow();
+        defer dg.deinit();
+        if (dg.get() != cg.get()) continue;
+        for (coro_starters.items) |st| {
+            if (st.cls == @as(u32, @intCast(i))) return st.start;
+        }
+    }
+    _ = name;
+    return null;
+}
+
+/// Queue a compiled `launch { … }` child on the driver that is running.
+export fn klio_nat_coro_launch(block: CValue) CValue {
+    var host: NativeCoroHost = .{ .allocator = natAlloc() };
+    const b = fromC(block);
+    const unit: runtime.Value = .Unit;
+    _ = cli.interp_ir.coroutines_diag.coroutineLaunch(&host, &b, &unit, natOutput()) catch
+        @panic("klio_nat_coro_launch: out of memory");
+    return toC(.Unit);
+}
+
 /// What the coroutine driver needs from a COMPILED program. The driver is the
 /// interpreter's own — the scheduler, the virtual clock, the Job graph, the
 /// park and resume order — and it asks its host for exactly two things: start a
@@ -851,12 +892,18 @@ const NativeCoroHost = struct {
         scope: ?*const runtime.Value,
         out: runtime.Output,
     ) std.mem.Allocator.Error!ir.eval.EvalResult {
-        _ = self;
         _ = args;
         _ = scope;
         _ = out;
-        _ = block;
-        return .{ .err = .{ .Type = "a compiled program cannot start a closure child yet" } };
+        const start = coroStarterFor(block.*) orelse
+            return .{ .err = .{ .Type = "no compiled body registered for this coroutine block" } };
+        const produced = fromC(start(toC(block.*)));
+        if (produced == .CoroutineSuspended) {
+            const st = ir.eval.takeInFlightSuspend(self.allocator) orelse
+                return .{ .err = .{ .Type = "compiled child suspended without a continuation" } };
+            return .{ .err = .{ .Suspended = st } };
+        }
+        return .{ .ok = produced };
     }
 
     pub fn resumeRaw(

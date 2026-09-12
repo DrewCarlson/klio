@@ -469,6 +469,10 @@ pub const VmIntrinsicHost = struct {
         return intrinsic_host.resumeRaw(self, state, value, out);
     }
 
+    pub fn invokeCallable(self: *VmIntrinsicHost, block: *const Value, args: []const Value, out: Output) Allocator.Error!runtime.EvalResult {
+        return intrinsic_host.invokeCallable(self, block, args, out);
+    }
+
     module: ObjRef(Module),
     closures: SharedClosures,
     globals: ObjRef(Env),

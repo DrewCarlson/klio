@@ -32,6 +32,15 @@ suspend fun nested(n: Int): Int {
 
 fun main() {
     runBlocking {
+        // A child queued on the driver that is running. The parent keeps
+        // going; the driver interleaves them on the shared virtual clock.
+        launch {
+            delay(20)
+            println("child")
+        }
+        println("parent")
+        delay(40)
+
         println(total())
         println(nested(5))
         // A suspend function that never actually suspends still compiles as

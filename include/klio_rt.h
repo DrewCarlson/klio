@@ -347,6 +347,14 @@ klio_value klio_nat_coro_park(klio_resume_fn call, void *frame);
 klio_value klio_nat_coro_delay(int64_t millis, klio_resume_fn call, void *frame);
 /* Run a compiled `runBlocking { … }` body to completion on the shared driver. */
 klio_value klio_nat_run_blocking(klio_resume_fn call, void *frame);
+/* How to START a compiled lambda that suspends: the emitted entry that unpacks
+ * the closure's captures and runs its body. Registered per lambda class before
+ * `main`, which is how the driver — handed a closure VALUE by `launch` — finds
+ * the code to run. */
+typedef klio_value (*klio_start_fn)(klio_value block);
+void klio_nat_coro_starter(uint32_t cls, klio_start_fn start);
+/* Queue a compiled `launch { … }` child on the driver that is running. */
+klio_value klio_nat_coro_launch(klio_value block);
 
 klio_value klio_nat_cell(klio_value v);
 klio_value klio_nat_cell_get(klio_value c);
