@@ -671,6 +671,11 @@ pub const Compiled = struct {
     /// emitter knows it — a list built from a literal of one scalar kind. Unit
     /// means unknown, and reading such a list yields an untyped reference.
     elem: []Ty,
+    /// For a container register, the CLASS its elements hold where the emitter
+    /// knows it — written down in `List<Shape>`, or an enum's own entries.
+    /// Null means unknown, and reading such a container yields a reference the
+    /// emitter cannot dispatch on.
+    elem_cls: []?u32,
     /// Frame slot of each object register, or -1 for a scalar in a C local.
     slot: []i32,
     n_slots: u32,
@@ -695,6 +700,7 @@ pub const Compiled = struct {
         gpa.free(self.types);
         gpa.free(self.cls);
         gpa.free(self.elem);
+        gpa.free(self.elem_cls);
         gpa.free(self.lam);
         gpa.free(self.slot);
         self.bare.deinit(gpa);
@@ -2008,6 +2014,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     const elem = try gpa.alloc(Ty, f.n_locals);
     errdefer gpa.free(elem);
     @memset(elem, .unit);
+    const elem_cls = try gpa.alloc(?u32, f.n_locals);
+    errdefer gpa.free(elem_cls);
+    @memset(elem_cls, null);
     const lam = try gpa.alloc(?LambdaInfo, f.n_locals);
     errdefer gpa.free(lam);
     @memset(lam, null);
@@ -2319,6 +2328,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     types[mv.dst.int()] = types[mv.src.int()];
                     cls[mv.dst.int()] = cls[mv.src.int()];
                     elem[mv.dst.int()] = elem[mv.src.int()];
+                    elem_cls[mv.dst.int()] = elem_cls[mv.src.int()];
                     lam[mv.dst.int()] = lam[mv.src.int()];
                     known[mv.dst.int()] = true;
                 },
@@ -2420,6 +2430,45 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     known[n.dst.int()] = true;
                 },
                 .CallMember => |cm| {
+                    // The iteration protocol on a builtin receiver, written
+                    // by name rather than bound to a slot. Which members those
+                    // are, and what each answers, is the interpreter's — the
+                    // same classification the slot-bound route reads.
+                    if (cm.arg_names.len == 0 and cm.name.int() < m.consts.items.len and
+                        cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
+                        types[cm.receiver.int()] == .object and cls[cm.receiver.int()] != null and
+                        isBuiltinCls(cls[cm.receiver.int()].?))
+                    {
+                        const bmn = m.consts.items[cm.name.int()];
+                        if (bmn == .String) {
+                            if (member_dispatch.hostFreeMemberAnswer(plainFieldName(bmn.String))) |ans| {
+                                var kkb: u32 = 0;
+                                while (kkb < cm.n_args) : (kkb += 1) {
+                                    const ab = cm.args.int() + kkb;
+                                    if (ab >= f.n_locals or !known[ab]) return no(f, "host member arg");
+                                }
+                                if (cm.dst.int() >= f.n_locals) return no(f, "host member dst");
+                                const et2 = elem[cm.receiver.int()];
+                                switch (ans) {
+                                    .iterator => {
+                                        types[cm.dst.int()] = .object;
+                                        cls[cm.dst.int()] = ITER_CLS;
+                                        elem[cm.dst.int()] = et2;
+                                        elem_cls[cm.dst.int()] = elem_cls[cm.receiver.int()];
+                                    },
+                                    .boolean => types[cm.dst.int()] = .boolean,
+                                    .index => types[cm.dst.int()] = .i32,
+                                    .unit => types[cm.dst.int()] = .unit,
+                                    .element => {
+                                        types[cm.dst.int()] = if (et2 == .unit) .object else et2;
+                                        if (types[cm.dst.int()] == .object) cls[cm.dst.int()] = elem_cls[cm.receiver.int()];
+                                    },
+                                }
+                                known[cm.dst.int()] = true;
+                                continue;
+                            }
+                        }
+                    }
                     if (cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
                         types[cm.receiver.int()] == .object and cls[cm.receiver.int()] != null and
                         cls[cm.receiver.int()].? == ARRAY_CLS)
@@ -2480,41 +2529,6 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             continue;
                         }
                         return no(f, "list member");
-                    }
-                    // The iteration protocol on a builtin receiver, written
-                    // by name rather than bound to a slot. Which members those
-                    // are, and what each answers, is the interpreter's — the
-                    // same classification the slot-bound route reads.
-                    if (cm.arg_names.len == 0 and cm.name.int() < m.consts.items.len and
-                        cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
-                        types[cm.receiver.int()] == .object and cls[cm.receiver.int()] != null and
-                        isBuiltinCls(cls[cm.receiver.int()].?))
-                    {
-                        const bmn = m.consts.items[cm.name.int()];
-                        if (bmn == .String) {
-                            if (member_dispatch.hostFreeMemberAnswer(plainFieldName(bmn.String))) |ans| {
-                                var kkb: u32 = 0;
-                                while (kkb < cm.n_args) : (kkb += 1) {
-                                    const ab = cm.args.int() + kkb;
-                                    if (ab >= f.n_locals or !known[ab]) return no(f, "host member arg");
-                                }
-                                if (cm.dst.int() >= f.n_locals) return no(f, "host member dst");
-                                const et2 = elem[cm.receiver.int()];
-                                switch (ans) {
-                                    .iterator => {
-                                        types[cm.dst.int()] = .object;
-                                        cls[cm.dst.int()] = ITER_CLS;
-                                        elem[cm.dst.int()] = et2;
-                                    },
-                                    .boolean => types[cm.dst.int()] = .boolean,
-                                    .index => types[cm.dst.int()] = .i32,
-                                    .unit => types[cm.dst.int()] = .unit,
-                                    .element => types[cm.dst.int()] = if (et2 == .unit) .object else et2,
-                                }
-                                known[cm.dst.int()] = true;
-                                continue;
-                            }
-                        }
                     }
                     // A member CALLED on a class name runs on that class's
                     // companion: `Config.of(3)` is a call on the companion
@@ -2870,6 +2884,18 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                 known[gf.dst.int()] = true;
                                 continue;
                             }
+                        }
+                        // `E.entries` is every entry of an enum, in
+                        // declaration order, as a list.
+                        if (std.mem.eql(u8, plainFieldName(enm.String), "entries") and
+                            enumEntries(m, prog, sc).len != 0)
+                        {
+                            if (gf.dst.int() >= f.n_locals) return no(f, "entries dst");
+                            types[gf.dst.int()] = .object;
+                            cls[gf.dst.int()] = LIST_CLS;
+                            elem_cls[gf.dst.int()] = sc;
+                            known[gf.dst.int()] = true;
+                            continue;
                         }
                         if (enumEntryIndex(m, prog, sc, plainFieldName(enm.String))) |_| {
                             if (gf.dst.int() >= f.n_locals) return no(f, "entry dst");
@@ -3409,7 +3435,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
         slot[r] = @intCast(n_slots);
         n_slots += 1;
     }
-    return .{ .f = f, .caps = caps, .params = params, .types = types, .cls = cls, .elem = elem, .lam = lam, .slot = slot, .n_slots = n_slots, .ret = ret, .ret_cls = ret_cls, .ret_elem = ret_elem, .suspends = suspends, .bare = bare };
+    return .{ .f = f, .caps = caps, .params = params, .types = types, .cls = cls, .elem = elem, .elem_cls = elem_cls, .lam = lam, .slot = slot, .n_slots = n_slots, .ret = ret, .ret_cls = ret_cls, .ret_elem = ret_elem, .suspends = suspends, .bare = bare };
 }
 
 /// A C identifier for the function. Derived from the fqn, never from the id:
@@ -4535,6 +4561,22 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             });
                             continue;
                         }
+                        if (std.mem.eql(u8, plainFieldName(enm), "entries") and
+                            enumEntries(m, prog, sc).len != 0)
+                        {
+                            const ents4 = enumEntries(m, prog, sc);
+                            var nb22: [32]u8 = undefined;
+                            try w.print("  {{ klio_value ee[{d}];\n", .{ents4.len});
+                            for (ents4, 0..) |_, ei4| {
+                                try w.print("    ee[{d}] = KO[{d}];\n", .{
+                                    ei4, singletonSlot(singletons, sc, @intCast(ei4)).?,
+                                });
+                            }
+                            try w.print("    {s} = klio_nat_list(ee, {d}); }}\n", .{
+                                regName(c, gf.dst.int(), &nb22), ents4.len,
+                            });
+                            continue;
+                        }
                         if (enumEntryIndex(m, prog, sc, plainFieldName(enm))) |ei2| {
                             var nb3: [32]u8 = undefined;
                             try w.print("  {s} = KO[{d}];\n", .{
@@ -4862,6 +4904,32 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     var nb: [32]u8 = undefined;
                     var rb: [32]u8 = undefined;
                     const recv = regName(c, cm.receiver.int(), &rb);
+                    // The iteration protocol on a builtin receiver, written by
+                    // name: the runtime picks the same handler by that name.
+                    if (c.cls[cm.receiver.int()]) |brc| {
+                        if (isBuiltinCls(brc) and member_dispatch.hostFreeMemberAnswer(plainFieldName(m.consts.items[cm.name.int()].String)) != null) {
+                            try w.print("  {{ klio_value ma[{d}];\n    ma[0] = {s};\n", .{ cm.n_args + 1, recv });
+                            var khb: u32 = 0;
+                            while (khb < cm.n_args) : (khb += 1) {
+                                const ahb = cm.args.int() + khb;
+                                var abb: [32]u8 = undefined;
+                                var bbb: [96]u8 = undefined;
+                                try w.print("    ma[{d}] = {s};\n", .{
+                                    khb + 1, boxExpr(c.types[ahb], regName(c, ahb, &abb), &bbb),
+                                });
+                            }
+                            var hbb: [320]u8 = undefined;
+                            var hob: [400]u8 = undefined;
+                            const hcall2 = try std.fmt.bufPrint(&hbb, "klio_nat_member(\"{s}\", ma, {d})", .{
+                                plainFieldName(m.consts.items[cm.name.int()].String), cm.n_args + 1,
+                            });
+                            try w.print("    {s} = {s}; }}\n", .{
+                                regName(c, cm.dst.int(), &nb),
+                                unboxExpr(c.types[cm.dst.int()], hcall2, &hob),
+                            });
+                            continue;
+                        }
+                    }
                     if (c.cls[cm.receiver.int()]) |rc| {
                         if (rc == ARRAY_CLS) {
                             const an2 = m.consts.items[cm.name.int()].String;
@@ -4909,32 +4977,6 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                                 });
                                 try w.print("  {s} = klio_nat_box_unit();\n", .{regName(c, cm.dst.int(), &nb)});
                             }
-                            continue;
-                        }
-                    }
-                    // The iteration protocol on a builtin receiver, written by
-                    // name: the runtime picks the same handler by that name.
-                    if (c.cls[cm.receiver.int()]) |brc| {
-                        if (isBuiltinCls(brc) and member_dispatch.hostFreeMemberAnswer(plainFieldName(m.consts.items[cm.name.int()].String)) != null) {
-                            try w.print("  {{ klio_value ma[{d}];\n    ma[0] = {s};\n", .{ cm.n_args + 1, recv });
-                            var khb: u32 = 0;
-                            while (khb < cm.n_args) : (khb += 1) {
-                                const ahb = cm.args.int() + khb;
-                                var abb: [32]u8 = undefined;
-                                var bbb: [96]u8 = undefined;
-                                try w.print("    ma[{d}] = {s};\n", .{
-                                    khb + 1, boxExpr(c.types[ahb], regName(c, ahb, &abb), &bbb),
-                                });
-                            }
-                            var hbb: [320]u8 = undefined;
-                            var hob: [400]u8 = undefined;
-                            const hcall2 = try std.fmt.bufPrint(&hbb, "klio_nat_member(\"{s}\", ma, {d})", .{
-                                plainFieldName(m.consts.items[cm.name.int()].String), cm.n_args + 1,
-                            });
-                            try w.print("    {s} = {s}; }}\n", .{
-                                regName(c, cm.dst.int(), &nb),
-                                unboxExpr(c.types[cm.dst.int()], hcall2, &hob),
-                            });
                             continue;
                         }
                     }
@@ -6002,6 +6044,33 @@ pub fn emit(
                     if (staticClassOf(c.types, c.cls, gq.receiver.int())) |sq| {
                         const eqn = m.consts.items[gq.field.int()];
                         if (eqn == .String) {
+                            const all_entries = std.mem.eql(u8, plainFieldName(eqn.String), "entries") and
+                                enumEntries(m, prog, sq).len != 0;
+                            if (all_entries) {
+                                var have_q5 = false;
+                                for (constructed.items) |uq| {
+                                    if (uq == sq) have_q5 = true;
+                                }
+                                if (!have_q5) try constructed.append(gpa, sq);
+                                const ents6 = enumEntries(m, prog, sq);
+                                for (ents6) |e6| {
+                                    for (e6.args) |afid6| {
+                                        const afn6 = m.funcById(afid6) orelse return false;
+                                        if (seen.contains(afn6.id.int())) continue;
+                                        try seen.put(afn6.id.int(), {});
+                                        try queue.append(gpa, .{ .f = afn6, .synth = null });
+                                    }
+                                }
+                                for (prog.of(sq).?) |fd6| {
+                                    if (fd6.from_parent or fd6.preset) continue;
+                                    const ifid6 = fd6.init orelse continue;
+                                    const ifn6 = m.funcById(ifid6) orelse return false;
+                                    if (seen.contains(ifn6.id.int())) continue;
+                                    try seen.put(ifn6.id.int(), {});
+                                    try queue.append(gpa, .{ .f = ifn6, .synth = null });
+                                }
+                                continue;
+                            }
                             if (enumEntryIndex(m, prog, sq, plainFieldName(eqn.String))) |eqi| {
                                 var have_q = false;
                                 for (constructed.items) |uq| {
@@ -6423,6 +6492,16 @@ pub fn emit(
                     if (staticClassOf(c.types, c.cls, gf3.receiver.int())) |sc2| {
                         const enm2 = m.consts.items[gf3.field.int()];
                         if (enm2 == .String) {
+                            if (std.mem.eql(u8, plainFieldName(enm2.String), "entries")) {
+                                const ents5 = enumEntries(m, prog, sc2);
+                                for (ents5, 0..) |_, ei5| {
+                                    var have_e5 = false;
+                                    for (used_singletons.items) |u| {
+                                        if (u.cid == sc2 and u.entry != null and u.entry.? == ei5) have_e5 = true;
+                                    }
+                                    if (!have_e5) try used_singletons.append(gpa, .{ .cid = sc2, .entry = @intCast(ei5) });
+                                }
+                            }
                             if (enumEntryIndex(m, prog, sc2, plainFieldName(enm2.String))) |ei3| {
                                 var have_e = false;
                                 for (used_singletons.items) |u| {
