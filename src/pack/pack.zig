@@ -1,15 +1,13 @@
-//! `pack` — on-disk module format for the klio interpreter.
+//! On-disk module format for the klio interpreter.
 //!
-//! A pack bundles a library's parsed AST, resolved symbols, type-check
-//! side tables, public symbol index, and optional native-binding manifest
-//! into a single byte stream that the interpreter can load without
-//! re-running the front end. The same format is used by the Kotlin
-//! standard library, by kotlinx modules, and by user libraries.
+//! A pack bundles a library's parsed AST, resolved symbols, type-check side
+//! tables, public symbol index, and optional native-binding manifest into one
+//! byte stream the interpreter loads without re-running the front end. The
+//! Kotlin standard library, kotlinx modules, and user libraries all use it.
 //!
-//! The core of this crate is the on-disk container: header layout,
-//! section directory, deterministic writer, validating reader, and
-//! optional per-section zstd compression. Higher-level schemas (manifest,
-//! symbol index, bindings, AST bundle, source bundle) live in `schema`.
+//! This module is the container: header layout, section directory,
+//! deterministic writer, validating reader, per-section zstd compression.
+//! Higher-level schemas live in `schema`.
 
 const std = @import("std");
 
@@ -33,10 +31,9 @@ pub const PackWriter = write.PackWriter;
 
 pub const PackError = @import("errors.zig").PackError;
 
-/// Highest ABI version this build of klio supports. Pack manifests
-/// declare an `abi_version`; the loader rejects packs whose ABI is
-/// greater than this value. Bump when the host-binding signature, the
-/// runtime value shape, or any other runtime-binding contract changes.
+/// Highest ABI version this build supports; the loader rejects a pack whose
+/// manifest declares a greater `abi_version`. Bump when the host-binding
+/// signature, the runtime value shape, or another binding contract changes.
 pub const SUPPORTED_ABI_VERSION: u32 = 1;
 
 test {
@@ -63,8 +60,7 @@ test "empty pack round trip" {
     defer reader.deinit();
     try std.testing.expectEqual(@as(usize, 0), reader.sections().len);
     try std.testing.expectEqual(@as(usize, 0), reader.sectionCount());
-    // Hash is recomputed by the reader; if it disagreed we'd have bailed
-    // before reaching this point.
+    // The reader recomputes the hash, so reaching here means it matched.
     _ = reader.packHash();
 
     // Re-encoding empty produces identical bytes.
@@ -117,8 +113,7 @@ test "deterministic byte output" {
     const payload_a = "payload-a";
     const payload_b = "payload-b";
 
-    // Insertion order is the opposite of what the writer should emit, to
-    // make a non-deterministic implementation visible.
+    // Reverse of the emitted order, so a non-deterministic writer shows up.
     var w1 = PackWriter.init(a);
     defer w1.deinit();
     _ = try w1.addRaw("b", payload_b);
@@ -146,8 +141,7 @@ test "tampered pack is rejected" {
     var bytes = (try w.finish(&err)).?;
     defer bytes.deinit(a);
 
-    // Flip a byte inside the payload area. The header hash should catch it
-    // on the next read.
+    // Flip a byte in the payload area; the header hash catches it on read.
     const owned = try a.dupe(u8, bytes.items);
     owned[owned.len - 1] ^= 0x01;
     const reader = try PackReader.fromBytes(a, owned, &err);
@@ -172,7 +166,7 @@ test "zstd section round trip" {
     const a = std.testing.allocator;
     var err: PackError = undefined;
 
-    // Repetitive payload so compression actually shrinks the bytes.
+    // Repetitive payload so compression shrinks the bytes.
     const payload = "klio pack zstd compressed section payload " ** 32;
 
     var w = PackWriter.init(a);
@@ -226,8 +220,7 @@ test "zstd dict round trip" {
     var reader = (try PackReader.fromBytes(a, owned, &err)).?;
     defer reader.deinit();
 
-    // The dictionary was emitted as its own section so the reader is
-    // self-contained.
+    // The dictionary ships as its own section, so the reader is self-contained.
     var saw_dict = false;
     var saw_symbols = false;
     for (reader.sections()) |e| {

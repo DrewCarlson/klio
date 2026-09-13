@@ -1,20 +1,16 @@
-//! Embedded stdlib pack.
-//!
-//! The interpreter ships with the stdlib pack baked into the binary,
-//! embedded at build time: the top-level build.zig runs `embed_gen` over
-//! the repo source checkout and wires the bytes in through the
-//! `stdlib_embedded` module.
+//! Stdlib pack baked into the binary: the top-level build.zig runs
+//! `embed_gen` over the repo source checkout and wires the bytes in through
+//! the `stdlib_embedded` module.
 //!
 //! `stdlibPackBytes` resolves the pack in this order:
-//!   1. `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack` — an explicit on-disk
-//!      pack override, strongest because it is a deliberate per-run choice.
-//!   2. The cwd source checkout (`kotlin/libraries/stdlib` + `kotlin-klio`),
-//!      built fresh by `build_stdlib_pack`. Ahead of the embedded bytes so
-//!      in-repo stdlib `.kt` edits take effect without rebuilding the
-//!      binary; in-repo behavior is byte-identical to the pre-embed build.
-//!   3. The embedded bytes — always present in a build.zig-produced binary,
-//!      so `klio run` works from any directory with zero setup.
-//! A `null` `env` skips the override and starts at the checkout.
+//!   1. `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack`, a deliberate per-run
+//!      on-disk override.
+//!   2. The cwd source checkout (`kotlin/libraries/stdlib`, `kotlin-klio`),
+//!      built fresh by `build_stdlib_pack`, so in-repo stdlib `.kt` edits
+//!      take effect without rebuilding the binary.
+//!   3. The embedded bytes, always present in a build.zig-produced binary, so
+//!      `klio run` works from any directory with no setup.
+//! A null `env` skips the override and starts at the checkout.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -30,18 +26,14 @@ const PackError = pack.PackError;
 /// that bypass build.zig (scripts/zigcheck.py wires the stub module).
 pub const EMBEDDED_PACK_BYTES: ?[]const u8 = embedded.pack_bytes;
 
-/// Name of the environment variable that, when set to a readable file
-/// path, overrides the built stdlib pack with the file's contents.
+/// Environment variable naming a readable file whose contents override the
+/// built stdlib pack.
 pub const STDLIB_PACK_ENV: []const u8 = "KLIO_STDLIB_PACK";
 
-/// Return the stdlib pack bytes the host should load, resolving in the
-/// order documented at the top of this file: `KLIO_STDLIB_PACK` override,
-/// then the cwd source checkout, then the bytes embedded in the binary.
-/// A `null` `env` skips the override entirely.
-///
-/// The returned slice is always owned by the caller and freed with
-/// `allocator`. When every source fails, `result` carries the checkout
-/// builder's error (it names the missing root) and `null` is returned.
+/// Stdlib pack bytes for the host to load, resolved in the order at the top
+/// of this file; a null `env` skips the override. The slice is owned by the
+/// caller and freed with `allocator`. When every source fails, `result`
+/// carries the checkout builder's error, which names the missing root.
 pub fn stdlibPackBytes(allocator: Allocator, env: ?*const EnvMap, result: *PackError) Allocator.Error!?[]u8 {
     if (env) |m| {
         if (m.get(STDLIB_PACK_ENV)) |path| {
@@ -59,12 +51,9 @@ pub fn stdlibPackBytes(allocator: Allocator, env: ?*const EnvMap, result: *PackE
     return null;
 }
 
-/// Read the embedded stdlib pack's manifest and return the implicit
-/// package list it declares. Reflects the pack's declaration, so as the
-/// embedded pack adds packages (or future kotlinx packs declare their own)
-/// callers automatically see the union. The returned slice and each of its
-/// strings are owned by the caller and freed with `allocator`. Any failure
-/// yields an empty slice.
+/// Implicit package list declared by the stdlib pack's manifest, so callers
+/// track whatever the pack declares. The slice and its strings are owned by
+/// the caller and freed with `allocator`; any failure yields an empty slice.
 pub fn embeddedImplicitPackages(allocator: Allocator, env: ?*const EnvMap) Allocator.Error![][]const u8 {
     var err: PackError = undefined;
     const bytes = (try stdlibPackBytes(allocator, env, &err)) orelse return &.{};
@@ -93,8 +82,8 @@ pub fn freeImplicitPackages(allocator: Allocator, packages: [][]const u8) void {
     allocator.free(packages);
 }
 
-/// Read `path` into an owned buffer, returning `null` if the file cannot
-/// be read (so the caller falls back to the built pack).
+/// Read `path` into an owned buffer. Null when the file cannot be read, so
+/// the caller falls back to the built pack.
 fn readFile(allocator: Allocator, path: []const u8) Allocator.Error!?[]u8 {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -112,8 +101,7 @@ test "embedded pack loads" {
     const bytes = (try stdlibPackBytes(a, null, &err)).?;
     try std.testing.expect(bytes.len != 0);
 
-    // Round-trip through PackReader to validate the embed. `fromBytes`
-    // takes ownership of `bytes`.
+    // `fromBytes` takes ownership of `bytes`.
     var reader = (try pack.PackReader.fromBytes(a, bytes, &err)).?;
     defer reader.deinit();
 
@@ -149,9 +137,8 @@ test "baked-in pack bytes parse and carry every section" {
 }
 
 test "embedded implicit packages match static list" {
-    // The static `stdlib.IMPLICITLY_IMPORTED_PACKAGES` is the boot-time
-    // source; the pack manifest is the persistent form a future build will
-    // read directly. They must agree for the duration of the transition.
+    // `stdlib.IMPLICITLY_IMPORTED_PACKAGES` is the boot-time source and the
+    // pack manifest the persistent form; the two must agree.
     const a = std.testing.allocator;
 
     const from_pack = try embeddedImplicitPackages(a, null);

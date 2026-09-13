@@ -1,12 +1,7 @@
-//! Stdlib codegen entry point.
-//!
-//! Subcommands:
-//! * `build` mines the upstream stdlib sources and emits the encoded symbol
-//!   index for `stdlib`.
-//! * `coverage` prints implemented / total counts from the current generated
-//!   registry.
-//!
-//! Exposes a `pub fn run` taking parsed arguments, not a real `main`.
+//! Stdlib codegen entry point, exposing `run` over parsed arguments rather than
+//! a real `main`. `build` mines the upstream stdlib sources and emits the
+//! encoded symbol index for `stdlib`; `coverage` prints implemented and total
+//! counts from the generated registry.
 
 const std = @import("std");
 
@@ -28,17 +23,15 @@ pub const Cmd = union(enum) {
     coverage,
 
     pub const Build = struct {
-        /// Path to the upstream Kotlin checkout's stdlib root
-        /// (`<repo>/kotlin/libraries/stdlib`).
+        /// Upstream stdlib root, default `<repo>/kotlin/libraries/stdlib`.
         stdlib: ?[]const u8 = null,
-        /// Output directory for generated data
-        /// (`<repo>/src/stdlib/generated`).
+        /// Generated-data directory, default `<repo>/src/stdlib/generated`.
         out: ?[]const u8 = null,
     };
 };
 
-/// Run a parsed subcommand. `writer`/`err_writer` receive stdout/stderr text.
-/// Returns the process exit code.
+/// Run a parsed subcommand. `writer`/`err_writer` take stdout/stderr text;
+/// the result is the process exit code.
 pub fn run(
     allocator: Allocator,
     io: Io,
@@ -52,8 +45,7 @@ pub fn run(
     };
 }
 
-/// Workspace root; resolves relative to the cwd, which the generator is
-/// run from.
+/// Workspace root: the generator runs from it, so paths stay relative to cwd.
 fn workspaceRoot(allocator: Allocator) Allocator.Error![]const u8 {
     return allocator.dupe(u8, ".");
 }

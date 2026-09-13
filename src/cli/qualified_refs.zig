@@ -2,18 +2,15 @@
 //! program.
 //!
 //! Kotlin needs no `import` to use a name by its fully-qualified path
-//! (`kotlin.coroutines.EmptyCoroutineContext`, `kotlinx.coroutines.launch(…)`).
-//! The stdlib/pack load gate keyed only on `import` lines, so a qualified-only
-//! program never opened the gated curated sources / selected the matching pack.
-//! This walk recovers the package prefixes such qualified uses imply, so the
-//! gate sees them exactly as if the program had imported them.
+//! (`kotlin.coroutines.EmptyCoroutineContext`, `kotlinx.coroutines.launch(…)`),
+//! but the stdlib and pack load gate keys on `import` lines. This walk recovers
+//! the package prefixes a qualified-only use implies, so the gate sees them as
+//! if the program had imported them.
 //!
-//! Conservative on purpose: a dotted chain contributes a prefix only when its
-//! head segment is one of the well-known package roots (`kotlin`, `kotlinx`,
-//! `java`, `javax`). A member access on a local (`obj.a.b`) is rooted at the
-//! local's name, never a package root, so it does not widen the gate. A missed
-//! position only fails to widen — never a false positive — so the walk is safe
-//! even where it is not exhaustive.
+//! A dotted chain contributes a prefix only when its head segment is a
+//! well-known package root (`kotlin`, `kotlinx`, `java`, `javax`); a member
+//! access on a local (`obj.a.b`) is rooted at the local's name and never widens
+//! the gate. A missed position only fails to widen, never a false positive.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -37,10 +34,9 @@ fn isPackageRoot(name: []const u8) bool {
     return false;
 }
 
-/// Collect every package-rooted qualified-reference prefix the files use, as
-/// a set of dotted strings. Each key is owned by the returned map's
-/// allocator; free the keys and `deinit` the map (the loader's `freeStringSet`
-/// does both).
+/// Collect every package-rooted qualified-reference prefix the files use, as a
+/// set of dotted strings. Keys are owned by `allocator`: free the keys and
+/// `deinit` the map (the loader's `freeStringSet` does both).
 pub fn collect(
     allocator: Allocator,
     files: []const KotlinFile,
@@ -57,9 +53,8 @@ pub fn collect(
     return out;
 }
 
-/// If `e` is a package-rooted dotted chain, record its package prefix (all
-/// segments except the trailing symbol). Walks the chain only when it is a
-/// `Member`/`Path` spine; any non-name link aborts the attempt.
+/// If `e` is a package-rooted dotted chain, record every segment but the
+/// trailing symbol. Walks a `Member`/`Path` spine only; a non-name link aborts.
 fn recordChainPrefix(
     allocator: Allocator,
     out: *std.StringHashMap(void),
@@ -68,8 +63,8 @@ fn recordChainPrefix(
     var segs: [16][]const u8 = undefined;
     var n: usize = 0;
     var cur: *const Expr = e;
-    // Unwind the chain right-to-left into `segs` (reversed), bounded by the
-    // buffer; longer chains are not package qualifiers worth gating on.
+    // Unwind the chain right-to-left into `segs`, bounded by the buffer; a
+    // longer chain is not a package qualifier worth gating on.
     while (true) {
         switch (cur.*) {
             .Member => |m| {
@@ -275,10 +270,6 @@ fn walkDecl(
         .TypeAlias => {},
     }
 }
-
-// ---------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------
 
 const lexer = @import("lexer");
 const parser = @import("parser");

@@ -1,8 +1,6 @@
-//! Shared bench plumbing: corpus loader, per-stage pipeline runners,
-//! timing helpers, and JSON result schema.
-//!
-//! The library is alloc-light on hot paths so it doesn't perturb the
-//! numbers it measures.
+//! Shared bench plumbing: corpus loader, per-stage pipeline runners, timing
+//! helpers, and the JSON result schema. Alloc-light on hot paths so it does
+//! not perturb the numbers it measures.
 
 const std = @import("std");
 
@@ -34,9 +32,8 @@ pub const BenchRecord = schema.BenchRecord;
 pub const BenchReport = schema.BenchReport;
 pub const RegressionLevel = schema.RegressionLevel;
 
-/// Output sink that captures lines. A `write` accumulates into a pending
-/// buffer and every embedded `\n` flushes one line (with the trailing
-/// newline trimmed).
+/// Output sink that captures lines: `write` accumulates into a pending buffer
+/// and every embedded newline flushes one line, with the newline trimmed.
 const CaptureOutput = struct {
     lines: std.ArrayList([]const u8) = .empty,
     cur: std.ArrayList(u8) = .empty,
@@ -82,15 +79,13 @@ const CaptureOutput = struct {
     }
 };
 
-/// Locate the bench corpus directory. The bench corpus physically lives under
-/// `tests/fixtures/bench_corpus`; the path is resolved relative to the process
-/// working directory. Caller owns the result.
+/// Path to the bench corpus, resolved relative to the process working
+/// directory. Caller owns the result.
 pub fn corpusRoot(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
     return allocator.dupe(u8, "tests/fixtures/bench_corpus");
 }
 
-/// Walk a corpus directory and return every `.kt` file, sorted. Caller
-/// owns the returned slice and each path within it.
+/// Every `.kt` file under `dir`, sorted. Caller owns the slice and each path.
 pub fn collectKt(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) std.mem.Allocator.Error![][]u8 {
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -146,8 +141,7 @@ pub const Program = struct {
         self.allocator.free(self.source);
     }
 
-    /// Stable label used in JSON output, e.g. `game/entity_tick`. Caller
-    /// owns the returned bytes.
+    /// Stable label for JSON output, e.g. `game/entity_tick`. Caller owns it.
     pub fn label(self: *const Program, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         const root = try corpusRoot(allocator);
         defer allocator.free(root);
@@ -167,7 +161,7 @@ pub const Program = struct {
     }
 };
 
-/// Fresh-`SourceMap` lex pass. Returned for downstream stages.
+/// Result of one lex pass, carried into the downstream stages.
 pub const Lexed = struct {
     id: FileId,
     source: []const u8,
@@ -194,9 +188,8 @@ pub fn typeckOnly(allocator: std.mem.Allocator, file: *const KotlinFile, res: *c
     return typeck.typecheck(allocator, file, res);
 }
 
-/// Run the program end-to-end, capturing stdout so it doesn't pollute the
-/// bench harness console. Returns the captured output (caller owns it) or
-/// a static error string describing the failure.
+/// Outcome of `runFull`: captured stdout, owned by the caller, or a failure
+/// description (static, except the allocated `runtime: ...` form).
 pub const RunOutcome = union(enum) {
     ok: []u8,
     err: []const u8,
@@ -251,9 +244,8 @@ pub const Timing = struct {
     p99_ns: u64,
 };
 
-/// Time `ctx.call()` for at least `min_total_ns` of wall clock, returning
-/// the median and p99 of per-iter samples and the total iter count. Cheap
-/// and good enough for end-to-end workloads.
+/// Time `ctx.call()` over at least `min_total_ns` of wall clock, returning the
+/// median and p99 per-iteration samples and the iteration count.
 pub fn timeIters(
     allocator: std.mem.Allocator,
     ctx: anytype,
@@ -289,9 +281,8 @@ pub const StageTimings = struct {
     e2e: Timing,
 };
 
-/// Time each stage of the pipeline independently for one program. Each
-/// stage runs against a fresh input so cache effects from one stage don't
-/// help the next.
+/// Time each pipeline stage independently, each against a fresh input so one
+/// stage's cache effects do not help the next.
 pub fn timePipelineStages(
     allocator: std.mem.Allocator,
     prog: *const Program,
@@ -378,8 +369,7 @@ pub fn timePipelineStages(
     };
 }
 
-/// Crude allocator-agnostic "memory footprint" sample for a workload.
-/// Times a closure that runs the program once and returns the total time.
+/// Wall time of a single `ctx.call()`.
 pub fn quickRunNs(ctx: anytype) u64 {
     var t = std.time.Timer.start() catch unreachable;
     ctx.call();
@@ -394,8 +384,8 @@ test {
     _ = main;
 }
 
-// Pinned size of `Value`. A bump here means a variant grew or a new
-// variant inflated the discriminant; investigate before bumping.
+// `Value` is pinned at 64 bytes or less; a bump means a variant grew or the
+// discriminant widened.
 test "value_size_is_pinned" {
     const sz = @sizeOf(runtime.Value);
     try testing.expect(sz <= 64);

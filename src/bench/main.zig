@@ -1,5 +1,4 @@
-//! End-to-end bench driver. Emits stable JSON on stdout and human
-//! summary on stderr.
+//! End-to-end bench driver: stable JSON on stdout, human summary on stderr.
 //!
 //! Usage:
 //!   klio-bench            # all corpora, fast budget
@@ -105,11 +104,9 @@ fn reportDiff(allocator: std.mem.Allocator, io: std.Io, base_path: []const u8, r
     return null;
 }
 
-/// Library entry point. Returns the process exit code. Takes args +
-/// allocator explicitly so the orchestrator wires the real executable.
+/// Entry point; the returned value is the process exit code.
 pub fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) u8 {
-    // Cap the bench process's RSS so a runaway corpus entry can't OOM the
-    // machine. Call-once.
+    // Cap the bench process's RSS so a runaway corpus entry cannot OOM the host.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
 
@@ -257,9 +254,8 @@ fn hostString(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
 }
 
 fn printErr(comptime fmt: []const u8, args: anytype) void {
-    // Silent under the test runner: arg-parsing tests exercise the usage/error
-    // paths for their exit codes, and stray stderr makes `zig build test` flag
-    // the test command as failed even though the unit passed.
+    // Silent under the test runner: arg-parsing tests exercise the usage and
+    // error paths, and stray stderr makes `zig build test` flag the command.
     if (@import("builtin").is_test) return;
     std.debug.print(fmt, args);
 }

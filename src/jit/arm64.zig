@@ -1,7 +1,6 @@
-//! AArch64 (AAPCS64) machine-code emitter. Mirrors the x86-64 `Emitter` API
-//! method-for-method so the loop/function compiler in `ir/jit_loop.zig` is
-//! arch-neutral: it programs a fixed-role register machine and this backend
-//! lowers each macro-op to ARM64.
+//! AArch64 (AAPCS64) machine-code emitter, mirroring the x86-64 `Emitter` API
+//! method-for-method so `ir/jit_loop.zig` programs one fixed-role register
+//! machine and this backend lowers each macro-op to ARM64.
 //!
 //! Role mapping (x86 name -> AArch64 register):
 //!   rax (T0, scratch / return / call-target) -> x9
@@ -13,10 +12,10 @@
 //!   xmm0 / xmm1                              -> v0 / v1
 //! Internal scratch (never a role): x12 (div quotient), x16/x17 (addr/imm).
 //!
-//! The C entry contract is preserved: the native unit takes the slots pointer
-//! in arg0 and returns its result code in the rax-role. The aarch64 `ret`
-//! reconciles that to x0 (the AAPCS return register), and `push`/`pop` pair the
-//! REGS save with the link register so a trampoline `blr` is transparent.
+//! C entry contract: the native unit takes the slots pointer in arg0 and
+//! returns its result code in the rax-role, which `ret` reconciles to x0, the
+//! AAPCS return register. `push`/`pop` pair the REGS save with the link
+//! register so a trampoline `blr` is transparent.
 
 const std = @import("std");
 const root = @import("jit.zig");
@@ -61,9 +60,8 @@ const LR: u32 = 30;
 const TMP_DIV: u32 = 12;
 const TMP_ADDR: u32 = 16;
 
-/// AArch64 4-bit condition code for an integer/float compare result. The
-/// abstract mnemonics partition cleanly: signed forms follow `cmp`, the
-/// `a`/`ae`/`be` forms only ever follow `fcmp`, and `e`/`ne` work for both.
+/// AArch64 4-bit condition code for a compare result: signed forms follow
+/// `cmp`, `a`/`ae`/`be` only ever follow `fcmp`, and `e`/`ne` suit both.
 fn condCode(c: Cond) u32 {
     return switch (c) {
         .e => 0b0000, // EQ
@@ -125,8 +123,6 @@ pub const Emitter = struct {
         self.buf.appendSlice(self.a, &le) catch return JitError.OutOfMemory;
     }
 
-    // --- constant materialization ------------------------------------------
-
     /// `movz`/`movk` sequence loading a full 64-bit immediate into `rd`.
     fn movImmRaw(self: *Emitter, rd: u32, v: u64) JitError!void {
         try self.inst(0xD2800000 | (@as(u32, @intCast(v & 0xFFFF)) << 5) | rd); // movz rd, #lo16
@@ -141,8 +137,6 @@ pub const Emitter = struct {
     pub fn movImm64(self: *Emitter, dst: Reg, v: u64) JitError!void {
         try self.movImmRaw(gp(dst), v);
     }
-
-    // --- register ALU ------------------------------------------------------
 
     pub fn movReg(self: *Emitter, dst: Reg, src: Reg) JitError!void {
         // orr dst, xzr, src
@@ -211,14 +205,12 @@ pub const Emitter = struct {
         }
     }
 
-    // --- signed divide / remainder -----------------------------------------
-
     /// x86 sign-extends rax into rdx:rax; AArch64 `sdiv` needs no setup.
     pub fn cqo(self: *Emitter) JitError!void {
         _ = self;
     }
-    /// Quotient of T0(rax/x9) by `src`, leaving quotient in T0 and remainder in
-    /// T2(rdx/x11) — the exact post-idiv register contract the compiler reads.
+    /// Divide T0(rax/x9) by `src`, leaving the quotient in T0 and the remainder
+    /// in T2(rdx/x11), the post-idiv register contract the compiler reads.
     pub fn idivReg(self: *Emitter, src: Reg) JitError!void {
         const dividend: u32 = gp(.rax);
         const divisor: u32 = gp(src);
@@ -231,8 +223,7 @@ pub const Emitter = struct {
         try self.inst(0xAA0003E0 | (TMP_DIV << 16) | dividend);
     }
 
-    // --- shifts (count in rcx/x10) -----------------------------------------
-
+    /// Shift `dst` by the count in the rcx role (x10).
     fn shiftBy(self: *Emitter, dst: Reg, op2: u32, w64: bool) JitError!void {
         const base: u32 = if (w64) 0x9AC00000 else 0x1AC00000;
         const d = gp(dst);
@@ -247,8 +238,6 @@ pub const Emitter = struct {
     pub fn shrCl(self: *Emitter, dst: Reg, w64: bool) JitError!void {
         try self.shiftBy(dst, 0x2400, w64); // lsrv
     }
-
-    // --- memory (base + disp) ----------------------------------------------
 
     /// Effective-address load/store with a 12-bit scaled unsigned offset when
     /// the displacement fits, else a materialized register offset.
@@ -278,8 +267,6 @@ pub const Emitter = struct {
         try self.memScaled(0x39000000, 0x38206800, TMP_DIV, base, disp, 0); // strb w
     }
 
-    // --- stack (REGS + LR pairing) -----------------------------------------
-
     /// Saves `r` together with the link register so a trampoline `blr` in the
     /// body is transparent: `pop` restores LR before `ret`.
     pub fn push(self: *Emitter, r: Reg) JitError!void {
@@ -290,8 +277,6 @@ pub const Emitter = struct {
         // ldp r, lr, [sp], #16     (post-index, imm7 = 2)
         try self.inst(0xA8C00000 | (0x02 << 15) | (LR << 10) | (SP << 5) | gp(r));
     }
-
-    // --- return / indirect call --------------------------------------------
 
     pub fn ret(self: *Emitter) JitError!void {
         // mov x0, <rax-role>  (reconcile to the AAPCS return register)
@@ -305,15 +290,11 @@ pub const Emitter = struct {
         try self.inst(0xAA0003E0 | (0 << 16) | gp(.rax)); // mov rax, x0
     }
 
-    // --- setcc -------------------------------------------------------------
-
     pub fn setccReg(self: *Emitter, cc: SetCc, reg: Reg) JitError!void {
         // cset reg, cc  ==  csinc reg, xzr, xzr, invert(cc)
         const inv = setCode(cc) ^ 1;
         try self.inst(0x9A9F07E0 | (inv << 12) | gp(reg));
     }
-
-    // --- SIMD / float ------------------------------------------------------
 
     fn fpMem(self: *Emitter, op_uoff: u32, op_roff: u32, t: u32, base: Reg, disp: i32, scale_log2: u5) JitError!void {
         try self.memScaled(op_uoff, op_roff, t, base, disp, scale_log2);
@@ -358,14 +339,14 @@ pub const Emitter = struct {
     pub fn divss(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.fpRRR(0x1E201800, dst, src);
     }
-    /// `fcmp dst, src` — sets NZCV (V=1 on unordered) for the cond mapping.
+    /// `fcmp dst, src`: sets NZCV (V=1 on unordered) for the cond mapping.
     pub fn ucomisd(self: *Emitter, a: Xmm, b: Xmm) JitError!void {
         try self.inst(0x1E602000 | (fp(b) << 16) | (fp(a) << 5));
     }
     pub fn ucomiss(self: *Emitter, a: Xmm, b: Xmm) JitError!void {
         try self.inst(0x1E202000 | (fp(b) << 16) | (fp(a) << 5));
     }
-    /// `eor Vd.8B, Vn.8B, Vm.8B` — zeroes the register when dst==src.
+    /// `eor Vd.8B, Vn.8B, Vm.8B`: zeroes the register when dst==src.
     pub fn xorps(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.inst(0x2E201C00 | (fp(src) << 16) | (fp(dst) << 5) | fp(dst));
     }
@@ -393,8 +374,6 @@ pub const Emitter = struct {
         // fcvtzs x, s
         try self.inst(0x9E380000 | (fp(src) << 5) | gp(dst));
     }
-
-    // --- array element access [base + index*scale] -------------------------
 
     fn elemLog2(w: ElemW) u5 {
         return switch (w) {
@@ -435,8 +414,6 @@ pub const Emitter = struct {
         const s: u32 = if (sh != 0) (1 << 12) else 0;
         try self.inst(opc | s | (gp(index) << 16) | (gp(base) << 5) | gp(src));
     }
-
-    // --- labels & branches -------------------------------------------------
 
     pub fn newLabel(self: *Emitter) JitError!Label {
         self.labels.append(self.a, null) catch return JitError.OutOfMemory;
@@ -487,8 +464,6 @@ pub const Emitter = struct {
         try self.branchRel(false, l, 0x54000000 | condCode(cc)); // b.cond
     }
 };
-
-// --- tests (execute natively; the host must be aarch64) ----------------------
 
 const builtin = @import("builtin");
 const testing = std.testing;
@@ -747,8 +722,8 @@ test "arm64: float compare with NaN semantics (Less/Eq/NotEq)" {
         fn build(em: *Emitter) !void {
             try em.push(.rbx);
             try em.movReg(.rbx, .rdi);
-            try em.movsdLoad(.xmm0, .rbx, 0); // a
-            try em.movsdLoad(.xmm1, .rbx, 8); // b
+            try em.movsdLoad(.xmm0, .rbx, 0);
+            try em.movsdLoad(.xmm1, .rbx, 8);
             // a<b: ucomi(b,a); seta
             try em.ucomisd(.xmm1, .xmm0);
             try em.setccReg(.a, .rax);

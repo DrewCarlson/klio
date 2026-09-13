@@ -1,20 +1,18 @@
-//! First-launch extraction of the embedded Skia shim: a UI bundle
-//! carries the rendering backend as a zstd blob; `dlopen` needs a real
-//! file, so the blob is written once to a content-addressed per-user
-//! cache and the path handed to the loader.
+//! First-launch extraction of the embedded Skia shim: a UI bundle carries the
+//! rendering backend as a zstd blob and `dlopen` needs a real file, so the blob
+//! is written once to a content-addressed per-user cache and the path handed to
+//! the loader.
 //!
-//! Cache layout: `<cache-base>/klio/shim/<blake3-16>/<libname>` where
-//! `<blake3-16>` is the hex prefix of the DECOMPRESSED bytes' hash —
-//! upgrades land in a new directory, co-installed bundles sharing a shim
-//! share one file, and a later launch that finds the file skips the
-//! write entirely. Writes go through a unique temp file + rename, so
-//! concurrent first launches are safe and a torn temp file is invisible.
+//! Layout: `<cache-base>/klio/shim/<blake3-16>/<libname>`, `<blake3-16>` being
+//! the hex prefix of the decompressed bytes' hash, so upgrades land in a new
+//! directory, bundles sharing a shim share one file, and a launch that finds
+//! the file skips the write. Writes go through a unique temp file and a rename,
+//! so concurrent first launches are safe and a torn temp file is invisible.
 //!
 //! `<cache-base>` is `$XDG_CACHE_HOME` (default `~/.cache`) on Linux,
-//! `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows. An
-//! unwritable cache falls back to the system temp dir; if that also
-//! fails the caller reports one stderr line and the program keeps the
-//! existing headless fallback.
+//! `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows; an unwritable
+//! cache falls back to the system temp dir, and if that fails too the caller
+//! reports one stderr line and the program stays headless.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -57,9 +55,8 @@ fn cacheBase(gpa: Allocator) ?[]const u8 {
     }
 }
 
-/// Ensure `bytes` exists as a file in the content-addressed cache and
-/// return its path (allocated from `gpa`, process-lifetime). Null when
-/// neither the cache nor the temp dir is writable.
+/// Ensure `bytes` exists in the content-addressed cache; the returned path is
+/// `gpa`-allocated for the process lifetime. Null when nothing is writable.
 pub fn ensureExtracted(gpa: Allocator, bytes: []const u8) ?[]const u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
@@ -84,7 +81,7 @@ fn extractInto(gpa: Allocator, dir: []const u8, bytes: []const u8) ?[]const u8 {
     const cwd = std.Io.Dir.cwd();
 
     const dest = std.fs.path.join(gpa, &.{ dir, libName() }) catch return null;
-    // Content-addressed: an existing file IS the right file.
+    // Content-addressed: an existing file is the right file.
     if (cwd.statFile(fio, dest, .{}) catch null) |st| {
         if (st.size == bytes.len) return dest;
     }
@@ -109,8 +106,7 @@ fn extractInto(gpa: Allocator, dir: []const u8, bytes: []const u8) ?[]const u8 {
     markExecutable(tmp_path);
     cwd.rename(tmp_path, cwd, dest, fio) catch {
         cwd.deleteFile(fio, tmp_path) catch {};
-        // A concurrent launch may have won the rename; the destination
-        // still serves.
+        // A concurrent launch may have won the rename; the destination serves.
         if (cwd.statFile(fio, dest, .{}) catch null) |_| return dest;
         gpa.free(dest);
         return null;
@@ -143,8 +139,7 @@ test "extraction is content-addressed and idempotent" {
     defer gpa.free(on_disk);
     try std.testing.expectEqualStrings(payload, on_disk);
 
-    // Second extraction finds the file and skips the write (same path,
-    // same mtime).
+    // Second extraction finds the file and skips the write: same path, mtime.
     const st_before = try std.Io.Dir.cwd().statFile(fio, first, .{});
     const second = extractInto(gpa, scratch, payload) orelse return error.TestUnexpectedResult;
     defer gpa.free(@constCast(second));

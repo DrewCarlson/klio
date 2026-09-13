@@ -1,4 +1,4 @@
-//! File walking + per-file parse driving.
+//! Walks the stdlib source tree and drives the per-file parse.
 
 const std = @import("std");
 
@@ -59,9 +59,9 @@ pub const CollectResult = struct {
     }
 };
 
-/// Walk the curated stdlib roots under `stdlib_root` and return all parsed
-/// declarations. `stdlib_root` is expected to be `kotlin/libraries/stdlib`.
-/// `stdlib_root` is relative to the cwd (or absolute).
+/// Parse every `.kt` file under the curated roots of `stdlib_root`, which is
+/// `kotlin/libraries/stdlib`, absolute or relative to the cwd. Caller releases
+/// the result with `CollectResult.deinit`.
 pub fn collectDecls(allocator: Allocator, io: Io, stdlib_root: []const u8) Allocator.Error!CollectResult {
     var out: std.ArrayList(FileDecls) = .empty;
     errdefer {
@@ -119,8 +119,7 @@ pub fn collectDecls(allocator: Allocator, io: Io, stdlib_root: []const u8) Alloc
     return .{ .files = try out.toOwnedSlice(allocator), .stats = stats };
 }
 
-/// Strip a leading `prefix` (plus any path separator) from `path`. Returns a
-/// slice into `path`.
+/// `path` minus a leading `prefix` and separator, as a slice into `path`.
 fn stripPrefix(path: []const u8, prefix: []const u8) []const u8 {
     if (path.len > prefix.len and std.mem.startsWith(u8, path, prefix)) {
         var rest = path[prefix.len..];

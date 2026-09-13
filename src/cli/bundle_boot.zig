@@ -1,14 +1,12 @@
-//! Bundle boot: detect a payload appended to the running executable and
-//! run the embedded program instead of the normal CLI.
+//! Bundle boot: detect a payload appended to the running executable and run the
+//! embedded program instead of the normal CLI.
 //!
-//! The probe is one `open` + one small `pread` of the 72-byte trailer;
-//! a plain `klio` binary probes negative and the CLI proceeds untouched.
-//! In bundle mode argv[1..] belongs entirely to the program
-//! (`fun main(args: Array<String>)` receives it); klio subcommands are
-//! unreachable, and the `~/.klio` cache and pack directories are never
-//! consulted. `KLIO_BUNDLE_INSPECT=1` prints the manifest and exits — the
-//! only bundle-mode CLI affordance. The `KLIO_*` diagnostic env vars keep
-//! working.
+//! The probe is one `open` plus one small `pread` of the 72-byte trailer; a
+//! plain `klio` binary probes negative and the CLI proceeds untouched. In bundle
+//! mode argv[1..] goes to `fun main(args: Array<String>)` verbatim, klio
+//! subcommands are unreachable, and the `~/.klio` cache and pack directories are
+//! never consulted. `KLIO_BUNDLE_INSPECT=1` prints the manifest and exits, the
+//! only bundle-mode CLI affordance; the `KLIO_*` diagnostic vars keep working.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -46,9 +44,9 @@ const ProbeState = union(enum) {
 var probe_state: ProbeState = .unknown;
 var probe_file_len: u64 = 0;
 
-/// Whether the running executable carries a bundle payload. Cheap and
-/// memoized; called before argv is interpreted (bundle argv belongs to
-/// the program, including `--opt`-shaped strings).
+/// Whether the running executable carries a bundle payload. Memoized, and
+/// probed before argv is interpreted: in bundle mode every argv entry, including
+/// an `--opt`-shaped one, belongs to the program.
 pub fn bundleModeActive() bool {
     return probeSelf() != null;
 }
@@ -65,13 +63,11 @@ fn probeSelf() ?bf.Trailer {
     return t;
 }
 
-/// Read the trailer candidate from the platform-specific tail position.
-/// Linux (ELF): plain overlay append, `EOF - 72`. macOS (Mach-O): the
-/// bundler strips the stub's signature and re-signs over the overlay, so
-/// the trailer sits at `LC_CODE_SIGNATURE.dataoff - 72`; an unsigned x86_64
-/// stub falls back to the plain EOF probe. Windows (PE): `EOF - 72` with a
-/// certificate-table-aware retry once Authenticode support lands
-/// (extension point).
+/// Read the trailer candidate from the platform-specific tail position. Linux
+/// (ELF): plain overlay append at `EOF - 72`. macOS (Mach-O): the bundler strips
+/// the stub's signature and re-signs over the overlay, so the trailer sits at
+/// `LC_CODE_SIGNATURE.dataoff - 72`, and an unsigned x86_64 stub falls back to
+/// the plain EOF probe. Windows (PE): `EOF - 72`.
 fn probeSelfInner() ?bf.Trailer {
     const path = selfExePathZ() orelse return null;
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
@@ -81,8 +77,7 @@ fn probeSelfInner() ?bf.Trailer {
     if (end <= bf.TRAILER_LEN) return null;
     const file_len: u64 = @intCast(end);
 
-    // macOS: the trailer precedes the code-signature blob. Read the Mach-O
-    // header to find LC_CODE_SIGNATURE.dataoff and probe at dataoff - 72.
+    // macOS: the trailer precedes the code-signature blob.
     if (builtin.os.tag == .macos) {
         if (machoTrailerPos(fd)) |pos| {
             if (readTrailerAt(fd, pos, file_len)) |t| {
@@ -125,9 +120,8 @@ fn machoTrailerPos(fd: c_int) ?u64 {
 
 var self_path_buf: [std.fs.max_path_bytes]u8 = undefined;
 
-/// Resolve the own-executable path into a static buffer (never trusts
-/// bare argv[0]). Windows (`GetModuleFileNameW`) is the extension point
-/// that lands with PE support.
+/// Resolve the own-executable path into a static buffer, never trusting bare
+/// argv[0]. Null on an OS with no supported query.
 fn selfExePathZ() ?[*:0]const u8 {
     switch (builtin.os.tag) {
         .linux => {
@@ -145,8 +139,8 @@ fn selfExePathZ() ?[*:0]const u8 {
     }
 }
 
-/// mmap the whole bundle file read-only (`MAP_PRIVATE`). The mapping is
-/// process-lifetime: the loaded base and every borrowed string live in it.
+/// mmap the whole bundle file read-only (`MAP_PRIVATE`). The mapping lives for
+/// the process: the loaded base and every borrowed string sit in it.
 fn mmapSelf(len: u64) ?[]const u8 {
     const path = selfExePathZ() orelse return null;
     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
@@ -163,8 +157,8 @@ fn mmapSelf(len: u64) ?[]const u8 {
     return mapped[0..@intCast(len)];
 }
 
-/// Run the embedded program. `argv` is the full process argv; argv[1..]
-/// is handed to `main(args)` verbatim. Returns the process exit code.
+/// Run the embedded program and return the process exit code. `argv` is the full
+/// process argv; argv[1..] reaches `main(args)` verbatim.
 pub fn run(gpa: Allocator, argv: []const []const u8) u8 {
     const trailer = probeSelf() orelse {
         io.writeStderr("error: bundle probe failed after activation\n");
@@ -232,14 +226,12 @@ fn bootProgram(
     interp_ir.resetReceiverThreadLocals();
     interp_ir.resetRunGlobalCaches();
 
-    // Resource table for the klio.bundle host surface, installed before
-    // the program runs.
+    // Resource table for the klio.bundle host surface, before the program runs.
     installResources(gpa, bytes, table, manifest);
 
-    // UI bundles: extract the embedded Skia shim to the content-addressed
-    // cache and point the loader at it; install the window icon + the
-    // default title. A failed extraction keeps the existing headless
-    // fallback with one stderr line.
+    // UI bundles: extract the embedded Skia shim to the content-addressed cache
+    // and point the loader at it, then install the window icon and default
+    // title. A failed extraction keeps the headless fallback and one stderr line.
     if (manifest.flavor == .ui) {
         if (bf.findSection(table, bf.section_names.SKIA_SHIM)) |shim_section| {
             const shim = (bf.sectionBytes(gpa, bytes, shim_section) catch null) orelse {
@@ -302,8 +294,7 @@ fn bootRest(
     };
     for (loaded.known_packages) |pkg| stdlib.registerKnownPackage(pkg);
 
-    // Program sources: parse and extend, exactly like the warm image
-    // cache path.
+    // Program sources: parse and extend, exactly like the warm image cache path.
     const src_section = bf.findSection(table, bf.section_names.PROGRAM_SRC) orelse {
         io.writeStderr("error: bundle carries no program sources; rebundle\n");
         return 1;
@@ -342,9 +333,9 @@ fn bootRest(
     return commands.runBuiltModuleArgs(gpa, built, bindings, map, "error: no main function found", argv[1..]);
 }
 
-/// Host bindings: the in-binary registry plus the manifest's replay
-/// lists. An unresolvable pack symbol means a version-skewed stub —
-/// already refused by the manifest check — so it errors hard (null).
+/// Host bindings: the in-binary registry plus the manifest's replay lists. An
+/// unresolvable pack symbol means a version-skewed stub, already refused by the
+/// manifest check, so it errors hard (null).
 fn replayBindings(
     gpa: Allocator,
     binding_fqns: []const []const u8,

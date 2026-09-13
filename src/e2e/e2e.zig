@@ -1,11 +1,8 @@
-//! End-to-end corpus test: run every examples/*.kt through the in-process klio
-//! pipeline (the `parity` module's runWithPacks) and assert stdout matches the
-//! checked-in expected output under tests/corpus/expected/. This makes the
-//! behavioral corpus part of `zig build test`, self-contained (no external
-//! reference needed at test time).
-//!
-//! The expected outputs were captured from the reference implementation and are
-//! the byte-exact kotlinc-compatible stdout for each program.
+//! End-to-end corpus test: runs every `examples/*.kt` through the in-process
+//! klio pipeline (`parity.runWithPacks`) and asserts stdout matches the
+//! checked-in expected output under `tests/corpus/expected/`, which holds the
+//! byte-exact kotlinc-compatible stdout for each program. Needs no external
+//! reference at test time.
 const std = @import("std");
 const parity = @import("parity");
 const jit = @import("ir").jit_loop;
@@ -13,10 +10,9 @@ const jit = @import("ir").jit_loop;
 const parser = @import("parser");
 const EXAMPLES = "examples";
 
-/// An example may document required flags in a header comment
-/// (`// Run with: klio run --language=+Feature examples/foo.kt`), the way
-/// `scripts/corpus_check.py` honors them on the CLI route. The in-process
-/// route applies the language specs to the parser for that example only.
+/// Apply the `--language=` specs an example declares in a `Run with:` header
+/// comment, as `scripts/corpus_check.py` does on the CLI route. They apply to
+/// the parser for this example only.
 fn applyRunDirective(io: std.Io, a: std.mem.Allocator, path: []const u8) void {
     const src = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return;
     var lines = std.mem.splitScalar(u8, src, '\n');
@@ -51,10 +47,9 @@ fn shardSkip(stem: []const u8) bool {
     return (h.final() % n) != k;
 }
 
-/// Per-program SKIP notices are silent by default: a PASSING `zig build`
-/// run step that writes to stderr is rendered as a failed command by the
-/// build runner, which has repeatedly been misread as an e2e flake. Set
-/// `KLIO_ITEST_VERBOSE` to surface them (same convention as differential).
+/// Per-program SKIP notices are silent by default: a passing `zig build` run
+/// step that writes to stderr is rendered as a failed command by the build
+/// runner. `KLIO_ITEST_VERBOSE` surfaces them.
 fn verbose() bool {
     return std.c.getenv("KLIO_ITEST_VERBOSE") != null;
 }
@@ -63,11 +58,9 @@ fn runCorpus(jit_on: bool) !void {
     jit.setEnabledForTest(jit_on);
     defer jit.setEnabledForTest(false);
 
-    // The corpus spans ~8 distinct pack masks, each of which otherwise
-    // retains its own full stdlib clone. The run below GROUPS the corpus by
-    // base key, so a cache of ONE base covers it with one rebuild per mask —
-    // two compose-scale bases plus a build transient is what used to trip
-    // the RSS watchdog.
+    // The corpus spans ~8 distinct pack masks, each otherwise retaining its own
+    // full stdlib clone. Grouping by base key lets a cache of one base cover the
+    // run with one rebuild per mask, staying under the RSS watchdog.
     parity.base_cache_max = if (std.c.getenv("KLIO_E2E_NO_EVICT") != null) 0 else 1;
 
     var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -146,10 +139,9 @@ test "e2e corpus matches expected output (jit off)" {
     try runCorpus(false);
 }
 
-// The whole-function JIT (native recursion) is opt-in (`KLIO_FUNC_JIT`), so the
-// corpus passes above never exercise it. Run the recursion example through it
-// here — a small, main-thread-only set, so the per-thread compiled-code retention
-// that keeps it out of the full corpus run cannot accumulate.
+// The whole-function JIT (native recursion) is opt-in via `KLIO_FUNC_JIT`, so
+// the corpus passes above never exercise it. Run a small main-thread-only set
+// here so the per-thread compiled-code retention cannot accumulate.
 test "function-JIT recursion matches the interpreter" {
     jit.setEnabledForTest(true);
     jit.setFuncEnabledForTest(true);

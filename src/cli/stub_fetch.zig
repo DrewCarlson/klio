@@ -1,20 +1,17 @@
-//! Cross-target stub + shim resolution for `klio bundle --target`.
+//! Cross-target stub and shim resolution for `klio bundle --target`.
 //!
-//! A cross bundle needs the target's runtime stub (the `klio` binary for
-//! that OS/arch, same version as the bundler) and, for UI bundles, its
-//! Skia shim blob. Resolve order:
+//! A cross bundle needs the target's runtime stub (the `klio` binary for that
+//! OS/arch, same version as the bundler) and, for UI bundles, its Skia shim
+//! blob; same-target bundling uses the running executable and never comes
+//! here. Resolve order:
 //!
-//!   1. `--stub <path>` (handled by the caller).
-//!   2. `KLIO_STUB_DIR`: `<dir>/<target>/<name>` — CI and air-gapped use.
-//!   3. `~/.klio/stubs/<version>/<target>/<name>` — the fetch cache.
+//!   1. `--stub <path>`, handled by the caller.
+//!   2. `KLIO_STUB_DIR`: `<dir>/<target>/<name>`, for CI and air-gapped use.
+//!   3. `~/.klio/stubs/<version>/<target>/<name>`, the fetch cache.
 //!   4. HTTPS fetch from the GitHub release of the bundler's own version,
-//!      verified against the sha256 manifest baked into the binary at
-//!      release build time, then cached under 3. A dev build carries no
-//!      manifest, so the fetch path refuses and the caller reports the
-//!      offline hint (`--stub` / `KLIO_STUB_DIR` still work).
-//!
-//! Same-target bundling never reaches this module (the stub is the
-//! running executable).
+//!      verified against the sha256 manifest baked in at release build time,
+//!      then cached under 3. A dev build has no manifest and refuses to fetch;
+//!      `--stub` and `KLIO_STUB_DIR` still work.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,10 +21,9 @@ const runtime = @import("runtime");
 const pack = @import("pack");
 const io = @import("io.zig");
 
-/// Release-baked `name -> sha256` manifest (JSON object of
-/// `"artifact-name": "hex-sha256"`). The committed placeholder is empty
-/// (`{}`) so dev builds refuse to fetch; the release workflow writes the
-/// real manifest over `src/cli/stubs-manifest.json` for the tag build.
+/// Release-baked manifest: a flat JSON object of `"artifact-name":
+/// "hex-sha256"`. The committed placeholder is `{}` so dev builds refuse to
+/// fetch; the release workflow overwrites it for a tag build.
 pub const baked_manifest_json: []const u8 = @embedFile("stubs-manifest.json");
 
 const RELEASE_URL_BASE = "https://github.com/klio-lang/klio/releases/download";
@@ -45,8 +41,8 @@ pub fn shimFileName(gpa: Allocator, target: []const u8, version: []const u8) ?[]
     return std.fmt.allocPrint(gpa, "klio-skia-{s}-{s}.zst", .{ version, target }) catch null;
 }
 
-/// The plain in-tree names accepted alongside the release names, so a
-/// test/CI dir can hold `<target>/klio` copies without renaming.
+/// In-tree names accepted alongside the release names, so a test or CI dir can
+/// hold `<target>/klio` copies without renaming.
 fn plainStubName(target: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, target, "windows")) "klio.exe" else "klio";
 }
@@ -57,8 +53,7 @@ fn plainShimName(target: []const u8) []const u8 {
     return "libklio_skia.so";
 }
 
-/// Look for `names` under `<dir>/<target>/`. Returns the first existing
-/// path (owned).
+/// First of `names` that exists under `<dir>/<target>/`, as an owned path.
 fn findIn(gpa: Allocator, dir: []const u8, target: []const u8, names: []const []const u8) ?[]const u8 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -81,8 +76,8 @@ fn stubCacheDir(gpa: Allocator, version: []const u8) ?[]const u8 {
     return std.fs.path.join(gpa, &.{ home, ".klio", "stubs", version }) catch null;
 }
 
-/// Resolve the runtime stub binary for `target`. Returns an owned path,
-/// or null when unavailable (the caller prints the offline hint).
+/// Runtime stub binary for `target` as an owned path, or null when
+/// unavailable and the caller prints the offline hint.
 pub fn resolveStub(gpa: Allocator, target: []const u8, version: []const u8) ?[]const u8 {
     const release_name = stubFileName(gpa, target, version) orelse return null;
     const names = [_][]const u8{ plainStubName(target), release_name };
@@ -99,8 +94,8 @@ pub fn resolveStub(gpa: Allocator, target: []const u8, version: []const u8) ?[]c
     return null;
 }
 
-/// Resolve the Skia shim BYTES for `target` (decompressed when the
-/// artifact is the release `.zst`). Allocates into `arena`.
+/// Skia shim bytes for `target`, decompressed when the artifact is the release
+/// `.zst`. Allocates into `arena`.
 pub fn resolveShim(arena: Allocator, target: []const u8, version: []const u8) ?[]const u8 {
     const release_name = shimFileName(arena, target, version) orelse return null;
     const names = [_][]const u8{ plainShimName(target), release_name };
@@ -125,17 +120,15 @@ pub fn resolveShim(arena: Allocator, target: []const u8, version: []const u8) ?[
     return bytes;
 }
 
-/// A release shim artifact is a bare zstd frame; its decompressed size is
-/// read from the frame header.
+/// A release shim artifact is a bare zstd frame carrying its decompressed size.
 fn decompressZstFrame(arena: Allocator, bytes: []const u8) ?[]const u8 {
     const size = pack.zstd.frameContentSize(bytes) orelse return null;
     return pack.zstd.decompress(arena, bytes, size) catch null;
 }
 
 /// Fetch `name` from the GitHub release for `version` into
-/// `<cache>/<target>/<name>`, verifying its sha256 against the manifest
-/// baked into this binary. Null when no manifest is baked (dev build),
-/// the network is unavailable, or verification fails.
+/// `<cache>/<target>/<name>`, verifying sha256 against the baked manifest. Null
+/// when no manifest is baked, the network fails, or verification fails.
 fn fetchIntoCache(
     gpa: Allocator,
     cache: []const u8,
@@ -186,8 +179,7 @@ fn verifySha256(bytes: []const u8, expect: [32]u8) bool {
     return std.mem.eql(u8, &got, &expect);
 }
 
-/// Look `name` up in the baked release manifest. The manifest is a flat
-/// JSON object of `"artifact-name": "hex-sha256"`.
+/// Look `name` up in the baked release manifest.
 fn manifestSha256(gpa: Allocator, name: []const u8) ?[32]u8 {
     return manifestSha256In(gpa, baked_manifest_json, name);
 }

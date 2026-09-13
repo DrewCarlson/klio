@@ -1,12 +1,11 @@
-//! `klio bundle` — turn a Kotlin program plus everything it needs (baked
-//! dependency image, embedded resources, and for Compose programs the
-//! Skia rendering backend) into one self-contained executable.
+//! `klio bundle`: turn a Kotlin program plus everything it needs (baked
+//! dependency image, embedded resources, and for Compose programs the Skia
+//! rendering backend) into one self-contained executable.
 //!
-//! Bundling is file surgery: copy the running `klio` binary (the stub),
-//! append an aligned payload area (`pack.bundle_format`), and write the
-//! trailer. No compiler or linker runs. The full assemble-and-lower
-//! pipeline executes at bundle time so every resolution diagnostic
-//! surfaces here, not on the user's machine.
+//! Bundling is file surgery: copy the running `klio` binary (the stub), append
+//! an aligned payload area (`pack.bundle_format`), and write the trailer. No
+//! compiler or linker runs. The full assemble-and-lower pipeline runs at bundle
+//! time so every resolution diagnostic surfaces here, not on the user's machine.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -78,12 +77,10 @@ const USAGE =
 ;
 
 /// `klio bake-image <program> -o <out>`: bake the dependency base (the embedded
-/// stdlib plus the packs the program pulls in) to a standalone `.klio-image`
-/// file. A mobile app host ships this as a resource and loads it with
-/// `run-image`, so the heavy stdlib + pack lowering happens once at build time
-/// instead of on device. The program's own code is NOT baked in — it is run
-/// against the base by `run-image`, which is what makes a fast reload cycle
-/// possible (the base is stable; only the small program is re-pushed).
+/// stdlib plus the packs the program pulls in) to a standalone `.klio-image`. A
+/// mobile host ships it as a resource and loads it with `run-image`, so the
+/// heavy stdlib + pack lowering happens once at build time, not on device. The
+/// program's own code is not baked in, so a reload re-pushes only the program.
 pub fn bakeImage(gpa: Allocator, paths: []const []const u8, requested: *RequestedFeatures, out_path: []const u8) u8 {
     var scratch_map = SourceMap.init(gpa);
     const user = stdlib_image.parseUserFiles(gpa, &scratch_map, paths, null) orelse {
@@ -106,11 +103,10 @@ pub fn bakeImage(gpa: Allocator, paths: []const []const u8, requested: *Requeste
     return 0;
 }
 
-/// Bake the WHOLE program — dependencies AND user files, lowered as one module —
-/// to an image file. This is the artifact a bundle boots from: loading it runs
-/// `main` with no parse and no lowering, which is why a bundle starts in a
-/// fraction of the time `run-image` needs. A transpiled binary pins the same
-/// artifact.
+/// Bake dependencies and user files, lowered as one module, to an image file.
+/// This is the artifact a bundle boots from: loading it runs `main` with no
+/// parse and no lowering, so a bundle starts in a fraction of the time
+/// `run-image` needs. A transpiled binary pins the same artifact.
 pub fn bakeProgramImageFile(gpa: Allocator, paths: []const []const u8, requested: *RequestedFeatures, out_path: []const u8) u8 {
     var scratch_map = SourceMap.init(gpa);
     const user = stdlib_image.parseUserFiles(gpa, &scratch_map, paths, null) orelse {
@@ -164,15 +160,9 @@ pub fn runProgramImage(gpa: Allocator, image_path: []const u8, program_args: []c
     return commands.runBuiltModuleArgs(gpa, asm_r.built, bindings, asm_r.map, "error: no main function found", program_args);
 }
 
-/// `klio run-image <base.klio-image> <program.kt> [args...]`: load a pre-baked
-/// dependency base from a file and run the program against it. The heavy
-/// stdlib + pack lowering is already in the base, so only the small program is
-/// parsed and lowered — the fast path a mobile host uses, and the hot-reload
-/// primitive (keep the base resident, re-extend a new program source). Mirrors
-/// the bundle base-image + program-src boot (see bundle_boot.bootRest).
-/// A program assembled against an explicit base-image artifact: the exact
-/// module `run-image` executes, exposed so the transpiler can emit against
-/// the same fid/const space the runtime will rebuild from the same file.
+/// A program assembled against an explicit base-image artifact: the exact module
+/// `run-image` executes, exposed so the transpiler can emit against the same
+/// fid/const space the runtime will rebuild from the same file.
 pub const ImageAssembly = struct {
     built: interp_ir.build.BuiltModule,
     map: *SourceMap,
@@ -213,6 +203,12 @@ pub fn assembleImageBuild(gpa: Allocator, base_path: []const u8, paths: []const 
     return .{ .built = built, .map = map, .binding_fqns = loaded.binding_fqns };
 }
 
+/// `klio run-image <base.klio-image> <program.kt> [args...]`: load a pre-baked
+/// dependency base from a file and run the program against it. The heavy stdlib
+/// + pack lowering is already in the base, so only the small program parses and
+/// lowers: the fast path a mobile host uses, and the hot-reload primitive (keep
+/// the base resident, re-extend a new program source). Mirrors the bundle
+/// base-image + program-src boot (`bundle_boot.bootRest`).
 pub fn runImage(gpa: Allocator, base_path: []const u8, paths: []const []const u8, program_args: []const []const u8) u8 {
     const asm_r = assembleImageBuild(gpa, base_path, paths) orelse return 1;
     var bindings = pack_cache.mergedHostBindings(gpa);
@@ -302,10 +298,6 @@ fn usageErr(gpa: Allocator, msg: []const u8) u8 {
     return 2;
 }
 
-// ---------------------------------------------------------------------
-// Assembly
-// ---------------------------------------------------------------------
-
 const target_names = [_][]const u8{
     "linux-x64", "linux-arm64", "macos-x64", "macos-arm64", "windows-x64", "windows-arm64",
 };
@@ -336,8 +328,8 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
     }
     const cross = !std.mem.eql(u8, target, hostTarget());
 
-    // Project mode: a directory with klio.toml supplies [application] and
-    // the full project source set.
+    // Project mode: a directory with klio.toml supplies [application] and the
+    // full project source set.
     var proj: ?project.Application = null;
     var main_path: []const u8 = opts.input;
     var paths: []const []const u8 = undefined;
@@ -377,26 +369,24 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         gop.value_ptr.put(spec[slash + 1 ..], {}) catch return 2;
     }
 
-    // 1. Parse the program.
     var scratch_map = SourceMap.init(gpa);
     const user = stdlib_image.parseUserFiles(gpa, &scratch_map, paths, null) orelse {
         // Re-run through the check pipeline so the diagnostics render.
         return commands.runCheck(gpa, paths, .Plain, &requested);
     };
 
-    // 2. Dependency load: embedded stdlib + installed packs. Lowering
-    //    mutates the parsed ASTs and baking strips dead AST bodies, so
-    //    each bake attempt below gets its own load.
+    // Dependency load: embedded stdlib + installed packs. Lowering mutates the
+    // parsed ASTs and baking strips dead AST bodies, so each bake attempt below
+    // gets its own load.
     var report = pack_cache.EmbeddedReport{};
     var selection = pack_cache.Selection{};
     const deps = stdlib_image.bundleDepLoad(gpa, user.asts, &requested, &report, &selection) orelse return 1;
 
-    // 3. Whole-program image first (mmap -> load -> run at boot, zero
-    //    parsing or lowering). The bake refuses outside the serializable
-    //    surface; the bundle then falls back to the always-works
-    //    base-image + program-src boot (startup is the only difference),
-    //    recorded in the manifest. A successful program bake is also the
-    //    program verification: it lowers cleanly with a main.
+    // Whole-program image first: mmap, load, run at boot with no parsing or
+    // lowering. The bake refuses outside the serializable surface, and the bundle
+    // then falls back to the base-image + program-src boot, which differs only in
+    // startup and is recorded in the manifest. A successful program bake is also
+    // the program verification: it lowers cleanly and has a main.
     var program_image: ?[]const u8 = null;
     var program_src_fallback = false;
     if (programImageEnabled()) {
@@ -404,10 +394,9 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         program_src_fallback = program_image == null;
     }
 
-    // 4. The base-image + program-src path (the program-image refusal
-    //    fallback, and the diagnostic renderer): fresh dep load, base
-    //    bake (or cache reuse), then an extend that surfaces every
-    //    resolution diagnostic at bundle time.
+    // Base-image + program-src path, taken on a program-image refusal and as the
+    // diagnostic renderer: fresh dep load, base bake (or cache reuse), then an
+    // extend that surfaces every resolution diagnostic at bundle time.
     var base_image: ?[]const u8 = null;
     if (program_image == null) {
         const deps2 = stdlib_image.bundleDepLoad(gpa, user.asts, &requested, null, null) orelse return 1;
@@ -442,10 +431,9 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         }
     }
 
-    // 5. Flavor: forced, or auto-detected off the selected pack set.
+    // Flavor: forced, or auto-detected off the selected pack set.
     const is_ui = opts.ui orelse detectUiFlavor(&selection);
 
-    // 6. Sections.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -468,10 +456,9 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
             return 1;
         };
         // A windowed Compose UI program (one that calls runApp) needs a real
-        // window backend; a shim built without one (the stub) still renders
-        // offscreen but its `winOpen` returns null, so the app would open no
-        // window and exit silently. Fail fast. Offscreen-only bundles
-        // (uiRenderer -> PNG) don't open a window, so they're exempt.
+        // window backend: a shim built without one still renders offscreen, but
+        // its `winOpen` returns null, so the app would open no window and exit
+        // silently. Offscreen-only bundles (uiRenderer to PNG) are exempt.
         if (programOpensWindow(user.texts)) {
             switch (skiaWindowSupport(shim_bytes.?)) {
                 .ok => {},
@@ -507,7 +494,6 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
     var perr: pack.PackError = undefined;
     const manifest_bytes = (pack.write.encode(bf.BundleManifest, arena, &manifest, &perr) catch return 1) orelse return 1;
 
-    // 6. Stub.
     const stub_path = opts.stub orelse blk: {
         if (cross) {
             const fetched = @import("stub_fetch.zig").resolveStub(gpa, target, VERSION) orelse {
@@ -522,7 +508,6 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         };
     };
 
-    // 7. Assemble.
     var w = bf.Writer.init(gpa);
     defer w.deinit();
     w.addSection(bf.section_names.MANIFEST, manifest_bytes.items, .none, false) catch return 1;
@@ -548,13 +533,12 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
         return 1;
     };
 
-    // macOS targets: the payload cannot simply trail the linker's code
-    // signature (the arm64 kernel refuses trailing data past it and the
-    // binary cannot be re-signed). Strip the stub's own signature, put the
-    // overlay in its place, and re-sign ad hoc; the trailer then sits at
-    // LC_CODE_SIGNATURE.dataoff - 72. Cross-assembling a macOS bundle from
-    // another host works — it is pure byte surgery. An unsigned x86_64 stub
-    // keeps the plain overlay append (macho stays null).
+    // macOS targets: the payload cannot trail the linker's code signature (the
+    // arm64 kernel refuses trailing data past it, and the binary cannot be
+    // re-signed). Strip the stub's own signature, put the overlay in its place,
+    // and re-sign ad hoc; the trailer then sits at LC_CODE_SIGNATURE.dataoff - 72.
+    // Cross-assembling a macOS bundle from another host is pure byte surgery and
+    // works. An unsigned x86_64 stub keeps the plain overlay append (macho null).
     var macho: ?macho_sign.MachoInfo = null;
     var base_len: u64 = stub_bytes.len;
     if (std.mem.startsWith(u8, target, "macos")) {
@@ -647,8 +631,8 @@ fn defaultOutput(gpa: Allocator, main_path: []const u8, target: []const u8) Allo
     return gpa.dupe(u8, stem);
 }
 
-/// UI flavor when the pack fixpoint selected any androidx.compose.ui*
-/// pack (or klio.compose.ui).
+/// UI flavor when the pack fixpoint selected any androidx.compose.ui* pack (or
+/// klio.compose.ui).
 fn detectUiFlavor(selection: *const pack_cache.Selection) bool {
     for (selection.packs.items) |p| {
         const base = std.fs.path.basename(p.path);
@@ -672,9 +656,9 @@ fn encodeProgramSources(arena: Allocator, paths: []const []const u8, texts: [][]
     return try out.toOwnedSlice(arena);
 }
 
-/// Append one `--include` (file or directory) to the resources blob.
-/// The default mount is the path relative to the main source's directory
-/// (falling back to the basename when it is not under it).
+/// Append one `--include` (file or directory) to the resources blob. The default
+/// mount is the path relative to the main source's directory, or its basename
+/// when it is not under that directory.
 fn collectInclude(
     arena: Allocator,
     fio: std.Io,
@@ -755,8 +739,8 @@ fn appendResource(
 
 /// Locate the Skia shim blob to embed for `target`. Same-target: the
 /// `KLIO_SKIA_LIB` override, then the shim installed next to the running
-/// executable (`../lib/`). Cross-target: `KLIO_STUB_DIR` / the stub cache
-/// (resolved by stub_fetch alongside the stub).
+/// executable (`../lib/`). Cross-target: `KLIO_STUB_DIR` or the stub cache,
+/// resolved by stub_fetch alongside the stub.
 fn findShimBytes(arena: Allocator, fio: std.Io, target: []const u8) ?[]const u8 {
     const cwd = std.Io.Dir.cwd();
     if (std.mem.eql(u8, target, hostTarget())) {
@@ -780,9 +764,9 @@ pub fn shimFileName(target: []const u8) []const u8 {
     return "libklio_skia.so";
 }
 
-/// Whether the program opens a window: it references `runApp`, the single
-/// windowing entrypoint in `klio.compose.ui` (offscreen `uiRenderer` bundles
-/// don't). A source scan is enough — runApp is the only window entry.
+/// Whether the program opens a window: it references `runApp`, the only
+/// windowing entrypoint in `klio.compose.ui`, so a source scan settles it.
+/// Offscreen `uiRenderer` bundles do not.
 fn programOpensWindow(texts: [][]const u8) bool {
     for (texts) |t| {
         if (std.mem.indexOf(u8, t, "runApp") != null) return true;
@@ -792,10 +776,9 @@ fn programOpensWindow(texts: [][]const u8) bool {
 
 const ShimWindowSupport = enum { ok, stub, unknown };
 
-/// Read the shim's baked windowing-backend marker (`skia_shim.cpp`
-/// `klio_win_backend_tag`) by a byte scan — works for the host shim and a
-/// cross-target one alike. `stub` means the backend cannot open a window;
-/// `unknown` means the marker is absent (a shim predating the marker).
+/// Read the shim's baked windowing-backend marker (`klio_win_backend_tag` in
+/// `skia_shim.cpp`) by byte scan, for a host or cross-target shim alike. `stub`
+/// means the backend cannot open a window; `unknown` means the marker is absent.
 fn skiaWindowSupport(shim: []const u8) ShimWindowSupport {
     const marker = "klio-win-backend:";
     const idx = std.mem.indexOf(u8, shim, marker) orelse return .unknown;
@@ -822,17 +805,17 @@ fn rebuildHint(target: []const u8) []const u8 {
     return "rebuild the backend with `zig build skia-lib -Dskia` after installing libsdl2-dev (or `scripts/fetch-sdl.sh` + `-Dsdl-static`), or use a UI-enabled klio build.";
 }
 
-/// Whether the whole-program image bake is attempted (default yes;
-/// KLIO_BUNDLE_PROGRAM_IMAGE=0 forces the program-src boot, mainly so
-/// tests can gate both paths).
+/// Whether the whole-program image bake is attempted. Default yes;
+/// `KLIO_BUNDLE_PROGRAM_IMAGE=0` forces the program-src boot so tests can gate
+/// both paths.
 fn programImageEnabled() bool {
     const v = runtime.envOnce("KLIO_BUNDLE_PROGRAM_IMAGE") orelse return true;
     return v.len == 0 or !std.mem.eql(u8, v, "0");
 }
 
-/// Lower deps + program as one module and bake it (semantically equal to
-/// the extend path — the run pipeline treats them as byte-identical).
-/// Null on any refusal; the caller records the program-src fallback.
+/// Lower deps + program as one module and bake it. Semantically equal to the
+/// extend path; the run pipeline treats the two as byte-identical. Null on any
+/// refusal, and the caller records the program-src fallback.
 fn bakeProgramImage(
     gpa: Allocator,
     deps: *const stdlib_image.BundleDeps,
@@ -840,8 +823,8 @@ fn bakeProgramImage(
     texts: [][]const u8,
     report: *const pack_cache.EmbeddedReport,
 ) ?[]const u8 {
-    // Parse the user files onto the dependency map (their FileIds continue
-    // after the deps'), then lower everything as one module.
+    // Parse the user files onto the dependency map, their FileIds continuing
+    // after the deps', then lower everything as one module.
     const dep_file_count = deps.map.files.items.len;
     const user = stdlib_image.parseUserFiles(gpa, deps.map, paths, texts) orelse return null;
     var all: std.ArrayList(KotlinFile) = .empty;
@@ -869,8 +852,8 @@ const ManifestInputs = struct {
 };
 
 fn buildManifest(arena: Allocator, in: ManifestInputs) !bf.BundleManifest {
-    // Pack infos, sorted by id for determinism (fixpoint order follows
-    // directory enumeration).
+    // Pack infos sorted by id for determinism; fixpoint order follows directory
+    // enumeration.
     var packs: std.ArrayList(bf.PackInfo) = .empty;
     for (in.selection.packs.items) |sp| {
         var id: []const u8 = std.fs.path.basename(sp.path);
@@ -915,11 +898,10 @@ fn buildManifest(arena: Allocator, in: ManifestInputs) !bf.BundleManifest {
     };
 }
 
-/// The host bindings the pack load added beyond the in-binary defaults,
-/// as replayable `(fqn, host_symbol)` pairs: for each entry whose FQN
-/// does not already resolve to the same host function, find the default
-/// registry name carrying that function pointer. Boot re-resolves the
-/// symbol and registers it under the FQN.
+/// The host bindings the pack load added beyond the in-binary defaults, as
+/// replayable `(fqn, host_symbol)` pairs: for each entry whose FQN does not
+/// already resolve to the same host function, find the default registry name
+/// carrying that function pointer. Boot re-resolves and registers it.
 fn harvestPackBindings(arena: Allocator, bindings: *const HostBindings) ![]bf.BindingPair {
     var merged = pack_cache.mergedHostBindings(arena);
     defer merged.deinit();
@@ -951,9 +933,8 @@ fn harvestPackBindings(arena: Allocator, bindings: *const HostBindings) ![]bf.Bi
     return out.toOwnedSlice(arena);
 }
 
-/// The running executable's path. Per-OS: /proc/self/exe on linux,
-/// `_NSGetExecutablePath` on macOS. Windows (`GetModuleFileNameW`) lands
-/// with PE support.
+/// The running executable's path: `/proc/self/exe` on linux,
+/// `_NSGetExecutablePath` on macOS, null on every other OS.
 pub fn selfExePath(arena: Allocator) ?[]const u8 {
     switch (builtin.os.tag) {
         .linux => {
@@ -1012,7 +993,7 @@ fn printDryRun(
     });
 }
 
-/// Emit `<name>.desktop` (+ the icon PNG when present) into `dir` for
+/// Emit `<name>.desktop` (plus the icon PNG when present) into `dir` for
 /// GUI-first Linux distribution.
 fn emitDesktopFiles(
     gpa: Allocator,
@@ -1050,11 +1031,11 @@ fn emitDesktopFiles(
     }
 }
 
-/// Emit `<dir>/<name>.app/Contents/` (`Info.plist`, `MacOS/<name>` copied
-/// from the signed bundle, `Resources/icon.icns` from `--icon`) so a macOS
-/// bundle double-clicks and shows a name/icon in the Dock. The inner binary
-/// is the ad-hoc-signed bundle; a user with a signing identity can re-sign
-/// the .app (`codesign --deep -f -s ...`) — the payload survives it.
+/// Emit `<dir>/<name>.app/Contents/` (`Info.plist`, `MacOS/<name>` copied from
+/// the signed bundle, `Resources/icon.icns` from `--icon`) so a macOS bundle
+/// double-clicks and shows a name and icon in the Dock. The inner binary is the
+/// ad-hoc-signed bundle, and the payload survives a re-sign of the .app
+/// (`codesign --deep -f -s ...`) with a real identity.
 fn emitAppBundle(
     gpa: Allocator,
     fio: std.Io,
@@ -1114,8 +1095,8 @@ fn emitAppBundle(
     cwd.writeFile(fio, .{ .sub_path = plist_path, .data = plist }) catch return;
 }
 
-/// Wrap a square PNG in a single-entry `.icns`, choosing the icon type from
-/// the PNG's pixel width (falling back to the 256×256 slot). macOS reads
+/// Wrap a square PNG in a single-entry `.icns`, choosing the icon type from the
+/// PNG's pixel width and falling back to the 256x256 slot. macOS reads
 /// PNG-encoded icon data directly.
 fn buildIcns(gpa: Allocator, png: []const u8) ?[]u8 {
     const kind = icnsTypeForWidth(pngWidth(png) orelse 256);

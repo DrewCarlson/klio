@@ -1,42 +1,35 @@
-//! Static-library entry point for embedding the interpreter into a mobile app
-//! host (iOS `.app`, Android APK). The app's native launch code links this
-//! archive and calls the exported C `klio_run` to interpret a program; there is
-//! no spawned `klio` executable on device (iOS forbids it), so the CLI runs
-//! in-process through `cli.runArgv`.
-//!
-//! Built via `zig build mobile-lib -Dtarget=<mobile triple>`; only meaningful
-//! for the mobile targets (`is_mobile_target`).
+//! Static-library entry point for embedding the interpreter in a mobile app
+//! host (iOS `.app`, Android APK): the host links this archive and calls the
+//! exported C `klio_run`. iOS forbids spawning a `klio` executable, so the CLI
+//! runs in-process through `cli.runArgv`. Built by
+//! `zig build mobile-lib -Dtarget=<mobile triple>`, for mobile targets only.
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli");
 const runtime = @import("runtime");
 const compose_ui = @import("compose_ui");
 
-/// This archive is only ever linked into a mobile app, which cannot symbolize
-/// its own image (see `runtime.trace`) — route panics to a minimal handler so
-/// the `SelfInfo` symbolizer is never pulled in.
+/// A mobile app cannot symbolize its own image (see `runtime.trace`), so panics
+/// route to a minimal handler and the `SelfInfo` symbolizer stays unlinked.
 pub const panic = std.debug.FullPanic(runtime.trace.panicFn);
 
-/// Opt into the statically-linked Skia shim (compose_ui reads this off the root).
-/// The app host links libklio_skia.a, so on iOS the interpreter resolves the shim
-/// from those symbols instead of dlopen. The plain interpreter exe omits this and
-/// stays headless.
+/// Opts into the statically-linked Skia shim; `compose_ui` reads it off the
+/// root. The host links libklio_skia.a, so the shim resolves from those symbols
+/// instead of dlopen. The plain interpreter exe omits it and stays headless.
 pub const klio_skia_static = true;
 
-/// Interpret a program in-process. `argc`/`argv` are the CLI arguments *after*
-/// the program name (e.g. the host passes `{"run", "<path>"}`); a synthetic
-/// `"klio"` program name is prepended. Returns the process exit code. Safe to
-/// call once per host process.
+/// Interpret a program in-process and return the exit code. `argv` holds the
+/// CLI arguments after the program name (`{"run", "<path>"}`); a synthetic
+/// `"klio"` name is prepended. Call once per host process.
 export fn klio_run(argc: c_int, argv: [*]const [*:0]const u8) c_int {
-    // The simulator is a host process where the JIT works; a real device
-    // forbids W^X for un-entitled apps, so fall back to the pure interpreter.
+    // The simulator is a host process where the JIT works; a device forbids
+    // W^X for un-entitled apps, so it falls back to the pure interpreter.
     runtime.perf.setProfile(if (builtin.abi == .simulator) .fast else .safe);
 
-    // The ArenaAllocator STRUCT (not just its backing memory) must outlive a
-    // hosted UI run: the allocator handle every VM object holds is
-    // `{ptr = &arena, vtable}`, and the platform frame source re-enters the VM
-    // after this returns. A stack `var arena` would leave that `ptr` dangling
-    // the instant `klio_run` returns, so heap-allocate it for a stable address.
+    // The ArenaAllocator struct, not just its backing memory, must outlive a
+    // hosted UI run: every VM object holds `{ptr = &arena, vtable}` and the
+    // frame source re-enters the VM after this returns. A stack `var arena`
+    // would leave that `ptr` dangling, so the struct lives on the heap.
     const arena = std.heap.page_allocator.create(std.heap.ArenaAllocator) catch return 71;
     arena.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const gpa = arena.allocator();
@@ -67,11 +60,9 @@ export fn klio_run(argc: c_int, argv: [*]const [*:0]const u8) c_int {
     };
 
     // A hosted UI run stays resident: `application` registered a frame callback
-    // and returned, and the platform frame source (iOS CADisplayLink) re-enters
-    // the VM after this call returns. Everything the callback touches lives on
-    // this arena (and its allocator handle points at the arena struct), so both
-    // must outlive `klio_run` — leak them (the OS reclaims at process exit). A
-    // non-UI run frees the arena now as usual.
+    // that the platform frame source (iOS CADisplayLink) drives after this
+    // returns, and everything it touches lives on this arena, so the arena
+    // leaks here and the OS reclaims it at process exit. A non-UI run frees it.
     if (compose_ui.hostedActive()) return rc;
     releaseArena(arena);
     return rc;

@@ -1,11 +1,9 @@
-//! Project resolution for `klio test` / `klio run`: read a directory's
-//! `klio.toml` and compose its active source sets. The bridge from a project
-//! manifest to the existing file-list run/test pipeline.
+//! Project resolution for `klio test` and `klio run`: read a directory's
+//! `klio.toml` and compose its active source sets for the file-list pipeline.
 //!
 //! A `[[test]]` set is composed for `klio test` when its `feature` is unset
-//! (core) or active (a default feature, or one requested via
-//! `--feature <pack>/<feat>`). The manifest's own `[[source]]`/`source_roots`
-//! are the project's main sources for `klio run`.
+//! (core) or active (a default feature, or one named by `--feature`). The
+//! manifest's `[[source]]`/`source_roots` are the main sources for `klio run`.
 
 const std = @import("std");
 const pack_build = @import("pack_build.zig");
@@ -24,14 +22,14 @@ pub const FeatureSel = union(enum) {
 };
 
 pub const TestPlan = struct {
-    /// Project directory (holds `klio.toml`). Its pack is built+installed so
-    /// the library API resolves inside the tests.
+    /// Project directory holding `klio.toml`. Its pack is built and installed
+    /// so the library API resolves inside the tests.
     project_dir: []const u8,
-    /// The manifest's library id (names the built pack: `target/packs/<id>.klio-pack`).
+    /// Manifest library id, naming the built `target/packs/<id>.klio-pack`.
     pack_id: []const u8,
-    /// Composed test source roots (project-dir-joined; core + active features).
+    /// Composed test source roots, project-dir-joined: core and active features.
     roots: []const []const u8,
-    /// Features whose sources must be activated so their tests compile — the
+    /// Features whose sources must be activated so their tests compile. The
     /// caller adds these to the requested-feature set before the pack loads.
     active_features: []const []const u8,
 };
@@ -68,11 +66,10 @@ pub const Application = struct {
     includes: []const []const u8,
 };
 
-/// Resolve the project at `dir` for `klio bundle <dir>`: read its
-/// `klio.toml`, join the `[application]` table's paths, and discover the
-/// `main` source when the manifest omits it (exactly one source under the
-/// project's roots may declare a top-level `main`). Null when there is no
-/// readable manifest or no main can be determined.
+/// Resolve the project at `dir` for `klio bundle <dir>`: read `klio.toml`, join
+/// the `[application]` paths, and discover `main` when the manifest omits it
+/// (exactly one source under the project's roots may declare a top-level
+/// `main`). Null without a readable manifest or a determinable main.
 pub fn loadApplication(a: Allocator, dir: []const u8) ?Application {
     const toml_path = std.fs.path.join(a, &.{ dir, "klio.toml" }) catch return null;
     const text = pack_build.readFileOwned(a, toml_path) orelse return null;
@@ -174,10 +171,9 @@ fn declaresMain(a: Allocator, path: []const u8) bool {
     return false;
 }
 
-/// Compose the active `[[test]]` roots of the project at `dir` under the given
-/// feature selection. Returns null when `dir` has no readable manifest or
-/// declares no tests (the caller then falls back to treating `dir` as a bare
-/// source directory). Allocations are in `a`.
+/// Compose the active `[[test]]` roots of the project at `dir` under `sel`.
+/// Null when `dir` has no readable manifest or declares no tests, and the
+/// caller then treats `dir` as a bare source directory. Allocations are in `a`.
 pub fn planTest(a: Allocator, dir: []const u8, sel: FeatureSel) ?TestPlan {
     const toml_path = std.fs.path.join(a, &.{ dir, "klio.toml" }) catch return null;
     const text = pack_build.readFileOwned(a, toml_path) orelse return null;
