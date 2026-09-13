@@ -43,6 +43,43 @@ Target 0.16: `std.ArrayList` (unmanaged) over `std.ArrayListUnmanaged`,
 labeled `switch` with `continue :label` for interpreter dispatch loops,
 `@branchHint` on cold paths, arena allocators for phase-scoped data.
 
+## Splits landed
+
+Eleven files over 5000 lines were split along real seams. Each parent keeps
+its public surface and re-exports it, so no call site outside the file
+changed.
+
+| was | lines | now | files | largest child |
+|---|---|---|---|---|
+| `ir/lower/expr.zig` | 27008 | `ir/lower/expr/` | 24 | 2229 |
+| `ir/ir.zig` | 17236 | `ir/core/` | 18 | 2365 |
+| `interp_ir/vm/host_call_member.zig` | 16968 | `.../host_call_member/` | 16 | 2112 |
+| `ir/eval.zig` | 13546 | `ir/eval/` | 17 | 1706 |
+| `stdlib/implementations/collections.zig` | 8222 | `.../collections/` | 13 | 1118 |
+| `cli/cgen.zig` | 8016 | `cli/cgen/` | 8 | 1848 |
+| `ir/jit_loop.zig` | 7304 | `ir/jit_loop/` | 10 | 1561 |
+| `interp_ir/build.zig` | 6495 | `interp_ir/build/` | 7 | 2988 |
+| `interp_ir/vm/host_instances.zig` | 6150 | `.../host_instances/` | 8 | 1399 |
+| `interp_ir/vm/host_fields.zig` | 5826 | `.../host_fields/` | 10 | 1572 |
+| `compose_pass/compose_pass.zig` | 5294 | `compose_pass/pass/` | 9 | 1829 |
+
+### What a split has to get right
+
+Three traps, each of which the compile caught only once the parent's test
+block referenced every child:
+
+- A `var` cannot be re-exported through a `const` alias. Either the `var`
+  stays in the parent, or every reader qualifies it against the one file
+  that owns the storage. Two copies of a cache is a real bug.
+- A struct method a sibling now calls needs `pub`. An object-only build
+  will not tell you: an unreferenced declaration is never analyzed.
+- Two functions that each declare their own anonymous result type cannot
+  delegate to each other. Give the type a name.
+
+The parent's test block must call `refAllDecls` on each child by path.
+Referencing only the children the alias table happens to name left the ir
+module running 162 of its 258 tests.
+
 ## Verification
 
 - `python3 scripts/comment_only_check.py <base-rev> [paths...]` proves a
