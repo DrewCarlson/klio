@@ -41,13 +41,11 @@ const Level = std.ArrayListUnmanaged(Source);
 const CalleeSig = struct {
     names: []const []const u8,
     types: []const []const u8,
-    /// The declaration's own generic type-parameter names, so a context
-    /// parameter typed by one (`context(ctx: T) fun <T> ...`) resolves
-    /// against the call-site type argument.
+    /// So a context parameter typed by one resolves against the call-site
+    /// type argument.
     type_params: []const []const u8,
-    /// A non-contextual overload with the same value signature exists, so an
-    /// unresolved context reports an overload ambiguity rather than a missing
-    /// context argument.
+    /// A plain overload with the same value signature exists, so an unresolved
+    /// context is an overload ambiguity, not a missing argument.
     has_plain_sibling: bool = false,
 };
 
@@ -94,12 +92,10 @@ pub fn checkContextParameters(self: *Checker, file: *const KotlinFile) Allocator
     // Declaration-position rules.
     for (file.decls) |*d| try checkDeclPositions(self, d);
 
-    // An override's context parameters must match the overridden member's
-    // types in order.
+    // An override's context types must match, in order.
     for (file.decls) |*d| try checkOverrides(self, &class_map, d);
 
-    // Call-site resolution and excluded forms. The file scope is the
-    // outermost level and carries no implicit sources.
+    // Call-site resolution; the file scope has no implicit sources.
     try ctx.pushLevel(&.{});
     defer ctx.popLevel();
     for (file.decls) |*d| try walkDecl(&ctx, d);
@@ -138,8 +134,7 @@ fn collectCallees(ctx: *Ctx, decls: []const Decl) Allocator.Error!void {
 }
 
 fn putCallee(ctx: *Ctx, name: []const u8, cps: []const ContextParam, tps: []const ast.TypeParam) Allocator.Error!void {
-    // The `context`/`contextOf` intrinsics carry a context parameter but
-    // resolve through dedicated lowering, never this walk.
+    // These intrinsics resolve through dedicated lowering, not this walk.
     if (std.mem.eql(u8, name, "context") or std.mem.eql(u8, name, "contextOf")) return;
     if (ctx.callees.contains(name)) return;
     const names = try ctx.self.allocator.alloc([]const u8, cps.len);
@@ -176,8 +171,7 @@ fn checkDeclPositions(self: *Checker, d: *const Decl) Allocator.Error!void {
 
 fn checkContextualProperty(self: *Checker, p: *const Property) Allocator.Error!void {
     const sp = if (p.context_params.len != 0) p.context_params[0].span else p.name.span;
-    // A contextual property has no backing field, so an initializer or
-    // `lateinit` is invalid.
+    // No backing field, so no initializer or `lateinit`.
     if (p.init) |_| {
         try emit(self, &g.CONTEXT_PARAMETERS_WITH_BACKING_FIELD, "Property with context parameters cannot be initialized because it has no backing field.", sp);
     } else if (p.is_lateinit) {
@@ -216,7 +210,7 @@ fn checkOverrides(self: *Checker, map: *std.StringHashMap(*const Class), d: *con
 }
 
 fn checkOneOverride(self: *Checker, map: *std.StringHashMap(*const Class), c: *const Class, f: *const Function) Allocator.Error!void {
-    // Find the overridden function by name in the transitive supertypes.
+    // By name, through the transitive supertypes.
     if (findOverridden(self, map, c, f.name.name)) |base| {
         if (!contextTypesMatch(base.context_params, f.context_params)) {
             const msg = try std.fmt.allocPrint(self.allocator, "'{s}' overrides nothing.", .{f.name.name});
@@ -263,8 +257,7 @@ fn namesDiffer(a: []const ContextParam, b: []const ContextParam) bool {
     return false;
 }
 
-/// The static type head of an implicit context value, or null when unknown.
-/// An unknown source is treated as compatible, so the walk never reports a
+/// Null when unknown, which counts as compatible so the walk never reports a
 /// spurious missing context argument.
 fn staticTypeName(e: *const Expr) ?[]const u8 {
     return switch (e.*) {
@@ -280,8 +273,7 @@ fn staticTypeName(e: *const Expr) ?[]const u8 {
         .As => |a| a.ty.name.name,
         .ObjectExpr => |o| if (o.supertypes.len != 0) o.supertypes[0].name.name else "Any",
         .Call => |c| blk: {
-            // A constructor call `Foo(...)` reports `Foo`, recognised by a
-            // capitalised single-segment callee.
+            // A capitalised single-segment callee reads as a constructor.
             if (c.callee.* == .Path and c.callee.Path.segments.len == 1) {
                 const nm = c.callee.Path.segments[0].name;
                 if (nm.len != 0 and std.ascii.isUpper(nm[0])) break :blk nm;
@@ -297,7 +289,6 @@ fn subtypeOf(self: *Checker, a: []const u8, b: []const u8) bool {
     const bt = std.mem.trimEnd(u8, b, "?");
     if (std.mem.eql(u8, at, bt)) return true;
     if (std.mem.eql(u8, bt, "Any")) return true;
-    // Walk `a`'s transitive supertypes.
     var seen = std.StringHashMap(void).init(self.allocator);
     defer seen.deinit();
     var stack: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -314,9 +305,7 @@ fn subtypeOf(self: *Checker, a: []const u8, b: []const u8) bool {
     return false;
 }
 
-/// Whether source type `src` satisfies a request for `want`. An unknown
-/// source, null or the empty sentinel, satisfies anything, so a value whose
-/// static type the walk cannot recover never reports a missing context.
+/// An unknown source, null or the empty sentinel, satisfies anything.
 fn sourceMatches(self: *Checker, src: ?[]const u8, want: []const u8) bool {
     const s = src orelse return true;
     if (s.len == 0) return true;
@@ -341,7 +330,7 @@ fn walkDecl(ctx: *Ctx, d: *const Decl) Allocator.Error!void {
 }
 
 fn walkClass(ctx: *Ctx, c: *const Class) Allocator.Error!void {
-    // The dispatch receiver `this` is an outer level for every member body.
+    // `this` is an outer level for every member body.
     var srcs: std.ArrayListUnmanaged(Source) = .empty;
     defer srcs.deinit(ctx.self.allocator);
     try srcs.append(ctx.self.allocator, .{ .ty = c.name.name, .is_receiver = true });
@@ -360,8 +349,7 @@ fn walkClass(ctx: *Ctx, c: *const Class) Allocator.Error!void {
     }
 }
 
-/// A function body's own level holds its extension receiver and every one of
-/// its context parameters.
+/// Its extension receiver and every context parameter share one level.
 fn ownLevelSources(self: *Checker, receiver: ?[]const u8, cps: []const ContextParam) Allocator.Error![]Source {
     var srcs: std.ArrayListUnmanaged(Source) = .empty;
     if (receiver) |r| try srcs.append(self.allocator, .{ .ty = r, .is_receiver = true });
@@ -439,8 +427,7 @@ fn walkExpr(ctx: *Ctx, e: *const Expr) Allocator.Error!void {
         .Postfix => |*p| try walkExpr(ctx, p.expr),
         .If => |*i| {
             try walkExpr(ctx, i.cond);
-            // Inside `if (x is T) …` the narrowed value is a T-typed context
-            // source for the then-branch.
+            // A narrowed value is a context source for the then-branch.
             if (i.cond.* == .IsCheck and !i.cond.IsCheck.negated) {
                 var srcs = [_]Source{.{ .ty = i.cond.IsCheck.ty.name.name, .is_receiver = false }};
                 try ctx.pushLevel(&srcs);
@@ -477,8 +464,7 @@ fn walkCall(ctx: *Ctx, c: anytype, call_span: Span) Allocator.Error!void {
     else
         null;
 
-    // For `context(v..., block)` the trailing lambda gets a level holding the
-    // static types of the leading context values.
+    // The trailing lambda gets a level of the leading values' static types.
     if (callee_name) |nm| {
         if (std.mem.eql(u8, nm, "context") and c.args.len >= 2 and c.args[c.args.len - 1] == .Lambda) {
             for (c.args[0 .. c.args.len - 1]) |*a| try walkExpr(ctx, a);
@@ -505,13 +491,11 @@ fn walkCall(ctx: *Ctx, c: anytype, call_span: Span) Allocator.Error!void {
         }
     }
 
-    // Recurse into the callee and the argument expressions.
     try walkExpr(ctx, c.callee);
     for (c.args) |*a| try walkExpr(ctx, a);
 
-    // At a call to a contextual callee, resolve each context parameter; a
-    // named argument targeting one is the explicit form, which 2.4 excludes
-    // without the opt-in flag.
+    // A named argument targeting a context parameter is the explicit form,
+    // which 2.4 excludes without the opt-in flag.
     if (callee_name) |nm| {
         if (ctx.callees.get(nm)) |sig| {
             try resolveContextArgs(ctx, sig, nm, c.type_args, call_span);
@@ -526,17 +510,14 @@ fn walkCall(ctx: *Ctx, c: anytype, call_span: Span) Allocator.Error!void {
                 }
             }
         } else if (c.callee.* == .Path and hasContextValueInScope(ctx)) {
-            // A bare member call whose implicit receiver is shadowed by a
-            // strictly-more-nested compatible context value. Only meaningful
-            // when a context value is actually in scope.
+            // Only meaningful with a context value actually in scope.
             try checkReceiverShadowed(ctx, nm, call_span);
         }
     }
 }
 
-/// An unqualified member call binds an implicit receiver at one level, but a
-/// context value at a strictly more nested level is type-compatible with that
-/// receiver, so the receiver is shadowed (context-parameters KEEP, §7.10(a)).
+/// A context value at a strictly more nested level than the implicit receiver,
+/// and compatible with it, shadows it (context-parameters KEEP, §7.10(a)).
 fn checkReceiverShadowed(ctx: *Ctx, nm: []const u8, call_span: Span) Allocator.Error!void {
     var recv_level: ?usize = null;
     var recv_ty: []const u8 = "";
@@ -596,9 +577,8 @@ fn classHasMemberRec(ctx: *Ctx, class_name: []const u8, member: []const u8, seen
 }
 
 fn resolveContextArgs(ctx: *Ctx, sig: CalleeSig, callee_name: []const u8, type_args: []const ast.TypeRef, call_span: Span) Allocator.Error!void {
-    // A contextual overload with a plain sibling never reports a missing
-    // context: if every context resolves the call is ambiguous with the plain
-    // overload, and otherwise the plain overload simply applies.
+    // With a plain sibling, either every context resolves and the call is
+    // ambiguous, or the plain overload simply applies.
     if (sig.has_plain_sibling) {
         var all_resolved = true;
         for (sig.types, 0..) |raw, pi| {
@@ -642,8 +622,7 @@ fn resolveContextArgs(ctx: *Ctx, sig: CalleeSig, callee_name: []const u8, type_a
     }
 }
 
-/// True when some in-scope level has a compatible source for `want`, taking
-/// the innermost level with a non-zero count.
+/// The innermost level with a non-zero count decides.
 fn contextResolves(ctx: *Ctx, want: []const u8) bool {
     var i = ctx.levels.items.len;
     while (i > 0) {
@@ -655,8 +634,7 @@ fn contextResolves(ctx: *Ctx, want: []const u8) bool {
     return false;
 }
 
-/// Resolve a context-parameter type against the call's explicit type
-/// arguments, substituting the callee's own type-parameter names.
+/// Substitutes the callee's own type-parameter names.
 fn substituteTypeParam(sig: CalleeSig, raw: []const u8, type_args: []const ast.TypeRef) []const u8 {
     for (sig.type_params, 0..) |tp, i| {
         if (std.mem.eql(u8, tp, raw) and i < type_args.len) return type_args[i].name.name;

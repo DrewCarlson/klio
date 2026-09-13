@@ -1,8 +1,6 @@
-//! Smart-cast narrowing: consumes the CFG smart-cast / VIA / reachability
-//! results to answer flow-sensitive queries (narrowed type, narrowed class,
-//! GADT substitution, definite assignment, reachability) plus the env-frame
-//! helpers and sealed-`when` exhaustiveness check. Free functions over
-//! `*Checker`.
+//! Flow-sensitive queries over the CFG smart-cast, VIA and reachability
+//! results, plus the env-frame helpers and sealed-`when` exhaustiveness.
+//! Free functions over `*Checker`.
 
 const std = @import("std");
 
@@ -34,22 +32,18 @@ const via = cfa.analyses.via;
 const reachable = cfa.analyses.reachable;
 const Place = cfa.Place;
 
-/// Phase hook for narrowing the value path `e` to `ty` along the current
-/// branch. Narrowing itself comes from the CFG `Assume` nodes consumed in
-/// `cfgNarrowedAt`; this exists so the root binds a uniform entry point.
+/// Phase hook only: narrowing comes from the CFG `Assume` nodes consumed in
+/// `cfgNarrowedAt`.
 pub fn narrow(self: *Checker, e: *const Expr, ty: Type) Allocator.Error!void {
     _ = self;
     _ = e;
     _ = ty;
 }
 
-/// Per-query analysis scratch. A fixpoint solve runs once per narrowing or
-/// reachability query and its working set must be genuinely reclaimed
-/// afterwards, which the driver's phase arena cannot do. The checker owns one
-/// retained arena: each query resets it keeping capacity, so the steady state
-/// allocates no new pages, and uses it for that query's dynamic extent only.
-/// Queries never nest, and anything escaping one (types, class names,
-/// substitutions) is cloned onto `self.allocator` before the next reset.
+/// Per-query scratch. A fixpoint solve's working set must be genuinely
+/// reclaimed, which the driver's phase arena cannot do, so one retained arena
+/// is reset per query, keeping capacity. Queries never nest, and anything
+/// escaping one is cloned onto `self.allocator` before the next reset.
 pub fn queryScratch(self: *const Checker) Allocator {
     _ = self.query_scratch.reset(.retain_capacity);
     return self.query_scratch.allocator();
@@ -82,32 +76,28 @@ pub fn lookup(self: *const Checker, name: []const u8) ?*const Binding {
     return null;
 }
 
-/// Narrowed type at `query_span`. Every refinement kind (`is`, null,
-/// cross-reference equality, `&&`/`||`, `as`, `!!`, bound aliases, stdlib
-/// contracts) reaches here as an Assume node the lowering emitted.
+/// Every refinement kind, from `is` through `!!` to the stdlib contracts,
+/// reaches here as an Assume node the lowering emitted.
 pub fn lookupNarrowedAt(self: *const Checker, name: []const u8, query_span: Span) Allocator.Error!?Type {
     return cfgNarrowedAt(self, name, query_span);
 }
 
-/// CFG-derived narrowed type for `name` at `query_span`, following the
-/// bound-smart-cast alias chain when the place itself has no fact. Null when
-/// the CFG offers nothing more specific than the declared type.
+/// Follows the bound-smart-cast alias chain when the place has no fact of its
+/// own. Null when the CFG offers nothing beyond the declared type.
 pub fn cfgNarrowedAt(self: *const Checker, name: []const u8, query_span: Span) Allocator.Error!?Type {
     const scratch = queryScratch(self);
     const at = (try solvedSmartStateAt(self, scratch, query_span)) orelse return null;
     return stateNarrowedType(self, at.lowered, at.state, name);
 }
 
-/// A solved smart-cast state at one program point, alive on the query-scratch
-/// arena until the next query resets it.
+/// Alive on the query-scratch arena until the next query resets it.
 const SmartStateAt = struct {
     lowered: *const cfa.lower.Lowered,
     state: *const smartcast.SmartCastLattice,
 };
 
-/// Locate `query_span` in the enclosing function's CFG and solve the
-/// smart-cast analysis up to that point. One solve serves every fact
-/// extraction there. All working memory lives on `scratch`.
+/// One solve serves every fact extraction at that point. All working memory
+/// lives on `scratch`.
 fn solvedSmartStateAt(self: *const Checker, scratch: Allocator, query_span: Span) Allocator.Error!?SmartStateAt {
     const fn_span = lastSpan(self.cfg_fn_stack.items) orelse return null;
     const lowered = self.lowerings.get(fn_span) orelse return null;
@@ -129,8 +119,7 @@ fn solvedSmartStateAt(self: *const Checker, scratch: Allocator, query_span: Span
     return .{ .lowered = lowered, .state = &states.items[pos] };
 }
 
-/// Narrowed type for `name` from a solved state, following the
-/// bound-smart-cast alias chain. Cloned onto `self.allocator`.
+/// Follows the alias chain; cloned onto `self.allocator`.
 fn stateNarrowedType(
     self: *const Checker,
     lowered: *const cfa.lower.Lowered,
@@ -142,16 +131,15 @@ fn stateNarrowedType(
     while (step < 8) : (step += 1) {
         if (smartFact(state, place)) |fact| {
             if (fact.narrowed) |t| {
-                // A user-class narrowing carries `Unresolved` as its type,
-                // which the checker treats permissively and pairs with the
-                // class recovered by `cfgNarrowedClassAt`.
+                // A user-class narrowing carries `Unresolved`, paired with
+                // the class `cfgNarrowedClassAt` recovers.
                 if (fact.null == .NonNull and t != .Unresolved) {
                     return try t.nonNull().clone(self.allocator);
                 }
                 return try t.clone(self.allocator);
             }
-            // No type narrowing, but the place is known non-null: project the
-            // declared type's non-null form so the caller gets a usable Type.
+            // Known non-null with no type narrowing: project the declared
+            // type's non-null form.
             if (fact.null == .NonNull) {
                 const bound: ?Type = switch (place) {
                     .Local => |sym| if (lookup(self, sym.name)) |b| b.ty else null,
@@ -178,8 +166,7 @@ fn stateNarrowedType(
     return null;
 }
 
-/// Narrowed user-class name for `name` from a solved state, duped onto
-/// `self.allocator`.
+/// Duped onto `self.allocator`.
 fn stateNarrowedClass(
     self: *const Checker,
     lowered: *const cfa.lower.Lowered,
@@ -208,18 +195,16 @@ fn stateNarrowedClass(
     return null;
 }
 
-/// Every smart-cast fact the expression checker wants at one program point,
-/// from a single dataflow solve. `narrowed` and `narrowed_class` are owned by
-/// `self.allocator`; the caller owns `gadt`, keys and values alike.
+/// `narrowed` and `narrowed_class` are owned by `self.allocator`; the caller
+/// owns `gadt`, keys and values alike.
 pub const SmartFacts = struct {
     narrowed: ?Type = null,
     narrowed_class: ?[]const u8 = null,
     gadt: std.StringHashMap(Type),
 };
 
-/// Narrowed type, narrowed class and, under `want_gadt`, the GADT
-/// substitution, all from one solve. `checkExpr` calls this once per name
-/// read rather than solving the same CFG three times.
+/// All from one solve, so `checkExpr` need not solve the same CFG three
+/// times per name read.
 pub fn cfgSmartFactsAt(
     self: *const Checker,
     name: []const u8,
@@ -235,11 +220,9 @@ pub fn cfgSmartFactsAt(
     return out;
 }
 
-/// GADT refinement: when a narrowing at `query_span` refines a place from
-/// `Super<T>` to a subclass whose typed-supertype chain instantiates
-/// `Super<f(...)>`, derive the substitution unifying `T` with the
-/// corresponding position in `f(...)`. Accumulated over every in-scope place;
-/// empty when there are no class narrowings or no type parameters in play.
+/// When a narrowing refines a place from `Super<T>` to a subclass whose
+/// supertype chain instantiates `Super<f(...)>`, unify `T` with the
+/// corresponding position. Accumulated over every in-scope place.
 pub fn cfgGadtSubstAt(self: *const Checker, query_span: Span) Allocator.Error!std.StringHashMap(Type) {
     var subst = std.StringHashMap(Type).init(self.allocator);
     errdefer deinitSubst(self.allocator, &subst);
@@ -249,9 +232,7 @@ pub fn cfgGadtSubstAt(self: *const Checker, query_span: Span) Allocator.Error!st
     return subst;
 }
 
-/// Accumulate into `subst` the GADT substitution implied by every
-/// class-narrowed place in a solved state. Keys and values on
-/// `self.allocator`.
+/// Keys and values on `self.allocator`.
 fn stateGadtSubst(
     self: *const Checker,
     scratch: Allocator,
@@ -296,17 +277,14 @@ fn stateGadtSubst(
     }
 }
 
-/// A synthetic `Block` for the primary-constructor init flow: every declared
-/// property becomes a `Stmt.Decl` in source order, and every init block
-/// contributes its statements where it appears in `c.members`. Lowering it
-/// gives a CFG whose exit VIA says which uninitialized properties are
-/// definitely assigned along every primary-constructor path.
+/// A synthetic `Block` for the primary-constructor init flow, interleaving
+/// property declarations and init blocks in source order. Its exit VIA says
+/// which properties every constructor path assigns.
 pub fn synthesizeClassInitBody(self: *const Checker, c: *const Class) Allocator.Error!Block {
     var stmts: std.ArrayList(Stmt) = .empty;
     errdefer stmts.deinit(self.allocator);
-    // A primary-parameter property is pre-assigned by its matching argument,
-    // so a degenerate `val name = name` seeds it as assigned at the synthetic
-    // entry.
+    // Pre-assigned by its matching argument, so a degenerate `val name = name`
+    // seeds it assigned at the synthetic entry.
     for (c.primary_params) |*p| {
         if (p.property != null) {
             const segments = try self.allocator.alloc(ast.Ident, 1);
@@ -338,8 +316,7 @@ pub fn synthesizeClassInitBody(self: *const Checker, c: *const Class) Allocator.
             try stmts.append(self.allocator, .{ .Decl = .{ .Property = sp } });
         }
     }
-    // Source order, so property initializers interleave with init blocks
-    // correctly.
+    // Source order interleaves initializers with init blocks correctly.
     for (c.members) |*m| {
         if (m.* == .Property) {
             const p = m.Property;
@@ -360,9 +337,8 @@ pub fn synthesizeClassInitBody(self: *const Checker, c: *const Class) Allocator.
     };
 }
 
-/// VIA classification of `name` at the exit of the CFG owned by `cfg_span`.
-/// The class post-init walker asks this of the synthetic class-init CFG to
-/// learn whether every primary-constructor path assigned a property.
+/// Asked of the synthetic class-init CFG, to learn whether every constructor
+/// path assigned a property.
 pub fn cfgViaUnassignedAtExit(self: *const Checker, cfg_span: Span, name: []const u8) Allocator.Error!?bool {
     const lowered = self.lowerings.get(cfg_span) orelse return null;
     const scratch = queryScratch(self);
@@ -375,8 +351,7 @@ pub fn cfgViaUnassignedAtExit(self: *const Checker, cfg_span: Span, name: []cons
     return viaVerdict(state, place);
 }
 
-/// True when the CFG's VIA analysis classifies `name` as possibly unassigned
-/// at `query_span`. Drives the definite-assignment check.
+/// Possibly unassigned at `query_span`. Drives the definite-assignment check.
 pub fn cfgViaUnassignedAt(self: *const Checker, name: []const u8, query_span: Span) Allocator.Error!?bool {
     const fn_span = lastSpan(self.cfg_fn_stack.items) orelse return null;
     const lowered = self.lowerings.get(fn_span) orelse return null;
@@ -394,33 +369,28 @@ pub fn cfgViaUnassignedAt(self: *const Checker, name: []const u8, query_span: Sp
     if (pos >= states.len) return null;
     const state = &states[pos];
     const place = Place{ .Local = .{ .name = name } };
-    // `Flat.Bottom` means the place has no VIA fact here: typically a
-    // parameter, assigned at entry and never `DeclLocal`-ed, or a name tracked
-    // outside the CFG. Answering null lets callers fall back to other signals,
-    // so a verdict is returned only for a place the CFG genuinely tracks.
+    // No VIA fact means a parameter, assigned at entry and never
+    // `DeclLocal`-ed, or a name tracked outside the CFG. Answer null there so
+    // callers fall back to other signals.
     return viaVerdict(state, place);
 }
 
-/// True when the CFG's reachability analysis classifies `query_span`'s block
-/// as unreachable. The checker's `Nothing`-typed spans are threaded through,
-/// so a `Nothing`-returning call such as `error(...)` prunes its block's
-/// successors exactly as an explicit `return` or `throw` would.
+/// The checker's `Nothing`-typed spans are threaded through, so a
+/// `Nothing`-returning call such as `error(...)` prunes its block's successors
+/// exactly as a `return` would.
 pub fn cfgIsUnreachableAt(self: *Checker, query_span: Span) Allocator.Error!?bool {
     const fn_span = lastSpan(self.cfg_fn_stack.items) orelse return null;
     const lowered = self.lowerings.get(fn_span) orelse return null;
     const pos_entry = lowered.span_to_pos.get(.{ .start = query_span.start, .end = query_span.end }) orelse return null;
     const bid = pos_entry.block;
 
-    // Reachability depends only on the CFG, immutable per function span, and
-    // the set of `Nothing`-typed spans, so the solve is memoized per function
-    // until that set changes. The query fires once per statement and without
-    // the memo dominates whole-module checks.
+    // The solve depends only on the CFG and the `Nothing` set, so it is
+    // memoized until that set changes. The query fires once per statement and
+    // without the memo dominates whole-module checks.
     const gop = try self.reach_cache.getOrPut(fn_span);
     if (!gop.found_existing or gop.value_ptr.epoch != self.nothing_epoch) {
         const scratch = queryScratch(self);
-        // The analysis only asks whether an expression in this CFG diverges,
-        // so feed it this function's `Nothing` spans, filtered for current
-        // membership, rather than the module-wide set.
+        // Only this function's spans matter, filtered for current membership.
         var type_map = reachable.TypeMap.init(scratch);
         if (self.nothing_by_fn.getPtr(fn_span)) |bucket| {
             var it = bucket.keyIterator();
@@ -436,9 +406,7 @@ pub fn cfgIsUnreachableAt(self: *Checker, query_span: Span) Allocator.Error!?boo
     }
     const r = reachable.Reachability{ .reachable = gop.value_ptr.reachable };
     if (!r.isReachable(bid)) return true;
-    // A statement is also unreachable when an earlier node in its own block
-    // diverges: an `Unreachable` marker, or an `Eval` of a `Nothing`-typed
-    // expression such as a call to a `Nothing`-returning function.
+    // Also unreachable when an earlier node in its own block diverges.
     const block = lowered.cfg.block(bid);
     const upto = @min(pos_entry.node_idx, block.nodes.items.len);
     for (block.nodes.items[0..upto]) |n| {
@@ -454,9 +422,8 @@ pub fn cfgIsUnreachableAt(self: *Checker, query_span: Span) Allocator.Error!?boo
     return false;
 }
 
-/// Per-place declared types drawn from every binding visible in the active
-/// frames. The smart-cast pass reads it so `AssumeRefEq` can narrow each side
-/// to the other's declared type when no prior fact applies.
+/// Read by the smart-cast pass so `AssumeRefEq` can narrow each side to the
+/// other's declared type when no prior fact applies.
 pub fn cfgDeclaredTypes(self: *const Checker, allocator: Allocator) Allocator.Error!DeclaredTypes {
     var out = DeclaredTypes{ .entries = .empty };
     errdefer out.deinit(allocator);
@@ -472,8 +439,7 @@ pub fn cfgDeclaredTypes(self: *const Checker, allocator: Allocator) Allocator.Er
     return out;
 }
 
-/// Owned `Place` to `Type` table. `map()` yields a borrowed `PlaceTypeMap`
-/// over these entries for the smart-cast pass.
+/// `map()` yields a borrowed `PlaceTypeMap` over these owned entries.
 pub const DeclaredTypes = struct {
     entries: std.ArrayList(smartcast.PlaceTypeMap.Entry),
 
@@ -490,8 +456,7 @@ pub const DeclaredTypes = struct {
     }
 };
 
-/// The user-class counterpart of `cfgNarrowedAt`: an owned class name when
-/// `name` is class-narrowed at `query_span`.
+/// The user-class counterpart of `cfgNarrowedAt`; the name is owned.
 pub fn cfgNarrowedClassAt(self: *const Checker, name: []const u8, query_span: Span) Allocator.Error!?[]const u8 {
     const scratch = queryScratch(self);
     const at = (try solvedSmartStateAt(self, scratch, query_span)) orelse return null;
@@ -502,8 +467,7 @@ pub fn resolution(self: *const Checker) *const root.Resolution {
     return self.resolution;
 }
 
-/// True when `candidate` is `target` itself or a transitive subclass of it in
-/// the local class table.
+/// `target` itself counts.
 pub fn isClassOrSubclass(self: *const Checker, candidate: []const u8, target: []const u8) bool {
     if (std.mem.eql(u8, candidate, target)) {
         return true;
@@ -511,9 +475,8 @@ pub fn isClassOrSubclass(self: *const Checker, candidate: []const u8, target: []
     return isSubtypeOf(self, candidate, target);
 }
 
-/// The concrete classes, neither abstract nor interface nor sealed, whose
-/// transitive supertype chain contains `root_name`: the leaf set a `when` must
-/// cover. The result and its elements are owned by the caller.
+/// The leaf set a `when` must cover: concrete descendants of `root_name`,
+/// owned by the caller along with its elements.
 pub fn sealedLeafSubclasses(self: *const Checker, root_name: []const u8) Allocator.Error![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -533,8 +496,7 @@ pub fn sealedLeafSubclasses(self: *const Checker, root_name: []const u8) Allocat
         if (!isSubtypeOf(self, name, root_name)) {
             continue;
         }
-        // A sealed or abstract intermediate is not a leaf; its concrete
-        // descendants are listed separately.
+        // Not a leaf; its concrete descendants are listed separately.
         if (info.is_sealed or info.is_abstract) {
             continue;
         }
@@ -606,8 +568,7 @@ pub fn checkWhenExhaustive(
     }
 }
 
-/// Walk a class's supertype chain for `sup`. False when `sub == sup`: an
-/// identity is not a strict subtype here.
+/// False when `sub == sup`: identity is not a strict subtype here.
 fn isSubtypeOf(self: *const Checker, sub: []const u8, sup: []const u8) bool {
     if (std.mem.eql(u8, sub, sup)) {
         return false;
@@ -638,8 +599,7 @@ fn isSubtypeOf(self: *const Checker, sub: []const u8, sup: []const u8) bool {
     return false;
 }
 
-/// `target`'s type-argument list as instantiated from `subclass`. The result
-/// and its elements are owned by the caller.
+/// Owned by the caller, elements included.
 fn walkSupertypeArgs(self: *const Checker, allocator: Allocator, subclass: []const u8, target: []const u8) Allocator.Error!?[]Type {
     const info = root.classNamed(self, subclass) orelse return null;
     if (std.mem.eql(u8, subclass, target)) {
@@ -658,9 +618,8 @@ fn walkSupertypeArgs(self: *const Checker, allocator: Allocator, subclass: []con
             return out;
         }
         if (try walkSupertypeArgs(self, allocator, s.name, target)) |deeper| {
-            // Substitute the subclass's arguments into the deeper result: for
-            // `subclass : Mid<X>` and `Mid<X> : Target<f(X)>`, replacing `X`
-            // with `s_args` gives `Target<f(arg)>`.
+            // For `subclass : Mid<X>` and `Mid<X> : Target<f(X)>`, replacing
+            // `X` with `s_args` gives `Target<f(arg)>`.
             const mid_info = root.classNamed(self, s.name) orelse return null;
             var subst = std.StringHashMap(Type).init(allocator);
             var i: usize = 0;
@@ -684,9 +643,7 @@ fn lastSpan(items: []const Span) ?Span {
     return items[items.len - 1];
 }
 
-/// Solve the smart-cast analysis to fixpoint and clone the entry state of
-/// block `bid`, ready for `statesWithinBlock`. Null when `bid` is out of
-/// range. The caller owns the returned lattice.
+/// Null when `bid` is out of range. The caller owns the returned lattice.
 fn solveBlockEntry(
     allocator: Allocator,
     lowered: *const cfa.lower.Lowered,
@@ -743,7 +700,7 @@ fn lessThanStr(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
 
-/// Join with ", "; the caller owns the result.
+/// Caller owns the result.
 fn joinComma(allocator: Allocator, items: []const []const u8) Allocator.Error![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();

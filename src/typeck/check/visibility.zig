@@ -25,16 +25,14 @@ const AssignOp = ast.AssignOp;
 const Annotation = ast.Annotation;
 const Type = types.Type;
 
-/// A conflicting-overload pair: the two declaration spans and the shared
-/// function name.
+/// Two declaration spans and the name they share.
 const OverloadPair = struct {
     a: Span,
     b: Span,
     name: []const u8,
 };
 
-/// Walk a class's supertype chain for `sup`. False when `sub == sup`: an
-/// identity is not a strict subtype here.
+/// False when `sub == sup`: identity is not a strict subtype here.
 fn isSubtypeOf(self: *const Checker, sub: []const u8, sup: []const u8) bool {
     if (std.mem.eql(u8, sub, sup)) {
         return false;
@@ -83,16 +81,14 @@ fn sliceContains(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Phase-driver entry point for access checks. The per-site checks below are
-/// invoked directly by the expression and declaration phases.
+/// Phase hook only; the per-site checks below are called directly.
 pub fn checkVisibility(self: *Checker, e: *const Expr) Allocator.Error!void {
     _ = self;
     _ = e;
 }
 
-/// The effective visibility a class declares for a member, with the class
-/// that declares it. Walks the supertype chain so an inherited member is seen
-/// with its declaring class's annotation.
+/// Returns the declaring class too, walking the supertype chain so an
+/// inherited member is seen with its own class's annotation.
 pub fn lookupMemberVisibility(
     self: *const Checker,
     class: []const u8,
@@ -126,9 +122,8 @@ pub fn lookupMemberVisibility(
     return null;
 }
 
-/// Kotlin allows `protected` access through a receiver only when the
-/// enclosing class is the declaring class or a subclass of it, and the
-/// receiver's static class is the enclosing class or a subclass of that.
+/// Kotlin needs both the enclosing class to be the declaring class or a
+/// subclass, and the receiver's static class to be that or a subclass of it.
 pub fn protectedAccessAllowed(
     self: *const Checker,
     declaring_class: []const u8,
@@ -150,9 +145,8 @@ pub fn protectedAccessAllowed(
         isSubtypeOf(self, rc, declaring_class);
 }
 
-/// Diagnose access at `member_span` to `name` on `declaring_class` when
-/// visibility forbids it. `recv_class` is the receiver's static user class
-/// when known, which the `protected` qualified-access rule needs.
+/// `recv_class` is the receiver's static user class when known, which the
+/// `protected` qualified-access rule needs.
 pub fn checkMemberVisibility(
     self: *Checker,
     declaring_class: []const u8,
@@ -189,17 +183,15 @@ pub fn checkMemberVisibility(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// Constructor and class-as-reference visibility. A `private` top-level class
-/// is reachable only from its own file; top-level `protected` is illegal in
-/// Kotlin and is treated the same as `private`.
+/// A `private` top-level class is reachable only from its own file, and
+/// top-level `protected`, illegal in Kotlin, is treated the same way.
 pub fn checkClassUseVisibility(
     self: *Checker,
     name: []const u8,
     info: *const ClassInfo,
     use_span: Span,
 ) Allocator.Error!void {
-    // `class Foo private constructor(...)` gates constructor invocations
-    // independently of the class's own visibility.
+    // `private constructor(...)` gates independently of class visibility.
     const same_file = info.decl_file == null or info.decl_file.? == use_span.file;
     if (info.primary_ctor_visibility) |pcv| {
         if (pcv == .Private and !same_file) {
@@ -238,8 +230,7 @@ pub fn checkClassUseVisibility(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// Inside a `public inline` body, a reference to an `internal` top-level
-/// declaration requires `@PublishedApi`.
+/// An `internal` declaration referenced from a `public inline` body needs it.
 pub fn checkPublishedApiUse(
     self: *Checker,
     name: []const u8,
@@ -268,8 +259,7 @@ pub fn checkPublishedApiUse(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// Diagnose a bare-name reference resolving to a `private` top-level function
-/// or property declared in another file.
+/// For a `private` top-level declaration in another file.
 pub fn checkTopLevelVisibility(
     self: *Checker,
     name: []const u8,
@@ -281,8 +271,7 @@ pub fn checkTopLevelVisibility(
         .Public, .Internal => return,
         else => {},
     }
-    // Top-level `protected` is illegal in Kotlin and is gated by file the
-    // same way `private` is.
+    // Illegal in Kotlin; gated by file the same way `private` is.
     if (use_span.file == decl_file) {
         return;
     }
@@ -296,10 +285,8 @@ pub fn checkTopLevelVisibility(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// Walk a class's supertype chain for a member by simple name, returning its
-/// declared `Type` with the user-class name when the type names one, which
-/// carries `expr_class` through a `foo.bar.baz` chain. The `Type` is cloned
-/// onto `allocator`.
+/// Returns the declared `Type`, cloned onto `allocator`, with the user-class
+/// name when it names one, which carries `expr_class` through a `a.b.c` chain.
 pub fn lookupMemberThroughChain(
     self: *const Checker,
     allocator: Allocator,
@@ -332,8 +319,7 @@ pub fn lookupMemberThroughChain(
     return null;
 }
 
-/// Whether a member named `name` is reachable through `class`'s supertype
-/// chain, without cloning the member type.
+/// As `lookupMemberThroughChain`, without cloning the member type.
 fn memberReachable(self: *const Checker, class: []const u8, name: []const u8) Allocator.Error!bool {
     var seen = std.StringHashMap(void).init(self.allocator);
     defer seen.deinit();
@@ -360,9 +346,8 @@ fn memberReachable(self: *const Checker, class: []const u8, name: []const u8) Al
     return false;
 }
 
-/// A bare member reference inside nested DSL lambdas must resolve against the
-/// innermost implicit receiver whenever a closer receiver shares a dsl marker
-/// with the one that owns the member.
+/// In nested DSL lambdas a bare member reference must resolve against the
+/// innermost receiver, whenever a closer one shares a marker with the owner.
 pub fn enforceDslScopeForMember(self: *Checker, name: []const u8, member_span: Span) Allocator.Error!void {
     const stack = self.dsl_receiver_stack.items;
     if (stack.len < 2) {
@@ -402,8 +387,7 @@ pub fn enforceDslScopeForMember(self: *Checker, name: []const u8, member_span: S
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// `this@Outer.b` is rejected when a closer implicit receiver shares a
-/// marker with `Outer` and also exposes `b`.
+/// The same rule for an explicitly qualified `this@Outer.b`.
 pub fn enforceDslScopeForQualifiedThis(
     self: *Checker,
     qualifier: []const u8,
@@ -460,9 +444,8 @@ fn markersIntersect(markers: *const std.StringHashMap(void), against: *const std
     return false;
 }
 
-/// An `a name b` call must resolve to a function declared `infix`. Walks
-/// top-level functions, the lhs class's members, and the extensions visible on
-/// its class chain, reporting when no candidate carries the modifier.
+/// Searches top-level functions, the lhs class's members and the extensions on
+/// its chain, reporting when no candidate carries the modifier.
 pub fn checkInfixModifier(self: *Checker, callee: *const Expr, args: []const Expr, call_span: Span) Allocator.Error!void {
     const segments = switch (callee.*) {
         .Path => |p| p.segments,
@@ -570,10 +553,9 @@ pub fn checkInfixModifier(self: *Checker, callee: *const Expr, args: []const Exp
     }
 }
 
-/// Compare every pair of same-scope declarations against a fully-specified
-/// phantom call site, where no default is used, so only equal arities can
-/// clash. A pair conflicts when neither dominates the other on the pairwise
-/// most-specific test and the tiebreakers below also pick no winner.
+/// Each same-scope pair is compared against a phantom call site supplying
+/// every parameter, so only equal arities clash. They conflict when neither
+/// dominates the other and the tiebreakers below pick no winner either.
 pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
     var pairs: std.ArrayList(OverloadPair) = .empty;
     defer pairs.deinit(self.allocator);
@@ -593,8 +575,7 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
                 if (a.params.len != b.params.len) {
                     continue;
                 }
-                // The conflicting-overloads domain is one package, so two
-                // packages may each declare the same signature.
+                // The conflict domain is one package.
                 if (!sameDeclPackage(self, a.decl_span, b.decl_span)) {
                     continue;
                 }
@@ -618,11 +599,9 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
                 if (a_va != b_va) {
                     continue;
                 }
-                // Context parameters are part of the signature, so two
-                // overloads with different context type-sets do not conflict.
-                // When one's contexts are a subset of the other's it is
-                // applicable wherever the other is, shadowing the more
-                // constrained one.
+                // Context parameters are part of the signature, so differing
+                // type-sets do not conflict. A subset is applicable wherever
+                // the superset is, shadowing the more constrained one.
                 if (!contextTypesEqual(a.context_types, b.context_types)) {
                     const more: ?Span = if (contextSubset(b.context_types, a.context_types))
                         a.decl_span
@@ -657,8 +636,7 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
     }
 }
 
-/// Whether two declaration sites live in the same package, judged by their
-/// files' package headers. A file with no recorded entry is the root package.
+/// Judged by the files' package headers; no entry means the root package.
 fn sameDeclPackage(self: *Checker, a: ?Span, b: ?Span) bool {
     const sa = a orelse return true;
     const sb = b orelse return true;
@@ -667,14 +645,13 @@ fn sameDeclPackage(self: *Checker, a: ?Span, b: ?Span) bool {
     return std.mem.eql(u8, pa, pb);
 }
 
-/// Whether two context type-lists denote the same multiset of types.
+/// Same multiset of types.
 fn contextTypesEqual(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     return contextSubset(a, b) and contextSubset(b, a);
 }
 
-/// Whether every type in `sub` also appears in `sup`, which is how one
-/// contextual overload is found applicable wherever another is.
+/// How one contextual overload is found applicable wherever another is.
 fn contextSubset(sub: []const []const u8, sup: []const []const u8) bool {
     outer: for (sub) |s| {
         for (sup) |t| {
@@ -700,9 +677,8 @@ fn anyTrue(flags: []const bool) bool {
     return false;
 }
 
-/// A compound assignment `A op= B` is ambiguous when the LHS receiver's class
-/// declares both the binary operator (`plus`, `minus`, `times`, `div`, `rem`)
-/// and the matching `opAssign` form.
+/// Ambiguous when the LHS class declares both the binary operator and the
+/// matching `opAssign` form.
 pub fn checkCompoundAssignAmbiguity(
     self: *Checker,
     target: *const Expr,
@@ -742,8 +718,7 @@ pub fn checkCompoundAssignAmbiguity(
     }
 }
 
-/// `super<Q>.f(...)` requires `Q` to be an immediate supertype of the
-/// enclosing class.
+/// `Q` must be an immediate supertype of the enclosing class.
 pub fn checkSuperQualifier(self: *Checker, qualifier: *const TypeRef, super_span: Span) Allocator.Error!void {
     if (self.class_stack.items.len == 0) {
         return;
@@ -770,9 +745,8 @@ pub fn checkSuperQualifier(self: *Checker, qualifier: *const TypeRef, super_span
     }
 }
 
-/// Unqualified `super.name`: report when two or more of the enclosing class's
-/// direct supertypes contribute a member named `name`, which the caller must
-/// disambiguate with `super<TypeName>.name(...)`.
+/// Two or more contributing direct supertypes need disambiguating with
+/// `super<TypeName>.name(...)`.
 pub fn checkAmbiguousSuper(self: *Checker, name: []const u8, super_span: Span) Allocator.Error!void {
     if (self.class_stack.items.len == 0) {
         return;

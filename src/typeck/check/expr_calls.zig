@@ -1,5 +1,4 @@
-//! Call-expression checking and overload resolution. Free functions over
-//! `*Checker`.
+//! Call checking and overload resolution. Free functions over `*Checker`.
 
 const std = @import("std");
 
@@ -36,9 +35,7 @@ const Type = types.Type;
 const GenericArg = types.GenericArg;
 const Variance = types.Variance;
 
-/// Single call-dispatch decision tree. `arg_names`/`type_args` are parallel
-/// to the parsed `Call` payload. Returns the callee's result type and records
-/// the result's class for the call span when it names one, so an unannotated
+/// Also records the result's class for the call span, so an unannotated
 /// `val m = makeThing()` carries a class into member resolution.
 pub fn checkCall(
     self: *Checker,
@@ -53,9 +50,7 @@ pub fn checkCall(
         if (returnClassName(self, &ty)) |cn| {
             self.expr_class.put(call_span, cn) catch {};
         } else if (callee.* == .Path and callee.Path.segments.len == 1) {
-            // A plain user class types as `Unresolved` here, so the class
-            // travels on the signature. One unambiguous declaration for the
-            // name settles it; an overload set does not.
+            // Class identity rides the signature; one declaration settles it.
             const nm0 = callee.Path.segments[0].name;
             if (self.fns.get(nm0)) |sigs| {
                 if (sigs.items.len == 1) {
@@ -64,7 +59,6 @@ pub fn checkCall(
                     }
                 }
             } else if (self.extern_fn_return_class) |ext| {
-                // Same rule against the declarations a prebuilt image carries.
                 if (ext.get(nm0)) |cn| {
                     if (self.classes.contains(cn)) self.expr_class.put(call_span, cn) catch {};
                 }
@@ -74,8 +68,7 @@ pub fn checkCall(
     return ty;
 }
 
-/// The user-class name a call result names, or null. A generic head counts
-/// only when the module declares that class; builtins and function types never do.
+/// Null unless the result's generic head names a class the module declares.
 fn returnClassName(self: *Checker, t: *const Type) ?[]const u8 {
     return switch (t.*) {
         .Generic => |g| if (self.classes.contains(g.name)) g.name else null,
@@ -93,8 +86,6 @@ fn checkCallInner(
     call_span: Span,
 ) Allocator.Error!Type {
     call_shape_counts[0] += 1;
-    // `foo(args)` where `foo` names a known user fn or class; anything else
-    // falls through to tolerant typing.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const callee_span = callee.Path.span;
         const name = callee.Path.segments[0].name;
@@ -103,11 +94,8 @@ fn checkCallInner(
             if (try checkToplevelContractCall(self, name, args, call_span)) |ty| {
                 return ty;
             }
-            // Inside a receiver-typed lambda an implicit receiver makes an
-            // extension callable without a qualifier (`launch { … }` is a
-            // `CoroutineScope` extension), but a bare call site carries no
-            // receiver-type context here. Only a trailing lambda argument
-            // marks the receiver-lambda builder shape worth treating so.
+            // An implicit receiver makes an extension callable unqualified
+            // (`launch { … }`), but a bare call site has no receiver context.
             const looks_like_builder = args.len > 0 and switch (args[args.len - 1]) {
                 .Lambda, .AnonFun => true,
                 else => false,
@@ -118,18 +106,14 @@ fn checkCallInner(
                 outer: while (it.next()) |list| {
                     for (list.items) |e| {
                         if (!std.mem.eql(u8, e.name, name)) continue;
-                        // Commit only when the extension's arity admits the
-                        // call; otherwise the bare name targets a member of
-                        // the enclosing builder's receiver, which dispatch
-                        // resolves at runtime.
+                        // Otherwise the bare name targets a member of the
+                        // builder's receiver, resolved at runtime.
                         const min = sigMinArity(&e.sig);
                         const fits_arity = if (sigVarargIdx(&e.sig) != null)
                             args.len >= min
                         else
                             args.len >= min and args.len <= e.sig.params.len;
                         if (!fits_arity) continue;
-                        // The builder shape needs a function parameter in
-                        // the trailing position.
                         const lam_slot = if (e.sig.params.len == 0)
                             continue
                         else
@@ -151,11 +135,8 @@ fn checkCallInner(
             }
         }
         if (self.fns.get(name)) |sigs_list| {
-            // A bare call in a lambda body may target a member of the
-            // lambda's eventual receiver that shares a name with a top-level
-            // function. With no top-level candidate's arity admitting the
-            // call, defer to runtime receiver-aware dispatch rather than
-            // reporting arity against the wrong declaration.
+            // A bare call here may target a member of the lambda's eventual
+            // receiver, so with no arity match defer to runtime dispatch.
             if (self.lambda_depth > 0) {
                 var any_arity_fits = false;
                 for (sigs_list.items) |*s| {
@@ -205,10 +186,8 @@ fn checkCallInner(
             if (is_builder) {
                 self.builder_inference_active = true;
             }
-            // A receiver lambda contributes implicit-receiver candidates the
-            // flat top-level map does not hold. If any same-named extension
-            // fits this call, that set is incomplete and its pick cannot
-            // enter the eager channel.
+            // A same-named extension that fits means the flat top-level map
+            // is an incomplete candidate set, so its pick cannot record.
             const extension_may_shadow = self.lambda_depth > 0 and
                 anyExtensionFitsArity(self, name, args.len);
             const result = if (extension_may_shadow)
@@ -238,9 +217,7 @@ fn checkCallInner(
         if (root.classNamed(self, name)) |cls| {
             try visibility.checkClassUseVisibility(self, name, &cls, callee_span);
             if (cls.has_secondary_ctors) {
-                // Secondary constructors give several arities and the
-                // runtime picks, so type each argument loosely instead of
-                // checking arity.
+                // Several arities exist and the runtime picks between them.
                 for (args) |*a| {
                     var t = try expr_mod.checkExpr(self, a, null);
                     t.deinit(self.allocator);
@@ -258,9 +235,8 @@ fn checkCallInner(
             return .Unresolved;
         }
     }
-    // Chain methods on a `List<T>` seeded by `listOf`/`mutableListOf` flow
-    // the element type through `map`/`filter`/`fold`/`forEach` so their
-    // lambdas get a concrete expected parameter type.
+    // Flow a seeded `List<T>` element type through the chain so each lambda
+    // gets a concrete expected parameter type.
     if (callee.* == .Member) {
         call_shape_counts[1] += 1;
         const m = callee.Member;
@@ -274,9 +250,8 @@ fn checkCallInner(
         // level makes a long `sb.append(..).append(..)` chain cost 2^depth.
         var recv_ty = try expr_mod.checkExpr(self, m.receiver, null);
         defer recv_ty.deinit(self.allocator);
-        // A read of an explicit-backing-field property outside its declaring
-        // scope has the property's public type, so the member must resolve on
-        // that type rather than on the field type.
+        // Outside its declaring scope the read has the property's public
+        // type, so the member resolves against that, not the field type.
         if (self.ebf_outside.get(m.receiver.span())) |info| {
             try enforceEbfPublicMember(self, &info, mname, args.len, m.name.span);
         }
@@ -338,21 +313,16 @@ fn checkCallInner(
                 return init_ty;
             }
         }
-        // Extension dispatch on a user-class receiver: walk the receiver's
-        // class chain for a name match, first-fit on argument types. A
-        // nullable receiver `s: T?` usually has no `expr_class`, so the head
-        // class comes from the receiver type instead, keeping `T?.foo`
-        // extensions reachable.
+        // A nullable receiver usually has no `expr_class`, so the head class
+        // comes from the receiver type, keeping `T?.foo` extensions reachable.
         var class_from_ty: ?[]const u8 = null;
         if (self.expr_class.get(m.receiver.span())) |cn| {
             class_from_ty = cn;
         } else if (self.rank_class.get(m.receiver.span())) |cn| {
-            // The ranking-only channel: enough to choose this call's
-            // candidates, never exported as a type.
+            // Ranking-only: enough to choose candidates, never a type.
             class_from_ty = cn;
         } else {
-            // Reuse the receiver typed above; a second checkExpr would
-            // re-recurse it, making deep call chains 2^depth.
+            // Reuse the receiver typed above; re-typing costs 2^depth.
             class_from_ty = switch (recv_ty.nonNull().*) {
                 .Generic => |g| g.name,
                 .String => "String",
@@ -366,8 +336,7 @@ fn checkCallInner(
             };
         }
         if (class_from_ty) |cn| {
-            // Runs before the extension fallback so a private member on the
-            // receiver's class is flagged at the use site.
+            // Before the extension fallback, so a private member is flagged.
             if (try visibility.lookupMemberVisibility(self, cn, mname) != null) {
                 try visibility.checkMemberVisibility(self, cn, mname, cn, m.name.span);
             }
@@ -380,16 +349,13 @@ fn checkCallInner(
             }
             if (cands.items.len != 0) {
                 call_shape_counts[3] += 1;
-                // Full overload selection over every reachable extension of
-                // this name, so `sb.append("x")` picks `append(String)` over
-                // an arity-matching sibling.
+                // Full selection, so `sb.append("x")` picks `append(String)`
+                // over an arity-matching sibling.
                 var sigs_buf: std.ArrayList(FnSig) = .empty;
                 defer sigs_buf.deinit(self.allocator);
                 for (cands.items) |c| try sigs_buf.append(self.allocator, c.sig);
-                // The candidate set for a member call on a known receiver
-                // class is complete: the image publishes every extension on
-                // that class and its supertype chain, and the program's own
-                // sources share the same table, so the pick may record.
+                // Complete here: the image publishes every extension on the
+                // class and its supertypes, so the pick may record.
                 const ret = try checkOverloadedCallRecordedAt(
                     self,
                     sigs_buf.items,
@@ -401,10 +367,8 @@ fn checkCallInner(
                     m.name.span,
                 );
                 if (cands.items[0].return_class) |rcn| {
-                    // An image extension's return head is ranking evidence
-                    // only: `expr_class` reaches lowering as type evidence,
-                    // and a head good enough to choose the next receiver is
-                    // not necessarily one lowering can bind against.
+                    // A head good enough to choose the next receiver is not
+                    // necessarily one lowering can bind against.
                     if (cands.items[0].sig.extern_fid != null) {
                         try self.rank_class.put(call_span, rcn);
                     } else {
@@ -415,7 +379,6 @@ fn checkCallInner(
             }
         }
     }
-    // Lambda value call: a function-typed callee checks its parameters.
     const callee_ty = try expr_mod.checkExpr(self, callee, null);
     if (callee_ty == .Function) {
         const f = callee_ty.Function;
@@ -469,9 +432,8 @@ fn isScopeFn(name: []const u8) bool {
         std.mem.eql(u8, name, "apply") or std.mem.eql(u8, name, "also");
 }
 
-/// Resolve a member call against the public type of an explicit-backing-field
-/// property read outside its declaring scope. The narrower field type is not
-/// visible there, so a member only it supplies is an unresolved reference.
+/// The narrower field type is not visible outside the declaring scope, so a
+/// member only it supplies is an unresolved reference.
 fn enforceEbfPublicMember(
     self: *Checker,
     info: *const root.EbfOutside,
@@ -517,8 +479,7 @@ fn emitEbfUnresolved(self: *Checker, name: []const u8, display: []const u8, sp: 
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// The mutation API the read-only kotlin.collections interfaces do not
-/// declare; it exists only on their `Mutable*` subtypes.
+/// The mutation API that exists only on the `Mutable*` subtypes.
 fn readOnlyCollectionLacks(head: []const u8, name: []const u8) bool {
     const read_only = [_][]const u8{ "List", "Collection", "Iterable", "Set", "Map" };
     var is_read_only = false;
@@ -554,8 +515,7 @@ fn newType(allocator: Allocator, t: Type) Allocator.Error!*Type {
     return p;
 }
 
-/// Diagnose a suspending callee invoked from a non-suspending context. The
-/// suspending context is set on entry to every `suspend fun` body and
+/// The suspending context is set on entry to every `suspend fun` body and
 /// inherited by enclosing lambdas; top-level code is non-suspending.
 pub fn enforceSuspendColoring(
     self: *Checker,
@@ -585,17 +545,14 @@ fn lastBool(stack: std.ArrayList(bool)) bool {
     return stack.items[stack.items.len - 1];
 }
 
-/// True when `stmts` contains a non-local `return`, one targeting the
-/// enclosing function rather than a nested lambda or anonymous function.
-/// A crossinline lambda may not contain one: its spliced body lives in the
+/// Non-local meaning it targets the enclosing function, not a nested lambda.
+/// A crossinline lambda may not contain one: its body is spliced into the
 /// inline call's frame.
 pub fn lambdaBodyHasNonlocalReturn(stmts: []const Stmt) bool {
     return helpers.scanLambdaStmtsForReturn(stmts);
 }
 
-/// Diagnose a lambda argument carrying a non-local `return` whose parameter
-/// is `crossinline` in any candidate. Named-argument positions are resolved
-/// against each candidate's `param_names`.
+/// Named-argument positions resolve against each candidate's `param_names`.
 pub fn checkCrossinlineArgReturns(
     self: *Checker,
     sigs: []const FnSig,
@@ -658,9 +615,7 @@ pub fn checkCrossinlineArgReturns(
     }
 }
 
-/// Whether `class_name` declares or inherits a member named `name`: the full
-/// Kotlin shadow surface, walked over the checker's supertype links. Bounded,
-/// with cycles cut by the visit list.
+/// The full Kotlin shadow surface. Bounded; cycles cut by the visit list.
 fn classChainHasMember(self: *Checker, class_name: []const u8, name: []const u8) bool {
     var frontier: [24][]const u8 = undefined;
     var seen: [24][]const u8 = undefined;
@@ -690,7 +645,6 @@ fn classChainHasMember(self: *Checker, class_name: []const u8, name: []const u8)
     return false;
 }
 
-/// Whether `t` is, or contains, a type parameter.
 fn typeMentionsTypeParam(t: *const Type) bool {
     return switch (t.*) {
         .TypeParam => true,
@@ -716,11 +670,8 @@ fn sigMentionsTypeParam(sig: *const FnSig) bool {
 
 /// `KLIO_EAGER_GATES=1`: which gate drops each candidate resolution.
 pub var eager_gate_counts: [7]u64 = @splat(0);
-/// `KLIO_EAGER_AUDIT` sizing: how `checkCall` disposes of each call.
-/// [0] calls seen, [1] member callees, [2] those whose receiver class the
-/// checker could name, [3] those that then found extension candidates. A
-/// call that never reaches [2] starts no member resolution, so it can never
-/// be recorded.
+/// `KLIO_EAGER_AUDIT`: [0] calls seen, [1] member callees, [2] those whose
+/// receiver class was named, [3] those that found extension candidates.
 pub var call_shape_counts: [5]u64 = @splat(0);
 fn eagerGate(i: usize) void {
     eager_gate_counts[i] += 1;
@@ -728,35 +679,25 @@ fn eagerGate(i: usize) void {
 
 fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record_name: []const u8) void {
     eagerGate(0);
-    // Picking within a vararg family needs the engine's packing logic
-    // (selection here can prefer a fixed-arity sibling), so vararg picks
-    // stay out of the channel.
+    // Picking within a vararg family needs the engine's packing logic.
     for (sig.is_vararg) |v| if (v) {
         eagerGate(1);
         return;
     };
-    // A pick made against a type parameter is a guess. For `a: T`,
-    // `listOf(a, b).minOrNull()` leaves both the total-order and the IEEE
-    // overload live, and only the runtime element values decide; binding
-    // either statically changes the answer (NaN instead of 0.0). Runtime
-    // dispatch decides these instead.
+    // A guess: `listOf(a, b).minOrNull()` for `a: T` leaves the total-order
+    // and IEEE overloads both live, and only the runtime values decide.
     if (sigMentionsTypeParam(sig)) {
         eagerGate(2);
         return;
     }
-    // Extension-shadow gate: a bare call inside an extension body has that
-    // extension's receiver in scope, so a same-named extension on it
-    // out-ranks the top-level declaration this registry would answer with.
-    // The member-shadow walk below covers members only, so the name is
-    // declined outright.
+    // A bare call inside an extension body has that receiver in scope, so a
+    // same-named extension on it out-ranks this registry's answer.
     if (self.extension_fn_names.contains(record_name)) {
         eagerGate(3);
         return;
     }
-    // Member-shadow gate: a bare call inside a class whose enclosing chain
-    // declares or inherits a same-name member resolves to that member by
-    // Kotlin scoping, out-ranking the top-level registry's answer, so it
-    // must not enter the channel. An inherited method shadows just the same.
+    // Kotlin scoping resolves a bare call to an enclosing class's member,
+    // declared or inherited, over any top-level declaration.
     {
         var ci: usize = self.class_stack.items.len;
         while (ci > 0) {
@@ -767,10 +708,7 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
             }
         }
     }
-    // File-private gate: a top-level `private fun` is visible only in its
-    // declaring file, but the name registry is file-blind, so one file's call
-    // could record another file's same-named private declaration and override
-    // the per-file mangled name lowering resolved correctly.
+    // The registry is file-blind, and these are visible in one file only.
     if (sig.decl_span) |ds| {
         if (ds.file.int() != call_span.file.int()) {
             if (self.fn_visibility.get(record_name)) |entries| {
@@ -784,10 +722,8 @@ fn recordResolvedCall(self: *Checker, call_span: Span, sig: *const FnSig, record
             }
         }
     }
-    // Package gate: the name registry is package-blind, so a same-name
-    // declaration from an unrelated package can win here where Kotlin scoping
-    // would never see it. Record only a declaration in the caller's own
-    // package or a default-imported `kotlin*` package.
+    // The registry is package-blind, so record only a declaration in the
+    // caller's own package or a default-imported `kotlin*` one.
     if (sig.decl_span) |ds| {
         const decl_pkg = self.file_packages.get(ds.file.int()) orelse "";
         const call_pkg = self.file_packages.get(call_span.file.int()) orelse "";
@@ -824,10 +760,8 @@ pub fn checkOverloadedCall(
     return checkOverloadedCallRec(self, sigs, args, arg_names, type_args, call_span, false);
 }
 
-/// As `checkOverloadedCall`, for a call form whose candidate set is complete
-/// from typeck's view (a bare top-level overload set), so the pick may enter
-/// the eager channel. Qualified member/extension calls see a partial set and
-/// must not record.
+/// As `checkOverloadedCall`, for a call form whose candidate set is complete,
+/// so the pick may record. A qualified call sees a partial set and must not.
 pub fn checkOverloadedCallRecorded(
     self: *Checker,
     sigs: []const FnSig,
@@ -840,9 +774,8 @@ pub fn checkOverloadedCallRecorded(
     return checkOverloadedCallRecImpl(self, sigs, args, arg_names, type_args, call_span, true, record_name);
 }
 
-/// As `checkOverloadedCallRecorded`, with the record keyed by a span of the
-/// caller's choosing. A member call keys on its member-name span, the
-/// identity lowering holds when it decides that call's target.
+/// A member call keys its record on the member-name span, the identity
+/// lowering holds when it decides that call's target.
 pub fn checkOverloadedCallRecordedAt(
     self: *Checker,
     sigs: []const FnSig,
@@ -859,13 +792,11 @@ pub fn checkOverloadedCallRecordedAt(
     return checkOverloadedCallRecImpl(self, sigs, args, arg_names, type_args, call_span, true, record_name);
 }
 
-/// Set for the duration of one `checkOverloadedCallRecordedAt`.
 var record_span_override: ?Span = null;
 
-/// True while the checker runs over a complete universe: the base's own
-/// sources at image bake time, where every reachable declaration is in front
-/// of it. Outside that a source-extension pick is refused, since a program
-/// loading packs sees only part of the surface.
+/// True over a complete universe: the base's own sources at image bake time.
+/// Outside it a source-extension pick is refused, since a program that loads
+/// packs sees only part of the surface.
 pub var complete_universe: bool = false;
 
 fn checkOverloadedCallRec(
@@ -891,9 +822,8 @@ fn checkOverloadedCallRecImpl(
     record_name: []const u8,
 ) Allocator.Error!Type {
     try checkCrossinlineArgReturns(self, sigs, args, arg_names);
-    // Filter candidates before selection runs: every named argument must map
-    // to a parameter of each surviving candidate, and explicit `<...>` must
-    // match its declaration-site type-parameter count exactly.
+    // Every named argument must map to a parameter of each survivor, and
+    // explicit `<...>` must match its type-parameter count exactly.
     const has_type_args = type_args.len != 0;
     var filtered: std.ArrayList(*const FnSig) = .empty;
     defer filtered.deinit(self.allocator);
@@ -920,9 +850,7 @@ fn checkOverloadedCallRecImpl(
         if (all_named) try filtered.append(self.allocator, s);
     }
     if (filtered.items.len == 0 and sigs.len != 0) {
-        // Report against the first named argument or the call span, then
-        // fall back to the unfiltered set so arity and assignability still
-        // surface.
+        // Fall back to the unfiltered set so later checks still surface.
         if (has_type_args) {
             var any_count = false;
             for (sigs) |*s| {
@@ -976,16 +904,12 @@ fn checkOverloadedCallRecImpl(
         }
         try checkArityAndArgs(self, sig, args, call_span);
         try enforceSuspendColoring(self, sig.is_suspend, "function", call_span);
-        // Filtering an overload set down to one is not a typed decision, so
-        // only a genuinely non-overloaded name records here.
+        // Filtering a set down to one is not a typed decision.
         if (record and sigs.len == 1 and !sig.is_extension) recordResolvedCall(self, call_span, sig, record_name);
         if (has_type_args or sig.type_param_count == 0) {
             return sig.return_ty.clone(self.allocator);
         }
-        // Pre-type each argument with its declared parameter type as the
-        // hint; type parameters stay abstract and permissive. A lambda whose
-        // parameter is `suspend` is checked in a suspend context, so
-        // `runBlocking { delay() }` does not flag its body.
+        // A `suspend` parameter gives the lambda a suspend context.
         const trailing_idx = trailingLambdaParamIdx(sig, args);
         var arg_tys: std.ArrayList(Type) = .empty;
         defer {
@@ -999,12 +923,8 @@ fn checkOverloadedCallRecImpl(
         }
         return inferCallReturnWithArgs(self, sig, arg_tys.items, args, call_span);
     }
-    // Pre-type each argument once; selection and the later assignability
-    // checks both read these types. Lambda and anonymous-function arguments
-    // are deferred: their shape comes from the chosen parameter, so typing
-    // them unhinted would invent a synthetic `it` and poison both selection
-    // and inference. They stay `Unresolved`, which fits every candidate,
-    // until a signature is chosen.
+    // Lambda arguments are deferred: unhinted they would invent a synthetic
+    // `it` and poison selection. `Unresolved` fits every candidate meanwhile.
     var arg_tys: std.ArrayList(Type) = .empty;
     defer {
         for (arg_tys.items) |*t| t.deinit(self.allocator);
@@ -1038,14 +958,12 @@ fn checkOverloadedCallRecImpl(
         var fits = true;
         var k: usize = 0;
         while (k < arg_tys.items.len) : (k += 1) {
-            // Past a vararg parameter every further positional argument
-            // lands on the vararg slot, whose declared type is the element
-            // type.
+            // Past a vararg, every further argument lands on its slot.
             const slot = if (va_idx != null and k >= va_idx.?) va_idx.? else k;
             if (slot >= s.params.len) break;
             if (k < args.len and args[k] == .Spread) {
-                // A spread's element type is checked against the chosen
-                // signature later; selection only requires a vararg slot.
+                // Selection only requires a vararg slot; the element type is
+                // checked against the chosen signature later.
                 if (va_idx == null or slot != va_idx.?) {
                     fits = false;
                     break;
@@ -1053,9 +971,7 @@ fn checkOverloadedCallRecImpl(
                 continue;
             }
             if (k < args.len and (args[k] == .Lambda or args[k] == .AnonFun)) {
-                // A deferred lambda types as `Unresolved` and would fit
-                // anything, but the literal can only land on a function-shaped
-                // or unknown parameter.
+                // `Unresolved` fits anything, but the literal cannot.
                 const pslot = s.params[slot].nonNull().*;
                 if (pslot != .Function and pslot != .Unresolved and pslot != .TypeParam) {
                     fits = false;
@@ -1070,20 +986,15 @@ fn checkOverloadedCallRecImpl(
         }
         if (fits) try fitting.append(self.allocator, s);
     }
-    // When candidates differ only in the function-typed parameter the
-    // deferred trailing lambda lands on, that lambda's actual return type is
-    // the selection signal (`sumOf` overloads differ only in the selector's
-    // return). Most-specific-candidate selection cannot see the deferred
-    // body, so this runs first.
+    // When candidates differ only in the lambda's return type (`sumOf`), that
+    // return is the signal, and selection cannot see the deferred body.
     if (chosen == null and fitting.items.len > 1) {
         if (try lambdaReturnTiebreak(self, fitting.items, args)) |s| {
             chosen = s;
         }
     }
     if (chosen == null and fitting.items.len != 0) {
-        // Pairwise most-specific-candidate forwarding test, with the integer
-        // widening rule folded into the comparison; an ambiguity falls back
-        // to the widen-only tiebreaker.
+        // Integer widening is folded into the specificity comparison.
         const msc = try helpers.pickMsc(self.allocator, fitting.items, args.len, &self.classes);
         switch (msc) {
             .ok => |best| chosen = best,
@@ -1123,8 +1034,7 @@ fn checkOverloadedCallRecImpl(
         var d = Diagnostic.err(msg, call_span);
         _ = d.withCode(codes.TYPE_NONE_APPLICABLE);
         try self.diagnostics.emit(self.allocator, d);
-        // No signature to hint with; still walk deferred lambda bodies so
-        // their own diagnostics surface.
+        // No hint, but walk the deferred bodies for their own diagnostics.
         for (args) |*a| {
             if (a.* != .Lambda and a.* != .AnonFun) continue;
             var t = try expr_mod.checkExpr(self, a, null);
@@ -1133,11 +1043,8 @@ fn checkOverloadedCallRecImpl(
         return .Unresolved;
     }
     const sig = chosen orelse arity_match.?;
-    // Record only a decided pick: the arity-match fallback is a guess at any
-    // same-arity overload, and a guess in the eager channel would override
-    // the runtime's evidence-based answer. An `Unresolved` argument fits
-    // every candidate, so a decision reached with one in play is not evidence
-    // enough either.
+    // The arity-match fallback is a guess, and an `Unresolved` argument fits
+    // every candidate, so neither is evidence.
     const args_decisive = blk: {
         for (arg_tys.items) |*t| {
             var core: *const Type = t;
@@ -1149,10 +1056,8 @@ fn checkOverloadedCallRecImpl(
         }
         break :blk true;
     };
-    // The chosen signature's bound parameter types must resolve too: a
-    // parameter the checker could not type (an interface from a pack it never
-    // saw) fits every argument, so a pick reached through it is arity luck
-    // rather than a typed decision.
+    // A parameter the checker could not type fits every argument, so a pick
+    // reached through it is arity luck, not a typed decision.
     const sig_params_decisive = blk: {
         const va2 = sigVarargIdx(sig);
         var k2: usize = 0;
@@ -1163,11 +1068,8 @@ fn checkOverloadedCallRecImpl(
         }
         break :blk true;
     };
-    // An extension pick records only when the chosen declaration came from
-    // the image, the one set the checker sees in full: the image publishes
-    // every extension on a class and its supertype chain. A source extension
-    // does not qualify however complete its own file looks, because a program
-    // that loads packs has extensions the checker never saw.
+    // Only image extensions are seen in full; a program that loads packs has
+    // source extensions the checker never saw.
     if (record and chosen != null and args_decisive and sig_params_decisive and
         (!sig.is_extension or sig.extern_fid != null or complete_universe))
     {
@@ -1188,8 +1090,7 @@ fn checkOverloadedCallRecImpl(
     if (has_type_args) {
         try decl_mod.checkTypeArgBounds(self, sig, type_args);
     }
-    // Type the deferred lambda arguments against the chosen signature so each
-    // body is checked exactly once with its declared shape expected.
+    // Each deferred body is checked exactly once, with its declared shape.
     {
         const t_idx = trailingLambdaParamIdx(sig, args);
         for (args, 0..) |*a, i| {
@@ -1252,8 +1153,6 @@ fn sigParamsResolved(sig: *const FnSig) bool {
     return true;
 }
 
-/// Class name identifying `arg_tys[i]` / `args[i]` when one is known:
-/// the recorded `expr_class`, or the builtin class of a primitive type.
 fn argClassName(self: *Checker, args: []const Expr, arg_tys: []const Type, i: usize) ?[]const u8 {
     if (i < args.len) {
         if (self.expr_class.get(args[i].span())) |cn| return cn;
@@ -1274,7 +1173,6 @@ fn argClassName(self: *Checker, args: []const Expr, arg_tys: []const Type, i: us
     };
 }
 
-/// Name-level subtype walk over the collected class table.
 fn classIsSubtypeOf(self: *Checker, sub: []const u8, sup: []const u8) bool {
     if (std.mem.eql(u8, sub, sup)) return true;
     const info = root.classNamed(self, sub) orelse return false;
@@ -1287,9 +1185,8 @@ fn classIsSubtypeOf(self: *Checker, sub: []const u8, sup: []const u8) bool {
     return false;
 }
 
-/// True when every parameter of `sig` carries selection signal: either a
-/// resolved type or (for user-class params typed `Unresolved`) a recorded
-/// class name in `param_class_names`.
+/// Selection signal means a resolved type, or a `param_class_names` entry for
+/// a user-class parameter typed `Unresolved`.
 fn sigParamsKnown(sig: *const FnSig) bool {
     for (sig.params, 0..) |*p, i| {
         if (p.nonNull().* != .Unresolved) continue;
@@ -1316,10 +1213,8 @@ fn paramListsEqual(a: *const FnSig, b: *const FnSig) bool {
     return true;
 }
 
-/// Type the deferred trailing lambda once with the expected shape of the
-/// first candidate but the return left open, then pick the candidate whose
-/// function-typed parameter returns what the body returned. Null when the
-/// tiebreak does not apply.
+/// Type the lambda once with the return left open, then pick the candidate
+/// whose function-typed parameter returns what the body returned.
 fn lambdaReturnTiebreak(
     self: *Checker,
     pool: []const *const FnSig,
@@ -1331,8 +1226,7 @@ fn lambdaReturnTiebreak(
     const slot = trailingLambdaParamIdx(pool[0], args) orelse li;
     if (slot >= pool[0].params.len) return null;
     if (pool[0].params[slot].nonNull().* != .Function) return null;
-    // Candidates must agree on everything except the lambda parameter's
-    // return type, otherwise the body's return says nothing.
+    // Unless they differ only there, the body's return says nothing.
     for (pool[1..]) |s| {
         if (s.params.len != pool[0].params.len) return null;
         for (s.params, pool[0].params, 0..) |pa, pb, i| {
@@ -1367,20 +1261,13 @@ fn lambdaReturnTiebreak(
 
 const AmbResolution = struct {
     sig: *const FnSig,
-    /// False when the tie was broken by guesswork (widen-score over
-    /// under-typed candidates): the pick still drives argument checks,
-    /// but its return type carries no signal.
+    /// False when guesswork broke the tie: the pick still drives argument
+    /// checks, but its return type carries no signal.
     certain: bool,
 };
 
-/// Disambiguate a most-specific-candidate tie. A frontier routinely holds
-/// signatures whose parameter types did not resolve, or duplicates across
-/// stdlib source sets, where an ambiguity report says nothing about the
-/// program. In order: a single fully-typed candidate; a single candidate
-/// whose class-named parameters accept the arguments; all candidates
-/// identical; a deferred trailing lambda's return type; a reported ambiguity
-/// when every type is known and candidates differ; otherwise a widen-score
-/// tiebreak, marked uncertain.
+/// A frontier routinely holds unresolved or duplicated signatures, where
+/// reporting an ambiguity says nothing, so the tiers below run first.
 fn resolveAmbiguousFrontier(
     self: *Checker,
     frontier: []const *const FnSig,
@@ -1403,9 +1290,7 @@ fn resolveAmbiguousFrontier(
     }
     if (known.items.len == 1) return .{ .sig = known.items[0], .certain = true };
     const pool: []const *const FnSig = if (known.items.len != 0) known.items else frontier;
-    // Tier 3: drop candidates whose class-named parameter cannot accept the
-    // argument's known class, so `decode(CharSequence)` beats
-    // `decode(ByteArray)` for a `String` argument.
+    // Tier 3: `decode(CharSequence)` beats `decode(ByteArray)` for a `String`.
     {
         var compatible: std.ArrayList(*const FnSig) = .empty;
         defer compatible.deinit(self.allocator);
@@ -1433,8 +1318,7 @@ fn resolveAmbiguousFrontier(
         }
     }
     if (all_same) return .{ .sig = pool[0], .certain = true };
-    // Also run before selection; kept here for frontiers reached by other
-    // selection paths.
+    // Also run before selection; here for frontiers reached another way.
     if (try lambdaReturnTiebreak(self, pool, args)) |s| {
         return .{ .sig = s, .certain = true };
     }
@@ -1442,8 +1326,7 @@ fn resolveAmbiguousFrontier(
     for (arg_tys, 0..) |*t, i| {
         const nn = t.nonNull().*;
         if (nn == .Unresolved or nn == .TypeParam) {
-            // A tolerantly-typed user-class value (constructor calls type
-            // as `Unresolved`) still identifies itself via `expr_class`.
+            // A constructor call types as `Unresolved` but has `expr_class`.
             if (i < args.len and self.expr_class.get(args[i].span()) != null) continue;
             args_known = false;
             break;
@@ -1495,10 +1378,8 @@ fn joinStrings(allocator: Allocator, parts: []const []const u8, sep: []const u8)
     return aw.toOwnedSlice();
 }
 
-/// Inference run inside a multi-call session so nested generic calls in
-/// `args` contribute to a single solver. The outermost call solves once and
-/// substitutes; inner calls return their fresh-var-bearing return type for
-/// the outer to continue constraining.
+/// One session per source-level expression: the outermost call solves and
+/// substitutes, inner ones hand back a type still carrying fresh vars.
 pub fn inferCallReturnWithArgs(
     self: *Checker,
     sig: *const FnSig,
@@ -1518,10 +1399,8 @@ pub fn inferCallReturnWithArgs(
             .all_vars = .empty,
         };
     }
-    // Values are the inference-var `TypeParam`s from `ConstraintSystem.fresh`;
-    // their name slices belong to the constraint system's arena, which
-    // outlives this map. The map borrows only, so its teardown frees the spine
-    // and never the arena-owned values.
+    // The value name slices belong to the constraint system's arena, which
+    // outlives this map, so teardown frees the spine only.
     var local_subst = std.StringHashMap(Type).init(self.allocator);
     defer local_subst.deinit();
     var vars: std.ArrayList(constraints.InferenceVar) = .empty;
@@ -1536,16 +1415,13 @@ pub fn inferCallReturnWithArgs(
             session.cs.setPreference(fresh[0], .PullUp);
             try local_subst.put(name, fresh[1]);
             try vars.append(self.allocator, fresh[0]);
-            // The name slice is arena-owned by the constraint system, which
-            // outlives the session, so the list may borrow it.
+            // Arena-owned by the constraint system, so the list may borrow.
             if (fresh[1] == .TypeParam) {
                 try session.all_vars.append(self.allocator, .{ .unique = fresh[1].TypeParam, .v = fresh[0] });
             }
         }
-        // Map each argument to its parameter slot, honouring a trailing
-        // lambda that binds to the last functional parameter past defaulted
-        // middle ones, so `async { … }` constrains against `block`, not
-        // `context`.
+        // A trailing lambda binds past defaulted middle parameters, so
+        // `async { … }` constrains against `block`, not `context`.
         const trailing_idx = trailingLambdaParamIdx(sig, args);
         for (arg_tys, 0..) |at, i| {
             if (at == .Unresolved) {
@@ -1566,14 +1442,10 @@ pub fn inferCallReturnWithArgs(
             );
         }
     }
-    // The return type carries the fresh inference vars; outer call resolution
-    // and the lambda re-typing pass below see them as `TypeParam`, which
-    // downstream checks treat permissively. The root call solves and replaces
-    // them with the concrete substitution.
+    // The fresh vars ride out as `TypeParam`, which downstream checks treat
+    // permissively, until the root call solves and substitutes.
     var returned = try helpers.substituteTypeParams(self.allocator, &sig.return_ty, &local_subst);
     errdefer returned.deinit(self.allocator);
-    // Lambda re-typing: re-check lambda args with substituted expected types
-    // when the outer call has begun to refine them.
     var final_subst = std.StringHashMap(Type).init(self.allocator);
     defer {
         var it = final_subst.valueIterator();
@@ -1666,11 +1538,7 @@ pub fn inferCallReturnWithArgs(
     const session = &self.inference_session.?;
     session.depth -= 1;
     if (is_root) {
-        // Refresh the recorded expression types with the solved variables
-        // before the session closes: a nested call recorded its result while
-        // its own vars were in flight, leaving `listOf("a")` in `self.types`
-        // as `List<TypeParam(T@…)>`, which the eager channel reads as
-        // "arguments unknown".
+        // A nested call recorded its result with vars still in flight.
         refreshRecordedTypes(self, session) catch {};
         self.inference_session.?.all_vars.deinit(self.allocator);
         self.inference_session.?.cs.deinit();
@@ -1679,9 +1547,8 @@ pub fn inferCallReturnWithArgs(
     return returned;
 }
 
-/// Substitute every solved inference variable into the types already recorded
-/// for this session's expressions. A variable the solver could not pin is left
-/// alone, so a partially-solved call degrades to "unknown", never to wrong.
+/// An unpinned variable is left alone, so a partially-solved call degrades to
+/// "unknown", never to wrong.
 fn refreshRecordedTypes(self: *Checker, session: *root.InferenceSession) Allocator.Error!void {
     if (session.all_vars.items.len == 0) return;
     var staged = try session.cs.solveStaged();
@@ -1714,11 +1581,8 @@ fn refreshRecordedTypes(self: *Checker, session: *root.InferenceSession) Allocat
     }
 }
 
-/// Index of the parameter a trailing-lambda argument binds to when the call
-/// omits defaulted middle parameters: Kotlin binds `obj.async { … }` to the
-/// last functional parameter, skipping the defaulted `context`. Non-null only
-/// when the final argument is a lambda, the call passed fewer arguments than
-/// parameters, and the last parameter is functional.
+/// Kotlin binds it past defaulted middle parameters, so `obj.async { … }`
+/// binds `block`, not `context`.
 pub fn trailingLambdaParamIdx(sig: *const FnSig, args: []const Expr) ?usize {
     if (args.len == 0 or sig.params.len <= args.len) {
         return null;
@@ -1742,8 +1606,7 @@ fn sigVarargIdx(sig: *const FnSig) ?usize {
     return null;
 }
 
-/// Minimum positional arity of a signature: parameters that are neither
-/// defaulted nor `vararg` (a vararg accepts zero arguments).
+/// Parameters neither defaulted nor `vararg`; a vararg accepts zero.
 fn sigMinArity(sig: *const FnSig) usize {
     var min: usize = 0;
     const n = @min(sig.has_default.len, sig.is_vararg.len);
@@ -1757,8 +1620,7 @@ fn sigMinArity(sig: *const FnSig) usize {
 pub fn checkArityAndArgs(self: *Checker, sig: *const FnSig, args: []const Expr, call_span: Span) Allocator.Error!void {
     const vararg_idx = sigVarargIdx(sig);
     const trailing_lambda_idx = trailingLambdaParamIdx(sig, args);
-    // A spread must land on a vararg parameter regardless of arity, reported
-    // up front so it still fires when the call also mismatches arity.
+    // Up front, so it still fires when the call also mismatches arity.
     if (vararg_idx == null) {
         for (args) |*a| {
             if (a.* == .Spread) {
@@ -1795,8 +1657,7 @@ pub fn checkArityAndArgs(self: *Checker, sig: *const FnSig, args: []const Expr, 
     const trailing_pos: ?usize = if (trailing_lambda_idx != null) args.len - 1 else null;
     for (args, 0..) |*a, i| {
         const is_spread = a.* == .Spread;
-        // Past the vararg index, every further positional argument lands on
-        // the vararg slot.
+        // Past the vararg index, every further argument lands on its slot.
         const target_param = if (trailing_pos != null and i == trailing_pos.?)
             trailing_lambda_idx.?
         else if (vararg_idx != null and i >= vararg_idx.?)
@@ -1813,12 +1674,10 @@ pub fn checkArityAndArgs(self: *Checker, sig: *const FnSig, args: []const Expr, 
                 _ = d.withCode(codes.TYPE_SPREAD_REQUIRES_VARARG);
                 try self.diagnostics.emit(self.allocator, d);
             }
-            // Recurse into the spread expression for diagnostics.
             const spread_expr = a.Spread.expr;
             var spread_ty = try expr_mod.checkExpr(self, spread_expr, null);
             defer spread_ty.deinit(self.allocator);
-            // The spread's element type must be a subtype of the vararg
-            // parameter's element type.
+            // Element type against the vararg's element type.
             if (is_va and target_param < sig.params.len) {
                 const param_elem = &sig.params[target_param];
                 var spread_elem: ?Type = try helpers.arrayElementType(self.allocator, &spread_ty);
@@ -1859,10 +1718,8 @@ pub fn checkArityAndArgs(self: *Checker, sig: *const FnSig, args: []const Expr, 
     }
 }
 
-/// Kotlin requires the `operator` modifier on every function reached through
-/// a definition-by-convention dispatch site. Walks the receiver's class and
-/// supertypes and warns when the member is found without it. Silent when the
-/// class is unknown: builtins, type parameters, generics without bounds.
+/// Kotlin requires `operator` on every function reached by convention
+/// dispatch. Silent when the receiver class is unknown.
 pub fn checkUserOperatorKeyword(
     self: *Checker,
     receiver_class: ?[]const u8,
@@ -1875,9 +1732,7 @@ pub fn checkUserOperatorKeyword(
     var stack: std.ArrayList([]const u8) = .empty;
     defer stack.deinit(self.allocator);
     try stack.append(self.allocator, class_name);
-    // The `operator` modifier is inherited, so an override may omit it when
-    // any declaration up the chain carries it; the whole chain is consulted
-    // before warning.
+    // `operator` is inherited, so an override may omit it.
     var found_name: ?[]const u8 = null;
     while (stack.pop()) |name| {
         if ((try visited.getOrPut(name)).found_existing) {
@@ -1909,13 +1764,11 @@ pub fn checkUserOperatorKeyword(
 pub fn checkBinary(self: *Checker, op: BinOp, lhs: *const Expr, rhs: *const Expr, sp: Span) Allocator.Error!Type {
     var l = try expr_mod.checkExpr(self, lhs, null);
     defer l.deinit(self.allocator);
-    // `&&`/`||` narrowing comes from the CFG: lowering emits AssumeIs /
-    // AssumeNull / AssumeRefEq on the rhs block before the rhs evaluates, so
-    // smart-cast queries at rhs spans see the lhs's truthy facts.
+    // `&&`/`||` narrowing comes from the CFG: an Assume lands on the rhs block
+    // before the rhs evaluates, so queries there see the lhs's truthy facts.
     var r = try expr_mod.checkExpr(self, rhs, null);
     defer r.deinit(self.allocator);
-    // Arithmetic, range and comparison operators dispatch on the lhs class;
-    // `in`/`!in` dispatch on the rhs class.
+    // Arithmetic and comparison dispatch on the lhs; `in`/`!in` on the rhs.
     const op_name: ?[]const u8 = switch (op) {
         .Add => "plus",
         .Sub => "minus",
@@ -1935,8 +1788,7 @@ pub fn checkBinary(self: *Checker, op: BinOp, lhs: *const Expr, rhs: *const Expr
         const cls = self.expr_class.get(rhs.span());
         try checkUserOperatorKeyword(self, cls, "contains", sp);
     }
-    // `x == null` on a statically non-nullable `x` always yields the same
-    // value; warn so the dead branch can go.
+    // Always the same value on a statically non-nullable `x`.
     if (op == .Eq or op == .Neq or op == .IdentEq or op == .IdentNeq) {
         const null_other: ?*const Type = if (lhs.* == .NullLit)
             &r
@@ -1959,9 +1811,8 @@ pub fn checkBinary(self: *Checker, op: BinOp, lhs: *const Expr, rhs: *const Expr
             }
         }
     }
-    // Equality between two definitely-distinct types unrelated by subtyping
-    // is an error. Skipped when either side is `null`, which routes above, or
-    // `Unresolved`, which carries no information.
+    // Unrelated operand types are an error; `null` routes above and
+    // `Unresolved` carries no information.
     if ((op == .Eq or op == .Neq or op == .IdentEq or op == .IdentNeq) and
         lhs.* != .NullLit and rhs.* != .NullLit and
         !helpers.equalityTypesCompatible(&l, &r))
@@ -2019,19 +1870,15 @@ pub fn checkBinary(self: *Checker, op: BinOp, lhs: *const Expr, rhs: *const Expr
                 else => try l.clone(self.allocator),
             };
             defer lhs_non_null.deinit(self.allocator);
-            // When the rhs diverges (return, throw, continue, break, all
-            // typed `Nothing`), control falls through only for a non-null
-            // lhs; the CFG carries that narrowing.
+            // A diverging rhs leaves fall-through only for a non-null lhs.
             break :blk try helpers.lub(self.allocator, &lhs_non_null, &r);
         },
         .Assign => .Unit,
     };
 }
 
-/// Type-check a stdlib top-level contract call like `run { ... }`,
-/// `with(x) { ... }`, `check(c)`, `require(c)`. Returns `null` if the shape
-/// does not match any known contract; the caller falls back to normal call
-/// dispatch in that case.
+/// Stdlib contract calls: `run`, `with`, `check`, `require`, the builders.
+/// Null when the shape matches none, and the caller falls back to dispatch.
 pub fn checkToplevelContractCall(
     self: *Checker,
     name: []const u8,
@@ -2055,9 +1902,8 @@ pub fn checkToplevelContractCall(
         std.mem.eql(u8, name, "suspendCoroutineUninterceptedOrReturn") or
         std.mem.eql(u8, name, "suspendCancellableCoroutine")) and args.len == 1)
     {
-        // `suspendCoroutine<T> { cont -> … }` returns T, not the lambda
-        // body's `Unit`. With no generic argument in hand the result stays
-        // unresolved and assignment context drives the binding type.
+        // This returns T, not the lambda body's `Unit`. With no generic
+        // argument in hand, assignment context drives the binding type.
         if (args[0] == .Lambda) {
             const lam = args[0].Lambda;
             try self.suspend_context_stack.append(self.allocator, true);
@@ -2087,9 +1933,7 @@ pub fn checkToplevelContractCall(
         recv.deinit(self.allocator);
         return null;
     }
-    // Builder inference over the call shape (one trailing lambda, optional
-    // initial capacity for the list, set and map variants), taking element
-    // and key/value types from the body's `add`/`put`/`yield` calls.
+    // Element and key/value types come from the body's `add`/`put`/`yield`.
     if ((std.mem.eql(u8, name, "buildList") or std.mem.eql(u8, name, "buildSet")) and
         (args.len >= 1 and args.len <= 2))
     {
@@ -2143,9 +1987,8 @@ pub fn checkToplevelContractCall(
         var elem: Type = .Nothing;
         if (args[0] == .Lambda) {
             const lam = args[0].Lambda;
-            // A `sequence { }` / `iterator { }` block is typed `suspend
-            // SequenceScope<T>.() -> Unit`, so the suspending `yield` and
-            // `yieldAll` inside it are in a suspending context.
+            // The block is `suspend SequenceScope<T>.() -> Unit`, so `yield`
+            // inside it is in a suspending context.
             try self.suspend_context_stack.append(self.allocator, true);
             var t = try checkLambdaInPlace(self, lam.params, &lam.body, null, .{ .ty = .Unresolved, .class_name = null });
             t.deinit(self.allocator);
@@ -2175,8 +2018,7 @@ pub fn checkToplevelContractCall(
         return .String;
     }
     // `repeat` is inline, so `action` inherits the caller's suspend context
-    // and `repeat(n) { delay() }` is legal inside a coroutine builder;
-    // `checkLambdaInPlace` preserves that inheritance.
+    // and `repeat(n) { delay() }` is legal inside a coroutine builder.
     if (std.mem.eql(u8, name, "repeat") and args.len == 2) {
         const int_ty: Type = .Int;
         var t0 = try expr_mod.checkExpr(self, &args[0], &int_ty);
@@ -2201,16 +2043,13 @@ pub fn checkToplevelContractCall(
             var t = try expr_mod.checkExpr(self, a, null);
             t.deinit(self.allocator);
         }
-        // The CFG's contract effect emits Assume nodes after the call,
-        // picking up every refinement lowering tracked on the condition.
+        // The CFG's contract effect emits the Assume nodes after the call.
         return .Unit;
     }
     return null;
 }
 
-/// Type-check a member-form scope-function call: `recv.let { ... }`,
-/// `recv.run { ... }`, `recv.apply { ... }`, `recv.also { ... }`. Returns
-/// `null` if `name` is not a recognized scope function.
+/// `recv.let`, `recv.run`, `recv.apply`, `recv.also`; null for anything else.
 pub fn checkMemberContractCall(
     self: *Checker,
     recv: *const Expr,
@@ -2274,9 +2113,8 @@ pub fn checkMemberContractCall(
     return null;
 }
 
-/// Walk a builder lambda body collecting argument types from every
-/// implicit-this call of `target_name` (e.g. `add(x)` in `buildList`).
-/// Returns the LUB of those argument types at `arg_idx`.
+/// LUB of the `arg_idx` argument over every implicit-this call of
+/// `target_name`, such as `add(x)` inside `buildList`.
 pub fn collectBuilderCallArgType(
     self: *Checker,
     body: *const Block,
@@ -2336,17 +2174,14 @@ pub fn walkBuilderExpr(
     }
 }
 
-/// A receiver binding for a scope-function lambda: a value type plus the
-/// optional user-class name behind it.
+/// A scope-function receiver: a value type plus the user-class name behind it.
 pub const ReceiverBinding = struct {
     ty: Type,
     class_name: ?[]const u8,
 };
 
-/// Type-check a lambda body without saving/restoring `assigned`. Per the
-/// calls-in-place exactly-once contract, assignments performed inside the
-/// body must propagate to the enclosing CFG. `it_binding` and `this_binding`
-/// supply implicit `it` / `this` from scope-function receivers.
+/// Under the calls-in-place exactly-once contract an assignment inside the
+/// body must reach the enclosing CFG, so `assigned` is not saved or restored.
 pub fn checkLambdaInPlace(
     self: *Checker,
     params: []const Ident,
@@ -2435,7 +2270,6 @@ pub fn checkLambdaShaped(
     expected: ?*const Type,
     implicit_it: bool,
 ) Allocator.Error!Type {
-    // Pull param types from expected function type, if it's one.
     var param_tys: std.ArrayList(Type) = .empty;
     defer {
         for (param_tys.items) |*t| t.deinit(self.allocator);
@@ -2450,23 +2284,19 @@ pub fn checkLambdaShaped(
             for (f.params) |*p| try param_tys.append(self.allocator, try p.clone(self.allocator));
             ret_expected = try f.return_type.clone(self.allocator);
             is_suspend = f.is_suspend;
-            // A receiver lambda records its body's receiver head, which is
-            // how member-versus-global inside the body is answered.
+            // The head that answers member-versus-global inside the body.
             if (f.receiver_head) |h| {
                 if (std.c.getenv("KLIO_RH_TRACE") != null)
                     std.debug.print("[rh-put] site=shaped f={d} s={d}..{d} head={s}\n", .{ body.span.file.int(), body.span.start, body.span.end, h });
                 self.lambda_recv_heads.put(body.span, h) catch {};
             }
-            // The lambda's own expected shape, keyed by its body span.
-            // Lowering falls back to this when the callee's signature is not
-            // in its name index, as for a cross-pack member call, which would
-            // otherwise leave the lambda a synthetic `it` and no receiver.
+            // Lowering falls back to this for a cross-pack member call, whose
+            // callee is not in its name index.
             self.lambda_param_shapes.put(body.span, .{
                 .has_receiver = f.receiver_head != null,
                 .arity = @intCast(f.params.len),
             }) catch {};
-            // Function-typed params the AST leaves unannotated: record
-            // their declared shape keyed by the param ident's span.
+            // Same, for function-typed params the AST leaves unannotated.
             for (params, 0..) |p2, i| {
                 if (i >= f.params.len) break;
                 const pt = &f.params[i];
@@ -2490,20 +2320,16 @@ pub fn checkLambdaShaped(
     }
     defer ret_expected.deinit(self.allocator);
     try narrowing.pushFrame(self);
-    // A lambda in a `suspend (…) -> R` slot is suspending, and one passed to
-    // an `inline` function is spliced into the caller and inherits the
-    // enclosing suspending bit. With the expected shape unknown (native entry
-    // points expose no signature) the literal may still bind to a `suspend`
-    // parameter, so its body is checked suspend-permissively.
+    // A lambda in a `suspend` slot is suspending, and one passed to an
+    // `inline` function inherits the enclosing bit. An unknown shape might be
+    // either, so it is checked permissively.
     const enclosing_suspend = lastBool(self.suspend_context_stack);
     const unknown_shape = expected == null or expected.?.nonNull().* != .Function;
     try self.suspend_context_stack.append(self.allocator, is_suspend or enclosing_suspend or unknown_shape);
     self.lambda_depth += 1;
     defer self.lambda_depth -= 1;
-    // The parser pushes a synthetic `it` for every zero-`->` trailing lambda,
-    // so the literal's real arity comes from the expected type: one parameter
-    // bound as `it` when the expected callable takes one, zero otherwise.
-    // With no expected function type a zero-`->` lambda is `() -> R`.
+    // The parser pushes a synthetic `it` for every zero-`->` lambda, so real
+    // arity comes from the expected type; with none, it is `() -> R`.
     const expected_arity: ?usize = if (expected) |exp| switch (exp.nonNull().*) {
         .Function => |f| f.params.len,
         else => null,
@@ -2512,10 +2338,8 @@ pub fn checkLambdaShaped(
         !(expected_arity != null and expected_arity.? >= 1);
     const effective_empty = params.len == 0 or synthetic_it;
     const expected_binds_it = effective_empty and expected_arity != null and expected_arity.? >= 1;
-    // A generic parameter (`listOf({ it })`) has no callable shape until its
-    // argument supplies one, and resolution says whether the parser's
-    // synthetic parameter is read. Infer a one-argument function only in that
-    // unknown-shape case, and only with no enclosing `it` to capture.
+    // A generic parameter (`listOf({ it })`) has no shape until its argument
+    // supplies one, so infer arity one only if the parameter is read.
     const inferred_it = effective_empty and expected_arity == null and
         narrowing.lookup(self, "it") == null and params.len == 1 and
         resolvedParamIsReferenced(self, params[0].span);
@@ -2581,9 +2405,8 @@ pub fn checkAssignable(self: *Checker, src: *const Type, dst: *const Type, sp: S
     if (src.isSubtypeOf(dst.*)) {
         return;
     }
-    // GADT-style refinement: when the destination carries a type parameter
-    // the CFG refined to a concrete type at this branch (an `is`-narrowing on
-    // a declared `Super<T>` receiver), substitute and retry.
+    // GADT refinement: substitute any type parameter the CFG narrowed at this
+    // branch and retry.
     var gadt = try narrowing.cfgGadtSubstAt(self, sp);
     defer {
         var it = gadt.valueIterator();

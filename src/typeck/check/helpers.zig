@@ -32,8 +32,7 @@ const ClassInfo = root.ClassInfo;
 const FnSig = root.FnSig;
 
 pub fn typeRefUses(t: *const TypeRef, name: []const u8) bool {
-    // `@UnsafeVariance` on the TypeRef suppresses the declaration-site
-    // variance-position check at this occurrence.
+    // `@UnsafeVariance` suppresses the check at this occurrence.
     if (hasUnsafeVariance(t.annotations)) {
         return false;
     }
@@ -74,9 +73,8 @@ pub fn hasPublishedApi(anns: []const Annotation) bool {
     return annotationsInclude(anns, "PublishedApi");
 }
 
-/// Every named type reference inside `t`: the head, every type-argument head,
-/// and a function type's receiver, parameters and return. Feeds the typealias
-/// cycle detector.
+/// The head, every type-argument head, and a function type's receiver,
+/// parameters and return.
 pub fn collectAliasedNames(allocator: Allocator, t: *const TypeRef, out: *std.ArrayList([]const u8)) Allocator.Error!void {
     if (t.function) |f| {
         if (f.receiver) |*r| try collectAliasedNames(allocator, r, out);
@@ -90,14 +88,12 @@ pub fn collectAliasedNames(allocator: Allocator, t: *const TypeRef, out: *std.Ar
     }
 }
 
-/// True when `before` and `after` differ structurally, meaning the
-/// substitution actually replaced a `TypeParam`.
+/// True when a substitution actually replaced a `TypeParam`.
 pub fn expectedChanged(before: *const Type, after: *const Type) bool {
     return !before.eql(after.*);
 }
 
-/// Replace every `Type.TypeParam(name)` keyed in `subst` with its concrete
-/// type. The result owns its heap data.
+/// The result owns its heap data.
 pub fn substituteTypeParams(
     allocator: Allocator,
     t: *const Type,
@@ -139,8 +135,7 @@ pub fn substituteTypeParams(
     }
 }
 
-/// Lower a `TypeRef`, preserving a reference to a declared type parameter as
-/// `Type.TypeParam(name)`. Names outside `tparams` go through
+/// Preserves a `tparams` name as `Type.TypeParam`; anything else goes through
 /// `convertTypeRefLossy`.
 pub fn convertTypeRefWithTparams(
     allocator: Allocator,
@@ -187,10 +182,8 @@ pub fn classNameFromTyperef(t: *const TypeRef) ?[]const u8 {
     return t.name.name;
 }
 
-/// Structural equality of two source type references: same head name,
-/// nullability and type-argument list. Function-typed references never compare
-/// equal, since their shape lives behind the boxed `function` payload and no
-/// caller needs to tell two apart.
+/// Same head name, nullability and type arguments. Function-typed references
+/// never compare equal: no caller needs to tell two apart.
 pub fn typeRefEql(a: *const TypeRef, b: *const TypeRef) bool {
     if (a.function != null or b.function != null) return false;
     if (a.nullable != b.nullable) return false;
@@ -204,8 +197,7 @@ pub fn typeRefEql(a: *const TypeRef, b: *const TypeRef) bool {
     return true;
 }
 
-/// Render a source type reference structurally, as `List<String>` or
-/// `Map<Int, String?>?`.
+/// As `List<String>` or `Map<Int, String?>?`.
 pub fn typeRefDisplay(allocator: Allocator, t: *const TypeRef) Allocator.Error![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -230,7 +222,6 @@ fn typeRefWrite(w: *std.Io.Writer, t: *const TypeRef) std.Io.Writer.Error!void {
     if (t.nullable) try w.writeAll("?");
 }
 
-/// Whether a lambda body contains a non-local `return`.
 pub fn scanLambdaStmtsForReturn(stmts: []const Stmt) bool {
     for (stmts) |s| {
         const hit = switch (s) {
@@ -355,8 +346,7 @@ pub fn blockUsesField(b: *const Block) bool {
     return false;
 }
 
-/// Record any bare-name path segment in `e` whose first identifier is keyed in
-/// `by_name`. Feeds the property-initializer cycle detector.
+/// Feeds the property-initializer cycle detector.
 pub fn collectPropertyReads(
     e: *const Expr,
     by_name: *const std.StringHashMap(usize),
@@ -428,8 +418,7 @@ pub fn collectPropertyReads(
     }
 }
 
-/// Whether the LHS type carries a builtin or stdlib `*Assign` operator
-/// matching `op`.
+/// Builtin or stdlib-shipped, either way.
 pub fn typeHasCompoundAssign(ty: *const Type, op: AssignOp) bool {
     if (op == .Assign) return false;
     switch (ty.*) {
@@ -460,8 +449,8 @@ pub fn typeHasCompoundAssign(ty: *const Type, op: AssignOp) bool {
     };
 }
 
-/// Kotlin allows a label only on a lambda literal, a loop statement, or a
-/// call whose trailing argument is a lambda literal.
+/// Kotlin allows a label only on a lambda literal, a loop, or a call with a
+/// trailing lambda.
 pub fn isLabelableTarget(e: *const Expr) bool {
     return switch (e.*) {
         .Lambda, .For, .While, .DoWhile => true,
@@ -510,13 +499,11 @@ pub const PhaseFScope = enum {
     Class,
 };
 
-/// Caller frees the result.
 pub fn typeDisplay(allocator: Allocator, t: *const Type) Allocator.Error![]u8 {
     return t.toString(allocator);
 }
 
-/// Dot-path identity of an expression: `"a.b.c"` for a `Path` or `Member`
-/// chain over plain identifiers, null otherwise. Owned by `allocator`.
+/// `"a.b.c"` for a chain over plain identifiers, null otherwise.
 pub fn dotPathKey(allocator: Allocator, e: *const Expr) Allocator.Error!?[]u8 {
     switch (e.*) {
         .Path => |p| {
@@ -540,7 +527,7 @@ pub fn singlePathName(e: *const Expr) ?[]const u8 {
     return null;
 }
 
-/// Element type behind a primitive-array class name: `IntArray` gives `Int`.
+/// `IntArray` gives `Int`.
 pub fn primitiveArrayElemByName(name: []const u8) ?Type {
     const short = if (std.mem.startsWith(u8, name, "kotlin.")) name["kotlin.".len..] else name;
     const map = .{
@@ -555,11 +542,9 @@ pub fn primitiveArrayElemByName(name: []const u8) ?Type {
     return null;
 }
 
-/// The type a `vararg x: T` parameter has inside the body: `Array<out T>`,
-/// not `T`. Kotlin declares the element type at the parameter but binds the
-/// packed array in the body, so `x.toList()` there resolves the `Array`
-/// extension. A primitive element type keeps its specialized array, so
-/// `vararg i: Int` is an `IntArray`.
+/// Kotlin declares the element type at the parameter but binds the packed
+/// array in the body, so `x.toList()` there resolves the `Array` extension. A
+/// primitive element keeps its specialized array: `vararg i: Int` is `IntArray`.
 pub fn varargParamType(allocator: Allocator, elem: *const Type) Allocator.Error!Type {
     const prim_array: ?[]const u8 = switch (elem.*) {
         .Int => "IntArray",
@@ -580,9 +565,8 @@ pub fn varargParamType(allocator: Allocator, elem: *const Type) Allocator.Error!
     return .{ .Generic = .{ .name = "Array", .args = args } };
 }
 
-/// Element type of an array-shaped value type: `Array<T>`, the primitive
-/// specializations, and their nullable forms. A non-null result owns its heap
-/// data.
+/// `Array<T>`, the primitive specializations, and their nullable forms. A
+/// non-null result owns its heap data.
 pub fn arrayElementType(allocator: Allocator, t: *const Type) Allocator.Error!?Type {
     const nn = t.nonNull();
     switch (nn.*) {
@@ -608,8 +592,7 @@ pub fn arrayElementType(allocator: Allocator, t: *const Type) Allocator.Error!?T
     }
 }
 
-/// True when `a` and `b` are statically compatible enough for an equality
-/// comparison to be meaningful.
+/// Compatible enough for an equality comparison to be meaningful.
 pub fn equalityTypesCompatible(a: *const Type, b: *const Type) bool {
     if (a.* == .Unresolved or b.* == .Unresolved) return true;
     if (a.* == .Nothing or b.* == .Nothing) return true;
@@ -623,7 +606,6 @@ pub fn equalityTypesCompatible(a: *const Type, b: *const Type) bool {
     return false;
 }
 
-/// Caller frees the result.
 pub fn typeLabel(allocator: Allocator, t: *const Type) Allocator.Error![]u8 {
     return t.toString(allocator);
 }
@@ -658,8 +640,7 @@ pub fn numericLub(a: *const Type, b: *const Type) Type {
     return winner;
 }
 
-/// Least upper bound, used to unify `if`/`when`/`try` branches. The result
-/// owns its heap data.
+/// Unifies `if`/`when`/`try` branches. The result owns its heap data.
 pub fn lub(allocator: Allocator, a: *const Type, b: *const Type) Allocator.Error!Type {
     if (a.* == .Unresolved or b.* == .Unresolved) return .Unresolved;
     if (a.eql(b.*)) return a.clone(allocator);
@@ -678,14 +659,14 @@ pub fn lub(allocator: Allocator, a: *const Type, b: *const Type) Allocator.Error
     return .Any;
 }
 
-/// Score a parameter list by widening rank; lower is more specific.
+/// Lower is more specific.
 pub fn widenScore(params: []const Type) u32 {
     var sum: u32 = 0;
     for (params) |*p| sum += intWidenRank(p);
     return sum;
 }
 
-/// Comma-joined display string for a parameter list. Caller frees the result.
+/// Caller frees the result.
 pub fn describeParams(allocator: Allocator, params: []const Type) Allocator.Error![]u8 {
     var aw: std.Io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
@@ -718,8 +699,8 @@ pub fn isBuiltinNumeric(t: *const Type) bool {
     return isBuiltinInteger(t) or t.* == .Float or t.* == .Double;
 }
 
-/// Position in Kotlin's numeric widening tower, Byte through Double. The
-/// narrower type is the more specific overload target, so a smaller rank wins.
+/// Byte through Double. The narrower type is the more specific overload
+/// target, so a smaller rank wins.
 pub fn numTowerRank(t: *const Type) u32 {
     return switch (t.*) {
         .Byte => 0,
@@ -732,8 +713,7 @@ pub fn numTowerRank(t: *const Type) u32 {
     };
 }
 
-/// Class-aware subtype check for the pairwise specificity test: walk `sub`'s
-/// supertype chain in `classes` for `sup`.
+/// Class-aware, for the pairwise specificity test.
 pub fn classIsSubtypeOf(
     allocator: Allocator,
     classes: *const std.StringHashMap(ClassInfo),
@@ -758,8 +738,7 @@ pub fn classIsSubtypeOf(
     return false;
 }
 
-/// True when `f1` is at least as applicable as `f2` for a call supplying
-/// `arg_count` arguments (Kotlin spec §11.4.2).
+/// For a call supplying `arg_count` arguments (Kotlin spec §11.4.2).
 pub fn atLeastAsApplicable(
     allocator: Allocator,
     f1: *const FnSig,
@@ -789,14 +768,12 @@ pub fn atLeastAsApplicable(
     return true;
 }
 
-/// A unique most-specific candidate, or the equally-specific frontier on
-/// ambiguity.
+/// A unique winner, or the equally-specific frontier on ambiguity.
 pub const MscResult = union(enum) {
     ok: *const FnSig,
     ambiguous: []const *const FnSig,
 };
 
-/// Pick the most specific candidate among `fitting`.
 pub fn pickMsc(
     allocator: Allocator,
     fitting: []const *const FnSig,
