@@ -1,15 +1,6 @@
-//! Context-parameter resolution stack for the VM.
-//!
-//! A thread-local stack of in-scope context values (introduced by the
-//! stdlib `context(...)` scope function and by implicit receivers). A
-//! contextual declaration's body loads each of its context parameters
-//! from the nearest compatible value on this stack (`CtxLoad`), and
-//! `contextOf<T>()` reads it directly. Resolution is nearest-first by the
-//! value's runtime type; the static ambiguity/absence rules are enforced
-//! separately by typeck.
-//!
-//! Free functions over `*VmHost`, aliased as `VmHost` methods by
-//! `vmhost.zig` and invoked by the generic IR evaluator.
+//! Context-parameter resolution stack: a thread-local stack of in-scope values from
+//! `context(...)` and implicit receivers, read nearest-first by runtime type.
+//! Typeck enforces the ambiguity and absence rules.
 
 const std = @import("std");
 
@@ -22,13 +13,10 @@ const Allocator = std.mem.Allocator;
 const Value = runtime.Value;
 const TypeRef = ir.TypeRef;
 
-/// In-scope context values, innermost last. Thread-local: context
-/// resolution never crosses a thread boundary in the shipped surface.
+/// In-scope context values, innermost last; resolution never crosses a thread.
 threadlocal var stack: std.ArrayListUnmanaged(Value) = .empty;
 
-/// Latched once the running module declares any context parameter. Lets
-/// hot receiver-lambda dispatch skip the context-stack push in the common
-/// (non-contextual) case without borrowing the module handle per call.
+/// Latched once the module declares a context parameter, so hot dispatch skips the push.
 threadlocal var active: bool = false;
 
 pub fn ctxActivate(_: *VmHost, on: bool) void {
@@ -56,10 +44,8 @@ pub fn ctxStackTruncate(self: *VmHost, mark: usize) void {
     }
 }
 
-/// Nearest in-scope context value whose runtime type is a subtype of
-/// `ty_name`. `erased` (a generic context-parameter type, or a `*` type
-/// argument) returns the innermost value unconditionally. Returns null
-/// when nothing compatible is in scope.
+/// Nearest in-scope context value whose runtime type is a subtype of `ty_name`, or null
+/// when none is. `erased` (a generic context type or `*` argument) takes the innermost.
 pub fn ctxResolve(self: *VmHost, ty_name: []const u8, erased: bool) ?Value {
     const want = TypeRef{ .name = ty_name, .nullable = false, .args = &.{} };
     var i = stack.items.len;
@@ -69,9 +55,8 @@ pub fn ctxResolve(self: *VmHost, ty_name: []const u8, erased: bool) ?Value {
         if (erased) return v;
         if (self.instanceOf(&v, want)) return v;
     }
-    // Not a `context(...)` scope value: the innermost enclosing receiver or
-    // spliced receiver-lambda subject of that type (`with(3) { context("u")
-    // { f(true) } }` reads 3 for the Int context).
+    // Not a `context(...)` value: fall back to the innermost enclosing or spliced
+    // receiver of that type.
     var chain = ir.eval.enclosingChainIter();
     while (chain.next()) |v| {
         if (erased) return v;

@@ -1,16 +1,7 @@
-//! `VmHost` global resolution: reading and writing top-level names,
-//! the throwing variant used during top-level init, the lazy
-//! first-access `object` / companion initialization gate, and the
-//! shadowing-capture check.
-//!
-//! Free functions over `*VmHost`, aliased as `VmHost` methods by
-//! `vmhost.zig` and invoked directly by the generic IR evaluator.
-//! The name-resolution probe chain in `lookupGlobal` runs: cached
-//! global, first-access `object` init, top-level-property init,
-//! delegate auto-resolve, user class/function, stdlib FQN probes, the
-//! loaded-pack overlay, the synthetic `Thread`/`Delegates` surfaces,
-//! primitive type names and their companion constants, package-qualified
-//! bare refs, and typealias follow.
+//! `VmHost` global resolution: top-level name reads and writes, the throwing
+//! read variant, the lazy first-access `object` / companion init gate, and
+//! the shadowing-capture check. Free functions over `*VmHost`, aliased as
+//! `VmHost` methods by `vmhost.zig`.
 
 const std = @import("std");
 
@@ -47,45 +38,21 @@ const MaybeValueResult = ir.eval.MaybeValueResult;
 const UnitResult = ir.eval.UnitResult;
 const SuspendState = ir.eval.SuspendState;
 
-// -------------------------------------------------------------------------
-// Lazy `object` / companion first-access initialization.
-//
-// Kotlin initializes an `object` singleton at its first access — never at
-// program start, exactly once across all threads — and a companion
-// additionally at the first instantiation of its owning class. The gate
-// below owns that contract: every singleton read path (bare-name
-// `LoadGlobal`, companion forwarding on a class receiver, qualified
-// nested-object access, `::class.objectInstance`, pack natives) routes
-// through `ensureObjectSingleton` instead of reading `globals` directly.
-//
-// State lives in the shared `object_states` table (one cell per program,
-// shared by handle with every OS thread). The cell's writer lock
-// serializes the first-access claim: the claiming thread constructs, any
-// other thread that races the same name waits for the entry to resolve,
-// and the constructing thread's own re-entrant reads observe the
-// in-flight instance (an object referencing itself during its own init).
-// The singleton publishes into `globals` only after construction
-// completes, so no other thread can observe a partially-initialized
-// instance. A construction failure is terminal: the initializer is never
-// retried, and every access after the first failure throws
-// `FileFailedToInitializeException` without the original cause, matching
-// kotlinc.
-// -------------------------------------------------------------------------
+// Kotlin initializes an `object` at its first access and a companion at the
+// first instantiation of its owning class, exactly once across all threads.
+// Every singleton read routes through `ensureObjectSingleton`, never `globals`
+// directly; the `object_states` writer lock serializes the claim, so a racer
+// waits and a re-entrant read sees the in-flight instance. Failure is terminal:
+// later accesses throw `FileFailedToInitializeException` with no cause.
 
 const ObjectInitState = root.ObjectInitState;
 
-/// Wrapper thrown when an `object` / companion initializer fails, named
-/// after the kotlinc-native exception so `e::class.simpleName` and catch
-/// matching agree with the reference. It is an `Error`-side throwable:
-/// `catch (e: Throwable)` and `catch (e: Error)` match it,
-/// `catch (e: Exception)` does not.
+/// Thrown when an `object` / companion initializer fails, named after the
+/// kotlinc exception. `Error`-side: `catch (e: Exception)` does not match it.
 pub const FILE_INIT_FAILED_FQN = "kotlin.native.internal.FileFailedToInitializeException";
 const FILE_INIT_FAILED_MSG = "There was an error during file or class initialization";
 
-/// Env-gated (`KLIO_INIT_DEBUG`) trace of the raw error that failed an
-/// `object`/companion initializer, printed at the point of first failure so
-/// the true root cause is visible even when later re-accesses (`.failed`)
-/// bury it under a cause-less `FileFailedToInitializeException`.
+/// `KLIO_INIT_DEBUG` trace of the raw error that failed an initializer.
 fn initDebugLog(name: []const u8, e: EvalError) void {
     if (runtime.envOnce("KLIO_INIT_DEBUG") == null) return;
     switch (e) {
@@ -126,23 +93,15 @@ fn fileInitFailedThrow(allocator: Allocator, cause: ?Value) Allocator.Error!Eval
     return .{ .Throw = try Value.newException(allocator, .{ .fqn = fqn, .message = .from(msg), .cause = cause_box }) };
 }
 
-/// What the claim step decided for one gate pass.
 const ClaimOutcome = union(enum) {
-    /// This thread inserted the in-progress entry and must construct.
     construct,
-    /// Construction is already running on this thread; the in-flight
-    /// instance (if the shell exists yet) is the singleton.
+    /// Already constructing on this thread; the in-flight instance, if any.
     reentrant: ?Value,
-    /// Another thread is constructing — wait and re-check.
     wait,
-    /// A previous construction failed; throw without retrying. Carries
-    /// the stashed original cause when this is the first throwing read to
-    /// reach the failure (take-once — later reads observe null).
+    /// A previous construction failed; the cause is taken once.
     failed: ?Value,
 };
 
-/// The thread holding an in-flight construction claim for `key`, for
-/// the wait diagnostic.
 fn objectInitOwner(self: *VmHost, key: []const u8) ?std.Thread.Id {
     const g = self.object_states.borrow();
     defer g.deinit();
@@ -175,12 +134,8 @@ fn claimObjectInit(self: *VmHost, key: []const u8) ClaimOutcome {
     return .construct;
 }
 
-/// Record the just-materialized instance shell for an in-flight `object`
-/// construction owned by the current thread, so re-entrant reads during
-/// the rest of construction (delegates, body properties, init blocks)
-/// observe the singleton. Returns false when no in-flight entry exists —
-/// the construction was not driven through the gate (a runtime-registered
-/// local object), and the caller publishes directly instead.
+/// Record the in-flight instance shell so re-entrant reads through the rest
+/// of construction see it. False when no entry exists: the caller publishes.
 pub fn noteObjectInFlight(self: *VmHost, name: []const u8, instance: Value) bool {
     const tid = std.Thread.getCurrentId();
     const g = self.object_states.borrowMut();
@@ -194,12 +149,6 @@ pub fn noteObjectInFlight(self: *VmHost, name: []const u8, instance: Value) bool
     return false;
 }
 
-/// The instance already published for `name`'s class in the shared,
-/// handle-shared `singletons_by_id` registry, or null. The registry is the
-/// process-global store for `object` / companion singletons: unlike the
-/// `globals` env (which can be a transient per-coroutine scope), it is
-/// visible from every execution context, so it deduplicates a singleton
-/// across scope boundaries.
 fn singletonFromSharedRegistry(self: *VmHost, name: []const u8) ?Value {
     const class_id = blk: {
         const mg = self.module.borrow();
@@ -214,13 +163,11 @@ fn singletonFromSharedRegistry(self: *VmHost, name: []const u8) ?Value {
     return null;
 }
 
-/// Resolve a registered `object` / companion singleton by its lifted
-/// global name, constructing it on first access. `.ok = null` when `name`
-/// is not a registered object (or is mid-construction on this thread with
-/// no shell yet); `.err` carries an init failure to the access site.
+/// Resolve a registered `object` / companion singleton by its lifted global
+/// name, constructing on first access. `.ok = null` when `name` is no
+/// registered object, or is mid-construction here with no shell yet.
 pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Error!MaybeValueResult {
     const allocator = self.allocator;
-    // Fast path: already published (construction completed).
     {
         const g = self.globals.borrow();
         defer g.deinit();
@@ -228,22 +175,14 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
             if (v == .Instance) return .{ .ok = v };
         }
     }
-    // Canonicalize to the run-stable program-image key: callers may pass
-    // a transient slice (a formatted `Outer$Nested` qualifier), and the
-    // claim entry / `globals` binding outlive the call.
+    // Canonicalize to the run-stable image key: the entry outlives the call.
     const name = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
         break :blk pg.get().object_names.getKey(raw_name) orelse return .{ .ok = null };
     };
-    // Process-global fallback: `globals` may be a transient per-context
-    // scope (a coroutine frame's env is not the program root), so a
-    // singleton published into one scope's `globals` is invisible to the
-    // fast path of another. The id-keyed `singletons_by_id` registry is
-    // shared by handle across every context, so it is the authoritative
-    // store — consult it before (re)constructing, or the same `object` /
-    // companion is materialized once per scope and identity comparisons
-    // against it (e.g. `slot === Composer.Empty`) break.
+    // `globals` can be a transient per-context scope, so the id-keyed registry
+    // is authoritative: skip it and each scope builds its own, breaking `===`.
     if (singletonFromSharedRegistry(self, name)) |v| return .{ .ok = v };
     var wait_rounds: u32 = 0;
     while (true) {
@@ -258,10 +197,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
             .construct => {},
             .reentrant => |inst| return .{ .ok = inst },
             .failed => |stashed| return .{ .err = try fileInitFailedThrow(allocator, stashed) },
-            // Another thread is running the singleton's interpreted
-            // constructor — an unbounded wait, so escalate from yield to
-            // a millisecond park instead of burning a core until it
-            // finishes (the sleep is GC blocking-safe).
+            // Unbounded wait on interpreted init: park 1ms, GC-safe.
             .wait => {
                 wait_rounds +|= 1;
                 if (wait_rounds <= 64) {
@@ -276,12 +212,8 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
                 continue;
             },
         }
-        // Re-check `globals` after winning the claim: a finishing
-        // constructor publishes and then clears its entry, so a thread
-        // whose pre-claim globals check raced ahead of the publish could
-        // otherwise construct a second instance. The claim's writer-lock
-        // acquire orders after the finisher's clear, which is sequenced
-        // after its publish, so the singleton is visible here.
+        // Re-check `globals` after winning the claim: a finisher publishes then
+        // clears, and the claim's acquire orders after that clear.
         {
             const published: ?Value = blk: {
                 const g = self.globals.borrow();
@@ -298,8 +230,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
         break;
     }
 
-    // This thread owns the claim. Any exit that does not publish must
-    // resolve the entry, or racing threads would wait forever.
+    // This thread owns the claim: every exit must resolve the entry.
     const class_id_opt: ?ir.ClassId = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -309,10 +240,8 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
         clearObjectState(self, name);
         return .{ .ok = null };
     };
-    // An object singleton is never an interface or abstract class; a
-    // simple-name pick resolving to one is a collision with a nested/
-    // scoped object the flat index cannot rank. Decline so the caller's
-    // scope walk continues.
+    // An object singleton is never abstract: such a pick is a collision with a
+    // nested object the flat index cannot rank. Decline; the scope walk goes on.
     {
         const bad = blk: {
             const mg = self.module.borrow();
@@ -342,9 +271,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
                 clearObjectState(self, name);
                 return .{ .ok = inst };
             }
-            // A companion's enclosing class is its `outer`, so
-            // `this`-relative resolution inside companion members sees
-            // the owning class's statics.
+            // A companion's `outer` is its enclosing class, for its statics.
             if (std.mem.indexOf(u8, name, "$Companion$")) |sep| {
                 const outer_name = name[0..sep];
                 const outer_def: ?ObjRef(ClassDef) = blk: {
@@ -359,9 +286,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
                     ig.get().outer = .{ .Class = od };
                 }
             }
-            // Publish, then resolve the claim. Publish-before-clear so a
-            // waiter that re-checks `globals` after the entry vanishes
-            // always finds the singleton.
+            // Publish before clearing, so a waiter always finds the singleton.
             {
                 const sg = self.singletons_by_id.borrowMut();
                 defer sg.deinit();
@@ -378,9 +303,6 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
         .err => |e| {
             initDebugLog(name, e);
             markObjectFailed(self, name, null);
-            // First access surfaces the failure wrapped with the original
-            // throwable as its cause; non-throw eval errors (an unresolved
-            // call inside init) propagate as-is.
             switch (e) {
                 .Throw => |cause| return .{ .err = try fileInitFailedThrow(allocator, cause) },
                 else => return .{ .err = e },
@@ -389,12 +311,8 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
     }
 }
 
-/// Id-directed singleton access, keyed by the class's FQN so a same-named
-/// top-level value in another package can never satisfy (or be shadowed
-/// by) this object's first access: `import ...server...ContentNegotiation`
-/// must construct THE imported object even while the client package binds
-/// the same simple name to a val. Publishes under the FQN, plus the simple
-/// name when that is still unbound (uncollided readers keep the name key).
+/// Id-directed singleton access keyed by the class FQN, so a same-named
+/// top-level value elsewhere can neither satisfy nor shadow this first access.
 pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.Error!MaybeValueResult {
     const allocator = self.allocator;
     const fqn: []const u8, const simple: []const u8 = blk: {
@@ -404,10 +322,7 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
         if (class_id.int() >= m.classes.items.len) return .{ .ok = null };
         break :blk .{ m.classes.items[class_id.int()].fqn, m.classes.items[class_id.int()].name };
     };
-    // An object singleton is never an interface or abstract class: a
-    // simple-name pick that resolves to one is a collision with a nested/
-    // scoped object the flat index cannot rank (CoroutineContext.Key vs a
-    // nested `object Key`). Decline so the caller's scope walk continues.
+    // Decline the simple-name collision: an object is never abstract.
     {
         const cg = self.classes.borrow();
         defer cg.deinit();
@@ -418,10 +333,6 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
             if (bad) return .{ .ok = null };
         }
     }
-    // Process-global fallback ahead of the per-context `globals` fast path:
-    // the id-keyed registry is shared by handle across every execution
-    // context, so it deduplicates the singleton even when it was first
-    // published into another scope's transient `globals` env.
     {
         const sg = self.singletons_by_id.borrow();
         defer sg.deinit();
@@ -442,8 +353,6 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
             .construct => {},
             .reentrant => |inst| return .{ .ok = inst },
             .failed => |stashed| return .{ .err = try fileInitFailedThrow(allocator, stashed) },
-            // Same escalation as the simple-name arm: the constructing
-            // thread runs interpreted init, so park instead of spinning.
             .wait => {
                 wait_rounds +|= 1;
                 if (wait_rounds <= 64) {
@@ -487,9 +396,6 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
                 clearObjectState(self, fqn);
                 return .{ .ok = inst };
             }
-            // A companion's enclosing class is its `outer` (same wiring as
-            // the name-keyed path): `this`-relative resolution inside
-            // companion members must see the owning class's statics.
             if (std.mem.indexOf(u8, simple, "$Companion$")) |sep| {
                 const outer_name = simple[0..sep];
                 const outer_def: ?ObjRef(ClassDef) = blk: {
@@ -529,12 +435,8 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
     }
 }
 
-/// Non-throwing gate for resolution chains that cannot carry an error
-/// (`lookupGlobal`, pack-native lookups). An init failure resolves to
-/// null here; the throwing read paths surface it. The swallowed wrapper's
-/// original cause is put back into the failed state so the first THROWING
-/// read still surfaces it — without this, a quiet gate driving the
-/// construction consumed the cause and every visible throw was cause-less.
+/// Non-throwing gate for chains with no error channel: a failure resolves to
+/// null, its cause restashed so the first throwing read still surfaces it.
 pub fn objectSingletonQuiet(self: *VmHost, name: []const u8) ?Value {
     const r = ensureObjectSingleton(self, name) catch return null;
     return switch (r) {
@@ -553,13 +455,8 @@ pub fn objectSingletonQuiet(self: *VmHost, name: []const u8) ?Value {
     };
 }
 
-/// Put a swallowed init-failure cause back into the `.Failed` state entry
-/// (keyed by the canonical object name), so the next throwing read's
-/// take-once still surfaces it.
 fn restashObjectCause(self: *VmHost, raw_name: []const u8, cause: Value) void {
-    // Canonical program-image key when the name registry knows it; the
-    // id-directed path marks failure under the raw FQN, so fall back to
-    // the raw key (the entry lookup below tolerates a miss either way).
+    // The id-directed path marks failure under the raw FQN, so fall back to it.
     const name = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
@@ -577,15 +474,8 @@ fn restashObjectCause(self: *VmHost, raw_name: []const u8, cause: Value) void {
     }
 }
 
-// -------------------------------------------------------------------------
-// Enum class initialization.
-// -------------------------------------------------------------------------
-
-/// A companion object of an enum class initializes as the last step of the
-/// enum's own initialization: a first access through the companion
-/// (`Foo.boo`, `Foo.foo()`) initializes the enum first, entries included.
-/// Null when `name` is not an enum's companion (or the enum is already
-/// initializing on this thread); an enum init failure otherwise.
+/// An enum's companion initializes last in the enum's own initialization, so
+/// a first access through it initializes the enum and its entries first.
 fn enumOwnerInitForCompanion(self: *VmHost, name: []const u8) Allocator.Error!?EvalError {
     const sep = std.mem.indexOf(u8, name, "$Companion$") orelse return null;
     const owner_name = name[0..sep];
@@ -604,15 +494,9 @@ fn enumOwnerInitForCompanion(self: *VmHost, name: []const u8) Allocator.Error!?E
     return try ensureEnumInit(self, owner);
 }
 
-/// Kotlin initializes an enum class on its first active use — an entry
-/// read, `values`/`valueOf`/`entries`, or a companion member — never on the
-/// access of a nested object, which is a class of its own. The
-/// initialization constructs every entry in declaration order and then
-/// initializes the companion object. A read re-entered from the
-/// initialization itself (an entry body reading a sibling, the companion
-/// reading `values()`) observes the table as built so far; another thread
-/// waits for the initializing one. A failed initialization stays failed and
-/// every later use rethrows it.
+/// Kotlin initializes an enum on its first active use (an entry read,
+/// `values`/`valueOf`/`entries`, a companion member), never on access of a
+/// nested object. Entries construct in order, then the companion; failure sticks.
 pub fn ensureEnumInit(self: *VmHost, cdef: ObjRef(ClassDef)) Allocator.Error!?EvalError {
     const fqn: []const u8 = blk: {
         const g = cdef.borrow();
@@ -658,9 +542,7 @@ pub fn ensureEnumInit(self: *VmHost, cdef: ObjRef(ClassDef)) Allocator.Error!?Ev
     return null;
 }
 
-/// `ensureEnumInit` for resolution chains that carry no error: an init
-/// failure resolves to false here and the next throwing use surfaces it
-/// (the swallowed wrapper's cause is put back for that read).
+/// `ensureEnumInit` with no error channel: false on failure, cause restashed.
 pub fn ensureEnumInitQuiet(self: *VmHost, cdef: ObjRef(ClassDef)) bool {
     const r = ensureEnumInit(self, cdef) catch return false;
     const e = r orelse return true;
@@ -687,7 +569,6 @@ fn enumSimpleName(fqn: []const u8) []const u8 {
     return if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
 }
 
-/// Construct the entries of one enum class, then initialize its companion.
 fn buildEnumClass(self: *VmHost, cdef: ObjRef(ClassDef), enum_fqn: []const u8) Allocator.Error!?EvalError {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -703,8 +584,7 @@ fn buildEnumClass(self: *VmHost, cdef: ObjRef(ClassDef), enum_fqn: []const u8) A
     if (try patchEnumEntryArgs(self, module, cdef, pa)) |e| return e;
     if (try instantiateEnumEntries(self, module, cdef, enum_fqn, pa)) |e| return e;
 
-    // Every entry exists: the companion initializes now, after the entries
-    // and before any other use of the class.
+    // The companion initializes after every entry, before any other use.
     const class_name = blk: {
         const g = cdef.borrow();
         defer g.deinit();
@@ -724,8 +604,7 @@ fn buildEnumClass(self: *VmHost, cdef: ObjRef(ClassDef), enum_fqn: []const u8) A
 }
 
 /// A body-less entry is the build-time instance: evaluate its constructor
-/// arguments and store them as its fields, before any entry body or the
-/// companion runs user code that may read it (`entries.map { it.symbol }`).
+/// arguments into its fields before any entry body or companion runs.
 fn patchEnumEntryArgs(self: *VmHost, module: *const Module, cdef: ObjRef(ClassDef), pa: Allocator) Allocator.Error!?EvalError {
     const allocator = self.allocator;
     const inits = blk: {
@@ -760,10 +639,8 @@ fn patchEnumEntryArgs(self: *VmHost, module: *const Module, cdef: ObjRef(ClassDe
         }
         const inst = entry_inst orelse continue;
         defer inst.deinit();
-        // An entry rebuilt through the ordinary instantiation path (a body
-        // subclass, a secondary or vararg constructor) bound its constructor
-        // fields there; patching those in again would define page-allocated
-        // values into a slab-owned instance.
+        // An entry rebuilt through the ordinary path already bound its ctor
+        // fields; re-patching would put page values in a slab-owned instance.
         {
             const g = inst.borrow();
             defer g.deinit();
@@ -772,11 +649,8 @@ fn patchEnumEntryArgs(self: *VmHost, module: *const Module, cdef: ObjRef(ClassDe
             icg.deinit();
             if (built_class or g.get().get("__enum_entry_built__") != null) continue;
         }
-        // A cached base shares these instances across per-program Vms, and
-        // the ctor args are per-class constants: once one Vm has patched the
-        // fields, re-evaluating them would only swap equal values — and the
-        // release of the previous Vm's value would cross allocators. Skip
-        // entries whose fields are already complete.
+        // These instances are shared across per-program Vms and the ctor args
+        // are constants, so re-patching only crosses allocators on release.
         const already_patched = blk: {
             const g = inst.borrow();
             defer g.deinit();
@@ -795,10 +669,8 @@ fn patchEnumEntryArgs(self: *VmHost, module: *const Module, cdef: ObjRef(ClassDe
                 .err => |e| return e,
             };
             if (idx >= param_names.items.len) continue;
-            // The instance is shared through the base cache, so the value
-            // stored must share the CACHE's lifetime: copy a string into
-            // the patch allocator (scalars are by value; anything else is
-            // left as-is and noted by the trace above when it appends).
+            // The instance outlives this Vm through the base cache, so copy
+            // strings into the patch allocator; scalars are by value.
             const stored: Value = switch (v) {
                 .String => |sref| blk: {
                     const sg = sref.borrow();
@@ -809,10 +681,8 @@ fn patchEnumEntryArgs(self: *VmHost, module: *const Module, cdef: ObjRef(ClassDe
             };
             const g = inst.borrowMut();
             defer g.deinit();
-            // A baked enum instance carries every constructor-parameter
-            // field, so this define REPLACES in place. An append here
-            // means the bake dropped a field — name it, because the
-            // shared image instance cannot grow a per-VM buffer.
+            // A baked enum instance carries every ctor-param field, so this
+            // replaces in place; an append means the bake dropped a field.
             if (g.get().get(param_names.items[idx]) == null and
                 runtime.envOnce("KLIO_ENUM_INIT_TRACE") != null)
             {
@@ -826,14 +696,9 @@ fn patchEnumEntryArgs(self: *VmHost, module: *const Module, cdef: ObjRef(ClassDe
     return null;
 }
 
-/// An enum entry declared with a body (`B(args) { … }`) is an instance of
-/// the nested class `$B : Enum(args)` the parser synthesized for it.
-/// Construct it through the ordinary class path (parent constructor
-/// arguments, property initializers, init blocks), carry the entry's name
-/// and ordinal over, and make it the entry's value. An enum declaring
-/// secondary or vararg constructors, init blocks or body properties builds
-/// every entry through that path: the entry's arguments pick the
-/// constructor and its body runs as written.
+/// An enum entry with a body instantiates the synthesized nested class
+/// `$<entry> : Enum(args)` through the ordinary class path, carrying the name
+/// and ordinal over. Secondary/vararg ctors and init blocks route every entry.
 fn instantiateEnumEntries(self: *VmHost, module: *const Module, cdef: ObjRef(ClassDef), enum_fqn: []const u8, pa: Allocator) Allocator.Error!?EvalError {
     const allocator = self.allocator;
     const n_entries = blk: {
@@ -851,20 +716,14 @@ fn instantiateEnumEntries(self: *VmHost, module: *const Module, cdef: ObjRef(Cla
         const dg = cdef.borrow();
         defer dg.deinit();
         if (dg.get().secondary_ctors.len != 0) break :blk true;
-        // A vararg primary parameter needs the ordinary argument packing
-        // too (an entry passing nothing still gets an empty array).
+        // A vararg primary parameter needs the ordinary argument packing.
         for (module.classes.items[enum_cid.int()].primary_params) |prm| if (prm.is_vararg) break :blk true;
-        // `init` blocks and body property initializers are user code
-        // that runs per entry: only the ordinary path runs them.
         if (dg.get().init_blocks.len != 0) break :blk true;
         for (dg.get().body_properties) |bp| if (bp.init != null) break :blk true;
         break :blk false;
     };
-    // The rebuilt entries are installed on the class before any is
-    // constructed: an entry's construction runs user code (safe points),
-    // and an instance held only in a local array between iterations is
-    // unreachable to the collector, which swept the first entry while
-    // the second was being built and left its fields dangling.
+    // Install the rebuilt entries before constructing any: construction spans
+    // safe points, and an instance held only in a local is unreachable.
     const replaced: []runtime.ClassDef.EnumEntry = blk: {
         const dg = cdef.borrow();
         defer dg.deinit();
@@ -923,17 +782,14 @@ fn instantiateEnumEntries(self: *VmHost, module: *const Module, cdef: ObjRef(Cla
         }
         const target_cid = body_cid orelse enum_cid;
         if (runtime.envOnce("KLIO_ENUM_INIT_TRACE") != null) std.debug.print("[enum-init] build {s}.{s} via {s} (body={}, secondary={}, nargs={d})\n", .{ enum_fqn, entry_name, module.classes.items[target_cid.int()].fqn, body_cid != null, has_secondary, ctor_args.items.len });
-        // The name string and the constructor arguments are pinned until
-        // the instance owns them: the header thunks run user code first.
+        // Pinned until the instance owns them: header thunks run user code.
         const preset_name: Value = .{ .String = try runtime.strInit(allocator, entry_name) };
         const entry_keepalive = self.ka.mark();
         defer self.ka.restore(entry_keepalive);
         self.ka.push(preset_name);
         self.ka.pushSlice(ctor_args.items);
-        // The entry's slot takes the instance as soon as its shell exists:
-        // the entry's own initializers (and its inner classes) refer to the
-        // entry by name while it is still under construction, and kotlinc
-        // binds that reference to the instance itself.
+        // The slot takes the instance as soon as its shell exists: the entry's
+        // own initializers name it mid-construction, as kotlinc binds them.
         host_instances.setEnumEntryPreset(.{
             .class_fqn = module.classes.items[target_cid.int()].fqn,
             .name = preset_name,
@@ -950,9 +806,8 @@ fn instantiateEnumEntries(self: *VmHost, module: *const Module, cdef: ObjRef(Cla
         host_instances.setEnumEntryPreset(null);
         if (made != .Instance) continue;
         if (body_cid == null) {
-            // The marker is appended through the instance's own allocator:
-            // a field list grown with the patch allocator is freed through
-            // the slab at sweep.
+            // The instance's own allocator: a patch-allocated list frees via
+            // the slab.
             const g = made.Instance.borrowMut();
             defer g.deinit();
             try g.get().define(allocator, "__enum_entry_built__", .{ .Bool = true });
@@ -963,11 +818,7 @@ fn instantiateEnumEntries(self: *VmHost, module: *const Module, cdef: ObjRef(Cla
     return null;
 }
 
-/// Whether the (possibly not-yet-initialized) singleton class
-/// `class_name` declares member function `name`, transitively over its
-/// supertypes. Drives the companion-forwarding call paths: a first access
-/// only constructs the companion when the member genuinely lives on it,
-/// so a miss probe (an enum entry, a nested class) does not initialize.
+/// Whether singleton class `class_name` transitively declares member `name`.
 pub fn objectClassDeclaresMethod(self: *VmHost, class_name: []const u8, name: []const u8) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -977,10 +828,6 @@ pub fn objectClassDeclaresMethod(self: *VmHost, class_name: []const u8, name: []
     return false;
 }
 
-/// Whether the (possibly not-yet-initialized) singleton class
-/// `class_name` declares property `name`: body properties / primary
-/// params along the runtime parent chain, a custom getter, or a
-/// companion-scoped extension property.
 pub fn objectClassDeclaresProp(self: *VmHost, class_name: []const u8, name: []const u8) bool {
     {
         const pg = self.prog.borrow();
@@ -1012,15 +859,9 @@ pub fn objectClassDeclaresProp(self: *VmHost, class_name: []const u8, name: []co
     return false;
 }
 
-/// Companion read gate for the speculative member-probe paths: resolve
-/// the singleton when already initialized; construct it on first access
-/// only when its class declares `name` (as a property or function).
+/// Companion read gate for member probes: construct only when the class declares `member`.
 pub fn objectSingletonForMember(self: *VmHost, name: []const u8, member: []const u8) Allocator.Error!MaybeValueResult {
-    // The declares gate applies to the already-initialized fast path too:
-    // an initialized companion (every `newInstance` initializes its
-    // class's companions) must not be offered as the owner of a member
-    // its class never declares, or the speculative probe redirects a call
-    // whose real target is an extension on the original receiver.
+    // Applies to the initialized fast path too, or the probe steals an extension's call.
     if (!(objectClassDeclaresProp(self, name, member) or objectClassDeclaresMethod(self, name, member))) {
         return .{ .ok = null };
     }
@@ -1040,11 +881,8 @@ fn clearObjectState(self: *VmHost, name: []const u8) void {
     _ = g.get().remove(name);
 }
 
-/// Record a terminal init failure. `cause` (when set) is the original
-/// throwable, retained into the state table so the first THROWING read can
-/// surface it — the construction attempt may have been driven by a quiet
-/// resolution gate whose wrapper never reached user code. A throwing
-/// construction site passes null (it surfaces the cause itself).
+/// Record a terminal init failure. A set `cause` is retained into the state
+/// table so the first throwing read surfaces it; a throwing site passes null.
 fn markObjectFailed(self: *VmHost, name: []const u8, cause: ?Value) void {
     const g = self.object_states.borrowMut();
     defer g.deinit();
@@ -1054,18 +892,9 @@ fn markObjectFailed(self: *VmHost, name: []const u8, cause: ?Value) void {
     g.get().put(name, .{ .Failed = .{ .cause = cause } }) catch {};
 }
 
-// -------------------------------------------------------------------------
-// Intrinsic resolution / dispatch. The resolution chain in `lookupGlobal`
-// calls them, so they are kept here as file-local helpers over `*VmHost`.
-// -------------------------------------------------------------------------
-
-/// Look up an intrinsic by FQN. Probes the pack-supplied
-/// `installed_bindings` overlay first so a loaded pack's binding shadows
-/// the stdlib's default implementation.
+/// Look up an intrinsic by FQN; a pack's `installed_bindings` shadows stdlib.
 fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
-    // Post-link the bindings table is read-only; consult it unguarded
-    // (gated on the published link flag) instead of taking two shared
-    // reader locks per lookup.
+    // Post-link the bindings table is read-only, so the link flag gates a lock-free read.
     {
         const img = self.prog.asPtrConst();
         if (@atomicLoad(bool, &img.resolved_linked, .acquire)) {
@@ -1081,10 +910,8 @@ fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
     return stdlib.implementation(fqn);
 }
 
-/// Invoke an intrinsic with `args`, building the `VmIntrinsicHost`
-/// side-channel so HOF bindings can call back into IR-lowered lambdas.
-/// Maps a thrown / control-flow `RuntimeError` onto the matching
-/// `EvalError`, preserving the thrown `Value` for try/catch matching.
+/// Invoke an intrinsic through the `VmIntrinsicHost` side-channel so HOF
+/// bindings reach IR lambdas; maps control-flow errors, keeping the `Value`.
 fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!union(enum) { ok: Value, err: EvalError } {
     vmhost.emitPath(allocator, "intrinsic_globals", fqn, null, null, args);
     const keepalive = self.ka.mark();
@@ -1132,13 +959,9 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
     return switch (r) {
         .ok => |v| .{ .ok = v },
         .err => |e| switch (e) {
-            // Preserve the thrown Value so the IR evaluator's try/catch
-            // can match the handler against the exception class.
             .Thrown => |v| .{ .err = .{ .Throw = v } },
             .Return => |v| .{ .err = .{ .NonLocalReturn = v } },
-            // A suspending primitive asked to park. Seed a fresh
-            // SuspendState; each enclosing `eval` frame snapshots itself
-            // as it unwinds and the coroutine driver parks the result.
+            // A parked primitive: each enclosing `eval` frame fills this in.
             .Suspend => |wake| blk: {
                 const state = try allocator.create(SuspendState);
                 state.* = .{
@@ -1154,7 +977,6 @@ fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func:
     };
 }
 
-/// Render a non-control-flow `RuntimeError` to its message text.
 fn runtimeErrorMessage(allocator: Allocator, e: RuntimeError) []const u8 {
     return switch (e) {
         .Unbound => |s| s,
@@ -1167,8 +989,7 @@ fn runtimeErrorMessage(allocator: Allocator, e: RuntimeError) []const u8 {
     };
 }
 
-/// Whether the function at `fid` is an extension (its first lowered
-/// param is the synthetic `this`).
+/// Whether `fid` is an extension: its first param is the synthetic `this`.
 fn isExtFid(fid: FuncId, m: *const Module) bool {
     const f = m.funcById(fid) orelse return false;
     if (f.params.len == 0) return false;
@@ -1180,8 +1001,7 @@ fn idGet(funcs: []const ir.Func, idx: u32) ?*const ir.Func {
     return &funcs[idx];
 }
 
-/// All-uppercase / underscore / digit final segment — Kotlin's constant
-/// naming convention (`PI`, `MAX_VALUE`).
+/// Kotlin constant naming: upper-case, underscore and digits (`MAX_VALUE`).
 fn looksConst(tail: []const u8) bool {
     if (tail.len == 0) return false;
     for (tail) |c| {
@@ -1190,16 +1010,14 @@ fn looksConst(tail: []const u8) bool {
     return true;
 }
 
-/// Synthetic `Thread` static surface stub: any direct call is an error;
-/// the static-call probe routes `Thread.sleep` / `Thread.currentThread`
-/// through the `kotlin.concurrent.Thread.*` bindings.
+/// Synthetic `Thread` static surface: a direct call errors; the static-call
+/// probe routes `sleep`/`currentThread` to `kotlin.concurrent.Thread.*`.
 fn threadStaticStub(ctx: *CallCtx) Allocator.Error!runtime.EvalResult {
     _ = ctx;
     return .{ .err = .{ .Type = "Thread: use Thread.sleep(ms) / Thread.currentThread()" } };
 }
 
-/// Synthetic `Delegates` singleton stub: member calls (`notNull`,
-/// `observable`, `vetoable`) are intercepted in `call_member`.
+/// Synthetic `Delegates`; its member calls are intercepted in `call_member`.
 fn delegatesStub(ctx: *CallCtx) Allocator.Error!runtime.EvalResult {
     _ = ctx;
     return .{ .err = .{ .Type = "Delegates: use Delegates.notNull / Delegates.observable / Delegates.vetoable" } };
@@ -1218,9 +1036,7 @@ fn isPrimitiveTypeName(name: []const u8) bool {
     return false;
 }
 
-/// Build a synthetic `ClassDef` for a primitive type name so `Int::class`
-/// and `Int.MAX_VALUE` resolve. The simple name plus a `kotlin.*` fqn back
-/// reflection-style reads.
+/// Synthetic `ClassDef` for a primitive type name, with fqn `kotlin.<name>`.
 fn primitiveClassDef(allocator: Allocator, name: []const u8) Allocator.Error!ObjRef(ClassDef) {
     const fqn = try std.fmt.allocPrint(allocator, "kotlin.{s}", .{name});
     const env = try ObjRef(runtime.Env).init(allocator, runtime.Env.init(allocator));
@@ -1261,18 +1077,8 @@ fn primitiveClassDef(allocator: Allocator, name: []const u8) Allocator.Error!Obj
     return ObjRef(ClassDef).init(allocator, cd);
 }
 
-// -------------------------------------------------------------------------
-// Public host functions.
-// -------------------------------------------------------------------------
-
-/// Resolve a top-level / qualifier-position name to a `Value`. One ordered
-/// probe chain (cached global, delegate auto-resolve, user class/function,
-/// stdlib FQN probes, synthetic class names, typealias follow); splitting
-/// it would fragment the fallthrough.
-/// The runtime value of one exact top-level function: a closure over its
-/// lowered body, or — for a bodyless decl whose single executable form
-/// was settled at link time — that native binding. Null when the func id
-/// is unknown or carries neither form.
+/// The runtime value of one top-level function: a closure over its lowered
+/// body, or the native binding link time settled for a bodyless declaration.
 fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -1303,11 +1109,8 @@ fn funcValueById(self: *VmHost, allocator: Allocator, fid: FuncId) ?Value {
     return null;
 }
 
-/// Resolve a lowering-bound global reference by exact identity: the
-/// symbol index already picked the declaration, so no name-keyed
-/// re-resolution can swap in a same-simple-name twin. Returns null when
-/// the id carries no runtime value (the caller falls back to the
-/// name-keyed path).
+/// Resolve a lowering-bound global by exact identity, so no name-keyed
+/// re-resolution swaps in a same-simple-name twin. Null falls to the name path.
 pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, class: ?ir.ClassId, ctor_ref: bool) ?Value {
     if (runtime.envOnce("KLIO_GLOBAL_TRACE") != null) {
         if (class) |cid| {
@@ -1318,13 +1121,9 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
         }
     }
     if (func) |fid| {
-        // A `@LowPriorityInOverloadResolution` / deprecated-stub function is
-        // never bound by id: it must not outrank a same-name class constructor
-        // (kotlinc), and a stub whose body calls the constructor by name would
-        // re-bind itself and recurse without bound (kotlinx-datetime's
-        // deprecated `fun LocalDateTime(...)`). Skip it so the class leg — or,
-        // when the committed class id is absent, the caller's name-keyed lookup
-        // — finds the constructor instead.
+        // A `@LowPriorityInOverloadResolution` function is never bound by id:
+        // kotlinc does not let it outrank a same-name constructor, and a stub
+        // calling that constructor by name would re-bind itself and recurse.
         const is_low = blk: {
             const mg = self.module.borrow();
             defer mg.deinit();
@@ -1336,20 +1135,14 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
         }
     }
     if (class) |cid| {
-        // The id table is the authoritative singleton read: publication
-        // under a name can never shadow what a committed class id yields.
+        // The id table is authoritative: a name binding cannot shadow it.
         if (!ctor_ref) {
             const sg = self.singletons_by_id.borrow();
             const own = sg.get().get(cid.int());
             sg.deinit();
             if (own) |v| return v;
-            // A class with a companion answers with the companion's
-            // published singleton by ID as well. This must be the class's OWN
-            // companion (a DIRECT child) — not `classIdNestedIn`, which walks up
-            // the enclosing chain, so a nested class with no companion of its
-            // own (`enum LayoutNode.LayoutState`) would wrongly answer with the
-            // ENCLOSING class's companion, turning the nested-class value into
-            // `Outer.Companion`.
+            // A class with a companion also answers with the companion's
+            // singleton, as a DIRECT child: `classIdNestedIn` walks up.
             const comp_id: ?ir.ClassId = blk: {
                 const mg = self.module.borrow();
                 defer mg.deinit();
@@ -1379,40 +1172,21 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                 break :blk null;
             };
             if (found) |def| {
-                // An `object` in value position is its singleton, not
-                // the bare class value (matching the name-keyed read).
-                // Only an already-published singleton resolves here;
-                // first-access construction stays with the name-keyed
-                // throwing path, which drives the init gate exactly once
-                // and surfaces an init failure with its cause.
                 const cls_name, const is_object = blk: {
                     const dg = def.borrow();
                     defer dg.deinit();
                     break :blk .{ dg.get().name, dg.get().is_object };
                 };
                 // In value position a class with a companion is its companion
-                // singleton (Kotlin: `C` ⇒ `C.Companion`); a plain `object` is
-                // its own singleton. Both only when the singleton is already
-                // published — first access stays on the name-keyed throwing
-                // path that drives the init gate once.
+                // singleton and a plain `object` its own, only once published.
                 const singleton_name: ?[]const u8 = blk: {
-                    // A constructor reference (`::C`) is the class, never
-                    // the companion; an `object`'s singleton still applies
-                    // (its "constructor" is the singleton itself).
                     if (ctor_ref and !is_object) break :blk null;
                     const mg = self.module.borrow();
                     defer mg.deinit();
                     const m = mg.get();
-                    // `companion_singletons` is keyed by SIMPLE class name, so a
-                    // different class of the same simple name (e.g. a nested
-                    // value class in another pack sharing a top-level enum's
-                    // name) would otherwise hijack this resolution — routing the
-                    // enum to the other class's companion. Only forward to the
-                    // companion when it actually belongs to THIS class (cid):
-                    // either cid declares a nested `Companion`, or the recorded
-                    // singleton name is one of cid's own lifted members (a
-                    // lifted companion is renamed away from the literal
-                    // `Companion`, e.g. `LineHeightStyle$Alignment$Companion$…`).
+                    // `companion_singletons` is keyed by SIMPLE name: forward
+                    // only when cid declares a nested `Companion` or the
+                    // singleton name starts with cid's (`Owner$Companion$...`).
                     if (!is_object) {
                         const cn_opt = m.registry.companion_singletons.get(cls_name);
                         const own = m.classIdNestedIn(cid, "Companion") != null or
@@ -1426,14 +1200,7 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                 if (singleton_name) |sn| {
                     def.deinit();
                     if (is_object) {
-                        // Identity-keyed: an already-built singleton reads
-                        // by FQN. Unbuilt, the name-keyed throwing path owns
-                        // first construction (its claim carries the init
-                        // failure with its cause) — EXCEPT when the simple
-                        // name is already bound to a FOREIGN value (a
-                        // cross-package top-level val colliding with the
-                        // imported object): then only the id-directed path
-                        // can ever construct it.
+                        // A built singleton reads by FQN.
                         {
                             const gg = self.globals.borrow();
                             defer gg.deinit();
@@ -1446,9 +1213,7 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                             defer gg.deinit();
                             break :blk gg.get().lookup(sn);
                         };
-                        // Our own singleton published under the simple name
-                        // (the name-keyed first construction) is not a
-                        // collision — return it, never rebuild.
+                        // Our own singleton under the simple name is no collision.
                         if (simple_bound) |v| {
                             if (v == .Instance) {
                                 const icls: ?[]const u8 = blk: {
@@ -1461,23 +1226,12 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                                 if (icls != null and std.mem.eql(u8, icls.?, f)) return v;
                             }
                         }
-                        // First-access construction driven by the authoritative
-                        // id. The caller committed an exact object class id, so
-                        // build it directly rather than deferring to the
-                        // name-keyed path — which cannot construct a
-                        // collision-mangled object (two packages share the
-                        // simple name `Operation.InsertSlotsWithFixups`, so the
-                        // bare name is ambiguous / mangled out of the flat
-                        // index). `ensureObjectSingletonById` shares the same
-                        // init gate (`claimObjectInit`), so this stays
-                        // once-only; `simple_bound` is irrelevant now.
+                        // Driven by the committed id: the bare name is mangled
+                        // out of the flat index when two packages share it.
                         const rr = ensureObjectSingletonById(self, cid) catch return null;
                         return switch (rr) {
                             .ok => |maybe| if (maybe) |v| (if (v == .Instance) v else null) else null,
-                            // This lookup has no error channel; the throwing
-                            // read path re-surfaces the failure. Put the
-                            // swallowed wrapper's original cause back into
-                            // the failed state so that throw still carries it.
+                            // No error channel: restash for the throwing read.
                             .err => |e| blk: {
                                 if (e == .Throw and e.Throw == .Exception) {
                                     if (e.Throw.Exception.cause) |cause_cell| {
@@ -1497,10 +1251,7 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
                     if (published) |v| {
                         if (v == .Instance) return v;
                     }
-                    // The companion is not published yet: the bound class
-                    // itself is the value (member dispatch on it reaches the
-                    // companion), never a same-named global of another
-                    // package.
+                    // Companion unpublished: the class itself is the value.
                     const again: ?ObjRef(ClassDef) = blk: {
                         const cg = self.classes.borrow();
                         defer cg.deinit();
@@ -1519,10 +1270,8 @@ pub fn lookupGlobalById(self: *VmHost, allocator: Allocator, func: ?FuncId, clas
 
 
 /// The effective lookup key for a top-level property read. A `var` with a
-/// custom setter but a DEFAULT getter keeps its storage under the raw
-/// `__klio_topfield__` key (so plain-name writes dispatch the setter); the
-/// plain-name read IS the raw-slot read. A property with a custom getter
-/// keeps the plain-name miss so the getter thunk dispatches instead.
+/// custom setter but a default getter stores under `__klio_topfield__<name>`
+/// so plain-name writes dispatch the setter; a custom getter keeps the miss.
 fn topPropReadKey(self: *VmHost, name: []const u8, buf: []u8) []const u8 {
     const reg = &self.module.asPtr().registry;
     if (reg.top_level_prop_setters.count() == 0) return name;
@@ -1532,11 +1281,8 @@ fn topPropReadKey(self: *VmHost, name: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "__klio_topfield__{s}", .{name}) catch name;
 }
 
-/// A leaf serve's global read: the already-bound value under the effective
-/// storage key, immediate scalars only. No initializer, singleton gate, or
-/// delegate is driven — any name whose read would need one misses here and
-/// the serve abandons to the frame path, which drives it exactly once.
-/// A custom-getter property has no plain binding, so it misses naturally.
+/// A leaf serve's global read: the bound value under the effective storage
+/// key, scalars only. Drives no initializer, gate or delegate; a miss defers.
 pub fn leafGlobalGet(self: *VmHost, name_in: []const u8) ?Value {
     var buf: [256]u8 = undefined;
     const name = topPropReadKey(self, name_in, &buf);
@@ -1552,34 +1298,26 @@ pub fn leafGlobalGet(self: *VmHost, name_in: []const u8) ?Value {
     };
 }
 
-/// Whether a bare simple-name global-fn pick is visible from the
-/// executing reference site (frame package + current statement's file).
-/// No frame context, or a candidate without package metadata, keeps the
-/// pick — only a confirmed unimported foreign package rejects it.
+/// Whether a bare simple-name global-fn pick is visible from the executing
+/// reference site. Only a confirmed unimported foreign package rejects it.
 fn bareGlobalFnVisible(self: *VmHost, m: *const Module, fid: FuncId, name: []const u8) bool {
     _ = self;
     const f = m.funcById(fid) orelse return true;
     if (f.package.len == 0) return true;
     const ref_file: ?ir.FileId = ir.eval.refSiteFile() orelse
         (if (ir.eval.currentCallSiteSpan()) |sp| sp.file else null);
-    // The reference package follows the executing statement's FILE when
-    // the module records it (synthesized accessor frames carry no
-    // package of their own); the frame's declared package is the
-    // fallback. No context at all keeps the pick.
+    // The reference package follows the executing statement's file when the
+    // module records it; the frame's declared package is the fallback.
     const file_pkg: ?[]const u8 = if (ref_file) |rf| m.packageOfFile(rf) else null;
     const ref_pkg = file_pkg orelse (ir.eval.nearestFramePackage() orelse return true);
     const cfile = ref_file orelse ir.FileId.from(std.math.maxInt(u32));
     return m.scopeTier(f.fqn, f.package, name, ref_pkg, cfile) != ir.Module.other_package_tier;
 }
 
-/// Bind a reified type-parameter NAME to the class value its type-ARGUMENT
-/// name resolves to, returning the shadowed global for restore. The same
-/// binding `callFuncTyped` installs, exposed for dispatch sites that must
-/// keep the normal member walk (its enclosing pushes) while a committed
-/// inline member's reified parameters stay live.
+/// Bind a reified type-parameter name to the class its type argument names,
+/// returning the shadowed global for restore, as `callFuncTyped` does.
 pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name_in: []const u8) ?Value {
-    // A stamped generic spelling (`List<Int>`) resolves its class by head;
-    // a nullable spelling (`A?`) by the class it names.
+    // A generic spelling resolves by head, a nullable one by the class named.
     const arg_head = if (std.mem.indexOfScalar(u8, arg_name_in, '<')) |lt| arg_name_in[0..lt] else arg_name_in;
     const arg_name = std.mem.trimEnd(u8, arg_head, "?");
     const cls_value: ?Value = blk: {
@@ -1601,14 +1339,11 @@ pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name_in: []co
     return prev;
 }
 
-/// The FULL generic spelling of a bound type argument, kept beside the
-/// class binding under `<tp><>` so a `typeOf<T>()` reached through the
-/// framed body materialises the arguments. Returns the previous value of
-/// the spelling key; null when the spelling carries no arguments (nothing
-/// is bound then).
+/// The full generic spelling of a bound type argument, kept beside the class
+/// binding under the key `<tp><>` so `typeOf<T>()` materialises its arguments.
+/// Returns the key's previous value; null when the spelling has no arguments.
 pub fn bindTypeParamSpelling(self: *VmHost, allocator: Allocator, tp_name: []const u8, arg_name_in: []const u8) ?struct { key: []const u8, prev: ?Value } {
-    // Arguments or nullability: both are the KType's business, and the
-    // class binding alone carries neither.
+    // The class binding carries neither type arguments nor nullability.
     if (std.mem.indexOfScalar(u8, arg_name_in, '<') == null and !std.mem.endsWith(u8, arg_name_in, "?")) return null;
     const key = std.fmt.allocPrint(allocator, "{s}<>", .{tp_name}) catch return null;
     const prev = blk: {
@@ -1637,13 +1372,8 @@ pub fn restoreGlobalBinding(self: *VmHost, name: []const u8, prev: ?Value) void 
     }
 }
 
-/// Threadlocal memo of the two snapshot-core globals the snapshot-fast
-/// `currentSnapshot` serve reads per call: probing the shared globals
-/// cell's reader lock from every worker on every read ping-ponged its
-/// line under the concurrent map test (the serve LOST 30% to the framed
-/// path there while winning 30% single-threaded). Both are top-level
-/// `private val`s — the VALUES never change within a program; the
-/// dispatch-cache generation invalidates across program boundaries.
+/// Threadlocal memo of the two snapshot-core globals `currentSnapshot` reads,
+/// off the shared reader lock; `private val`s, so only the gen invalidates.
 const SnapGlobals = struct { gen: u32 = 0, ts: Value = .Null, gs: Value = .Null };
 threadlocal var snap_globals: SnapGlobals = .{};
 
@@ -1662,8 +1392,7 @@ pub fn composeSnapshotGlobals(self: *VmHost) ?struct { ts: Value, gs: Value } {
 pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
     const allocator = self.allocator;
     var top_prop_buf: [256]u8 = undefined;
-    // A NULLABLE type spelling (`A?` bound as a reified argument) names
-    // the same class; nullability is the KType's business.
+    // A nullable spelling (`A?`) names the same class.
     const name_in = if (std.mem.endsWith(u8, name_in_raw, "?")) name_in_raw[0 .. name_in_raw.len - 1] else name_in_raw;
     const name = topPropReadKey(self, name_in, &top_prop_buf);
     const gtrace = blk: {
@@ -1685,25 +1414,15 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         break :blk g.get().lookup(name);
     };
 
-    // First access to an `object` / companion singleton constructs it —
-    // once, thread-safe — through the shared gate. A non-Instance cached
-    // value still drives the gate: a user object outranks a same-named
-    // implicit stdlib alias pre-defined in globals (`object E` vs
-    // `kotlin.math.E`). Errors cannot surface through this non-throwing
-    // chain (a failed init resolves to null and falls through);
-    // `lookupGlobalThrowing` drives the gate on the throwing read path
-    // and propagates the failure to the access site.
+    // First access constructs the singleton through the shared gate; a
+    // non-Instance cached value still drives it and outranks a stdlib alias.
     if ((cached == null or cached.? != .Instance) and progHasObjectName(self, name)) {
         if (objectSingletonQuiet(self, name)) |v| return v;
     }
 
-    // Top-level property whose own initializer has not produced its value
-    // yet: a deferred prop (`cached == null`) is driven on first access.
-    // During the startup pass an annotated property read ahead of its
-    // initializer resolves to its declared type's default instead — and
-    // that default must surface even when it is `Null` (a forward-read
-    // String prints "null" on the JVM), so it returns before the
-    // Null-dropping unwrap below.
+    // A deferred top-level property is driven on first access. In the startup
+    // pass a read ahead of the initializer takes the declared type's default,
+    // which must surface even as `Null`, so it returns before the unwrap.
     if (cached == null and progHasTopLevelPropInit(self, name)) {
         if (host_impl.pendingTypedDefault(self, name)) |d| return d;
         const r = host_impl.ensureTopLevelInited(self, name) catch return null;
@@ -1714,8 +1433,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         }
     }
 
-    // Any value with a `getValue` operator (member or extension) can be the
-    // delegate: a `String` delegate reads through `String.getValue`.
+    // Any value with a `getValue` operator, member or extension, can delegate.
     if (registryHasDelegatedProp(self, name)) {
         if (cached) |v| {
             if (v != .Null) {
@@ -1728,7 +1446,6 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
 
     if (cached) |v| {
         if (gtrace) std.debug.print("[gtrace] {s} arm=cached kind={s}\n", .{ name, @tagName(v) });
-        // Delegate auto-resolve for top-level `var/val X by <delegate>`.
         if (v == .Delegate) {
             const d = v.Delegate;
             const kind: DelegateKind = blk2: {
@@ -1754,9 +1471,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
                 },
                 .NotNull => |nn| {
                     if (nn.value) |x| return x;
-                    // Reading a `Delegates.notNull` slot before it has
-                    // been written throws IllegalStateException per
-                    // Kotlin; the non-throwing path returns null here.
+                    // Kotlin throws ISE on read-before-write; this path nulls.
                     return null;
                 },
                 .Observable => |ob| {
@@ -1764,9 +1479,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
                 },
             }
         }
-        // A boxed capture (an anon-object method's captured outer `var`)
-        // reads THROUGH the cell; the cell itself is a carrier, never a
-        // user value.
+        // A boxed capture reads through the cell; the cell is a carrier.
         if (v == .Cell) {
             const cg = v.Cell.borrow();
             defer cg.deinit();
@@ -1775,8 +1488,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         return v;
     }
 
-    // User-class lookup: a `Value.Class` lets call sites like `Foo(args)`
-    // dispatch through new_instance and lets reflection resolve.
+    // A `Value.Class` lets `Foo(args)` dispatch and reflection resolve.
     {
         const cg = self.classes.borrow();
         defer cg.deinit();
@@ -1785,25 +1497,15 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         }
     }
 
-    // User-declared top-level function: surface its body via a synthetic
-    // closure value so `val f = ::name; f(args)` routes through call_value.
-    // A bare (unqualified, receiverless) reference must never resolve to
-    // an extension function (a synthetic `this` first param) — prefer a
-    // non-extension same-named sibling, otherwise fall through. A dotted
-    // name is an exact-FQN reference (the lowerer's index-resolved
-    // emission); it binds that one declaration or nothing.
+    // A top-level function surfaces as a synthetic closure for `::name`. A bare
+    // reference never binds an extension; a dotted name is an exact FQN.
     {
         const mg = self.module.borrow();
         defer mg.deinit();
         const m = mg.get();
-        // A dotted name is an exact-FQN reference, but it must still
-        // never bind an extension form: a top-level extension twin
-        // shares the receiverless FQN string (`build` puts no receiver
-        // segment in `Func.fqn`), and a value reference cannot supply
-        // its receiver — so the non-extension declaration under the FQN
-        // is the only candidate.
+        // An extension twin shares the receiverless FQN (`Func.fqn` carries no
+        // receiver segment) and a value reference cannot supply a receiver.
         const by_fqn: ?FuncId = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| pick: {
-            // Match by simple name (lazy-friendly), then confirm the full fqn.
             for (m.funcsBySimpleName(name[dot + 1 ..])) |fid| {
                 const f = m.funcById(fid) orelse continue;
                 if (!std.mem.eql(u8, f.fqn, name)) continue;
@@ -1826,12 +1528,8 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
                 break :pick fid;
             }
         } else null;
-        // A bare simple-name pick must be visible from the executing
-        // reference site: a first-registered namesake from an unimported
-        // foreign package (`androidx...unit.max` for a `kotlin.math.*`
-        // caller) is not Kotlin's target — prefer a visible sibling, or
-        // fall through so the stdlib/intrinsic resolution below serves
-        // the name. Exact-FQN (dotted) references bind as written.
+        // A bare pick must be visible from the reference site: a namesake in an
+        // unimported package is not Kotlin's target. Dotted refs bind as written.
         if (by_fqn == null) {
             if (chosen) |fid| {
                 if (!bareGlobalFnVisible(self, m, fid, name)) {
@@ -1846,14 +1544,8 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
                             break;
                         }
                     }
-                    // Discard the invisible pick only when something
-                    // visible can actually serve the name — a visible
-                    // sibling, or the stdlib/intrinsic resolution below.
-                    // Otherwise keep the lenient pick: turning a
-                    // previously-resolving reference into `unresolved
-                    // global` breaks receivers the walk still serves
-                    // (`LongSparseArray.set` reached through an inline
-                    // splice with no import record at runtime).
+                    // Discard the invisible pick only when a visible sibling
+                    // or the stdlib below can serve the name; else keep it.
                     if (replacement != null) {
                         chosen = replacement;
                     } else {
@@ -1873,13 +1565,8 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         }
     }
 
-    // Stdlib resolution: an exact-FQN reference (the lowerer emits dotted
-    // names fully qualified) resolves directly; a bare simple name
-    // resolves through the link-settled name → FQN maps — the
-    // default-import map over the implicit stdlib surface, then the
-    // pack-binding bare aliases. One deterministic edge per name, built
-    // once by `linkResolvedForms`, replacing the per-call prefix-probe
-    // ladder and the hash-order suffix scan.
+    // Stdlib resolution: a dotted name is an exact FQN; a bare one goes through
+    // the link-settled default-import map, then the pack bare aliases.
     {
         const mapped: ?[]const u8 = if (lookupIntrinsic(self, name) != null)
             name
@@ -1890,11 +1577,8 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         };
         if (mapped) |m| {
             if (lookupIntrinsic(self, m)) |func| {
-                // `m` is a program-lifetime string (the instruction's const-pool
-                // name, or a prog-owned default-import / pack-alias entry), so the
-                // resolved value can borrow it directly: `Intrinsic.fqn` is a raw
-                // slice the collector never frees, and a duped copy would leak on
-                // every discarded bare-name intrinsic reference.
+                // `m` is a program-lifetime string, so `Intrinsic.fqn` borrows
+                // it: never freed, and a dup would leak per discarded reference.
                 const fqn = m;
                 if (trace.enabled(name)) {
                     trace.emit("map=global_fqn name={s} fqn={s}", .{ name, fqn });
@@ -1910,28 +1594,19 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         }
     }
 
-    // `Thread` static surface — a synthetic intrinsic value exposing
-    // `Thread.sleep(ms)` and `Thread.currentThread()`.
     if (std.mem.eql(u8, name, "Thread")) {
         return Value.internIntrinsic("kotlin.concurrent.Thread", threadStaticStub);
     }
 
-    // `Delegates` singleton — a synthetic intrinsic value exposing
-    // `notNull`, `observable`, and `vetoable` member calls.
     if (std.mem.eql(u8, name, "Delegates")) {
         return Value.internIntrinsic("kotlin.properties.Delegates", delegatesStub);
     }
 
-    // Primitive type names — `Int`, `Long`, `String`, etc. — resolve to a
-    // synthetic `Value.Class` so `Int::class` and `Int.MAX_VALUE` work.
     if (isPrimitiveTypeName(name)) {
         const def = primitiveClassDef(allocator, name) catch return null;
         return .{ .Class = def };
     }
 
-    // Primitive-companion constants (`Int.MAX_VALUE`, `Double.NaN`, …).
-    // The IR lowers these as a single dotted-name global ref; split on
-    // `.` and consult the stdlib's primitive-companion table.
     if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
         const ty = name[0..dot];
         const member = name[dot + 1 ..];
@@ -1940,10 +1615,8 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         }
     }
 
-    // Package-qualified reference (not a call) to a user / pack top-level
-    // class. The class table is keyed by simple name, so retry the
-    // trailing segment. Reached only after every other probe returned
-    // null, so a name that already resolves is untouched.
+    // Package-qualified class reference: the class table is keyed by simple
+    // name, so retry the trailing segment once every other probe missed.
     if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
         const tail = name[dot + 1 ..];
         if (!std.mem.eql(u8, tail, name) and tail.len != 0) {
@@ -1955,8 +1628,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         }
     }
 
-    // `typealias Alias = Target` — resolve the alias to the aliased
-    // declaration. Follow chains with a cycle guard.
+    // `typealias Alias = Target`: follow the chain with a cycle guard.
     {
         var seen: std.ArrayListUnmanaged([]const u8) = .empty;
         defer seen.deinit(allocator);
@@ -1993,9 +1665,8 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
         }
     }
     if (!std.mem.startsWith(u8, name, "__klio_topfield__")) {
-        // A top-level `var` with a custom setter: the plain-name write runs
-        // the setter thunk. Its own `field =` write targets the raw
-        // `__klio_topfield__` storage key, which skips this dispatch.
+        // A plain-name write to a `var` with a custom setter runs the setter;
+        // the thunk's own `field =` targets the raw key and skips this.
         const setter_fid: ?ir.FuncId = blk: {
             const mg = self.module.borrow();
             defer mg.deinit();
@@ -2006,9 +1677,8 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
             if (r == .err) return .{ .err = r.err };
             return .{ .ok = {} };
         }
-        // Storage moved to the raw key (custom getter over a backing
-        // field, default setter): a plain-name write with no plain
-        // binding lands on the raw storage binding.
+        // With storage under the raw key (custom getter, default setter), a
+        // plain-name write with no plain binding lands on the raw binding.
         const plain_exists = blk: {
             const g = self.globals.borrow();
             defer g.deinit();
@@ -2044,10 +1714,7 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
         }
     }
 
-    // Delegate-aware write: if the slot currently holds a
-    // `Value.Delegate(NotNull/Observable)`, route the write through the
-    // delegate's setValue semantics. Observable fires its on_change
-    // callback (oldValue, newValue).
+    // A `NotNull`/`Observable` slot takes the write through setValue semantics.
     const existing: ?Value = blk: {
         const g = self.globals.borrow();
         defer g.deinit();
@@ -2086,10 +1753,7 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
         }
     }
 
-    // A boxed capture (shared Cell) takes the write THROUGH the cell so
-    // every holder observes it — an anon-object method writing a captured
-    // outer `var` must not replace the binding in its transient capture
-    // layer.
+    // A boxed capture takes the write through the cell so every holder sees it.
     if (existing) |ev| {
         if (ev == .Cell) {
             const cg = ev.Cell.borrowMut();
@@ -2103,10 +1767,8 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
         }
     }
 
-    // Assign through the scope chain so a write to an existing (top-level)
-    // binding from inside a child scope mutates the real global instead of
-    // shadowing it with a transient local. Only a genuinely new name
-    // defines here.
+    // Assign through the scope chain so a write from a child scope mutates the
+    // real top-level binding; only a genuinely new name defines here.
     const g = self.globals.borrowMut();
     defer g.deinit();
     if (g.get().assign(name, value) != null) {
@@ -2115,9 +1777,8 @@ pub fn storeGlobal(self: *VmHost, allocator: Allocator, name: []const u8, value:
     return .{ .ok = {} };
 }
 
-/// Whether `fid` names `name` in the MAIN module's function table — the id
-/// space lowering commits for cross-module bare calls. A sub-module frame
-/// validates a committed id here before serving it by id.
+/// Whether `fid` names `name` in the MAIN module's table, the id space
+/// lowering commits for cross-module calls; a sub-module frame validates here.
 pub fn mainFuncNameMatches(self: *VmHost, fid: ir.FuncId, name: []const u8) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -2137,24 +1798,16 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
         break :blk g.get().lookup(name);
     };
 
-    // First access to an `object` / companion singleton: construct it and
-    // PROPAGATE an init failure to the access site (the non-throwing
-    // `lookupGlobal` below would swallow it). A non-Instance cached value
-    // still drives the gate — a user object outranks a same-named
-    // implicit stdlib alias pre-defined in globals.
+    // First access constructs the singleton and PROPAGATES an init failure that
+    // the non-throwing `lookupGlobal` below would swallow.
     if ((raw == null or raw.? != .Instance) and progHasObjectName(self, name)) {
         switch (try ensureObjectSingleton(self, name)) {
             .ok => |maybe| if (maybe) |v| return .{ .ok = v },
             .err => |e| return .{ .err = e },
         }
     }
-    // A package-qualified reference to an `object` (`demo.Singleton`,
-    // `androidx…drawscope.Fill`) is keyed by its FQN, not the by-simple-name
-    // object registry, so the read above misses and the raw global is the
-    // classifier. Map the FQN to the object's simple name and resolve through
-    // the SAME path the bare name takes, so both yield the one singleton — but
-    // only when the FQN names a genuine object (its simple name is a registered
-    // object), so a qualified reference to a regular class stays the class value.
+    // A package-qualified `object` reference is keyed by FQN: map it to the
+    // simple name, but only when that name is a registered object.
     if (raw == null or raw.? != .Instance) {
         const obj_simple: ?[]const u8 = blk_obj: {
             const mg = self.module.borrow();
@@ -2189,12 +1842,8 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
         }
     }
 
-    // Top-level delegated property backed by an Instance delegate (e.g.
-    // `by Delegates.notNull()` which inlines to a NotNullProperty
-    // instance): dispatch getValue and PROPAGATE its throw. `lookupGlobal`
-    // calls getValue too but swallows the error and falls back to the
-    // delegate instance, so a NotNullProperty read-before-init silently
-    // yielded the delegate instead of throwing IllegalStateException.
+    // An Instance-backed delegated property dispatches getValue and PROPAGATES
+    // its throw; `lookupGlobal` swallows it and yields the delegate instead.
     if (registryHasDelegatedProp(self, name)) {
         if (raw) |rv| {
             if (rv != .Null) {
@@ -2208,11 +1857,8 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
         }
     }
 
-    // Suspend-implicit `coroutineContext` intrinsic reached as a plain
-    // global read (a top-level suspend body has no receiver to probe):
-    // the active coroutine scope's context, or — from the root driver,
-    // e.g. `suspend fun main` — the empty context. Only when no user
-    // global shadows the name.
+    // `coroutineContext` as a plain global read: the active scope's context, or
+    // the empty context from the root driver, unless a user global shadows it.
     if (raw == null and
         (std.mem.eql(u8, name, "coroutineContext") or
             std.mem.eql(u8, name, "kotlin.coroutines.coroutineContext")) and
@@ -2223,10 +1869,7 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
                 .ok => |v| return .{ .ok = v },
                 .err => {},
             }
-            // A `startCoroutine` completion built by the stdlib
-            // `Continuation(context) {}` factory declares only `context`;
-            // the intrinsic is the current continuation's context, so read
-            // that before falling back to the empty context.
+            // A `Continuation(context) {}` completion declares only `context`.
             switch (try vmhost.host_fields.getField(self, allocator, &scope, "context")) {
                 .ok => |v| return .{ .ok = v },
                 .err => {},
@@ -2239,19 +1882,15 @@ pub fn lookupGlobalThrowing(self: *VmHost, allocator: Allocator, name_in: []cons
     }
 
     const found = lookupGlobal(self, name);
-    // A top-level `lateinit var` is bound by its first write; a read that
-    // finds no binding is the uninitialized access.
+    // A top-level `lateinit var` binds on first write; no binding is the error.
     if (found == null and registryHasLateinitProp(self, name)) {
         return .{ .err = try ir.eval.lateinitThrow(allocator, name) };
     }
     return .{ .ok = found };
 }
 
-/// Whether an ACTIVE scoped-global layer (a runtime-lowered method body's
-/// captured enclosing locals) binds `name`. The layered lookup is the
-/// runtime materialization of a nearer lexical scope, so a hit here
-/// outranks any implicit receiver's EXTENSION property in bare-name
-/// resolution (real members stay nearer — the caller checks those first).
+/// Whether an ACTIVE scoped-global layer (captured enclosing locals) binds
+/// `name`; it is nearer than any receiver's EXTENSION property.
 pub fn scopedLocalBinds(self: *VmHost, name: []const u8) bool {
     const g = self.globals.borrow();
     defer g.deinit();
@@ -2271,10 +1910,6 @@ pub fn isShadowingCapture(self: *VmHost, name: []const u8) bool {
         else => false,
     };
 }
-
-// -------------------------------------------------------------------------
-// Small accessors over the shared program/module tables.
-// -------------------------------------------------------------------------
 
 pub fn progHasObjectName(self: *VmHost, name: []const u8) bool {
     const pg = self.prog.borrow();
@@ -2303,10 +1938,6 @@ pub fn registryHasLateinitProp(self: *VmHost, name: []const u8) bool {
 fn makePropertyRef(allocator: Allocator, name: []const u8) Allocator.Error!Value {
     return .{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
 }
-
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -2338,12 +1969,8 @@ test "ctor guard defaults empty" {
 const root = @import("../interp_ir.zig");
 const Vm = root.Vm;
 
-/// A `VmHost` over an empty-module `Vm`, allocated from a caller-owned
-/// arena. Every shared handle, the env, the program image, and any
-/// synthetic `ClassDef` `lookupGlobal` builds are arena-backed, so a
-/// single `arena.deinit()` reclaims them — the runtime `ClassDef` has no
-/// destructor (it is arena-owned in the real build), so leak-checked
-/// per-handle frees would otherwise report it.
+/// A `VmHost` over an empty-module `Vm`; every handle, the env, the program
+/// image and any synthetic `ClassDef` are arena-backed for one `deinit()`.
 const HostFixture = struct {
     vm: Vm,
     host: VmHost,
@@ -2407,8 +2034,7 @@ test "is_shadowing_capture is false at the top level" {
     const a = arena.allocator();
     var fx = try HostFixture.init(a);
 
-    // The Vm's global env is the root scope (no parent), so a capture can
-    // never shadow it.
+    // The Vm's global env is the root scope, so a capture cannot shadow it.
     try testing.expect(!isShadowingCapture(&fx.host, "anything"));
 }
 
@@ -2418,8 +2044,6 @@ test "object init gate: claim is once per thread, re-entrant, clearable" {
     const a = arena.allocator();
     var fx = try HostFixture.init(a);
 
-    // First claim wins construction; a re-entrant claim on the same
-    // thread observes the in-flight state instead of re-constructing.
     try testing.expect(claimObjectInit(&fx.host, "O") == .construct);
     {
         const second = claimObjectInit(&fx.host, "O");
@@ -2427,7 +2051,6 @@ test "object init gate: claim is once per thread, re-entrant, clearable" {
         try testing.expect(second.reentrant == null);
     }
 
-    // Recording the in-flight shell makes re-entrant access observe it.
     try testing.expect(noteObjectInFlight(&fx.host, "O", .{ .Int = 7 }));
     {
         const third = claimObjectInit(&fx.host, "O");
@@ -2436,12 +2059,10 @@ test "object init gate: claim is once per thread, re-entrant, clearable" {
         try testing.expect(third.reentrant.?.Int == 7);
     }
 
-    // Clearing resolves the entry; the next claim constructs again.
     clearObjectState(&fx.host, "O");
     try testing.expect(claimObjectInit(&fx.host, "O") == .construct);
     clearObjectState(&fx.host, "O");
 
-    // An in-flight note with no entry reports not-gate-driven.
     try testing.expect(!noteObjectInFlight(&fx.host, "P", .{ .Int = 1 }));
 }
 
@@ -2480,7 +2101,6 @@ test "object init gate: unknown names resolve to null without state" {
     const r = try ensureObjectSingleton(&fx.host, "NotAnObject");
     try testing.expect(r == .ok);
     try testing.expect(r.ok == null);
-    // No state entry is left behind for a non-object name.
     const g = fx.host.object_states.borrow();
     defer g.deinit();
     try testing.expect(g.get().count() == 0);
@@ -2500,11 +2120,8 @@ test "object singleton dedup: shared id registry serves a transient globals scop
         try mg.get().class_index.append(a, .{ .name = "O", .id = id });
     }
 
-    // Publish an object instance ONLY into the shared, handle-shared
-    // `singletons_by_id` registry — never into `globals`. This mirrors a
-    // companion / `object` singleton that was first constructed under
-    // another execution context whose `globals` env is a transient
-    // per-coroutine scope, invisible to this context's fast path.
+    // Publish only into the shared registry, never `globals`, mirroring a
+    // singleton built under another context's transient scope.
     const cd = try primitiveClassDef(a, "O");
     const inst_ref = try ObjRef(InstanceData).init(a, .{
         .class = cd,
@@ -2519,9 +2136,6 @@ test "object singleton dedup: shared id registry serves a transient globals scop
         try sg.get().put(id.int(), .{ .Instance = inst_ref });
     }
 
-    // The registry must serve the SAME instance even though the current
-    // `globals` env has no "O" binding — otherwise a second instance is
-    // materialized per scope and `===` against the singleton breaks.
     const got = singletonFromSharedRegistry(&fx.host, "O");
     try testing.expect(got != null);
     try testing.expect(got.? == .Instance);
@@ -2531,6 +2145,5 @@ test "object singleton dedup: shared id registry serves a transient globals scop
         try testing.expectEqual(@as(u64, 4242), gg.get().identity);
     }
 
-    // No class id, or no registry entry for the id, yields null.
     try testing.expect(singletonFromSharedRegistry(&fx.host, "Unregistered") == null);
 }

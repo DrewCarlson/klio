@@ -1,27 +1,9 @@
-//! Shared dispatcher worker pool — the host scheduler behind
-//! `Dispatchers.Default` and `Dispatchers.IO`.
-//!
-//! One pool of real OS worker threads serves both dispatchers, mirroring
-//! the upstream `CoroutineScheduler` model: `Default` is the CPU-bounded
-//! view (at most `max(2, nproc)` of its tasks run concurrently) and `IO`
-//! is the elastic view (up to `max(64, nproc)` workers in total), with
-//! both views drawing from the same threads so a `withContext(IO)` hop
-//! from a `Default` worker can land on the same pool. Per-view execution
-//! is FIFO: a posted task is taken in arrival order whenever its view has
-//! capacity, so no task starves while workers are alive.
-//!
-//! Workers are spawned on demand up to the pool ceiling, park on a
-//! condition variable when idle, and are named
-//! `DefaultDispatcher-worker-N` through the runtime thread-name registry.
-//! The pool is per-run, and its tasks are daemons (upstream `GlobalScope`
-//! semantics: dispatcher work never blocks process exit). `shutdownAndJoin`
-//! runs at the run boundary (from `joinAllThreads`, after the explicit
-//! thread table has drained): it stops the pool, drops still-queued tasks,
-//! asks in-flight tasks to abandon themselves (the evaluator polls the
-//! abandon flag on worker threads, so even a non-terminating daemon body
-//! stops at its next instruction or sleep), joins every worker, and resets
-//! the pool for the next run, so no task or seed handle can dangle into a
-//! reset arena.
+//! Shared dispatcher worker pool behind `Dispatchers.Default` and `Dispatchers.IO`.
+//! One pool of OS threads serves both, mirroring upstream's `CoroutineScheduler`:
+//! `Default` is the CPU-bounded view, `IO` the elastic one, so a `withContext(IO)`
+//! hop stays on the pool. Per-view execution is FIFO; workers spawn on demand to the
+//! ceiling and park on an event when idle. The pool is per-run and its tasks are
+//! daemons (work never blocks process exit), torn down by `shutdownAndJoin`.
 
 const std = @import("std");
 
@@ -35,12 +17,8 @@ const RuntimeError = runtime.RuntimeError;
 const SendableVmSeed = root.SendableVmSeed;
 const TimeMode = root.TimeMode;
 
-/// Which dispatcher view a task was posted through.
 pub const Kind = enum { default, io };
 
-/// One posted runnable: the program-state seed the worker materializes a
-/// child `Vm` from, the runnable closure, and the modes the worker thread
-/// must inherit from the posting run.
 pub const Task = struct {
     seed: SendableVmSeed,
     block: Value,
@@ -49,45 +27,31 @@ pub const Task = struct {
     kind: Kind,
 };
 
-/// `true` while the current thread is a pool worker executing a task.
-/// Lets `outstandingOther` exclude the caller's own task so a blocking
-/// wait run from inside a dispatched body never waits on itself.
+/// True while this thread runs a pool task, so a blocking wait never waits on itself.
 threadlocal var in_pool_task: bool = false;
 
 pub fn onPoolWorker() bool {
     return in_pool_task;
 }
 
-/// The dispatcher worker pool. Instantiable so unit tests can drive a
-/// private pool with a stub runner; production uses the process-global
-/// instance below.
 pub const Pool = struct {
     mutex: runtime.SpinMutex = .{},
-    /// Rung on every post, task completion (a Default cap slot frees), and
-    /// stop, so an idle worker parks on an event instead of polling the
-    /// queue at a millisecond cadence — the 1ms pickup tax serialized
-    /// dispatch-heavy tests (10k launches paid ~half of it each).
+    /// Rung on every post, completion and stop, so an idle worker parks, not polls.
     gate: runtime.EventGate = .{},
-    /// FIFO queues per view. Head-index pops keep posting O(1) without
-    /// shifting; the spine compacts when the head crosses half.
+    /// FIFO per view; head-index pops are O(1) and the spine compacts past half.
     queue_default: Fifo = .{},
     queue_io: Fifo = .{},
     /// Worker join handles, owned by the pool.
     workers: std.ArrayList(std.Thread) = .empty,
-    /// Tasks currently executing, total and per the Default view's cap.
     running: usize = 0,
     running_default: usize = 0,
-    /// Monotonic worker name counter (`DefaultDispatcher-worker-N`).
     worker_seq: usize = 0,
     stopping: bool = false,
-    /// First internal task failure of the run, surfaced at the run
-    /// boundary when the main result was otherwise ok.
+    /// First internal task failure of the run, read at the run boundary.
     first_error: ?RuntimeError = null,
-    /// Executes one task. Production: materialize a child Vm and run the
-    /// block; tests inject a stub.
+    /// Executes one task; production materializes a child Vm, tests inject a stub.
     run_fn: *const fn (task: *Task) ?RuntimeError = runVmTask,
-    /// Releases a task that never ran (dropped at shutdown). Production:
-    /// release the seed's handles through the child-Vm teardown.
+    /// Releases a task that never ran (dropped at shutdown).
     drop_fn: *const fn (task: *Task) void = dropVmTask,
     /// Concurrency cap of the Default view; 0 = derive from nproc.
     default_cap_override: usize = 0,
@@ -125,19 +89,13 @@ pub const Pool = struct {
         }
     };
 
-    /// Allocator backing the pool's own spines (queues, worker list).
-    /// Process-lifetime; task payloads reach into the posting run's value
-    /// graph and are dropped at the run boundary.
+    /// Process-lifetime allocator for the pool's own spines (queues, worker list).
     fn allocator(self: *Pool) Allocator {
         _ = self;
         return std.heap.page_allocator;
     }
 
-    /// `KLIO_MAX_WORKERS`: process-wide ceiling on dispatcher worker
-    /// threads. A test-fleet driver runs several klio processes at once;
-    /// without a ceiling each child's pool can fan out to 64 workers on a
-    /// concurrent burst and the fleet multiplies into full-machine
-    /// saturation. 0 = unset (built-in defaults).
+    /// `KLIO_MAX_WORKERS`: process-wide ceiling on worker threads; 0 means unset.
     fn envWorkerCap() usize {
         const S = struct {
             var cached = std.atomic.Value(usize).init(std.math.maxInt(usize));
@@ -152,8 +110,7 @@ pub const Pool = struct {
         return v;
     }
 
-    /// `getCpuCount` is a sysctl SYSCALL; `maxWorkers` runs on every task
-    /// post, so resolve the count once per process.
+    /// `getCpuCount` is a syscall and `maxWorkers` runs on every post, so cache it.
     fn cpuCountCached() usize {
         const S = struct {
             var cached: std.atomic.Value(usize) = .init(0);
@@ -170,10 +127,7 @@ pub const Pool = struct {
         const n = cpuCountCached();
         const cap = envWorkerCap();
         if (cap != 0) return @max(2, @min(cap, n));
-        // HALF the cores by default: several harness instances routinely run
-        // side by side (sweeps, gates, editors), and a full-width compute
-        // pool per instance starves the machine. `KLIO_MAX_WORKERS` widens
-        // a single instance when it owns the box.
+        // Half the cores by default: several harness instances routinely run side by side.
         return @max(2, (n + 1) / 2);
     }
 
@@ -181,16 +135,12 @@ pub const Pool = struct {
         if (self.max_workers_override != 0) return self.max_workers_override;
         const cap = envWorkerCap();
         if (cap != 0) return @max(2, cap);
-        // The elastic IO ceiling: parked workers cost address space and
-        // scheduler noise, not compute, but a 64-thread floor made every
-        // instance a ~67-thread process. 16 keeps IO bursts overlapped;
-        // `KLIO_MAX_WORKERS` raises it for genuinely wide IO workloads.
+        // Elastic IO ceiling: parked workers cost address space, not compute.
         return @max(16, cpuCountCached());
     }
 
-    /// Post a task. Spawns a worker when none is idle and the pool is
-    /// below its ceiling. A post into a stopping pool is dropped (the
-    /// run is past its boundary; dispatcher threads are daemons).
+    /// Post a task, spawning a worker when none is idle and the pool is below its
+    /// ceiling. A post into a stopping pool is dropped.
     pub fn post(self: *Pool, task: Task) Allocator.Error!void {
         gcInstallPoolRoot();
         const a = self.allocator();
@@ -206,21 +156,17 @@ pub const Pool = struct {
                 .default => try self.queue_default.push(a, task),
                 .io => try self.queue_io.push(a, task),
             }
-            // Spawn against the backlog: every queued task deserves a
-            // worker until the pool ceiling, so a burst of 80 IO posts
-            // reaches the elastic view's full parallelism instead of
-            // trickling through the first few workers.
+            // Spawn against the backlog so an IO burst reaches the view's full width.
             const idle = self.workers.items.len - self.running;
             const backlog = self.queue_default.len() + self.queue_io.len();
             if (idle < backlog and self.workers.items.len < self.maxWorkers()) {
-                // Spawn under the lock so a concurrent shutdown can never
-                // observe a reserved-but-unstarted handle.
+                // Spawn under the lock so a concurrent shutdown never sees a
+                // reserved-but-unstarted handle.
                 self.worker_seq += 1;
                 const handle = std.Thread.spawn(.{ .stack_size = 64 * 1024 * 1024 }, workerMain, .{ self, self.worker_seq }) catch null;
                 if (handle) |h| {
                     self.workers.append(a, h) catch {
-                        // Untracked worker: let it run as a detached
-                        // daemon; it exits on the stopping flag.
+                        // Untracked worker: runs detached and exits on the stopping flag.
                         h.detach();
                     };
                 } else {
@@ -231,10 +177,8 @@ pub const Pool = struct {
         self.gate.ring();
     }
 
-    /// Queued + running tasks, excluding the task the calling thread is
-    /// itself executing. The cooperative driver's idle wait consults this
-    /// so `runBlocking` does not return while dispatched work that could
-    /// still resume one of its coroutines is in flight.
+    /// Queued plus running tasks, excluding the caller's own, so `runBlocking` waits out
+    /// work that could resume its coroutines.
     pub fn outstandingOther(self: *Pool) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -243,7 +187,6 @@ pub const Pool = struct {
         return total;
     }
 
-    /// First internal task failure recorded this run, if any.
     pub fn takeFirstError(self: *Pool) ?RuntimeError {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -252,15 +195,9 @@ pub const Pool = struct {
         return e;
     }
 
-    /// Run-boundary teardown. Dispatcher tasks are daemons (the
-    /// upstream `GlobalScope` model): stop accepting work, ask every
-    /// in-flight task to abandon itself (the evaluator and the host
-    /// sleep primitives poll the abandon flag on worker threads), join
-    /// every worker, drop still-queued tasks, and reset the pool for
-    /// the next run. `first_error` is NOT cleared here: it carries the
-    /// run's first internal task failure to `takeFirstError`, which the
-    /// run boundary reads strictly after this join and which owns the
-    /// per-run reset.
+    /// Run-boundary teardown: stop accepting work, ask in-flight tasks to abandon (the
+    /// evaluator and host sleeps poll that flag), join every worker, drop queued tasks,
+    /// reset. `first_error` survives for `takeFirstError`, read strictly after this join.
     pub fn shutdownAndJoin(self: *Pool) void {
         const a = self.allocator();
         var handles: std.ArrayList(std.Thread) = .empty;
@@ -306,8 +243,7 @@ pub const Pool = struct {
         self.stopping = false;
     }
 
-    /// Take the next runnable task in view-FIFO order, honoring the
-    /// Default view's concurrency cap. Caller holds the mutex.
+    /// Take the next task in view-FIFO order under the Default cap. Caller holds the mutex.
     fn takeEligible(self: *Pool) ?Task {
         if (self.running_default < self.defaultCap()) {
             if (self.queue_default.pop()) |t| {
@@ -335,33 +271,27 @@ pub const Pool = struct {
         while (true) {
             var task: Task = blk: {
                 while (true) {
-                    // Epoch BEFORE the emptiness check: a post landing
-                    // between the check and the wait bumps it, so the wait
-                    // returns immediately (same protocol as the pumps).
+                    // Epoch read BEFORE the emptiness check: a post landing between the
+                    // two bumps it, so the wait returns immediately.
                     const seen = self.gate.epochNow();
                     {
                         self.mutex.lock();
                         defer self.mutex.unlock();
-                        // Stopping wins over the backlog: a stopping pool
-                        // drops queued daemon tasks instead of executing
-                        // them (the run is past its boundary).
+                        // Stopping wins over the backlog: queued daemon tasks are
+                        // dropped, not run.
                         if (self.stopping) return;
                         if (self.takeEligible()) |t| break :blk t;
                     }
-                    // Idle park: event-wait until a task arrives, a
-                    // Default cap slot frees, or the run ends; the 1ms cap
-                    // keeps the abandon poll cadence. The gate wait
-                    // brackets the GC blocking-safe region, so an idle
-                    // worker never stalls a collection's rendezvous.
+                    // Idle park; the 1ms cap paces the abandon poll and the wait is
+                    // GC-safe.
                     self.gate.waitFrom(seen, 1_000);
                 }
             };
             in_pool_task = true;
             runtime.setThreadAbandonable(true);
             const err = self.run_fn(&task);
-            // An abandoned task aborts cooperatively at the run
-            // boundary; its unwind error is the abandonment itself,
-            // not a task failure to surface.
+            // An abandoned task's unwind error is the abandonment, not a failure to
+            // surface.
             const abandoned = runtime.shouldAbandon();
             runtime.setThreadAbandonable(false);
             in_pool_task = false;
@@ -380,27 +310,20 @@ pub const Pool = struct {
     }
 };
 
-/// Production task runner: materialize a child `Vm` from the task's seed
-/// on this worker thread and run the block, inheriting the posting run's
-/// time and reclaim modes (the same contract as `workerEntry` for
-/// `kotlin.concurrent.thread`).
+/// Materialize a child `Vm` from the task's seed on this worker thread and run the
+/// block under the posting run's modes.
 fn runVmTask(task: *Task) ?RuntimeError {
     root.setCoroutineTimeMode(task.time_mode);
     runtime.setReclaim(task.reclaim);
-    // This task was counted "unsettled" on the virtual clock at dispatch (so a
-    // top-level driver could not advance time across the dispatch→start gap).
-    // Arm the per-thread flag so its pump's first published barrier floor
-    // settles it; settle on return if the body never published.
+    // The task counted as unsettled on the virtual clock at dispatch; its pump's first
+    // barrier floor settles it.
     coroutines.poolTaskRunBegin();
     defer coroutines.poolTaskRunEnd();
-    // The block left the queue, so its closure is reachable only through this
-    // stack local now; pin it on the keepalive stack so a collection during the
-    // task keeps the closure's capture store + chain alive.
+    // The block is reachable only through this stack local now; pin it for the task.
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     runtime.keepalivePush(task.block);
-    // Balance the post-time retain on the block; runs after `vm.deinit`
-    // (LIFO) so the block stays live for the whole task.
+    // Balance the post-time retain; runs after `vm.deinit` (LIFO).
     defer if (runtime.reclaimEnabled()) task.block.release(task.seed.allocator);
     var vm = task.seed.materialize() catch {
         return .{ .Type = "failed to materialize dispatch worker Vm" };
@@ -423,11 +346,9 @@ fn runVmTask(task: *Task) ?RuntimeError {
     };
 }
 
-/// Drop a task that never ran (pool stopping). The seed's handles are
-/// released through the same child-Vm teardown a completed task uses.
+/// Drop a task that never ran; the seed's handles release through child-Vm teardown.
 fn dropVmTask(task: *Task) void {
-    // The task was counted "unsettled" at dispatch and will never run; release
-    // that count so a virtual-clock gate is not held by a dropped task.
+    // Release the dispatch-time unsettled count so no virtual-clock gate is held.
     coroutines.poolTaskSettleDropped();
     if (runtime.reclaimEnabled()) task.block.release(task.seed.allocator);
     var vm = task.seed.materialize() catch return;
@@ -441,12 +362,9 @@ pub fn globalPool() *Pool {
     return &global_pool;
 }
 
-// GC root: a queued task's block is an `IrClosure` reachable only through the
-// pool FIFO until a worker dequeues it, so the collector must mark it or its
-// closure would be reclaimed before it runs. The in-flight (dequeued, running)
-// block is pinned by the worker via the keepalive stack in `runVmTask` /
-// `workerEntry`. Marking runs during stop-the-world with every worker parked at
-// a safe point, so the pool mutex is uncontended here.
+// GC root: a queued task's block is reachable only through the pool FIFO until a worker
+// dequeues it; a running block is pinned by its worker's keepalive stack. Marking runs
+// stop-the-world with every worker parked, so the pool mutex is uncontended here.
 var pool_root_registered = std.atomic.Value(bool).init(false);
 
 fn gcInstallPoolRoot() void {
@@ -464,30 +382,22 @@ fn gcMarkPool(m: *runtime.gc.Marker) void {
     for (qi.items.items[qi.head..]) |*t| t.block.gcMark(m);
 }
 
-/// Post onto the global pool.
 pub fn post(task: Task) Allocator.Error!void {
     return global_pool.post(task);
 }
 
-/// Outstanding dispatched work (queued + running, excluding the calling
-/// worker's own task) on the global pool.
 pub fn outstandingOther() usize {
     return global_pool.outstandingOther();
 }
 
-/// Run-boundary teardown of the global pool.
 pub fn shutdownAndJoin() void {
     global_pool.shutdownAndJoin();
 }
 
-/// Surface the first internal dispatched-task failure of the run.
 pub fn takeFirstError() ?RuntimeError {
     return global_pool.takeFirstError();
 }
 
-// -------------------------------------------------------------------------
-// Tests — pool mechanics with a stub runner (no Vm).
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -537,8 +447,7 @@ fn posterMain(pool: *Pool, n: usize, kind: Kind) void {
 
 test "pool runs every task posted from many threads and joins clean" {
     var pool: Pool = .{ .run_fn = countingRunner, .drop_fn = noopDrop, .default_cap_override = 3, .max_workers_override = 6 };
-    // The stub runner never touches the seed, so dropTask must not run
-    // (no queued task may remain at shutdown after the drain below).
+    // The stub runner never touches the seed, so no queued task may remain at shutdown.
     test_counter.store(0, .release);
     test_concurrent.store(0, .release);
     test_max_concurrent.store(0, .release);
@@ -550,7 +459,6 @@ test "pool runs every task posted from many threads and joins clean" {
     }
     for (&posters) |p| p.join();
 
-    // Every posted task must eventually run while workers are alive.
     var spins: usize = 0;
     while (test_counter.load(.acquire) < 100 and spins < 10_000) : (spins += 1) {
         runtime.clockSleepMillis(1);
@@ -559,7 +467,6 @@ test "pool runs every task posted from many threads and joins clean" {
     try testing.expectEqual(@as(usize, 0), pool.outstandingOther());
 
     pool.shutdownAndJoin();
-    // The pool resets for the next run.
     try testing.expectEqual(@as(usize, 0), pool.workers.items.len);
     try testing.expect(!pool.stopping);
 }
@@ -645,8 +552,6 @@ test "single-worker pool executes tasks in FIFO order" {
 
 test "shutdown drops queued tasks and resets for reuse" {
     var pool: Pool = .{ .run_fn = countingRunner, .drop_fn = noopDrop, .default_cap_override = 1, .max_workers_override = 1 };
-    // No worker ever spawns if we mark stopping before posting; instead
-    // exercise the reset path: post, shut down, then reuse.
     try pool.post(stubTask(.default));
     pool.shutdownAndJoin();
     try testing.expect(!pool.stopping);

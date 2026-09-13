@@ -1,9 +1,6 @@
-//! `VmHost` class-side dispatch: `is`/`as` checks (`instance_of`,
-//! `is_concrete_cast_target`) and runtime class registration for
-//! locally-declared / anonymous-object classes lowered during eval.
-//!
-//! Free functions over `*VmHost`, aliased as `VmHost` methods by
-//! `vmhost.zig` and invoked directly by the generic IR evaluator.
+//! `VmHost` class-side dispatch: `is`/`as` checks and runtime registration of
+//! local and anonymous-object classes lowered during eval. Free functions over
+//! `*VmHost`, aliased as methods by `vmhost.zig`.
 
 const std = @import("std");
 
@@ -40,14 +37,8 @@ const MaybeValueResult = ir.eval.MaybeValueResult;
 const TypeRef = ir.TypeRef;
 const UnitResult = ir.eval.UnitResult;
 
-/// Whether `name` denotes a concrete type a checked cast can test
-/// against (user/pack class, a reified type-param bound to a class,
-/// or a builtin). Anything else is an erased type parameter, for
-/// which `x as <that>` is an unchecked, non-throwing cast.
-/// Whether the program or a loaded library declares a class spelled `name`.
-/// Whether a class spelled `name` is declared in package `pkg`: the
-/// program's own `class B` makes `as? B` a real check at a site in that
-/// package, while a library function's `as T` never sees it.
+/// Whether a class spelled `name` is declared in package `pkg`: the program's
+/// own `class B` makes `as? B` a real check only at a site in that package.
 pub fn isDeclaredClassNameFrom(self: *VmHost, name: []const u8, pkg: []const u8) bool {
     const n = std.mem.trimEnd(u8, name, "?");
     if (n.len == 0) return false;
@@ -59,15 +50,14 @@ pub fn isDeclaredClassNameFrom(self: *VmHost, name: []const u8, pkg: []const u8)
     return std.mem.eql(u8, mod.classes.items[cid.int()].package, pkg);
 }
 
+/// Whether `name` denotes a concrete type a checked cast can test against.
+/// Anything else is an erased type parameter, whose `x as <that>` never throws.
 pub fn isConcreteCastTarget(self: *VmHost, name: []const u8) bool {
     const n = std.mem.trimEnd(u8, name, "?");
     if (n.len == 0) return false;
-    // A nested spelling (`MutableMap.MutableEntry`) is as concrete as its
-    // last segment.
     if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| {
         if (dot + 1 < n.len and isBuiltinTypeName(n[dot + 1 ..])) return true;
     }
-    // A user / pack class declaration.
     {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -78,9 +68,7 @@ pub fn isConcreteCastTarget(self: *VmHost, name: []const u8) bool {
         defer cg.deinit();
         if (cg.get().contains(n)) return true;
     }
-    // A reified type parameter bound to a concrete class value at the
-    // call site (`Value::Class` whose name differs from the bare param
-    // name) — the cast can be checked against it.
+    // A reified type param bound to a `.Class` of a different name is checkable.
     {
         const gg = self.globals.borrow();
         defer gg.deinit();
@@ -98,8 +86,6 @@ pub fn isConcreteCastTarget(self: *VmHost, name: []const u8) bool {
     return isBuiltinTypeName(n);
 }
 
-/// Whether a closure body kept an unconstrained parser-injected `it`
-/// (see `Func.lambda_it_unconstrained`).
 fn closureIsSuspend(self: *VmHost, body_func: ir.FuncId, sub_module: ?*const ir.Module) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -117,24 +103,16 @@ fn closureItUnconstrained(self: *VmHost, body_func: ir.FuncId, sub_module: ?*con
 }
 
 pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
-    // `null is T?` is true for any nullable type. `null is T`
-    // (non-null T) is false.
+    // `null is T?` holds for any nullable type; `null is T` does not.
     if (value.* == .Null) return ty.nullable;
-    // A function-local class is spelled by its `$lc<fn>` alias in lowered
-    // type names; at runtime it registers under its bare name, so the check
-    // resolves the bare name (the frame's or the latest registered class).
+    // A local class is spelled `$lc<fn>` in lowered types, registered bare.
     if (std.mem.indexOf(u8, ty.name, "$lc")) |lci| {
         return instanceOf(self, value, .{ .name = ty.name[0..lci], .nullable = ty.nullable, .args = ty.args });
     }
 
-    // Reified type parameter resolution: the inline-fn splice binds the
-    // reified type-param name (e.g. `T`) to the call-site type
-    // argument's class value as a global. An `x is T` check against the
-    // unresolved type-param name redirects to a check against that bound
-    // class's simple name. Only fires when the type name is not already
-    // a class in the module — otherwise a legitimate `is Foo` check
-    // where `Foo` happens to be registered as a global would recurse
-    // forever resolving its own name.
+    // A reified type param is a global bound to the call-site class value, so
+    // `x is T` redirects to it. Gated on the name not being a module class, or
+    // an `is Foo` whose `Foo` is also a global would recurse forever.
     {
         const module_has_class = blk: {
             const mg = self.module.borrow();
@@ -162,14 +140,10 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         }
     }
 
-    // `Any` is the universal supertype for non-null values.
     if (std.mem.eql(u8, ty.name, "Any")) return true;
 
-    // Typealias indirection: an `is`/`as` against an alias head
-    // (`typealias TR = Unit`) behaves as against the aliased target.
-    // Only when no real class owns the name; an `expect class` stub that
-    // an `actual typealias` supersedes is handled by the last-resort
-    // unfold at the end of this function.
+    // A typealias head behaves as its target, but only when no real class owns
+    // the name; an `expect class` stub falls to the last-resort unfold below.
     {
         const module_has_class = blk: {
             const mg = self.module.borrow();
@@ -183,11 +157,8 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         }
     }
 
-    // Reflection-style checks against synth bound refs. `Box::v` lowers
-    // as an Instance with `__bound_receiver__` (a Class for unbound prop
-    // refs, an Instance for bound method refs). Match KProperty /
-    // KFunction / KCallable accordingly so `is`-checks return what
-    // kotlinc produces.
+    // In a synth bound ref, `__bound_receiver__` is a Class for an unbound
+    // property ref, an Instance for a bound method ref.
     if (isReflectionTypeName(ty.name)) {
         switch (value.*) {
             .Instance => |inst| {
@@ -207,8 +178,6 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
             },
             else => {},
         }
-        // `::greet` for a top-level fn surfaces as a Value::IrClosure (or
-        // Function). Treat those as KFunction / KCallable.
         switch (value.*) {
             .IrClosure => {
                 return std.mem.eql(u8, ty.name, "KFunction") or
@@ -222,8 +191,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     }
 
     if (std.mem.eql(u8, ty.name, "KClass")) return value.* == .Class;
-    // `x is Enum<*>`: every enum entry is an instance of a class registered
-    // with `is_enum` (kotlin.Enum is its implicit supertype).
+    // `x is Enum<*>`: every enum entry's class is registered `is_enum`.
     if (std.mem.eql(u8, ty.name, "Enum")) {
         if (value.* == .Instance) {
             const g = value.Instance.borrow();
@@ -240,13 +208,9 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         };
     }
 
-    // Builtin collection / array / range values match their Kotlin
-    // supertype names. klio represents these as host value variants (not
-    // user Instances), so without this an `is`/`as` against
-    // List/Collection/Iterable/Array/Set/Map/range fails. Mutable views
-    // match the Mutable* supertypes too — the read-only/mutable
-    // distinction is erased on the JVM, so kotlinc reports `listOf(…) is
-    // MutableList` as true; match that.
+    // Collections, arrays and ranges are host value variants, not user Instances,
+    // so they match their Kotlin supertype names here. Mutable views match the
+    // `Mutable*` names too: kotlinc reports `listOf(…) is MutableList` as true.
     switch (value.*) {
         .Array => {
             if (std.mem.eql(u8, ty.name, "Array")) return true;
@@ -276,8 +240,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                 "IntProgression", "LongProgression", "CharProgression", "Iterable",
             })) return true;
             // A `..` range (step 1) is also an XRange / ClosedRange; a downTo,
-            // stepped, or reversed progression is only a progression — even
-            // with step 1 (`1..10 step 1` is an IntProgression, not IntRange).
+            // stepped or reversed progression is not, even at step 1.
             if (r.step == 1 and !r.progression and matchesAny(ty.name, &.{
                 "IntRange", "LongRange", "CharRange", "ClosedRange", "OpenEndRange",
             })) return true;
@@ -285,9 +248,6 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         else => {},
     }
 
-    // Lambda / function values match `Function<R>`, `Function0`,
-    // `Function1`, `Function2`, … (the arity-indexed `FunctionN`
-    // hierarchy from kotlin.jvm.functions).
     switch (value.*) {
         .IrClosure => |c| {
             if (std.mem.eql(u8, ty.name, "Function")) return true;
@@ -295,11 +255,9 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
             if (is_suspend_name or std.mem.startsWith(u8, ty.name, "Function")) {
                 const rest = ty.name[(if (is_suspend_name) "SuspendFunction".len else "Function".len)..];
                 if (rest.len != 0 and allAsciiDigit(rest)) {
-                    // `FunctionN` names an arity: the closure's declared
-                    // parameters plus its receiver (`Foo.() -> R` is
-                    // `Function1<Foo, R>`), the way kotlinc's `instanceof`
-                    // sees it. A suspend closure is `SuspendFunctionN` and,
-                    // carrying its continuation, `Function(N+1)`.
+                    // `FunctionN` counts the declared parameters plus the
+                    // receiver (`Foo.() -> R` is `Function1<Foo, R>`). A suspend
+                    // closure is `SuspendFunctionN` and `Function(N+1)`.
                     const want = std.fmt.parseInt(usize, rest, 10) catch return true;
                     const info = self.closures.get(c.asPtr().id) orelse return true;
                     var have = info.n_params + @as(usize, @intFromBool(info.has_receiver));
@@ -314,12 +272,9 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         else => {},
     }
 
-    // Dotted nested-class names (`S.A`, `Outer.Inner`) — match by the
-    // last segment, which corresponds to the lifted top-level class name
-    // in our module table. A user-`Instance` value keeps the full dotted
-    // name so the identity-aware hierarchy walk below can reject a
-    // same-simple-name class from another package (`c is b.Shape` when the
-    // instance's supertype is `a.Shape`).
+    // A dotted nested-class name matches by its last segment, the lifted top-level
+    // name in the module table. A user Instance keeps the full dotted name, so the
+    // identity walk below can reject another package's class.
     if (value.* != .Instance) {
         if (std.mem.indexOfScalar(u8, ty.name, '.')) |_| {
             if (std.mem.lastIndexOfScalar(u8, ty.name, '.')) |i| {
@@ -330,12 +285,9 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         }
     }
 
-    // Generic type-parameter casts (`x as T`) are erased at runtime —
-    // Kotlin matches them unchecked. Single-letter (or short uppercase)
-    // type names are conventionally generic parameters and have no class
-    // entry; treat them as accept-any-non-null — unless the call site
-    // bound a reified type-param to a concrete `Value::Class`, in which
-    // case redirect the check to that class's name.
+    // Generic type-parameter casts are erased and match unchecked: a single-letter
+    // name with no class entry accepts any non-null, unless a reified bind
+    // redirects the check to a concrete class.
     if (matchesAny(ty.name, &.{
         "T", "U", "V", "K", "R", "E", "X", "Y", "Z", "A", "B", "C", "D",
     })) {
@@ -368,10 +320,8 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         }
     }
 
-    // Exception values match by walking the builtin Throwable hierarchy.
-    // The nominal type for every Exception loses the specific class name,
-    // so resolve `catch (e: IllegalArgumentException)` against the throw
-    // site's actual fqn here.
+    // An Exception's nominal type loses the specific class name, so match against
+    // the throw site's actual fqn through the builtin Throwable hierarchy.
     switch (value.*) {
         .Exception => |e| {
             const g = e.fqn.borrow();
@@ -381,7 +331,6 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
         else => {},
     }
 
-    // User-class instance: walk the runtime ClassDef chain.
     switch (value.*) {
         .Instance => |inst| {
             const builtin_exception_names = [_][]const u8{
@@ -393,13 +342,9 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                 "ClassCastException",            "NumberFormatException",
                 "UnsupportedOperationException", "Any",
             };
-            // Resolve the target once: its simple name (for a same-name
-            // match) and, when it unambiguously denotes a registered class,
-            // its FQN (for an identity check that rejects a same-simple-name
-            // class in another package). The parent/interface chain is already
-            // linked package-aware (`build_module` resolves each supertype in
-            // its own package), so walking it and comparing by identity is
-            // collision-proof.
+            // The target's FQN resolves only when it unambiguously denotes a
+            // registered class, letting the identity check reject another
+            // package's same-simple-name class.
             const target_simple = lastSegment(ty.name);
             const target_fqn = resolveClassFqn(self, ty.name);
             var cur: ?ObjRef(ClassDef) = blk: {
@@ -416,14 +361,9 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                 if (subtypeMatch(self, cdef.name, cdef.fqn, target_simple, target_fqn, ty.name)) {
                     return true;
                 }
-                // Direct + transitive interface supertypes.
                 if (interfaceChainMatches(self, cdef, target_simple, target_fqn, ty.name)) return true;
-                // Walk supertype names — covers chains where the direct parent
-                // is a built-in class not in the user class table. A target
-                // that names a definite registered class is matched by identity
-                // via the parent/interface walks above, so a supertype name is
-                // matched directly only for a builtin / ambiguous simple-name
-                // target (where identity resolution is unavailable).
+                // Supertype names cover chains whose parent is a builtin absent
+                // from the class table; matched by name only when no identity.
                 for (cdef.supertype_names) |sup| {
                     if (target_fqn == null and std.mem.eql(u8, sup, target_simple)) return true;
                     if (containsStr(&builtin_exception_names, sup) and
@@ -433,19 +373,14 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
                     for (cdef.supertype_names) |n| {
                         if (std.mem.eql(u8, n, target_simple)) return true;
                     }
-                    // An anonymous class records only the supertypes it was
-                    // WRITTEN with, and those are names, not resolved
-                    // handles: `object : KSerializer<Int> by …` never filled
-                    // `interfaces`, so the direct-name test above was the
-                    // whole answer and `is SerializationStrategy` — which
-                    // `KSerializer` extends — said false.
+                    // An anonymous class records its written supertypes as names,
+                    // never resolved handles, so the walk resolves them itself.
                     if (supertypeNameChainMatches(self, cdef, target_simple, target_fqn, ty.name)) return true;
                 }
                 if (cdef.parent) |parent| {
                     cur = parent.clone();
                 }
             }
-            // `Any` matches every instance.
             if (std.mem.eql(u8, ty.name, "Any")) return true;
             return false;
         },
@@ -460,20 +395,15 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     {
         return true;
     }
-    // Builtin runtime types satisfy their nominal supertypes.
     if (value.isRuntimeType(ty.name)) return true;
-    // Last resort: a typealias registered under the name (an `expect class`
-    // whose platform `actual` is a typealias keeps a class stub in the
-    // module, so the eager unfold above was gated off) — match against
-    // the aliased target.
+    // Last resort: a typealias the eager unfold skipped because an `expect class`
+    // stub still owns the name in the module.
     if (typeAliasTarget(self, ty.name)) |t| {
         return instanceOf(self, value, .{ .name = t, .nullable = ty.nullable, .args = ty.args });
     }
     return false;
 }
 
-/// Resolve a (possibly chained) `typealias` head to its final target, or
-/// null when the name is not an alias.
 fn typeAliasTarget(self: *VmHost, name: []const u8) ?[]const u8 {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -488,14 +418,8 @@ fn typeAliasTarget(self: *VmHost, name: []const u8) ?[]const u8 {
     return cur;
 }
 
-/// Walk a class's direct + transitive interface supertypes, matching the
-/// target against each by identity (`subtypeMatch`). The `interfaces` slices
-/// are linked package-aware, so the walk follows the real interface hierarchy;
-/// a same-simple-name interface in another package cannot be reached.
-/// Whether any TRANSITIVE supertype of a class recorded by NAME matches the
-/// target. `interfaceChainMatches` walks resolved `interfaces` handles, which
-/// a runtime-synthesized class never has; this resolves each recorded name to
-/// its registered declaration and continues from there.
+/// Whether any transitive supertype recorded by NAME matches the target: a
+/// runtime-synthesized class has no resolved `interfaces` handles to walk.
 fn supertypeNameChainMatches(
     self: *VmHost,
     cdef: *const ClassDef,
@@ -514,8 +438,6 @@ fn supertypeNameChainMatches(
         const name = queue.items[head];
         if (containsStr(seen.items, name)) continue;
         seen.append(a, name) catch return false;
-        // A supertype with no class of its own (an erased `FunctionN`
-        // name, a builtin interface) matches the target by name.
         if (target_fqn == null and std.mem.eql(u8, name, target_simple)) return true;
         const def = classDefByNameLocal(self, name) orelse continue;
         defer def.deinit();
@@ -545,6 +467,8 @@ fn classDefByNameLocal(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
     return null;
 }
 
+/// Walk a class's interface supertypes, matching each by identity. The
+/// `interfaces` slices are linked package-aware, so no other package leaks in.
 fn interfaceChainMatches(
     self: *VmHost,
     cdef: *const ClassDef,
@@ -558,8 +482,7 @@ fn interfaceChainMatches(
         for (queue.items) |q| q.deinit();
         queue.deinit(a);
     }
-    // Dedup by FQN (identity): two same-simple-name interfaces from different
-    // packages must each be walked, never collapsed into one.
+    // Dedup by FQN: two same-simple-name interfaces must each be walked.
     var seen: std.ArrayList([]const u8) = .empty;
     defer seen.deinit(a);
 
@@ -582,16 +505,13 @@ fn interfaceChainMatches(
         if (containsStr(seen.items, idef.fqn)) continue;
         seen.append(a, idef.fqn) catch return false;
         if (subtypeMatch(self, idef.name, idef.fqn, target_simple, target_fqn, raw_target)) return true;
-        // Builtin / ambiguous interface supertypes (e.g. `Comparable`) are not
-        // resolved into `interfaces`; match them by simple name only when the
-        // target is not a definite registered class (identity unavailable).
+        // Builtin interface supertypes are absent from `interfaces`; match by
+        // simple name only when identity is unavailable.
         if (target_fqn == null) {
             for (idef.supertype_names) |sup| {
                 if (std.mem.eql(u8, sup, target_simple)) return true;
             }
         }
-        // Resolved interface supertypes, walked by identity (never re-resolved
-        // from a collidable simple name).
         for (idef.interfaces) |sup| {
             queue.append(a, sup.clone()) catch return false;
         }
@@ -599,23 +519,18 @@ fn interfaceChainMatches(
     return false;
 }
 
-/// Best-effort builtin-Throwable parent walk used for `Value.Exception`
-/// `is`/`as` matches when the target is one of the exception class's
-/// known parents. The common case here is the immediate parent.
 fn builtinExceptionParentMatch(tail: []const u8, target: []const u8) bool {
     return runtime.Value.builtinThrowableIsA(tail, target);
 }
 
 /// `(class, member)` key for `anon_methods`, unit-separated. Must match
-/// `run.zig`/`host_fields.zig`/`host_call_member.zig`.
+/// `run.zig`, `host_fields.zig` and `host_call_member.zig`.
 fn anonKey(allocator: Allocator, class_name: []const u8, member: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ class_name, member });
 }
 
-/// The captured scope of the local class being registered. A supertype
-/// naming a sibling local class resolves to the captured `.Class` value:
-/// that is the registration in scope at the declaration, where the by-name
-/// class table holds only the latest one.
+/// Captured scope of the local class being registered: a supertype naming a
+/// sibling resolves to that `.Class`, as the by-name table holds only the last.
 threadlocal var registering_captures: []const NameValue = &.{};
 
 fn capturedClass(name: []const u8) ?ObjRef(ClassDef) {
@@ -625,8 +540,7 @@ fn capturedClass(name: []const u8) ?ObjRef(ClassDef) {
     return null;
 }
 
-/// Synthesize a runtime `ClassDef` matching `build_module`'s shape for a
-/// local (function-body) class lowered at runtime.
+/// Synthesize the `ClassDef` shape `build_module` produces, for a local class.
 fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!ObjRef(ClassDef) {
     var primary_params = try allocator.alloc(ClassParamDef, class.primary_params.len);
     for (class.primary_params, 0..) |*p, i| {
@@ -679,10 +593,8 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         supertype_paths[i] = t.qualified_path;
     }
 
-    // Local classes are registered after the program class graph has been
-    // linked, so connect their direct parent/interface handles here. Keeping
-    // only the written supertype names makes a direct `is Base` check work but
-    // loses Base's transitive interfaces (`Segment` -> `NotCompleted`).
+    // Local classes register after the class graph is linked, so connect their
+    // parent/interface handles here: names alone lose transitive interfaces.
     var parent: ?ObjRef(ClassDef) = null;
     errdefer if (parent) |p| p.deinit();
     var interfaces: std.ArrayList(ObjRef(ClassDef)) = .empty;
@@ -695,15 +607,13 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         defer classes.deinit();
         for (supertype_names, 0..) |name, i| {
             const qualified = if (i < supertype_paths.len) supertype_paths[i] else null;
-            // Resolve program classes through the same file/package/import
-            // index used during lowering. Only fall back to the runtime table
-            // when the supertype is another local class absent from the IR.
+            // Resolve program classes through the index used at lowering; the
+            // runtime table serves only a local class absent from the IR.
             const resolved_fqn: ?[]const u8 = static: {
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 const module = mg.get();
-                // An erased function-type tag past the written supertypes
-                // names no class.
+                // An erased function-type tag names no class.
                 if (i >= class.supertypes.len) break :static null;
                 const file = class.supertypes[i].name.span.file;
                 const cid = if (qualified) |path|
@@ -739,11 +649,8 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
         allocator.free(interface_slice);
     }
 
-    // Init blocks, with each block's member-index position converted to the
-    // body-property index it runs before (the ClassDef convention), so
-    // construction interleaves them with property initializers in
-    // declaration order. The blocks themselves execute through the
-    // `$init$block$<idx>` anon thunks registered alongside the methods.
+    // ClassDef convention: an init block's position is the body-property index
+    // it runs before, so construction interleaves them in declaration order.
     const ib_blocks = try allocator.alloc(FF(ast.Block), class.init_blocks.len);
     const ib_positions = try allocator.alloc(usize, class.init_blocks.len);
     for (class.init_blocks, 0..) |*blk, idx| {
@@ -803,9 +710,8 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
     });
 }
 
-/// Resolve a dotted runtime-only supertype against the class table by an
-/// aligned FQN suffix, preferring the least-nested match. Program declarations
-/// resolve through the module's scope-aware class index before this fallback.
+/// Resolve a dotted runtime-only supertype by aligned FQN suffix, preferring the
+/// least-nested match. Program declarations resolve through the module first.
 fn classByQualifiedSuffix(classes: *const ClassTable, qualified: []const u8) ?ObjRef(ClassDef) {
     if (std.mem.indexOfScalar(u8, qualified, '.') == null) return null;
     var best: ?ObjRef(ClassDef) = null;
@@ -826,11 +732,9 @@ fn classByQualifiedSuffix(classes: *const ClassTable, qualified: []const u8) ?Ob
     return best;
 }
 
-/// Lower each member function of `class` into the class's shared side
-/// module (an image clone — see `anonSiteModule`) and register it in
-/// `anon_methods` under both the arity-qualified and bare keys, with
-/// `capture_pairs` bound. `own_members` scopes bare-name resolution inside
-/// the bodies.
+/// Lower each member function into the class's side module and register it in
+/// `anon_methods` under the arity-qualified and bare keys, `capture_pairs` bound;
+/// `own_members` scopes bare names in the bodies.
 fn lowerAndRegisterMethods(
     self: *VmHost,
     allocator: Allocator,
@@ -840,10 +744,8 @@ fn lowerAndRegisterMethods(
 ) Allocator.Error!void {
     var site_mod: ?ObjRef(Module) = null;
     defer if (site_mod) |m| m.deinit();
-    // The class's DECLARED property types (ctor `val data: Collection<E>`,
-    // annotated body properties) carry into the member lowerings through
-    // the same channel the anonymous-object path uses, so a body's
-    // `data.iterator()` types its receiver instead of walking by name.
+    // The class's declared property types carry into the member lowerings, so a
+    // body's `data.iterator()` types its receiver instead of walking by name.
     var prop_heads: std.ArrayList(ir.build.AnonPropHead) = .empty;
     defer prop_heads.deinit(allocator);
     for (class.primary_params) |*pp| {
@@ -869,8 +771,7 @@ fn lowerAndRegisterMethods(
     defer _ = ir.build.setLowerAnonPropHeads(prev_prop_heads);
     host_instances.anonLowerEnter();
     defer host_instances.anonLowerExit();
-    // Occurrence counter per `name#arity`: two same-arity overloads of one
-    // name share that key, so each also registers under an indexed key.
+    // Same-arity overloads share the `name#arity` key, so each is also indexed.
     var overload_seen = std.StringHashMap(usize).init(allocator);
     defer overload_seen.deinit();
     for (class.members) |*m| {
@@ -902,14 +803,9 @@ fn lowerAndRegisterMethods(
                 try tbl.get().put(try anonKey(allocator, class.name.name, arity_name), entry);
                 try tbl.get().put(try anonKey(allocator, class.name.name, f.name.name), .{ .module = sub_ref.clone(), .func = fid, .captures = caps });
             },
-            // A body property with a custom getter registers its accessor
-            // thunk, exactly as an anonymous object's does — a local class's
-            // `override val size get() = …` is otherwise unreadable.
             .Property => |p| {
                 if (p.getter) |getter| {
-                    // `field` in the accessor body targets the raw backing
-                    // storage (`this.__klio_field__<prop>`), bypassing the
-                    // accessor dispatch exactly like a module class's.
+                    // `field` targets `this.__klio_field__<prop>` directly.
                     const gbody = try rewriteAccessorFieldRefs(allocator, getter.body, p.name.name);
                     const thunk = host_instances.synthThunk(p.name, gbody, getter.return_type, p.is_override);
                     const sub_ref = try host_instances.anonSiteModule(self, allocator, &site_mod);
@@ -921,9 +817,6 @@ fn lowerAndRegisterMethods(
                     defer tbl.deinit();
                     try tbl.get().put(try anonKey(allocator, class.name.name, key), .{ .module = sub_ref, .func = fid, .captures = caps });
                 }
-                // A custom setter registers its 1-arg thunk symmetrically, so a
-                // local class's `override var x set(value) { … }` dispatches on
-                // writes instead of landing on a phantom raw field.
                 if (p.setter) |setter| {
                     const vp: ast.Ident = if (setter.params.len != 0) setter.params[0] else .{ .name = "value", .span = p.name.span };
                     const sbody = try rewriteAccessorFieldRefs(allocator, setter.body, p.name.name);
@@ -937,18 +830,12 @@ fn lowerAndRegisterMethods(
                     defer tbl.deinit();
                     try tbl.get().put(try anonKey(allocator, class.name.name, key), .{ .module = sub_ref, .func = fid, .captures = caps });
                 }
-                // A complex initializer (`val items = mutableListOf<...>()`)
-                // lowers as a `$init$` thunk the construction pipeline runs;
-                // simple literals stay inline (`simpleLiteral`).
-                // A delegated property (`var left by Box(left)`) lowers its
-                // DELEGATE expression as the `$init$` thunk; construction
-                // stores the evaluated delegate under the property name and
-                // reads/writes route through getValue/setValue.
+                // A complex initializer lowers as a `$init$` thunk; a delegated
+                // property lowers its DELEGATE expression as that thunk, stored
+                // under the property name for getValue/setValue.
                 if (p.delegate) |dexpr| {
-                    // The delegate expression may read PLAIN constructor
-                    // params (`Node(value, left)` with `var left by
-                    // Box(left)`), so the thunk declares the primary params
-                    // and construction passes the ctor args.
+                    // The delegate may read plain ctor params, so the thunk
+                    // declares them and construction passes the args.
                     var thunk = host_instances.synthThunk(p.name, .{ .Expr = dexpr.* }, null, false);
                     const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
                     for (class.primary_params, 0..) |*pp, pi| {
@@ -974,12 +861,8 @@ fn lowerAndRegisterMethods(
                     try tbl.get().put(try anonKey(allocator, class.name.name, key), .{ .module = sub_ref, .func = fid, .captures = caps });
                 }
                 if (p.init) |init_expr| {
-                    // The initializer may read PLAIN constructor params —
-                    // including one the property itself shadows (`class N(
-                    // property: String) { var property = property }`): declare
-                    // the primary params so the bare name binds the param,
-                    // never the not-yet-initialized property. Construction
-                    // passes the ctor args.
+                    // Declaring the primary params binds a bare name to the ctor
+                    // param, even one the property shadows.
                     var thunk = host_instances.synthThunk(p.name, .{ .Expr = init_expr }, null, false);
                     const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
                     for (class.primary_params, 0..) |*pp, pi| {
@@ -1008,11 +891,8 @@ fn lowerAndRegisterMethods(
             else => {},
         }
     }
-    // A primary-constructor default that is not a plain literal lowers as a
-    // `$default$<i>` thunk declaring the parameters before it, so a default
-    // that reads a captured local (`class Local(val t: String = x)`) or an
-    // earlier parameter evaluates in the class's captured scope at
-    // construction; a literal default stays inline (`simpleLiteral`).
+    // A non-literal primary-constructor default lowers as a `$default$<i>` thunk
+    // declaring the parameters before it, evaluated in the captured scope.
     for (class.primary_params, 0..) |*pp, pi| {
         const dexpr: ast.Expr = pp.default orelse continue;
         if (host_call_value.simpleLiteral(allocator, &dexpr) != null) continue;
@@ -1042,20 +922,16 @@ fn lowerAndRegisterMethods(
         defer tbl.deinit();
         try tbl.get().put(try anonKey(allocator, class.name.name, thunk_name.name), .{ .module = sub_ref, .func = func.id, .captures = caps });
     }
-    // `init { … }` blocks lower as 0-arg thunks over `this`, registered under
-    // `$init$block$<idx>` — the same shape the anonymous-object materializer
-    // uses — so construction can run them (with the class's captured cells
-    // bound) interleaved with the property initializers.
+    // `init { … }` blocks lower as thunks over `this` under `$init$block$<idx>`,
+    // run with the captured cells bound.
     for (class.init_blocks, 0..) |*blk, idx| {
         const thunk_name: ast.Ident = .{
             .name = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx}),
             .span = blk.span,
         };
         var thunk = host_instances.synthThunk(thunk_name, .{ .Block = blk.* }, null, false);
-        // Declare the primary-constructor params, exactly as the
-        // `$super$arg$<i>` thunks do: an `init` block may read a constructor
-        // PARAMETER that is not a property, and a 0-arg thunk left that name
-        // to fall through to a field read on `this`.
+        // An `init` block may read a constructor parameter that is not a
+        // property, which a 0-arg thunk would leave as a field read on `this`.
         {
             const tparams = try allocator.alloc(ast.Param, class.primary_params.len);
             for (class.primary_params, 0..) |*pp, pi| {
@@ -1081,8 +957,6 @@ fn lowerAndRegisterMethods(
     }
 }
 
-/// Collect a local class's own member names (primary-ctor properties, body
-/// properties, methods) into `out`.
 fn collectOwnMembers(class: *const ast.Class, out: *StringSet) Allocator.Error!void {
     for (class.primary_params) |*p| {
         if (p.property != null) try out.put(p.name.name, {});
@@ -1096,24 +970,12 @@ fn collectOwnMembers(class: *const ast.Class, out: *StringSet) Allocator.Error!v
     }
 }
 
-/// Register the class declarations NESTED inside a local class.
-///
-/// `registerClass` synthesises a ClassDef for the local class itself and
-/// lowers its methods, but never walked its members, so a class declared
-/// inside a local class was unresolvable: kotlinx-io's `rawSourceSample`
-/// declares `RC4DecryptingSource` inside a test function and an
-/// `inner class RC4Key` inside that, and constructing it failed with
-/// `unresolved global RC4Key`. Applies to plain nested and `inner` classes
-/// alike — neither was registered.
-///
-/// Recurses, so a class nested two deep inside a local class registers too.
 fn registerNestedClasses(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!void {
     try registerNestedMembers(self, allocator, class.name.name, class.members);
 }
 
-/// Register the classes and objects declared in the body of a runtime
-/// class (a local class, an anonymous object) under `owner`: each becomes
-/// a runtime class the body's members construct by bare name.
+/// Register a runtime class's nested classes and objects under `owner`, so the
+/// body's members construct them by bare name.
 pub const registerNestedClassMembers = registerNestedMembers;
 
 pub fn registerNestedMembers(self: *VmHost, allocator: Allocator, owner: []const u8, members: []const ast.Decl) Allocator.Error!void {
@@ -1121,11 +983,8 @@ pub fn registerNestedMembers(self: *VmHost, allocator: Allocator, owner: []const
         switch (m.*) {
             .Class => |*nested| {
                 if (nested.is_companion) {
-                    // A LOCAL class's companion: registered under a
-                    // mangled runtime name, constructed once here, and
-                    // published as the class's `$companion:<name>` global
-                    // so a member call on the class value forwards to it
-                    // (`W.serializer()` on a local `@Serializable` class).
+                    // A local class's companion registers under a mangled name
+                    // and publishes as the global `$companion:<owner>`.
                     var renamed = nested.*;
                     renamed.name = .{ .name = try std.fmt.allocPrint(allocator, "{s}$Companion", .{owner}), .span = nested.name.span };
                     renamed.is_companion = false;
@@ -1137,9 +996,7 @@ pub fn registerNestedMembers(self: *VmHost, allocator: Allocator, owner: []const
                 }
                 _ = try registerClass(self, allocator, nested);
             },
-            // A nested `object` of a local class: registered as a class,
-            // constructed once, and bound under its own name so the
-            // class's members reach it by bare name.
+            // A nested `object` registers as a class and binds under its name.
             .Object => |*o| {
                 const synth = try allocator.create(ast.Class);
                 synth.* = try build.lift.synthesizeClassFromObject(allocator, o);
@@ -1151,8 +1008,6 @@ pub fn registerNestedMembers(self: *VmHost, allocator: Allocator, owner: []const
     }
 }
 
-/// Construct the runtime-registered class `class_name` with no arguments
-/// and bind the instance to the global `global_name`.
 fn publishLocalSingleton(self: *VmHost, allocator: Allocator, class_name: []const u8, global_name: []const u8) Allocator.Error!void {
     const def: ?ObjRef(ClassDef) = blk: {
         const g = self.classes.borrow();
@@ -1181,9 +1036,7 @@ fn publishLocalSingleton(self: *VmHost, allocator: Allocator, class_name: []cons
 }
 
 pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Class) Allocator.Error!UnitResult {
-    // Local classes declared inside fn bodies arrive here at runtime.
-    // Synthesise the same ClassDef shape build_module produces and stash
-    // it in the Vm's class table.
+    // A local class declared in a fn body arrives here at runtime.
     var site_mod: ?ObjRef(Module) = null;
     defer if (site_mod) |m| m.deinit();
     host_instances.anonLowerEnter();
@@ -1194,15 +1047,13 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
         defer g.deinit();
         try g.get().put(class.name.name, def);
     }
-    // Lower local-class methods into per-method side modules.
     var own_members = StringSet.init(allocator);
     defer own_members.deinit();
     try collectOwnMembers(class, &own_members);
     try lowerAndRegisterMethods(self, allocator, class, &own_members, &.{});
     try registerNestedClasses(self, allocator, class);
-    // Parent-constructor arguments (`class C : Base(expr...)`) lower as
-    // `$super$arg$<i>` thunks declaring the primary params, so a MODULE
-    // parent's fields and body properties can initialize at construction.
+    // Parent-constructor arguments lower as `$super$arg$<i>` thunks declaring the
+    // primary params, so a module parent initializes at construction.
     for (class.supertypes, 0..) |_, si| {
         if (si >= class.supertype_args.len) break;
         const sargs = class.supertype_args[si] orelse continue;
@@ -1238,11 +1089,8 @@ pub fn registerClass(self: *VmHost, allocator: Allocator, class: *const ast.Clas
     return .ok;
 }
 
-/// Rewrite bare `field` references in an accessor body to the raw backing
-/// member (`this.__klio_field__<prop>`), the same substitution the module
-/// class pipeline applies — the host's get/set detect the prefix and bypass
-/// the accessor dispatch, so a custom setter's `field = value` writes the
-/// stored property instead of recursing or landing on a phantom field.
+/// Rewrite bare `field` to `this.__klio_field__<prop>`; get/set detect that
+/// prefix and bypass accessor dispatch, so `field = value` does not recurse.
 pub fn rewriteAccessorFieldRefs(allocator: Allocator, body: ast.FunctionBody, prop: []const u8) Allocator.Error!ast.FunctionBody {
     return switch (body) {
         .Expr => |e| .{ .Expr = (try build.lift.substituteFieldWithThis(allocator, prop, &e, null)).* },
@@ -1250,9 +1098,7 @@ pub fn rewriteAccessorFieldRefs(allocator: Allocator, body: ast.FunctionBody, pr
     };
 }
 
-/// The class's nested singletons (its companion, its nested objects) sit
-/// in the same lexical scope as the class: their bare reads of the
-/// enclosing receiver's members walk the same outer.
+/// A class's nested singletons share its lexical scope and so its outer.
 fn assignNestedOuters(self: *VmHost, allocator: Allocator, class: *const ast.Class, this_val: Value) Allocator.Error!void {
     for (class.members) |*m| {
         const global_name: ?[]const u8 = switch (m.*) {
@@ -1281,15 +1127,11 @@ fn assignNestedOuters(self: *VmHost, allocator: Allocator, class: *const ast.Cla
 pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const ast.Class, captured_names: []const []const u8, captures: []const Value) Allocator.Error!UnitResult {
     host_instances.anonLowerEnter();
     defer host_instances.anonLowerExit();
-    // The member lowerings below must know which bare names are captured
-    // enclosing locals: a captured `count` is nearer than any top-level
-    // prop/const of that name and must stay a dynamic read/write.
+    // A captured local outranks a top-level prop of that name and stays dynamic.
     const prev_caps = ir.build.setLowerAnonCaptureNames(captured_names);
     defer _ = ir.build.setLowerAnonCaptureNames(prev_caps);
-    // A captured value that is a shared cell is a `var` the enclosing
-    // function boxed because a closure writes it; the member lowerings box
-    // it too, so a write inside a method (or a lambda nested in one) lands
-    // on the cell.
+    // A captured `.Cell` is a boxed `var`; the member lowerings box it too, so a
+    // write inside a method lands on the cell.
     var boxed_names: std.ArrayList([]const u8) = .empty;
     defer boxed_names.deinit(allocator);
     for (captured_names, 0..) |n, i| {
@@ -1297,11 +1139,9 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
     }
     const prev_boxed = ir.build.setLowerAnonBoxedNames(boxed_names.items);
     defer _ = ir.build.setLowerAnonBoxedNames(prev_boxed);
-    // The same names go into the capture SET the member lowerings consult
-    // (an anonymous object installs it too): a lambda inside a method or a
-    // parent-constructor argument then captures `o` through the method's
-    // own capture slot, filled by name at dispatch, instead of reading a
-    // global that only exists while the method runs.
+    // The same names go into the capture set the member lowerings consult, so a
+    // nested lambda captures through the method's own slot, filled by name at
+    // dispatch, not a global that lives only while the method runs.
     var cap_set = StringSet.init(allocator);
     for (captured_names) |n| try cap_set.put(n, {});
     const prev_set = ir.lower.takeLowerAnonCaptures();
@@ -1315,8 +1155,6 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
         .ok => {},
         .err => |e| return .{ .err = e },
     }
-    // Snapshot `this` from the captured outer env so instances of this
-    // local class get an `outer` pointing back at the enclosing receiver.
     var captured_this: ?Value = null;
     for (captured_names, 0..) |n, i| {
         if (std.mem.eql(u8, n, "this") and i < captures.len) {
@@ -1329,9 +1167,8 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
         defer g.deinit();
         try g.get().put(class.name.name, this_val);
     }
-    // Re-lower the local class's methods with the captured outer's field
-    // + member names merged into own_members, so bare references to outer
-    // properties lower as `this.X` and resolve via the outer chain.
+    // Re-lower with the outer's member names merged into `own_members`, so bare
+    // outer property reads lower as `this.X` and resolve through the chain.
     if (captured_this) |tv| {
         if (tv == .Instance) {
             var own_members = StringSet.init(allocator);
@@ -1346,8 +1183,6 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
             }
             try collectOwnMembers(class, &own_members);
             try lowerAndRegisterMethods(self, allocator, class, &own_members, capture_pairs);
-            // Same reason as the uncaptured path: a class nested inside a
-            // local class is otherwise never registered.
             try registerNestedClasses(self, allocator, class);
             try assignNestedOuters(self, allocator, class, tv);
             try patchCaptureEntries(self, allocator, class, capture_pairs);
@@ -1355,19 +1190,15 @@ pub fn registerClassCaptured(self: *VmHost, allocator: Allocator, class: *const 
             return .ok;
         }
     }
-    // No `this` instance captured: patch the just-registered method
-    // entries with the captured outer-env so dispatch can layer them
-    // under globals.
+    // No `this` captured: patch the method entries with the outer env instead.
     if (capture_pairs.len != 0) try patchCaptureEntries(self, allocator, class, capture_pairs);
     try bindClassFamily(self, allocator, class, capture_pairs);
     return .ok;
 }
 
-/// Publish the registration's scope on every def of the class family (the
-/// class and the classes nested in it): the captured pairs, then each
-/// family member by name. Dispatch layers the list under globals, so a
-/// method's bare `C(...)` and an `outer.D()` construct this registration's
-/// defs, and an instance keeps reading the scope it was declared in.
+/// Publish the registration's scope (captured pairs, then each family member by
+/// name) on every def of the class and its nested classes. Dispatch layers it
+/// under globals, so a method's bare `C(...)` builds this registration.
 fn bindClassFamily(self: *VmHost, allocator: Allocator, class: *const ast.Class, capture_pairs: []const NameValue) Allocator.Error!void {
     var list: std.ArrayList(InstanceData.Capture) = .empty;
     for (capture_pairs) |nv| try list.append(allocator, .{ .name = nv.name, .value = nv.value });
@@ -1406,10 +1237,8 @@ fn collectFamilyDefs(
     }
 }
 
-/// Point every registry entry the class registered (methods, accessor and
-/// initializer thunks, init blocks, parent-constructor argument thunks) at
-/// the captured enclosing env, and the same for its nested classes: an
-/// inner class's `Base({ o + k })` closes over the function's `o` too.
+/// Point every registry entry the class registered, and its nested classes', at
+/// the captured enclosing env.
 fn patchCaptureEntries(self: *VmHost, allocator: Allocator, class: *const ast.Class, capture_pairs: []NameValue) Allocator.Error!void {
     {
         const tbl = self.anon_methods.borrowMut();
@@ -1438,8 +1267,7 @@ fn patchCaptureEntries(self: *VmHost, allocator: Allocator, class: *const ast.Cl
                             entry.captures = capture_pairs;
                         }
                     }
-                    // The indexed keys of a same-arity overload family are dense
-                    // from zero, so patch until one is missing.
+                    // Indexed overload keys are dense from zero.
                     var overload_index: usize = 0;
                     while (true) : (overload_index += 1) {
                         const member = try root.anonOverloadMemberName(allocator, arity_name, overload_index);
@@ -1448,8 +1276,6 @@ fn patchCaptureEntries(self: *VmHost, allocator: Allocator, class: *const ast.Cl
                         entry.captures = capture_pairs;
                     }
                 },
-                // Accessor / property-initializer thunks capture the same outer
-                // env: `val doubled = count * 2` reads the enclosing fn's cell.
                 .Property => |p| {
                     for ([_][]const u8{ "$get$", "$set$", "$init$" }) |prefix| {
                         const nm = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, p.name.name });
@@ -1462,8 +1288,6 @@ fn patchCaptureEntries(self: *VmHost, allocator: Allocator, class: *const ast.Cl
                 else => {},
             }
         }
-        // The `$init$block$<idx>` thunks capture the same outer env: an
-        // `init { count++ }` writes through the enclosing fn's boxed cell.
         for (class.init_blocks, 0..) |_, idx| {
             const nm = try std.fmt.allocPrint(allocator, "$init$block${d}", .{idx});
             const key = try anonKey(allocator, class.name.name, nm);
@@ -1478,10 +1302,7 @@ fn patchCaptureEntries(self: *VmHost, allocator: Allocator, class: *const ast.Cl
     }
 }
 
-/// The `.Class` value for a local class just registered under `name`, so the
-/// declaration site can bind the name to it (a local class shadows a same-named
-/// top-level function for a constructor call). Null if no such class table
-/// entry exists.
+/// The `.Class` for a local class, which shadows a same-named top-level fn.
 pub fn localClassValue(self: *VmHost, allocator: Allocator, name: []const u8) Allocator.Error!MaybeValueResult {
     _ = allocator;
     const cg = self.classes.borrow();
@@ -1496,19 +1317,13 @@ fn buildCapturePairs(allocator: Allocator, captured_names: []const []const u8, c
     const n = @min(captured_names.len, captures.len);
     var pairs = try allocator.alloc(NameValue, n);
     for (0..n) |i| {
-        // The anon-method registry holds these captures for the object's whole
-        // lifetime (its methods read them long after the enclosing frame that
-        // produced them has returned). Retain so a captured value outlives that
-        // frame; released when the registry entry is dropped. No-op under arena.
+        // The registry holds these captures for the object's whole lifetime, so
+        // retain; released when the entry is dropped, a no-op under the arena.
         if (runtime.reclaimEnabled()) captures[i].retain();
         pairs[i] = .{ .name = captured_names[i], .value = captures[i] };
     }
     return pairs;
 }
-
-// -------------------------------------------------------------------------
-// Helpers
-// -------------------------------------------------------------------------
 
 fn lookupGlobal(self: *VmHost, name: []const u8) ?Value {
     const g = self.globals.borrow();
@@ -1523,12 +1338,8 @@ fn matchesAny(name: []const u8, candidates: []const []const u8) bool {
     return false;
 }
 
-/// Resolve a type name from an `is`/`as` check to the FQN of the single
-/// registered user/pack class it denotes, or null when it is a bare simple
-/// name shared by several classes, a builtin, a generic parameter, or
-/// otherwise not a uniquely-registered class. `classIdByFqn` returns null on
-/// an ambiguous FQN, so a residual collision stays null and the caller keeps
-/// its collision-proof simple-name behaviour.
+/// The FQN of the single registered class `name` denotes, or null for a shared
+/// simple name, a builtin, a generic parameter, or an ambiguous FQN.
 fn resolveClassFqn(self: *VmHost, name: []const u8) ?[]const u8 {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -1538,13 +1349,9 @@ fn resolveClassFqn(self: *VmHost, name: []const u8) ?[]const u8 {
     return m.classes.items[cid.int()].fqn;
 }
 
-/// Identity-aware subtype match for the `is`/`as` hierarchy walk. `ent_name`/
-/// `ent_fqn` describe a class reached in the walk; `target_simple`/`target_fqn`
-/// the type being tested against (`target_fqn` is non-null only when the
-/// target unambiguously denotes a registered class). A same-simple-name match
-/// is rejected only when the two names PROVABLY denote different registered
-/// classes (different FQNs); otherwise the collision-proof simple-name match is
-/// preserved (builtins, generics, anonymous / unregistered classes).
+/// Identity-aware subtype match for the `is`/`as` walk: `target_fqn` is non-null
+/// only when the target unambiguously denotes a registered class, so a
+/// same-simple-name match is rejected only when the two provably differ.
 fn subtypeMatch(
     self: *VmHost,
     ent_name: []const u8,
@@ -1557,9 +1364,7 @@ fn subtypeMatch(
     if (!std.mem.eql(u8, ent_name, target_simple)) return false;
     const tf = target_fqn orelse return true;
     if (std.mem.eql(u8, ent_fqn, tf)) return true;
-    // Simple names coincide but the target is a specific, different class.
-    // Reject only when the walked class is itself a registered class (so the
-    // two provably differ); otherwise keep the simple-name match.
+    // Reject only when the walked class is itself registered, so the two differ.
     return resolveClassFqn(self, ent_fqn) == null;
 }
 
@@ -1589,10 +1394,8 @@ fn isReflectionTypeName(name: []const u8) bool {
     });
 }
 
-/// Recognise the builtin / stdlib type names that are not registered as
-/// user classes but are still concrete cast targets (so `x as String`
-/// against a non-String still throws). Used to distinguish a real
-/// checked cast from an erased type-parameter cast (`x as TBuilder`).
+/// Builtin and stdlib type names that are not user classes but are still concrete
+/// cast targets, so `x as String` throws while `x as TBuilder` stays unchecked.
 fn isBuiltinTypeName(name: []const u8) bool {
     const builtins = [_][]const u8{
         // Primitives + their boxed/number forms.

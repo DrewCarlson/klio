@@ -1,23 +1,9 @@
-//! Host fast path for bulk removal on the Compose-vendored
-//! persistent-vector builder (`androidx.compose.runtime.external.kotlinx.
-//! collections.immutable.implementations.immutableList.
-//! PersistentVectorBuilder`).
-//!
-//! `SnapshotStateList.removeRange` runs `builder.subList(from, to).clear()`,
-//! which the abstract list serves as one interpreted `removeAt` per removed
-//! element; each removeAt shifts the whole suffix through the trie, so
-//! clearing a range is a quadratic interpreted walk (~3.8ms for 100
-//! elements). The host collects the kept elements once and rebuilds the
-//! builder's trie in fresh owned buffers.
-//!
-//! Exactness: the rebuilt state keeps every builder invariant the
-//! interpreted path maintains — leaves under `root` full, `tail` holding
-//! `size - rootSize` elements, `rootShift` matching the trie height,
-//! buffers 33 slots wide with the builder's `ownership` marker in the last
-//! slot, and `modCount` advanced once per removed element. Fresh buffers
-//! are never shared with a published vector, so the in-place-reuse
-//! aliasing rules of `makeMutable` cannot be violated. Any structural
-//! surprise bails to the interpreted body.
+//! Host fast path for bulk mutation on the Compose-vendored `PersistentVectorBuilder`,
+//! rebuilding the trie in place of the interpreted one-`removeAt`-per-element shift.
+//! Every builder invariant holds: leaves under `root` full, `tail` holding
+//! `size - rootSize` elements, `rootShift` matching the trie height, 33-slot buffers
+//! with the `ownership` marker last, `modCount` advanced once per removed element.
+//! Fresh buffers are never shared with a published vector; a structural surprise bails.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -55,8 +41,7 @@ pub fn isBuilderClass(inst: ObjRef(InstanceData)) bool {
     return true;
 }
 
-/// Append the `remaining` logical elements under a trie node at `shift`
-/// to `out` as borrowed copies, in order. False = structural bail.
+/// Append as borrowed copies; false means a structural bail.
 fn collectNode(a: Allocator, arr: ArrayData, shift: u32, remaining: usize, out: *std.ArrayList(Value)) Allocator.Error!bool {
     if (remaining == 0) return true;
     if (shift == 0) {
@@ -78,9 +63,8 @@ fn collectNode(a: Allocator, arr: ArrayData, shift: u32, remaining: usize, out: 
     return true;
 }
 
-/// A fresh 33-slot mutable buffer: `items` retained into the leading
-/// slots, Null padding, and the builder's ownership marker (retained) in
-/// the final slot — exactly what `mutableBuffer()` + fills produce.
+/// A fresh 33-slot mutable buffer: `items` retained into the leading slots, Null
+/// padding, ownership marker last.
 fn packBuffer(a: Allocator, items: []const Value, owner: *const Value) Allocator.Error!Value {
     var list: std.ArrayList(Value) = .empty;
     try list.ensureTotalCapacity(a, MUTABLE_BUFFER_SIZE);
@@ -101,7 +85,6 @@ fn asIntIndex(v: *const Value) ?i64 {
     };
 }
 
-/// The builder's live fields, read in one borrow. Null = shape bail.
 const BuilderState = struct {
     root: Value,
     tail: Value,
@@ -141,8 +124,6 @@ fn readState(inst: ObjRef(InstanceData)) ?BuilderState {
     };
 }
 
-/// Append every logical element (root walk then tail) as borrowed copies.
-/// False = structural bail.
 fn collectAll(a: Allocator, st: *const BuilderState, out: *std.ArrayList(Value)) Allocator.Error!bool {
     const root_len = st.rootLen();
     const tail_len = st.total - root_len;
@@ -156,8 +137,7 @@ fn collectAll(a: Allocator, st: *const BuilderState, out: *std.ArrayList(Value))
     return true;
 }
 
-/// Rebuild the builder's root/tail/size/rootShift from `items` (fresh
-/// owned buffers throughout) and set `modCount`.
+/// Rebuild root/tail/size/rootShift from `items` in fresh owned buffers; set `modCount`.
 fn writeState(a: Allocator, inst: ObjRef(InstanceData), items: []const Value, owner: *const Value, new_modc: i64) Allocator.Error!void {
     const new_size = items.len;
     var new_root: Value = .Null;
@@ -169,8 +149,7 @@ fn writeState(a: Allocator, inst: ObjRef(InstanceData), items: []const Value, ow
         const new_root_len: usize = if (new_size <= BRANCH) 0 else (new_size - 1) & ~@as(usize, BRANCH - 1);
         new_tail = try packBuffer(a, items[new_root_len..], owner);
         if (new_root_len > 0) {
-            // Full leaves, then parent levels of 32 children until one
-            // node remains; a single leaf is itself the root at shift 0.
+            // Full leaves, then parent levels of 32 until one node remains.
             var nodes: std.ArrayList(Value) = .empty;
             defer nodes.deinit(a);
             var off: usize = 0;
@@ -185,8 +164,7 @@ fn writeState(a: Allocator, inst: ObjRef(InstanceData), items: []const Value, ow
                     const end = @min(j + BRANCH, nodes.items.len);
                     try parents.append(a, try packBuffer(a, nodes.items[j..end], owner));
                 }
-                // The parents retained the children on store; drop the
-                // build list's own refs so each child is owned once.
+                // Parents retained the children on store; drop the build list's refs.
                 if (runtime.reclaimEnabled()) for (nodes.items) |n| n.release(a);
                 nodes.deinit(a);
                 nodes = parents;
@@ -205,8 +183,7 @@ fn writeState(a: Allocator, inst: ObjRef(InstanceData), items: []const Value, ow
     try d.define(a, "modCount", Value.newInt(new_modc));
 }
 
-/// Serve `builder.removeRange(from, to)`. Returns Unit on success, null
-/// to bail to the interpreted body.
+/// Serve `builder.removeRange(from, to)`: Unit on success, null bails to the body.
 pub fn tryRemoveRange(a: Allocator, inst: ObjRef(InstanceData), from_v: *const Value, to_v: *const Value) Allocator.Error!?Value {
     const from_i = asIntIndex(from_v) orelse return null;
     const to_i = asIntIndex(to_v) orelse return null;
@@ -224,7 +201,6 @@ pub fn tryRemoveRange(a: Allocator, inst: ObjRef(InstanceData), from_v: *const V
     if (!try collectAll(a, &st, &all)) return null;
     if (all.items.len != st.total) return null;
 
-    // Kept elements in order: [0, from) then [to, total).
     var kept: std.ArrayList(Value) = .empty;
     defer kept.deinit(a);
     try kept.ensureTotalCapacity(a, st.total - count);
@@ -234,8 +210,6 @@ pub fn tryRemoveRange(a: Allocator, inst: ObjRef(InstanceData), from_v: *const V
     return Value.Unit;
 }
 
-/// Copy the elements of a host-readable collection value into `out` as
-/// borrowed copies. False = not host-readable.
 fn collectionItems(a: Allocator, v: *const Value, out: *std.ArrayList(Value)) Allocator.Error!bool {
     switch (v.*) {
         .List => |l| {
@@ -255,8 +229,7 @@ fn collectionItems(a: Allocator, v: *const Value, out: *std.ArrayList(Value)) Al
     }
 }
 
-/// Serve `builder.addAll(elements)` — the append-at-end overload.
-/// Returns Bool on success, null to bail to the interpreted body.
+/// Serve the append-at-end `builder.addAll(elements)`: Bool on success, null bails.
 pub fn tryAddAll(a: Allocator, inst: ObjRef(InstanceData), elements: *const Value) Allocator.Error!?Value {
     if (elements.* != .List and elements.* != .Array) return null;
     if (!isBuilderClass(inst)) return null;
@@ -290,9 +263,8 @@ pub fn tryAddAll(a: Allocator, inst: ObjRef(InstanceData), elements: *const Valu
         return .{ .Bool = true };
     }
 
-    // Root work needed: rebuild from the full element sequence. A rebuild
-    // walks the whole list, so a tiny append onto a huge list stays on
-    // the interpreted path, which is O(append).
+    // Rebuilding walks the whole list, so a tiny append onto a huge list stays on the
+    // O(append) interpreted path.
     if (st.total > 1024 and k * 8 < st.total) return null;
     var all: std.ArrayList(Value) = .empty;
     defer all.deinit(a);

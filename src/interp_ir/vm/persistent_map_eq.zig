@@ -1,25 +1,8 @@
-//! Host fast path for structural equality of the Compose-vendored
-//! persistent hash map (`androidx.compose.runtime.external.kotlinx.
-//! collections.immutable.implementations.immutableMap.PersistentHashMap`).
-//!
-//! The vendored class has no `equals` override, so `newMap == oldMap`
-//! dispatches `AbstractMap.equals` — an interpreted walk that re-gets
-//! every entry through the trie. `SnapshotStateMap.mutate` runs that
-//! compare on every optimistic-retry attempt, and a replace keeps the
-//! sizes equal so it never short-circuits; under concurrent writers the
-//! walk dominates the whole workload.
-//!
-//! CHAMP tries are canonical: content-equal maps have identical node
-//! structure, and a one-key update shares every untouched subtree with
-//! its parent map. Comparing the tries directly with node-identity
-//! pruning gives the same structural-equality answer while touching
-//! only the changed path. Collision nodes (past MAX_SHIFT) hold their
-//! entries in insertion order, so they compare unordered.
-//!
-//! Exactness rule: the fast path answers only when every compared key
-//! and value is a scalar/string/null — values the host owns equality
-//! for. Any other element (an instance whose `equals` could be
-//! user-defined) bails to the interpreted dispatch by returning null.
+//! Host fast path for structural equality of the Compose-vendored `PersistentHashMap`,
+//! which has no `equals` override, so `newMap == oldMap` otherwise dispatches
+//! `AbstractMap.equals` and re-gets every entry through the trie. CHAMP tries are
+//! canonical, so content-equal maps have identical node structure and node-identity
+//! pruning touches only the changed path; collision nodes compare unordered.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -31,9 +14,8 @@ const PKG = "androidx.compose.runtime.external.kotlinx.collections.immutable.imp
 const MAP_FQN = PKG ++ "PersistentHashMap";
 const NODE_FQN = PKG ++ "TrieNode";
 
-/// Bits of hash consumed per trie level; a child of a MAX_SHIFT-level
-/// node is a collision node (mirrors the vendored LOG_MAX_BRANCHING_
-/// FACTOR = 5, MAX_SHIFT = 30).
+/// Bits of hash consumed per trie level, and the shift past which a child is a collision
+/// node (the vendored LOG_MAX_BRANCHING_FACTOR and MAX_SHIFT).
 const LOG_BRANCH = 5;
 const MAX_SHIFT = 30;
 
@@ -58,9 +40,8 @@ fn classMatches(inst: ObjRef(InstanceData), hit: *std.atomic.Value(usize), fqn: 
     return true;
 }
 
-/// Equality the host can answer exactly without dispatch: scalars,
-/// strings, null, unit. Anything else returns null and the caller bails
-/// to interpreted `equals`.
+/// Equality the host answers exactly: scalars, strings, null, unit; anything else
+/// returns null and bails.
 fn eqVal(a: *const Value, b: *const Value) ?bool {
     const hostable = switch (a.*) {
         .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char, .String, .Null, .Unit => switch (b.*) {
@@ -92,8 +73,7 @@ fn nodeEq(a: ObjRef(InstanceData), b: ObjRef(InstanceData), shift: u32) ?bool {
     const abuf = ba.Array;
     const bbuf = bb.Array;
     if (shift > MAX_SHIFT) {
-        // Collision nodes: flat [k, v, k, v, ...] with insertion order,
-        // so match pairs unordered.
+        // Collision nodes: flat [k, v, k, v, ...] in insertion order, so match unordered.
         if (abuf.len() != bbuf.len()) return false;
         var i: usize = 0;
         while (i < abuf.len()) : (i += 2) {
@@ -114,8 +94,7 @@ fn nodeEq(a: ObjRef(InstanceData), b: ObjRef(InstanceData), shift: u32) ?bool {
         }
         return true;
     }
-    // Canonical shape: content-equal maps agree on both bitmaps; a
-    // disagreement means the key sets differ.
+    // Content-equal maps agree on both bitmaps; a disagreement means the key sets differ.
     if (da.Int != db.Int or na.Int != nb.Int) return false;
     if (abuf.len() != bbuf.len()) return false;
     const entries: usize = 2 * @as(usize, @popCount(@as(u32, @bitCast(da.Int))));
@@ -134,9 +113,8 @@ fn nodeEq(a: ObjRef(InstanceData), b: ObjRef(InstanceData), shift: u32) ?bool {
     return true;
 }
 
-/// Answer `a.equals(b)` for two vendored PersistentHashMap instances, or
-/// null when either operand is not that class or an element needs
-/// dispatched equality.
+/// `a.equals(b)` for two vendored `PersistentHashMap`s, or null when either is another
+/// class or needs dispatch.
 pub fn tryEquals(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) ?bool {
     if (!classMatches(a, &map_class_hit, MAP_FQN)) return null;
     if (!classMatches(b, &map_class_hit, MAP_FQN)) return null;

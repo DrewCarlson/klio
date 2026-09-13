@@ -1,22 +1,10 @@
-//! Declared-vs-runtime type matching for overload selection.
-//!
-//! The lowered `Param.ty` carries the full declared `TypeRef` (generic
-//! arguments, function shapes, a `#suspend` marker, variance prefixes).
-//! The head-name scorers in `host_call_func.zig` / `host_call_member.zig`
-//! accept a candidate on the head alone; this module refines that verdict
-//! with whatever type knowledge the runtime value actually carries:
-//! container elements (or the declared element head an empty container was
-//! created with), a closure body's declared parameter types, and a closure
-//! body's suspend marking.
-//!
-//! The refinement is a score *delta* so head-level ordering is never
-//! flipped: `null` disqualifies the candidate outright (kotlinc would not
-//! consider it), a positive delta rewards a declared-type proof so it
-//! outranks an unprovable sibling, zero means no knowledge either way, and
-//! a small negative delta ranks a suspend-converted binding below an exact
-//! one. Disproofs are definite-only — the same discipline as
-//! `argDefinitelyNotParamType` — so an unknowable shape keeps today's
-//! declaration-order tie instead of gaining a wrong rejection.
+//! Declared-vs-runtime type matching for overload selection. The head-name scorers
+//! in `host_call_func.zig` / `host_call_member.zig` accept a candidate on its head
+//! alone; this refines that with what the runtime value knows: container elements,
+//! an empty container's declared element head, a closure's annotations and suspend
+//! marking. The verdict is a score delta that never flips head-level ordering: `null`
+//! disqualifies, positive rewards a proof, zero means no knowledge, a small negative
+//! ranks a suspend conversion below an exact binding; disproofs are definite-only.
 
 const std = @import("std");
 
@@ -32,14 +20,12 @@ const Func = ir.Func;
 const FuncId = ir.FuncId;
 const TypeRef = ir.TypeRef;
 
-/// Reward for a declared generic argument / function shape the runtime
-/// value proves. Small enough that it can never outrank a head-level
-/// score difference (the scorers' tiers are >= 10 apart).
+/// Reward for a shape the runtime value proves, below the head-level tiers that sit >=
+/// 10 apart.
 const PROOF_BONUS: i32 = 6;
 
-/// Penalty for binding a not-provably-suspend callable to a `suspend`
-/// function-typed parameter: the suspend conversion is legal for a
-/// literal, but kotlinc ranks the conversion-free sibling above it.
+/// Ranks a not-provably-suspend callable below its conversion-free sibling, as kotlinc
+/// does.
 const SUSPEND_CONVERSION_PENALTY: i32 = 2;
 
 pub fn simpleName(name: []const u8) []const u8 {
@@ -55,8 +41,6 @@ fn allUppercase(s: []const u8) bool {
     return true;
 }
 
-/// Strip a variance projection prefix and trailing nullability from a
-/// lowered type-argument head.
 fn bareHead(name: []const u8) []const u8 {
     var h = name;
     if (std.mem.startsWith(u8, h, "in#")) h = h["in#".len..];
@@ -71,22 +55,16 @@ fn isMarker(name: []const u8) bool {
         std.mem.startsWith(u8, name, "#qual:");
 }
 
-/// `loweredTypeRef` appends `#non-null` / `#qual:` markers after the real
-/// generic arguments; drop them so positional reasoning sees only types.
+/// `loweredTypeRef` appends `#non-null`/`#qual:` markers after the real generic
+/// arguments; drop them.
 fn realArgs(args: []const TypeRef) []const TypeRef {
     var end = args.len;
     while (end > 0 and isMarker(args[end - 1].name)) end -= 1;
     return args[0..end];
 }
 
-// -------------------------------------------------------------------------
-// Builtin value kinds (shared with the definite-disproof checks in
-// host_call_member.zig).
-// -------------------------------------------------------------------------
-
-/// Coarse builtin value kinds for definite argument-type disproof.
-/// Numeric widths collapse into one kind: klio's lowered literals may
-/// carry a narrower tag than the declared parameter type.
+/// Coarse builtin kinds for definite disproof. Numeric widths collapse into one:
+/// a lowered literal may carry a narrower tag than the declared parameter type.
 pub const BuiltinKind = enum { numeric, string, boolean, char, array };
 
 pub fn builtinParamKind(pn: []const u8) ?BuiltinKind {
@@ -116,11 +94,8 @@ pub fn builtinValueKind(v: *const Value) ?BuiltinKind {
     };
 }
 
-/// `true` when the parameter's declared builtin kind and the argument's
-/// runtime builtin kind are both known and differ — a definite
-/// inapplicability kotlinc would never consider. An `Array` argument
-/// against a non-array parameter stays non-definite: dispatch can carry a
-/// pre-packed vararg array against the vararg's element type.
+/// Both kinds known and different. An `Array` argument against a non-array parameter
+/// stays non-definite: dispatch can carry a pre-packed vararg array element-wise.
 pub fn builtinKindMismatch(pn: []const u8, arg: *const Value) bool {
     const pk = builtinParamKind(pn) orelse return false;
     const vk = builtinValueKind(arg) orelse return false;
@@ -128,16 +103,10 @@ pub fn builtinKindMismatch(pn: []const u8, arg: *const Value) bool {
     return pk != vk;
 }
 
-// -------------------------------------------------------------------------
-// Tri-state value-vs-declared-type matching.
-// -------------------------------------------------------------------------
-
 const Match = enum { proven, disproven, unknown };
 
-/// Is `pn` a plausible declared type parameter rather than a class? The
-/// scorers have no candidate `FuncId` context here, so this mirrors the
-/// short-all-uppercase convention used across dispatch, excluding names
-/// registered as runtime classes.
+/// Is `pn` a type parameter rather than a class? Short-all-uppercase convention, minus
+/// registered class names.
 fn looksLikeTypeParam(self: *VmHost, pn: []const u8) bool {
     if (ir.parseClassTypeParamIdentity(pn) != null) return true;
     if (!(pn.len > 0 and pn.len <= 2 and allUppercase(pn))) return false;
@@ -163,16 +132,10 @@ fn isMapFamily(pn: []const u8) bool {
     return std.mem.eql(u8, pn, "Map") or std.mem.eql(u8, pn, "MutableMap");
 }
 
-/// Definite container-content disproof for the dispatch-side
-/// applicability checks: the declared type's generic arguments are
-/// provably incompatible with the container value's elements
-/// (`List<IntRange>` offered a list of LongRanges).
 pub fn valueDefinitelyNot(self: *VmHost, ty: *const TypeRef, v: *const Value) bool {
     return valueMatches(self, ty, v, 0) == .disproven;
 }
 
-/// Whether `pn` is a builtin container or range-family head — a nominal
-/// surface no scalar/String/Bool/Char value can satisfy.
 pub fn isContainerOrRangeHead(pn: []const u8) bool {
     if (isListFamily(pn) or isSetFamily(pn) or isMapFamily(pn)) return true;
     for ([_][]const u8{
@@ -185,9 +148,8 @@ pub fn isContainerOrRangeHead(pn: []const u8) bool {
     return false;
 }
 
-/// One runtime value against one declared type. Definite-only: `disproven`
-/// requires positive evidence of incompatibility, everything uncertain is
-/// `unknown`.
+/// One runtime value against one declared type; `disproven` needs positive evidence,
+/// everything uncertain is `unknown`.
 fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Match {
     if (fuel > 6) return .unknown;
     const head = bareHead(ty.name);
@@ -206,19 +168,14 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
                 const delta = functionShapeDelta(self, head, realArgs(ty.args), v) orelse return .disproven;
                 return if (delta > 0) .proven else .unknown;
             },
-            // A plain data value is definitely not a function; anything
-            // else (an instance with a possible SAM/invoke surface) is
-            // unknowable here.
+            // A data value is never a function; an instance may expose invoke.
             .String, .Bool, .Char, .Byte, .Short, .Int, .Long, .Float, .Double, .UByte, .UShort, .UInt, .ULong => return .disproven,
             else => return .unknown,
         }
     }
 
-    // Ranges: `..` (step 1) is an XRange/ClosedRange/XProgression/Iterable;
-    // downTo / stepped (step != 1) is only an XProgression/Iterable. Decide
-    // here (ignoring the element type argument, which is always the range's
-    // own element kind) so `x downTo y` picks the Iterable overload, not the
-    // XRange one.
+    // `..` (step 1) is an XRange/ClosedRange/XProgression/Iterable; downTo or step
+    // != 1 is only an XProgression/Iterable, so `x downTo y` picks Iterable.
     if (v.* == .Range) {
         const r = v.Range;
         const prog: []const u8 = switch (r.kind) {
@@ -238,7 +195,6 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
         if (std.mem.eql(u8, head, "Iterable") or std.mem.eql(u8, head, prog)) return .proven;
         if (r.step == 1 and (std.mem.eql(u8, head, rng) or
             std.mem.eql(u8, head, "ClosedRange") or std.mem.eql(u8, head, "OpenEndRange"))) return .proven;
-        // Named a range-family type this value is not.
         for ([_][]const u8{
             "IntRange",        "LongRange",        "CharRange",       "UIntRange",
             "ULongRange",      "IntProgression",   "LongProgression", "CharProgression",
@@ -246,8 +202,7 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
         }) |fam| {
             if (std.mem.eql(u8, head, fam)) return .disproven;
         }
-        // A range satisfies Iterable (proven above) but is never a
-        // List/Set/Map/Collection.
+        // A range satisfies Iterable but is never a List/Set/Map/Collection.
         if (isListFamily(head) or isSetFamily(head) or isMapFamily(head)) return .disproven;
         return .unknown;
     }
@@ -259,7 +214,6 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
         return switch (containerArgsMatch(self, head, args, v, fuel)) {
             .proven => .proven,
             .disproven => .disproven,
-            // The head fits; only the generic arguments are unknowable.
             .unknown => .unknown,
         };
     }
@@ -272,13 +226,9 @@ fn valueMatches(self: *VmHost, ty: *const TypeRef, v: *const Value, fuel: u8) Ma
         return .unknown;
     }
 
-    // A bare callable value against a REGISTERED class/interface that is not
-    // a `fun interface` is a definite mismatch: no SAM conversion applies, so
-    // a lambda argument can never satisfy `FlowCollector` — the member
-    // `collect(FlowCollector)` must stand aside for the extension
-    // `collect(action)` exactly as kotlinc resolves it. A head that names no
-    // registered class (a typealias of a function type, an unseen import)
-    // stays unknown.
+    // A callable against a registered class that is not a `fun interface` can never
+    // bind: no SAM conversion applies, so the member `collect(FlowCollector)` stands
+    // aside for the extension `collect(action)`. An unregistered head stays unknown.
     switch (v.*) {
         .IrClosure, .Intrinsic, .BoundMethod => {
             const cg = self.classes.borrow();
@@ -308,9 +258,8 @@ pub fn runtimeHead(v: *const Value) []const u8 {
     };
 }
 
-/// The dotted path a parameter type carried when written qualified
-/// (`x: a.Box` lowers a `#qual:a.Box` marker arg), or null for an unqualified
-/// parameter type.
+/// Dotted path of a qualified parameter type (`x: a.Box` lowers a `#qual:a.Box` marker
+/// arg), else null.
 fn qualifiedMarker(ty: *const TypeRef) ?[]const u8 {
     for (ty.args) |*a| {
         if (std.mem.startsWith(u8, a.name, "#qual:")) return a.name["#qual:".len..];
@@ -318,13 +267,9 @@ fn qualifiedMarker(ty: *const TypeRef) ?[]const u8 {
     return null;
 }
 
-/// Whether a `param_ty` written qualified to a specific class and the runtime
-/// value `v` provably denote DIFFERENT registered classes that merely share a
-/// simple name — a cross-package collision. Lets the exact-name overload tier
-/// reject the wrong-package candidate so the identity-matching sibling wins.
-/// Definite-only: false unless the param's qualified target AND the arg's class
-/// both resolve to registered classes with different FQNs, so an unqualified
-/// param, a builtin, or an unregistered/anonymous arg never conflicts.
+/// Whether a qualified `param_ty` and the value denote different registered classes
+/// sharing a simple name, so the exact-name tier drops the wrong-package candidate.
+/// Definite-only: both sides must resolve to registered FQNs.
 pub fn crossPackageIdentityConflict(self: *VmHost, param_ty: *const TypeRef, v: *const Value) bool {
     if (v.* != .Instance) return false;
     const target_path = qualifiedMarker(param_ty) orelse return false;
@@ -346,9 +291,7 @@ pub fn crossPackageIdentityConflict(self: *VmHost, param_ty: *const TypeRef, v: 
     return !std.mem.eql(u8, m.classes.items[target_cid.int()].fqn, m.classes.items[arg_cid.int()].fqn);
 }
 
-/// Does the declared head accept this runtime head through the builtin
-/// supertype table (`List` value for an `Iterable` parameter, `String`
-/// for `CharSequence`, …)?
+/// Builtin supertype table: a `List` value satisfies an `Iterable` parameter.
 fn builtinHeadAccepts(head: []const u8, v_ty: []const u8) bool {
     const supers: []const []const u8 = blk: {
         const eq = std.mem.eql;
@@ -391,9 +334,7 @@ fn instanceIsA(self: *VmHost, v: *const Value, target: []const u8) bool {
     return false;
 }
 
-/// Definite instance disproof: the declared head names a registered class,
-/// the instance's own class is registered (so its supertype closure is
-/// complete), and the walk never reaches the head.
+/// Definite only when both classes are registered, so the supertype closure is complete.
 fn instanceDefinitelyNot(self: *VmHost, v: *const Value, target: []const u8) bool {
     {
         const cg = self.classes.borrow();
@@ -404,21 +345,12 @@ fn instanceDefinitelyNot(self: *VmHost, v: *const Value, target: []const u8) boo
     return !instanceIsA(self, v, target);
 }
 
-// -------------------------------------------------------------------------
-// Container generic-argument refinement.
-// -------------------------------------------------------------------------
-
-/// Element-walk cap for the scorer: enough to type any literal container
-/// a call site disambiguates with, without rescanning a large collection
-/// once per overload candidate. Elements past the cap leave the verdict
-/// at whatever the sampled prefix established (never a disproof).
+/// Elements walked per candidate; those past the cap leave the sampled prefix's
+/// verdict, never a disproof.
 const SCORER_ELEM_CAP: usize = 16;
 
-/// Match a container value's content knowledge against the declared
-/// generic arguments. Element values decide where present; an empty
-/// container falls back to the declared element head it was created with
-/// (explicit call-site type arguments on the stdlib creators), and is
-/// `unknown` when it carries none.
+/// Elements decide where present; an empty container falls back to its declared element
+/// head.
 fn containerArgsMatch(self: *VmHost, head: []const u8, ty_args: []const TypeRef, v: *const Value, fuel: u8) Match {
     if (isMapFamily(head)) {
         if (v.* != .Map or ty_args.len < 2) return .unknown;
@@ -473,17 +405,12 @@ fn combine(a: Match, b: Match) Match {
     return .proven;
 }
 
-/// Does an empty container's recorded element head *prove* the declared
-/// generic argument? Used by the strict receiver prover, which needs a
-/// positive proof (everything else falls to its lenient pass).
 pub fn declaredElemProves(self: *VmHost, want: *const TypeRef, have_head: ?[]const u8) bool {
     return declaredHeadMatch(self, want, have_head) == .proven;
 }
 
-/// Declared-vs-declared head comparison for an empty container that
-/// carries the element head it was created with. Head-level only: the
-/// creation-site type argument is recorded as the written head name, so
-/// nested generic arguments on the candidate side stay unknowable.
+/// Declared-vs-declared for an empty container; head-level only, so nested arguments
+/// stay unknowable.
 fn declaredHeadMatch(self: *VmHost, want: *const TypeRef, have_head: ?[]const u8) Match {
     const have_full = simpleName(have_head orelse return .unknown);
     // A recorded FULL generic spelling (`List<Int>`) compares by head.
@@ -493,11 +420,9 @@ fn declaredHeadMatch(self: *VmHost, want: *const TypeRef, have_head: ?[]const u8
     if (std.mem.eql(u8, want_head, "Any")) return .proven;
     if (looksLikeTypeParam(self, want_head)) return .unknown;
     if (std.mem.eql(u8, want_head, have)) {
-        // Nested arguments on the wanted side are not recorded on the
-        // value; an exact head match alone cannot prove them.
+        // Nested arguments on the wanted side are not recorded on the value.
         return if (realArgs(want.args).len == 0) .proven else .unknown;
     }
-    // Both heads known and recognisably different value kinds: definite.
     const wk = builtinParamKind(want_head);
     const hk = builtinParamKind(have);
     if (wk != null and hk != null and wk != hk) return .disproven;
@@ -505,17 +430,10 @@ fn declaredHeadMatch(self: *VmHost, want: *const TypeRef, have_head: ?[]const u8
     return .unknown;
 }
 
-// -------------------------------------------------------------------------
-// Function-shape refinement.
-// -------------------------------------------------------------------------
-
-/// The slice of a closure's lowered body `Func` the matcher consults.
 /// `params` borrows the module's func table, which outlives every call.
 const ClosureBody = struct { is_suspend: bool, params: []const ir.Param };
 
-/// Resolve a closure's lowered body `Func`. The side-table records the
-/// sub-module the body was lowered into; null means the main program
-/// module.
+/// A null `info.module` means the body was lowered into the main program module.
 fn closureBodyFunc(self: *VmHost, id: u64) ?ClosureBody {
     const info = self.closures.get(@intCast(id)) orelse return null;
     if (info.module) |m| {
@@ -528,9 +446,7 @@ fn closureBodyFunc(self: *VmHost, id: u64) ?ClosureBody {
     return .{ .is_suspend = f.is_suspend, .params = f.params };
 }
 
-/// Declared-vs-declared comparison of one lambda parameter annotation
-/// against one declared function-type parameter. Definite only when both
-/// heads name recognised builtin value types.
+/// Definite only when both heads name recognised builtin value types.
 fn lambdaParamMatch(self: *VmHost, declared: *const TypeRef, annotated: *const TypeRef) Match {
     const want = bareHead(declared.name);
     const have = bareHead(annotated.name);
@@ -539,18 +455,16 @@ fn lambdaParamMatch(self: *VmHost, declared: *const TypeRef, annotated: *const T
     if (std.mem.eql(u8, want, "Any")) return .proven;
     if (looksLikeTypeParam(self, want) or looksLikeTypeParam(self, have)) return .unknown;
     if (std.mem.eql(u8, want, have)) return .proven;
-    // Both sides are concrete builtin value types with different names:
-    // function-type parameters are invariant, so the annotated lambda can
-    // never bind (an `(Int) -> Int` never accepts `{ s: String -> … }`).
+    // Function-type parameters are invariant: `(Int) -> Int` never accepts `{ s: String
+    // -> … }`.
     _ = builtinParamKind(want) orelse return .unknown;
     _ = builtinParamKind(have) orelse return .unknown;
     return .disproven;
 }
 
-/// Refine a head/arity-accepted callable argument against a declared
-/// `FunctionN` parameter: the `#suspend` marker and, for an `IrClosure`
-/// whose lambda literal carried parameter type annotations, the parameter
-/// types. `null` disqualifies; positive proves; zero is unknowable.
+/// Refine a head/arity-accepted callable against a declared `FunctionN` parameter by
+/// the `#suspend` marker and any lambda annotations. `null` disqualifies, a positive
+/// delta proves, zero is unknowable.
 pub fn functionShapeDelta(self: *VmHost, head: []const u8, ty_args: []const TypeRef, arg: *const Value) ?i32 {
     const declared_suspend = ty_args.len > 0 and std.mem.eql(u8, ty_args[0].name, "#suspend");
     const shape = ty_args[@intFromBool(declared_suspend)..];
@@ -570,11 +484,9 @@ pub fn functionShapeDelta(self: *VmHost, head: []const u8, ty_args: []const Type
     }
     if (!declaredSuspendProven(body, declared_suspend)) delta -= SUSPEND_CONVERSION_PENALTY;
 
-    // Positional parameter types, when the declared shape is the plain
-    // (no extension receiver) form and the closure declares the same
-    // count. `Function{d}` counts value parameters only; the lowered args
-    // are `params… , return` (receiver form has one extra slot and stays
-    // unknowable here).
+    // Positional parameter types, only for the plain (no extension receiver) shape
+    // at matching arity: `Function{d}` counts value parameters and the lowered args
+    // are `params…, return`, so the receiver form's extra slot stays unknowable.
     const want_n = std.fmt.parseInt(usize, head["Function".len..], 10) catch return delta;
     if (shape.len != want_n + 1) return delta;
     const b = body orelse return delta;
@@ -597,13 +509,8 @@ fn declaredSuspendProven(body: ?ClosureBody, declared_suspend: bool) bool {
     return b.is_suspend;
 }
 
-// -------------------------------------------------------------------------
-// Entry point for the scorers.
-// -------------------------------------------------------------------------
-
-/// Refine a head-accepted arg/param pair using the declared `TypeRef`'s
-/// generic arguments. Callers add the result to the head-level base
-/// score; `null` disqualifies the candidate.
+/// Refine a head-accepted arg/param pair; callers add the result to the head-level base
+/// score.
 pub fn refineByDeclaredArgs(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) ?i32 {
     const head = bareHead(param_ty.name);
     if (std.mem.startsWith(u8, head, "Function")) {
