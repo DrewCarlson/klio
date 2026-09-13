@@ -357,6 +357,7 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
+    inline for (.{ common, enum_static, bound_ref, read_paths, get_field_inner, class_access, ext_props, instance_field, field_cache, set_field }) |m| testing.refAllDecls(m);
 }
 
 test "utf16Len counts code units, falling back to bytes" {

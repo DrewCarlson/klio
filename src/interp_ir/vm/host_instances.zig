@@ -227,6 +227,7 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
+    inline for (.{ common, ctor_select, ctor_defaults, super_chain, new_instance, ctor_path, materialize, build_object }) |m| testing.refAllDecls(m);
 }
 
 test "isIntrinsicClass / isBuiltinThrowableName classification" {

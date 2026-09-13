@@ -57,7 +57,6 @@ const anonSiteModule = common.anonSiteModule;
 const anonSiteName = common.anonSiteName;
 const anonSiteThunksGet = common.anonSiteThunksGet;
 const anonSiteThunksPut = common.anonSiteThunksPut;
-const anon_site_thunks_root_registered = common.anon_site_thunks_root_registered;
 const gcMarkAnonSites = common.gcMarkAnonSites;
 const typeErr = common.typeErr;
 
@@ -252,7 +251,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
     if (expr.* != .ObjectExpr) {
         return .{ .err = try typeErr(allocator, "Vm::build_object: not an ObjectExpr AST node", .{}) };
     }
-    if (runtime.gc.gc_enabled and !anon_site_thunks_root_registered.swap(true, .monotonic)) {
+    if (runtime.gc.gc_enabled and !common.anon_site_thunks_root_registered.swap(true, .monotonic)) {
         runtime.gc.registerRoot(gcMarkAnonSites);
     }
     // The member bodies below lower into fresh side modules with none of

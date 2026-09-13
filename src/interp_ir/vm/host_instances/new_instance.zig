@@ -49,9 +49,6 @@ const NameValue = root.NameValue;
 const common = @import("common.zig");
 const CTOR_HEADS_MAX = common.CTOR_HEADS_MAX;
 const ctorGuardContains = common.ctorGuardContains;
-const ctor_bounds = common.ctor_bounds;
-const ctor_static_heads = common.ctor_static_heads;
-const enum_under_init = common.enum_under_init;
 const installCtorBounds = common.installCtorBounds;
 const takeCtorStaticHeads = common.takeCtorStaticHeads;
 const typeErr = common.typeErr;
@@ -557,7 +554,7 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     };
     defer class_def.deinit();
     const prev_bounds = installCtorBounds(class_def);
-    defer ctor_bounds = prev_bounds;
+    defer common.ctor_bounds = prev_bounds;
 
     if (classDefIsAbstract(class_def)) {
         return throwInstantiation(self, allocator, "Cannot create an instance of an abstract class: {s}", classDefName(class_def));
@@ -578,7 +575,7 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
         while (cur) |c| {
             const cname = classDefName(c);
             const comp_name: ?[]const u8 = blk: {
-                if (enum_under_init) |ef| {
+                if (common.enum_under_init) |ef| {
                     const g = c.borrow();
                     defer g.deinit();
                     if (std.mem.eql(u8, g.get().fqn, ef)) break :blk null;
@@ -617,8 +614,8 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
         @memcpy(site_heads_buf[0..sh.len], sh);
         break :blk site_heads_buf[0..sh.len];
     } else null;
-    ctor_static_heads = site_heads;
-    defer ctor_static_heads = null;
+    common.ctor_static_heads = site_heads;
+    defer common.ctor_static_heads = null;
     // A class without a primary constructor dispatches to the secondary
     // constructor its arguments fit, defaults included (`A()` reaching
     // `constructor(arg1: String = global)`).
@@ -667,7 +664,7 @@ pub fn newInstance(self: *VmHost, allocator: Allocator, class: ClassId, args: []
     };
     const shell_guarded = ctorGuardContains(class_name);
     if (!shell_guarded and (args.len != n_primary_initial or zero_primary_secondary or same_arity_secondary_better)) {
-        ctor_static_heads = site_heads;
+        common.ctor_static_heads = site_heads;
         if (try dispatchSecondaryCtor(self, allocator, class, class_def, args, outer_hint)) |res| {
             return res;
         }

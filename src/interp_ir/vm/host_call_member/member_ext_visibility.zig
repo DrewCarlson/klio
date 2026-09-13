@@ -593,7 +593,7 @@ pub const OwnerSet = struct {
         }
         return false;
     }
-    fn deinit(self: *OwnerSet) void {
+    pub fn deinit(self: *OwnerSet) void {
         if (self.owned) |*m| m.deinit();
     }
     fn add(self: *OwnerSet, cls: usize) bool {

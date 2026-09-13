@@ -50,7 +50,6 @@ const build_object = @import("build_object.zig");
 const anonKey = build_object.anonKey;
 
 const common = @import("common.zig");
-const ctor_bounds = common.ctor_bounds;
 const installCtorBounds = common.installCtorBounds;
 const typeErr = common.typeErr;
 
@@ -309,8 +308,8 @@ pub fn runSuperCtorChain(
     const entries = secondaryCtors(self, class_fqn, class_name);
     const chain_def = classDefByName(self, sideTableKey(class_fqn, class_name));
     defer if (chain_def) |d| d.deinit();
-    const prev_bounds = if (chain_def) |d| installCtorBounds(d) else ctor_bounds;
-    defer ctor_bounds = prev_bounds;
+    const prev_bounds = if (chain_def) |d| installCtorBounds(d) else common.ctor_bounds;
+    defer common.ctor_bounds = prev_bounds;
     // A secondary constructor takes the call when the primary cannot (its
     // arity, defaults and vararg considered); otherwise only an exact fit.
     const primary_takes = if (chain_def) |d| primaryCanTake(self, d, args.len) else true;

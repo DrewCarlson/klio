@@ -809,10 +809,14 @@ pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *cons
 
 /// Build the `n_params`-length argument vector, filling positions past
 /// the provided args from default-arg thunks.
-pub fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Module, n_params: usize, provided: []const Value, defaults: ?[]const ?FuncId) Allocator.Error!union(enum) { ok: []Value, err: EvalError } {
+/// Either the filled argument vector or the error raised while evaluating a
+/// default. Named so the two entry points share one return type.
+pub const PaddedArgs = union(enum) { ok: []Value, err: EvalError };
+
+pub fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Module, n_params: usize, provided: []const Value, defaults: ?[]const ?FuncId) Allocator.Error!PaddedArgs {
     return padArgsWithDefaultsFor(self, allocator, module, n_params, provided, defaults, &.{});
 }
-pub fn padArgsWithDefaultsFor(self: *VmHost, allocator: Allocator, module: *const Module, n_params: usize, provided: []const Value, defaults: ?[]const ?FuncId, params: []const ir.Param) Allocator.Error!union(enum) { ok: []Value, err: EvalError } {
+pub fn padArgsWithDefaultsFor(self: *VmHost, allocator: Allocator, module: *const Module, n_params: usize, provided: []const Value, defaults: ?[]const ?FuncId, params: []const ir.Param) Allocator.Error!PaddedArgs {
     // Kotlin binds a trailing lambda to the LAST parameter. When the
     // positional layout would leave a default-less last parameter empty
     // while the last provided arg is callable, the call was the
