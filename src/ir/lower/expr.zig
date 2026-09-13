@@ -818,12 +818,12 @@ fn tryLocalCallableRef(b: *FuncBuilder, pr: @FieldType(Expr, "PropertyRef"), dst
 /// declared by a receiver class.
 fn tryReceiverMemberRef(b: *FuncBuilder, pr: @FieldType(Expr, "PropertyRef"), dst: Reg, nm: ConstId) Allocator.Error!?Reg {
 
-    if (!ir.isAliasName(pr.name.name)) {
-        const rh = b.recvTy() orelse return null;
+    if (!ir.isAliasName(pr.name.name)) receiver_member: {
+        const rh = b.recvTy() orelse break :receiver_member;
         const cid = (b.module.uniqueClassIdBySimpleName(rh) orelse
-            b.module.classIdByFqn(rh)) orelse return null;
+            b.module.classIdByFqn(rh)) orelse break :receiver_member;
         if (!b.module.classHierarchyDeclaresMember(cid, pr.name.name))
-            return null;
+            break :receiver_member;
         if (try resolveThisRegKind(b, true, false)) |this_reg| {
             try b.push(.{ .MemberRef = .{ .dst = dst, .receiver = this_reg, .name = nm, .adapt_arity = b.pending_lambda_arity, .adapt_unit = b.pending_ref_lambda_unit, .adapt_heads = try expectedHeadsConst(b) } });
             return dst;
