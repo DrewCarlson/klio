@@ -1,17 +1,9 @@
-//! The per-evaluation `VmHost` — the host type the IR evaluator
-//! dispatches non-trivial operations through, plus the `VmIntrinsicHost`
-//! adapter the stdlib reaches back through to invoke lambdas and the rest
-//! of the runtime.
-//!
-//! The IR evaluator (`ir.eval`) is generic over its host type
-//! (`comptime H`); `interp_ir` supplies `H = VmHost` at every
-//! `ir.eval.evalWith(VmHost, ...)` call site, so `host.callValue(...)` and
-//! the rest resolve as direct comptime-duck-typed method calls with no
-//! `{ctx, vtable}` indirection. The per-operation methods are FREE
-//! FUNCTIONS over `*VmHost` living in the sibling `host_*.zig` files; this
-//! file owns the struct definitions and aliases each free function as a
-//! `VmHost` method decl. `VmIntrinsicHost` still uses the
-//! `runtime.IntrinsicHost` `{ctx, vtable}` pair, which is a separate seam.
+//! The per-evaluation `VmHost` the IR evaluator dispatches non-trivial operations
+//! through, plus the `VmIntrinsicHost` adapter the stdlib reaches back through to
+//! invoke lambdas. `ir.eval` is generic over its host type, so `host.callValue(...)`
+//! resolves as a direct comptime call with no vtable indirection: the per-operation
+//! methods are free functions over `*VmHost` in the sibling `host_*.zig` files,
+//! aliased here as decls. `VmIntrinsicHost` keeps the `{ctx, vtable}` pair instead.
 
 const std = @import("std");
 
@@ -40,9 +32,7 @@ const FuncId = ir.FuncId;
 const ClassId = ir.ClassId;
 const TypeRef = ir.TypeRef;
 const EvalResult = ir.eval.EvalResult;
-/// The stdlib `IntrinsicHost` callbacks carry `runtime.EvalResult`
-/// (`Value` / `RuntimeError`), distinct from the IR evaluator's
-/// `ir.eval.EvalResult` (`Value` / `EvalError`).
+/// The stdlib callbacks carry `runtime.EvalResult`, not the evaluator's.
 const RuntimeEvalResult = runtime.EvalResult;
 const EvalError = ir.eval.EvalError;
 const UnitResult = ir.eval.UnitResult;
@@ -57,8 +47,6 @@ const SharedClosures = root.SharedClosures;
 const ThreadTable = root.ThreadTable;
 const ObjectStates = root.ObjectStates;
 
-// Sibling impl files. Each holds the free functions over `*VmHost` /
-// `*VmIntrinsicHost` that fill in one slice of host behaviour.
 pub const host_call_func = @import("host_call_func.zig");
 pub const host_call_member = @import("host_call_member.zig");
 pub const host_call_value = @import("host_call_value.zig");
@@ -75,12 +63,8 @@ pub const compose = @import("compose.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const trace = @import("trace.zig");
 
-/// Emit one structured `[PATH]` dispatch record (`KLIO_TRACE_PATH`) for a
-/// terminal dispatch site: `path_tag` identifies the site, `decl_fqn`/`fid`
-/// the chosen declaration (`fid` null for a native intrinsic form),
-/// `receiver` the dispatch receiver (null for receiverless entries), and
-/// `args` the call arguments. Free when the gate is off: the first check
-/// returns before any label or tag work.
+/// Emit one `[PATH]` record (`KLIO_TRACE_PATH`): `path_tag` names the site,
+/// `decl_fqn`/`fid` the chosen declaration (`fid` null for a native intrinsic).
 pub fn emitPath(
     allocator: Allocator,
     path_tag: []const u8,
@@ -98,12 +82,8 @@ pub fn emitPath(
     emitPathLabeled(allocator, path_tag, decl_fqn, fid, recv_label, args);
 }
 
-/// `emitPath` with a caller-supplied receiver label. Super-qualified
-/// dispatch uses this to label the record with the resolved static target
-/// class (`super(Base)`) rather than the runtime receiver: `super.f()` is
-/// static dispatch, so keying it on the runtime class would collide with
-/// the virtual `recv.f()` key while legitimately choosing a different
-/// declaration.
+/// Super-qualified dispatch labels the record with the static target class
+/// (`super(Base)`), since keying on the runtime class would collide with `recv.f()`.
 pub fn emitPathLabeled(
     allocator: Allocator,
     path_tag: []const u8,
@@ -113,10 +93,7 @@ pub fn emitPathLabeled(
     args: []const Value,
 ) void {
     if (!trace.pathEnabled()) return;
-    // Coarse arg-shape tags via `trace.recvLabel`: the runtime-type label
-    // per argument — the same axis member dispatch probes — with an
-    // instance reporting its runtime class name. Comma-joined; `-` for a
-    // zero-arg call so the record stays one space-separated token list.
+    // One runtime-type label per argument, `-` for a zero-arg call.
     var tags: std.ArrayList(u8) = .empty;
     defer tags.deinit(allocator);
     if (args.len == 0) {
@@ -144,15 +121,12 @@ pub fn emitPathLabeled(
     }
 }
 
-/// Simple-name tail of a possibly-qualified name (`a.b.C` -> `C`).
 fn pathSimpleName(fqn: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| return fqn[i + 1 ..];
     return fqn;
 }
 
-/// Assert (Debug) that the process-wide receiver/coroutine thread-locals are
-/// empty at a run boundary, then clear them. Run between programs so leaked
-/// state is a loud failure rather than silently threaded into the next run.
+/// Assert (Debug) the receiver/coroutine thread-locals are empty at a run boundary.
 pub fn resetReceiverThreadLocals() void {
     host_instances.resetReceiverTls();
     host_call_member.resetReceiverTls();
@@ -162,39 +136,28 @@ pub fn resetReceiverThreadLocals() void {
     compose.resetAtRunBoundary();
 }
 
-/// Drop the process-global anon-`object` site caches: their keys and thunk
-/// sub-modules belong to the finished run and must not be reused by the next
-/// one in the same process (tests, repeated CLI runs). PROGRAM boundary only —
-/// never from a Vm deinit: transient Vms (worker-pool tasks, nested drivers)
-/// tear down while the program's classes registry still holds the site names
-/// as live map keys, and freeing them there is a use-after-free on the next
-/// anon-object instantiation.
+/// Drop the process-global anon-`object` site caches, whose keys and thunk sub-modules
+/// belong to the finished run. PROGRAM boundary only, never a Vm deinit: a transient Vm
+/// tears down while the classes registry still holds the site names as live keys.
 pub fn resetRunGlobalCaches() void {
     host_instances.resetAnonSiteCache();
     host_call_member.resetStaticApplicabilityCache();
-    // Invalidate every pointer-keyed dispatch cache (the thread-local method /
-    // resolve / perm L1s, the name-identity slots, the owner-keyed ext-prop
-    // memo) in one stroke: entries carry a generation stamp, and stale
-    // generations never hit — including on still-parked pool worker threads a
-    // per-thread clear could not reach. Without this, an in-process driver
-    // running many programs replayed the previous program's resolutions off
-    // reused cell addresses (wrong overloads, calls into freed IR).
+    // Invalidate every pointer-keyed dispatch cache in one stroke: entries carry a
+    // generation stamp, so stale ones never hit, including on parked pool workers a
+    // per-thread clear cannot reach, and a reused cell address cannot replay a
+    // resolution into freed IR.
     host_call_member.bumpDispatchCacheGen();
-    // The bytecode-tier stream cache keys on blocks-pointer identity;
-    // reused addresses across in-process programs must not replay a prior
-    // program's compiled stream.
+    // The bytecode stream cache keys on blocks-pointer identity, so a reused address
+    // must not replay it.
     ir.bc.resetCacheForTest();
     ir.eval.resetSuspendLivenessCache();
     stdlib.resetEmptyCollectionSingletons();
     stdlib.resetEmptySequenceSingleton();
 }
 
-/// A borrowed view over a `Vm`'s (or another host's) shared program-state
-/// handles. The fields are plain value copies of `ObjRef`/`Shared*`
-/// handles — copying them does NOT bump any refcount, so a `SharedHandles`
-/// owns nothing and must never be `deinit`'d. The owner (`self`) keeps every
-/// cell alive for the view's whole lifetime. Used to stamp out transient,
-/// call-scoped `VmHost`/`VmIntrinsicHost`s without per-handle atomic traffic.
+/// A borrowed view over another host's shared program-state handles. The fields are
+/// value copies that bump no refcount, so a `SharedHandles` owns nothing and must never
+/// be `deinit`'d; the owner keeps every cell alive for the view's lifetime.
 pub const SharedHandles = struct {
     globals: ObjRef(Env),
     module: ObjRef(Module),
@@ -210,7 +173,6 @@ pub const SharedHandles = struct {
     singletons_by_id: root.SingletonsById,
     allocator: Allocator,
 
-    /// Borrow the shared handles a live `VmHost` holds, without cloning.
     pub fn fromHost(host: *const VmHost) SharedHandles {
         return .{
             .globals = host.globals,
@@ -229,7 +191,6 @@ pub const SharedHandles = struct {
         };
     }
 
-    /// Borrow the shared handles a live `VmIntrinsicHost` holds.
     pub fn fromIntrinsic(host: *const VmIntrinsicHost) SharedHandles {
         return .{
             .globals = host.globals,
@@ -249,10 +210,7 @@ pub const SharedHandles = struct {
     }
 };
 
-/// IR Host implementation. Every method native to the Vm lives as a
-/// free function over `*VmHost` in a sibling file; this struct holds the
-/// shared state those functions read and write for the duration of one
-/// evaluation.
+/// The shared state the sibling free functions read and write for one evaluation.
 pub const VmHost = struct {
     globals: ObjRef(Env),
     module: ObjRef(Module),
@@ -268,23 +226,14 @@ pub const VmHost = struct {
     object_states: ObjectStates,
     singletons_by_id: root.SingletonsById,
     allocator: Allocator,
-    /// This THREAD's field caches, resolved once when the view is built. A
-    /// view is stack-local to the thread that builds it (never stored, never
-    /// shared), so the pointer stays valid for the view's whole life — and the
-    /// per-field-operation paths reach the caches through it instead of
-    /// re-resolving a threadlocal, which on Darwin is a `_tlv_get_addr` CALL.
+    /// This thread's field caches: a view is stack-local to its building thread.
     tls: *host_fields.FieldsTls,
-    /// This THREAD's keepalive handle, resolved with `tls`: pinning across a
-    /// host re-entry happens on every member call, and each mark/push/restore
-    /// was its own threadlocal resolution.
+    /// This thread's keepalive handle; every member call pins across a host re-entry.
     ka: runtime.KeepaliveHandle,
 
-    /// Build a transient `VmHost` that BORROWS another host/Vm's shared
-    /// handles by value, with no refcount bump. The view never outlives the
-    /// owner, so it must not `deinit` any borrowed handle — the owner still
-    /// holds each cell. `globals` and `out` are passed explicitly because a
-    /// delegated closure body layers its own scoped env, and each call binds
-    /// its own output sink.
+    /// Transient `VmHost` BORROWING another host's handles by value, with no refcount
+    /// bump: it never outlives the owner and must not `deinit` a borrowed handle.
+    /// `globals` and `out` are explicit: a delegated closure body layers its own env.
     pub fn borrowed(state: SharedHandles, globals: ObjRef(Env), out: Output) VmHost {
         return .{
             .globals = globals,
@@ -306,12 +255,6 @@ pub const VmHost = struct {
         };
     }
 
-    // The IR evaluator is generic over its host type (`comptime H`) and
-    // invokes these as plain methods (`host.callValue(...)`). Each is the
-    // free function over `*VmHost` living in a sibling file; aliasing them
-    // here as struct decls makes method-call syntax resolve directly, with
-    // no `{ctx, vtable}` indirection. `interp_ir` supplies `H = VmHost` at
-    // every `ir.eval.evalWith(VmHost, ...)` call site.
     pub const callValue = host_call_value.callValue;
     pub const callableDeclaredArity = host_call_func.callableDeclaredArity;
     pub const prepareClosureFlatCall = host_call_value.prepareClosureFlatCall;
@@ -452,15 +395,9 @@ pub const VmHost = struct {
     pub const bareUnsettledHeaderNoOp = host_call_func.bareUnsettledHeaderNoOp;
 };
 
-/// Stdlib `CallCtx` host adapter for native Vm dispatch. HOF bindings
-/// (`map`, `forEach`, scope fns, …) reach back through this adapter to
-/// invoke the lambda they were passed.
+/// Stdlib `CallCtx` host adapter: HOF bindings reach through it to invoke a lambda.
 pub const VmIntrinsicHost = struct {
-    /// The two operations the coroutine driver needs from whoever it is
-    /// driving: start a queued closure, and resume a parked continuation. They
-    /// are methods so a COMPILED program can present its own host to the same
-    /// driver — the scheduler, the clock and the Job graph are then shared
-    /// rather than written twice.
+    /// Methods, so a compiled program can present its own host.
     pub fn evalClosureRaw(self: *VmIntrinsicHost, block: *const Value, args: []const Value, scope: ?*const Value, out: Output) Allocator.Error!intrinsic_host.RawResult {
         return intrinsic_host.evalClosureRaw(self, block, args, scope, out);
     }
@@ -487,10 +424,7 @@ pub const VmIntrinsicHost = struct {
     singletons_by_id: root.SingletonsById,
     allocator: Allocator,
 
-    /// Build a transient `VmIntrinsicHost` that BORROWS another host's shared
-    /// handles by value, with no refcount bump. Same non-owning contract as
-    /// `VmHost.borrowed`: the view never outlives its owner and must not
-    /// `deinit` any borrowed handle.
+    /// Borrows handles by value, under `VmHost.borrowed`'s non-owning contract.
     pub fn borrowed(state: SharedHandles) VmIntrinsicHost {
         return .{
             .module = state.module,
@@ -509,16 +443,10 @@ pub const VmIntrinsicHost = struct {
         };
     }
 
-    /// Build a `runtime.IntrinsicHost` `{ctx, vtable}` pair bound to this
-    /// adapter.
     pub fn intrinsicHost(self: *VmIntrinsicHost) IntrinsicHost {
         return .{ .ctx = self, .vtable = &intrinsic_vtable };
     }
 };
-
-// -------------------------------------------------------------------------
-// `runtime.IntrinsicHost` vtable wiring for `VmIntrinsicHost`.
-// -------------------------------------------------------------------------
 
 fn ip(ctx: *anyopaque) *VmIntrinsicHost {
     return @ptrCast(@alignCast(ctx));
@@ -624,10 +552,9 @@ fn ivBuilderStep(ctx: *anyopaque, state: runtime.BuilderStateRef, out: Output) A
 }
 fn ivPersist(ctx: *anyopaque) IntrinsicHost {
     const src = ip(ctx);
-    // Clone the shared handles into an allocator-owned host so it outlives the
-    // `main` activation whose transient host this was. Refcounts hold the
-    // module / globals / closures / object-states alive; the copy is never
-    // released — an OS-driven frame loop owns it until the process exits.
+    // Clone the handles into an allocator-owned host so it outlives the `main`
+    // activation whose transient host this was. The copy is never released; an
+    // OS-driven frame loop owns it until the process exits.
     const p = src.allocator.create(VmIntrinsicHost) catch return .{ .ctx = src, .vtable = &intrinsic_vtable };
     p.* = .{
         .module = src.module.clone(),

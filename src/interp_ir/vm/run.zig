@@ -1,12 +1,7 @@
-//! The `Vm` run loop and constructors.
-//!
-//! Establishes a `Vm` around a lowered IR module, runs the startup
-//! pipeline (top-level property initialisers, enum-entry ctor args), and
-//! drives `main` through the IR evaluator. `object` / companion
-//! singletons are not part of startup: they initialize lazily at first
-//! access through `host_globals.ensureObjectSingleton`.
-//! Inherent methods over `*Vm`, exported under `Vm.*` aliases by the
-//! module root.
+//! The `Vm` run loop and constructors: establishes a `Vm` around a lowered IR
+//! module, runs the startup pipeline, and drives `main` through the IR evaluator.
+//! `object` and companion singletons initialize lazily at first access through
+//! `host_globals.ensureObjectSingleton`, not at startup.
 
 const std = @import("std");
 const host_instances = @import("host_instances.zig");
@@ -44,10 +39,7 @@ const OuterTable = root.OuterTable;
 const AnonMethodEntry = root.AnonMethodEntry;
 const SharedClosures = root.SharedClosures;
 
-/// Build a Vm around an already-lowered IR module. Stdlib aliases
-/// (`print`, `println`, `listOf`, …) are installed into globals up front
-/// so identifiers covered by Kotlin's default imports resolve without an
-/// explicit `import`.
+/// Stdlib aliases go into globals up front, so Kotlin's default imports need no `import`.
 pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
     var env = Env.init(allocator);
     for (stdlib.IMPLICIT_ALIASES) |alias| {
@@ -76,29 +68,20 @@ pub fn vmNew(allocator: Allocator, module: ObjRef(Module)) Allocator.Error!Vm {
     };
 }
 
-/// Build a Vm from a fully-prepared `build.BuiltModule`. The recommended
-/// entry point for the driver — it carries both the IR module and the
-/// synthesised runtime `ClassDef` table.
 pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Error!struct { vm: Vm, main: ?FuncId } {
     var vm = try vmNew(allocator, built.module.clone());
     vm.classes.deinit();
-    // Take ownership of the built class table; leave an empty map behind
-    // so the `BuiltModule`'s own `deinit` is a no-op for it.
+    // Take the built class table, leaving an empty map so `built.deinit` is a no-op.
     const taken = built.classes;
     built.classes = ClassTable.init(allocator);
     vm.classes = try ObjRef(ClassTable).init(allocator, taken);
 
-    // COPY the enum-entry ctor-arg thunks rather than moving the list: the
-    // built list is arena-owned, and the Vm frees its own containers with
-    // the VM allocator — under a GC run that is the slab, and freeing an
-    // arena buffer through the slab reads a garbage page header at
-    // teardown. The entries are plain values; the donor list stays with
-    // `built` so its own deinit frees it where it was allocated.
+    // Copy the enum-entry thunks rather than move the list: the built list is arena-owned
+    // and the Vm frees its containers with the VM allocator, which misreads that buffer.
     vm.enum_entry_arg_inits.deinit(allocator);
     vm.enum_entry_arg_inits = .empty;
     try vm.enum_entry_arg_inits.appendSlice(allocator, built.enum_entry_arg_inits.items);
 
-    // Top-level property initialiser order is preserved.
     vm.top_level_props.deinit(allocator);
     vm.top_level_props = .empty;
     {
@@ -109,13 +92,10 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
             try vm.top_level_props.append(allocator, nf);
             try prog.top_level_prop_inits.put(nf.name, .{ .func = nf.func, .default = nf.default, .file = nf.file });
         }
-        // The Vm owns the ordered list for the run; the program image borrows
-        // its slice so the on-demand driver can run a file's clinit in order.
+        // The Vm owns the ordered list; the image borrows its slice for per-file clinit.
         prog.top_level_props_ordered = vm.top_level_props.items;
 
-        // Move every dispatch-time side table into the program image. Each
-        // map is swapped with a fresh empty so the `BuiltModule`'s own
-        // `deinit` is a no-op for the moved table.
+        // Move each dispatch-time side table into the image, swapping a fresh empty in.
         prog.body_prop_inits.deinit();
         prog.body_prop_inits = built.body_prop_inits;
         built.body_prop_inits = build.PairFuncMap.init(allocator);
@@ -183,13 +163,10 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
         prog.func_defaults = built.func_defaults;
         built.func_defaults = std.AutoHashMap(u32, []?FuncId).init(allocator);
 
-        // `object_names` is a set in the program image; copy the names in.
         for (built.object_names.items) |n| try prog.object_names.put(n, {});
     }
 
-    // Pre-populated enum-entry override methods land in the same
-    // `anon_methods` side-table the Vm consults for anon-object +
-    // local-class methods.
+    // Enum-entry overrides share the `anon_methods` table with anon-object methods.
     {
         const ag = vm.anon_methods.borrowMut();
         defer ag.deinit();
@@ -207,15 +184,13 @@ pub fn vmFromBuilt(allocator: Allocator, built: *build.BuiltModule) Allocator.Er
     return .{ .vm = vm, .main = built.main };
 }
 
-/// `(class, method)` key for the `anon_methods` table, matching the
-/// `\u{1f}`-joined key the rest of the Vm uses.
+/// `(class, method)` key for `anon_methods`, `\u{1f}`-joined as elsewhere in the Vm.
 fn anonMethodKey(allocator: Allocator, class: []const u8, method: []const u8) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}\u{1f}{s}", .{ class, method });
 }
 
-/// Install pack-provided host bindings. Probed before
-/// `stdlib.implementation` during dispatch so a pack's FQN-keyed
-/// bindings shadow the stdlib's default lookup. Called before `run`.
+/// Install pack-provided host bindings, probed before `stdlib.implementation`
+/// during dispatch so they shadow it. Call before `run`.
 pub fn vmSetInstalledBindings(self: *Vm, bindings: stdlib.HostBindings) Allocator.Error!void {
     {
         const g = self.prog.borrowMut();
@@ -223,29 +198,20 @@ pub fn vmSetInstalledBindings(self: *Vm, bindings: stdlib.HostBindings) Allocato
         g.get().installed_bindings.deinit();
         g.get().installed_bindings = try ObjRef(stdlib.HostBindings).init(self.allocator, bindings);
     }
-    // Re-settle each symbol's single executable form against the new
-    // overlay so dispatch consults the link-time form, not a per-call probe.
     try linkProgramForms(self);
 }
 
-/// Resolve every symbol's single executable form once against the current
-/// `installed_bindings` overlay. The VM dispatch paths consult the recorded
-/// form rather than probing the overlay per call.
+/// Resolve every symbol's executable form once against `installed_bindings`.
 fn linkProgramForms(self: *Vm) Allocator.Error!void {
     const module_ref = self.module.clone();
     defer module_ref.deinit();
     {
-        // Build the name->ClassId overlay once here (single-threaded setup), so
-        // `classId` is O(1) at run time instead of a linear scan over every
-        // class (the dominant cost of `is`/`when` type checks).
+        // Build the name->ClassId overlay once here so `classId` is O(1) at run time.
         const mm = module_ref.borrowMut();
         defer mm.deinit();
         try mm.get().buildClassIdMap(self.allocator);
-        // The HOST-SHADOW set: every non-stdlib overlay fqn names a pack
-        // declaration whose host binding is authoritative over its
-        // interpreted body (auto_bindings marks them overrides). A static
-        // member bind consults this to leave those on the runtime walk's
-        // binding preference.
+        // Host-shadow set: a non-stdlib overlay fqn names a pack declaration whose
+        // host binding is authoritative over its body, so a static bind defers to the walk.
         {
             const reg = &mm.get().registry;
             const bg = self.prog.borrow();
@@ -268,9 +234,7 @@ fn linkProgramForms(self: *Vm) Allocator.Error!void {
     try g.get().linkResolvedForms(mg.get());
 }
 
-/// A borrowed view over this Vm's shared program-state handles. Copying
-/// the handles by value bumps no refcount; the `Vm` keeps every cell alive
-/// for the view's whole lifetime, so the view owns nothing.
+/// Borrowed view of this Vm's shared handles; copies bump no refcount and own nothing.
 fn sharedHandles(self: *Vm) vmhost.SharedHandles {
     return .{
         .globals = self.globals,
@@ -289,22 +253,13 @@ fn sharedHandles(self: *Vm) vmhost.SharedHandles {
     };
 }
 
-/// Build a `VmHost` that borrows this Vm's shared state for the duration of
-/// one evaluation. The handles are copied by value with no refcount bump,
-/// so the host owns nothing and is dropped just by going out of scope — the
-/// `Vm` keeps every cell alive for the call's whole lifetime.
+/// `VmHost` borrowing this Vm's state for one evaluation; it owns nothing, no deinit.
 pub fn vmMakeHost(self: *Vm, out: Output) VmHost {
     return VmHost.borrowed(sharedHandles(self), self.globals, out);
 }
 
-/// A snapshot of every handle a freshly spawned OS thread needs to
-/// materialize its own child `Vm`. The seed carries `self.allocator`
-/// verbatim; the child allocates and frees against it on another thread.
-/// That sharing is sound under Zig 0.16 only while the backing allocator
-/// is thread-safe and nothing calls `.reset()`/`.deinit()` on it while a
-/// worker is live — the two invariants documented and guarded at the live
-/// spawn seam (`assertSpawnAllocatorInvariant` in `intrinsic_host.zig`).
-/// Here we assert the cheaply-checkable part: a non-degenerate allocator.
+/// Snapshot of every handle a spawned OS thread needs for its own child `Vm`; the seed
+/// carries `self.allocator` verbatim, sound under `assertSpawnAllocatorInvariant`.
 pub fn vmSpawnChild(self: *Vm) SendableVmSeed {
     const ok = @intFromPtr(self.allocator.vtable) != 0;
     if (!ok and trace.invariantsEnabled()) {
@@ -328,23 +283,14 @@ pub fn vmSpawnChild(self: *Vm) SendableVmSeed {
     };
 }
 
-/// Invoke a thread-body callable on this (child) Vm, writing through the
-/// shared serialized sink.
 pub fn vmRunThreadBlock(self: *Vm, block: *const Value) Allocator.Error!runtime.EvalResult {
-    // The intrinsic host borrows the child Vm's shared handles by value (no
-    // refcount bump) and runs for the duration of this one call on the same
-    // (worker) thread, so it owns nothing and needs no matching deinit — the
-    // child `Vm` keeps every cell alive across the call.
+    // The intrinsic host borrows the child Vm's handles by value for this one call.
     var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
     const host = intrinsic.intrinsicHost();
     const r = try host.invokeCallable(block, &.{}, self.out_sink.output());
     return r;
 }
 
-/// Run the program's `main` function. All evaluation writes through one
-/// shared serialized sink (`out_sink`); on completion the accumulated
-/// output is replayed into the caller's `out` in order.
-// ---- GC: the Vm program-graph root provider -----------------------------
 var gc_vms: std.ArrayListUnmanaged(*const Vm) = .empty;
 var gc_vm_root_registered = std.atomic.Value(bool).init(false);
 var gc_vms_lock = std.atomic.Value(bool).init(false);
@@ -364,12 +310,9 @@ fn gcMarkAllVms(m: *runtime.gc.Marker) void {
         m.shade(&vm.globals.cell.hdr);
         m.shade(&vm.classes.cell.hdr);
         m.shade(&vm.class_default_outer.cell.hdr);
-        // The lambda side-table spine is permanent and traces nothing (its
-        // per-closure captures/chain are kept alive by `markClosureHook` only
-        // while a live value references the id), so it is NOT shaded here — that
-        // strong root was the closure leak.
-        // Object/companion singletons captured mid-construction, anon-object
-        // method receivers, and the program image's default-value Values.
+        // The lambda side-table spine traces nothing and its per-closure captures
+        // stay alive through `markClosureHook`, so shading it would pin every closure.
+        // Mid-construction singletons, anon-object receivers, image default Values.
         m.shade(&vm.object_states.cell.hdr);
         m.shade(&vm.singletons_by_id.cell.hdr);
         m.shade(&vm.anon_methods.cell.hdr);
@@ -377,18 +320,13 @@ fn gcMarkAllVms(m: *runtime.gc.Marker) void {
     }
 }
 
-/// Register a live Vm as a GC root (its globals/class graph). Idempotent root
-/// registration; the Vm pointer is stable for the run.
+/// Register a live Vm as a GC root (globals and class graph). Idempotent.
 pub fn gcRegisterVm(vm: *const Vm) void {
-    // The lazy-`sequence{}` builder continuation mark/free hooks are needed
-    // regardless of the memory mode: `BuilderState.deinit` calls `freeSuspendHook`
-    // under refcount teardown too. Install them unconditionally (idempotent).
+    // The lazy-`sequence {}` continuation hooks are needed in every memory mode.
     runtime.gc.markSuspendHook = ir.eval.gcMarkSuspendStateOpaque;
     runtime.gc.freeSuspendHook = ir.eval.freeSuspendStateOpaque;
-    // All Vms share one closure side-table by handle clone; install it (and the
-    // liveness + non-capturing-lambda singleton-identity hooks) with it. The
-    // singleton-identity comparison must hold in every memory mode, so install
-    // unconditionally — the GC mark/sweep hooks are inert when GC is off.
+    // All Vms share one closure side table by handle clone; install it with the
+    // liveness and lambda-identity hooks in every mode (GC hooks are inert when off).
     root.gcInstallClosureHook(vm.closures);
     if (!runtime.gc.gc_enabled) return;
     if (!gc_vm_root_registered.swap(true, .monotonic)) runtime.gc.registerRoot(gcMarkAllVms);
@@ -400,9 +338,8 @@ pub fn gcRegisterVm(vm: *const Vm) void {
     gc_vms.append(std.heap.page_allocator, vm) catch @panic("KGC: vm root registration failed");
 }
 
-/// Remove a finished Vm from the process root set. The root callback itself is
-/// process-lifetime, but it must never retain a pointer into a completed
-/// in-process test run's phase arena.
+/// Drop a finished Vm from the process root set; the process-lifetime callback
+/// must never retain a pointer into a completed run's phase arena.
 pub fn gcUnregisterVm(vm: *const Vm) void {
     if (!runtime.gc.gc_enabled) return;
     gcVmsLock();
@@ -417,19 +354,13 @@ pub fn gcUnregisterVm(vm: *const Vm) void {
 
 pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     gcRegisterVm(self);
-    // Stream program output from here on: a run that hangs, loops, or is killed
-    // must still show what it printed. `replayInto` below is then a no-op,
-    // except for a caller that attaches nothing (the capture harnesses).
+    // Stream output from here so a run that hangs or is killed still shows its prints.
     self.out_sink.attach(out);
-    // Close the permanent generation: everything minted up to here (the stdlib
-    // image, the program's class/IR graph, the empty global/class tables) is
-    // immortal and reference-stable; cells minted from here on are nursery and
-    // tracked for sweep. Worker threads minting cells run program code only and
-    // set their own threadlocal `alloc_perm = false` at thread entry.
+    // Close the permanent generation: cells minted up to here are immortal and
+    // reference-stable, later ones nursery and swept (a worker does the same at entry).
     runtime.gc.alloc_perm = false;
     runtime.gc.program_started = true;
-    // The main run thread joins the mutator set so a collection started by any
-    // spawned worker stops it at a safe point before touching the shared heap.
+    // The run thread joins the mutator set, so a worker's collection stops it safely.
     vmhost.coroutines.gcThreadEnter();
     defer vmhost.coroutines.gcThreadExit();
     const result = try vmRunInner(self, main);
@@ -437,29 +368,17 @@ pub fn vmRun(self: *Vm, main: FuncId, out: Output) Allocator.Error!VmResult {
     return result;
 }
 
-/// Sequential startup pipeline sharing mutable host state. Every exit —
-/// including a failing top-level initializer, enum-entry init, or invalid
-/// `main` — routes through `joinAllThreads`: outstanding worker threads
-/// and the dispatcher pool must drain, and the process-global registries
-/// (slot owners, persisted continuations, run-scoped library state) must
-/// sweep, before the Vm and its arena tear down on any path.
-/// Count of Vm runs live in this process. A nested run (a lazy
-/// image-extend baking eager calls mid-program) must not treat its own
-/// completion as THE run boundary: the abandon flags, the dispatcher
-/// pool, and the run-scoped global registries all belong to the
-/// outermost run, and raising the boundary from a nested join killed the
-/// outer program's coroutines mid-flight.
+/// Count of Vm runs live in this process. A nested run (a mid-program image
+/// extend) must not treat its own completion as the run boundary: the abandon
+/// flags, dispatcher pool and run-scoped registries belong to the outermost run.
 var live_vm_runs = std.atomic.Value(usize).init(0);
 
 pub fn vmRunInner(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     _ = live_vm_runs.fetchAdd(1, .acq_rel);
     defer _ = live_vm_runs.fetchSub(1, .acq_rel);
     const result = try vmRunBody(self, main);
-    // Join every still-running spawned thread before returning so a
-    // program that omits an explicit `join()` does not lose a child's
-    // writes (and the process does not outlive them, racing the next
-    // run's ObjCell borrows). A child that threw surfaces here only if
-    // `main` itself did not already fail.
+    // Join spawned threads on every exit so a program that omits `join()` keeps a
+    // child's writes. A child error surfaces only if `main` did not already fail.
     return joinAllThreads(self, result);
 }
 
@@ -474,10 +393,7 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     if (try vmPrepareInner(self, module, sink)) |verr| return .{ .err = verr };
 
     const func = module.funcById(main) orelse return .{ .err = .InvalidMain };
-    // A `suspend fun main` is driven through the cooperative coroutine pump
-    // (kotlinc wraps it in `runSuspend`), so a real suspension such as
-    // `delay` parks and resumes instead of escaping as a "suspended outside a
-    // driver" error.
+    // A `suspend fun main` runs on the cooperative pump, so `delay` parks, not escapes.
     if (func.is_suspend) {
         var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
         const r = try vmhost.coroutines.driveSuspendMain(&intrinsic, main, sink);
@@ -488,7 +404,7 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     }
     var host = vmMakeHost(self, sink);
     // `fun main(args: Array<String>)` receives the program argv (a bundle's
-    // argv[1..]; empty under `klio run`), matching Kotlin's entry contract.
+    // `argv[1..]`, empty under `klio run`), per Kotlin's entry contract.
     var args: std.ArrayList(Value) = .empty;
     if (func.params.len >= 1) {
         try args.append(self.allocator, try programArgsValue(self.allocator, self.program_args));
@@ -500,7 +416,6 @@ fn vmRunBody(self: *Vm, main: FuncId) Allocator.Error!VmResult {
     };
 }
 
-/// Build the `Array<String>` value bound to `main`'s parameter.
 fn programArgsValue(a: Allocator, argv: []const []const u8) Allocator.Error!Value {
     var list: std.ArrayList(Value) = .empty;
     errdefer list.deinit(a);
@@ -510,9 +425,7 @@ fn programArgsValue(a: Allocator, argv: []const []const u8) Allocator.Error!Valu
     return runtime.ArrayData.fromBoxedList(try runtime.ValueList.init(a, list));
 }
 
-/// Outcome of invoking a function/method/constructor into a prepared Vm.
-/// `ok` carries the return value, `threw` the uncaught Kotlin Throwable, and
-/// `failed` an interpreter-level error message (unbound symbol, arity, etc.).
+/// Call outcome: `threw` is an uncaught Throwable, `failed` an interpreter error.
 pub const CallOutcome = union(enum) {
     ok: Value,
     threw: Value,
@@ -529,8 +442,6 @@ fn outcomeFromEval(self: *Vm, r: ir.eval.EvalResult) CallOutcome {
     };
 }
 
-/// Human-readable message for a non-throw `EvalError` (an interpreter-level
-/// failure surfaced as a test failure rather than an assertion failure).
 fn evalErrMessage(allocator: Allocator, e: EvalError) []const u8 {
     return switch (e) {
         .Unsupported, .Type, .Unbound, .Unimplemented, .CalleeFailed, .Arity, .StackOverflow => |s| s,
@@ -548,16 +459,10 @@ fn outcomeFromRuntime(self: *Vm, r: runtime.EvalResult) CallOutcome {
     };
 }
 
-/// The pre-main startup pipeline, factored out so an embedder (the test
-/// runner) can prepare a Vm and then invoke arbitrary entry points instead
-/// of `main`. Returns `null` on success, or the `VmError` of a failing
-/// top-level / enum-entry initializer. `module` and `sink` are already
-/// borrowed by the caller.
+/// Pre-main startup pipeline; null on success, else the failing `VmError`.
 fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Error!?VmError {
-    // Canonicalize name-bearing strings once per module, before any user
-    // code runs, so hot-path name compares exit on pointer equality. The
-    // shared borrow the callers hold guards nothing concurrent here —
-    // prepare is single-threaded — so the const cast is sound.
+    // Canonicalize name-bearing strings once per module so hot-path compares exit on
+    // pointer equality; prepare is single-threaded, so the const cast is sound.
     {
         const need = blk: {
             const pg = self.prog.borrow();
@@ -573,12 +478,7 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
             pg.get().canonicalized_module_identity = self.module.identity();
         }
     }
-    // Settle each symbol's single executable form before any user code
-    // runs. `setInstalledBindings` already links when a pack overlay is
-    // installed; this covers the no-overlay configurations (the embedded
-    // run path, the bench harness) so every dispatch consults a populated
-    // resolved-form table. Idempotent — skip if already linked for the
-    // current overlay.
+    // Settle each symbol's executable form before user code runs; idempotent when linked.
     {
         const linked = blk: {
             const g = self.prog.borrow();
@@ -592,9 +492,7 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         }
     }
 
-    // Enum classes initialize on first active use (`host_globals.ensureEnumInit`);
-    // the entry constructor-argument thunks and the patch allocator the
-    // driver needs travel on the program image.
+    // Enum classes initialize on first use; their entry thunks ride the program image.
     {
         const pg = self.prog.borrowMut();
         defer pg.deinit();
@@ -602,10 +500,8 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         pg.get().patch_allocator = self.patch_allocator;
     }
 
-    // Top-level `const val`s are compile-time constants; bind them in
-    // globals up front — before the object / companion initializers
-    // below, which run ahead of the top-level property inits and may read
-    // a top-level const.
+    // Top-level `const val`s are compile-time constants; bind them before the
+    // object and companion initializers, which run first and may read one.
     {
         var it = module.registry.class_const_inits.iterator();
         while (it.next()) |e| {
@@ -617,21 +513,13 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
         }
     }
 
-    // `object Foo { … }` singletons and companions are NOT constructed
-    // here: Kotlin initializes an object lazily at its first access (and a
-    // companion additionally at the first instantiation of its owning
-    // class), and a never-referenced object never initializes. The
-    // first-access gate lives in `host_globals.ensureObjectSingleton`;
-    // every read path for a singleton routes through it.
+    // `object` singletons and companions are not constructed here: Kotlin initializes
+    // one at first access, and every read path routes through `ensureObjectSingleton`.
 
-    // Run top-level property initialisers before main so global reads
-    // against the env see the initial values. A property already defined
-    // (its initializer was driven on demand by an earlier initialiser via
-    // `ensureTopLevelInited`) is not re-run: the initializer executes once.
-    // While this pass is mid-flight, a forward read of a later annotated
-    // property observes its declared type's default (JVM <clinit> field
-    // semantics) instead of driving the initializer out of order; the flag
-    // scopes that window to this loop alone.
+    // Run top-level property initialisers before main so global reads see the
+    // initial values; one already driven on demand is not re-run. While the pass
+    // is mid-flight a forward read of a later annotated property observes its
+    // declared type's default (JVM <clinit> semantics); the flag scopes that here.
     {
         vmhost.host_impl.setStartupInitsActive(true);
         defer vmhost.host_impl.setStartupInitsActive(false);
@@ -643,13 +531,9 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                 g.deinit();
                 if (exists) continue;
             }
-            // This prop's file `<clinit>` is running for its initializer, so a
-            // same-file forward read defaults while a cross-file read drives
-            // (per-file lazy static init, not one global clinit). Guard the
-            // prop itself too, so a re-entrant on-demand drive of this file
-            // (an object this initializer constructs reads a later sibling)
-            // skips the prop the startup pass is still evaluating instead of
-            // re-driving it into an unresolved cycle.
+            // This prop's file `<clinit>` is running, so a same-file forward read
+            // defaults while a cross-file read drives. Guarding the prop itself keeps
+            // a re-entrant drive of this file out of an unresolved cycle.
             vmhost.host_impl.pushInitFile(nf.file);
             defer vmhost.host_impl.popInitFile(nf.file);
             vmhost.host_impl.pushInitProp(nf.name);
@@ -662,12 +546,9 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
                     defer g.deinit();
                     g.get().define(nf.name, v) catch {};
                 },
-                // A top-level `val` whose initializer references a not-yet-
-                // consumed symbol is deferred to on-access; only a missing-
-                // symbol failure defers. `CalleeFailed` is the body-exit
-                // re-tag of the same missing-symbol condition. A deferred
-                // property is past its turn, so later reads inside this
-                // window drive it rather than defaulting it.
+                // A top-level `val` whose initializer names a not-yet-consumed
+                // symbol defers to on-access (`CalleeFailed` is the body-exit re-tag
+                // of that condition); past its turn, a later read drives it.
                 .err => |e| switch (e) {
                     .Unbound, .Unimplemented, .CalleeFailed => {
                         if (runtime.envOnce("KLIO_TOPPROP_TRACE") != null) std.debug.print("[topprop-defer] {s}: {s}\n", .{ nf.name, @tagName(e) });
@@ -682,8 +563,7 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
     if (runtime.envOnce("KLIO_DUMP_FN")) |w| {
         const dmg = self.module.borrow();
         defer dmg.deinit();
-        // Accepts a numeric FuncId or a function simple name (dumps every
-        // func bearing the name).
+        // Accepts a numeric FuncId or a function simple name.
         const by_id: ?u32 = std.fmt.parseInt(u32, w, 10) catch null;
         for (dmg.get().funcs.items) |*df| {
             if (by_id) |want| {
@@ -775,8 +655,6 @@ fn vmPrepareInner(self: *Vm, module: *const Module, sink: Output) Allocator.Erro
     return null;
 }
 
-/// Run the pre-main startup pipeline against this Vm. Public entry for an
-/// embedder that drives entry points other than `main` (the test runner).
 pub fn vmPrepare(self: *Vm) Allocator.Error!?VmError {
     const module_ref = self.module.clone();
     defer module_ref.deinit();
@@ -785,8 +663,6 @@ pub fn vmPrepare(self: *Vm) Allocator.Error!?VmError {
     return vmPrepareInner(self, mg.get(), self.out_sink.output());
 }
 
-/// Invoke a top-level, no-argument function (a test function) on a prepared
-/// Vm and classify the result.
 pub fn vmCallNoArg(self: *Vm, func_id: FuncId) Allocator.Error!CallOutcome {
     const module_ref = self.module.clone();
     defer module_ref.deinit();
@@ -799,20 +675,15 @@ pub fn vmCallNoArg(self: *Vm, func_id: FuncId) Allocator.Error!CallOutcome {
     return outcomeFromEval(self, r);
 }
 
-/// Construct an instance of `class_id` via its no-argument constructor.
 pub fn vmConstruct(self: *Vm, class_id: ir.ClassId) Allocator.Error!CallOutcome {
     var intrinsic = VmIntrinsicHost.borrowed(sharedHandles(self));
     const r = try vmhost.intrinsic_host.construct(&intrinsic, class_id, &.{}, self.out_sink.output());
     return outcomeFromEval(self, r);
 }
 
-/// Invoke the no-argument method `name` on `receiver` (a test class's
-/// `@BeforeTest`/`@Test`/`@AfterTest` method).
 pub fn vmCallMethod(self: *Vm, receiver: *const Value, name: []const u8) Allocator.Error!CallOutcome {
-    // Route through `callMember` directly (not `invokeMethod`, which flattens
-    // every non-throw error to null) so a test method's real failure surfaces.
-    // The test runner owns `receiver` in a Zig local rather than an evaluator
-    // frame; pin it across dispatch until the called frame has rooted its params.
+    // Route through `callMember`, not `invokeMethod` (which flattens every
+    // non-throw error to null), and pin `receiver` until the callee roots its params.
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     runtime.keepalivePush(receiver.*);
@@ -821,11 +692,7 @@ pub fn vmCallMethod(self: *Vm, receiver: *const Value, name: []const u8) Allocat
     return outcomeFromEval(self, r);
 }
 
-/// Prepare the Vm, run `body` (which invokes entry points via the call
-/// helpers above), then drain workers. Returns a startup `VmError` if
-/// preparation failed (in which case `body` does not run). The shared output
-/// sink mirrors the `main` run path: writes during `body` stream to `out` as
-/// they happen.
+/// Prepare the Vm, run `body`, then drain workers; a startup `VmError` skips `body`.
 pub fn vmRunCalls(
     self: *Vm,
     out: Output,
@@ -848,34 +715,17 @@ pub fn vmRunCalls(
     return prep;
 }
 
-/// Join every outstanding spawned/dispatched worker thread, called at the
-/// end of `vmRunInner`. If `main` succeeded but a child threw, the
-/// child's error is surfaced; if `main` already failed,
-/// child errors are swallowed (the original failure wins).
-///
-/// After the last worker has joined this is the only run-boundary seam that
-/// runs exclusively on the top-level driver thread (workers run through
-/// `vmRunThreadBlock`, which never reaches here), so it is where the
-/// process-global slot-owner registry is drained: any slot a driver left
-/// registered on an error/abort/cancel path holds a clone of an arena-backed
-/// `DriverWakeup`, and draining here — once no worker can still route through
-/// it — keeps a stale entry from surviving into the next run's reset arena.
+/// Join every outstanding spawned and dispatched worker; a child's error surfaces only
+/// when `main` succeeded. The last join is the only run-boundary seam on the driver
+/// thread alone, so it drains the slot-owner registry before the next run resets its arena.
 fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     var out = result;
-    // A NESTED join (a mid-program image-extend's bake Vm) owns only its
-    // own explicit threads. The abandon flags, the shared dispatcher
-    // pool, and the run-scoped global registries belong to the outermost
-    // run — raising the boundary here aborted the outer program's
-    // coroutines at their next block edge.
+    // A nested join owns only its own explicit threads; the abandon flags, the
+    // shared dispatcher pool and the run-scoped registries belong to the outermost run.
     const outermost = live_vm_runs.load(.acquire) <= 1;
     if (outermost) {
-        // The run's result is computed; every worker still executing user code
-        // — explicit threads included — must stop cooperatively so a leaked
-        // spinner or sleeper cannot hold this join open forever (the per-test
-        // wall cap is already cleared here, and the pool's own abandonment
-        // only begins after the explicit joins). The pool shutdown inside the
-        // drain loop clears `abandon_requested` when it finishes; re-arm it at
-        // each pass so the request stays live for stragglers.
+        // Every worker still running user code must stop cooperatively, or a leaked
+        // spinner holds the join open. Pool shutdown clears it, so re-arm each pass.
         runtime.setRunBoundaryAbandon(true);
         runtime.requestAbandon();
     }
@@ -883,28 +733,20 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
         runtime.setRunBoundaryAbandon(false);
         runtime.clearAbandon();
     };
-    // Once both worker populations have drained, sweep the process-global
-    // registries that key into this run's value graph: the slot-owner and
-    // persisted-continuation maps here, and each library layer's run-scoped
-    // state (e.g. the kxco channel registry) through its registered
-    // run-boundary hook.
+    // Once both populations drain, sweep the process-global registries keyed into this
+    // run's graph: slot owners, persisted continuations, per-library run-scoped state.
     defer if (outermost) runtime.runBoundarySweep();
     defer if (outermost) vmhost.coroutines.drainVirtualClock();
     defer if (outermost) vmhost.coroutines.drainPersistedParked();
     defer if (outermost) vmhost.coroutines.drainSlotOwners();
-    // Two worker populations drain in turn: explicit `kotlin.concurrent`
-    // threads (which may still post dispatcher tasks) first, then the
-    // dispatcher pool (whose tasks may have spawned threads). Loop until
-    // a full pass leaves both empty.
+    // The two populations drain in turn: explicit threads (which may post tasks)
+    // then the dispatcher pool (whose tasks may spawn threads), until both empty.
     while (true) {
         var joined_any = false;
-        // The pool-shutdown pass below clears the abandon request when it
-        // finishes; re-arm for this pass's joins.
         if (outermost) runtime.requestAbandon();
         while (true) {
-            // Take one outstanding handle under the lock, then join it
-            // without holding the lock so the worker's own result
-            // publication (which re-locks the table) cannot deadlock.
+            // Take one handle under the lock and join it without holding the lock,
+            // so the worker's own result publication cannot deadlock against it.
             const id = blk: {
                 const g = self.threads.borrowMut();
                 defer g.deinit();
@@ -960,7 +802,6 @@ fn joinAllThreads(self: *Vm, result: VmResult) VmResult {
     return out;
 }
 
-/// Render a child thread's `RuntimeError` into a `VmError.Eval` message.
 fn vmEvalMessage(allocator: Allocator, e: RuntimeError) []const u8 {
     return switch (e) {
         .Unbound => |s| s,
@@ -973,8 +814,6 @@ fn vmEvalMessage(allocator: Allocator, e: RuntimeError) []const u8 {
     };
 }
 
-/// Format an `EvalError` into a `VmError` (a thrown exception renders
-/// its fqn + message).
 fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
     switch (e) {
         .Throw => |v| {
@@ -1002,13 +841,9 @@ fn vmErrorFromEval(allocator: Allocator, e: EvalError) VmError {
     }
 }
 
-/// Release every owned handle of the Vm.
-///
-/// The pure arena profile drops everything en masse. Freeing profiles still
-/// release raw host containers here; under tracing GC the `ObjRef` releases are
-/// inert and reachability owns their cells. Receiver/coroutine thread-locals are
-/// cleared in every mode. Real OS thread handles were already joined by
-/// `joinAllThreads`.
+/// Release every owned handle of the Vm. The pure arena profile drops everything en masse;
+/// freeing profiles release the raw host containers here, and under tracing GC the releases
+/// are inert since reachability owns the cells. Thread locals are cleared in every mode.
 pub fn vmDeinit(self: *Vm) void {
     gcUnregisterVm(self);
     if (runtime.freeScratch()) {
@@ -1027,10 +862,6 @@ pub fn vmDeinit(self: *Vm) void {
         self.object_states.deinit();
         self.singletons_by_id.deinit();
     }
-    // The receiver/coroutine thread-locals are balanced within a run; assert
-    // they are empty at the boundary and clear them so leaked-across-runs
-    // state is a loud Debug failure for the next program in this thread. This
-    // runs on both paths — it is a thread-local clear, not arena memory.
     vmhost.resetReceiverThreadLocals();
 }
 
@@ -1040,8 +871,7 @@ test {
     testing.refAllDecls(@This());
 }
 
-/// Free a `Func` body produced by `FuncBuilder.finish` (the module's
-/// `deinit` frees the `funcs` list but not each func's owned blocks).
+/// Free a `Func` body from `FuncBuilder.finish`; module `deinit` frees the list only.
 fn freeFunc(func: ir.Func) void {
     for (func.blocks) |blk| {
         if (blk.insts.len != 0) testing.allocator.free(blk.insts);

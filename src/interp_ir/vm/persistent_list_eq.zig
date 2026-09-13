@@ -1,24 +1,10 @@
-//! Host fast path for structural equality of the Compose-vendored
-//! persistent vectors (`androidx.compose.runtime.external.kotlinx.
-//! collections.immutable.implementations.immutableList.
-//! SmallPersistentVector` / `PersistentVector`).
-//!
-//! Same motivation as persistent_map_eq.zig: `newList == oldList` in
-//! `SnapshotStateList.mutate` dispatches an interpreted ordered walk on
-//! every optimistic-retry attempt. The vector trie's node arrays are
-//! immutable once built and a one-element update shares every untouched
-//! subtree, so identity-pruned array comparison touches only the
-//! changed path.
-//!
-//! Layout facts this depends on (PersistentVector.kt): a trie-based
-//! vector always has size > 32 and a small vector size <= 32, so
-//! content-equal lists are the same representation and a class mismatch
-//! means a size mismatch; leaves under `root` are always full; `tail`
-//! arrays carry capacity padding, so only the logical tail length
-//! (size - rootSize, rootSize = (size-1) & ~31) is compared.
-//!
-//! Exactness rule matches the map path: any element the host does not
-//! own equality for bails to the interpreted dispatch (null).
+//! Host fast path for structural equality of the Compose-vendored persistent vectors,
+//! which `SnapshotStateList.mutate` otherwise walks interpreted on every optimistic
+//! retry. Node arrays are immutable once built and an update shares every untouched
+//! subtree, so identity-pruned comparison touches only the changed path. A trie vector
+//! always has size > 32 and a small vector <= 32, so a class mismatch means a size
+//! mismatch; leaves under `root` are full and only `tail`'s logical length
+//! (size - rootSize, rootSize = (size-1) & ~31) is compared, never its padding.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -70,9 +56,7 @@ fn sameArrayCell(a: ArrayData, b: ArrayData) bool {
     return a.cellPtr() == b.cellPtr();
 }
 
-/// Ordered compare of the first `remaining` logical elements under a
-/// pair of trie node arrays at `shift`. Slots past the used range are
-/// capacity padding and never read.
+/// Ordered compare of the first `remaining` elements; padding past them is never read.
 fn nodeEq(a: ArrayData, b: ArrayData, shift: u32, remaining: usize) ?bool {
     if (sameArrayCell(a, b)) return true;
     if (shift == 0) {
@@ -99,19 +83,14 @@ fn nodeEq(a: ArrayData, b: ArrayData, shift: u32, remaining: usize) ?bool {
     return true;
 }
 
-/// Ordered host scan of a vendored persistent vector for `element`,
-/// returning its first index, -1 when absent, or null when the receiver
-/// is another class or an element needs dispatched equality. Serves
-/// `contains`/`indexOf`, which otherwise walk the trie through a fully
-/// interpreted iterator with a dispatched equals per element.
-/// Whether `inst` is one of the vendored persistent-vector classes —
-/// the gate a flat-call preparer uses to stand aside so the host scan
-/// intercepts serve `contains`/`indexOf`.
+/// The gate a flat-call preparer uses to stand aside.
 pub fn isVectorClass(inst: ObjRef(InstanceData)) bool {
     if (classMatches(inst, &small_class_hit, SMALL_FQN)) return true;
     return classMatches(inst, &vec_class_hit, VEC_FQN);
 }
 
+/// Ordered host scan for `element`: its first index, -1 when absent, null when an
+/// element needs dispatched equality.
 pub fn tryIndexOf(a: ObjRef(InstanceData), element: *const Value) ?i64 {
     const hostable = switch (element.*) {
         .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char, .String, .Null, .Unit => true,
@@ -156,9 +135,7 @@ pub fn tryIndexOf(a: ObjRef(InstanceData), element: *const Value) ?i64 {
     return -1;
 }
 
-/// First index of `element` under a trie node covering `remaining`
-/// logical elements starting at absolute index `base`; -1 = absent,
-/// null = bail.
+/// First index under a node covering `remaining` elements from `base`; -1 absent.
 fn nodeIndexOf(arr: ArrayData, shift: u32, remaining: usize, base: usize, element: *const Value) ?i64 {
     if (remaining == 0) return -1;
     if (shift == 0) {
@@ -184,9 +161,7 @@ fn nodeIndexOf(arr: ArrayData, shift: u32, remaining: usize, base: usize, elemen
     return -1;
 }
 
-/// Answer `a.equals(b)` for two vendored persistent-vector instances,
-/// or null when either operand is another class or an element needs
-/// dispatched equality.
+/// Null when either is another class or needs dispatched equality.
 pub fn tryEquals(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) ?bool {
     const a_small = classMatches(a, &small_class_hit, SMALL_FQN);
     const a_vec = !a_small and classMatches(a, &vec_class_hit, VEC_FQN);
@@ -195,8 +170,7 @@ pub fn tryEquals(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) ?bool {
     const b_vec = !b_small and classMatches(b, &vec_class_hit, VEC_FQN);
     if (!b_small and !b_vec) return null;
     if (ObjRef(InstanceData).ptrEq(a, b)) return true;
-    // Small holds <= 32 elements and the trie vector > 32, so different
-    // representations cannot be content-equal.
+    // Small holds <= 32 elements and the trie vector > 32, so the two cannot agree.
     if (a_small != b_small) return false;
     const ga = a.borrow();
     defer ga.deinit();

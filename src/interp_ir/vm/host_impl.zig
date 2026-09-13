@@ -1,11 +1,5 @@
-//! `VmHost` lifecycle helpers that are not host-dispatch methods:
-//! on-demand top-level property init, spawned-thread join, and the
-//! spawned-thread liveness check.
-//!
-//! The IR evaluator is generic over its host type and `vmhost.zig` aliases
-//! the per-operation free functions over `*VmHost` as `VmHost` methods, so
-//! this file holds the inherent free functions that are not part of that
-//! dispatch surface.
+//! `VmHost` lifecycle helpers outside the host-dispatch surface `vmhost.zig`
+//! aliases: on-demand top-level property init, spawned-thread join and liveness.
 
 const std = @import("std");
 
@@ -21,21 +15,14 @@ const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
 const EvalError = ir.eval.EvalError;
 
-/// `Result<?Value, EvalError>` for `ensureTopLevelInited`.
 pub const MaybeValueResult = ir.eval.MaybeValueResult;
 
-/// True while the startup pass is running the top-level property
-/// initializers in file order on this thread. Inside that window a forward
-/// read of a later annotated property resolves to its declared type's
-/// static-field default (`pendingTypedDefault`) instead of driving the
-/// initializer out of order, matching the JVM's <clinit> field semantics.
+/// True while the startup pass runs the top-level initializers in file order here.
+/// Inside the window a forward read takes the declared type's default, as `<clinit>` does.
 threadlocal var startup_inits_active: bool = false;
 
-/// Properties whose startup turn already came and deferred (a missing-
-/// symbol failure left them to on-access driving). These are not forward
-/// references — their declarations precede the initializer doing the
-/// reading — so they keep the drive-on-demand path rather than a default.
-/// Holds run-stable `top_level_props` name slices for the window only.
+/// Properties whose startup turn came and deferred to on-access driving, so they keep
+/// the drive path. Holds run-stable `top_level_props` name slices for the window only.
 threadlocal var startup_deferred: std.ArrayListUnmanaged([]const u8) = .empty;
 
 /// Set by `vmRunBody` around the in-order top-level init loop.
@@ -44,17 +31,12 @@ pub fn setStartupInitsActive(active: bool) void {
     if (!active) startup_deferred.clearRetainingCapacity();
 }
 
-/// Record a property whose startup-pass initializer deferred to on-access.
 pub fn noteStartupDeferred(name: []const u8) void {
     startup_deferred.append(std.heap.page_allocator, name) catch {};
 }
 
-/// The declared type's pre-init default for a top-level property read
-/// before its initializer has run, while the startup pass is mid-flight.
-/// Null when the window is closed, the name is not a top-level property,
-/// or the declaration has no usable type annotation (the caller keeps the
-/// drive-on-demand path). Callers have already established that `name` is
-/// not yet bound in globals.
+/// The declared type's pre-init default for a top-level property read before its
+/// initializer runs; null outside the window or with no usable annotation.
 pub fn pendingTypedDefault(self: *VmHost, name: []const u8) ?Value {
     if (!startup_inits_active) return null;
     for (startup_deferred.items) |n| {
@@ -63,17 +45,14 @@ pub fn pendingTypedDefault(self: *VmHost, name: []const u8) ?Value {
     const pg = self.prog.borrow();
     defer pg.deinit();
     const entry = pg.get().top_level_prop_inits.get(name) orelse return null;
-    // Default only a SAME-file forward read: the prop's own file `<clinit>` is
-    // already running, so its field is still zero/null (JVM within-clinit
-    // semantics). A read of a prop in a file whose clinit has NOT started is a
-    // cross-file dependency that must be driven (Kotlin forces the other
-    // file's lazy static init) — returning null falls through to the drive.
+    // Default only a same-file forward read, whose `<clinit>` is already running: a prop
+    // whose file clinit has not started is a cross-file dependency Kotlin forces, so
+    // drive it instead.
     if (!inProgressFileContains(entry.file)) return null;
     return typedDefaultValue(entry.default);
 }
 
-/// The runtime value of a static-field default category, or null for
-/// `.none` (no annotation to default from).
+/// Null for `.none`: no annotation to default from.
 fn typedDefaultValue(kind: build.TypedDefault) ?Value {
     return switch (kind) {
         .none => null,
@@ -93,22 +72,13 @@ fn typedDefaultValue(kind: build.TypedDefault) ?Value {
     };
 }
 
-/// Top-level property initializers currently executing on this thread —
-/// breaks initializer cycles.
-/// Stores the program-image-owned key slices (run-stable, shared by the
-/// `prog` handle), so the entries outlive the borrowed `name` slice without
-/// per-key duplication. Page-allocator backed and cleared capacity-retaining
-/// like the sibling resolution guards, so it leaks nothing across runs.
+/// Top-level property initializers executing on this thread, which breaks init cycles.
+/// Keys are program-image-owned slices, so an entry outlives a borrowed `name`.
 threadlocal var in_progress: std.ArrayListUnmanaged([]const u8) = .empty;
 
-/// FileIds whose top-level `<clinit>` is currently executing on this thread.
-/// Kotlin initializes top-level `val`s per FILE (one facade `<clinit>` each),
-/// lazily on first access. So a forward read of a prop whose file clinit is
-/// ALREADY running observes the declared-type default (JVM within-clinit field
-/// semantics), but a read of a prop in a file whose clinit has NOT started must
-/// DRIVE it (forcing that file's clinit) rather than defaulting — otherwise a
-/// cross-file `val a = b.f()` reads `b`'s zero/null default instead of its real
-/// value during a companion/object init cascade.
+/// FileIds whose top-level `<clinit>` is running on this thread. Kotlin initializes
+/// top-level `val`s per FILE, lazily on first access: a prop whose file clinit already
+/// runs takes the declared-type default, one whose clinit has not started is driven.
 threadlocal var in_progress_files: std.ArrayListUnmanaged(u32) = .empty;
 
 fn inProgressFileContains(file: u32) bool {
@@ -118,25 +88,19 @@ fn inProgressFileContains(file: u32) bool {
     return false;
 }
 
-/// Mark a top-level prop as initializing (the in-order startup pass owns the
-/// prop it is currently evaluating): a re-entrant on-demand drive of the same
-/// file then SKIPS this prop rather than re-driving it while the startup pass
-/// still holds it mid-initialization.
+/// Mark a prop as initializing, so a re-entrant drive of the same file skips it.
 pub fn pushInitProp(name: []const u8) void {
     in_progress.append(std.heap.page_allocator, name) catch {};
 }
 
-/// Release a startup-pass prop guard (mirrors `InitGuard.release`).
 pub fn popInitProp(name: []const u8) void {
     (InitGuard{ .key = name }).release();
 }
 
-/// Mark a file's `<clinit>` as running for the duration of an initializer.
 pub fn pushInitFile(file: u32) void {
     in_progress_files.append(std.heap.page_allocator, file) catch {};
 }
 
-/// Clear the innermost matching file after its initializer returns.
 pub fn popInitFile(file: u32) void {
     var i: usize = in_progress_files.items.len;
     while (i > 0) {
@@ -148,16 +112,13 @@ pub fn popInitFile(file: u32) void {
     }
 }
 
-/// Assert (Debug) the in-progress top-level-init set is empty at a run
-/// boundary and clear it capacity-retaining, so state leaked across runs is a
-/// loud failure rather than silently threaded into the next run.
+/// Assert (Debug) the in-progress init set is empty at a run boundary, then clear it.
 pub fn resetReceiverTls() void {
     std.debug.assert(in_progress.items.len == 0);
     in_progress.clearRetainingCapacity();
     in_progress_files.clearRetainingCapacity();
 }
 
-/// True when `name` is already initializing on this thread's stack.
 fn inProgressContains(name: []const u8) bool {
     for (in_progress.items) |n| {
         if (std.mem.eql(u8, n, name)) return true;
@@ -165,9 +126,7 @@ fn inProgressContains(name: []const u8) bool {
     return false;
 }
 
-/// Clears a top-level property name from the in-progress set when an
-/// on-demand initializer returns, breaking re-entrant init cycles. Removes
-/// the matching key by identity (the run-stable key, not a fresh copy).
+/// Matches the run-stable key rather than a fresh copy.
 const InitGuard = struct {
     key: []const u8,
 
@@ -183,14 +142,8 @@ const InitGuard = struct {
     }
 };
 
-/// Drive a top-level property's initializer on demand when it is read
-/// before the in-order startup pass has reached it (an earlier top-level
-/// initializer constructs a class whose body reads a property declared
-/// later). Returns the value (also cached into `globals` so the later
-/// startup pass and subsequent reads are consistent), or `null` if `name`
-/// is not a top-level property. A thread-local guard breaks initializer
-/// cycles: a re-entrant read returns `null`, matching the JVM static-field
-/// zero/null default rather than recursing.
+/// Drive a top-level property's initializer on demand, caching into `globals`. Null for
+/// a non-top-level name or a re-entrant read inside a cycle.
 pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!MaybeValueResult {
     {
         const g = self.globals.borrow();
@@ -199,9 +152,7 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
             return .{ .ok = v };
         }
     }
-    // A pre-init forward read during the startup pass: an annotated
-    // property resolves to its declared type's default and its initializer
-    // stays queued for the in-order pass (JVM <clinit> semantics).
+    // A pre-init forward read takes the declared-type default and stays queued.
     if (pendingTypedDefault(self, name)) |d| return .{ .ok = d };
     const file: u32 = blk: {
         const pg = self.prog.borrow();
@@ -209,13 +160,9 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
         const entry = pg.get().top_level_prop_inits.get(name) orelse return .{ .ok = null };
         break :blk entry.file;
     };
-    // Drive `name`'s file `<clinit>`: every top-level prop declared in that
-    // file, in declaration order, so a same-file EARLIER prop is assigned
-    // before a later one — or the cross-file dependency that forced us here —
-    // reads it. A file already mid-clinit was defaulted by
-    // `pendingTypedDefault` above, so reaching here means its clinit has not
-    // started. This matches Kotlin's per-file lazy static init: accessing any
-    // top-level member of a file runs that whole facade's `<clinit>`.
+    // Drive `name`'s file `<clinit>`: every top-level prop of that file in declaration
+    // order, so an earlier prop is assigned before a later one reads it. Kotlin runs a
+    // whole facade `<clinit>` on access to any of its top-level members.
     pushInitFile(file);
     defer popInitFile(file);
     const props = blk: {
@@ -236,8 +183,7 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
             g.deinit();
             if (done) continue;
         }
-        // A prop initializer that re-reads its own name (a genuine cycle):
-        // leave it to resolve to null/default rather than recursing.
+        // A prop initializer re-reading its own name: leave it null, do not recurse.
         if (inProgressContains(nf.name)) continue;
         in_progress.append(std.heap.page_allocator, nf.name) catch {};
         const guard = InitGuard{ .key = nf.name };
@@ -262,13 +208,9 @@ pub fn ensureTopLevelInited(self: *VmHost, name: []const u8) Allocator.Error!May
     return .{ .ok = null };
 }
 
-/// `Result<void, RuntimeError>` for the join helpers.
 pub const JoinResult = union(enum) { ok: void, err: RuntimeError };
 
-/// Join the spawned OS thread `id`, propagating a thrown Throwable as a
-/// `RuntimeError`. Idempotent: a second join (or an unknown id) is a no-op
-/// since the happens-before edge was already established. The join() below
-/// is itself the memory-model boundary.
+/// Join the spawned OS thread `id`, propagating a thrown Throwable; a repeat is a no-op.
 pub fn joinSpawned(self: *VmHost, id: u64) JoinResult {
     const handle = blk: {
         const g = self.threads.borrowMut();
@@ -290,7 +232,6 @@ pub fn joinSpawned(self: *VmHost, id: u64) JoinResult {
     };
 }
 
-/// Whether spawned thread `id` is still running.
 pub fn threadAlive(self: *VmHost, id: u64) bool {
     const g = self.threads.borrow();
     defer g.deinit();

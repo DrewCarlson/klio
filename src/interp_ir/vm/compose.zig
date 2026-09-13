@@ -1,16 +1,8 @@
-//! Ambient-composer support for plugin-lowered `@Composable` execution.
-//!
-//! The `@Composable` lowering pass threads the synthetic `$composer, $changed`
-//! pair through every composable signature; this module keeps the per-thread
-//! AMBIENT composer stack that bridges the places the threaded argument cannot
-//! reach: a `@Composable` property getter has no composer parameter of its own,
-//! so the pass compiles its composer references to the
-//! `__compose_currentComposer` intrinsic, which reads this stack. The call
-//! dispatcher publishes each call's threaded `$composer` argument here for the
-//! body's dynamic extent (`threadedComposerArgFor` detects the pair).
-//!
-//! Modeled on the coroutine `active_scope_stack` (`coroutines.zig`): a
-//! page-allocator-backed threadlocal that is a GC thread-root for its lifetime.
+//! Ambient-composer support for plugin-lowered `@Composable` execution. The lowering
+//! threads a synthetic `$composer, $changed` pair through every composable signature;
+//! this keeps the per-thread ambient composer stack for what that pair cannot reach: a
+//! `@Composable` property getter has no composer parameter, so its composer references
+//! compile to `__compose_currentComposer`, which reads this stack.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -24,17 +16,12 @@ const CallCtx = runtime.CallCtx;
 const HostBindings = stdlib.HostBindings;
 const Error = Allocator.Error;
 
-/// Stack of the active composer values (klioMain `KlioComposer`). The head is
-/// the composer the current `@Composable` body runs against. Page-allocator
-/// backed for the same reason the coroutine scope stack is: it persists across
-/// GC safepoints taken inside composition.
+/// Stack of active `KlioComposer` values, head first; page-allocator backed and GC-rooted.
 threadlocal var composer_stack: std.ArrayList(Value) = .empty;
 
 fn stackAllocator() Allocator {
     return runtime.slab.tracedPage();
 }
-
-// ----- GC rooting -----
 
 threadlocal var compose_troot: runtime.gc.ThreadRoot = undefined;
 threadlocal var compose_troot_inited: bool = false;
@@ -53,14 +40,11 @@ fn ensureComposeRoot() void {
     }
 }
 
-/// Unlink this thread's compose root node at its exit seam.
 pub fn gcUninstallComposeRoot() void {
     if (!compose_troot_inited) return;
     runtime.gc.unregisterThreadRoot(&compose_troot);
     compose_troot_inited = false;
 }
-
-// ----- composer stack -----
 
 pub fn pushComposer(v: Value) void {
     ensureComposeRoot();
@@ -76,20 +60,9 @@ pub fn currentComposer() ?Value {
     return composer_stack.items[composer_stack.items.len - 1];
 }
 
-/// The threaded `$composer` argument to publish as the ambient composer for a
-/// pass-lowered `@Composable` call, or null when the call is not a threaded
-/// composable (so the caller pushes nothing).
-///
-/// The plugin ABI ends a composable's parameter list with the synthetic
-/// `$composer, $changed` pair. `args` are the call arguments right-aligned with
-/// `params`: for a free function or value call they map 1:1 (`args.len ==
-/// params.len`); for a member method `params` carries an extra leading `this`
-/// receiver param while `args` is receiver-excluded (`args.len == params.len -
-/// 1`). In both shapes the `$composer` value is the second-to-last argument. It
-/// must be an `Instance` (the real Composer) — a defaulted/absent composer is
-/// not a stack entry.
-/// As `threadedComposerArg`, logging the owning declaration under the
-/// KLIO_COMPOSER_BIND_TRACE diagnostic.
+/// The threaded `$composer`, or null when the call is not a threaded composable. The
+/// plugin ABI ends the parameter list with `$composer, $changed` and right-aligns `args`
+/// with `params`: 1:1 for a free call, one shorter when `params` carry a leading `this`.
 pub fn threadedComposerArgFor(fqn: []const u8, params: []const ir.Param, args: []const Value) ?Value {
     const got = threadedComposerArg(params, args);
     if (got != null and runtime.envOnce("KLIO_COMPOSER_BIND_TRACE") != null) {
@@ -110,9 +83,7 @@ pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value
         const cg = ig.get().class.borrow();
         const cls_name = cg.get().name;
         std.debug.print("[composer-bind] class={s} args={d} params={d} last={s}\n", .{ cls_name, args.len, params.len, @tagName(std.meta.activeTag(args[args.len - 1])) });
-        // A non-Composer instance in the pair slot is the misbind under
-        // investigation: dump the interpreter frame chain to find the frame
-        // that first received it.
+        // A non-Composer instance in the pair slot is a misbind; dump the frame chain.
         const is_composer = std.mem.indexOf(u8, cls_name, "Composer") != null;
         cg.deinit();
         ig.deinit();
@@ -121,13 +92,10 @@ pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value
     return composer;
 }
 
-/// Clear the composer stack at a run boundary (a leaked composer across runs is
-/// a bug, but the synchronous `Composition` always pops in a `finally`).
+/// Clear the composer stack at a run boundary; `Composition` itself pops in a `finally`.
 pub fn resetAtRunBoundary() void {
     composer_stack.clearRetainingCapacity();
 }
-
-// ----- host intrinsics (klioMain composer stack management) -----
 
 fn intrPushComposer(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len >= 1) pushComposer(ctx.args[0]);
@@ -145,8 +113,6 @@ fn intrCurrentComposer(ctx: *CallCtx) Error!EvalResult {
     return .{ .ok = currentComposer() orelse .{ .Null = {} } };
 }
 
-/// Compose intrinsics that touch the interpreter's composer stack (registered
-/// from interp_ir, merged alongside the `src/compose_runtime` pure intrinsics).
 pub fn hostBindings(allocator: Allocator) Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("androidx.compose.runtime.__compose_pushComposer", intrPushComposer);

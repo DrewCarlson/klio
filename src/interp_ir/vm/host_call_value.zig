@@ -1,9 +1,6 @@
-//! `VmHost` value-call dispatch: invoking callable `Value`s (closures,
-//! lambdas, intrinsics, bound methods), lambda construction, and the
-//! capture-read / receiver-shape helpers the IR evaluator consults.
-//!
-//! Free functions over `*VmHost`, aliased as `VmHost` methods by
-//! `vmhost.zig` and invoked directly by the generic IR evaluator.
+//! `VmHost` value-call dispatch: invoking callable `Value`s (closures, lambdas,
+//! intrinsics, bound methods), lambda construction, and receiver-shape helpers.
+//! Free functions over `*VmHost`, aliased as methods by `vmhost.zig`.
 
 const std = @import("std");
 
@@ -47,8 +44,6 @@ fn unsupported(name: []const u8) EvalResult {
     return .{ .err = .{ .Unsupported = name } };
 }
 
-/// Whether `v` is a companion-object singleton instance. Its lift name
-/// carries the `$Companion$` marker and its FQN ends in `.Companion`.
 fn isCompanionInstance(v: Value) bool {
     if (v != .Instance) return false;
     const g = v.Instance.borrow();
@@ -59,13 +54,8 @@ fn isCompanionInstance(v: Value) bool {
         std.mem.endsWith(u8, cg.get().fqn, ".Companion");
 }
 
-/// Whether the companion surface itself serves `name`, so a
-/// `Type::name` reference stays BOUND to the companion instead of
-/// consuming its first argument as the receiver. A real IR member, a
-/// companion-FQN intrinsic (`kotlin.Double.Companion.fromBits`), or a
-/// declared companion-receiver extension header all count — the last
-/// two are what `hostHasMember` alone cannot see, which mis-classified
-/// `Double.Companion::fromBits` as an unbound instance-method ref.
+/// Whether the companion surface serves `name`, so `Type::name` stays bound to it
+/// rather than taking its first argument as the receiver.
 fn companionServesName(self: *VmHost, rv: *const Value, name: []const u8) bool {
     if (host_call_member.hostHasMember(self, rv, name)) return true;
     if (rv.* != .Instance) return false;
@@ -79,8 +69,8 @@ fn companionServesName(self: *VmHost, rv: *const Value, name: []const u8) bool {
         const cls_fqn = cg.get().fqn;
         if (!std.mem.endsWith(u8, cls_fqn, ".Companion")) break :blk null;
         const fqn = std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ cls_fqn, name }) catch break :blk null;
-        // The declared receiver form is the FQN's `Type.Companion` tail
-        // (`kotlin.Double.Companion` -> `Double.Companion`).
+        // Declared receiver form: the FQN's tail, `kotlin.Double.Companion` ->
+        // `Double.Companion`.
         const owner = cls_fqn[0 .. cls_fqn.len - ".Companion".len];
         const owner_simple = if (std.mem.lastIndexOfScalar(u8, owner, '.')) |d| owner[d + 1 ..] else owner;
         const recv = std.fmt.bufPrint(&simple_buf, "{s}.Companion", .{owner_simple}) catch break :blk null;
@@ -108,10 +98,8 @@ fn companionServesName(self: *VmHost, rv: *const Value, name: []const u8) bool {
     return false;
 }
 
-/// The declared receiver head captured by an unbound type reference. A
-/// `String?::plus` reference carries the String class value even when its
-/// eventual receiver is null; invocation must continue resolving against
-/// that static type instead of widening to every extension named `plus`.
+/// Declared receiver head of an unbound type reference: invocation resolves
+/// against it, never every extension of the name.
 fn typeReferenceStaticReceiver(v: *const Value) ?[]const u8 {
     if (v.* == .Class) {
         const g = v.Class.borrow();
@@ -138,42 +126,25 @@ fn boundReferenceFunc(callee: *const Value) ?FuncId {
     return FuncId.from(@intCast(value.Int));
 }
 
-/// Single callable-value dispatch over the value variants.
-/// Resolve a plain positional exact-arity closure invocation into a ready
-/// flat-call request, or null when any of the value-call ladder's special
-/// shapes applies (receiver rebind, defaults padding, varargs, resolved
-/// native form, composer arg completion) — those fall back to the recursive
-/// path unchanged. Mirrors the `IrClosure` branch of `callValue` up to its
-/// `evalWithCapturesChained` terminal, including the ambient-composer push,
-/// which the flat activation's teardown undoes via `flatCallClosed`.
+/// Resolve a plain positional exact-arity closure invocation into a flat-call
+/// request; null for a special shape (receiver rebind, defaults, varargs, native
+/// form, composer completion). Pushes the composer that `flatCallClosed` pops.
 pub fn prepareClosureFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     return prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.asPtr().id, callee.IrClosure, null, args);
 }
 
-/// JIT call-out fast path. A trampoline's loop-invariant `CallValue` site
-/// re-enters the interpreter through the full `callValue` preamble every
-/// iteration; when the callee is a plain exact-arity closure, the same
-/// prepare `execArmCallValue`'s flat hook uses resolves it, and the body
-/// runs on the recursive nested entry directly. Null = shape declined
-/// (arity mismatch, vararg, native form, unknown id); the caller falls
-/// back to `callValue`, which owns every special case.
+/// JIT fast path for a plain exact-arity closure; null when the shape declined.
 pub fn callClosureFast(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!?EvalResult {
     if (callee.* != .IrClosure) return null;
     const prep = (try prepareClosureFlatCallSlots(self, allocator, callee.IrClosure.asPtr().id, callee.IrClosure, null, args)) orelse return null;
     defer if (prep.composer_pushed) compose.popComposer();
-    // `prepareClosureFlatCallSlots` always resolves and records the body's
-    // module in the request.
+    // `prepareClosureFlatCallSlots` always records the body's module.
     return try ir.eval.evalWithCapturesChained(VmHost, allocator, prep.run_module.?, prep.owning, prep.func, prep.args, prep.captures, prep.chain, prep.closure_id, self);
 }
 
-/// One capture slot replaced at activation open — the receiver bind of a
-/// with-this call, applied to the COPIED capture vector so no bound closure
-/// value is materialized per call.
 const ThisOverride = struct { idx: usize, val: Value };
 
-/// `KLIO_CALLVALUE_TRACE` gate, cached: the memoized `getenvSlice` still
-/// takes a lock + hashmap probe per consult, which shows up when consulted
-/// per call on the flat dispatch path.
+/// `KLIO_CALLVALUE_TRACE` gate, cached: `getenvSlice` costs a lock and a probe.
 var cvt_trace_cached: ?bool = null;
 fn callValueTraceOn() bool {
     if (cvt_trace_cached) |v| return v;
@@ -187,8 +158,7 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
     if (args.len != info.n_params) return null;
     const module: *const Module = blk: {
         if (info.module) |m| break :blk m;
-        // Pointer read only: the host's own reference keeps the main module
-        // alive for the whole run, so the activation may hold the pointer.
+        // The host's reference keeps the main module alive for the run.
         const g = self.module.clone();
         defer g.deinit();
         break :blk g.asPtr();
@@ -201,8 +171,7 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
         host_call_func.linkAuditCheck(self, module, func.id, func, args);
         if (host_call_func.resolvedNativeForm(self, func.id)) |_| return null;
     }
-    // Pooled carrier: the closure's params and captures are frame buffers
-    // like any other, released through the frame's teardown.
+    // Pooled carrier: frame buffers released by the frame's teardown.
     var call_args = try ir.eval.acquireArgsCap(allocator, args.len);
     if (call_args.capacity >= args.len) call_args.appendSliceAssumeCapacity(args) else try call_args.appendSlice(allocator, args);
     if (callValueTraceOn()) {
@@ -245,22 +214,14 @@ fn prepareClosureFlatCallSlots(self: *VmHost, allocator: Allocator, id: u64, cap
     };
 }
 
-/// Flat-activation close hook: unwind the ambient-composer push
-/// `prepareClosureFlatCall` applied for the call's duration.
 pub fn flatCallClosed(self: *VmHost) void {
     _ = self;
     compose.popComposer();
 }
 
-/// Resolve a plain receiver-lambda invocation (`recv.block()` /
-/// `block(recv, …)` lowered as CallValueWithThis) into a ready flat-call
-/// request: the same receiver head-match, context-source push, capture
-/// bind, and enclosing pushes `callValueWithThis` performs up to its
-/// `callValue(&bound, …)` terminal, with the receiver bind applied as a
-/// slot override on the activation's capture copy. The special shapes —
-/// local named fn, receiver-fills-param, pass-threaded composable,
-/// explicit-receiver overflow, varargs — decline and keep the recursive
-/// path.
+/// Resolve a plain receiver-lambda invocation (`recv.block()` lowered as
+/// CallValueWithThis) into a flat-call request, receiver applied as a slot
+/// override on the capture copy. Non-plain shapes decline.
 pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     if (callee.* != .IrClosure) return null;
     const id = callee.IrClosure.asPtr().id;
@@ -276,9 +237,7 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
         for (f.params) |*p| {
             if (p.is_vararg) return null;
         }
-        // A named LOCAL FUNCTION lowered as a closure is not a receiver
-        // lambda; a body with a declared leading `this` param binds the
-        // receiver positionally — both keep the recursive path.
+        // A named local fn, and a leading declared `this` param, both decline.
         const takes_receiver = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
         if (takes_receiver) return null;
         if (!std.mem.eql(u8, f.name, "<lambda>")) return null;
@@ -296,16 +255,11 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
             break;
         }
     }
-    // The receiver is an implicit receiver, hence a context-argument
-    // source for a contextual callee inside the block. The mark is taken
-    // BEFORE the push so the activation's close truncates it away.
+    // The receiver is a context-argument source for a contextual callee in the
+    // block; the mark predates the push so activation close truncates it.
     const ctx_mark = self.ctxStackLen();
     if (self.ctxIsActive()) self.ctxPush(selected_this) catch {};
-    // With a `this` capture, the receiver binds into that slot exactly as
-    // the recursive bind does, and the displaced prior `this` stays
-    // reachable as an outer implicit receiver. Without one, the body takes
-    // no receiver and the receiver is only the innermost subject — the
-    // recursive path's plain terminal.
+    // The receiver binds into the `this` slot; the displaced prior stays outer.
     const prior_this: ?Value = blk: {
         const ti = this_idx orelse break :blk null;
         const g = captures.borrow();
@@ -314,8 +268,7 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
         if (ti < slice.len) break :blk slice[ti];
         break :blk null;
     };
-    // The same pushes (and LIFO pop order at activation close) as the
-    // recursive bind.
+    // These pushes unwind LIFO at activation close.
     var pushes: u8 = 0;
     const pushed_outer = po: {
         if (this_idx == null) break :po false;
@@ -334,14 +287,10 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
         host_call_member.pushAccessEnclosingSubject(self, &selected_this);
         pushes += 1;
     }
-    // The receiver bind is a slot override on the activation's COPIED
-    // capture vector; the receiver stays rooted by the caller's registers
-    // (or the context stack) for the call's duration, so no bound closure
-    // value or keepalive is needed.
+    // Slot override on the copied vector; the caller's registers root the receiver.
     const override: ?ThisOverride = if (this_idx) |ti| .{ .idx = ti, .val = selected_this } else null;
     var req = (try prepareClosureFlatCallSlots(self, allocator, id, captures, override, args)) orelse {
-        // Declined at the terminal (native form): undo everything and let
-        // the recursive path run.
+        // Declined at the terminal (native form): undo the pushes.
         while (pushes > 0) : (pushes -= 1) host_call_member.popAccessEnclosing(self);
         self.ctxStackTruncate(ctx_mark);
         return null;
@@ -354,23 +303,14 @@ pub fn prepareClosureWithThisFlatCall(self: *VmHost, allocator: Allocator, calle
     return req;
 }
 
-/// Resolve an undispatched coroutine start (`__klio_co_startRootOrSuspended`
-/// under an enclosing pump) into a BARRIER flat-call request: the block runs
-/// as an activation on the caller's driver, a suspension parks the segment
-/// into the pump (`undispatchedFlatPark`) and the caller continues with
-/// COROUTINE_SUSPENDED. Mirrors `coroutineStartRootOrSuspended`'s
-/// enclosing-driver branch up to its `evalClosureRaw` terminal: scope-guard
-/// push, empty call args (the block declares none), live captures with
-/// every-`this` override by the scope value. The no-driver root branch
-/// (pump construction) and every non-plain shape decline to the recursive
-/// path.
+/// Resolve an undispatched coroutine start into a barrier flat-call request: the
+/// block runs on the caller's driver, a suspension parks the segment into the
+/// pump, and the caller gets COROUTINE_SUSPENDED.
 pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, module: *const Module, fid: FuncId, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     if (args.len != 2) return null;
     const f = module.funcById(fid) orelse return null;
     if (!std.mem.eql(u8, f.name, "__klio_co_startRootOrSuspended")) return null;
-    // Without the registered native form the Kotlin fallback body serves
-    // the call; without an enclosing pump the root branch's pump machinery
-    // must run.
+    // Without the registered native form the Kotlin fallback body serves.
     if (host_call_func.resolvedNativeForm(self, fid) == null) return null;
     const has_driver = vmhost.coroutines.coroutineHasDriver();
     const scope_v = args[0];
@@ -380,15 +320,13 @@ pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, mod
     const captures = block.IrClosure;
     const info = self.closures.get(@intCast(id)) orelse return null;
     if (info.n_params != 0) return null;
-    // `evalClosureRaw` falls back to the ClosureInfo cell when the live
-    // vector's length mismatches; that shape declines here.
+    // `evalClosureRaw` falls back to the ClosureInfo cell on a length mismatch.
     {
         const g = captures.borrow();
         defer g.deinit();
         if (g.get().captures.len != info.capture_names.len) return null;
     }
-    // `evalClosureRaw` overrides EVERY capture named `this`; the slot
-    // override binds one, so a multi-`this` shape declines.
+    // `evalClosureRaw` overrides every `this` capture, a slot override only one.
     var this_idx: ?usize = null;
     for (info.capture_names, 0..) |n, i| {
         if (std.mem.eql(u8, n, "this")) {
@@ -404,9 +342,7 @@ pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, mod
         req.barrier_scope_base = enter.base;
         req.scope_guard_ident = enter.ident;
     } else {
-        // No enclosing pump: this activation becomes its own root pump —
-        // completion and suspension run the pump loop through the host
-        // hooks. The scope value rides as the keepalive for the hooks.
+        // No enclosing pump: this activation becomes its own, scope as keepalive.
         const enter = (try vmhost.coroutines.rootPumpFlatEnter(allocator, &scope_v)).?;
         req.suspend_barrier = true;
         req.root_pump = true;
@@ -418,9 +354,8 @@ pub fn prepareUndispatchedStartFlatCall(self: *VmHost, allocator: Allocator, mod
     return req;
 }
 
-/// Driver hook: no-driver root suspension — park the root into its own
-/// pump, drain it, exit it, and hand back the resumed value or
-/// COROUTINE_SUSPENDED.
+/// Driver hook: park the root into its own pump, drain and exit it, and return
+/// the resumed value or COROUTINE_SUSPENDED.
 pub fn rootPumpBarrierPark(self: *VmHost, allocator: Allocator, st: *SuspendState, scope: Value, base: usize) Allocator.Error!EvalResult {
     var sink = self.out_sink.clone();
     defer sink.deinit();
@@ -433,9 +368,8 @@ pub fn rootPumpBarrierPark(self: *VmHost, allocator: Allocator, st: *SuspendStat
     };
 }
 
-/// Driver hook: no-driver root completion — run the pump to quiescence
-/// with the body's result as the root value (or just exit the pump when
-/// the body raised), the recursive branch's tail.
+/// Driver hook: run the pump to quiescence with the body's result as the root
+/// value, or just exit it when the body raised.
 pub fn rootPumpFlatComplete(self: *VmHost, allocator: Allocator, res: EvalResult, scope: Value, base: usize) Allocator.Error!EvalResult {
     var sink = self.out_sink.clone();
     defer sink.deinit();
@@ -452,24 +386,20 @@ pub fn rootPumpFlatComplete(self: *VmHost, allocator: Allocator, res: EvalResult
     return res;
 }
 
-/// Driver hook: barrier park for a flat undispatched-start activation.
 pub fn undispatchedBarrierPark(self: *VmHost, allocator: Allocator, st: *SuspendState, scope_base: usize) Allocator.Error!Value {
     _ = self;
     return vmhost.coroutines.undispatchedFlatPark(allocator, st, scope_base);
 }
 
-/// Driver hook: remove the scope entry a barrier prepare pushed, by
-/// identity, at activation teardown.
+/// Driver hook: remove the scope entry the prepare pushed, by identity.
 pub fn undispatchedScopeLeave(self: *VmHost, ident: usize) void {
     _ = self;
     vmhost.coroutines.undispatchedFlatLeaveIdent(ident);
 }
 
-/// Flat counterpart of `callValueNamedRecvCtx`: the receiver-context
-/// dispatch (a no-this-capture exact-arity closure invoked bare with an
-/// Instance implicit receiver at the call site) prepares through the
-/// with-this path; every other closure shape prepares as a plain value
-/// call, mirroring the recursive routing exactly.
+/// Flat counterpart of `callValueNamedRecvCtx`: an exact-arity closure with no
+/// `this` capture (or a receiver lambda) prepares with-this, any other shape as
+/// a plain call.
 pub fn prepareValueRecvCtxFlatCall(self: *VmHost, allocator: Allocator, callee: *const Value, recv: *const Value, args: []const Value) Allocator.Error!?ir.eval.FlatCallReq {
     if (callee.* != .IrClosure) return null;
     if (recv.* == .Instance) {
@@ -507,8 +437,8 @@ fn rselTraceOn() bool {
     return rsel_trace_on;
 }
 
-/// Whether any declaration named `name` is an extension function (a
-/// reference to the name then denotes a function, never a property).
+/// Whether a declaration named `name` is an extension fn, so the name is not a
+/// property.
 pub fn extensionFnNamed(self: *VmHost, name: []const u8) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -520,9 +450,7 @@ pub fn extensionFnNamed(self: *VmHost, name: []const u8) bool {
 }
 
 pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
-    // A captured-and-written local is BOXED into a shared cell at its binding
-    // site, so a function-typed one arrives here as the cell, not the closure.
-    // `block(i)` on such a binding calls what the cell holds.
+    // A captured-and-written local is boxed, so a function-typed one is a cell.
     if (callee.* == .Cell) {
         const cg = callee.Cell.borrow();
         const inner = cg.get().*;
@@ -534,11 +462,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
     if (callee.* == .Intrinsic) {
         return dispatchIntrinsic(self, callee.Intrinsic.fqn, callee.Intrinsic.func, args);
     }
-    // `instance()` — bound-member-reference invocation
-    // (`recv::method`, `String::plus`) wins over `operator fun
-    // invoke`. A `$bound_ref$` synth carries `__bound_receiver__`
-    // and `__bound_name__`; dispatch through them so an unbound
-    // class-method ref consumes its first arg as the receiver.
+    // Bound-member-reference invocation (`recv::method`) beats `operator fun
+    // invoke`: dispatch through `__bound_receiver__` and `__bound_name__`.
     if (callee.* == .Instance) {
         var recv: ?Value = null;
         var name_v: ?Value = null;
@@ -555,9 +480,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 defer g.deinit();
                 break :blk g.get().bytes;
             };
-            // Dispatch under the reference's creation-site file: a
-            // file-private target is visible to the reference where it
-            // was written, not where a combinator invokes it.
+            // Dispatch under the creation-site file, where a private target is visible.
             var ref_pushed = false;
             var ref_prev: ?ir.eval.RefSiteOverride = null;
             if (host_call_member.boundRefFile(callee)) |bf| {
@@ -565,27 +488,19 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 ref_pushed = true;
             }
             defer if (ref_pushed) ir.eval.popRefSiteFile(ref_prev);
-            // `A::Inner` names an INNER class's constructor: the unbound form
-            // takes the outer instance as its first argument and constructs
-            // through it (`(A::Inner)(a)` is `a.Inner()`).
+            // `A::Inner` unbound: arg0 is the outer, so `(A::Inner)(a)` is `a.Inner()`.
             if (rv == .Class and args.len != 0 and classHasInnerNamed(self, &rv, name)) {
                 return host_call_member.callMemberNamedStatic(self, allocator, &args[0], name, args[1..], &.{}, null);
             }
-            // `outer::Inner` binds the outer instance: construct through it so
-            // the instance carries its `outer` link.
             if (rv == .Instance and instanceHasInnerNamed(self, &rv, name)) {
                 return host_call_member.callMemberNamedStatic(self, allocator, &rv, name, args, &.{}, null);
             }
             if (boundReferenceFunc(callee)) |func| {
                 var exact_args: std.ArrayList(Value) = .empty;
                 defer exact_args.deinit(allocator);
-                // A TYPE-form reference is unbound — the first call argument
-                // is the receiver. The type value is a `.Class`, but for a
-                // companion-carrying class (`Int` declares one) the name in
-                // value position is the COMPANION INSTANCE; prepending it
-                // shifted every argument (`map(Int::toUInt)` ran `toUInt`
-                // with the companion as `this`). Same predicate as the
-                // by-name path below.
+                // A type-form reference is unbound: arg0 is the receiver. For a
+                // class declaring a companion, the name in value position is that
+                // companion, never prepended.
                 const fid_type_like = (rv == .Class) or
                     (rv == .Instance and isCompanionInstance(rv) and
                         !companionServesName(self, &rv, name));
@@ -605,16 +520,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     exact_args.items,
                 );
             }
-            // An unbound class-method reference (`Long::toByte`, `String::plus`)
-            // consumes its first argument as the receiver. The reference's
-            // captured receiver is the type itself: a `.Class` value, or — when
-            // a companion object is in scope for the type — that companion's
-            // instance. Both are type-like; route the first argument as the
-            // receiver when the named member is an instance method rather than a
-            // companion member.
-            // An unsigned-array type name in value position lowers to its
-            // `E::valueOf` / `E::values` / `E::entries`: an enum's static
-            // members take no receiver, so the arguments are the call's.
+            // `valueOf`/`values`/`entries` are enum statics: no receiver.
             if (rv == .Class and (std.mem.eql(u8, name, "valueOf") or std.mem.eql(u8, name, "values") or
                 std.mem.eql(u8, name, "entries")))
             {
@@ -640,10 +546,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     &.{},
                     typeReferenceStaticReceiver(&rv),
                 );
-                // `JsonPrimitive::booleanOrNull` names an EXTENSION
-                // property: no member takes the call, so the reference
-                // reads the property on its receiver (the field-read path
-                // resolves extension getters).
+                // An extension property takes no member call; read it as a field.
                 if (rest.len == 0 and mr == .err and mr.err == .Unimplemented) {
                     const pr = try host_fields.getField(self, allocator, &first, name);
                     if (runtime.envOnce("KLIO_ERR_TRACE") != null) std.debug.print("[boundref-typelike] {s} on {s}: field read {s}\n", .{ name, first.typeFqn(), if (pr == .ok) "ok" else "miss" });
@@ -656,9 +559,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 return host_fields.getField(self, allocator, &rv, name);
             }
             const r = try host_call_member.callMember(self, allocator, &rv, name, args);
-            // A bound EXTENSION-property reference invoked (`(::extProp)()`,
-            // `a::extProp` then `ref()`) reads the property once member
-            // dispatch has missed the name itself.
+            // A bound extension-property reference reads it, after a name miss.
             if (args.len == 0 and host_call_member.isDispatchMissFor(r, name)) {
                 const pr = try host_fields.getField(self, allocator, &rv, name);
                 if (pr == .ok) {
@@ -666,14 +567,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     return pr;
                 }
             }
-            // Fallback: a bare `::name` the lowerer bound to the enclosing
-            // `this` may actually target a *top-level function* — the
-            // binding is lowered before the function is registered (e.g. a
-            // method default-arg thunk's `::shout`), so it can't be
-            // distinguished at lower time. Only when member dispatch finds
-            // no such member do we retry the global callable, so a genuine
-            // bound member ref (`obj::method`, even one whose name matches
-            // a top-level fn) keeps dispatching the member.
+            // A bare `::name` bound to the enclosing `this` may target a top-level
+            // function lowered after the binding; retry the global on a member miss.
             if (r == .err and r.err == .Unimplemented) {
                 if (host_globals.lookupGlobal(self, name)) |callable| {
                     if (callable == .IrClosure) {
@@ -692,13 +587,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             defer cg.deinit();
             break :blk std.mem.eql(u8, cg.get().fqn, "androidx.compose.runtime.internal.ComposableLambdaImpl");
         };
-        // Compose-plugin arg completion, instance side: a
-        // ComposableLambdaImpl invoked through a typeless route
-        // (`arr[i]()`, forEach's `it()`) misses its `invoke` because the
-        // call lacks the trailing `(composer, changed)` the wrapper's
-        // overloads declare. With a composer ambient, complete the pair
-        // and retry — the type-directed emission kotlinc performs from the
-        // value's declared `@Composable` fn type.
+        // Compose arg completion, instance side: a ComposableLambdaImpl invoked
+        // typelessly misses `invoke` without the trailing `(composer, changed)`.
         if (inv == .err and inv.err == .Unimplemented and callee_is_cli) {
             if (compose.currentComposer()) |comp| {
                 if (runtime.freeScratch()) {
@@ -713,12 +603,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 return host_call_member.callMember(self, allocator, callee, "invoke", buf);
             }
         }
-        // A `fun interface` instance with a single abstract method that is NOT
-        // `invoke` — notably `kotlinx.coroutines.Runnable { fun run() }` — is
-        // invoked as a function value by the dispatcher resume path
-        // (`block()`); route it to `run()`. Only on the `invoke` dispatch miss,
-        // so an `operator fun invoke` or a SAM whose method IS `invoke` is
-        // unaffected.
+        // A `fun interface` whose lone method is not `invoke` routes to `run()`.
         if (inv == .err and inv.err == .Unimplemented and callee.* == .Instance and
             host_call_member.hostHasMember(self, callee, "run"))
         {
@@ -730,20 +615,12 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         }
         return inv;
     }
-    // Constructor-like call on a user class value
-    // (`val ctor = ::Foo; ctor(1, 2)`). Falls through to a
-    // direct ClassDef-based allocation when the class isn't
-    // in the IR module's class_index — covers local classes
-    // declared inside a fn body and registered via
-    // Inst::RegisterClass.
+    // Constructor-like call on a class value (`val ctor = ::Foo; ctor(1, 2)`); a
+    // class absent from the module's class_index falls to direct allocation below.
     if (callee.* == .Class) {
         const cls = callee.Class;
-        // SAM conversion: `FunInterface { lambda }` constructs a
-        // synthetic instance whose single abstract method
-        // dispatches the lambda body. We allocate a thin
-        // InstanceData whose `fields` carry the lambda under
-        // `__sam_target__`; call_member on this instance routes
-        // any method call back through the lambda.
+        // SAM conversion: `FunInterface { lambda }` builds a thin InstanceData
+        // holding the lambda under `__sam_target__`, which member dispatch routes to.
         const is_fun_interface = blk: {
             const g = cls.borrow();
             defer g.deinit();
@@ -752,8 +629,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         if (is_fun_interface and args.len == 1) {
             const identity = nextInstanceId(self);
             var fields: std.ArrayList(InstanceData.Field) = .empty;
-            // The SAM instance owns one ref to its target; `args[0]` is a borrow
-            // of the caller's register, so retain (instance teardown releases it).
+            // The instance owns one ref to its target; `args[0]` is a borrow.
             if (runtime.reclaimEnabled()) args[0].retain();
             try fields.append(allocator, .{ .name = "__sam_target__", .value = args[0] });
             const inst = try ObjRef(InstanceData).init(allocator, .{
@@ -775,12 +651,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             defer g.deinit();
             break :blk g.get().fqn;
         };
-        // The bound ClassDef carries the resolved FQN; the module class
-        // resolves by it, so `(::Ctor)(args)` constructs the referenced
-        // class even when another package declares the same simple name.
-        // A runtime-registered LOCAL class def IS the class: never redirect
-        // it through the module index, where an unrelated same-simple-name
-        // class (a nested class of another owner) can shadow it.
+        // The bound ClassDef carries the resolved FQN, so `(::Ctor)(args)` builds
+        // the referenced class even when another package shares the simple name.
+        // A runtime-registered local class def IS the class, never re-indexed.
         const is_local_runtime = blk: {
             const g = cls.borrow();
             defer g.deinit();
@@ -796,9 +669,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             break :blk null;
         };
         if (class_id) |cid| {
-            // `Outer::Inner` is the inner class's constructor in its unbound
-            // form: the first argument is the outer instance, the rest are
-            // the constructor's own (`(Outer::Inner)(outer, n)`).
+            // `Outer::Inner` unbound: arg0 is the outer instance, the rest the ctor's.
             const inner = blk: {
                 const g = cls.borrow();
                 defer g.deinit();
@@ -816,21 +687,14 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             }
             return host_instances.newInstance(self, allocator, cid, args, null);
         }
-        // Direct allocation for classes that aren't in the IR
-        // module index. The runtime ClassDef carries enough to
-        // bind primary-param properties; init blocks + custom
-        // getters land when local-class lowering grows them.
         const identity = nextInstanceId(self);
         const default_outer: ?Value = blk: {
             const g = self.class_default_outer.borrow();
             defer g.deinit();
             break :blk g.get().get(cls_name);
         };
-        // An omitted trailing primary parameter takes its default: a plain
-        // literal inline, anything else through the `$default$<i>` thunk
-        // registered with the class, run in the class's captured scope with
-        // the arguments before it. Every consumer below (fields, property
-        // initializers, init blocks, the parent chain) sees the full vector.
+        // An omitted trailing primary parameter takes its default: a literal inline,
+        // anything else through the class's registered `$default$<i>` thunk.
         var full_args: std.ArrayList(Value) = .empty;
         defer full_args.deinit(allocator);
         try full_args.appendSlice(allocator, args);
@@ -857,9 +721,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 }
                 const thunk_name = try std.fmt.allocPrint(allocator, "$default${d}", .{pi});
                 defer allocator.free(thunk_name);
-                // The thunk's `this` is the declaration scope's innermost
-                // receiver: the captured enclosing instance, else the last
-                // implicit receiver in scope at the declaration.
+                // The thunk's `this` is the captured enclosing instance, else the
+                // innermost receiver in scope.
                 const recv: Value = default_outer orelse blk: {
                     const g = cls.borrow();
                     defer g.deinit();
@@ -887,18 +750,15 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             while (i < cdef.primary_params.len) : (i += 1) {
                 if (cdef.primary_params[i].property == null) continue;
                 if (i < ctor_args.len) {
-                    // The instance owns one ref per primary-ctor field; `args[i]`
-                    // is a borrow of the caller's register, so retain.
+                    // The instance owns one ref per primary-ctor field.
                     if (runtime.reclaimEnabled()) ctor_args[i].retain();
                     try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = ctor_args[i] });
                 } else {
                     try fields.append(allocator, .{ .name = cdef.primary_params[i].name, .value = Value.Null });
                 }
             }
-            // Body-property defaults for runtime-registered local
-            // classes. Literal inits evaluate inline; complex inits were
-            // lowered as `$init$` thunks at class registration and run
-            // below once the instance exists (they may read `this`).
+            // Literal body-property inits evaluate inline; complex ones run below
+            // as `$init$` thunks once the instance exists, since they read `this`.
             for (cdef.body_properties) |p| {
                 if (p.init) |init_field| {
                     const v = simpleLiteral(allocator, init_field.get()) orelse Value.Null;
@@ -917,16 +777,13 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             .native_state = null,
         });
         const inst_value: Value = .{ .Instance = inst };
-        // A MODULE parent chain (`class MyApplier : AbstractApplier<T>(root)`)
-        // binds its primary-param fields and runs its body-property inits
-        // through the registered `$super$arg$<i>` thunks and the static
-        // per-class init maps.
+        // A module parent chain binds its primary-param fields and runs its
+        // body-property inits through the `$super$arg$<i>` thunks.
         if (try host_instances.initLocalParentChain(self, allocator, inst, inst_value, cls, cls_name, ctor_args)) |e| {
             return .{ .err = e };
         }
-        // Interleave `init { … }` blocks (lowered as `$init$block$<idx>` anon
-        // thunks at registration, with the enclosing scope's captured cells
-        // bound) with the complex property initializers in declaration order.
+        // Kotlin runs `init { … }` blocks and property initializers in declaration
+        // order; the blocks are `$init$block$<idx>` anon thunks.
         const n_props = blk: {
             const g = cls.borrow();
             defer g.deinit();
@@ -965,10 +822,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 break :blk ag.get().contains(key);
             };
             if (!has) continue;
-            // Both delegate and plain-initializer thunks declare the primary
-            // params so the expression can read plain ctor params — including
-            // one the property itself shadows (`class N(property: String) {
-            // var property = property }`).
+            // The thunks declare the primary params, so a shadowed one stays read.
             switch (try host_call_member.callMember(self, allocator, &inst_value, init_name, ctor_args)) {
                 .ok => |rv| {
                     const ig = inst.borrowMut();
@@ -988,13 +842,9 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         }
         return .{ .ok = inst_value };
     }
-    // Invoking a `Value::PropertyRef` (`::name`). A callable reference
-    // to a top-level function (`::tag`) calls that function with the
-    // args — preferred over the property reading, since a default-arg
-    // thunk lowered before the function was registered records the
-    // reference as a `PropertyRef` rather than a `LoadGlobal`. A
-    // genuine property reference (`::prop`) invoked with one arg reads
-    // the named field from that arg (`KProperty1.get(receiver)`).
+    // Invoking a `PropertyRef` (`::name`): a reference to a top-level function
+    // calls it, winning over the property read because a thunk lowered before that
+    // function registered records it as a `PropertyRef`.
     if (callee.* == .PropertyRef) {
         const name = blk: {
             const g = callee.PropertyRef.name.borrow();
@@ -1025,10 +875,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             return host_fields.getField(self, allocator, &args[0], name);
         }
     }
-    // Bound method/property reference: synthetic instance
-    // carrying a receiver + method name. Invocation forwards
-    // through the captured receiver (or reads the property on
-    // the first arg for unbound property refs).
+    // Bound method/property reference: a synthetic instance carrying receiver and
+    // name; invocation forwards through it, or reads the property on arg0 unbound.
     if (callee.* == .Instance) {
         var recv: ?Value = null;
         var name_v: ?Value = null;
@@ -1056,8 +904,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 return host_fields.getField(self, allocator, &args[0], name);
             }
             const r = try host_call_member.callMember(self, allocator, &rv, name, args);
-            // A bound PROPERTY reference invoked (`(::extProp)()`) reads the
-            // property; only a top-level miss of the name itself falls to it.
+            // A bound property reference reads the property, after a name miss.
             if (args.len == 0 and host_call_member.isDispatchMissFor(r, name)) {
                 host_call_member.freeDispatchMiss(allocator, r);
                 return host_fields.getField(self, allocator, &rv, name);
@@ -1068,35 +915,23 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
     if (callee.* == .IrClosure) {
         const id = callee.IrClosure.asPtr().id;
         const captures = callee.IrClosure;
-        // Closure id indexes the closure table.
         const info = self.closures.get(@intCast(id)) orelse {
             const msg = try std.fmt.allocPrint(allocator, "unknown IrClosure id {d}", .{id});
             return .{ .err = .{ .Type = msg } };
         };
         const module_ref = self.module.clone();
         defer module_ref.deinit();
-        // A closure created inside a sub-module-lowered body resolves its
-        // `FuncId` against that sub-module, never the main func table.
+        // A sub-module closure resolves its `FuncId` against that sub-module.
         const module = info.module orelse module_ref.asPtr();
         const func = module.funcById(info.body_func) orelse {
             const msg = try std.fmt.allocPrint(allocator, "closure body FuncId {d} out of range", .{info.body_func.int()});
             return .{ .err = .{ .Type = msg } };
         };
-        // Compose-plugin arg completion: a pass-threaded composable value
-        // invoked through a TYPELESS route (`arr[i]()`, forEach's `it()`)
-        // has no static site the pass could append the pair to — kotlinc
-        // knows the value's `@Composable` fn type, the interpreter only
-        // sees the value. When the closure's protocol wants exactly the
-        // trailing `($composer, $changed)` more than the call supplied and
-        // a composer is ambient, complete the pair and re-enter, exactly
-        // as the type-directed emission would have.
-        // A pair-tailed composable local fn called WITH the pair but fewer
-        // user args than declared (`useA()` lowered as useA($composer,
-        // $changed) against `useA(a: A = A(), $composer, $changed)`): keep
-        // the pair in the trailing slots and fill the defaulted gap from
-        // the registered local-fn default thunks — positional Null-padding
-        // shoved the composer into `a` and the changed flags into
-        // `$composer`.
+        // Compose arg completion: a composable invoked through a typeless route
+        // reaches no static site the pass could append `($composer, $changed)` to.
+        // A pair-tailed local fn called with the pair but fewer user args keeps
+        // the pair in the trailing slots and fills the gap from the default
+        // thunks; Null-padding would shove the composer into a user param.
         if (func.params.len >= 2 and
             args.len >= 2 and args.len < info.n_params and
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
@@ -1154,27 +989,17 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 return callValue(self, allocator, callee, buf);
             }
         }
-        // One executable form per symbol: when the wrapped top-level fn's
-        // single form was resolved to a native binding at link time
-        // (e.g. a closure-of `kotlinx.datetime.__kxdt_*`), dispatch that
-        // binding instead of running the shim placeholder body. The form
-        // was settled once by `linkResolvedForms`; this consults it by
-        // `FuncId` with no per-call FQN probe. Link tables are keyed by
-        // main-module ids, so sub-module closures never consult them.
+        // One executable form per symbol: when `linkResolvedForms` bound this fn to
+        // a native form, dispatch that. Link tables are keyed by main-module ids.
         if (info.module == null) {
             host_call_func.linkAuditCheck(self, module, func.id, func, args);
             if (host_call_func.resolvedNativeForm(self, func.id)) |intrinsic| {
                 return dispatchIntrinsic(self, func.fqn, intrinsic, args);
             }
-            // A closure published for an OVERLOADED top-level name carries
-            // only ONE signature (first-wins). A call its arity cannot bind
-            // belongs to a same-name sibling (a same-file private 3-arg
-            // published over the public 2-arg overload in another file);
-            // padding it with Nulls runs the wrong body. Re-rank the full
-            // same-name set through the overload binder.
-            // The SOURCE-level simple name: a file-private top-level fn is
-            // registered under a per-file rename (`over$f220`); its overload
-            // siblings live under the plain name.
+            // A closure published for an overloaded top-level name carries one
+            // signature (first wins), so a call its arity cannot bind belongs to a
+            // same-name sibling; re-rank through the overload binder. The
+            // source-level name strips a file-private fn's rename (`over$f220`).
             const src_name = blk: {
                 const n = func.name;
                 const i = std.mem.lastIndexOfScalar(u8, n, '$') orelse break :blk n;
@@ -1186,12 +1011,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             };
             const sibling_count = module.funcsBySimpleName(src_name).len +
                 @intFromBool(src_name.len != func.name.len);
-            // A LOCAL fn's defaults live only as registered thunks — its
-            // lowered params carry no `has_default` flag and it has no
-            // DeclSig — so `globalArityCanBind` under-counts and the
-            // sibling redirect stole `check(1)` on a local
-            // `check(a, b = 5)` for `kotlin.check`. The same thunk table
-            // `padArgsWithDefaults` pads from decides bindability here.
+            // A local fn's defaults live only as registered thunks (no `has_default`
+            // flag, no DeclSig), so decide bindability from that thunk table.
             const binds_with_defaults = blk: {
                 if (module.globalArityCanBind(func.id, func, args.len)) break :blk true;
                 const pg = self.prog.borrow();
@@ -1219,8 +1040,6 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                         .err => |e| return .{ .err = e },
                     }
                 }
-                // A single plain-named sibling of a renamed file-private fn:
-                // dispatch it directly when the arity fits.
                 for (module.funcsBySimpleName(src_name)) |sib_id| {
                     if (sib_id.int() == func.id.int()) continue;
                     const sib = module.funcById(sib_id) orelse continue;
@@ -1241,27 +1060,11 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 if (ir.eval.currentFrameFunc()) |cf| cf.fqn else "<none>",
             });
         }
-        // Value-style invocation of a receiver lambda
-        // (`block.invoke(receiver, p)` / `block(receiver, p)` for a
-        // `R.(P) -> T`): the lambda's value params are `[p]`, so being
-        // called with exactly one *extra* leading arg means arg0 is the
-        // extension receiver when the lowered callable explicitly carries
-        // receiver shape. Bind it into the closure's `this` capture
-        // and re-run on this same (main-evaluator) path — which snapshots
-        // frames so a suspension inside the body (`delay`) parks
-        // correctly, unlike the intrinsic-host invoke. The body resolves
-        // its receiver through the `this` capture slot
-        // (`func.capture_order`), so overriding the closure value's
-        // captures (not the side-table `info.captures`, which this path
-        // ignores) is what reaches the evaluator. Valid Kotlin never
-        // over-supplies a non-receiver lambda, and receiver-ness is never
-        // inferred from a `this` capture (which may instead be lexical).
-        // Vararg targets (legitimately variadic) are excluded.
-        // ANY vararg param (not only a final one): a variadic function
-        // legitimately takes more arguments than its parameter count, so the
-        // receiver-overflow inference below must never consume its first
-        // argument (`report("A", 1, 2, 3)` on `(title, vararg items,
-        // footer = …)` lost "A" to a phantom receiver).
+        // Value-style invocation of a receiver lambda (`block(receiver, p)` for an
+        // `R.(P) -> T`): one extra leading arg means arg0 is the extension
+        // receiver. Bind it into the closure VALUE's `this` capture, which is what
+        // the evaluator reads, and re-run on the main evaluator path, which
+        // snapshots frames so a suspension parks. Any vararg excludes this.
         const last_vararg = blk: {
             for (func.params) |*p| {
                 if (p.is_vararg) break :blk true;
@@ -1274,36 +1077,23 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             }
             break :blk null;
         };
-        // A pass-wrapped composable block loses its receiver shape when the
-        // compose pass moves the literal into `composableLambdaInstance(...)`
-        // (the wrapper's param carries no function type for the lowering to
-        // read). The compose ABI is the one caller of such a block with an
-        // extra leading arg (`ComposableLambdaImpl.invoke(p1, c, changed)`
-        // feeding an `R.()` block), so a pair-tailed closure with a `this`
-        // capture infers the receiver there; padding the receiver into the
-        // `$composer` slot is never right.
+        // A block the compose pass moved into `composableLambdaInstance(...)` loses
+        // its receiver shape, and the compose ABI is the only caller passing one an
+        // extra leading arg, so a pair-tailed closure infers its receiver there.
         const pair_tailed =
             func.params.len >= 2 and
             std.mem.eql(u8, func.params[func.params.len - 1].name, "$changed") and
             std.mem.eql(u8, func.params[func.params.len - 2].name, "$composer");
         const compose_recv_infer = !info.receiver_shape_known and
             this_cap_idx != null and pair_tailed;
-        // Receiver-first shapes: the full one (`f(recv, a…)` with every
-        // declared param supplied) and the pair-less composable one
-        // (`content.item(itemScope, i)` against `(index, $composer,
-        // $changed)`) — the recursion below re-enters `callValue` on
-        // `args[1..]`, whose ambient-composer completion supplies the pair.
+        // Receiver-first shapes: every declared param supplied, or the pair-less
+        // composable one whose `($composer, $changed)` the re-entry supplies.
         const recv_first_shape = args.len == info.n_params + 1 or
             (pair_tailed and args.len + 2 == info.n_params + 1);
-        // Shape UNKNOWN (a handler stored through a generic hook slot —
-        // ktor's `on(Send)` block replayed as `handler(Sender(…), request)`)
-        // with one arg MORE than the declared params can only be the
-        // explicit-receiver form: Kotlin function types with and without
-        // receivers are interchangeable, and no legal call supplies a plain
-        // closure an extra argument. A HEADERLESS block is excluded — its
-        // lone param is the lowering's speculative `it`, and a suspend
-        // lambda's start supplies (receiver, completion), which this split
-        // would corrupt by feeding the completion into `it`.
+        // Unknown shape with one arg more than the declared params can only be the
+        // explicit-receiver form: Kotlin function types with and without receivers
+        // are interchangeable and no legal call over-supplies a plain closure. A
+        // headerless block, whose lone param is a speculative `it`, is excluded.
         const unknown_recv_infer = !info.receiver_shape_known and
             args.len == info.n_params + 1 and
             !(func.params.len != 0 and std.mem.eql(u8, func.params[0].name, "it"));
@@ -1311,9 +1101,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             if (runtime.envOnce("KLIO_REBIND_AUDIT") != null) {
                 std.debug.print("[REBIND] fn={s} n_params={d}\n", .{ func.name, info.n_params });
             }
-            // A receiver lambda need not read its receiver. Such a body has
-            // no `this` capture, but the leading receiver argument must still
-            // be removed before its value parameters are bound.
+            // A receiver lambda need not read it; arg0 is still removed.
             if (this_cap_idx == null) {
                 const receiver = args[0];
                 const pushed = receiver == .Instance or receiver == .Null;
@@ -1323,14 +1111,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 return r;
             }
             const this_idx = this_cap_idx.?;
-            // The closure's captured `this` (before the explicit
-            // receiver overrides it) is the lexically-enclosing
-            // receiver the body closed over — e.g. ktor's engine
-            // interceptor lambda closes over `this@install` (the
-            // `HttpClientEngine`) yet is invoked by the pipeline as
-            // `interceptor.invoke(pipelineContext, subject)`. Push it
-            // as an enclosing receiver so the body can still resolve
-            // the engine's members, mirroring `invoke_callable_with_this`.
+            // The displaced capture is the body's lexically enclosing receiver.
             const prior_this: ?Value = blk: {
                 const g = captures.borrow();
                 defer g.deinit();
@@ -1349,9 +1130,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                     try new_caps.appendNTimes(allocator, Value.Null, this_idx + 1 - new_caps.items.len);
                 }
                 new_caps.items[this_idx] = args[0];
-                // The bound closure owns one ref to each capture (its teardown
-                // releases them); the copied originals and the bound receiver
-                // are borrows, so retain. No-op under the arena fast path.
+                // The bound closure owns one ref per capture; the copies are borrows.
                 if (runtime.reclaimEnabled()) for (new_caps.items) |c| c.retain();
                 const slice = try new_caps.toOwnedSlice(allocator);
                 const caps_ref = try IrClosureRef.init(allocator, .{ .id = id, .captures = slice });
@@ -1380,23 +1159,16 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             if (pushed_outer) host_call_member.popAccessEnclosing(self);
             return r;
         }
-        // Fill missing positional args from the target's
-        // registered default-arg thunks (an implicit-`it` lambda
-        // invoked with zero args still gets its slot as Null).
-        // Pack trailing vararg args into an Array when the
-        // target's last param is marked vararg. The defaults table is
-        // keyed by main-module ids, so sub-module closures skip it.
+        // Fill missing positional args from registered default-arg thunks, then pack
+        // trailing varargs into an Array. Keyed by main-module ids: sub-modules skip.
         const defaults: ?[]?FuncId = blk: {
             if (info.module != null) break :blk null;
             const pg = self.prog.borrow();
             defer pg.deinit();
             break :blk pg.get().func_defaults.get(info.body_func.int());
         };
-        // Trailing-lambda rule for a value call: `f { … }` where `f`'s last
-        // parameter is function-typed and the omitted leading parameters are
-        // defaulted (e.g. `runBlocking(context = …) { block }`) binds the
-        // lambda to the LAST parameter, not the first. Without this the
-        // closure lands in `context` and a later `context[Key]` misdispatches.
+        // Trailing-lambda rule: `f { … }` with a function-typed last parameter and
+        // defaulted omitted leading ones binds the lambda to that last parameter.
         var call_args = blk: {
             const np = info.n_params;
             if (np >= 2 and args.len < np and args.len > 0 and func.params.len >= np) {
@@ -1416,12 +1188,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 .err => |e| return .{ .err = e },
             };
         };
-        // Non-final vararg (Kotlin allows `vararg` before a trailing
-        // function param): positionally, the declared params AFTER the
-        // vararg take the LAST args and everything between the fixed
-        // prefix and them packs into the vararg's Array. The static call
-        // path binds this shape through the reorder-aware binder; a value
-        // call must bind it identically.
+        // Non-final vararg (Kotlin allows `vararg` before a trailing function param):
+        // the params after it take the last args, the middle packs into its Array.
         nonfinal: {
             if (func.params.len < 2) break :nonfinal;
             var vi: usize = func.params.len;
@@ -1432,12 +1200,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
                 }
             }
             if (vi >= func.params.len - 1) break :nonfinal;
-            // A post-vararg param claims a positional tail arg only when it
-            // cannot default (a generated slot-exact call) or through
-            // trailing-lambda syntax; a defaulted tail (`footer: String =
-            // "end"`) never claims one — `report("A", 1, 2, 3)` packs all
-            // three ints and the footer defaults. Mirrors the reorder-aware
-            // named binder's rule.
+            // A post-vararg param claims a tail arg only when it cannot default.
             const trailing = blk: {
                 const tail_defaults: ?[]?FuncId = dblk: {
                     const pg = self.prog.borrow();
@@ -1510,11 +1273,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             try capture_values.appendSlice(allocator, g.get().captures);
         }
         vmhost.emitPath(allocator, "call_value_closure", func.fqn, func.id, null, args);
-        // A pass-threaded composable invoked as a value (a restart-scope
-        // re-invocation is a positional closure call) must publish its
-        // `$composer` argument as the ambient composer, exactly like the
-        // named-call path: a `@Composable` property getter reached from the
-        // body reads it via `__compose_currentComposer`.
+        // A composable invoked as a value publishes its `$composer` argument as the
+        // ambient composer, which `__compose_currentComposer` in the body reads.
         {
             if (compose.threadedComposerArgFor(func.fqn, func.params, call_args.items)) |c| {
                 compose.pushComposer(c);
@@ -1524,8 +1284,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         }
         return ir.eval.evalWithCapturesChained(VmHost, allocator, module, info.module, func, call_args, capture_values, info.chain, @intCast(id), self);
     }
-    // `Comparator` is a `fun interface`: invoking it as a value
-    // (`comparator(a, b)`) calls `compare`.
+    // `Comparator` is a `fun interface`: calling it as a value calls `compare`.
     if (callee.* == .Comparator and args.len == 2) {
         return self.callMember(allocator, callee, "compare", args);
     }
@@ -1536,11 +1295,8 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
     return .{ .err = .{ .Unimplemented = msg } };
 }
 
-/// `callValueNamed` with explicit call-site type arguments preserved
-/// through a deferred bare-call form. One consumer today: an unsigned
-/// element-type argument coerces integral args before the intrinsic
-/// (`arrayOf<ULong>(1u, 2u)` — the literal's default tag is UInt and
-/// kotlinc types it by its expected type).
+/// `callValueNamed` with call-site type arguments preserved: an unsigned element
+/// type retags integral args, as kotlinc types literals by expected type.
 pub fn callValueNamedTyped(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8) Allocator.Error!EvalResult {
     if (type_args.len == 1 and args.len != 0) {
         const tn = type_args[0];
@@ -1573,13 +1329,8 @@ pub fn callValueNamedTyped(self: *VmHost, allocator: Allocator, callee: *const V
     return callValueNamed(self, allocator, callee, args, arg_names);
 }
 
-/// `callValueNamed` with the call site's member-fallback receiver as
-/// dispatch context: a receiver-typed closure with no `this` capture
-/// invoked bare (`block()` for an `R.() -> T` field/local inside a
-/// spliced scope function) rides the receiver along as its innermost
-/// subject so the body's member-extension dispatch sees it. The exact
-/// arity and missing `this` slot guarantee no positional or capture
-/// binding changes; every other callee shape dispatches as before.
+/// `callValueNamed` with the call site's member-fallback receiver as dispatch
+/// context: a receiver-typed closure invoked bare rides it as innermost subject.
 pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const Value, recv: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     if (callee.* == .IrClosure and recv.* == .Instance) {
         if (self.closures.get(@intCast(callee.IrClosure.asPtr().id))) |info| {
@@ -1590,12 +1341,8 @@ pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const
                     break;
                 }
             }
-            // A RECEIVER LAMBDA invoked bare binds the call site's
-            // implicit receiver through the invoke convention regardless
-            // of its `this` capture: a `Box.(Int) -> Int` local called as
-            // `add(n)` inside a Box scope runs against that scope's
-            // receiver — the capture only holds the creation-site
-            // leftover, values never carry receivers in Kotlin.
+            // A receiver lambda invoked bare binds the call site's implicit receiver
+            // whatever its `this` capture: Kotlin values never carry receivers.
             const receiver_lambda = blk: {
                 if (!has_this) break :blk false;
                 const module_g = self.module.borrow();
@@ -1623,10 +1370,7 @@ pub fn callValueNamedRecvCtx(self: *VmHost, allocator: Allocator, callee: *const
 }
 
 pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
-    // A Class callee constructed with named arguments (e.g. a local class
-    // `Box(bb = true)` that skips a defaulted parameter) must reorder + default-
-    // fill; callValue constructs positionally and would shift values into the
-    // wrong fields.
+    // Named args skipping a default must reorder; `callValue` is positional.
     if (callee.* == .Class) {
         var any_named = false;
         for (arg_names) |n| {
@@ -1647,8 +1391,6 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                 defer g.deinit();
                 break :blk g.get().fqn;
             };
-            // Same local-runtime guard as the positional arm: the def in
-            // hand is the class; the index scan can only mis-resolve it.
             const is_local_runtime = blk: {
                 const g = cls.borrow();
                 defer g.deinit();
@@ -1666,9 +1408,6 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
             if (class_id) |cid| {
                 return host_instances.newInstanceNamed(self, allocator, cid, args, arg_names, null);
             }
-            // Local class (not in the module index): reorder named args and fill
-            // literal defaults into a positional vector, then construct through
-            // callValue's positional direct-allocation path.
             var positional: []Value = &.{};
             {
                 const g = cls.borrow();
@@ -1689,9 +1428,7 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                         }
                     }
                 }
-                // A trailing positional callable binds the last ctor param
-                // when it is still unfilled (`LocalClass(a = 1) { ... }`),
-                // mirroring the fn-call trailing-lambda rule.
+                // A trailing callable binds the last ctor param while unfilled.
                 var trailing_lambda: ?usize = null;
                 if (args.len > 0 and n > 0) {
                     const last = args.len - 1;
@@ -1729,12 +1466,7 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
             return callValue(self, allocator, callee, positional);
         }
     }
-    // A local function / lambda value (`IrClosure`) called with named arguments
-    // that skip a defaulted parameter must reorder + default-fill against the
-    // closure body's value parameters; callValue binds positionally and would
-    // otherwise land a named arg in the wrong slot (`check(a, b, expectedMod = x)`
-    // dropping `x` into `expectedFd`). Mirrors the direct-FuncId path in
-    // callFuncNamed.
+    // Named args skipping a default reorder and fill, as `callFuncNamed` does.
     if (callee.* == .IrClosure) {
         var any_named = false;
         for (arg_names) |n| {
@@ -1750,9 +1482,7 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                 const module = info.module orelse module_ref.asPtr();
                 if (module.funcById(info.body_func)) |func| {
                     const np = info.n_params;
-                    // Named args address the value parameters (`params[0..np]`);
-                    // a vararg among them keeps the positional path below, whose
-                    // callValue vararg packing is already correct.
+                    // Named args address the value parameters; a vararg does not.
                     var has_vararg = false;
                     for (func.params[0..@min(np, func.params.len)]) |p| {
                         if (p.is_vararg) {
@@ -1765,7 +1495,6 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                         var slots = try allocator.alloc(?Value, np);
                         defer allocator.free(slots);
                         for (slots) |*s| s.* = null;
-                        // Bind named arguments to their declared slots.
                         for (args, 0..) |a, i| {
                             if (i < arg_names.len) {
                                 if (arg_names[i]) |nm| {
@@ -1778,10 +1507,7 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                                 }
                             }
                         }
-                        // A trailing positional callable binds to the last
-                        // function-typed parameter, out of sequence, so the
-                        // intervening defaulted parameters are not consumed
-                        // by it (mirrors callFuncNamed's rule).
+                        // A trailing callable binds the last function-typed param.
                         var trailing_lambda: ?usize = null;
                         if (args.len > 0) {
                             const last = args.len - 1;
@@ -1794,7 +1520,6 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                                 trailing_lambda = last;
                             }
                         }
-                        // Fill unnamed positional args into the remaining slots.
                         var pidx: usize = 0;
                         for (args, 0..) |a, i| {
                             const is_named = i < arg_names.len and arg_names[i] != null;
@@ -1806,10 +1531,8 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                                 pidx += 1;
                             }
                         }
-                        // Materialize a full positional vector, evaluating each
-                        // omitted slot's default-arg thunk (holes as well as the
-                        // tail). Keyed by main-module ids, so a sub-module closure
-                        // has no defaults table.
+                        // Evaluate each omitted slot's default thunk, holes and
+                        // tail; a sub-module closure has none.
                         const defaults: ?[]?FuncId = blk: {
                             if (info.module != null) break :blk null;
                             const pg = self.prog.borrow();
@@ -1829,9 +1552,7 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
                                     const msg = try std.fmt.allocPrint(allocator, "default-arg FuncId {d} out of range", .{fid.int()});
                                     return .{ .err = .{ .Type = msg } };
                                 };
-                                // Seed the first bound arg as a capture so a
-                                // receiver-referencing default thunk resolves,
-                                // mirroring padArgsWithDefaults.
+                                // The first bound arg seeds the receiver capture.
                                 var captures: std.ArrayList(Value) = .empty;
                                 if (positional.items.len != 0) {
                                     try captures.append(allocator, positional.items[0]);
@@ -1856,11 +1577,9 @@ pub fn callValueNamed(self: *VmHost, allocator: Allocator, callee: *const Value,
     return callValue(self, allocator, callee, args);
 }
 
-/// Whether a closure's DECLARED value-parameter types definitely refute
-/// the runtime arguments (arity aside — a mismatch there is handled by
-/// binding). Used by `CallValueOrMember`: a captured local fn whose
-/// params refute the args is not the target, so the call falls to the
-/// same-named enclosing member (Kotlin picked the member overload).
+/// Whether a closure's declared value-parameter types refute the runtime
+/// arguments, arity aside. A captured local fn whose params refute them is not the
+/// target, so `CallValueOrMember` falls to the same-named enclosing member.
 pub fn closureParamsDisproven(self: *VmHost, callee: *const Value, args: []const Value) bool {
     var v = callee.*;
     if (v == .Cell) {
@@ -1879,9 +1598,8 @@ pub fn closureParamsDisproven(self: *VmHost, callee: *const Value, args: []const
         if (i >= args.len) break;
         if (p.is_vararg) continue;
         if (host_call_member.argDefinitelyNotParamType(self, &p.ty, &args[i])) return true;
-        // An array argument on a definite non-array builtin param is a
-        // mismatch the shared helper declines to adjudicate (vararg /
-        // spread ambiguity); a declared non-vararg scalar param is safe.
+        // The shared helper declines array-against-scalar (vararg/spread ambiguity),
+        // but a declared non-vararg builtin scalar param refutes it.
         if (args[i] == .Array) {
             if (overload_match.builtinParamKind(overload_match.simpleName(p.ty.name))) |pk| {
                 if (pk != .array) return true;
@@ -1895,12 +1613,8 @@ pub fn callValueWithThis(self: *VmHost, allocator: Allocator, callee: *const Val
     return callValueWithThisSel(self, allocator, callee, this_value_in, args, arg_names, true);
 }
 
-/// `callValueWithThis` with the receiver re-selected by the DECLARED head
-/// the call site carried (a receiver-lambda param's declared receiver
-/// type). The passed register can be a coroutine that rebound the
-/// enclosing block's `this` capture; Kotlin binds the innermost implicit
-/// receiver OF THE DECLARED TYPE. Re-selection already applied, so the
-/// compatibility resel stays off.
+/// `callValueWithThis` with the receiver re-selected by the head the call site
+/// declared: Kotlin binds the innermost implicit receiver of that type.
 pub fn callValueWithThisHead(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value, arg_names: []const ?[]const u8, head: []const u8) Allocator.Error!EvalResult {
     var selected = this_value_in.*;
     if (head.len != 0) {
@@ -1911,13 +1625,9 @@ pub fn callValueWithThisHead(self: *VmHost, allocator: Allocator, callee: *const
     return callValueWithThisSel(self, allocator, callee, &selected, args, arg_names, false);
 }
 
-/// `callValueWithThis` with the compatibility receiver RE-SELECTION gated:
-/// a caller that PROVED the receiver (the lowering's
-/// fallback_takes_receiver contract) passes `allow_resel = false` — the
-/// recorded receiver head can be WRONG (a placement block nested in a
-/// measure lambda carried the enclosing "MeasureScope" head, and
-/// re-selection swapped the real PlacementScope for the coordinator), and
-/// an explicitly supplied receiver is authoritative.
+/// `callValueWithThis` with receiver re-selection gated: a caller that proved the
+/// receiver passes `allow_resel = false`, since a recorded head can name an
+/// enclosing scope while a supplied receiver is authoritative.
 pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const Value, this_value_in: *const Value, args: []const Value, arg_names: []const ?[]const u8, allow_resel: bool) Allocator.Error!EvalResult {
     _ = arg_names;
     var selected_this = this_value_in.*;
@@ -1940,24 +1650,14 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
         }
     }
     const this_value = &selected_this;
-    // A receiver-lambda's receiver (`with(r) { … }`, `r.apply { … }`) is an
-    // implicit receiver, hence a context-argument source for a contextual
-    // callee inside the block. Feed it into the context stack for the
-    // block's duration; the push unwinds on every return path.
+    // A receiver-lambda's receiver is a context-argument source in that block.
     const ctx_mark = self.ctxStackLen();
     defer self.ctxStackTruncate(ctx_mark);
     if (self.ctxIsActive()) self.ctxPush(this_value.*) catch {};
-    // Explicit-receiver receiver-lambda call (`block(receiver, p)` for a
-    // `R.(P) -> T`, exactly one extra leading arg): bind `this_value`
-    // into the `this` capture as a fallback and dispatch on the MAIN
-    // evaluator path (`call_value`). That path applies the receiver-split
-    // — arg0 is the explicit receiver and overrides `this` — and snapshots
-    // frames so a suspension inside a `suspend` body parks correctly. The
-    // intrinsic-host invoke below does neither, which strands a captured
-    // receiver-lambda call such as ktor's on(Send) handler
-    // `handler(Sender(this, …), request)` (the body's bare `proceed`
-    // resolves against the receiver only when it reaches the body as the
-    // closure's `this`).
+    // Explicit-receiver receiver-lambda call (`block(receiver, p)` for an
+    // `R.(P) -> T`): bind `this_value` into the `this` capture and dispatch on the
+    // main evaluator path, which splits the receiver and snapshots frames so a
+    // suspension parks; the intrinsic-host invoke does neither.
     if (callee.* == .IrClosure) {
         const id = callee.IrClosure.asPtr().id;
         const captures = callee.IrClosure;
@@ -1997,47 +1697,25 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                     },
                 );
             }
-            // A named LOCAL FUNCTION lowers as a closure but is not a
-            // receiver lambda: the caller's `this` reaches its body
-            // lexically (captures), never as an argument. The
-            // receiver-binding heuristics below would corrupt its
-            // positional args (a `vararg values + trailing lambda`
-            // local fn got the test instance spliced in). Dispatch it
-            // as a plain value call.
+            // A named local function lowers as a closure but is not a receiver
+            // lambda: its `this` comes from captures, so the binds below corrupt it.
             {
                 const module_ref = self.module.clone();
                 defer module_ref.deinit();
                 const module = info.module orelse module_ref.asPtr();
                 if (module.funcById(info.body_func)) |bf| {
                     const takes_receiver = bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "this");
-                    // …unless the reference is being INVOKED as a
-                    // receiver-function: a `::localFn` value in a
-                    // `T.() -> R` slot declares exactly one parameter more
-                    // than the call supplies, and the receiver fills it
-                    // (`obj.allSubFormatsNegative()` is
-                    // `checkIfAllNegative(obj)`). Dropping the receiver
-                    // there passed the body a null argument.
+                    // Unless invoked as a receiver fn, whose extra param takes it.
                     const receiver_fills_slot = bf.params.len == args.len + 1;
                     if (!std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver and
                         !receiver_fills_slot)
                     {
                         return callValue(self, allocator, callee, args);
                     }
-                    // A pass-threaded composable lambda declaring one param
-                    // MORE than the call supplies, with no leading `this`
-                    // param, takes the bound receiver as that leading
-                    // positional slot regardless of its captures — the compose
-                    // pass flattens a composable `R.() -> T` literal's
-                    // receiver into exactly this shape
-                    // (`[it, $composer, $changed]`). Binding the receiver into
-                    // a `this` capture instead leaves the params one short and
-                    // shifts the composer pair left. The trailing pair is the
-                    // discriminator: a plain headerless lambda lowered with a
-                    // speculative `it` (an `apply { }` block) has no pair, and
-                    // its receiver must keep binding through the `this`
-                    // capture below. Keep the receiver reachable as the
-                    // innermost subject so the body's bare member calls still
-                    // dispatch against it.
+                    // The compose pass flattens a composable `R.() -> T` literal's
+                    // receiver into a leading slot (`[it, $composer, $changed]`),
+                    // so such a lambda takes the bound receiver there whatever its
+                    // captures; the trailing pair tells it from a headerless one.
                     const pass_threaded = bf.params.len >= 3 and
                         std.mem.eql(u8, bf.params[bf.params.len - 2].name, "$composer") and
                         std.mem.eql(u8, bf.params[bf.params.len - 1].name, "$changed");
@@ -2060,18 +1738,10 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                         if (pushed) host_call_member.popAccessEnclosing(self);
                         return r;
                     }
-                    // Shape UNKNOWN (a lambda stored through a generic-typed
-                    // slot — ktor's `plugins[key] = { scope -> … }` map keeps
-                    // no function shape) with one declared param MORE than
-                    // the supplied args, and no adapted receiver-`this`
-                    // leading param: the receiver rides positionally in that
-                    // slot, whichever way the source spelled the block. A
-                    // parameterless receiver lambda declares no extra param
-                    // and keeps the receiver-binding path below — and so does
-                    // a HEADERLESS block, whose lone param is the lowering's
-                    // speculative `it` (an `apply { }` body reads `this`, not
-                    // `it`; a source-written `{ it -> }` loses this call shape
-                    // but a named parameter keeps it).
+                    // Unknown shape with one declared param more than the supplied
+                    // args and no leading `this`: the receiver rides positionally
+                    // there. A parameterless receiver lambda and a headerless
+                    // block's `it` keep the bind below.
                     if (std.mem.eql(u8, bf.name, "<lambda>") and !takes_receiver and
                         !info.receiver_shape_known and args.len + 1 == info.n_params and
                         !(bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "it")))
@@ -2088,11 +1758,8 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                     }
                 }
             }
-            // Kotlin function types with and without receivers are
-            // interchangeable: an ordinary `(R, P) -> T` closure used as
-            // `R.(P) -> T` receives the call receiver as its first positional
-            // argument. Its captured `this` remains the lexical receiver and
-            // must not be rebound to `R`.
+            // Kotlin function types with and without receivers are interchangeable:
+            // an `(R, P) -> T` takes the receiver positionally, keeping its `this`.
             if (info.receiver_shape_known and !info.has_receiver and args.len + 1 == info.n_params) {
                 const with_recv = try allocator.alloc(Value, args.len + 1);
                 defer if (runtime.freeScratch()) allocator.free(with_recv);
@@ -2107,36 +1774,16 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 break :blk null;
             };
             if (this_idx) |idx| {
-                // Two receiver-lambda shapes reach here, both dispatched on
-                // the MAIN evaluator path (`call_value`) so a suspension
-                // inside a `suspend` body snapshots frames and parks:
-                //   * explicit-receiver call (`block(receiver, p)` for a
-                //     `R.(P) -> T`): arg0 is the receiver and overrides
-                //     `this`, the body's value params follow.
-                //   * receiver-bound call (`recv.block()` where `block` is a
-                //     `suspend R.() -> Unit` param/property): the receiver
-                //     arrives via `this_value`, the body's value params are
-                //     `args` unchanged.
-                // The intrinsic-host invoke below does neither, which would
-                // both strand a captured receiver-lambda's bare-member
-                // resolution and flatten an `EvalError.Suspended` into a
-                // "suspended outside a driver" runtime error.
-                // One arg MORE than the declared params, on a closure that has a
-                // genuine `this` capture (checked above): arg0 is the extension
-                // receiver. This holds at zero params too — a `R.() -> T` field
-                // invoked as `holder.block(r)` (Kotlin's `Function1<R, T>` form,
-                // e.g. `getOrBuildCachedDrawBlock(this).block(this)`) supplies
-                // its receiver positionally, and the value-call path
-                // (`callValueRec`) already splits it that way.
+                // Two receiver-lambda shapes reach here, both on the main evaluator
+                // path so a suspension snapshots frames and parks: an
+                // explicit-receiver call, where arg0 is the receiver, and a
+                // receiver-bound call, where it arrives via `this_value`.
                 const explicit_receiver = info.has_receiver and args.len == info.n_params + 1;
                 const receiver: Value = if (explicit_receiver) args[0] else this_value.*;
                 const body_args: []const Value = if (explicit_receiver) args[1..] else args;
 
-                // Bind the receiver into a fresh captures cell's `this` slot
-                // (the evaluator reads the closure value's captures, not the
-                // side-table). Snapshot the prior `this` to keep it reachable
-                // as an enclosing receiver for the body's bare-member /
-                // member-extension resolution.
+                // Bind into a fresh captures cell's `this` slot: the evaluator reads
+                // the closure value's captures, not the side-table.
                 var new_caps: std.ArrayList(Value) = .empty;
                 {
                     const g = captures.borrow();
@@ -2148,18 +1795,14 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                     try new_caps.appendNTimes(allocator, Value.Null, idx + 1 - new_caps.items.len);
                 }
                 new_caps.items[idx] = receiver;
-                // The bound closure owns one ref to each capture (its teardown
-                // releases them); the copied originals and the bound receiver
-                // are borrows, so retain. No-op under the arena fast path.
+                // The bound closure owns one ref per capture; the copies are borrows.
                 if (runtime.reclaimEnabled()) for (new_caps.items) |c| c.retain();
                 const slice = try new_caps.toOwnedSlice(allocator);
                 const caps_ref = try IrClosureRef.init(allocator, .{ .id = id, .captures = slice });
                 const bound = Value{ .IrClosure = caps_ref };
 
-                // Keep the displaced prior `this` reachable as an outer
-                // implicit receiver, and push the new receiver so a body
-                // calling a member-extension declared on its class sees the
-                // owner as visible — mirroring `invoke_callable_with_this`.
+                // Keep the displaced prior `this` as an outer implicit receiver, and
+                // push the new one so a member-extension on its class sees the owner.
                 const pushed_outer = po: {
                     const pt = prior_this orelse break :po false;
                     if (pt == .Null or pt == .Unit) break :po false;
@@ -2171,9 +1814,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 if (pushed_outer) {
                     if (prior_this) |p| host_call_member.pushAccessEnclosing(self, &p);
                 }
-                // A null subject is pushed too: it is a real receiver
-                // candidate for nullable-receiver extensions
-                // (`fun Thing?.show()` inside `with(t)` where `t == null`).
+                // A null subject is a real candidate for `fun Thing?.show()`.
                 const pushed_receiver = receiver == .Instance or receiver == .Null;
                 if (pushed_receiver) {
                     host_call_member.pushAccessEnclosingSubject(self, &receiver);
@@ -2183,13 +1824,8 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 if (pushed_outer) host_call_member.popAccessEnclosing(self);
                 return r;
             }
-            // No `this` capture: the receiver binds as the leading
-            // declared `this` param when the body has one (a local
-            // extension function lowered as a closure); otherwise the
-            // body takes no receiver. Either way the call runs on the
-            // MAIN evaluator path (the intrinsic invoke below flattens a
-            // suspension into a hard error), with the receiver reachable
-            // as the innermost subject for dispatch-time resolution.
+            // No `this` capture: the receiver binds as a leading declared `this` param
+            // when the body has one, otherwise it is only the innermost subject.
             const takes_this_param = blk: {
                 const module_g = self.module.borrow();
                 defer module_g.deinit();
@@ -2198,11 +1834,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 const fp = f.params;
                 break :blk fp.len != 0 and std.mem.eql(u8, fp[0].name, "this");
             };
-            // Explicit-receiver call shape on a body that never captured
-            // `this` (`handler(Context(), a, b, c)` for a
-            // `Context.(A, B, C) -> R` whose body reads no receiver
-            // member): arg0 is the receiver, not a positional param —
-            // split it off and keep it reachable as the innermost subject.
+            // On a body that never captured `this`, arg0 is still the receiver.
             if (info.has_receiver and !takes_this_param and args.len == info.n_params + 1) {
                 const recv0 = args[0];
                 const pushed = recv0 == .Instance or recv0 == .Null;
@@ -2211,10 +1843,7 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 if (pushed) host_call_member.popAccessEnclosing(self);
                 return r;
             }
-            // A plain `(T, …) -> R` lambda used where a `T.(…) -> R` is
-            // expected declares one more positional param than the call
-            // supplies; the receiver fills it (kotlinc: the receiver IS
-            // the underlying function's first param).
+            // A plain lambda used as `T.(…) -> R` takes the receiver as its extra param.
             const recv_fills_param = !info.has_receiver and !takes_this_param and args.len + 1 == info.n_params;
             var all_args: std.ArrayList(Value) = .empty;
             defer all_args.deinit(allocator);
@@ -2229,12 +1858,9 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
             return r;
         }
     }
-    // A member-reference value (`Type::method`, `obj::method`) invoked
-    // with an explicit receiver — an extension-function-typed parameter
-    // (`sortDescending: TArray.(Int, Int) -> Unit` fed
-    // `ULongArray::sortDescending`, then `array.sortDescending(from, to)`).
-    // The explicit receiver dispatches the member walk with the args
-    // passed through; the intrinsic-host fallback below drops them.
+    // A member-reference value invoked with an explicit receiver (an
+    // extension-function-typed parameter fed `ULongArray::sortDescending`) drives
+    // the member walk with the args passed through, which the fallback drops.
     if (callee.* == .Instance) {
         var name_v: ?Value = null;
         var bound_recv: ?Value = null;
@@ -2244,12 +1870,9 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
             name_v = snap.get().get("__bound_name__");
             bound_recv = snap.get().get("__bound_receiver__");
         }
-        // A BOUND reference (`predicate::test` on an instance / object
-        // singleton) already carries its receiver. Converted to a
-        // receiver-function type (`T.() -> Boolean`), the supplied `this`
-        // is its ARGUMENT — `obj.condition()` means `predicate.test(obj)`,
-        // never `obj.test()`. A TYPE-form reference (`String::plus`) is
-        // unbound and keeps the receiver-dispatch route below.
+        // A bound reference (`predicate::test`) already carries its receiver, so
+        // under a receiver-function type the supplied `this` is its ARGUMENT:
+        // `obj.condition()` means `predicate.test(obj)`. A type form is unbound.
         if (name_v != null and name_v.? == .String) {
             if (bound_recv) |rv| {
                 const name0 = blk: {
@@ -2291,20 +1914,15 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
                 &.{},
                 boundReferenceStaticReceiver(callee),
             );
-            // `JsonPrimitive::booleanOrNull` as a receiver function names
-            // an EXTENSION property: no member takes the call, so the
-            // reference reads the property on the supplied receiver.
+            // A reference naming an extension property takes no member call.
             if (args.len == 0 and mr == .err and mr.err == .Unimplemented) {
                 const pr = try host_fields.getField(self, allocator, this_value, name);
                 if (pr == .ok) return pr;
             }
             return mr;
         }
-        // A plain instance of a class extending a function type: its
-        // `invoke` takes the call's arguments, and a receiver-form call
-        // (`r.fn()`, `R.() -> T`) passes the receiver as the first one. A
-        // mere `invoke` member (compose `MovableContent`) is NOT such a
-        // subtype and stays on its own dispatch.
+        // An instance of a class EXTENDING a function type takes the args through
+        // `invoke`, receiver first; a mere `invoke` member is not such a subtype.
         if (name_v == null and host_call_member.instanceExtendsFunctionType(self, callee)) {
             const direct = try host_call_member.callMemberNamed(self, allocator, callee, "invoke", args, &.{});
             if (!host_call_member.isDispatchMissFor(direct, "invoke")) return direct;
@@ -2328,22 +1946,14 @@ pub fn callValueWithThisSel(self: *VmHost, allocator: Allocator, callee: *const 
     };
 }
 
-/// Receiver-function invocation from an IR site whose declared callable shape
-/// is known. A plain function adapted to a receiver type receives the receiver
-/// positionally even when its body is a named local function; genuine receiver
-/// lambdas keep the receiver-binding path.
+/// Receiver-function invocation from an IR site whose callable shape is known: a
+/// plain function adapted to a receiver type takes it positionally, a receiver
+/// lambda keeps the bind path.
 pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *const Value, this_value: *const Value, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     if (callee.* == .IrClosure) {
         if (self.closures.get(@intCast(callee.IrClosure.asPtr().id))) |info| {
-            // Shape UNKNOWN (a lambda stored through a generic-typed slot —
-            // ktor's `plugins[key] = { scope -> … }` map keeps no function
-            // shape) falls back to the declared arity: a body declaring
-            // exactly one more parameter than the supplied arguments wants
-            // the receiver in that slot, whichever way the source spelled
-            // it. A parameterless receiver lambda declares no extra param,
-            // so it never matches — and a headerless block's lone
-            // speculative `it` param keeps the receiver-binding path (see
-            // callValueWithThisSel).
+            // Unknown shape falls back to declared arity: one param more than the
+            // supplied args wants the receiver there, unless it is a speculative `it`.
             const speculative_it = blk: {
                 if (info.receiver_shape_known) break :blk false;
                 const module_g = self.module.borrow();
@@ -2360,13 +1970,7 @@ pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *cons
                 defer if (runtime.freeScratch()) allocator.free(with_recv);
                 with_recv[0] = this_value.*;
                 @memcpy(with_recv[1..], args);
-                // The receiver rides positionally, but it is still the
-                // block's innermost IMPLICIT receiver: publish it on the
-                // enclosing chain so member-extension dispatch inside the
-                // body sees its owner (`placeable.place(x, y)` inside a
-                // `Placeable.PlacementScope.() -> Unit` placement block —
-                // the owner-visibility set was missing the scope and every
-                // window placement pass died on it).
+                // The receiver rides positionally but is still published innermost.
                 const push_subject = this_value.* == .Instance or this_value.* == .Null;
                 if (push_subject) host_call_member.pushAccessEnclosingSubject(self, this_value);
                 defer if (push_subject) host_call_member.popAccessEnclosing(self);
@@ -2377,7 +1981,6 @@ pub fn callValueWithThisExact(self: *VmHost, allocator: Allocator, callee: *cons
     return callValueWithThisSel(self, allocator, callee, this_value, args, arg_names, false);
 }
 
-/// Whether the class value `cv` declares an `inner class` named `name`.
 fn classHasInnerNamed(self: *VmHost, cv: *const Value, name: []const u8) bool {
     const fqn = blk: {
         const g = cv.Class.borrow();
@@ -2387,7 +1990,6 @@ fn classHasInnerNamed(self: *VmHost, cv: *const Value, name: []const u8) bool {
     return classFqnHasInnerNamed(self, fqn, name);
 }
 
-/// Whether the instance's class declares an `inner class` named `name`.
 fn instanceHasInnerNamed(self: *VmHost, iv: *const Value, name: []const u8) bool {
     const fqn = blk: {
         const g = iv.Instance.borrow();
@@ -2410,8 +2012,6 @@ fn classFqnHasInnerNamed(self: *VmHost, fqn: []const u8, name: []const u8) bool 
 }
 
 pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, body_func: FuncId, captures: []const Value) Allocator.Error!EvalResult {
-    // Derive the lambda's param count + capture-name list from the body
-    // func so `LoadCapture` reads the right snapshot per closure.
     var n_params: usize = 0;
     var receiver_shape_known = false;
     var has_receiver = false;
@@ -2422,9 +2022,8 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
         has_receiver = f.lambda_has_receiver;
         capture_names = try allocator.dupe([]const u8, f.capture_order);
     }
-    // Canonical capture store for this closure (read by the HOF invoke
-    // path). A captured `var` a nested closure writes is itself a shared
-    // `Value.Cell` carried here, so its mutation is visible by reference.
+    // Canonical capture store for the HOF invoke path; a captured `var` is a
+    // shared `Value.Cell`, so writes are visible by reference.
     var cell_list: std.ArrayList(Value) = .empty;
     try cell_list.appendSlice(allocator, captures);
     const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);
@@ -2438,8 +2037,8 @@ pub fn buildClosure(self: *VmHost, allocator: Allocator, module: *const Module, 
         .captures = cell,
         .chain = try ir.eval.captureChainAlloc(allocator),
     });
-    // The IrClosure owns one ref to each capture (its `release` recursively
-    // frees them); the registry `cell` above is a non-owning view.
+    // The IrClosure owns one ref per capture, freed in `release`; the registry cell
+    // is a non-owning view.
     if (runtime.reclaimEnabled()) for (captures) |c| c.retain();
     const caps_ref = try IrClosureRef.init(allocator, .{ .id = id, .captures = try allocator.dupe(Value, captures) });
     return .{ .ok = .{ .IrClosure = caps_ref } };
@@ -2449,20 +2048,15 @@ pub fn buildAstLambdaWithFlagFuncid(self: *VmHost, allocator: Allocator, module:
     _ = body;
     _ = absorb_return;
     const fid = body_func orelse return .{ .err = .{ .Unimplemented = "Vm: lambda lower did not provide body_func" } };
-    // Canonical capture store for this closure (read by the HOF invoke
-    // path). A captured `var` a nested closure writes is itself a shared
-    // `Value.Cell` carried here, so its mutation is visible by reference.
+    // Canonical capture store for the HOF invoke path; a captured `var` is a
+    // shared `Value.Cell`, so writes are visible by reference.
     var cell_list: std.ArrayList(Value) = .empty;
     try cell_list.appendSlice(allocator, captures);
     const cell = try ObjRef(std.ArrayList(Value)).init(allocator, cell_list);
     var chain = try ir.eval.captureChainAlloc(allocator);
-    // A closure that captures `this` but whose creation-time chain is empty
-    // (a `sequence { … }` / `iterator { … }` AstLambda created in a property
-    // getter — the accessor frame binds its receiver only as a parameter, not
-    // on the lexical receiver chain a member call publishes) would resolve
-    // `this@Class` against nothing. Seed the captured `this` as the chain's
-    // receiver so the enclosing receiver survives into the coroutine body.
-    // Method/lambda closures already carry a chain receiver and are untouched.
+    // A closure capturing `this` whose creation-time chain is empty (an AstLambda
+    // in a property getter, whose accessor frame binds the receiver only as a
+    // parameter) resolves `this@Class` against nothing, so seed the chain.
     if (chain.len == 0) {
         for (captured_names, 0..) |cn, i| {
             if (std.mem.eql(u8, cn, "this") and i < captures.len and captures[i] == .Instance) {
@@ -2495,21 +2089,15 @@ pub fn callableReceiverShape(self: *VmHost, v: *const Value) ?ReceiverShape {
     return null;
 }
 
-/// The declared positional-parameter count of a callable value, or null
-/// when the shape is unknown (intrinsics, bound refs). Consulted by the
-/// `CallMemberOrValue` value arm: a local callable that cannot take the
-/// call's args (a `TArray.(Int, Int) -> Unit` param invoked as
-/// `receiver.name()`) is not a candidate — Kotlin resolves the
-/// extension instead of Null-padding the local's parameters.
+/// Whether a callable value's declared arity accepts `n_args`, or null when the
+/// shape is unknown (intrinsics, bound refs). `CallMemberOrValue` drops a local
+/// callable that cannot take the args: Kotlin resolves the extension instead.
 pub fn callableAcceptsArgs(self: *VmHost, v: *const Value, n_args: usize) ?bool {
     switch (v.*) {
         .IrClosure => |c| {
             const info = self.closures.get(@intCast(c.asPtr().id)) orelse return null;
-            // A local FUNCTION lowers as a closure too and may carry
-            // defaults or a vararg; its body func's declared arity is
-            // authoritative (`String.endsWithCs(suffix, ignoreCase =
-            // false)` accepts one arg). A plain lambda has no DeclSig —
-            // its param count is exact.
+            // A local function lowers as a closure too and may carry defaults or a
+            // vararg, so its DeclSig arity is authoritative; a lambda's is exact.
             var required: usize = info.n_params;
             var total: usize = info.n_params;
             var has_vararg = false;
@@ -2522,33 +2110,27 @@ pub fn callableAcceptsArgs(self: *VmHost, v: *const Value, n_args: usize) ?bool 
                     has_vararg = sig.arity.has_vararg;
                 }
             }
-            // The receiver may arrive through `this` (args bind the
-            // params directly) or fill the first param (args + 1).
+            // The receiver may arrive through `this` or fill the first param.
             inline for ([_]usize{ 0, 1 }) |extra| {
                 const k = n_args + extra;
                 if (k >= required and (k <= total or has_vararg)) return true;
             }
             return false;
         },
-        // Function declarations, intrinsics, and bound refs are opaque
-        // here; the value arm stays unguarded for them.
+        // Declarations, intrinsics and bound refs are opaque; unguarded.
         else => return null,
     }
 }
 
-/// True when a declared parameter type positively excludes `null` — the
-/// "Unit" name is the unannotated-param placeholder, which carries no
-/// information.
+/// True when a declared parameter type excludes `null`; "Unit" is the
+/// unannotated-param placeholder and carries no information.
 fn nonNullDeclared(t: ir.TypeRef) bool {
     return !t.nullable and t.name.len != 0 and !std.mem.eql(u8, t.name, "Unit");
 }
 
-/// Whether a callable value can bind this exact call: receiver-aware
-/// declared arity, named arguments, and null arguments against
-/// non-nullable declared parameter types. Returns null when the shape is
-/// unknown (intrinsics, bound refs). Consulted by the `CallMemberOrValue`
-/// value arm: a local callable that cannot take the call is not a
-/// candidate — Kotlin resolves the member/extension instead.
+/// Whether a callable value can bind this exact call: receiver-aware declared
+/// arity, named arguments, and null arguments against non-nullable declared
+/// parameter types. Null when the shape is unknown.
 pub fn callableAcceptsCall(self: *VmHost, v: *const Value, recv: *const Value, args: []const Value, arg_names: []const ?[]const u8) ?bool {
     switch (v.*) {
         .IrClosure => |c| {
@@ -2571,8 +2153,6 @@ pub fn callableAcceptsCall(self: *VmHost, v: *const Value, recv: *const Value, a
                 if (m.funcById(info.body_func)) |bf| {
                     const receiver_param = bf.params.len != 0 and std.mem.eql(u8, bf.params[0].name, "this");
                     const shift: usize = @intFromBool(receiver_param);
-                    // A named argument that names no declared parameter
-                    // disqualifies the candidate.
                     for (arg_names) |maybe| {
                         const nm = maybe orelse continue;
                         var found = false;
@@ -2599,10 +2179,8 @@ pub fn callableAcceptsCall(self: *VmHost, v: *const Value, recv: *const Value, a
                         }
                         if (pt) |t| if (nonNullDeclared(t)) return false;
                     }
-                    // A local fn closure without a DeclSig: its declared
-                    // shape is the body func itself; the receiver always
-                    // fills a leading `this` param, so user args bind the
-                    // rest exactly (minus registered defaults).
+                    // Without a DeclSig the body func is the declared shape: the
+                    // receiver fills a leading `this`, user args bind the rest.
                     if (!has_decl_sig) {
                         var n_def: usize = 0;
                         if (mg.get().registry.local_fn_defaults.get(info.body_func)) |slots| {
@@ -2624,28 +2202,21 @@ pub fn callableAcceptsCall(self: *VmHost, v: *const Value, recv: *const Value, a
                 }
             }
             if (exact) |ok_exact| return ok_exact;
-            // The receiver may arrive through `this` (args bind the
-            // params directly) or fill the first param (args + 1).
+            // The receiver may arrive through `this` or fill the first param.
             inline for ([_]usize{ 0, 1 }) |extra| {
                 const k = args.len + extra;
                 if (k >= required and (k <= total or has_vararg)) return true;
             }
             return false;
         },
-        // Function declarations, intrinsics, and bound refs are opaque
-        // here; the value arm stays unguarded for them.
+        // Declarations, intrinsics and bound refs are opaque; unguarded.
         else => return null,
     }
 }
 
-/// Whether `v` is a receiver lambda whose `this` arrives through a capture
-/// slot: its body declares a receiver type and carries a `this` capture,
-/// so a bare invocation (`proc()`) must bind the caller's implicit
-/// receiver into that slot before the body runs. Without the bind the slot
-/// keeps the creation-time lexical `this`, and every bare call in the body
-/// resolves against the WRONG scope — `createTestResult { launch {…} }`
-/// launched the runTest work runner on the outer TestScope, whose
-/// dispatcher queues onto the very scheduler only that runner pumps.
+/// Whether `v` is a receiver lambda whose `this` arrives through a capture slot,
+/// so a bare invocation (`proc()`) must bind the caller's implicit receiver into
+/// that slot first, or the body resolves against the creation-time `this`.
 pub fn closureNeedsThisCapture(self: *VmHost, v: *const Value) bool {
     if (v.* != .IrClosure) return false;
     const info = self.closures.get(@intCast(v.IrClosure.asPtr().id)) orelse return false;
@@ -2659,11 +2230,8 @@ pub fn closureNeedsThisCapture(self: *VmHost, v: *const Value) bool {
     return false;
 }
 
-/// Bind `new_this` into the closure's `this` capture slot (see
-/// `closureNeedsThisCapture`). The slot is written in place through the
-/// captures cell: the invocation is about to run and the binding is the
-/// receiver for exactly this call, the same in-place channel the
-/// receiver-split paths use.
+/// Bind `new_this` into the closure's `this` capture slot, in place through the
+/// captures cell, the binding being the receiver for exactly this call.
 pub fn overrideClosureThis(self: *VmHost, v: *const Value, new_this: *const Value) void {
     if (v.* != .IrClosure) return;
     const info = self.closures.get(@intCast(v.IrClosure.asPtr().id)) orelse return;
@@ -2687,20 +2255,14 @@ pub fn overrideClosureThis(self: *VmHost, v: *const Value, new_this: *const Valu
     }
 }
 
-// -------------------------------------------------------------------------
-// Internal helpers used by the value-call paths above. They live here so
-// the value-call logic is self-contained.
-// -------------------------------------------------------------------------
-
-/// Monotonic instance identity, mirroring `instance_id_counter.fetch_add(_, Relaxed) + 1`.
+/// Monotonic instance identity, counting from 1.
 fn nextInstanceId(self: *VmHost) u64 {
     const g = self.instance_id_counter.borrowMut();
     defer g.deinit();
     return g.get().fetchAdd(1, .monotonic) + 1;
 }
 
-/// Build an `IntrinsicHost` adapter sharing this host's state, so HOF
-/// stdlib bindings can recursively invoke lambdas via the closure table.
+/// An `IntrinsicHost` over this host's state, so HOF bindings reach the closures.
 fn makeIntrinsicHost(self: *VmHost) VmIntrinsicHost {
     return .{
         .module = self.module.clone(),
@@ -2734,8 +2296,7 @@ fn intrinsicHostDeinit(h: *VmIntrinsicHost) void {
     h.threads.deinit();
 }
 
-/// Invoke a native stdlib intrinsic, mapping its `RuntimeError`
-/// control-flow signals back into the IR evaluator's `EvalError`.
+/// Invoke a native stdlib intrinsic, mapping `RuntimeError` signals to `EvalError`.
 fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(self.allocator, "intrinsic_call_value", fqn, null, null, args);
     const keepalive = self.ka.mark();
@@ -2760,18 +2321,14 @@ fn dispatchIntrinsic(self: *VmHost, fqn: []const u8, func: StdlibFn, args: []con
     };
 }
 
-/// Map a stdlib `RuntimeError` onto an `EvalError`, preserving thrown
-/// values, non-local returns, and suspension requests.
+/// Map a `RuntimeError` onto an `EvalError`, preserving throws, returns, suspends.
 fn runtimeErrToEval(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalResult {
     switch (e) {
-        // Preserve the thrown Value so the IR evaluator's try/catch can
-        // match the handler against the exception class.
+        // Preserve the thrown Value so try/catch can match the exception class.
         .Thrown => |v| return .{ .err = .{ .Throw = v } },
         .Return => |v| return .{ .err = .{ .NonLocalReturn = v } },
-        // A suspending primitive (`delay` / `yield`) asked to park. Seed
-        // a fresh SuspendState; each enclosing `eval` frame snapshots
-        // itself as it unwinds, and the coroutine driver parks the
-        // result under a token.
+        // A suspending primitive asked to park: seed a fresh SuspendState. Each
+        // enclosing `eval` frame snapshots itself as it unwinds.
         .Suspend => |wake| {
             const st = try allocator.create(SuspendState);
             st.* = .{
@@ -2782,11 +2339,8 @@ fn runtimeErrToEval(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalR
             };
             return .{ .err = .{ .Suspended = st } };
         },
-        // Map each error kind back to its `EvalError` counterpart, keeping
-        // the carried message as the same string (the inverse of
-        // `runtimeErrorFromEval`). Formatting the whole `RuntimeError` with
-        // `{any}` would print its `[]const u8` payload as a raw byte array
-        // and re-wrap an already-rendered message inside a second `.Type`.
+        // Each kind maps to its `EvalError` counterpart, message carried through;
+        // `{any}` would print the payload raw and re-wrap it in a second `.Type`.
         .Unbound => |s| return .{ .err = .{ .Unbound = s } },
         .Type => |s| return .{ .err = .{ .Type = s } },
         .Arity => |s| return .{ .err = .{ .Arity = s } },
@@ -2800,12 +2354,10 @@ fn runtimeErrToEval(allocator: Allocator, e: RuntimeError) Allocator.Error!EvalR
     }
 }
 
-/// `Result<std.ArrayList(Value), EvalError>` for `padArgsWithDefaults`.
 const PadResult = union(enum) { ok: std.ArrayList(Value), err: EvalError };
 
-/// Pad `provided` to `n_params`, evaluating each missing slot's default
-/// thunk. A default-arg thunk that references the receiver records `this`
-/// as a capture, so the first already-bound arg seeds the capture slot.
+/// Pad `provided` to `n_params`, evaluating each missing slot's default thunk. A
+/// thunk referencing the receiver takes it from the first already-bound arg.
 fn padArgsWithDefaults(
     self: *VmHost,
     allocator: Allocator,
@@ -2817,12 +2369,8 @@ fn padArgsWithDefaults(
     return padArgsWithDefaultsFor(self, allocator, module_ref, n_params, provided, defaults, &.{});
 }
 
-/// `padArgsWithDefaults` with the callee's parameters: an omitted `vararg`
-/// parameter takes an empty array (a callable reference to
-/// `foo(vararg a: String, result: String = "OK")` invoked as `() -> String`
-/// is kotlinc's adapted reference, which supplies the empty vararg and the
-/// default), so the default thunks of the parameters after it see their
-/// slots in place.
+/// `padArgsWithDefaults` with the callee's parameters: an omitted `vararg` takes an
+/// empty array, so the default thunks after it find their slots in place.
 fn padArgsWithDefaultsFor(
     self: *VmHost,
     allocator: Allocator,
@@ -2840,9 +2388,7 @@ fn padArgsWithDefaultsFor(
             continue;
         }
         const dfid: ?FuncId = if (defaults) |d| (if (i < d.len) d[i] else null) else null;
-        // An omitted vararg with no default of its own is the empty array;
-        // one declared with a default (`vararg y: T = arrayOf(...)`) takes
-        // that default below like any other parameter.
+        // An omitted vararg with no default of its own is the empty array.
         if (dfid == null and i < params.len and params[i].is_vararg) {
             const empty: std.ArrayList(Value) = .empty;
             const items = try ValueList.init(allocator, empty);
@@ -2850,11 +2396,8 @@ fn padArgsWithDefaultsFor(
             continue;
         }
         if (dfid) |fid| {
-            // A default-arg thunk lowered inside an extension fn body that
-            // references the receiver (`toIndex = size` on `IntArray.fill`)
-            // records `this` as a capture, not a param. Seed the capture
-            // slot with the receiver so the bare `size` resolves through it
-            // instead of failing as an unresolved global.
+            // A default-arg thunk in an extension body records a receiver reference
+            // (`toIndex = size`) as a capture, so seed the capture slot.
             var captures: std.ArrayList(Value) = .empty;
             if (call_args.items.len != 0) {
                 try captures.append(allocator, call_args.items[0]);
@@ -2885,8 +2428,7 @@ fn padArgsWithDefaultsFor(
     return .{ .ok = call_args };
 }
 
-/// Literal-only constant folder for a body-property initializer on a
-/// runtime-registered local class (no lowered init thunk available).
+/// Literal-only folder for a local class's body-property initializer (no thunk).
 pub fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) ?Value {
     switch (e.*) {
         .IntLit => |x| return Value.newInt(x.value),

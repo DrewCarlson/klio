@@ -1,30 +1,10 @@
-//! Host fast path for the Compose-vendored persistent hash map BUILDER
-//! mutation (`androidx.compose.runtime.external.kotlinx.collections.
-//! immutable.implementations.immutableMap.PersistentHashMapBuilder`).
-//!
-//! `SnapshotStateMap.put` runs one `mutate { it.put(k, v) }` cycle per
-//! write: `oldMap.builder()`, ONE builder.put, `builder.build()`. The
-//! interpreted put walks the CHAMP trie through framed calls and copies
-//! buffers через interpreted array helpers; the concurrent map stress
-//! spends most of its budget there. The trie data is fully
-//! host-readable (TrieNode {dataMap, nodeMap, buffer, ownedBy}), so the
-//! host performs the exact `mutablePut` algorithm of the vendored
-//! TrieNode.kt over the interpreted objects, and `build()`'s
-//! node-identity check likewise.
-//!
-//! Exactness rules:
-//! - Keys must be host-hashable scalars/strings whose `hashCode` and
-//!   `equals` the host owns exactly (`Value.kotlinScalarHash`,
-//!   same-tag structural equality). Float/Double keys bail (`equals`
-//!   NaN semantics diverge from `==`), as do Null keys and any
-//!   receiver/stored shape surprise.
-//! - Mutations follow the vendored ownership discipline: in-place only
-//!   when `node.ownedBy === builder.ownership` (instance identity),
-//!   fresh TrieNode instances otherwise, minted from a template
-//!   captured off live instances (exact field-name set verified; an
-//!   unknown field bails before anything is touched).
-//! - A bail can only happen BEFORE the first mutation: every in-place
-//!   write sits at a success point after all shape checks on its path.
+//! Host fast path for the Compose-vendored persistent hash map builder mutation,
+//! replacing the interpreted `builder()`/`put`/`build()` cycle `SnapshotStateMap.put`
+//! runs per write. The trie is host-readable (TrieNode {dataMap, nodeMap, buffer,
+//! ownedBy}), so the host runs the vendored `TrieNode.mutablePut` over it; keys must
+//! be scalars or strings, and Float/Double, Null and shape surprises bail. A node
+//! mutates in place only when `node.ownedBy === builder.ownership`, else a fresh one
+//! is minted from a captured template; a bail can only happen before the first mutation.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -88,11 +68,7 @@ pub fn isMapClass(inst: ObjRef(InstanceData)) bool {
     return classMatches(inst, &map_class_hit, MAP_FQN);
 }
 
-/// Key shapes the host owns hashing AND equality for, at exactly
-/// kotlinc's semantics. Float/Double stay out (`equals` treats NaN as
-/// equal to itself and -0.0 as distinct from 0.0, unlike `==` which
-/// structural equality mirrors); Null stays out (its hashCode is a
-/// nullable-receiver dispatch, not a value property).
+/// Key shapes the host hashes at kotlinc's exact semantics; Float, Double and Null bail.
 fn keyHostable(v: *const Value) bool {
     return switch (v.*) {
         .Int, .Long, .Short, .Byte, .Char, .Bool, .UInt, .ULong, .UShort, .UByte, .String => true,
@@ -100,16 +76,14 @@ fn keyHostable(v: *const Value) bool {
     };
 }
 
-/// `a == b` for two hostable keys: a differing runtime type is `false`
-/// exactly as kotlinc's typed `equals` answers; same-tag values compare
-/// structurally.
+/// `a == b` for two hostable keys: a differing runtime type is `false`, as kotlinc's
+/// typed `equals` answers.
 fn keyEq(a: *const Value, b: *const Value) bool {
     if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
     return Value.structuralEq(a, b);
 }
 
-/// The vendored `===` on a stored value, at klio's own identity
-/// semantics: reference shapes by cell, scalars by tag + bits.
+/// The vendored `===`: reference shapes by cell, scalars by tag and bits.
 fn valueIdentical(a: *const Value, b: *const Value) bool {
     return switch (a.*) {
         .Instance => |x| b.* == .Instance and ObjRef(InstanceData).ptrEq(x, b.Instance),
@@ -121,10 +95,7 @@ fn valueIdentical(a: *const Value, b: *const Value) bool {
     };
 }
 
-/// TrieNode minting template: the class cell plus the four interned
-/// field-name slices in the instance's declaration order. Captured per
-/// thread from a live node; a node instance carrying any OTHER field
-/// name refuses capture (and the serve bails).
+/// TrieNode minting template: class cell plus the four interned field names in order.
 const NodeTmpl = struct {
     gen: u32 = 0,
     class: ?ObjRef(ClassDef) = null,
@@ -137,7 +108,6 @@ fn cacheGen() u32 {
     return @import("host_call_member.zig").dispatch_cache_gen.load(.monotonic);
 }
 
-/// Capture (or re-verify) the TrieNode template from a live node.
 fn nodeTemplate(node: ObjRef(InstanceData)) ?*const NodeTmpl {
     const gen = cacheGen();
     if (node_tmpl.gen == gen) return &node_tmpl;
@@ -167,7 +137,6 @@ fn nodeTemplate(node: ObjRef(InstanceData)) ?*const NodeTmpl {
     return &node_tmpl;
 }
 
-/// The mutable view of one trie node the walk works over.
 const NodeView = struct {
     inst: ObjRef(InstanceData),
     data_map: i32,
@@ -197,8 +166,6 @@ const NodeView = struct {
     }
 };
 
-/// The builder-side effects a put accumulates; applied in one write-back
-/// after the walk succeeds.
 const PutCtx = struct {
     a: Allocator,
     self: *VmHost,
@@ -214,8 +181,6 @@ fn retainAll(items: []const Value) void {
     for (items) |v| v.retain();
 }
 
-/// Mint a fresh TrieNode instance over `items` with the template's exact
-/// field order. `owned_by` is the new node's owner slot value.
 fn mintNode(ctx: *PutCtx, data_map: i32, node_map: i32, items: []const Value, owned_by: Value) Allocator.Error!Value {
     retainAll(items);
     var list: std.ArrayList(Value) = .empty;
@@ -243,16 +208,12 @@ fn mintNode(ctx: *PutCtx, data_map: i32, node_map: i32, items: []const Value, ow
         .native_state = null,
     });
     const v: Value = .{ .Instance = inst };
-    // Collect-at-alloc: the NEXT host allocation on this thread may run a
-    // collection, and a freshly minted node referenced only by native
-    // locals is invisible to the root walk — pin until the serve's
-    // entry-mark restores.
+    // Collect-at-alloc: a fresh node reachable only from native locals is unrooted.
     runtime.keepalivePush(v);
     return v;
 }
 
-/// In-place store of the node's three mutable fields (the caller proved
-/// ownership). `buffer` may be a NEW array value replacing the old slot.
+/// In-place store of the node's mutable fields; the caller proved ownership.
 fn storeNode(ctx: *PutCtx, view: *const NodeView, data_map: i32, node_map: i32, buffer: ?Value) Allocator.Error!void {
     const g = view.inst.borrowMut();
     defer g.deinit();
@@ -262,8 +223,8 @@ fn storeNode(ctx: *PutCtx, view: *const NodeView, data_map: i32, node_map: i32, 
     if (buffer) |b| try d.define(ctx.a, "buffer", b);
 }
 
-// All bitmap arithmetic runs in the u32 domain: `mask - 1` on the i32
-// spelling overflows (panics) when the mask is bit 31.
+// Bitmap arithmetic runs in the u32 domain: `mask - 1` on the i32 spelling overflows
+// when the mask is bit 31.
 fn keyIndexOf(view: *const NodeView, mask: u32) usize {
     return ENTRY_SIZE * @as(usize, @popCount(@as(u32, @bitCast(view.data_map)) & (mask - 1)));
 }
@@ -272,7 +233,6 @@ fn nodeIndexOf(view: *const NodeView, mask: u32) usize {
     return view.buffer.len() - 1 - @as(usize, @popCount(@as(u32, @bitCast(view.node_map)) & (mask - 1)));
 }
 
-/// `buffer.insertEntryAtIndex(keyIndex, key, value)` as a fresh snapshot.
 fn bufferInsertEntry(ctx: *PutCtx, buffer: ArrayData, key_index: usize, key: *const Value, value: *const Value) Allocator.Error!Value {
     const n = buffer.len();
     var list: std.ArrayList(Value) = .empty;
@@ -288,9 +248,8 @@ fn bufferInsertEntry(ctx: *PutCtx, buffer: ArrayData, key_index: usize, key: *co
     return bv;
 }
 
-/// `buffer.replaceEntryWithNode(keyIndex, nodeIndex, node)` as a fresh
-/// snapshot: the two entry slots vanish, the node lands where the
-/// vendored helper puts it (`nodeIndex - ENTRY_SIZE` of the old frame).
+/// `buffer.replaceEntryWithNode` as a fresh snapshot; the node lands at
+/// `nodeIndex - ENTRY_SIZE`.
 fn bufferReplaceEntryWithNode(ctx: *PutCtx, buffer: ArrayData, key_index: usize, node_index: usize, node: Value) Allocator.Error!Value {
     const n = buffer.len();
     var list: std.ArrayList(Value) = .empty;
@@ -307,7 +266,6 @@ fn bufferReplaceEntryWithNode(ctx: *PutCtx, buffer: ArrayData, key_index: usize,
     return bv;
 }
 
-/// A whole-buffer copy with one slot replaced.
 fn bufferCopyReplace(ctx: *PutCtx, buffer: ArrayData, index: usize, v: *const Value) Allocator.Error!Value {
     const n = buffer.len();
     var list: std.ArrayList(Value) = .empty;
@@ -320,8 +278,6 @@ fn bufferCopyReplace(ctx: *PutCtx, buffer: ArrayData, index: usize, v: *const Va
     return bv;
 }
 
-/// `makeNode`: a fresh subtree holding the two entries, recursing while
-/// their hash segments collide, a collision node past MAX_SHIFT.
 fn makeNode(ctx: *PutCtx, h1: i32, k1: *const Value, v1: *const Value, h2: i32, k2: *const Value, v2: *const Value, shift: u32, owned_by: Value) Allocator.Error!Value {
     if (shift > MAX_SHIFT) {
         return mintNode(ctx, 0, 0, &.{ k1.*, v1.*, k2.*, v2.* }, owned_by);
@@ -344,11 +300,8 @@ fn makeNode(ctx: *PutCtx, h1: i32, k1: *const Value, v1: *const Value, h2: i32, 
     return parent;
 }
 
-/// The exact `TrieNode.mutablePut` walk. Returns the (possibly same)
-/// node as a Value; null bails to the interpreter — provably before any
-/// mutation (every in-place write follows the last shape check on its
-/// path, and recursion bails bottom-up before its parent touches
-/// anything).
+/// The exact `TrieNode.mutablePut` walk; a null bail reaches the interpreter before any
+/// mutation.
 fn mutablePut(ctx: *PutCtx, node_inst: ObjRef(InstanceData), key_hash: i32, key: *const Value, value: *const Value, shift: u32) Allocator.Error!?Value {
     const view = NodeView.read(node_inst, &ctx.owner) orelse return null;
     if (shift > MAX_SHIFT) return mutableCollisionPut(ctx, &view, key, value);
@@ -372,8 +325,8 @@ fn mutablePut(ctx: *PutCtx, node_inst: ObjRef(InstanceData), key_hash: i32, key:
             const new_buf = try bufferCopyReplace(ctx, view.buffer, key_index + 1, value);
             return try mintNodeFromBuf(ctx, view.data_map, view.node_map, new_buf);
         }
-        // mutableMoveEntryToNode: the stored key's own hash drives the
-        // subtree, so it must be host-hashable too.
+        // mutableMoveEntryToNode: the stored key's own hash drives the subtree, so it
+        // must be hostable.
         const stored_hash = Value.kotlinScalarHash(&stored_key) orelse return null;
         const stored_value = view.buffer.get(key_index + 1);
         ctx.size_delta += 1;
@@ -413,7 +366,6 @@ fn mutablePut(ctx: *PutCtx, node_inst: ObjRef(InstanceData), key_hash: i32, key:
         if (new_node == .Instance and ObjRef(InstanceData).ptrEq(new_node.Instance, target.Instance)) {
             return .{ .Instance = node_inst };
         }
-        // mutableUpdateNodeAtIndex, including the single-entry upping.
         if (view.buffer.len() == 1) {
             const nv = NodeView.read(new_node.Instance, &ctx.owner) orelse return null;
             if (nv.buffer.len() == ENTRY_SIZE and nv.node_map == 0) {
@@ -422,8 +374,7 @@ fn mutablePut(ctx: *PutCtx, node_inst: ObjRef(InstanceData), key_hash: i32, key:
             }
         }
         if (view.owned) {
-            // `set` retains for the slot; drop the walk's own ref to the
-            // freshly minted child.
+            // `set` retains for the slot; drop the walk's ref to the fresh child.
             view.buffer.set(ctx.a, node_index, new_node);
             if (runtime.reclaimEnabled()) new_node.release(ctx.a);
             return .{ .Instance = node_inst };
@@ -432,7 +383,6 @@ fn mutablePut(ctx: *PutCtx, node_inst: ObjRef(InstanceData), key_hash: i32, key:
         if (runtime.reclaimEnabled()) new_node.release(ctx.a);
         return try mintNodeFromBuf(ctx, view.data_map, view.node_map, new_buf);
     }
-    // Key absent at this level: insert the entry.
     ctx.size_delta += 1;
     const key_index = keyIndexOf(&view, mask);
     const new_buf = try bufferInsertEntry(ctx, view.buffer, key_index, key, value);
@@ -444,8 +394,7 @@ fn mutablePut(ctx: *PutCtx, node_inst: ObjRef(InstanceData), key_hash: i32, key:
     return try mintNodeFromBuf(ctx, new_dm, view.node_map, new_buf);
 }
 
-/// Mint over an ALREADY-built buffer value (fresh, so no per-item
-/// retain: `bufferInsertEntry`-family already retained the elements).
+/// Mint over an already-built buffer whose elements the caller retained.
 fn mintNodeFromBuf(ctx: *PutCtx, data_map: i32, node_map: i32, buf_v: Value) Allocator.Error!Value {
     if (runtime.reclaimEnabled() and ctx.owner == .Instance) ctx.owner.retain();
     var fields: std.ArrayList(InstanceData.Field) = .empty;
@@ -495,28 +444,18 @@ fn mutableCollisionPut(ctx: *PutCtx, view: *const NodeView, key: *const Value, v
     return try mintNodeFromBuf(ctx, 0, 0, new_buf);
 }
 
-/// Builder minting template: the class cell plus the interned field
-/// names in declaration order, captured from a live builder in `tryPut`.
-/// A builder carrying any field outside the six known ones refuses
-/// capture, so `tryBuilder` can only ever mint the exact shape the
-/// interpreted constructor produces.
 const BuilderTmpl = struct {
     gen: u32 = 0,
     class: ?ObjRef(ClassDef) = null,
     owner_class: ?ObjRef(ClassDef) = null,
     count: u8 = 0,
     names: [12][]const u8 = @splat(""),
-    /// 0 map, 1 ownership, 2 node, 3 operationResult, 4 modCount,
-    /// 5 size, 6 a null-initialized lazy view cache (`_keys`/`_values`
-    /// from AbstractMap plus their owner-mangled AbstractMutableMap
-    /// twins).
+    /// Slot roles: 0 map, 1 ownership, 2 node, 3 operationResult, 4 modCount,
+    /// 5 size, 6 a null-initialized lazy view cache (`_keys`/`_values` and twins).
     order: [12]u8 = @splat(0),
 };
 threadlocal var builder_tmpl: BuilderTmpl = .{};
 
-/// Whether a stored field name is one of the AbstractMap-family lazy
-/// view caches (`_keys`/`_values`, possibly behind an owner-qualified
-/// `<Owner>\x1f` prefix) whose constructor-initial value is null.
 fn isViewCacheName(name: []const u8) bool {
     const last = if (std.mem.lastIndexOfScalar(u8, name, 0x1f)) |i| name[i + 1 ..] else name;
     return std.mem.eql(u8, last, "_keys") or std.mem.eql(u8, last, "_values");
@@ -555,10 +494,7 @@ fn captureBuilderTemplate(inst: ObjRef(InstanceData), ownership: *const Value) v
         } else if (std.mem.eql(u8, f.name, "size")) {
             tmpl.order[i] = 5;
         } else if (isViewCacheName(f.name)) {
-            // Lazy view caches (AbstractMap's `_keys`/`_values` and their
-            // owner-qualified `AbstractMutableMap\x1f_keys` twins —
-            // owner-scoped storage names use the 0x1f separator):
-            // ctor-initial null.
+            // Lazy view caches, owner-qualified twins included (0x1f separator).
             tmpl.order[i] = 6;
             continue;
         } else {
@@ -567,8 +503,7 @@ fn captureBuilderTemplate(inst: ObjRef(InstanceData), ownership: *const Value) v
         }
         seen |= @as(u8, 1) << @intCast(tmpl.order[i]);
     }
-    // All six declared fields must be present, or the mint would build a
-    // shape the interpreted constructor never produces.
+    // All six declared fields must be present; a partial shape is never minted.
     if (seen != 0b111111) {
         if (trace) std.debug.print("[mapmut] capture bail seen={b}\n", .{seen});
         return;
@@ -589,10 +524,8 @@ fn captureBuilderTemplate(inst: ObjRef(InstanceData), ownership: *const Value) v
     if (trace) std.debug.print("[mapmut] capture OK count={d} gen={d}\n", .{ tmpl.count, tmpl.gen });
 }
 
-/// Serve `map.builder()`: mint the PersistentHashMapBuilder + a fresh
-/// MutabilityOwnership without the interpreted constructor chain. Bails
-/// until `tryPut` has captured the builder template from a live builder
-/// (the first cycle of a process runs interpreted).
+/// Serve `map.builder()` with no interpreted ctor chain; bails until `tryPut` captured
+/// the template.
 pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) Allocator.Error!?Value {
     if (!classMatches(map_inst, &map_class_hit, MAP_FQN)) return null;
     const km = self.ka.mark();
@@ -656,7 +589,6 @@ pub fn tryBuilder(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData)) A
     return .{ .Instance = inst };
 }
 
-/// The builder's live fields for a put, in one borrow.
 const BuilderState = struct {
     node: Value,
     ownership: Value,
@@ -677,8 +609,7 @@ fn readBuilder(inst: ObjRef(InstanceData)) ?BuilderState {
     return .{ .node = node, .ownership = ownership, .size = size.Int, .modcount = modcount.Int };
 }
 
-/// Serve `builder.put(key, value)`. Returns the previous value (retained)
-/// or Null; null bails to the interpreted body.
+/// Serve `builder.put`: the previous value (retained) or Null; null bails.
 pub fn tryPut(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData), key: *const Value, value: *const Value) Allocator.Error!?Value {
     if (!isBuilderClass(inst)) return null;
     const km = self.ka.mark();
@@ -696,8 +627,8 @@ pub fn tryPut(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData), key: *con
         defer g.deinit();
         const d = g.get();
         if (!(new_node == .Instance and ObjRef(InstanceData).ptrEq(new_node.Instance, st.node.Instance))) {
-            // A non-identical result is freshly minted (owned); `define`
-            // consumes it and releases the old node.
+            // A non-identical result is freshly minted; `define` consumes it and releases
+            // the old node.
             try d.define(a, "node", new_node);
         }
         if (ctx.size_delta != 0) {
@@ -714,19 +645,10 @@ pub fn tryPut(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData), key: *con
     return ctx.op_result;
 }
 
-// ==== Whole-cycle SnapshotStateMap.put serve ====
-//
-// The steady-state write cycle (`mutate { it.put(key, value) }` when the
-// current snapshot is the observer-free GlobalSnapshot and the record was
-// born in it) replayed host-side: read the record under the map file's
-// `sync` monitor, compute the new PersistentHashMap fully persistently
-// (owner = Null: every trie path mints, nothing mutates in place), then
-// re-check `modification` under the monitor and assign — exactly
-// `attemptUpdate`'s protected section. No builder, no ownership, no
-// build step, and an identical-value put allocates nothing. Every gate
-// failure bails BEFORE any mutation, so the interpreted cycle serves the
-// rest (record creation after a snapshot advance, nested snapshots,
-// observers, non-scalar keys).
+// The steady-state write cycle (`mutate { it.put(key, value) }` under the observer-free
+// GlobalSnapshot) replayed host-side: read the record under the map file's `sync` monitor,
+// compute the new map fully persistently (owner = Null, so every trie path mints), then
+// re-check `modification` under the monitor and assign, as `attemptUpdate` does.
 
 const SSM_FQN = "androidx.compose.runtime.snapshots.SnapshotStateMap";
 var ssm_class_hit = std.atomic.Value(usize).init(0);
@@ -739,10 +661,8 @@ pub fn isSnapshotMapClass(inst: ObjRef(InstanceData)) bool {
     return classMatches(inst, &ssm_class_hit, SSM_FQN);
 }
 
-/// A file-private top-level global (`<prefix>$f<N>` where file N's path
-/// ends in `file_base`), resolved by scanning the globals env once per
-/// dispatch gen and re-LOOKED-UP by name per call (the cell may be a
-/// `var`). The memo holds the mangled NAME.
+/// A file-private top-level global (`<prefix>$f<N>`, N the file whose path ends in
+/// `file_base`), scanned once per dispatch gen; the memo holds the mangled name.
 const FpName = struct { gen: u32 = 0, ok: bool = false, buf: [64]u8 = undefined, len: usize = 0 };
 
 fn filePrivateGlobal(self: *VmHost, memo: *FpName, comptime prefix: []const u8, comptime file_base: []const u8) ?Value {
@@ -776,10 +696,8 @@ fn filePrivateGlobal(self: *VmHost, memo: *FpName, comptime prefix: []const u8, 
         }
     }
     if (!memo.ok) {
-        // A file-private top-level only gets the `$f<N>` mangle on a
-        // NAME COLLISION; a program-wide-unique one binds plain — and a
-        // plain hit is unambiguous (a second declaration anywhere would
-        // have forced both onto the mangled form).
+        // The `$f<N>` mangle appears only on a name collision, so a plain hit is
+        // unambiguous.
         const g = self.globals.borrow();
         defer g.deinit();
         return g.get().lookup(prefix);
@@ -798,9 +716,8 @@ fn snapshotMapSync(self: *VmHost) ?Value {
     return v;
 }
 
-/// notifyWrite is a provable no-op only while the file-private
-/// `globalWriteObservers` list (Snapshot.kt) is EMPTY — GlobalSnapshot's
-/// writeObserver is the ctor lambda draining it.
+/// notifyWrite is a provable no-op only while `globalWriteObservers` (Snapshot.kt) is
+/// empty.
 fn globalWriteObserversEmpty(self: *VmHost) bool {
     const v = filePrivateGlobal(self, &gwo_name, "globalWriteObservers", "Snapshot.kt") orelse {
         ssmTrace("gwo-unresolved");
@@ -833,10 +750,8 @@ fn globalWriteObserversEmpty(self: *VmHost) bool {
     }
 }
 
-/// Mint a PersistentHashMap over (node, size) from a live map's exact
-/// field surface (`node`, `size`, AbstractMap's null view caches).
-/// Consumes `node`'s reference on success; the caller releases it on a
-/// null bail.
+/// Mint a PersistentHashMap over (node, size) from a live map's field surface.
+/// Consumes `node`'s reference on success; the caller releases it on a null bail.
 fn mintMapFrom(self: *VmHost, a: Allocator, proto: ObjRef(InstanceData), node: Value, size: i32) Allocator.Error!?Value {
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     {
@@ -874,8 +789,7 @@ fn mintMapFrom(self: *VmHost, a: Allocator, proto: ObjRef(InstanceData), node: V
 }
 
 
-/// Debug (KLIO_SSMPUT=5): recursively validate a trie's shape — every
-/// reachable node must read as a well-formed TrieNode.
+/// Whether the page holding `addr` is mapped (`KLIO_SSMPUT=5` trie shape audit).
 fn pageMapped(addr: usize) bool {
     const pg = std.heap.pageSize();
     const base = std.mem.alignBackward(usize, addr, pg);
@@ -925,10 +839,8 @@ fn mapTrieValid(map_v: Value) bool {
     return validateTrie(node_v.Instance, 0);
 }
 
-// ==== Pre-sweep mark audit (KLIO_SSMPUT=8) ====
-// Commits register their record; the GC audit hook re-walks each
-// registered record's map trie after marking and reports any cell the
-// sweep would free — naming the broken edge before it becomes a UAF.
+// Pre-sweep mark audit (`KLIO_SSMPUT=8`): re-walk a registered record's trie after
+// marking, naming any cell the sweep would free.
 var audit_lock: runtime.SpinMutex = .{};
 var audit_records: [64]?ObjRef(InstanceData) = @splat(null);
 var audit_next: usize = 0;
@@ -945,8 +857,7 @@ fn auditRegisterOne(rec: ObjRef(InstanceData)) void {
 fn auditRegisterRecord(rec: ObjRef(InstanceData)) void {
     audit_lock.lock();
     defer audit_lock.unlock();
-    // The whole record chain: commits and reads may target different
-    // records (readable walk vs the chain head).
+    // Walk the whole record chain: commits and reads may target different records.
     var cur: ?ObjRef(InstanceData) = rec;
     var hops: u32 = 0;
     while (cur) |c| : (hops += 1) {
@@ -993,7 +904,6 @@ fn auditWalkNode(node: ObjRef(InstanceData), major: bool, depth: u32, parent: us
     }
     const null_owner: Value = .Null;
     const view = NodeView.read(node, &null_owner) orelse return;
-    // The buffer cell's own fate.
     var i: usize = 0;
     const n = view.buffer.len();
     while (i < n) : (i += 1) {
@@ -1004,8 +914,8 @@ fn auditWalkNode(node: ObjRef(InstanceData), major: bool, depth: u32, parent: us
     }
 }
 
-/// Post-sweep: re-walk the audited records; a node that now reads as
-/// poisoned/unmapped was freed THIS epoch despite the pre-sweep walk.
+/// Post-sweep: a node that now reads poisoned or unmapped was freed this epoch despite
+/// the pre-sweep walk.
 fn gcPostSweep(major: bool, epoch: usize) void {
     _ = major;
     audit_lock.lock();
@@ -1061,7 +971,7 @@ fn gcAudit(major: bool, epoch: usize) void {
     for (audit_records) |e| {
         const rec = e orelse continue;
         const rec_fate = runtime.gc.cellSweepFate(&rec.cell.hdr, major);
-        if (rec_fate == .white) continue; // the record itself died (map gone) — fine
+        if (rec_fate == .white) continue; // the record itself died, so its map is gone
         const g = rec.borrow();
         const map_v = g.get().getCached(&fn_rec_map, "map") orelse {
             g.deinit();
@@ -1074,10 +984,7 @@ fn gcAudit(major: bool, epoch: usize) void {
             std.debug.print("[gc-audit] WHITE map {x} under {s} record {x} major={}\n", .{ @intFromPtr(map_v.Instance.cell), @tagName(rec_fate), @intFromPtr(rec.cell), major });
             continue;
         }
-        // A tenured map under a registered record is a STALE entry (a
-        // finished round, or commits moved to another record in the
-        // chain): its unreferenced children are legitimately white.
-        // Audit only records whose map is CURRENT (marked this epoch).
+        // A tenured map is stale, so its unreferenced children are legitimately white.
         if (map_fate == .tenured and !major) continue;
         const node_v: Value = blk: {
             const g2 = map_v.Instance.borrow();
@@ -1092,10 +999,8 @@ fn gcAudit(major: bool, epoch: usize) void {
 
 const RecordRead = struct { rec: ObjRef(InstanceData), map: Value, mod: i32 };
 
-/// The current-snapshot record of `map_inst` with its stored map and
-/// modification count; null unless the record was BORN in the gate's
-/// snapshot (the writableRecord fast path — no record creation, no
-/// recordModified).
+/// The current-snapshot record with its map and modification count; null unless the
+/// record was born in the gate's snapshot.
 fn currentBornRecord(map_inst: ObjRef(InstanceData), gate: ir.snapshot_fast.WriteGate) ?RecordRead {
     const first: Value = blk: {
         const g = map_inst.borrow();
@@ -1122,9 +1027,6 @@ fn currentBornRecord(map_inst: ObjRef(InstanceData), gate: ir.snapshot_fast.Writ
     return .{ .rec = rec_v.Instance, .map = map_v, .mod = mod_v.Int };
 }
 
-/// Serve `SnapshotStateMap.put(key, value)` end to end. Returns the
-/// previous value (retained) / Null; null bails to the interpreted
-/// mutate cycle with nothing mutated.
 fn ssmTrace(comptime why: []const u8) void {
     const S = struct {
         var state: u8 = 0;
@@ -1143,11 +1045,10 @@ fn ssmPhase(comptime tag: []const u8) void {
     if (S.state == 3) std.debug.print("[ssm:{d}] " ++ tag ++ "\n", .{std.Thread.getCurrentId()});
 }
 
+/// Serve `SnapshotStateMap.put(key, value)` end to end. Returns the previous
+/// value (retained) or Null; null bails to the interpreted cycle, nothing mutated.
 pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceData), key: *const Value, value: *const Value) Allocator.Error!?Value {
-    // KLIO_SSMPUT=0 restores the interpreted mutate cycle (bisect). The
-    // GC crash that kept this opt-in was the perm-mint birth-edge hole
-    // (worker mints are permanent; a host mint holds nursery references
-    // from birth with no barrier) — fixed at gc.register.
+    // `KLIO_SSMPUT=0` restores the interpreted mutate cycle (bisect).
     const S = struct {
         var state: u8 = 0;
     };
@@ -1179,10 +1080,8 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
 
     var attempts: u32 = 0;
     while (attempts < 64) : (attempts += 1) {
-        // A concurrent committer REPLACES record.map, unrooting the map
-        // this attempt reads (and the previous value inside its buffers)
-        // while they sit in native locals the collector cannot see — pin
-        // for the attempt, and hold a reference under reclaim.
+        // A concurrent committer replaces `record.map`, unrooting the map held only in
+        // native locals: pin it.
         const km = self.ka.mark();
         defer self.ka.restore(km);
         // Read phase, mirroring mutate's `synchronized(sync) { ... }`.
@@ -1230,10 +1129,7 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
         if (!full_lock) _ = try concurrent.monitorExit(sync_key);
 
         ssmPhase("read-done");
-        // Compute phase (unlocked): the interpreted cycle's exact
-        // builder()/put/build sequence, composed from the proven builder
-        // serves. `old_size` is read above only to keep the read-phase
-        // shape; the builder tracks size itself.
+        // Compute phase (unlocked): the interpreted cycle's builder()/put/build sequence.
         _ = old_size;
         const builder_v = (try tryBuilder(self, a, old_map.Instance)) orelse return null;
         if (builder_v != .Instance) return null;
@@ -1245,16 +1141,15 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
             return null;
         };
         if (new_map == .Instance and ObjRef(InstanceData).ptrEq(new_map.Instance, old_map.Instance)) {
-            // Node unchanged (identical value already present): mutate's
-            // `newMap == oldMap` break — no CAS.
+            // Node unchanged (identical value already present): mutate's `newMap ==
+            // oldMap` break.
             if (runtime.reclaimEnabled()) new_map.release(a);
             return prev;
         }
         self.ka.push(new_map);
         ssmPhase("minted");
 
-        // KLIO_SSMPUT=2: compute-only bisect mode — mint then bail to the
-        // interpreted cycle without ever committing.
+        // `KLIO_SSMPUT=2`: mint then bail without committing, for bisecting.
         if (std.mem.eql(u8, runtime.envOnce("KLIO_SSMPUT") orelse "1", "2")) {
             if (runtime.reclaimEnabled()) {
                 new_map.release(a);
@@ -1292,9 +1187,7 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
             const g = r2.rec.borrowMut();
             defer g.deinit();
             const d = g.get();
-            // The record's storage names must be the plain spellings —
-            // `define` CREATES a missing field, and an owner-qualified
-            // twin surface would leave readers on the stale slot.
+            // Storage names must be the plain spellings: `define` creates a missing field.
             if (d.get("map") == null or d.get("modification") == null) {
                 _ = try concurrent.monitorExit(sync_key);
                 if (runtime.reclaimEnabled()) {
@@ -1351,15 +1244,12 @@ pub fn trySnapshotMapPut(self: *VmHost, a: Allocator, map_inst: ObjRef(InstanceD
             new_map.release(a);
             prev.release(a);
         }
-        // Another writer moved `modification`: retry the whole cycle,
-        // exactly as the interpreted mutate loop does.
     }
     return null;
 }
 
-/// Serve `builder.build()`: the stored map when the node is unchanged,
-/// else a fresh PersistentHashMap over (node, size) plus a fresh
-/// ownership for the builder. Bails on any shape surprise.
+/// Serve `builder.build()`: the stored map when the node is unchanged, else a fresh
+/// PersistentHashMap plus ownership.
 pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocator.Error!?Value {
     if (!isBuilderClass(inst)) return null;
     const km = self.ka.mark();
@@ -1381,10 +1271,6 @@ pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocat
         if (runtime.reclaimEnabled()) map_v.retain();
         return map_v;
     }
-    // node !== map.node: mint PersistentHashMap(node, size) + a fresh
-    // MutabilityOwnership for the builder, exactly as the source does.
-    // Field surface verified against the template map: node, size, and
-    // AbstractMap's null-initialized view caches only.
     var fields: std.ArrayList(InstanceData.Field) = .empty;
     {
         const g = map_v.Instance.borrow();
@@ -1419,7 +1305,6 @@ pub fn tryBuild(self: *VmHost, a: Allocator, inst: ObjRef(InstanceData)) Allocat
         .native_state = null,
     });
     self.ka.push(.{ .Instance = new_map });
-    // Fresh ownership: an empty instance of the ownership's own class.
     const new_owner: Value = blk: {
         if (st.ownership != .Instance) return null;
         const og = st.ownership.Instance.borrow();
