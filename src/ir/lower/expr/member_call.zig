@@ -134,6 +134,35 @@ const ReceiverState = struct {
     /// does not disqualify a member.
     non_null: bool = false,
 };
+/// The state one resolved-member-call ladder threads through its rungs.
+///
+/// The driver settles the receiver's type and owning class, then hands every
+/// rung below a pointer to it. `owner_id` and `static_owner` are filled in
+/// partway down and read by the rungs after; the order is Kotlin's resolution
+/// order and is load-bearing.
+const MemberCall = struct {
+    b: *FuncBuilder,
+    receiver: *const Expr,
+    name: ast.Ident,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    declared_ty: ?TypeRef,
+    recv_state: ReceiverState,
+    /// The receiver's declared or derived type, settled once `declared_ty` is
+    /// known to be present.
+    ty: TypeRef = undefined,
+    /// `ty` with the `?` stripped: the type overload resolution ranks against.
+    recv_ty: TypeRef = undefined,
+    /// `ty`'s name with `?` and type arguments stripped.
+    identity: []const u8 = &.{},
+    /// `identity`'s last `.`-separated segment.
+    head: []const u8 = &.{},
+    /// The class declaring the member, once one is found.
+    owner_id: ?ir.ClassId = null,
+    /// `owner_id`, redirected to the companion for a classifier receiver.
+    static_owner: ir.ClassId = undefined,
+};
 
 pub fn lowerResolvedMemberCall(
     b: *FuncBuilder,
@@ -147,8 +176,37 @@ pub fn lowerResolvedMemberCall(
 ) Allocator.Error!ResolvedMemberLowering {
     if (ast_type_args.len != 0 or receiver.* == .Super) return .none;
     last_member_refuted = false;
-    // The checker's pick needs no receiver type, so it is asked ahead of the
-    // lazy engine's receiver-type requirement. Image-declared extensions only.
+    var m = MemberCall{
+        .b = b,
+        .receiver = receiver,
+        .name = name,
+        .args = args,
+        .ast_arg_names = ast_arg_names,
+        .ast_type_args = ast_type_args,
+        .declared_ty = declared_ty,
+        .recv_state = recv_state,
+    };
+    if (try tryEagerExternPick(&m)) |r| return r;
+    m.ty = declared_ty orelse return noReceiverTypeResult(&m);
+    if (try tryNullableReceiverExtension(&m)) |r| return r;
+    settleReceiverIdentity(&m);
+    if (try resolveOwnerClass(&m)) |r| return r;
+    if (try tryCastToAnyExtension(&m)) |r| return r;
+    if (try tryLocalClassMemberSlot(&m)) |r| return r;
+    m.static_owner = m.owner_id orelse return noClassIdResult(&m);
+    if (try redirectClassifierToCompanion(&m)) |r| return r;
+    return resolveAndEmitMemberCall(&m);
+}
+
+/// The checker's pick needs no receiver type, so it is asked ahead of the lazy
+/// engine's receiver-type requirement. Image-declared extensions only.
+fn tryEagerExternPick(m: *MemberCall) Allocator.Error!?ResolvedMemberLowering {
+    const b = m.b;
+    const receiver = m.receiver;
+    const name = m.name;
+    const args = m.args;
+    const declared_ty = m.declared_ty;
+
     if (declared_ty == null and !std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) {
         if (b.module.eagerExternCallTarget(name.span)) |ep| ez: {
             audit_mod.lm_eager_norecv[0] += 1;
@@ -183,233 +241,277 @@ pub fn lowerResolvedMemberCall(
             return .{ .lowered = dst };
         }
     }
-    const ty = declared_ty orelse {
-        if (runtime.envOnce("KLIO_EXT_TRACE")) |wanted| {
-            if (std.mem.eql(u8, wanted, name.name)) {
-                std.debug.print("[member-static] {s} recv=<unknown>\n", .{name.name});
+    return null;
+}
+
+/// No receiver type is known. A couple of forms still bind, and the rest feeds
+/// the no-receiver census before declining.
+fn noReceiverTypeResult(m: *MemberCall) Allocator.Error!ResolvedMemberLowering {
+    const b = m.b;
+    const receiver = m.receiver;
+    const name = m.name;
+    const args = m.args;
+    const ast_arg_names = m.ast_arg_names;
+    const ast_type_args = m.ast_type_args;
+    const recv_state = m.recv_state;
+
+    if (runtime.envOnce("KLIO_EXT_TRACE")) |wanted| {
+        if (std.mem.eql(u8, wanted, name.name)) {
+            std.debug.print("[member-static] {s} recv=<unknown>\n", .{name.name});
+        }
+    }
+// Kotlin binds the stdlib's `Any?` extensions `toString`/`hashCode` for a
+// possibly-null receiver. Taken only when that extension is unique here.
+    if (recv_state.reg == null and ast_type_args.len == 0) {
+        if (allNull(ast_arg_names)) {
+            if (uniqueAnyNullableExtension(b, name.name, args.len)) |fid| {
+                const vals = try b.allocator.alloc(Reg, args.len + 1);
+                defer b.allocator.free(vals);
+                const rv = try lowerExpr(b, receiver);
+                const recv_slot = b.allocReg();
+                try b.push(.{ .Move = .{ .dst = recv_slot, .src = rv } });
+                vals[0] = recv_slot;
+                for (args, 0..) |*arg, i| vals[i + 1] = try lowerExpr(b, arg);
+                const args_start = try packContiguous(b, vals);
+                const dst = b.allocReg();
+                try b.push(.{ .Call = .{
+                    .dst = dst,
+                    .func = fid,
+                    .trailing_lambda = false,
+                    .args = args_start,
+                    .n_args = @intCast(vals.len),
+                    .arg_names = &.{},
+                    .type_args = &.{},
+                    .exact = true,
+                } });
+                lmNote(.bound_static);
+                return .{ .lowered = dst };
             }
         }
-    // Kotlin binds the stdlib's `Any?` extensions `toString`/`hashCode` for a
-    // possibly-null receiver. Taken only when that extension is unique here.
-        if (recv_state.reg == null and ast_type_args.len == 0) {
-            if (allNull(ast_arg_names)) {
-                if (uniqueAnyNullableExtension(b, name.name, args.len)) |fid| {
-                    const vals = try b.allocator.alloc(Reg, args.len + 1);
-                    defer b.allocator.free(vals);
-                    const rv = try lowerExpr(b, receiver);
-                    const recv_slot = b.allocReg();
-                    try b.push(.{ .Move = .{ .dst = recv_slot, .src = rv } });
-                    vals[0] = recv_slot;
-                    for (args, 0..) |*arg, i| vals[i + 1] = try lowerExpr(b, arg);
-                    const args_start = try packContiguous(b, vals);
-                    const dst = b.allocReg();
-                    try b.push(.{ .Call = .{
-                        .dst = dst,
-                        .func = fid,
-                        .trailing_lambda = false,
-                        .args = args_start,
-                        .n_args = @intCast(vals.len),
-                        .arg_names = &.{},
-                        .type_args = &.{},
-                        .exact = true,
-                    } });
-                    lmNote(.bound_static);
-                    return .{ .lowered = dst };
-                }
-            }
-        }
-    // A name whose only declaration is a universal inline extension (`T.let`
-    // and family) splices rather than dispatches.
-        if (uniqueUniversalInlineExtension(b, name.name, args.len) != null) {
-            lmNote(.bound_static);
-            return .none;
-        }
-    // Receiver typed by a bare type parameter with a receiver-taking callable
-    // value in scope: Kotlin resolves against the bound, finds no member, and
-    // commits the invoke protocol.
-        if ((b.resolve(name.name) != null or b.knowsOuter(name.name)) and
-            (b.isReceiverLambdaParam(name.name) or b.isLocalExtFn(name.name) or
-                b.localDeclRecvFn(name.name)) and
-            receiver.* == .Path and receiver.Path.segments.len == 1 and
-            (b.isErasedRecvParam(receiver.Path.segments[0].name) or
-                enclosingPropertyBareTp(b, receiver.Path.segments[0].name)))
-        {
-            lmNote(.dynamic_by_design);
-            return .none;
-        }
-        if (b.census_quiet) return .none;
-        lmNote(.no_receiver_type);
-        if (!norecvCensusOn()) return .none;
-        audit_mod.lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
-        if (receiver.* == .This and runtime.envOnce("KLIO_NORECV_NAMES") != null) {
-            std.debug.print("[no-recv-this] call={s} fn={s} owner={s} recv={s} splice={s}\n", .{
+    }
+// A name whose only declaration is a universal inline extension (`T.let`
+// and family) splices rather than dispatches.
+    if (uniqueUniversalInlineExtension(b, name.name, args.len) != null) {
+        lmNote(.bound_static);
+        return .none;
+    }
+// Receiver typed by a bare type parameter with a receiver-taking callable
+// value in scope: Kotlin resolves against the bound, finds no member, and
+// commits the invoke protocol.
+    if ((b.resolve(name.name) != null or b.knowsOuter(name.name)) and
+        (b.isReceiverLambdaParam(name.name) or b.isLocalExtFn(name.name) or
+            b.localDeclRecvFn(name.name)) and
+        receiver.* == .Path and receiver.Path.segments.len == 1 and
+        (b.isErasedRecvParam(receiver.Path.segments[0].name) or
+            enclosingPropertyBareTp(b, receiver.Path.segments[0].name)))
+    {
+        lmNote(.dynamic_by_design);
+        return .none;
+    }
+    recordNoReceiverCensus(b, receiver, name);
+    return .none;
+}
+
+/// The no-receiver-type census: which receiver shape declined, and under
+/// `KLIO_NORECV_NAMES` the name and site behind each one.
+fn recordNoReceiverCensus(b: *FuncBuilder, receiver: *const Expr, name: ast.Ident) void {
+    if (b.census_quiet) return;
+    lmNote(.no_receiver_type);
+    if (!norecvCensusOn()) return;
+    audit_mod.lm_norecv[@intFromEnum(std.meta.activeTag(receiver.*))] += 1;
+    if (receiver.* == .This and runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+        std.debug.print("[no-recv-this] call={s} fn={s} owner={s} recv={s} splice={s}\n", .{
+            name.name,
+            build.currentRealFn() orelse "-",
+            b.ownerClass() orelse "-",
+            b.recvTy() orelse "-",
+            b.spliceRecvTy() orelse "-",
+        });
+    }
+    audit_mod.lm_norecv_eager[if (b.module.eagerTypeOf(receiver.span()) != null) 0 else 1] += 1;
+    if (receiver.* == .Call) {
+        audit_mod.lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
+        if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+            const callee = receiver.Call.callee;
+            const cn = switch (callee.*) {
+                .Path => |cp| if (cp.segments.len != 0) cp.segments[cp.segments.len - 1].name else "?",
+                .Member => |cm2| cm2.name.name,
+                else => @tagName(std.meta.activeTag(callee.*)),
+            };
+            std.debug.print("[no-recv-callrecv] callee={s} kind={s} why={s} call={s} fn={s}\n", .{
+                cn,
+                @tagName(std.meta.activeTag(callee.*)),
+                @tagName(classifyCallReturn(b, receiver)),
                 name.name,
                 build.currentRealFn() orelse "-",
-                b.ownerClass() orelse "-",
-                b.recvTy() orelse "-",
-                b.spliceRecvTy() orelse "-",
             });
         }
-        audit_mod.lm_norecv_eager[if (b.module.eagerTypeOf(receiver.span()) != null) 0 else 1] += 1;
-        if (receiver.* == .Call) {
-            audit_mod.lm_norecv_call[@intFromEnum(classifyCallReturn(b, receiver))] += 1;
-            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
-                const callee = receiver.Call.callee;
-                const cn = switch (callee.*) {
-                    .Path => |cp| if (cp.segments.len != 0) cp.segments[cp.segments.len - 1].name else "?",
-                    .Member => |cm2| cm2.name.name,
-                    else => @tagName(std.meta.activeTag(callee.*)),
-                };
-                std.debug.print("[no-recv-callrecv] callee={s} kind={s} why={s} call={s} fn={s}\n", .{
-                    cn,
-                    @tagName(std.meta.activeTag(callee.*)),
-                    @tagName(classifyCallReturn(b, receiver)),
-                    name.name,
-                    build.currentRealFn() orelse "-",
-                });
-            }
+    }
+    if (receiver.* == .Binary) {
+        if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+            std.debug.print("[no-recv-binary] op={s} call={s} fn={s}\n", .{
+                @tagName(receiver.Binary.op),
+                name.name,
+                build.currentRealFn() orelse "-",
+            });
         }
-        if (receiver.* == .Binary) {
-            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
-                std.debug.print("[no-recv-binary] op={s} call={s} fn={s}\n", .{
-                    @tagName(receiver.Binary.op),
-                    name.name,
-                    build.currentRealFn() orelse "-",
-                });
-            }
+    }
+    if (receiver.* == .Member) {
+        if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+            std.debug.print("[no-recv-member] .{s} call={s} fn={s}\n", .{
+                receiver.Member.name.name,
+                name.name,
+                build.currentRealFn() orelse "-",
+            });
         }
-        if (receiver.* == .Member) {
-            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
-                std.debug.print("[no-recv-member] .{s} call={s} fn={s}\n", .{
-                    receiver.Member.name.name,
-                    name.name,
-                    build.currentRealFn() orelse "-",
-                });
-            }
+    }
+    if (receiver.* == .Call or receiver.* == .Index or receiver.* == .Postfix) {
+        if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+            const inner_nm: []const u8 = switch (receiver.*) {
+                .Call => |c2| if (c2.callee.* == .Member) c2.callee.Member.name.name else if (c2.callee.* == .Path and c2.callee.Path.segments.len != 0) c2.callee.Path.segments[c2.callee.Path.segments.len - 1].name else "?",
+                .Index => "[]",
+                .Postfix => @tagName(receiver.Postfix.op),
+                else => "?",
+            };
+            std.debug.print("[no-recv-{s}] {s}() call={s} fn={s} recvty={s} splice={s} owner={s}\n", .{
+                @tagName(std.meta.activeTag(receiver.*)),
+                inner_nm,
+                name.name,
+                build.currentRealFn() orelse "-",
+                b.recvTy() orelse "-",
+                b.spliceRecvTy() orelse "-",
+                b.ownerClass() orelse "-",
+            });
         }
-        if (receiver.* == .Call or receiver.* == .Index or receiver.* == .Postfix) {
-            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
-                const inner_nm: []const u8 = switch (receiver.*) {
-                    .Call => |c2| if (c2.callee.* == .Member) c2.callee.Member.name.name else if (c2.callee.* == .Path and c2.callee.Path.segments.len != 0) c2.callee.Path.segments[c2.callee.Path.segments.len - 1].name else "?",
-                    .Index => "[]",
-                    .Postfix => @tagName(receiver.Postfix.op),
-                    else => "?",
-                };
-                std.debug.print("[no-recv-{s}] {s}() call={s} fn={s} recvty={s} splice={s} owner={s}\n", .{
-                    @tagName(std.meta.activeTag(receiver.*)),
-                    inner_nm,
-                    name.name,
-                    build.currentRealFn() orelse "-",
-                    b.recvTy() orelse "-",
-                    b.spliceRecvTy() orelse "-",
-                    b.ownerClass() orelse "-",
-                });
-            }
+    }
+    if (receiver.* == .Path and receiver.Path.segments.len > 1) {
+        if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
+            std.debug.print("[no-recv-multipath] {s}.{s} call={s} fn={s}\n", .{
+                receiver.Path.segments[0].name,
+                receiver.Path.segments[receiver.Path.segments.len - 1].name,
+                name.name,
+                build.currentRealFn() orelse "-",
+            });
         }
-        if (receiver.* == .Path and receiver.Path.segments.len > 1) {
-            if (runtime.envOnce("KLIO_NORECV_NAMES") != null) {
-                std.debug.print("[no-recv-multipath] {s}.{s} call={s} fn={s}\n", .{
-                    receiver.Path.segments[0].name,
-                    receiver.Path.segments[receiver.Path.segments.len - 1].name,
-                    name.name,
-                    build.currentRealFn() orelse "-",
-                });
-            }
+    }
+    recordNoReceiverPathCensus(b, receiver, name);
+}
+
+/// The census for a single-segment path receiver, which carries the most
+/// actionable evidence: whether the name was a local with no declared type, a
+/// capture, an enclosing member, or unknown.
+fn recordNoReceiverPathCensus(b: *FuncBuilder, receiver: *const Expr, name: ast.Ident) void {
+    if (!(receiver.* == .Path and receiver.Path.segments.len == 1)) return;
+
+    const rn = receiver.Path.segments[0].name;
+    const which: NoRecvPath = if (b.resolve(rn) != null)
+        .local_no_decl_type
+    else if (b.knowsOuter(rn))
+        .captured
+    else if (enclosingHasMemberNamed(b, rn))
+        .enclosing_member
+    else
+        .unknown;
+    audit_mod.lm_norecv_path[@intFromEnum(which)] += 1;
+    if (runtime.envOnce("KLIO_NORECV_NAMES")) |want| {
+        if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, @tagName(which))) {
+            var nloc_buf: [256]u8 = undefined;
+            const nloc: []const u8 = nblk: {
+                if (span.active_map) |m| {
+                    if (m.getChecked(name.span.file)) |sf| {
+                        const lc = sf.lineCol(name.span.start);
+                        const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |si| sf.path[si + 1 ..] else sf.path;
+                        break :nblk std.fmt.bufPrint(&nloc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
+                    }
+                }
+                break :nblk "?";
+            };
+            std.debug.print("[no-recv-name] {s} {s} at={s} owner={s} recv={s} call={s} fn={s} param={} splice={s} lam_recv={s}\n", .{
+                @tagName(which),
+                rn,
+                nloc,
+                b.ownerClass() orelse "<none>",
+                bareStaticRecvHead(b) orelse "<none>",
+                name.name,
+                build.currentRealFn() orelse "-",
+                b.isParam(rn),
+                b.spliceRecvTy() orelse "-",
+                b.recvTy() orelse "-",
+            });
         }
-        if (receiver.* == .Path and receiver.Path.segments.len == 1) {
-            const rn = receiver.Path.segments[0].name;
-            const which: NoRecvPath = if (b.resolve(rn) != null)
-                .local_no_decl_type
-            else if (b.knowsOuter(rn))
-                .captured
-            else if (enclosingHasMemberNamed(b, rn))
-                .enclosing_member
-            else
-                .unknown;
-            audit_mod.lm_norecv_path[@intFromEnum(which)] += 1;
-            if (runtime.envOnce("KLIO_NORECV_NAMES")) |want| {
-                if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, @tagName(which))) {
-                    var nloc_buf: [256]u8 = undefined;
-                    const nloc: []const u8 = nblk: {
+    }
+    traceNoReceiverLocalInit(b, receiver, which, rn);
+}
+
+/// `KLIO_NORECV_WHY=<name>`: print the lazy deriver's terminal for a local
+/// whose initializer failed to type it.
+fn traceNoReceiverLocalInit(b: *FuncBuilder, receiver: *const Expr, which: NoRecvPath, rn: []const u8) void {
+
+    if (which == .local_no_decl_type) {
+        if (b.localInitExpr(rn)) |ini| {
+            audit_mod.lm_norecv_init[1] += 1;
+            audit_mod.lm_norecv_call[@intFromEnum(classifyCallReturn(b, ini))] += 1;
+            // `KLIO_NORECV_WHY=<name>`: print the lazy deriver's terminal.
+            if (runtime.envOnce("KLIO_NORECV_WHY")) |want| {
+                if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, rn)) {
+                    const redo = argDeclTypeRefLazy(b, receiver);
+                    const prev_self = expr_mod.init_self_name;
+                    if (b.localInitNameFree(rn)) expr_mod.init_self_name = rn;
+                    const full = staticCallReturnTypeRef(b, ini) catch null;
+                    expr_mod.init_self_name = prev_self;
+                    const why_head = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse "-";
+                    var wloc_buf: [256]u8 = undefined;
+                    const wcs = ini.span();
+                    const wloc: []const u8 = wblk: {
                         if (span.active_map) |m| {
-                            if (m.getChecked(name.span.file)) |sf| {
-                                const lc = sf.lineCol(name.span.start);
-                                const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |si| sf.path[si + 1 ..] else sf.path;
-                                break :nblk std.fmt.bufPrint(&nloc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
+                            if (m.getChecked(wcs.file)) |sf| {
+                                const lc = sf.lineCol(wcs.start);
+                                const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                                break :wblk std.fmt.bufPrint(&wloc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
                             }
                         }
-                        break :nblk "?";
+                        break :wblk "?";
                     };
-                    std.debug.print("[no-recv-name] {s} {s} at={s} owner={s} recv={s} call={s} fn={s} param={} splice={s} lam_recv={s}\n", .{
-                        @tagName(which),
+                    std.debug.print("[norecv-why] at={s} {s} init_tag={s} free={} redo={s} full={s} in_fn={s} head={s} head_cid={} it_cid={} anon={} nfuncs={d}\n", .{
+                        wloc,
                         rn,
-                        nloc,
-                        b.ownerClass() orelse "<none>",
-                        bareStaticRecvHead(b) orelse "<none>",
-                        name.name,
+                        @tagName(std.meta.activeTag(ini.*)),
+                        b.localInitNameFree(rn),
+                        if (redo) |r| r.name else "<null>",
+                        if (full) |r| r.name else "<null>",
                         build.currentRealFn() orelse "-",
-                        b.isParam(rn),
-                        b.spliceRecvTy() orelse "-",
-                        b.recvTy() orelse "-",
+                        why_head,
+                        b.module.uniqueClassIdBySimpleName(typeHead(std.mem.trimEnd(u8, why_head, "?"))) != null,
+                        b.module.uniqueClassIdBySimpleName("Iterator") != null,
+                        b.module.anon_side,
+                        b.module.funcs.items.len,
                     });
+                    if (redo) |r| {
+                        var owned = r;
+                        owned.deinit(b.allocator);
+                    }
+                    if (full) |r| {
+                        var owned = r;
+                        owned.deinit(b.allocator);
+                    }
                 }
             }
-            if (which == .local_no_decl_type) {
-                if (b.localInitExpr(rn)) |ini| {
-                    audit_mod.lm_norecv_init[1] += 1;
-                    audit_mod.lm_norecv_call[@intFromEnum(classifyCallReturn(b, ini))] += 1;
-                    // `KLIO_NORECV_WHY=<name>`: print the lazy deriver's terminal.
-                    if (runtime.envOnce("KLIO_NORECV_WHY")) |want| {
-                        if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, rn)) {
-                            const redo = argDeclTypeRefLazy(b, receiver);
-                            const prev_self = expr_mod.init_self_name;
-                            if (b.localInitNameFree(rn)) expr_mod.init_self_name = rn;
-                            const full = staticCallReturnTypeRef(b, ini) catch null;
-                            expr_mod.init_self_name = prev_self;
-                            const why_head = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse "-";
-                            var wloc_buf: [256]u8 = undefined;
-                            const wcs = ini.span();
-                            const wloc: []const u8 = wblk: {
-                                if (span.active_map) |m| {
-                                    if (m.getChecked(wcs.file)) |sf| {
-                                        const lc = sf.lineCol(wcs.start);
-                                        const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
-                                        break :wblk std.fmt.bufPrint(&wloc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
-                                    }
-                                }
-                                break :wblk "?";
-                            };
-                            std.debug.print("[norecv-why] at={s} {s} init_tag={s} free={} redo={s} full={s} in_fn={s} head={s} head_cid={} it_cid={} anon={} nfuncs={d}\n", .{
-                                wloc,
-                                rn,
-                                @tagName(std.meta.activeTag(ini.*)),
-                                b.localInitNameFree(rn),
-                                if (redo) |r| r.name else "<null>",
-                                if (full) |r| r.name else "<null>",
-                                build.currentRealFn() orelse "-",
-                                why_head,
-                                b.module.uniqueClassIdBySimpleName(typeHead(std.mem.trimEnd(u8, why_head, "?"))) != null,
-                                b.module.uniqueClassIdBySimpleName("Iterator") != null,
-                                b.module.anon_side,
-                                b.module.funcs.items.len,
-                            });
-                            if (redo) |r| {
-                                var owned = r;
-                                owned.deinit(b.allocator);
-                            }
-                            if (full) |r| {
-                                var owned = r;
-                                owned.deinit(b.allocator);
-                            }
-                        }
-                    }
-                } else audit_mod.lm_norecv_init[0] += 1;
-            }
-        }
-        return .none;
-    };
-    // An extension on `T?` outranks a member, so `x.f()` on a nullable `x` is
-    // only legal when one exists. A safe call's member runs on the non-null branch.
+        } else audit_mod.lm_norecv_init[0] += 1;
+    }
+}
+
+/// An extension on `T?` outranks a member, so `x.f()` on a nullable `x` is only
+/// legal when one exists. A safe call's member runs on the non-null branch.
+fn tryNullableReceiverExtension(m: *MemberCall) Allocator.Error!?ResolvedMemberLowering {
+    const b = m.b;
+    const receiver = m.receiver;
+    const name = m.name;
+    const args = m.args;
+    const ast_arg_names = m.ast_arg_names;
+    const ast_type_args = m.ast_type_args;
+    const recv_state = m.recv_state;
+    const ty = m.ty;
+
     if (ty.nullable and !recv_state.non_null) {
         // Unless the name declares no such extension, leaving the member as
         // Kotlin's only legal target. Checked module-wide.
@@ -452,21 +554,40 @@ pub fn lowerResolvedMemberCall(
             return .none;
         }
     }
-    const recv_ty = if (ty.nullable)
+    return null;
+}
+
+/// The non-null receiver type overload resolution ranks against, and the type's
+/// head with `?` and type arguments stripped.
+fn settleReceiverIdentity(m: *MemberCall) void {
+    const ty = m.ty;
+
+    m.recv_ty = if (ty.nullable)
         TypeRef{ .name = std.mem.trimEnd(u8, ty.name, "?"), .nullable = false, .args = ty.args }
     else
         ty;
     var identity = std.mem.trimEnd(u8, ty.name, "?");
     if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
-    const head = typeHead(identity);
-    // A simple head shared by several classes (geometry's `Size`, the
-    // `androidx.annotation.Size` annotation) is decided by the call site's
-    // imports and package.
+    m.identity = identity;
+    m.head = typeHead(identity);
+}
+
+/// The class whose hierarchy declares the member: the receiver's own class, a
+/// type parameter's upper bound, a nested classifier resolved at this site, or
+/// `Any` for a type-parameter-shaped head with no bound in scope. A
+/// function-typed receiver dispatches by the invoke convention instead, and
+/// declines here.
+fn resolveOwnerClass(m: *MemberCall) Allocator.Error!?ResolvedMemberLowering {
+    const b = m.b;
+    const name = m.name;
+    const identity = m.identity;
+    const head = m.head;
     var owner_id = if (std.mem.findScalar(u8, identity, '.') != null)
         b.module.classIdByFqn(identity)
     else
         b.module.uniqueClassIdBySimpleName(head) orelse
             (if (b.isTypeParam(head)) null else b.module.classIdIndexed(head, b.self_package, name.span.file));
+
     // A receiver typed by a type parameter names no class; Kotlin resolves the
     // member against its upper bound. Only a `complete` bound: an incomplete
     // record dropped intersection or structural information.
@@ -529,8 +650,23 @@ pub fn lowerResolvedMemberCall(
             return .none;
         }
     }
-    // An argument written `expr as Any` fits no member whose parameter has a
-    // concrete class type; kotlinc binds the same-named extension instead.
+    m.owner_id = owner_id;
+    return null;
+}
+
+/// An argument written `expr as Any` fits no member whose parameter has a
+/// concrete class type; kotlinc binds the same-named extension instead.
+fn tryCastToAnyExtension(m: *MemberCall) Allocator.Error!?ResolvedMemberLowering {
+    const b = m.b;
+    const receiver = m.receiver;
+    const name = m.name;
+    const args = m.args;
+    const ast_arg_names = m.ast_arg_names;
+    const ast_type_args = m.ast_type_args;
+    const recv_state = m.recv_state;
+    const ty = m.ty;
+    const owner_id = m.owner_id;
+
     if (owner_id) |oid| {
         if (recv_state.reg == null and ast_type_args.len == 0 and anyCastToAny(args) and
             b.module.classHierarchyDeclaresMember(oid, name.name))
@@ -551,8 +687,21 @@ pub fn lowerResolvedMemberCall(
             }
         }
     }
-    // A local-class typing record has no class row, but its mangled head
-    // registered methods as headers, so bind the virtual slot directly.
+    return null;
+}
+
+/// A local-class typing record has no class row, but its mangled head
+/// registered methods as headers, so bind the virtual slot directly.
+fn tryLocalClassMemberSlot(m: *MemberCall) Allocator.Error!?ResolvedMemberLowering {
+    const b = m.b;
+    const receiver = m.receiver;
+    const name = m.name;
+    const args = m.args;
+    const ast_arg_names = m.ast_arg_names;
+    const ast_type_args = m.ast_type_args;
+    const owner_id = m.owner_id;
+    const head = m.head;
+
     if (owner_id == null and ast_type_args.len == 0 and allNull(ast_arg_names) and
         // Only the `$lc` mangle: `class_super_names` is the general super
         // registry, and probing it for any row-less head binds pack stubs over
@@ -580,34 +729,52 @@ pub fn lowerResolvedMemberCall(
             return .{ .lowered = dst };
         }
     }
-    var static_owner = owner_id orelse {
-        lmNote(.no_class_id);
-        noteNoClassHead(head);
-        if (norecvCensusOn()) {
-            const k: NoClassKind = if (std.mem.findScalar(u8, identity, '.') != null)
-                .fqn_unknown
-            else if (b.module.classId(head) != null)
-                .simple_ambiguous
-            else
-                .simple_unknown;
-            audit_mod.lm_noclass[@intFromEnum(k)] += 1;
-            if (runtime.envOnce("KLIO_NOCLASS_HEADS") != null) {
-                if (b.typeParamBound(head)) |tpb| {
-                    std.debug.print("[no-class-head] {s} bound={s} complete={} head_only={}\n", .{ head, tpb.bound, tpb.complete, tpb.head_only });
-                } else {
-                    std.debug.print("[no-class-head] {s} id={s} no-bound-record tp={} call={s} fn={s} owner={s}\n", .{
-                        head,
-                        identity,
-                        b.isTypeParam(head),
-                        name.name,
-                        build.currentRealFn() orelse "-",
-                        b.ownerClass() orelse "-",
-                    });
-                }
+    return null;
+}
+
+/// No class row for the receiver's head: record why and decline.
+fn noClassIdResult(m: *MemberCall) ResolvedMemberLowering {
+    const b = m.b;
+    const name = m.name;
+    const identity = m.identity;
+    const head = m.head;
+
+    lmNote(.no_class_id);
+    noteNoClassHead(head);
+    if (norecvCensusOn()) {
+        const k: NoClassKind = if (std.mem.findScalar(u8, identity, '.') != null)
+            .fqn_unknown
+        else if (b.module.classId(head) != null)
+            .simple_ambiguous
+        else
+            .simple_unknown;
+        audit_mod.lm_noclass[@intFromEnum(k)] += 1;
+        if (runtime.envOnce("KLIO_NOCLASS_HEADS") != null) {
+            if (b.typeParamBound(head)) |tpb| {
+                std.debug.print("[no-class-head] {s} bound={s} complete={} head_only={}\n", .{ head, tpb.bound, tpb.complete, tpb.head_only });
+            } else {
+                std.debug.print("[no-class-head] {s} id={s} no-bound-record tp={} call={s} fn={s} owner={s}\n", .{
+                    head,
+                    identity,
+                    b.isTypeParam(head),
+                    name.name,
+                    build.currentRealFn() orelse "-",
+                    b.ownerClass() orelse "-",
+                });
             }
         }
-        return .none;
-    };
+    }
+    return .none;
+}
+
+/// A bare name resolving to nothing lexically is a class-name access (members
+/// on the companion) only when no enclosing receiver declares a property of
+/// that name.
+fn redirectClassifierToCompanion(m: *MemberCall) Allocator.Error!?ResolvedMemberLowering {
+    const b = m.b;
+    const receiver = m.receiver;
+    var static_owner = m.static_owner;
+
     if (receiver.* == .Path and receiver.Path.segments.len != 0) {
         const receiver_name = receiver.Path.segments[receiver.Path.segments.len - 1].name;
         // A bare name resolving to nothing lexically is a class-name access
@@ -621,10 +788,25 @@ pub fn lowerResolvedMemberCall(
         {
             const classifier = &b.module.classes.items[static_owner.int()];
             if (!classifier.is_object) {
-                static_owner = classifier.companion orelse return .none;
+                static_owner = classifier.companion orelse return ResolvedMemberLowering.none;
             }
         }
     }
+    m.static_owner = static_owner;
+    return null;
+}
+
+
+/// Rank the overload set against the argument shapes, settle the dispatch kind,
+/// then emit the call the pick names.
+fn resolveAndEmitMemberCall(m: *MemberCall) Allocator.Error!ResolvedMemberLowering {
+    const b = m.b;
+    const name = m.name;
+    const args = m.args;
+    const ast_arg_names = m.ast_arg_names;
+    const ty = m.ty;
+    const recv_ty = m.recv_ty;
+    const static_owner = m.static_owner;
 
     var shape_set = try buildStaticReturnArgShapes(b, args, ast_arg_names);
     defer shape_set.deinit(b.allocator);
@@ -644,37 +826,78 @@ pub fn lowerResolvedMemberCall(
         .actual_type_param_bounds = owned_type_param_bounds orelse &.{},
         .receiver_type = recv_ty,
     });
-    if (runtime.envOnce("KLIO_EXT_TRACE")) |wanted| {
-        if (std.mem.eql(u8, wanted, name.name)) {
-            std.debug.print(
-                "[member-static] {s} recv={s} target={?d} dispatch={s} applicable={}\n",
-                .{
-                    name.name,
-                    ty.name,
-                    if (resolved.target) |target| target.int() else null,
-                    @tagName(resolved.dispatch),
-                    resolved.applicable,
-                },
-            );
-            for (owned_type_param_bounds orelse &.{}) |bound| {
-                std.debug.print(
-                    "[member-static-bound] {s} <: {s} complete={}\n",
-                    .{ bound.param, bound.bound, bound.complete },
-                );
-            }
-            for (shapes, 0..) |sh, i| {
-                std.debug.print("[member-static-shape] #{d} ty={s} auth={}\n", .{ i, if (sh.ty) |t| t.name else "<null>", sh.ty_authoritative });
+    traceMemberStatic(name, ty, resolved, owned_type_param_bounds, shapes);
+
+    if (selfRecursiveUndecided(b, name, resolved, shapes)) return .none;
+    const eager_pick = eagerMemberPick(b, name, resolved);
+
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name.name)) {
+            std.debug.print("[lrm] {s} owner={s} dispatch={s} applicable={} target={?d} eager={?d} nargs={d} shapes:", .{ name.name, b.module.classes.items[static_owner.int()].fqn, @tagName(resolved.dispatch), resolved.applicable, if (resolved.target) |t| t.int() else null, if (eager_pick) |e| e.int() else null, args.len });
+            for (shapes) |*sh| std.debug.print(" {s}{s}", .{ if (sh.ty) |t| t.name else "?", if (sh.is_lambda) "(lambda)" else "" });
+            std.debug.print("\n", .{});
+        }
+    }
+    const func_id = eager_pick orelse resolved.target orelse {
+        last_member_refuted = !resolved.applicable;
+        return if (resolved.applicable) .deferred else .none;
+    };
+    // A host-shadowed declaration (a pack stub whose installed binding is
+    // authoritative) must never statically bind its interpreted body.
+    if (b.module.funcById(func_id)) |cf| {
+        if (cf.hasBody() and b.module.registry.host_shadowed_fqns.contains(cf.fqn)) {
+            return .deferred;
+        }
+    }
+    if (eagerAuditOn()) {
+        if (eager_pick) |ep| {
+            const lazy_str: i64 = if (resolved.target) |l| @intCast(l.int()) else -1;
+            const efqn: []const u8 = if (b.module.funcById(ep)) |f| f.fqn else "?";
+            std.debug.print("[EAGER-MEMBER-HIT] '{s}': eager={d}({s}) lazy={d}\n", .{ name.name, ep.int(), efqn, lazy_str });
+        }
+    }
+    const promo_ext_why = promotionExtWhy(m, resolved, shapes);
+    if (try settleDispatchKind(m, &resolved, shapes, promo_ext_why, eager_pick)) |r| return r;
+    var target = b.module.funcById(func_id) orelse {
+        lmNote(.resolver_declined);
+        if (norecvCensusOn()) audit_mod.lm_decline[@intFromEnum(DeclineKind.target_unresolvable)] += 1;
+        return .deferred;
+    };
+
+    if (resolved.dispatch == .virtual) {
+        const owner = &b.module.classes.items[static_owner.int()];
+        // A final target on a closed stub/value class never needs the slot, and
+        // its vtable-less representation cannot serve one.
+        if (owner.is_value or owner.is_stub) {
+            if (b.module.dispatchForTarget(static_owner, func_id)) |d2| {
+                if (d2 == .direct) resolved.dispatch = .direct;
             }
         }
     }
-    // kotlinc rejects a member whose invariant generic argument mismatches and
-    // only the runtime holds the deciding values, so a self-recursive pick with
-    // a non-authoritative argument defers to the runtime walk.
-    if (resolved.target) |rt| self_rec: {
-        const cur = build.currentRealFn() orelse break :self_rec;
-        if (!std.mem.eql(u8, cur, name.name)) break :self_rec;
-        const rf = b.module.funcById(rt) orelse break :self_rec;
-        if (!std.mem.eql(u8, rf.name, name.name)) break :self_rec;
+    const has_spread = anySpread(args);
+    if (resolved.dispatch == .direct and has_spread) {
+        declineNote(.direct_spread);
+        return .deferred;
+    }
+    if (virtualAbiDeclines(m, resolved, func_id)) |r| return r;
+    return emitResolvedMemberCall(m, func_id, &target, resolved, has_spread);
+}
+
+/// kotlinc rejects a member whose invariant generic argument mismatches and
+/// only the runtime holds the deciding values, so a self-recursive pick with a
+/// non-authoritative argument defers to the runtime walk.
+fn selfRecursiveUndecided(
+    b: *FuncBuilder,
+    name: ast.Ident,
+    resolved: ir.Module.MemberResolution,
+    shapes: []const applicability.ArgShape,
+) bool {
+
+    if (resolved.target) |rt| {
+        const cur = build.currentRealFn() orelse return false;
+        if (!std.mem.eql(u8, cur, name.name)) return false;
+        const rf = b.module.funcById(rt) orelse return false;
+        if (!std.mem.eql(u8, rf.name, name.name)) return false;
         if (runtime.envOnce("KLIO_EXT_TRACE")) |w| {
             if (std.mem.eql(u8, w, name.name)) {
                 for (shapes, 0..) |sh, i| {
@@ -701,78 +924,28 @@ pub fn lowerResolvedMemberCall(
                 }
                 break :blk false;
             };
-            if (undecided) return .none;
+            if (undecided) return true;
         }
     }
-    // The checker's pick ranks by argument type, which the shape-based lazy
-    // ranking cannot. Taken only where the resolver reached no target, since
-    // downstream reads `resolved` for dispatch kind, owner, and arity.
-    const eager_pick: ?FuncId = if (!std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) blk: {
-        const ep = b.module.eagerExternCallTarget(name.span) orelse break :blk null;
-        const ef = b.module.funcById(ep) orelse break :blk null;
-        if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) break :blk null;
-        // Where the resolver did name one, the pick replaces it only for the
-        // same call form: downstream reads `resolved` for the call shape.
-        if (resolved.target) |rt| {
-            if (rt.int() == ep.int()) break :blk null;
-            const rf = b.module.funcById(rt) orelse break :blk null;
-            if (rf.params.len == 0 or !std.mem.eql(u8, rf.params[0].name, "this")) break :blk null;
-            if (resolved.dispatch != .direct) break :blk null;
-        }
-        break :blk ep;
-    } else null;
-    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
-        if (std.mem.eql(u8, w, name.name)) {
-            std.debug.print("[lrm] {s} owner={s} dispatch={s} applicable={} target={?d} eager={?d} nargs={d} shapes:", .{ name.name, b.module.classes.items[static_owner.int()].fqn, @tagName(resolved.dispatch), resolved.applicable, if (resolved.target) |t| t.int() else null, if (eager_pick) |e| e.int() else null, args.len });
-            for (shapes) |*sh| std.debug.print(" {s}{s}", .{ if (sh.ty) |t| t.name else "?", if (sh.is_lambda) "(lambda)" else "" });
-            std.debug.print("\n", .{});
-        }
-    }
-    const func_id = eager_pick orelse resolved.target orelse {
-        last_member_refuted = !resolved.applicable;
-        return if (resolved.applicable) .deferred else .none;
-    };
-    // A host-shadowed declaration (a pack stub whose installed binding is
-    // authoritative) must never statically bind its interpreted body.
-    if (b.module.funcById(func_id)) |cf| {
-        if (cf.hasBody() and b.module.registry.host_shadowed_fqns.contains(cf.fqn)) {
-            return .deferred;
-        }
-    }
-    if (eagerAuditOn()) {
-        if (eager_pick) |ep| {
-            const lazy_str: i64 = if (resolved.target) |l| @intCast(l.int()) else -1;
-            const efqn: []const u8 = if (b.module.funcById(ep)) |f| f.fqn else "?";
-            std.debug.print("[EAGER-MEMBER-HIT] '{s}': eager={d}({s}) lazy={d}\n", .{ name.name, ep.int(), efqn, lazy_str });
-        }
-    }
-    // The resolver withholds dispatch on an unknown argument type though the
-    // identity is certain. Only a same-name extension beats an applicable
-    // member, and `extCouldApply` is conservative, so `false` settles it.
-    const promo_ext_why: ir.Module.ExtCouldApplyWhy =
-        if (resolved.dispatch == .deferred and resolved.target != null)
-            b.module.extCouldApplyWhy(b.allocator, head, name.name, args.len)
-        else
-            .none;
-    if (norecvCensusOn() and resolved.dispatch == .deferred and resolved.target != null) {
-        if (runtime.envOnce("KLIO_PROMO_NAMES") != null and promo_ext_why != .none) {
-            var typed_args: usize = 0;
-            for (shapes) |sh| {
-                if (sh.ty != null or sh.literal_kind != null or sh.is_lambda) typed_args += 1;
-            }
-            std.debug.print("[promo-ext] {s}.{s} nargs={d} typed={d} why={s}\n", .{
-                head, name.name, args.len, typed_args, @tagName(promo_ext_why),
-            });
-        }
-        switch (promo_ext_why) {
-            .none => {},
-            .index_stale => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_index_stale)] += 1,
-            .generic_receiver => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_generic_receiver)] += 1,
-            .own_head => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_own_head)] += 1,
-            .builtin_super => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_builtin_super)] += 1,
-            .declared_super => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
-        }
-    }
+    return false;
+}
+
+/// Promote a deferred pick to a real dispatch kind where the evidence proves
+/// it, and hand back a deferral where it does not.
+fn settleDispatchKind(
+    m: *MemberCall,
+    resolved: *ir.Module.MemberResolution,
+    shapes: []const applicability.ArgShape,
+    promo_ext_why: ir.Module.ExtCouldApplyWhy,
+    eager_pick: ?FuncId,
+) Allocator.Error!?ResolvedMemberLowering {
+    const b = m.b;
+    const name = m.name;
+    const args = m.args;
+    const recv_ty = m.recv_ty;
+    const head = m.head;
+    const static_owner = m.static_owner;
+
     // Proof by refutation: the member compatible and every reachable same-name
     // extension refuted (`KLIO_MEMBER_PROMO=0` disables). A stub/value receiver
     // does not block it, since the runtime resolves the slot against the
@@ -811,7 +984,7 @@ pub fn lowerResolvedMemberCall(
             // with the refutation recorded, so the strict-winner rule commits.
             if (std.mem.eql(u8, ir.Module.mpp_why, "member-arg-refuted")) {
                 last_member_refuted = true;
-                return .none;
+                return ResolvedMemberLowering.none;
             }
         }
     }
@@ -854,28 +1027,23 @@ pub fn lowerResolvedMemberCall(
                 .not_applicable;
             audit_mod.lm_decline[@intFromEnum(k)] += 1;
         }
-        return .deferred;
+        return ResolvedMemberLowering.deferred;
     }
-    var target = b.module.funcById(func_id) orelse {
-        lmNote(.resolver_declined);
-        if (norecvCensusOn()) audit_mod.lm_decline[@intFromEnum(DeclineKind.target_unresolvable)] += 1;
-        return .deferred;
-    };
-    if (resolved.dispatch == .virtual) {
-        const owner = &b.module.classes.items[static_owner.int()];
-        // A final target on a closed stub/value class never needs the slot, and
-        // its vtable-less representation cannot serve one.
-        if (owner.is_value or owner.is_stub) {
-            if (b.module.dispatchForTarget(static_owner, func_id)) |d2| {
-                if (d2 == .direct) resolved.dispatch = .direct;
-            }
-        }
-    }
-    const has_spread = anySpread(args);
-    if (resolved.dispatch == .direct and has_spread) {
-        declineNote(.direct_spread);
-        return .deferred;
-    }
+    return null;
+}
+
+/// Numeric virtual slots operate on `Value.Instance`; classifier ABI metadata
+/// keeps mixed host-backed receivers on the host member path.
+fn virtualAbiDeclines(
+    m: *MemberCall,
+    resolved: ir.Module.MemberResolution,
+    func_id: FuncId,
+) ?ResolvedMemberLowering {
+    const b = m.b;
+    const name = m.name;
+    const ast_type_args = m.ast_type_args;
+    const static_owner = m.static_owner;
+
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
         // Numeric virtual slots operate on `Value.Instance`; classifier ABI
@@ -903,9 +1071,126 @@ pub fn lowerResolvedMemberCall(
                     if (t) |tf| tf.blocks.len else 0,
                 });
             }
-            return .deferred;
+            return ResolvedMemberLowering.deferred;
         }
     }
+    return null;
+}
+
+/// `KLIO_EXT_TRACE=<name>`: the pick, its dispatch kind, and the bounds and
+/// argument shapes it was ranked against.
+fn traceMemberStatic(
+    name: ast.Ident,
+    ty: TypeRef,
+    resolved: ir.Module.MemberResolution,
+    owned_type_param_bounds: ?[]const ir.ModuleRegistry.TypeParamBound,
+    shapes: []const applicability.ArgShape,
+) void {
+
+    if (runtime.envOnce("KLIO_EXT_TRACE")) |wanted| {
+        if (std.mem.eql(u8, wanted, name.name)) {
+            std.debug.print(
+                "[member-static] {s} recv={s} target={?d} dispatch={s} applicable={}\n",
+                .{
+                    name.name,
+                    ty.name,
+                    if (resolved.target) |target| target.int() else null,
+                    @tagName(resolved.dispatch),
+                    resolved.applicable,
+                },
+            );
+            for (owned_type_param_bounds orelse &.{}) |bound| {
+                std.debug.print(
+                    "[member-static-bound] {s} <: {s} complete={}\n",
+                    .{ bound.param, bound.bound, bound.complete },
+                );
+            }
+            for (shapes, 0..) |sh, i| {
+                std.debug.print("[member-static-shape] #{d} ty={s} auth={}\n", .{ i, if (sh.ty) |t| t.name else "<null>", sh.ty_authoritative });
+            }
+        }
+    }
+}
+
+/// The checker's pick ranks by argument type, which the shape-based lazy
+/// ranking cannot. Taken only where the resolver reached no target, since
+/// downstream reads `resolved` for dispatch kind, owner, and arity.
+fn eagerMemberPick(b: *FuncBuilder, name: ast.Ident, resolved: ir.Module.MemberResolution) ?FuncId {
+
+    if (std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) return null;
+    return blk: {
+        const ep = b.module.eagerExternCallTarget(name.span) orelse break :blk null;
+        const ef = b.module.funcById(ep) orelse break :blk null;
+        if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) break :blk null;
+        // Where the resolver did name one, the pick replaces it only for the
+        // same call form: downstream reads `resolved` for the call shape.
+        if (resolved.target) |rt| {
+            if (rt.int() == ep.int()) break :blk null;
+            const rf = b.module.funcById(rt) orelse break :blk null;
+            if (rf.params.len == 0 or !std.mem.eql(u8, rf.params[0].name, "this")) break :blk null;
+            if (resolved.dispatch != .direct) break :blk null;
+        }
+        break :blk ep;
+    };
+}
+
+/// The resolver withholds dispatch on an unknown argument type though the
+/// identity is certain. Only a same-name extension beats an applicable member,
+/// and `extCouldApply` is conservative, so `false` settles it.
+fn promotionExtWhy(
+    m: *MemberCall,
+    resolved: ir.Module.MemberResolution,
+    shapes: []const applicability.ArgShape,
+) ir.Module.ExtCouldApplyWhy {
+    const b = m.b;
+    const name = m.name;
+    const args = m.args;
+    const head = m.head;
+
+    const promo_ext_why: ir.Module.ExtCouldApplyWhy =
+        if (resolved.dispatch == .deferred and resolved.target != null)
+            b.module.extCouldApplyWhy(b.allocator, head, name.name, args.len)
+        else
+            .none;
+    if (norecvCensusOn() and resolved.dispatch == .deferred and resolved.target != null) {
+        if (runtime.envOnce("KLIO_PROMO_NAMES") != null and promo_ext_why != .none) {
+            var typed_args: usize = 0;
+            for (shapes) |sh| {
+                if (sh.ty != null or sh.literal_kind != null or sh.is_lambda) typed_args += 1;
+            }
+            std.debug.print("[promo-ext] {s}.{s} nargs={d} typed={d} why={s}\n", .{
+                head, name.name, args.len, typed_args, @tagName(promo_ext_why),
+            });
+        }
+        switch (promo_ext_why) {
+            .none => {},
+            .index_stale => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_index_stale)] += 1,
+            .generic_receiver => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_generic_receiver)] += 1,
+            .own_head => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_own_head)] += 1,
+            .builtin_super => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_builtin_super)] += 1,
+            .declared_super => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
+        }
+    }
+    return promo_ext_why;
+}
+
+/// Record the argument shapes for the call and emit it: a virtual slot, a
+/// spread, or the exact static call the pick names.
+fn emitResolvedMemberCall(
+    m: *MemberCall,
+    func_id: FuncId,
+    target_ptr: *(*const ir.Func),
+    resolved: ir.Module.MemberResolution,
+    has_spread: bool,
+) Allocator.Error!ResolvedMemberLowering {
+    const b = m.b;
+    const receiver = m.receiver;
+    const args = m.args;
+    const ast_arg_names = m.ast_arg_names;
+    const ast_type_args = m.ast_type_args;
+    const recv_state = m.recv_state;
+    const recv_ty = m.recv_ty;
+    var target = target_ptr.*;
 
     try recordLambdaArgReceivers(b, target, args, ast_arg_names, ast_type_args, 1);
     const broad_masks = try argLambdaBroadMasks(b, target, args, ast_arg_names, 1);
@@ -1018,6 +1303,7 @@ pub fn lowerResolvedMemberCall(
     } });
     return .{ .lowered = dst };
 }
+
 
 /// Bind an explicit-receiver top-level extension to its declaration identity.
 /// The resolver returns a target only when receiver compatibility, visibility,
@@ -1142,7 +1428,25 @@ fn uniqueAnyNullableExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?
 }
 
 pub var ext_route_tag: []const u8 = "?";
+/// The state the resolved-extension call threads through its emission arms.
+const ExtCall = struct {
+    b: *FuncBuilder,
+    receiver: *const Expr,
+    name: ast.Ident,
+    ast_type_args: []const ast.TypeRef,
+    /// The receiver's declared type, which instantiates the callee's own type
+    /// parameters for the argument lambdas.
+    recv_ty: TypeRef,
+    /// The owner a member extension dispatches its receiver against.
+    dispatch_owner: ?ir.ClassId,
+    func_id: FuncId,
+    target: *const ir.Func,
+    /// The argument run the selection settled on, and its names.
+    values: []const Expr,
+    names: []const ?[]const u8,
+};
 
+/// Bind an explicit-receiver top-level extension to its declaration identity.
 pub fn lowerResolvedExtensionCall(
     b: *FuncBuilder,
     receiver: *const Expr,
@@ -1152,6 +1456,7 @@ pub fn lowerResolvedExtensionCall(
     ast_type_args: []const ast.TypeRef,
     declared_ty: ?TypeRef,
 ) Allocator.Error!?Reg {
+
     // Explicit call-site type arguments constrain the eligible generic
     // declarations before overload ranking.
     if (ast_type_args.len != 0) return null;
@@ -1197,89 +1502,136 @@ pub fn lowerResolvedExtensionCall(
         recv_ty,
         1,
     );
+    const x = ExtCall{
+        .b = b,
+        .receiver = receiver,
+        .name = name,
+        .ast_type_args = ast_type_args,
+        .recv_ty = recv_ty,
+        .dispatch_owner = resolution.dispatch_owner,
+        .func_id = func_id,
+        .target = target,
+        .values = selected_values,
+        .names = selected_names,
+    };
     // An image header stub of an inline extension has no `is_inline` flag but
     // does have its declaration in the inline table, and must splice: a direct
     // call reaches a bodiless stub whose reified parameters nothing binds.
     if (target.is_inline or inline_state.inlineAstById(func_id.int()) != null) {
-        const inline_decl = inline_state.inlineAstById(func_id.int()) orelse return null;
-        inline_state.ensureInlineBody(inline_decl);
-        // The splice lowers lambda arguments in its own loop, bypassing
-        // `lowerArgRun`'s typing transfer, so instantiate expected param types
-        // here for the eagerly lowered closure bodies.
-        if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] inlineSplice fn={s}\n", .{target.name});
-        const inline_lambda_param_types = try argLambdaParamTypesRecv(
-            b,
-            target,
-            selected_values,
-            selected_names,
-            ast_type_args,
-            1,
-            substitutionRecv(b, &recv_ty),
-        );
-        defer if (inline_lambda_param_types) |types|
-            deinitArgLambdaParamTypes(b.allocator, types);
-        // The splice expands lambda bodies rather than going through
-        // `lowerArgRun`, so the `-> Unit` mask has no consumer and would dangle
-        // into calls lowered inside the spliced body.
-        if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
-        b.pending_arg_lambda_unit = null;
-        b.pending_arg_lambda_param_types = inline_lambda_param_types;
-        defer b.pending_arg_lambda_param_types = null;
-        // Solve the callee's bindings once (receiver plus typed args) so every
-        // in-window consumer sees the call-site instantiation. Registry-stable
-        // fn-tp names only; owner identities stay per-channel.
-        {
-            var sc2 = std.heap.ArenaAllocator.init(b.allocator);
-            defer sc2.deinit();
-            const a2 = sc2.allocator();
-            var sh_set2 = try buildStaticReturnArgShapes(b, selected_values, selected_names);
-            defer sh_set2.deinit(b.allocator);
-            if (b.module.solveCallBindings(a2, func_id, target, recv_ty, null, sh_set2.shapes, &.{}, false) catch null) |solved2| blk_s4: {
-                const fn_tps = b.module.registry.func_type_params.get(func_id) orelse break :blk_s4;
-                var outl: std.ArrayList(ir.Module.TypeBinding) = .empty;
-                errdefer {
-                    for (outl.items) |*e| {
-                        var t = e.ty;
-                        t.deinit(b.allocator);
-                    }
-                    outl.deinit(b.allocator);
-                }
-                for (solved2.bindings) |sb| {
-                    const h2 = typeHead(std.mem.trimEnd(u8, sb.ty.name, "?"));
-                    if (std.mem.eql(u8, h2, "*") or h2.len == 0) continue;
-                    var stable: ?[]const u8 = null;
-                    for (fn_tps.items) |tp| {
-                        if (std.mem.eql(u8, tp, sb.name)) {
-                            stable = tp;
-                            break;
-                        }
-                    }
-                    const sname = stable orelse continue;
-                    try outl.append(b.allocator, .{ .name = sname, .ty = try sb.ty.clone(b.allocator) });
-                }
-                if (outl.items.len != 0) {
-                    b.module.pending_splice_solved = try outl.toOwnedSlice(b.allocator);
-                } else outl.deinit(b.allocator);
-            }
-        }
-        const expected = b.peekExpected();
-        const expected_ptr: ?*const ast.TypeRef = if (expected) |*ty| ty else null;
-        inline_call.splice_route_tag = "lowerResolvedExtensionCall:20312";
-        const spliced = try tryInlineCallWithTypeArgs(
-            b,
-            name.name,
-            inline_decl,
-            selected_values,
-            selected_names,
-            receiver,
-            ast_type_args,
-            expected_ptr,
-        );
-        if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
-            if (std.mem.eql(u8, w, name.name)) std.debug.print("[splice-{s}] {s} fid={d} span={}:{} route={s} nta={d}\n", .{ if (spliced != null) @as([]const u8, "ok") else "bail", name.name, func_id.int(), name.span.file, name.span.start, ext_route_tag, ast_type_args.len });
-        }
-        return spliced;
+        return try spliceInlineExtensionCall(x);
     }
+    return try emitExtensionCall(x);
+}
+
+/// Splice the inline extension's body at the call site. The splice lowers
+/// lambda arguments in its own loop, bypassing `lowerArgRun`'s typing transfer,
+/// so expected param types are instantiated here for the eagerly lowered
+/// closure bodies.
+fn spliceInlineExtensionCall(x: ExtCall) Allocator.Error!?Reg {
+    const b = x.b;
+    const receiver = x.receiver;
+    const name = x.name;
+    const ast_type_args = x.ast_type_args;
+    const recv_ty = x.recv_ty;
+    const func_id = x.func_id;
+    const target = x.target;
+    const selected_values = x.values;
+    const selected_names = x.names;
+
+    const inline_decl = inline_state.inlineAstById(func_id.int()) orelse return null;
+    inline_state.ensureInlineBody(inline_decl);
+    // The splice lowers lambda arguments in its own loop, bypassing
+    // `lowerArgRun`'s typing transfer, so instantiate expected param types
+    // here for the eagerly lowered closure bodies.
+    if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] inlineSplice fn={s}\n", .{target.name});
+    const inline_lambda_param_types = try argLambdaParamTypesRecv(
+        b,
+        target,
+        selected_values,
+        selected_names,
+        ast_type_args,
+        1,
+        substitutionRecv(b, &recv_ty),
+    );
+    defer if (inline_lambda_param_types) |types|
+        deinitArgLambdaParamTypes(b.allocator, types);
+    // The splice expands lambda bodies rather than going through
+    // `lowerArgRun`, so the `-> Unit` mask has no consumer and would dangle
+    // into calls lowered inside the spliced body.
+    if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
+    b.pending_arg_lambda_unit = null;
+    b.pending_arg_lambda_param_types = inline_lambda_param_types;
+    defer b.pending_arg_lambda_param_types = null;
+    // Solve the callee's bindings once (receiver plus typed args) so every
+    // in-window consumer sees the call-site instantiation. Registry-stable
+    // fn-tp names only; owner identities stay per-channel.
+    {
+        var sc2 = std.heap.ArenaAllocator.init(b.allocator);
+        defer sc2.deinit();
+        const a2 = sc2.allocator();
+        var sh_set2 = try buildStaticReturnArgShapes(b, selected_values, selected_names);
+        defer sh_set2.deinit(b.allocator);
+        if (b.module.solveCallBindings(a2, func_id, target, recv_ty, null, sh_set2.shapes, &.{}, false) catch null) |solved2| blk_s4: {
+            const fn_tps = b.module.registry.func_type_params.get(func_id) orelse break :blk_s4;
+            var outl: std.ArrayList(ir.Module.TypeBinding) = .empty;
+            errdefer {
+                for (outl.items) |*e| {
+                    var t = e.ty;
+                    t.deinit(b.allocator);
+                }
+                outl.deinit(b.allocator);
+            }
+            for (solved2.bindings) |sb| {
+                const h2 = typeHead(std.mem.trimEnd(u8, sb.ty.name, "?"));
+                if (std.mem.eql(u8, h2, "*") or h2.len == 0) continue;
+                var stable: ?[]const u8 = null;
+                for (fn_tps.items) |tp| {
+                    if (std.mem.eql(u8, tp, sb.name)) {
+                        stable = tp;
+                        break;
+                    }
+                }
+                const sname = stable orelse continue;
+                try outl.append(b.allocator, .{ .name = sname, .ty = try sb.ty.clone(b.allocator) });
+            }
+            if (outl.items.len != 0) {
+                b.module.pending_splice_solved = try outl.toOwnedSlice(b.allocator);
+            } else outl.deinit(b.allocator);
+        }
+    }
+    const expected = b.peekExpected();
+    const expected_ptr: ?*const ast.TypeRef = if (expected) |*ty| ty else null;
+    inline_call.splice_route_tag = "lowerResolvedExtensionCall:20312";
+    const spliced = try tryInlineCallWithTypeArgs(
+        b,
+        name.name,
+        inline_decl,
+        selected_values,
+        selected_names,
+        receiver,
+        ast_type_args,
+        expected_ptr,
+    );
+    if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name.name)) std.debug.print("[splice-{s}] {s} fid={d} span={}:{} route={s} nta={d}\n", .{ if (spliced != null) @as([]const u8, "ok") else "bail", name.name, func_id.int(), name.span.file, name.span.start, ext_route_tag, ast_type_args.len });
+    }
+    return spliced;
+}
+
+/// Emit the extension as an exact static call, its receiver in the leading
+/// `this` slot; a member extension additionally carries the dispatch receiver
+/// its owner class supplies.
+fn emitExtensionCall(x: ExtCall) Allocator.Error!?Reg {
+    const b = x.b;
+    const receiver = x.receiver;
+    const name = x.name;
+    const ast_type_args = x.ast_type_args;
+    const recv_ty = x.recv_ty;
+    const func_id = x.func_id;
+    const target = x.target;
+    const selected_values = x.values;
+    const selected_names = x.names;
+    const dispatch_owner = x.dispatch_owner;
 
     const broad_masks = try argLambdaBroadMasks(b, target, selected_values, selected_names, 1);
     defer if (broad_masks) |masks| b.allocator.free(masks);
@@ -1309,7 +1661,7 @@ pub fn lowerResolvedExtensionCall(
     const dispatch_reg: ?Reg = if (target_is_member_extension)
         (try lowerMemberExtensionDispatchReceiver(
             b,
-            resolution.dispatch_owner orelse return null,
+            dispatch_owner orelse return null,
         )) orelse return null
     else
         null;
@@ -1377,6 +1729,7 @@ pub fn lowerResolvedExtensionCall(
     } });
     return dst;
 }
+
 
 /// Whether the preceding member resolution statically refuted every candidate,
 /// so the extension leg running next can commit a sole receiver-proven one.
@@ -1622,6 +1975,24 @@ fn callableExtensionPropertyTarget(
     );
 }
 
+/// The state one member-call fallback ladder threads through its rungs.
+const Fallback = struct {
+    b: *FuncBuilder,
+    expr: *const Expr,
+    receiver: *const Expr,
+    name: ast.Ident,
+    args: []Expr,
+    ast_arg_names: []?[]const u8,
+    ast_type_args: []ast.TypeRef,
+    /// The receiver's declared type, or the one the static deriver lends it.
+    declared_ty: ?TypeRef,
+    /// Static resolution found an applicable member but withheld dispatch, so
+    /// no extension may take the call.
+    member_shadows_extensions: bool,
+};
+
+/// The catch-all `recv.name(args)` path: everything static member resolution
+/// left unbound.
 pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -1630,8 +2001,72 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
     const ast_type_args = call.type_args;
     const receiver = callee.Member.receiver;
     const name = callee.Member.name;
-    // A class-named receiver whose member names a nested constructible class is
-    // a constructor call, so emit NewInstance rather than a companion walk.
+    if (try tryNestedClassCtorOnReceiver(b, receiver, name, args, ast_arg_names)) |r| return r;
+
+    const declared_from_expr = argDeclTypeRef(b, receiver);
+    // The full static deriver, not just the call-return channel: a binary
+    // receiver types by the numeric-promotion arm, a companion-const read by
+    // the Path arm.
+    var inferred_declared_ty: ?ir.TypeRef = if (declared_from_expr == null)
+        try staticExprTypeRef(b, receiver)
+    else
+        null;
+    if (runtime.envOnce("KLIO_DECLTY_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name.name)) {
+            const src: []const u8 = if (declared_from_expr != null) "decl" else "inferred";
+            const tyn: []const u8 = if (declared_from_expr) |t| t.name else if (inferred_declared_ty) |t| t.name else "-";
+            std.debug.print("[declty] {s} recv_tag={s} src={s} ty={s} at={d}:{d}\n", .{ name.name, @tagName(std.meta.activeTag(receiver.*)), src, tyn, name.span.file.int(), name.span.start });
+        }
+    }
+    defer if (inferred_declared_ty) |*ty| ty.deinit(b.allocator);
+    const declared_ty = declared_from_expr orelse inferred_declared_ty;
+
+    // Member declarations take precedence over local callables and extensions.
+    // Only ambiguous or incomplete receiver shapes continue below.
+    const static_member = try lowerResolvedMemberCall(
+        b,
+        receiver,
+        name,
+        args,
+        ast_arg_names,
+        ast_type_args,
+        declared_ty,
+        .{},
+    );
+    switch (static_member) {
+        .lowered => |reg| return reg,
+        .deferred, .none => {},
+    }
+
+    var f = Fallback{
+        .b = b,
+        .expr = expr,
+        .receiver = receiver,
+        .name = name,
+        .args = args,
+        .ast_arg_names = ast_arg_names,
+        .ast_type_args = ast_type_args,
+        .declared_ty = declared_ty,
+        .member_shadows_extensions = static_member == .deferred,
+    };
+    if (try tryLocalCallableOnReceiver(&f)) |r| return r;
+    if (try trySuperCall(&f)) |r| return r;
+    if (try tryComposerPairRetry(&f)) |r| return r;
+    if (try tryCallableExtensionProperty(&f)) |r| return r;
+    if (try tryExtensionCall(&f)) |r| return r;
+    return emitDeferredMemberCall(&f);
+}
+
+/// A class-named receiver whose member names a nested constructible class is a
+/// constructor call, so emit NewInstance rather than a companion walk.
+fn tryNestedClassCtorOnReceiver(
+    b: *FuncBuilder,
+    receiver: *const Expr,
+    name: ast.Ident,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?Reg {
+
     if (receiver.* == .Path and receiver.Path.segments.len >= 1 and receiver.Path.segments.len <= 3) {
         const outer_name = receiver.Path.segments[0].name;
         var all_class_like = true;
@@ -1681,44 +2116,16 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
             }
         }
     }
-    const declared_from_expr = argDeclTypeRef(b, receiver);
-    // The full static deriver, not just the call-return channel: a binary
-    // receiver types by the numeric-promotion arm, a companion-const read by
-    // the Path arm.
-    var inferred_declared_ty: ?ir.TypeRef = if (declared_from_expr == null)
-        try staticExprTypeRef(b, receiver)
-    else
-        null;
-    if (runtime.envOnce("KLIO_DECLTY_TRACE")) |w| {
-        if (std.mem.eql(u8, w, name.name)) {
-            const src: []const u8 = if (declared_from_expr != null) "decl" else "inferred";
-            const tyn: []const u8 = if (declared_from_expr) |t| t.name else if (inferred_declared_ty) |t| t.name else "-";
-            std.debug.print("[declty] {s} recv_tag={s} src={s} ty={s} at={d}:{d}\n", .{ name.name, @tagName(std.meta.activeTag(receiver.*)), src, tyn, name.span.file.int(), name.span.start });
-        }
-    }
-    defer if (inferred_declared_ty) |*ty| ty.deinit(b.allocator);
-    const declared_ty = declared_from_expr orelse inferred_declared_ty;
+    return null;
+}
 
-    // Member declarations take precedence over local callables and extensions.
-    // Only ambiguous or incomplete receiver shapes continue below.
-    const static_member = try lowerResolvedMemberCall(
-        b,
-        receiver,
-        name,
-        args,
-        ast_arg_names,
-        ast_type_args,
-        declared_ty,
-        .{},
-    );
-    switch (static_member) {
-        .lowered => |reg| return reg,
-        .deferred, .none => {},
-    }
-    const member_shadows_extensions = static_member == .deferred;
+/// Whether a bound local, param, or captured-outer competes with the member.
+/// Kotlin resolves `recv.name(args)` to a member or extension of `recv`; a
+/// local competes only when its type is an extension-function type
+/// (`Modifier.() -> Unit`). Treating a plain `(FocusState) -> Unit` as a
+/// candidate makes the call invoke the callback with itself.
+fn localCallableCompetes(b: *FuncBuilder, name: ast.Ident, declared_ty: ?TypeRef) Allocator.Error!bool {
 
-    // A bound local, param, or captured-outer shadows the member, including a
-    // plain local; the member is still tried first at runtime.
     const anon_cap = isLowerAnonCapture(name.name) and b.resolve(name.name) == null and
         !b.isLocalFn(name.name) and !b.isParam(name.name) and !b.knowsOuter(name.name);
     // Kotlin resolves `recv.name(args)` to a member or extension of `recv`; a
@@ -1728,85 +2135,107 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
     const plain_fn_local = b.isPlainFnParam(name.name);
     const local_receiver_applicable = !b.isLocalExtFn(name.name) or
         try localExtensionReceiverCouldApply(b, name.name, declared_ty);
-    const local_callable = !plain_fn_local and local_receiver_applicable and
+    return !plain_fn_local and local_receiver_applicable and
         (b.isLocalFn(name.name) or b.isParam(name.name) or
             b.knowsOuter(name.name) or anon_cap or b.resolve(name.name) != null);
-    if (local_callable) {
-        // Same-named local siblings share the plain-name slot, which may hold a
-        // non-extension sibling or the boxed self-cell's placeholder, so select
-        // the extension by signature. Needs a derived receiver: untyped, a
-        // same-named global extension may be the target.
-        if (declared_ty != null) {
-            if (b.localFnOverloads(name.name)) |ovs| {
-                if (try selectLocalExtOverload(b, ovs, declared_ty, args, ast_arg_names)) |mangled| {
-                    if (try lowerSelectedLocalExtCallWithReceiver(b, mangled, receiver, args, ast_arg_names)) |r| return r;
-                }
+}
+
+/// The local callable takes the call, the member still being tried first at
+/// runtime through the arbitrated forms.
+fn tryLocalCallableOnReceiver(f: *Fallback) Allocator.Error!?Reg {
+    const b = f.b;
+    const receiver = f.receiver;
+    const name = f.name;
+    const args = f.args;
+    const ast_arg_names = f.ast_arg_names;
+    const declared_ty = f.declared_ty;
+    const anon_cap = isLowerAnonCapture(name.name) and b.resolve(name.name) == null and
+        !b.isLocalFn(name.name) and !b.isParam(name.name) and !b.knowsOuter(name.name);
+    if (!try localCallableCompetes(b, name, declared_ty)) return null;
+
+    // Same-named local siblings share the plain-name slot, which may hold a
+    // non-extension sibling or the boxed self-cell's placeholder, so select
+    // the extension by signature. Needs a derived receiver: untyped, a
+    // same-named global extension may be the target.
+    if (declared_ty != null) {
+        if (b.localFnOverloads(name.name)) |ovs| {
+            if (try selectLocalExtOverload(b, ovs, declared_ty, args, ast_arg_names)) |mangled| {
+                if (try lowerSelectedLocalExtCallWithReceiver(b, mangled, receiver, args, ast_arg_names)) |r| return r;
             }
         }
-        const local_reg = blk: {
-            if (anon_cap) {
-                const idx = try b.recordCapture(name.name);
-                const r = b.allocReg();
-                try b.push(.{ .LoadCapture = .{ .dst = r, .idx = idx } });
-                break :blk r;
-            }
-            // A directly-bound local uses its own register; `resolveCapture`
-            // would mint a bogus slot for a name that is not closed over.
-            if (b.resolve(name.name)) |reg| {
-                if (b.isBoxed(name.name)) {
-                    const c = b.allocReg();
-                    try b.push(.{ .CellGet = .{ .dst = c, .cell = reg } });
-                    break :blk c;
-                }
-                break :blk reg;
-            }
-            break :blk try resolveCapture(b, name.name);
-        };
-        const recv = try lowerReceiver(b, receiver);
-        const run = try lowerArgRun(b, args);
-        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
-        const dst = b.allocReg();
-    // A receiver statically typed by an unbounded type parameter declares no
-    // members, so the in-scope callable is Kotlin's only candidate.
-        const recv_erased = receiver.* == .Path and
-            receiver.Path.segments.len == 1 and
-            (b.isErasedRecvParam(receiver.Path.segments[0].name) or
-                enclosingPropertyBareTp(b, receiver.Path.segments[0].name));
-        const callable_takes_receiver = b.isReceiverLambdaParam(name.name) or
-            b.isLocalExtFn(name.name) or b.localDeclRecvFn(name.name);
-        const callable_shape_known = callable_takes_receiver or
-            (b.isLocalFn(name.name) and !b.isLocalExtFn(name.name));
-        if (callable_takes_receiver and
-            (recv_erased or staticReceiverHasNoCompetingCallable(b, declared_ty, name.name, args.len)))
-        {
-            orEmitAudit(b, "member_or_local_exact_value", "CallValueWithThis", name.name);
-            try b.push(.{ .CallValueWithThis = .{
-                .dst = dst,
-                .callee = local_reg,
-                .receiver = recv,
-                .args = run[0],
-                .n_args = run[1],
-                .arg_names = arg_names,
-                .receiver_shape_exact = true,
-            } });
-            return dst;
+    }
+    const local_reg = blk: {
+        if (anon_cap) {
+            const idx = try b.recordCapture(name.name);
+            const r = b.allocReg();
+            try b.push(.{ .LoadCapture = .{ .dst = r, .idx = idx } });
+            break :blk r;
         }
-        orEmitAudit(b, "member_or_local_callable", "CallMemberOrValue", name.name);
-        try b.push(.{ .CallMemberOrValue = .{
+        // A directly-bound local uses its own register; `resolveCapture`
+        // would mint a bogus slot for a name that is not closed over.
+        if (b.resolve(name.name)) |reg| {
+            if (b.isBoxed(name.name)) {
+                const c = b.allocReg();
+                try b.push(.{ .CellGet = .{ .dst = c, .cell = reg } });
+                break :blk c;
+            }
+            break :blk reg;
+        }
+        break :blk try resolveCapture(b, name.name);
+    };
+    const recv = try lowerReceiver(b, receiver);
+    const run = try lowerArgRun(b, args);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
+    const dst = b.allocReg();
+// A receiver statically typed by an unbounded type parameter declares no
+// members, so the in-scope callable is Kotlin's only candidate.
+    const recv_erased = receiver.* == .Path and
+        receiver.Path.segments.len == 1 and
+        (b.isErasedRecvParam(receiver.Path.segments[0].name) or
+            enclosingPropertyBareTp(b, receiver.Path.segments[0].name));
+    const callable_takes_receiver = b.isReceiverLambdaParam(name.name) or
+        b.isLocalExtFn(name.name) or b.localDeclRecvFn(name.name);
+    const callable_shape_known = callable_takes_receiver or
+        (b.isLocalFn(name.name) and !b.isLocalExtFn(name.name));
+    if (callable_takes_receiver and
+        (recv_erased or staticReceiverHasNoCompetingCallable(b, declared_ty, name.name, args.len)))
+    {
+        orEmitAudit(b, "member_or_local_exact_value", "CallValueWithThis", name.name);
+        try b.push(.{ .CallValueWithThis = .{
             .dst = dst,
+            .callee = local_reg,
             .receiver = recv,
-            .name = nm,
-            .fallback = local_reg,
             .args = run[0],
             .n_args = run[1],
             .arg_names = arg_names,
-            .recv_erased = recv_erased,
-            .fallback_takes_receiver = callable_takes_receiver,
-            .fallback_receiver_shape_known = callable_shape_known,
+            .receiver_shape_exact = true,
         } });
         return dst;
     }
+    orEmitAudit(b, "member_or_local_callable", "CallMemberOrValue", name.name);
+    try b.push(.{ .CallMemberOrValue = .{
+        .dst = dst,
+        .receiver = recv,
+        .name = nm,
+        .fallback = local_reg,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .recv_erased = recv_erased,
+        .fallback_takes_receiver = callable_takes_receiver,
+        .fallback_receiver_shape_known = callable_shape_known,
+    } });
+    return dst;
+}
+
+/// `super.name(args)`: the call binds the named supertype's member.
+fn trySuperCall(f: *Fallback) Allocator.Error!?Reg {
+    const b = f.b;
+    const receiver = f.receiver;
+    const name = f.name;
+    const args = f.args;
+    const ast_arg_names = f.ast_arg_names;
 
     if (receiver.* == .Super) {
         const sup = receiver.Super;
@@ -1830,10 +2259,22 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
             return dst;
         }
     }
+    return null;
+}
 
-    // The Compose syntax pass may thread a same-named call before overload
-    // resolution; a source-shaped member or extension proves the declaration is
-    // not composable, so the ABI pair does not belong here.
+/// The Compose syntax pass may thread a same-named call before overload
+/// resolution; a source-shaped member or extension proves the declaration is
+/// not composable, so the ABI pair does not belong here.
+fn tryComposerPairRetry(f: *Fallback) Allocator.Error!?Reg {
+    const b = f.b;
+    const expr = f.expr;
+    const receiver = f.receiver;
+    const name = f.name;
+    const args = f.args;
+    const ast_arg_names = f.ast_arg_names;
+    const ast_type_args = f.ast_type_args;
+    const declared_ty = f.declared_ty;
+
     if (hasComposerArgPair(ast_arg_names) and args.len >= 2) {
         const source_args = args[0 .. args.len - 2];
         const source_names = ast_arg_names[0 .. ast_arg_names.len - 2];
@@ -1865,7 +2306,7 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
                         var rewritten = expr.*;
                         rewritten.Call.args = source_args;
                         rewritten.Call.arg_names = source_names;
-                        return lowerMemberCallFallback(b, &rewritten);
+                        return try lowerMemberCallFallback(b, &rewritten);
                     }
                 }
             } else if (source_extension.applicable and
@@ -1874,10 +2315,23 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
                 var rewritten = expr.*;
                 rewritten.Call.args = source_args;
                 rewritten.Call.arg_names = source_names;
-                return lowerMemberCallFallback(b, &rewritten);
+                return try lowerMemberCallFallback(b, &rewritten);
             }
         }
     }
+    return null;
+}
+
+/// A callable extension property: the marker field holds the callable the call
+/// invokes.
+fn tryCallableExtensionProperty(f: *Fallback) Allocator.Error!?Reg {
+    const b = f.b;
+    const receiver = f.receiver;
+    const name = f.name;
+    const args = f.args;
+    const ast_arg_names = f.ast_arg_names;
+    const declared_ty = f.declared_ty;
+    const member_shadows_extensions = f.member_shadows_extensions;
 
     if (!member_shadows_extensions and
         callableExtensionPropertyTarget(b, receiver, name, args.len, declared_ty) != null)
@@ -1904,6 +2358,19 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
         } });
         return dst;
     }
+    return null;
+}
+
+/// An extension bound statically to its declaration identity.
+fn tryExtensionCall(f: *Fallback) Allocator.Error!?Reg {
+    const b = f.b;
+    const receiver = f.receiver;
+    const name = f.name;
+    const args = f.args;
+    const ast_arg_names = f.ast_arg_names;
+    const ast_type_args = f.ast_type_args;
+    const declared_ty = f.declared_ty;
+    const member_shadows_extensions = f.member_shadows_extensions;
 
     if (!member_shadows_extensions) {
         ext_route_tag = "lowerMemberCallFallback:20993";
@@ -1917,6 +2384,20 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
             declared_ty,
         )) |reg| return reg;
     }
+    return null;
+}
+
+/// Nothing bound statically, so dispatch stays deferred to the runtime member
+/// walk, carrying the receiver's declared head so member-versus-extension is
+/// still resolved against the declared type.
+fn emitDeferredMemberCall(f: *Fallback) Allocator.Error!Reg {
+    const b = f.b;
+    const receiver = f.receiver;
+    const name = f.name;
+    const args = f.args;
+    const ast_arg_names = f.ast_arg_names;
+    const ast_type_args = f.ast_type_args;
+    const declared_ty = f.declared_ty;
 
     const recv = try lowerReceiver(b, receiver);
     // A class-named receiver resolves its member's signature through the lifted
@@ -1991,3 +2472,4 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
     } });
     return dst;
 }
+

@@ -219,54 +219,32 @@ fn receiverConcreteMemberTakes(b: *FuncBuilder, receiver: *const Expr, name: []c
     return res.target != null or res.applicable;
 }
 
+/// The state one call-lowering ladder threads through its rungs.
+///
+/// The driver settles the call's shape once and hands every rung below a
+/// pointer to it; a rung that resolves the call returns its register, and a
+/// rung that declines returns null so the next one is tried. The order the
+/// driver runs them in is Kotlin's resolution order and is load-bearing.
+const CallCtx = struct {
+    b: *FuncBuilder,
+    /// The whole `.Call` expression, for the rungs that rewrite and re-enter.
+    expr: *const Expr,
+    /// The callee with any `!!` assertions stripped.
+    callee: *const Expr,
+    args: []Expr,
+    ast_arg_names: []?[]const u8,
+    ast_type_args: []ast.TypeRef,
+    is_infix: bool,
+    /// Whether the call sits in tail position, captured before the nested
+    /// lowering below clears it.
+    call_tail: bool,
+};
+
 pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call_tail = b.call_tail;
-    // `c.TA(args)` where `TA` aliases a nested or inner class of `c`'s class
-    // constructs the aliased class, which the inner-constructor route serves.
-    if (expr.Call.callee.* == .Member and !expr.Call.callee.Member.safe) {
-        const mn = expr.Call.callee.Member.name.name;
-        if (b.module.registry.type_alias_types.get(mn)) |shape| {
-            const target = shape.target.name;
-            const simple = if (std.mem.findScalarLast(u8, target, '.')) |dot| target[dot + 1 ..] else target;
-            const fn_alias = if (b.module.registry.type_aliases.get(mn)) |tag| std.mem.startsWith(u8, tag, "Function") else false;
-            // Only an alias onto a nested class, and never one whose target is
-            // itself an alias: a rewrite chain would loop.
-            const nested_target = blk: {
-                if (b.module.registry.type_alias_types.contains(simple)) break :blk false;
-                const cid = b.module.classIdIndexed(simple, b.self_package, expr.Call.callee.Member.name.span.file) orelse break :blk false;
-                if (cid.int() >= b.module.classes.items.len) break :blk false;
-                break :blk std.mem.findScalar(u8, b.module.classes.items[cid.int()].fqn, '.') != null;
-            };
-            if (!std.mem.eql(u8, simple, mn) and !fn_alias and nested_target) {
-                const callee_copy = try b.allocator.create(Expr);
-                callee_copy.* = expr.Call.callee.*;
-                callee_copy.Member.name = .{ .name = simple, .span = expr.Call.callee.Member.name.span };
-                var rewritten = expr.*;
-                rewritten.Call.callee = callee_copy;
-                return lowerCall(b, &rewritten);
-            }
-        }
-    }
-    // A bare call of a delegated local invokes the value the delegate's
-    // `getValue` yields, never the delegate object bound under the plain name.
-    if (expr.Call.callee.* == .Path and expr.Call.callee.Path.segments.len == 1 and expr.Call.type_args.len == 0) {
-        const dn = expr.Call.callee.Path.segments[0].name;
-        if (b.resolve(dn) != null or b.knowsOuter(dn) or isLowerAnonCapture(dn) or build.anonCaptureBinds(dn)) {
-            if (try lowerDelegateRead(b, dn)) |delegate_value| {
-                const run = try lowerArgRun(b, expr.Call.args);
-                const arg_names = try internArgNames(b.allocator, b.module, expr.Call.arg_names);
-                const dst = b.allocReg();
-                try b.push(.{ .CallValue = .{
-                    .dst = dst,
-                    .callee = delegate_value,
-                    .args = run[0],
-                    .n_args = run[1],
-                    .arg_names = arg_names,
-                } });
-                return dst;
-            }
-        }
-    }
+    if (try tryNestedAliasCtorRewrite(b, expr)) |r| return r;
+    if (try tryDelegatedLocalInvoke(b, expr)) |r| return r;
+
     // Saved and restored across nested calls.
     const prev_tail_ok = b.tail_call_ok;
     b.tail_call_ok = call_tail;
@@ -313,9 +291,109 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
-    // Scalar bitwise infix on Int/Long (Bool for the logical trio) are Int
-    // members with intrinsic semantics, so emit the BinOp. Members outrank
-    // extensions on these final receivers, so no user code is shadowed.
+
+    var c = CallCtx{
+        .b = b,
+        .expr = expr,
+        .callee = callee,
+        .args = args,
+        .ast_arg_names = ast_arg_names,
+        .ast_type_args = ast_type_args,
+        .is_infix = is_infix,
+        .call_tail = call_tail,
+    };
+
+    if (try tryScalarBitwiseInfix(&c)) |r| return r;
+    try recordBareCallLambdaShapes(&c);
+    if (try tryContextIntrinsic(&c)) |r| return r;
+    if (try tryContextualFnValueCall(&c)) |r| return r;
+    if (try tryScopeRenamedCallee(&c)) |r| return r;
+    if (try tryFilePrivateCallee(&c)) |r| return r;
+    if (try tryImportedCompanionCallee(&c)) |r| return r;
+    if (try tryEmptyContainerCreator(&c)) |r| return r;
+    if (try tryMemberInlineSplice(&c)) |r| return r;
+    if (try tryScalarExtensionSplice(&c)) |r| return r;
+    if (try trySplicedLabelSplice(&c)) |r| return r;
+    if (try tryExtensionLambdaSplice(&c)) |r| return r;
+    if (callee.* == .Member and callee.Member.safe) return lowerSafeMemberCall(&c);
+    if (try tryRepeatDesugar(&c)) |r| return r;
+    if (try trySpreadCall(&c)) |r| return r;
+
+    b.call_tail = call_tail;
+    return lowerCallGeneral(b, expr);
+}
+
+
+/// `c.TA(args)` where `TA` aliases a nested or inner class of `c`'s class
+/// constructs the aliased class, which the inner-constructor route serves.
+fn tryNestedAliasCtorRewrite(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
+
+    if (expr.Call.callee.* == .Member and !expr.Call.callee.Member.safe) {
+        const mn = expr.Call.callee.Member.name.name;
+        if (b.module.registry.type_alias_types.get(mn)) |shape| {
+            const target = shape.target.name;
+            const simple = if (std.mem.findScalarLast(u8, target, '.')) |dot| target[dot + 1 ..] else target;
+            const fn_alias = if (b.module.registry.type_aliases.get(mn)) |tag| std.mem.startsWith(u8, tag, "Function") else false;
+            // Only an alias onto a nested class, and never one whose target is
+            // itself an alias: a rewrite chain would loop.
+            const nested_target = blk: {
+                if (b.module.registry.type_alias_types.contains(simple)) break :blk false;
+                const cid = b.module.classIdIndexed(simple, b.self_package, expr.Call.callee.Member.name.span.file) orelse break :blk false;
+                if (cid.int() >= b.module.classes.items.len) break :blk false;
+                break :blk std.mem.findScalar(u8, b.module.classes.items[cid.int()].fqn, '.') != null;
+            };
+            if (!std.mem.eql(u8, simple, mn) and !fn_alias and nested_target) {
+                const callee_copy = try b.allocator.create(Expr);
+                callee_copy.* = expr.Call.callee.*;
+                callee_copy.Member.name = .{ .name = simple, .span = expr.Call.callee.Member.name.span };
+                var rewritten = expr.*;
+                rewritten.Call.callee = callee_copy;
+                return try lowerCall(b, &rewritten);
+            }
+        }
+    }
+    return null;
+}
+
+
+/// A bare call of a delegated local invokes the value the delegate's
+/// `getValue` yields, never the delegate object bound under the plain name.
+fn tryDelegatedLocalInvoke(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
+
+    if (expr.Call.callee.* == .Path and expr.Call.callee.Path.segments.len == 1 and expr.Call.type_args.len == 0) {
+        const dn = expr.Call.callee.Path.segments[0].name;
+        if (b.resolve(dn) != null or b.knowsOuter(dn) or isLowerAnonCapture(dn) or build.anonCaptureBinds(dn)) {
+            if (try lowerDelegateRead(b, dn)) |delegate_value| {
+                const run = try lowerArgRun(b, expr.Call.args);
+                const arg_names = try internArgNames(b.allocator, b.module, expr.Call.arg_names);
+                const dst = b.allocReg();
+                try b.push(.{ .CallValue = .{
+                    .dst = dst,
+                    .callee = delegate_value,
+                    .args = run[0],
+                    .n_args = run[1],
+                    .arg_names = arg_names,
+                } });
+                return dst;
+            }
+        }
+    }
+    return null;
+}
+
+
+/// Scalar bitwise infix on Int/Long (Bool for the logical trio) are Int
+/// members with intrinsic semantics, so emit the BinOp. Members outrank
+/// extensions on these final receivers, so no user code is shadowed.
+fn tryScalarBitwiseInfix(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_type_args = c.ast_type_args;
+    const is_infix = c.is_infix;
+    const call_tail = c.call_tail;
+    const expr = c.expr;
+
     if (is_infix and args.len == 2 and callee.* == .Path and
         callee.Path.segments.len == 1 and ast_type_args.len == 0)
     {
@@ -326,7 +404,7 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 b.terminate(.{ .TailJump = .{ .args = run[0], .n_args = @intCast(run[1].int()) } });
                 const dead = try b.allocBlock();
                 b.switchTo(dead);
-                return b.emitConst(.Unit);
+                return try b.emitConst(.Unit);
             }
         };
         if (scalarBitBinOp(callee.Path.segments[0].name)) |op| blk: {
@@ -352,9 +430,20 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return dst;
         }
     }
-    // Record each lambda argument's expected value-parameter arity by span
-    // before the args lower; `lowerLambda` reads it authoritatively, so a
-    // receiver lambda drops its `it` on every emit branch.
+    return null;
+}
+
+
+/// Record each lambda argument's expected value-parameter arity by span
+/// before the args lower; `lowerLambda` reads it authoritatively, so a
+/// receiver lambda drops its `it` on every emit branch.
+fn recordBareCallLambdaShapes(c: *CallCtx) Allocator.Error!void {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const cnm = callee.Path.segments[0].name;
     // A bare call to an own member resolves to the member, which is absent from
@@ -462,9 +551,18 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
     }
+}
 
-    // `context(v..., block)` and `contextOf<T>()` lower to context-stack ops, so
-    // implicit resolution is driven by the runtime stack. Only when unshadowed.
+
+/// `context(v..., block)` and `contextOf<T>()` lower to context-stack ops, so
+/// implicit resolution is driven by the runtime stack. Only when unshadowed.
+fn tryContextIntrinsic(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_type_args = c.ast_type_args;
+    const is_infix = c.is_infix;
+
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1) {
         const cname = callee.Path.segments[0].name;
         if (b.resolve(cname) == null and !b.knowsOuter(cname)) {
@@ -491,10 +589,20 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
     }
+    return null;
+}
 
-    // Fully-positional call of a contextual function-type value: when the arg
-    // count matches the flattened `n_ctx + n_regular`, split the leading context
-    // args onto the context stack; the implicit form falls to the value path.
+
+/// Fully-positional call of a contextual function-type value: when the arg
+/// count matches the flattened `n_ctx + n_regular`, split the leading context
+/// args onto the context stack; the implicit form falls to the value path.
+fn tryContextualFnValueCall(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_type_args = c.ast_type_args;
+    const is_infix = c.is_infix;
+
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len == 0) {
         const cname = callee.Path.segments[0].name;
         if (b.contextFnParam(cname)) |shape| {
@@ -552,9 +660,17 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
     }
+    return null;
+}
 
-    // A bare head naming a mangled nested class or a renamed file-private
-    // class/typealias resolves to the lift name; locals and own members shadow it.
+
+/// A bare head naming a mangled nested class or a renamed file-private
+/// class/typealias resolves to the lift name; locals and own members shadow it.
+fn tryScopeRenamedCallee(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const expr = c.expr;
+
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const head = callee.Path.segments[0];
         if (scopeTypeRename(b, head.name, head.span.file.int())) |renamed| {
@@ -563,15 +679,24 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 var new_callee = Expr{ .Path = .{ .segments = &new_segs, .span = callee.Path.span } };
                 var rewritten = expr.*;
                 rewritten.Call.callee = &new_callee;
-                return lowerCall(b, &rewritten);
+                return try lowerCall(b, &rewritten);
             }
         }
     }
+    return null;
+}
 
-    // A bare call to a per-file mangled private top-level function resolves to
-    // the calling file's name. Locals, outer captures, own members, and an
-    // applicable extension on an in-scope implicit receiver all shadow it:
-    // Kotlin ranks the implicit-receiver group before any no-receiver candidate.
+
+/// A bare call to a per-file mangled private top-level function resolves to
+/// the calling file's name. Locals, outer captures, own members, and an
+/// applicable extension on an in-scope implicit receiver all shadow it:
+/// Kotlin ranks the implicit-receiver group before any no-receiver candidate.
+fn tryFilePrivateCallee(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const expr = c.expr;
+    const call = expr.Call;
+
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const head = callee.Path.segments[0];
         if (build.filePrivateFuncRename(head.name, head.span.file.int())) |renamed| {
@@ -582,13 +707,21 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 var new_callee = Expr{ .Path = .{ .segments = &new_segs, .span = callee.Path.span } };
                 var rewritten = expr.*;
                 rewritten.Call.callee = &new_callee;
-                return lowerCall(b, &rewritten);
+                return try lowerCall(b, &rewritten);
             }
         }
     }
+    return null;
+}
 
-    // A bare call to a name-imported companion member dispatches on the owner's
-    // companion, so rewrite the callee to `X.member`; local bindings shadow it.
+
+/// A bare call to a name-imported companion member dispatches on the owner's
+/// companion, so rewrite the callee to `X.member`; local bindings shadow it.
+fn tryImportedCompanionCallee(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const expr = c.expr;
+
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const head = callee.Path.segments[0];
         if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name)) {
@@ -605,14 +738,26 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 } };
                 var rewritten = expr.*;
                 rewritten.Call.callee = &new_callee;
-                return lowerCall(b, &rewritten);
+                return try lowerCall(b, &rewritten);
             }
         }
     }
+    return null;
+}
 
-    // An empty stdlib container creator carries no element head at run time, so
-    // pass the tail-position expected type's element or entry heads as type args
-    // and let the creation-site path stamp `declared_elem`.
+
+/// An empty stdlib container creator carries no element head at run time, so
+/// pass the tail-position expected type's element or entry heads as type args
+/// and let the creation-site path stamp `declared_elem`.
+fn tryEmptyContainerCreator(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_type_args = c.ast_type_args;
+    const is_infix = c.is_infix;
+    const call_tail = c.call_tail;
+    const expr = c.expr;
+
     if (!is_infix and ast_type_args.len == 0 and args.len == 0 and
         callee.* == .Path and callee.Path.segments.len == 1)
     {
@@ -625,719 +770,897 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         var rewritten = expr.*;
                         rewritten.Call.type_args = synth;
                         b.call_tail = call_tail;
-                        return lowerCallGeneral(b, &rewritten);
+                        return try lowerCallGeneral(b, &rewritten);
                     }
                 }
             }
         }
     }
+    return null;
+}
 
-    // A member call onto an inline `reified` extension. Explicit type args or an
-    // expected type let the splice bind the reified parameters.
-    if (!is_infix and callee.* == .Member and !callee.Member.safe and gate: {
-        if (ast_type_args.len != 0 or b.peekExpected() != null) break :gate true;
-        // A trailing-lambda call with a monomorphic member-inline candidate
-        // enters regardless of receiver form; the strict pick inside revalidates.
-        if (args.len != 0 and switch (args[args.len - 1]) {
-            .Lambda, .AnonFun => true,
-            else => false,
-        }) {
-            if (inline_state.candidatesForName(callee.Member.name.name)) |mcands| {
-                for (mcands) |mcf| {
-                    if (mcf.receiver_type == null and mcf.type_params.len == 0 and
-                        inline_state.inlineMemberOwner(mcf) != null) break :gate true;
-                }
-            }
-        }
-    // Statement position with no type args: splice when the value arguments alone
-    // bind every reified parameter, unless the receiver's static type serves the
-    // name, since kotlinc resolves members before extensions.
-        if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args, b)) {
-            // The receiver's applicable member wins over the inline extensions,
-            // unless it is itself reified inline and so bodiless in the image.
-            if (try receiverMemberIsReifiedInline(b, callee.Member.receiver, callee.Member.name.name, args.len)) break :gate true;
-            break :gate !(try receiverStaticMemberApplies(b, callee.Member.receiver, callee.Member.name.name, args, ast_arg_names, callee.Member.name.span.file));
-        }
-        const recv = callee.Member.receiver;
-        if (recv.* != .Path or recv.Path.segments.len != 1) break :gate false;
-        const n = recv.Path.segments[0].name;
-        if (b.resolve(n) != null or b.knowsOuter(n)) break :gate false;
-        break :gate b.module.registry.companion_singletons.contains(n);
+
+/// The state the member-inline arm threads through its own helpers.
+const MemberInline = struct {
+    c: *CallCtx,
+    mname: []const u8,
+    receiver: *const Expr,
+    /// The tail-position expected type, which lets a splice bind a reified
+    /// parameter the arguments alone leave open.
+    exp_ptr: ?*const ast.TypeRef,
+};
+
+/// Whether a member call is a candidate for the reified/member inline arm:
+/// explicit type args or an expected type, a trailing lambda with a
+/// monomorphic member-inline candidate, arguments that bind every reified
+/// parameter, or a companion-qualified receiver.
+fn memberInlineArmApplies(c: *CallCtx) Allocator.Error!bool {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+
+    if (ast_type_args.len != 0 or b.peekExpected() != null) return true;
+    // A trailing-lambda call with a monomorphic member-inline candidate
+    // enters regardless of receiver form; the strict pick inside revalidates.
+    if (args.len != 0 and switch (args[args.len - 1]) {
+        .Lambda, .AnonFun => true,
+        else => false,
     }) {
-        const mname = callee.Member.name.name;
-        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s} cands={d}\n", .{ mname, if (inline_state.candidatesForName(mname)) |c| c.len else 0 });
-    // A monomorphic member `inline fun` taking a lambda splices like its reified
-    // siblings. The pick is strict: no type parameters, no defaults or varargs,
-    // arity matched, callback shape matched, owner on the receiver chain.
-        const plain_member_inline: ?*const ast.Function = blk: {
-            // `KLIO_MEMBER_INLINE`: "0" disables; a comma list allows only those
-            // names; a list starting with '!' allows all but those.
-            if (runtime.envOnce("KLIO_MEMBER_INLINE")) |sel| {
-                if (std.mem.eql(u8, sel, "0")) break :blk null;
-                if (!std.mem.eql(u8, sel, "1")) {
-                    var wanted = std.mem.startsWith(u8, sel, "!");
-                    var it = std.mem.splitScalar(u8, if (wanted) sel[1..] else sel, ',');
-                    const inverted = wanted;
-                    wanted = inverted;
-                    while (it.next()) |tok| {
-                        if (tok.len != 0 and std.mem.eql(u8, tok, mname)) {
-                            wanted = !inverted;
-                            break;
-                        }
-                    }
-                    if (inverted) {
-                        if (!wanted) break :blk null;
-                    } else if (!wanted) break :blk null;
+        if (inline_state.candidatesForName(callee.Member.name.name)) |mcands| {
+            for (mcands) |mcf| {
+                if (mcf.receiver_type == null and mcf.type_params.len == 0 and
+                    inline_state.inlineMemberOwner(mcf) != null) return true;
+            }
+        }
+    }
+// Statement position with no type args: splice when the value arguments alone
+// bind every reified parameter, unless the receiver's static type serves the
+// name, since kotlinc resolves members before extensions.
+    if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args, b)) {
+        // The receiver's applicable member wins over the inline extensions,
+        // unless it is itself reified inline and so bodiless in the image.
+        if (try receiverMemberIsReifiedInline(b, callee.Member.receiver, callee.Member.name.name, args.len)) return true;
+        return !(try receiverStaticMemberApplies(b, callee.Member.receiver, callee.Member.name.name, args, ast_arg_names, callee.Member.name.span.file));
+    }
+    const recv = callee.Member.receiver;
+    if (recv.* != .Path or recv.Path.segments.len != 1) return false;
+    const n = recv.Path.segments[0].name;
+    if (b.resolve(n) != null or b.knowsOuter(n)) return false;
+    return b.module.registry.companion_singletons.contains(n);
+}
+
+/// A member call onto an inline `reified` extension. Explicit type args or an
+/// expected type let the splice bind the reified parameters.
+fn tryMemberInlineSplice(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const ast_type_args = c.ast_type_args;
+    if (c.is_infix or callee.* != .Member or callee.Member.safe) return null;
+    if (!try memberInlineArmApplies(c)) return null;
+    const mname = callee.Member.name.name;
+    if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s} cands={d}\n", .{ mname, if (inline_state.candidatesForName(mname)) |cc| cc.len else 0 });
+    const plain_member_inline = try plainMemberInlineTarget(c, mname);
+    const reified_ext = reifiedInlineCandidateExists(c, mname);
+    if (!(reified_ext or plain_member_inline != null)) return null;
+    const receiver = callee.Member.receiver;
+    const expected = b.peekExpected();
+    var mi = MemberInline{
+        .c = c,
+        .mname = mname,
+        .receiver = receiver,
+        .exp_ptr = if (expected) |*_e| _e else null,
+    };
+    var member_target = try memberInlineTargetFromTypeArgs(&mi);
+    if (ast_type_args.len == 0) {
+        if (try tryInferredReifiedMemberInline(&mi)) |r| return r;
+    }
+    if (member_target == null) member_target = plain_member_inline;
+    if (runtime.envOnce("KLIO_PMI_TRACE") != null and plain_member_inline != null and
+        member_target == plain_member_inline)
+    {
+        std.debug.print("[pmi] {s}\n", .{mname});
+    }
+    return try spliceOrDispatchMemberInline(&mi, member_target);
+}
+
+/// A monomorphic member `inline fun` taking a lambda splices like its reified
+/// siblings. The pick is strict: no type parameters, no defaults or varargs,
+/// arity matched, callback shape matched, owner on the receiver chain.
+fn plainMemberInlineTarget(c: *CallCtx, mname: []const u8) Allocator.Error!?*const ast.Function {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_type_args = c.ast_type_args;
+
+    // `KLIO_MEMBER_INLINE`: "0" disables; a comma list allows only those
+    // names; a list starting with '!' allows all but those.
+    if (runtime.envOnce("KLIO_MEMBER_INLINE")) |sel| {
+        if (std.mem.eql(u8, sel, "0")) return null;
+        if (!std.mem.eql(u8, sel, "1")) {
+            var wanted = std.mem.startsWith(u8, sel, "!");
+            var it = std.mem.splitScalar(u8, if (wanted) sel[1..] else sel, ',');
+            const inverted = wanted;
+            wanted = inverted;
+            while (it.next()) |tok| {
+                if (tok.len != 0 and std.mem.eql(u8, tok, mname)) {
+                    wanted = !inverted;
+                    break;
                 }
             }
-            if (ast_type_args.len != 0) break :blk null;
-            if (args.len == 0) break :blk null;
-            const site_lambda: ?struct { n: usize, implicit: bool } = switch (args[args.len - 1]) {
-                .Lambda => |l| .{ .n = l.params.len, .implicit = l.implicit_it },
-                .AnonFun => |af| .{ .n = af.params.len, .implicit = false },
-                else => null,
-            };
-            const sl = site_lambda orelse break :blk null;
-            const cands = inline_state.candidatesForName(mname) orelse break :blk null;
-            var found: ?*const ast.Function = null;
+            if (inverted) {
+                if (!wanted) return null;
+            } else if (!wanted) return null;
+        }
+    }
+    if (ast_type_args.len != 0) return null;
+    if (args.len == 0) return null;
+    const site_lambda: ?struct { n: usize, implicit: bool } = switch (args[args.len - 1]) {
+        .Lambda => |l| .{ .n = l.params.len, .implicit = l.implicit_it },
+        .AnonFun => |af| .{ .n = af.params.len, .implicit = false },
+        else => null,
+    };
+    const sl = site_lambda orelse return null;
+    const cands = inline_state.candidatesForName(mname) orelse return null;
+    var found: ?*const ast.Function = null;
+    for (cands) |cf| {
+        if (cf.receiver_type != null) continue;
+        const owner = inline_state.inlineMemberOwner(cf) orelse continue;
+        if (cf.type_params.len != 0) continue;
+        // The owner must be monomorphic too: a generic class's member
+        // body casts through the class parameter, which a splice leaves
+        // reading a stale process-global slot.
+        const owner_cid = b.module.uniqueClassIdBySimpleName(owner) orelse
+            b.module.classIdByFqn(owner) orelse continue;
+        if (owner_cid.int() >= b.module.classes.items.len) continue;
+        if (b.module.classes.items[owner_cid.int()].type_params.len != 0) continue;
+        if (cf.params.len != args.len) continue;
+        var irregular = false;
+        for (cf.params) |*p| {
+            if (p.default != null or p.is_vararg) irregular = true;
+        }
+        if (irregular) continue;
+        // Same-name same-arity member-inline overloads can differ only in
+        // callback shape: a receiver lambda matches a parameterless site
+        // block, an implicit-`it` block matches arity 0 or 1.
+        const decl_fn = cf.params[cf.params.len - 1].ty.function orelse continue;
+        const shape_ok = if (decl_fn.receiver != null)
+            (sl.implicit or sl.n == decl_fn.params.len)
+        else if (sl.implicit)
+            decl_fn.params.len <= 1
+        else
+            sl.n == decl_fn.params.len;
+        if (!shape_ok) continue;
+        if (cf.body == null) continue;
+        if (!try memberOwnerOnReceiverChainStrict(b, callee.Member.receiver, cf)) continue;
+        if (found != null) return null;
+        found = cf;
+    }
+    return found;
+}
+
+/// Whether a reified inline candidate for `mname` exists that only a splice
+/// can serve: a reified extension, or a reified member-inline declaration.
+fn reifiedInlineCandidateExists(c: *CallCtx, mname: []const u8) bool {
+    const ast_type_args = c.ast_type_args;
+
+    if (inlineFnAst(mname)) |f| {
+        if (f.receiver_type != null and anyReified(f.type_params)) return true;
+    }
+    // A reified member-inline fn is invisible to the top-level stub index
+    // and a reified extension can be outranked there, yet both must
+    // splice or the reified parameter dies. Type-argumented calls only.
+    if (ast_type_args.len != 0) {
+        if (inline_state.candidatesForName(mname)) |cands| {
             for (cands) |cf| {
-                if (cf.receiver_type != null) continue;
-                const owner = inline_state.inlineMemberOwner(cf) orelse continue;
-                if (cf.type_params.len != 0) continue;
-                // The owner must be monomorphic too: a generic class's member
-                // body casts through the class parameter, which a splice leaves
-                // reading a stale process-global slot.
-                const owner_cid = b.module.uniqueClassIdBySimpleName(owner) orelse
-                    b.module.classIdByFqn(owner) orelse continue;
-                if (owner_cid.int() >= b.module.classes.items.len) continue;
-                if (b.module.classes.items[owner_cid.int()].type_params.len != 0) continue;
-                if (cf.params.len != args.len) continue;
-                var irregular = false;
-                for (cf.params) |*p| {
-                    if (p.default != null or p.is_vararg) irregular = true;
-                }
-                if (irregular) continue;
-                // Same-name same-arity member-inline overloads can differ only in
-                // callback shape: a receiver lambda matches a parameterless site
-                // block, an implicit-`it` block matches arity 0 or 1.
-                const decl_fn = cf.params[cf.params.len - 1].ty.function orelse continue;
-                const shape_ok = if (decl_fn.receiver != null)
-                    (sl.implicit or sl.n == decl_fn.params.len)
-                else if (sl.implicit)
-                    decl_fn.params.len <= 1
-                else
-                    sl.n == decl_fn.params.len;
-                if (!shape_ok) continue;
-                if (cf.body == null) continue;
-                if (!try memberOwnerOnReceiverChainStrict(b, callee.Member.receiver, cf)) continue;
-                if (found != null) break :blk null;
-                found = cf;
+                if (anyReified(cf.type_params) and cf.receiver_type != null) return true;
             }
-            break :blk found;
-        };
-        const reified_ext = blk: {
-            if (inlineFnAst(mname)) |f| {
-                if (f.receiver_type != null and anyReified(f.type_params)) break :blk true;
+        }
+    }
+    if (inline_state.candidatesForName(mname)) |cands| {
+        for (cands) |cf| {
+            if (anyReified(cf.type_params) and cf.receiver_type == null and
+                inline_state.inlineMemberOwner(cf) != null)
+            {
+                return true;
             }
-            // A reified member-inline fn is invisible to the top-level stub index
-            // and a reified extension can be outranked there, yet both must
-            // splice or the reified parameter dies. Type-argumented calls only.
-            if (ast_type_args.len != 0) {
-                if (inline_state.candidatesForName(mname)) |cands| {
-                    for (cands) |cf| {
-                        if (anyReified(cf.type_params) and cf.receiver_type != null) break :blk true;
-                    }
-                }
-            }
-            if (inline_state.candidatesForName(mname)) |cands| {
-                for (cands) |cf| {
-                    if (anyReified(cf.type_params) and cf.receiver_type == null and
-                        inline_state.inlineMemberOwner(cf) != null)
-                    {
-                        break :blk true;
-                    }
-                }
-            }
-            break :blk false;
-        };
-        if (reified_ext or plain_member_inline != null) {
-            const receiver = callee.Member.receiver;
-            const expected = b.peekExpected();
-            const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-            // A member-inline overload set is invisible to the stub index, whose
-            // receiver-blind shape pick cannot separate the reified overload. The
-            // candidate whose type parameters the call can bind wins.
-            var member_target: ?*const ast.Function = null;
-            if (ast_type_args.len != 0) {
-                if (inline_state.candidatesForName(mname)) |cands| {
-                    if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-xn] {s}: cands={d} ptr={x} enc={?s}\n", .{ mname, cands.len, @intFromPtr(cands.ptr), b.ownerClass() orelse build.currentOwnerClass() });
-                    for (cands) |cf| {
-                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-x] {s}: cand owner={?s} reified={} recv={?s} params={d} args={d} enc={?s}/{?s}\n", .{ mname, inline_state.inlineMemberOwner(cf), anyReified(cf.type_params), if (cf.receiver_type) |rt| rt.name.name else null, cf.params.len, args.len, b.ownerClass(), build.currentOwnerClass() });
-                        if (inline_state.inlineMemberOwner(cf) == null) continue;
-                        if (!anyReified(cf.type_params)) continue;
-                        if (inlineEvidenceRejects(b, cf, args, ast_arg_names)) continue;
-                        if (cf.receiver_type) |crt| {
-                            // For a reified member extension declared by an
-                            // enclosing class, the receiver's static type must
-                            // fit its extension receiver and the owner must be
-                            // in the enclosing hierarchy.
-                            const enclosing = b.ownerClass() orelse build.currentOwnerClass() orelse continue;
-                            if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-x] {s}: inHier={}\n", .{ mname, inlineOwnerInEnclosingHierarchy(b, enclosing, cf) });
-                            if (!inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) continue;
-                            if (cf.params.len != args.len) continue;
-                            // An unknown static head still reaches the splice:
-                            // its own receiver gates decide, and a dynamic call
-                            // cannot honor the explicit type arguments.
-                            if (try inline_call.gateReceiverHead(b, receiver)) |head| {
-                                var h = std.mem.trimEnd(u8, head, "?");
-                                if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
-                                const want = typeHead(std.mem.trimEnd(u8, crt.name.name, "?"));
-                                if (!std.mem.eql(u8, typeHead(h), want) and !b.module.classIsOrExtends(typeHead(h), want)) continue;
-                            }
-                        } else {
-                            if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
-                            // A member overload that cannot take this many
-                            // arguments must not preempt a sibling that can.
-                            if (cf.params.len < args.len) continue;
-                            var required: usize = 0;
-                            for (cf.params) |*cp| {
-                                if (cp.default == null and !cp.is_vararg) required += 1;
-                            }
-                            if (args.len < required) continue;
-                        }
-                        member_target = cf;
-                        break;
-                    }
-                }
-            }
-            if (ast_type_args.len == 0) blk_mit: {
-                const cands = inline_state.candidatesForName(mname) orelse break :blk_mit;
-                if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-n] {s}: cands={d} enc={?s}\n", .{ mname, cands.len, b.ownerClass() orelse build.currentOwnerClass() });
-                // Inference-bound reified member-inline call: dispatch a
-                // statically bound typed member call, which binds the reified
-                // parameters from the inferred type-argument names.
-                for (cands) |cf| {
-                    if (!anyReified(cf.type_params)) continue;
-                    // Argument evidence refuting the candidate leaves the
-                    // receiver's own applicable member to the general path.
-                    if (inlineEvidenceRejects(b, cf, args, ast_arg_names)) continue;
-                    // The receiver's own applicable member outranks a member
-                    // extension declared elsewhere.
-                    if (cf.receiver_type != null and try receiverConcreteMemberTakes(b, receiver, mname, args, ast_arg_names)) continue;
-                    if (cf.receiver_type) |crt| {
-                        // For a reified member extension on the receiver's static
-                        // type, the owner must be in the enclosing hierarchy.
-                        if (inline_state.inlineMemberOwner(cf) == null) continue;
-                        const enclosing = b.ownerClass() orelse build.currentOwnerClass() orelse continue;
-                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: ext-cand owner={s} enclosing={s} inHier={}\n", .{ mname, inline_state.inlineMemberOwner(cf).?, enclosing, inlineOwnerInEnclosingHierarchy(b, enclosing, cf) });
-                        if (!inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) continue;
-                        const head = (try inline_call.gateReceiverHead(b, receiver)) orelse continue;
+        }
+    }
+    return false;
+}
+
+/// A member-inline overload set is invisible to the stub index, whose
+/// receiver-blind shape pick cannot separate the reified overload. The
+/// candidate whose type parameters the call can bind wins.
+fn memberInlineTargetFromTypeArgs(mi: *MemberInline) Allocator.Error!?*const ast.Function {
+    const c = mi.c;
+    const b = c.b;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+    const mname = mi.mname;
+    const receiver = mi.receiver;
+
+    var member_target: ?*const ast.Function = null;
+    if (ast_type_args.len != 0) {
+        if (inline_state.candidatesForName(mname)) |cands| {
+            if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-xn] {s}: cands={d} ptr={x} enc={?s}\n", .{ mname, cands.len, @intFromPtr(cands.ptr), b.ownerClass() orelse build.currentOwnerClass() });
+            for (cands) |cf| {
+                if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-x] {s}: cand owner={?s} reified={} recv={?s} params={d} args={d} enc={?s}/{?s}\n", .{ mname, inline_state.inlineMemberOwner(cf), anyReified(cf.type_params), if (cf.receiver_type) |rt| rt.name.name else null, cf.params.len, args.len, b.ownerClass(), build.currentOwnerClass() });
+                if (inline_state.inlineMemberOwner(cf) == null) continue;
+                if (!anyReified(cf.type_params)) continue;
+                if (inlineEvidenceRejects(b, cf, args, ast_arg_names)) continue;
+                if (cf.receiver_type) |crt| {
+                    // For a reified member extension declared by an
+                    // enclosing class, the receiver's static type must
+                    // fit its extension receiver and the owner must be
+                    // in the enclosing hierarchy.
+                    const enclosing = b.ownerClass() orelse build.currentOwnerClass() orelse continue;
+                    if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-x] {s}: inHier={}\n", .{ mname, inlineOwnerInEnclosingHierarchy(b, enclosing, cf) });
+                    if (!inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) continue;
+                    if (cf.params.len != args.len) continue;
+                    // An unknown static head still reaches the splice:
+                    // its own receiver gates decide, and a dynamic call
+                    // cannot honor the explicit type arguments.
+                    if (try inline_call.gateReceiverHead(b, receiver)) |head| {
                         var h = std.mem.trimEnd(u8, head, "?");
                         if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
                         const want = typeHead(std.mem.trimEnd(u8, crt.name.name, "?"));
                         if (!std.mem.eql(u8, typeHead(h), want) and !b.module.classIsOrExtends(typeHead(h), want)) continue;
-                        if (cf.params.len != args.len) continue;
-                    } else {
-                        if (inline_state.inlineMemberOwner(cf) == null) continue;
-                        if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
                     }
-                    const names = inline_call.inferReifiedNamesForCall(b, cf, args, ast_arg_names, callee.Member.name.span.file.int()) orelse
-                        (try reifiedNamesFromExpected(b, cf, exp_ptr)) orelse
-                    {
-                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: names=null\n", .{mname});
-                        continue;
-                    };
-                    const fid = blk: {
-                        for (b.module.funcsBySimpleName(mname)) |cand_fid| {
-                            const ds = b.module.decl_span.get(cand_fid.int()) orelse continue;
-                            if (ds.file.int() == cf.name.span.file.int() and ds.start == cf.name.span.start) {
-                                if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid by span -> {s}\n", .{ mname, if (b.module.funcById(cand_fid)) |cfn| cfn.fqn else "?" });
-                                break :blk cand_fid;
-                            }
-                        }
-                        // Instance methods are not in the simple-name index, so
-                        // match by declaration span; a user-file method has none,
-                        // so identify the overload by its parameter-name sequence
-                        // behind the implicit `this`.
-                        var fi: u32 = 0;
-                        const appended: u32 = @intCast(b.module.appendedFuncCount());
-                        const base_n: u32 = @intCast(b.module.func_header_offsets.len);
-                        while (fi < appended) : (fi += 1) {
-                            const mf = b.module.funcById(FuncId.from(base_n + fi)) orelse continue;
-                            if (!std.mem.eql(u8, mf.name, mname)) continue;
-                            if (mf.kind != .instance_method) continue;
-                            if (mf.params.len != cf.params.len + 1) continue;
-                            var all_match = mf.params.len > 0 and std.mem.eql(u8, mf.params[0].name, "this");
-                            if (all_match) {
-                                for (cf.params, 0..) |*cp, pi| {
-                                    if (!std.mem.eql(u8, mf.params[pi + 1].name, cp.name.name)) {
-                                        all_match = false;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (all_match) {
-                                if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid by param names -> {s}\n", .{ mname, mf.fqn });
-                                break :blk mf.id;
-                            }
-                        }
-                        break :blk null;
-                    } orelse {
-                        // No registered function for the member (a pack's reified
-                        // inline member is a header stub), so splice its AST.
-                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid=null -> splice\n", .{mname});
-                        inline_call.splice_route_tag = "lowerCall:6578";
-                        if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
-                        continue;
-                    };
-                    // A registered function with no type-parameter record cannot
-                    // bind the stamped names at runtime, leaving only the splice.
-                    {
-                        const tp_rec = b.module.registry.func_type_params.get(fid);
-                        const n_rec: usize = if (tp_rec) |l| l.items.len else 0;
-                        if (n_rec < cf.type_params.len) {
-                            if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid without type params -> splice\n", .{mname});
-                            inline_call.splice_route_tag = "lowerCall:6590";
-                            if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
-                        }
+                } else {
+                    if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
+                    // A member overload that cannot take this many
+                    // arguments must not preempt a sibling that can.
+                    if (cf.params.len < args.len) continue;
+                    var required: usize = 0;
+                    for (cf.params) |*cp| {
+                        if (cp.default == null and !cp.is_vararg) required += 1;
                     }
-                    // A reified inline callee with no written type arguments binds
-                    // `T` only through the splice; the typed member call below
-                    // stamps written names and would otherwise read a stale one.
-                    reified_splice: {
-                        var any_reified = false;
-                        for (cf.type_params) |*tp| {
-                            if (tp.is_reified) any_reified = true;
-                        }
-                        if (!any_reified) break :reified_splice;
-                    // Only when the registered target is this declaration: `cf`
-                    // came from a simple-name lookup, and another class's
-                    // same-named inline member must not splice onto this receiver.
-                        const cf_recv: ?[]const u8 = if (cf.receiver_type) |*rt|
-                            typeHead(std.mem.trimEnd(u8, rt.name.name, "?"))
-                        else
-                            inline_state.inlineMemberOwner(cf);
-                        const mf_reg = b.module.funcById(fid) orelse break :reified_splice;
-                        const mf_recv: ?[]const u8 = if (mf_reg.params.len != 0 and std.mem.eql(u8, mf_reg.params[0].name, "this"))
-                            typeHead(std.mem.trimEnd(u8, mf_reg.params[0].ty.name, "?"))
-                        else
-                            null;
-                        const same_target = blk_same: {
-                            const cr = cf_recv orelse break :blk_same mf_recv == null;
-                            const mr = mf_recv orelse break :blk_same false;
-                            break :blk_same std.mem.eql(u8, typeHead(cr), mr);
-                        };
-                        if (!same_target) break :reified_splice;
-                        // And the call-site receiver must be that type or a
-                        // subtype; an untyped receiver keeps the typed call.
-                        const site_ty: ?ir.TypeRef = staticExprTypeRef(b, receiver) catch null;
-                        const recv_ok = blk_recv: {
-                            const mr = mf_recv orelse break :blk_recv site_ty == null;
-                            const st = site_ty orelse break :blk_recv false;
-                            const sh = typeHead(std.mem.trimEnd(u8, st.name, "?"));
-                            break :blk_recv std.mem.eql(u8, sh, mr) or b.module.classIsOrExtends(sh, mr);
-                        };
-                        if (!recv_ok) break :reified_splice;
-                        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: reified -> splice first\n", .{mname});
-                        inline_call.splice_route_tag = "lowerCall:reified";
-                        if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
-                    }
-                    const recv = try lowerReceiver(b, receiver);
-                    const run = try lowerArgRun(b, args);
-                    const arg_names_c = try internArgNames(b.allocator, b.module, ast_arg_names);
-                    var ta_ids = try b.allocator.alloc(ir.ConstId, names.len);
-                    for (names, 0..) |n, i| ta_ids[i] = try b.module.internConst(b.allocator, .{ .String = n });
-                    const nm = try b.module.internConst(b.allocator, .{ .String = mname });
-                    const dst = b.allocReg();
-                    orEmitAudit(b, "member_inline_typed", "CallMemberOrGlobal", mname);
-                    try b.push(.{ .CallMemberOrGlobal = .{
-                        .dst = dst,
-                        .this_idx = 0,
-                        .name = nm,
-                        .trailing_lambda = b.callTrailingLambda(),
-                        .args = run[0],
-                        .n_args = run[1],
-                        .arg_names = arg_names_c,
-                        .recv = recv,
-                        .func = fid,
-                        .candidates = try cmgCandidates(b, mname, callee.Member.name.span.file, run[1]),
-                        .type_args = ta_ids,
-                    } });
-                    return dst;
+                    if (args.len < required) continue;
                 }
-            }
-            if (member_target == null) member_target = plain_member_inline;
-            if (runtime.envOnce("KLIO_PMI_TRACE") != null and plain_member_inline != null and
-                member_target == plain_member_inline)
-            {
-                std.debug.print("[pmi] {s}\n", .{mname});
-            }
-            inline_call.splice_route_tag = "lowerCall:6623";
-            // A receiver whose static class declares a member that binds this
-            // call outranks any extension in Kotlin's resolution order.
-            const member_binds = member_target == null and try receiverConcreteMemberTakes(b, receiver, mname, args, ast_arg_names);
-            if (!member_binds) {
-                if (try tryInlineCallWithTypeArgs(b, mname, member_target, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
-                    if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
-                        if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-ok] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });
-                    }
-                    return r;
-                }
-            }
-            if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
-                if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-bail] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });
-            }
-            // Splice bailed, so dispatch plainly. The body then reads the reified
-            // parameters from the process-wide slot the splice writes, so write
-            // this call's type arguments there first.
-            try storeExplicitReifiedGlobals(b, mname, ast_type_args);
-            const recv = try lowerReceiver(b, receiver);
-            const bail_arity: ?[]const i16 = try memberCallArgArities(b, receiver, mname, args, ast_arg_names);
-            const run = try lowerArgRunWithArity(b, args, bail_arity);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-            const nm = try b.module.internConst(b.allocator, .{ .String = mname });
-            const dst = b.allocReg();
-            // An unsafe cast's target fixes the static type for overload
-            // resolution even on this bail, so a deprecated stub cast to its
-            // supertype does not re-bind itself and self-recurse.
-            const bail_declared: ?ir.ConstId = blk: {
-                if (receiver.* != .As or receiver.As.safe) break :blk null;
-                const t = argDeclTypeRef(b, receiver) orelse break :blk null;
-                const head = std.mem.trimEnd(u8, t.name, "?");
-                if (head.len == 0) break :blk null;
-                break :blk try b.module.internConst(b.allocator, .{ .String = head });
-            };
-            try b.push(.{ .CallMember = .{
-                .dst = dst,
-                .receiver = recv,
-                .name = nm,
-                .trailing_lambda = b.callTrailingLambda(),
-                .args = run[0],
-                .n_args = run[1],
-                .arg_names = arg_names,
-                .declared_recv = bail_declared,
-            } });
-            return dst;
-        }
-    }
-
-    // An explicit-receiver call to a no-lambda inline extension on a scalar
-    // receiver splices as kotlinc inlines it. Scalar heads with no member
-    // namesake in the program only, since a member would outrank it.
-    if (!is_infix and callee.* == .Member and !callee.Member.safe and
-        ast_type_args.len == 0 and args.len <= 2 and
-        inline_call.rfsEnabled() and
-        !lastArgIsLambdaOrAnon(args))
-    scalar_ext: {
-        const mname = callee.Member.name.name;
-        const receiver = callee.Member.receiver;
-        const sxt = if (runtime.envOnce("KLIO_SEXT_TRACE")) |w| std.mem.eql(u8, w, mname) else false;
-        const cands = inline_state.candidatesForName(mname) orelse {
-            if (sxt) std.debug.print("[sext] {s}: no candidates\n", .{mname});
-            break :scalar_ext;
-        };
-        const head = (try inline_call.gateReceiverHead(b, receiver)) orelse {
-            if (sxt) std.debug.print("[sext] {s}: no receiver head (in {s})\n", .{ mname, build.currentRealFn() orelse "-" });
-            break :scalar_ext;
-        };
-        const h = typeHead(std.mem.trimEnd(u8, head, "?"));
-        if (sxt) std.debug.print("[sext] {s}: head={s} in {s}\n", .{ mname, h, build.currentRealFn() orelse "-" });
-        // `class_member_names` is owner-blind, so any class declaring the name
-        // would suppress the splice program-wide; on a scalar head only the
-        // scalar's own hierarchy can outrank the extension.
-        if (b.module.registry.class_member_names.contains(mname)) {
-            const shadowed = blk: {
-                const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk true;
-                if (!hs.complete) break :blk true;
-                break :blk hs.names.contains(mname);
-            };
-            if (shadowed) break :scalar_ext;
-        }
-        const scalar = for ([_][]const u8{
-            "Int",   "Long",  "Short",  "Byte",  "Char", "Boolean",
-            "Float", "Double", "UInt",  "ULong", "UShort", "UByte",
-        }) |sc| {
-            if (std.mem.eql(u8, h, sc)) break true;
-        } else false;
-        if (!scalar) break :scalar_ext;
-        for (cands) |cf| {
-            const rt = cf.receiver_type orelse continue;
-            if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, rt.name.name, "?")), h)) continue;
-            if (cf.params.len != args.len) continue;
-            var has_fn_or_vararg = false;
-            for (cf.params) |*p| {
-                if (p.ty.function != null or p.is_vararg) has_fn_or_vararg = true;
-            }
-            if (has_fn_or_vararg) continue;
-            if (anyReified(cf.type_params)) continue;
-            // Scalar overload sets differ only by parameter width, so every
-            // argument's derived head must equal the declared param head.
-            var args_match = true;
-            for (cf.params, 0..) |*p, pi| {
-                const want = typeHead(std.mem.trimEnd(u8, p.ty.name.name, "?"));
-                var got_owned: ?ir.TypeRef = null;
-                defer if (got_owned) |*t| t.deinit(b.allocator);
-                const got: ?ir.TypeRef = argDeclTypeRefLazy(b, &args[pi]) orelse gblk: {
-                    got_owned = try staticExprTypeRef(b, &args[pi]);
-                    break :gblk got_owned;
-                };
-                const gv = got orelse {
-                    args_match = false;
-                    break;
-                };
-                if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, gv.name, "?")), want)) {
-                    args_match = false;
-                    break;
-                }
-            }
-            if (!args_match) continue;
-            const expected0 = b.peekExpected();
-            const exp_ptr0: ?*const ast.TypeRef = if (expected0) |*_e| _e else null;
-            inline_call.splice_route_tag = "lowerCall:6755";
-            if (try inline_call.tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr0)) |r| {
-                return r;
-            }
-            break;
-        }
-    }
-
-    // A qualified member-inline call whose lambda carries a labeled return
-    // targeting an open splice must splice: the label names a frameless scope in
-    // the caller, which a dynamic dispatch cannot deliver a return to.
-    if (!is_infix and callee.* == .Member and !callee.Member.safe and
-        inline_call.argLambdaTargetsSplicedLabel(b, args))
-    {
-        const mname = callee.Member.name.name;
-        const receiver = callee.Member.receiver;
-        const expected = b.peekExpected();
-        const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-        if (inline_state.candidatesForName(mname)) |cands| {
-            // Strict owner evidence only: a lenient unknown-receiver keep would
-            // splice an unrelated same-named member.
-            const head = try inline_call.gateReceiverHead(b, receiver);
-            if (head != null) {
-                for (cands) |cf| {
-                    if (cf.receiver_type != null) continue;
-                    const owner = inline_state.inlineMemberOwner(cf) orelse continue;
-                // A duplicated class name is uniquified per file at registration
-                // (`SlotTable$f356`) while the inferred head keeps the
-                // source-level name, so accept a base-name match too.
-                    const owner_base = if (std.mem.find(u8, owner, "$f")) |i| owner[0..i] else owner;
-                    if (!classIsOrExtendsHosted(b, head.?, owner) and
-                        !std.mem.eql(u8, head.?, owner_base)) continue;
-                    inline_call.splice_route_tag = "lowerCall:6794";
-                    if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
-                        return r;
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    // An explicit-receiver call to a top-level inline extension with an fn-typed
-    // last param fed a lambda splices. The declared receiver may be a concrete
-    // head or a bounded fn type param the derived head extends; unbounded `T` and
-    // unknown heads keep other routes, and a member of the head's own hierarchy
-    // outranks the extension.
-    if (!is_infix and callee.* == .Member and !callee.Member.safe and
-        ast_type_args.len == 0 and args.len >= 1 and
-        !std.mem.eql(u8, runtime.envOnce("KLIO_XLE") orelse "1", "0") and
-        !inline_call.argLambdaTargetsLabel(args, callee.Member.name.name))
-    ext_lambda: {
-        const mname = callee.Member.name.name;
-        const receiver = callee.Member.receiver;
-        const xlt = if (runtime.envOnce("KLIO_XLE_TRACE")) |w|
-            (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, mname))
-        else
-            false;
-        const last = &args[args.len - 1];
-        const last_forwarded = last.* == .Path and last.Path.segments.len == 1 and
-            b.inlineLambdaFor(last.Path.segments[0].name) != null;
-        if (last.* != .Lambda and last.* != .AnonFun and !last_forwarded) break :ext_lambda;
-        const cands = inline_state.candidatesForName(mname) orelse break :ext_lambda;
-        // Declared evidence only: an unsafe cast's target, a declared local or
-        // param type, a constructor call, or the enclosing extension's receiver
-        // for `this`. The general chain resolves overloaded returns heuristically
-        // and can hand back a supertype whose eager overload misfits.
-        const head0: []const u8 = blk: {
-            switch (receiver.*) {
-                .As => |a| {
-                    if (a.safe) break :ext_lambda;
-                    break :blk a.ty.name.name;
-                },
-                .This => |t| {
-                    if (t.qualifier != null) break :ext_lambda;
-                    break :blk b.recvTy() orelse break :ext_lambda;
-                },
-                else => {
-                    if (argDeclTypeRefLazy(b, receiver)) |ty| break :blk ty.name;
-                    break :ext_lambda;
-                },
-            }
-        };
-        const h = typeHead(std.mem.trimEnd(u8, head0, "?"));
-        if (b.module.registry.class_member_names.contains(mname)) {
-            const cid = b.module.classIdIndexed(h, b.self_package, callee.Member.name.span.file) orelse {
-                if (xlt) std.debug.print("[xle] {s}: head {s} unresolvable for shadow check\n", .{ mname, h });
-                break :ext_lambda;
-            };
-            if (b.module.classHierarchyDeclaresMember(cid, mname)) {
-                if (xlt) std.debug.print("[xle] {s}: member shadows on {s}\n", .{ mname, h });
-                break :ext_lambda;
-            }
-        }
-        var picked: ?*const ast.Function = null;
-        var ambiguous = false;
-        for (cands) |cf| {
-            if (inline_state.inlineMemberOwner(cf) != null) continue;
-            const rt = cf.receiver_type orelse continue;
-            if (cf.params.len != args.len) continue;
-            if (anyReified(cf.type_params)) continue;
-            if (anyCrossOrNoinlineParam(cf)) continue;
-            if (cf.params[cf.params.len - 1].ty.function == null) continue;
-            const rhead = typeHead(std.mem.trimEnd(u8, rt.name.name, "?"));
-            var head_ok = std.mem.eql(u8, rhead, h);
-            if (!head_ok) {
-                for (cf.type_params) |tp| {
-                    if (!std.mem.eql(u8, tp.name.name, rhead)) continue;
-                    const ub = tp.upper_bound orelse break;
-                    const ub_head = typeHead(std.mem.trimEnd(u8, ub.name.name, "?"));
-                    head_ok = b.module.classIsOrExtends(h, ub_head);
-                    break;
-                }
-            }
-            if (!head_ok) continue;
-            if (picked != null) {
-                ambiguous = true;
+                member_target = cf;
                 break;
             }
-            picked = cf;
-        }
-        if (ambiguous) {
-            if (xlt) std.debug.print("[xle] {s}: ambiguous candidates\n", .{mname});
-            break :ext_lambda;
-        }
-        const cf = picked orelse {
-            if (xlt) std.debug.print("[xle] {s}: no applicable candidate (head {s})\n", .{ mname, h });
-            break :ext_lambda;
-        };
-        if (xlt) std.debug.print("[xle] {s}: splicing head={s} in {s}\n", .{ mname, h, build.currentRealFn() orelse "-" });
-        const expected0 = b.peekExpected();
-        const exp_ptr0: ?*const ast.TypeRef = if (expected0) |*_e| _e else null;
-        inline_call.splice_route_tag = "lowerCall:6899";
-        if (try inline_call.tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr0)) |r| {
-            return r;
         }
     }
+    return member_target;
+}
 
-    // `recv?.m(args)`: null-guard the whole call.
-    if (callee.* == .Member and callee.Member.safe) {
-        const receiver = callee.Member.receiver;
-        const name = callee.Member.name;
+/// Inference-bound reified member-inline call: dispatch a statically bound
+/// typed member call, which binds the reified parameters from the inferred
+/// type-argument names.
+fn tryInferredReifiedMemberInline(mi: *MemberInline) Allocator.Error!?Reg {
+    const c = mi.c;
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+    const mname = mi.mname;
+    const receiver = mi.receiver;
+    const exp_ptr = mi.exp_ptr;
+    const cands = inline_state.candidatesForName(mname) orelse return null;
+    if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-n] {s}: cands={d} enc={?s}\n", .{ mname, cands.len, b.ownerClass() orelse build.currentOwnerClass() });
+
+    for (cands) |cf| {
+        if (!anyReified(cf.type_params)) continue;
+        // Argument evidence refuting the candidate leaves the
+        // receiver's own applicable member to the general path.
+        if (inlineEvidenceRejects(b, cf, args, ast_arg_names)) continue;
+        // The receiver's own applicable member outranks a member
+        // extension declared elsewhere.
+        if (cf.receiver_type != null and try receiverConcreteMemberTakes(b, receiver, mname, args, ast_arg_names)) continue;
+        if (cf.receiver_type) |crt| {
+            // For a reified member extension on the receiver's static
+            // type, the owner must be in the enclosing hierarchy.
+            if (inline_state.inlineMemberOwner(cf) == null) continue;
+            const enclosing = b.ownerClass() orelse build.currentOwnerClass() orelse continue;
+            if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: ext-cand owner={s} enclosing={s} inHier={}\n", .{ mname, inline_state.inlineMemberOwner(cf).?, enclosing, inlineOwnerInEnclosingHierarchy(b, enclosing, cf) });
+            if (!inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) continue;
+            const head = (try inline_call.gateReceiverHead(b, receiver)) orelse continue;
+            var h = std.mem.trimEnd(u8, head, "?");
+            if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const want = typeHead(std.mem.trimEnd(u8, crt.name.name, "?"));
+            if (!std.mem.eql(u8, typeHead(h), want) and !b.module.classIsOrExtends(typeHead(h), want)) continue;
+            if (cf.params.len != args.len) continue;
+        } else {
+            if (inline_state.inlineMemberOwner(cf) == null) continue;
+            if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
+        }
+        const names = inline_call.inferReifiedNamesForCall(b, cf, args, ast_arg_names, callee.Member.name.span.file.int()) orelse
+            (try reifiedNamesFromExpected(b, cf, exp_ptr)) orelse
+        {
+            if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: names=null\n", .{mname});
+            continue;
+        };
+            const fid = registeredFuncForInlineCandidate(b, mname, cf) orelse {
+
+            // No registered function for the member (a pack's reified
+            // inline member is a header stub), so splice its AST.
+            if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid=null -> splice\n", .{mname});
+            inline_call.splice_route_tag = "lowerCall:6578";
+            if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
+            continue;
+            };
+
+        // A registered function with no type-parameter record cannot
+        // bind the stamped names at runtime, leaving only the splice.
+            if (try tryUntypedInlineSplice(mi, cf, fid)) |r| return r;
+
+        // A reified inline callee with no written type arguments binds
+        // `T` only through the splice; the typed member call below
+        // stamps written names and would otherwise read a stale one.
+            if (try tryReifiedFirstSplice(mi, cf, fid)) |r| return r;
+
         const recv = try lowerReceiver(b, receiver);
-        const null_r = try b.emitConst(.Null);
-        const is_null = b.allocReg();
-        try b.push(.{ .BinOp = .{ .dst = is_null, .op = .Eq, .lhs = recv, .rhs = null_r } });
-        const then_b = try b.allocBlock();
-        const else_b = try b.allocBlock();
-        const join = try b.allocBlock();
-        const dst = b.allocReg();
-        b.terminate(.{ .Branch = .{ .cond = is_null, .t = then_b, .f = else_b } });
-        b.switchTo(then_b);
-        const n = try b.emitConst(.Null);
-        try b.push(.{ .Move = .{ .dst = dst, .src = n } });
-        b.terminate(.{ .Goto = join });
-        b.switchTo(else_b);
-        // The receiver is proven non-null here, so declared nullability no longer
-        // disqualifies a member, and it is already in a register.
-        const declared_from_expr = argDeclTypeRef(b, receiver);
-        // The full static deriver, matching the plain member path.
-        var inferred_ty: ?ir.TypeRef = if (declared_from_expr == null)
-            try staticExprTypeRef(b, receiver)
-        else
-            null;
-        defer if (inferred_ty) |*t| t.deinit(b.allocator);
-        switch (try lowerResolvedMemberCall(
-            b,
-            receiver,
-            name,
-            args,
-            ast_arg_names,
-            ast_type_args,
-            declared_from_expr orelse inferred_ty,
-            .{ .reg = recv, .non_null = true },
-        )) {
-            .lowered => |reg| {
-                try b.push(.{ .Move = .{ .dst = dst, .src = reg } });
-                b.terminate(.{ .Goto = join });
-                b.switchTo(join);
-                return dst;
-            },
-            .deferred, .none => {},
-        }
-        // The ordinary call path has more to try, an inline splice above all:
-        // `x?.let { it.f() }` gives `it` the non-null receiver type in Kotlin,
-        // which a runtime member call does not. Rewrite onto a temporary holding
-        // the already-lowered receiver.
-        if (declared_from_expr orelse inferred_ty) |rty| non_null_rewrite: {
-            const nn_name = std.mem.trimEnd(u8, rty.name, "?");
-            if (nn_name.len == 0) break :non_null_rewrite;
-            const tmp_name = try std.fmt.allocPrint(b.allocator, "$nn{d}", .{recv});
-            var tmp_ty = try rty.clone(b.allocator);
-            tmp_ty.nullable = false;
-            b.allocator.free(tmp_ty.name);
-            tmp_ty.name = try b.allocator.dupe(u8, nn_name);
-            try b.pushScope();
-            try b.bind(tmp_name, recv);
-            try b.setLocalDeclTypeOwned(tmp_name, tmp_ty);
-            var segs = [_]ast.Ident{.{ .name = tmp_name, .span = receiver.span() }};
-            var recv_expr = Expr{ .Path = .{ .segments = segs[0..], .span = receiver.span() } };
-            var plain_callee = Expr{ .Member = .{
-                .receiver = &recv_expr,
-                .name = name,
-                .safe = false,
-                .span = callee.span(),
-            } };
-            var plain = expr.Call;
-            plain.callee = &plain_callee;
-            const rewritten = Expr{ .Call = plain };
-            const rv = try lowerCall(b, &rewritten);
-            try b.popScope();
-            try b.push(.{ .Move = .{ .dst = dst, .src = rv } });
-            b.terminate(.{ .Goto = join });
-            b.switchTo(join);
-            return dst;
-        }
         const run = try lowerArgRun(b, args);
-        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
-        const v = b.allocReg();
-        try b.push(.{ .CallMember = .{
-            .dst = v,
-            .receiver = recv,
+        const arg_names_c = try internArgNames(b.allocator, b.module, ast_arg_names);
+        var ta_ids = try b.allocator.alloc(ir.ConstId, names.len);
+        for (names, 0..) |n, i| ta_ids[i] = try b.module.internConst(b.allocator, .{ .String = n });
+        const nm = try b.module.internConst(b.allocator, .{ .String = mname });
+        const dst = b.allocReg();
+        orEmitAudit(b, "member_inline_typed", "CallMemberOrGlobal", mname);
+        try b.push(.{ .CallMemberOrGlobal = .{
+            .dst = dst,
+            .this_idx = 0,
             .name = nm,
             .trailing_lambda = b.callTrailingLambda(),
             .args = run[0],
             .n_args = run[1],
-            .arg_names = arg_names,
+            .arg_names = arg_names_c,
+            .recv = recv,
+            .func = fid,
+            .candidates = try cmgCandidates(b, mname, callee.Member.name.span.file, run[1]),
+            .type_args = ta_ids,
         } });
-        try b.push(.{ .Move = .{ .dst = dst, .src = v } });
+        return dst;
+    }
+    return null;
+}
+
+/// The registered function for an inline member candidate: matched by
+/// declaration span, else by the parameter-name sequence behind the implicit
+/// `this`, since a user-file instance method is absent from the simple-name
+/// index and carries no declaration span.
+fn registeredFuncForInlineCandidate(b: *FuncBuilder, mname: []const u8, cf: *const ast.Function) ?FuncId {
+
+    for (b.module.funcsBySimpleName(mname)) |cand_fid| {
+        const ds = b.module.decl_span.get(cand_fid.int()) orelse continue;
+        if (ds.file.int() == cf.name.span.file.int() and ds.start == cf.name.span.start) {
+            if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid by span -> {s}\n", .{ mname, if (b.module.funcById(cand_fid)) |cfn| cfn.fqn else "?" });
+            return cand_fid;
+        }
+    }
+    // Instance methods are not in the simple-name index, so
+    // match by declaration span; a user-file method has none,
+    // so identify the overload by its parameter-name sequence
+    // behind the implicit `this`.
+    var fi: u32 = 0;
+    const appended: u32 = @intCast(b.module.appendedFuncCount());
+    const base_n: u32 = @intCast(b.module.func_header_offsets.len);
+    while (fi < appended) : (fi += 1) {
+        const mf = b.module.funcById(FuncId.from(base_n + fi)) orelse continue;
+        if (!std.mem.eql(u8, mf.name, mname)) continue;
+        if (mf.kind != .instance_method) continue;
+        if (mf.params.len != cf.params.len + 1) continue;
+        var all_match = mf.params.len > 0 and std.mem.eql(u8, mf.params[0].name, "this");
+        if (all_match) {
+            for (cf.params, 0..) |*cp, pi| {
+                if (!std.mem.eql(u8, mf.params[pi + 1].name, cp.name.name)) {
+                    all_match = false;
+                    break;
+                }
+            }
+        }
+        if (all_match) {
+            if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid by param names -> {s}\n", .{ mname, mf.fqn });
+            return mf.id;
+        }
+    }
+    return null;
+}
+
+/// A registered function with no type-parameter record cannot bind the
+/// stamped names at runtime, leaving only the splice.
+fn tryUntypedInlineSplice(mi: *MemberInline, cf: *const ast.Function, fid: FuncId) Allocator.Error!?Reg {
+    const c = mi.c;
+    const b = c.b;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+    const mname = mi.mname;
+    const receiver = mi.receiver;
+    const exp_ptr = mi.exp_ptr;
+
+    const tp_rec = b.module.registry.func_type_params.get(fid);
+    const n_rec: usize = if (tp_rec) |l| l.items.len else 0;
+    if (n_rec < cf.type_params.len) {
+        if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid without type params -> splice\n", .{mname});
+        inline_call.splice_route_tag = "lowerCall:6590";
+        if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
+    }
+    return null;
+}
+
+/// A reified inline callee with no written type arguments binds `T` only
+/// through the splice; the typed member call stamps written names and would
+/// otherwise read a stale one.
+fn tryReifiedFirstSplice(mi: *MemberInline, cf: *const ast.Function, fid: FuncId) Allocator.Error!?Reg {
+    const c = mi.c;
+    const b = c.b;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+    const mname = mi.mname;
+    const receiver = mi.receiver;
+    const exp_ptr = mi.exp_ptr;
+
+    var any_reified = false;
+    for (cf.type_params) |*tp| {
+        if (tp.is_reified) any_reified = true;
+    }
+    if (!any_reified) return null;
+// Only when the registered target is this declaration: `cf`
+// came from a simple-name lookup, and another class's
+// same-named inline member must not splice onto this receiver.
+    const cf_recv: ?[]const u8 = if (cf.receiver_type) |*rt|
+        typeHead(std.mem.trimEnd(u8, rt.name.name, "?"))
+    else
+        inline_state.inlineMemberOwner(cf);
+    const mf_reg = b.module.funcById(fid) orelse return null;
+    const mf_recv: ?[]const u8 = if (mf_reg.params.len != 0 and std.mem.eql(u8, mf_reg.params[0].name, "this"))
+        typeHead(std.mem.trimEnd(u8, mf_reg.params[0].ty.name, "?"))
+    else
+        null;
+    const same_target = blk_same: {
+        const cr = cf_recv orelse break :blk_same mf_recv == null;
+        const mr = mf_recv orelse break :blk_same false;
+        break :blk_same std.mem.eql(u8, typeHead(cr), mr);
+    };
+    if (!same_target) return null;
+    // And the call-site receiver must be that type or a
+    // subtype; an untyped receiver keeps the typed call.
+    const site_ty: ?ir.TypeRef = staticExprTypeRef(b, receiver) catch null;
+    const recv_ok = blk_recv: {
+        const mr = mf_recv orelse break :blk_recv site_ty == null;
+        const st = site_ty orelse break :blk_recv false;
+        const sh = typeHead(std.mem.trimEnd(u8, st.name, "?"));
+        break :blk_recv std.mem.eql(u8, sh, mr) or b.module.classIsOrExtends(sh, mr);
+    };
+    if (!recv_ok) return null;
+    if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: reified -> splice first\n", .{mname});
+    inline_call.splice_route_tag = "lowerCall:reified";
+    if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
+    return null;
+}
+
+/// The splice the arm exists for, and the plain dispatch it falls back to
+/// when the splice bails.
+fn spliceOrDispatchMemberInline(mi: *MemberInline, member_target: ?*const ast.Function) Allocator.Error!Reg {
+    const c = mi.c;
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+    const mname = mi.mname;
+    const receiver = mi.receiver;
+    const exp_ptr = mi.exp_ptr;
+
+    inline_call.splice_route_tag = "lowerCall:6623";
+    // A receiver whose static class declares a member that binds this
+    // call outranks any extension in Kotlin's resolution order.
+    const member_binds = member_target == null and try receiverConcreteMemberTakes(b, receiver, mname, args, ast_arg_names);
+    if (!member_binds) {
+        if (try tryInlineCallWithTypeArgs(b, mname, member_target, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
+            if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+                if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-ok] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });
+            }
+            return r;
+        }
+    }
+    if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-bail] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });
+    }
+    // Splice bailed, so dispatch plainly. The body then reads the reified
+    // parameters from the process-wide slot the splice writes, so write
+    // this call's type arguments there first.
+    try storeExplicitReifiedGlobals(b, mname, ast_type_args);
+    const recv = try lowerReceiver(b, receiver);
+    const bail_arity: ?[]const i16 = try memberCallArgArities(b, receiver, mname, args, ast_arg_names);
+    const run = try lowerArgRunWithArity(b, args, bail_arity);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const nm = try b.module.internConst(b.allocator, .{ .String = mname });
+    const dst = b.allocReg();
+    // An unsafe cast's target fixes the static type for overload
+    // resolution even on this bail, so a deprecated stub cast to its
+    // supertype does not re-bind itself and self-recurse.
+    const bail_declared: ?ir.ConstId = blk: {
+        if (receiver.* != .As or receiver.As.safe) break :blk null;
+        const t = argDeclTypeRef(b, receiver) orelse break :blk null;
+        const head = std.mem.trimEnd(u8, t.name, "?");
+        if (head.len == 0) break :blk null;
+        break :blk try b.module.internConst(b.allocator, .{ .String = head });
+    };
+    try b.push(.{ .CallMember = .{
+        .dst = dst,
+        .receiver = recv,
+        .name = nm,
+        .trailing_lambda = b.callTrailingLambda(),
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .declared_recv = bail_declared,
+    } });
+    return dst;
+}
+
+
+/// An explicit-receiver call to a no-lambda inline extension on a scalar
+/// receiver splices as kotlinc inlines it. Scalar heads with no member
+/// namesake in the program only, since a member would outrank it.
+fn tryScalarExtensionSplice(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+    if (!(!c.is_infix and callee.* == .Member and !callee.Member.safe and
+        ast_type_args.len == 0 and args.len <= 2 and
+        inline_call.rfsEnabled() and
+        !lastArgIsLambdaOrAnon(args))) return null;
+
+    const mname = callee.Member.name.name;
+    const receiver = callee.Member.receiver;
+    const sxt = if (runtime.envOnce("KLIO_SEXT_TRACE")) |w| std.mem.eql(u8, w, mname) else false;
+    const cands = inline_state.candidatesForName(mname) orelse {
+        if (sxt) std.debug.print("[sext] {s}: no candidates\n", .{mname});
+        return null;
+    };
+    const head = (try inline_call.gateReceiverHead(b, receiver)) orelse {
+        if (sxt) std.debug.print("[sext] {s}: no receiver head (in {s})\n", .{ mname, build.currentRealFn() orelse "-" });
+        return null;
+    };
+    const h = typeHead(std.mem.trimEnd(u8, head, "?"));
+    if (sxt) std.debug.print("[sext] {s}: head={s} in {s}\n", .{ mname, h, build.currentRealFn() orelse "-" });
+    // `class_member_names` is owner-blind, so any class declaring the name
+    // would suppress the splice program-wide; on a scalar head only the
+    // scalar's own hierarchy can outrank the extension.
+    if (b.module.registry.class_member_names.contains(mname)) {
+        const shadowed = blk: {
+            const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk true;
+            if (!hs.complete) break :blk true;
+            break :blk hs.names.contains(mname);
+        };
+        if (shadowed) return null;
+    }
+    const scalar = for ([_][]const u8{
+        "Int",   "Long",  "Short",  "Byte",  "Char", "Boolean",
+        "Float", "Double", "UInt",  "ULong", "UShort", "UByte",
+    }) |sc| {
+        if (std.mem.eql(u8, h, sc)) break true;
+    } else false;
+    if (!scalar) return null;
+    for (cands) |cf| {
+        const rt = cf.receiver_type orelse continue;
+        if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, rt.name.name, "?")), h)) continue;
+        if (cf.params.len != args.len) continue;
+        var has_fn_or_vararg = false;
+        for (cf.params) |*p| {
+            if (p.ty.function != null or p.is_vararg) has_fn_or_vararg = true;
+        }
+        if (has_fn_or_vararg) continue;
+        if (anyReified(cf.type_params)) continue;
+        // Scalar overload sets differ only by parameter width, so every
+        // argument's derived head must equal the declared param head.
+        var args_match = true;
+        for (cf.params, 0..) |*p, pi| {
+            const want = typeHead(std.mem.trimEnd(u8, p.ty.name.name, "?"));
+            var got_owned: ?ir.TypeRef = null;
+            defer if (got_owned) |*t| t.deinit(b.allocator);
+            const got: ?ir.TypeRef = argDeclTypeRefLazy(b, &args[pi]) orelse gblk: {
+                got_owned = try staticExprTypeRef(b, &args[pi]);
+                break :gblk got_owned;
+            };
+            const gv = got orelse {
+                args_match = false;
+                break;
+            };
+            if (!std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, gv.name, "?")), want)) {
+                args_match = false;
+                break;
+            }
+        }
+        if (!args_match) continue;
+        const expected0 = b.peekExpected();
+        const exp_ptr0: ?*const ast.TypeRef = if (expected0) |*_e| _e else null;
+        inline_call.splice_route_tag = "lowerCall:6755";
+        if (try inline_call.tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr0)) |r| {
+            return r;
+        }
+        break;
+    }
+    return null;
+}
+
+
+/// A qualified member-inline call whose lambda carries a labeled return
+/// targeting an open splice must splice: the label names a frameless scope in
+/// the caller, which a dynamic dispatch cannot deliver a return to.
+fn trySplicedLabelSplice(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+    if (!(!c.is_infix and callee.* == .Member and !callee.Member.safe and
+        inline_call.argLambdaTargetsSplicedLabel(b, args))) return null;
+
+    const mname = callee.Member.name.name;
+    const receiver = callee.Member.receiver;
+    const expected = b.peekExpected();
+    const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
+    if (inline_state.candidatesForName(mname)) |cands| {
+        // Strict owner evidence only: a lenient unknown-receiver keep would
+        // splice an unrelated same-named member.
+        const head = try inline_call.gateReceiverHead(b, receiver);
+        if (head != null) {
+            for (cands) |cf| {
+                if (cf.receiver_type != null) continue;
+                const owner = inline_state.inlineMemberOwner(cf) orelse continue;
+            // A duplicated class name is uniquified per file at registration
+            // (`SlotTable$f356`) while the inferred head keeps the
+            // source-level name, so accept a base-name match too.
+                const owner_base = if (std.mem.find(u8, owner, "$f")) |i| owner[0..i] else owner;
+                if (!classIsOrExtendsHosted(b, head.?, owner) and
+                    !std.mem.eql(u8, head.?, owner_base)) continue;
+                inline_call.splice_route_tag = "lowerCall:6794";
+                if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
+                    return r;
+                }
+                break;
+            }
+        }
+    }
+    return null;
+}
+
+
+/// An explicit-receiver call to a top-level inline extension with an fn-typed
+/// last param fed a lambda splices. The declared receiver may be a concrete
+/// head or a bounded fn type param the derived head extends; unbounded `T` and
+/// unknown heads keep other routes, and a member of the head's own hierarchy
+/// outranks the extension.
+fn tryExtensionLambdaSplice(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+    if (!(!c.is_infix and callee.* == .Member and !callee.Member.safe and
+        ast_type_args.len == 0 and args.len >= 1 and
+        !std.mem.eql(u8, runtime.envOnce("KLIO_XLE") orelse "1", "0") and
+        !inline_call.argLambdaTargetsLabel(args, callee.Member.name.name))) return null;
+
+    const mname = callee.Member.name.name;
+    const receiver = callee.Member.receiver;
+    const xlt = if (runtime.envOnce("KLIO_XLE_TRACE")) |w|
+        (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, mname))
+    else
+        false;
+    const last = &args[args.len - 1];
+    const last_forwarded = last.* == .Path and last.Path.segments.len == 1 and
+        b.inlineLambdaFor(last.Path.segments[0].name) != null;
+    if (last.* != .Lambda and last.* != .AnonFun and !last_forwarded) return null;
+    const cands = inline_state.candidatesForName(mname) orelse return null;
+    // Declared evidence only: an unsafe cast's target, a declared local or
+    // param type, a constructor call, or the enclosing extension's receiver
+    // for `this`. The general chain resolves overloaded returns heuristically
+    // and can hand back a supertype whose eager overload misfits.
+    const head0: []const u8 = blk: {
+        switch (receiver.*) {
+            .As => |a| {
+                if (a.safe) return null;
+                break :blk a.ty.name.name;
+            },
+            .This => |t| {
+                if (t.qualifier != null) return null;
+                break :blk b.recvTy() orelse return null;
+            },
+            else => {
+                if (argDeclTypeRefLazy(b, receiver)) |ty| break :blk ty.name;
+                return null;
+            },
+        }
+    };
+    const h = typeHead(std.mem.trimEnd(u8, head0, "?"));
+    if (b.module.registry.class_member_names.contains(mname)) {
+        const cid = b.module.classIdIndexed(h, b.self_package, callee.Member.name.span.file) orelse {
+            if (xlt) std.debug.print("[xle] {s}: head {s} unresolvable for shadow check\n", .{ mname, h });
+            return null;
+        };
+        if (b.module.classHierarchyDeclaresMember(cid, mname)) {
+            if (xlt) std.debug.print("[xle] {s}: member shadows on {s}\n", .{ mname, h });
+            return null;
+        }
+    }
+    var picked: ?*const ast.Function = null;
+    var ambiguous = false;
+    for (cands) |cf| {
+        if (inline_state.inlineMemberOwner(cf) != null) continue;
+        const rt = cf.receiver_type orelse continue;
+        if (cf.params.len != args.len) continue;
+        if (anyReified(cf.type_params)) continue;
+        if (anyCrossOrNoinlineParam(cf)) continue;
+        if (cf.params[cf.params.len - 1].ty.function == null) continue;
+        const rhead = typeHead(std.mem.trimEnd(u8, rt.name.name, "?"));
+        var head_ok = std.mem.eql(u8, rhead, h);
+        if (!head_ok) {
+            for (cf.type_params) |tp| {
+                if (!std.mem.eql(u8, tp.name.name, rhead)) continue;
+                const ub = tp.upper_bound orelse break;
+                const ub_head = typeHead(std.mem.trimEnd(u8, ub.name.name, "?"));
+                head_ok = b.module.classIsOrExtends(h, ub_head);
+                break;
+            }
+        }
+        if (!head_ok) continue;
+        if (picked != null) {
+            ambiguous = true;
+            break;
+        }
+        picked = cf;
+    }
+    if (ambiguous) {
+        if (xlt) std.debug.print("[xle] {s}: ambiguous candidates\n", .{mname});
+        return null;
+    }
+    const cf = picked orelse {
+        if (xlt) std.debug.print("[xle] {s}: no applicable candidate (head {s})\n", .{ mname, h });
+        return null;
+    };
+    if (xlt) std.debug.print("[xle] {s}: splicing head={s} in {s}\n", .{ mname, h, build.currentRealFn() orelse "-" });
+    const expected0 = b.peekExpected();
+    const exp_ptr0: ?*const ast.TypeRef = if (expected0) |*_e| _e else null;
+    inline_call.splice_route_tag = "lowerCall:6899";
+    if (try inline_call.tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr0)) |r| {
+        return r;
+    }
+    return null;
+}
+
+
+/// `recv?.m(args)`: null-guard the whole call.
+fn lowerSafeMemberCall(c: *CallCtx) Allocator.Error!Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+    const expr = c.expr;
+
+    const receiver = callee.Member.receiver;
+    const name = callee.Member.name;
+    const recv = try lowerReceiver(b, receiver);
+    const null_r = try b.emitConst(.Null);
+    const is_null = b.allocReg();
+    try b.push(.{ .BinOp = .{ .dst = is_null, .op = .Eq, .lhs = recv, .rhs = null_r } });
+    const then_b = try b.allocBlock();
+    const else_b = try b.allocBlock();
+    const join = try b.allocBlock();
+    const dst = b.allocReg();
+    b.terminate(.{ .Branch = .{ .cond = is_null, .t = then_b, .f = else_b } });
+    b.switchTo(then_b);
+    const n = try b.emitConst(.Null);
+    try b.push(.{ .Move = .{ .dst = dst, .src = n } });
+    b.terminate(.{ .Goto = join });
+    b.switchTo(else_b);
+    // The receiver is proven non-null here, so declared nullability no longer
+    // disqualifies a member, and it is already in a register.
+    const declared_from_expr = argDeclTypeRef(b, receiver);
+    // The full static deriver, matching the plain member path.
+    var inferred_ty: ?ir.TypeRef = if (declared_from_expr == null)
+        try staticExprTypeRef(b, receiver)
+    else
+        null;
+    defer if (inferred_ty) |*t| t.deinit(b.allocator);
+    switch (try lowerResolvedMemberCall(
+        b,
+        receiver,
+        name,
+        args,
+        ast_arg_names,
+        ast_type_args,
+        declared_from_expr orelse inferred_ty,
+        .{ .reg = recv, .non_null = true },
+    )) {
+        .lowered => |reg| {
+            try b.push(.{ .Move = .{ .dst = dst, .src = reg } });
+            b.terminate(.{ .Goto = join });
+            b.switchTo(join);
+            return dst;
+        },
+        .deferred, .none => {},
+    }
+    // The ordinary call path has more to try, an inline splice above all:
+    // `x?.let { it.f() }` gives `it` the non-null receiver type in Kotlin,
+    // which a runtime member call does not. Rewrite onto a temporary holding
+    // the already-lowered receiver.
+    if (declared_from_expr orelse inferred_ty) |rty| non_null_rewrite: {
+        const nn_name = std.mem.trimEnd(u8, rty.name, "?");
+        if (nn_name.len == 0) break :non_null_rewrite;
+        const tmp_name = try std.fmt.allocPrint(b.allocator, "$nn{d}", .{recv});
+        var tmp_ty = try rty.clone(b.allocator);
+        tmp_ty.nullable = false;
+        b.allocator.free(tmp_ty.name);
+        tmp_ty.name = try b.allocator.dupe(u8, nn_name);
+        try b.pushScope();
+        try b.bind(tmp_name, recv);
+        try b.setLocalDeclTypeOwned(tmp_name, tmp_ty);
+        var segs = [_]ast.Ident{.{ .name = tmp_name, .span = receiver.span() }};
+        var recv_expr = Expr{ .Path = .{ .segments = segs[0..], .span = receiver.span() } };
+        var plain_callee = Expr{ .Member = .{
+            .receiver = &recv_expr,
+            .name = name,
+            .safe = false,
+            .span = callee.span(),
+        } };
+        var plain = expr.Call;
+        plain.callee = &plain_callee;
+        const rewritten = Expr{ .Call = plain };
+        const rv = try lowerCall(b, &rewritten);
+        try b.popScope();
+        try b.push(.{ .Move = .{ .dst = dst, .src = rv } });
         b.terminate(.{ .Goto = join });
         b.switchTo(join);
         return dst;
     }
+    const run = try lowerArgRun(b, args);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
+    const v = b.allocReg();
+    try b.push(.{ .CallMember = .{
+        .dst = v,
+        .receiver = recv,
+        .name = nm,
+        .trailing_lambda = b.callTrailingLambda(),
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+    } });
+    try b.push(.{ .Move = .{ .dst = dst, .src = v } });
+    b.terminate(.{ .Goto = join });
+    b.switchTo(join);
+    return dst;
+}
 
-    // `repeat(n) { … }`: inline-desugar to a counted loop.
-    if (!is_infix and args.len == 2 and args[1] == .Lambda and
+
+/// `repeat(n) { … }`: inline-desugar to a counted loop.
+fn tryRepeatDesugar(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    if (!c.is_infix and args.len == 2 and args[1] == .Lambda and
         callee.* == .Path and callee.Path.segments.len == 1 and
         std.mem.eql(u8, callee.Path.segments[0].name, "repeat") and
         b.resolve("repeat") == null and b.module.funcId("repeat") == null)
     {
-        return lowerRepeat(b, &args[0], &args[1]);
+        return try lowerRepeat(b, &args[0], &args[1]);
     }
+    return null;
+}
 
-    // Calls containing a `*spread` argument.
+
+/// Calls containing a `*spread` argument.
+fn trySpreadCall(c: *CallCtx) Allocator.Error!?Reg {
+    const b = c.b;
+    const callee = c.callee;
+    const args = c.args;
+    const ast_arg_names = c.ast_arg_names;
+    const ast_type_args = c.ast_type_args;
+
     if (anySpread(args)) {
         if (callee.* == .Member and !callee.Member.safe) {
             const member = callee.Member;
@@ -1355,12 +1678,11 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 .deferred, .none => {},
             }
         }
-        return lowerCallSpread(b, callee, args, ast_arg_names);
+        return try lowerCallSpread(b, callee, args, ast_arg_names);
     }
-
-    b.call_tail = call_tail;
-    return lowerCallGeneral(b, expr);
+    return null;
 }
+
 
 /// Whether any argument is written `expr as Any` / `as Any?`.
 pub fn anyCastToAny(args: []const Expr) bool {

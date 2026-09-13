@@ -421,6 +421,7 @@ fn topLevelNameExists(b: *FuncBuilder, name: []const u8) bool {
     return b.module.registry.top_level_prop_pkgs.contains(name);
 }
 
+/// Lower a path expression: a bare name, or a dotted chain of field reads.
 pub fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const segments = expr.Path.segments;
     const span0 = expr.Path.span;
@@ -430,505 +431,737 @@ pub fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (segments.len == 1) {
         if (try lowerDelegateRead(b, segments[0].name)) |r| return r;
     }
+    if (try tryFilePrivatePropRename(b, segments, span0)) |r| return r;
+    if (try tryClassConstInline(b, segments)) |r| return r;
+    if (try tryScopeRenamedHead(b, segments, span0)) |r| return r;
+    if (segments.len == 1) return lowerBareName(b, segments);
+    if (try tryPackageQualifiedGlobal(b, segments)) |r| return r;
+    return lowerDottedPath(b, segments);
+}
 
-    // A bare reference from the declaring file resolves to the per-file mangled
-    // global, unless shadowed.
+/// A bare reference from the declaring file resolves to the per-file mangled
+/// global, unless shadowed.
+fn tryFilePrivatePropRename(b: *FuncBuilder, segments: []const ast.Ident, span0: ast.Span) Allocator.Error!?Reg {
+
     if (filePrivatePropRename(b, segments[0].name, segments[0].span.file.int())) |renamed| {
         const new_segs = try b.allocator.dupe(ast.Ident, segments);
         defer b.allocator.free(new_segs);
         new_segs[0] = .{ .name = renamed, .span = segments[0].span };
         const rewritten = Expr{ .Path = .{ .segments = new_segs, .span = span0 } };
-        return lowerExpr(b, &rewritten);
+        return try lowerExpr(b, &rewritten);
     }
+    return null;
+}
 
-    // `const val name = <literal>` inline.
+/// `const val name = <literal>` inline.
+fn tryClassConstInline(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+
     if (segments.len == 1 and b.ownerClass() != null and b.resolve(segments[0].name) == null) {
         const owner = b.ownerClass().?;
         if (b.module.registry.class_const_inits.get(.{ .a = owner, .b = segments[0].name })) |c| {
-            return b.emitConst(c);
+            return try b.emitConst(c);
         }
     }
-    // Mangled nested-class/object alias and file-private type rewrite.
-    {
-        const renamed = scopeTypeRename(b, segments[0].name, segments[0].span.file.int());
-        if (renamed != null and b.resolve(segments[0].name) == null) {
-            const new_segs = try b.allocator.dupe(ast.Ident, segments);
-            defer b.allocator.free(new_segs);
-            new_segs[0] = .{ .name = renamed.?, .span = segments[0].span };
-            const rewritten = Expr{ .Path = .{ .segments = new_segs, .span = span0 } };
-            return lowerExpr(b, &rewritten);
-        }
-    }
+    return null;
+}
 
-    if (segments.len == 1) {
-        const name0 = segments[0].name;
-        // Bare `Unit` is the Unit singleton value.
-        if (std.mem.eql(u8, name0, "Unit") and b.resolve("Unit") == null) {
-            return b.emitConst(.Unit);
-        }
-        // Splice hygiene for the suspend-implicit `coroutineContext`: inside a
-        // spliced inline-fn body, the bare name means the intrinsic, since the
-        // callee could not see a caller local sharing it.
-        if (std.mem.eql(u8, name0, "coroutineContext") and b.lambda_splice_resolve == null) {
-            if (b.inlineLambdaCallerDepth()) |base| {
-                if (b.resolveSpliceLocal(name0, base) == null) {
-                    const dst = b.allocReg();
-                    const n = try b.module.internConst(b.allocator, .{ .String = "coroutineContext" });
-                    try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
-                    return dst;
-                }
-            }
-        }
-        // A renamed import binds this spelling to another declaration, and a bare
-        // property read has no other alias path.
-        if (bareAliasTargetName(b, &segments[0])) |target| {
-            const dst = b.allocReg();
-            const n = try b.module.internConst(b.allocator, .{ .String = target });
-            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
-            return dst;
-        }
-        if (b.resolve(name0)) |r| {
-            if (runtime.envOnce("KLIO_BARE_TRACE")) |w| if (std.mem.eql(u8, w, name0)) {
-                std.debug.print("[bare-read-local] {s} reg={d} in={s} window={}\n", .{ name0, r.int(), build.currentRealFn() orelse "-", b.lambda_splice_resolve != null });
-            };
-            if (b.isBoxed(name0)) {
+/// Mangled nested-class/object alias and file-private type rewrite.
+fn tryScopeRenamedHead(b: *FuncBuilder, segments: []const ast.Ident, span0: ast.Span) Allocator.Error!?Reg {
+
+    const renamed = scopeTypeRename(b, segments[0].name, segments[0].span.file.int());
+    if (renamed != null and b.resolve(segments[0].name) == null) {
+        const new_segs = try b.allocator.dupe(ast.Ident, segments);
+        defer b.allocator.free(new_segs);
+        new_segs[0] = .{ .name = renamed.?, .span = segments[0].span };
+        const rewritten = Expr{ .Path = .{ .segments = new_segs, .span = span0 } };
+        return try lowerExpr(b, &rewritten);
+    }
+    return null;
+}
+
+/// A single-segment path: the bare-name resolution ladder, in Kotlin's scope
+/// order. Each rung either binds the name or declines to the next.
+fn lowerBareName(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!Reg {
+    const name0 = segments[0].name;
+    if (try tryUnitSingleton(b, name0)) |r| return r;
+    if (try tryCoroutineContextIntrinsic(b, name0)) |r| return r;
+    if (try tryRenamedImportAlias(b, segments)) |r| return r;
+    if (try tryBoundLocal(b, name0)) |r| return r;
+    if (try tryAnonObjectCapture(b, name0)) |r| return r;
+    if (try tryLambdaCapture(b, name0)) |r| return r;
+    if (try tryUnboundIt(b, segments)) |r| return r;
+    if (try tryCoroutineContextMember(b, name0)) |r| return r;
+    if (try tryOwnMemberRead(b, name0)) |r| return r;
+    if (try tryOwnCompanionRead(b, segments)) |r| return r;
+    if (try tryAnonScopeClass(b, name0)) |r| return r;
+    if (try tryTopLevelConstInline(b, segments)) |r| return r;
+    if (try tryImportedCompanionMember(b, segments)) |r| return r;
+    if (try tryClassReference(b, segments)) |r| return r;
+    if (try tryBuiltinTypeName(b, name0)) |r| return r;
+    if (try tryImportRewrites(b, segments)) |r| return r;
+    if (try tryTopLevelPropRead(b, segments)) |r| return r;
+    if (try tryTopLevelFnValueRef(b, segments)) |r| return r;
+    traceBareName(b, segments);
+    if (try tryBareThisRead(b, segments)) |r| return r;
+    if (try tryNoReceiverGlobalRead(b, segments)) |r| return r;
+    return emitBareThisOrGlobal(b, segments);
+}
+
+
+/// Bare `Unit` is the Unit singleton value.
+fn tryUnitSingleton(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+    if (std.mem.eql(u8, name0, "Unit") and b.resolve("Unit") == null) {
+        return try b.emitConst(.Unit);
+    }
+    return null;
+}
+
+
+/// Splice hygiene for the suspend-implicit `coroutineContext`: inside a
+/// spliced inline-fn body, the bare name means the intrinsic, since the callee
+/// could not see a caller local sharing it.
+fn tryCoroutineContextIntrinsic(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+    if (std.mem.eql(u8, name0, "coroutineContext") and b.lambda_splice_resolve == null) {
+        if (b.inlineLambdaCallerDepth()) |base| {
+            if (b.resolveSpliceLocal(name0, base) == null) {
                 const dst = b.allocReg();
-                try b.push(.{ .CellGet = .{ .dst = dst, .cell = r } });
-                return lateinitLocalRead(b, name0, dst, r);
+                const n = try b.module.internConst(b.allocator, .{ .String = "coroutineContext" });
+                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+                return dst;
             }
-            return lateinitLocalRead(b, name0, r, r);
         }
-        // Whether a capture is a shared Cell is decided by the capture site's
-        // builder, invisible here, so always read through CellGet, which passes a
-        // non-cell value unchanged.
-        if (isLowerAnonCapture(name0)) {
-            const cell = try b.loadCaptureHoisted(name0);
+    }
+    return null;
+}
+
+
+/// A renamed import binds this spelling to another declaration, and a bare
+/// property read has no other alias path.
+fn tryRenamedImportAlias(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    if (bareAliasTargetName(b, &segments[0])) |target| {
+        const dst = b.allocReg();
+        const n = try b.module.internConst(b.allocator, .{ .String = target });
+        try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
+        return dst;
+    }
+    return null;
+}
+
+
+/// A name bound in a lexical scope, read through its cell when boxed.
+fn tryBoundLocal(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+    if (b.resolve(name0)) |r| {
+        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| if (std.mem.eql(u8, w, name0)) {
+            std.debug.print("[bare-read-local] {s} reg={d} in={s} window={}\n", .{ name0, r.int(), build.currentRealFn() orelse "-", b.lambda_splice_resolve != null });
+        };
+        if (b.isBoxed(name0)) {
+            const dst = b.allocReg();
+            try b.push(.{ .CellGet = .{ .dst = dst, .cell = r } });
+            return try lateinitLocalRead(b, name0, dst, r);
+        }
+        return try lateinitLocalRead(b, name0, r, r);
+    }
+    return null;
+}
+
+
+/// Whether a capture is a shared Cell is decided by the capture site's
+/// builder, invisible here, so always read through CellGet, which passes a
+/// non-cell value unchanged.
+fn tryAnonObjectCapture(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+    if (isLowerAnonCapture(name0)) {
+        const cell = try b.loadCaptureHoisted(name0);
+        const dst = b.allocReg();
+        try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
+        return try lateinitLocalRead(b, name0, dst, null);
+    }
+    return null;
+}
+
+
+/// Lambda-body capture.
+fn tryLambdaCapture(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+    if (b.knowsOuter(name0)) {
+        const cell = try b.loadCaptureHoisted(name0);
+        if (b.isBoxed(name0)) {
             const dst = b.allocReg();
             try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
-            return lateinitLocalRead(b, name0, dst, null);
+            return try lateinitLocalRead(b, name0, dst, null);
         }
-        // Lambda-body capture.
-        if (b.knowsOuter(name0)) {
-            const cell = try b.loadCaptureHoisted(name0);
-            if (b.isBoxed(name0)) {
+        return try lateinitLocalRead(b, name0, cell, null);
+    }
+    return null;
+}
+
+
+/// An `it` with no lambda supplying one is an unresolved reference in Kotlin;
+/// record the diagnostic so the driver fails before the run.
+fn tryUnboundIt(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    if (b.it_suppressed and std.mem.eql(u8, name0, "it")) {
+        try b.module.resolve_diags.append(b.allocator, .{
+            .name = "it",
+            .fqn_a = "",
+            .fqn_b = "",
+            .span = segments[0].span,
+            .kind = .unresolved_local,
+        });
+        return try b.emitConst(.Unit);
+    }
+    return null;
+}
+
+
+/// A bare `coroutineContext` member of the implicit receiver.
+fn tryCoroutineContextMember(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+    if (std.mem.eql(u8, name0, "coroutineContext") and b.hasOwnMember("coroutineContext")) {
+        if (b.resolve("this")) |this_reg| {
+            const dst = b.allocReg();
+            const field = try b.module.internConst(b.allocator, .{ .String = "$coroutineContext$explicit" });
+            try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = field } });
+            return dst;
+        }
+    }
+    return null;
+}
+
+
+/// Member read on `this` when the owning class declares the name. A
+/// companioned class name is its companion singleton, and a nested classifier
+/// is a class reference, so both are excepted.
+fn tryOwnMemberRead(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+    if (b.hasOwnMember(name0) and !classWithCompanion(b, name0) and
+        !spliceSubjectHidesOwnMember(b, name0))
+    {
+        if (b.resolve("this")) |this_reg| {
+            const dst = b.allocReg();
+            const nm = try sgetterName(b, name0);
+            try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
+            return dst;
+        }
+    // Superclass-ctor delegation thunk: a bare own-member is a companion access.
+        if (b.isParamThunk()) {
+            if (b.ownerClass()) |owner| {
+                const cls = b.allocReg();
+                const on = try b.module.internConst(b.allocator, .{ .String = owner });
+                try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on } });
                 const dst = b.allocReg();
-                try b.push(.{ .CellGet = .{ .dst = dst, .cell = cell } });
-                return lateinitLocalRead(b, name0, dst, null);
-            }
-            return lateinitLocalRead(b, name0, cell, null);
-        }
-        // An `it` with no lambda supplying one is an unresolved reference in
-        // Kotlin; record the diagnostic so the driver fails before the run.
-        if (b.it_suppressed and std.mem.eql(u8, name0, "it")) {
-            try b.module.resolve_diags.append(b.allocator, .{
-                .name = "it",
-                .fqn_a = "",
-                .fqn_b = "",
-                .span = segments[0].span,
-                .kind = .unresolved_local,
-            });
-            return b.emitConst(.Unit);
-        }
-        // A bare `coroutineContext` member of the implicit receiver.
-        if (std.mem.eql(u8, name0, "coroutineContext") and b.hasOwnMember("coroutineContext")) {
-            if (b.resolve("this")) |this_reg| {
-                const dst = b.allocReg();
-                const field = try b.module.internConst(b.allocator, .{ .String = "$coroutineContext$explicit" });
-                try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = field } });
+                const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+                try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = nm } });
                 return dst;
             }
         }
-        // Member read on `this` when the owning class declares the name. A
-        // companioned class name is its companion singleton, and a nested
-        // classifier is a class reference, so both are excepted.
-        if (b.hasOwnMember(name0) and !classWithCompanion(b, name0) and
-            !spliceSubjectHidesOwnMember(b, name0))
-        {
-            if (b.resolve("this")) |this_reg| {
+    }
+    return null;
+}
+
+
+/// A bare reference to the enclosing type's own companion resolves to that
+/// singleton; a companion with a supertype is also a classId under its simple
+/// name and would otherwise route to the class reference. Loaded by exact class
+/// id, since a bare head inside a body extending a same-named nested type names
+/// the inherited one.
+fn tryOwnCompanionRead(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    if (b.ownerClass()) |owner| {
+        const comp_mangled: ?[]const u8 = b.module.registry.companion_singletons.get(owner);
+        if (comp_mangled) |cm| {
+            const simple = if (std.mem.findScalarLast(u8, cm, '$')) |i| cm[i + 1 ..] else cm;
+            if (std.mem.eql(u8, simple, name0)) {
+                const cls = b.allocReg();
+                const on = try b.module.internConst(b.allocator, .{ .String = owner });
+                const cid = b.module.classIdIndexed(owner, b.self_package, segments[0].span.file);
+                try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on, .class = cid } });
                 const dst = b.allocReg();
-                const nm = try sgetterName(b, name0);
-                try b.push(.{ .GetField = .{ .dst = dst, .receiver = this_reg, .field = nm } });
+                const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+                try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = nm } });
                 return dst;
             }
-        // Superclass-ctor delegation thunk: a bare own-member is a companion access.
-            if (b.isParamThunk()) {
-                if (b.ownerClass()) |owner| {
-                    const cls = b.allocReg();
-                    const on = try b.module.internConst(b.allocator, .{ .String = owner });
-                    try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on } });
-                    const dst = b.allocReg();
-                    const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-                    try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = nm } });
-                    return dst;
-                }
-            }
         }
-        // A bare reference to the enclosing type's own companion resolves to that
-        // singleton; a companion with a supertype is also a classId under its
-        // simple name and would otherwise route to the class reference. Loaded by
-        // exact class id, since a bare head inside a body extending a same-named
-        // nested type names the inherited one.
-        if (b.ownerClass()) |owner| {
-            const comp_mangled: ?[]const u8 = b.module.registry.companion_singletons.get(owner);
-            if (comp_mangled) |cm| {
-                const simple = if (std.mem.findScalarLast(u8, cm, '$')) |i| cm[i + 1 ..] else cm;
-                if (std.mem.eql(u8, simple, name0)) {
-                    const cls = b.allocReg();
-                    const on = try b.module.internConst(b.allocator, .{ .String = owner });
-                    const cid = b.module.classIdIndexed(owner, b.self_package, segments[0].span.file);
-                    try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on, .class = cid } });
-                    const dst = b.allocReg();
-                    const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-                    try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = nm } });
-                    return dst;
-                }
-            }
-        }
-        // Runtime-lowered anon-object bodies carry the classifier identities
-        // visible at their lexical site, and their side modules have no class
-        // index, so bind by FQN after locals, captures, and members.
-        if (build.anonScopeClass(name0)) |class_ref| {
-            const cls = b.allocReg();
-            const fqn = try b.module.internConst(b.allocator, .{ .String = class_ref.fqn });
-            try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = fqn } });
-            if (!class_ref.has_companion) return cls;
-            const dst = b.allocReg();
-            const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
-            try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = sentinel } });
-            return dst;
-        }
-        // Kotlin inlines a visible top-level `const val` at every reference, and
-        // it outranks a class binding from a less-visible scope.
-        if (b.resolve(name0) == null and !b.knowsOuter(name0) and
-            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
-            !build.anonCaptureBinds(name0))
-        {
-            if (b.module.topLevelConstLiteral(name0, b.self_package, segments[0].span.file)) |cv| {
-                const ptier = b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 255;
-                const ctier = b.module.classRefTier(name0, b.self_package, segments[0].span.file) orelse 255;
-                if (ptier < ctier) {
-                    orEmitAudit(b, "top_level_prop", "ConstInline", name0);
-                    return try b.emitConst(cv);
-                }
-            }
-        }
-        // A named companion-member import outranks a same-named class in
-        // expression position, where the classifier only matters in type position.
-        if (b.resolve(name0) == null and !b.knowsOuter(name0) and
-            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0))
-        {
-            if (importCompanionRewrite(b, segments[0].span.file, name0)) |rw| {
-                const sp = segments[0].span;
-                const rsegs = try b.allocator.alloc(ast.Ident, rw.segs.len);
-                for (rw.segs, 0..) |s2, k| rsegs[k] = .{ .name = s2, .span = sp };
-                const qualified = Expr{ .Path = .{ .segments = rsegs, .span = sp } };
-                return lowerExpr(b, &qualified);
-            }
-        }
-        // A bare name that is a known class is a class reference, but in a receiver
-        // context a runtime member shadows the classifier, so the read decides at
-        // runtime with the index-resolved class as the exact global arm. `classId`
-        // is null under collision-mangling, where an explicit import still names one.
-        if ((b.module.classId(name0) != null or
-            b.module.classIdExactImport(name0, segments[0].span.file) != null) and
-            (!enclosingMemberShadowsClass(b, name0) or classWithCompanion(b, name0)))
-        {
-            const n = try b.module.internConst(b.allocator, .{ .String = name0 });
-            const cls = b.allocReg();
-            if (inReceiverContext(b)) {
-                const this_idx = try b.recordCapture("this");
-                orEmitAudit(b, "class_name_value", "LoadFromThisOrGlobal", name0);
-                try b.push(.{ .LoadFromThisOrGlobal = .{
-                    .dst = cls,
-                    .this_idx = this_idx,
-                    .name = n,
-                    .class = scopedClassIdForRead(b, name0, segments[0].span.file),
-                } });
-            } else {
-                orEmitAudit(b, "class_name_value", "LoadGlobal", name0);
-                try b.push(.{ .LoadGlobal = .{
-                    .dst = cls,
-                    .name = n,
-                    .class = scopedClassIdForRead(b, name0, segments[0].span.file),
-                } });
-            }
-            const dst = b.allocReg();
-            const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
-            try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = sentinel } });
-            return dst;
-        }
-        // Outside any receiver context nothing can shadow a builtin type name.
-        if (isBuiltinTypeName(name0)) {
-            const name = try b.module.internConst(b.allocator, .{ .String = name0 });
-            const dst = b.allocReg();
-            if (inReceiverContext(b)) {
-                const this_idx = try b.recordCapture("this");
-                orEmitAudit(b, "builtin_type_name", "LoadFromThisOrGlobal", name0);
-                try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = name } });
-            } else {
-                orEmitAudit(b, "builtin_type_name", "LoadGlobal", name0);
-                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = name } });
-            }
-            return dst;
-        }
-        // An imported companion member rewrites to the qualified `C.MEMBER` access.
-        if (b.resolve(name0) == null) {
-            if (importCompanionRewrite(b, segments[0].span.file, name0)) |rw| {
-                const sp = segments[0].span;
-                const rsegs = try b.allocator.alloc(ast.Ident, rw.segs.len);
-                for (rw.segs, 0..) |s, k| rsegs[k] = .{ .name = s, .span = sp };
-                const qualified = Expr{ .Path = .{ .segments = rsegs, .span = sp } };
-                return lowerExpr(b, &qualified);
-            }
-        // A member brought in bare by `import EnumOrObject.*`. An implicit-receiver
-        // member shadows a star-import, including one of a lexically enclosing
-        // receiver that `hasOwnMember` misses inside a lambda, and so does a
-        // same-scope top-level declaration.
-            if (!b.hasEnclosingMember(name0) and !isTopLevelProp(name0) and
-                !b.module.hasBareCallCandidate(name0, segments[0].span.file))
-            {
-                if (wildcardClassMemberRewrite(b, segments[0].span.file)) |cls| {
-                    const sp = segments[0].span;
-                    var rsegs = [_]ast.Ident{
-                        .{ .name = cls, .span = sp },
-                        .{ .name = name0, .span = sp },
-                    };
-                    const qualified = Expr{ .Path = .{ .segments = &rsegs, .span = sp } };
-                    return lowerExpr(b, &qualified);
-                }
-            }
-        }
-        // A known top-level property is a global read unless a runtime implicit
-        // receiver could shadow it, since kotlinc resolves implicit-receiver
-        // members ahead of package-scope properties. A class visible from this
-        // scope also outranks a top-level property the file never imported; an
-        // `object` has no property tier and stays on the top-level path.
-        const class_over_unimported_prop = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file) != null and
-            (b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 0) >= 4;
-        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
-            if (std.mem.eql(u8, w, name0) and isTopLevelProp(name0)) std.debug.print("[tlp] {s} narrow={?s} recvTy={?s} in_recv_ctx={} narrowed_declares={}\n", .{ name0, b.thisNarrow(), b.recvTy(), inReceiverContext(b), narrowedThisDeclares(b, name0, segments[0].span.file) });
-        }
-        if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
-            !narrowedThisDeclares(b, name0, segments[0].span.file) and
-            !build.anonCaptureBinds(name0) and !class_over_unimported_prop and
-            b.module.classIdExactImport(name0, segments[0].span.file) == null and
-            !(inReceiverContext(b) and anyReceiverClassDeclares(b, name0)))
-        {
-            // Kotlin inlines a visible `const val` at every reference, which also
-            // keeps the read out of the flat runtime global table.
-            if (b.module.topLevelConstLiteral(name0, b.self_package, segments[0].span.file)) |cv| {
+    }
+    return null;
+}
+
+
+/// Runtime-lowered anon-object bodies carry the classifier identities visible
+/// at their lexical site, and their side modules have no class index, so bind
+/// by FQN after locals, captures, and members.
+fn tryAnonScopeClass(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+    if (build.anonScopeClass(name0)) |class_ref| {
+        const cls = b.allocReg();
+        const fqn = try b.module.internConst(b.allocator, .{ .String = class_ref.fqn });
+        try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = fqn } });
+        if (!class_ref.has_companion) return cls;
+        const dst = b.allocReg();
+        const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
+        try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = sentinel } });
+        return dst;
+    }
+    return null;
+}
+
+
+/// Kotlin inlines a visible top-level `const val` at every reference, and it
+/// outranks a class binding from a less-visible scope.
+fn tryTopLevelConstInline(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    if (b.resolve(name0) == null and !b.knowsOuter(name0) and
+        !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
+        !build.anonCaptureBinds(name0))
+    {
+        if (b.module.topLevelConstLiteral(name0, b.self_package, segments[0].span.file)) |cv| {
+            const ptier = b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 255;
+            const ctier = b.module.classRefTier(name0, b.self_package, segments[0].span.file) orelse 255;
+            if (ptier < ctier) {
                 orEmitAudit(b, "top_level_prop", "ConstInline", name0);
                 return try b.emitConst(cv);
             }
-            // A bare read whose only declaration is an unimported cross-package
-            // property is unresolved.
-            if (b.module.topLevelPropFqn(name0)) |pfqn| {
-                _ = try recordOutOfScopeRef(b, name0, segments[0].span, pfqn, b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file));
-            }
-            orEmitAudit(b, "top_level_prop", "LoadGlobal", name0);
-            const dst = b.allocReg();
-            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
-            return dst;
         }
-        // Value-position reference to a top-level function no receiver can shadow:
-        // the symbol index resolves it from the caller's scope and a unique pick
-        // loads by exact FQN.
-        if (!inReceiverContext(b) and
-            !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and !isTopLevelProp(name0))
-        {
-            const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
-            refAudit(b, name0, ref_pick);
-            if (ref_pick) |fid| {
-                if (b.module.funcById(fid)) |f| {
-                    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
-                        if (std.mem.eql(u8, w, name0)) {
-                            std.debug.print("[bare-value-arm] {s} -> {s}#{d} self_pkg={s} file={d} fn={s}\n", .{ name0, f.fqn, fid.int(), b.self_package, segments[0].span.file.int(), build.currentRealFn() orelse "-" });
-                        }
-                    }
-                    _ = try recordOutOfScopeRef(b, name0, segments[0].span, f.fqn, b.module.bareRefTier(name0, b.self_package, segments[0].span.file));
-                    const dst = b.allocReg();
-                    const n = try b.module.internConst(b.allocator, .{ .String = f.fqn });
-                    try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
-                    return dst;
-                }
-            }
+    }
+    return null;
+}
+
+
+/// A named companion-member import outranks a same-named class in expression
+/// position, where the classifier only matters in type position.
+fn tryImportedCompanionMember(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    if (b.resolve(name0) == null and !b.knowsOuter(name0) and
+        !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0))
+    {
+        if (importCompanionRewrite(b, segments[0].span.file, name0)) |rw| {
+            const sp = segments[0].span;
+            const rsegs = try b.allocator.alloc(ast.Ident, rw.segs.len);
+            for (rw.segs, 0..) |s2, k| rsegs[k] = .{ .name = s2, .span = sp };
+            const qualified = Expr{ .Path = .{ .segments = rsegs, .span = sp } };
+            return try lowerExpr(b, &qualified);
         }
-        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
-            if (std.mem.eql(u8, w, name0)) {
-                std.debug.print("[bare-read-pre] {s} this={} splice_recv={s} window={} in={s} own={} encl={} owner={s}\n", .{
-                    name0,
-                    b.resolve("this") != null,
-                    b.spliceRecvTy() orelse "-",
-                    b.lambda_splice_resolve != null,
-                    build.currentRealFn() orelse "-",
-                    b.hasOwnMember(name0),
-                    b.enclosing_members.contains(name0),
-                    b.ownerClass() orelse "-",
-                });
-                if (b.enclosing_members.contains(name0)) {
-                    std.debug.print("[bare-read-encl]", .{});
-                    var eit = b.enclosing_members.keyIterator();
-                    var n: usize = 0;
-                    while (eit.next()) |k| : (n += 1) {
-                        if (n < 40) std.debug.print(" {s}", .{k.*});
-                    }
-                    std.debug.print(" (total {d})\n", .{n});
-                }
-            }
+    }
+    return null;
+}
+
+
+/// A bare name that is a known class is a class reference, but in a receiver
+/// context a runtime member shadows the classifier, so the read decides at
+/// runtime with the index-resolved class as the exact global arm. `classId` is
+/// null under collision-mangling, where an explicit import still names one.
+fn tryClassReference(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    if ((b.module.classId(name0) != null or
+        b.module.classIdExactImport(name0, segments[0].span.file) != null) and
+        (!enclosingMemberShadowsClass(b, name0) or classWithCompanion(b, name0)))
+    {
+        const n = try b.module.internConst(b.allocator, .{ .String = name0 });
+        const cls = b.allocReg();
+        if (inReceiverContext(b)) {
+            const this_idx = try b.recordCapture("this");
+            orEmitAudit(b, "class_name_value", "LoadFromThisOrGlobal", name0);
+            try b.push(.{ .LoadFromThisOrGlobal = .{
+                .dst = cls,
+                .this_idx = this_idx,
+                .name = n,
+                .class = scopedClassIdForRead(b, name0, segments[0].span.file),
+            } });
+        } else {
+            orEmitAudit(b, "class_name_value", "LoadGlobal", name0);
+            try b.push(.{ .LoadGlobal = .{
+                .dst = cls,
+                .name = n,
+                .class = scopedClassIdForRead(b, name0, segments[0].span.file),
+            } });
         }
-        if (b.resolve("this")) |this_reg| {
-            // A known top-level fn is a value-position function reference, and a
-            // known top-level property likewise skips the GetField shortcut, whose
-            // lenient field resolution adopts outer-chain members.
-            const is_known_global =
-                b.module.hasBareCallCandidate(name0, segments[0].span.file) or
-                isTopLevelProp(name0);
-            // A name declared only by an outer class defers to the
-            // implicit-receiver walk, which carries the declaring class in the
-            // scoped getter name.
-            const enclosing_only_member = !b.hasOwnMember(name0) and b.hasEnclosingMember(name0);
-            // Directly inside an inline extension splice the body was written
-            // against the declaration's scope, where the bound receiver's members
-            // shadow any top-level candidate; the GetField read keeps its runtime
-            // miss-fallback. A nested lambda inside the splice is excluded.
-            // A spliced receiver lambda has no runtime closure, its receiver being
-            // only the window's bound register, so when the window head statically
-            // declares the name the member read wins.
-            const window_recv_declares = b.lambda_splice_resolve != null and
-                // The head must describe the value actually bound as `this`: a
-                // member-inline splice binds its owner while a nested plain-lambda
-                // window carries the lambda's context head.
-                b.splice_recv_from_window and blk: {
-                const rh = b.spliceRecvTy() orelse break :blk false;
-                const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
-                const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
-                if (!hs.complete) break :blk false;
-                break :blk hs.names.contains(name0);
-            };
-            const splice_receiver_first = (b.lambda_splice_resolve == null and b.spliceRecvTy() != null) or
-                window_recv_declares;
-            if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
-                if (std.mem.eql(u8, w, name0)) {
-                    std.debug.print("[bare-read] {s} in={s} known_global={} own={} encl={} splice_recv={s} owner={s} narrow={s} recvTy={s}\n", .{
-                        name0,
-                        build.currentRealFn() orelse "-",
-                        is_known_global,
-                        b.hasOwnMember(name0),
-                        b.hasEnclosingMember(name0),
-                        b.spliceRecvTy() orelse "-",
-                        b.ownerClass() orelse "-",
-                        b.thisNarrow() orelse "-",
-                        b.recvTy() orelse "-",
-                    });
-                }
-            }
-            // Unless the innermost receiver is statically the class the scoped
-            // getter names. A receiver lambda inside a companion binds `this` to
-            // the scope-function receiver, unreachable by the deferred walk, which
-            // rides a capture chain holding no instance.
-            const receiver_is_owner = blk: {
-                if (!enclosing_only_member) break :blk false;
-                // The splice head vouches for the resolved `this` only when the
-                // window bound it; a bare member-inline splice binds nothing, so
-                // the ambient `this` is whatever the enclosing lambda holds.
-                const rh = (if (b.lambda_splice_resolve == null or b.splice_recv_from_window)
-                    b.spliceRecvTy()
-                else
-                    null) orelse b.recvTy() orelse break :blk false;
-                const decl_owner = sgetterOwner(b, name0) orelse break :blk false;
-                const rhh = typeHead(std.mem.trimEnd(u8, rh, "?"));
-                if (rhh.len == 0) break :blk false;
-                if (b.module.classIsOrExtends(rhh, decl_owner)) break :blk true;
-                // The declaring owner may carry a file-collision mangle the
-                // receiver's source-spelled head never does.
-                if (!inline_call.rfsEnabled()) break :blk false;
-                break :blk std.mem.eql(u8, rhh, stripLowerFileMangle(decl_owner)) or
-                    b.module.classIsOrExtends(rhh, stripLowerFileMangle(decl_owner));
-            };
-            // kotlinc ranks implicit receivers innermost first, so the extension
-            // receiver's members shadow the enclosing class's; a smart-cast `this`
-            // likewise exposes the narrowed class's members ahead of any global.
-            const narrow_declares = narrowedThisDeclares(b, name0, segments[0].span.file);
-            const recv_declares = narrow_declares or blk: {
-                const rh = b.recvTy() orelse break :blk false;
-                const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
-                const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
-                if (!hs.complete) break :blk false;
-                break :blk hs.names.contains(name0);
-            };
-            if ((!is_known_global or splice_receiver_first or recv_declares) and
-                (!enclosing_only_member or receiver_is_owner or recv_declares))
-            {
-                const dst = b.allocReg();
-                const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-                // The ambient `this` may be a spliced subject whose static class
-                // lacks the name; kotlinc ranks implicit receivers by static type,
-                // so the read binds the innermost subject that declares it.
-                const target = subjectCorrectedBareThis(b, name0, this_reg);
-                try b.push(.{ .GetField = .{ .dst = dst, .receiver = target, .field = nm } });
-                return dst;
-            }
-            // Inside a spliced receiver lambda whose subject's static class lacks
-            // the name, the enclosing class's member is the binding: kotlinc ranks
-            // implicit receivers by static type, not by the runtime object.
-            const window_head_lacks = b.lambda_splice_resolve != null and b.splice_recv_from_window and blk: {
-                const rh = b.spliceRecvTy() orelse break :blk false;
-                const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
-                const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
-                if (!hs.complete) break :blk false;
-                break :blk !hs.names.contains(name0);
-            };
-            if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
-                if (std.mem.eql(u8, w, name0)) {
-                    const rh0 = b.spliceRecvTy() orelse "-";
-                    const hs0 = b.module.registry.hierarchy_shadow_names.get(typeHead(std.mem.trimEnd(u8, rh0, "?")));
-                    std.debug.print("[bare-read-corr] {s} window_lacks={} encl_only={} window={} from_window={} recv={s} hs={} complete={} subjects={d} known_global={} recv_declares={}\n", .{ name0, window_head_lacks, enclosing_only_member, b.lambda_splice_resolve != null, b.splice_recv_from_window, rh0, hs0 != null, if (hs0) |h| h.complete else false, b.subject_binds.items.len, is_known_global, recv_declares });
-                }
-            }
-            if ((enclosing_only_member or window_head_lacks) and !recv_declares and !is_known_global) blk: {
-                const oc = b.ownerClass() orelse break :blk;
-                const ocid = b.module.classIdIndexed(oc, b.self_package, segments[0].span.file) orelse
-                    b.module.classId(oc) orelse break :blk;
-                if (!b.module.classHierarchyDeclaresMember(ocid, name0)) break :blk;
-                const corrected = subjectCorrectedBareThis(b, name0, this_reg);
-                if (corrected == this_reg) break :blk;
-                orEmitAudit(b, "subject_corrected_read", "GetField", name0);
-                const dst = b.allocReg();
-                const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-                try b.push(.{ .GetField = .{ .dst = dst, .receiver = corrected, .field = nm } });
-                return dst;
-            }
-        }
-        // Outside any receiver context no member can shadow the name; kotlinc
-        // rejects resolving it against a caller's receiver.
-        if (!inReceiverContext(b)) {
-            orEmitAudit(b, "bare_name_fallthrough", "LoadGlobal", name0);
-            const dst = b.allocReg();
-            // A renamed import binds this spelling to another declaration, and a
-            // bare property read has no other alias path. Resolved at emission
-            // only, so diagnostics report the source spelling.
-            const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
-            return dst;
-        }
-        const this_idx = try b.recordCapture("this");
         const dst = b.allocReg();
-        const name = try sgetterName(b, name0);
-        // The index's unique pick rides as the exact global arm; the runtime member
-        // probe still runs first.
-        const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
-        orEmitAudit(b, "bare_name_fallthrough", "LoadFromThisOrGlobal", name0);
-        try b.push(.{ .LoadFromThisOrGlobal = .{
-            .dst = dst,
-            .this_idx = this_idx,
-            .name = name,
-            .func = ref_pick,
-        } });
+        const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
+        try b.push(.{ .GetField = .{ .dst = dst, .receiver = cls, .field = sentinel } });
         return dst;
     }
+    return null;
+}
 
-    // Multi-segment paths. Try the full FQN against the host first.
+
+/// Outside any receiver context nothing can shadow a builtin type name.
+fn tryBuiltinTypeName(b: *FuncBuilder, name0: []const u8) Allocator.Error!?Reg {
+    if (isBuiltinTypeName(name0)) {
+        const name = try b.module.internConst(b.allocator, .{ .String = name0 });
+        const dst = b.allocReg();
+        if (inReceiverContext(b)) {
+            const this_idx = try b.recordCapture("this");
+            orEmitAudit(b, "builtin_type_name", "LoadFromThisOrGlobal", name0);
+            try b.push(.{ .LoadFromThisOrGlobal = .{ .dst = dst, .this_idx = this_idx, .name = name } });
+        } else {
+            orEmitAudit(b, "builtin_type_name", "LoadGlobal", name0);
+            try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = name } });
+        }
+        return dst;
+    }
+    return null;
+}
+
+
+/// An imported companion member rewrites to the qualified `C.MEMBER` access,
+/// and a member brought in bare by `import EnumOrObject.*` to `Cls.MEMBER`. An
+/// implicit-receiver member shadows a star-import, including one of a lexically
+/// enclosing receiver that `hasOwnMember` misses inside a lambda, and so does a
+/// same-scope top-level declaration.
+fn tryImportRewrites(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    if (b.resolve(name0) == null) {
+        if (importCompanionRewrite(b, segments[0].span.file, name0)) |rw| {
+            const sp = segments[0].span;
+            const rsegs = try b.allocator.alloc(ast.Ident, rw.segs.len);
+            for (rw.segs, 0..) |s, k| rsegs[k] = .{ .name = s, .span = sp };
+            const qualified = Expr{ .Path = .{ .segments = rsegs, .span = sp } };
+            return try lowerExpr(b, &qualified);
+        }
+    // A member brought in bare by `import EnumOrObject.*`. An implicit-receiver
+    // member shadows a star-import, including one of a lexically enclosing
+    // receiver that `hasOwnMember` misses inside a lambda, and so does a
+    // same-scope top-level declaration.
+        if (!b.hasEnclosingMember(name0) and !isTopLevelProp(name0) and
+            !b.module.hasBareCallCandidate(name0, segments[0].span.file))
+        {
+            if (wildcardClassMemberRewrite(b, segments[0].span.file)) |cls| {
+                const sp = segments[0].span;
+                var rsegs = [_]ast.Ident{
+                    .{ .name = cls, .span = sp },
+                    .{ .name = name0, .span = sp },
+                };
+                const qualified = Expr{ .Path = .{ .segments = &rsegs, .span = sp } };
+                return try lowerExpr(b, &qualified);
+            }
+        }
+    }
+    return null;
+}
+
+
+/// A known top-level property is a global read unless a runtime implicit
+/// receiver could shadow it, since kotlinc resolves implicit-receiver members
+/// ahead of package-scope properties. A class visible from this scope also
+/// outranks a top-level property the file never imported; an `object` has no
+/// property tier and stays on the top-level path.
+fn tryTopLevelPropRead(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    const class_over_unimported_prop = b.module.classIdIndexed(name0, b.self_package, segments[0].span.file) != null and
+        (b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file) orelse 0) >= 4;
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name0) and isTopLevelProp(name0)) std.debug.print("[tlp] {s} narrow={?s} recvTy={?s} in_recv_ctx={} narrowed_declares={}\n", .{ name0, b.thisNarrow(), b.recvTy(), inReceiverContext(b), narrowedThisDeclares(b, name0, segments[0].span.file) });
+    }
+    if (isTopLevelProp(name0) and !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and
+        !narrowedThisDeclares(b, name0, segments[0].span.file) and
+        !build.anonCaptureBinds(name0) and !class_over_unimported_prop and
+        b.module.classIdExactImport(name0, segments[0].span.file) == null and
+        !(inReceiverContext(b) and anyReceiverClassDeclares(b, name0)))
+    {
+        // Kotlin inlines a visible `const val` at every reference, which also
+        // keeps the read out of the flat runtime global table.
+        if (b.module.topLevelConstLiteral(name0, b.self_package, segments[0].span.file)) |cv| {
+            orEmitAudit(b, "top_level_prop", "ConstInline", name0);
+            return try b.emitConst(cv);
+        }
+        // A bare read whose only declaration is an unimported cross-package
+        // property is unresolved.
+        if (b.module.topLevelPropFqn(name0)) |pfqn| {
+            _ = try recordOutOfScopeRef(b, name0, segments[0].span, pfqn, b.module.topLevelPropRefTier(name0, b.self_package, segments[0].span.file));
+        }
+        orEmitAudit(b, "top_level_prop", "LoadGlobal", name0);
+        const dst = b.allocReg();
+        const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+        try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
+        return dst;
+    }
+    return null;
+}
+
+
+/// Value-position reference to a top-level function no receiver can shadow:
+/// the symbol index resolves it from the caller's scope and a unique pick loads
+/// by exact FQN.
+fn tryTopLevelFnValueRef(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    if (!inReceiverContext(b) and
+        !b.hasOwnMember(name0) and !b.hasEnclosingMember(name0) and !isTopLevelProp(name0))
+    {
+        const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
+        refAudit(b, name0, ref_pick);
+        if (ref_pick) |fid| {
+            if (b.module.funcById(fid)) |f| {
+                if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+                    if (std.mem.eql(u8, w, name0)) {
+                        std.debug.print("[bare-value-arm] {s} -> {s}#{d} self_pkg={s} file={d} fn={s}\n", .{ name0, f.fqn, fid.int(), b.self_package, segments[0].span.file.int(), build.currentRealFn() orelse "-" });
+                    }
+                }
+                _ = try recordOutOfScopeRef(b, name0, segments[0].span, f.fqn, b.module.bareRefTier(name0, b.self_package, segments[0].span.file));
+                const dst = b.allocReg();
+                const n = try b.module.internConst(b.allocator, .{ .String = f.fqn });
+                try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n, .func = fid } });
+                return dst;
+            }
+        }
+    }
+    return null;
+}
+
+
+/// `KLIO_BARE_TRACE=<name>`: the scope facts every rung below reads.
+fn traceBareName(b: *FuncBuilder, segments: []const ast.Ident) void {
+    const name0 = segments[0].name;
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name0)) {
+            std.debug.print("[bare-read-pre] {s} this={} splice_recv={s} window={} in={s} own={} encl={} owner={s}\n", .{
+                name0,
+                b.resolve("this") != null,
+                b.spliceRecvTy() orelse "-",
+                b.lambda_splice_resolve != null,
+                build.currentRealFn() orelse "-",
+                b.hasOwnMember(name0),
+                b.enclosing_members.contains(name0),
+                b.ownerClass() orelse "-",
+            });
+            if (b.enclosing_members.contains(name0)) {
+                std.debug.print("[bare-read-encl]", .{});
+                var eit = b.enclosing_members.keyIterator();
+                var n: usize = 0;
+                while (eit.next()) |k| : (n += 1) {
+                    if (n < 40) std.debug.print(" {s}", .{k.*});
+                }
+                std.debug.print(" (total {d})\n", .{n});
+            }
+        }
+    }
+}
+
+
+/// The scope facts that decide whether the bound `this` serves a bare read.
+const BareThisEvidence = struct {
+    /// A known top-level fn or property, which skips the GetField shortcut
+    /// whose lenient field resolution adopts outer-chain members.
+    is_known_global: bool,
+    /// The name is declared only by an outer class, so it defers to the
+    /// implicit-receiver walk, which carries the declaring class in the scoped
+    /// getter name.
+    enclosing_only_member: bool,
+    /// Directly inside an inline extension splice the body was written against
+    /// the declaration's scope, where the bound receiver's members shadow any
+    /// top-level candidate.
+    splice_receiver_first: bool,
+    /// The innermost receiver is statically the class the scoped getter names.
+    receiver_is_owner: bool,
+    /// An implicit receiver, or a smart-cast `this`, declares the name.
+    recv_declares: bool,
+};
+
+fn bareThisReadEvidence(b: *FuncBuilder, segments: []const ast.Ident, this_reg: Reg) BareThisEvidence {
+    const name0 = segments[0].name;
+    _ = this_reg;
+
+// A known top-level fn is a value-position function reference, and a
+// known top-level property likewise skips the GetField shortcut, whose
+// lenient field resolution adopts outer-chain members.
+const is_known_global =
+    b.module.hasBareCallCandidate(name0, segments[0].span.file) or
+    isTopLevelProp(name0);
+// A name declared only by an outer class defers to the
+// implicit-receiver walk, which carries the declaring class in the
+// scoped getter name.
+const enclosing_only_member = !b.hasOwnMember(name0) and b.hasEnclosingMember(name0);
+// Directly inside an inline extension splice the body was written
+// against the declaration's scope, where the bound receiver's members
+// shadow any top-level candidate; the GetField read keeps its runtime
+// miss-fallback. A nested lambda inside the splice is excluded.
+// A spliced receiver lambda has no runtime closure, its receiver being
+// only the window's bound register, so when the window head statically
+// declares the name the member read wins.
+const window_recv_declares = b.lambda_splice_resolve != null and
+    // The head must describe the value actually bound as `this`: a
+    // member-inline splice binds its owner while a nested plain-lambda
+    // window carries the lambda's context head.
+    b.splice_recv_from_window and blk: {
+    const rh = b.spliceRecvTy() orelse break :blk false;
+    const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
+    const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
+    if (!hs.complete) break :blk false;
+    break :blk hs.names.contains(name0);
+};
+const splice_receiver_first = (b.lambda_splice_resolve == null and b.spliceRecvTy() != null) or
+    window_recv_declares;
+if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+    if (std.mem.eql(u8, w, name0)) {
+        std.debug.print("[bare-read] {s} in={s} known_global={} own={} encl={} splice_recv={s} owner={s} narrow={s} recvTy={s}\n", .{
+            name0,
+            build.currentRealFn() orelse "-",
+            is_known_global,
+            b.hasOwnMember(name0),
+            b.hasEnclosingMember(name0),
+            b.spliceRecvTy() orelse "-",
+            b.ownerClass() orelse "-",
+            b.thisNarrow() orelse "-",
+            b.recvTy() orelse "-",
+        });
+    }
+}
+// Unless the innermost receiver is statically the class the scoped
+// getter names. A receiver lambda inside a companion binds `this` to
+// the scope-function receiver, unreachable by the deferred walk, which
+// rides a capture chain holding no instance.
+const receiver_is_owner = blk: {
+    if (!enclosing_only_member) break :blk false;
+    // The splice head vouches for the resolved `this` only when the
+    // window bound it; a bare member-inline splice binds nothing, so
+    // the ambient `this` is whatever the enclosing lambda holds.
+    const rh = (if (b.lambda_splice_resolve == null or b.splice_recv_from_window)
+        b.spliceRecvTy()
+    else
+        null) orelse b.recvTy() orelse break :blk false;
+    const decl_owner = sgetterOwner(b, name0) orelse break :blk false;
+    const rhh = typeHead(std.mem.trimEnd(u8, rh, "?"));
+    if (rhh.len == 0) break :blk false;
+    if (b.module.classIsOrExtends(rhh, decl_owner)) break :blk true;
+    // The declaring owner may carry a file-collision mangle the
+    // receiver's source-spelled head never does.
+    if (!inline_call.rfsEnabled()) break :blk false;
+    break :blk std.mem.eql(u8, rhh, stripLowerFileMangle(decl_owner)) or
+        b.module.classIsOrExtends(rhh, stripLowerFileMangle(decl_owner));
+};
+// kotlinc ranks implicit receivers innermost first, so the extension
+// receiver's members shadow the enclosing class's; a smart-cast `this`
+// likewise exposes the narrowed class's members ahead of any global.
+const narrow_declares = narrowedThisDeclares(b, name0, segments[0].span.file);
+const recv_declares = narrow_declares or blk: {
+    const rh = b.recvTy() orelse break :blk false;
+    const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
+    const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
+    if (!hs.complete) break :blk false;
+    break :blk hs.names.contains(name0);
+};
+    return .{
+        .is_known_global = is_known_global,
+        .enclosing_only_member = enclosing_only_member,
+        .splice_receiver_first = splice_receiver_first,
+        .receiver_is_owner = receiver_is_owner,
+        .recv_declares = recv_declares,
+    };
+}
+
+/// The bound `this` serves the read. The ambient `this` may be a spliced
+/// subject whose static class lacks the name; kotlinc ranks implicit receivers
+/// by static type, so the read binds the innermost subject that declares it.
+fn tryBareThisMemberRead(b: *FuncBuilder, name0: []const u8, this_reg: Reg, ev: BareThisEvidence) Allocator.Error!?Reg {
+    const is_known_global = ev.is_known_global;
+    const splice_receiver_first = ev.splice_receiver_first;
+    const recv_declares = ev.recv_declares;
+    const enclosing_only_member = ev.enclosing_only_member;
+    const receiver_is_owner = ev.receiver_is_owner;
+
+if ((!is_known_global or splice_receiver_first or recv_declares) and
+    (!enclosing_only_member or receiver_is_owner or recv_declares))
+{
+    const dst = b.allocReg();
+    const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+    // The ambient `this` may be a spliced subject whose static class
+    // lacks the name; kotlinc ranks implicit receivers by static type,
+    // so the read binds the innermost subject that declares it.
+    const target = subjectCorrectedBareThis(b, name0, this_reg);
+    try b.push(.{ .GetField = .{ .dst = dst, .receiver = target, .field = nm } });
+    return dst;
+}
+    return null;
+}
+
+/// Inside a spliced receiver lambda whose subject's static class lacks the
+/// name, the enclosing class's member is the binding: kotlinc ranks implicit
+/// receivers by static type, not by the runtime object.
+fn trySubjectCorrectedRead(b: *FuncBuilder, segments: []const ast.Ident, this_reg: Reg, ev: BareThisEvidence) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    const is_known_global = ev.is_known_global;
+    const recv_declares = ev.recv_declares;
+    const enclosing_only_member = ev.enclosing_only_member;
+
+// Inside a spliced receiver lambda whose subject's static class lacks
+// the name, the enclosing class's member is the binding: kotlinc ranks
+// implicit receivers by static type, not by the runtime object.
+const window_head_lacks = b.lambda_splice_resolve != null and b.splice_recv_from_window and blk: {
+    const rh = b.spliceRecvTy() orelse break :blk false;
+    const h = typeHead(std.mem.trimEnd(u8, rh, "?"));
+    const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk false;
+    if (!hs.complete) break :blk false;
+    break :blk !hs.names.contains(name0);
+};
+if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+    if (std.mem.eql(u8, w, name0)) {
+        const rh0 = b.spliceRecvTy() orelse "-";
+        const hs0 = b.module.registry.hierarchy_shadow_names.get(typeHead(std.mem.trimEnd(u8, rh0, "?")));
+        std.debug.print("[bare-read-corr] {s} window_lacks={} encl_only={} window={} from_window={} recv={s} hs={} complete={} subjects={d} known_global={} recv_declares={}\n", .{ name0, window_head_lacks, enclosing_only_member, b.lambda_splice_resolve != null, b.splice_recv_from_window, rh0, hs0 != null, if (hs0) |h| h.complete else false, b.subject_binds.items.len, is_known_global, recv_declares });
+    }
+}
+if ((enclosing_only_member or window_head_lacks) and !recv_declares and !is_known_global) {
+    const oc = b.ownerClass() orelse return null;
+    const ocid = b.module.classIdIndexed(oc, b.self_package, segments[0].span.file) orelse
+        b.module.classId(oc) orelse return null;
+    if (!b.module.classHierarchyDeclaresMember(ocid, name0)) return null;
+    const corrected = subjectCorrectedBareThis(b, name0, this_reg);
+    if (corrected == this_reg) return null;
+    orEmitAudit(b, "subject_corrected_read", "GetField", name0);
+    const dst = b.allocReg();
+    const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+    try b.push(.{ .GetField = .{ .dst = dst, .receiver = corrected, .field = nm } });
+    return dst;
+}
+    return null;
+}
+
+/// A bare read against the innermost bound `this`.
+fn tryBareThisRead(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const this_reg = b.resolve("this") orelse return null;
+    const ev = bareThisReadEvidence(b, segments, this_reg);
+    if (try tryBareThisMemberRead(b, segments[0].name, this_reg, ev)) |r| return r;
+    if (try trySubjectCorrectedRead(b, segments, this_reg, ev)) |r| return r;
+    return null;
+}
+
+
+/// Outside any receiver context no member can shadow the name; kotlinc rejects
+/// resolving it against a caller's receiver.
+fn tryNoReceiverGlobalRead(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+    if (!inReceiverContext(b)) {
+        orEmitAudit(b, "bare_name_fallthrough", "LoadGlobal", name0);
+        const dst = b.allocReg();
+        // A renamed import binds this spelling to another declaration, and a
+        // bare property read has no other alias path. Resolved at emission
+        // only, so diagnostics report the source spelling.
+        const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
+        try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
+        return dst;
+    }
+    return null;
+}
+
+
+/// Nothing bound the name statically, so the runtime member probe runs first
+/// and the index's unique pick rides as the exact global arm.
+fn emitBareThisOrGlobal(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!Reg {
+    const name0 = segments[0].name;
+
+    const this_idx = try b.recordCapture("this");
+    const dst = b.allocReg();
+    const name = try sgetterName(b, name0);
+    // The index's unique pick rides as the exact global arm; the runtime member
+    // probe still runs first.
+    const ref_pick = b.module.resolveBareRefIndexed(name0, b.self_package, segments[0].span.file);
+    orEmitAudit(b, "bare_name_fallthrough", "LoadFromThisOrGlobal", name0);
+    try b.push(.{ .LoadFromThisOrGlobal = .{
+        .dst = dst,
+        .this_idx = this_idx,
+        .name = name,
+        .func = ref_pick,
+    } });
+    return dst;
+}
+
+/// Multi-segment paths. Try the full FQN against the host first.
+fn tryPackageQualifiedGlobal(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!?Reg {
+
     if (segments.len >= 2 and
         isPackageHead(segments[0].name) and
         headIsPackage(b, segments[0].name) and
@@ -958,6 +1191,11 @@ pub fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
         return dst;
     }
+    return null;
+}
+
+/// A dotted chain: bind the head, then read each remaining segment as a field.
+fn lowerDottedPath(b: *FuncBuilder, segments: []const ast.Ident) Allocator.Error!Reg {
 
     const first = segments[0];
     var cur: Reg = undefined;
@@ -997,6 +1235,7 @@ pub fn lowerPath(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }
     return cur;
 }
+
 
 /// The source-level name behind a file-collision mangle (`X$f12` -> `X`).
 pub fn stripLowerFileMangle(n: []const u8) []const u8 {

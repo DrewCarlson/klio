@@ -111,18 +111,97 @@ const lowerMemberCallFallback = member_call_mod.lowerMemberCallFallback;
 const tests_shapes_mod = @import("tests_shapes.zig");
 const span = tests_shapes_mod.span;
 
+/// The state one general call-lowering ladder threads through its rungs.
+///
+/// The driver settles the call's shape once and hands every rung a pointer to
+/// it; a rung that resolves the call returns its register and a rung that
+/// declines returns null. The classifier fields below are settled partway down
+/// by `settleClassifier` and read by the constructor rungs after it, so the
+/// order the driver runs the rungs in is load-bearing.
+const GenCtx = struct {
+    b: *FuncBuilder,
+    expr: *const Expr,
+    callee: *const Expr,
+    args: []Expr,
+    ast_arg_names: []?[]const u8,
+    ast_type_args: []ast.TypeRef,
+    is_infix: bool,
+    call_tail: bool,
+    /// The class a single-segment callee names, if any.
+    callee_class_id: ?ir.ClassId = null,
+    callee_is_object: bool = false,
+    /// Whether a single-segment class-name call resolves to the constructor.
+    shadowed_by_class: bool = false,
+    /// Whether a constructible same-named class competes with the function
+    /// candidates for this argument count.
+    class_competes: bool = false,
+    /// Set by the top-level-function rung when its pick leaves the constructor
+    /// as the static winner.
+    force_static_class: bool = false,
+};
+
 pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call_tail = b.call_tail;
     b.call_tail = false;
     const call = expr.Call;
     const callee = call.callee;
-    const args = call.args;
-    const ast_arg_names = call.arg_names;
-    const ast_type_args = call.type_args;
-    const is_infix = call.is_infix;
+    var g = GenCtx{
+        .b = b,
+        .expr = expr,
+        .callee = callee,
+        .args = call.args,
+        .ast_arg_names = call.arg_names,
+        .ast_type_args = call.type_args,
+        .is_infix = call.is_infix,
+        .call_tail = call_tail,
+    };
 
-    // A bare ctor callee naming a nested class must bind the one in this
-    // enclosing-class chain, so walk the owner's FQN for a class prefix.
+    if (try tryEnclosingNestedClassCtor(&g)) |r| return r;
+    if (try tryInlineLambdaOnThis(&g)) |r| return r;
+    if (try tryInlineLambdaOnReceiver(&g)) |r| return r;
+    // Inline expansion (suspend-inline only).
+    if (try tryBareInlineExpansion(b, expr)) |r| return r;
+    if (try tryOwnReceiverFnProperty(&g)) |r| return r;
+    if (try trySplicedReceiverMember(&g)) |r| return r;
+    if (try tryAnonCaptureCall(&g)) |r| return r;
+    if (try tryInfixAsMemberCall(&g)) |r| return r;
+    if (try trySuspendBuilder(&g)) |r| return r;
+    if (try tryContractMarker(&g)) |r| return r;
+    if (try tryTailrecMemberJump(&g)) |r| return r;
+    if (try tryTailrecBareJump(&g)) |r| return r;
+    if (try tryCtorParamVarargShadow(&g)) |r| return r;
+    if (try tryPlainValueShadowedGlobal(&g)) |r| return r;
+    if (try tryTypedCallShadowedGlobal(&g)) |r| return r;
+    if (try tryLocalBindingInvocation(&g)) |r| return r;
+
+    try settleClassifier(&g);
+
+    if (try tryRegisteredTopLevelFn(&g)) |r| return r;
+    if (try tryObjectValueCall(&g)) |r| return r;
+    if (try tryLocalClassCapture(&g)) |r| return r;
+    if (try tryIndexedConstructor(&g)) |r| return r;
+    if (try tryImplicitThisBareCall(&g)) |r| return r;
+    if (try tryUncommittedBareCall(&g)) |r| return r;
+    // Built-in stdlib companion shortcuts: `Result.success(x)` etc.
+    if (try lowerCompanionShortcut(b, callee, g.args, g.ast_arg_names)) |r| return r;
+    if (try tryDottedCallee(&g)) |r| return r;
+    // The catch-all member / value call.
+    if (callee.* == .Member) return lowerMemberCallFallback(b, expr);
+    if (try tryBareMemberFirst(&g)) |r| return r;
+    if (try tryArbitratedBareLocal(&g)) |r| return r;
+    if (try tryReceiverFnProperty(&g)) |r| return r;
+    return emitPlainValueCall(&g);
+}
+
+
+/// A bare ctor callee naming a nested class must bind the one in this
+/// enclosing-class chain, so walk the owner's FQN for a class prefix.
+fn tryEnclosingNestedClassCtor(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const ast_type_args = g.ast_type_args;
+    const is_infix = g.is_infix;
+    const call = g.expr.Call;
     if (!is_infix and ast_type_args.len == 0 and callee.* == .Path and
         callee.Path.segments.len == 1 and b.resolve(callee.Path.segments[0].name) == null)
     {
@@ -146,15 +225,23 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
                     var new_call = call;
                     new_call.callee = new_callee;
                     const rewritten = Expr{ .Call = new_call };
-                    return lowerCallGeneral(b, &rewritten);
+                    return try lowerCallGeneral(b, &rewritten);
                 }
                 b.allocator.free(cand);
             }
         }
     }
+    return null;
+}
 
-    // An inline lambda parameter with a receiver type invoked through an explicit
-    // `this`: the qualifier names the lambda's receiver, so this splices.
+
+/// An inline lambda parameter with a receiver type invoked through an explicit
+/// `this`: the qualifier names the lambda's receiver, so this splices.
+fn tryInlineLambdaOnThis(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const is_infix = g.is_infix;
     if (!is_infix and callee.* == .Member and !callee.Member.safe and
         callee.Member.receiver.* == .This and callee.Member.receiver.This.qualifier == null)
     {
@@ -166,11 +253,19 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             }
         }
     }
+    return null;
+}
 
-    // An inline lambda parameter with a receiver-typed function type invoked with
-    // an explicit receiver. Kotlin's invoke convention resolves the local
-    // parameter over the receiver's same-named member, so the lambda splices with
-    // the qualifier as its receiver. Receiver-typed params only.
+
+/// An inline lambda parameter with a receiver-typed function type invoked with
+/// an explicit receiver. Kotlin's invoke convention resolves the local
+/// parameter over the receiver's same-named member, so the lambda splices with
+/// the qualifier as its receiver. Receiver-typed params only.
+fn tryInlineLambdaOnReceiver(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const is_infix = g.is_infix;
     if (!is_infix and callee.* == .Member and !callee.Member.safe and
         callee.Member.receiver.* != .This)
     {
@@ -184,14 +279,18 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             }
         }
     }
+    return null;
+}
 
-    // Inline expansion (suspend-inline only).
-    if (try tryBareInlineExpansion(b, expr)) |r| {
-        return r;
-    }
 
-    // An explicit receiver invoking the enclosing class's receiver-function-typed
-    // property: Kotlin runs the stored callable with that value as its receiver.
+/// An explicit receiver invoking the enclosing class's receiver-function-typed
+/// property: Kotlin runs the stored callable with that value as its receiver.
+fn tryOwnReceiverFnProperty(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const is_infix = g.is_infix;
     if (!is_infix and callee.* == .Member and !callee.Member.safe and
         callee.Member.receiver.* != .This)
     {
@@ -227,237 +326,306 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             return dst;
         }
     }
+    return null;
+}
 
-    // Inside an inline-extension splice, a bare call to a member of the spliced
-    // receiver is `this.member(...)`, resolved before the bare-name paths treat it
-    // as a top-level function. The bound `this` is a local register, so it
-    // dispatches as an explicit `CallMember`.
-    if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1 and
-        b.currentInlineFn() != null)
-    {
-        const nm = callee.Path.segments[0].name;
-        // Route to the spliced receiver only when the bare name is a member of it
-        // or names a chain-compatible extension.
-        var recv_chain = try narrowingRecvChain(b);
-        // Inside a splice the active receiver is the splice's own.
-        if (recv_chain == null) {
-            if (b.spliceRecvTy()) |sr| recv_chain = try recvChainOf(b, sr);
-        } else if (b.lambda_splice_resolve != null and inline_call.rfsEnabled()) {
-            // A spliced receiver lambda is the innermost implicit receiver, ahead
-            // of the enclosing framed receiver, exactly as kotlinc scopes it.
-            if (b.spliceRecvTy()) |sr| {
-                var sh = typeHead(std.mem.trimEnd(u8, sr, "?"));
-                // Registry keys carry file-collision mangles (`Operation$f429`).
-                if (b.module.classIdIndexed(sh, b.self_package, callee.Path.segments[0].span.file)) |cid| {
-                    if (cid.int() < b.module.classes.items.len) sh = b.module.classes.items[cid.int()].name;
-                }
-                if (recv_chain.?.len == 0 or !std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, recv_chain.?[0], "?")), sh)) {
-                    const inner = try recvChainOf(b, sh);
-                    const outer = recv_chain.?;
-                    const joined = try b.allocator.alloc([]const u8, inner.len + outer.len);
-                    @memcpy(joined[0..inner.len], inner);
-                    @memcpy(joined[inner.len..], outer);
-                    recv_chain = joined;
-                }
+
+/// The spliced receiver's chain for a bare call inside an inline body: the
+/// narrowing chain, else the splice's own, with a spliced receiver lambda's
+/// subject joined ahead of the enclosing framed receiver as kotlinc scopes it.
+fn spliceReceiverChain(g: *GenCtx) Allocator.Error!?[]const []const u8 {
+    const b = g.b;
+    const callee = g.callee;
+
+    var recv_chain = try narrowingRecvChain(b);
+    // Inside a splice the active receiver is the splice's own.
+    if (recv_chain == null) {
+        if (b.spliceRecvTy()) |sr| recv_chain = try recvChainOf(b, sr);
+    } else if (b.lambda_splice_resolve != null and inline_call.rfsEnabled()) {
+        // A spliced receiver lambda is the innermost implicit receiver, ahead
+        // of the enclosing framed receiver, exactly as kotlinc scopes it.
+        if (b.spliceRecvTy()) |sr| {
+            var sh = typeHead(std.mem.trimEnd(u8, sr, "?"));
+            // Registry keys carry file-collision mangles (`Operation$f429`).
+            if (b.module.classIdIndexed(sh, b.self_package, callee.Path.segments[0].span.file)) |cid| {
+                if (cid.int() < b.module.classes.items.len) sh = b.module.classes.items[cid.int()].name;
             }
-        }
-        // A captured crossinline param shadows a same-named member of the anon
-        // object being lowered, so fall through to the anon-capture invocation.
-        if (b.resolve(nm) == null and !b.knowsOuter(nm) and !isLowerAnonCapture(nm) and
-            !nameHasReifiedInlineCandidate(nm))
-        {
-            // The call binds to the spliced `this` when the name is a member of
-            // its class or a chain-compatible extension. A capitalized bare call
-            // to a nested class name is a constructor, not a method on `this`.
-            const is_scoped_class = nm.len > 0 and std.ascii.isUpper(nm[0]) and
-                (scopedClassIdForRead(b, nm, callee.Path.segments[0].span.file) != null or
-                    b.module.classId(nm) != null or anyClassNamed(b, nm));
-            // A declared member of the spliced receiver's hierarchy binds the
-            // receiver as an extension namesake does.
-            const member_of_recv = blk: {
-                const chain = recv_chain orelse break :blk false;
-                if (chain.len == 0) break :blk false;
-                const hs = b.module.registry.hierarchy_shadow_names.get(chain[0]) orelse {
-                    // An image-loaded class has no shadow entry, but the function
-                    // index still proves member-extension membership.
-                    if (!inline_call.rfsEnabled()) break :blk false;
-                    break :blk mextCandidateOwnedBy(b, nm, chain[0], callee.Path.segments[0].span.file) catch false;
-                };
-                if (!hs.complete) break :blk false;
-                break :blk hs.names.contains(nm);
-            };
-            // An extension namesake does not pin the walk: static resolution below
-            // ranks the overload set with argument evidence.
-            var binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv);
-            // Under the subject tower, arbitrating member versus extension needs
-            // argument applicability, which is static resolution's strength.
-            if (binds_this and inline_call.rfsEnabled() and b.encl_tower_depth > 0 and
-                nameHasReceiverCandidate(b, nm, null))
-            {
-                binds_this = false;
-            }
-            if (runtime.envOnce("KLIO_BINDS_TRACE")) |w| {
-                if (std.mem.eql(u8, w, nm)) {
-                    const c0: []const u8 = if (recv_chain) |ch| (if (ch.len != 0) ch[0] else "<empty>") else "<null>";
-                    const hs_state: []const u8 = if (recv_chain) |ch| blk: {
-                        if (ch.len == 0) break :blk "-";
-                        const hs = b.module.registry.hierarchy_shadow_names.get(ch[0]) orelse break :blk "no-entry";
-                        if (!hs.complete) break :blk "incomplete";
-                        break :blk if (hs.names.contains(nm)) "contains" else "missing";
-                    } else "-";
-                    std.debug.print("[binds] {s} chain0={s} hs={s} own={} scoped_class={} binds={}\n", .{
-                        nm, c0, hs_state, b.hasOwnMember(nm), is_scoped_class, binds_this,
-                    });
-                }
-            }
-            if (binds_this) {
-                // Pinning to the innermost bound `this` is sound only when the
-                // receiver evidence proves that value serves the member; the
-                // `hasOwnMember` leg names the lexically enclosing class, which
-                // inside a receiver lambda is not the bound `this`.
-                if (b.resolve("this")) |bound_this| {
-                    // Sound only when no enclosing receiver could shadow, so the
-                    // chain must be exactly the bound receiver.
-                    if (member_of_recv and ast_type_args.len == 0 and
-                        recv_chain.?.len == 1 and
-                        // Under the subject tower the bound `this` is the spliced
-                        // subject, not the lexical owner a pin would resolve.
-                        b.encl_tower_depth == 0 and
-                        runtime.envOnce("KLIO_SPLICE_PIN") == null and
-                        allNull(ast_arg_names)) pin: {
-                        const chain0 = recv_chain.?[0];
-                        // The pin dispatches on the bound `this`, so the chain
-                        // head must be that same value.
-                        if (b.recvTy() orelse b.spliceRecvTy()) |inner| {
-                            const ih = typeHead(std.mem.trimEnd(u8, inner, "?"));
-                            const ch = typeHead(std.mem.trimEnd(u8, chain0, "?"));
-                            if (!std.mem.eql(u8, ih, ch) and
-                                !std.mem.eql(u8, simpleTail(ih), simpleTail(ch))) break :pin;
-                        }
-                        const pin_cid = (if (std.mem.findScalar(u8, chain0, '.') != null)
-                            b.module.classIdByFqn(chain0)
-                        else
-                            b.module.uniqueClassIdBySimpleName(chain0)) orelse break :pin;
-                        var shape_set = try buildStaticReturnArgShapes(b, args, ast_arg_names);
-                        defer shape_set.deinit(b.allocator);
-                        const pin_recv_ref: ir.TypeRef = .{ .name = chain0, .nullable = false, .args = &.{} };
-                        const resolved = b.module.resolveMemberCall(pin_cid, nm, shape_set.shapes, .{
-                            .caller_file = callee.Path.segments[0].span.file,
-                            .lexical_owner = null,
-                            .actual_type_param_bounds = &.{},
-                            .receiver_type = pin_recv_ref,
-                        });
-                        const target = resolved.target orelse break :pin;
-                        const tf = b.module.funcById(target) orelse break :pin;
-                        if (!tf.hasBody()) break :pin;
-                        // A function-spelled parameter fed a non-lambda argument
-                        // is the member-versus-extension shape static shapes
-                        // cannot refute through a splice substitution.
-                        for (tf.params, 0..) |*tp, tpi| {
-                            if (tpi == 0 and std.mem.eql(u8, tp.name, "this")) continue;
-                            const ai = tpi - @intFromBool(tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this"));
-                            if (ai >= args.len) break;
-                            if (recvHeadIsFunctionType(tp.ty.name) and
-                                args[ai] != .Lambda and args[ai] != .AnonFun) break :pin;
-                        }
-                        // A stdlib or pack member may be shadowed by an invisible
-                        // host binding, so pin only program-owned declarations.
-                        const shipped_pkg = std.mem.eql(u8, tf.package, "kotlin") or
-                            std.mem.startsWith(u8, tf.package, "kotlin.") or
-                            std.mem.startsWith(u8, tf.package, "kotlinx.") or
-                            std.mem.startsWith(u8, tf.package, "androidx.") or
-                            std.mem.startsWith(u8, tf.package, "io.ktor");
-                        if (shipped_pkg) break :pin;
-                        const run = try lowerArgRun(b, args);
-                        const dst = b.allocReg();
-                        orEmitAudit(b, "inline_splice_recv_pin", "CallVirtual", nm);
-                        try b.push(.{ .CallVirtual = .{
-                            .dst = dst,
-                            .receiver = bound_this,
-                            .slot = ir.MethodSlotId.fromFunc(target),
-                            .args = run[0],
-                            .n_args = run[1],
-                        } });
-                        return dst;
-                    }
-                    const run = try lowerArgRun(b, args);
-                    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-                    const dst = b.allocReg();
-                    const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
-                    orEmitAudit(b, "inline_splice_recv_walk", "CallMemberOrGlobal", nm);
-                    try b.push(.{ .CallMemberOrGlobal = .{
-                        .dst = dst,
-                        .this_idx = 0,
-                        .name = nmc,
-                        .trailing_lambda = b.callTrailingLambda(),
-                        .args = run[0],
-                        .n_args = run[1],
-                        .arg_names = arg_names,
-                        // The chain already holds every nested subject in scope
-                        // order, so pinning one register inverts Kotlin's
-                        // innermost-first ranking.
-                        .recv = if (b.encl_tower_depth > 0) null else bound_this,
-                        .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
-                        // Under the subject tower the runtime chain ranks the
-                        // receivers; a static head would pin the strict-ext arm to
-                        // the subject where the walk should fall outward.
-                        .static_recv = if (b.encl_tower_depth > 0) null else try cmgStaticRecv(b),
-                    } });
-                    return dst;
-                }
-            } else if (recv_chain == null and nameHasReceiverCandidate(b, nm, null)) {
-                // With the spliced receiver's type unknown the call cannot be
-                // proven to bind the innermost `this`, so `CallMemberOrGlobal`
-                // tries the bound receiver, then each enclosing receiver
-                // innermost-first, before any global. The bound register is passed
-                // directly so the splice receiver stays innermost.
-                if (b.resolve("this")) |bound_this| {
-                    const run = try lowerArgRun(b, args);
-                    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-                    const dst = b.allocReg();
-                    const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
-                    orEmitAudit(b, "inline_splice_unknown_recv", "CallMemberOrGlobal", nm);
-                    try b.push(.{ .CallMemberOrGlobal = .{
-                        .dst = dst,
-                        .this_idx = 0,
-                        .name = nmc,
-                        .trailing_lambda = b.callTrailingLambda(),
-                        .args = run[0],
-                        .n_args = run[1],
-                        .arg_names = arg_names,
-                        .recv = if (b.encl_tower_depth > 0) null else bound_this,
-                        .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
-                        // Under the subject tower the runtime chain ranks the
-                        // receivers; a static head would pin the strict-ext arm to
-                        // the subject where the walk should fall outward.
-                        .static_recv = if (b.encl_tower_depth > 0) null else try cmgStaticRecv(b),
-                    } });
-                    return dst;
-                } else if (b.knowsOuter("this") or b.capturesThisSlot()) {
-                    const run = try lowerArgRun(b, args);
-                    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-                    const this_idx = try b.recordCapture("this");
-                    const dst = b.allocReg();
-                    const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
-                    orEmitAudit(b, "inline_splice_unknown_recv", "CallMemberOrGlobal", nm);
-                    try b.push(.{ .CallMemberOrGlobal = .{
-                        .dst = dst,
-                        .this_idx = this_idx,
-                        .name = nmc,
-                        .trailing_lambda = b.callTrailingLambda(),
-                        .args = run[0],
-                        .n_args = run[1],
-                        .arg_names = arg_names,
-                        .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
-                        .static_recv = try cmgStaticRecv(b),
-                    } });
-                    return dst;
-                }
+            if (recv_chain.?.len == 0 or !std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, recv_chain.?[0], "?")), sh)) {
+                const inner = try recvChainOf(b, sh);
+                const outer = recv_chain.?;
+                const joined = try b.allocator.alloc([]const u8, inner.len + outer.len);
+                @memcpy(joined[0..inner.len], inner);
+                @memcpy(joined[inner.len..], outer);
+                recv_chain = joined;
             }
         }
     }
+    return recv_chain;
+}
 
-    // Bare call to a name the enclosing anon object closes over.
+/// Whether the bare name binds the spliced `this`, and whether it is a declared
+/// member of the spliced receiver's hierarchy (which the pin below requires).
+const SpliceBindEvidence = struct { binds_this: bool, member_of_recv: bool };
+
+fn spliceBareNameEvidence(g: *GenCtx, nm: []const u8, recv_chain: ?[]const []const u8) SpliceBindEvidence {
+    const b = g.b;
+    const callee = g.callee;
+
+    // The call binds to the spliced `this` when the name is a member of
+    // its class or a chain-compatible extension. A capitalized bare call
+    // to a nested class name is a constructor, not a method on `this`.
+    const is_scoped_class = nm.len > 0 and std.ascii.isUpper(nm[0]) and
+        (scopedClassIdForRead(b, nm, callee.Path.segments[0].span.file) != null or
+            b.module.classId(nm) != null or anyClassNamed(b, nm));
+    // A declared member of the spliced receiver's hierarchy binds the
+    // receiver as an extension namesake does.
+    const member_of_recv = blk: {
+        const chain = recv_chain orelse break :blk false;
+        if (chain.len == 0) break :blk false;
+        const hs = b.module.registry.hierarchy_shadow_names.get(chain[0]) orelse {
+            // An image-loaded class has no shadow entry, but the function
+            // index still proves member-extension membership.
+            if (!inline_call.rfsEnabled()) break :blk false;
+            break :blk mextCandidateOwnedBy(b, nm, chain[0], callee.Path.segments[0].span.file) catch false;
+        };
+        if (!hs.complete) break :blk false;
+        break :blk hs.names.contains(nm);
+    };
+    // An extension namesake does not pin the walk: static resolution below
+    // ranks the overload set with argument evidence.
+    var binds_this = !is_scoped_class and (b.hasOwnMember(nm) or member_of_recv);
+    // Under the subject tower, arbitrating member versus extension needs
+    // argument applicability, which is static resolution's strength.
+    if (binds_this and inline_call.rfsEnabled() and b.encl_tower_depth > 0 and
+        nameHasReceiverCandidate(b, nm, null))
+    {
+        binds_this = false;
+    }
+    if (runtime.envOnce("KLIO_BINDS_TRACE")) |w| {
+        if (std.mem.eql(u8, w, nm)) {
+            const c0: []const u8 = if (recv_chain) |ch| (if (ch.len != 0) ch[0] else "<empty>") else "<null>";
+            const hs_state: []const u8 = if (recv_chain) |ch| blk: {
+                if (ch.len == 0) break :blk "-";
+                const hs = b.module.registry.hierarchy_shadow_names.get(ch[0]) orelse break :blk "no-entry";
+                if (!hs.complete) break :blk "incomplete";
+                break :blk if (hs.names.contains(nm)) "contains" else "missing";
+            } else "-";
+            std.debug.print("[binds] {s} chain0={s} hs={s} own={} scoped_class={} binds={}\n", .{
+                nm, c0, hs_state, b.hasOwnMember(nm), is_scoped_class, binds_this,
+            });
+        }
+    }
+    return .{ .binds_this = binds_this, .member_of_recv = member_of_recv };
+}
+
+/// Pinning to the innermost bound `this` is sound only when the receiver
+/// evidence proves that value serves the member; the `hasOwnMember` leg names
+/// the lexically enclosing class, which inside a receiver lambda is not the
+/// bound `this`.
+fn trySpliceReceiverPin(g: *GenCtx, nm: []const u8, recv_chain: []const []const u8, bound_this: Reg) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+
+const chain0 = recv_chain[0];
+// The pin dispatches on the bound `this`, so the chain
+// head must be that same value.
+if (b.recvTy() orelse b.spliceRecvTy()) |inner| {
+    const ih = typeHead(std.mem.trimEnd(u8, inner, "?"));
+    const ch = typeHead(std.mem.trimEnd(u8, chain0, "?"));
+    if (!std.mem.eql(u8, ih, ch) and
+        !std.mem.eql(u8, simpleTail(ih), simpleTail(ch))) return null;
+}
+const pin_cid = (if (std.mem.findScalar(u8, chain0, '.') != null)
+    b.module.classIdByFqn(chain0)
+else
+    b.module.uniqueClassIdBySimpleName(chain0)) orelse return null;
+var shape_set = try buildStaticReturnArgShapes(b, args, ast_arg_names);
+defer shape_set.deinit(b.allocator);
+const pin_recv_ref: ir.TypeRef = .{ .name = chain0, .nullable = false, .args = &.{} };
+const resolved = b.module.resolveMemberCall(pin_cid, nm, shape_set.shapes, .{
+    .caller_file = callee.Path.segments[0].span.file,
+    .lexical_owner = null,
+    .actual_type_param_bounds = &.{},
+    .receiver_type = pin_recv_ref,
+});
+const target = resolved.target orelse return null;
+const tf = b.module.funcById(target) orelse return null;
+if (!tf.hasBody()) return null;
+// A function-spelled parameter fed a non-lambda argument
+// is the member-versus-extension shape static shapes
+// cannot refute through a splice substitution.
+for (tf.params, 0..) |*tp, tpi| {
+    if (tpi == 0 and std.mem.eql(u8, tp.name, "this")) continue;
+    const ai = tpi - @intFromBool(tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this"));
+    if (ai >= args.len) break;
+    if (recvHeadIsFunctionType(tp.ty.name) and
+        args[ai] != .Lambda and args[ai] != .AnonFun) return null;
+}
+// A stdlib or pack member may be shadowed by an invisible
+// host binding, so pin only program-owned declarations.
+const shipped_pkg = std.mem.eql(u8, tf.package, "kotlin") or
+    std.mem.startsWith(u8, tf.package, "kotlin.") or
+    std.mem.startsWith(u8, tf.package, "kotlinx.") or
+    std.mem.startsWith(u8, tf.package, "androidx.") or
+    std.mem.startsWith(u8, tf.package, "io.ktor");
+if (shipped_pkg) return null;
+const run = try lowerArgRun(b, args);
+const dst = b.allocReg();
+orEmitAudit(b, "inline_splice_recv_pin", "CallVirtual", nm);
+try b.push(.{ .CallVirtual = .{
+    .dst = dst,
+    .receiver = bound_this,
+    .slot = ir.MethodSlotId.fromFunc(target),
+    .args = run[0],
+    .n_args = run[1],
+} });
+return dst;
+}
+
+/// The runtime member-or-global walk: the chain already holds every nested
+/// subject in scope order, so pinning one register would invert Kotlin's
+/// innermost-first ranking.
+fn emitSpliceReceiverWalk(g: *GenCtx, nm: []const u8, bound_this: Reg) Allocator.Error!Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+
+const run = try lowerArgRun(b, args);
+const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+const dst = b.allocReg();
+const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
+orEmitAudit(b, "inline_splice_recv_walk", "CallMemberOrGlobal", nm);
+try b.push(.{ .CallMemberOrGlobal = .{
+    .dst = dst,
+    .this_idx = 0,
+    .name = nmc,
+    .trailing_lambda = b.callTrailingLambda(),
+    .args = run[0],
+    .n_args = run[1],
+    .arg_names = arg_names,
+    // The chain already holds every nested subject in scope
+    // order, so pinning one register inverts Kotlin's
+    // innermost-first ranking.
+    .recv = if (b.encl_tower_depth > 0) null else bound_this,
+    .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
+    // Under the subject tower the runtime chain ranks the
+    // receivers; a static head would pin the strict-ext arm to
+    // the subject where the walk should fall outward.
+    .static_recv = if (b.encl_tower_depth > 0) null else try cmgStaticRecv(b),
+} });
+return dst;
+}
+
+/// With the spliced receiver's type unknown the call cannot be proven to bind
+/// the innermost `this`, so `CallMemberOrGlobal` tries the bound receiver, then
+/// each enclosing receiver innermost-first, before any global.
+fn emitSpliceUnknownReceiver(g: *GenCtx, nm: []const u8) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+
+// With the spliced receiver's type unknown the call cannot be
+// proven to bind the innermost `this`, so `CallMemberOrGlobal`
+// tries the bound receiver, then each enclosing receiver
+// innermost-first, before any global. The bound register is passed
+// directly so the splice receiver stays innermost.
+if (b.resolve("this")) |bound_this| {
+    const run = try lowerArgRun(b, args);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const dst = b.allocReg();
+    const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
+    orEmitAudit(b, "inline_splice_unknown_recv", "CallMemberOrGlobal", nm);
+    try b.push(.{ .CallMemberOrGlobal = .{
+        .dst = dst,
+        .this_idx = 0,
+        .name = nmc,
+        .trailing_lambda = b.callTrailingLambda(),
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .recv = if (b.encl_tower_depth > 0) null else bound_this,
+        .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
+        // Under the subject tower the runtime chain ranks the
+        // receivers; a static head would pin the strict-ext arm to
+        // the subject where the walk should fall outward.
+        .static_recv = if (b.encl_tower_depth > 0) null else try cmgStaticRecv(b),
+    } });
+    return dst;
+} else if (b.knowsOuter("this") or b.capturesThisSlot()) {
+    const run = try lowerArgRun(b, args);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const this_idx = try b.recordCapture("this");
+    const dst = b.allocReg();
+    const nmc = try b.module.internConst(b.allocator, .{ .String = nm });
+    orEmitAudit(b, "inline_splice_unknown_recv", "CallMemberOrGlobal", nm);
+    try b.push(.{ .CallMemberOrGlobal = .{
+        .dst = dst,
+        .this_idx = this_idx,
+        .name = nmc,
+        .trailing_lambda = b.callTrailingLambda(),
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .candidates = try cmgCandidates(b, nm, callee.Path.segments[0].span.file, run[1]),
+        .static_recv = try cmgStaticRecv(b),
+    } });
+    return dst;
+}
+    return null;
+}
+
+/// Inside an inline-extension splice, a bare call to a member of the spliced
+/// receiver is `this.member(...)`, resolved before the bare-name paths treat it
+/// as a top-level function. The bound `this` is a local register, so it
+/// dispatches as an explicit `CallMember`.
+fn trySplicedReceiverMember(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const ast_arg_names = g.ast_arg_names;
+    const ast_type_args = g.ast_type_args;
+    if (!(!g.is_infix and callee.* == .Path and callee.Path.segments.len == 1 and
+        b.currentInlineFn() != null)) return null;
+    const nm = callee.Path.segments[0].name;
+    const recv_chain = try spliceReceiverChain(g);
+    // A captured crossinline param shadows a same-named member of the anon
+    // object being lowered, so fall through to the anon-capture invocation.
+    if (!(b.resolve(nm) == null and !b.knowsOuter(nm) and !isLowerAnonCapture(nm) and
+        !nameHasReifiedInlineCandidate(nm))) return null;
+    const ev = spliceBareNameEvidence(g, nm, recv_chain);
+    if (ev.binds_this) {
+        if (b.resolve("this")) |bound_this| {
+            // Sound only when no enclosing receiver could shadow, so the
+            // chain must be exactly the bound receiver.
+            if (ev.member_of_recv and ast_type_args.len == 0 and
+                recv_chain.?.len == 1 and
+                // Under the subject tower the bound `this` is the spliced
+                // subject, not the lexical owner a pin would resolve.
+                b.encl_tower_depth == 0 and
+                runtime.envOnce("KLIO_SPLICE_PIN") == null and
+                allNull(ast_arg_names))
+            {
+                if (try trySpliceReceiverPin(g, nm, recv_chain.?, bound_this)) |r| return r;
+            }
+            return try emitSpliceReceiverWalk(g, nm, bound_this);
+        }
+    } else if (recv_chain == null and nameHasReceiverCandidate(b, nm, null)) {
+        return try emitSpliceUnknownReceiver(g, nm);
+    }
+    return null;
+}
+
+
+/// Bare call to a name the enclosing anon object closes over.
+fn tryAnonCaptureCall(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const is_infix = g.is_infix;
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1 and
         b.resolve(callee.Path.segments[0].name) == null and
         isLowerAnonCapture(callee.Path.segments[0].name))
@@ -496,8 +664,18 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
         } });
         return dst;
     }
+    return null;
+}
 
-    // Infix call `a fn b` → `a.fn(b)`.
+
+/// Infix call `a fn b` becomes `a.fn(b)`, routed through member lowering so it
+/// binds statically; a plain CallMember leaves every infix extension walking.
+fn tryInfixAsMemberCall(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const is_infix = g.is_infix;
+    const call = g.expr.Call;
     if (is_infix and args.len == 2 and callee.* == .Path and callee.Path.segments.len == 1) {
         // An infix call is `a.f(b)`, so route it through member lowering and bind
         // statically; a plain CallMember leaves every infix extension walking.
@@ -518,27 +696,52 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
         } };
         return try lowerMemberCallFallback(b, &member_call);
     }
+    return null;
+}
 
-    // `suspend { … }` builder: the value is the lambda itself, its body marked
-    // suspend so dispatch can distinguish it from a plain function value.
+
+/// `suspend { … }` builder: the value is the lambda itself, its body marked
+/// suspend so dispatch can distinguish it from a plain function value.
+fn trySuspendBuilder(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
     if (callee.* == .Path and callee.Path.segments.len == 1 and
         std.mem.eql(u8, callee.Path.segments[0].name, "suspend") and
         args.len == 1 and args[0] == .Lambda)
     {
         b.pending_suspend_lambda = true;
-        return lowerExpr(b, &args[0]);
+        return try lowerExpr(b, &args[0]);
     }
-    // `contract { … }`: compile-time marker with no runtime effect.
+    return null;
+}
+
+
+/// `contract { … }`: compile-time marker with no runtime effect.
+fn tryContractMarker(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
     if (callee.* == .Path and callee.Path.segments.len == 1 and
         std.mem.eql(u8, callee.Path.segments[0].name, "contract") and
         args.len == 1 and args[0] == .Lambda)
     {
-        return b.emitConst(.Unit);
+        return try b.emitConst(.Unit);
     }
-    // A self-call inside a tailrec fn becomes a TailJump that re-binds the
-    // parameters in place. An instance or extension tailrec function carries its
-    // receiver as the leading implicit param, so the arg run must lead with
-    // `this` or every re-bound parameter shifts by one.
+    return null;
+}
+
+
+/// A self-call inside a tailrec fn becomes a TailJump that re-binds the
+/// parameters in place. An instance or extension tailrec function carries its
+/// receiver as the leading implicit param, so the arg run must lead with
+/// `this` or every re-bound parameter shifts by one.
+fn tryTailrecMemberJump(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const call_tail = g.call_tail;
+    const expr = g.expr;
     if (call_tail and callee.* == .Member and !callee.Member.safe and b.tailrecSelfHasThis() and
         tailrecReceiverIsSelf(b, callee.Member.receiver))
     {
@@ -548,11 +751,23 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
                     b.terminate(.{ .TailJump = .{ .args = run[0], .n_args = @intCast(run[1].int()) } });
                     const dead = try b.allocBlock();
                     b.switchTo(dead);
-                    return b.emitConst(.Unit);
+                    return try b.emitConst(.Unit);
                 }
             }
         }
     }
+    return null;
+}
+
+
+/// The same jump for a bare self-call, whose receiver is synthesized.
+fn tryTailrecBareJump(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const is_infix = g.is_infix;
+    const call_tail = g.call_tail;
+    const expr = g.expr;
     if (call_tail and callee.* == .Path and callee.Path.segments.len == 1) {
         if (b.tailrecSelf()) |ts| {
             if (std.mem.eql(u8, ts, callee.Path.segments[0].name)) {
@@ -564,17 +779,25 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
                 // An infix self-call (`(this - 1) test x`) carries its receiver
                 // as the first written argument.
                 const recv: ?*const Expr = if (b.tailrecSelfHasThis() and !is_infix) &this_expr else null;
-                const run = (try emitTailJumpRun(b, recv, args, expr.Call.arg_names)) orelse return lowerCallGeneralNoJump(b, expr);
+                const run = (try emitTailJumpRun(b, recv, args, expr.Call.arg_names)) orelse return try lowerCallGeneralNoJump(b, expr);
                 b.terminate(.{ .TailJump = .{ .args = run[0], .n_args = @intCast(run[1].int()) } });
                 const dead = try b.allocBlock();
                 b.switchTo(dead);
-                return b.emitConst(.Unit);
+                return try b.emitConst(.Unit);
             }
         }
     }
+    return null;
+}
 
-    // A ctor-property param shadowing a same-named vararg method dispatches by
-    // argument shape, so route to member dispatch.
+
+/// A ctor-property param shadowing a same-named vararg method dispatches by
+/// argument shape, so route to member dispatch.
+fn tryCtorParamVarargShadow(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
     if (callee.* == .Path and callee.Path.segments.len == 1 and
         b.resolve(callee.Path.segments[0].name) != null and
         ctorParamShadowsVarargMethod(b, callee.Path.segments[0].name))
@@ -596,10 +819,18 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             return dst;
         }
     }
+    return null;
+}
 
-    // A `name<T>(…)` call whose name resolves to a non-function local names the
-    // shadowed global: a value takes no call-site type arguments. Likewise when
-    // the local's declared type cannot be invoked at all.
+
+/// A `name(…)` call whose name resolves to a non-function local names the
+/// shadowed global when the local's declared type cannot be invoked at all.
+fn tryPlainValueShadowedGlobal(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const ast_type_args = g.ast_type_args;
     if (callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len == 0) {
         const nm0 = callee.Path.segments[0].name;
         // A member function of the enclosing class chain still takes the call
@@ -631,6 +862,18 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             return dst;
         }
     }
+    return null;
+}
+
+
+/// A `name<T>(…)` call whose name resolves to a non-function local names the
+/// shadowed global: a value takes no call-site type arguments.
+fn tryTypedCallShadowedGlobal(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const ast_type_args = g.ast_type_args;
     if (callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len != 0) {
         const nm0 = callee.Path.segments[0].name;
         if (b.resolve(nm0) != null and !b.isLocalFn(nm0) and
@@ -655,9 +898,17 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             return dst;
         }
     }
+    return null;
+}
 
-    // A single-name callee resolving to a local binding or parameter is a value
-    // invocation.
+
+/// A single-name callee resolving to a local binding or parameter is a value
+/// invocation.
+fn tryLocalBindingInvocation(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         // Same-named local-fn siblings are overloads: when the call's static facts
         // select exactly one, call through its mangled cell.
@@ -740,6 +991,19 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             }
         }
     }
+    return null;
+}
+
+
+/// Settle the classifier facts the constructor rungs below read: the class a
+/// single-segment callee names, whether it is an object, whether the call
+/// resolves to its constructor, and whether it competes with the function
+/// candidates.
+fn settleClassifier(g: *GenCtx) Allocator.Error!void {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
 
     const callee_class_id: ?ir.ClassId = if (callee.* == .Path and callee.Path.segments.len == 1)
         b.module.classIdIndexed(callee.Path.segments[0].name, b.self_package, callee.Path.segments[0].span.file) orelse
@@ -753,7 +1017,6 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
 
     // Whether a single-segment class-name call resolves to the constructor.
     const shadowed_by_class = if (callee_is_object) false else try shadowedByClass(b, callee, args, ast_arg_names);
-    var force_static_class = false;
     // A constructible same-named class competes with the function candidates.
     // Until constructors join the shared applicability set, the deferred
     // class-carrying form below compares both on the actual argument types.
@@ -781,26 +1044,55 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
         break :blk (args.len >= required and (has_vararg or args.len <= cls.primary_params.len)) or
             args.len > cls.primary_params.len;
     };
+    g.callee_class_id = callee_class_id;
+    g.callee_is_object = callee_is_object;
+    g.shadowed_by_class = shadowed_by_class;
+    g.class_competes = class_competes;
+}
 
-    // Path-callee with a registered top-level fn → Call{func}.
+
+/// Path-callee with a registered top-level fn becomes `Call{func}`.
+fn tryRegisteredTopLevelFn(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const expr = g.expr;
+    const shadowed_by_class = g.shadowed_by_class;
+    const class_competes = g.class_competes;
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         if (try lowerPathCall(
             b,
             expr,
             shadowed_by_class,
             class_competes,
-            &force_static_class,
+            &g.force_static_class,
         )) |r| return r;
     }
+    return null;
+}
 
-    // A named object is a singleton value, invoked through its operator surface
-    // once same-named function overloads have had their tier.
-    if (callee_is_object) {
-        return try emitObjectValueCall(b, args, ast_arg_names, ast_type_args, callee.Path.segments[0].name, callee_class_id.?);
+
+/// A named object is a singleton value, invoked through its operator surface
+/// once same-named function overloads have had their tier.
+fn tryObjectValueCall(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const ast_type_args = g.ast_type_args;
+    if (g.callee_is_object) {
+        return try emitObjectValueCall(b, args, ast_arg_names, ast_type_args, callee.Path.segments[0].name, g.callee_class_id.?);
     }
+    return null;
+}
 
-    // A local class declared in this or an enclosing function shadows any
-    // same-simple-name module class for a bare constructor call.
+
+/// A local class declared in this or an enclosing function shadows any
+/// same-simple-name module class for a bare constructor call.
+fn tryLocalClassCapture(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const nm0 = callee.Path.segments[0].name;
         if (build.isLocalClassInScope(nm0) and b.resolve(nm0) == null and b.knowsOuter(nm0)) {
@@ -819,121 +1111,155 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             return dst;
         }
     }
+    return null;
+}
 
-    // The indexed lookup binds the class visible from the caller's package and
-    // imports, so a cross-package simple-name collision constructs the right
-    // class. A typealias constructs its expansion, retried through the alias
-    // registry scoped at this site.
-    if (callee.* == .Path and callee.Path.segments.len == 1) {
-        const ctor_seg = callee.Path.segments[0];
-        const ctor_cid: ?ir.ClassId = b.module.classIdIndexed(ctor_seg.name, b.self_package, ctor_seg.span.file) orelse
-            b.module.classIdExactImport(ctor_seg.name, ctor_seg.span.file) orelse blk_alias: {
-                const aref = ir.TypeRef{ .name = ctor_seg.name, .nullable = false, .args = &.{} };
-                const resolved = try b.module.resolveTypeAliasAt(b.allocator, aref, ctor_seg.span.file, b.self_package);
-                const rh = typeHead(std.mem.trimEnd(u8, resolved.name, "?"));
-                if (std.mem.eql(u8, rh, ctor_seg.name)) break :blk_alias null;
-                break :blk_alias b.module.classIdIndexed(rh, b.self_package, ctor_seg.span.file) orelse
-                    b.module.classId(rh);
-            };
-        // An applicable own member named like a class in scope wins the bare call
-        // in Kotlin's scope order, binding the member's lambda shapes.
-        if (ctor_cid != null and b.ownerClass() != null and b.resolve("this") != null and
-            b.hasOwnMember(ctor_seg.name) and b.ownFunctionApplicable(ctor_seg.name, args.len) and
-            !ownMemberRejectsLambdas(b, ctor_seg.name, args))
-        {
-            if (try lowerImplicitThisCall(b, callee, args, ast_arg_names, call.type_args)) |r| return r;
-        }
-        if (ctor_cid) |class_id| {
-            applyExpectedLiteralKindsToCtorArgs(b, class_id, args, ast_arg_names);
-            const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
-            defer if (ctor_arity) |ca| b.allocator.free(ca);
-            // The compose pass shapes a sink lambda with the bare composer pair and
-            // lowering repairs it against the resolved parameter's arity; a class
-            // whose primary constructor takes a composable lambda needs the same
-            // repair or the content invokes with shifted slots.
-            try transformCtorComposableArgs(b, class_id, args, ast_arg_names);
-            const cls = &b.module.classes.items[class_id.int()];
-            // A fun-interface conversion types its lambda's params from the
-            // interface's single abstract method, instantiated by the explicit type
-            // args or the expected type.
-            var sam_lpt: ?[]?[]ir.TypeRef = null;
-            defer if (sam_lpt) |types| deinitArgLambdaParamTypes(b.allocator, types);
-            if (cls.is_fun_interface and args.len == 1 and args[0] == .Lambda and
-                cls.type_params.len != 0)
-            {
-                sam_lpt = try samLambdaParamTypes(b, class_id, call.type_args);
-            }
-            if (runtime.envOnce("KLIO_SAM_TRACE") != null and cls.is_fun_interface) {
-                std.debug.print("[sam] {s} tps={d} lam={} lpt={} exp={}\n", .{ cls.name, cls.type_params.len, args.len == 1 and args[0] == .Lambda, sam_lpt != null, b.peekExpected() != null });
-            }
-            // A ctor's concrete fn-typed params type their lambda arguments
-            // (`IntArray(256) { it shr 4 }` types `it` Int).
-            if (sam_lpt == null) sam_lpt = try ctorLambdaParamTypes(b, class_id, args);
-            b.pending_arg_lambda_param_types = sam_lpt;
-            const run = try lowerArgRunFull(b, args, ctor_arity, null);
-            b.pending_arg_lambda_param_types = null;
-            const realigned = try ctorRealignedArgNames(b, class_id, args, ast_arg_names);
-            defer if (realigned) |r| b.allocator.free(r);
-            const arg_names = try internArgNames(b.allocator, b.module, realigned orelse ast_arg_names);
-            const dst = b.allocReg();
-            const static_sam = cls.is_fun_interface and args.len == 1 and !anyNamedArg(ast_arg_names);
-            if (shadowed_by_class or force_static_class or static_sam) {
-                // The subject of an enclosing receiver lambda is the innermost
-                // implicit receiver of the inner class's outer type, so it is the
-                // new instance's outer, as kotlinc emits for `w.Inner()`.
-                if (spliceSubjectOuterFor(b, class_id)) |subject| {
-                    const nm = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
-                    orEmitAudit(b, "inner_ctor_on_splice_subject", "CallMember", callee.Path.segments[0].name);
-                    try b.push(.{ .CallMember = .{
-                        .dst = dst,
-                        .receiver = subject,
-                        .name = nm,
-                        .args = run[0],
-                        .n_args = run[1],
-                        .arg_names = arg_names,
-                    } });
-                    return dst;
-                }
-                // A bare `Inner()` uses the enclosing `this` as the new instance's
-                // outer, reachable inside a lambda body only through the capture
-                // set; kotlinc likewise forces a `this$0` capture.
-                if (class_id.int() < b.module.classes.items.len and
-                    b.module.classes.items[class_id.int()].is_inner and
-                    b.resolve("this") == null and b.capturesThisSlot())
-                {
-                    _ = try b.recordCapture("this");
-                }
-                orEmitAudit(b, if (static_sam) "fun_interface_sam" else "bare_ctor_shadowed_by_class", "NewInstance", callee.Path.segments[0].name);
-                try b.push(.{ .NewInstance = .{
-                    .dst = dst,
-                    .class = class_id,
-                    .args = run[0],
-                    .n_args = run[1],
-                    .arg_names = arg_names,
-                    .arg_static_heads = try ctorArgStaticHeads(b, args),
-                } });
-            } else {
-                const this_idx = try b.recordCapture("this");
-                const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
-                orEmitAudit(b, "class_or_factory_call", "CallMemberOrGlobal", callee.Path.segments[0].name);
-                try b.push(.{ .CallMemberOrGlobal = .{
-                    .dst = dst,
-                    .this_idx = this_idx,
-                    .name = nmc,
-                    .args = run[0],
-                    .n_args = run[1],
-                    .arg_names = arg_names,
-                    .class = class_id,
-                    .candidates = try cmgCandidates(b, callee.Path.segments[0].name, callee.Path.segments[0].span.file, run[1]),
-                    .static_recv = try cmgStaticRecv(b),
-                } });
-            }
-            return dst;
-        }
+
+/// The class a bare constructor call names: the indexed lookup binds the class
+/// visible from the caller's package and imports, so a cross-package
+/// simple-name collision constructs the right class. A typealias constructs its
+/// expansion, retried through the alias registry scoped at this site.
+fn indexedCtorClassId(b: *FuncBuilder, ctor_seg: ast.Ident) Allocator.Error!?ir.ClassId {
+    return b.module.classIdIndexed(ctor_seg.name, b.self_package, ctor_seg.span.file) orelse
+        b.module.classIdExactImport(ctor_seg.name, ctor_seg.span.file) orelse blk_alias: {
+            const aref = ir.TypeRef{ .name = ctor_seg.name, .nullable = false, .args = &.{} };
+            const resolved = try b.module.resolveTypeAliasAt(b.allocator, aref, ctor_seg.span.file, b.self_package);
+            const rh = typeHead(std.mem.trimEnd(u8, resolved.name, "?"));
+            if (std.mem.eql(u8, rh, ctor_seg.name)) break :blk_alias null;
+            break :blk_alias b.module.classIdIndexed(rh, b.self_package, ctor_seg.span.file) orelse
+                b.module.classId(rh);
+        };
+}
+
+/// Construct the named class, or hand the call to the runtime arbitration
+/// between the class and a same-named factory function.
+fn emitIndexedConstructor(g: *GenCtx, class_id: ir.ClassId) Allocator.Error!Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const call = g.expr.Call;
+    const shadowed_by_class = g.shadowed_by_class;
+    const force_static_class = g.force_static_class;
+
+applyExpectedLiteralKindsToCtorArgs(b, class_id, args, ast_arg_names);
+const ctor_arity = try ctorArgFnArities(b, class_id, args, ast_arg_names);
+defer if (ctor_arity) |ca| b.allocator.free(ca);
+// The compose pass shapes a sink lambda with the bare composer pair and
+// lowering repairs it against the resolved parameter's arity; a class
+// whose primary constructor takes a composable lambda needs the same
+// repair or the content invokes with shifted slots.
+try transformCtorComposableArgs(b, class_id, args, ast_arg_names);
+const cls = &b.module.classes.items[class_id.int()];
+// A fun-interface conversion types its lambda's params from the
+// interface's single abstract method, instantiated by the explicit type
+// args or the expected type.
+var sam_lpt: ?[]?[]ir.TypeRef = null;
+defer if (sam_lpt) |types| deinitArgLambdaParamTypes(b.allocator, types);
+if (cls.is_fun_interface and args.len == 1 and args[0] == .Lambda and
+    cls.type_params.len != 0)
+{
+    sam_lpt = try samLambdaParamTypes(b, class_id, call.type_args);
+}
+if (runtime.envOnce("KLIO_SAM_TRACE") != null and cls.is_fun_interface) {
+    std.debug.print("[sam] {s} tps={d} lam={} lpt={} exp={}\n", .{ cls.name, cls.type_params.len, args.len == 1 and args[0] == .Lambda, sam_lpt != null, b.peekExpected() != null });
+}
+// A ctor's concrete fn-typed params type their lambda arguments
+// (`IntArray(256) { it shr 4 }` types `it` Int).
+if (sam_lpt == null) sam_lpt = try ctorLambdaParamTypes(b, class_id, args);
+b.pending_arg_lambda_param_types = sam_lpt;
+const run = try lowerArgRunFull(b, args, ctor_arity, null);
+b.pending_arg_lambda_param_types = null;
+const realigned = try ctorRealignedArgNames(b, class_id, args, ast_arg_names);
+defer if (realigned) |r| b.allocator.free(r);
+const arg_names = try internArgNames(b.allocator, b.module, realigned orelse ast_arg_names);
+const dst = b.allocReg();
+const static_sam = cls.is_fun_interface and args.len == 1 and !anyNamedArg(ast_arg_names);
+if (shadowed_by_class or force_static_class or static_sam) {
+    // The subject of an enclosing receiver lambda is the innermost
+    // implicit receiver of the inner class's outer type, so it is the
+    // new instance's outer, as kotlinc emits for `w.Inner()`.
+    if (spliceSubjectOuterFor(b, class_id)) |subject| {
+        const nm = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
+        orEmitAudit(b, "inner_ctor_on_splice_subject", "CallMember", callee.Path.segments[0].name);
+        try b.push(.{ .CallMember = .{
+            .dst = dst,
+            .receiver = subject,
+            .name = nm,
+            .args = run[0],
+            .n_args = run[1],
+            .arg_names = arg_names,
+        } });
+        return dst;
     }
+    // A bare `Inner()` uses the enclosing `this` as the new instance's
+    // outer, reachable inside a lambda body only through the capture
+    // set; kotlinc likewise forces a `this$0` capture.
+    if (class_id.int() < b.module.classes.items.len and
+        b.module.classes.items[class_id.int()].is_inner and
+        b.resolve("this") == null and b.capturesThisSlot())
+    {
+        _ = try b.recordCapture("this");
+    }
+    orEmitAudit(b, if (static_sam) "fun_interface_sam" else "bare_ctor_shadowed_by_class", "NewInstance", callee.Path.segments[0].name);
+    try b.push(.{ .NewInstance = .{
+        .dst = dst,
+        .class = class_id,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .arg_static_heads = try ctorArgStaticHeads(b, args),
+    } });
+} else {
+    const this_idx = try b.recordCapture("this");
+    const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
+    orEmitAudit(b, "class_or_factory_call", "CallMemberOrGlobal", callee.Path.segments[0].name);
+    try b.push(.{ .CallMemberOrGlobal = .{
+        .dst = dst,
+        .this_idx = this_idx,
+        .name = nmc,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+        .class = class_id,
+        .candidates = try cmgCandidates(b, callee.Path.segments[0].name, callee.Path.segments[0].span.file, run[1]),
+        .static_recv = try cmgStaticRecv(b),
+    } });
+}
+return dst;
+}
 
-    // Inside a method or extension body, an unqualified `name(...)` that matched
-    // no local, top-level fn, or class is a method call on `this`.
+/// A bare `Name(...)` naming a class in scope.
+fn tryIndexedConstructor(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const call = g.expr.Call;
+    if (!(callee.* == .Path and callee.Path.segments.len == 1)) return null;
+    const ctor_seg = callee.Path.segments[0];
+    const ctor_cid = try indexedCtorClassId(b, ctor_seg);
+    // An applicable own member named like a class in scope wins the bare call
+    // in Kotlin's scope order, binding the member's lambda shapes.
+    if (ctor_cid != null and b.ownerClass() != null and b.resolve("this") != null and
+        b.hasOwnMember(ctor_seg.name) and b.ownFunctionApplicable(ctor_seg.name, args.len) and
+        !ownMemberRejectsLambdas(b, ctor_seg.name, args))
+    {
+        if (try lowerImplicitThisCall(b, callee, args, ast_arg_names, call.type_args)) |r| return r;
+    }
+    if (ctor_cid) |class_id| return try emitIndexedConstructor(g, class_id);
+    return null;
+}
+
+
+/// Inside a method or extension body, an unqualified `name(...)` that matched
+/// no local, top-level fn, or class is a method call on `this`.
+fn tryImplicitThisBareCall(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const ast_type_args = g.ast_type_args;
     if (callee.* == .Path) {
         if (try lowerImplicitThisCall(
             b,
@@ -943,11 +1269,20 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             ast_type_args,
         )) |r| return r;
     }
+    return null;
+}
 
-    // The resolver above declined to commit a target, so in a receiver context the
-    // call must still dispatch member-first; a bare-name value load would miss
-    // receiver methods entirely. Outside a receiver context an indexed name keeps
-    // the value-call fallback.
+
+/// The resolver above declined to commit a target, so in a receiver context the
+/// call must still dispatch member-first; a bare-name value load would miss
+/// receiver methods entirely. Outside a receiver context an indexed name keeps
+/// the value-call fallback.
+fn tryUncommittedBareCall(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const ast_type_args = g.ast_type_args;
     if (callee.* == .Path and callee.Path.segments.len == 1 and
         b.resolve(callee.Path.segments[0].name) == null and
         !b.knowsOuter(callee.Path.segments[0].name) and
@@ -959,14 +1294,21 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
     {
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
     }
+    return null;
+}
 
-    // Built-in stdlib companion shortcuts: `Result.success(x)` etc.
-    if (try lowerCompanionShortcut(b, callee, args, ast_arg_names)) |r| return r;
 
-    // A package-qualified constructor call is resolved before the function-FQN and
-    // member-fallback paths, which would read the package head as a field of the
-    // implicit receiver. A multi-segment Path callee is the same dotted-FQN shape,
-    // so it routes here for the same overload-precise binding.
+/// A package-qualified constructor call is resolved before the function-FQN and
+/// member-fallback paths, which would read the package head as a field of the
+/// implicit receiver. A multi-segment Path callee is the same dotted-FQN shape,
+/// so it routes here for the same overload-precise binding.
+fn tryDottedCallee(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const ast_type_args = g.ast_type_args;
+    const expr = g.expr;
     const dotted_callee = callee.* == .Member or
         (callee.* == .Path and callee.Path.segments.len >= 2);
     if (callee.* == .Member) {
@@ -980,14 +1322,20 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
     if (dotted_callee) {
         if (try lowerFqnGlobalCall(b, callee, args, ast_arg_names)) |r| return r;
     }
+    return null;
+}
 
-    // The catch-all member / value call.
-    if (callee.* == .Member) {
-        return lowerMemberCallFallback(b, expr);
-    }
-    // A bare single-name call no earlier path resolved, whose name could be a
-    // member of an implicit receiver, must dispatch member-first rather than fall
-    // to a value load binding a same-named top-level global.
+
+/// A bare single-name call no earlier path resolved, whose name could be a
+/// member of an implicit receiver, must dispatch member-first rather than fall
+/// to a value load binding a same-named top-level global.
+fn tryBareMemberFirst(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const ast_type_args = g.ast_type_args;
+    const call = g.expr.Call;
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const nm0 = callee.Path.segments[0].name;
         // Only reroute a name that actually is an own or enclosing member, so a
@@ -1019,9 +1367,19 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, null)) |r| return r;
         }
     }
-    // A bare call whose name is a bound local or captured outer does not shadow an
-    // implicit receiver's member unless the local is invokable, so emit the
-    // arbitrated form: value when callable, else the member on `this`.
+    return null;
+}
+
+
+/// A bare call whose name is a bound local or captured outer does not shadow an
+/// implicit receiver's member unless the local is invokable, so emit the
+/// arbitrated form: value when callable, else the member on `this`.
+fn tryArbitratedBareLocal(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const call = g.expr.Call;
     if (callee.* == .Path and callee.Path.segments.len == 1 and call.type_args.len == 0) {
         const nm0 = callee.Path.segments[0].name;
         // A receiver-lambda param is Kotlin-unambiguous, the param winning with its
@@ -1051,48 +1409,66 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
             }
         }
     }
-    // A receiver-function-typed property invoked bare takes the innermost implicit
-    // receiver in scope, exactly as Kotlin binds it; otherwise the closure body
-    // runs receiverless and its member calls fall to globals.
-    recv_fn: {
-        var core = callee;
-        var hops: usize = 0;
-        while (hops < 8) : (hops += 1) {
-            switch (core.*) {
-                .Unary => |u| core = u.expr,
-                .Postfix => |pf| core = pf.expr,
-                else => break,
-            }
+    return null;
+}
+
+
+/// A receiver-function-typed property invoked bare takes the innermost implicit
+/// receiver in scope, exactly as Kotlin binds it; otherwise the closure body
+/// runs receiverless and its member calls fall to globals.
+fn tryReceiverFnProperty(g: *GenCtx) Allocator.Error!?Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+
+    var core = callee;
+    var hops: usize = 0;
+    while (hops < 8) : (hops += 1) {
+        switch (core.*) {
+            .Unary => |u| core = u.expr,
+            .Postfix => |pf| core = pf.expr,
+            else => break,
         }
-        if (core.* != .Path or core.Path.segments.len != 1) break :recv_fn;
-        const pname = core.Path.segments[0].name;
-        if (b.resolve(pname) != null or b.knowsOuter(pname)) break :recv_fn;
-        const this_reg = b.resolve("this") orelse break :recv_fn;
-        var owner: ?[]const u8 = b.ownerClass();
-        var ohops: usize = 0;
-        const is_recv_fn = blk: {
-            while (owner) |o| : (ohops += 1) {
-                if (ohops > 32) break;
-                if (b.module.registry.recv_fn_props.get(.{ .a = o, .b = pname }) != null) break :blk true;
-                owner = b.module.registry.enclosing_class.get(o);
-            }
-            break :blk false;
-        };
-        if (!is_recv_fn) break :recv_fn;
-        const callee_r = try lowerExpr(b, callee);
-        const run = try lowerArgRun(b, args);
-        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const dst = b.allocReg();
-        try b.push(.{ .CallValueWithThis = .{
-            .dst = dst,
-            .callee = callee_r,
-            .receiver = this_reg,
-            .args = run[0],
-            .n_args = run[1],
-            .arg_names = arg_names,
-        } });
-        return dst;
     }
+    if (core.* != .Path or core.Path.segments.len != 1) return null;
+    const pname = core.Path.segments[0].name;
+    if (b.resolve(pname) != null or b.knowsOuter(pname)) return null;
+    const this_reg = b.resolve("this") orelse return null;
+    var owner: ?[]const u8 = b.ownerClass();
+    var ohops: usize = 0;
+    const is_recv_fn = blk: {
+        while (owner) |o| : (ohops += 1) {
+            if (ohops > 32) break;
+            if (b.module.registry.recv_fn_props.get(.{ .a = o, .b = pname }) != null) break :blk true;
+            owner = b.module.registry.enclosing_class.get(o);
+        }
+        break :blk false;
+    };
+    if (!is_recv_fn) return null;
+    const callee_r = try lowerExpr(b, callee);
+    const run = try lowerArgRun(b, args);
+    const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+    const dst = b.allocReg();
+    try b.push(.{ .CallValueWithThis = .{
+        .dst = dst,
+        .callee = callee_r,
+        .receiver = this_reg,
+        .args = run[0],
+        .n_args = run[1],
+        .arg_names = arg_names,
+    } });
+    return dst;
+}
+
+/// Nothing above bound the call, so invoke the lowered callee value.
+fn emitPlainValueCall(g: *GenCtx) Allocator.Error!Reg {
+    const b = g.b;
+    const callee = g.callee;
+    const args = g.args;
+    const ast_arg_names = g.ast_arg_names;
+    const call = g.expr.Call;
+
     const callee_r = try lowerExpr(b, callee);
     const run = try lowerArgRun(b, args);
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
@@ -1110,6 +1486,7 @@ pub fn lowerCallGeneral(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg 
     } });
     return dst;
 }
+
 
 /// True when a bodied same-name function already accepts this call's arity.
 pub fn aFuncFits(b: *FuncBuilder, nm: []const u8, want: usize) bool {
