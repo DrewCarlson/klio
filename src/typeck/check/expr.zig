@@ -981,7 +981,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                 const label = if (always) "true" else "false";
                 const msg = try std.fmt.allocPrint(
                     a,
-                    "`{s}` is always `{s}` — `null` {s} `{s}` per spec §8.11.1",
+                    "`{s}` is always `{s}`: `null` {s} `{s}`",
                     .{
                         if (ic.negated) "!is" else "is",
                         label,
