@@ -1,10 +1,7 @@
-//! AST lifting helpers used by the IR module builder.
-//!
-//! These transform anonymous-object / nested-class / accessor-body
-//! AST shapes before lowering: lifting companion / nested / inner classes
-//! to top level, rewriting bare `field` references in accessor bodies to
-//! the synthetic backing slot, and synthesising a `Class` shell from an
-//! `object` declaration so the regular class-lowering pipeline applies.
+//! AST lifting for the module builder: companion, nested and inner classes lift to
+//! top level, bare `field` references in accessor bodies rewrite to the synthetic
+//! backing slot, and an `object` declaration gains a `Class` shell so the regular
+//! class-lowering pipeline applies.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -33,18 +30,12 @@ pub const MangledMap = std.StringHashMap([]const u8);
 
 const dummySpan = Span.init(FileId.from(0), 0, 0);
 
-/// How a bare `field` reference in an accessor body maps onto storage:
-/// instance accessors read/write `this.__klio_field__<prop>`; top-level
-/// accessors read/write the `__klio_topfield__<prop>` global binding.
-/// `this_member` carries the owning class name when known, so a `field`
-/// read inside an anonymous object declared in the accessor reaches the
-/// OWNER's backing slot (`object_member`) rather than the object's `this`.
+/// How a bare `field` reference maps onto storage: an instance accessor uses
+/// `this.__klio_field__<prop>`, a top-level one the `__klio_topfield__<prop>` global.
+/// `this_member` carries the owning class, so a `field` read inside an anonymous
+/// object reaches the OWNER's slot, not the object's `this`.
 pub const FieldSubst = union(enum) { this_member: ?[]const u8, object_member: []const u8, global };
 
-/// Replace every bare `field` identifier in `expr` with
-/// `this.__klio_field__<prop_name>`. Used by accessor-body lowering so
-/// the IR thunk reads / writes the backing field on the receiver.
-///
 /// Returns a freshly-allocated rewritten expression owned by `allocator`.
 pub fn substituteFieldWithThis(allocator: Allocator, prop_name: []const u8, expr: *const Expr, owner: ?[]const u8) Allocator.Error!*Expr {
     const out = try allocator.create(Expr);
@@ -53,10 +44,7 @@ pub fn substituteFieldWithThis(allocator: Allocator, prop_name: []const u8, expr
     return out;
 }
 
-/// Replace every bare `field` identifier in `expr` with the raw global
-/// storage name `__klio_topfield__<prop_name>`. Used by top-level
-/// accessor-body lowering; the storage binding itself is registered
-/// under that raw key, so the read/write bypasses accessor dispatch.
+/// The binding is registered under the raw key, so this bypasses accessor dispatch.
 pub fn substituteFieldWithGlobal(allocator: Allocator, prop_name: []const u8, expr: *const Expr) Allocator.Error!*Expr {
     const out = try allocator.create(Expr);
     out.* = expr.*;
@@ -64,10 +52,8 @@ pub fn substituteFieldWithGlobal(allocator: Allocator, prop_name: []const u8, ex
     return out;
 }
 
-/// Rewrite a bare `field` reference per `mode` (see `FieldSubst`). The Vm's
-/// get_field / set_field detect the `__klio_field__` prefix and skip the
-/// custom-getter/setter dispatch; `__klio_topfield__` is the storage key
-/// itself for top-level properties.
+/// The Vm's get_field/set_field detect the `__klio_field__` prefix and skip custom
+/// getter/setter dispatch; `__klio_topfield__` is the top-level storage key itself.
 pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSubst) Allocator.Error!void {
     if (e.* == .Path) {
         const p = e.Path;
@@ -143,11 +129,8 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
             if (r.value) |v| try walkField(allocator, v, prop, mode);
         },
         .Throw => |t| try walkField(allocator, t.value, prop, mode),
-        // `field` is an ordinary binding inside the accessor, so a nested scope
-        // captures it like any other. The walk stopped at the flat forms, so a
-        // `field` inside a lambda / loop / when / try survived as a bare name
-        // and read an unresolved global — `get() = synchronized(lock) { field }`
-        // is how kotlinx-coroutines-test guards its scheduler clock.
+        // `field` is an ordinary binding inside the accessor, so a nested scope captures it:
+        // without this walk a `field` inside a lambda, loop, when or try reads an unresolved global.
         .Lambda => |*l| {
             for (l.body.stmts) |*s| try walkFieldStmt(allocator, s, prop, mode);
         },
@@ -175,10 +158,8 @@ pub fn walkField(allocator: Allocator, e: *Expr, prop: []const u8, mode: FieldSu
                 .this_member => |owner| if (owner) |own| .{ .object_member = own } else mode,
                 else => mode,
             };
-            // The object's members are rewritten in place inside an AST
-            // that can outlive this lowering (a pack class body lowered
-            // again by a later program in the same process), so the
-            // replacement nodes must outlive it too.
+            // The object's members are rewritten in place inside an AST that can outlive this
+            // lowering, so the replacement nodes must outlive it too.
             const keep = std.heap.page_allocator;
             for (o.members) |*m| try walkFieldDecl(keep, m, prop, inner);
             for (o.init_blocks) |*blk| {
@@ -217,10 +198,8 @@ fn walkFieldStmt(allocator: Allocator, s: *Stmt, prop: []const u8, mode: FieldSu
             try walkField(allocator, &a.target, prop, mode);
             try walkField(allocator, &a.value, prop, mode);
         },
-        // A local `val`/`var` in an accessor body (`val old = field`) carries
-        // its initializer in a `Decl.Property`; its `field` reference must be
-        // rewritten too. A local declaration cannot itself have custom
-        // accessors, so only the initializer / delegate is walked.
+        // A local `val`/`var` carries its initializer in a `Decl.Property` whose `field`
+        // reference must be rewritten; a local cannot have accessors, so only its initializer walks.
         .Decl => |*d| try walkFieldDecl(allocator, d, prop, mode),
         .DestructuringDecl => |*dd| try walkField(allocator, &dd.init, prop, mode),
     }
@@ -242,19 +221,15 @@ fn walkFieldDecl(allocator: Allocator, d: *Decl, prop: []const u8, mode: FieldSu
     }
 }
 
-/// Rewrite a `field` backing reference inside an accessor block. Returns
-/// a freshly-allocated block whose statements have had each bare `field`
-/// reference replaced with the synthetic backing-slot access.
+/// Returns a freshly-allocated block with each bare `field` replaced.
 pub fn rewriteBlockField(allocator: Allocator, block: *const Block, prop: []const u8, owner: ?[]const u8) Allocator.Error!Block {
     const stmts = try allocator.dupe(Stmt, block.stmts);
     for (stmts) |*s| try walkFieldStmt(allocator, s, prop, .{ .this_member = owner });
     return .{ .stmts = stmts, .span = block.span };
 }
 
-/// Collect the qualified supertype paths used across all declarations
-/// (recursing into nested classes), reduced to their last two segments
-/// (`Outer.Name`). A nested class is mangled on a name collision only when
-/// it is actually extended this way — see the call site.
+/// Qualified supertype paths across all declarations, reduced to their last two
+/// segments. A nested class mangles on a collision only when extended this way.
 pub fn collectUsedQualifiedSupertypes(allocator: Allocator, decls: []const Decl, out: *StringSet) Allocator.Error!void {
     for (decls) |*d| {
         if (d.* == .Class) try walkQualifiedSupertypes(allocator, &d.Class, out);
@@ -274,10 +249,7 @@ fn walkQualifiedSupertypes(allocator: Allocator, c: *const Class, out: *StringSe
     }
 }
 
-/// Reduce a dotted path to its last two segments (`a.b.C` -> `b.C`).
-/// Returns `null` when the path has fewer than two segments. The returned
-/// slice references `path`'s storage (no allocation); `allocator` is
-/// accepted for signature symmetry and unused.
+/// Null below two segments. The result references `path`'s storage; `allocator` is unused.
 fn lastTwo(allocator: Allocator, path: []const u8) ?[]const u8 {
     _ = allocator;
     var last: ?usize = null;
@@ -294,10 +266,8 @@ fn lastTwo(allocator: Allocator, path: []const u8) ?[]const u8 {
     return path[start..];
 }
 
-/// Collect the member names visible from `c` to siblings / nested classes:
-/// primary-ctor params, body properties + functions, companion members,
-/// and (for an enum) the synthetic statics + entry names. Inserts into
-/// `out`, allocating each key in `out`'s allocator.
+/// Member names visible from `c` to siblings and nested classes, an enum's synthetic
+/// statics and entry names included.
 pub fn collectEnclosingMemberNames(c: *const Class, out: *StringSet) Allocator.Error!void {
     const a = out.allocator;
     for (c.primary_params) |*p| {
@@ -331,15 +301,12 @@ pub fn collectEnclosingMemberNames(c: *const Class, out: *StringSet) Allocator.E
     }
 }
 
-/// Accumulators threaded through the recursive lift.
 pub const LiftCtx = struct {
     allocator: Allocator,
     out_decls: *std.ArrayList(Decl),
     object_names: *std.ArrayList([]const u8),
-    /// Declaration spans appended in lockstep with `object_names`: the
-    /// identity of each lifted `object` decl. `buildClassDef` matches a
-    /// class's span against these — never the simple name, which a
-    /// same-named class from another package can collide with.
+    /// Spans appended in lockstep with `object_names`. `buildClassDef` matches a class's
+    /// span against these, never the simple name, which another package can share.
     object_spans: *std.ArrayList(Span),
     companion_singletons: *std.StringHashMap([]const u8),
     nested_outer_members: *OuterMembers,
@@ -348,16 +315,12 @@ pub const LiftCtx = struct {
     top_level_type_names: *const StringSet,
     mangled_nested: *MangledMap,
     used_qualified_supertypes: *const StringSet,
-    /// Nested class/object simple names declared MORE THAN ONCE across the
-    /// module (two `Builder`s under different outers). The flat lifted
-    /// namespace can hold only one, so every duplicate lifts mangled.
+    /// Nested simple names declared MORE THAN ONCE. The flat lifted namespace holds one,
+    /// so every duplicate lifts mangled.
     dup_nested_names: *const StringSet,
 };
 
-/// Collect nested class/object simple names that appear more than once
-/// across `decls` (recursively), so the lift mangles every one of them —
-/// `HexFormat.BytesHexFormat.Builder` and `HexFormat.NumberHexFormat.Builder`
-/// cannot share the flat name `Builder`.
+/// `BytesHexFormat.Builder` and `NumberHexFormat.Builder` cannot share flat `Builder`.
 pub fn collectDupNestedNames(a: Allocator, decls: []const ast.Decl, out: *StringSet) Allocator.Error!void {
     var counts = std.StringHashMap(u32).init(a);
     defer counts.deinit();
@@ -396,10 +359,8 @@ fn countNestedNames(counts: *std.StringHashMap(u32), members: []const ast.Decl) 
     }
 }
 
-/// Recursively walk a class's members and lift companion objects, plain
-/// nested classes, and inner classes to top-level entries in `out_decls`.
-/// Companion singletons are registered in `companion_singletons` and
-/// tagged with the outer's visible-member set in `nested_outer_members`.
+/// Companion singletons register in `companion_singletons`, tagged with the outer's
+/// visible-member set in `nested_outer_members`.
 pub fn liftClassRecursive(
     ctx: *LiftCtx,
     c: *const Class,
@@ -437,9 +398,7 @@ pub fn liftClassRecursive(
             if (is_private) {
                 synth.name = .{ .name = lifted_name, .span = co.name.span };
             }
-            // A type nested inside this object (e.g. an inline `value class`
-            // declared in `object Monotonic`) is itself a classifier that
-            // must lift to a top-level class and register its simple name.
+            // A type nested inside this object is itself a classifier and must lift to top level.
             const next_chain = try appendChain(a, enclosing_chain, c);
             defer a.free(next_chain);
             try liftClassRecursive(ctx, &synth, next_chain);
@@ -480,28 +439,24 @@ pub fn liftClassRecursive(
                 try liftClassRecursive(ctx, &renamed, next_chain);
                 try ctx.out_decls.append(a, .{ .Class = renamed });
                 try ctx.companion_singletons.put(c.name.name, comp_name);
-                // Also under the enclosing-chain-qualified name (`Outer.C`):
-                // two nested `C`s in different outers otherwise share the
-                // bare key and the last registration wins for both.
+                // Also under the enclosing-chain-qualified name: two nested `C`s in different outers
+                // otherwise share the bare key and the last registration wins for both.
                 if (enclosing_chain.len != 0) {
                     var qual: std.ArrayList(u8) = .empty;
                     for (enclosing_chain) |ec| {
                         try qual.appendSlice(a, ec.name.name);
                         try qual.append(a, '.');
                     }
-                    // The class's SOURCE simple name: a mangled nested
-                    // class carries its outer as a `$` prefix.
+                    // The class's SOURCE simple name: a mangled nested class prefixes its outer with `$`.
                     const own = if (std.mem.findScalarLast(u8, c.name.name, '$')) |d| c.name.name[d + 1 ..] else c.name.name;
                     try qual.appendSlice(a, own);
                     try ctx.companion_singletons.put(try qual.toOwnedSlice(a), comp_name);
                 }
             } else {
                 var extras = StringSet.init(a);
-                // The enclosing class's own members AND its companion's members
-                // are visible under bare names inside this nested class — a
-                // companion `Default` referenced from a nested `Builder` must
-                // bind the enclosing companion, not an unrelated global class of
-                // the same simple name.
+                // The enclosing class's own members and its companion's are visible under bare names
+                // inside a nested class, so a companion `Default` read from a nested `Builder` binds
+                // the enclosing companion.
                 try collectEnclosingMemberNames(c, &extras);
                 var ci = enclosing_chain.len;
                 while (ci > 0) {
@@ -509,46 +464,21 @@ pub fn liftClassRecursive(
                     try collectEnclosingMemberNames(enclosing_chain[ci], &extras);
                 }
                 const qualified = try std.fmt.allocPrint(a, "{s}.{s}", .{ c.name.name, nested.name.name });
-                // Kotlin scopes a `private` nested class to its declaring
-                // class; the lifted top-level namespace is flat, so a
-                // private nested class always lifts under a scope-keyed
-                // mangled name (the same identity a private nested object
-                // gets) and bare references inside the declaring class's
-                // subtree rewrite through `nested_object_aliases`. A
-                // non-private nested class is mangled only when its bare
-                // name would collide with a top-level type that is also
-                // extended through the qualified form.
+                // Kotlin scopes a `private` nested class to its declaring class, but the lifted namespace
+                // is flat: it lifts under a scope-keyed mangled name, and bare references in the declaring
+                // subtree rewrite through `nested_object_aliases`.
                 const is_private = nested.visibility == .Private;
-                // A nested class with its OWN companion, referenced by bare name
-                // for a companion member (`Alignment.Proportional` inside
-                // `LineHeightStyle`, where `Alignment` is a nested value class),
-                // must mangle+alias UNCONDITIONALLY: a cross-module collision
-                // (its simple name vs another pack's top-level type, e.g.
-                // ui.Alignment loaded only once material3 pulls ui-core in beside
-                // ui-text) is NOT visible at this module's bake, so gating on a
-                // bake-visible collision misses it and the bare name resolves to
-                // the wrong same-named type at runtime. Mangling is safe: the
-                // class keeps its NESTED fqn (from the pre-lift span override),
-                // so external qualified refs still resolve, while bare refs in
-                // the declaring subtree rewrite through the alias. The
-                // qualified-supertype form is the older, narrower trigger.
+                // A nested class with its OWN companion, referenced by bare name for a companion member,
+                // mangles unconditionally: a cross-module collision is invisible at this module's bake.
+                // The class keeps its nested fqn, so qualified references still resolve.
                 const nested_has_companion = blk: {
                     for (nested.members) |*nm| {
                         if (nm.* == .Class and nm.Class.is_companion) break :blk true;
                     }
                     break :blk false;
                 };
-                // A nested class whose simple name matches ANY top-level
-                // type in the image mangles unconditionally, like a nested
-                // object: the image build combines every pack, so a flat
-                // lift here clobbers (or is clobbered by) the top-level in
-                // the shared class table regardless of extension shape —
-                // ui-graphics' `IntervalTree.Node` lifted flat displaced
-                // ui's top-level `HitPathTracker`-file `Node`, and
-                // `super.buildCache` then found a parentless `Node`. The
-                // qualified-supertype condition stays only as history: the
-                // collision itself is the hazard, not how the class is
-                // extended.
+                // A nested simple name matching ANY top-level type in the image mangles too: the image
+                // build combines every pack, so a flat lift would clobber the top-level entry.
                 const collides = nested_has_companion or
                     ctx.dup_nested_names.contains(nested.name.name) or
                     ctx.top_level_type_names.contains(nested.name.name);
@@ -557,12 +487,8 @@ pub fn liftClassRecursive(
                     const mangled = try std.fmt.allocPrint(a, "{s}${s}", .{ c.name.name, nested.name.name });
                     try ctx.mangled_nested.put(qualified, mangled);
                     lifted.name = .{ .name = mangled, .span = nested.name.span };
-                    // Register the bare-name alias whenever the class is mangled,
-                    // not only for a private one: a mangled nested class
-                    // referenced by bare name inside its declaring subtree (a
-                    // colliding value class read for a companion member) needs
-                    // the alias so `scopeTypeRename` rewrites the reference to
-                    // the mangled name.
+                    // The alias is registered whenever the class is mangled, so `scopeTypeRename` rewrites
+                    // references inside the declaring subtree.
                     try putAlias(ctx, c.name.name, nested.name.name, mangled);
                 } else {
                     a.free(qualified);
@@ -591,16 +517,11 @@ fn putAlias(ctx: *LiftCtx, cls: []const u8, simple: []const u8, mangled: []const
     try gop.value_ptr.put(simple, mangled);
 }
 
-/// Synthesise a `Class` AST node that mirrors an `ObjectDecl`. The
-/// resulting class participates in the regular class-lowering pipeline
-/// (members, supertype delegation, init blocks); a separate
-/// `object_names` map then allocates one instance per name and the Vm
-/// publishes it as a global at startup.
+/// The synthesised class runs the regular class-lowering pipeline; `object_names` then
+/// allocates one instance per name, published as a global.
 pub fn synthesizeClassFromObject(allocator: Allocator, o: *const ObjectDecl) Allocator.Error!Class {
-    // Inheritance delegation carries over: `object O : Iface by impl` builds
-    // the same forwarders a delegating class does. The slot array is padded to
-    // the supertype count so a declaration that delegates only some supertypes
-    // still lines up.
+    // Delegation carries over: the slot array is padded to the supertype count so a
+    // declaration delegating only some supertypes lines up.
     const delegates = try allocator.alloc(?Expr, o.supertypes.len);
     for (delegates, 0..) |*d, i| d.* = if (i < o.supertype_delegates.len) o.supertype_delegates[i] else null;
     return .{

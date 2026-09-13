@@ -1,6 +1,7 @@
-//! The once-per-process dependency base: building the immutable snapshot
-//! of the stdlib (+ pack) files and the gate deciding whether a user
-//! program may extend it instead of re-lowering the world.
+//! The once-per-process dependency base: stdlib and pack files are lowered one time
+//! into an immutable snapshot, and each program extends an arena-backed clone with its
+//! own declarations. The snapshot is never run and every runtime-mutable structure is
+//! deep-cloned per program, so nothing a run mutates is shared.
 
 const std = @import("std");
 
@@ -24,132 +25,75 @@ const buildModuleFilesInner = build_module.buildModuleFilesInner;
 const build_types = @import("types.zig");
 const BuiltModule = build_types.BuiltModule;
 
-// -------------------------------------------------------------------------
-// Once-per-process dependency base: the stdlib (+ pack) files are lowered
-// one time into an immutable snapshot; each program then extends an
-// arena-backed clone with just its own declarations. The snapshot's
-// BuiltModule is NEVER run — every runtime-mutable structure (the Vm's
-// ClassDefs, enum-entry instances, companion/object cells) is deep-cloned
-// per program, so nothing a run mutates is shared across programs.
-// -------------------------------------------------------------------------
-
-/// Immutable lowered snapshot of a program's dependency files. Owned by a
-/// process-lifetime arena managed by the caller; safe to read from many
-/// threads once built.
+/// Owned by a process-lifetime arena; safe to read from many threads once built.
 pub const StdlibBase = struct {
-    /// The lowered dependency program. Cloned (never consumed) per run.
+    /// The lowered dependency program. Cloned, never consumed, per run.
     built: BuiltModule,
-    /// Post-lift, post-retain dependency decls: the context universe the
-    /// extending build scans (file_classes, inline fns, top-level prop
-    /// names) without re-lowering.
+    /// Post-lift, post-retain decls: the universe the extending build scans, un-lowered.
     lifted_decls: []const Decl,
-    /// Every top-level simple name the base declares (functions,
-    /// properties, classes, objects, typealiases — raw and post-lift).
-    /// A user program redeclaring any of these falls back to the full
-    /// whole-program build, because cross-boundary renames/mangles and
-    /// resolution could differ from the snapshot's.
+    /// Every top-level simple name the base declares, raw and post-lift; a user program
+    /// redeclaring one falls back to the whole-program build.
     decl_names: StringSet,
-    /// The subset of `decl_names` declared in the ROOT package (files with
-    /// no package header) plus every lifted/mangled decl. Only these can
-    /// collide with a root-package user declaration under Kotlin scoping —
-    /// a named-package base decl is invisible to bare references in other
-    /// packages, so a user namesake cannot change any decision the base
-    /// build settled and the extend gate lets it through.
+    /// The `decl_names` subset in the ROOT package plus every lifted or mangled decl: only
+    /// these collide with a root-package user declaration, a named-package base decl being
+    /// invisible to bare references elsewhere.
     root_decl_names: StringSet,
-    /// Packages the base files declare; a user file sharing one falls back
-    /// (pack-private object aliasing scans sibling types per package).
+    /// Packages the base files declare; a user file sharing one falls back.
     packages: StringSet,
-    /// Every lowered base Func param type name. A user function-type
-    /// typealias matching one would rewrite base param types in the
-    /// whole-program build; the extend build falls back instead.
+    /// A user function-type typealias matching one would rewrite base param types, so the
+    /// extend build falls back.
     param_type_names: StringSet,
-    /// Top-level type simple names (post-lift), seeded into the extending
-    /// build's nested-mangle collision universe.
+    /// Top-level type simple names, seeded into the extending build's collision universe.
     type_names: StringSet,
-    /// (FuncId, AST) pairs replayed into the per-build inline-fn registry
-    /// so user calls resolving to base inline fns still splice.
+    /// Replayed into the per-build inline-fn registry so user calls to base inline fns splice.
     inline_ids: []const InlineId,
-    /// Simple-name -> base inline-fn forest refs (overloads in declaration
-    /// order), the lazy replacement for walking `lifted_decls` with
-    /// `collectInline` at load. Empty for a freshly-built base (which walks its
-    /// own decls); populated only when loaded from an image. Includes class /
-    /// object member inline fns, which carry no `inline_ids` stub.
+    /// Simple name to base inline-fn forest refs, overloads in declaration order. Empty for
+    /// a freshly-built base; an image's also covers member inline fns, which have no stub.
     inline_by_name: []const InlineNames = &.{},
-    /// Class simple-name -> base class forest ref, the lazy replacement for
-    /// walking `lifted_decls` to seed `file_classes` at load. Empty for a
-    /// freshly-built base. Used for hierarchy walks when a USER class reaches
-    /// into a base class.
+    /// Class simple name to forest ref, for a user class reaching into a base class.
     file_classes: []const ClassRef = &.{},
-    /// Base top-level (file-scope) property scope data — the lazy replacement for
-    /// re-running `notePropScope` over `lifted_decls` at load. Empty for a
-    /// freshly-built base. Strings only (no AST).
+    /// Base file-scope property scope data, strings only. Empty for a freshly-built base.
     top_props: []const TopProp = &.{},
-    /// Baked top-level function return class heads (see `FnReturn`).
     fn_returns: []const FnReturn = &.{},
-    /// Baked extension return class heads (see `ExtReturn`).
     ext_returns: []const ExtReturn = &.{},
-    /// Baked eager call resolutions inside the base (see `EagerCall`).
     eager_calls: []const EagerCall = &.{},
     /// Base SourceMap files occupy ids [0..user_file_start).
     user_file_start: u32,
-    /// Next enum-entry identity, continuing the base build's sequence so
-    /// default toString/hashCode match the whole-program numbering.
+    /// Continues the base build's sequence so default toString/hashCode numbering matches.
     enum_id_next: u64,
-    /// Side section holding the self-contained encodings of `inline`,
-    /// object-free function bodies, decoded lazily on first splice. Empty for a
-    /// freshly-built base (its `lifted_decls` keep full bodies); populated only
-    /// when loaded from an image, where those bodies are markers. Borrows the
-    /// image buffer.
+    /// Encoded `inline`, object-free function bodies, decoded lazily on first splice and
+    /// borrowing the image buffer. Empty for a freshly-built base, which keeps full bodies.
     deferred_bodies: []const u8 = &.{},
-    /// Per-decl self-contained encodings of `lifted_decls` and their byte
-    /// offsets (decl `i` at `lifted_decl_offsets[i]`). Borrow the image buffer.
-    /// Back the lazy forest: a decl decodes on first touch from here instead of
-    /// the whole forest materialising at load. Empty for a freshly-built base.
+    /// Per-decl encodings of `lifted_decls` with byte offsets (decl `i` at
+    /// `lifted_decl_offsets[i]`), decoded on first touch. Borrow the image buffer.
     lifted_decl_section: []const u8 = &.{},
     lifted_decl_offsets: []const u32 = &.{},
-    /// The process-lifetime allocator the base (and its `lifted_decls`) live in.
-    /// A lazily-decoded deferred body must persist across per-program builds, so
-    /// it is decoded here, not into a per-build arena.
+    /// The process-lifetime allocator the base lives in: a lazily decoded deferred body
+    /// must outlive a per-program build, so it decodes here.
     arena: Allocator = undefined,
 
     pub const InlineId = struct { id: u32, f: FF(ast.Function) };
-    /// One simple name's base inline-fn forest refs (overloads in order).
     pub const InlineNames = struct { k: []const u8, v: []const runtime.forest.ForestRef };
-    /// One class simple name -> its base-class forest ref.
     pub const ClassRef = struct { k: []const u8, v: runtime.forest.ForestRef };
-    /// One base top-level property's scope identity.
     pub const TopProp = struct { name: []const u8, fqn: []const u8, package: []const u8, type_head: []const u8 = "" };
-    /// A top-level function's simple name paired with the class head it
-    /// returns. Baked because the funcs themselves are lazy in an image:
-    /// nothing else can answer "what class does `listOf` return" without
-    /// decoding the whole stdlib.
+    /// Baked because an image's funcs are lazy: nothing else can say what `listOf` returns.
     pub const FnReturn = struct { name: []const u8, head: []const u8 };
-    /// An EXTENSION's return class head, keyed `<receiver head>\x00<name>`.
-    /// Declaration signatures keep parameters and no return type, so without
-    /// this a chained call loses its receiver class at the first link.
+    /// An EXTENSION's return class head, keyed `<receiver head>\x00<name>`. Declaration
+    /// signatures carry no return type, so a chained call would lose its receiver class.
     pub const ExtReturn = struct { key: []const u8, head: []const u8 };
-    /// A call site inside the BASE and the declaration the checker picked
-    /// for it. Collected while the base's sources exist (image bake) and
-    /// replayed at load, because a cached run never parses them.
+    /// A base call site and the declaration the checker picked, replayed at load because a
+    /// cached run never parses the sources.
     pub const EagerCall = struct { call: span.Span, fid: u32 };
 };
 
-/// Build the dependency snapshot from already-parsed base files. The
-/// allocator must be the process-lifetime base arena. Returns null when the
-/// base program is not snapshot-safe (it has resolve diagnostics or a
-/// `main`), in which case callers must use the full per-program build.
+/// The allocator must be the process-lifetime base arena. Null when the base is not
+/// snapshot-safe (resolve diagnostics or a `main`), leaving the full per-program build.
 pub fn buildStdlibBase(allocator: Allocator, files: []const KotlinFile) Allocator.Error!?*StdlibBase {
     return buildBaseInner(allocator, files, false);
 }
 
-/// Whole-program variant of `buildStdlibBase` for `klio bundle`: the same
-/// lowered snapshot, but `files` includes the user program so `main` is
-/// present (and serialized). Boot then runs the loaded module directly —
-/// no parse, no extend.
-/// The declared type of the parent class's primary parameter at `idx`,
-/// instantiated by the supertype's written type arguments
-/// (`JsonTransformingSerializer<String>(serializer())` expects
-/// `KSerializer<String>`). Null when the parent or its parameter is unknown.
+/// The parent's primary parameter at `idx`, instantiated by the supertype's written
+/// type arguments. Null when the parent or parameter is unknown.
 pub fn parentCtorParamExpected(a: Allocator, module: *ir.Module, c: *const ast.Class, sup_idx: usize, idx: usize) ?ast.TypeRef {
     if (sup_idx >= c.supertypes.len) return null;
     const sup = &c.supertypes[sup_idx];
@@ -225,8 +169,8 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_mai
         .arena = allocator,
     };
 
-    // Name universes for the reuse gate, over raw AND lifted decls (a
-    // lifted/mangled name is a real top-level slot too).
+    // Name universes for the reuse gate span raw AND lifted decls: a lifted or mangled
+    // name is a real top-level slot too.
     for (files) |*f| {
         if (f.package) |p| {
             var dotted: std.ArrayList(u8) = .empty;
@@ -238,11 +182,8 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_mai
         }
         for (f.decls) |*d| try noteBaseDeclNames(base, d, f.package == null);
     }
-    // Lifted decls: mangled names carry `$` (never a legal user identifier,
-    // so never collidable), and plain-named lifts (member extensions and
-    // company) originate from the named-package files noted above — their
-    // bare-name visibility follows the same package scoping. They join the
-    // general universe only; the root universe keeps the files-loop truth.
+    // Mangled lift names carry `$`, never a legal user identifier, and plain-named lifts
+    // follow their package scoping; both join the general universe only.
     for (base.lifted_decls) |*d| try noteBaseDeclNames(base, d, false);
 
     {
@@ -261,8 +202,7 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_mai
         base.inline_ids = try inline_ids.toOwnedSlice(allocator);
     }
 
-    // Continue the enum-entry identity sequence after the base's: identities
-    // were assigned 1..N in build order over the base's unique class defs.
+    // Continue the enum-entry identity sequence: identities run 1..N in build order.
     {
         var counted = std.AutoHashMap(usize, void).init(allocator);
         defer counted.deinit();
@@ -278,25 +218,15 @@ pub fn buildBaseInner(allocator: Allocator, files: []const KotlinFile, allow_mai
         base.enum_id_next = 1 + n;
     }
 
-    // A non-inline base function never runs from its AST body (its lowered IR
-    // does); strip those bodies so the baked image and the resident forest drop
-    // the dead statement trees while keeping the metadata dispatch reads.
+    // A non-inline base function runs from its lowered IR, never its AST body, so stripping
+    // those bodies drops dead trees while keeping dispatch metadata.
     prune.stripDeadBodies(@constCast(base.lifted_decls), true);
 
     return base;
 }
 
-/// Add the simple names of every `@Composable` function in the baked base
-/// (pack composables the user calls) to the plugin oracle set.
-/// The base's lifted decls for the compose-plugin collectors. A freshly-built
-/// base carries the full forest in `lifted_decls`; an image-loaded base leaves
-/// that empty (the forest decodes lazily per-decl) and holds the per-decl
-/// `lifted_decl_section`/`lifted_decl_offsets` instead. The plugin collectors
-/// below need the whole base surface, so decode every section decl here — an
-/// image-loaded base otherwise reports zero base composables/sinks, and a
-/// composable lambda passed to a base sink (`setContent { … }`, `key(…) { … }`)
-/// never gets `$composer` threaded (`startRestartGroup on Nothing`). Returns
-/// `base.lifted_decls` unchanged for a fresh base (no allocation).
+/// The base's lifted decls for the compose-plugin collectors, which need the whole base
+/// surface: an image-loaded base decodes every section decl here.
 pub fn composeBaseDecls(allocator: Allocator, base: *const StdlibBase) Allocator.Error![]const Decl {
     if (base.lifted_decls.len != 0) return base.lifted_decls;
     if (base.lifted_decl_section.len == 0 or base.lifted_decl_offsets.len == 0) return &.{};
@@ -324,8 +254,8 @@ pub fn composeBaseNameDecl(names: *std.StringHashMap(void), d: *const Decl) Allo
     }
 }
 
-/// Add the names of baked-base functions with a `@Composable`-typed lambda
-/// parameter (composable-lambda sinks the user's composable calls pass into).
+/// Base functions taking a `@Composable` lambda parameter: the sinks user composable
+/// calls pass into.
 pub fn composeBaseSinks(sinks: *std.StringHashMap(void), base_decls: []const Decl) Allocator.Error!void {
     for (base_decls) |*d| try composeBaseSinkDecl(sinks, d);
 }
@@ -366,8 +296,7 @@ pub fn composeBaseSinkDecl(sinks: *std.StringHashMap(void), d: *const Decl) Allo
             }
         },
         .Class => |*c| {
-            // A class constructor taking a `@Composable` lambda is a sink
-            // under the class name (`MovableContent({ … })`).
+            // A class constructor taking a `@Composable` lambda is a sink under the class name.
             for (c.primary_params) |*p| {
                 if (p.ty.function != null and compose_pass.isComposable(p.ty.annotations)) {
                     try sinks.put(c.name.name, {});
@@ -409,11 +338,8 @@ pub fn noteBaseDeclNames(base: *StdlibBase, d: *const Decl, root_pkg: bool) Allo
     }
 }
 
-/// Whether `user_files` can extend `base` without changing any decision the
-/// base build already settled. Conservative: any top-level simple-name
-/// overlap (either namespace), any expect/actual decl, any package overlap,
-/// or a function-type alias matching a base param type forces the full
-/// whole-program build.
+/// Conservative: any top-level simple-name overlap in either namespace, any expect or
+/// actual decl, any package overlap, or a function-type alias matching a base param type.
 pub fn canExtendBase(base: *const StdlibBase, user_files: []const KotlinFile) bool {
     for (user_files) |*f| {
         if (f.package) |p| {
@@ -431,19 +357,9 @@ pub fn canExtendBase(base: *const StdlibBase, user_files: []const KotlinFile) bo
             }
             if (base.packages.contains(buf[0..n])) return extendRefused("package overlap", buf[0..n]);
         }
-        // A root-package user FUNCTION or PROPERTY can only collide with a
-        // base callable that is itself reachable from the root package
-        // (root-package base files): named-package base callables are
-        // invisible to bare references outside their package under Kotlin
-        // scoping, and the callable dispatch tails are visibility-filtered,
-        // so the user namesake cannot change any base decision. The TYPE
-        // namespace (classes, objects, typealiases) stays on the whole-set
-        // refusal: runtime casts / `is` checks / reified probes resolve
-        // type names WITHOUT package scoping (a user `Node` broke the
-        // kotlinx.coroutines-internal `as Node` cast), so a user type
-        // namesake of ANY base type forces the full build. A user file
-        // that DECLARES a package keeps the conservative whole-set refusal
-        // for callables too.
+        // A root-package user callable collides only with a base callable reachable from the root
+        // package. The TYPE namespace keeps the whole-set refusal, since casts, `is` checks and
+        // reified probes resolve type names WITHOUT package scoping.
         const callable_names: *const StringSet = if (f.package == null) &base.root_decl_names else &base.decl_names;
         for (f.decls) |*d| {
             switch (d.*) {
@@ -473,9 +389,8 @@ pub fn canExtendBase(base: *const StdlibBase, user_files: []const KotlinFile) bo
     return true;
 }
 
-/// Named refusal for the extend gate, surfaced under `KLIO_TRACE_STDLIB_IMAGE`
-/// so a silent image fallback (a full source re-lower costing seconds) is
-/// attributable to the exact colliding declaration.
+/// Named refusal surfaced under `KLIO_TRACE_STDLIB_IMAGE`, so a silent fallback to a
+/// full source re-lower names the colliding declaration.
 pub fn extendRefused(reason: []const u8, name: []const u8) bool {
     if (runtime.envOnce("KLIO_TRACE_STDLIB_IMAGE")) |v| {
         if (v.len != 0 and !std.mem.eql(u8, v, "0")) {

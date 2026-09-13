@@ -1,5 +1,4 @@
-//! Post-resolution composable lambda argument transform and the capture
-//! analysis behind memoized lambda lifting.
+//! Composable lambda-argument transform after resolution, and the capture analysis.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -22,9 +21,8 @@ const memoWrappedLambda = epilogue.memoWrappedLambda;
 const walker = @import("walker.zig");
 const Walker = walker.Walker;
 
-/// Transform a lambda argument after IR call resolution has selected its exact
-/// declaration and parameter. The overload-precise path for composable
-/// parameters that are not the source trailing lambda (`Scaffold(topBar = {…})`).
+/// Transform a lambda argument once resolution has selected its exact declaration and
+/// parameter: the overload-precise path for non-trailing composable parameters.
 pub fn transformResolvedComposableLambda(
     a: std.mem.Allocator,
     arg: *Expr,
@@ -34,13 +32,8 @@ pub fn transformResolvedComposableLambda(
 ) std.mem.Allocator.Error!bool {
     const lam = trailingLambda(arg) orelse memoWrappedLambda(arg) orelse return false;
     if (lambdaHasComposerParams(lam)) {
-        // The pass already shaped this lambda; repair it against the declared
-        // arity of the parameter resolution just selected. The pass shapes
-        // headerless lambdas with the bare pair only, and the resolved
-        // declaration is the authority on the synthetic slot count. A one-short
-        // lambda gains the implicit `it`; one over is the flattened receiver
-        // slot the declared arity omits and is left alone. Anything else is
-        // audited.
+        // Repair an already-shaped lambda against the resolved arity: one short gains the
+        // implicit `it`, one over is the flattened receiver slot and is left alone.
         const user_n = lam.params.len - 2;
         if (user_n + 1 == expected_params) {
             const np = a.alloc(ast.Ident, lam.params.len + 1) catch return false;
@@ -79,20 +72,16 @@ pub fn transformResolvedComposableLambda(
         .thread = true,
     };
     try w.transformComposableLambda(lam, expected_params, label);
-    // Wrap by TYPE, not content: the callee's parameter is declared
-    // `@Composable`, so kotlinc memoizes the lambda regardless of what its body
-    // does. Wrapping by content instead passes a fresh instance on every parent
-    // recompose, `rememberUpdatedState(content)` records a real state change,
-    // and the subcomposition recomposes an extra frame.
+    // Wrap by TYPE, not content: the parameter is declared `@Composable`, so kotlinc
+    // memoizes regardless of the body.
     if (root.emit_lambda_memo and !callee_inline) {
         w.wrapInComposableLambdaLabeled(arg, label);
     }
     return true;
 }
 
-/// Composable callees whose lambda argument is itself a memoization or effect
-/// calculation: wrapping it in `remember` would nest memoization or displace the
-/// effect protocol's own keying.
+/// Callees whose lambda argument is itself a memoization or effect calculation, where
+/// wrapping would nest memoization or displace the effect keying.
 pub fn plainMemoExcluded(name: []const u8) bool {
     const excluded = [_][]const u8{
         "remember",           "derivedStateOf",        "rememberSaveable",
@@ -106,11 +95,9 @@ pub fn plainMemoExcluded(name: []const u8) bool {
     return false;
 }
 
-/// Capture-fact walk for plain-lambda memoization. `refs` collects bare name
-/// reads, call callees excluded; `declared` the names bound inside; `bad` flags
-/// shapes memoization must skip: a write to a captured bare name, where a boxed
-/// `var` cell key is meaningless, or a labeled return to the callee's implicit
-/// label, which rewrapping would re-parent.
+/// `refs` collects bare name reads, `declared` the names bound inside, `bad` the shapes
+/// memoization must skip: a write to a captured name, whose boxed cell key is
+/// meaningless, or a labeled return that rewrapping would re-parent.
 pub fn collectLambdaCaptureFacts(stmts: []const Stmt, refs: *std.StringHashMap(void), declared: *std.StringHashMap(void), bad: *bool, callee_name: []const u8) void {
     for (stmts) |*st| collectCaptureFactsStmt(st, refs, declared, bad, callee_name);
 }
@@ -174,7 +161,6 @@ fn collectCaptureFactsExpr(e: *const Expr, refs: *std.StringHashMap(void), decla
         },
         .Unary => |u| collectCaptureFactsExpr(u.expr, refs, declared, bad, callee),
         .Postfix => |px| {
-            // `x++` writes its operand.
             if (px.expr.* == .Path and px.expr.Path.segments.len == 1 and
                 !declared.contains(px.expr.Path.segments[0].name))
             {
@@ -231,8 +217,7 @@ fn collectCaptureFactsExpr(e: *const Expr, refs: *std.StringHashMap(void), decla
     }
 }
 
-/// The span of an expression, for the memoization key. Falls back to a zero span
-/// when the node form carries none the pass knows about.
+/// The span of an expression, for the memoization key; zero when the form carries none.
 pub fn exprSpanOf(e: *const Expr) Span {
     return switch (e.*) {
         .Lambda => |l| l.span,
@@ -242,8 +227,7 @@ pub fn exprSpanOf(e: *const Expr) Span {
     };
 }
 
-/// Whether `e` denotes `currentComposer`, as a bare path or a trailing member
-/// segment of that name.
+/// Whether `e` denotes `currentComposer`, bare or as a trailing member segment.
 pub fn isCurrentComposer(e: *const Expr) bool {
     return switch (e.*) {
         .Path => |p| p.segments.len == 1 and std.mem.eql(u8, p.segments[0].name, "currentComposer"),

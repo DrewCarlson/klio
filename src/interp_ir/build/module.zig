@@ -1,6 +1,5 @@
-//! The file-set build drivers: the single-file and multi-file entry
-//! points, the per-file package/FQN override scan, and the pass that
-//! lowers a whole file set into one shared module.
+//! The file-set build drivers: the single-file and multi-file entry points, the
+//! per-file package/FQN override scan, and the whole-file-set lowering pass.
 
 const std = @import("std");
 
@@ -38,7 +37,6 @@ const BuiltModule = build_types.BuiltModule;
 const Span = build_types.Span;
 const SpanStrMap = build_types.SpanStrMap;
 
-/// Lower a single file's declarations into an IR module.
 pub fn buildModule(allocator: Allocator, file: *const KotlinFile) Allocator.Error!BuiltModule {
     var fqn = SpanStrMap.init(allocator);
     defer fqn.deinit();
@@ -59,24 +57,20 @@ pub fn buildModule(allocator: Allocator, file: *const KotlinFile) Allocator.Erro
     );
 }
 
-/// Drive `buildModule` against multiple parsed files. All declarations
-/// from every file are concatenated into one synthesised file and
+/// Declarations from every file are concatenated into one synthesised file and
 /// lowered as a single program.
 pub fn buildModuleFiles(allocator: Allocator, files: []const KotlinFile) Allocator.Error!BuiltModule {
     return buildModuleFilesInner(allocator, files, null, null);
 }
 
-/// Extend an immutable dependency base with `user_files` only: the base's
-/// lowered module/tables are cloned onto `allocator` and just the user
-/// declarations are lifted and lowered on top. Callers must have verified
-/// `canExtendBase` first.
+/// The base's lowered module and tables are cloned onto `allocator` and only the
+/// user declarations are lifted on top. Callers must have verified `canExtendBase`.
 pub fn buildModuleFilesExtend(allocator: Allocator, base: *const StdlibBase, user_files: []const KotlinFile) Allocator.Error!BuiltModule {
     return buildModuleFilesInner(allocator, user_files, base, null);
 }
 
-/// Files where a bare `@Composable` is the program's own annotation class:
-/// their package declares `annotation class Composable` (the compose runtime's
-/// own package excepted) and the file imports no other `Composable`.
+/// Files where a bare `@Composable` is the program's own annotation class: the package
+/// declares `annotation class Composable` and the file imports no other `Composable`.
 pub fn collectUserComposableFiles(allocator: Allocator, files: []const KotlinFile) Allocator.Error!std.AutoHashMap(ir.FileId, void) {
     var out = std.AutoHashMap(ir.FileId, void).init(allocator);
     errdefer out.deinit();
@@ -158,14 +152,11 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         }
         break :blk next;
     } else 0;
-    // `@Serializable` lowering plugin: synthesize each serializable class's
-    // generated serializer declarations (the companion `serializer()`, the
-    // `$serializer` object, sealed/enum/object/value-class forms) as ordinary
-    // Kotlin before anything reads the decls, so packs and programs alike
-    // carry real generated serializers.
+    // `@Serializable` lowering: each serializable class's generated serializer
+    // declarations are synthesized as ordinary Kotlin before anything reads the decls.
     const files: []KotlinFile = try serialization_pass.transformFiles(allocator, files_in);
-    // Typealias expansion: every alias reference becomes its target before
-    // any phase reads the declarations (`KLIO_ALIAS_EXPAND=0` skips it).
+    // Typealias expansion: every alias reference becomes its target before any phase
+    // reads the declarations (`KLIO_ALIAS_EXPAND=0` skips it).
     const alias_expand_off = if (runtime.envOnce("KLIO_ALIAS_EXPAND")) |v| std.mem.eql(u8, v, "0") else false;
     if (!alias_expand_off) try ast.alias_expand.expandFiles(allocator, files);
     var user_composable_files = try collectUserComposableFiles(allocator, files);
@@ -192,10 +183,8 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         try imports.appendSlice(allocator, f.imports);
     }
 
-    // `@Composable` lowering plugin: rewrite composable functions to thread the
-    // composer per the Compose plugin ABI, so upstream's real Composer/SlotTable
-    // runs. This is the only compose path. The oracle spans this module's decls
-    // plus the baked base (pack composables the user calls, e.g. `Text`).
+    // `@Composable` lowering: composable functions are rewritten to thread the composer per
+    // the Compose plugin ABI. The oracle spans this module's decls plus the baked base.
     {
         var names = try compose_pass.collectComposableNames(allocator, decls.items);
         defer names.deinit();
@@ -206,8 +195,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         var inline_fns = try compose_pass.collectInlineFnNames(allocator, decls.items);
         defer inline_fns.deinit();
         if (base) |bsp| {
-            // Decode once: an image-loaded base leaves `lifted_decls` empty, so
-            // every collector below must read the decoded section instead.
+            // An image-loaded base leaves `lifted_decls` empty, so collectors read the decoded section.
             const base_decls = try composeBaseDecls(allocator, bsp);
             try composeBaseNames(&names, base_decls);
             try composeBaseSinks(&sinks, base_decls);
@@ -270,17 +258,11 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         compose_pass.active_stability = &maps.stability;
     }
 
-    // Kotlin gives same-named top-level properties distinct storage per
-    // declaration — a `private` one is scoped to its declaring file, and
-    // non-private ones in different packages are distinct declarations —
-    // but the lowered globals table is flat. Rename colliding declarations
-    // (per-file mangle for `private`, the declaring FQN for cross-package
-    // non-private slots) and install the per-file rename table the
-    // bare-name lowering consults through the reference's span file (an
-    // inline-spliced body keeps its declaring file's spans, so a splice
-    // still reads the right file's property). A bare reference resolves
-    // Kotlin's scope order: own-file private > own package > named import
-    // > wildcard import.
+    // Kotlin gives same-named top-level properties distinct storage per declaration (a
+    // `private` one is file-scoped, non-private ones in different packages are distinct)
+    // but the lowered globals table is flat, so colliding declarations are renamed and a
+    // per-file rename table drives bare reads. Scope order: own-file private, own package,
+    // named import, wildcard import.
     var private_prop_renames = ir.build.FilePrivateRenames.init(allocator);
     defer {
         var it = private_prop_renames.valueIterator();
@@ -311,8 +293,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
                 gop.value_ptr.* += 1;
             }
         }
-        // Private decls: per-file mangled slots; bare reads in the
-        // declaring file rewrite to them.
+        // Private decls: per-file mangled slots, and declaring-file bare reads rewrite to them.
         for (decls.items) |*d| {
             if (d.* != .Property) continue;
             const p = d.Property;
@@ -327,11 +308,8 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
             try gop.value_ptr.put(p.name.name, mangled);
             p.name = .{ .name = mangled, .span = p.name.span };
         }
-        // File-private top-level FUNCTIONS: same story as private properties.
-        // Two files each declaring `private fun debugLog(...)` are file-scoped
-        // in Kotlin, but klio's function namespace is flat, so identical
-        // signatures read as conflicting overloads. Mangle each per file and
-        // record the rename so the declaring file's bare calls rewrite to it.
+        // File-private top-level FUNCTIONS: file-scoped in Kotlin but flat here, so two files
+        // declaring `private fun debugLog(...)` read as conflicting overloads without a mangle.
         {
             var fn_files = std.StringHashMap(u32).init(allocator);
             defer fn_files.deinit();
@@ -365,8 +343,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
                 fdec.name = .{ .name = mangled, .span = fdec.name.span };
             }
         }
-        // Non-private decls of one simple name declared by two or more
-        // packages: each gets its declaring-FQN slot.
+        // A simple name declared non-privately by two or more packages: each gets its FQN slot.
         const FqnCand = struct { pkg: []const u8, fqn: []const u8 };
         var fqn_renamed = std.StringHashMap(std.ArrayList(FqnCand)).init(allocator);
         defer {
@@ -383,10 +360,8 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
             if (count < 2) continue;
             const pkg = decl_pkg.get(p.span) orelse "";
             if (pkg.len == 0) continue;
-            // Rename only when another package also declares the name
-            // non-privately: same-package duplicates are a kotlinc
-            // redeclaration error, and a private-only collision is
-            // already file-scoped above.
+            // Rename only when another package also declares the name non-privately: a same-package
+            // duplicate is a redeclaration error, a private-only collision is file-scoped above.
             var other_pkg = false;
             for (decls.items) |*d2| {
                 if (d2.* != .Property) continue;
@@ -403,19 +378,15 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
             const fid = p.span.file.int();
             const gop = try private_prop_renames.getOrPut(fid);
             if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);
-            // A file-private decl of the same name in this file wins for
-            // the file's own references; only add when absent.
+            // A file-private decl of the same name wins for its own file's references.
             if (gop.value_ptr.get(simple) == null) try gop.value_ptr.put(simple, fqn);
             const lgop = try fqn_renamed.getOrPut(simple);
             if (!lgop.found_existing) lgop.value_ptr.* = .empty;
             try lgop.value_ptr.append(allocator, .{ .pkg = pkg, .fqn = fqn });
             p.name = .{ .name = fqn, .span = p.name.span };
         }
-        // Resolve bare references from every other file: own package
-        // first, then a named import of a declaring FQN, then a wildcard
-        // import of a declaring package. A file with no visible
-        // declaration keeps the name-keyed read (Kotlin would reject the
-        // reference outright; klio's lenient pick stays unchanged).
+        // Bare references from other files resolve own package, then a named import of a
+        // declaring FQN, then a wildcard import; otherwise the name-keyed read stands.
         if (fqn_renamed.count() != 0) {
             for (files) |*f| {
                 const fid = f.span.file.int();
@@ -466,13 +437,9 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
     const prev_fn_renames = ir.build.setLowerFilePrivateFuncRenames(&private_func_renames);
     defer _ = ir.build.setLowerFilePrivateFuncRenames(prev_fn_renames);
 
-    // Kotlin scopes a file-`private` top-level class or typealias to its
-    // declaring file; the lowered type namespace is flat. Mangle a private
-    // class/typealias whose simple name another file also claims as a type
-    // (class, object, or typealias — the coroutines pack's file-private
-    // `typealias Node` must not capture another file's `Node` class), and
-    // install the per-file rename table; the reference sites (bare heads,
-    // `as`/`is`, supertypes) rewrite through the reference's span file.
+    // Kotlin scopes a file-`private` top-level class or typealias to its declaring file, but
+    // the lowered type namespace is flat, so one whose simple name another file also claims
+    // as a type is mangled and its reference sites rewritten through their span file.
     var file_type_renames = ir.build.FileTypeRenames.init(allocator);
     defer {
         var it = file_type_renames.valueIterator();
@@ -490,9 +457,7 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
         defer name_files.deinit();
         var name_counts = std.StringHashMap(u32).init(allocator);
         defer name_counts.deinit();
-        // A name any expect/actual declaration claims is shared by design
-        // (the pair resolves as one classifier); it never participates in
-        // collision mangling.
+        // A name any expect/actual declaration claims is shared by design and never mangles.
         var ea_names = StringSet.init(allocator);
         defer ea_names.deinit();
         for (decls.items) |*d| {
@@ -522,16 +487,9 @@ pub fn buildModuleFilesInner(allocator: Allocator, files_in: []const KotlinFile,
             if ((tg.vis != .Private and tg.vis != .Internal) or tg.is_ea) continue;
             if (ea_names.contains(tg.name.name)) continue;
             if ((name_counts.get(tg.name.name) orelse 0) < 2) continue;
-            // A file-`private` classifier is file-scoped: the per-file map
-            // serves every legal reference. An `internal` one cannot be
-            // named from another pack (module) at all, so its legal
-            // references are the declaring file (file map), same-package
-            // files (package map), and imports — which resolve by FQN and
-            // keep the source name via the fqn override. Without the
-            // mangle the combined image keeps ONE of the same-named
-            // top-levels: foundation's `text.input.internal.Node`
-            // displaced the ui pointer-dispatch `Node` and
-            // `super.buildCache` walked a parentless class.
+            // A file-`private` classifier is file-scoped, so the per-file map serves every legal
+            // reference. An `internal` one cannot be named from another pack, leaving the declaring
+            // file, same-package files, and imports, which resolve by FQN through the fqn override.
             const mangled = try std.fmt.allocPrint(allocator, "{s}$f{d}", .{ tg.name.name, tg.fid });
             const gop = try file_type_renames.getOrPut(tg.fid);
             if (!gop.found_existing) gop.value_ptr.* = std.StringHashMap([]const u8).init(allocator);

@@ -98,27 +98,20 @@ test "a composable-lambda-sink argument is transformed to (…, composer, change
     try sinks.put("Column", {});
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null, null);
-    // The Column call sits inside the skip-if's then-block.
     const col = wrappedBodyStmts(&out)[0].Expr.Call;
-    // Column is composable too, so it gains its own (composer, changed). The sink
-    // lambda is memoized: `rememberComposableLambda(key, true, <lambda>,
-    // $composer, 0)`, the slot-based memoizer with no child group, block third,
-    // composer pair last.
+    // Column gains its own pair; the sink lambda is memoized by rememberComposableLambda.
     const memo = col.args[0].Call;
     const memo_path = memo.callee.Path;
     try testing.expectEqualStrings("rememberComposableLambda", memo_path.segments[memo_path.segments.len - 1].name);
     try testing.expectEqual(@as(usize, 5), memo.args.len);
-    // The threaded composer pair trails the (key, tracked, block) triple.
     try testing.expectEqualStrings(composer_param, memo.args[3].Path.segments[0].name);
     const lam = memo.args[2].Labeled.expr.Lambda;
-    // The sink lambda had only the synthetic `it`, replaced by
-    // ($composer, $changed) rather than appended after.
+    // The sink lambda's synthetic `it` is REPLACED by ($composer, $changed), not appended.
     try testing.expectEqual(@as(usize, 2), lam.params.len);
     try testing.expectEqualStrings(composer_param, lam.params[0].name);
     try testing.expectEqualStrings(changed_param, lam.params[1].name);
     try testing.expect(!lam.implicit_it);
-    // The body sits inside the lambda's shouldExecute pause gate; bare
-    // declaration calls stay source-shaped for the IR resolver.
+    // Bare declaration calls stay source-shaped for the IR resolver.
     const gate = lam.body.stmts[0].Expr.If;
     try testing.expectEqualStrings("shouldExecute", gate.cond.Call.callee.Member.name.name);
     const inner = gate.then_branch.Block.stmts[0].Expr.Call;
@@ -129,8 +122,7 @@ fn noneComposable(_: *anyopaque, _: []const u8) bool {
     return false;
 }
 
-/// The restart-wrapped body statements: the then-block of the skip `if`, the
-/// second-to-last statement of the transformed body.
+/// The restart-wrapped body statements: the then-block of the skip `if`.
 fn wrappedBodyStmts(out: *const Function) []const Stmt {
     const stmts = out.body.?.Block.stmts;
     return stmts[stmts.len - 2].Expr.If.then_branch.Block.stmts;
@@ -282,13 +274,10 @@ test "a @Composable getter property is collected and detected as composable cont
     try testing.expect(set.contains("currentRecomposeScope"));
     try testing.expect(!set.contains("ordinaryProp"));
 
-    // A content lambda that ONLY reads such a property (no composable call) is
-    // detected as composable content once the getter-prop set is installed.
     root.active_composable_getter_props = &set;
     defer root.active_composable_getter_props = null;
 
-    // { record(currentRecomposeScope) }: `record` is not composable, so the only
-    // signal is the getter-property argument read.
+    // `record` is not composable, so the getter property read is the only signal.
     var crs_ref = [_]Ident{dummyIdent("currentRecomposeScope")};
     var rec_callee_segs = [_]Ident{dummyIdent("record")};
     var rec_callee = Expr{ .Path = .{ .segments = &rec_callee_segs, .span = gsp } };
@@ -314,7 +303,6 @@ test "a @Composable getter property is collected and detected as composable cont
     var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = noComposable, .oracle_ctx = &ctx };
     try testing.expect(w.branchHasComposable(&lam));
 
-    // With the set cleared, the same lambda reads as non-composable.
     root.active_composable_getter_props = null;
     try testing.expect(!w.branchHasComposable(&lam));
 }
@@ -345,10 +333,8 @@ test "walker replaces currentComposer with the threaded composer inside a nested
 
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &host, allComposable, &ctx, null, false, null, null);
-    // The Emit call sits inside the skip-if's then-block.
     const emit = wrappedBodyStmts(&out)[0].Expr.Call;
-    // The bare declaration call stays source-shaped; its first arg, originally
-    // currentComposer, is rewritten to the threaded $composer.
+    // The bare call stays source-shaped; `currentComposer` becomes the threaded `$composer`.
     try testing.expectEqual(@as(usize, 1), emit.args.len);
     try testing.expectEqualStrings(composer_param, emit.args[0].Path.segments[0].name);
 }
@@ -378,7 +364,6 @@ test "transform injects composer/changed params and brackets the body" {
         .annotations = &.{},
         .span = gsp,
     }};
-    // body: Text("hi")
     var text_segs = [_]Ident{dummyIdent("Text")};
     var text_callee = Expr{ .Path = .{ .segments = &text_segs, .span = gsp } };
     var str_parts = [_]ast.StringPart{.{ .Text = "hi" }};
@@ -398,7 +383,6 @@ test "transform injects composer/changed params and brackets the body" {
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &app, allComposable, &ctx, null, false, null, null);
 
-    // Signature gained the two synthetic params.
     try testing.expectEqual(@as(usize, 3), out.params.len);
     try testing.expectEqualStrings("x", out.params[0].name.name);
     try testing.expectEqualStrings(composer_param, out.params[1].name.name);
@@ -408,30 +392,25 @@ test "transform injects composer/changed params and brackets the body" {
     const stmts = out.body.?.Block.stmts;
     // startRestartGroup + $dirty decl + probe(x) + skip-if + endRestartGroup.
     try testing.expectEqual(@as(usize, 5), stmts.len);
-    // First stmt: $composer.startRestartGroup(<key>)
     try testing.expectEqualStrings("startRestartGroup", stmts[0].Expr.Call.callee.Member.name.name);
     try testing.expectEqualStrings(composer_param, stmts[0].Expr.Call.callee.Member.receiver.Path.segments[0].name);
     // Skip calculus: `var $dirty = $changed and 1`, then one probe per param.
     try testing.expectEqualStrings(dirty_local, stmts[1].Decl.Property.name.name);
     try testing.expect(stmts[1].Decl.Property.mutable);
-    // The probe is guarded by the caller-certainty check
-    // `if ($changed and 0b110 == 0)`.
+    // The probe is guarded by `if ($changed and 0b110 == 0)`.
     const probe_guard = stmts[2].Expr.If;
     try testing.expect(probe_guard.cond.Binary.op == .Eq);
     const probe = probe_guard.then_branch.Block.stmts[0].Assign.value.Call;
     try testing.expectEqualStrings("or", probe.callee.Member.name.name);
     try testing.expectEqualStrings("changed", probe.args[0].If.cond.Call.callee.Member.name.name);
     try testing.expectEqualStrings("x", probe.args[0].If.cond.Call.args[0].Path.segments[0].name);
-    // The skip if: body in the then-block, skipToGroupEnd in the else.
     const skip_if = stmts[3].Expr.If;
     try testing.expectEqualStrings(
         "skipToGroupEnd",
         skip_if.else_branch.?.Block.stmts[0].Expr.Call.callee.Member.name.name,
     );
-    // The bare Text declaration stays source-shaped until IR resolution.
     const text_call = wrappedBodyStmts(&out)[0].Expr.Call;
     try testing.expectEqual(@as(usize, 1), text_call.args.len);
-    // Last stmt: endRestartGroup()?.updateScope { ... }
     const upd = stmts[4].Expr.Call;
     try testing.expect(upd.callee.Member.safe);
     try testing.expectEqualStrings("updateScope", upd.callee.Member.name.name);
@@ -462,14 +441,13 @@ test "defaulted composable param becomes marker-guarded prologue" {
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &app, allComposable, &ctx, null, false, null, null);
 
-    // The param is renamed and its default is the marker call.
     try testing.expectEqualStrings("x$arg", out.params[0].name.name);
     const marker = out.params[0].default.?.Call;
     const seg = marker.callee.Path.segments;
     try testing.expectEqualStrings("klioComposableDefaultMarker", seg[seg.len - 1].name);
 
-    // Body: startRestartGroup, `val x = if (x$arg === marker()) 5 else x$arg`,
-    // $dirty decl, probe(x), skip-if, endRestartGroup?.updateScope.
+    // Body: startRestartGroup, `val x = if (x$arg === marker()) 5 else x$arg`, $dirty,
+    // probe(x), skip-if, endRestartGroup?.updateScope.
     const stmts = out.body.?.Block.stmts;
     try testing.expectEqual(@as(usize, 6), stmts.len);
     const prop = stmts[1].Decl.Property;
@@ -481,9 +459,7 @@ test "defaulted composable param becomes marker-guarded prologue" {
     try testing.expectEqual(@as(i64, 5), pick.then_branch.IntLit.value);
     try testing.expectEqualStrings("x$arg", pick.else_branch.?.Path.segments[0].name);
 
-    // A defaulted param's probe is guarded by the caller-certainty check and then
-    // by `if (x$arg !== marker())`, so a param that fell back to its default
-    // stores no `changed` slot.
+    // A defaulted param's probe is also guarded by `if (x$arg !== marker())`.
     const cguard = stmts[3].Expr.If;
     try testing.expect(cguard.cond.Binary.op == .Eq);
     const guard = cguard.then_branch.Block.stmts[0].Expr.If;
@@ -627,11 +603,8 @@ test "remember propagates a composable result type into its calculation result" 
 }
 
 test "threadCall re-names a trailing lambda across a defaulted gap" {
-    // `ExplicitStartReplaceGroup(key) { content }`: one positional arg then a
-    // trailing lambda binding the last param `content`, with a defaulted
-    // `insertGroup` in between. Threading appends the composer pair and clears
-    // `has_trailing_lambda`, so the lambda is re-emitted by name to rejoin
-    // `content` rather than sliding into `insertGroup`.
+    // Threading appends the composer pair and clears `has_trailing_lambda`, so the lambda
+    // is re-emitted by name to rejoin `content` rather than the defaulted `insertGroup`.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -667,10 +640,7 @@ test "threadCall re-names a trailing lambda across a defaulted gap" {
     const c = call.Call;
     try testing.expectEqual(@as(usize, 4), c.args.len);
     try testing.expect(c.arg_names[0] == null); // key stays positional
-    // The pass leaves the trailing argument POSITIONAL: the runtime binders'
-    // trailing-callable rules, the positional gate and the named
-    // lambda-before-pair binder, place it on the resolved declaration's trailing
-    // parameter.
+    // The trailing argument stays POSITIONAL for the runtime binders.
     try testing.expect(c.arg_names[1] == null);
     try testing.expectEqualStrings(composer_param, c.arg_names[2].?);
     try testing.expectEqualStrings(changed_param, c.arg_names[3].?);
@@ -678,12 +648,8 @@ test "threadCall re-names a trailing lambda across a defaulted gap" {
 }
 
 test "threadCall leaves a non-content overload's trailing lambda positional" {
-    // `ComposeNode(::factory) { update }`: one positional arg then a trailing
-    // lambda. The name `ComposeNode` maps to the content sink's `content` param
-    // (reach 3: factory, update, content), but this 2-arg call binds the smaller
-    // `(factory, update)` overload whose trailing lambda IS `update`, already at
-    // its correct slot. It stays positional; naming it `content=` would misbind
-    // the call.
+    // This 2-arg call binds the `(factory, update)` overload whose trailing lambda IS
+    // `update`, already at its slot, so naming it `content=` would misbind.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -732,9 +698,7 @@ test "a sink lambda is shaped with the bare pair; slots come from resolution" {
     const a = arena.allocator();
     const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
 
-    // Bar(title = { }): the pass appends only the composer pair, no synthetic
-    // `it`. The slot count is the lowering's decision, made against the parameter
-    // the resolution selects.
+    // Bar(title = { }): the pass appends only the composer pair, no synthetic `it`.
     var segs = [_]Ident{dummyIdent("Bar")};
     var callee = Expr{ .Path = .{ .segments = &segs, .span = gsp } };
     var args = [_]Expr{.{ .Lambda = .{
@@ -760,8 +724,6 @@ test "a sink lambda is shaped with the bare pair; slots come from resolution" {
     var ctx: u8 = 0;
     var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = gsp }, .oracle = allComposable, .oracle_ctx = &ctx, .sinks = &sinks, .thread = true };
     try w.walkExpr(&call);
-    // The sink lambda is memoized by TYPE (rememberComposableLambda(key, tracked,
-    // block, $composer, 0)); the shaped lambda is the block arg.
     const wrapped = call.Call.args[0].Call;
     const lam = wrapped.args[2].Labeled.expr.Lambda;
     try testing.expectEqual(@as(usize, 2), lam.params.len);
@@ -791,7 +753,6 @@ test "non-composable callees are not threaded" {
     const fnp = emptyFn("Host", &noparams, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &fnp, noneComposable, &ctx, null, false, null, null);
-    // println keeps 0 args (not threaded).
     try testing.expectEqual(@as(usize, 0), wrappedBodyStmts(&out)[0].Expr.Call.args.len);
 }
 
@@ -800,8 +761,8 @@ test "movableContentWithReceiverOf type args pick the headerless lambda's overlo
     defer arena.deinit();
     const a = arena.allocator();
     const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
-    // mcwro<Int>() { … }: a headerless it-free lambda. One type arg means
-    // receiver only, so the block gains exactly ($composer, $changed), no `it`.
+    // mcwro<Int>() { … }: one type arg means receiver only, so the block gains exactly
+    // ($composer, $changed) and no `it`.
     var lam_params: [0]Ident = .{};
     var lam_ptys: [0]?TypeRef = .{};
     var call_args = [_]Expr{.{ .Lambda = .{
@@ -840,8 +801,6 @@ test "movableContentWithReceiverOf type args pick the headerless lambda's overlo
     var ctx: u8 = 0;
     const out = try transformComposableFunction(a, &host, noneComposable, &ctx, &sinks, false, null, null);
     const call = wrappedBodyStmts(&out)[0].Expr.Call;
-    // Memoized by TYPE: the content lambda rides inside
-    // rememberComposableLambda(key, tracked, block, $composer, 0).
     const wrapped = call.args[call.args.len - 1].Call;
     const lam = wrapped.args[2].Labeled.expr.Lambda;
     try testing.expectEqual(@as(usize, 2), lam.params.len);
@@ -946,8 +905,7 @@ test "stability: an unstable param drops the skip calculus, a stable one keeps i
     var body_stmts = [_]Stmt{};
     var ctx: u8 = 0;
 
-    // @Composable fun Show(m: Model) under strong skipping: the unstable param
-    // keeps the skip calculus but probes by identity (changedInstance).
+    // Under strong skipping an unstable param probes by identity (changedInstance).
     var unstable_params = [_]Param{.{
         .name = dummyIdent("m"),
         .ty = testTypeRef("Model"),
@@ -961,13 +919,11 @@ test "stability: an unstable param drops the skip calculus, a stable one keeps i
     const show = emptyFn("Show", &unstable_params, .{ .Block = .{ .stmts = &body_stmts, .span = gsp } }, true);
     const out = try transformComposableFunction(a, &show, allComposable, &ctx, null, false, null, null);
     const stmts = out.body.?.Block.stmts;
-    // startRestartGroup + $dirty + changedInstance probe + skip-if +
-    // endRestartGroup.
+    // startRestartGroup + $dirty + changedInstance probe + skip-if + endRestartGroup.
     try testing.expectEqual(@as(usize, 5), stmts.len);
     try testing.expectEqualStrings(dirty_local, stmts[1].Decl.Property.name.name);
     const probe_call = stmts[2].Expr.If.then_branch.Block.stmts[0].Assign.value.Call.args[0].If.cond.Call;
     try testing.expectEqualStrings("changedInstance", probe_call.callee.Member.name.name);
-    // The restart re-call is still emitted.
     try testing.expectEqualStrings("updateScope", stmts[4].Expr.Call.callee.Member.name.name);
 
     // @Composable fun ShowInt(x: Int) keeps the probe and $dirty calculus.
@@ -985,7 +941,6 @@ test "stability: an unstable param drops the skip calculus, a stable one keeps i
     const show_int = emptyFn("ShowInt", &stable_params, .{ .Block = .{ .stmts = &body_stmts2, .span = gsp } }, true);
     const out2 = try transformComposableFunction(a, &show_int, allComposable, &ctx, null, false, null, null);
     const stmts2 = out2.body.?.Block.stmts;
-    // startRestartGroup + $dirty + probe + skip-if + endRestartGroup.
     try testing.expectEqual(@as(usize, 5), stmts2.len);
     try testing.expectEqualStrings(dirty_local, stmts2[1].Decl.Property.name.name);
 }
@@ -1052,7 +1007,6 @@ test "key(k) { } gains a movable-group bracket with the dynamic key" {
     try testing.expectEqualStrings("k", start.args[1].Path.segments[0].name);
     const kcall = blk.stmts[1].Decl.Property.init.?.Call;
     try testing.expectEqualStrings("key", kcall.callee.Path.segments[0].name);
-    // The bare key declaration stays source-shaped for IR resolution.
     try testing.expectEqual(@as(usize, 2), kcall.args.len);
     try testing.expectEqualStrings("endMovableGroup", blk.stmts[2].Expr.Call.callee.Member.name.name);
     try testing.expectEqualStrings("$key$v", blk.stmts[3].Expr.Path.segments[0].name);
@@ -1064,9 +1018,7 @@ test "a non-local return through a sink lambda closes groups via endToMarker" {
     const a = arena.allocator();
     const gsp = Span.init(span_mod.FileId.from(0), 0, 0);
 
-    // Body: InlineLinear outer@{ InlineLinear { return@outer } }. A `return@outer`
-    // from the inner sink lambda is non-local, so it closes the inner group
-    // before unwinding.
+    // The inner `return@outer` is non-local, so it closes the inner group before unwinding.
     const ret = try a.create(Expr);
     ret.* = .{ .Return = .{ .value = null, .label = dummyIdent("outer"), .span = gsp } };
     const inner_body = try a.alloc(Stmt, 1);
@@ -1134,8 +1086,7 @@ test "a non-local return through a sink lambda closes groups via endToMarker" {
 
     var sinks = std.StringHashMap(void).init(a);
     try sinks.put("InlineLinear", {});
-    // `InlineLinear` is an inline function: its lambda is spliced, never wrapped
-    // in composableLambda, so the sink lambda stays raw here too.
+    // `InlineLinear` inlines, so its lambda is spliced, never wrapped, and stays raw.
     var inline_fns = std.StringHashMap(void).init(a);
     try inline_fns.put("InlineLinear", {});
     root.active_inline_fns = &inline_fns;
@@ -1144,7 +1095,6 @@ test "a non-local return through a sink lambda closes groups via endToMarker" {
     const out = try transformComposableFunction(a, &host, allComposable, &ctx, &sinks, false, null, null);
 
     const ocall = wrappedBodyStmts(&out)[0].Expr.Call;
-    // The labeled trailing lambda is unwrapped and threaded.
     const olam = ocall.args[0].Labeled.expr.Lambda;
     try testing.expectEqual(@as(usize, 2), olam.params.len);
     try testing.expectEqualStrings(composer_param, olam.params[0].name);
@@ -1185,20 +1135,15 @@ var explicitGroupsAnno = [_]ast.Annotation{
 };
 var explicitGroupsPath = [_]Ident{dummyIdent("ExplicitGroupsComposable")};
 
-// A statement-position `if (cond) { Foo() }` in an @ExplicitGroupsComposable
-// body must NOT gain the per-branch replace-group inserted for ordinary
-// composables, since the function manages its own groups; inserting one makes
-// `ReusableContentHost`'s deactivate/reactivate branches mis-key their groups and
-// delete the reused nodes. A plain @Composable inline body with the same shape
-// DOES get the bracket.
+// A statement-position `if` in an @ExplicitGroupsComposable body must NOT gain the
+// per-branch replace-group: one there makes `ReusableContentHost` mis-key its groups.
 test "an @ExplicitGroupsComposable body skips per-branch replace-groups" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const gsp = Span.init(span_mod.FileId.from(0), 40, 60);
 
-    // Build `if (true) { Foo() }` as a statement body. `buildIfFooBody` re-runs
-    // per fixture so the two transforms do not share mutated AST.
+    // `buildBody` re-runs per fixture so the two transforms share no mutated AST.
     const S = struct {
         fn buildBody(al: std.mem.Allocator, sp: Span) ![]Stmt {
             const foo_segs = try al.alloc(Ident, 1);
@@ -1235,7 +1180,6 @@ test "an @ExplicitGroupsComposable body skips per-branch replace-groups" {
 
     var ctx: u8 = 0;
 
-    // Explicit-groups: no bracket.
     const eg_body = try S.buildBody(a, gsp);
     var eg = emptyFn("EgHost", &.{}, .{ .Block = .{ .stmts = eg_body, .span = gsp } }, true);
     eg.is_inline = true;
@@ -1243,13 +1187,10 @@ test "an @ExplicitGroupsComposable body skips per-branch replace-groups" {
     const eg_out = try transformThreadedComposable(a, &eg, allComposable, &ctx, null, null);
     const eg_if = eg_out.body.?.Block.stmts[0].Expr.If;
     const eg_then = eg_if.then_branch.Block.stmts;
-    // First (and only) statement is the Foo() call, NOT a startReplaceGroup.
     try testing.expect(!isComposerCallStmt(&eg_then[0], "startReplaceGroup"));
     try testing.expectEqualStrings("Foo", eg_then[0].Expr.Call.callee.Path.segments[0].name);
-    // No synthesized else either: it manages its own groups.
     try testing.expect(eg_if.else_branch == null);
 
-    // Plain composable inline: the branch IS bracketed.
     const plain_body = try S.buildBody(a, gsp);
     var plain = emptyFn("PlainHost", &.{}, .{ .Block = .{ .stmts = plain_body, .span = gsp } }, true);
     plain.is_inline = true;
@@ -1266,8 +1207,7 @@ test "an @ExplicitGroupsComposable body skips per-branch replace-groups" {
     try testing.expect(plain_then[3] == .Expr);
     try testing.expect(plain_then[3].Expr == .Path);
     try testing.expectEqualStrings(branch_result.name.name, plain_then[3].Expr.Path.segments[0].name);
-    // A no-else composable `if` gains a synthesized empty else whose replace
-    // group keeps the conditional position-stable across a branch flip.
+    // A no-else composable `if` gains a synthesized empty else to stay position-stable.
     try testing.expect(plain_if.else_branch != null);
     const plain_else = plain_if.else_branch.?.Block.stmts;
     try testing.expect(isComposerCallStmt(&plain_else[0], "startReplaceGroup"));

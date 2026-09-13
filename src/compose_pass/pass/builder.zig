@@ -24,14 +24,12 @@ pub const B = struct {
         return p;
     }
 
-    /// `name` as a single-segment path expression.
     pub fn pathExpr(self: B, name: []const u8) Expr {
         const segs = self.a.alloc(Ident, 1) catch @panic("oom");
         segs[0] = self.ident(name);
         return .{ .Path = .{ .segments = segs, .span = self.gen_span } };
     }
 
-    /// `a.b.c` as a multi-segment path expression.
     pub fn pathExprSegs(self: B, names: []const []const u8) Expr {
         const segs = self.a.alloc(Ident, names.len) catch @panic("oom");
         for (names, segs) |nm, *s| s.* = self.ident(nm);
@@ -42,7 +40,6 @@ pub const B = struct {
         return .{ .IntLit = .{ .value = v, .kind = .Int, .span = self.gen_span } };
     }
 
-    /// `receiver.name`.
     pub fn member(self: B, receiver: Expr, name: []const u8) Expr {
         return .{ .Member = .{
             .receiver = self.box(receiver),
@@ -52,12 +49,11 @@ pub const B = struct {
         } };
     }
 
-    /// `receiver.name(args)` (positional args, no trailing lambda).
     pub fn callMember(self: B, receiver: Expr, name: []const u8, args: []Expr) Expr {
         return self.call(self.member(receiver, name), args);
     }
 
-    /// `callee(args)` with all-positional args.
+    /// `callee(args)`, all arguments positional.
     pub fn call(self: B, callee: Expr, args: []Expr) Expr {
         const names = self.a.alloc(?[]const u8, args.len) catch @panic("oom");
         for (names) |*n| n.* = null;
@@ -78,7 +74,6 @@ pub const B = struct {
         return s;
     }
 
-    /// A named user type reference (`Composer`, `Int`) with no generics.
     pub fn typeRef(self: B, name: []const u8) TypeRef {
         return .{
             .name = self.ident(name),

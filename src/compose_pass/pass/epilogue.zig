@@ -1,5 +1,4 @@
-//! Restart-epilogue injection at every exit of a restartable composable,
-//! plus the shared lambda and function-signature helpers.
+//! Restart-epilogue injection at every exit of a restartable composable.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -23,28 +22,22 @@ const collect = @import("collect.zig");
 const calleeInlinesLambda = collect.calleeInlinesLambda;
 
 /// Injects the restart epilogue before every `return` that exits the restartable
-/// composable, so an early or conditional return closes its open groups as
-/// kotlinc's generated code does; otherwise the group stays open and the next
-/// composition throws "Start/end imbalance". Each injected block closes the
-/// enclosing wrapped replace-groups first, one `$composer.endReplaceGroup()` per
-/// open bracket, then runs `$composer.endRestartGroup()?.updateScope(..)`.
-/// Descends through control flow and into lambda arguments of INLINE callees,
-/// where a bare `return` is a non-local exit of the composable; a non-inline
-/// lambda, anonymous fn, local fn, or local class keeps its own returns.
+/// composable, so an early return closes its open groups instead of leaving the next
+/// composition to throw "Start/end imbalance": one `$composer.endReplaceGroup()` per
+/// open bracket, then `$composer.endRestartGroup()?.updateScope(..)`. It descends into
+/// INLINE callees' lambdas, where a bare `return` is a non-local exit.
 pub const EpilogueInjector = struct {
     a: std.mem.Allocator,
     b: B,
     fn_name: []const u8,
     value_params: []const Param,
-    /// Whether the body being injected owns a restart bracket. A content
-    /// lambda's restart group belongs to `ComposableLambdaImpl`, so only
-    /// replace-groups close there.
+    /// Whether the body owns a restart bracket: a content lambda's belongs to
+    /// `ComposableLambdaImpl`, so only replace-groups close there.
     has_restart: bool = true,
     /// Open wrapped replace-groups at the current descent position.
     replace_depth: usize = 0,
-    /// Inline-lambda boundaries the descent entered: the callee's simple name,
-    /// the implicit label of its lambda, and the replace-depth at entry, so
-    /// `return@run` closes exactly the brackets opened inside.
+    /// Inline-lambda boundaries entered: callee name, implicit label, and the
+    /// replace-depth at entry, so `return@run` closes exactly the brackets opened inside.
     labels: [16]LabelEntry = undefined,
     n_labels: usize = 0,
 
@@ -67,22 +60,17 @@ pub const EpilogueInjector = struct {
                     if (p.init) |*ini| try self.expr(ini);
                     if (p.delegate) |del| try self.expr(del);
                 },
-                // A local fn or class owns its returns.
                 else => {},
             },
         }
     }
 
     fn block(self: *EpilogueInjector, blk: *ast.Block) std.mem.Allocator.Error!void {
-        // A marker-close block the walker already emitted for a non-local return
-        // (`{ …; $composer.endToMarker(m); return@label }`) closes every open
-        // group down to the target scope, so per-bracket endReplaceGroup calls on
-        // top would double-close.
+        // A marker-close block already closes every group down to the target scope.
         for (blk.stmts) |*st| {
             if (isComposerCallStmt(st, "endToMarker")) return;
         }
-        // A branch block the walker wrapped opens a replace-group; a return
-        // inside closes it too.
+        // A branch block the walker wrapped opens a replace-group a return also closes.
         const wrapped = blk.stmts.len != 0 and isComposerCallStmt(&blk.stmts[0], "startReplaceGroup");
         if (wrapped) self.replace_depth += 1;
         defer if (wrapped) {
@@ -96,9 +84,7 @@ pub const EpilogueInjector = struct {
             .Return => |*r| {
                 if (r.value) |v| try self.expr(v);
                 const ret_span = r.span;
-                // How many open replace-groups this return crosses, and whether
-                // it exits the composable itself, which also runs the restart
-                // epilogue.
+                // How many open replace-groups this return crosses, and whether it exits the fn.
                 var n_end: usize = 0;
                 var exits_composable = false;
                 if (r.label == null or std.mem.eql(u8, r.label.?.name, self.fn_name)) {
@@ -106,8 +92,7 @@ pub const EpilogueInjector = struct {
                     exits_composable = self.has_restart;
                     if (!self.has_restart and n_end == 0) return;
                 } else {
-                    // `return@run`: the exit crosses the brackets opened since
-                    // the labeled inline lambda's entry.
+                    // `return@run` crosses the brackets opened since that lambda's entry.
                     var found = false;
                     var i: usize = self.n_labels;
                     while (i > 0) {
@@ -213,7 +198,6 @@ pub const EpilogueInjector = struct {
     }
 };
 
-/// Whether a headerless lambda body reads the implicit `it` anywhere.
 fn blockUsesIt(blk: *const ast.Block) bool {
     for (blk.stmts) |*st| {
         if (stmtUsesIt(st)) return true;
@@ -287,7 +271,6 @@ fn exprUsesIt(e: *const Expr) bool {
     }
 }
 
-/// Whether `s` is a bare `$composer.<name>()` call statement.
 pub fn isComposerCallStmt(s: *const Stmt, name: []const u8) bool {
     if (s.* != .Expr) return false;
     const e = &s.Expr;
@@ -301,9 +284,7 @@ pub fn isComposerCallStmt(s: *const Stmt, name: []const u8) bool {
 }
 
 pub fn endRestartGroupExpr(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params: []const Param) std.mem.Allocator.Error!Expr {
-    // `$composer.endRestartGroup()`
     const end_call = b.callMember(b.pathExpr(composer_param), "endRestartGroup", &.{});
-    // `?.updateScope(<lambda>)`, a safe member call.
     const lambda = try recomposeLambda(a, b, fn_name, value_params);
     return .{ .Call = .{
         .callee = b.box(.{ .Member = .{
@@ -321,24 +302,17 @@ pub fn endRestartGroupExpr(a: std.mem.Allocator, b: B, fn_name: []const u8, valu
     } };
 }
 
-/// `{ c, _f -> Self(origValueArgs, c, $changed or 1) }`: the recompose lambda
-/// re-invoking the function with the same value arguments, the recompose
-/// composer, and `$changed or 1`. `value_params` are the TRANSFORMED value
-/// params, so a defaulted param is its renamed `p$arg`, the restart passes the
-/// marker through, and the default re-evaluates in the new composition.
+/// `{ c, _f -> Self(origValueArgs, c, $changed or 1) }`. `value_params` are the
+/// TRANSFORMED params, so a defaulted one is its renamed `p$arg` and the marker
+/// flows through the restart.
 fn recomposeLambda(a: std.mem.Allocator, b: B, fn_name: []const u8, value_params: []const Param) std.mem.Allocator.Error!Expr {
-    // Re-invoke the function: original value params by name, then the recompose
-    // composer and `$changed or 1`.
     var call_args = try a.alloc(Expr, value_params.len + 2);
     for (value_params, 0..) |p, i| call_args[i] = b.pathExpr(p.name.name);
     call_args[value_params.len] = b.pathExpr("$rc"); // recompose composer lambda param
-    // `updateChangedFlags($changed or 1)`, kotlinc's restart re-invoke. The wrap
-    // folds every DYNAMIC "changed" triple down to "same": the restart re-runs
-    // with the very values the scope captured, so a caller-recombined changed bit
-    // frozen in `$changed` must not force the callee's downstream to re-execute
-    // forever. Static triples, both bits set, survive the fold unchanged. `or` is
-    // Kotlin's infix bitwise function; the AST `BinOp.Or` is logical `||`, whose
-    // short-circuit on an Int kills the invocation.
+    // `updateChangedFlags($changed or 1)` folds every DYNAMIC "changed" triple to "same":
+    // the restart re-runs with the values the scope captured, so a frozen caller bit must
+    // not force the downstream forever; static triples survive. `or` is Kotlin's infix
+    // bitwise function, not the AST `BinOp.Or`, whose short-circuit on an Int kills it.
     const forced = b.callMember(
         b.pathExpr(changed_param),
         "or",
@@ -375,8 +349,7 @@ fn oneNull(a: std.mem.Allocator) std.mem.Allocator.Error![]?[]const u8 {
     return s;
 }
 
-/// The simple (last-segment) name a call's callee denotes, or null when the
-/// callee is neither a plain name nor a member; only those shapes are threaded.
+/// Only a plain name or a member is threaded; anything else is null.
 pub fn calleeSimpleName(callee: *const Expr) ?[]const u8 {
     return switch (callee.*) {
         .Path => |p| if (p.segments.len >= 1) p.segments[p.segments.len - 1].name else null,
@@ -385,10 +358,8 @@ pub fn calleeSimpleName(callee: *const Expr) ?[]const u8 {
     };
 }
 
-/// The lambda inside a memo wrap the pass emitted around a sink argument
-/// (`rememberComposableLambda(key, tracked, block, $composer, 0)` or
-/// `composableLambdaInstance(key, tracked, block)`), for the lowering-side shape
-/// repair: the wrap runs before resolution selects the parameter.
+/// The lambda inside a memo wrap the pass emitted around a sink argument, for the
+/// lowering-side shape repair: the wrap runs before resolution selects the parameter.
 pub fn memoWrappedLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
     if (e.* != .Call) return null;
     const c = &e.Call;
@@ -399,9 +370,8 @@ pub fn memoWrappedLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
     return trailingLambda(&c.args[2]);
 }
 
-/// A lambda literal argument, or a lambda wrapped in a `Labeled` node from an
-/// explicit `lbl@{ … }` trailing lambda. Returns the lambda payload pointer so
-/// the labeled form threads exactly like the bare one; null for a non-lambda arg.
+/// A lambda literal argument, or one wrapped in a `Labeled` node from `lbl@{ … }`,
+/// returned as the payload pointer so both forms thread alike.
 pub fn trailingLambda(e: *Expr) ?*@FieldType(Expr, "Lambda") {
     return switch (e.*) {
         .Lambda => &e.Lambda,
@@ -416,9 +386,8 @@ pub fn signatureOnly(f: *const Function, params: []Param) Function {
     return out;
 }
 
-/// A copy of `f` with new params and body, every other field preserved. The
-/// `@Composable` annotation stays so downstream passes still recognise the
-/// function.
+/// A copy of `f` with new params and body. The `@Composable` annotation stays so
+/// downstream passes still recognise the function.
 pub fn withBody(f: *const Function, params: []Param, body: FunctionBody) Function {
     var out = f.*;
     out.params = params;

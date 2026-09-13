@@ -1,6 +1,5 @@
-//! Entry into and exit out of compiled code: seeding slots from live
-//! registers, running a compiled loop or function body, and converting slots
-//! back to `Value`s at a deopt or return.
+//! Entry into and exit out of compiled code: seeding slots from live registers, running
+//! a compiled loop or function body, and converting slots back to `Value`s at a deopt.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -24,8 +23,6 @@ const TrampFn = common.TrampFn;
 const boxedElemsOf = shapes.boxedElemsOf;
 const instanceClassIdentity = type_infer.instanceClassIdentity;
 
-// --- runtime entry / unbox / rebox ------------------------------------------
-
 pub const Resume = struct { block: BlockId, inst: u32 };
 
 pub const RunResult = union(enum) {
@@ -33,12 +30,10 @@ pub const RunResult = union(enum) {
     bail,
 };
 
-/// Cache each indexed array's element buffer pointer and length in its high
-/// slots. Called at loop entry and again after every host callback: the callback
-/// runs arbitrary Kotlin, which may grow the backing store (moving the buffer) or
-/// rebind the receiver register outright, and the native code reads the cache
-/// with nothing but a bounds check. Returns false when the register no longer
-/// holds the array the loop was compiled for.
+/// Caches each indexed array's buffer pointer and length in its high slots, at loop entry
+/// and after every host callback: a callback runs arbitrary Kotlin that may grow the store
+/// (moving the buffer) or rebind the register, and native code reads the cache behind
+/// nothing but a bounds check. False when the register no longer holds the compiled-for array.
 pub fn reseedArrays(self: *const CompiledLoop, regs: []const Value, slots: []i64) bool {
     for (self.arrays) |au| {
         if (au.reg.int() >= regs.len) return false;
@@ -67,15 +62,9 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     var r: usize = 0;
     while (r < self.n_regs) : (r += 1) {
         slots[r] = 0;
-        // A register the loop READS must carry its live-in value or the run is
-        // simply wrong, so a kind that does not fit its slot bails to the
-        // interpreter. A register the loop only WRITES carries it too where it
-        // can: the write may sit behind a branch this run never takes, and the
-        // exit reboxes every written register — an unseeded slot then reports
-        // zero (`var ok = true` inside a loop that never clears it came back
-        // false). Its live-in value need not be recoverable, though: a register
-        // first assigned inside the loop holds `Unit` here and nothing reads the
-        // old value afterwards, so a misfit leaves the zero rather than bailing.
+        // A register the loop READS must carry its live-in value, so a kind that does not fit its
+        // slot bails to the interpreter. A written-only register is seeded too where it can be:
+        // the write may sit behind an untaken branch and the exit reboxes every written register.
         const must_seed = self.read_set[r];
         if (!must_seed and !self.def_set[r]) continue;
         if (r >= regs.len) {
@@ -88,8 +77,6 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
                 .Int => |x| slots[r] = x,
                 .Char => |x| {
                     slots[r] = x;
-                    // A live-in char read-only in the loop reboxes as itself;
-                    // a redefined register keeps its statically-derived kind.
                     if (!self.def_set[r]) tags[r] = @intFromEnum(@as(std.meta.Tag(Value), .Char));
                 },
                 .Short => |x| {
@@ -120,19 +107,15 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
             },
             .unit => if (v != .Unit and must_seed) return .bail,
             .null_ => if (v != .Null and must_seed) return .bail,
-            // Object registers are never slot-backed (excluded from read_set);
-            // they stay in `regs`. Reaching here would be a bug, but it is safe.
             .object => {},
             .unknown => if (must_seed) return .bail,
         }
     }
 
-    // Unbox each indexed array's buffer pointer + length into its high slots.
     if (!reseedArrays(self, regs, slots)) return .bail;
 
-    // Unbox each capture cell's scalar into the cell register's own slot. No
-    // calls or GC run inside the loop, so the box is unobserved by anyone else;
-    // the cached scalar is written back through the box at exit.
+    // Unbox each capture cell's scalar into its register's slot: no calls or GC run inside
+    // the loop, and the scalar is written back through the box at exit.
     for (self.cells) |cu| {
         if (cu.reg.int() >= regs.len) return .bail;
         const v = regs[cu.reg.int()];
@@ -143,8 +126,6 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
         slots[cu.reg.int()] = cellSlotIn(cu.rt, inner) orelse return .bail;
     }
 
-    // Unbox each loop-carried nullable-scalar register: a null value sets its
-    // flag slot, otherwise the scalar lands in the value slot with the flag clear.
     for (self.nullables) |nu| {
         if (!nu.live_in) continue;
         if (nu.reg.int() >= regs.len) return .bail;
@@ -158,13 +139,11 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
         }
     }
 
-    // A loop with trampolined calls needs its reserved slots wired before entry:
-    // one holds the `*TrampCtx` the native call sites load into rdi, the other the
-    // host callback. `tctx` is a stack local live across the whole native run.
+    // One reserved slot holds the `*TrampCtx` the native sites load into rdi, the other the
+    // host callback.
     var tctx: TrampCtx = undefined;
-    // Field bases and direct callees are seeded whether or not this loop has any
-    // TRAMPOLINE site left: a direct call consumes the only call site a loop may
-    // have had, and its receiver's field base still has to be cached.
+    // Field bases and direct callees are seeded even with no TRAMPOLINE site left: a direct
+    // call consumes the site, and its receiver's field base still needs caching.
     {
         if (self.regs_ptr_slot != 0) slots[self.regs_ptr_slot] = @bitCast(@intFromPtr(regs.ptr));
         for (self.field_bases) |fb| {
@@ -174,9 +153,8 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
             slots[fb.ptr_slot] = @bitCast(@intFromPtr(g.get().fields.items.ptr));
             g.deinit();
         }
-        // A direct call reaches its callee's body WITHOUT the callee's own entry
-        // guard, so this entry proves the layout that body was compiled against
-        // still holds on the receiver it will read.
+        // A direct call reaches its callee's body WITHOUT that body's own entry guard, so this
+        // entry proves the layout it was compiled against still holds on the receiver.
         for (self.direct_sites) |ds| {
             const rr = ds.recv_reg;
             if (rr >= regs.len or regs[rr] != .Instance) return .bail;
@@ -193,20 +171,16 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     }
     if (self.call_sites.len != 0) {
         if (tramp == null or user == null) return .bail;
-        // Each member call's receiver must still be an Instance of the class the
-        // site was compiled against; otherwise its method (and return type) could
-        // differ this activation — deopt to the interpreter.
+        // Each member call's receiver must still be an Instance of the class the site was
+        // compiled against, or its method and return type could differ this activation: deopt.
         for (self.call_sites) |site| {
-            // Loop-invariant member / field receivers are validated once here; a
-            // varying receiver is re-checked by its callback each iteration.
             if (site.recv_varies or site.recv_class == 0 or !(site.is_member or site.is_field or site.is_field_set)) continue;
             if (site.recv_reg >= regs.len) return .bail;
             const rv = regs[site.recv_reg];
             if (rv != .Instance or instanceClassIdentity(rv) != site.recv_class) return .bail;
         }
-        // Cache each native-field receiver's field buffer pointer. The receiver is
-        // an already-validated loop-invariant Instance; the buffer does not move or
-        // resize inside the native run, so the pointer stays valid throughout.
+        // The native-field receiver is a validated loop-invariant Instance, so its field buffer
+        // neither moves nor resizes for the duration of the native run.
         tctx = .{ .slots = slots.ptr, .compiled = self, .user = user.?, .tags = tags.ptr };
         slots[self.uc_slot] = @bitCast(@intFromPtr(&tctx));
         slots[self.tramp_slot] = @bitCast(@intFromPtr(tramp.?));
@@ -231,17 +205,13 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
             .boolean => .{ .Bool = slots[r] != 0 },
             .unit => .Unit,
             .null_ => .Null,
-            // Object registers were written straight to `regs` by callbacks
-            // (never slot-backed); keep the current value.
             .object => regs[r],
             .unknown => regs[r],
         };
     }
 
-    // Write each cell's final cached scalar back through its box. The old inner
-    // value is a primitive of the same kind, so its release is a no-op — and
-    // its TAG is the kind the writeback must restore (a captured `Char` var
-    // must not come back as an `Int`; cells are type-stable in Kotlin).
+    // Write each cell's cached scalar back through its box. Its TAG is the kind the
+    // writeback must restore: a captured `Char` var must not come back as an `Int`.
     for (self.cells) |cu| {
         if (cu.reg.int() >= regs.len) continue;
         const v = regs[cu.reg.int()];
@@ -252,8 +222,6 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
         g.deinit();
     }
 
-    // Rebox each written nullable-scalar register: a set flag slot restores null,
-    // otherwise the scalar value is reboxed.
     for (self.nullables) |nu| {
         if (!nu.live_out or nu.reg.int() >= regs.len) continue;
         regs[nu.reg.int()] = if (slots[nu.flag_slot] != 0) .Null else valueFromSlotTagged(nu.rt, tags[nu.reg.int()], slots[nu.reg.int()]);
@@ -261,8 +229,8 @@ pub fn runLoop(self: *const CompiledLoop, regs: []Value, slots: []i64, tags: []u
     return .{ .resume_at = .{ .block = target, .inst = inst } };
 }
 
-/// Read the cell's inner scalar into an i64 slot, or null if the box no longer
-/// holds the specialized kind (deopt to interpreter).
+/// Reads a cell's inner scalar into an i64 slot; null when the box no longer holds the
+/// specialized kind, which deopts.
 pub fn cellSlotIn(rt: RegType, v: Value) ?i64 {
     return switch (rt) {
         .i32 => switch (v) {
@@ -303,11 +271,10 @@ pub fn valueFromSlot(rt: RegType, s: i64) Value {
     };
 }
 
-/// The default box tag for `box_tags`: `.Int`.
 pub const INT_TAG: u8 = @intFromEnum(@as(std.meta.Tag(Value), .Int));
 
-/// As `valueFromSlot`, but an `.i32` slot boxes back to its register's
-/// ORIGINAL value kind (`Char`/`Short`/`Byte`) instead of always `.Int`.
+/// As `valueFromSlot`, but an `.i32` slot boxes back to its register's ORIGINAL kind
+/// (`Char`/`Short`/`Byte`) instead of always `.Int`.
 pub fn valueFromSlotTagged(rt: RegType, tag: u8, s: i64) Value {
     if (rt == .i32) {
         const T = std.meta.Tag(Value);
@@ -321,24 +288,16 @@ pub fn valueFromSlotTagged(rt: RegType, tag: u8, s: i64) Value {
     return valueFromSlot(rt, s);
 }
 
-/// A whole-function native run's outcome. `code.inst == RETURN_INST` → the
-/// function returned `value`; otherwise `code` is an interpreter resume point
-/// (a div-by-zero deopt or a callee throw) with the frame's registers reboxed.
+/// A whole-function native run's outcome: `code.inst == RETURN_INST` means the function
+/// returned `value`, otherwise `code` is an interpreter resume point with registers reboxed.
 pub const FuncOutcome = struct { code: Resume, value: Value };
 
-/// Run a compiled function body. Fills the param slots from `params` (deopting if
-/// a kind no longer matches), runs the native code, and returns its outcome.
 pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, slots: []i64, tags: []u8, tramp: ?TrampFn, user: ?*anyopaque) ?FuncOutcome {
-    // No blanket slot zeroing: Kotlin's definite-assignment rule means the
-    // compiled body never reads a register before writing it, and the param
-    // / trampoline slots are seeded explicitly below. (The zero fill was
-    // 70%+ of a native fib's per-call cost.)
+    // No blanket slot zeroing: Kotlin's definite-assignment rule means the compiled body
+    // never reads a register before writing it, and param and trampoline slots are seeded here.
     @memcpy(tags[0..self.n_regs], self.box_tags[0..self.n_regs]);
-    // Method mode: the receiver must be an Instance of exactly the class the
-    // body was specialized on (its stored-field indexes and kinds are that
-    // class's); anything else declines to the interpreter. The field-buffer
-    // pointer is stable for the run — the body never adds fields, and the
-    // buffer does not move (same contract as the loop tier's field bases).
+    // Method mode: the receiver must be an Instance of exactly the class the body was
+    // specialized on, whose stored-field indexes and kinds it uses; anything else declines.
     if (self.method_mode) {
         if (params.len == 0 or params[0] != .Instance) {
             if (debugEnabled()) std.debug.print("[jit-dbg] method run: recv not instance (len={d} tag={s})\n", .{ params.len, if (params.len > 0) @tagName(std.meta.activeTag(params[0])) else "none" });
@@ -351,8 +310,6 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
         const g = params[0].Instance.borrow();
         const bthis = g.get();
         const items = bthis.fields.items;
-        // A layout match proves every (index, name) pair at once; a drifted
-        // or unshaped receiver pays the per-entry loop.
         if (self.guard_shape == 0 or bthis.shapeOf() != self.guard_shape) {
             for (self.method_fields) |mf| {
                 if (mf.idx >= items.len or !(items[mf.idx].name.ptr == mf.name.ptr or std.mem.eql(u8, items[mf.idx].name, mf.name))) {
@@ -386,10 +343,8 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
     const target = BlockId.from(@intCast(code >> 32));
     const inst: u32 = @truncate(code & 0xffff_ffff);
     if (inst == RETURN_INST) {
-        // Frame-resident return (object / escape-typed): the taken `Return`
-        // recorded its register index; the handlers left the real value in
-        // that frame register. Hand it back owned (retain — the frame keeps
-        // its own reference until teardown).
+        // Frame-resident return: the taken `Return` recorded its register index and the handlers
+        // left the value there; it is handed back retained.
         const frame_reg = slots[self.result_reg_slot];
         if (frame_reg >= 0) {
             const rr: u64 = @intCast(frame_reg);
@@ -402,7 +357,6 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
         }
         return .{ .code = .{ .block = target, .inst = inst }, .value = valueFromSlot(self.result_rt, slots[self.result_slot]) };
     }
-    // Deopt / throw: rebox written scalar registers so the interpreter resumes.
     const skip_reg: u32 = if (self.call_sites.len != 0 and self.has_tramp_sites) tctx.deopt_skip_reg else std.math.maxInt(u32);
     var r: u32 = 0;
     while (r < self.n_regs) : (r += 1) {
@@ -415,10 +369,8 @@ pub fn runFunc(self: *const CompiledLoop, regs: []Value, params: []const Value, 
     return .{ .code = .{ .block = target, .inst = inst }, .value = .Unit };
 }
 
-/// Interpreter hook at function entry: once the function is hot, compile its
-/// whole body and run it natively. Returns the outcome, or null to interpret.
-/// Frame register buffers live outside the GC heap (see `eval.regsAlloc`);
-/// growth here must use the same allocator.
+/// Frame register buffers live outside the GC heap (see `eval.regsAlloc`); growth here
+/// must use the same allocator.
 pub inline fn regsGrowAlloc(fallback: Allocator) Allocator {
     if (!runtime.reclaimEnabled() and runtime.gc.gc_enabled) return std.heap.c_allocator;
     return fallback;

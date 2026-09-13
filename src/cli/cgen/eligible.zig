@@ -110,16 +110,12 @@ const typeReaches = cgen.typeReaches;
 const unsignedTypeOf = cgen.unsignedTypeOf;
 const virtualProp = cgen.virtualProp;
 
-/// What a step leaves the walk to do: type the next instruction, let the
-/// following step try this one, leave the block, or give up on the function.
+/// What a step leaves the walk to do: type the next instruction, pass, stop, or refuse.
 const Step = enum { next, pass, stop, refuse };
 
-/// The result the returned registers agree on.
 const ReturnShape = struct { ty: Ty, cls: ?u32, elem: Ty };
 
-/// The pass's refusal helpers, answering a step's verdict rather than the
-/// pass's own result. Each reports what the pass reports; only the answer
-/// differs.
+/// Refusal helpers reporting what the pass reports, differing only in the answer type.
 inline fn stepNo(f: *const Func, comptime why: []const u8) Step {
     _ = no(f, why);
     return .refuse;
@@ -145,15 +141,12 @@ inline fn stepInstRefuseNamed(m: *const Module, f: *const Func, inst: *const ir.
     return .refuse;
 }
 
-/// The same, answering the result the returned registers agree on.
 inline fn noShape(f: *const Func, comptime why: []const u8) ?ReturnShape {
     _ = no(f, why);
     return null;
 }
 
-/// The tables the walk fills in and the scope it reads: one machine type,
-/// class and element type per register, plus the implicit receivers a bare
-/// name searches.
+/// Per-register machine type, class and element tables, plus the implicit receivers in scope.
 const Walk = struct {
     gpa: std.mem.Allocator,
     m: *const Module,
@@ -174,36 +167,23 @@ const Walk = struct {
 };
 
 pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *const Func, globals: []const Global, synth: ?[]const ir.Param, caps: []const CapInfo) Error!?Compiled {
-    // A synthesized thunk declares no parameters and reads its caller's
-    // positionally, so it is compiled against the signature it will be handed.
+    // A synthesized thunk declares no parameters and reads its caller's positionally.
     const params: []const ir.Param = synth orelse f.params;
-    // A `suspend` body compiles to a state machine over a heap frame; the
-    // result is boxed, because it answers either the value or SUSPENDED. A
-    // lambda the lowering did not MARK suspending still needs that shape when
-    // it calls something that suspends — a `runBlocking` block is written
-    // without the keyword.
+    // A `suspend` body compiles to a state machine over a heap frame and boxes its result. A
+    // lambda the lowering did not mark suspending needs that shape when it calls one that is.
     const suspends = bodySuspends(m, f);
-    // A method is an ordinary function whose first parameter is the receiver;
-    // the call sites already move it into arg 0.
+    // A method is an ordinary function whose first parameter is the receiver.
     if (f.has_receiver_param and receiverClass(m, f) == null) return no(f, "receiver class");
-    // A body the image left deferred is decoded on first touch. The emitter
-    // reaches only what the program can call, so this materialises exactly the
-    // bodies it compiles.
+    // A body the image left deferred is decoded on first touch, so only reachable ones are.
     if (f.blocks.len == 0) _ = m.ensureFuncBody(@constCast(f));
     if (!f.hasBody() or f.blocks.len == 0) return no(f, "no body");
     if (f.n_locals == 0) return no(f, "no locals");
 
-    // The declared return type is a starting point only. An unannotated
-    // declaration (`var counter = 0` lowers to a thunk) carries a placeholder,
-    // so the authority is the register the body actually returns; the declared
-    // type settles the Unit case, where there is no register to ask.
+    // The declared return type is a starting point: an unannotated declaration carries a
+    // placeholder, so the returned register decides, and the declaration settles the Unit case.
     const ret = funcRetTy2(m, f) orelse Ty.unit;
     for (params) |p| {
-        // A default is the CALLER's business: the callee takes the parameter
-        // like any other, and a call that omits it runs the thunk.
-        // A parameter whose type names nothing the module declares is an
-        // erased reference, not a refusal: it can be passed, returned and
-        // stored, and any use that needs its layout refuses where it is used.
+        // A parameter naming nothing the module declares is an erased reference, not a refusal.
         _ = p;
     }
 
@@ -219,9 +199,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     const elem_cls = try gpa.alloc(?u32, f.n_locals);
     errdefer gpa.free(elem_cls);
     @memset(elem_cls, null);
-    // The integer constant a register was JUST given. Any other instruction
-    // clears the whole table, because which register it wrote is not modelled
-    // here: a value still known to be constant is one nothing has touched.
+    // The integer constant a register was JUST given; any other instruction clears the table.
     const const_at = try gpa.alloc(?i64, f.n_locals);
     defer gpa.free(const_at);
     @memset(const_at, null);
@@ -239,8 +217,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     // the Compiled this returns; freed on refusal.
     var bare: std.AutoHashMapUnmanaged(*const ir.Inst, BareResolution) = .empty;
     errdefer bare.deinit(gpa);
-    // The implicit receivers in scope, innermost last. `with(x) { … }` and
-    // `apply` splice their bodies inline and push the subject here.
+    // The implicit receivers in scope, innermost last: `with(x)` and `apply` splice inline.
     var encl: std.ArrayList(u32) = .empty;
     defer encl.deinit(gpa);
 
@@ -270,12 +247,8 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     return .{ .f = f, .caps = caps, .params = params, .types = types, .cls = cls, .elem = elem, .elem_cls = elem_cls, .lam = lam, .slot = slot, .n_slots = n_slots, .ret = shape.ty, .ret_cls = shape.cls, .ret_elem = shape.elem, .suspends = suspends, .bare = bare };
 }
 
-/// Type every register the reachable blocks define. Blocks in reverse
-/// postorder, so a register's definition is typed before every use of it
-/// except across a back edge, where the lowering already puts the
-/// definition ahead of the edge. Source order does not have that property:
-/// a `when` writes its result in the arm blocks, which sit after the block
-/// that returns it.
+/// Type every register the reachable blocks define, in reverse postorder so a definition is
+/// typed before every use except across a back edge, where the lowering puts it first.
 fn walkBody(w: *Walk, order: []const u32) Error!Step {
     const m = w.m;
     const prog = w.prog;
@@ -287,21 +260,18 @@ fn walkBody(w: *Walk, order: []const u32) Error!Step {
     var pending_const: ?struct { reg: u32, val: i64 } = null;
     for (order) |bi| {
         const blk = &f.blocks[bi];
-        // A `finally` has to run on every exit from its region, including a
-        // throw passing through; that is a separate shape from a handler.
+        // A `finally` runs on every exit from its region, a separate shape from a handler.
         if (blk.finally != null) return stepNo(f, "finally");
         for (blk.catches) |h| {
             if (h.exception_reg.int() >= f.n_locals) return stepNo(f, "catch register");
-            // The handler tests an interval, so the caught type has to be one
-            // the program's throwable hierarchy places.
+            // The handler tests an interval, so the caught type has to be one the hierarchy places.
             if (prog.throws.find(h.type_name) == null) return stepNo(f, "catch type");
             types[h.exception_reg.int()] = .object;
             cls[h.exception_reg.int()] = THROWABLE_CLS;
             known[h.exception_reg.int()] = true;
         }
         for (blk.insts) |*inst| {
-            // What the PREVIOUS instruction made constant, which is all this
-            // pass claims to know: anything else may have written any register.
+            // What the PREVIOUS instruction made constant is all this pass claims to know.
             @memset(const_at, null);
             if (pending_const) |pc| const_at[pc.reg] = pc.val;
             pending_const = null;
@@ -334,9 +304,7 @@ fn walkBody(w: *Walk, order: []const u32) Error!Step {
                     if (rr.int() >= f.n_locals or !known[rr.int()]) return stepNo(f, "return value");
                 }
             },
-            // A block carrying a catch handler is refused above, so a program
-            // that compiles has no handler anywhere and a throw always leaves
-            // it. That is what makes an uncaught throw the whole story here.
+            // A catch-carrying block is refused above, so in a compiled program a throw always leaves.
             .Throw => |t| {
                 if (t.int() >= f.n_locals or !known[t.int()]) return stepNo(f, "throw value");
             },
@@ -358,11 +326,7 @@ fn step(w: *Walk, inst: *const ir.Inst) Error!Step {
     const encl = w.encl;
     switch (inst.*) {
         .Trace => {},
-        // The enclosing-subject chain exists for the interpreter's
-        // dynamic resolution: a bare name or a member the lowering
-        // could not bind consults it while a inlined body runs.
-        // Compiled code resolves every one of those statically or
-        // refuses, so there is nothing for the chain to answer.
+        // The enclosing-subject chain serves dynamic resolution; compiled code resolves statically.
         .EnclosingPush => |ep| {
             if (ep.src.int() >= f.n_locals) return stepNo(f, "enclosing src");
             try encl.append(gpa, ep.src.int());
@@ -370,15 +334,10 @@ fn step(w: *Walk, inst: *const ir.Inst) Error!Step {
         .EnclosingPop => {
             if (encl.items.len != 0) _ = encl.pop();
         },
-        // A bare name inside such a body: the interpreter searches the
-        // implicit receivers innermost first and falls back to the
-        // global. The emitter does that search once, here.
+        // A bare name inside such a body: the emitter runs the receiver search once, here.
         .LoadFromThisOrGlobal => return try bareNameLoads(w, inst),
         .StoreToThisOrGlobal => return try bareNameStores(w, inst),
-        // A bare call whose name may be a member of an implicit
-        // receiver or a top-level declaration. The interpreter decides
-        // at run time by searching the receivers; the emitter searches
-        // the same ones once, here.
+        // A bare call whose name may be a member of an implicit receiver or a top-level declaration.
         .CallMemberOrGlobal => return try bareCall(w, inst),
         .Const => return try loadConstant(w, inst),
         .MakeCell => return try makeCell(w, inst),
@@ -397,14 +356,9 @@ fn step(w: *Walk, inst: *const ir.Inst) Error!Step {
             elem[lc.dst.int()] = caps[lc.idx].elem;
             known[lc.dst.int()] = true;
         },
-        // `x as T`. The value passes through unchanged when the test
-        // holds; otherwise a `ClassCastException`, or null for `as?`.
-        // The named type is what the result register carries, which is
-        // the point of writing the cast.
+        // `x as T` passes the value through, raises `ClassCastException`, or answers null for `as?`.
         .Cast => return try castValue(w, inst),
-        // `x is T`. Which classes answer it is decided at emit time
-        // from the hierarchy the program compiled; a value that is not
-        // a compiled instance answers from its own representation.
+        // `x is T`: a value that is not a compiled instance answers from its own representation.
         .InstanceOf => |io| {
             if (io.src.int() >= f.n_locals or !known[io.src.int()]) return stepNo(f, "is operand");
             if (io.dst.int() >= f.n_locals) return stepNo(f, "is dst");
@@ -429,10 +383,7 @@ fn step(w: *Walk, inst: *const ir.Inst) Error!Step {
         .LoadGlobal => return try loadGlobal(w, inst),
         .StoreGlobal => return try storeGlobal(w, inst),
         .AstLambda => return try astLambda(w, inst),
-        // A bare call whose name is both a callable in scope and
-        // possibly a member of the receiver. When the local is a
-        // function value the local wins, which is what the interpreter
-        // decides at run time by finding it first.
+        // A name both a local callable and possibly a member: the local wins when it holds one.
         .CallValueOrMember => return try callValueOrMember(w, inst),
         .CallValue => return try callValue(w, inst),
         .Call => return try callResolved(w, inst),
@@ -441,8 +392,7 @@ fn step(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A bare name in value position: the innermost implicit receiver that
-/// declares it answers, and a global answers when none does.
+/// A bare name in value position: the innermost receiver declaring it answers, else a global.
 fn bareNameLoads(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -464,8 +414,7 @@ fn bareNameLoads(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (resolveBare(m, prog, types, cls, known, encl.items, null, bn.String, false)) |res| {
         try bare.put(gpa, inst, res);
         switch (res) {
-            // A bare NAME never resolves to a construction;
-            // only a bare call can.
+            // A bare NAME never resolves to a construction; only a bare call can.
             .construct => return stepNo(f, "bare name"),
             .field => |fl| {
                 const fds = prog.of(cls[fl.recv].?).?;
@@ -499,8 +448,7 @@ fn bareNameLoads(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A write through a bare name, resolved against the same receivers the
-/// read searches.
+/// A write through a bare name, resolved against the receivers the read searches.
 fn bareNameStores(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -541,8 +489,7 @@ fn bareNameStores(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A bare call to a stdlib entry the backend performs directly: that
-/// operation, not a call to a body that does not exist.
+/// A bare call to a stdlib entry the backend performs directly is that operation.
 fn bareCallPrintsIt(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -551,9 +498,6 @@ fn bareCallPrintsIt(w: *Walk, inst: *const ir.Inst) Error!Step {
     const known = w.known;
     const bare = w.bare;
     const cg2 = inst.CallMemberOrGlobal;
-    // A bare call to a stdlib entry the backend performs
-    // directly is that operation, not a call to a body that
-    // does not exist.
     if (cg2.func) |gfid0| {
         if (m.funcById(gfid0)) |gfn0| {
             if (isPrintln(gfn0) or scalarIntrinsic(gfn0) == .print) {
@@ -569,8 +513,7 @@ fn bareCallPrintsIt(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A bare call that names a class and nothing else: a construction, with
-/// the primary constructor taking the arguments in its own order.
+/// A bare call naming a class: a construction, the constructor taking arguments in its order.
 fn bareCallConstructs(w: *Walk, inst: *const ir.Inst, bcid: u32) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -618,8 +561,7 @@ fn bareCallConstructs(w: *Walk, inst: *const ir.Inst, bcid: u32) Error!Step {
     return .stop;
 }
 
-/// Which declaration a bare call names, answered once: a construction, or
-/// the one unambiguous function the arguments fit.
+/// Which declaration a bare call names: a construction, or the one function the arguments fit.
 fn bareCallNamesDeclaration(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -634,23 +576,13 @@ fn bareCallNamesDeclaration(w: *Walk, inst: *const ir.Inst) Error!Step {
     const bare = w.bare;
     const cg2 = inst.CallMemberOrGlobal;
     const cn2 = m.consts.items[cg2.name.int()];
-    // Which declaration a bare call names is a question of
-    // scope: an overload set the arguments do not separate,
-    // a class of the same name (constructor versus
-    // factory), or a property holding a function all answer
-    // it at run time in the interpreter. The emitter has to
-    // answer it once, so it answers only when the
-    // declaration is unambiguous.
+    // Which declaration a bare call names is a scope question the interpreter answers at run time.
     const picked = bareCallTarget(m, prog, cn2.String, types, cg2.args.int(), cg2.n_args, cg2.arg_names);
-    // No function owns the name: a class of it is a
-    // construction, which is what the lowering leaves open
-    // when there is nothing else the name could mean.
+    // No function owns the name, so a class of it is a construction.
     if (picked == null and globalIndex(globals, cn2.String) == null) {
         if (classQualifierNamed(m, cn2.String)) |bcid| return try bareCallConstructs(w, inst, bcid);
     }
     if (picked == null) {
-        // Which declarations the name could mean, and what
-        // the arguments are: that is the backlog entry.
         if (traceOn()) {
             for (m.funcs.items) |*cnd| {
                 if (!std.mem.eql(u8, cnd.name, cn2.String)) continue;
@@ -672,8 +604,7 @@ fn bareCallNamesDeclaration(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gfn9 = m.funcById(gfid) orelse return stepNo(f, "bare call target");
     if (!gfn9.hasBody()) return stepNoCallee(f, gfn9, "no body for");
     if (gfn9.params.len < cg2.n_args) return stepNoCallee(f, gfn9, "arity of");
-    // Arguments reach the callee in ITS order, and a
-    // parameter nothing binds runs the thunk for it.
+    // Arguments reach the callee in ITS order, and an unbound parameter runs its thunk.
     const bb9 = bindCallArgs(m, gfn9.params, cg2.args.int(), cg2.n_args, cg2.arg_names) orelse
         return stepNoCallee(f, gfn9, "argument binding of");
     var db9: u32 = 0;
@@ -695,8 +626,7 @@ fn bareCallNamesDeclaration(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A bare call whose name may be a member of an implicit receiver or a
-/// top-level declaration. The receivers are searched innermost first.
+/// A bare call whose name may be a member or a top-level declaration; receivers innermost first.
 fn bareCall(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -721,8 +651,7 @@ fn bareCall(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (cg2.dst.int() >= f.n_locals) return stepNo(f, "bare call dst");
     const printed = try bareCallPrintsIt(w, inst);
     if (printed != .pass) return printed;
-    // The innermost implicit receiver that declares the name
-    // wins, which is what shadows a same-named global.
+    // The innermost implicit receiver that declares the name wins, shadowing a global.
     var mi: usize = encl.items.len;
     while (mi > 0) {
         mi -= 1;
@@ -730,9 +659,7 @@ fn bareCall(w: *Walk, inst: *const ir.Inst) Error!Step {
         if (r9 >= f.n_locals or !known[r9] or types[r9] != .object) continue;
         const rc9 = cls[r9] orelse continue;
         if (isBuiltinCls(rc9)) continue;
-        // A FUNCTION-TYPED property of the receiver answers
-        // through the invoke convention, which outranks a
-        // global of the same name.
+        // A FUNCTION-TYPED property answers through invoke, outranking a global of the same name.
         if (fieldIndex(prog, rc9, cn2.String) != null) return stepNoName(f, "bare call names a property", cn2.String);
         const root9b = memberRoot(m, prog, rc9, cn2.String, cg2.n_args) orelse continue;
         const rt9 = funcRetTy2(m, root9b) orelse return stepNo(f, "bare call return type");
@@ -763,15 +690,13 @@ fn loadConstant(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (c.value.int() >= m.consts.items.len) return stepNo(f, "const id");
     const t = constTy(m.consts.items[c.value.int()]) orelse return stepNo(f, "const kind");
     types[c.dst.int()] = t;
-    // A null literal has no class of its own; whatever it is
-    // compared against or assigned to supplies that.
+    // A null literal has no class of its own; what it meets supplies that.
     if (t == .object and m.consts.items[c.value.int()] == .String) cls[c.dst.int()] = STRING_CLS;
     known[c.dst.int()] = true;
     return .next;
 }
 
-/// A captured `var`. The cell holds one machine type for its whole life,
-/// so it is the one every write to it agrees on.
+/// A captured `var`: the cell holds one machine type for life, the one every write agrees on.
 fn makeCell(w: *Walk, inst: *const ir.Inst) Error!Step {
     const f = w.f;
     const types = w.types;
@@ -783,11 +708,7 @@ fn makeCell(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (!known[mk.src.int()]) return stepNo(f, "cell source");
     types[mk.dst.int()] = .object;
     cls[mk.dst.int()] = CELL_CLS;
-    // A cell holds one machine type for its whole life, so it
-    // is the one every write agrees on. The lowering seeds a
-    // `var` with a Unit placeholder where the declaration has
-    // no initializer, which says nothing; writes that disagree
-    // leave the cell holding boxed values.
+    // A `var` with no initializer is seeded with a Unit placeholder, which says nothing.
     var cet = types[mk.src.int()];
     for (f.blocks) |*b2| {
         for (b2.insts) |*ci| {
@@ -808,8 +729,7 @@ fn makeCell(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A write into a cell: a cell of boxed values takes anything, one of a
-/// machine type takes that type.
+/// A write into a cell: a boxed cell takes anything, a machine-typed cell takes that type.
 fn setCell(w: *Walk, inst: *const ir.Inst) Error!Step {
     const f = w.f;
     const types = w.types;
@@ -820,16 +740,13 @@ fn setCell(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (cs.cell.int() >= f.n_locals or !known[cs.cell.int()]) return stepNo(f, "cell write");
     if (cls[cs.cell.int()] == null or cls[cs.cell.int()].? != CELL_CLS) return stepNo(f, "cell write to a non-cell");
     if (cs.value.int() >= f.n_locals or !known[cs.value.int()]) return stepNo(f, "cell value");
-    // A cell of boxed values takes anything; one of a machine
-    // type takes that type.
     if (elem[cs.cell.int()] != .object and types[cs.value.int()] != elem[cs.cell.int()]) {
         return stepNo(f, "cell value type");
     }
     return .next;
 }
 
-/// `x as T`. The named type is what the result register carries; `as?`
-/// and a nullable target admit null, so those stay references.
+/// `x as T` carries the named type, but `as?` and a nullable target stay references.
 fn castValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -841,8 +758,6 @@ fn castValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     const ca = inst.Cast;
     if (ca.src.int() >= f.n_locals or !known[ca.src.int()]) return stepNo(f, "cast operand");
     if (ca.dst.int() >= f.n_locals) return stepNo(f, "cast dst");
-    // `as?` and `as T?` admit null, so the result is a
-    // reference whatever the named type is.
     const scalar = if (ca.safe or ca.ty.nullable) null else tyOf(ca.ty);
     if (scalar) |t| {
         types[ca.dst.int()] = t;
@@ -856,8 +771,7 @@ fn castValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A parameter: its declared type, with a vararg holding the array the
-/// call site built and a written-down element type needing no inference.
+/// A parameter: its declared type, a vararg holding the array the call site built.
 fn loadParam(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -885,9 +799,7 @@ fn loadParam(w: *Walk, inst: *const ir.Inst) Error!Step {
         cls[lp.dst.int()] = classIndexOfName(m, pt);
         if (refElemOf(cls[lp.dst.int()], pt)) |re_| elem[lp.dst.int()] = re_;
         elem_cls[lp.dst.int()] = refElemCls(m, cls[lp.dst.int()], pt);
-        // `List<Int>` says what its elements are; a list whose
-        // element type is written down needs no inference. An
-        // array says so in its own name.
+        // A written-down element type (`List<Int>`, an array's own name) needs no inference.
         if (cls[lp.dst.int()]) |rc| {
             if (rc == LIST_CLS and pt.args.len == 1) {
                 if (tyOf(pt.args[0])) |et| elem[lp.dst.int()] = et;
@@ -901,7 +813,6 @@ fn loadParam(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A copy: the destination carries everything the source carries.
 fn moveRegister(w: *Walk, inst: *const ir.Inst) Error!Step {
     const f = w.f;
     const types = w.types;
@@ -922,8 +833,7 @@ fn moveRegister(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A binary operator: structural equality, identity, concatenation and a
-/// range each answer their own shape, and the rest promote.
+/// A binary operator: equality, identity, concatenation and ranges have their own shapes.
 fn binOp(w: *Walk, inst: *const ir.Inst) Error!Step {
     const f = w.f;
     const types = w.types;
@@ -935,26 +845,21 @@ fn binOp(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (!known[b.lhs.int()] or !known[b.rhs.int()]) return .refuse;
     const lt = types[b.lhs.int()];
     const rt = types[b.rhs.int()];
-    // `==`/`!=` where either side is a reference is Kotlin's
-    // structural equality, which a null operand reduces to a
-    // null test. Either way the runtime decides it.
+    // `==`/`!=` with a reference is Kotlin's structural equality, which the runtime decides.
     if ((b.op == .Eq or b.op == .NotEq) and (lt == .object or rt == .object)) {
         if (b.dst.int() >= f.n_locals) return stepNo(f, "compare dst");
         types[b.dst.int()] = .boolean;
         known[b.dst.int()] = true;
         return .next;
     }
-    // `===` is referential identity, which never dispatches a
-    // user `equals`.
+    // `===` is referential identity, which never dispatches a user `equals`.
     if (b.op == .IdentEq or b.op == .IdentNeq) {
         if (b.dst.int() >= f.n_locals) return stepNo(f, "compare dst");
         types[b.dst.int()] = .boolean;
         known[b.dst.int()] = true;
         return .next;
     }
-    // Concatenation, either spelled as itself or as `+` with a
-    // string on one side. Kotlin renders the other operand
-    // through its own `toString`, so anything may be joined.
+    // Concatenation renders the other operand through its `toString`, so anything may be joined.
     const str_join = b.op == .StringConcat or
         (b.op == .Add and (isStringReg(types, cls, b.lhs.int()) or isStringReg(types, cls, b.rhs.int())));
     if (str_join) {
@@ -964,24 +869,18 @@ fn binOp(w: *Walk, inst: *const ir.Inst) Error!Step {
         known[b.dst.int()] = true;
         return .next;
     }
-    // `a..b` and `a..<b` build a progression: a runtime value
-    // with its own bound and step resolution, which the
-    // interpreter performs and compiled code reuses.
+    // `a..b` and `a..<b` build a progression, a runtime value the interpreter resolves.
     if (b.op == .RangeTo or b.op == .RangeUntil) {
         if (!isNumericTy(lt) or !isNumericTy(rt)) return stepNo(f, "range operand types");
         if (b.dst.int() >= f.n_locals) return stepNo(f, "range dst");
         types[b.dst.int()] = .object;
         cls[b.dst.int()] = RANGE_CLS;
-        // A progression counts values of the operands' own
-        // type: `'a'..'e'` yields Chars, where the ARITHMETIC
-        // promotion of two Chars would be Int.
+        // A progression counts the operands' own type: `'a'..'e'` yields Chars, not the promoted Int.
         elem[b.dst.int()] = if (lt == rt) lt else (promote(lt, rt) orelse lt);
         known[b.dst.int()] = true;
         return .next;
     }
-    // `ushr` has no C spelling of its own — it is a cast to
-    // unsigned around `>>` — so it is admitted here and written
-    // out below rather than looked up.
+    // `ushr` is a cast to unsigned around `>>`, so it is written out below rather than looked up.
     if (b.op != .UShr and cOp(b.op) == null) {
         if (traceOn()) std.debug.print("[cgen] refuse {s}: binop kind `{s}`\n", .{ f.fqn, @tagName(b.op) });
         return .refuse;
@@ -990,16 +889,14 @@ fn binOp(w: *Walk, inst: *const ir.Inst) Error!Step {
         if (lt == .unit or rt == .unit) return .refuse;
         types[b.dst.int()] = .boolean;
     } else if (isBitwise(b.op)) {
-        // Kotlin's shifts and bitwise ops are integer-only and
-        // take the LEFT operand's width.
+        // Kotlin's shifts and bitwise operators are integer-only and take the left operand's width.
         if (lt.isFloat() or rt.isFloat() or lt == .unit or rt == .unit) return .refuse;
         if ((lt == .boolean) != (rt == .boolean)) return .refuse;
         types[b.dst.int()] = lt;
     } else if (lt == .char and (b.op == .Add or b.op == .Sub) and
         rt != .char and isNumericTy(rt) and !rt.isFloat())
     {
-        // Kotlin's `Char + Int` and `Char - Int` answer a Char;
-        // `Char - Char` answers the distance, which promotes.
+        // Kotlin's `Char + Int` answers a Char; `Char - Char` answers a distance, which promotes.
         types[b.dst.int()] = .char;
     } else {
         types[b.dst.int()] = promote(lt, rt) orelse return stepNo(f, "binop operand types");
@@ -1008,8 +905,7 @@ fn binOp(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// Unary minus and plus widen a Byte or a Short to Int; `inc` and `dec`
-/// keep the receiver s type.
+/// Unary minus and plus widen a Byte or a Short to Int; `inc` and `dec` keep the type.
 fn unOp(w: *Walk, inst: *const ir.Inst) Error!Step {
     const f = w.f;
     const types = w.types;
@@ -1020,19 +916,16 @@ fn unOp(w: *Walk, inst: *const ir.Inst) Error!Step {
     const ot = types[u.operand.int()];
     if (!isNumericTy(ot)) return stepNo(f, "unop operand type");
     types[u.dst.int()] = switch (u.op) {
-        // Kotlin's unary minus and plus on a Byte or a Short
-        // answer an Int; every other width answers itself.
+        // Kotlin's unary minus and plus on a Byte or a Short answer an Int.
         .Neg, .Plus => if (ot == .byte or ot == .short) Ty.i32 else ot,
-        // `inc()`/`dec()` keep the receiver's type, and wrap
-        // like the rest of Kotlin's integer arithmetic.
+        // `inc()`/`dec()` keep the receiver's type and wrap like the rest of Kotlin's arithmetic.
         .Inc, .Dec => ot,
     };
     known[u.dst.int()] = true;
     return .next;
 }
 
-/// `toString()` on a value that declares no override of its own: the
-/// runtime renders it as it renders it for printing.
+/// `toString()` on a value with no override of its own: the runtime renders it.
 fn memberRendersToString(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const prog = w.prog;
@@ -1041,9 +934,7 @@ fn memberRendersToString(w: *Walk, inst: *const ir.Inst) Error!Step {
     const cls = w.cls;
     const known = w.known;
     const cm = inst.CallMember;
-    // `toString()` on a value that declares no override of its
-    // own: the runtime renders it as it renders it for
-    // printing. A class that DOES override still dispatches.
+    // A class that DOES override still dispatches.
     if (cm.name.int() < m.consts.items.len) {
         const tsn = m.consts.items[cm.name.int()];
         if (tsn == .String and isToStringCall(tsn.String, cm.n_args) and
@@ -1061,8 +952,7 @@ fn memberRendersToString(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// The iteration protocol on a builtin receiver, written by name. What
-/// each member answers is the interpreter s own classification.
+/// The iteration protocol on a builtin receiver, by name, as the interpreter classifies it.
 fn memberOfHostValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1072,10 +962,6 @@ fn memberOfHostValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     const elem_cls = w.elem_cls;
     const known = w.known;
     const cm = inst.CallMember;
-    // The iteration protocol on a builtin receiver, written
-    // by name rather than bound to a slot. Which members those
-    // are, and what each answers, is the interpreter's — the
-    // same classification the slot-bound route reads.
     if (cm.arg_names.len == 0 and cm.name.int() < m.consts.items.len and
         cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
         types[cm.receiver.int()] == .object and cls[cm.receiver.int()] != null and
@@ -1114,7 +1000,6 @@ fn memberOfHostValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// `get` and `set` on an array, which are an index and a store.
 fn memberOfArray(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1152,7 +1037,6 @@ fn memberOfArray(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// `get`, `add` and `set` on a list, which the runtime serves.
 fn memberOfList(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1200,8 +1084,7 @@ fn memberOfList(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A member called on a class NAME runs on that class s companion, with
-/// the companion as the receiver.
+/// A member called on a class NAME runs on that class's companion, as the receiver.
 fn memberOfCompanion(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const prog = w.prog;
@@ -1212,9 +1095,6 @@ fn memberOfCompanion(w: *Walk, inst: *const ir.Inst) Error!Step {
     const elem_cls = w.elem_cls;
     const known = w.known;
     const cm = inst.CallMember;
-    // A member CALLED on a class name runs on that class's
-    // companion: `Config.of(3)` is a call on the companion
-    // object, with the companion as the receiver.
     if (numConv(m, cm) == null and cm.arg_names.len == 0 and cm.name.int() < m.consts.items.len) {
         if (companionReceiver(m, prog, types, cls, cm.receiver.int())) |cc6| {
             const mn6 = m.consts.items[cm.name.int()];
@@ -1241,8 +1121,7 @@ fn memberOfCompanion(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A member call on a user class the lowering left by name: the
-/// declaration it binds to is decided here, and dispatch runs as usual.
+/// A member call on a user class left by name: the declaration it binds to is decided here.
 fn memberOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const prog = w.prog;
@@ -1253,10 +1132,6 @@ fn memberOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     const elem_cls = w.elem_cls;
     const known = w.known;
     const cm = inst.CallMember;
-    // A member call on a user class the lowering left by
-    // name. The declaration it binds to is decided here, and
-    // dispatch then runs exactly as it does for a slot the
-    // lowering resolved.
     if (numConv(m, cm) == null and cm.arg_names.len == 0 and
         cm.receiver.int() < f.n_locals and known[cm.receiver.int()] and
         types[cm.receiver.int()] == .object)
@@ -1265,9 +1140,7 @@ fn memberOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
             if (!isBuiltinCls(rc5) and cm.name.int() < m.consts.items.len) {
                 const mnm = m.consts.items[cm.name.int()];
                 if (mnm != .String) return stepNo(f, "member name kind");
-                // A property holding a function, called by its
-                // name: read the property, then invoke what it
-                // holds.
+                // A property holding a function, called by its name: read the property, invoke what it holds.
                 if (fieldIndex(prog, rc5, mnm.String)) |fidx| {
                     const fds5 = prog.of(rc5).?;
                     const far = funcClsArity(fds5[fidx].cls orelse 0) orelse return stepNoName(f, "member", mnm.String);
@@ -1283,9 +1156,7 @@ fn memberOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
                     return .next;
                 }
                 const root5 = memberRoot(m, prog, rc5, plainFieldName(mnm.String), cm.n_args) orelse {
-                    // A value with no `toString` of its own
-                    // renders the way the runtime renders it
-                    // for printing: one renderer, two callers.
+                    // A value with no `toString` of its own renders the way the runtime renders it.
                     if (cm.n_args == 0 and std.mem.eql(u8, plainFieldName(mnm.String), "toString")) {
                         if (cm.dst.int() >= f.n_locals) return stepNo(f, "member dst");
                         types[cm.dst.int()] = .object;
@@ -1314,8 +1185,7 @@ fn memberOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A member call the lowering left by name, resolved against the shape of
-/// the receiver and falling back to a numeric conversion.
+/// A member call left by name, resolved against the receiver, falling back to a conversion.
 fn callMemberByName(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1339,16 +1209,14 @@ fn callMemberByName(w: *Walk, inst: *const ir.Inst) Error!Step {
     const rt2 = types[cm.receiver.int()];
     if (!isNumericTy(rt2)) return stepNo(f, "conv receiver type");
     if (cm.dst.int() >= f.n_locals) return stepNo(f, "conv dst");
-    // Kotlin saturates a floating value to Int.MIN/MAX and maps
-    // NaN to 0; a C cast leaves all three undefined.
+    // Kotlin saturates a floating value and maps NaN to 0; a C cast leaves all three undefined.
     if (rt2.isFloat() and (to == .i32 or to == .i64)) return stepNo(f, "float to int");
     types[cm.dst.int()] = to;
     known[cm.dst.int()] = true;
     return .next;
 }
 
-/// `toString()` through a slot on a value that declares no override:
-/// the runtime renders it.
+/// `toString()` through a slot on a value that declares no override: the runtime renders it.
 fn virtualRendersToString(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const prog = w.prog;
@@ -1357,9 +1225,7 @@ fn virtualRendersToString(w: *Walk, inst: *const ir.Inst) Error!Step {
     const cls = w.cls;
     const known = w.known;
     const cv = inst.CallVirtual;
-    // `toString()` on a value that declares no override of its
-    // own renders through the runtime; a class that DOES
-    // override still dispatches.
+    // A class that DOES override still dispatches.
     if (m.funcById(ir.FuncId.from(cv.slot.int()))) |tsd| {
         if (isToStringCall(tsd.name, cv.n_args) and
             cv.receiver.int() < f.n_locals and known[cv.receiver.int()])
@@ -1376,8 +1242,7 @@ fn virtualRendersToString(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A member the runtime serves from the receiver s own representation,
-/// which needs a runtime value rather than a compiled class.
+/// A member the runtime serves from the receiver's own representation, not a compiled class.
 fn virtualOfHostValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1387,10 +1252,7 @@ fn virtualOfHostValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     const elem_cls = w.elem_cls;
     const known = w.known;
     const cv = inst.CallVirtual;
-    // A member the runtime serves from the receiver's own
-    // representation. The receiver has to be a runtime value
-    // rather than a compiled class: a user class that
-    // implements the same interface dispatches to its body.
+    // A user class implementing the same interface dispatches to its own body instead.
     if (cv.receiver.int() < f.n_locals and known[cv.receiver.int()] and
         types[cv.receiver.int()] == .object and cls[cv.receiver.int()] != null and
         isBuiltinCls(cls[cv.receiver.int()].?))
@@ -1411,10 +1273,8 @@ fn virtualOfHostValue(w: *Walk, inst: *const ir.Inst) Error!Step {
                 known[cv.dst.int()] = true;
                 return .next;
             }
-            // The declaration says what the step answers. A
-            // return type that names neither a machine type
-            // nor a compiled class is the container's own
-            // element type, which the receiver carries.
+            // The declaration says what the step answers. A return type naming neither a machine type
+            // nor a compiled class is the container's own element type, which the receiver carries.
             const hrt = tyOf(decl.return_ty) orelse blk: {
                 if (classIndexOfName(m, decl.return_ty) == null and
                     elem[cv.receiver.int()] != .unit) break :blk elem[cv.receiver.int()];
@@ -1432,8 +1292,7 @@ fn virtualOfHostValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A slot-bound member of a list: the three the lowering names, and any
-/// other one the interpreter already implements.
+/// A slot-bound list member: the three the lowering names, plus any the interpreter implements.
 fn virtualOfList(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1465,8 +1324,7 @@ fn virtualOfList(w: *Walk, inst: *const ir.Inst) Error!Step {
             types[cv.dst.int()] = .object;
             cls[cv.dst.int()] = null;
         } else {
-            // Any other member of a builtin receiver is an
-            // operation the interpreter already implements.
+            // Any other member of a builtin receiver is an operation the interpreter implements.
             const decl = m.funcById(ir.FuncId.from(cv.slot.int())) orelse return stepNo(f, "list virtual member");
             const sym = stdlibEntry(decl) orelse return stepNoName(f, "list virtual member", decl.fqn);
             _ = sym;
@@ -1486,8 +1344,7 @@ fn virtualOfList(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A slot on a compiled instance: the root declaration gives the result
-/// type and the argument shape, and the receiver picks the body.
+/// A slot on a compiled instance: the root declaration types it, the receiver picks the body.
 fn virtualOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1502,17 +1359,10 @@ fn virtualOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     {
         if (m.funcById(ir.FuncId.from(cv.slot.int()))) |root| {
             if (root.hasBody() or root.params.len != 0) {
-                // The slot's root declaration gives the result
-                // type and the argument shape; which body runs
-                // is decided at run time by the receiver.
                 const rt4 = funcRetTy2(m, root) orelse return stepNo(f, "virtual return type");
-                // The dispatcher forwards what the site passes
-                // straight into the body it picks, so the site
-                // has to supply the declaration's parameters
-                // positionally. A site that omits one — a
-                // default, or a named argument the lowering
-                // reordered — needs the missing value computed
-                // HERE, before the receiver is known.
+                // The dispatcher forwards what the site passes straight into the body it picks, so the
+                // site has to supply the declaration's parameters positionally: a site that omits one
+                // needs the missing value computed here, before the receiver is known.
                 if (cv.n_args + 1 != root.params.len) return stepNoCallee(f, root, "virtual call arity");
                 var kk2: u32 = 0;
                 while (kk2 < cv.n_args) : (kk2 += 1) {
@@ -1532,8 +1382,7 @@ fn virtualOfInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A call through a method slot, resolved against the shape of the
-/// receiver and falling back to a numeric conversion.
+/// A call through a method slot, falling back to a numeric conversion.
 fn callVirtualBySlot(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1567,8 +1416,6 @@ fn newUnsignedValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     const types = w.types;
     const known = w.known;
     const ni = inst.NewInstance;
-    // An unsigned integer is a value class: constructing one
-    // reinterprets the same bits.
     if (ni.class.int() < m.classes.items.len) {
         if (unsignedTypeOf(m.classes.items[ni.class.int()].name)) |ut| {
             if (ni.n_args != 1) return stepNo(f, "unsigned ctor arity");
@@ -1584,8 +1431,7 @@ fn newUnsignedValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// `IntArray(n)` is a sized array, and `IntArray(n) { … }` runs a body
-/// per element, which is a loop rather than an allocation.
+/// `IntArray(n)` is a sized array; `IntArray(n) { … }` runs a body per element, as a loop.
 fn newArray(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1598,9 +1444,6 @@ fn newArray(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (ni.class.int() < m.classes.items.len and
         isArrayTypeName(m.classes.items[ni.class.int()].name))
     {
-        // `IntArray(n)` is a sized array, not an instance with
-        // fields. `IntArray(n) { i -> … }` runs a body per
-        // element, which is a loop rather than an allocation.
         if (ni.n_args != 1 and ni.n_args != 2) return stepNo(f, "array ctor arity");
         const nr = ni.args.int();
         if (nr >= f.n_locals or !known[nr]) return stepNo(f, "array size");
@@ -1648,8 +1491,7 @@ fn newThrowable(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A construction: the class has to have a layout, and every argument has
-/// to fit the field the primary constructor stores it in.
+/// A construction: the class needs a layout, and every argument must fit its field.
 fn newInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -1680,12 +1522,10 @@ fn newInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     };
     const cdef3 = &m.classes.items[ni.class.int()];
     if (cdef3.primary_params.len < ni.n_args) return stepNo(f, "ctor arity");
-    // A constructor takes its arguments in ITS order, whatever
-    // order the call writes them in.
+    // A constructor takes its arguments in ITS order, whatever order the call writes them in.
     const cb3 = bindCallArgs(m, cdef3.primary_params, ni.args.int(), ni.n_args, ni.arg_names) orelse
         return stepNo(f, "ctor argument binding");
-    // A parameter nothing binds runs the thunk the declaration
-    // lowered for its default.
+    // A parameter nothing binds runs the thunk the declaration lowered for its default.
     var ci3: u32 = 0;
     while (ci3 < cdef3.primary_params.len) : (ci3 += 1) {
         if (cb3.regs[ci3] != null) continue;
@@ -1697,14 +1537,8 @@ fn newInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
         const ai = fd.arg orelse continue;
         const ar = cb3.regs[ai] orelse continue;
         if (ar >= f.n_locals or !known[ar]) return stepNo(f, "ctor arg");
-        // A field that holds a REFERENCE takes any value: the
-        // call site boxes a machine type for it, which is what
-        // an erased type parameter needs.
-        // A narrower integer CONSTANT reaching a wider field
-        // is the same value, which is what an overload the
-        // lowering resolved to the constructor leaves behind.
-        // A negative one is not: widening it would sign-extend
-        // where the interpreter keeps the number it computed.
+        // A field holding a REFERENCE takes any value, boxed at the call site. A narrower integer
+        // CONSTANT widens to the same value; a negative one would sign-extend, so it does not.
         const widen_ok = isNumericTy(fd.ty) and isNumericTy(types[ar]) and
             !fd.ty.isFloat() and !types[ar].isFloat() and
             (if (const_at[ar]) |kv2| kv2 >= 0 else false);
@@ -1714,11 +1548,8 @@ fn newInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
             if (traceOn()) std.debug.print("[cgen]   field `{s}` is {s}, argument r{d} is {s}\n", .{ fd.name, @tagName(fd.ty), ar, @tagName(types[ar]) });
             return stepNo(f, "ctor arg type");
         }
-        // An argument whose class is not the field's is a call
-        // to a SECONDARY constructor, which runs a body the
-        // emitter does not have. Matching arity alone made it
-        // look like the primary and stored the argument as it
-        // came.
+        // An argument whose class is not the field's is a call to a SECONDARY constructor, whose
+        // body the emitter does not have: matching arity alone made it look like the primary.
         if (fd.ty == .object) {
             if (fd.cls) |want_c| {
                 const got_c = cls[ar] orelse return stepNo(f, "ctor arg class");
@@ -1735,8 +1566,7 @@ fn newInstance(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// The lowering s sentinel for a bare name in value position: a CLASS
-/// resolves to its companion, and anything else is itself.
+/// The lowering's sentinel for a bare name: a CLASS resolves to its companion, else itself.
 fn fieldOfClassCompanionOrSelf(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const prog = w.prog;
@@ -1746,9 +1576,6 @@ fn fieldOfClassCompanionOrSelf(w: *Walk, inst: *const ir.Inst) Error!Step {
     const elem = w.elem;
     const known = w.known;
     const gf = inst.GetField;
-    // The lowering's sentinel for a bare name in value
-    // position: a CLASS resolves to its companion, and
-    // anything else is itself.
     if (gf.field.int() < m.consts.items.len) {
         const sen = m.consts.items[gf.field.int()];
         if (sen == .String and std.mem.eql(u8, sen.String, "<class-companion-or-self>")) {
@@ -1773,8 +1600,7 @@ fn fieldOfClassCompanionOrSelf(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .pass;
 }
 
-/// A read off a class NAME: a builtin constant, a nested class, an enum
-/// entry, or the companion that owns the member.
+/// A read off a class NAME: a builtin constant, nested class, enum entry, or companion member.
 fn fieldOffClassName(w: *Walk, inst: *const ir.Inst, sc: u32, qual_recv: *?u32) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -1806,8 +1632,7 @@ fn fieldOffClassName(w: *Walk, inst: *const ir.Inst, sc: u32, qual_recv: *?u32) 
             return .next;
         }
     }
-    // `E.entries` is every entry of an enum, in
-    // declaration order, as a list.
+    // `E.entries` is every entry of an enum, in declaration order, as a list.
     if (std.mem.eql(u8, plainFieldName(enm.String), "entries") and
         enumEntries(m, prog, sc).len != 0)
     {
@@ -1830,8 +1655,6 @@ fn fieldOffClassName(w: *Walk, inst: *const ir.Inst, sc: u32, qual_recv: *?u32) 
             std.debug.print("[cgen] refuse {s}: member `{s}` of the class `{s}`, which has no companion the program laid out\n", .{
                 f.fqn, enm.String, if (sc < m.classes.items.len) m.classes.items[sc].fqn else "?",
             });
-            // Say WHY the companion has no layout, which is
-            // the thing to fix.
             var ci9: u32 = 0;
             while (ci9 < m.classes.items.len) : (ci9 += 1) {
                 if (!m.classes.items[ci9].is_object) continue;
@@ -1853,8 +1676,7 @@ fn fieldOffClassName(w: *Walk, inst: *const ir.Inst, sc: u32, qual_recv: *?u32) 
     return .pass;
 }
 
-/// `length` and `size` on a string, a list and an array, and a
-/// progression s own first, last and step.
+/// `length` and `size` on a string, list and array, and a progression's first, last and step.
 fn fieldOfBuiltinReceiver(w: *Walk, inst: *const ir.Inst, rc: u32) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -1872,9 +1694,7 @@ fn fieldOfBuiltinReceiver(w: *Walk, inst: *const ir.Inst, rc: u32) Error!Step {
         known[gf.dst.int()] = true;
         return .next;
     }
-    // A progression answers its bounds and its step from its
-    // own record; the counted loop the lowering writes for
-    // `for (x in r)` reads exactly those three.
+    // A progression answers bounds and step from its own record, as the counted loop reads them.
     if (rc == RANGE_CLS) {
         const pnm = m.consts.items[gf.field.int()];
         if (pnm != .String) return stepNo(f, "builtin member name");
@@ -1894,8 +1714,7 @@ fn fieldOfBuiltinReceiver(w: *Walk, inst: *const ir.Inst, rc: u32) Error!Step {
     return .pass;
 }
 
-/// How the class answers the name: from storage, through a getter, or
-/// through a dispatcher for a property declared without storage.
+/// How the class answers the name: storage, a getter, or a dispatcher for a storage-less one.
 fn fieldByAccessPlan(w: *Walk, inst: *const ir.Inst, rc: u32) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -1911,8 +1730,6 @@ fn fieldByAccessPlan(w: *Walk, inst: *const ir.Inst, rc: u32) Error!Step {
     const nm = m.consts.items[gf.field.int()];
     switch (accessPlan(m, prog, rc, nm.String, false)) {
         .none => {
-            // Name why the class has no layout, when that is
-            // the reason the field is not there.
             if (traceOn() and prog.of(rc) == null and rc < m.classes.items.len) {
                 if (cgen.layout_diag_busy) return stepNo(f, "class layout");
                 cgen.layout_diag_busy = true;
@@ -1959,9 +1776,7 @@ fn fieldByAccessPlan(w: *Walk, inst: *const ir.Inst, rc: u32) Error!Step {
     return .next;
 }
 
-/// A property read, resolved against the receiver: a qualifier names a
-/// companion or a constant, a builtin answers from its own record, and a
-/// compiled class answers through its layout.
+/// A property read resolved against the receiver: qualifier, builtin record, or class layout.
 fn getField(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const prog = w.prog;
@@ -1973,9 +1788,7 @@ fn getField(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (gf.receiver.int() >= f.n_locals or !known[gf.receiver.int()]) return stepNo(f, "field receiver");
     const sentinel = try fieldOfClassCompanionOrSelf(w, inst);
     if (sentinel != .pass) return sentinel;
-    // A read off a class NAME whose member belongs to that
-    // class's companion: the companion answers it, so the
-    // access runs against the companion singleton.
+    // A read off a class NAME whose member belongs to the companion runs against that singleton.
     var qual_recv: ?u32 = null;
     if (staticClassOf(types, cls, gf.receiver.int())) |sc| {
         const qualified = try fieldOffClassName(w, inst, sc, &qual_recv);
@@ -1988,8 +1801,7 @@ fn getField(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (gf.field.int() >= m.consts.items.len) return stepNo(f, "field name");
     const nm = m.consts.items[gf.field.int()];
     if (nm != .String) return stepNo(f, "field name kind");
-    // A nested class read off its outer names a type, not a
-    // value: the register is a qualifier and holds nothing.
+    // A nested class read off its outer names a type, not a value: the register holds nothing.
     if (rc < m.classes.items.len) {
         if (nestedClassNamed(m, qualifierOwnerFqn(m.classes.items[rc].fqn), plainFieldName(nm.String))) |nc| {
             if (gf.dst.int() >= f.n_locals) return stepNo(f, "qualifier dst");
@@ -2008,8 +1820,7 @@ fn getField(w: *Walk, inst: *const ir.Inst) Error!Step {
     return try fieldByAccessPlan(w, inst, rc);
 }
 
-/// A property write: the setter s own parameter, or the field s type,
-/// decides what the value has to be.
+/// A property write: the setter's own parameter, or the field's type, decides the value.
 fn setField(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const prog = w.prog;
@@ -2045,8 +1856,7 @@ fn setField(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A global name: a singleton, a type qualifier, a function in value
-/// position, or the global s own storage.
+/// A global name: a singleton, a type qualifier, a function value, or the global's storage.
 fn loadGlobal(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -2072,9 +1882,7 @@ fn loadGlobal(w: *Walk, inst: *const ir.Inst) Error!Step {
         known[lg.dst.int()] = true;
         return .next;
     }
-    // A builtin type's name is a qualifier too: `Int` in
-    // `Int.MAX_VALUE` names the type, and the constant read
-    // off it is the language's own number.
+    // A builtin type's name is a qualifier too: the constant read off `Int` is the language's.
     if (builtinQualifier(gn.String)) |bt| {
         if (globalIndex(globals, gn.String) == null) {
             if (lg.dst.int() >= f.n_locals) return stepNo(f, "qualifier dst");
@@ -2084,8 +1892,7 @@ fn loadGlobal(w: *Walk, inst: *const ir.Inst) Error!Step {
             return .next;
         }
     }
-    // An enum's own name is a qualifier: it carries no value,
-    // and the member read off it resolves at emit time.
+    // An enum's own name is a qualifier: it carries no value, and a read off it resolves here.
     if (enumClassNamed(m, prog, gn.String)) |ec| {
         if (lg.dst.int() >= f.n_locals) return stepNo(f, "qualifier dst");
         types[lg.dst.int()] = .unit;
@@ -2093,9 +1900,7 @@ fn loadGlobal(w: *Walk, inst: *const ir.Inst) Error!Step {
         known[lg.dst.int()] = true;
         return .next;
     }
-    // Any other class name is a qualifier too: `Outer` in
-    // `Outer.Section` names the type the nested name is read
-    // off. A global of the same name is a value and wins.
+    // Any class name is a qualifier too, but a global of the same name is a value and wins.
     if (globalIndex(globals, gn.String) == null) {
         if (classQualifierNamed(m, gn.String)) |qc| {
             if (lg.dst.int() >= f.n_locals) return stepNo(f, "qualifier dst");
@@ -2106,9 +1911,7 @@ fn loadGlobal(w: *Walk, inst: *const ir.Inst) Error!Step {
         }
     }
     if (globalIndex(globals, gn.String) == null) {
-        // A function's NAME in value position is the function
-        // itself: a callable with no captures, which is the
-        // same shape a lambda that captures nothing takes.
+        // A function's NAME in value position is the function itself: a callable with no captures.
         if (topLevelFuncNamed(m, gn.String)) |rf| {
             if (rf.params.len <= FUNC_MAX_ARITY) {
                 if (lg.dst.int() >= f.n_locals) return stepNo(f, "callable dst");
@@ -2135,7 +1938,6 @@ fn loadGlobal(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A write to a global, which takes the global s own type.
 fn storeGlobal(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -2158,8 +1960,7 @@ fn storeGlobal(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A lambda: never materialised where every use is a direct call, and
-/// otherwise an instance of a class synthesized for this body.
+/// A lambda: not materialised where every use is a direct call, else a synthesized instance.
 fn astLambda(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -2180,15 +1981,11 @@ fn astLambda(w: *Walk, inst: *const ir.Inst) Error!Step {
     lam[al.dst.int()] = .{ .body = body, .captures = al.captures };
     known[al.dst.int()] = true;
     if (!lambdaEscapes(m, f, al.dst)) {
-        // Never materialised: every use is a direct call, so
-        // the call site passes the captures itself.
         types[al.dst.int()] = .unit;
         return .next;
     }
-    // The value has to exist. It becomes an instance of a
-    // class the emitter synthesizes for this body, one field
-    // per capture, which is what lets the collector trace it
-    // and a call through it find the body again.
+    // The value has to exist: an instance of a class synthesized for this body with one field
+    // per capture, which lets the collector trace it and a call through it find the body.
     const bfn = m.funcById(body) orelse return stepNo(f, "lambda body missing");
     const arity = bfn.params.len;
     if (arity > FUNC_MAX_ARITY) return stepNo(f, "lambda arity");
@@ -2207,8 +2004,7 @@ fn astLambda(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A name that is both a callable in scope and possibly a member: the
-/// local wins where it holds a function value.
+/// A name both callable in scope and possibly a member: the local wins with a function value.
 fn callValueOrMember(w: *Walk, inst: *const ir.Inst) Error!Step {
     const f = w.f;
     const types = w.types;
@@ -2233,8 +2029,7 @@ fn callValueOrMember(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// A call through a value: a function VALUE passes its arguments and
-/// result boxed, and a known lambda compiles its body with its captures.
+/// A call through a value: a function VALUE boxes arguments and result, a known lambda does not.
 fn callValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     const gpa = w.gpa;
     const m = w.m;
@@ -2251,9 +2046,6 @@ fn callValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     if (cv2.arg_names.len != 0 or cv2.type_args.len != 0) return stepNo(f, "value call names/type args");
     if (cv2.callee.int() >= f.n_locals) return stepNo(f, "value callee");
     if (types[cv2.callee.int()] == .object) {
-        // A call through a function VALUE: the body is decided
-        // at run time by which closure the value is, so the
-        // arguments and the result pass boxed.
         const fc = cls[cv2.callee.int()] orelse return stepNo(f, "value callee class");
         const ar6 = funcClsArity(fc) orelse return stepNo(f, "value callee is not callable");
         if (cv2.n_args != ar6) return stepNo(f, "value call arity");
@@ -2269,10 +2061,7 @@ fn callValue(w: *Walk, inst: *const ir.Inst) Error!Step {
     }
     const li = lam[cv2.callee.int()] orelse return stepNo(f, "value call to an unknown callee");
     const bf = m.funcById(li.body) orelse return stepNo(f, "lambda body missing");
-    // The lowering always gives a lambda an `it` slot, so a
-    // zero-argument call leaves one parameter unsupplied. It is
-    // unreachable in a lambda that declares none, and gets the
-    // type's zero.
+    // A lambda always gets an `it` slot, so an unsupplied parameter is unreachable and zeroed.
     if (cv2.n_args > bf.params.len) return stepNo(f, "lambda arity");
     var kk3: u32 = 0;
     while (kk3 < cv2.n_args) : (kk3 += 1) {
@@ -2280,9 +2069,7 @@ fn callValue(w: *Walk, inst: *const ir.Inst) Error!Step {
         if (ar3 >= f.n_locals or !known[ar3]) return stepNo(f, "lambda arg");
     }
     if (cv2.dst.int() >= f.n_locals) return stepNo(f, "lambda dst");
-    // A lambda declares no return type, so the answer is what
-    // its body compiles to — with the captures it was made
-    // with, since those are part of its signature here.
+    // A lambda declares no return type: the answer is what its body compiles to, captures included.
     const ct2 = try gpa.alloc(CapInfo, li.captures.len);
     defer gpa.free(ct2);
     for (li.captures, 0..) |cr2, ci5| ct2[ci5] = .{ .ty = types[cr2.int()], .cls = cls[cr2.int()], .elem = elem[cr2.int()] };
@@ -2316,8 +2103,7 @@ fn callLaunches(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!Step 
     return .pass;
 }
 
-/// `runBlocking` roots a coroutine, so the block has to be a lambda this
-/// program compiled and suspending.
+/// `runBlocking` roots a coroutine: the block must be a suspending lambda compiled here.
 fn callRunsBlocking(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -2326,9 +2112,7 @@ fn callRunsBlocking(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!S
     const known = w.known;
     const c = inst.Call;
     if (isRunBlocking(callee)) {
-        // The block is the root coroutine. It has to be a
-        // lambda whose body this program compiled: the driver
-        // resumes it by calling it.
+        // The driver resumes the block by calling it, so its body has to be compiled here.
         if (c.n_args < 1) return stepNo(f, "runBlocking arity");
         const br = c.args.int() + c.n_args - 1;
         if (br >= f.n_locals or !known[br]) return stepNo(f, "runBlocking block");
@@ -2363,8 +2147,7 @@ fn callArrayOfNulls(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!S
     return .pass;
 }
 
-/// `arrayOf` and its primitive forms, whose elements have to agree with
-/// the element type the form names.
+/// `arrayOf` and its primitive forms: elements must agree with the element type named.
 fn callArrayOf(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!Step {
     const f = w.f;
     const types = w.types;
@@ -2395,8 +2178,7 @@ fn callArrayOf(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!Step {
     return .pass;
 }
 
-/// `listOf` and friends: the element type is the one every argument
-/// shares, and a mixed list holds references.
+/// `listOf` and friends: the element type every argument shares, a mixed list holding references.
 fn callListOf(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!Step {
     const m = w.m;
     const f = w.f;
@@ -2428,8 +2210,7 @@ fn callListOf(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!Step {
     return .pass;
 }
 
-/// A stdlib entry the backend performs directly, whose operands the
-/// declaration constrains.
+/// A stdlib entry the backend performs directly, whose operands the declaration constrains.
 fn callScalarIntrinsic(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!Step {
     const f = w.f;
     const types = w.types;
@@ -2448,9 +2229,8 @@ fn callScalarIntrinsic(w: *Walk, inst: *const ir.Inst, callee: *const Func) Erro
                 if (types[sa] == .unit) return stepNo(f, "print of Unit");
                 types[c.dst.int()] = .unit;
             },
-            // The floating forms differ from C's: Kotlin's
-            // `max` propagates NaN and orders -0.0 below 0.0,
-            // where `fmax` does neither.
+            // The floating forms differ from C's: Kotlin's `max` propagates NaN and orders -0.0 below
+            // 0.0, where `fmax` does neither.
             .max, .min => {
                 if (c.n_args != 2) return stepNo(f, "intrinsic arity");
                 if (types[sa] != types[sa + 1]) return stepNo(f, "intrinsic operand types");
@@ -2469,9 +2249,7 @@ fn callScalarIntrinsic(w: *Walk, inst: *const ir.Inst, callee: *const Func) Erro
     return .pass;
 }
 
-/// A call the lowering resolved: the declaration has to be the one the
-/// arguments pick, every parameter has to be bound or defaulted, and a
-/// runtime value cannot stand where an instance is declared.
+/// A call the lowering resolved: the arguments must pick the declaration and fill every parameter.
 fn callDeclaredBody(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!Step {
     const m = w.m;
     const prog = w.prog;
@@ -2483,8 +2261,7 @@ fn callDeclaredBody(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!S
     const known = w.known;
     const c = inst.Call;
     if (!callee.hasBody()) {
-        // No Kotlin body, but the interpreter implements
-        // it: compiled code runs the same entry.
+        // No Kotlin body, but the interpreter implements it: compiled code runs the same entry.
         if (stdlibEntry(callee) != null) {
             var ks9: u32 = 0;
             while (ks9 < c.n_args) : (ks9 += 1) {
@@ -2492,10 +2269,7 @@ fn callDeclaredBody(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!S
                 if (a9 >= f.n_locals or !known[a9]) return stepNo(f, "stdlib arg");
             }
             if (c.dst.int() >= f.n_locals) return stepNo(f, "stdlib dst");
-            // The table answers a value; the DECLARATION
-            // says what kind, so a result that is a machine
-            // type comes back as one rather than staying
-            // boxed and refusing the next `+`.
+            // The table answers a value; the DECLARATION says what kind, so a machine type comes back as one.
             const srt = tyOf(callee.return_ty) orelse Ty.object;
             types[c.dst.int()] = srt;
             if (srt == .object) {
@@ -2508,10 +2282,7 @@ fn callDeclaredBody(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!S
         }
         return stepNoCallee(f, callee, "no body for");
     }
-    // A name several declarations answer, which these
-    // arguments do not separate, is decided from the
-    // VALUES at run time; the lowering's pick is one
-    // candidate, not the answer.
+    // A name these arguments do not separate is decided from the VALUES at run time.
     if (!callee.has_receiver_param and
         ambiguousOverload(m, prog, callee.name, types, c.args.int(), c.n_args, c.arg_names))
     {
@@ -2523,13 +2294,7 @@ fn callDeclaredBody(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!S
     if (callee.params.len < c.n_args and !has_vararg) return stepNoCallee(f, callee, "arity of");
     const bnd = bindCallArgs(m, callee.params, c.args.int(), c.n_args, c.arg_names) orelse
         return stepNoCallee(f, callee, "argument binding of");
-    // A parameter nothing binds is filled by the thunk the
-    // declaration lowered for it, run with the arguments
-    // ahead of it.
-    // A parameter declared as a class the emitter lays
-    // out cannot take a RUNTIME value: a body that reads
-    // its fields would address a list, a range or a string
-    // as though it were an instance.
+    // A parameter declared as a laid-out class cannot take a RUNTIME value.
     var ai9: u32 = 0;
     while (ai9 < bnd.n) : (ai9 += 1) {
         const areg9 = bnd.regs[ai9] orelse continue;
@@ -2539,18 +2304,14 @@ fn callDeclaredBody(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!S
         const want9 = classIndexOfName(m, callee.params[ai9].ty) orelse continue;
         if (isBuiltinCls(want9)) continue;
         const wf9 = prog.of(want9) orelse continue;
-        // A supertype with no storage — `Any`, an
-        // interface — is satisfied by a runtime value; one
-        // with fields is not, and a body reading them would
-        // address a list or a range as an instance.
+        // A supertype with no storage (`Any`, an interface) is satisfied by a runtime value.
         if (wf9.len == 0) continue;
         return stepNoCallee(f, callee, "a runtime value where an instance is declared by");
     }
     var di: u32 = 0;
     while (di < bnd.n) : (di += 1) {
         if (bnd.regs[di] != null) continue;
-        // A `vararg` nothing filled is the empty array, not
-        // a missing argument.
+        // A `vararg` nothing filled is the empty array, not a missing argument.
         if (bnd.vararg_param != null and bnd.vararg_param.? == di) continue;
         const dfid = prog.defaultThunk(callee.id, di) orelse return stepNoCallee(f, callee, "arity of");
         const dfn = m.funcById(dfid) orelse return stepNo(f, "default thunk");
@@ -2565,16 +2326,14 @@ fn callDeclaredBody(w: *Walk, inst: *const ir.Inst, callee: *const Func) Error!S
     return .pass;
 }
 
-/// A call to a named declaration: the intrinsics the backend performs
-/// itself first, then the body the lowering picked.
+/// A call to a named declaration: backend intrinsics first, then the body the lowering picked.
 fn callResolved(w: *Walk, inst: *const ir.Inst) Error!Step {
     const m = w.m;
     const f = w.f;
     const types = w.types;
     const known = w.known;
     const c = inst.Call;
-    // Type arguments say nothing about which body runs for a
-    // call the lowering already resolved.
+    // Type arguments say nothing about which body runs for a call already resolved.
     if (c.dst.int() >= f.n_locals) return .refuse;
     const callee = m.funcById(c.func) orelse return stepNo(f, "call target missing");
     const launched = try callLaunches(w, inst, callee);
@@ -2616,8 +2375,7 @@ fn callResolved(w: *Walk, inst: *const ir.Inst) Error!Step {
     return .next;
 }
 
-/// Resolve the result from the returned registers, which the walk has now
-/// typed. Disagreeing returns mean the emitter cannot name one C type.
+/// The result the returned registers agree on. Disagreeing returns mean no single C type.
 fn returnShape(w: *Walk, order: []const u32, declared: Ty) Error!?ReturnShape {
     const gpa = w.gpa;
     const f = w.f;
@@ -2629,8 +2387,7 @@ fn returnShape(w: *Walk, order: []const u32, declared: Ty) Error!?ReturnShape {
     var saw_ret = false;
     var ret_cls: ?u32 = null;
     var ret_elem: Ty = .unit;
-    // Only the blocks the body can reach: an unreachable one was never typed,
-    // and its terminator names a register nothing defined.
+    // Only the blocks the body can reach: an unreachable one was never typed.
     const live_ret = try gpa.alloc(bool, f.blocks.len);
     defer gpa.free(live_ret);
     @memset(live_ret, false);

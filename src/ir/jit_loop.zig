@@ -1,17 +1,10 @@
-//! Stage-3 JIT: compile a hot natural loop to native x86-64 machine code.
-//!
-//! Additive tier over the IR interpreter (see docs/design/JIT-DESIGN.md). The loop's
-//! IR registers live as i64 slots in a scratch file; the emitted code uses
-//! rax/rcx/rdx/rsi scratch per op (no register allocator) and runs the loop
-//! natively, eliminating Value boxing, member dispatch, and per-instruction
-//! interpreter overhead. Packed primitive arrays are indexed directly out of
-//! their scalar buffer (the F5 representation), with a bounds-check that deopts
-//! to the interpreter at the faulting instruction on out-of-range access.
-//!
-//! Gated behind `KLIO_JIT` and entered only when the live-in registers' runtime
-//! types (and indexed-array kinds) match the compiled specialization; otherwise
-//! the interpreter runs the loop unchanged. So the build stays correct with the
-//! JIT off (default) or on.
+//! Stage-3 JIT: compiles a hot natural loop to native x86-64, an additive tier over
+//! the IR interpreter (docs/design/JIT-DESIGN.md). The loop's IR registers live as i64
+//! slots in a scratch frame, the emitted code uses rax/rcx/rdx/rsi scratch per op with
+//! no register allocator, and packed primitive arrays are indexed out of their scalar
+//! buffer under a bounds check that deopts at the faulting instruction. Gated behind
+//! `KLIO_JIT` and entered only when live-in register types and array kinds match the
+//! compiled specialization; otherwise the interpreter runs the loop unchanged.
 
 const std = @import("std");
 const ir = @import("ir.zig");

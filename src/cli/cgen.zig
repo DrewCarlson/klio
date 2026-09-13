@@ -1,22 +1,10 @@
-//! Ahead-of-time C generation: the program itself, not a launcher for it.
-//!
-//! The emitted file is self-contained. Every function is a C function, every
-//! block a label, every register a typed C local, and every constant a C
-//! literal — nothing here names a block or an instruction index, so nothing
-//! reads the module at run time and no image is loaded.
-//!
-//! This is the scalar core: the statically-typed arithmetic subset, which needs
-//! no runtime at all. Everything outside it is refused by `eligible` and the
-//! caller falls back, so the set can widen without a correctness cliff. See
-//! `plans/native-c-backend.md`.
+//! Ahead-of-time C generation: the program itself, not a launcher for it. The
+//! emitted file is self-contained (every function a C function, every block a
+//! label, every register a typed C local), so nothing reads the module at run
+//! time and no image is loaded. Only the statically-typed scalar subset is
+//! covered; the rest is refused by `eligible` and the caller falls back.
 const std = @import("std");
-/// The interpreter's own stdlib table. A member the backend does not perform
-/// directly is not a gap to fill here: the operation already exists, named, and
-/// compiled code calls the same entry the interpreter does.
 const stdlib = @import("stdlib");
-/// The interpreter's member dispatch. Which builtin member calls the runtime
-/// can serve is its classification, read here at compile time so the backend
-/// keeps no second table of the same names.
 const member_dispatch = @import("interp_ir").member_dispatch;
 const ir = @import("ir");
 
@@ -216,15 +204,12 @@ pub const writeBody = mod_body.writeBody;
 const mod_emit = @import("cgen/emit.zig");
 pub const emit = mod_emit.emit;
 
-/// Why a class has no layout. Reported only when a program actually needed
-/// one: the table is built for every class in the module, so reporting during
-/// the build names classes nothing ever asked about — mostly library
-/// interfaces, which have no layout by their nature.
+/// Why a class has no layout, reported only when a program needed one: the
+/// table covers every class in the module, most of which nothing asks about.
 pub var layout_quiet = true;
 
-/// A refusal may re-derive a class layout just to SAY why it has none, and
-/// deriving one compiles property initializers, which can refuse again. Without
-/// this, the explanation recurses into itself.
+/// Deriving a layout to explain why one is missing compiles property
+/// initializers, which can refuse again; this stops the explanation recursing.
 pub var layout_diag_busy = false;
 
 test {

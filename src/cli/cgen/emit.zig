@@ -84,15 +84,11 @@ const writeProto = cgen.writeProto;
 const writeSymbol = cgen.writeSymbol;
 const zeroKindOf = cgen.zeroKindOf;
 
-/// One body waiting to be compiled, and the signature it is compiled
-/// against.
 const Pending = struct { f: *const Func, synth: ?[]const ir.Param, caps: []const CapInfo = &.{} };
 
-/// A field read or write whose receiver class the emitter knows.
 const AccessSite = struct { rc: u32, name: ir.ConstId, set: bool };
 
-/// Everything the walk and the writers share: the module being emitted, the
-/// sets the reachability walk fills, and what the output has to declare.
+/// Shared by the walk and the writers: the module, the reachability sets, the output.
 const Emit = struct {
     gpa: std.mem.Allocator,
     m: *const Module,
@@ -101,15 +97,12 @@ const Emit = struct {
     w: *std.Io.Writer,
     src_path: []const u8,
     prog: Program,
-    /// Every body the entry reaches, in the order they were compiled.
     accepted: *std.ArrayList(Compiled),
-    /// The bodies already queued, so none is compiled twice.
     seen: *std.AutoHashMap(u32, void),
     queue: *std.ArrayList(Pending),
     /// The synthesized signatures and capture tables queue entries point at.
     synth_owned: *std.ArrayList([]ir.Param),
     cap_owned: *std.ArrayList([]CapInfo),
-    /// The classes the walk saw constructed, and the slots it saw called.
     constructed: *std.ArrayList(u32),
     vsites: *std.ArrayList(ir.MethodSlotId),
     used_slots: *std.ArrayList(SlotUse),
@@ -119,8 +112,7 @@ const Emit = struct {
     used_classes: *std.ArrayList(u32),
     ctor_classes: *std.ArrayList(u32),
     used_globals: *std.ArrayList(Global),
-    /// Whether the program needs the runtime at all, and the hints that
-    /// decide it once every phase has run.
+    /// Whether the program needs the runtime at all, decided once every phase has run.
     uses_objects: bool = false,
     uses_objects_hint: bool = false,
     uses_try: bool = false,
@@ -128,8 +120,7 @@ const Emit = struct {
     needs_cast: bool = false,
 };
 
-/// Emit the whole program. Returns false when `main` itself is outside the
-/// subset, which is the caller's signal to fall back.
+/// Emit the whole program. False means `main` is outside the subset: the caller falls back.
 pub fn emit(
     gpa: std.mem.Allocator,
     m: *const Module,
@@ -143,13 +134,8 @@ pub fn emit(
     var throws = try buildThrowTable(gpa, m);
     defer throws.deinit(gpa);
 
-    // Resolve every class's layout: the emitter asks about the same classes
-    // repeatedly, and resolving walks the class table each time. A property
-    // the source left unannotated takes the type its initializer computes, and
-    // asking the initializer needs the layouts resolved so far — so the table
-    // is built to a fixed point rather than in one pass. The passes only ever
-    // ADD fields, so it settles in as many rounds as an initializer chain is
-    // deep.
+    // Every class's layout, resolved once to a fixed point: an unannotated property takes the
+    // type its initializer computes, and asking that needs the layouts resolved so far.
     const table = try gpa.alloc(?[]const FieldInfo, m.classes.items.len);
     defer {
         for (table) |maybe| {
@@ -187,10 +173,8 @@ pub fn emit(
     }
     var queue: std.ArrayList(Pending) = .empty;
     defer queue.deinit(gpa);
-    // Only a class the program CONSTRUCTS can answer a virtual call, so the
-    // two sets grow together: draining the queue discovers constructions and
-    // call sites, and pairing them can queue more bodies, which can construct
-    // more classes. The walk runs until neither set grows.
+    // Only a class the program CONSTRUCTS answers a virtual call, so both sets grow together
+    // and the walk runs until neither does.
     var constructed: std.ArrayList(u32) = .empty;
     defer constructed.deinit(gpa);
     var vsites: std.ArrayList(ir.MethodSlotId) = .empty;
@@ -249,9 +233,7 @@ pub fn emit(
     collectArithmeticHelpers(&e);
 
     try writeFileHeader(&e);
-    // Every hint is in: a program that prints, throws, holds a global or
-    // dispatches needs the runtime, and the header has to say so before the
-    // first declaration that uses it.
+    // The header has to say the program needs the runtime before the first declaration does.
     if (e.uses_objects_hint) e.uses_objects = true;
     try writeRuntimeDeclarations(&e);
     try writeTryMachinery(&e);
@@ -273,8 +255,6 @@ pub fn emit(
     return true;
 }
 
-/// Every class's layout, resolved to a fixed point: a pass only ever adds
-/// fields, so it settles once no pass adds one.
 fn resolveClassLayouts(
     gpa: std.mem.Allocator,
     m: *const Module,
@@ -307,8 +287,7 @@ fn resolveClassLayouts(
         }
         if (!grew_layout) break;
     }
-    // A class still missing a property has no usable layout: handing out a
-    // partial one would address the wrong field.
+    // A partial layout would address the wrong field, so a class missing a property has none.
     for (table, 0..) |*slot_p, i| {
         if (complete_table[i]) continue;
         if (slot_p.*) |old_fs| gpa.free(old_fs);
@@ -317,21 +296,15 @@ fn resolveClassLayouts(
     }
 }
 
-/// Compile everything the entry reaches: drain the queue, pair what it
-/// found against what it built, and repeat until neither set grows.
 fn compileReachableBodies(e: *Emit) Error!bool {
     const gpa = e.gpa;
     const entry = e.entry;
     const seen = e.seen;
     const queue = e.queue;
-    // Reachable closure from the entry: only what the program can call is
-    // emitted, which is what keeps a whole-stdlib lowering from becoming tens
-    // of thousands of C functions.
+    // Reachable closure from the entry keeps a whole-stdlib lowering out of the output.
     try queue.append(gpa, .{ .f = entry, .synth = null });
     try seen.put(entry.id.int(), {});
-    // A single refusal anywhere in the reachable set fails the whole emission:
-    // a compiled program has no interpreter to fall back INTO, so a body it
-    // cannot call is not a slow path, it is a missing one.
+    // One refusal in the reachable set fails the emission: compiled code has no fallback.
     while (true) {
         if (!try drainCompileQueue(e)) return false;
         var grew_reach = false;
@@ -341,8 +314,6 @@ fn compileReachableBodies(e: *Emit) Error!bool {
     return true;
 }
 
-/// Compile each queued body and walk its instructions for what else it
-/// reaches.
 fn drainCompileQueue(e: *Emit) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -363,8 +334,6 @@ fn drainCompileQueue(e: *Emit) Error!bool {
     return true;
 }
 
-/// What one instruction reaches: the bodies it can call, the classes it
-/// builds and the slots it dispatches through. False refuses the emission.
 fn discoverFromInst(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -372,8 +341,7 @@ fn discoverFromInst(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bo
     const seen = e.seen;
     const queue = e.queue;
     const vsites = e.vsites;
-    // A function's NAME in value position: the body it refers to
-    // is reachable through the reference alone.
+    // A function's NAME in value position makes its body reachable through the reference.
     if (inst.* == .LoadGlobal) {
         if (c.lam[inst.LoadGlobal.dst.int()]) |li11| {
             const rfn = m.funcById(li11.body) orelse return false;
@@ -384,10 +352,8 @@ fn discoverFromInst(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bo
         }
     }
     if (!try queueSingletonUse(e, c, inst)) return false;
-    // A referenced global drags in the thunk that initializes it.
-    // Only referenced ones: the list carries every top-level
-    // property in the program AND its libraries, and pulling them
-    // all in would compile the whole stdlib to run `main`.
+    // A referenced global drags in its initializer thunk; only referenced ones, or every
+    // top-level property of every library comes with it.
     const gname: ?ir.ConstId = switch (inst.*) {
         .LoadGlobal => |lg| lg.name,
         .StoreGlobal => |sg| sg.name,
@@ -397,8 +363,7 @@ fn discoverFromInst(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bo
         if (!try queueGlobalThunk(e, cid)) return false;
         return true;
     }
-    // Constructing a class runs the thunks that initialize its body
-    // properties, so those are reachable too.
+    // Constructing a class runs the thunks that initialize its body properties.
     if (inst.* == .AstLambda) {
         if (!try queueLambdaBody(e, c, inst)) return false;
         return true;
@@ -419,9 +384,8 @@ fn discoverFromInst(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bo
             if (!have_site) try vsites.append(gpa, cv2.slot);
         }
     }
-    // Reading an entry off its enum's name builds that entry:
-    // the thunks its declaration writes for the constructor run,
-    // and so do the enum's own body-property initializers.
+    // Reading an entry off its enum's name builds it, running the constructor thunks its
+    // declaration writes and the enum's own body-property initializers.
     if (inst.* == .GetField) {
         const gq = inst.GetField;
         if (staticClassOf(c.types, c.cls, gq.receiver.int())) |sq| {
@@ -440,15 +404,11 @@ fn discoverFromInst(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bo
             }
         }
     }
-    // A bare name inside an inlined receiver body resolved to a
-    // computed property or to a top-level one; either way what it
-    // resolved to has to be compiled.
     if (c.bare.get(inst)) |res| {
         if (!try queueBareTarget(e, inst, res)) return false;
         return true;
     }
-    // A computed property reads and writes through its accessors,
-    // so those are reachable wherever the property is touched.
+    // A computed property reads and writes through its accessors.
     const acc: ?AccessSite = switch (inst.*) {
         .GetField => |gf2| blk3: {
             const rcx = c.cls[gf2.receiver.int()] orelse break :blk3 null;
@@ -472,8 +432,7 @@ fn discoverFromInst(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bo
     return try queueDirectCall(e, inst);
 }
 
-/// The one instance an `object` declaration has, named either
-/// by its own name or through the class whose companion it is.
+/// The one instance an `object` has, named by itself or through the class it companions.
 fn queueSingletonUse(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -522,7 +481,6 @@ fn queueSingletonUse(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!b
     return true;
 }
 
-/// The thunk that initializes a referenced top-level property.
 fn queueGlobalThunk(e: *Emit, cid: ir.ConstId) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -544,8 +502,6 @@ fn queueGlobalThunk(e: *Emit, cid: ir.ConstId) Error!bool {
     return true;
 }
 
-/// The body a lambda literal runs, compiled against what this site
-/// captured.
 fn queueLambdaBody(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -557,11 +513,8 @@ fn queueLambdaBody(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!boo
     const bfid = al2.body_func orelse return false;
     const bfn = m.funcById(bfid) orelse return false;
     if (!seen.contains(bfn.id.int())) {
-        // The body is compiled against what this site captured:
-        // those values arrive as leading arguments. Its own
-        // parameters carry no declared types, so they come from
-        // the function type the value is expected to have —
-        // the same signature `eligible` typed it against.
+        // The body is compiled against what this site captured: those values arrive as leading
+        // arguments, and its parameters come from the function type the value is expected to have.
         const ct = try gpa.alloc(CapInfo, al2.captures.len);
         for (al2.captures, 0..) |cr, ci4| ct[ci4] = .{ .ty = c.types[cr.int()], .cls = c.cls[cr.int()], .elem = c.elem[cr.int()] };
         try cap_owned.append(gpa, ct);
@@ -576,7 +529,6 @@ fn queueLambdaBody(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!boo
     return true;
 }
 
-/// The slot a member call dispatches through.
 fn noteMemberCallSite(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -599,8 +551,6 @@ fn noteMemberCallSite(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!
     };
 }
 
-/// Rendering a value calls its `toString`, so that slot is a
-/// call site like any other.
 fn noteRenderedToString(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -624,7 +574,6 @@ fn noteRenderedToString(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Erro
     }
 }
 
-/// Printing a value calls its `toString` too.
 fn notePrintedToString(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -651,7 +600,6 @@ fn notePrintedToString(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error
     }
 }
 
-/// Every entry of an enum, built where the program reads `entries`.
 fn queueAllEnumEntries(e: *Emit, sq: u32) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -684,7 +632,6 @@ fn queueAllEnumEntries(e: *Emit, sq: u32) Error!bool {
     return true;
 }
 
-/// One entry of an enum, built where the program names it.
 fn queueEnumEntry(e: *Emit, sq: u32, eqi: u32) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -715,8 +662,7 @@ fn queueEnumEntry(e: *Emit, sq: u32, eqi: u32) Error!bool {
     return true;
 }
 
-/// What a resolved bare name reaches: a construction, an accessor, a
-/// global, a member slot or a call.
+/// What a resolved bare name reaches: a construction, accessor, global, slot or call.
 fn queueBareTarget(e: *Emit, inst: *const ir.Inst, res: BareResolution) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -754,8 +700,7 @@ fn queueBareTarget(e: *Emit, inst: *const ir.Inst, res: BareResolution) Error!bo
             }
         },
         .member => |mb| {
-            // Every class beneath the receiver's type may
-            // answer, which the virtual pairing then queues.
+            // Every class beneath the receiver's type may answer, which the virtual pairing queues.
             var have_m = false;
             for (vsites.items) |sv6| {
                 if (sv6.int() == mb.slot) have_m = true;
@@ -771,8 +716,7 @@ fn queueBareTarget(e: *Emit, inst: *const ir.Inst, res: BareResolution) Error!bo
                 try seen.put(cfn.id.int(), {});
                 try queue.append(gpa, .{ .f = cfn, .synth = null });
             }
-            // A parameter the call leaves unbound runs the
-            // thunk the declaration lowered for it.
+            // A parameter the call leaves unbound runs the thunk the declaration lowered for it.
             if (inst.* == .CallMemberOrGlobal) {
                 const cgq = inst.CallMemberOrGlobal;
                 if (bindCallArgs(m, cfn.params, cgq.args.int(), cgq.n_args, cgq.arg_names)) |bq| {
@@ -792,8 +736,6 @@ fn queueBareTarget(e: *Emit, inst: *const ir.Inst, res: BareResolution) Error!bo
     return true;
 }
 
-/// Constructing runs the class's own initializers,
-/// which the construction walk below queues.
 fn queueConstructedFromBare(e: *Emit, bcid2: u32) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -837,7 +779,6 @@ fn queueConstructedFromBare(e: *Emit, bcid2: u32) Error!bool {
     return true;
 }
 
-/// The accessors a property read or write goes through.
 fn queuePropertyAccessors(e: *Emit, a2: AccessSite) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -856,8 +797,7 @@ fn queuePropertyAccessors(e: *Emit, a2: AccessSite) Error!bool {
                     }
                 },
                 .virtual => {
-                    // Every class beneath the receiver's type
-                    // may answer, so every getter is reachable.
+                    // Every class beneath the receiver's type may answer, so every getter is reachable.
                     const pn = plainFieldName(anm.String);
                     var pc: u32 = 0;
                     while (pc < m.classes.items.len) : (pc += 1) {
@@ -877,8 +817,6 @@ fn queuePropertyAccessors(e: *Emit, a2: AccessSite) Error!bool {
     return true;
 }
 
-/// Constructing a class runs every initializer in its chain, so each one
-/// is reachable wherever the construction is.
 fn queueConstruction(e: *Emit, inst: *const ir.Inst) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -898,9 +836,8 @@ fn queueConstruction(e: *Emit, inst: *const ir.Inst) Error!bool {
         }
         if (!have_c) try constructed.append(gpa, nc2);
     }
-    // Constructing a class runs every initializer in its chain:
-    // each class's body-property thunks, and the thunks it
-    // passes to its superclass's constructor.
+    // Constructing a class runs every initializer in its chain: each class's body-property
+    // thunks, and the thunks it passes to its superclass's constructor.
     var walk: ?u32 = inst.NewInstance.class.int();
     var steps: u32 = 0;
     while (walk) |wc| : (steps += 1) {
@@ -916,8 +853,7 @@ fn queueConstruction(e: *Emit, inst: *const ir.Inst) Error!bool {
                 try queue.append(gpa, .{ .f = ibn2, .synth = null });
             }
         }
-        // And the thunk behind every constructor parameter the
-        // construction may omit.
+        // And the thunk behind every constructor parameter the construction may omit.
         if (wc == inst.NewInstance.class.int()) {
             var dpi: usize = 0;
             while (dpi < wdef.primary_params.len) : (dpi += 1) {
@@ -925,11 +861,8 @@ fn queueConstruction(e: *Emit, inst: *const ir.Inst) Error!bool {
                 const dfn5 = m.funcById(dfd) orelse return false;
                 if (seen.contains(dfn5.id.int())) continue;
                 try seen.put(dfn5.id.int(), {});
-                // Like a superclass-argument thunk, it
-                // declares no parameters and reads its
-                // caller's positionally: a synthesized
-                // receiver slot first, then the constructor
-                // arguments AHEAD of the one it fills.
+                // Like a superclass-argument thunk it declares no parameters and reads its caller's
+                // positionally: a synthesized receiver slot, then the constructor arguments ahead of it.
                 const csyn = try gpa.alloc(ir.Param, 1 + wdef.primary_params.len);
                 try synth_owned.append(gpa, csyn);
                 csyn[0] = .{
@@ -954,10 +887,7 @@ fn queueConstruction(e: *Emit, inst: *const ir.Inst) Error!bool {
             const ifn = m.funcById(tf) orelse return false;
             if (seen.contains(ifn.id.int())) continue;
             try seen.put(ifn.id.int(), {});
-            // A superclass-argument thunk declares no
-            // parameters and reads its class's constructor
-            // arguments positionally, so it compiles against
-            // them.
+            // A superclass-argument thunk declares no parameters and reads its class's positionally.
             try queue.append(gpa, .{ .f = ifn, .synth = wdef.primary_params });
         }
         walk = pp.cid;
@@ -965,8 +895,6 @@ fn queueConstruction(e: *Emit, inst: *const ir.Inst) Error!bool {
     return true;
 }
 
-/// The body a direct call runs, and the thunk behind every parameter it
-/// leaves unbound.
 fn queueDirectCall(e: *Emit, inst: *const ir.Inst) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -977,11 +905,8 @@ fn queueDirectCall(e: *Emit, inst: *const ir.Inst) Error!bool {
     if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or
         arrayOfIntrinsic(callee) != null or isArrayOfNulls(callee) or isRunBlocking(callee) or
         isDelay(callee) or isLaunch(callee)) return true;
-    // A declaration the interpreter implements has no body to
-    // compile: the call reaches the same entry the interpreter
-    // reaches.
+    // A declaration the interpreter implements has no body: the call reaches that same entry.
     if (!callee.hasBody() and stdlibEntry(callee) != null) return true;
-    // A call that leaves a parameter unbound runs the thunk for it.
     const bnd3 = bindCallArgs(m, callee.params, inst.Call.args.int(), inst.Call.n_args, inst.Call.arg_names) orelse
         return false;
     var dq: u32 = 0;
@@ -991,9 +916,7 @@ fn queueDirectCall(e: *Emit, inst: *const ir.Inst) Error!bool {
         const dfn2 = m.funcById(dfid2) orelse return false;
         if (seen.contains(dfn2.id.int())) continue;
         try seen.put(dfn2.id.int(), {});
-        // The thunk reads the parameters ahead of its own
-        // positionally, so it compiles against the callee's
-        // signature up to that point.
+        // The thunk reads the parameters ahead of its own positionally, and compiles against them.
         try queue.append(gpa, .{ .f = dfn2, .synth = callee.params[0..dq] });
     }
     if (seen.contains(callee.id.int())) return true;
@@ -1002,9 +925,8 @@ fn queueDirectCall(e: *Emit, inst: *const ir.Inst) Error!bool {
     return true;
 }
 
-/// Every construction the walk found, against every virtual call site
-/// it found. A class the program never builds answers nothing, which is
-/// what keeps an abstract library base out of the compile.
+/// Every construction the walk found against every virtual call site it found. A class
+/// the program never builds answers nothing, keeping abstract library bases out.
 fn pairConstructionsWithSites(e: *Emit, grew_reach: *bool) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -1016,11 +938,8 @@ fn pairConstructionsWithSites(e: *Emit, grew_reach: *bool) Error!bool {
     for (vsites.items) |slot| {
         for (constructed.items) |cid| {
             const impl = slotImpl(m, prog, cid, slot) orelse {
-                // The class has the member in its type but no body for it:
-                // it satisfies the interface by DELEGATION, which forwards
-                // to another object at run time. Refusing keeps that a
-                // refusal rather than an AbstractMethodError in a compiled
-                // program.
+                // The class has the member in its type but no body: it satisfies the interface by
+                // DELEGATION, so refusing keeps that a refusal rather than a run-time AbstractMethodError.
                 const root9 = m.funcById(ir.FuncId.from(slot.int())) orelse continue;
                 if (typeHasSlot(m, cid, root9)) {
                     if (traceOn()) {
@@ -1032,9 +951,7 @@ fn pairConstructionsWithSites(e: *Emit, grew_reach: *bool) Error!bool {
                 }
                 continue;
             };
-            // An override declaring more parameters than the site supplies
-            // fills them from its own default thunks, so those are
-            // reachable wherever the dispatcher is.
+            // An override's extra parameters run their own default thunks, reachable with the dispatcher.
             const vroot = m.funcById(ir.FuncId.from(slot.int()));
             var vk: u32 = 1;
             while (vk < impl.params.len) : (vk += 1) {
@@ -1055,10 +972,7 @@ fn pairConstructionsWithSites(e: *Emit, grew_reach: *bool) Error!bool {
     return true;
 }
 
-// Printing a floating value is the one place where C's formatting and
-// Kotlin's disagree, so the helper rides along only when it is used.
-// A program with any handler carries the try machinery, and its throws go
-// through it rather than straight out.
+// A program with any handler carries the try machinery, and its throws go through it.
 fn collectTryRegions(e: *Emit) void {
     const accepted = e.accepted;
     for (accepted.items) |*c| {
@@ -1068,8 +982,6 @@ fn collectTryRegions(e: *Emit) void {
     }
 }
 
-/// Virtual call sites: each distinct slot gets one dispatcher, switching on
-/// the receiver's class.
 fn collectVirtualSlots(e: *Emit) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -1168,8 +1080,7 @@ fn collectVirtualSlots(e: *Emit) Error!void {
     }
 }
 
-/// `object` declarations the program names. Each has ONE instance, created
-/// before the program runs and rooted for its whole life.
+/// `object` declarations the program names: one instance each, built and rooted before main.
 fn collectSingletons(e: *Emit) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -1179,8 +1090,7 @@ fn collectSingletons(e: *Emit) Error!void {
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
-                // An enum entry read off the enum's name is an instance built
-                // once, exactly like an `object` declaration's.
+                // An enum entry read off the enum's name is an instance built once, like an `object`.
                 if (inst.* == .CallMember) {
                     if (companionReceiver(m, prog, c.types, c.cls, inst.CallMember.receiver.int())) |cc9| {
                         var have_c9 = false;
@@ -1193,8 +1103,7 @@ fn collectSingletons(e: *Emit) Error!void {
                 }
                 if (inst.* == .GetField) {
                     const gf3 = inst.GetField;
-                    // A property the receiver's own class does not carry is its
-                    // companion's, and that singleton has to exist.
+                    // A property the receiver's own class does not carry is its companion's, which must exist.
                     if (staticClassOf(c.types, c.cls, gf3.receiver.int()) == null) {
                         if (gf3.field.int() < m.consts.items.len) {
                             const fnm3 = m.consts.items[gf3.field.int()];
@@ -1231,9 +1140,6 @@ fn collectSingletons(e: *Emit) Error!void {
                                 }
                                 if (!have_e) try used_singletons.append(gpa, .{ .cid = sc2, .entry = ei3 });
                             } else if (sc2 < m.classes.items.len) {
-                                // A member read off a class name answers from
-                                // that class's companion, which is a singleton
-                                // the program has to build.
                                 if (companionObjectNamed(m, prog, m.classes.items[sc2].fqn)) |cc2| {
                                     var have_c = false;
                                     for (used_singletons.items) |u| {
@@ -1263,9 +1169,7 @@ fn collectSingletons(e: *Emit) Error!void {
     }
 }
 
-/// Properties read through a type that declares them without storage. One
-/// dispatcher per (receiver type, name): which getter runs is the
-/// receiver's class, exactly as for a method.
+/// Properties declared without storage: one dispatcher per (receiver type, name).
 fn collectVirtualProps(e: *Emit) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -1295,10 +1199,8 @@ fn collectVirtualProps(e: *Emit) Error!void {
     }
 }
 
-/// Lambdas whose value has to exist. Each becomes a class the emitter
-/// synthesizes for that body, one field per capture: the collector traces
-/// it like any instance, and a call through the value finds the body again
-/// by its class handle.
+/// Lambdas whose value has to exist. Each becomes a synthesized class with one field per
+/// capture, traced like any instance, and a call through the value finds the body by handle.
 fn collectLambdas(e: *Emit) Error!void {
     const gpa = e.gpa;
     const accepted = e.accepted;
@@ -1344,9 +1246,8 @@ fn collectLambdas(e: *Emit) Error!void {
     }
 }
 
-/// Classes the program constructs or reads through. Emitted as descriptors
-/// and registered before main: a compiled program carries its own layout
-/// because there is no module to ask.
+/// Classes the program constructs or reads through, emitted as descriptors and registered
+/// before main: a compiled program carries its own layout, with no module to ask.
 fn collectDescriptorClasses(e: *Emit) Error!void {
     const gpa = e.gpa;
     const prog = e.prog;
@@ -1364,10 +1265,8 @@ fn collectDescriptorClasses(e: *Emit) Error!void {
         for (c.cls) |maybe| {
             const cid = maybe orelse continue;
             if (isBuiltinCls(cid)) continue;
-            // A class the program never laid out has no descriptor to
-            // register: an interface, or a library type a value merely passes
-            // through. Nothing constructs one, and every read that would need
-            // its fields is refused before it reaches here.
+            // A class the program never laid out has no descriptor: an interface, or a library type a
+            // value merely passes through. Reads needing its fields are refused before reaching here.
             if (prog.of(cid) == null) continue;
             var seen_cls = false;
             for (used_classes.items) |u| {
@@ -1378,8 +1277,7 @@ fn collectDescriptorClasses(e: *Emit) Error!void {
     }
 }
 
-/// Classes the program actually constructs, and every superclass in their
-/// chains: each gets an initializer, and a subclass's calls its parent's.
+/// Classes the program constructs and their superclasses: each gets an initializer.
 fn collectConstructedClasses(e: *Emit) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -1396,8 +1294,7 @@ fn collectConstructedClasses(e: *Emit) Error!void {
                 if (inst.* != .NewInstance) continue;
                 const nc = inst.NewInstance.class.int();
                 if (isThrowableClass(m, nc)) continue;
-                // An array is a runtime value, not an instance the emitter
-                // lays out or initializes.
+                // An array is a runtime value, not an instance the emitter lays out or initializes.
                 if (nc < m.classes.items.len and
                     (isArrayTypeName(m.classes.items[nc].name) or unsignedTypeOf(m.classes.items[nc].name) != null)) continue;
                 try want.append(gpa, nc);
@@ -1418,17 +1315,14 @@ fn collectConstructedClasses(e: *Emit) Error!void {
     }
 }
 
-/// A string is a reference too: a program that only concatenates still needs
-/// the runtime for its collector and renderer.
+/// A string is a reference too: concatenation alone still needs the collector and renderer.
 fn collectObjectUse(e: *Emit) void {
     const accepted = e.accepted;
     const used_classes = e.used_classes;
     e.uses_objects = used_classes.items.len != 0;
     for (accepted.items) |*c| {
         for (c.types) |t| {
-            // A `Char` prints as a character, a `Short`/`Byte` as itself, and
-            // an unsigned value as unsigned, so a program holding one needs the
-            // runtime's renderer even if it never touches the heap.
+            // A `Char`, `Short`, `Byte` or unsigned value prints as itself, so it needs the renderer.
             switch (t) {
                 .object, .char, .short, .byte, .u32, .u64, .u16, .u8 => e.uses_objects = true,
                 else => {},
@@ -1450,8 +1344,7 @@ fn collectGlobals(e: *Emit) Error!void {
                 const nm: ?ir.ConstId = switch (inst.*) {
                     .LoadGlobal => |lg| lg.name,
                     .StoreGlobal => |sg| sg.name,
-                    // A bare name that resolved to no implicit receiver is the
-                    // top-level property it falls back to.
+                    // A bare name that resolved to no implicit receiver is a top-level property.
                     .LoadFromThisOrGlobal => |lt2| if (c.bare.get(inst)) |r2|
                         (if (r2 == .global) lt2.name else null)
                     else
@@ -1476,8 +1369,6 @@ fn collectGlobals(e: *Emit) Error!void {
     }
 }
 
-/// Whether the program's arithmetic and casts need their helpers, and
-/// whether either forces the runtime in.
 fn collectArithmeticHelpers(e: *Emit) void {
     const m = e.m;
     const accepted = e.accepted;
@@ -1493,8 +1384,7 @@ fn collectArithmeticHelpers(e: *Emit) void {
                     .BinOp => |b| {
                         if ((b.op == .Div or b.op == .Mod) and !c.types[b.dst.int()].isFloat()) e.needs_div = true;
                     },
-                    // Printing goes through the runtime's renderer, so a
-                    // program that prints anything links it.
+                    // Printing goes through the runtime's renderer, so a program that prints links it.
                     .Call => |call| {
                         const callee = m.funcById(call.func) orelse continue;
                         if (isPrintln(callee) or scalarIntrinsic(callee) == .print) e.uses_objects_hint = true;
@@ -1506,7 +1396,6 @@ fn collectArithmeticHelpers(e: *Emit) void {
     }
 }
 
-/// What generated the file, and what the C compiler has to include.
 fn writeFileHeader(e: *Emit) Error!void {
     const w = e.w;
     const src_path = e.src_path;
@@ -1524,7 +1413,6 @@ fn writeFileHeader(e: *Emit) Error!void {
     , .{src_path});
 }
 
-/// The runtime header, and the handles a program that needs it declares.
 fn writeRuntimeDeclarations(e: *Emit) Error!void {
     const w = e.w;
     const accepted = e.accepted;
@@ -1539,8 +1427,7 @@ fn writeRuntimeDeclarations(e: *Emit) Error!void {
         );
         for (used_classes.items) |cid| try w.print("static uint32_t KCLS_{d};\n", .{cid});
         for (used_lambdas.items) |lu| try w.print("static uint32_t KLAM_{d};\n", .{lu.body.int()});
-        // The starter a lambda that suspends is registered under, declared
-        // before the registration that names it.
+        // The starter a suspending lambda is registered under, declared before its registration.
         for (used_lambdas.items) |lu| {
             for (accepted.items) |*cc| {
                 if (cc.f.id != lu.body or !cc.suspends) continue;
@@ -1571,9 +1458,7 @@ fn writeClassRegistry(e: *Emit) Error!void {
             try w.writeByte('"');
         }
         if (fields.len == 0) try w.writeAll("0");
-        // The primary constructor's properties are the fields this class
-        // contributes from its own arguments: the parent's come first and
-        // belong to the parent.
+        // This class contributes the fields filled from its own arguments; the parent's come first.
         var plo: u32 = 0;
         var phi: u32 = 0;
         for (fields, 0..) |fld2, fi2| {
@@ -1616,7 +1501,6 @@ fn writeClassRegistry(e: *Emit) Error!void {
     try w.writeAll("}\n\n");
 }
 
-/// The handler stack a program with any `catch` throws through.
 fn writeTryMachinery(e: *Emit) Error!void {
     const w = e.w;
     const uses_try = e.uses_try;
@@ -1640,15 +1524,13 @@ fn writeTryMachinery(e: *Emit) Error!void {
     );
 }
 
-/// The helper a failed `as` throws through.
 fn writeCastHelper(e: *Emit) Error!void {
     const w = e.w;
     const prog = e.prog;
     const uses_try = e.uses_try;
     const needs_cast = e.needs_cast;
     if (needs_cast) {
-        // A failed `as` is a ClassCastException, a real throwable a handler in
-        // the same program can catch.
+        // A failed `as` is a ClassCastException, catchable by a handler in the same program.
         const cce = prog.throws.find("ClassCastException");
         try w.print(
             \\KLIO_NORETURN static void klio_cast_fail(const char *ty, size_t n) {{
@@ -1661,17 +1543,14 @@ fn writeCastHelper(e: *Emit) Error!void {
     }
 }
 
-/// The helper an integer division by zero throws through.
 fn writeDivHelper(e: *Emit) Error!void {
     const w = e.w;
     const prog = e.prog;
     const uses_try = e.uses_try;
     const needs_div = e.needs_div;
     if (needs_div) {
-        // Kotlin THROWS on integer division by zero; C leaves it undefined.
-        // It is a real throwable, so a `catch` in compiled code sees it and
-        // an uncaught one is reported by the runtime, in the one place that
-        // knows how a throwable reads.
+        // Kotlin THROWS on integer division by zero where C leaves it undefined; it is a real
+        // throwable, so a `catch` sees it and an uncaught one is reported by the runtime.
         const az = prog.throws.find("ArithmeticException");
         try w.print(
             \\KLIO_NORETURN static void klio_arith_zero(void) {{
@@ -1684,7 +1563,6 @@ fn writeDivHelper(e: *Emit) Error!void {
     }
 }
 
-/// Storage for the singletons, the capture-less lambdas and the globals.
 fn writeStaticStorage(e: *Emit) Error!void {
     const w = e.w;
     const used_singletons = e.used_singletons;
@@ -1718,8 +1596,8 @@ fn writeStaticStorage(e: *Emit) Error!void {
     }
 }
 
-/// Prototypes first: the call graph has cycles (recursion, mutual calls),
-/// and a dispatcher is defined after the bodies it selects between.
+/// Prototypes first: the call graph has cycles (recursion, mutual calls), and a dispatcher
+/// is defined after the bodies it selects between.
 fn writePrototypes(e: *Emit) Error!void {
     const m = e.m;
     const w = e.w;
@@ -1772,10 +1650,8 @@ fn writePrototypes(e: *Emit) Error!void {
         });
     }
 
-    // One adapter per materialised lambda, and one dispatcher per arity called
-    // through a value. A function value's arguments and result pass boxed,
-    // because which body runs is a run-time answer and two bodies of the same
-    // arity need not agree on machine types.
+    // One adapter per materialised lambda, one dispatcher per arity called through a value.
+    // Arguments and result pass boxed: which body runs is a run-time answer.
     for (used_lambdas.items) |lu| {
         try w.print("static klio_value klam_{d}(klio_value self", .{lu.body.int()});
         var ai7: u32 = 0;
@@ -1796,7 +1672,6 @@ fn writePrototypes(e: *Emit) Error!void {
     try w.writeAll("\n");
 }
 
-/// Every accepted body, in the order they were compiled.
 fn writeFunctionBodies(e: *Emit) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -1813,8 +1688,7 @@ fn writeFunctionBodies(e: *Emit) Error!void {
     for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try, accepted.items, used_classes.items, used_lambdas.items);
 }
 
-/// One dispatcher per virtual call site, switching on the receiver's
-/// class. False refuses the emission.
+/// One dispatcher per virtual call site, switching on the receiver's class.
 fn writeVirtualDispatchers(e: *Emit) Error!bool {
     const gpa = e.gpa;
     const m = e.m;
@@ -1835,9 +1709,7 @@ fn writeVirtualDispatchers(e: *Emit) Error!bool {
             const pt2: Ty = if (ai + 1 < root.params.len) (tyOf(root.params[ai + 1].ty) orelse .object) else .object;
             try w.print(", {s} a{d}", .{ pt2.cName(), ai });
         }
-        // A slot no constructed class answers still needs a body: the call
-        // site is reachable, and reaching it means no receiver implements the
-        // method.
+        // A slot no constructed class answers still needs a body: the call site is reachable.
         try w.writeAll(") {\n  uint32_t k = klio_nat_class_of(recv);\n  (void)k;\n");
         for (used_classes.items) |cid| {
             const impl = slotImpl(m, prog, cid, ir.MethodSlotId.from(su.slot)) orelse continue;
@@ -1846,15 +1718,12 @@ fn writeVirtualDispatchers(e: *Emit) Error!bool {
                 if (cc.f == impl) in_set = true;
             }
             if (!in_set) continue;
-            // The implementation may declare more parameters than the call
-            // site supplies: an override can carry defaults the site omits.
-            // Those run their thunks here, handed what came before them.
+            // An override's extra parameters run their default thunks here, handed what came before.
             try w.print("  if (k == KCLS_{d}) {{\n", .{cid});
             var dk9: u32 = su.n_args + 1;
             while (dk9 < impl.params.len) : (dk9 += 1) {
-                // The default may be declared where the method is DECLARED
-                // rather than where its body is: an interface can carry the
-                // default for a method a superclass implements.
+                // The default may be declared where the method is DECLARED rather than where its body is:
+                // an interface can carry the default for a method a superclass implements.
                 const dfid9 = prog.defaultThunk(impl.id, dk9) orelse
                     prog.defaultThunk(root.id, dk9) orelse break;
                 const dfn9 = m.funcById(dfid9) orelse break;
@@ -1874,11 +1743,8 @@ fn writeVirtualDispatchers(e: *Emit) Error!bool {
                 try w.writeAll(");\n");
             }
             if (dk9 != impl.params.len) {
-                // A parameter with no default and no argument: nothing can
-                // fill it, so this receiver cannot answer at all. Leaving the
-                // arm empty would let the call fall through to the
-                // no-implementation tail at run time, which is a wrong answer
-                // rather than a refusal.
+                // A parameter with no default and no argument cannot be filled, so this receiver cannot
+                // answer: an empty arm would fall through to the no-implementation tail at run time.
                 if (traceOn()) std.debug.print("[cgen] refuse {s}: dispatcher arm cannot fill a parameter of `{s}`\n", .{ root.name, impl.fqn });
                 return false;
             }
@@ -1896,8 +1762,7 @@ fn writeVirtualDispatchers(e: *Emit) Error!bool {
             try w.writeAll(");\n  }\n");
         }
         try w.print("  klio_nat_no_method(\"{s}\");\n", .{root.name});
-        // `klio_nat_no_method` does not return, but C does not know that from
-        // the declaration alone, so give the function a value to fall off with.
+        // `klio_nat_no_method` does not return, but C cannot see that, so return a value anyway.
         if (rt5 == .object) {
             try w.writeAll("  return klio_nat_box_unit();\n");
         } else {
@@ -1908,7 +1773,6 @@ fn writeVirtualDispatchers(e: *Emit) Error!bool {
     return true;
 }
 
-/// One initializer per class the program constructs.
 fn writeConstructorBodies(e: *Emit) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -1920,8 +1784,7 @@ fn writeConstructorBodies(e: *Emit) Error!void {
     if (ctor_classes.items.len != 0) try w.writeAll("\n");
 }
 
-/// A lambda that suspends and can be handed to `launch` needs a starter:
-/// the driver is given the closure VALUE and has to find the code.
+/// A suspending lambda handed to `launch` needs a starter: the driver has only the value.
 fn writeLambdaStarters(e: *Emit) Error!bool {
     const w = e.w;
     const accepted = e.accepted;
@@ -1955,8 +1818,7 @@ fn writeLambdaStarters(e: *Emit) Error!bool {
     return true;
 }
 
-/// One adapter per materialised lambda: its arguments and its result pass
-/// boxed, because which body runs is a run-time answer.
+/// One adapter per materialised lambda: its arguments and its result pass boxed.
 fn writeLambdaAdapters(e: *Emit) Error!bool {
     const gpa = e.gpa;
     const w = e.w;
@@ -1974,8 +1836,7 @@ fn writeLambdaAdapters(e: *Emit) Error!bool {
         while (ai9 < lu.arity) : (ai9 += 1) try w.print(", klio_value a{d}", .{ai9});
         try w.writeAll(") {\n");
         if (lu.n_caps == 0) try w.writeAll("  (void)self;\n");
-        // The lowering always gives a lambda an `it` slot, so a body can
-        // declare fewer parameters than its type takes.
+        // The lowering always gives a lambda an `it` slot, so a body can declare fewer parameters.
         var av9: u32 = 0;
         while (av9 < lu.arity) : (av9 += 1) try w.print("  (void)a{d};\n", .{av9});
         var call9: std.Io.Writer.Allocating = .init(gpa);
@@ -1993,9 +1854,6 @@ fn writeLambdaAdapters(e: *Emit) Error!bool {
             if (pi9 != 0 or bc2.caps.len != 0) try call9.writer.writeAll(", ");
             const pt9: Ty = tyOf(p9.ty) orelse .object;
             var ab10: [16]u8 = undefined;
-            // The lowering always gives a lambda an `it` slot, so a body may
-            // declare a parameter the call never supplies; it gets the type's
-            // zero, which is unreachable in a lambda that declares none.
             const src10 = if (pi9 < lu.arity)
                 try std.fmt.bufPrint(&ab10, "a{d}", .{pi9})
             else
@@ -2010,8 +1868,7 @@ fn writeLambdaAdapters(e: *Emit) Error!bool {
     return true;
 }
 
-/// One dispatcher per arity called through a function value, and the
-/// uniform shape a stdlib entry calls back through.
+/// One dispatcher per arity called through a function value, plus the stdlib callback shape.
 fn writeValueCallDispatchers(e: *Emit) Error!void {
     const w = e.w;
     const used_lambdas = e.used_lambdas;
@@ -2031,9 +1888,7 @@ fn writeValueCallDispatchers(e: *Emit) Error!void {
             try w.writeAll(");\n");
         }
         try w.writeAll("  klio_nat_no_method(\"invoke\");\n  return klio_nat_box_unit();\n}\n");
-        // The same dispatcher in the uniform shape a stdlib entry calls
-        // back through: `forEach` and its kind hand the runtime a closure
-        // VALUE and an argument array.
+        // The shape a stdlib entry calls back through: a closure VALUE and an argument array.
         try w.print("static klio_value klam_inv_{d}(klio_value f, const klio_value *a) {{\n  (void)a;\n  return klam_call_{d}(f", .{ lu.arity, lu.arity });
         var ai11: u32 = 0;
         while (ai11 < lu.arity) : (ai11 += 1) try w.print(", a[{d}]", .{ai11});
@@ -2041,8 +1896,7 @@ fn writeValueCallDispatchers(e: *Emit) Error!void {
     }
 }
 
-/// One dispatcher per storage-less property, switching on the receiver's
-/// class exactly as a method does.
+/// One dispatcher per storage-less property, switching on the receiver's class.
 fn writePropertyDispatchers(e: *Emit) Error!void {
     const m = e.m;
     const w = e.w;
@@ -2084,8 +1938,7 @@ fn writePropertyDispatchers(e: *Emit) Error!void {
     }
 }
 
-/// The one instance of each `object` and enum entry, built and rooted
-/// before the program runs.
+/// The one instance of each `object` and enum entry, built and rooted before main.
 fn writeSingletonInitializer(e: *Emit) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -2102,8 +1955,7 @@ fn writeSingletonInitializer(e: *Emit) Error!void {
                 try w.print("  kinit_{d}(KO[{d}]);\n", .{ su4.cid, oi });
                 continue;
             };
-            // An enum entry carries its own name and position, then runs the
-            // enum's constructor with the arguments its declaration writes.
+            // An enum entry carries its own name and position, then runs the enum's constructor.
             const ents2 = enumEntries(m, prog, su4.cid);
             try w.print("  klio_nat_set(KO[{d}], 0, klio_nat_string(\"{s}\", {d}));\n", .{ oi, ents2[ei].name, ents2[ei].name.len });
             try w.print("  klio_nat_set(KO[{d}], 1, klio_nat_box_int({d}));\n", .{ oi, ei });
@@ -2139,7 +1991,6 @@ fn writeSingletonInitializer(e: *Emit) Error!void {
     }
 }
 
-/// The top-level properties, initialized in declaration order.
 fn writeGlobalInitializer(e: *Emit) Error!void {
     const gpa = e.gpa;
     const m = e.m;
@@ -2186,8 +2037,7 @@ fn writeMain(e: *Emit) Error!void {
         "  klio_nat_enter(&klio_in_flight_frame);\n",
     );
     {
-        // Every arity a closure can be called through, registered so a stdlib
-        // entry that takes a lambda can reach compiled code.
+        // Every arity a closure can be called through, registered so stdlib entries reach it.
         var seen_ar3: [FUNC_MAX_ARITY + 1]bool = @splat(false);
         for (used_lambdas.items) |lu| {
             if (seen_ar3[lu.arity]) continue;
@@ -2201,8 +2051,7 @@ fn writeMain(e: *Emit) Error!void {
             if (lu.n_caps == 0) n_ls3 += 1;
         }
         if (n_ls3 != 0) {
-            // A lambda literal that captures nothing has ONE instance for the
-            // life of the program, built here and rooted.
+            // A lambda literal that captures nothing has ONE instance for the program's life.
             try w.print("  for (unsigned i = 0; i < {d}; i++) KL[i] = klio_nat_box_unit();\n", .{n_ls3});
             try w.print("  KLF.n = {d}; KLF.slots = KL; klio_nat_enter(&KLF);\n", .{n_ls3});
             var li3: usize = 0;
@@ -2215,9 +2064,8 @@ fn writeMain(e: *Emit) Error!void {
     }
     if (used_singletons.items.len != 0) try w.writeAll("  klio_init_singletons();\n");
     if (used_globals.items.len != 0) {
-        // Top-level properties run their initializers in declaration order,
-        // which is the order the interpreter runs them in, and BEFORE the
-        // permanent phase ends: a global outlives every collection.
+        // Top-level properties run in declaration order, as the interpreter runs them, and BEFORE
+        // the permanent phase ends: a global outlives every collection.
         try w.writeAll("  klio_init_globals();\n");
     }
     if (uses_objects) try w.writeAll("  klio_nat_begin();\n");

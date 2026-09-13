@@ -89,8 +89,7 @@ const writeConst = cgen.writeConst;
 const writeProto = cgen.writeProto;
 const writeSymbol = cgen.writeSymbol;
 
-/// What every step of one body reads: the writer it appends to, the module and
-/// program being emitted, and the analysis results the instruction steps consult.
+/// What every step of one body reads: the writer, the module, the program, the analysis.
 const Body = struct {
     gpa: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -140,10 +139,8 @@ pub fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, pr
     try writeRegisterLocals(&ctx, has_catch);
     if (c.n_slots != 0 and !c.suspends) try writeGcSlotFrame(&ctx);
     if (has_catch) {
-        // The handler stack as this call found it. A `return` out of an armed
-        // region leaves without reaching the block that disarms it, so every
-        // return puts the stack back where it was: otherwise the next region
-        // armed anywhere chains onto a `klio_try` in a frame that is gone.
+        // The handler stack as found: a `return` out of an armed region never reaches its disarm,
+        // so every return puts the stack back where it was.
         try w.writeAll("  klio_try *KTE = klio_try_top;\n");
     }
     if (!c.suspends) try w.writeAll("  goto B0;\n");
@@ -158,8 +155,7 @@ pub fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, pr
     try w.writeAll("}\n\n");
 }
 
-/// The C this body opens with: a suspending body needs its frame, its builder,
-/// its entry and its continuation header; an ordinary one needs a prototype.
+/// The C a body opens with: a prototype, or a suspending body's frame, entry and header.
 fn writeFunctionOpening(ctx: *const Body) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -174,9 +170,8 @@ fn writeFunctionOpening(ctx: *const Body) !void {
     }
 }
 
-/// The frame a suspension leaves behind: every register, plus the resume label
-/// and the collector's view of the object slots. It is heap memory because the
-/// body returns in the middle of itself.
+/// The frame a suspension leaves behind: registers, resume label and object slots, on the
+/// heap because the body returns in the middle of itself.
 fn writeCoroutineFrameType(ctx: *const Body) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -195,8 +190,7 @@ fn writeCoroutineFrameType(ctx: *const Body) !void {
     try w.print("}} kfr_{d};\n", .{f.id.int()});
 }
 
-/// Building the frame is separate from running it: a coroutine the DRIVER
-/// starts needs the frame handed over, not a body already running.
+/// Building the frame is separate from running it: a DRIVER-started coroutine is handed one.
 fn writeCoroutineFrameBuilder(ctx: *const Body) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -224,7 +218,6 @@ fn writeCoroutineFrameBuilder(ctx: *const Body) !void {
     try w.writeAll("  return fr;\n}\n");
 }
 
-/// The entry: build the frame, then run the body from its start.
 fn writeSuspendingEntry(ctx: *const Body) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -259,8 +252,6 @@ fn writeContinuationPreamble(ctx: *const Body) !void {
     try w.writeAll("  goto B0;\n");
 }
 
-/// The register file as C locals: one per register the body holds in a machine
-/// type, and a `(void)` for each one it never reads.
 fn writeRegisterLocals(ctx: *const Body, has_catch: bool) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -269,14 +260,10 @@ fn writeRegisterLocals(ctx: *const Body, has_catch: bool) !void {
     if (c.suspends) r = f.n_locals;
     while (r < f.n_locals) : (r += 1) {
         if (c.types[r] == .object) continue;
-        // A local written after `setjmp` and read after the jump back is
-        // indeterminate unless it is volatile. The object slots live in an
-        // array, which is memory already.
+        // A local written after `setjmp` and read after the jump back must be volatile.
         try w.print("  {s}{s} r{d} = 0;\n", .{ if (has_catch) "volatile " else "", c.types[r].cName(), r });
     }
-    // Registers the lowering allocated but this body never reads: a C compiler
-    // warns on them and the emitted file should be warning-clean. A suspend
-    // body has no locals to void — its registers are frame fields.
+    // Registers the body never reads: the emitted file should be warning-clean.
     r = if (c.suspends) f.n_locals else 0;
     while (r < f.n_locals) : (r += 1) {
         if (c.types[r] == .object) continue;
@@ -285,10 +272,8 @@ fn writeRegisterLocals(ctx: *const Body, has_catch: bool) !void {
     try w.writeAll("\n");
 }
 
-/// The references this body holds, published to the collector for the duration
-/// of the call. Cleared first: a collection can happen before the first
-/// assignment, and a slot holding whatever was on the stack is a slot the
-/// collector will follow.
+/// References published to the collector for the call, cleared first so a collection before
+/// the first assignment does not follow whatever the stack held.
 fn writeGcSlotFrame(ctx: *const Body) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -297,16 +282,13 @@ fn writeGcSlotFrame(ctx: *const Body) !void {
     try w.print("  klio_nat_frame KF; KF.n = {d}; KF.slots = KS; klio_nat_enter(&KF);\n", .{c.n_slots});
 }
 
-/// Arm before the region's body. A throw inside it lands back here with the
-/// value in flight, and each handler is tried in order.
+/// Arm before the region's body: a throw lands back here and each handler is tried in order.
 fn writeCatchLandingPad(ctx: *const Body, blk: *const ir.Block, bi: usize) !void {
     const w = ctx.w;
     const prog = ctx.prog;
     const c = ctx.c;
     try w.print("  klio_try KT{d};\n", .{bi});
-    // The published-frame chain at the moment of arming. A throw
-    // reaching here skipped every frame's `leave` on the way, so the
-    // landing pad puts the chain back before anything else runs.
+    // A throw reaching here skipped every frame's `leave`, so the chain is put back first.
     try w.print("  klio_nat_frame *KM{d} = klio_nat_frame_mark();\n", .{bi});
     try w.print("  klio_try_arm(&KT{d});\n", .{bi});
     try w.print("  if (setjmp(KT{d}.jb) != 0) {{\n", .{bi});
@@ -322,7 +304,6 @@ fn writeCatchLandingPad(ctx: *const Body, blk: *const ir.Block, bi: usize) !void
     try w.writeAll("    klio_do_throw(klio_in_flight);\n  }\n");
 }
 
-/// One instruction, in the C its register-machine shape maps onto.
 fn writeInst(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -335,8 +316,7 @@ fn writeInst(ctx: *const Body, inst: *const ir.Inst) !void {
         .LoadFromThisOrGlobal => try writeBareLoad(ctx, inst),
         .StoreToThisOrGlobal => try writeBareStore(ctx, inst),
         .Const => try writeConstLoad(ctx, inst),
-        // A suspend body reads its parameters and captures from the
-        // frame: the C arguments are gone by the time it resumes.
+        // A suspend body reads its parameters and captures from the frame: the C arguments are gone.
         .LoadParam => |lp| {
             var nb: [32]u8 = undefined;
             try w.print("  {s} = {s}p{d};\n", .{ regName(c, lp.dst.int(), &nb), if (c.suspends) "fr->" else "", lp.idx });
@@ -416,8 +396,7 @@ fn writeInst(ctx: *const Body, inst: *const ir.Inst) !void {
     }
 }
 
-/// A call the lowering left open between a member and a global, written as
-/// whichever the bare table resolved it to.
+/// A call the lowering left open between a member and a global, as the bare table resolved it.
 fn writeBareCall(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -442,9 +421,7 @@ fn writeBareCall(ctx: *const Body, inst: *const ir.Inst) !void {
     }
 }
 
-/// The instance a bare constructor call builds: a local per parameter nothing
-/// binds, holding what that parameter's default thunk answers, then the
-/// allocation and the class's own initializer.
+/// The instance a bare constructor call builds: defaults into locals, allocation, initializer.
 fn writeBareConstruction(ctx: *const Body, inst: *const ir.Inst, cdst: []const u8, bcid3: u32) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -505,7 +482,6 @@ fn writeBareConstruction(ctx: *const Body, inst: *const ir.Inst, cdst: []const u
     try w.writeAll(");\n");
 }
 
-/// The top-level declaration a bare call bound to, called by symbol.
 fn writeBareStaticCall(ctx: *const Body, inst: *const ir.Inst, cdst: []const u8, cf2: ir.FuncId) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -606,7 +582,6 @@ fn writeBareLoad(ctx: *const Body, inst: *const ir.Inst) !void {
     }
 }
 
-/// A bare name written: a field of the receiver, its setter, or a global.
 fn writeBareStore(ctx: *const Body, inst: *const ir.Inst) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -652,7 +627,6 @@ fn writeBareStore(ctx: *const Body, inst: *const ir.Inst) !void {
     }
 }
 
-/// A constant materialised into its register.
 fn writeConstLoad(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -670,11 +644,8 @@ fn writeConstLoad(ctx: *const Body, inst: *const ir.Inst) !void {
         try w.print(", {d});\n", .{kv.String.len});
         return;
     }
-    // The lowering declares a result register by writing Unit
-    // into it before the body that fills it runs, so a register
-    // that ends up holding a reference can still be assigned a
-    // scalar constant. The value is the same either way; the
-    // spelling is the register's.
+    // The lowering writes Unit into a result register first, so a reference register can also
+    // be assigned a scalar constant.
     if (c.types[k.dst.int()] == .object) {
         var kb: [48]u8 = undefined;
         var kw: std.Io.Writer = .fixed(&kb);
@@ -691,8 +662,7 @@ fn writeConstLoad(ctx: *const Body, inst: *const ir.Inst) !void {
     try w.writeAll(";\n");
 }
 
-/// A constructor call: a throwable the runtime builds, an unsigned wrapper that
-/// is its own value, an array, or an ordinary instance.
+/// A constructor call: a runtime throwable, an unsigned wrapper, an array, or an instance.
 fn writeNewInstance(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -730,7 +700,6 @@ fn writeNewInstance(ctx: *const Body, inst: *const ir.Inst) !void {
     try writeNewObject(ctx, inst, dst);
 }
 
-/// An array of the requested size, filled by the initializer the source wrote.
 fn writeNewArray(ctx: *const Body, inst: *const ir.Inst, dst: []const u8) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -746,9 +715,7 @@ fn writeNewArray(ctx: *const Body, inst: *const ir.Inst, dst: []const u8) !void 
         try w.print("  {s} = klio_nat_ref_array_sized({s});\n", .{ dst, nsz });
     }
     if (ni.n_args == 2) {
-        // Each element is what the initializer returns for
-        // its index, which is a loop here rather than the
-        // per-element dispatch the interpreter runs.
+        // Each element is what the initializer returns for its index, a loop rather than dispatch.
         const lr2 = ni.args.int() + 1;
         var elem_call: std.Io.Writer.Allocating = .init(gpa);
         defer elem_call.deinit();
@@ -790,8 +757,6 @@ fn writeNewArray(ctx: *const Body, inst: *const ir.Inst, dst: []const u8) !void 
     }
 }
 
-/// An ordinary instance: the defaults it needs, the allocation, and the
-/// class's own initializer.
 fn writeNewObject(ctx: *const Body, inst: *const ir.Inst, dst: []const u8) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -802,10 +767,7 @@ fn writeNewObject(ctx: *const Body, inst: *const ir.Inst, dst: []const u8) !void
     const ni = inst.NewInstance;
     const cdef2 = &m.classes.items[ni.class.int()];
     const cb4 = bindCallArgs(m, cdef2.primary_params, ni.args.int(), ni.n_args, ni.arg_names).?;
-    // A parameter nothing binds runs the thunk the declaration
-    // lowered for its default, handed the arguments ahead of
-    // it; each lands in a local first, because a later default
-    // may read an earlier one.
+    // A parameter nothing binds runs its default thunk into a local: a later default may read it.
     var dp3: u32 = 0;
     while (dp3 < cb4.n) : (dp3 += 1) {
         if (cb4.regs[dp3] != null) continue;
@@ -815,10 +777,8 @@ fn writeNewObject(ctx: *const Body, inst: *const ir.Inst, dst: []const u8) !void
         defer csym.deinit();
         try writeSymbol(&csym.writer, cdfn2);
         try w.print("  {s} kcd{d}_{d} = {s}(klio_nat_null()", .{ cdt.cName(), ni.dst.int(), dp3, csym.written() });
-        // The thunk is compiled against the whole constructor
-        // signature; Kotlin forbids a default from reading a
-        // parameter declared after it, so the rest go in as
-        // whatever their C type zeroes to.
+        // Kotlin forbids a default from reading a parameter declared after it, so the thunk takes
+        // the whole signature and the rest go in as their C zero.
         var ck3: u32 = 0;
         while (ck3 < cb4.n) : (ck3 += 1) {
             try w.writeAll(", ");
@@ -842,8 +802,7 @@ fn writeNewObject(ctx: *const Body, inst: *const ir.Inst, dst: []const u8) !void
         try w.writeAll(");\n");
     }
     try w.print("  {s} = klio_nat_alloc_instance(KCLS_{d});\n", .{ dst, ni.class.int() });
-    // The class's own initializer fills it, which is what lets
-    // a subclass hand the same instance up to its superclass's.
+    // The class's own initializer fills it, which lets a subclass hand the same instance up.
     try w.print("  kinit_{d}({s}", .{ ni.class.int(), dst });
     var pi3: u32 = 0;
     while (pi3 < cb4.n) : (pi3 += 1) {
@@ -864,8 +823,7 @@ fn writeNewObject(ctx: *const Body, inst: *const ir.Inst, dst: []const u8) !void
     try w.writeAll(");\n");
 }
 
-/// A property read, resolved to whatever answers it: a builtin, an enum entry,
-/// a companion, a dispatcher, an accessor, or a slot.
+/// A property read, resolved to a builtin, enum entry, companion, dispatcher, accessor or slot.
 fn writeGetField(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -873,9 +831,7 @@ fn writeGetField(ctx: *const Body, inst: *const ir.Inst) !void {
     const c = ctx.c;
     const singletons = ctx.singletons;
     const gf = inst.GetField;
-    // A read whose result NAMES a class resolves at emit time
-    // and leaves nothing behind, exactly as loading the name
-    // of a class does.
+    // A read whose result NAMES a class resolves at emit time and leaves nothing behind.
     if (staticClassOf(c.types, c.cls, gf.dst.int()) != null) return;
     {
         const sen2 = m.consts.items[gf.field.int()];
@@ -896,9 +852,7 @@ fn writeGetField(ctx: *const Body, inst: *const ir.Inst) !void {
         }
     }
     var rc = c.cls[gf.receiver.int()].?;
-    // Where the value is read FROM: the receiver register, or
-    // the companion singleton when the receiver is a class
-    // name that answers through its companion.
+    // Read FROM the receiver register, or the companion singleton when the receiver is a class name.
     var qrb: [32]u8 = undefined;
     var recv_txt: []const u8 = regName(c, gf.receiver.int(), &qrb);
     if (staticClassOf(c.types, c.cls, gf.receiver.int())) |sc| {
@@ -942,8 +896,7 @@ fn writeGetField(ctx: *const Body, inst: *const ir.Inst) !void {
     try writeFieldAccess(ctx, inst, rc, recv_txt);
 }
 
-/// A read written on a class NAME that answers with no receiver at all: a
-/// builtin constant, an enum's entries, or one entry. True when it wrote one.
+/// A read on a class NAME with no receiver: a builtin constant, an enum's entries, or one entry.
 fn writeStaticClassRead(ctx: *const Body, inst: *const ir.Inst, sc: u32) !bool {
     const w = ctx.w;
     const m = ctx.m;
@@ -986,7 +939,6 @@ fn writeStaticClassRead(ctx: *const Body, inst: *const ir.Inst, sc: u32) !bool {
     return false;
 }
 
-/// The read itself: through the property dispatcher, the getter, or the slot.
 fn writeFieldAccess(ctx: *const Body, inst: *const ir.Inst, rc: u32, recv_txt: []const u8) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -1027,7 +979,6 @@ fn writeFieldAccess(ctx: *const Body, inst: *const ir.Inst, rc: u32, recv_txt: [
     }
 }
 
-/// A property write, through the setter or straight into the slot.
 fn writeSetField(ctx: *const Body, inst: *const ir.Inst) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -1063,8 +1014,7 @@ fn writeSetField(ctx: *const Body, inst: *const ir.Inst) !void {
     }
 }
 
-/// A binary operator whose result is a VALUE: identity, equality on references,
-/// a range, or concatenation.
+/// A binary operator whose result is a VALUE: identity, reference equality, range, concatenation.
 fn writeBinOp(ctx: *const Body, inst: *const ir.Inst) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -1118,8 +1068,7 @@ fn writeBinOp(ctx: *const Body, inst: *const ir.Inst) !void {
         return;
     }
     if (dt == .object) {
-        // Concatenation: either operand may be any value, and
-        // the runtime renders it as Kotlin would.
+        // Concatenation: either operand may be any value, rendered as Kotlin would render it.
         var db: [32]u8 = undefined;
         var lb: [32]u8 = undefined;
         var rb: [32]u8 = undefined;
@@ -1143,8 +1092,7 @@ fn writeBinOp(ctx: *const Body, inst: *const ir.Inst) !void {
     try writeArithBinOp(ctx, inst, dt);
 }
 
-/// A binary operator on machine types, in the C that keeps Kotlin's wrapping
-/// and shift-masking rules.
+/// A binary operator on machine types, keeping Kotlin's wrapping and shift masking.
 fn writeArithBinOp(ctx: *const Body, inst: *const ir.Inst, dt: Ty) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -1156,10 +1104,8 @@ fn writeArithBinOp(ctx: *const Body, inst: *const ir.Inst, dt: Ty) !void {
     const rn = regName(c, b.rhs.int(), &rnb);
     const dn = regName(c, b.dst.int(), &dnb);
     if (b.op == .UShr) {
-        // C has no unsigned right shift of a signed value, so
-        // it runs in the unsigned type of the same width;
-        // Kotlin masks the shift count where C leaves an
-        // over-wide shift undefined.
+        // C has no unsigned right shift of a signed value, so it runs in the unsigned type of the
+        // same width; Kotlin masks the shift count where C leaves an over-wide shift undefined.
         const lt5 = c.types[b.lhs.int()];
         const ut5: []const u8 = if (lt5 == .i64) "uint64_t" else "uint32_t";
         try w.print("  {s} = ({s})(({s}){s} >> ({s} & {d}));\n", .{
@@ -1171,9 +1117,7 @@ fn writeArithBinOp(ctx: *const Body, inst: *const ir.Inst, dt: Ty) !void {
     const op = cOp(b.op).?;
     if ((b.op == .Div or b.op == .Mod) and !dt.isFloat() and !isCmp(b.op)) {
         try w.print("  if ({s} == 0) klio_arith_zero();\n", .{rn});
-        // The most negative value divided by -1 overflows.
-        // Kotlin wraps it to itself and leaves the remainder
-        // zero; in C the division itself is undefined.
+        // The most negative value divided by -1 overflows: Kotlin wraps it, C leaves it undefined.
         if (wrapTy(dt)) |ut4| {
             if (b.op == .Div) {
                 try w.print("  if ({s} == -1) {{ {s} = ({s})(0 - ({s}){s}); }} else\n", .{
@@ -1185,21 +1129,15 @@ fn writeArithBinOp(ctx: *const Body, inst: *const ir.Inst, dt: Ty) !void {
         }
     }
     if (b.op == .Shl or b.op == .Shr) {
-        // Kotlin masks the shift count; C leaves an over-wide
-        // shift undefined.
+        // Kotlin masks the shift count; C leaves an over-wide shift undefined.
         const lt = c.types[b.lhs.int()];
         try w.print("  {s} = ({s})({s} {s} ({s} & {d}));\n", .{
             dn, dt.cName(), ln, op, rn,
             @as(u32, if (lt == .i64) 63 else 31),
         });
     } else if ((b.op == .Add or b.op == .Sub or b.op == .Mul) and wrapTy(dt) != null) {
-        // Kotlin's integer arithmetic WRAPS. C leaves signed
-        // overflow undefined, and an optimizer is entitled to
-        // assume it never happens, so the operation runs in the
-        // unsigned type of the same width and converts back.
-        // Only these three can overflow that way: division has
-        // its own case above, and the bitwise operations have
-        // no overflow to speak of.
+        // Kotlin's integer arithmetic WRAPS where C leaves signed overflow undefined, so it runs in
+        // the unsigned type of the same width. Only these three overflow that way.
         const ut2 = wrapTy(dt).?;
         try w.print("  {s} = ({s})(({s}){s} {s} ({s}){s});\n", .{
             dn, dt.cName(), ut2, ln, op, ut2, rn,
@@ -1222,8 +1160,7 @@ fn writeUnOp(ctx: *const Body, inst: *const ir.Inst) !void {
     const u = inst.UnOp;
     const t = c.types[u.dst.int()];
     switch (u.op) {
-        // Negating the most negative value overflows, which
-        // Kotlin wraps and C leaves undefined.
+        // Negating the most negative value overflows, which Kotlin wraps and C leaves undefined.
         .Neg => if (wrapTy(t)) |ut3| {
             try w.print("  r{d} = ({s})(0{s} - ({s})r{d});\n", .{
                 u.dst.int(), t.cName(), if (t == .i64) "u" else "u", ut3, u.operand.int(),
@@ -1232,9 +1169,7 @@ fn writeUnOp(ctx: *const Body, inst: *const ir.Inst) !void {
             try w.print("  r{d} = ({s})(-r{d});\n", .{ u.dst.int(), t.cName(), u.operand.int() });
         },
         .Plus => try w.print("  r{d} = ({s})r{d};\n", .{ u.dst.int(), t.cName(), u.operand.int() }),
-        // Kotlin's `inc`/`dec` wrap; in C a signed overflow is
-        // undefined, so the step runs in the unsigned type of
-        // the same width.
+        // Kotlin's `inc`/`dec` wrap; C leaves signed overflow undefined, so the step runs unsigned.
         .Inc, .Dec => {
             const step: []const u8 = if (u.op == .Inc) "+" else "-";
             if (wrapTy(t)) |ut6| {
@@ -1250,8 +1185,7 @@ fn writeUnOp(ctx: *const Body, inst: *const ir.Inst) !void {
     }
 }
 
-/// A cast: an exact test against every registered class the target reaches,
-/// then the runtime's own test and the failure it raises.
+/// A cast: an exact test against every registered class the target reaches, then the runtime's.
 fn writeCast(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -1262,8 +1196,6 @@ fn writeCast(ctx: *const Body, inst: *const ir.Inst) !void {
     var rb20: [32]u8 = undefined;
     var bx20: [96]u8 = undefined;
     const sn = regName(c, ca.src.int(), &rb20);
-    // The test is asked of a VALUE; a register holding a
-    // machine type is boxed for it.
     const sv = boxExpr(c.types[ca.src.int()], sn, &bx20);
     const dn20 = regName(c, ca.dst.int(), &nb20);
     const tname = simpleName(ca.ty.name);
@@ -1288,16 +1220,14 @@ fn writeCast(ctx: *const Body, inst: *const ir.Inst) !void {
     }
 }
 
-/// A type test, answered by class identity where the program registered one.
 fn writeInstanceOf(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const m = ctx.m;
     const c = ctx.c;
     const registered = ctx.registered;
     const io = inst.InstanceOf;
-    // The classes the program registered whose type includes
-    // the one asked about: an exact test for every compiled
-    // instance. Anything else answers from its representation.
+    // Registered classes whose type includes the one asked about get an exact test; anything
+    // else answers from its representation.
     var nb19: [32]u8 = undefined;
     var rb19: [32]u8 = undefined;
     var bx19: [96]u8 = undefined;
@@ -1320,7 +1250,6 @@ fn writeInstanceOf(ctx: *const Body, inst: *const ir.Inst) !void {
     });
 }
 
-/// A member call written by NAME, resolved to whatever answers it.
 fn writeCallMember(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -1342,8 +1271,7 @@ fn writeCallMember(ctx: *const Body, inst: *const ir.Inst) !void {
         });
         return;
     }
-    // The iteration protocol on a builtin receiver, written by
-    // name: the runtime picks the same handler by that name.
+    // The iteration protocol on a builtin receiver, by name: the runtime picks the same handler.
     if (c.cls[cm.receiver.int()]) |brc| {
         if (isBuiltinCls(brc) and member_dispatch.hostFreeMemberAnswer(plainFieldName(m.consts.items[cm.name.int()].String)) != null) {
             try writeHostMemberCall(ctx, inst, recv);
@@ -1360,8 +1288,7 @@ fn writeCallMember(ctx: *const Body, inst: *const ir.Inst) !void {
             return;
         }
     }
-    // A call written on a class NAME runs on that class's
-    // companion, and the singleton is the receiver.
+    // A call written on a class NAME runs on that class's companion, the singleton receiver.
     if (companionReceiver(m, prog, c.types, c.cls, cm.receiver.int())) |cc7| {
         const mn7 = m.consts.items[cm.name.int()].String;
         const root7b = memberRoot(m, prog, cc7, plainFieldName(mn7), cm.n_args).?;
@@ -1387,8 +1314,7 @@ fn writeCallMember(ctx: *const Body, inst: *const ir.Inst) !void {
     });
 }
 
-/// A member the runtime answers by name, with the receiver as its first
-/// argument.
+/// A member the runtime answers by name, with the receiver as its first argument.
 fn writeHostMemberCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -1416,7 +1342,6 @@ fn writeHostMemberCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8)
     });
 }
 
-/// `get` or `set` on an array, as the runtime's own indexing.
 fn writeArrayMemberCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -1443,7 +1368,6 @@ fn writeArrayMemberCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8
     }
 }
 
-/// `get`, `add`, or `set` on a list, as the runtime's own calls.
 fn writeListMemberCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -1476,8 +1400,7 @@ fn writeListMemberCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8)
     }
 }
 
-/// A member of a class the emitter compiled: a property holding a lambda, or a
-/// dispatch through the member's root slot.
+/// A member of a compiled class: a property holding a lambda, or a dispatch through its slot.
 fn writeDeclaredMemberCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -1531,7 +1454,6 @@ fn writeDeclaredMemberCall(ctx: *const Body, inst: *const ir.Inst, recv: []const
     try w.writeAll(");\n");
 }
 
-/// A call through a resolved member slot.
 fn writeCallVirtual(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -1578,8 +1500,7 @@ fn writeCallVirtual(ctx: *const Body, inst: *const ir.Inst) !void {
     });
 }
 
-/// A builtin receiver's member, answered by the declaration's own name. True
-/// when it wrote the call.
+/// A builtin receiver's member, answered by the declaration's own name. True when it wrote it.
 fn writeHostVirtualCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8) !bool {
     const w = ctx.w;
     const m = ctx.m;
@@ -1590,9 +1511,7 @@ fn writeHostVirtualCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8
         if (isBuiltinCls(rc0)) host: {
             const decl0 = m.funcById(ir.FuncId.from(cv.slot.int())) orelse break :host;
             if (hostMemberOp(decl0) == null) break :host;
-            // The runtime reads the declaration's name to pick
-            // the same operation the emitter classified, and
-            // takes the receiver as the first argument.
+            // The runtime reads the declaration's name to pick the operation, receiver first.
             try w.print("  {{ klio_value ma[{d}];\n    ma[0] = {s};\n", .{ cv.n_args + 1, recv });
             var kh: u32 = 0;
             while (kh < cv.n_args) : (kh += 1) {
@@ -1616,8 +1535,7 @@ fn writeHostVirtualCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8
     return false;
 }
 
-/// A list member reached through a slot: the runtime's own calls where one
-/// exists, and the interpreter's entry otherwise.
+/// A list member through a slot: the runtime's calls where one exists, the interpreter's entry.
 fn writeListVirtualCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -1671,7 +1589,6 @@ fn writeListVirtualCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8
     }
 }
 
-/// A global read: a lambda singleton, an object singleton, or the global array.
 fn writeLoadGlobal(ctx: *const Body, inst: *const ir.Inst) !void {
     const w = ctx.w;
     const m = ctx.m;
@@ -1681,8 +1598,6 @@ fn writeLoadGlobal(ctx: *const Body, inst: *const ir.Inst) !void {
     const lambdas = ctx.lambdas;
     const lg = inst.LoadGlobal;
     const gn = m.consts.items[lg.name.int()].String;
-    // A class name used as a qualifier resolves at emit time
-    // and leaves nothing behind to load.
     if (staticClassOf(c.types, c.cls, lg.dst.int()) != null) return;
     if (c.lam[lg.dst.int()]) |li10| {
         var nb23: [32]u8 = undefined;
@@ -1717,15 +1632,13 @@ fn writeAstLambda(ctx: *const Body, inst: *const ir.Inst) !void {
     const lambdas = ctx.lambdas;
     const al3 = inst.AstLambda;
     if (c.types[al3.dst.int()] != .object) {
-        // Nothing to materialise: every use is a direct call,
-        // so the call site passes the captures itself.
+        // Nothing to materialise: every use is a direct call passing the captures itself.
         return;
     }
     var nb12: [32]u8 = undefined;
     const ldst = regName(c, al3.dst.int(), &nb12);
     if (al3.captures.len == 0) {
-        // The literal's one instance, built before the program
-        // runs: two evaluations of it are the same object.
+        // The literal's one instance, built before the program runs: two evaluations are one object.
         try w.print("  {s} = KL[{d}];\n", .{
             ldst, lambdaSingletonSlot(lambdas, al3.body_func.?).?,
         });
@@ -1742,8 +1655,7 @@ fn writeAstLambda(ctx: *const Body, inst: *const ir.Inst) !void {
     }
 }
 
-/// A call on a value the emitter could not resolve to a body, through the
-/// lambda class's dispatcher.
+/// A call on a value the emitter could not resolve, through the lambda class's dispatcher.
 fn writeValueDispatchCall(ctx: *const Body, inst: *const ir.Inst) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -1774,8 +1686,7 @@ fn writeValueDispatchCall(ctx: *const Body, inst: *const ir.Inst) !void {
     });
 }
 
-/// A call on a callable register: through the dispatcher, or straight to the
-/// body the emitter knows it holds.
+/// A call on a callable register: the dispatcher, or the body the emitter knows it holds.
 fn writeCallValue(ctx: *const Body, inst: *const ir.Inst) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -1838,8 +1749,7 @@ fn writeCallValue(ctx: *const Body, inst: *const ir.Inst) !void {
     try w.writeAll(");\n");
 }
 
-/// A static call: an intrinsic the emitter writes itself, or the callee by
-/// symbol.
+/// A static call: an intrinsic the emitter writes itself, or the callee by symbol.
 fn writeCall(ctx: *const Body, inst: *const ir.Inst) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -1884,13 +1794,8 @@ fn writeCall(ctx: *const Body, inst: *const ir.Inst) !void {
     if (isPrintln(callee)) {
         const a0 = call.args.int();
         const at = c.types[a0];
-        // EVERYTHING prints through the runtime's renderer.
-        // How Kotlin renders a value — the shortest
-        // round-tripping decimal, `true`/`false`, a data class
-        // by its properties — is the interpreter's own code,
-        // and a second copy of it in emitted C is a second
-        // thing to keep in agreement. printf's buffered stream
-        // also interleaves wrongly with the runtime's writes.
+        // EVERYTHING prints through the runtime's renderer: how Kotlin renders a value is the
+        // interpreter's own code, and printf's buffered stream interleaves wrongly with it.
         _ = at;
         var rex: std.Io.Writer.Allocating = .init(gpa);
         defer rex.deinit();
@@ -1903,7 +1808,6 @@ fn writeCall(ctx: *const Body, inst: *const ir.Inst) !void {
     }
 }
 
-/// An intrinsic on machine types, written as the C operation it is.
 fn writeScalarIntrinsicCall(ctx: *const Body, inst: *const ir.Inst, si: ScalarIntrinsic) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -1925,9 +1829,7 @@ fn writeScalarIntrinsicCall(ctx: *const Body, inst: *const ir.Inst, si: ScalarIn
                 sdst, x1, if (si == .max) ">" else "<", x2, x1, x2,
             });
         },
-        // Kotlin's `abs` on the most negative value returns
-        // it unchanged; negating it in C is undefined, so
-        // the negation runs unsigned and wraps.
+        // Kotlin's `abs` on the most negative value returns it unchanged, so the negation runs unsigned.
         .abs => try w.print("  {s} = ({s} < 0) ? ({s})(0u{s} - ({s}){s}) : {s};\n", .{
             sdst, x1, c.types[sa].cName(),
             if (c.types[sa] == .i64) "ll" else "",
@@ -1955,8 +1857,7 @@ fn writeRunBlockingCall(ctx: *const Body, inst: *const ir.Inst) !void {
         var cb6: [32]u8 = undefined;
         try w.print("{s}", .{regName(c, cr6.int(), &cb6)});
     }
-    // The block's own parameters (a receiver slot the
-    // lowering always gives it) start unset.
+    // The block's own parameters, a receiver slot the lowering always gives it, start unset.
     var pk6: usize = 0;
     while (pk6 < bfn4.params.len) : (pk6 += 1) {
         if (pk6 != 0 or li4.captures.len != 0) try w.writeAll(", ");
@@ -1967,7 +1868,6 @@ fn writeRunBlockingCall(ctx: *const Body, inst: *const ir.Inst) !void {
     try w.writeAll("));\n");
 }
 
-/// `arrayOf` and its primitive forms, built from the argument registers.
 fn writeArrayOfCall(ctx: *const Body, inst: *const ir.Inst, maybe_kind: ?u32) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -1999,7 +1899,6 @@ fn writeArrayOfCall(ctx: *const Body, inst: *const ir.Inst, maybe_kind: ?u32) !v
     }
 }
 
-/// `listOf` and `mutableListOf`, built from the argument registers.
 fn writeListOfCall(ctx: *const Body, inst: *const ir.Inst, kind: ListIntrinsic) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -2027,8 +1926,7 @@ fn writeListOfCall(ctx: *const Body, inst: *const ir.Inst, kind: ListIntrinsic) 
     });
 }
 
-/// The interpreter's own entry, called by name with the arguments boxed: the
-/// table is typed in Kotlin.
+/// The interpreter's own entry, called by name with the arguments boxed.
 fn writeStdlibCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.Func) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -2064,8 +1962,6 @@ fn writeStdlibCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.Fun
     });
 }
 
-/// A call to a body the emitter compiled: the defaults it needs, the suspension
-/// it may be, the `vararg` array it may take, and the call itself.
 fn writeDeclaredCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.Func) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -2075,39 +1971,24 @@ fn writeDeclaredCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.F
     const accepted = ctx.accepted;
     const points = ctx.points;
     const call = inst.Call;
-    // Arguments go to the callee in ITS order: positional
-    // ones bind in order and named ones by name. A
-    // parameter nothing binds runs the thunk for it, handed
-    // the arguments ahead of it; each lands in a local
-    // first, because a later default may read an earlier
-    // one.
+    // Arguments go to the callee in ITS order; an unbound parameter runs its thunk into a local.
     const bnd2 = bindCallArgs(m, callee.params, call.args.int(), call.n_args, call.arg_names).?;
     try writeDefaultThunks(ctx, inst, callee, &bnd2);
-    // A SUSPENDING call may not come back. The state is
-    // saved before it runs; if the callee suspends, this
-    // frame records its own continuation and answers
-    // SUSPENDED in turn, and the driver re-enters at the
-    // resume label with the value the suspension produced.
+    // A SUSPENDING call may not come back. The state is saved before it runs; if the callee
+    // suspends, this frame records its own continuation and answers SUSPENDED in turn.
     if (suspendIndex(points, inst)) |sp| {
         try writeSuspendingCall(ctx, inst, callee, &bnd2, sp);
         return;
     }
-    // The register the result lands in may hold a
-    // reference where the callee returns a machine type:
-    // the lowering reuses one register for both, and the
-    // register's own type is what the C local declares.
+    // The result register may hold a reference where the callee returns a machine type.
     const cret = acceptedRet(accepted, callee) orelse funcRetTy2(m, callee) orelse .unit;
     const dwant = c.types[call.dst.int()];
-    // A `vararg` parameter takes ONE array holding the
-    // trailing arguments, which the call site builds.
+    // A `vararg` parameter takes ONE array holding the trailing arguments.
     if (bnd2.vararg_param) |vp2| {
         try writeVarargArray(ctx, inst, callee, &bnd2, vp2);
     }
     var db: [32]u8 = undefined;
-    // The call is built whole, then converted: a callee
-    // that answers Unit still has to RUN when its result
-    // lands in a reference register, which a bare box name
-    // cannot express.
+    // The call is built whole, then converted: a Unit-answering callee still has to RUN.
     var callx: std.Io.Writer.Allocating = .init(gpa);
     defer callx.deinit();
     const cw = &callx.writer;
@@ -2129,9 +2010,7 @@ fn writeDeclaredCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.F
             });
             continue;
         }
-        // The parameter's own type decides: a thunk that
-        // computed a scalar arrives boxed where the
-        // parameter is a reference.
+        // The parameter's own type decides: a thunk's scalar arrives boxed at a reference parameter.
         const want4: Ty = paramTy(callee.params[k]);
         const dfn4 = m.funcById(prog.defaultThunk(callee.id, k).?).?;
         const have4 = acceptedRet(accepted, dfn4) orelse funcRetTy2(m, dfn4).?;
@@ -2152,7 +2031,6 @@ fn writeDeclaredCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.F
     });
 }
 
-/// A local per parameter nothing binds, holding what its default thunk answers.
 fn writeDefaultThunks(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.Func, bnd2: *const ArgBinding) !void {
     const gpa = ctx.gpa;
     const w = ctx.w;
@@ -2164,8 +2042,7 @@ fn writeDefaultThunks(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.
     var di2: u32 = 0;
     while (di2 < bnd2.n) : (di2 += 1) {
         if (bnd2.regs[di2] != null) continue;
-        // A `vararg` takes the array built below, not a
-        // default thunk.
+        // A `vararg` takes the array built below, not a default thunk.
         if (bnd2.vararg_param != null and bnd2.vararg_param.? == di2) continue;
         const dfn = m.funcById(prog.defaultThunk(callee.id, di2).?).?;
         const dt2 = acceptedRet(accepted, dfn) orelse funcRetTy2(m, dfn).?;
@@ -2187,8 +2064,7 @@ fn writeDefaultThunks(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.
     }
 }
 
-/// A call that may not come back: the state saved before it runs, the park that
-/// answers SUSPENDED in turn, and the resume label both paths converge on.
+/// A call that may not come back: state saved, the park answering SUSPENDED, the resume label.
 fn writeSuspendingCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.Func, bnd2: *const ArgBinding, sp: u32) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -2197,9 +2073,7 @@ fn writeSuspendingCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir
     const call = inst.Call;
     var db9: [32]u8 = undefined;
     if (isDelay(callee)) {
-        // The wait IS the suspension: it records this
-        // frame's continuation and answers SUSPENDED,
-        // which this frame hands straight back.
+        // The wait IS the suspension: it records the continuation and answers SUSPENDED.
         var mb9: [32]u8 = undefined;
         var cb10: [96]u8 = undefined;
         const mr9 = call.args.int();
@@ -2240,9 +2114,7 @@ fn writeSuspendingCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir
         unboxExpr(c.types[call.dst.int()], "sv", &ob9),
     });
     try w.print("  goto RD{d};\n", .{sp});
-    // The resume lands here with the value the
-    // suspension produced, and both arms converge on
-    // the same register.
+    // The resume lands here with the value the suspension produced, both arms on one register.
     try w.print("RS{d}:;\n", .{sp});
     var ob10: [200]u8 = undefined;
     try w.print("  {s} = {s};\n", .{
@@ -2253,7 +2125,6 @@ fn writeSuspendingCall(ctx: *const Body, inst: *const ir.Inst, callee: *const ir
     return;
 }
 
-/// The one array a `vararg` parameter takes, holding the trailing arguments.
 fn writeVarargArray(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.Func, bnd2: *const ArgBinding, vp2: u32) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -2283,8 +2154,7 @@ fn writeVarargArray(ctx: *const Body, inst: *const ir.Inst, callee: *const ir.Fu
     }
 }
 
-/// How the block leaves: a jump, a two-way branch, a throw, or the return that
-/// also gives back the frame and the handler stack.
+/// How the block leaves: a jump, a branch, a throw, or the return that gives back the frame.
 fn writeTerminator(ctx: *const Body, blk: *const ir.Block, bi: usize, has_catch: bool) !void {
     const w = ctx.w;
     const c = ctx.c;
@@ -2292,18 +2162,15 @@ fn writeTerminator(ctx: *const Body, blk: *const ir.Block, bi: usize, has_catch:
     const uses_try = ctx.uses_try;
     switch (blk.terminator) {
         .Goto => |g| {
-            // A jump to a block at or before this one closes a loop, which
-            // is where an allocating body would otherwise run to the end of
-            // the heap before anything could collect.
+            // A jump to a block at or before this one closes a loop, where an allocating body would
+            // otherwise run to the end of the heap before anything could collect.
             if (uses_objects and g.int() <= bi) try w.writeAll("  klio_nat_safepoint();\n");
             try w.print("  goto B{d};\n", .{g.int()});
         },
         .Branch => |br| {
             var cb: [32]u8 = undefined;
             var ub7: [96]u8 = undefined;
-            // A condition is a Boolean in Kotlin even when it arrives
-            // boxed — a property read through a dispatcher, say — so it
-            // unboxes here rather than being tested as a reference.
+            // A condition is a Boolean in Kotlin even when boxed, so it unboxes rather than tests as a ref.
             const cond = convExpr(c.types[br.cond.int()], .boolean, regName(c, br.cond.int(), &cb), &ub7);
             try w.print("  if ({s}) goto B{d}; else goto B{d};\n", .{ cond, br.t.int(), br.f.int() });
         },
