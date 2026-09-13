@@ -1864,6 +1864,11 @@ fn traceOn() bool {
 /// interfaces, which have no layout by their nature.
 var layout_quiet = true;
 
+/// A refusal may re-derive a class layout just to SAY why it has none, and
+/// deriving one compiles property initializers, which can refuse again. Without
+/// this, the explanation recurses into itself.
+var layout_diag_busy = false;
+
 fn layoutNo(c: *const ir.Class, comptime why: []const u8) ?Laid {
     if (traceOn() and !layout_quiet) std.debug.print("[cgen] layout {s}: " ++ why ++ "\n", .{c.name});
     return null;
@@ -3122,9 +3127,12 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     }
                     const fields = prog.of(ni.class.int()) orelse {
                         if (traceOn() and ni.class.int() < m.classes.items.len) {
+                            if (layout_diag_busy) return no(f, "class layout");
+                            layout_diag_busy = true;
                             layout_quiet = false;
                             if (try classFields(gpa, m, prog.layouts, ni.class, &prog, globals, true)) |junk| gpa.free(junk.fields);
                             layout_quiet = true;
+                            layout_diag_busy = false;
                         }
                         return no(f, "class layout");
                     };
@@ -3268,9 +3276,12 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                     if (sc >= m.classes.items.len) break;
                                     if (!std.mem.eql(u8, own9, m.classes.items[sc].fqn) and
                                         !std.mem.eql(u8, simpleName(own9), simpleName(m.classes.items[sc].fqn))) continue;
-                                    layout_quiet = false;
+                                    if (layout_diag_busy) return no(f, "class layout");
+                            layout_diag_busy = true;
+                            layout_quiet = false;
                                     if (try classFields(gpa, m, prog.layouts, @enumFromInt(ci9), &prog, globals, true)) |j9| gpa.free(j9.fields);
                                     layout_quiet = true;
+                                    layout_diag_busy = false;
                                 }
                             }
                             return null;
@@ -3332,11 +3343,14 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             // Name why the class has no layout, when that is
                             // the reason the field is not there.
                             if (traceOn() and prog.of(rc) == null and rc < m.classes.items.len) {
-                                layout_quiet = false;
+                                if (layout_diag_busy) return no(f, "class layout");
+                            layout_diag_busy = true;
+                            layout_quiet = false;
                                 if (try classFields(gpa, m, prog.layouts, @enumFromInt(rc), &prog, globals, true)) |junk2| {
                                     gpa.free(junk2.fields);
                                 }
                                 layout_quiet = true;
+                                layout_diag_busy = false;
                             }
                             return noName(f, "field not laid out", nm.String);
                         },
