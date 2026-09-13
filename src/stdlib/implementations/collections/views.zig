@@ -1,5 +1,4 @@
-//! Live map-view (`keys`/`values`/`entries`) and `subList`
-//! write-through synchronisation.
+//! Live map-view and `subList` write-through synchronisation.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -15,15 +14,9 @@ const common_mod = @import("common.zig");
 const eqBoxed = common_mod.eqBoxed;
 const thrown = common_mod.thrown;
 
-// =====================================================================
-// Map-view sync (keys/values/entries live views)
-// =====================================================================
-
 const MapView = struct { entries: MapEntries, kind: MapViewKind };
 const MapViewRef = struct { items: ValueList, backing: MapView };
 
-/// Resolve a view value to its map-backing, or null when it is not a live map
-/// view (a plain collection, a `subList`, or an array `.asList()`).
 fn mapBackingOf(receiver: Value) ?MapView {
     const cell = switch (receiver) {
         .Set => |s| s.backing,
@@ -36,9 +29,6 @@ fn mapBackingOf(receiver: Value) ?MapView {
     };
 }
 
-/// After a live `MutableMap.keys`/`.values`/`.entries` view mutated its
-/// `items`, rebuild the backing map's entries to mirror the survivors.
-/// Order-preserving subsequence match.
 pub fn syncMapView(a: Allocator, receiver: Value) void {
     _ = a;
     const backing = mapBackingOf(receiver) orelse return;
@@ -83,12 +73,6 @@ pub fn syncMapView(a: Allocator, receiver: Value) void {
     entries.invalidate();
 }
 
-// =====================================================================
-// subList live-view write-through
-// =====================================================================
-
-/// Resolve a value to its live `subList` backing cell, or null when it is not a
-/// `subList` view (a plain list, a map view, or an array `.asList()`).
 pub fn sublistBackingOf(receiver: Value) ?*runtime.CollBackingRef.Cell {
     if (receiver != .List) return null;
     const cell = receiver.List.backing orelse return null;
@@ -96,21 +80,17 @@ pub fn sublistBackingOf(receiver: Value) ?*runtime.CollBackingRef.Cell {
     return cell;
 }
 
-/// After a `subList` view mutated its own `items`, splice the new window back
-/// into the parent list so the change shows through, and record the window's
-/// new length. A no-op for any receiver that is not a live `subList`. Declared
-/// as the *first* `defer` of every list mutator so it runs after the mutator's
-/// own item-borrow guard has been released (no nested borrow of `items`).
+/// Splice a mutated `subList` window back into the parent list. Declared as the
+/// first `defer` of every list mutator so it runs once the mutator's own
+/// item-borrow guard is released.
 pub fn syncSublist(a: Allocator, receiver: Value) void {
     const cell = sublistBackingOf(receiver) orelse return;
     const cur = counterNowOf(receiver.List.mod_count);
     syncSublistChain(a, cell, receiver.List.items, cur);
 }
 
-/// Splice a mutated view's cache into its parent window and recurse up
-/// the ancestor chain, growing/shrinking each window and re-stamping each
-/// ancestor's comod expectation. Siblings keep their stale stamp and fail
-/// fast on their next access.
+/// Recurse up the ancestor chain, re-stamping each ancestor's comod
+/// expectation. Siblings keep their stale stamp and fail fast on next access.
 fn syncSublistChain(a: Allocator, cell: *runtime.CollBackingRef.Cell, view_items: ValueList, cur: u64) void {
     if (cell.data != .sublist) return;
     const sb = &cell.data.sublist;
@@ -139,7 +119,6 @@ fn syncSublistChain(a: Allocator, cell: *runtime.CollBackingRef.Cell, view_items
     if (sb.parent_backing) |pb| syncSublistChain(a, pb, sb.parent, cur);
 }
 
-/// Current value of a shared structural counter (0 when uncounted).
 pub fn counterNowOf(mc: runtime.OptRef(u64)) u64 {
     const cell = mc.get() orelse return 0;
     const g = cell.borrow();
@@ -147,25 +126,20 @@ pub fn counterNowOf(mc: runtime.OptRef(u64)) u64 {
     return g.get().*;
 }
 
-/// Whether a live `subList` view's backing changed structurally not
-/// through the view (or a descendant) — the CME predicate. The freeze bit
-/// is masked so a leaked-but-unmodified builder view still reads after
-/// `build()`.
+/// The CME predicate: the backing changed structurally other than through this
+/// view or a descendant. The freeze bit is masked so a leaked but unmodified
+/// builder view still reads after `build()`.
 pub fn sublistViewStale(v: *const Value) bool {
     return v.sublistViewStale();
 }
 
-/// ConcurrentModificationException when `sublistViewStale`; read choke
-/// points call this before serving.
 pub fn sublistComodGuard(a: Allocator, v: *const Value) Error!?EvalResult {
     if (!sublistViewStale(v)) return null;
     return try thrown(a, "kotlin.ConcurrentModificationException", null);
 }
 
-/// Live-entry prologue shared by the `Map.Entry` intrinsics: after a
-/// structural map change every access throws CME; before that, the value
-/// box is refreshed from the live pair so non-structural updates show
-/// through.
+/// After a structural map change every `Map.Entry` access throws CME; before
+/// that the value box is refreshed so non-structural updates show through.
 pub fn mapEntryViewGuard(a: Allocator, v: *const Value) Error!?EvalResult {
     if (v.* != .MapEntry) return null;
     const me = v.MapEntry;

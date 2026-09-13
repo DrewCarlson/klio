@@ -18,10 +18,6 @@ const makeTriple = common_mod.makeTriple;
 const ok = common_mod.ok;
 const typeErr = common_mod.typeErr;
 
-// =====================================================================
-// Pair / Triple members
-// =====================================================================
-
 fn recvPair(a: Allocator, args: []const Value, what: []const u8) Error!union(enum) { pair: Value, err: EvalResult } {
     if (args.len > 0 and args[0] == .Pair) return .{ .pair = args[0] };
     return .{ .err = typeErr(try fmt(a, "{s} requires a Pair receiver", .{what})) };
@@ -45,8 +41,6 @@ pub fn pair_second(ctx: *CallCtx) Error!EvalResult {
     out.retain();
     return ok(out);
 }
-/// Render one value the way `toString()` would, dispatching a user override on
-/// an instance. Falls back to the structural renderer for everything else.
 fn displayElemH(ctx: *CallCtx, v: Value) Error!union(enum) { ok: []u8, err: EvalResult } {
     const a = ctx.allocator;
     if (v == .Instance) {

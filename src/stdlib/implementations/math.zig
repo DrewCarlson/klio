@@ -16,9 +16,7 @@ fn ok(v: Value) EvalResult {
     return .{ .ok = v };
 }
 
-/// A computed f64 or the `EvalResult` carrying a data-level error.
 const DoubleResult = union(enum) { ok: f64, err: EvalResult };
-/// A computed natural-ordering or the `EvalResult` carrying a data-level error.
 const OrderResult = union(enum) { ok: std.math.Order, err: EvalResult };
 
 fn typeErr(ctx: *CallCtx, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!EvalResult {
@@ -31,14 +29,10 @@ fn arityErr(ctx: *CallCtx, comptime fmt: []const u8, args: anytype) std.mem.Allo
     return .{ .err = .{ .Arity = msg } };
 }
 
-// ============================================================
-// math
-// ============================================================
 
-/// Accept every numeric type (Float/Long/Short/Byte too), each widening
-/// to f64 like Kotlin's numeric conversions, so math intrinsics aren't
-/// limited to `Double`/`Int` operands. Returns null when the value is not
-/// numeric; callers wrap that into a `Type` error including `what`.
+/// Every numeric type widened to f64 as Kotlin's conversions do, so the math
+/// intrinsics are not limited to `Double` and `Int`. Null for a non-numeric
+/// value, which callers wrap into a `Type` error naming `what`.
 pub fn as_double(v: *const Value, what: []const u8, ctx: *CallCtx) std.mem.Allocator.Error!DoubleResult {
     if (numeric_as_f64(v)) |d| return .{ .ok = d };
     const rendered = v.display(ctx.allocator) catch return .{ .err = .{ .err = .{ .Type = "out of memory" } } };
@@ -62,7 +56,6 @@ pub fn math_abs(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 fn numeric_as_f64(v: *const Value) ?f64 {
     return switch (v.*) {
         .Int => |x| @floatFromInt(x),
-        // Kotlin Long widens to Double (may lose precision past 2^53).
         .Long => |x| @floatFromInt(x),
         .Short => |x| @floatFromInt(x),
         .Byte => |x| @floatFromInt(x),
@@ -82,16 +75,12 @@ fn numeric_as_i64(v: *const Value) ?i64 {
     };
 }
 
-/// Numeric `min`/`max` over any Kotlin number pair (Byte/Short/Int/
-/// Long/Float/Double, including mixed). Doubles as the
-/// `kotlin.comparisons.minOf`/`maxOf` and `kotlin.math.min`/`max`
-/// implementation. Integral pairs keep an integral result (widened
-/// to the larger of the two so e.g. `minOf(Long, Int)` is a Long);
-/// any floating operand promotes the result to Double.
+/// Numeric `min` and `max` over any Kotlin number pair, mixed kinds included.
+/// An integral pair keeps an integral result widened to the larger kind, and any
+/// floating operand promotes to Double.
 pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []const u8) std.mem.Allocator.Error!EvalResult {
     if (args.len == 0) return arityErr(ctx, "{s} expects at least 2 arguments", .{what});
     if (args.len == 1) return ok(args[0]);
-    // `minOf(a, b, c, …)` / `minOf(a, vararg others)` fold pairwise.
     if (args.len > 2) {
         var acc = args[0];
         var i: usize = 1;
@@ -110,13 +99,12 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
     if (floating) {
         const x = numeric_as_f64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
         const y = numeric_as_f64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
-        // Kotlin's minOf/maxOf use Math.min/max, which propagate NaN.
         const r: f64 = if (std.math.isNan(x) or std.math.isNan(y))
             std.math.nan(f64)
         else if (x == 0.0 and y == 0.0)
-            // Signed-zero tie (`@min`/`@max` treat -0.0 == 0.0): match
-            // Math.min/max — min yields -0.0 if either is -0.0, max yields
-            // +0.0 unless both are -0.0.
+            // On a signed-zero tie, which `@min` and `@max` treat as equal,
+            // follow Math.min/max: min gives -0.0 if either operand is, max
+            // gives +0.0 unless both are.
             (if (want_min)
                 (if (std.math.signbit(x) or std.math.signbit(y)) -@as(f64, 0.0) else 0.0)
             else
@@ -125,13 +113,11 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
             @min(x, y)
         else
             @max(x, y);
-        // Kotlin's `min/max(Float, Float)` (and Float+integral) returns Float;
-        // only a Double operand widens the result to Double.
+        // Kotlin's `min`/`max` over Float returns Float; only a Double operand
+        // widens the result.
         if (first.* != .Double and second.* != .Double) return ok(.{ .Float = @floatCast(r) });
         return ok(.{ .Double = r });
     }
-    // A pair that is *both* unsigned compares by unsigned magnitude and keeps
-    // its unsigned kind, widening to the larger when the kinds differ.
     if (unsigned_as_u64(first) != null and unsigned_as_u64(second) != null) {
         const x = unsigned_as_u64(first).?;
         const y = unsigned_as_u64(second).?;
@@ -141,11 +127,9 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
         if (first.* == .UShort or second.* == .UShort) return ok(.{ .UShort = @intCast(r) });
         return ok(.{ .UByte = @intCast(r) });
     }
-    // Otherwise compare by signed value, accepting an unsigned operand by its
-    // magnitude: a mixed signed/unsigned pair arises when an untyped integer
-    // literal lands on the unsigned overload of `minOf`/`maxOf`. Kotlin's
-    // result there is the signed integral type, so widen to i64 and return
-    // Int (or Long when either side is 64-bit).
+    // Otherwise compare by signed value, taking an unsigned operand by its
+    // magnitude: a mixed pair arises when an untyped integer literal lands on
+    // the unsigned overload, and Kotlin's result is then the signed type.
     const x = integral_as_i64(first) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
     const y = integral_as_i64(second) orelse return typeErr(ctx, "{s}: non-numeric arg", .{what});
     const r: i64 = if (want_min) @min(x, y) else @max(x, y);
@@ -155,7 +139,6 @@ pub fn num_extreme(ctx: *CallCtx, args: []const Value, want_min: bool, what: []c
     return ok(.{ .Int = @truncate(r) });
 }
 
-/// Any integral operand widened to `i64`, signed or unsigned, by magnitude.
 fn integral_as_i64(v: *const Value) ?i64 {
     return switch (v.*) {
         .Int => |x| @intCast(x),
@@ -170,7 +153,6 @@ fn integral_as_i64(v: *const Value) ?i64 {
     };
 }
 
-/// Unsigned operand widened to `u64` (UByte/UShort/UInt/ULong only).
 fn unsigned_as_u64(v: *const Value) ?u64 {
     return switch (v.*) {
         .UByte => |x| @as(u64, x),
@@ -190,9 +172,8 @@ pub fn math_max(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 pub fn cmp_extreme(ctx: *CallCtx, want_min: bool, what: []const u8) std.mem.Allocator.Error!EvalResult {
-    // A statically selected final-vararg overload reaches its native form with
-    // the vararg materialized in the second ABI slot. Normalize that packed
-    // array to the flat value sequence consumed by the intrinsic.
+    // A statically selected final-vararg overload materializes the vararg in the
+    // second ABI slot, so that packed array is normalized to a flat sequence.
     if (ctx.args.len == 2 and ctx.args[1] == .Array) {
         const tail = try ctx.args[1].Array.snapshot(ctx.allocator);
         defer ctx.allocator.free(tail);
@@ -205,10 +186,9 @@ pub fn cmp_extreme(ctx: *CallCtx, want_min: bool, what: []const u8) std.mem.Allo
         return cmp_extreme(&flattened, want_min, what);
     }
 
-    // `maxOf(a, b, comparator)` / `maxOf(a, b, c, comparator)` /
-    // `maxOf(a, vararg other, comparator)`: a trailing `Comparator` picks the
-    // extreme of the preceding values by `comparator.compare`, not numerically.
-    // On a tie the first operand wins (Kotlin's `compare(a,b) >= 0 ? a : b`).
+    // A trailing `Comparator` picks the extreme of the preceding values by
+    // `comparator.compare` rather than numerically, and on a tie the first
+    // operand wins, as Kotlin's `compare(a, b) >= 0 ? a : b` does.
     if (ctx.args.len >= 3 and ctx.args[ctx.args.len - 1] == .Comparator) {
         const cmp = ctx.args[ctx.args.len - 1];
         const vals = ctx.args[0 .. ctx.args.len - 1];
@@ -229,9 +209,8 @@ pub fn cmp_extreme(ctx: *CallCtx, want_min: bool, what: []const u8) std.mem.Allo
         }
         return ok(acc);
     }
-    // Instance-aware path: a user receiver implementing Comparable
-    // (`operator fun compareTo`) reaches min/max via call_member,
-    // falling back to the primitive num_extreme for plain numbers.
+    // A user receiver implementing Comparable reaches min and max through member
+    // dispatch, falling back to `numExtreme` for plain numbers.
     if (ctx.args.len == 2) {
         const a = &ctx.args[0];
         const b = &ctx.args[1];
@@ -243,10 +222,9 @@ pub fn cmp_extreme(ctx: *CallCtx, want_min: bool, what: []const u8) std.mem.Allo
             const pick_first = if (want_min) ord != .gt else ord != .lt;
             return ok(if (pick_first) a.* else b.*);
         }
-        // Numeric operands use `num_extreme` (width widening +
-        // Math.min/max NaN propagation). Any other `Comparable`
-        // (`maxOf("a","b")`, Char) picks by the total comparison
-        // order, mirroring the generic `maxOf<T : Comparable<T>>`.
+        // Numeric operands go through `numExtreme`; any other `Comparable`, a
+        // String or Char, picks by the total comparison order, as the generic
+        // `maxOf<T : Comparable<T>>` does.
         if (!(a.isNumeric() and b.isNumeric())) {
             const ord = switch (try compare_values(ctx, a, b)) {
                 .ok => |o| o,
@@ -272,8 +250,6 @@ pub fn math_sqrt(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .Double = @sqrt(d) });
 }
 
-/// `Double.pow(Double)` and `Double.pow(Int)` — Kotlin's only `pow` shape.
-/// Receiver is `args[0]`, exponent is `args[1]`.
 pub fn double_pow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len != 2) {
         return .{ .err = .{ .Arity = "Double.pow expects 1 argument" } };
@@ -286,16 +262,14 @@ pub fn double_pow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return e,
     };
-    // Java/Kotlin Math.pow: `pow(±1, ±Inf)` is NaN (unlike C/Zig pow which
-    // returns 1). Every other base with a NaN exponent is NaN too.
+    // Java and Kotlin's Math.pow make `pow(±1, ±Inf)` NaN, where C and Zig pow
+    // return 1. Every other base with a NaN exponent is NaN too.
     if (@abs(base) == 1.0 and (std.math.isInf(exp) or std.math.isNan(exp))) {
         return ok(.{ .Double = std.math.nan(f64) });
     }
     return ok(.{ .Double = std.math.pow(f64, base, exp) });
 }
 
-/// `Float.pow(Float)` / `Float.pow(Int)` — like `Double.pow` but keeping a
-/// `Float` result.
 pub fn float_pow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len != 2) {
         return .{ .err = .{ .Arity = "Float.pow expects 1 argument" } };
@@ -310,14 +284,12 @@ pub fn float_pow(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     const base: f32 = @floatCast(base_d);
     const exp: f32 = @floatCast(exp_d);
-    // Java/Kotlin Math.pow: `pow(±1, ±Inf)` is NaN (C/Zig pow returns 1).
     if (@abs(base) == 1.0 and (std.math.isInf(exp) or std.math.isNan(exp))) {
         return ok(.{ .Float = std.math.nan(f32) });
     }
     return ok(.{ .Float = std.math.pow(f32, base, exp) });
 }
 
-/// `Math.nextUp` — the adjacent f64 toward +∞.
 fn f64_next_up(x: f64) f64 {
     if (std.math.isNan(x) or x == std.math.inf(f64)) {
         return x;
@@ -329,7 +301,6 @@ fn f64_next_up(x: f64) f64 {
     return @bitCast(if (x > 0.0) bits + 1 else bits - 1);
 }
 
-/// `Math.nextDown` — the adjacent f64 toward -∞.
 fn f64_next_down(x: f64) f64 {
     return -f64_next_up(-x);
 }
@@ -382,8 +353,8 @@ pub fn double_ulp(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     else blk: {
         const a = @abs(x);
         const up = f64_next_up(a);
-        // At MAX_VALUE the successor is +Inf; the ulp is then the gap to the
-        // predecessor (2^971), not Infinity.
+        // At MAX_VALUE the successor is +Inf, so the ulp is the gap to the
+        // predecessor, 2^971, not Infinity.
         break :blk if (std.math.isInf(up)) a - f64_next_down(a) else up - a;
     };
     return ok(.{ .Double = r });
@@ -419,7 +390,6 @@ pub fn float_with_sign(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .Float = std.math.copysign(x, sign) });
 }
 
-/// Apply a one-argument f64 -> f64 function over the single numeric arg.
 fn unaryDouble(ctx: *CallCtx, what: []const u8, comptime f: fn (f64) f64) std.mem.Allocator.Error!EvalResult {
     const v = switch (try arg1(ctx, what)) {
         .ok => |p| p,
@@ -431,15 +401,14 @@ fn unaryDouble(ctx: *CallCtx, what: []const u8, comptime f: fn (f64) f64) std.me
         .err => |e| return e,
     };
     const r = f(d);
-    // The `Float` overload of each function returns a `Float`; computing in
-    // f64 and narrowing matches the special values (NaN/±∞/±0) exactly and
-    // is within tolerance for the finite cases the tests assert.
+    // The `Float` overload returns a `Float`; computing in f64 and narrowing
+    // reproduces the special values exactly and stays within tolerance.
     if (is_float) return ok(.{ .Float = @floatCast(r) });
     return ok(.{ .Double = r });
 }
 
-/// As `unaryDouble`, for a two-argument function: the `Float,Float` overload
-/// returns a `Float`, so narrow when both operands are `Float`.
+/// As `unaryDouble` for two arguments: the result narrows when both operands
+/// are `Float`.
 fn binaryDouble(ctx: *CallCtx, what: []const u8, comptime f: fn (f64, f64) f64) std.mem.Allocator.Error!EvalResult {
     const pair = switch (try arg2(ctx, what)) {
         .ok => |p| p,
@@ -584,8 +553,8 @@ pub fn math_log(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return e,
     };
-    // Kotlin's `Double.log(base)` is `ln(x) / ln(base)`, and is NaN when the
-    // base is not a usable logarithm base (`base <= 0` or `base == 1`).
+    // Kotlin's `Double.log(base)` is `ln(x) / ln(base)`, NaN when the base is
+    // unusable, meaning `base <= 0` or `base == 1`.
     const r = if (base <= 0.0 or base == 1.0) std.math.nan(f64) else std.math.log(f64, base, x);
     if (both_float) return ok(.{ .Float = @floatCast(r) });
     return ok(.{ .Double = r });
@@ -606,22 +575,20 @@ pub fn math_ceil(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return unaryDouble(ctx, "ceil", fCeil);
 }
 
-/// Round half to even (IEEE rint), matching `kotlin.math.round`. Zig has
-/// no ties-to-even builtin, so floor-and-adjust on the .5 boundary.
+/// Round half to even (IEEE rint), as `kotlin.math.round` does. Zig has no
+/// ties-to-even builtin, so this floors and adjusts on the .5 boundary.
 fn roundTiesEven(x: f64) f64 {
     if (std.math.isNan(x) or std.math.isInf(x) or x == 0.0) return x;
     const fl = @floor(x);
     const diff = x - fl;
     if (diff < 0.5) return fl;
     if (diff > 0.5) return fl + 1.0;
-    // Exactly halfway: pick the even neighbor.
     const half = fl * 0.5;
     if (@floor(half) == half) return fl; // fl is even
     return fl + 1.0;
 }
 
 pub fn math_round(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // Kotlin's kotlin.math.round rounds half to even (IEEE rint).
     return unaryDouble(ctx, "round", roundTiesEven);
 }
 pub fn math_truncate(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
@@ -631,8 +598,7 @@ pub fn math_hypot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return binaryDouble(ctx, "hypot", fHypot);
 }
 
-/// Kotlin's sign preserves a signed/NaN zero: sign(0.0)=0.0, sign(-0.0)=-0.0,
-/// sign(NaN)=NaN, so zero and NaN are special-cased below.
+/// Kotlin's sign preserves signed zero and NaN, so both are special-cased.
 fn fsign(n: f64) f64 {
     if (n == 0.0 or std.math.isNan(n)) {
         return n;
@@ -647,9 +613,7 @@ pub fn math_sign(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     switch (v.*) {
         .Int => |n| return ok(.{ .Int = signumI32(n) }),
-        // Long.signum() yields -1/0/1, which always fits an Int.
         .Long => |n| return ok(.{ .Int = @intCast(signumI64(n)) }),
-        // Float.sign stays a Float.
         .Float => |n| return ok(.{ .Float = @floatCast(fsign(@as(f64, @floatCast(n)))) }),
         .Double => |n| return ok(.{ .Double = fsign(n) }),
         else => {
@@ -675,8 +639,8 @@ pub fn math_cbrt(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return unaryDouble(ctx, "cbrt", fCbrt);
 }
 
-/// `roundToInt()` / `roundToLong()`: round half toward +∞ (Java `Math.round`),
-/// throw on NaN, clamp out-of-range to the type's MIN/MAX.
+/// Round half toward +∞ as Java's `Math.round` does, throw on NaN, and clamp
+/// out-of-range to the type's bounds.
 pub fn num_round_to_int(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const v = switch (try arg1(ctx, "roundToInt")) {
         .ok => |p| p,
@@ -837,8 +801,7 @@ pub fn num_rotate_right(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
 }
 
-/// `Double.rem(Double)` / `Float.rem` — IEEE remainder (sign of dividend),
-/// same as the `%` operator.
+/// The IEEE remainder, taking the dividend's sign, the same as `%`.
 pub fn num_float_rem(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const pair = switch (try arg2(ctx, "rem")) {
         .ok => |p| p,
@@ -859,7 +822,7 @@ pub fn num_float_rem(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .Double = r });
 }
 
-/// `Double.mod(Double)` / `Float.mod` — floored modulus (sign of divisor).
+/// The floored modulus, taking the divisor's sign.
 pub fn num_float_mod(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const pair = switch (try arg2(ctx, "mod")) {
         .ok => |p| p,
@@ -909,10 +872,6 @@ pub fn arg2(ctx: *CallCtx, what: []const u8) std.mem.Allocator.Error!ArgPair {
     return .{ .ok = .{ .a = &ctx.args[0], .b = &ctx.args[1] } };
 }
 
-// ============================================================
-// Additional math
-// ============================================================
-
 pub fn math_asin(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return unaryDouble(ctx, "asin", fAsin);
 }
@@ -926,11 +885,6 @@ pub fn math_atan2(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return binaryDouble(ctx, "atan2", fAtan2);
 }
 
-// ------------------------------------------------------------
-// Shared helpers used by the math intrinsics above.
-// ------------------------------------------------------------
-
-/// `numeric::recv_double` — the receiver as f64, or a `Type` error.
 fn recv_double(ctx: *CallCtx, what: []const u8) std.mem.Allocator.Error!DoubleResult {
     if (ctx.args.len > 0) {
         if (ctx.args[0].asF64()) |d| return .{ .ok = d };
@@ -938,16 +892,12 @@ fn recv_double(ctx: *CallCtx, what: []const u8) std.mem.Allocator.Error!DoubleRe
     return .{ .err = try typeErr(ctx, "{s} requires a numeric receiver", .{what}) };
 }
 
-/// `exceptions::make_exception` — a bare Throwable with the given fqn and
-/// message. The fqn/message are duped into shared refcounted strings.
 fn make_exception(ctx: *CallCtx, fqn: []const u8, message: ?[]const u8) std.mem.Allocator.Error!Value {
     const fqn_ref = try runtime.strInit(ctx.allocator, fqn);
     const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(ctx.allocator, m) else null;
     return try Value.newException(ctx.allocator, .{ .fqn = fqn_ref, .message = .from(msg_ref), .cause = null });
 }
 
-/// `collections::kotlin_float_total_cmp` — total order over f64 with NaN
-/// sorting greatest and -0.0 < +0.0.
 fn kotlin_float_total_cmp(a: f64, b: f64) std.math.Order {
     if (a < b) return .lt;
     if (a > b) return .gt;
@@ -962,8 +912,6 @@ fn kotlin_float_total_cmp(a: f64, b: f64) std.math.Order {
     return std.math.order(bits(a), bits(b));
 }
 
-/// `collections::compare_values` — Kotlin natural ordering for the
-/// builtin comparable kinds. Returns a `Type` error when incomparable.
 fn compare_values(ctx: *CallCtx, a: *const Value, b: *const Value) std.mem.Allocator.Error!OrderResult {
     if (a.isNumeric() and b.isNumeric()) {
         if (a.isIntegral() and b.isIntegral()) {
@@ -997,8 +945,6 @@ fn i32_to_ordering(n: i32) std.math.Order {
     return std.math.order(n, 0);
 }
 
-/// `collections::compare_host_aware` — defer to a user `compareTo` for an
-/// `Instance` receiver, else the structural `compare_values`.
 fn compare_host_aware(a: *const Value, b: *const Value, host: IntrinsicHost, out: Output) std.mem.Allocator.Error!OrderResult {
     if (a.* == .Instance) {
         if (try host.invokeMethod(a, "compareTo", b[0..1], out)) |r| {
@@ -1008,17 +954,13 @@ fn compare_host_aware(a: *const Value, b: *const Value, host: IntrinsicHost, out
             }
         }
     }
-    // compare_values needs an allocator for error rendering; build a
-    // throwaway CallCtx so the helper signature stays uniform.
+    // The comparison needs an allocator for error rendering, so a throwaway
+    // CallCtx keeps the helper signature uniform.
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var tmp = CallCtx{ .args = &.{}, .out = out, .host = host, .allocator = arena.allocator() };
     return compare_values(&tmp, a, b);
 }
-
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 const NoopHost = runtime.NoopHost;
@@ -1052,7 +994,6 @@ test "abs over numeric kinds" {
     var c4 = makeCtx(&.{.{ .Float = -1.5 }}, &h, &cap);
     try testing.expectEqual(@as(f32, 1.5), (try math_abs(&c4)).ok.Float);
 
-    // i32::MIN abs wraps to itself.
     var c5 = makeCtx(&.{.{ .Int = std.math.minInt(i32) }}, &h, &cap);
     try testing.expectEqual(std.math.minInt(i32), (try math_abs(&c5)).ok.Int);
 
@@ -1069,7 +1010,6 @@ test "sqrt and trig" {
     var ctx = makeCtx(&.{.{ .Double = 9.0 }}, &h, &cap);
     try expectDouble(3.0, try math_sqrt(&ctx));
 
-    // sqrt accepts an Int operand, widening it.
     var ci = makeCtx(&.{.{ .Int = 16 }}, &h, &cap);
     try expectDouble(4.0, try math_sqrt(&ci));
 
@@ -1098,7 +1038,6 @@ test "ln log10 log2 exp and base log" {
     var c4 = makeCtx(&.{.{ .Double = 0.0 }}, &h, &cap);
     try expectDouble(1.0, try math_exp(&c4));
 
-    // log(81, 3) == 4
     var c5 = makeCtx(&.{ .{ .Double = 81.0 }, .{ .Double = 3.0 } }, &h, &cap);
     try expectDouble(4.0, try math_log(&c5));
 }
@@ -1118,7 +1057,6 @@ test "floor ceil truncate round ties-even" {
     var c3 = makeCtx(&.{.{ .Double = -2.7 }}, &h, &cap);
     try expectDouble(-2.0, try math_truncate(&c3));
 
-    // 2.5 rounds to even (2), 3.5 rounds to even (4).
     var c4 = makeCtx(&.{.{ .Double = 2.5 }}, &h, &cap);
     try expectDouble(2.0, try math_round(&c4));
     var c5 = makeCtx(&.{.{ .Double = 3.5 }}, &h, &cap);
@@ -1139,24 +1077,20 @@ test "min and max widen and propagate NaN" {
     var c2 = makeCtx(&.{ .{ .Int = 3 }, .{ .Int = 7 } }, &h, &cap);
     try testing.expectEqual(@as(i32, 7), (try math_max(&c2)).ok.Int);
 
-    // Mixed Long/Int widens to Long.
     var c3 = makeCtx(&.{ .{ .Long = 10 }, .{ .Int = 4 } }, &h, &cap);
     const r3 = try math_min(&c3);
     try testing.expect(r3.ok == .Long);
     try testing.expectEqual(@as(i64, 4), r3.ok.Long);
 
-    // Any floating operand promotes to Double; NaN propagates.
     var c4 = makeCtx(&.{ .{ .Double = std.math.nan(f64) }, .{ .Int = 1 } }, &h, &cap);
     const r4 = try math_max(&c4);
     try testing.expect(r4.ok == .Double);
     try testing.expect(std.math.isNan(r4.ok.Double));
 
-    // Non-numeric Comparable (Char) picks by natural order.
     var c5 = makeCtx(&.{ .{ .Char = 'b' }, .{ .Char = 'a' } }, &h, &cap);
     const r5 = try math_min(&c5);
     try testing.expectEqual(@as(u16, 'a'), r5.ok.Char);
 
-    // Static vararg dispatch materializes the spread as a primitive array.
     const packed_values = try runtime.ArrayData.initPacked(testing.allocator, .Double, &.{
         .{ .Double = 2.0 },
         .{ .Double = std.math.nan(f64) },
@@ -1183,13 +1117,11 @@ test "min and max compare unsigned operands by magnitude" {
     const r2 = try math_min(&c2);
     try testing.expectEqual(@as(u32, 1), r2.ok.UInt);
 
-    // A high-bit ULong is large, not negative.
     var c3 = makeCtx(&.{ .{ .ULong = 0xFFFF_FFFF_FFFF_FFFF }, .{ .ULong = 3 } }, &h, &cap);
     const r3 = try math_max(&c3);
     try testing.expect(r3.ok == .ULong);
     try testing.expectEqual(@as(u64, 0xFFFF_FFFF_FFFF_FFFF), r3.ok.ULong);
 
-    // Mixed unsigned kinds widen to the larger kind.
     var c4 = makeCtx(&.{ .{ .UInt = 7 }, .{ .ULong = 2 } }, &h, &cap);
     const r4 = try math_min(&c4);
     try testing.expect(r4.ok == .ULong);
@@ -1280,7 +1212,6 @@ test "roundToInt and roundToLong clamp and reject NaN" {
     try testing.expectEqual(@as(i64, 5), (try num_round_to_long(&c5)).ok.Long);
 }
 
-/// Drop a freshly-built `Exception` value (its box owns the strings).
 fn freeException(v: Value) void {
     if (v == .Exception) runtime.exceptionRefOf(v.Exception).deinit();
 }
@@ -1300,14 +1231,12 @@ test "bit operations" {
     var c3 = makeCtx(&.{.{ .Int = 0 }}, &h, &cap);
     try testing.expectEqual(@as(i32, 0), (try num_take_highest_one_bit(&c3)).ok.Int);
 
-    // rotateLeft by 4 on a byte-width pattern.
     var c4 = makeCtx(&.{ .{ .Int = 1 }, .{ .Int = 1 } }, &h, &cap);
     try testing.expectEqual(@as(i32, 2), (try num_rotate_left(&c4)).ok.Int);
 
     var c5 = makeCtx(&.{ .{ .Int = 2 }, .{ .Int = 1 } }, &h, &cap);
     try testing.expectEqual(@as(i32, 1), (try num_rotate_right(&c5)).ok.Int);
 
-    // Negative/over-width shift counts wrap via rem_euclid.
     var c6 = makeCtx(&.{ .{ .Int = 1 }, .{ .Int = 33 } }, &h, &cap);
     try testing.expectEqual(@as(i32, 2), (try num_rotate_left(&c6)).ok.Int);
 }
@@ -1318,15 +1247,12 @@ test "float rem and mod sign behavior" {
     var cap = CaptureOutput.init(testing.allocator);
     defer cap.deinit();
 
-    // rem takes the sign of the dividend.
     var c1 = makeCtx(&.{ .{ .Double = -5.0 }, .{ .Double = 3.0 } }, &h, &cap);
     try expectDouble(-2.0, try num_float_rem(&c1));
 
-    // mod takes the sign of the divisor.
     var c2 = makeCtx(&.{ .{ .Double = -5.0 }, .{ .Double = 3.0 } }, &h, &cap);
     try expectDouble(1.0, try num_float_mod(&c2));
 
-    // Float operands keep a Float result.
     var c3 = makeCtx(&.{ .{ .Float = 5.0 }, .{ .Float = 3.0 } }, &h, &cap);
     const r3 = try num_float_rem(&c3);
     try testing.expect(r3.ok == .Float);

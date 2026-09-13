@@ -1,14 +1,11 @@
 //! Collection stdlib intrinsics (List / Set / Map / Iterable / Array /
 //! Pair / Triple / Sequence).
 //!
-//! Each intrinsic is a `fn(*CallCtx) std.mem.Allocator.Error!EvalResult`.
-//! `Ok(v)` becomes `EvalResult{ .ok = v }` and `Err(e)` becomes
-//! `EvalResult{ .err = e }`. OOM is the only Zig `error`.
-//!
-//! Memory model: heap-owning containers (`StringRef`, `ValueList`,
-//! `MapEntries`) are created via `ctx.allocator` and never freed
-//! individually — the interpreter drives an arena per eval phase instead. A
-//! plain `Value` copy shares the same backing handle.
+//! Each intrinsic is a `fn(*CallCtx) std.mem.Allocator.Error!EvalResult`, with
+//! OOM the only Zig `error`. Heap-owning containers (`StringRef`, `ValueList`,
+//! `MapEntries`) are created through `ctx.allocator` and never freed
+//! individually: the interpreter drives an arena per eval phase, and a plain
+//! `Value` copy shares the same backing handle.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -38,10 +35,8 @@ const Allocator = std.mem.Allocator;
 const Error = std.mem.Allocator.Error;
 const Order = std.math.Order;
 
-// =====================================================================
-// Subsystem files: each cluster re-exports its public intrinsics here,
-// so every `collections.<name>` call site keeps resolving.
-// =====================================================================
+// Each subsystem file re-exports its public intrinsics here, so every
+// `collections.<name>` call site keeps resolving.
 
 const common_mod = @import("collections/common.zig");
 pub const bumpModCount = common_mod.bumpModCount;
@@ -343,10 +338,6 @@ pub const coll_min_with = array_mod.coll_min_with;
 pub const coll_max_with = array_mod.coll_max_with;
 pub const coll_min_with_or_null = array_mod.coll_min_with_or_null;
 pub const coll_max_with_or_null = array_mod.coll_max_with_or_null;
-
-// =====================================================================
-// Tests
-// =====================================================================
 
 const testing = std.testing;
 

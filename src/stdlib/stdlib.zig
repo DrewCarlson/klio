@@ -1,26 +1,14 @@
 //! Kotlin stdlib host.
 //!
-//! This module is the home of the Zig-native Kotlin standard library. The
-//! shape of the API surface is produced by the stdlib generator from the
-//! upstream Kotlin sources (`kotlin/libraries/stdlib/`) and lives in
-//! `generated/`.
+//! Home of the Zig-native Kotlin standard library. The API surface is produced
+//! by the stdlib generator from the upstream Kotlin sources
+//! (`kotlin/libraries/stdlib/`) and lives in `generated/`.
 //!
-//! # Symbol schema
-//!
-//! Every public symbol mined from the upstream tree is recorded as a
-//! `SymbolEntry`. The slice returned by `generated.stdlibSymbols()` is the
-//! canonical registry. Each entry carries:
-//!
-//! * `fqn`        — fully qualified name (`kotlin.collections.listOf`)
-//! * `package`    — package path (`kotlin.collections`)
-//! * `name`       — simple name (`listOf`)
-//! * `kind`       — function / property / class / interface / typealias / object
-//! * `receiver`   — extension receiver type as text, if any
-//! * `signature`  — raw textual signature (trimmed source line)
-//! * `param_names`— parameter names in declaration order
-//! * `modifiers`  — bitset of Kotlin modifiers we care about
-//! * `source`     — relative upstream path + 1-based line/column
-//! * `impl_fn`    — non-null once a Zig implementation is wired up.
+//! Every public symbol mined from that tree is a `SymbolEntry` in the canonical
+//! registry `generated.stdlibSymbols()`, carrying its fqn, package, simple name,
+//! kind, extension receiver, raw signature line, parameter names, modifier
+//! bitset, upstream source position, and `impl_fn` once a Zig implementation is
+//! wired up.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -30,7 +18,6 @@ pub const implementations = @import("implementations.zig");
 pub const pack_builder = @import("pack_builder.zig");
 pub const bundle_resources = @import("bundle_resources.zig");
 
-// Per-area documentation shims.
 pub const collections = @import("collections.zig");
 pub const exceptions = @import("exceptions.zig");
 pub const io = @import("io.zig");
@@ -39,12 +26,10 @@ pub const ranges = @import("ranges.zig");
 pub const sequences = @import("sequences.zig");
 pub const text = @import("text.zig");
 
-/// Function pointer signature for a Zig-native stdlib intrinsic.
 pub const StdlibFn = runtime.StdlibFn;
 
 pub const build_stdlib_pack = pack_builder.buildStdlibPack;
 
-// Internal helpers the interpreter's higher-order ops use for comparisons.
 pub const compare_values = implementations.compare_values;
 pub const materialise_sequence = implementations.materialise_sequence;
 pub const materialise_sequence_bounded = implementations.materialise_sequence_bounded;
@@ -56,13 +41,10 @@ pub const freshBuilderSeq = implementations.collections.freshBuilderSeq;
 pub const primitive_companion_const = implementations.primitive_companion_const;
 pub const compareUtf16 = text.compareUtf16;
 
-/// `(name, fqn)` pair installed into globals so identifiers like `println`,
-/// `listOf`, or `IllegalArgumentException` resolve without an explicit import.
 pub const Alias = struct { name: []const u8, fqn: []const u8 };
 
-/// Bare names that resolve through implicit Kotlin imports. Mirrors Kotlin's
-/// `kotlin.*` / `kotlin.io.*` / `kotlin.collections.*` / `kotlin.text.*` /
-/// `kotlin.ranges.*` default imports.
+/// Bare names resolving through Kotlin's default imports: `kotlin.*`,
+/// `kotlin.io.*`, `kotlin.collections.*`, `kotlin.text.*`, `kotlin.ranges.*`.
 pub const IMPLICIT_ALIASES = [_]Alias{
     .{ .name = "print", .fqn = "kotlin.io.print" },
     .{ .name = "println", .fqn = "kotlin.io.println" },
@@ -88,8 +70,6 @@ pub const IMPLICIT_ALIASES = [_]Alias{
     .{ .name = "emptyList", .fqn = "kotlin.collections.emptyList" },
     .{ .name = "emptyMap", .fqn = "kotlin.collections.emptyMap" },
     .{ .name = "emptySet", .fqn = "kotlin.collections.emptySet" },
-    // The inline builder factories. A bare reference must resolve to the host
-    // intrinsic actual rather than to a same-named Kotlin-source overload.
     .{ .name = "buildList", .fqn = "kotlin.collections.buildList" },
     .{ .name = "buildSet", .fqn = "kotlin.collections.buildSet" },
     .{ .name = "buildMap", .fqn = "kotlin.collections.buildMap" },
@@ -100,9 +80,8 @@ pub const IMPLICIT_ALIASES = [_]Alias{
     .{ .name = "mutableMapOf", .fqn = "kotlin.collections.mutableMapOf" },
     .{ .name = "mutableSetOf", .fqn = "kotlin.collections.mutableSetOf" },
     .{ .name = "setOf", .fqn = "kotlin.collections.setOf" },
-    // Collection factories whose Kotlin source the build drops for an intrinsic
-    // (so they have no lowered FuncId): bind them as value-position globals too,
-    // so `factory(*array)` spread calls and value-position references resolve.
+    // These factories have no lowered FuncId, their Kotlin source being dropped
+    // for an intrinsic, so they bind as value-position globals too.
     .{ .name = "arrayListOf", .fqn = "kotlin.collections.arrayListOf" },
     .{ .name = "hashMapOf", .fqn = "kotlin.collections.hashMapOf" },
     .{ .name = "linkedMapOf", .fqn = "kotlin.collections.linkedMapOf" },
@@ -132,11 +111,9 @@ pub const IMPLICIT_ALIASES = [_]Alias{
     .{ .name = "StringBuilder", .fqn = "kotlin.text.StringBuilder" },
 };
 
-/// The array constructor builders. Each is a top-level global factory
-/// (`arrayOf(vararg T): Array<T>`, ...) with no receiver-typed variant.
-/// Member dispatch uses this to resolve a bare call inside a method / lambda
-/// body to the global intrinsic instead of prepending the enclosing receiver
-/// as a spurious first element.
+/// The array constructor builders. Member dispatch uses this to resolve a bare
+/// call inside a method or lambda body to the global intrinsic instead of
+/// prepending the enclosing receiver as a spurious first element.
 pub const ARRAY_BUILDERS = [_][]const u8{
     "arrayOf",      "arrayOfNulls",  "emptyArray",    "byteArrayOf",
     "ubyteArrayOf", "shortArrayOf",  "ushortArrayOf", "intArrayOf",
@@ -145,9 +122,8 @@ pub const ARRAY_BUILDERS = [_][]const u8{
 };
 
 pub fn isArrayBuilder(name: []const u8) bool {
-    // Consulted per member dispatch, so reject on length and final byte
-    // before any string compare — every builder is 7..14 bytes and ends in
-    // `f` (`intArrayOf`), `s` (`arrayOfNulls`) or `y` (`emptyArray`).
+    // Consulted per member dispatch, so reject on length and final byte before
+    // any string compare: every builder is 7..14 bytes and ends in `f`, `s`, `y`.
     if (name.len < 7 or name.len > 14) return false;
     switch (name[name.len - 1]) {
         'f', 's', 'y' => {},
@@ -159,24 +135,16 @@ pub fn isArrayBuilder(name: []const u8) bool {
     return false;
 }
 
-/// True when `name` is a top-level stdlib *function* (a builder / factory / IO
-/// / comparison helper), as opposed to an extension or infix function on a
-/// receiver, a type, or an exception. Derived from `IMPLICIT_ALIASES`: take
-/// the lowercase entries (functions, not types/exceptions) and exclude the few
-/// that genuinely are receiver/infix extensions.
+/// True when `name` is a top-level stdlib function rather than an extension or
+/// infix function on a receiver, a type, or an exception.
 pub fn isToplevelFunction(name: []const u8) bool {
-    // `to`, `downTo`, `step`, `until` are infix extensions on a receiver.
     const receiver_infix = [_][]const u8{ "to", "downTo", "step", "until" };
     for (receiver_infix) |r| {
         if (std.mem.eql(u8, r, name)) return false;
     }
-    // Top-level control / precondition intrinsics (`kotlin.error`,
-    // `kotlin.check`, …). Their first parameter is a plain value, not a
-    // receiver, so member dispatch must never prepend the enclosing
-    // receiver as a spurious first argument — otherwise a bare
-    // `error("msg")` inside a receiver context (e.g. a `runBlocking`
-    // CoroutineScope lambda) would pass `this` as the message and drop the
-    // literal. Same `Any`-typed-parameter trap the array builders avoid.
+    // The first parameter of a control or precondition intrinsic is a plain
+    // value, so member dispatch must never prepend the enclosing receiver: a
+    // bare `error("msg")` in a `CoroutineScope` lambda would pass `this`.
     for (CONTROL_INTRINSICS) |c| {
         if (std.mem.eql(u8, c, name)) return true;
     }
@@ -188,30 +156,22 @@ pub fn isToplevelFunction(name: []const u8) bool {
     return false;
 }
 
-/// True when `name` is a top-level `kotlin.math` function whose two parameters
-/// are both plain values (`min(a, b)` / `max(a, b)`), as opposed to a
-/// single-receiver accessor. A property read probes `kotlin.math.{name}` and
-/// dispatches the match with the receiver as the sole argument; for these the
-/// runtime implementation returns its lone argument unchanged, which would
-/// silently report the receiver itself as the property value. A property read
-/// must never match them — a bare `min(x, y)` callee in a receiver context
-/// resolves to the package function, not a member of the implicit receiver.
+/// True when `name` is a top-level `kotlin.math` function taking two plain
+/// values rather than a single receiver. These return their lone argument
+/// unchanged, so a property read matching one would report the receiver as its
+/// own property value.
 pub fn isBinaryMathFunction(name: []const u8) bool {
     return std.mem.eql(u8, name, "min") or std.mem.eql(u8, name, "max");
 }
 
-/// Top-level non-extension control / precondition functions in `kotlin`.
-/// Each takes a value (not a receiver) as its first parameter, so member
-/// dispatch must resolve a bare call to the global intrinsic instead of
-/// prepending the enclosing receiver.
+/// Top-level non-extension control and precondition functions in `kotlin`, each
+/// taking a value rather than a receiver as its first parameter.
 pub const CONTROL_INTRINSICS = [_][]const u8{
     "error",     "check",          "checkNotNull",
     "require",   "requireNotNull", "TODO",
     "assert",
 };
 
-/// Packages whose top-level entities are implicitly visible in every Kotlin
-/// source file. The exact set the spec lists for `Kotlin/Core`.
 pub const IMPLICITLY_IMPORTED_PACKAGES = [_][]const u8{
     "kotlin",
     "kotlin.annotation",
@@ -223,8 +183,6 @@ pub const IMPLICITLY_IMPORTED_PACKAGES = [_][]const u8{
     "kotlin.text",
 };
 
-/// Returns true when `package_path` is one of the implicitly imported
-/// packages (an exact match against `IMPLICITLY_IMPORTED_PACKAGES`).
 pub fn isImplicitlyImportedPackage(package_path: []const u8) bool {
     for (IMPLICITLY_IMPORTED_PACKAGES) |p| {
         if (std.mem.eql(u8, p, package_path)) return true;
@@ -232,14 +190,10 @@ pub fn isImplicitlyImportedPackage(package_path: []const u8) bool {
     return false;
 }
 
-/// Record `fqn`'s simple name into `map` when its declaring package is
-/// one of `packages` (exact match), keeping the mapping whose package
-/// ranks earliest in the list. This is the single bare-name → FQN map
-/// constructor: the link-time `default_import_globals` /
-/// `any_member_globals` maps and the lowerer's inline-shadow name set
-/// all derive their name domain from this one rule, so the
-/// "which bare names does the shipped surface own" answer has exactly
-/// one source of truth.
+/// Record `fqn`'s simple name into `map` when its declaring package is one of
+/// `packages`, keeping the earliest-ranked package. The only bare-name to FQN
+/// map constructor: the link-time global maps and the lowerer's inline-shadow
+/// name set all take their name domain from this rule.
 pub fn noteBareNameMapping(
     map: *std.StringHashMap([]const u8),
     packages: []const []const u8,
@@ -266,12 +220,8 @@ fn bareNamePkgRank(packages: []const []const u8, pkg: []const u8) ?usize {
     return null;
 }
 
-/// Curated stdlib sources that PARSE but are not yet *consumed*. The loaders
-/// skip these by `rel_path` suffix. Empty today.
 pub const CONSUMPTION_DEFERRED_SOURCES = [_][]const u8{};
 
-/// True when `rel_path` names a curated source on the consumption deferral
-/// list (see `CONSUMPTION_DEFERRED_SOURCES`).
 pub fn isConsumptionDeferredSource(rel_path: []const u8) bool {
     for (CONSUMPTION_DEFERRED_SOURCES) |suffix| {
         if (std.mem.endsWith(u8, rel_path, suffix)) return true;
@@ -279,19 +229,15 @@ pub fn isConsumptionDeferredSource(rel_path: []const u8) bool {
     return false;
 }
 
-/// Returns true when `package_path` names any package recognised by the stdlib
-/// registry. Wider than `isImplicitlyImportedPackage` — covers every package
-/// that has at least one symbol mined from upstream Kotlin (e.g.
-/// `kotlin.coroutines`, `kotlin.reflect`). Used by the resolver to decide
-/// whether an `import kotlin.<pkg>.*` is well-formed.
+/// Whether `package_path` names any package the stdlib registry knows: wider
+/// than `isImplicitlyImportedPackage`, covering every package with at least one
+/// mined symbol.
 pub fn isKnownPackage(package_path: []const u8) bool {
     if (isImplicitlyImportedPackage(package_path)) return true;
     if (extra_known_packages.contains(package_path)) return true;
-    // The mined symbol table and the intrinsic registry are static per
-    // process; the per-query linear scan over both (thousands of string
-    // compares) was a top interpreter-profile frame. Build the set of
-    // every known package path — each symbol's package plus every dotted
-    // prefix of every FQN — once, and answer from it.
+    // The mined symbol table and intrinsic registry are static per process, so
+    // the set of known package paths, each symbol's package plus every dotted
+    // prefix of every FQN, is built once and every query answered from it.
     known_packages_lock.lock();
     if (!known_packages_built) {
         buildKnownPackages() catch {
@@ -322,15 +268,12 @@ fn buildKnownPackages() !void {
         try known_packages.put(std.heap.page_allocator, e.package, {});
         try addFqnPrefixes(e.fqn);
     }
-    // Hand-written intrinsics live outside the mined symbol index. A package
-    // that owns at least one such intrinsic is just as real as a mined one.
     var it = implementations.allFqns();
     while (it.next()) |fqn| {
         try addFqnPrefixes(fqn);
     }
 }
 
-/// The pre-memoization fallback, kept for the OOM path only.
 fn isKnownPackageScan(package_path: []const u8) bool {
     for (generated.stdlibSymbols()) |e| {
         if (std.mem.eql(u8, e.package, package_path)) return true;
@@ -352,10 +295,6 @@ fn startsWithPrefixDot(fqn: []const u8, package_path: []const u8) bool {
     return fqn[package_path.len] == '.';
 }
 
-/// Small atomic spin lock. Zig 0.16's blocking `std.Io.Mutex` is parameterised
-/// on an `Io` handle; this set-up-time config has none, so it guards itself
-/// with a spin lock built on `std.atomic.Value` (the same approach the runtime
-/// uses for its cell locks).
 const SpinLock = struct {
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
@@ -370,9 +309,8 @@ const SpinLock = struct {
     }
 };
 
-/// Process-global resolver configuration: package names loaded packs have
-/// registered. Set-up-time configuration, not Kotlin heap state, written as
-/// packs install and read-only during execution. Guarded by a spin lock.
+/// Package names loaded packs have registered. Set-up-time configuration, not
+/// Kotlin heap state: written as packs install, read-only during execution.
 const ExtraKnownPackages = struct {
     lock: SpinLock = .{},
     set: ?std.StringHashMapUnmanaged(void) = null,
@@ -396,17 +334,13 @@ const ExtraKnownPackages = struct {
 
 var extra_known_packages: ExtraKnownPackages = .{};
 
-/// Augment the set of packages `isKnownPackage` recognises. Loaded packs call
-/// this when their manifest declares packages outside the static stdlib
-/// surface (e.g. `kotlinx.coroutines`). Idempotent.
 pub fn registerKnownPackage(package_path: []const u8) void {
     extra_known_packages.insert(package_path);
 }
 
-/// Snapshot of every package registered via `registerKnownPackage`, sorted
-/// for deterministic output. The bundler records this after the dependency
-/// load so bundle boot can replay the registrations without reading any
-/// pack. Caller owns the slice and its strings.
+/// Every package registered via `registerKnownPackage`, sorted. The bundler
+/// records this after the dependency load so bundle boot can replay the
+/// registrations without reading a pack. Caller owns the slice.
 pub fn knownPackagesSnapshot(allocator: std.mem.Allocator) std.mem.Allocator.Error![]const []const u8 {
     extra_known_packages.lock.lock();
     defer extra_known_packages.lock.unlock();
@@ -449,8 +383,6 @@ pub const SymbolKind = enum {
     }
 };
 
-/// Modifier flags as a bitset. Stable bit assignments so the generator can
-/// emit `Modifiers(0b...)` literals.
 pub const Modifiers = struct {
     bits: u32 = 0,
 
@@ -496,17 +428,12 @@ pub const SymbolEntry = struct {
     kind: SymbolKind,
     receiver: ?[]const u8,
     signature: []const u8,
-    /// Parameter names in declaration order. Empty for non-function
-    /// declarations. The interpreter consults this when reordering
-    /// named-argument calls before dispatching the function pointer.
     param_names: []const []const u8,
     modifiers: Modifiers,
     source: SourceLoc,
     impl_fn: ?StdlibFn,
 };
 
-/// Look up a symbol by fully qualified name. Linear scan; the registry is
-/// small enough that this is fine.
 pub fn lookup(fqn: []const u8) ?*const SymbolEntry {
     for (generated.stdlibSymbols()) |*e| {
         if (std.mem.eql(u8, e.fqn, fqn)) return e;
@@ -514,9 +441,6 @@ pub fn lookup(fqn: []const u8) ?*const SymbolEntry {
     return null;
 }
 
-/// Iterates every registered stdlib symbol FQN: first the mined registry,
-/// then the hand-written intrinsic table. Used by import resolution to expand
-/// wildcard imports (`import kotlin.math.*`).
 pub const SymbolNameIterator = struct {
     registry_i: usize = 0,
     hand: implementations.FqnIterator = .{},
@@ -547,9 +471,8 @@ pub const Coverage = struct {
 };
 
 /// How many hand-written intrinsic entries name a declaration the mined index
-/// knows, and how many do not. A name in the table that matches nothing
-/// upstream is either a klio-internal entry or a typo nothing will ever reach;
-/// the split is what tells them apart.
+/// knows, and how many do not: an entry matching nothing upstream is either
+/// klio-internal or a typo.
 pub const TableAudit = struct { matched: usize, unmatched: usize, internal: usize, receiver_form: usize };
 
 pub fn auditImplementationTable() TableAudit {
@@ -564,10 +487,8 @@ pub fn auditImplementationTable() TableAudit {
             out.matched += 1;
             continue;
         }
-        // The table may name a declaration in its RECEIVER-QUALIFIED form
-        // (`kotlin.Double.roundToInt`) where upstream declares the same thing
-        // as an extension (`kotlin.math.roundToInt` on a `Double`). Same
-        // declaration, different spelling.
+        // The table may use the receiver-qualified form
+        // (`kotlin.Double.roundToInt`) where upstream declares an extension.
         const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse {
             out.unmatched += 1;
             continue;
@@ -598,16 +519,10 @@ pub fn coverage() Coverage {
     };
 }
 
-/// Look up a hand-written intrinsic by FQN. Used by the interpreter to
-/// dispatch qualified calls (`kotlin.math.abs`) and member access on builtin
-/// types (`<typeFQN>.<name>`).
 pub fn implementation(fqn: []const u8) ?StdlibFn {
     return implementations.lookup(fqn);
 }
 
-/// Exact host ABI symbol for a Kotlin declaration, when this build provides
-/// one. The returned string is stable for the process lifetime and is suitable
-/// for declaration metadata and image serialization.
 pub fn declarationHostSymbol(
     source_fqn: []const u8,
     receiver_name: ?[]const u8,
@@ -616,16 +531,12 @@ pub fn declarationHostSymbol(
     return implementations.declarationHostSymbol(source_fqn, receiver_name, name);
 }
 
-/// Return whether a host-backed member accepts this argument run when the
-/// binding carries explicit applicability metadata. Null means the binding
-/// has no extra predicate and ordinary member precedence applies.
 pub fn implementationApplicable(fqn: []const u8, args: []const runtime.Value) ?bool {
     return implementations.applicable(fqn, args);
 }
 
-/// Registry of native bindings — `host_symbol` -> `StdlibFn`. A pack carries
-/// the FQN -> `host_symbol` mapping; the host populates this registry with the
-/// actual function pointers; the interpreter joins them at load time.
+/// Registry of native bindings, `host_symbol` -> `StdlibFn`. A pack carries the
+/// FQN to `host_symbol` mapping and the interpreter joins them at load time.
 pub const HostBindings = struct {
     table: std.StringHashMapUnmanaged(StdlibFn) = .empty,
     allocator: std.mem.Allocator,
@@ -639,8 +550,6 @@ pub const HostBindings = struct {
         self.* = undefined;
     }
 
-    /// Build a registry pre-populated with every FQN this build of the stdlib
-    /// knows how to handle.
     pub fn withStdlibDefaults(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBindings {
         var out = HostBindings.init(allocator);
         var it = implementations.allFqns();
@@ -674,18 +583,11 @@ pub const HostBindings = struct {
     }
 };
 
-/// Look up the declared parameter names for a function FQN. The interpreter
-/// uses this to reorder named-argument calls before dispatching the intrinsic.
-/// Returns `null` when no entry exists or when the FQN names a non-function
-/// symbol.
 pub fn paramNames(fqn: []const u8) ?[]const []const u8 {
-    // Hand-impl table wins.
     if (implementations.lookupParamNames(fqn)) |p| return p;
     if (directParamLookup(fqn)) |p| return p;
-    // Our dispatch synthesizes FQNs like `kotlin.collections.List.joinToString`
-    // for member calls on a `List`, but the upstream surface stores the
-    // extension form `kotlin.collections.joinToString`. Strip the
-    // second-to-last segment (the receiver type) and retry once.
+    // Dispatch synthesizes FQNs like `kotlin.collections.List.joinToString`,
+    // while upstream stores the extension form, so strip the receiver segment.
     var parts_buf: [32][]const u8 = undefined;
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, fqn, '.');
@@ -714,17 +616,14 @@ pub fn paramNames(fqn: []const u8) ?[]const []const u8 {
 }
 
 fn directParamLookup(fqn: []const u8) ?[]const []const u8 {
-    // Indexed lookup. The upstream mining produces multiple rows per FQN; the
-    // first non-empty hit is correct for the common case, and that is exactly
-    // what `buildParamIndex` records (first insert wins). A linear scan here
-    // was O(total-symbols) per probe and dominated named-argument dispatch on
-    // hot paths (every coroutine resume probes several FQNs).
+    // Upstream mining produces several rows per FQN and the first non-empty hit
+    // is the right one. A linear scan would be O(total-symbols) per probe, and
+    // every coroutine resume probes several FQNs.
     return paramIndex().get(fqn);
 }
 
-/// FQN -> declared parameter names, first non-empty row winning. Built once
-/// from `stdlibSymbols()`; the keys/values borrow the process-lifetime symbol
-/// slices, so the map is never freed.
+/// Keys and values borrow the process-lifetime symbol slices, so this map is
+/// never freed.
 var param_index: std.StringHashMapUnmanaged([]const []const u8) = .empty;
 var param_index_lock = std.atomic.Value(u32).init(0);
 var param_index_done = std.atomic.Value(bool).init(false);
@@ -750,10 +649,6 @@ fn buildParamIndex() std.mem.Allocator.Error!void {
         if (!gop.found_existing) gop.value_ptr.* = e.param_names;
     }
 }
-
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -794,8 +689,8 @@ test "implicitly imported packages match spec list" {
     for (expected, IMPLICITLY_IMPORTED_PACKAGES) |a, b| {
         try testing.expectEqualStrings(a, b);
     }
-    // `kotlin.math` is NOT default-imported: `PI` / `E` need an explicit
-    // import, and a user declaration named `E` must win over `kotlin.math.E`.
+    // `kotlin.math` is not default-imported: `PI` and `E` need an explicit
+    // import, and a user declaration named `E` wins over `kotlin.math.E`.
     try testing.expect(!isImplicitlyImportedPackage("kotlin.math"));
     try testing.expect(!isImplicitlyImportedPackage("kotlin.reflect"));
     try testing.expect(!isImplicitlyImportedPackage("kotlin.math.foo"));
@@ -807,13 +702,10 @@ test "noteBareNameMapping keeps the earliest-ranked package and ignores the rest
     const pkgs = [_][]const u8{ "kotlin", "kotlin.math" };
     try noteBareNameMapping(&map, &pkgs, "kotlin.math.abs");
     try testing.expectEqualStrings("kotlin.math.abs", map.get("abs").?);
-    // An earlier-ranked package takes the name over a later one.
     try noteBareNameMapping(&map, &pkgs, "kotlin.abs");
     try testing.expectEqualStrings("kotlin.abs", map.get("abs").?);
-    // A later-ranked arrival never displaces the earlier rank.
     try noteBareNameMapping(&map, &pkgs, "kotlin.math.abs");
     try testing.expectEqualStrings("kotlin.abs", map.get("abs").?);
-    // Packages outside the list, and dotless names, are ignored.
     try noteBareNameMapping(&map, &pkgs, "other.pkg.abs");
     try testing.expectEqualStrings("kotlin.abs", map.get("abs").?);
     try noteBareNameMapping(&map, &pkgs, "abs");
@@ -821,12 +713,9 @@ test "noteBareNameMapping keeps the earliest-ranked package and ignores the rest
 }
 
 test "the inline shadow set's name domain comes from the shared constructor" {
-    // The lowerer derives `shadowed_inline_names` from
-    // `noteBareNameMapping` over `IMPLICITLY_IMPORTED_PACKAGES`; pin two
-    // production-load-bearing members of that domain and one
-    // non-implicit exclusion. `synchronized` is deliberately NOT a member:
-    // it is an inline actual that splices (so its block can suspend), not a
-    // host binding, so its name must remain expandable.
+    // The lowerer derives `shadowed_inline_names` from `noteBareNameMapping` over
+    // `IMPLICITLY_IMPORTED_PACKAGES`. `synchronized` is deliberately absent: it
+    // is an inline actual that splices so its block can suspend.
     var map = std.StringHashMap([]const u8).init(testing.allocator);
     defer map.deinit();
     var it = implementations.allFqns();
@@ -836,7 +725,6 @@ test "the inline shadow set's name domain comes from the shared constructor" {
     try testing.expect(map.contains("listOf"));
     try testing.expect(map.contains("arrayOf"));
     try testing.expect(!map.contains("synchronized"));
-    // kotlin.concurrent is not implicitly imported.
     try testing.expect(!map.contains("thread"));
 }
 
@@ -880,8 +768,6 @@ test "is array builder and toplevel function" {
     try testing.expect(isToplevelFunction("listOf"));
     try testing.expect(!isToplevelFunction("to"));
     try testing.expect(!isToplevelFunction("Pair"));
-    // Control / precondition intrinsics are top-level functions: member
-    // dispatch must not prepend a receiver to their value parameter.
     try testing.expect(isToplevelFunction("error"));
     try testing.expect(isToplevelFunction("check"));
     try testing.expect(isToplevelFunction("require"));
@@ -894,7 +780,6 @@ test "is array builder and toplevel function" {
 test "binary math functions are not property accessors" {
     try testing.expect(isBinaryMathFunction("min"));
     try testing.expect(isBinaryMathFunction("max"));
-    // Single-receiver math accessors stay property-eligible.
     try testing.expect(!isBinaryMathFunction("absoluteValue"));
     try testing.expect(!isBinaryMathFunction("sign"));
     try testing.expect(!isBinaryMathFunction("minOf"));
@@ -903,19 +788,14 @@ test "binary math functions are not property accessors" {
 
 test "every hand-written intrinsic is accounted for against the mined index" {
     const a = auditImplementationTable();
-    // Four ways an entry is accounted for:
-    //   by-fqn          upstream declares exactly this name
-    //   by-receiver-form the same declaration, spelled receiver-qualified
-    //                   (`kotlin.Double.roundToInt` for `kotlin.math.roundToInt`)
-    //   klio-owned      a `__klio` entry with no upstream counterpart by design
-    //   unknown         neither — a JVM-only declaration (`exitProcess`,
-    //                   `readLine`), a platform helper (`nativeIndexOf`), or a
-    //                   declaration in a stdlib source the sparse checkout does
-    //                   not include
+    // Four ways an entry is accounted for: by-fqn, upstream declares this name;
+    // by-receiver-form, the same declaration spelled receiver-qualified;
+    // klio-owned, a `__klio` entry with no upstream counterpart; and unknown, a
+    // JVM-only declaration, a platform helper, or a declaration in a stdlib
+    // source the sparse checkout omits.
     //
-    // The last bucket is the one to watch. It is a RATCHET rather than zero:
-    // the mined index is built from whatever upstream sources are present, so
-    // some legitimate entries land there. What must not happen is it growing.
+    // The unknown bucket is a ratchet rather than zero, since the mined index is
+    // built from whatever upstream sources are present. It must not grow.
     const UNKNOWN_CEILING: usize = 141;
     if (a.unmatched > UNKNOWN_CEILING) {
         std.debug.print(

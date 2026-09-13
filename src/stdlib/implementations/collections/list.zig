@@ -1,5 +1,5 @@
-//! `List` / `MutableList` intrinsics: access, search, fold-right,
-//! joinToString, mutation and the additional list members.
+//! `List` and `MutableList` intrinsics: access, search, fold-right,
+//! joinToString and mutation.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -51,10 +51,6 @@ const sublistComodGuard = views_mod.sublistComodGuard;
 const syncMapView = views_mod.syncMapView;
 const syncSublist = views_mod.syncSublist;
 
-// =====================================================================
-// List / MutableList
-// =====================================================================
-
 pub fn coll_list_size(ctx: *CallCtx) Error!EvalResult {
     const it = switch (try recvListItems(ctx.allocator, ctx.args, "List.size")) {
         .items => |x| x,
@@ -102,8 +98,8 @@ pub fn coll_list_contains(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("contains requires an argument");
     const needle = ctx.args[1];
-    // Snapshot before dispatching a user `equals` (re-entering the VM under the
-    // list borrow is unsafe).
+    // Snapshot first: re-entering the VM for a user `equals` under the list
+    // borrow is unsafe.
     const items = try snapshotItems(ctx.allocator, it);
     defer if (runtime.freeScratch()) ctx.allocator.free(items);
     return ok(.{ .Bool = try containsBoxedH(ctx.host, ctx.out, items, &needle) });
@@ -210,8 +206,8 @@ pub fn coll_list_reduce_right_or_null(ctx: *CallCtx) Error!EvalResult {
 }
 fn listLastImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
     const a = ctx.allocator;
-    // Fast path: no predicate on a List/Array — index the last element directly
-    // instead of snapshotting the whole collection (which made `last()` O(n)).
+    // With no predicate, index the last element directly rather than snapshot
+    // the whole collection, which would make `last()` O(n).
     if (ctx.args.len < 2) {
         switch (ctx.args[0]) {
             .List => |l| {
@@ -235,8 +231,6 @@ fn listLastImpl(ctx: *CallCtx, or_null: bool) Error!EvalResult {
         .items => |x| x,
         .err => |e| return e,
     };
-    // `iterableItems` returns a scratch snapshot/array; the returned element is
-    // copied out, so free the snapshot spine on exit.
     defer if (runtime.freeScratch()) a.free(items);
     if (ctx.args.len >= 2) {
         const block = ctx.args[1];
@@ -344,8 +338,6 @@ fn joinToStringImpl(ctx: *CallCtx, items: []const Value, allow_instance_to_strin
             break :blk try display(a, v);
         } else try display(a, v);
         try out.appendSlice(a, piece);
-        // `piece` is always a fresh `dupe`/`display` allocation, copied into
-        // `out`; free it per element rather than leaking one per joined value.
         if (runtime.freeScratch()) a.free(piece);
     }
     if (limit >= 0 and n > take) {
@@ -381,14 +373,10 @@ pub fn coll_array_join_to_string(ctx: *CallCtx) Error!EvalResult {
     return joinToStringImpl(ctx, items, false);
 }
 
-/// Render one collection element/key/value: a user Instance via its own
-/// `toString()` (dispatched through the VM); everything else via `display`.
-/// Caller owns the returned slice.
+/// Render one collection element, key or value: a user Instance through its own
+/// `toString()`, everything else through `display`. Caller owns the slice.
 fn elemPiece(ctx: *CallCtx, v: Value) Error![]u8 {
     const a = ctx.allocator;
-    // A user Instance renders through its own override; a nested CONTAINER
-    // renders through its own `toString()` so ITS elements' overrides fire in
-    // turn (`listOf(listOf(box))`).
     if (v == .Instance or v == .List or v == .Set or v == .Map or
         v == .Pair or v == .Triple or v == .Result)
     {
@@ -427,10 +415,6 @@ pub fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
         try out.append(a, '}');
         return ok(try makeStringOwned(a, try out.toOwnedSlice(a)));
     }
-    // A List/Set element that is a user Instance must render via its own
-    // `toString()` (dispatched through the VM), not the Zig-level `display`
-    // formatter, which prints `ClassName@id` for a non-data class. Primitives
-    // and data classes fall back to `display` (already correct).
     const items: ?[]Value = switch (recv) {
         .List => |l| try snapshotItems(a, l.items),
         .Set => |s| try snapshotItems(a, s.items),
@@ -443,8 +427,8 @@ pub fn collToString(ctx: *CallCtx, what: []const u8) Error!EvalResult {
         try out.append(a, '[');
         for (elems, 0..) |v, i| {
             if (i > 0) try out.appendSlice(a, ", ");
-            // A collection that contains itself renders the self-slot as
-            // `(this Collection)` rather than recursing (matches Kotlin).
+            // A collection containing itself renders the self-slot as
+            // `(this Collection)` rather than recursing, as Kotlin does.
             if (Value.referenceEq(&v, &recv)) {
                 try out.appendSlice(a, "(this Collection)");
                 continue;
@@ -482,7 +466,6 @@ pub fn coll_mut_list_add(ctx: *CallCtx) Error!EvalResult {
     if (user == 1) {
         const g = it.borrowMut();
         defer g.deinit();
-        // The list owns one ref to each element it stores.
         if (runtime.reclaimEnabled()) ctx.args[1].retain();
         try g.get().append(a, ctx.args[1]);
         return ok(.{ .Bool = true });
@@ -596,7 +579,6 @@ pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
     {
         const g = it.borrowMut();
         defer g.deinit();
-        // clear() discards every element; drop the list's owned references.
         if (runtime.reclaimEnabled()) for (g.get().items) |v| v.release(a);
         g.get().clearRetainingCapacity();
     }
@@ -604,16 +586,12 @@ pub fn coll_mut_list_clear(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 pub fn coll_array_list_capacity_noop(ctx: *CallCtx) Error!EvalResult {
-    // `ArrayList.trimToSize()` / `ensureCapacity(n)` are capacity-only no-ops
-    // here (no backing-array capacity is tracked), but Java registers them as
-    // structural modifications, so a concurrent iterator must still fail-fast.
+    // `trimToSize()` and `ensureCapacity(n)` are no-ops here, no backing-array
+    // capacity being tracked, but Java registers them as structural
+    // modifications, so a concurrent iterator must still fail fast.
     if (ctx.args.len > 0) bumpModCount(&ctx.args[0]);
     return ok(Value.Unit);
 }
-
-// =====================================================================
-// Additional List ops
-// =====================================================================
 
 pub fn coll_list_flatten(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
@@ -628,9 +606,6 @@ pub fn coll_list_flatten(ctx: *CallCtx) Error!EvalResult {
         switch (v) {
             .List => |l| try appendVL(&out, a, l.items),
             .Set => |s| try appendVL(&out, a, s.items),
-            // Any other inner iterable (a range, array, sequence, map, or user
-            // Iterable) is drained through the shared helper, which retains each
-            // element it yields.
             else => {
                 const inner = switch (try iterableItemsCtx(ctx, v, "flatten")) {
                     .items => |x| x,
@@ -712,9 +687,8 @@ pub fn coll_list_to_mutable_set(ctx: *CallCtx) Error!EvalResult {
     };
     const items = try snapshotItems(a, it);
     defer if (runtime.freeScratch()) a.free(items);
-    // A LIST source may hold elements a user `equals` calls equal, and a Set
-    // holds one of each — `distinct()` is `toMutableSet().toList()`, so a
-    // structural-only dedup here made it answer by identity.
+    // `distinct()` is `toMutableSet().toList()`, so it dedups by `equals`, not
+    // structurally.
     return ok(try makeSetH(ctx.host, ctx.out, a, items, true));
 }
 
@@ -757,9 +731,9 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
     if (try mapViewAddGuard(ctx.allocator, ctx.args)) |e| return e;
     if (try sublistComodGuard(ctx.allocator, &ctx.args[0])) |e| return e;
     defer syncSublist(ctx.allocator, ctx.args[0]);
-    // `addAll` bumps the counter even when the argument is empty (JVM
-    // `ArrayList.addAll` touches modCount via ensureCapacity before the
-    // size check), so a live iterator fails fast afterwards.
+    // `addAll` bumps the counter even for an empty argument, as JVM
+    // `ArrayList.addAll` touches modCount before the size check, so a live
+    // iterator fails fast afterwards.
     defer bumpModCount(&ctx.args[0]);
     const a = ctx.allocator;
     const it = switch (try recvListItems(a, ctx.args, "MutableList.addAll")) {
@@ -767,30 +741,24 @@ pub fn coll_mut_list_add_all(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     if (ctx.args.len < 2) return arityErr("addAll requires an argument");
-    // Indexed overload `addAll(index: Int, elements)`: the collection is the
-    // third argument and is inserted at `index` rather than appended.
+    // In `addAll(index: Int, elements)` the collection is the third argument and
+    // is inserted at `index` rather than appended.
     const indexed = ctx.args.len >= 3 and ctx.args[1] == .Int;
     const arg = if (indexed) ctx.args[2] else ctx.args[1];
     var to_add: []Value = undefined;
     switch (arg) {
         .List => |l| to_add = try snapshotItems(a, l.items),
         .Set => |s| to_add = try snapshotItems(a, s.items),
-        // `MutableCollection<in T>.addAll(elements: Array<out T>)`.
         .Array => |arr| to_add = try arr.snapshot(a),
-        // `addAll(elements: Sequence<T>)` and `addAll(elements: Iterable<T>)`
-        // over a lazy sequence or a user/anonymous iterable.
         else => to_add = switch (try iterableItemsCtx(ctx, arg, "addAll")) {
             .items => |x| x,
             .err => |e| return e,
         },
     }
-    // `to_add` is a shallow `snapshotItems` dupe; `appendSlice` copies its
-    // elements into the list, so the dupe spine is scratch — free it on exit.
     defer if (runtime.freeScratch()) a.free(to_add);
     const changed = to_add.len != 0;
     const g = it.borrowMut();
     defer g.deinit();
-    // The list owns one ref to each element it stores.
     if (runtime.reclaimEnabled()) for (to_add) |v| v.retain();
     if (indexed) {
         const idx: usize = @min(@as(usize, @intCast(@max(ctx.args[1].Int, 0))), g.get().items.len);
@@ -820,8 +788,6 @@ pub fn coll_mut_list_remove(ctx: *CallCtx) Error!EvalResult {
         defer g.deinit();
         if (indexOfBoxed(g.get().items, &arg)) |pos| {
             const gone = g.get().orderedRemove(pos);
-            // remove(element): Boolean discards the element; drop the
-            // collection's owned reference to it.
             if (runtime.reclaimEnabled()) gone.release(a);
             removed = true;
         }
@@ -879,8 +845,7 @@ pub fn coll_mut_list_set(ctx: *CallCtx) Error!EvalResult {
         if (runtime.freeScratch()) a.free(msg);
         return e;
     }
-    // The list owns the new value; the replaced value's ownership transfers
-    // to the returned `prev` (Kotlin `set` returns the previous element).
+        // The replaced value's ownership transfers to the returned `prev`.
     if (runtime.reclaimEnabled()) value.retain();
     const prev = g.get().items[@intCast(i)];
     g.get().items[@intCast(i)] = value;

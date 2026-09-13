@@ -1,18 +1,12 @@
 //! Native bindings for `kotlinx.atomicfu`.
 //!
-//! klio runs real worker threads (`kotlin.concurrent.thread`,
-//! `Dispatchers.Default`/`IO`), so every read-modify-write here —
-//! `compareAndSet`, `getAndSet`, the increment/add family — executes
-//! under a single exclusive borrow of the receiver's cell: the
-//! read, the compute, and the write-back happen while the cell's
-//! writer lock is held, so concurrent workers observe each operation
-//! atomically. The `kotlinx.atomicfu.locks` lock classes are backed
-//! by the same per-object reentrant monitor as `kotlin.synchronized`.
-//! The pack consumes upstream atomicfu commonMain `expect`
-//! declarations plus klio `actual`s (under `klioMain/`) that declare
-//! the class shapes; these bindings shadow the actual method bodies
-//! at dispatch time via the `installed_bindings` table on the
-//! interpreter.
+//! Real worker threads run Kotlin code, so every read-modify-write here
+//! executes under a single exclusive borrow of the receiver's cell: the read,
+//! the compute and the write-back happen while the cell's writer lock is held,
+//! so concurrent workers observe each operation atomically. The
+//! `kotlinx.atomicfu.locks` classes take the same per-object reentrant monitor
+//! as `kotlin.synchronized`. These bindings shadow the pack's `actual` method
+//! bodies at dispatch time through the interpreter's `installed_bindings`.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -64,22 +58,14 @@ pub fn hostBindings(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBi
         .{ "kotlinx.atomicfu.AtomicBoolean.getAndSet", atomicBoolGetAndSet },
         .{ "kotlinx.atomicfu.AtomicRef.compareAndSet", atomicRefCas },
         .{ "kotlinx.atomicfu.AtomicRef.getAndSet", atomicRefGetAndSet },
-        // `kotlinx.atomicfu.locks`: the lock classes are real locks backed
-        // by the same per-object reentrant monitor as `kotlin.synchronized`
-        // (keyed on the receiver's identity), so a lock held on one worker
-        // thread excludes every other worker.
         .{ "kotlinx.atomicfu.locks.ReentrantLock.lock", stdlib.implementations.concurrent_lock_enter },
         .{ "kotlinx.atomicfu.locks.ReentrantLock.tryLock", stdlib.implementations.concurrent_lock_try_enter },
         .{ "kotlinx.atomicfu.locks.ReentrantLock.unlock", stdlib.implementations.concurrent_lock_exit },
         .{ "kotlinx.atomicfu.locks.SynchronousMutex.lock", stdlib.implementations.concurrent_lock_enter },
         .{ "kotlinx.atomicfu.locks.SynchronousMutex.tryLock", stdlib.implementations.concurrent_lock_try_enter },
         .{ "kotlinx.atomicfu.locks.SynchronousMutex.unlock", stdlib.implementations.concurrent_lock_exit },
-        // The pack's top-level `synchronized(lock, block)` shares the
-        // bare name `synchronized` with the stdlib host binding, and a
-        // bare call in a program that loads this pack can resolve to the
-        // pack's lifted declaration instead of the default import. Bind
-        // the pack fqn to the same monitor so both routes hold real
-        // exclusion.
+        // The pack's top-level `synchronized(lock, block)` shares its bare name
+        // with the stdlib host binding, so the pack FQN binds the same monitor.
         .{ "kotlinx.atomicfu.locks.synchronized", stdlib.implementations.concurrent_synchronized },
     };
     for (bindings) |entry| {
@@ -88,9 +74,6 @@ pub fn hostBindings(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBi
     return b;
 }
 
-/// `Result<&InstanceRef, RuntimeError>` for the receiver lookup. On the
-/// error path it carries the `RuntimeError` data; on success the receiver
-/// handle.
 const ReceiverResult = union(enum) {
     inst: InstanceRef,
     err: RuntimeError,
@@ -106,13 +89,11 @@ fn receiverInstance(ctx: *const CallCtx) ReceiverResult {
     return .{ .err = .{ .Type = "kotlinx.atomicfu binding expected an instance receiver" } };
 }
 
-/// `Result<i64, RuntimeError>` for primitive field/argument reads.
 const IntResult = union(enum) {
     val: i64,
     err: RuntimeError,
 };
 
-/// `Result<bool, RuntimeError>` for boolean field/argument reads.
 const BoolResult = union(enum) {
     val: bool,
     err: RuntimeError,
@@ -141,22 +122,15 @@ fn argBool(ctx: *const CallCtx, idx: usize) std.mem.Allocator.Error!BoolResult {
     return .{ .err = .{ .Type = msg } };
 }
 
-// ---------- AtomicInt ----------
-
-/// Outcome of an int read-modify-write closure: the value to store back
-/// plus the call's result `Value`.
 const IntStep = struct { next: i64, out: Value };
 
-/// `Result<Value, RuntimeError>` for the read-modify-write helper.
 const StepResult = union(enum) {
     val: Value,
     err: RuntimeError,
 };
 
-/// Run `f` under a single exclusive borrow of the receiver instance so
-/// the read-modify-write is observed atomically. `f` receives the current
-/// `Int`/`Long` value and returns the new value plus the call's result
-/// `Value`.
+/// Run `f` under a single exclusive borrow of the receiver so the
+/// read-modify-write is observed atomically.
 fn withIntFieldMut(
     allocator: std.mem.Allocator,
     inst: InstanceRef,
@@ -367,11 +341,6 @@ fn atomicIntMinusAssign(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
 }
 
-// ---------- AtomicLong ----------
-
-/// `withIntFieldMut` for `AtomicLong`: run `f` under a single exclusive
-/// borrow of the receiver so the read-modify-write is observed
-/// atomically by concurrent workers, storing the result back as `Long`.
 fn withLongFieldMut(
     allocator: std.mem.Allocator,
     inst: InstanceRef,
@@ -582,8 +551,6 @@ fn atomicLongMinusAssign(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
 }
 
-// ---------- AtomicBoolean ----------
-
 fn atomicBoolCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const inst = switch (receiverInstance(ctx)) {
         .inst => |i| i,
@@ -597,8 +564,6 @@ fn atomicBoolCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         .val => |v| v,
         .err => |e| return .{ .err = e },
     };
-    // Compare and swap under one exclusive borrow so two racing workers
-    // cannot both observe the expected value and both report success.
     const g = inst.borrowMut();
     defer g.deinit();
     const guard = g.get();
@@ -633,8 +598,6 @@ fn atomicBoolGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .Bool = prev });
 }
 
-// ---------- AtomicRef<T> ----------
-
 fn atomicRefCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const inst = switch (receiverInstance(ctx)) {
         .inst => |i| i,
@@ -642,23 +605,15 @@ fn atomicRefCas(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     };
     const expected = if (ctx.args.len > 1) ctx.args[1] else Value.Null;
     const update = if (ctx.args.len > 2) ctx.args[2] else Value.Null;
-    // atomicfu `compareAndSet` is a CAS: it compares by *referential
-    // identity* for reference types (and by value for primitives /
-    // null), exactly like Kotlin `===`. The lock-free channel /
-    // coroutine algorithms swap on sentinel-object identity (e.g.
-    // `_closeCause.compareAndSet(NO_CLOSE_CAUSE, cause)`); structural
-    // equality mis-CASes distinct-but-equal objects and corrupts
-    // that state. The compare and the swap run under one exclusive
-    // borrow so the read cannot interleave with another worker's
-    // write (`LockFreeLinkedList` and the channel state machines rely
-    // on this for their helping protocols).
+    // atomicfu `compareAndSet` compares by referential identity for reference
+    // types and by value for primitives and null, exactly like Kotlin `===`: the
+    // lock-free channel algorithms swap on sentinel-object identity, which
+    // structural equality would mis-CAS.
     const g = inst.borrowMut();
     defer g.deinit();
     const guard = g.get();
     const cur = guard.get("value") orelse Value.Null;
     if (Value.referenceEq(&cur, &expected)) {
-        // The atomic owns its stored value; `define` releases the replaced
-        // `cur`, so retain `update` to keep the store balanced.
         if (runtime.reclaimEnabled()) update.retain();
         try guard.define(ctx.allocator, "value", update);
         return ok(.{ .Bool = true });
@@ -676,17 +631,12 @@ fn atomicRefGetAndSet(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     defer g.deinit();
     const guard = g.get();
     const prev = guard.get("value") orelse Value.Null;
-    // getAndSet returns the previous value: its ownership transfers to the
-    // caller, so overwrite without releasing it (a plain `set`, not `define`),
-    // and retain `next` since the atomic now owns it.
+    // getAndSet transfers the previous value's ownership to the caller, so
+    // overwrite with a plain `set` and retain `next` for the atomic.
     if (runtime.reclaimEnabled()) next.retain();
     _ = guard.set("value", next);
     return ok(prev);
 }
-
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const Env = runtime.Env;
 const ClassDef = runtime.ClassDef;
@@ -930,19 +880,16 @@ test "AtomicRef compareAndSet by identity and getAndSet" {
     const sentinel = try makeInstance(a, "Sentinel", .{ .Int = 1 });
     const other = try makeInstance(a, "Other", .{ .Int = 2 });
 
-    // CAS Null -> sentinel succeeds.
     var cas_args = [_]Value{ .{ .Instance = inst }, Value.Null, .{ .Instance = sentinel } };
     var cas_ctx = makeCtx(a, &cas_args, &h, &cap);
     const cas = try atomicRefCas(&cas_ctx);
     try testing.expect(cas.ok.Bool == true);
 
-    // CAS against a distinct instance fails (identity, not structural).
     var cas2_args = [_]Value{ .{ .Instance = inst }, .{ .Instance = other }, .{ .Instance = other } };
     var cas2_ctx = makeCtx(a, &cas2_args, &h, &cap);
     const cas2 = try atomicRefCas(&cas2_ctx);
     try testing.expect(cas2.ok.Bool == false);
 
-    // getAndSet returns prior (sentinel) and stores `other`.
     var gs_args = [_]Value{ .{ .Instance = inst }, .{ .Instance = other } };
     var gs_ctx = makeCtx(a, &gs_args, &h, &cap);
     const gs = try atomicRefGetAndSet(&gs_ctx);

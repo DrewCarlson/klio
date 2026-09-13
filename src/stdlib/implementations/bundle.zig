@@ -1,10 +1,8 @@
 //! `klio.bundle.*` intrinsics: the embedded-resource surface a bundled
 //! program reads through `klio.bundle.Resources`, plus
 //! `kotlin.system.exitProcess`.
-//!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`; the Kotlin side lives
-//! in the `klio.bundle` pack (`kotlin-klio/klio-bundle`), whose thin
-//! object methods delegate to these `__klio_bundle_*` functions.
+//! The Kotlin side lives in the `klio.bundle` pack, whose thin object methods
+//! delegate to these `__klio_bundle_*` functions.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -56,7 +54,6 @@ fn resourceBytes(ctx: *CallCtx, path: []const u8) Allocator.Error!union(enum) { 
     return .{ .bytes = bytes };
 }
 
-/// `klio.bundle.__klio_bundle_readBytes(path: String): ByteArray`
 pub fn bundle_read_bytes(ctx: *CallCtx) Allocator.Error!EvalResult {
     const path = pathArg(ctx) orelse return .{ .err = .{ .Arity = "readBytes expects a String path" } };
     const res = try resourceBytes(ctx, path);
@@ -70,7 +67,6 @@ pub fn bundle_read_bytes(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
 }
 
-/// `klio.bundle.__klio_bundle_readText(path: String): String`
 pub fn bundle_read_text(ctx: *CallCtx) Allocator.Error!EvalResult {
     const path = pathArg(ctx) orelse return .{ .err = .{ .Arity = "readText expects a String path" } };
     const res = try resourceBytes(ctx, path);
@@ -80,13 +76,11 @@ pub fn bundle_read_text(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
 }
 
-/// `klio.bundle.__klio_bundle_exists(path: String): Boolean`
 pub fn bundle_exists(ctx: *CallCtx) Allocator.Error!EvalResult {
     const path = pathArg(ctx) orelse return .{ .err = .{ .Arity = "exists expects a String path" } };
     return ok(.{ .Bool = bundle_resources.isActive() and bundle_resources.find(path) != null });
 }
 
-/// `klio.bundle.__klio_bundle_list(): List<String>`
 pub fn bundle_list(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     var items: std.ArrayList(Value) = .empty;
@@ -98,9 +92,8 @@ pub fn bundle_list(ctx: *CallCtx) Allocator.Error!EvalResult {
     return ok(try Value.newList(a, .{ .items = items_ref, .mutable = false, .enum_entries = false, .backing = null }));
 }
 
-/// `kotlin.system.exitProcess(status: Int): Nothing` — terminates the
-/// process immediately with `status`, like the JVM's `System.exit`.
-/// Program output is written unbuffered, so nothing is lost.
+/// Terminate the process immediately with `status`, like the JVM's
+/// `System.exit`. Program output is unbuffered, so nothing is lost.
 pub fn system_exit_process(ctx: *CallCtx) Allocator.Error!EvalResult {
     const status: u8 = if (ctx.args.len >= 1) switch (ctx.args[ctx.args.len - 1]) {
         .Int => |i| @truncate(@as(u32, @bitCast(i))),

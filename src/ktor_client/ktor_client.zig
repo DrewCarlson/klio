@@ -1,17 +1,10 @@
 //! Native HTTP engine for klio's ktor-client pack.
 //!
-//! The Kotlin shim declares `HttpClient`, `HttpRequestBuilder`,
-//! `HttpResponse`, and the common `HttpMethod` surface. The engine
-//! helpers `__kktor_request` / `__kktor_get` / `__kktor_post` are
-//! bound here against a small blocking HTTP/1.1 transport built on the
-//! platform sockets, keeping the dependency footprint modest and
-//! avoiding pulling a full async runtime into the interpreter: each
-//! request blocks the calling thread for its duration.
-//!
-//! Each request returns a flat `Array<String>` shaped like
-//! `[statusCode, body, contentType, headerKey, headerVal, ...]` so
-//! the shim can rebuild a `HttpResponse` without the native side
-//! having to construct Kotlin instances.
+//! The Kotlin shim declares the client surface; the engine helpers bind here
+//! against a blocking HTTP/1.1 transport over the platform sockets, so each
+//! request blocks the calling thread. A request returns a flat `Array<String>`
+//! shaped `[statusCode, body, contentType, headerKey, headerVal, ...]`, so the
+//! shim rebuilds a `HttpResponse` without constructing Kotlin instances here.
 
 const std = @import("std");
 
@@ -30,39 +23,23 @@ const Output = runtime.Output;
 const HostBindings = stdlib.HostBindings;
 
 const Allocator = std.mem.Allocator;
-// The HTTP transport is a small blocking client/server over libc sockets,
-// which the binary links on every target (zstd pulls in libc). `posix`
-// supplies the address/constant types; `c` the syscalls; errno comes back
-// through `posix.errno`.
 const c = std.c;
 const posix = std.posix;
 
-/// Build the FQN -> `StdlibFn` registry for the ktor-client pack. Each
-/// `"fqn" => function` pair is registered into a fresh `HostBindings`.
 pub fn hostBindings(allocator: Allocator) Allocator.Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("io.ktor.client.engine.__kktor_request", request);
     try b.register("io.ktor.client.engine.__kktor_get", get);
     try b.register("io.ktor.client.engine.__kktor_post", post);
     try b.register("io.ktor.client.engine.__kktor_setHeader", set_header);
-    // Server engine: bind a socket and dispatch each request back
-    // into the interpreter's routing lambda.
     try b.register("io.ktor.server.engine.__kktor_serve", serve);
-    // Platform clock for `io.ktor.util.date` (the posix actual reads it
-    // via cinterop; klio supplies the wall-clock epoch millis).
     try b.register("io.ktor.util.date.getTimeMillis", get_time_millis);
-    // `io.ktor.utils.io.locks.ReentrantLock`: real locks over the same
-    // per-object reentrant monitor as `kotlin.synchronized`, keyed on
-    // the receiver's identity. A `ByteChannel` can be written from a
-    // `Dispatchers.Default` worker while another coroutine reads, so
-    // the lock actual must hold real exclusion across threads.
+    // These lock classes take the same per-object reentrant monitor as
+    // `kotlin.synchronized`: a `ByteChannel` can be written from a worker while
+    // another coroutine reads, so the actual must exclude across threads.
     try b.register("io.ktor.utils.io.locks.ReentrantLock.lock", stdlib.implementations.concurrent_lock_enter);
     try b.register("io.ktor.utils.io.locks.ReentrantLock.tryLock", stdlib.implementations.concurrent_lock_try_enter);
     try b.register("io.ktor.utils.io.locks.ReentrantLock.unlock", stdlib.implementations.concurrent_lock_exit);
-    // The locks actual's top-level `synchronized(lock, block)` shares the
-    // bare name with the stdlib host binding; bind the pack fqn so a call
-    // that resolves to the pack's lifted declaration (instead of the
-    // default import) still holds the real monitor.
     try b.register("io.ktor.utils.io.locks.synchronized", stdlib.implementations.concurrent_synchronized);
     return b;
 }
@@ -72,13 +49,10 @@ fn get_time_millis(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .{ .Long = runtime.clockWallMillis() } };
 }
 
-/// `Result<T, RuntimeError>` returned by the argument decoders. OOM stays
-/// a Zig error; a `RuntimeError` surfaces as data.
 fn ArgResult(comptime T: type) type {
     return union(enum) { ok: T, err: RuntimeError };
 }
 
-/// Read the `idx`th argument as a `String`. Returns an owned copy.
 fn arg_string(allocator: Allocator, ctx: *const CallCtx, idx: usize) Allocator.Error!ArgResult([]const u8) {
     if (idx < ctx.args.len) {
         switch (ctx.args[idx]) {
@@ -94,8 +68,6 @@ fn arg_string(allocator: Allocator, ctx: *const CallCtx, idx: usize) Allocator.E
     return .{ .err = .{ .Type = msg } };
 }
 
-/// Read the `idx`th argument as an `Array<String>`. Non-string items
-/// become empty strings. Returns owned copies.
 fn arg_string_array(allocator: Allocator, ctx: *const CallCtx, idx: usize) Allocator.Error!ArgResult([][]const u8) {
     if (idx < ctx.args.len) {
         switch (ctx.args[idx]) {
@@ -122,7 +94,6 @@ fn arg_string_array(allocator: Allocator, ctx: *const CallCtx, idx: usize) Alloc
     return .{ .err = .{ .Type = msg } };
 }
 
-/// Wrap an owned slice of owned strings in a `Value::Array { prim: None }`.
 fn make_string_array(allocator: Allocator, values: [][]const u8) Allocator.Error!Value {
     var list: std.ArrayList(Value) = .empty;
     errdefer list.deinit(allocator);
@@ -134,23 +105,17 @@ fn make_string_array(allocator: Allocator, values: [][]const u8) Allocator.Error
     return runtime.ArrayData.fromBoxedList(items);
 }
 
-/// Free an owned slice of owned strings produced by `perform`. The strings
-/// are copied into fresh `StringRef` cells by `make_string_array`, which dupes
-/// the bytes whenever a freeing allocator is active (reclaim or GC), so the
-/// originals are independent and must be released. Gated on `freeScratch`; only
-/// the legacy arena fast path reclaims them wholesale.
+/// Free an owned slice of owned strings produced by `perform`: under a freeing
+/// allocator `makeStringArray` copied the bytes into fresh cells, so the
+/// originals are independent. The arena fast path reclaims them wholesale.
 fn freeOwnedStrings(allocator: Allocator, values: [][]const u8) void {
     if (!runtime.freeScratch()) return;
     for (values) |s| allocator.free(s);
     allocator.free(values);
 }
 
-/// One header key/value pair captured off a response.
 const HeaderPair = struct { key: []const u8, value: []const u8 };
 
-/// Carry out a single blocking HTTP/1.1 request and flatten the response
-/// into `[statusCode, body, contentType, headerKey, headerVal, ...]`. All
-/// strings are owned by `allocator`.
 fn perform(
     allocator: Allocator,
     method: []const u8,
@@ -158,9 +123,8 @@ fn perform(
     body: []const u8,
     headers: []const []const u8,
 ) Allocator.Error![][]const u8 {
-    // Extract per-request config from reserved header keys before
-    // they hit the agent. `__klio_cfg_*` keys are stripped; the
-    // remainder are forwarded verbatim.
+    // The reserved `__klio_cfg_*` header keys carry per-request config and are
+    // stripped; the rest are forwarded verbatim.
     var timeout_ms: u64 = 60_000;
     var tls_insecure: bool = false;
     var connect_timeout_ms: ?u64 = null;
@@ -184,8 +148,8 @@ fn perform(
         }
     }
     if (tls_insecure) {
-        // A permissive TLS verifier is not wired into this transport.
-        // Surface the request explicitly so users know it was honored.
+        // This transport wires in no permissive TLS verifier, so the request is
+        // surfaced rather than silently ignored.
         stderrPrint("warning: __klio_cfg_tls_insecure requested; insecure mode is a no-op until a custom verifier is wired\n");
     }
 
@@ -199,7 +163,6 @@ fn perform(
     }) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            // Transport-level failure: `["0", "transport error: ...", ""]`.
             var out = try allocator.alloc([]const u8, 3);
             out[0] = try allocator.dupe(u8, "0");
             out[1] = try std.fmt.allocPrint(allocator, "transport error: {s}", .{@errorName(e)});
@@ -210,7 +173,6 @@ fn perform(
     return result;
 }
 
-/// Inputs for a single transport request.
 const RequestInputs = struct {
     method: []const u8,
     url: []const u8,
@@ -232,8 +194,6 @@ const TransportError = error{
     BadResponse,
 };
 
-/// Drive the request over a TCP socket and flatten the response. The
-/// returned slice and every string it holds are owned by `allocator`.
 fn httpRequest(allocator: Allocator, in: RequestInputs) TransportError![][]const u8 {
     const target = try parseUrl(in.url);
     if (!std.ascii.eqlIgnoreCase(target.scheme, "http")) return error.UnsupportedScheme;
@@ -244,8 +204,6 @@ fn httpRequest(allocator: Allocator, in: RequestInputs) TransportError![][]const
     defer _ = c.close(fd);
     applyTimeout(fd, in.timeout_ms);
 
-    // `GET`/`HEAD`/`DELETE` and any empty-body method skip sending a
-    // request body.
     const send_body = !(std.mem.eql(u8, in.method, "GET") or
         std.mem.eql(u8, in.method, "HEAD") or
         std.mem.eql(u8, in.method, "DELETE") or
@@ -289,8 +247,6 @@ fn httpRequest(allocator: Allocator, in: RequestInputs) TransportError![][]const
     return flattenResponse(allocator, raw.items);
 }
 
-/// Parse `[status, body, contentType, k, v, ...]` out of a raw HTTP/1.1
-/// response. Strings are owned by `allocator`.
 fn flattenResponse(allocator: Allocator, raw: []const u8) TransportError![][]const u8 {
     const sep = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadResponse;
     const head = raw[0..sep];
@@ -325,7 +281,6 @@ fn flattenResponse(allocator: Allocator, raw: []const u8) TransportError![][]con
     return out.toOwnedSlice(allocator);
 }
 
-/// Pull the numeric status code out of `HTTP/1.1 200 OK`.
 fn parseStatusLine(line: []const u8) ?i64 {
     var it = std.mem.tokenizeScalar(u8, line, ' ');
     _ = it.next() orelse return null; // HTTP version
@@ -340,8 +295,8 @@ const ParsedUrl = struct {
     path: []const u8,
 };
 
-/// Split `scheme://host[:port][/path]` into its parts. The path defaults
-/// to `/` and the port to the scheme default (80 for http, 443 for https).
+/// Split `scheme://host[:port][/path]`; the path defaults to `/` and the port to
+/// the scheme default.
 fn parseUrl(url: []const u8) TransportError!ParsedUrl {
     const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
     const scheme = url[0..scheme_end];
@@ -360,8 +315,6 @@ fn parseUrl(url: []const u8) TransportError!ParsedUrl {
     return .{ .scheme = scheme, .host = host, .port = port, .path = path };
 }
 
-/// Resolve a host to an IPv4 `sockaddr.in`. Numeric dotted-quads are
-/// parsed directly; hostnames are looked up over UDP DNS.
 fn resolveIp4(host: []const u8, port: u16) TransportError!posix.sockaddr.in {
     if (parseIp4Literal(host)) |octets| {
         return makeSockaddrIn(octets, port);
@@ -371,8 +324,8 @@ fn resolveIp4(host: []const u8, port: u16) TransportError!posix.sockaddr.in {
 }
 
 fn makeSockaddrIn(octets: [4]u8, port: u16) posix.sockaddr.in {
-    // `addr` holds the four octets in network order in memory; a bit-cast
-    // preserves that layout regardless of host endianness.
+    // `addr` holds the four octets in network order, and a bit-cast preserves
+    // that layout regardless of host endianness.
     return .{
         .family = posix.AF.INET,
         .port = std.mem.nativeToBig(u16, port),
@@ -380,7 +333,6 @@ fn makeSockaddrIn(octets: [4]u8, port: u16) posix.sockaddr.in {
     };
 }
 
-/// Parse a dotted-quad literal into four octets, or `null` if not numeric.
 fn parseIp4Literal(host: []const u8) ?[4]u8 {
     var octets: [4]u8 = undefined;
     var it = std.mem.splitScalar(u8, host, '.');
@@ -393,9 +345,8 @@ fn parseIp4Literal(host: []const u8) ?[4]u8 {
     return octets;
 }
 
-/// Minimal UDP DNS A-record query against the first nameserver in
-/// `/etc/resolv.conf` (falling back to `127.0.0.53`, systemd-resolved's
-/// stub). Returns the first A record's four octets.
+/// UDP DNS A-record query against the first nameserver in `/etc/resolv.conf`,
+/// falling back to systemd-resolved's stub at `127.0.0.53`.
 fn resolveDns(host: []const u8) ![4]u8 {
     const server = readResolvConf() orelse [4]u8{ 127, 0, 0, 53 };
 
@@ -424,7 +375,6 @@ fn resolveDns(host: []const u8) ![4]u8 {
     return parseDnsAnswer(resp[0..@intCast(got)]) orelse error.ResolveFailed;
 }
 
-/// Read the first `nameserver` line from `/etc/resolv.conf`.
 fn readResolvConf() ?[4]u8 {
     const fd = c.open("/etc/resolv.conf", .{ .ACCMODE = .RDONLY });
     if (fd < 0) return null;
@@ -445,11 +395,8 @@ fn readResolvConf() ?[4]u8 {
     return null;
 }
 
-/// Encode a standard A-record DNS query for `host` into `buf`, returning
-/// its length.
 fn buildDnsQuery(buf: []u8, host: []const u8) ?usize {
     if (buf.len < 12) return null;
-    // Header: id=0x4b4b, RD flag set, 1 question.
     buf[0] = 0x4b;
     buf[1] = 0x4b;
     buf[2] = 0x01; // RD
@@ -483,13 +430,11 @@ fn buildDnsQuery(buf: []u8, host: []const u8) ?usize {
     return pos;
 }
 
-/// Walk a DNS response and return the first A record's four octets.
 fn parseDnsAnswer(resp: []const u8) ?[4]u8 {
     if (resp.len < 12) return null;
     const qd = std.mem.readInt(u16, resp[4..6], .big);
     const an = std.mem.readInt(u16, resp[6..8], .big);
     var pos: usize = 12;
-    // Skip the question section.
     var q: usize = 0;
     while (q < qd) : (q += 1) {
         pos = skipName(resp, pos) orelse return null;
@@ -512,8 +457,6 @@ fn parseDnsAnswer(resp: []const u8) ?[4]u8 {
     return null;
 }
 
-/// Advance past a (possibly compressed) DNS name, returning the position
-/// just after it.
 fn skipName(resp: []const u8, start: usize) ?usize {
     var pos = start;
     while (pos < resp.len) {
@@ -525,8 +468,6 @@ fn skipName(resp: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// Connect a fresh TCP socket to `addr`, honoring `timeout_ms` for the
-/// connect itself.
 fn connectTimeout(addr: posix.sockaddr.in, timeout_ms: u64) TransportError!i32 {
     const fd = c.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
@@ -537,7 +478,6 @@ fn connectTimeout(addr: posix.sockaddr.in, timeout_ms: u64) TransportError!i32 {
     return fd;
 }
 
-/// Apply a send/receive timeout to a socket (best-effort).
 fn applyTimeout(fd: i32, timeout_ms: u64) void {
     const tv = posix.timeval{
         .sec = @intCast(timeout_ms / 1000),
@@ -592,9 +532,6 @@ fn request(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |s| s,
         .err => |e| return .{ .err = e },
     };
-    // Permanent, env-gated HTTP trace (`KLIO_TRACE_HTTP=1`): logs each
-    // outbound request to stderr. Useful for confirming whether a client
-    // call actually reached the engine's transport layer.
     if (envIsSet(a, "KLIO_TRACE_HTTP")) {
         var buf: [1024]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "[HTTP] {s} {s}\n", .{ method, url }) catch "[HTTP]\n";
@@ -631,15 +568,11 @@ fn post(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try make_string_array(a, out) };
 }
 
-// Signature is fixed by the `host_bindings!` registration table.
 fn set_header(ctx: *CallCtx) Allocator.Error!EvalResult {
     _ = ctx;
     return .{ .ok = .Unit };
 }
 
-// ----- Server engine -----
-
-/// One parsed inbound HTTP/1.1 request.
 const HeaderPairOwned = struct { key: []const u8, value: []const u8 };
 
 const ParsedRequest = struct {
@@ -649,14 +582,11 @@ const ParsedRequest = struct {
     headers: []HeaderPairOwned,
 };
 
-/// Read one HTTP/1.1 request off `fd`: returns `(method, path, body, headers)`.
-/// Every request header is collected (and `Content-Length` also drives the
-/// body read). Returns `null` on a closed / malformed stream. All strings
-/// are owned by `allocator`.
+/// Read one HTTP/1.1 request off `fd` as `(method, path, body, headers)`, with
+/// `Content-Length` driving the body read. Null on a closed or malformed stream.
 fn read_request(allocator: Allocator, fd: i32) Allocator.Error!?ParsedRequest {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
-    // Read until we see the header terminator.
     var chunk: [1024]u8 = undefined;
     var header_end: ?usize = null;
     while (header_end == null) {
@@ -720,7 +650,6 @@ fn read_request(allocator: Allocator, fd: i32) Allocator.Error!?ParsedRequest {
     return .{ .method = method, .path = path, .body = body, .headers = header_slice };
 }
 
-/// Case-insensitive `strip_prefix`.
 fn asciiStripPrefixIgnoreCase(s: []const u8, prefix: []const u8) ?[]const u8 {
     if (s.len < prefix.len) return null;
     if (!std.ascii.eqlIgnoreCase(s[0..prefix.len], prefix)) return null;
@@ -736,7 +665,6 @@ fn reason_phrase(status: i64) []const u8 {
         403 => "Forbidden",
         404 => "Not Found",
         500 => "Internal Server Error",
-        // 200 and any unmapped code use the generic OK phrase.
         else => "OK",
     };
 }
@@ -752,8 +680,6 @@ fn write_response(
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     try out.print(allocator, "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n", .{ status, reason_phrase(status), content_type, body.len });
-    // Handler-supplied response headers. Content-Type / Content-Length /
-    // Connection are emitted above, so skip any duplicates the handler set.
     for (headers) |h| {
         if (std.ascii.eqlIgnoreCase(h.key, "content-type") or
             std.ascii.eqlIgnoreCase(h.key, "content-length") or
@@ -765,17 +691,14 @@ fn write_response(
     writeAll(fd, out.items) catch {};
 }
 
-/// `__kktor_serve(port, dispatch)`: bind `127.0.0.1:port` and serve
-/// forever. Each request is handed to `dispatch` — a Kotlin lambda
-/// `(Array<String>) -> Array<String>` taking `[method, path, body, …headers]`
-/// and returning `[status, contentType, body, …headers]` — run on this
-/// thread. Connections are accepted and handled sequentially on the serving
-/// thread (the dispatch lambda runs on the Vm that owns it).
+/// Bind `127.0.0.1:port` and serve forever, handing each request to `dispatch`,
+/// a Kotlin `(Array<String>) -> Array<String>` over
+/// `[method, path, body, …headers]` returning `[status, contentType, body,
+/// …headers]`, sequentially on the serving thread.
 ///
-/// The accept is polled with a timeout so a daemon serve started by
-/// `start(wait = false)` (dispatched onto the coroutine worker pool) can
-/// notice the run-boundary abandon request between connections and return;
-/// on the main thread `shouldAbandon` stays false, so it serves forever.
+/// The accept is polled with a timeout so a daemon serve dispatched onto the
+/// coroutine worker pool notices the run-boundary abandon request between
+/// connections; on the main thread `shouldAbandon` stays false.
 fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     const a = ctx.allocator;
     const port: u16 = blk: {
@@ -799,8 +722,6 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     defer _ = c.close(listen_fd);
 
-    // Diagnostic: serve a bounded number of requests then return cleanly, so a
-    // leak-checking allocator (KLIO_GC_ALLOC=gpa) reaches its end-of-run report.
     const serve_max: usize = blk: {
         const v = runtime.envOnce("KLIO_SERVE_MAX") orelse break :blk 0;
         break :blk std.fmt.parseInt(usize, v, 10) catch 0;
@@ -811,11 +732,9 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
         if (runtime.shouldAbandon()) break;
         if (serve_max != 0 and served >= serve_max) break;
         var pfd = [_]posix.pollfd{.{ .fd = listen_fd, .events = posix.POLL.IN, .revents = 0 }};
-        // The accept wait holds no unrooted live Value, so bracket it as a GC
-        // blocking-safe region: a collection triggered by a concurrent
-        // dispatcher worker (e.g. the application's `launch { … }` running on
-        // `Dispatchers.Default`) can complete its stop-the-world rendezvous
-        // while this thread parks here instead of stalling on it.
+        // The accept wait holds no unrooted live Value, so it is bracketed as a
+        // GC blocking-safe region and a concurrent worker's collection can
+        // complete its rendezvous while this thread parks.
         runtime.gc.enterBlockingSafe();
         const ready = c.poll(&pfd, 1, 200);
         runtime.gc.exitBlockingSafe();
@@ -824,10 +743,8 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
         if (conn < 0) continue;
         defer _ = c.close(conn);
         const parsed = (try read_request(a, conn)) orelse continue;
-        // The parsed strings are owned by `a`; their bytes are copied into the
-        // request array's `StringRef` cells below, so the originals are dead
-        // once the array is built. Free them under a freeing allocator (the
-        // collector never owns these raw host buffers).
+        // The parsed strings are owned by `a` and their bytes are copied into the
+        // request array's cells, so free the originals under a freeing allocator.
         defer if (runtime.freeScratch()) {
             a.free(parsed.method);
             a.free(parsed.path);
@@ -838,8 +755,6 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
             }
             a.free(parsed.headers);
         };
-        // Request array: [method, path, body, hk1, hv1, hk2, hv2, ...] — the
-        // shim reads the fixed head and the trailing header key/value pairs.
         var items: std.ArrayList(Value) = .empty;
         try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, parsed.method)) });
         try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, parsed.path)) });
@@ -849,8 +764,7 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
             try items.append(a, .{ .String = try runtime.strInitOwned(a, try a.dupe(u8, h.value)) });
         }
         const req = runtime.ArrayData.fromBoxedList(try ValueList.init(a, items));
-        // serve owns `req`; invokeCallable BORROWS its args, so release it per
-        // iteration. No-op under the arena fast path.
+        // serve owns `req` and `invokeCallable` only borrows it.
         defer if (runtime.reclaimEnabled()) req.release(a);
         const resp = try ctx.host.invokeCallable(&dispatch, &.{req}, ctx.out);
         switch (resp) {
@@ -858,8 +772,6 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
             .ok => |rv| {
                 const decoded = try decode_response(a, &rv);
                 try write_response(a, conn, decoded.status, decoded.content_type, decoded.body, decoded.headers);
-                // The decoded strings are owned by `a` and only needed to build
-                // the on-wire response; free them once written.
                 if (runtime.freeScratch()) {
                     a.free(decoded.content_type);
                     a.free(decoded.body);
@@ -869,7 +781,6 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
                     }
                     a.free(decoded.headers);
                 }
-                // `rv` is an owned host result; release it once decoded+written.
                 if (runtime.reclaimEnabled()) rv.release(a);
             },
         }
@@ -878,7 +789,6 @@ fn serve(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .Unit };
 }
 
-/// Bind and listen on `127.0.0.1:port`, returning the listening fd.
 fn bindListener(port: u16) !i32 {
     const fd = c.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     if (fd < 0) return error.SocketFailed;
@@ -891,7 +801,6 @@ fn bindListener(port: u16) !i32 {
     return fd;
 }
 
-/// Decoded `[status, contentType, body, hk1, hv1, ...]` response.
 const DecodedResponse = struct {
     status: i64,
     content_type: []const u8,
@@ -899,9 +808,6 @@ const DecodedResponse = struct {
     headers: []HeaderPairOwned,
 };
 
-/// Pull `[status, contentType, body, hk1, hv1, ...]` out of the dispatch
-/// lambda's returned `Array<String>`, with lenient fallbacks. The trailing
-/// key/value pairs are response headers. Strings are owned by `allocator`.
 fn decode_response(allocator: Allocator, v: *const Value) Allocator.Error!DecodedResponse {
     const items_ref: ?ValueList = switch (v.*) {
         .Array => |a| a.boxedList(),
@@ -945,8 +851,6 @@ fn decode_response(allocator: Allocator, v: *const Value) Allocator.Error!Decode
     };
 }
 
-/// The `i`th item rendered as an owned string, or `""` when it is missing
-/// or not a `String`.
 fn strAt(allocator: Allocator, slice: []const Value, i: usize) Allocator.Error![]const u8 {
     if (i < slice.len) {
         switch (slice[i]) {
@@ -961,11 +865,8 @@ fn strAt(allocator: Allocator, slice: []const Value, i: usize) Allocator.Error![
     return allocator.dupe(u8, "");
 }
 
-// Bring `PrimitiveArrayKind` into the import group for forward-compat
-// when the binding starts returning typed arrays.
 fn _kind_in_scope(_: PrimitiveArrayKind) void {}
 
-/// Write `s` to stderr (best-effort).
 fn stderrPrint(s: []const u8) void {
     var off: usize = 0;
     while (off < s.len) {
@@ -976,15 +877,9 @@ fn stderrPrint(s: []const u8) void {
     }
 }
 
-/// `std::env::var(name).is_ok()` — true when the env var is present.
-/// Reads the process environment portably (see `runtime.procEnvIsSet`).
 fn envIsSet(allocator: Allocator, name: []const u8) bool {
     return runtime.procEnvIsSet(allocator, name);
 }
-
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -1192,7 +1087,6 @@ test "flattenResponse extracts status body content-type and headers" {
     try testing.expectEqualStrings("200", out[0]);
     try testing.expectEqualStrings("{\"ok\":true}", out[1]);
     try testing.expectEqualStrings("application/json", out[2]);
-    // Header pairs follow the fixed prefix.
     try testing.expectEqualStrings("Content-Type", out[3]);
     try testing.expectEqualStrings("application/json", out[4]);
     try testing.expectEqualStrings("X-Test", out[5]);
@@ -1202,12 +1096,9 @@ test "flattenResponse extracts status body content-type and headers" {
 test "buildDnsQuery and parseDnsAnswer round-trip an A record" {
     var q: [512]u8 = undefined;
     const n = buildDnsQuery(&q, "example.com").?;
-    // Header is 12 bytes; question has the encoded name + 4 trailing bytes.
     try testing.expect(n > 12);
-    // 7 'example' 3 'com' 0 + qtype/qclass.
     try testing.expectEqual(@as(u8, 7), q[12]);
 
-    // Build a fake response: echo the question, then one A answer.
     var resp: [512]u8 = undefined;
     @memcpy(resp[0..n], q[0..n]);
     resp[2] = 0x81; // QR + RD

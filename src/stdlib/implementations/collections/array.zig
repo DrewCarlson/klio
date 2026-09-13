@@ -1,5 +1,5 @@
-//! `Array` intrinsics: slicing, content equality/toString/hashCode,
-//! deep variants, copying, filling, sorting and reductions.
+//! `Array` intrinsics: slicing, content equality and rendering, copying,
+//! filling, sorting and reductions.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -38,10 +38,6 @@ const sortListHostAware = list_transforms_mod.sortListHostAware;
 const sortListHostAwareDesc = list_transforms_mod.sortListHostAwareDesc;
 const sumValues = list_transforms_mod.sumValues;
 
-// =====================================================================
-// Array ops
-// =====================================================================
-
 fn arrayPrimDefault(prim: ?PrimitiveArrayKind) Value {
     return switch (prim orelse return Value.Null) {
         .Int => .{ .Int = 0 },
@@ -70,14 +66,11 @@ const IdxOutcome = union(enum) { idx: i64, err: EvalResult };
 
 fn arrayOptIndex(a: Allocator, ctx: *CallCtx, idx: usize, default: i64, what: []const u8) Error!IdxOutcome {
     if (idx >= ctx.args.len) return .{ .idx = default };
-    // A named-arg reorder pads omitted middle defaults with Null.
     if (ctx.args[idx] == .Null) return .{ .idx = default };
     if (ctx.args[idx].asI64()) |v| return .{ .idx = v };
     return .{ .err = typeErr(try fmt(a, "{s}: index argument must be an Int", .{what})) };
 }
 
-/// Every caller passes a freshly-`fmt`'d (owned) message; free it after
-/// `thrown` has duped it into the StringRef under the reclaim path.
 fn indexOob(a: Allocator, msg: []const u8) Error!EvalResult {
     const e = try thrown(a, "kotlin.IndexOutOfBoundsException", msg);
     if (runtime.freeScratch()) a.free(msg);
@@ -104,15 +97,14 @@ pub fn array_slice_impl(ctx: *CallCtx) Error!EvalResult {
         const rs = ctx.args[1].Range.start;
         const re = ctx.args[1].Range.end;
         const slen: i64 = @intCast(src.len);
-        // An empty range yields an empty array; otherwise the range must be in
-        // bounds (Kotlin's sliceArray throws for a negative/over-length range).
+        // An empty range yields an empty array; otherwise Kotlin's `sliceArray`
+        // throws for an out-of-bounds range.
         if (rs > re) return ok(try makeArray(a, &.{}, prim));
         if (rs < 0 or re >= slen) {
             return indexOob(a, try fmt(a, "sliceArray: range {d}..{d} out of bounds for length {d}", .{ rs, re, src.len }));
         }
         return ok(try makeArray(a, src[@intCast(rs)..@intCast(re + 1)], prim));
     }
-    // `sliceArray(indices: Collection<Int>)`: gather `this[indices[k]]`.
     const idxs = switch (try iterableItemsCtx(ctx, ctx.args[1], "sliceArray")) {
         .items => |x| x,
         .err => |e| return e,
@@ -174,8 +166,6 @@ pub fn array_content_to_string(ctx: *CallCtx) Error!EvalResult {
     try out.append(a, '[');
     for (items, 0..) |v, i| {
         if (i > 0) try out.appendSlice(a, ", ");
-        // Each element renders through its own `toString()`, so a user
-        // override fires instead of the structural `ClassName@id`.
         if (v == .Instance) {
             if (try ctx.host.invokeMethod(&v, "toString", &.{}, ctx.out)) |m| {
                 if (m == .ok and m.ok == .String) {
@@ -201,8 +191,6 @@ fn longHash(bits: i64) i32 {
     return @bitCast(@as(u32, @truncate(@as(u64, @bitCast(bits ^ @as(i64, @bitCast(u >> 32)))))));
 }
 
-/// `kotlinValueHash` with member dispatch: a user instance's own
-/// hashCode() override participates, as on the JVM.
 fn valueHashDispatch(ctx: *CallCtx, v: Value) i32 {
     switch (v) {
         .Instance, .Exception => {
@@ -218,10 +206,9 @@ fn valueHashDispatch(ctx: *CallCtx, v: Value) i32 {
 }
 
 fn kotlinValueHash(v: Value) i32 {
-    // The scalar/String cases live in `Value.kotlinScalarHash` (shared
-    // with the host persistent-collection fast paths so bucket placement
-    // can never diverge); every other shape hashes 0 here exactly as the
-    // pre-refactor switch did.
+    // Scalars and Strings hash in `Value.kotlinScalarHash`, shared with the host
+    // persistent-collection fast paths so bucket placement cannot diverge; every
+    // other shape hashes 0.
     return Value.kotlinScalarHash(&v) orelse 0;
 }
 
@@ -255,8 +242,7 @@ fn deepToString(a: Allocator, v: Value) Error![]u8 {
 }
 
 /// `contentDeepToString`, tracking the array-backing identities on the current
-/// path so a reference cycle (`b[0] = a; a[0] = b`) renders as `[...]` instead
-/// of recursing forever.
+/// path so a reference cycle renders as `[...]` instead of recursing forever.
 fn deepToStringRec(a: Allocator, v: Value, path: *std.ArrayList(usize)) Error![]u8 {
     switch (v) {
         .Array => |arr| {
@@ -465,8 +451,6 @@ pub fn array_copy_into(ctx: *CallCtx) Error!EvalResult {
         return indexOob(a, try fmt(a, "copyInto: destination range [{d}, {d}) out of bounds for length {d}", .{ dest_offset, dest_offset + count, dest_len }));
     }
     const sub = try src_arr.snapshotRange(a, @intCast(start), @intCast(end));
-    // The snapshot bridges src->dest; free the spine on exit (`set` retains into
-    // the destination under a reclaiming backend).
     defer if (runtime.freeScratch()) a.free(sub);
     const base: usize = @intCast(dest_offset);
     for (sub, 0..) |v, i| dest_arr.set(a, base + i, v);
@@ -553,10 +537,9 @@ pub fn array_fill(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 
-/// `UIntArray.asIntArray()` (and the U{Byte,Short,Long} siblings): a signed
-/// VIEW sharing the unsigned array's packed buffer, so mutations through either
-/// alias — the mirror of `IntArray.asUIntArray()` (the unsigned ctor). klio
-/// otherwise falls to the stdlib body, which copies.
+/// `UIntArray.asIntArray()` and its siblings: a signed view sharing the
+/// unsigned array's packed buffer, so mutations through either alias. The
+/// stdlib body would copy instead.
 pub fn array_as_signed_view(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("asArray requires an array receiver");
     const arr = ctx.args[0].Array;
@@ -574,9 +557,9 @@ pub fn array_as_signed_view(ctx: *CallCtx) Error!EvalResult {
     }
 }
 
-/// In-place `reverse()` / `reverse(fromIndex, toIndex)` for an array. The
-/// unsigned `reverse()` stdlib body delegates to `storage.reverse()`, which
-/// does not reach the array's elements here, so the unsigned arrays bind this.
+/// In-place `reverse()`. The unsigned stdlib body delegates to
+/// `storage.reverse()`, which does not reach the elements, so unsigned arrays
+/// bind this.
 pub fn array_reverse(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("reverse requires an array receiver");
@@ -654,10 +637,6 @@ pub fn array_sort_with(ctx: *CallCtx) Error!EvalResult {
     const buf = try arr.snapshot(a);
     defer if (runtime.freeScratch()) a.free(buf);
     const sub = buf[@intCast(from)..@intCast(to)];
-    // An empty-step natural/reversed Comparator (`naturalOrder()`,
-    // `reverseOrder()` — the body of `sortDescending`) sorts by the
-    // elements' own order, host-aware so user `Comparable.compareTo`
-    // dispatches; its `compare` surface cannot see the host.
     if (comparator == .Comparator) {
         const empty = blk: {
             const steps_g = comparator.Comparator.steps.borrow();
@@ -703,9 +682,8 @@ pub fn array_sum_int(ctx: *CallCtx) Error!EvalResult {
     return arraySumImpl(ctx, "Array.sum");
 }
 
-/// `U{Byte,Short,Int}Array.sum(): UInt` and `ULongArray.sum(): ULong`. The
-/// generic sum widens unsigned elements but returns `Int`/`Long`; Kotlin's
-/// unsigned sum widens to `UInt` (or `ULong` for a ULongArray).
+/// Unsigned array sums widen to `UInt`, or `ULong` for a ULongArray, where the
+/// generic sum would return `Int` or `Long`.
 pub fn array_sum_unsigned(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Array) return typeErr("sum requires an array receiver");
@@ -773,10 +751,8 @@ fn arrayMaxMinCore(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u
         if (runtime.freeScratch()) a.free(msg);
         return e;
     }
-    // Floating-point arrays follow `Math.min`/`Math.max` semantics: NaN
-    // propagates (any NaN element makes the result NaN) and signed zero is
-    // ordered `-0.0 < 0.0`. The natural `compareValues` order expresses
-    // neither, so fold the raw f64s directly.
+    // Floating-point arrays follow `Math.min`/`Math.max`: NaN propagates and
+    // `-0.0 < 0.0`. The natural order expresses neither, so fold raw f64s.
     if (items[0] == .Double or items[0] == .Float) {
         const is_float = items[0] == .Float;
         var acc: f64 = floatVal(items[0]) orelse return floatFallback(a, items, want_max);
@@ -809,8 +785,6 @@ pub fn kotlinFloatMax(x: f64, y: f64) f64 {
     return @max(x, y);
 }
 
-/// Natural-order min/max fold (non-float arrays, or a float array that turned
-/// out to hold a non-float `Comparable` element).
 pub fn floatFallback(a: Allocator, items: []const Value, want_max: bool) Error!EvalResult {
     var best = items[0];
     for (items[1..]) |v| {
@@ -831,13 +805,9 @@ pub fn array_min(ctx: *CallCtx) Error!EvalResult {
     return arrayMaxMinImpl(ctx, false, "Array.min");
 }
 
-/// `minWith`/`maxWith`(`OrNull`) over any iterable: fold by the Comparator
-/// argument (args[1]) rather than natural order.
 fn minMaxWithImpl(ctx: *CallCtx, want_max: bool, or_null: bool, what: []const u8) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len < 2) return arityErr(try fmt(a, "{s} expects (comparator)", .{what}));
-    // `iterableItemsCtx` drains a `.Sequence` receiver via the host (the plain
-    // `iterableItems` only snapshots eager collections).
     const items = switch (try iterableItemsCtx(ctx, ctx.args[0], what)) {
         .items => |x| x,
         .err => |e| return e,

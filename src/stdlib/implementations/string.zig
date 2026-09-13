@@ -1,9 +1,8 @@
 //! String stdlib intrinsics.
 //!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. For member access the
-//! receiver is `args[0]`, with any further user arguments following. A
-//! `RuntimeError` surfaces as data via `EvalResult`; OOM surfaces as a Zig
-//! error. Heap that an intrinsic produces is allocated with `ctx.allocator`.
+//! Each intrinsic is a `fn(*CallCtx) !EvalResult`; for a member the receiver is
+//! `args[0]`. A `RuntimeError` surfaces as data via `EvalResult`, OOM as a Zig
+//! error, and produced heap is allocated with `ctx.allocator`.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -29,10 +28,6 @@ const coalesceSurrogates = runtime.coalesceSurrogates;
 
 const Allocator = std.mem.Allocator;
 
-// ============================================================
-// Small data-construction helpers.
-// ============================================================
-
 fn errType(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
@@ -41,8 +36,6 @@ fn errArity(msg: []const u8) EvalResult {
     return .{ .err = .{ .Arity = msg } };
 }
 
-/// Build a thrown Kotlin Throwable value. `message` is owned by the
-/// allocator (or null). Mirrors `exceptions::make_exception`.
 fn makeException(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator.Error!Value {
     const fqn_ref = try runtime.strInitOwned(allocator, try allocator.dupe(u8, fqn));
     const msg_ref: ?StringRef = if (message) |m| try runtime.strInit(allocator, m) else null;
@@ -53,26 +46,18 @@ fn thrown(allocator: Allocator, fqn: []const u8, message: ?[]const u8) Allocator
     return .{ .err = .{ .Thrown = try makeException(allocator, fqn, message) } };
 }
 
-/// Like `thrown`, but for an OWNED `message` buffer. `makeException` dupes the
-/// message under the reclaim path, so the caller's buffer must be freed there
-/// to avoid leaking it (the arena fast path reclaims it wholesale).
 fn thrownOwned(allocator: Allocator, fqn: []const u8, message: []const u8) Allocator.Error!EvalResult {
     const res = try thrown(allocator, fqn, message);
     if (runtime.freeScratch()) allocator.free(message);
     return res;
 }
 
-/// Build a `List` / `MutableList` from an owned slice of values. Mirrors
-/// `collections::make_list`.
 fn makeList(allocator: Allocator, items: []Value, mutable: bool) Allocator.Error!Value {
     const list = std.ArrayList(Value).fromOwnedSlice(items);
     const items_ref = try ValueList.init(allocator, list);
     return try Value.newList(allocator, .{ .items = items_ref, .mutable = mutable, .enum_entries = false, .backing = null });
 }
 
-/// Build an items-only `Sequence` from an owned slice. Mirrors
-/// `sequence::make_sequence`. klio collects eagerly, which is faithful for
-/// finite inputs (every `String`).
 fn makeSequence(allocator: Allocator, items: []Value) Allocator.Error!Value {
     const slice_ref = try runtime.ValueSlice.init(allocator, items);
     const data: SequenceData = .{ .source = .{ .Items = slice_ref }, .ops = &.{} };
@@ -80,12 +65,10 @@ fn makeSequence(allocator: Allocator, items: []Value) Allocator.Error!Value {
     return .{ .Sequence = data_ref };
 }
 
-/// Wrap an owned `[]const u8` in a fresh `String` value.
 fn newString(allocator: Allocator, owned: []const u8) Allocator.Error!Value {
     return .{ .String = try runtime.strInitOwned(allocator, owned) };
 }
 
-/// Default radix (10) or the Int radix in `v`. Mirrors `numeric::recv_int_radix`.
 fn recvIntRadix(allocator: Allocator, v: ?Value, what: []const u8) Allocator.Error!union(enum) { ok: i64, err: RuntimeError } {
     if (v) |val| {
         if (val.asI64()) |n| return .{ .ok = n };
@@ -95,19 +78,11 @@ fn recvIntRadix(allocator: Allocator, v: ?Value, what: []const u8) Allocator.Err
     return .{ .ok = 10 };
 }
 
-/// Decode a `Char` code unit to a Unicode scalar. A lone surrogate has no
-/// scalar value (`null`). Mirrors `char::char_unit_to_scalar`.
 fn charUnitToScalar(unit: u16) ?u21 {
     if (unit >= 0xD800 and unit <= 0xDFFF) return null;
     return unit;
 }
 
-// ============================================================
-// String members (receiver in args[0])
-// ============================================================
-
-/// Borrow the `String` receiver's bytes. The slice stays valid for the
-/// call: the receiver `String` lives in `ctx.args`.
 fn recvString(allocator: Allocator, args: []const Value, what: []const u8) Allocator.Error!union(enum) { ok: []const u8, err: RuntimeError } {
     if (args.len == 0) {
         const msg = try std.fmt.allocPrint(allocator, "{s} requires a receiver", .{what});
@@ -134,8 +109,6 @@ fn recvString(allocator: Allocator, args: []const Value, what: []const u8) Alloc
     }
 }
 
-/// Stringify a `String`-like argument. Mirrors `arg_as_string`. Caller
-/// owns the returned slice.
 fn argAsString(allocator: Allocator, v: Value, what: []const u8) Allocator.Error!union(enum) { ok: []const u8, err: RuntimeError } {
     switch (v) {
         .String => |s| {
@@ -160,12 +133,10 @@ fn argAsString(allocator: Allocator, v: Value, what: []const u8) Allocator.Error
     }
 }
 
-/// Number of UTF-16 code units in `s` — Kotlin's `String.length` /
-/// indexing unit (an astral scalar counts as 2).
-/// True if `s` is pure ASCII (no byte has the high bit set). For an ASCII string
-/// the UTF-16 length and indices coincide with byte offsets, so the per-codepoint
-/// `utf8Decode` walks collapse to direct byte access. The scan itself is a simple
-/// byte loop the compiler vectorizes — far cheaper than decoding each codepoint.
+/// Number of UTF-16 code units, the unit of Kotlin's `String.length` and
+/// indexing. An astral scalar counts as 2.
+/// True if `s` is pure ASCII, in which case UTF-16 indices coincide with byte
+/// offsets and every per-codepoint walk collapses to direct byte access.
 fn asciiScan(s: []const u8) bool {
     if (memoFor(s)) |m| return m.ascii;
     for (s) |b| {
@@ -174,17 +145,12 @@ fn asciiScan(s: []const u8) bool {
     return true;
 }
 
-/// The most recent `String` RECEIVER's cached header meta and its cell. The
-/// builtins receive bare bytes, so without this every `substring`/
-/// `startsWith`/`indexOf` rescanned the whole receiver for ASCII-ness, and
-/// a non-ASCII receiver was re-walked from byte 0 on each index conversion:
-/// a lexer stepping through a long source one token at a time was
-/// quadratic. Keyed by the immutable bytes' address and length; only
-/// `String` cells set it (a StringBuilder's buffer mutates in place and is
-/// never memoized), and every receiver extraction re-points it, so a slice
-/// that matches IS the live receiver's bytes. Walk positions live on the
-/// cell's own cursor (see `StringData.cursor`), so they carry across calls
-/// and across the other paths that read the same string.
+/// The most recent `String` receiver's cached header meta and its cell. The
+/// builtins receive bare bytes, so the memo keeps `substring` and `indexOf` from
+/// rescanning for ASCII-ness and re-walking a non-ASCII receiver from byte 0 per
+/// index conversion. Keyed by the immutable bytes' address and length; only
+/// `String` cells set it, a StringBuilder's buffer mutating in place. Walk
+/// positions live on the cell's own cursor, so they carry across calls.
 const RecvMemo = struct {
     ptr: [*]const u8 = undefined,
     len: usize = 0,
@@ -203,9 +169,8 @@ const RecvMemo = struct {
 };
 threadlocal var recv_memo: RecvMemo = .{};
 
-/// Forget the receiver memo: called at every host-builtin entry so a cell
-/// pointer never outlives the call whose argument kept it alive (a reclaimed
-/// or collected cell must never be written through `save`).
+/// Forget the receiver memo. Called at every host-builtin entry so a cell
+/// pointer never outlives the call whose argument kept it alive.
 pub fn clearRecvMemo() void {
     recv_memo.valid = false;
     recv_memo.cell = null;
@@ -217,10 +182,8 @@ fn memoFor(s: []const u8) ?*RecvMemo {
 }
 
 fn noteRecvData(d: *const runtime.StringData) void {
-    // Always refreshed from the live header: a collected string's bytes can
-    // be reused by a new string of the same length at the same address, so
-    // address and length alone never prove the cached meta still applies.
-    // The walk cursor lives on the cell, so nothing is lost by re-pointing.
+    // Always refreshed from the live header: a collected string's bytes can be
+    // reused by a new string of the same length at the same address.
     recv_memo = .{
         .ptr = d.bytes.ptr,
         .len = d.bytes.len,
@@ -231,18 +194,15 @@ fn noteRecvData(d: *const runtime.StringData) void {
     };
 }
 
-/// Byte offset of the boundary at UTF-16 index `target` in a non-ASCII
-/// string, walking from `from` (a known index/offset pair, `0/0` when none).
+/// Byte offset of the boundary at UTF-16 index `target` in a non-ASCII string,
+/// walking from the known index and offset pair `from`.
 fn unitBoundaryFrom(s: []const u8, from: runtime.StringData.Cursor, target: usize) runtime.StringData.Cursor {
     var it = Utf16View{ .bytes = s };
     var count: usize = 0;
     if (from.byte_pos <= s.len and from.u16_pos > target) {
-        // The cursor is AHEAD of the target (an escaper reads `text[i]`, then
-        // appends `text[last, i)`): step back over whole code points from it
-        // rather than restarting at byte 0. A 4-byte sequence is one astral
-        // scalar (two units); a WTF-8 surrogate or any shorter sequence is
-        // one unit. A target inside an astral pair lands after the pair,
-        // as the forward walk does.
+        // The cursor sits ahead of the target, so step back over whole code
+        // points rather than restart at byte 0. A 4-byte sequence is one astral
+        // scalar, two units; anything shorter is one unit.
         var c = from.u16_pos;
         var pos = from.byte_pos;
         while (c > target and pos > 0) {
@@ -271,8 +231,7 @@ fn unitBoundaryFrom(s: []const u8, from: runtime.StringData.Cursor, target: usiz
 }
 
 /// The byte range of `d.bytes[start, end)` in UTF-16 indices, through the
-/// string's own cursor: advancing ranges over one string (an escaper's
-/// `append(text, from, to)` runs) stay linear overall.
+/// string's own cursor, so advancing ranges over one string stay linear.
 pub fn utf16RangeBytes(d: *const runtime.StringData, start: usize, end: usize) [2]usize {
     if (d.ascii) return .{ @min(start, d.bytes.len), @min(end, d.bytes.len) };
     const lo = unitBoundaryFrom(d.bytes, d.cursorGet(), start);
@@ -290,9 +249,8 @@ fn utf16Len(s: []const u8) usize {
     return n;
 }
 
-/// The UTF-16 code unit at index `i` (Kotlin `String` indexing), if any.
-/// On the memoized receiver the walk resumes from the last position, so a
-/// sequential `s[i]` loop over a non-ASCII string stays linear.
+/// The UTF-16 code unit at index `i`. On the memoized receiver the walk resumes
+/// from the last position, so a sequential `s[i]` loop stays linear.
 fn utf16UnitAt(s: []const u8, i: usize) ?u16 {
     var n: usize = 0;
     var it = Utf16View{ .bytes = s };
@@ -324,7 +282,6 @@ fn utf16UnitAt(s: []const u8, i: usize) ?u16 {
     }
 }
 
-/// The UTF-16 code units of `s`, owned by the allocator.
 fn utf16Units(allocator: Allocator, s: []const u8) Allocator.Error![]u16 {
     var out: std.ArrayList(u16) = .empty;
     errdefer out.deinit(allocator);
@@ -333,18 +290,17 @@ fn utf16Units(allocator: Allocator, s: []const u8) Allocator.Error![]u16 {
     return out.toOwnedSlice(allocator);
 }
 
-/// Case-insensitive equality of two UTF-16 code units (Kotlin's
-/// `equals(ignoreCase=true)` per-char rule). Lone surrogates compare by
-/// raw equality (no case mapping).
+/// Case-insensitive equality of two UTF-16 code units, Kotlin's
+/// `equals(ignoreCase=true)` per-char rule. Lone surrogates compare raw.
 fn charUnitsEqIgnoreCase(a: u16, b: u16) bool {
     const ca = charUnitToScalar(a);
     const cb = charUnitToScalar(b);
     if (ca != null and cb != null) {
         if (ca.? == cb.?) return true;
-        // Kotlin's per-char fold: uppercase both; on a miss, lowercase
-        // the UPPERCASED forms (not the originals — 'ϑ' uppercases to
-        // 'Θ' whose lowercase meets lowercase('ϴ'), while lowercasing
-        // the originals directly never converges).
+        // Kotlin's per-char fold: uppercase both, and on a miss lowercase the
+        // uppercased forms, not the originals. 'ϑ' uppercases to 'Θ', whose
+        // lowercase meets lowercase('ϴ'); lowercasing the originals never
+        // converges.
         const ua = scalarToUpper(ca.?);
         const ub = scalarToUpper(cb.?);
         if (ua == ub) return true;
@@ -353,13 +309,10 @@ fn charUnitsEqIgnoreCase(a: u16, b: u16) bool {
     return a == b;
 }
 
-/// The substring spanning UTF-16 units `[start, end)`. Owned by the
-/// allocator.
 fn utf16Slice(allocator: Allocator, s: []const u8, start: usize, end: usize) Allocator.Error![]u8 {
-    // Both boundaries on whole characters: the slice is the bytes between
-    // them, found through the receiver's cursor rather than by converting
-    // the whole string. A range that splits a surrogate pair keeps the
-    // unit path, which renders the lone halves.
+    // With both boundaries on whole characters the slice is the bytes between
+    // them. A range splitting a surrogate pair keeps the unit path, which
+    // renders the lone halves.
     const lo = utf16Boundary(s, start);
     const hi = utf16Boundary(s, end);
     if (lo.u16_pos == start and hi.u16_pos == end and lo.byte_pos <= hi.byte_pos) {
@@ -371,7 +324,6 @@ fn utf16Slice(allocator: Allocator, s: []const u8, start: usize, end: usize) All
 }
 
 pub fn string_length(ctx: *CallCtx) Allocator.Error!EvalResult {
-    // O(1): the UTF-16 length is cached on the string at creation.
     if (ctx.args.len > 0 and ctx.args[0] == .String) {
         const g = ctx.args[0].String.borrow();
         defer g.deinit();
@@ -384,7 +336,6 @@ pub fn string_length(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
 }
 
-/// `String.toString()` — the receiver itself.
 pub fn string_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .String) {
         const r = try recvString(ctx.allocator, ctx.args, "String.toString");
@@ -396,32 +347,22 @@ pub fn string_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .{ .String = ctx.args[0].String.clone() } };
 }
 
-/// `String.encodeToByteArray()` / `String.toByteArray()` — the receiver's
-/// UTF-8 bytes as a Kotlin signed `ByteArray`. An explicit charset argument
-/// is treated as UTF-8.
+/// `String.encodeToByteArray()` and `toByteArray()`: the receiver's UTF-8 bytes
+/// as a Kotlin signed `ByteArray`. An explicit charset argument means UTF-8.
 pub fn string_to_byte_array(ctx: *CallCtx) Allocator.Error!EvalResult {
     const r = try recvString(ctx.allocator, ctx.args, "String.toByteArray");
     const s = switch (r) {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    // `encodeToByteArray(startIndex, endIndex, throwOnInvalidSequence)` indices
-    // are Kotlin char (UTF-16 unit) offsets, not byte offsets; an astral char
-    // is a 4-byte UTF-8 sequence counted as two units. `String.toByteArray`
-    // (a separate stdlib entry that shares this body) is always called with a
-    // charset receiver-arg and no range, so the range path is encode-only.
+    // `encodeToByteArray` indices are Kotlin char (UTF-16 unit) offsets, not
+    // byte offsets; an astral char is a 4-byte sequence counted as two units.
     const char_len = charLen(s);
-    // A range is requested when a positional/named startIndex or endIndex slot
-    // carries an integer (a defaulted slot reorders to `Null` and keeps the
-    // default). `String.toByteArray` shares this body but always passes only a
-    // charset receiver-arg, so it never enters the range/bounds path.
     const has_start = ctx.args.len > 1 and isIntLike(ctx.args[1]);
     const has_end = ctx.args.len > 2 and isIntLike(ctx.args[2]);
     const start = if (has_start) (ctx.args[1].asI64() orelse 0) else 0;
     const end = if (has_end) (ctx.args[2].asI64() orelse char_len) else char_len;
     if (has_start or has_end) {
-        // AbstractList.checkBoundsIndexes: OOB throws IndexOutOfBoundsException;
-        // start > end throws IllegalArgumentException.
         if (start < 0 or end > char_len) {
             const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, char_len });
             return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
@@ -431,9 +372,8 @@ pub fn string_to_byte_array(ctx: *CallCtx) Allocator.Error!EvalResult {
             return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
         }
     }
-    // Slice in UTF-16-unit space (decode → slice → re-encode) so a range that
-    // splits an astral char's surrogate pair yields the expected lone
-    // surrogate, then encode that.
+    // Slice in UTF-16-unit space so a range splitting a surrogate pair yields
+    // the expected lone surrogate.
     var unit_list: std.ArrayList(u16) = .empty;
     defer unit_list.deinit(ctx.allocator);
     var uv = Utf16View{ .bytes = s };
@@ -441,9 +381,9 @@ pub fn string_to_byte_array(ctx: *CallCtx) Allocator.Error!EvalResult {
     const slice_owned = try runtime.charUnitsToString(ctx.allocator, unit_list.items[@intCast(start)..@intCast(end)]);
     defer ctx.allocator.free(slice_owned);
     const slice = slice_owned;
-    // A lone surrogate (stored as WTF-8) is not valid UTF-8: encodeToByteArray
-    // replaces it with U+FFFD by default, or throws CharacterCodingException
-    // when `throwOnInvalidSequence` is set. Any Bool argument is that flag.
+    // A lone surrogate is not valid UTF-8: `encodeToByteArray` replaces it with
+    // U+FFFD, or throws CharacterCodingException when the Bool argument
+    // `throwOnInvalidSequence` is set.
     var throw_on_invalid = false;
     for (ctx.args[1..]) |arg| {
         if (arg == .Bool) throw_on_invalid = arg.Bool;
@@ -466,8 +406,6 @@ pub fn string_to_byte_array(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try runtime.ArrayData.initPacked(ctx.allocator, .Byte, out.items) };
 }
 
-/// Number of Kotlin char (UTF-16) units the UTF-8 string `s` decodes to: a
-/// 4-byte sequence (astral plane) is two units, everything else is one.
 fn charLen(s: []const u8) i64 {
     var n: i64 = 0;
     var i: usize = 0;
@@ -480,7 +418,6 @@ fn charLen(s: []const u8) i64 {
     return n;
 }
 
-/// Byte offset of Kotlin char unit `target` within UTF-8 string `s`.
 fn charToByteOffset(s: []const u8, target: usize) usize {
     var units: usize = 0;
     var i: usize = 0;
@@ -500,10 +437,8 @@ fn isIntLike(v: Value) bool {
     };
 }
 
-/// `ByteArray.decodeToString(startIndex = 0, endIndex = size,
-/// throwOnInvalidSequence = false)` — decode the byte range as UTF-8.
-/// Malformed sequences become U+FFFD, matching Kotlin's default
-/// (non-throwing) behaviour.
+/// `ByteArray.decodeToString(...)`: decode the byte range as UTF-8, malformed
+/// sequences becoming U+FFFD, which is Kotlin's non-throwing default.
 pub fn byte_array_decode_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .Array) {
         return errType("decodeToString requires a ByteArray receiver");
@@ -526,8 +461,6 @@ pub fn byte_array_decode_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     const has_end = ctx.args.len > 2 and isIntLike(ctx.args[2]);
     const start = if (has_start) (ctx.args[1].asI64() orelse 0) else 0;
     const end = if (has_end) (ctx.args[2].asI64() orelse len) else len;
-    // AbstractList.checkBoundsIndexes: out-of-bounds throws
-    // IndexOutOfBoundsException; start > end throws IllegalArgumentException.
     if (start < 0 or end > len) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "startIndex: {d}, endIndex: {d}, size: {d}", .{ start, end, len });
         return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
@@ -537,8 +470,6 @@ pub fn byte_array_decode_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
         return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
     const slice = bytes[@intCast(start)..@intCast(end)];
-    // `throwOnInvalidSequence` is the third user parameter (`args[3]` after
-    // the receiver and the reordered start/end slots).
     const throw_invalid = ctx.args.len > 3 and ctx.args[3] == .Bool and ctx.args[3].Bool;
     if (throw_invalid and !utf8WellFormed(slice)) {
         return try thrown(ctx.allocator, "kotlin.text.CharacterCodingException", "Input length = 1");
@@ -547,9 +478,6 @@ pub fn byte_array_decode_to_string(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try newString(ctx.allocator, out) };
 }
 
-/// Strict UTF-8 well-formedness check matching Kotlin's decoder: rejects
-/// overlong forms, surrogate code points (U+D800..U+DFFF), code points above
-/// U+10FFFF, and truncated sequences.
 fn utf8WellFormed(bytes: []const u8) bool {
     var i: usize = 0;
     while (i < bytes.len) {
@@ -594,11 +522,9 @@ pub fn string_plus(ctx: *CallCtx) Allocator.Error!EvalResult {
     var joined: std.ArrayList(u8) = .empty;
     errdefer joined.deinit(ctx.allocator);
     try joined.appendSlice(ctx.allocator, s);
-    // An instance operand must stringify through its (possibly overridden)
-    // `toString()` so `"x=" + obj` matches the template `"x=$obj"`. A
-    // CONTAINER goes the same way: the structural renderer prints
-    // `ClassName@id` for a user element, so `"" + listOf(obj)` disagreed with
-    // `"$listOf(obj)"` and with `listOf(obj).toString()`.
+    // An instance operand stringifies through its own `toString()`, so
+    // `"x=" + obj` matches the template `"x=$obj"`. A container goes the same
+    // way, since the structural renderer would print `ClassName@id`.
     if (other == .Instance or other == .List or other == .Set or other == .Map or
         other == .Pair or other == .Triple or other == .Result)
     {
@@ -647,8 +573,6 @@ pub fn string_get(ctx: *CallCtx) Allocator.Error!EvalResult {
         defer g.deinit();
         const sd = g.get();
         u16len = sd.u16_len;
-        // ASCII: the UTF-16 unit at `ui` is just byte `ui` — O(1), no walk (this
-        // is what makes `for (i in indices) s[i]` linear instead of quadratic).
         if (sd.ascii) {
             unit = if (ui < sd.bytes.len) @as(u16, sd.bytes[ui]) else null;
         } else {
@@ -672,8 +596,8 @@ pub fn string_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     var end: i64 = undefined;
     const rest = ctx.args[1..];
     if (rest.len == 1 and rest[0] == .Range) {
-        // `substring(range)` keeps `range.start .. range.endInclusive`,
-        // i.e. an exclusive end of `endInclusive + 1`.
+        // `substring(range)` keeps `range.start .. range.endInclusive`, an
+        // exclusive end of `endInclusive + 1`.
         const rg = rest[0].Range;
         start = rg.start;
         end = rg.end + 1;
@@ -686,9 +610,6 @@ pub fn string_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     } else {
         return errArity("substring requires 1 or 2 Int args");
     }
-    // `String.substring(begin[, end])` throws StringIndexOutOfBoundsException
-    // (an IndexOutOfBoundsException) for every out-of-bounds case, including
-    // `begin > end`.
     if (start < 0 or end > len or start > end) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "begin {d}, end {d}, length {d}", .{ start, end, len });
         return try thrownOwned(ctx.allocator, "kotlin.IndexOutOfBoundsException", msg);
@@ -696,7 +617,6 @@ pub fn string_substring(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try newString(ctx.allocator, try utf16Slice(ctx.allocator, s, @intCast(start), @intCast(end))) };
 }
 
-/// `CharSequence.padStart(length, padChar = ' ')` / `padEnd`.
 fn stringPad(ctx: *CallCtx, at_start: bool, who: []const u8) Allocator.Error!EvalResult {
     const r = try recvString(ctx.allocator, ctx.args, who);
     const s = switch (r) {
@@ -769,7 +689,6 @@ pub fn string_starts_with(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(prefix);
-    // Remaining args are `startIndex: Int` and/or `ignoreCase: Boolean`.
     var ignore_case = false;
     var start_index: i64 = 0;
     var k: usize = 2;
@@ -781,9 +700,6 @@ pub fn string_starts_with(ctx: *CallCtx) Allocator.Error!EvalResult {
         }
     }
     if (start_index < 0) return .{ .ok = .{ .Bool = false } };
-    // Case-sensitive with a prefix free of surrogate encodings (`ED ..`):
-    // unit-wise equality is byte-wise equality of the UTF-8, so compare the
-    // bytes at the start boundary instead of converting the whole receiver.
     if (!ignore_case and std.mem.indexOfScalar(u8, prefix, 0xED) == null) {
         const lo = utf16Boundary(s, @intCast(start_index));
         if (lo.u16_pos == start_index) {
@@ -807,8 +723,6 @@ pub fn string_starts_with(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .{ .Bool = true } };
 }
 
-/// `String.regionMatches(thisOffset, other, otherOffset, length,
-/// ignoreCase = false)` — true when the `length`-char regions match.
 pub fn string_region_matches(ctx: *CallCtx) Allocator.Error!EvalResult {
     const r = try recvString(ctx.allocator, ctx.args, "String.regionMatches");
     const s = switch (r) {
@@ -852,7 +766,6 @@ pub fn string_region_matches(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .{ .Bool = true } };
 }
 
-/// `internal inline fun String.skipWhile(startIndex, predicate)`.
 pub fn string_skip_while(ctx: *CallCtx) Allocator.Error!EvalResult {
     const r = try recvString(ctx.allocator, ctx.args, "String.skipWhile");
     const s = switch (r) {
@@ -1025,15 +938,12 @@ pub fn string_none(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
 }
 
-/// `String.equals(other, ignoreCase = false)`.
 pub fn string_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
-    // `String?.equals(other, ignoreCase)` on a null receiver: equal iff `other`
-    // is also null (the bodyless expect would otherwise evaluate to Unit).
     if (ctx.args.len > 0 and ctx.args[0] == .Null) {
         return .{ .ok = .{ .Bool = ctx.args.len > 1 and ctx.args[1] == .Null } };
     }
     // `Char.equals(other: Char, ignoreCase)` shares the `kotlin.text.equals`
-    // FQN with `String?.equals`; dispatch it by receiver kind.
+    // FQN with `String?.equals`, so dispatch by receiver kind.
     if (ctx.args.len > 0 and ctx.args[0] == .Char) {
         var ceq = false;
         if (ctx.args.len > 1 and ctx.args[1] == .Char) {
@@ -1062,7 +972,6 @@ pub fn string_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .{ .Bool = eq } };
 }
 
-/// `CharSequence.contentEquals(other: CharSequence?, ignoreCase = false)`.
 pub fn char_sequence_content_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0) return errType("contentEquals requires a receiver");
     if (ctx.args[0] == .Null) {
@@ -1089,7 +998,6 @@ pub fn char_sequence_content_equals(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .{ .Bool = eq } };
 }
 
-/// `CharSequence.elementAt(index)` — the `Char` (UTF-16 unit) at `index`.
 pub fn char_sequence_element_at(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0) return errType("elementAt requires a receiver");
     const sr = try charSeqToString(ctx.allocator, ctx.args[0], "elementAt");
@@ -1117,7 +1025,6 @@ pub fn string_contains(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     if (ctx.args.len < 2) return errArity("contains requires an argument");
-    // `regex in string` → CharSequence.contains(Regex) → regex.containsMatchIn.
     if (ctx.args[1] == .Regex) {
         return .{ .ok = .{ .Bool = try regexp.regexContainsIn(ctx.allocator, ctx.args[1].Regex, s) } };
     }
@@ -1154,11 +1061,9 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     const start_i64 = if (ctx.args.len > 2) (ctx.args[2].asI64() orelse 0) else 0;
     const start_u16: usize = if (start_i64 < 0) 0 else @intCast(start_i64);
     // Two shapes share this name: the public
-    // `indexOf(other, startIndex = 0, ignoreCase = false)` and the stdlib's
-    // internal `indexOf(other, startIndex, endIndex, ignoreCase, last = ...)`
-    // (args[3] is an Int endIndex there, and args[4] the flag). Reading the
-    // internal shape's endIndex as the flag searched case-sensitively and
-    // ignored the bound.
+    // `indexOf(other, startIndex = 0, ignoreCase = false)` and the internal
+    // `indexOf(other, startIndex, endIndex, ignoreCase, last = ...)`, where
+    // args[3] is an Int endIndex and args[4] the flag.
     const internal_shape = ctx.args.len > 3 and ctx.args[3] != .Bool;
     const end_u16: ?usize = if (internal_shape) blk: {
         const e = ctx.args[3].asI64() orelse break :blk null;
@@ -1168,9 +1073,6 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     const ignore_case = ctx.args.len > flag_idx and ctx.args[flag_idx] == .Bool and ctx.args[flag_idx].Bool;
     const last_flag = internal_shape and ctx.args.len > 5 and ctx.args[5] == .Bool and ctx.args[5].Bool;
     if (last_flag) {
-        // Backward form (the lastIndexOf driver): the largest match start in
-        // `[endIndex, startIndex]` (the internal signature runs its indices
-        // from startIndex DOWN to endIndex).
         const total = utf16Len(s);
         const upper: usize = @min(start_u16, total);
         const lower: usize = end_u16 orelse 0;
@@ -1188,16 +1090,14 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
         }
         return .{ .ok = Value.newInt(best) };
     }
-    // The empty string matches at the start index, clamped to the length (the
-    // JVM behavior `"abc".indexOf("", n)` returns `n.coerceAtMost(length)`).
+    // The empty string matches at the start index clamped to the length, as
+    // `"abc".indexOf("", n)` does on the JVM.
     if (needle.len == 0) {
         const total = utf16Len(s);
         return .{ .ok = Value.newInt(@intCast(@min(start_u16, total))) };
     }
     const start_byte = utf16IndexToByte(s, start_u16);
     if (start_byte > s.len) return .{ .ok = Value.newInt(-1) };
-    // The internal shape's endIndex bounds the match START (a match may
-    // extend past it); search the full tail and bound-check the hit.
     const end_start_byte: usize = if (end_u16) |e| @min(utf16IndexToByte(s, e), s.len) else s.len;
     if (end_start_byte < start_byte) return .{ .ok = Value.newInt(-1) };
     const hay = s[start_byte..];
@@ -1217,15 +1117,12 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = Value.newInt(byteToCharIndex(s, found)) };
 }
 
-/// Byte offset of the char boundary at or after the given UTF-16 code-unit
-/// index — the inverse of `byteToCharIndex`'s unit.
 fn utf16IndexToByte(s: []const u8, target: usize) usize {
     return utf16Boundary(s, target).byte_pos;
 }
 
-/// The boundary reached for UTF-16 index `target`: its byte offset and the
-/// unit index actually landed on (one past `target` when `target` names the
-/// low half of a surrogate pair, whose bytes cannot be split).
+/// The boundary reached for UTF-16 index `target`: its byte offset and the unit
+/// landed on, one past `target` when it names a surrogate pair's low half.
 fn utf16Boundary(s: []const u8, target: usize) runtime.StringData.Cursor {
     if (target == 0) return .{ .u16_pos = 0, .byte_pos = 0 };
     if (asciiScan(s)) {
@@ -1253,9 +1150,6 @@ pub fn string_last_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
     defer ctx.allocator.free(needle);
     const total = utf16Len(s);
-    // Optional `startIndex: Int` then `ignoreCase: Boolean`. The search runs
-    // backward from `startIndex` (a code-unit index, default the last index),
-    // returning the start of the last occurrence whose start is <= startIndex.
     var from_char: i64 = @intCast(total);
     var ignore_case = false;
     var k: usize = 2;
@@ -1284,7 +1178,6 @@ pub fn string_last_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = Value.newInt(result) };
 }
 
-/// Kotlin indexOf/lastIndexOf return an Int code-unit index (or -1).
 fn byteToCharIndex(s: []const u8, byte: ?usize) i64 {
     const b = byte orelse return -1;
     if (memoFor(s)) |m| {
@@ -1342,8 +1235,6 @@ pub fn string_replace(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try newString(ctx.allocator, out) };
 }
 
-/// trim / trimStart / trimEnd, honoring the optional argument: a vararg
-/// Char set, a `(Char)->Boolean` predicate, or nothing (whitespace).
 fn stringTrimGeneric(ctx: *CallCtx, trim_start: bool, trim_end: bool, who: []const u8) Allocator.Error!EvalResult {
     const r = try recvString(ctx.allocator, ctx.args, who);
     const s = switch (r) {
@@ -1462,12 +1353,10 @@ pub fn string_reversed(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    // Reverse by Unicode scalar.
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(ctx.allocator);
     var i: usize = s.len;
     while (i > 0) {
-        // Walk back to the start of the preceding scalar.
         var start = i - 1;
         while (start > 0 and (s[start] & 0xC0) == 0x80) start -= 1;
         try out.appendSlice(ctx.allocator, s[start..i]);
@@ -1476,9 +1365,9 @@ pub fn string_reversed(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try newString(ctx.allocator, try out.toOwnedSlice(ctx.allocator)) };
 }
 
-/// Kotlin `String.compareTo(other, ignoreCase = true)`: per scalar, when the
-/// two differ, compare uppercased forms then lowercased-uppercased forms; the
-/// shorter string sorts first on a common prefix.
+/// Kotlin `String.compareTo(other, ignoreCase = true)`: per scalar, compare
+/// uppercased forms then lowercased-uppercased forms; on a common prefix the
+/// shorter string sorts first.
 fn compareIgnoreCaseUtf8(a: []const u8, b: []const u8) std.math.Order {
     var ia = (std.unicode.Utf8View.init(a) catch return text.compareUtf16(a, b)).iterator();
     var ib = (std.unicode.Utf8View.init(b) catch return text.compareUtf16(a, b)).iterator();
@@ -1499,9 +1388,8 @@ fn compareIgnoreCaseUtf8(a: []const u8, b: []const u8) std.math.Order {
     }
 }
 
-/// `compareIgnoreCaseUtf8` returning kotlinc's VALUE: `compareToIgnoreCase`
-/// is the difference of the case-folded units at the first mismatch, and the
-/// length difference when one string is a prefix of the other.
+/// `compareToIgnoreCase` returns the difference of the case-folded units at the
+/// first mismatch, or the length difference when one string is a prefix.
 fn compareIgnoreCaseUtf8Difference(a: []const u8, b: []const u8) i32 {
     var ia = (std.unicode.Utf8View.init(a) catch return text.compareUtf16Difference(a, b)).iterator();
     var ib = (std.unicode.Utf8View.init(b) catch return text.compareUtf16Difference(a, b)).iterator();
@@ -1576,8 +1464,8 @@ pub fn string_to_int_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => return .{ .ok = .Null },
     };
-    // An invalid radix is a programming error and throws even on the OrNull
-    // path (Kotlin's `checkRadix`); only an unparseable string yields null.
+    // An invalid radix throws even on the OrNull path, per Kotlin's
+    // `checkRadix`; only an unparseable string yields null.
     if (radix < 2 or radix > 36) {
         const msg = try std.fmt.allocPrint(ctx.allocator, "radix {d} was not in valid range 2..36", .{radix});
         return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
@@ -1591,8 +1479,6 @@ pub fn string_to_int_or_null(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = .Null };
 }
 
-/// Parse a signed integer in the given radix (Kotlin semantics: trims
-/// whitespace, accepts a leading sign). Returns null on any failure.
 fn parseIntRadix(raw: []const u8, radix: u32) ?i64 {
     const s = std.mem.trim(u8, raw, " \t\n\r");
     if (s.len == 0) return null;
@@ -1605,9 +1491,8 @@ fn parseIntRadix(raw: []const u8, radix: u32) ?i64 {
         body = s[1..];
     }
     if (body.len == 0) return null;
-    // Accumulate in the negative range so the most-negative value (e.g.
-    // Long.MIN_VALUE, whose magnitude is one past Long.MAX_VALUE) is
-    // representable; flip to positive at the end when not negative.
+    // Accumulate in the negative range so the most-negative value, whose
+    // magnitude is one past the maximum, is representable.
     var acc: i64 = 0;
     for (body) |ch| {
         const d = digitValue(ch, radix) orelse return null;
@@ -1652,7 +1537,6 @@ pub fn string_split(ctx: *CallCtx) Allocator.Error!EvalResult {
     };
 }
 
-/// `splitToSequence(...)` shares `split`'s delimiter handling.
 pub fn string_split_to_sequence(ctx: *CallCtx) Allocator.Error!EvalResult {
     const r = try stringSplitItems(ctx, "String.splitToSequence");
     return switch (r) {
@@ -1683,7 +1567,6 @@ fn stringSplitItems(ctx: *CallCtx, who: []const u8) Allocator.Error!union(enum) 
             .err => |e| .{ .err = e },
         };
     }
-    // `split(vararg delimiters: String/Char, ignoreCase = false, limit = 0)`.
     var delims: std.ArrayList([]const u8) = .empty;
     defer {
         for (delims.items) |d| ctx.allocator.free(d);
@@ -1736,9 +1619,8 @@ fn stringSplitItems(ctx: *CallCtx, who: []const u8) Allocator.Error!union(enum) 
             .ok => unreachable,
         };
     }
-    // `split(vararg)` with no delimiters supplied returns the whole string
-    // as a single element. A supplied empty-string delimiter still splits
-    // at every position (matched length 0), so it is not "no delimiter".
+    // `split(vararg)` with no delimiters returns the whole string. A supplied
+    // empty-string delimiter still splits at every position, matching length 0.
     if (delims.items.len == 0) {
         var single: std.ArrayList(Value) = .empty;
         try single.append(ctx.allocator, try newString(ctx.allocator, try ctx.allocator.dupe(u8, s)));
@@ -1748,7 +1630,6 @@ fn stringSplitItems(ctx: *CallCtx, who: []const u8) Allocator.Error!union(enum) 
     return .{ .ok = out };
 }
 
-/// Stringify a String/Char delimiter (owned), or null if not one.
 fn delimToString(allocator: Allocator, v: Value) Allocator.Error!?[]const u8 {
     switch (v) {
         .String => |s| {
@@ -1761,7 +1642,6 @@ fn delimToString(allocator: Allocator, v: Value) Allocator.Error!?[]const u8 {
     }
 }
 
-/// Advance one UTF-8 code point forward from byte offset `i` in `s`.
 fn nextCharBoundary(s: []const u8, i: usize) usize {
     if (i >= s.len) return s.len;
     var j = i + 1;
@@ -1769,12 +1649,11 @@ fn nextCharBoundary(s: []const u8, i: usize) usize {
     return j;
 }
 
-/// Split `s` on any of `delims`, mirroring `DelimitedRangesSequence`: at
-/// each search position find the first (declaration-order) delimiter that
-/// matches and emit the segment before it. A positive `limit` bounds the
-/// number of substrings; an empty-string delimiter matches with length 0
-/// (advancing the search by one code point) so `"abc".split("")` yields
-/// the inter-character segments. ASCII `ignore_case`.
+/// Split `s` on any of `delims`, as `DelimitedRangesSequence` does: at each
+/// position take the first delimiter in declaration order and emit the segment
+/// before it. A positive `limit` bounds the number of substrings; an empty
+/// delimiter matches with length 0, advancing one code point, so
+/// `"abc".split("")` yields the inter-character segments.
 fn splitOnAny(allocator: Allocator, s: []const u8, delims: []const []const u8, ignore_case: bool, limit: i64) Allocator.Error![]Value {
     var out: std.ArrayList(Value) = .empty;
     errdefer out.deinit(allocator);
@@ -1783,7 +1662,6 @@ fn splitOnAny(allocator: Allocator, s: []const u8, delims: []const []const u8, i
     while (true) {
         if (limit > 0 and @as(i64, @intCast(out.items.len)) == limit - 1) break;
         if (search > s.len) break;
-        // Find the first delimiter match at or after `search`.
         var match_at: ?usize = null;
         var match_len: usize = 0;
         var pos: usize = search;
@@ -1806,10 +1684,6 @@ fn splitOnAny(allocator: Allocator, s: []const u8, delims: []const []const u8, i
         const idx = match_at orelse break;
         try out.append(allocator, try newString(allocator, try allocator.dupe(u8, s[seg_start..idx])));
         seg_start = idx + match_len;
-        // A zero-length match (empty delimiter) advances the search one
-        // code point so the next iteration makes progress; at end of input
-        // that pushes `search` past `s.len`, ending the loop after the
-        // final trailing segment is emitted.
         if (match_len == 0) {
             search = if (seg_start >= s.len) s.len + 1 else nextCharBoundary(s, seg_start);
         } else {
@@ -1885,10 +1759,9 @@ pub fn string_windowed(ctx: *CallCtx) Allocator.Error!EvalResult {
         const msg = try std.fmt.allocPrint(ctx.allocator, "size {d} must be greater than zero.", .{size_i});
         return try thrownOwned(ctx.allocator, "kotlin.IllegalArgumentException", msg);
     }
-    // Peel a trailing callable as the `transform` (the `windowed(size,
-    // step, partialWindows, transform)` overload). The scalar step /
-    // partialWindows read positionally from the remaining args, so a
-    // trailing lambda with omitted middle defaults binds correctly.
+    // Peel a trailing callable as the `transform` of the
+    // `windowed(size, step, partialWindows, transform)` overload, so the scalar
+    // args read positionally and omitted middle defaults still bind.
     var n_scalar = ctx.args.len;
     const transform: ?Value = if (n_scalar > 2 and isCallableTransform(ctx.args[n_scalar - 1])) blk: {
         n_scalar -= 1;
@@ -2020,7 +1893,6 @@ pub fn string_to_byte(ctx: *CallCtx) Allocator.Error!EvalResult {
     return numberFormatError(ctx.allocator, s);
 }
 
-/// Deprecated `String.capitalize()` — upper-case the first scalar.
 pub fn string_capitalize(ctx: *CallCtx) Allocator.Error!EvalResult {
     const r = try recvString(ctx.allocator, ctx.args, "String.capitalize");
     const s = switch (r) {
@@ -2055,10 +1927,6 @@ fn capitalizeFirst(allocator: Allocator, s: []const u8, upper: bool) Allocator.E
     try out.appendSlice(allocator, s[fend..]);
     return out.toOwnedSlice(allocator);
 }
-
-// ============================================================
-// Additional String members
-// ============================================================
 
 fn missingArg(allocator: Allocator, v: ?Value, s: []const u8) Allocator.Error![]const u8 {
     if (v) |val| {
@@ -2195,7 +2063,6 @@ pub fn string_trim_indent(ctx: *CallCtx) Allocator.Error!EvalResult {
         var it = std.mem.splitScalar(u8, s, '\n');
         while (it.next()) |l| try lines.append(ctx.allocator, l);
     }
-    // Minimum indent of non-blank lines.
     var min_indent: ?usize = null;
     for (lines.items) |l| {
         if (lineAllWhitespace(l)) continue;
@@ -2208,9 +2075,8 @@ pub fn string_trim_indent(ctx: *CallCtx) Allocator.Error!EvalResult {
     const mi = min_indent orelse 0;
     var out_lines: std.ArrayList([]const u8) = .empty;
     defer out_lines.deinit(ctx.allocator);
-    // Drop the first line and the last line if blank; every other line (blank or
-    // not) keeps whatever remains after removing the common indent — so a blank
-    // line wider than the common indent retains its extra whitespace.
+    // Drop the first and last line if blank; every other line keeps what remains
+    // after the common indent, so a blank line wider than it keeps the extra.
     const last_idx = lines.items.len - 1;
     for (lines.items, 0..) |l, idx| {
         if ((idx == 0 or idx == last_idx) and lineAllWhitespace(l)) continue;
@@ -2219,7 +2085,6 @@ pub fn string_trim_indent(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try newString(ctx.allocator, try joinLines(ctx.allocator, out_lines.items)) };
 }
 
-/// Drop the first `n` Unicode scalars from `l`. Owned slice.
 fn dropLeadingChars(allocator: Allocator, l: []const u8, n: usize) Allocator.Error![]const u8 {
     var i: usize = 0;
     var dropped: usize = 0;
@@ -2258,7 +2123,6 @@ pub fn string_trim_margin(ctx: *CallCtx) Allocator.Error!EvalResult {
             },
         }
     }
-    // Split into lines (LF / CR / CRLF), mirroring `lines()`.
     var raw_lines: std.ArrayList([]const u8) = .empty;
     defer raw_lines.deinit(ctx.allocator);
     {
@@ -2281,11 +2145,9 @@ pub fn string_trim_margin(ctx: *CallCtx) Allocator.Error!EvalResult {
     }
     const last_index = raw_lines.items.len - 1;
     for (raw_lines.items, 0..) |l, idx| {
-        // A blank first or last line is dropped entirely (`reindent`).
         if ((idx == 0 or idx == last_index) and lineIsBlank(l)) continue;
-        // Cut at the margin prefix following the leading whitespace; a line
-        // with no such prefix (including an all-whitespace line) is kept
-        // unchanged (`indentCutFunction(...) ?: value`).
+        // Cut at the margin prefix after the leading whitespace; a line without
+        // one, an all-whitespace line included, is kept unchanged.
         const fnw = firstNonWhitespaceByte(l);
         if (fnw) |w| {
             if (std.mem.startsWith(u8, l[w..], prefix_buf)) {
@@ -2298,8 +2160,6 @@ pub fn string_trim_margin(ctx: *CallCtx) Allocator.Error!EvalResult {
     return .{ .ok = try newString(ctx.allocator, try joinLines(ctx.allocator, out_lines.items)) };
 }
 
-/// Byte offset of the first non-whitespace code point in `l`, or null when
-/// every code point is whitespace (`indexOfFirst { !it.isWhitespace() }`).
 fn firstNonWhitespaceByte(l: []const u8) ?usize {
     var i: usize = 0;
     while (i < l.len) {
@@ -2312,7 +2172,6 @@ fn firstNonWhitespaceByte(l: []const u8) ?usize {
     return null;
 }
 
-/// Whether every code point in `l` is whitespace (`CharSequence.isBlank`).
 fn lineIsBlank(l: []const u8) bool {
     return firstNonWhitespaceByte(l) == null;
 }
@@ -2323,7 +2182,7 @@ pub fn string_lines(ctx: *CallCtx) Allocator.Error!EvalResult {
         .ok => |v| v,
         .err => |e| return .{ .err = e },
     };
-    // Kotlin lines() splits on \r\n, \r, and \n.
+    // Kotlin's `lines()` splits on \r\n, \r and \n.
     const normalized = try normalizeNewlines(ctx.allocator, s);
     defer ctx.allocator.free(normalized);
     var items: std.ArrayList(Value) = .empty;
@@ -2345,9 +2204,6 @@ pub fn string_to_char_array(ctx: *CallCtx) Allocator.Error!EvalResult {
     while (it.next()) |u| try units.append(ctx.allocator, u);
     const length: i64 = @intCast(units.items.len);
 
-    // `toCharArray(destination, destinationOffset, startIndex, endIndex)`:
-    // copy the `[startIndex, endIndex)` subrange into the existing
-    // `destination` CharArray at `destinationOffset` and return it.
     if (ctx.args.len > 1 and ctx.args[1] == .Array) {
         const dest = ctx.args[1].Array;
         const dest_offset = if (ctx.args.len > 2 and isIntLike(ctx.args[2])) (ctx.args[2].asI64() orelse 0) else 0;
@@ -2374,8 +2230,6 @@ pub fn string_to_char_array(ctx: *CallCtx) Allocator.Error!EvalResult {
         return .{ .ok = ctx.args[1] };
     }
 
-    // `toCharArray()` / `toCharArray(startIndex, endIndex)`: a fresh
-    // CharArray holding the `[startIndex, endIndex)` subrange.
     const start = if (ctx.args.len > 1 and isIntLike(ctx.args[1])) (ctx.args[1].asI64() orelse 0) else 0;
     const end = if (ctx.args.len > 2 and isIntLike(ctx.args[2])) (ctx.args[2].asI64() orelse length) else length;
     if (start < 0 or end > length) {
@@ -2456,9 +2310,8 @@ fn uMake(kind: UKind, v: u64) Value {
     };
 }
 
-/// Parse an unsigned magnitude in `radix`, capped at `limit`. Kotlin's
-/// unsigned parse accepts an optional leading `+` (never `-`) and yields
-/// null on any invalid digit or overflow past `limit`.
+/// Parse an unsigned magnitude in `radix`, capped at `limit`. Kotlin's unsigned
+/// parse accepts a leading `+` but never `-`, and yields null on overflow.
 fn parseUintRadix(raw: []const u8, radix: u32, limit: u64) ?u64 {
     const s = std.mem.trim(u8, raw, " \t\n\r");
     if (s.len == 0) return null;
@@ -2557,10 +2410,6 @@ pub fn string_to_boolean_strict_or_null(ctx: *CallCtx) Allocator.Error!EvalResul
     return .{ .ok = .Null };
 }
 
-// ============================================================
-// String.format / kotlin.text.format
-// ============================================================
-
 pub fn string_format_static(ctx: *CallCtx) Allocator.Error!EvalResult {
     if (ctx.args.len == 0 or ctx.args[0] != .String) {
         return errType("format requires a format String");
@@ -2577,13 +2426,11 @@ pub fn string_format_static(ctx: *CallCtx) Allocator.Error!EvalResult {
 }
 
 pub fn string_format_member(ctx: *CallCtx) Allocator.Error!EvalResult {
-    // Receiver-style `"%d".format(x)` — receiver is args[0], args follow.
     return string_format_static(ctx);
 }
 
 const FmtResult = union(enum) { ok: []u8, err: RuntimeError };
 
-/// Render a format string in the printf subset Kotlin commonly uses.
 fn formatKotlin(allocator: Allocator, fmt: []const u8, args: []const Value) Allocator.Error!FmtResult {
     var chars = try decodeScalars(allocator, fmt);
     defer allocator.free(chars);
@@ -2602,7 +2449,6 @@ fn formatKotlin(allocator: Allocator, fmt: []const u8, args: []const Value) Allo
         if (i >= chars.len) {
             return .{ .err = .{ .Thrown = try makeException(allocator, "java.util.UnknownFormatConversionException", "trailing %") } };
         }
-        // Optional argument index `n$`.
         const start_i = i;
         var idx_override: ?usize = null;
         var j = i;
@@ -2614,7 +2460,6 @@ fn formatKotlin(allocator: Allocator, fmt: []const u8, args: []const Value) Allo
         } else {
             i = start_i;
         }
-        // Flags.
         var flag_left = false;
         var flag_zero = false;
         var flag_plus = false;
@@ -2633,12 +2478,10 @@ fn formatKotlin(allocator: Allocator, fmt: []const u8, args: []const Value) Allo
             }
             i += 1;
         }
-        // Width.
         var width: ?usize = null;
         const wstart = i;
         while (i < chars.len and isAsciiDigit(chars[i])) i += 1;
         if (i > wstart) width = parseUsizeScalars(chars[wstart..i]) orelse 0;
-        // Precision.
         var precision: ?usize = null;
         if (i < chars.len and chars[i] == '.') {
             i += 1;
@@ -2872,7 +2715,6 @@ fn formatConv(
     }
 }
 
-/// Prefix a sign or space onto `body`. Returns an owned slice.
 fn signWrap(allocator: Allocator, body: []const u8, negative: bool, plus: bool, space: bool) Allocator.Error![]u8 {
     if (negative) return std.fmt.allocPrint(allocator, "-{s}", .{body});
     if (plus) return std.fmt.allocPrint(allocator, "+{s}", .{body});
@@ -2935,7 +2777,6 @@ fn insertCommasDecimal(allocator: Allocator, s: []const u8) Allocator.Error![]u8
     return out.toOwnedSlice(allocator);
 }
 
-/// Convert Zig's `1.234e2` form into Java's `1.234e+02`. Owned slice.
 fn normalizeScientific(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u8 {
     const epos = std.mem.indexOfScalar(u8, s, 'e') orelse std.mem.indexOfScalar(u8, s, 'E');
     const mantissa = if (epos) |p| s[0..p] else s;
@@ -2947,13 +2788,6 @@ fn normalizeScientific(allocator: Allocator, s: []const u8, upper: bool) Allocat
     return std.fmt.allocPrint(allocator, "{s}{c}{c}{d:0>2}", .{ mantissa, e_letter, exp_sign, exp_mag });
 }
 
-// ============================================================
-// UTF-16 / scalar utilities
-// ============================================================
-
-/// Streams the UTF-16 code units of a UTF-8 string one at a time. A
-/// supplementary code point yields its high surrogate, then its low
-/// surrogate on the following call.
 const Utf16View = struct {
     bytes: []const u8,
     pos: usize = 0,
@@ -2965,8 +2799,6 @@ const Utf16View = struct {
             return low;
         }
         if (self.pos >= self.bytes.len) return null;
-        // A WTF-8 lone surrogate (`ED A0-BF 8x`) decodes to its surrogate code
-        // unit directly — `utf8Decode` would reject it.
         if (isWtf8SurrogateAt(self.bytes, self.pos)) {
             const unit = wtf8SurrogateUnit(self.bytes, self.pos);
             self.pos += 3;
@@ -3006,9 +2838,6 @@ fn appendScalar(allocator: Allocator, out: *std.ArrayList(u8), cp: u21) Allocato
     try out.appendSlice(allocator, buf[0..n]);
 }
 
-/// Decode a UTF-8 string into its Unicode scalars. Malformed bytes become
-/// individual scalars (matching `Vec<char>` over a valid string; klio
-/// inputs are valid UTF-8). Owned slice.
 fn decodeScalars(allocator: Allocator, s: []const u8) Allocator.Error![]u21 {
     var out: std.ArrayList(u21) = .empty;
     errdefer out.deinit(allocator);
@@ -3049,8 +2878,6 @@ fn parseUsizeScalars(scalars: []const u21) ?usize {
     return acc;
 }
 
-/// Decode `bytes` as UTF-8, substituting U+FFFD for malformed sequences
-/// (`String::from_utf8_lossy`). Owned slice.
 fn utf8Lossy(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -3063,10 +2890,9 @@ fn utf8Lossy(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
             continue;
         }
         // Unicode "U+FFFD substitution of maximal subparts" (Table 3-7): a lead
-        // byte fixes the sequence length and the valid range of its first
-        // continuation; the rest must be 80-BF. An ill-formed sequence emits
-        // ONE U+FFFD for its maximal valid prefix, then resumes at the first
-        // byte that broke it. C0/C1 and F5-FF are never lead bytes.
+        // byte fixes the sequence length and its first continuation's valid
+        // range, the rest must be 80-BF, and an ill-formed sequence emits one
+        // U+FFFD for its maximal valid prefix. C0/C1 and F5-FF are never leads.
         var length: usize = 0;
         var lo2: u8 = 0x80;
         var hi2: u8 = 0xBF;
@@ -3076,10 +2902,8 @@ fn utf8Lossy(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
             length = 3;
             lo2 = 0xA0;
         } else if (b0 >= 0xE1 and b0 <= 0xEF) {
-            // ED A0-BF 80-BF structurally encodes a surrogate: like the JVM
-            // decoder, consume the whole 3-byte sequence and emit a single
-            // U+FFFD for the surrogate code point (utf8Decode rejects it), rather
-            // than splitting per the stricter WHATWG maximal-subpart rule.
+            // ED A0-BF 80-BF structurally encodes a surrogate: consume the whole
+            // 3-byte sequence and emit one U+FFFD, as the JVM decoder does.
             length = 3;
         } else if (b0 == 0xF0) {
             length = 4;
@@ -3121,9 +2945,6 @@ fn utf8Lossy(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// Map every scalar of `s` to upper- or lower-case. Owned slice. Covers
-/// ASCII and the common 1:1 Latin mappings; non-1:1 expansions fall back to
-/// the scalar unchanged.
 fn mapCase(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -3152,14 +2973,10 @@ fn mapCase(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u
     return out.toOwnedSlice(allocator);
 }
 
-/// Case-insensitive Unicode equality via case-folded comparison. Strings
-/// are compared after lower-casing each scalar.
 fn eqIgnoreCaseUnicode(allocator: Allocator, a: []const u8, b: []const u8) Allocator.Error!bool {
-    // Kotlin's `equals(ignoreCase = true)` folds PER UTF-16 UNIT (each
-    // char uppercased, then lowercased on a miss) — whole-string
-    // lowercasing diverges where a char's lowercase differs but its
-    // uppercase folds ('ſ' vs 'S': lowercase keeps 'ſ', uppercase folds
-    // to 'S'), and multi-char expansions ("ß" vs "SS") must NOT equate.
+    // Kotlin's `equals(ignoreCase = true)` folds per UTF-16 unit. Whole-string
+    // lowercasing diverges where a char's lowercase differs but its uppercase
+    // folds ('ſ' vs 'S'), and expansions ("ß" vs "SS") must not equate.
     const ua = try utf16Units(allocator, a);
     defer allocator.free(ua);
     const ub = try utf16Units(allocator, b);
@@ -3171,19 +2988,16 @@ fn eqIgnoreCaseUnicode(allocator: Allocator, a: []const u8, b: []const u8) Alloc
     return true;
 }
 
-/// Lower-case a single Unicode scalar (ASCII + common Latin/Greek/Cyrillic
-/// 1:1 ranges).
 fn scalarToLower(cp: u21) u21 {
     if (cp < 0x80) return std.ascii.toLower(@intCast(cp));
-    // The full Unicode 1:1 table — a hand-rolled range subset here missed
-    // real mappings (KELVIN SIGN -> 'k' broke compareTo(ignoreCase)).
+    // The full Unicode 1:1 table: a range subset misses mappings such as
+    // KELVIN SIGN -> 'k'.
     return char.lowerScalar(cp);
 }
 
-/// Unicode SpecialCasing unconditional multi-character upper-casings — a
-/// single scalar whose upper-case form is a sequence (`ß` -> `SS`, the `ﬀ`…`ﬆ`
-/// ligatures). `String.uppercase()` / `Char.uppercase()` apply these; the 1:1
-/// `scalarToUpper` cannot express an expansion.
+/// Unicode SpecialCasing unconditional multi-character upper-casings, a scalar
+/// whose upper-case form is a sequence (`ß` -> `SS`). `uppercase()` applies
+/// these; the 1:1 `scalarToUpper` cannot express an expansion.
 fn scalarToUpperMulti(cp: u21) ?[]const u21 {
     return switch (cp) {
         0x00DF => &.{ 'S', 'S' }, // ß LATIN SMALL LETTER SHARP S
@@ -3194,14 +3008,12 @@ fn scalarToUpperMulti(cp: u21) ?[]const u21 {
         0xFB04 => &.{ 'F', 'F', 'L' }, // ﬄ
         0xFB05 => &.{ 'S', 'T' }, // ﬅ LATIN SMALL LIGATURE LONG S T
         0xFB06 => &.{ 'S', 'T' }, // ﬆ LATIN SMALL LIGATURE ST
-        // Greek small letters with dialytika + tonos -> capital + combining marks.
         0x0390 => &.{ 0x0399, 0x0308, 0x0301 }, // ΐ
         0x03B0 => &.{ 0x03A5, 0x0308, 0x0301 }, // ΰ
         else => null,
     };
 }
 
-/// Unicode SpecialCasing unconditional multi-character lower-casings.
 fn scalarToLowerMulti(cp: u21) ?[]const u21 {
     return switch (cp) {
         0x0130 => &.{ 0x0069, 0x0307 }, // İ -> i + COMBINING DOT ABOVE
@@ -3209,14 +3021,11 @@ fn scalarToLowerMulti(cp: u21) ?[]const u21 {
     };
 }
 
-/// Upper-case a single Unicode scalar (inverse of `scalarToLower`'s ranges).
 fn scalarToUpper(cp: u21) u21 {
     if (cp < 0x80) return std.ascii.toUpper(@intCast(cp));
-    // The full Unicode 1:1 table, matching scalarToLower.
     return char.upperScalar(cp);
 }
 
-/// Unicode whitespace test for the scalars Kotlin programs encounter.
 fn isWhitespace(cp: u21) bool {
     return switch (cp) {
         0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680 => true,
@@ -3238,7 +3047,6 @@ fn lineAllWhitespace(l: []const u8) bool {
     return true;
 }
 
-/// Case-insensitive equality of two UTF-16 unit sub-slices of equal length.
 fn unitsEqIgnoreCase(a: []const u16, b: []const u16) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
@@ -3247,10 +3055,8 @@ fn unitsEqIgnoreCase(a: []const u16, b: []const u16) bool {
     return true;
 }
 
-/// `replace`/`replaceFirst` with ASCII/Unicode case folding. Matches the
-/// JVM behavior of comparing each candidate window to `old` with
-/// `Char.equals(ignoreCase = true)`. Works in UTF-16 units so a delimiter
-/// matches at code-unit boundaries. `max` bounds the number of replacements.
+/// `replace` and `replaceFirst` with case folding, comparing each window to
+/// `old` with `Char.equals(ignoreCase = true)` as the JVM does, in UTF-16 units.
 fn replaceAllIgnoreCase(allocator: Allocator, s: []const u8, old: []const u8, new: []const u8, max: ?usize) Allocator.Error![]u8 {
     const su = try utf16Units(allocator, s);
     defer allocator.free(su);
@@ -3289,14 +3095,12 @@ fn replaceAllIgnoreCase(allocator: Allocator, s: []const u8, old: []const u8, ne
     return charUnitsToString(allocator, out.items);
 }
 
-/// Replace occurrences of `old` with `new`, up to `max` (null = all). An
-/// empty `old` inserts `new` between every char and at both ends. Owned
-/// slice.
+/// Replace occurrences of `old` with `new`, up to `max`, null meaning all. An
+/// empty `old` inserts `new` between every char and at both ends.
 fn replaceAll(allocator: Allocator, s: []const u8, old: []const u8, new: []const u8, max: ?usize) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     if (old.len == 0) {
-        // Insert `new` between every char and at both ends.
         var count: usize = 0;
         try out.appendSlice(allocator, new);
         count += 1;
@@ -3328,7 +3132,6 @@ fn replaceAll(allocator: Allocator, s: []const u8, old: []const u8, new: []const
     return out.toOwnedSlice(allocator);
 }
 
-/// Normalize CRLF and lone CR to LF. Owned slice.
 fn normalizeNewlines(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -3349,7 +3152,6 @@ fn normalizeNewlines(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-/// Join lines with `\n` and trim leading/trailing empty lines (trimIndent).
 fn joinLines(allocator: Allocator, lines: []const []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -3360,7 +3162,6 @@ fn joinLines(allocator: Allocator, lines: []const []const u8) Allocator.Error![]
     return out.toOwnedSlice(allocator);
 }
 
-/// Stringify a CharSequence receiver (String or StringBuilder). Owned slice.
 fn charSeqToString(allocator: Allocator, v: Value, what: []const u8) Allocator.Error!union(enum) { ok: []u8, err: RuntimeError } {
     switch (v) {
         .StringBuilder => |sb| {
@@ -3378,19 +3179,12 @@ fn charSeqToString(allocator: Allocator, v: Value, what: []const u8) Allocator.E
     }
 }
 
-/// Parse a Double the way Kotlin's `String.toDouble` does (Java
-/// `Double.parseDouble`): trims surrounding whitespace, accepts Kotlin's
-/// `NaN`/`Infinity` spellings, otherwise standard float syntax.
-/// Kotlin only accepts the exact-case `NaN`/`Infinity` symbols (with an
-/// optional sign); a number otherwise begins with a digit, `.` or sign. A
-/// leading letter (after an optional sign) is a non-canonical spelling like
-/// "naN"/"inf"/"infinity" that `std.fmt.parseFloat` would wrongly accept, so
-/// reject it. (A digit-led overflow like "1e400" correctly yields Infinity.)
-/// Kotlin/Java accept a single trailing float type-suffix (`f`/`F`/`d`/`D`),
-/// which `std.fmt.parseFloat` does not. Strip it. For a hex literal the suffix
-/// letters are also hex digits, so only strip when a `p`/`P` binary exponent is
-/// present (a complete hex float); a bare `0x1f` keeps its `f` (and is rejected
-/// for lacking the exponent).
+/// Parse a Double as Kotlin's `String.toDouble` does: trims surrounding
+/// whitespace and accepts only the exact-case `NaN` and `Infinity` spellings,
+/// optionally signed, so a leading letter such as "naN" that
+/// `std.fmt.parseFloat` would accept is rejected. One trailing float
+/// type-suffix is stripped, but in a hex literal those letters are hex digits,
+/// so the strip needs a `p`/`P` exponent to confirm a complete hex float.
 fn stripFloatSuffix(s: []const u8) []const u8 {
     if (s.len == 0) return s;
     const last = s[s.len - 1];
@@ -3406,20 +3200,17 @@ fn stripFloatSuffix(s: []const u8) []const u8 {
 fn floatSymbolReject(s: []const u8) bool {
     const body = if (s.len > 0 and (s[0] == '+' or s[0] == '-')) s[1..] else s;
     if (body.len == 0) return false;
-    // A non-canonical nan/inf spelling (leading letter).
     if (std.ascii.isAlphabetic(body[0])) return true;
-    // A hex float requires a `p`/`P` binary exponent (Java/Kotlin format
-    // `0x1.8p3`). `std.fmt.parseFloat` also accepts a bare hex *integer*
-    // (`0x11ff33`), which Kotlin rejects — so reject a `0x…` lacking `p`/`P`.
+    // A hex float requires a `p`/`P` binary exponent; `std.fmt.parseFloat` also
+    // accepts a bare hex integer, which Kotlin rejects.
     if (body.len >= 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X')) {
         return std.mem.indexOfScalar(u8, body, 'p') == null and std.mem.indexOfScalar(u8, body, 'P') == null;
     }
     return false;
 }
 
-/// Java/Kotlin `parseDouble` trims any leading/trailing char `<= ' '`
-/// (the same set `String.trim()` strips — space, tab, newlines, and NUL and
-/// other ASCII controls). All such code units are single WTF-8 bytes.
+/// `parseDouble` trims any leading or trailing char `<= ' '`, the set
+/// `String.trim()` strips. All such code units are single WTF-8 bytes.
 fn trimNumericWhitespace(raw: []const u8) []const u8 {
     var lo: usize = 0;
     var hi: usize = raw.len;
@@ -3447,10 +3238,6 @@ fn parseFloat(raw: []const u8) ?f32 {
     if (floatSymbolReject(s)) return null;
     return std.fmt.parseFloat(f32, stripFloatSuffix(s)) catch null;
 }
-
-// ============================================================
-// Tests
-// ============================================================
 
 const testing = std.testing;
 
@@ -3504,7 +3291,6 @@ test "length counts utf16 code units" {
         try testing.expectEqual(@as(i32, 5), r.ok.Int);
     }
     {
-        // An astral scalar counts as 2 UTF-16 units.
         var ctx = ctxFor(a, &.{try strVal(a, "\u{1F600}")});
         const r = try string_length(&ctx);
         try testing.expectEqual(@as(i32, 2), r.ok.Int);
@@ -3591,7 +3377,6 @@ test "contains and indexOf" {
         try testing.expectEqual(@as(i32, 1), (try string_index_of(&ctx)).ok.Int);
     }
     {
-        // startIndex skips the first match.
         var ctx = ctxFor(a, &.{ try strVal(a, "abcabc"), try strVal(a, "bc"), .{ .Int = 2 } });
         try testing.expectEqual(@as(i32, 4), (try string_index_of(&ctx)).ok.Int);
     }
@@ -3654,7 +3439,6 @@ test "trim variants" {
         try expectStr(a, try string_trim_end(&ctx), "  hi");
     }
     {
-        // Trim a vararg char set.
         var ctx = ctxFor(a, &.{ try strVal(a, "xxabcxx"), .{ .Char = 'x' } });
         try expectStr(a, try string_trim(&ctx), "abc");
     }
@@ -3683,8 +3467,6 @@ test "compareTo yields the code-unit difference kotlinc yields" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // `'c' - 'd'` is -1, so this pair passes under a sign-only result too;
-    // the cases below are the ones that distinguish them.
     {
         var ctx = ctxFor(a, &.{ try strVal(a, "abc"), try strVal(a, "abd") });
         try testing.expectEqual(@as(i32, -1), (try string_compare_to(&ctx)).ok.Int);
@@ -3693,7 +3475,6 @@ test "compareTo yields the code-unit difference kotlinc yields" {
         var ctx = ctxFor(a, &.{ try strVal(a, "abc"), try strVal(a, "abc") });
         try testing.expectEqual(@as(i32, 0), (try string_compare_to(&ctx)).ok.Int);
     }
-    // First mismatch: the difference of the code units, not its sign.
     {
         var ctx = ctxFor(a, &.{ try strVal(a, "a"), try strVal(a, "c") });
         try testing.expectEqual(@as(i32, -2), (try string_compare_to(&ctx)).ok.Int);
@@ -3702,7 +3483,6 @@ test "compareTo yields the code-unit difference kotlinc yields" {
         var ctx = ctxFor(a, &.{ try strVal(a, "A"), try strVal(a, "a") });
         try testing.expectEqual(@as(i32, -32), (try string_compare_to(&ctx)).ok.Int);
     }
-    // A prefix: the LENGTH difference in UTF-16 code units.
     {
         var ctx = ctxFor(a, &.{ try strVal(a, "ab"), try strVal(a, "abcd") });
         try testing.expectEqual(@as(i32, -2), (try string_compare_to(&ctx)).ok.Int);
@@ -3711,7 +3491,6 @@ test "compareTo yields the code-unit difference kotlinc yields" {
         var ctx = ctxFor(a, &.{ try strVal(a, ""), try strVal(a, "abc") });
         try testing.expectEqual(@as(i32, -3), (try string_compare_to(&ctx)).ok.Int);
     }
-    // `ignoreCase` folds first, then takes the same difference.
     {
         var ctx = ctxFor(a, &.{ try strVal(a, "A"), try strVal(a, "a"), .{ .Bool = true } });
         try testing.expectEqual(@as(i32, 0), (try string_compare_to(&ctx)).ok.Int);
@@ -3740,7 +3519,6 @@ test "toInt parses with radix and bounds" {
         try testing.expect(r == .err and r.err == .Thrown);
     }
     {
-        // Overflows i32 -> null for toIntOrNull.
         var ctx = ctxFor(a, &.{try strVal(a, "9999999999")});
         try testing.expect((try string_to_int_or_null(&ctx)).ok == .Null);
     }
@@ -3832,7 +3610,6 @@ test "padStart and padEnd" {
         try expectStr(a, try string_pad_end(&ctx), "7  ");
     }
     {
-        // Already at/over length: returned unchanged.
         var ctx = ctxFor(a, &.{ try strVal(a, "abcd"), .{ .Int = 2 } });
         try expectStr(a, try string_pad_start(&ctx), "abcd");
     }
@@ -3895,7 +3672,6 @@ test "substringBefore and After" {
         try expectStr(a, try string_substring_after(&ctx), "value");
     }
     {
-        // Missing delimiter returns the whole receiver by default.
         var ctx = ctxFor(a, &.{ try strVal(a, "novalue"), try strVal(a, "=") });
         try expectStr(a, try string_substring_after(&ctx), "novalue");
     }
@@ -4013,7 +3789,6 @@ test "format string and float specifiers" {
         try expectStr(a, try string_format_static(&ctx), "50%");
     }
     {
-        // Positional argument index.
         var ctx = ctxFor(a, &.{ try strVal(a, "%2$s %1$s"), try strVal(a, "a"), try strVal(a, "b") });
         try expectStr(a, try string_format_static(&ctx), "b a");
     }

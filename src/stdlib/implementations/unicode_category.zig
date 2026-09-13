@@ -1,7 +1,5 @@
-//! Generated Unicode general-category table (from upstream
-//! `_CharCategories.kt`, unicode_general_category data). Compiled into the
-//! binary so the category lookup costs no per-program / per-base memory,
-//! unlike the equivalent huge Kotlin `intArrayOf` literals.
+//! Generated Unicode general-category table from upstream `_CharCategories.kt`,
+//! compiled into the binary so the lookup costs no per-program memory.
 
 const std = @import("std");
 
@@ -179,8 +177,6 @@ const range_category = [_]i32{
     5, 17, 5, 17957, 17573, 27185, 28474, 27484, 913, 25, 28, 17, 16, 28, 17,
 };
 
-/// Index of the range containing `needle` (mirrors the Kotlin
-/// `binarySearchRange`).
 fn binarySearchRange(arr: []const i32, needle: i32) usize {
     var bottom: i64 = 0;
     var top: i64 = @as(i64, @intCast(arr.len)) - 1;
@@ -214,8 +210,8 @@ fn categoryValueFrom(code: i32, ch: i32) i32 {
     };
 }
 
-/// Unicode general category value (JVM `Character.getType` style codes) of a
-/// code point; 0 (UNASSIGNED) for an undefined code point.
+/// Unicode general category of a code point, in JVM `Character.getType` codes;
+/// 0 (UNASSIGNED) for an undefined code point.
 pub fn categoryValue(ch: i32) i32 {
     const index = binarySearchRange(&range_start, ch);
     const start = range_start[index];

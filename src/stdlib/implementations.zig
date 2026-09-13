@@ -1,13 +1,8 @@
 //! Hand-written Kotlin stdlib intrinsics.
 //!
-//! Each entry binds a fully qualified Kotlin name to a Zig function with
-//! the `StdlibFn` signature. The interpreter consults `lookup` when
-//! resolving qualified call expressions (`kotlin.math.abs(-5)`), member
-//! access on builtin types (`"hello".length`, `"hi".uppercase()`), and
-//! indexing (`s[0]` -> `kotlin.String.get`).
-//!
-//! The per-area bodies live in `implementations/<area>.zig`; this file
-//! fixes the registration and calling convention.
+//! Each entry binds a fully qualified Kotlin name to a Zig function with the
+//! `StdlibFn` signature; the per-area bodies live in `implementations/<area>.zig`
+//! and this file fixes the registration.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -15,7 +10,6 @@ const runtime = @import("runtime");
 const StdlibFn = runtime.StdlibFn;
 const Value = runtime.Value;
 
-// Per-area intrinsic submodules.
 pub const atomics = @import("implementations/atomics.zig");
 pub const bundle = @import("implementations/bundle.zig");
 pub const char = @import("implementations/char.zig");
@@ -36,8 +30,6 @@ pub const string = @import("implementations/string.zig");
 pub const stringbuilder = @import("implementations/stringbuilder.zig");
 pub const time = @import("implementations/time.zig");
 
-/// Internal helpers the interpreter's higher-order ops re-export through
-/// the stdlib root.
 pub const compare_values = collections.compare_values;
 pub const materialise_sequence = collections.materialise_sequence;
 pub const materialise_sequence_bounded = collections.materialise_sequence_bounded;
@@ -49,10 +41,9 @@ pub const concurrent_lock_enter = concurrent.concurrent_lock_enter;
 pub const concurrent_lock_try_enter = concurrent.concurrent_lock_try_enter;
 pub const concurrent_lock_exit = concurrent.concurrent_lock_exit;
 
-/// Optional argument-only applicability predicate for a host-backed member
-/// whose Kotlin declaration is not retained in the runtime image. Most
-/// bindings need none; overloaded scalar operators use it when a distinct
-/// extension with the same receiver and name competes.
+/// Optional argument-only applicability predicate for a host-backed member whose
+/// Kotlin declaration is not retained in the runtime image, used when a
+/// same-named extension on the receiver competes.
 const ApplicableFn = *const fn (args: []const Value) bool;
 const Entry = struct { fqn: []const u8, f: StdlibFn, applicable: ?ApplicableFn = null };
 
@@ -67,14 +58,11 @@ fn integerBinaryApplicable(args: []const Value) bool {
     return args.len == 1 and args[0].asI64() != null;
 }
 
-/// The integral range builders (`a until b`, `downTo`, `step`) share their
-/// names with library extensions on non-integral types
-/// (`LocalDate.until(other, unit)`, `LocalDateRange.step(DatePeriod)`).
-/// A call whose single argument is not an integral (or Char) endpoint is
-/// not the builtin's, so the probe must decline and let the extension bind.
-/// A property GETTER binding never serves a call that passes arguments:
-/// `progression.step` reads the stride, `progression.step(n, unit)` is the
-/// library extension of the same name.
+/// The integral range builders share their names with library extensions on
+/// non-integral types, so a call whose single argument is not an integral or
+/// Char endpoint declines and the extension binds. A property getter binding
+/// never serves a call with arguments: `progression.step` reads the stride,
+/// `progression.step(n, unit)` is the extension.
 fn zeroArgApplicable(args: []const Value) bool {
     return args.len == 0;
 }
@@ -86,8 +74,6 @@ fn rangeBuilderApplicable(args: []const Value) bool {
 }
 
 const TABLE = [_]Entry{
-    // kotlin.concurrent.atomics — composite read-modify-write under the cell
-    // lock (load/store stay as the class's atomic single field access).
     .{ .fqn = "kotlin.concurrent.atomics.AtomicInt.exchange", .f = atomics.exchange },
     .{ .fqn = "kotlin.concurrent.atomics.AtomicInt.compareAndSet", .f = atomics.compareAndSet },
     .{ .fqn = "kotlin.concurrent.atomics.AtomicInt.compareAndExchange", .f = atomics.compareAndExchange },
@@ -220,9 +206,6 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.endsWith", .f = string.string_ends_with },
     .{ .fqn = "kotlin.String.get", .f = string.string_get },
     .{ .fqn = "kotlin.String.indexOf", .f = string.string_index_of },
-    // `nativeIndexOf` / `nativeLastIndexOf` are the platform helpers the
-    // common `CharSequence.indexOf(char/string)` calls when `this is String`.
-    // klio backs them with the same UTF-16 index intrinsics.
     .{ .fqn = "kotlin.text.nativeIndexOf", .f = string.string_index_of },
     .{ .fqn = "kotlin.text.nativeLastIndexOf", .f = string.string_last_index_of },
     .{ .fqn = "kotlin.String.nativeIndexOf", .f = string.string_index_of },
@@ -251,11 +234,8 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.plus", .f = string.string_plus },
     .{ .fqn = "kotlin.String.equals", .f = string.string_equals },
     .{ .fqn = "kotlin.text.equals", .f = string.string_equals },
-    // `repeat` also names the stdlib's top-level `repeat(times) { … }`: the
-    // member binding must decline any call that is not exactly `(Int)`, or a
-    // bare `repeat(2) { … }` reaching a String through the enclosing-receiver
-    // walk silently no-ops (the CookieDateParser year/day parse was the live
-    // case).
+    // `repeat` also names the top-level `repeat(times) { … }`, so the member
+    // binding declines any call that is not exactly `(Int)`.
     .{ .fqn = "kotlin.String.repeat", .f = string.string_repeat, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.CharSequence.repeat", .f = string.string_repeat, .applicable = integerBinaryApplicable },
     .{ .fqn = "kotlin.String.replace", .f = string.string_replace },
@@ -296,10 +276,9 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.String.windowed", .f = string.string_windowed },
     .{ .fqn = "kotlin.String.trimEnd", .f = string.string_trim_end },
     .{ .fqn = "kotlin.String.trimStart", .f = string.string_trim_start },
-    // `CharSequence.trim*` runs over any CharSequence receiver (e.g. a
-    // StringBuilder); `recvString` reads its backing units, so the String
-    // trim intrinsics serve both. A StringBuilder receiver probes the
-    // `kotlin.text.<name>` FQN, so the helpers are registered there too.
+    // `CharSequence.trim*` runs over any CharSequence receiver and `recvString`
+    // reads its backing units, so the String intrinsics serve both; a
+    // StringBuilder receiver probes the `kotlin.text.<name>` FQN.
     .{ .fqn = "kotlin.CharSequence.trim", .f = string.string_trim },
     .{ .fqn = "kotlin.CharSequence.trimEnd", .f = string.string_trim_end },
     .{ .fqn = "kotlin.CharSequence.trimStart", .f = string.string_trim_start },
@@ -399,7 +378,6 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.UInt.toShort", .f = numeric.unsigned_to_short },
     .{ .fqn = "kotlin.UInt.toInt", .f = numeric.unsigned_to_int },
     .{ .fqn = "kotlin.UInt.toLong", .f = numeric.unsigned_to_long },
-    // Unsigned div/rem method forms (floorDiv == div, mod == rem for unsigned).
     .{ .fqn = "kotlin.UInt.div", .f = numeric.unsigned_div },
     .{ .fqn = "kotlin.UInt.rem", .f = numeric.unsigned_rem },
     .{ .fqn = "kotlin.UInt.floorDiv", .f = numeric.unsigned_div },
@@ -835,16 +813,12 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.LongArray.min", .f = collections.array_min },
     .{ .fqn = "kotlin.DoubleArray.max", .f = collections.array_max },
     .{ .fqn = "kotlin.DoubleArray.min", .f = collections.array_min },
-    // Boxed `Array<T>.min()/max()` return the smallest/largest ELEMENT by
-    // natural order (no numeric promotion: `arrayOf(1, 2, Long.MAX_VALUE).min()`
-    // is the `Int` 1, not a widened `Long`). Without these the call falls to the
-    // sequence-terminal path, which folds through the promoting `numExtreme`.
+    // Boxed `Array<T>.min()` returns the extreme element by natural order with no
+    // numeric promotion, where the sequence-terminal path would promote.
     .{ .fqn = "kotlin.Array.max", .f = collections.array_max },
     .{ .fqn = "kotlin.Array.min", .f = collections.array_min },
     .{ .fqn = "kotlin.Array.maxOrNull", .f = collections.array_max_or_null },
     .{ .fqn = "kotlin.Array.minOrNull", .f = collections.array_min_or_null },
-    // `minWith`/`maxWith`(OrNull) fold by the Comparator argument (the prior
-    // path ignored the comparator and used natural order).
     .{ .fqn = "kotlin.Array.minWith", .f = collections.coll_min_with },
     .{ .fqn = "kotlin.Array.maxWith", .f = collections.coll_max_with },
     .{ .fqn = "kotlin.Array.minWithOrNull", .f = collections.coll_min_with_or_null },
@@ -1115,7 +1089,6 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.ranges.IntRange.count", .f = ranges.range_count },
     .{ .fqn = "kotlin.ranges.IntProgression.count", .f = ranges.range_count },
     .{ .fqn = "kotlin.ranges.IntRange.sum", .f = ranges.range_sum },
-    // Char range/progression intrinsics (same kind-agnostic bodies).
     .{ .fqn = "kotlin.ranges.CharRange.asSequence", .f = sequence.seq_from_range },
     .{ .fqn = "kotlin.ranges.CharProgression.asSequence", .f = sequence.seq_from_range },
     .{ .fqn = "kotlin.ranges.CharRange.first", .f = ranges.range_first },
@@ -1138,7 +1111,6 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.ranges.CharProgression.toList", .f = ranges.range_to_list },
     .{ .fqn = "kotlin.ranges.CharRange.count", .f = ranges.range_count },
     .{ .fqn = "kotlin.ranges.CharProgression.count", .f = ranges.range_count },
-    // Unsigned range/progression intrinsics (same O(1) bodies).
     .{ .fqn = "kotlin.ranges.UIntRange.asSequence", .f = sequence.seq_from_range },
     .{ .fqn = "kotlin.ranges.UIntProgression.asSequence", .f = sequence.seq_from_range },
     .{ .fqn = "kotlin.ranges.UIntRange.first", .f = ranges.range_first },
@@ -1605,16 +1577,12 @@ const TABLE = [_]Entry{
     .{ .fqn = "kotlin.Char.titlecaseChar", .f = char.char_titlecase_char },
 };
 
-/// Number of hand-implemented intrinsics; surfaced through coverage.
 pub const COUNT: usize = TABLE.len;
 
-/// One declared parameter-name list for a hand-implemented intrinsic.
 const ParamEntry = struct { fqn: []const u8, names: []const []const u8 };
 
-/// Parameter names for hand-implemented intrinsics. Keyed by the same FQNs
-/// used in `TABLE`. Consulted by the stdlib root's `paramNames` so callers
-/// can reorder named arguments to match each intrinsic's declared parameter
-/// order. Entries omitted here fall through to the upstream lookup.
+/// Parameter names for hand-implemented intrinsics, so callers can reorder named
+/// arguments into declared order. An omitted entry falls through to upstream.
 const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.collections.List.chunked", .names = &.{"size", "transform"} },
     .{ .fqn = "kotlin.Array.copyInto", .names = &.{ "destination", "destinationOffset", "startIndex", "endIndex" } },
@@ -1644,9 +1612,6 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.collections.MutableList.joinToString", .names = &.{"separator", "prefix", "postfix", "limit", "truncated", "transform"} },
     .{ .fqn = "kotlin.collections.MutableList.slice", .names = &.{"indices"} },
     .{ .fqn = "kotlin.collections.MutableList.subList", .names = &.{"fromIndex", "toIndex"} },
-    // The ranged primitive/object array `sort(fromIndex, toIndex)` — named
-    // args (`content.sort(fromIndex = 0, toIndex = _size)`, as androidx's
-    // primitive `*List.sort()` calls it) must reorder to positional.
     .{ .fqn = "kotlin.Array.sort", .names = &.{ "fromIndex", "toIndex" } },
     .{ .fqn = "kotlin.IntArray.sort", .names = &.{ "fromIndex", "toIndex" } },
     .{ .fqn = "kotlin.LongArray.sort", .names = &.{ "fromIndex", "toIndex" } },
@@ -1663,8 +1628,6 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.collections.MutableList.takeLast", .names = &.{"n"} },
     .{ .fqn = "kotlin.collections.MutableList.windowed", .names = &.{"size", "step", "partialWindows", "transform"} },
     .{ .fqn = "kotlin.String.chunked", .names = &.{"size", "transform"} },
-    // The 2-arg form; the upstream mining also has the 1-arg operator
-    // `compareTo(other)`, so a hand entry is needed for `ignoreCase` to reorder.
     .{ .fqn = "kotlin.String.compareTo", .names = &.{ "other", "ignoreCase" } },
     .{ .fqn = "kotlin.String.repeat", .names = &.{"n"} },
     .{ .fqn = "kotlin.CharSequence.repeat", .names = &.{"n"} },
@@ -1729,10 +1692,8 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.__klioMonitorExit", .names = &.{"lock"} },
     .{ .fqn = "kotlin.concurrent.thread", .names = &.{"start", "isDaemon", "contextClassLoader", "name", "priority", "block"} },
     .{ .fqn = "kotlin.concurrent.Thread.sleep", .names = &.{"millis"} },
-    // `copyInto(destination, destinationOffset, startIndex, endIndex)` —
-    // kotlinx-io's `Segment.writeTo` calls it with named arguments, so a
-    // missing entry here silently dropped the named offsets and copied
-    // nothing (zeroed bytes on the buffer compact path).
+    // kotlinx-io's `Segment.writeTo` calls `copyInto` with named arguments, and
+    // without an entry here the named offsets are dropped and nothing is copied.
     .{ .fqn = "kotlin.Array.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
     .{ .fqn = "kotlin.IntArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
     .{ .fqn = "kotlin.LongArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
@@ -1748,8 +1709,6 @@ const PARAM_NAMES = [_]ParamEntry{
     .{ .fqn = "kotlin.UByteArray.copyInto", .names = &.{"destination", "destinationOffset", "startIndex", "endIndex"} },
 };
 
-/// Hashed lookup map built from `TABLE`, the single source of truth. The
-/// FqnIterator/COUNT still read `TABLE` directly so the table stays canonical.
 const TABLE_MAP = blk: {
     @setEvalBranchQuota(TABLE.len * TABLE.len);
     var kvs: [TABLE.len]struct { []const u8, StdlibFn } = undefined;
@@ -1757,7 +1716,6 @@ const TABLE_MAP = blk: {
     break :blk std.StaticStringMap(StdlibFn).initComptime(kvs);
 };
 
-/// Hashed lookup map built from `PARAM_NAMES`, its single source of truth.
 const PARAM_NAMES_MAP = blk: {
     @setEvalBranchQuota(PARAM_NAMES.len * PARAM_NAMES.len);
     var kvs: [PARAM_NAMES.len]struct { []const u8, []const []const u8 } = undefined;
@@ -1773,16 +1731,10 @@ pub fn lookup(fqn: []const u8) ?StdlibFn {
     return TABLE_MAP.get(fqn);
 }
 
-/// Resolve one Kotlin source declaration to the exact host ABI symbol that
-/// implements it. Receiverless declarations normally match `source_fqn`
-/// directly. Receiver-formed declarations may instead use the runtime
-/// receiver-qualified form (`kotlin.String.nativeIndexOf`,
-/// `kotlin.collections.MutableList.fill`, and so on).
-///
-/// A receiver-qualified result is returned only when exactly one registered
-/// symbol has the requested receiver/name suffix. The chosen FQN can therefore
-/// be stored on the declaration and linked by FuncId without recreating the
-/// runtime's package/type probe ladder.
+/// Resolve one Kotlin source declaration to the host ABI symbol implementing it.
+/// A receiver-formed declaration may use the runtime receiver-qualified form,
+/// which resolves only when exactly one registered symbol carries that receiver
+/// and name suffix.
 pub fn declarationHostSymbol(
     source_fqn: []const u8,
     receiver_name: ?[]const u8,
@@ -1825,7 +1777,6 @@ pub fn applicable(fqn: []const u8, args: []const Value) ?bool {
     return null;
 }
 
-/// Iterator over every registered intrinsic FQN.
 pub const FqnIterator = struct {
     i: usize = 0,
 
@@ -1840,10 +1791,6 @@ pub const FqnIterator = struct {
 pub fn allFqns() FqnIterator {
     return .{};
 }
-
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 

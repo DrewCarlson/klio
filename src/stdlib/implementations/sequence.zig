@@ -1,8 +1,7 @@
 //! Sequence (lazy) stdlib intrinsics.
 //!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. The receiver, when
-//! present, is `args[0]`. A `RuntimeError` surfaces as data through
-//! `EvalResult.err`; OOM stays a Zig error.
+//! The receiver, when present, is `args[0]`. A `RuntimeError` surfaces as data
+//! through `EvalResult.err`; OOM stays a Zig error.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -31,19 +30,11 @@ fn err(e: RuntimeError) EvalResult {
     return .{ .err = e };
 }
 
-/// `Result<[]Value, RuntimeError>` for the materialiser helpers: OOM stays
-/// a Zig error, a `RuntimeError` rides back as data.
 const Materialised = union(enum) {
     ok: []Value,
     err: RuntimeError,
 };
 
-// ============================================================
-// Constructors / receiver helpers (mirror the `super::` imports)
-// ============================================================
-
-/// Build an items-only Sequence from an owned `[]Value`. Used by
-/// `asSequence`, `sequenceOf`, and `emptySequence`.
 fn makeSequence(allocator: std.mem.Allocator, items: []Value) std.mem.Allocator.Error!Value {
     const src = try ValueSlice.init(allocator, items);
     const data = try ObjRef(SequenceData).init(allocator, .{
@@ -95,16 +86,11 @@ fn recvString(args: []const Value, what: []const u8) union(enum) { s: Value, err
     return .{ .err = .{ .Type = typeMsg(what, "a String receiver") } };
 }
 
-/// `"<what> requires <suffix>"`. The message is owned by a small static
-/// table when possible; the dynamic forms used here are all comptime
-/// concatenations at the call sites, so the slices live for the program.
 fn typeMsg(comptime_what: []const u8, comptime_suffix: []const u8) []const u8 {
     _ = comptime_suffix;
     return comptime_what;
 }
 
-/// `range_iter_int`: collect the inclusive progression `start..end step` into
-/// an owned `[]i64`. Empty when the step points away from `end`.
 fn rangeIterInt(allocator: std.mem.Allocator, start: i64, end: i64, step: i64) std.mem.Allocator.Error![]i64 {
     var acc: std.ArrayList(i64) = .empty;
     if (step == 0) return acc.toOwnedSlice(allocator);
@@ -126,26 +112,19 @@ fn rangeIterInt(allocator: std.mem.Allocator, start: i64, end: i64, step: i64) s
     return acc.toOwnedSlice(allocator);
 }
 
-// ============================================================
-// Sequence builder (`sequence { yield(...) }`)
-// ============================================================
-
 const BuilderState = runtime.BuilderState;
 const BuilderStateRef = runtime.BuilderStateRef;
 const SeqIterState = runtime.SeqIterState;
 const SeqIterStateRef = runtime.SeqIterStateRef;
 
-// Scope-instance field names shared with the host builder driver
-// (`coroutines.builderStep`).
 const seq_has_value_field = "__seq_has_value";
 const seq_value_field = "__seq_value";
 const seq_yield_iter_field = "__seq_yield_iter";
 
-/// Build the lazy `Builder`-source Sequence for `sequence { ... }` /
-/// `iterator { ... }`. The `suspend SequenceScope<T>.() -> Unit` block is NOT
-/// run here — the host drives it one `yield` at a time as the consumer pulls
-/// (`builderStep`). The scope is a synthetic `SequenceScope` instance carrying
-/// the pending yield value / yieldAll iterator between pulls.
+/// Build the lazy `Builder`-source Sequence for `sequence { }` and
+/// `iterator { }`. The block does not run here: the host's `builderStep` drives
+/// it one `yield` at a time as the consumer pulls, and the scope is a synthetic
+/// `SequenceScope` carrying the pending yield between pulls.
 fn makeBuilderSequence(ctx: *CallCtx) std.mem.Allocator.Error!union(enum) { seq: Value, err: RuntimeError } {
     if (ctx.args.len < 1) return .{ .err = .{ .Arity = "sequence builder expects a block" } };
     const block = ctx.args[0];
@@ -186,16 +165,13 @@ pub fn seq_iterator_builder(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(try makeSeqIter(ctx.allocator, seq));
 }
 
-/// A lazy `SeqIter` over `seq` (the `Sequence.iterator()` / `iterator{}`
-/// result). Adopts one owned reference to `seq`.
 pub fn makeSeqIter(allocator: std.mem.Allocator, seq: Value) std.mem.Allocator.Error!Value {
     const state = try SeqIterStateRef.init(allocator, .{ .seq = seq });
     return .{ .SeqIter = state };
 }
 
-/// `SequenceScope.yield(value)` — stash the value on the scope and suspend the
-/// builder coroutine. The host's `builderStep` reads the value and resumes the
-/// block on the next pull.
+/// Stash the yielded value on the scope and suspend the builder coroutine;
+/// `builderStep` reads it and resumes the block on the next pull.
 pub fn seq_scope_yield(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1 or ctx.args[0] != .Instance) return err(.{ .Type = "yield: not a SequenceScope" });
     const g = ctx.args[0].Instance.borrowMut();
@@ -208,13 +184,11 @@ pub fn seq_scope_yield(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return err(.{ .Suspend = -1 });
 }
 
-/// `SequenceScope.yieldAll(iterator/iterable/sequence)` — stash an Iterator on
-/// the scope and suspend; the host drains it lazily before resuming the block.
+/// Stash an Iterator on the scope and suspend; the host drains it lazily.
 pub fn seq_scope_yield_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1 or ctx.args[0] != .Instance) return err(.{ .Type = "yieldAll: not a SequenceScope" });
     if (ctx.args.len <= 1) return ok(.Unit);
     const arg = ctx.args[1];
-    // Obtain a fresh Iterator over the argument so the host can pull lazily.
     var iter: Value = undefined;
     switch (arg) {
         .Iterator, .RangeIter, .SeqIter => iter = arg,
@@ -244,10 +218,6 @@ pub fn seq_scope_yield_all(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
     return err(.{ .Suspend = -1 });
 }
-
-// ============================================================
-// asSequence / sequenceOf / emptySequence / generateSequence
-// ============================================================
 
 pub fn seq_from_list(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const r = recvListItems(ctx.args, "asSequence");
@@ -312,9 +282,9 @@ pub fn seq_of(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(try makeSequence(ctx.allocator, items));
 }
 
-// emptySequence() is a singleton (Kotlin's EmptySequence object):
-// identity asserts across call sites hold. Arena profile only — under
-// refcount reclaim a process cache reads as a leak.
+// `emptySequence()` is a singleton, as Kotlin's EmptySequence object is, so
+// identity asserts hold across call sites. Arena profile only: under refcount
+// reclaim a process cache reads as a leak.
 var empty_seq_singleton: ?Value = null;
 var empty_seq_root_registered = std.atomic.Value(bool).init(false);
 
@@ -327,11 +297,6 @@ pub fn resetEmptySequenceSingleton() void {
 }
 
 pub fn seq_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // One process singleton: `emptySequence()` is an object on the JVM,
-    // and `orEmpty()`/`assertEquals` compare it by identity. Under
-    // refcount reclaim the process cache would register as a leak, so
-    // that profile serves fresh values (as the empty-collection
-    // singletons do).
     if (runtime.reclaimEnabled()) {
         const items = try ctx.allocator.alloc(Value, 0);
         return ok(try makeSequence(ctx.allocator, items));
@@ -348,12 +313,10 @@ pub fn seq_empty(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(v);
 }
 
-/// `Sequence { () -> Iterator<T> }` — the SAM factory. Lazy and
-/// re-iterable: each iteration invokes the factory for a fresh Iterator.
+/// The `Sequence { () -> Iterator<T> }` SAM factory: lazy and re-iterable, each
+/// iteration invoking the factory for a fresh Iterator.
 pub fn seq_from_iterator_fn(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const args = ctx.args;
-    // The factory lambda is the last callable argument (a receiver may be
-    // prepended by the member walk).
     var i: usize = args.len;
     while (i > 0) {
         i -= 1;
@@ -378,16 +341,12 @@ pub fn seq_generate_sequence(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
         const data = try ObjRef(SequenceData).init(ctx.allocator, .{
             .source = .{ .Generate = .{ .seed = null, .next = next } },
             .ops = &.{},
-            // The nullary form is stateful: the source constrains it to
-            // one consumption.
             .one_shot = true,
         });
         return ok(.{ .Sequence = data });
     }
     if (args.len == 2 and isLambdaLike(args[1])) {
         var seed: ?ValueBox = null;
-        // `generateSequence(seedFunction, nextFunction)`: the seed is a
-        // producer invoked at each iteration start.
         const seed_is_fn = isLambdaLike(args[0]);
         if (args[0] != .Null) {
             args[0].retain();
@@ -408,21 +367,14 @@ fn isLambdaLike(v: Value) bool {
     return v == .IrClosure;
 }
 
-// ============================================================
-// Eager fast-path terminals
-// ============================================================
-
 const EagerResult = union(enum) {
-    /// `Items`-source Sequence with no ops: the frozen elements.
     some: ValueSlice,
-    /// Has ops or a non-trivial source — caller routes through the lazy path.
     none,
     err: RuntimeError,
 };
 
-/// Fast-path Sequence terminal ops handle the special case of an
-/// `Items`-source Sequence with no ops. Anything more (intermediate ops,
-/// generator sources) goes through the lazy materialize path.
+/// Fast-path terminals handle an `Items`-source Sequence with no ops; anything
+/// else takes the lazy materialize path.
 fn recvSeqEager(args: []const Value, what: []const u8) EagerResult {
     if (args.len < 1 or args[0] != .Sequence) {
         _ = what;
@@ -497,11 +449,6 @@ pub fn seq_last(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
 }
 
-// ============================================================
-// Short-circuiting predicate terminals
-// ============================================================
-
-/// Append one more op to a Sequence, returning a new lazy Sequence value.
 fn seqWithExtraOp(allocator: std.mem.Allocator, seq_val: Value, op: SeqOp) std.mem.Allocator.Error!Value {
     if (seq_val != .Sequence) return seq_val;
     const g = seq_val.Sequence.borrow();
@@ -522,8 +469,8 @@ const FilterTarget = union(enum) {
     err: RuntimeError,
 };
 
-/// The receiver Sequence, with a trailing `Filter(predicate)` op when the
-/// call supplies one (the `first { p }` / `find { p }` / `any { p }` shape).
+/// The receiver Sequence plus a trailing `Filter(predicate)` when the call
+/// supplies one, the `first { p }` and `any { p }` shape.
 fn seqWithOptionalFilter(ctx: *CallCtx, who: []const u8) std.mem.Allocator.Error!FilterTarget {
     if (ctx.args.len < 1 or ctx.args[0] != .Sequence) {
         _ = who;
@@ -597,17 +544,11 @@ pub fn seq_none(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 }
 
 pub fn seq_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // Kotlin returns an opaque id like `kotlin.sequences.TransformingSequence@…`.
-    // Stable parity for that string is meaningless (it embeds the heap
-    // address), so we emit a deterministic placeholder. Programs that need a
-    // useful value should call `.toList()` before printing.
+    // Kotlin returns an opaque id embedding a heap address, so a deterministic
+    // placeholder is emitted instead.
     const s = try runtime.strInit(ctx.allocator, "kotlin.sequences.Sequence");
     return ok(.{ .String = s });
 }
-
-// ============================================================
-// Map.Entry members
-// ============================================================
 
 pub fn map_entry_key(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len < 1 or ctx.args[0] != .MapEntry) {
@@ -639,10 +580,6 @@ pub fn map_entry_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = ref });
 }
 
-// ============================================================
-// Lazy materialiser (faithful port of the `super::` driver)
-// ============================================================
-
 fn materialiseSequence(
     allocator: std.mem.Allocator,
     host: IntrinsicHost,
@@ -652,12 +589,10 @@ fn materialiseSequence(
     return materialiseSequenceBounded(allocator, host, out, seq_val, null);
 }
 
-/// Materialize a Sequence, optionally stopping once `max` items have been
-/// produced. The bound makes short-circuiting terminals (`first`, `find`,
-/// `any`, `take(n).toList()`) pull only as far as needed instead of running
-/// the whole (possibly infinite) source. The bound applies on the streaming
-/// fast path; ops that must buffer (sort, flatMap, distinct) fall back to
-/// full materialization, as in Kotlin.
+/// Materialize a Sequence, optionally stopping after `max` items so a
+/// short-circuiting terminal pulls only as far as needed instead of running a
+/// possibly infinite source. The bound applies on the streaming fast path; ops
+/// that must buffer fall back to full materialization, as in Kotlin.
 fn materialiseSequenceBounded(
     allocator: std.mem.Allocator,
     host: IntrinsicHost,
@@ -707,8 +642,8 @@ fn materialiseSequenceBounded(
                 }
             },
             .Builder => |bstate0| {
-                // Drive a FRESH cursor so this materialisation is independent of
-                // any other consumption of the same (re-iterable) Sequence.
+                // Drive a fresh cursor so this materialisation is independent of
+                // any other consumption of the same re-iterable Sequence.
                 const bstate = try collections.freshBuilderState(host, allocator, bstate0);
                 try collections.pinBuilderState(allocator, bstate);
                 while (true) {
@@ -872,7 +807,6 @@ fn materialiseSequenceBounded(
         return .{ .ok = try output.toOwnedSlice(allocator) };
     }
 
-    // Buffered path: materialize the source fully, then apply each op.
     var items: std.ArrayList(Value) = .empty;
     switch (seq.source) {
         .Items => |v| {
@@ -1007,16 +941,12 @@ fn materialiseSequenceBounded(
     return .{ .ok = try items.toOwnedSlice(allocator) };
 }
 
-/// Apply one buffered op in place. Returns a `RuntimeError` on failure.
-/// Outcome of expanding a `flatMap` transform result.
 const FlatMapOutcome = union(enum) { expanded: void, single: void, err: RuntimeError };
 
-/// Flatten a `flatMap` transform result that is neither a List/Set/Sequence
-/// (handled inline by the caller). Built-in iterable shapes (Array, Range,
-/// Map) expand directly through the shared `iterableItems` extractor; any
-/// other value (a user `Instance` that is `Iterable`) drains through the host
-/// `iterator()`/`hasNext()`/`next()` protocol. Returns `.single` when the
-/// value is not iterable, so the caller appends it as one element.
+/// Flatten a `flatMap` result that is not a List, Set or Sequence, which the
+/// caller handles inline: built-in iterable shapes expand through
+/// `iterableItems`, a user `Iterable` drains through the host iterator protocol,
+/// and a non-iterable returns `.single` for the caller to append as one element.
 fn flatMapExpand(
     allocator: std.mem.Allocator,
     host: IntrinsicHost,
@@ -1257,8 +1187,6 @@ fn applyBufferedOp(
             if (try sortByKey(host, out, items.items, keyed, sb.descending)) |e| return e;
         },
         .SortedWith => |comparator| {
-            // Insertion sort so the comparator callback can dispatch back
-            // through the host.
             var i: usize = 1;
             while (i < items.items.len) : (i += 1) {
                 var j = i;
@@ -1286,8 +1214,6 @@ fn applyBufferedOp(
     }
     return null;
 }
-
-// ----- streaming pump state -----
 
 const StreamState = struct {
     taken: []usize,
@@ -1320,7 +1246,6 @@ const StreamState = struct {
 };
 
 const PumpResult = union(enum) {
-    /// `true` keep pulling the source, `false` stop entirely.
     cont: bool,
     err: RuntimeError,
 };
@@ -1422,8 +1347,8 @@ fn pump(
     return .{ .cont = true };
 }
 
-/// Has any Take stage reached its cap? If so the pipeline is exhausted and
-/// the source must NOT be pulled again.
+/// Whether a Take stage has reached its cap, which exhausts the pipeline so the
+/// source must not be pulled again.
 fn takeCapReached(ops: []const SeqOp, taken: []const usize) bool {
     for (ops, 0..) |op, i| {
         switch (op) {
@@ -1436,8 +1361,6 @@ fn takeCapReached(ops: []const SeqOp, taken: []const usize) bool {
     }
     return false;
 }
-
-// ----- shared small helpers -----
 
 fn invokeCallable(host: IntrinsicHost, f: *const Value, args: []const Value, out: Output) std.mem.Allocator.Error!EvalResult {
     return host.invokeCallable(f, args, out);
@@ -1484,11 +1407,8 @@ fn noSuchElement(allocator: std.mem.Allocator, message: []const u8) std.mem.Allo
     return .{ .Thrown = try Value.newException(allocator, .{ .fqn = fqn, .message = .from(msg), .cause = null }) };
 }
 
-// ----- comparison / sort (faithful `compare_values`) -----
-
-/// Kotlin's `Double`/`Float` total order (matching `java.lang.Double.compare`):
-/// every `NaN` is greater than all other values and all `NaN`s are equal, and
-/// `-0.0 < 0.0`.
+/// Kotlin's `Double` and `Float` total order, as `java.lang.Double.compare`:
+/// every NaN is greater than every other value, all NaNs equal, `-0.0 < 0.0`.
 fn kotlinFloatTotalCmp(a: f64, b: f64) std.math.Order {
     if (a < b) return .lt;
     if (a > b) return .gt;
@@ -1532,8 +1452,6 @@ fn compareValues(a: *const Value, b: *const Value) CmpResult {
     return .{ .err = .{ .Type = "values are not comparable" } };
 }
 
-/// Compare two strings the way Kotlin's `String.compareTo` does:
-/// lexicographically over UTF-16 code units.
 fn compareUtf16(a: []const u8, b: []const u8) std.math.Order {
     var ai = Utf16Iter{ .bytes = a };
     var bi = Utf16Iter{ .bytes = b };
@@ -1553,7 +1471,6 @@ fn compareUtf16(a: []const u8, b: []const u8) std.math.Order {
     }
 }
 
-/// Streams UTF-16 code units from a UTF-8 byte slice.
 const Utf16Iter = struct {
     bytes: []const u8,
     pos: usize = 0,
@@ -1586,9 +1503,8 @@ const Utf16Iter = struct {
     }
 };
 
-/// Kotlin's natural ordering reaches any class that implements
-/// `Comparable`. The builtin table above covers the primitives; anything
-/// else dispatches its own `compareTo` before the sort gives up.
+/// Kotlin's natural ordering reaches any `Comparable`: the builtin table covers
+/// the primitives, and anything else dispatches its own `compareTo`.
 fn compareValuesVia(
     host: IntrinsicHost,
     out: Output,
@@ -1609,8 +1525,8 @@ fn compareValuesVia(
 }
 
 fn sortNatural(host: IntrinsicHost, out: Output, items: []Value, descending: bool) std.mem.Allocator.Error!?RuntimeError {
-    // Insertion sort: the comparison is fallible (returns RuntimeError data),
-    // so a borrow-free total-order sort that can bail out is simplest.
+    // Insertion sort: the comparison is fallible, returning RuntimeError data,
+    // so the sort must bail out mid-way.
     var i: usize = 1;
     while (i < items.len) : (i += 1) {
         var j = i;
@@ -1651,17 +1567,12 @@ fn sortByKey(host: IntrinsicHost, out: Output, items: []Value, keys: []Value, de
     return null;
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
-
 const testing = std.testing;
 const NoopHost = runtime.NoopHost;
 const CaptureOutput = runtime.CaptureOutput;
 
-/// Per-test harness: an arena (so an intrinsic's allocations are reclaimed
-/// in one shot, exactly as the runtime drives them), a NoopHost, and a
-/// capture sink. Drop with `deinit`.
+/// Per-test harness: an arena reclaiming an intrinsic's allocations in one shot,
+/// a NoopHost and a capture sink. Drop with `deinit`.
 const Harness = struct {
     arena: std.heap.ArenaAllocator,
     host: NoopHost,
@@ -1755,7 +1666,6 @@ test "asSequence from a range enumerates the progression" {
     defer g.deinit();
     const sg = g.get().source.Items.borrow();
     defer sg.deinit();
-    // 1, 3, 5
     try testing.expectEqual(@as(usize, 3), sg.get().len);
     try testing.expectEqual(@as(i32, 1), sg.get().*[0].Int);
     try testing.expectEqual(@as(i32, 3), sg.get().*[1].Int);
@@ -1801,7 +1711,6 @@ test "Sequence.toList on a non-trivial chain is routed to the interpreter" {
 
     const empty = try h.allocator().alloc(Value, 0);
     const seq = try makeSequence(h.allocator(), empty);
-    // Attach a Filter op so the fast path declines.
     const target = try seqWithExtraOp(h.allocator(), seq, .{ .Filter = .Unit });
     var args = [_]Value{target};
     var ctx = h.ctx(&args);

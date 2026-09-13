@@ -1,16 +1,8 @@
 //! Native bindings for `kotlinx-datetime`.
 //!
-//! The Kotlin shim under `shim/` declares the public API; the bindings
-//! here expose host-side helpers the shim calls into:
-//!
-//! - system clock (`__kxdt_currentTimeMillis`,
-//!   `__kxdt_currentNanosOfSecond`, `__kxdt_currentSystemTimeZoneId`)
-//! - `Instant` <-> `LocalDateTime` conversion in a given IANA tz
-//! - ISO-8601 rendering and parsing of `Instant`
-//! - tz id validation
-//!
-//! Top-level arithmetic, formatting of `LocalDate` / `LocalTime` /
-//! `LocalDateTime`, and operator dispatch are pure-Kotlin in the shim.
+//! The Kotlin shim declares the public API; these are the host-side helpers it
+//! calls into: the system clock, `Instant` to `LocalDateTime` conversion in a
+//! given IANA tz, ISO-8601 rendering and parsing, and tz id validation.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -26,8 +18,6 @@ const ObjRef = runtime.ObjRef;
 const PrimitiveArrayKind = runtime.PrimitiveArrayKind;
 const HostBindings = stdlib.HostBindings;
 
-/// Build a registry populated with this crate's native bindings, keyed by
-/// the FQN the shim's `external` declarations resolve to.
 pub fn hostBindings(allocator: std.mem.Allocator) std.mem.Allocator.Error!HostBindings {
     var b = HostBindings.init(allocator);
     try b.register("kotlinx.datetime.__kxdt_currentTimeMillis", currentTimeMillis);
@@ -54,10 +44,6 @@ fn typeErr(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype
 fn typeErrLit(msg: []const u8) EvalResult {
     return .{ .err = .{ .Type = msg } };
 }
-
-// -------------------------------------------------------------------------
-// Wall-clock readings
-// -------------------------------------------------------------------------
 
 const Now = struct {
     secs: i64,
@@ -87,9 +73,8 @@ fn currentSystemTzId(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .String = try runtime.strInitOwned(ctx.allocator, id) });
 }
 
-/// Best-effort detection of the host IANA tz id. Honors `$TZ` when it
-/// names a zone, then the `/etc/localtime` symlink target, else `UTC`.
-/// The returned slice is owned by `allocator`.
+/// Best-effort detection of the host IANA tz id: `$TZ` when it names a zone,
+/// then the `/etc/localtime` symlink target, else `UTC`. Owned by `allocator`.
 fn systemTimeZoneId(allocator: std.mem.Allocator) std.mem.Allocator.Error![]const u8 {
     if (try getEnvVar(allocator, "TZ")) |tz| {
         if (tz.len != 0 and tz[0] != ':') return tz;
@@ -109,15 +94,9 @@ fn systemTimeZoneId(allocator: std.mem.Allocator) std.mem.Allocator.Error![]cons
     return try allocator.dupe(u8, "UTC");
 }
 
-/// Read an environment variable's value. Returns an `allocator`-owned copy or
-/// null. Reads the process environment portably (see `runtime.procEnvGetVar`).
 fn getEnvVar(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error!?[]u8 {
     return runtime.procEnvGetVar(allocator, name);
 }
-
-// -------------------------------------------------------------------------
-// Argument coercion
-// -------------------------------------------------------------------------
 
 const ArgError = error{ OutOfMemory, BadArg };
 
@@ -132,7 +111,6 @@ fn argLong(ctx: *CallCtx, idx: usize) ArgError!i64 {
     return ArgError.BadArg;
 }
 
-// Kotlin Long.toInt() truncates.
 fn argI32(ctx: *CallCtx, idx: usize) ArgError!i32 {
     return @truncate(try argLong(ctx, idx));
 }
@@ -159,11 +137,9 @@ fn badStrArg(allocator: std.mem.Allocator, idx: usize) std.mem.Allocator.Error!E
     return typeErr(allocator, "kotlinx.datetime: argument {d} must be String", .{idx});
 }
 
-// -------------------------------------------------------------------------
-// Civil-time math (Howard Hinnant's algorithms; proleptic Gregorian)
-// -------------------------------------------------------------------------
+// Civil-time math over the proleptic Gregorian calendar, by Howard Hinnant's
+// algorithms.
 
-/// Days since 1970-01-01 for a y/m/d in the proleptic Gregorian calendar.
 fn daysFromCivil(y: i64, m: u32, d: u32) i64 {
     const yy = if (m <= 2) y - 1 else y;
     const era = @divFloor(if (yy >= 0) yy else yy - 399, 400);
@@ -176,7 +152,6 @@ fn daysFromCivil(y: i64, m: u32, d: u32) i64 {
 
 const Civil = struct { y: i64, m: u32, d: u32 };
 
-/// y/m/d for a count of days since 1970-01-01.
 fn civilFromDays(z_in: i64) Civil {
     const z = z_in + 719468;
     const era = @divFloor(if (z >= 0) z else z - 146096, 146097);
@@ -210,7 +185,6 @@ const Parts = struct {
     nano: u32,
 };
 
-/// Decompose an epoch second (plus sub-second nanos) into civil parts.
 fn partsFromEpoch(epoch_sec: i64, nano: u32) Parts {
     const days = @divFloor(epoch_sec, 86_400);
     var rem = epoch_sec - days * 86_400; // 0..86399
@@ -235,12 +209,10 @@ fn epochFromCivil(p: Parts) i64 {
     return days * 86_400 + @as(i64, p.hour) * 3600 + @as(i64, p.minute) * 60 + @as(i64, p.second);
 }
 
-// -------------------------------------------------------------------------
-// IANA timezone offsets (TZif / system zoneinfo)
-// -------------------------------------------------------------------------
+// IANA timezone offsets (TZif and system zoneinfo)
 
-/// UTC offset in seconds for a tz id at a given UTC instant. `"Z"` / `"UTC"`
-/// are offset 0. Unknown ids return null so callers fall back to UTC.
+/// UTC offset in seconds for a tz id at a given UTC instant; `"Z"` and `"UTC"`
+/// are 0, and an unknown id returns null so callers fall back to UTC.
 fn tzOffsetAtUtc(allocator: std.mem.Allocator, id: []const u8, epoch_sec: i64) ?i32 {
     if (std.mem.eql(u8, id, "Z") or std.mem.eql(u8, id, "UTC")) return 0;
     const data = readZoneInfo(allocator, id) catch return null;
@@ -248,9 +220,9 @@ fn tzOffsetAtUtc(allocator: std.mem.Allocator, id: []const u8, epoch_sec: i64) ?
     return tzifOffsetUtc(data, epoch_sec);
 }
 
-/// Resolve a local (wall-clock) instant to a UTC offset for `id`. Mirrors the
-/// "single" local-time semantics: the offset whose application reproduces the
-/// requested local time. Returns null on unknown id, leaving UTC fallback.
+/// Resolve a local wall-clock instant to a UTC offset for `id`, the "single"
+/// local-time semantics: the offset whose application reproduces the requested
+/// local time.
 fn tzOffsetForLocal(allocator: std.mem.Allocator, id: []const u8, local_epoch: i64) ?i32 {
     if (std.mem.eql(u8, id, "Z") or std.mem.eql(u8, id, "UTC")) return 0;
     const data = readZoneInfo(allocator, id) catch return null;
@@ -259,7 +231,6 @@ fn tzOffsetForLocal(allocator: std.mem.Allocator, id: []const u8, local_epoch: i
 }
 
 fn readZoneInfo(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
-    // Reject traversal / absolute ids before touching the filesystem.
     if (id.len == 0 or id[0] == '/' or std.mem.indexOf(u8, id, "..") != null) {
         return error.BadZone;
     }
@@ -279,8 +250,6 @@ const TzifEntry = struct {
     offset: i32,
 };
 
-/// A TZif buffer's parsed transition table: the initial (pre-history) offset
-/// and the chronologically ordered transitions.
 const TzifTable = struct {
     initial_offset: i32,
     entries: []TzifEntry,
@@ -291,7 +260,6 @@ fn parseTzif(allocator: std.mem.Allocator, data: []const u8) ?TzifTable {
     const version = data[4];
     const first = parseTzifBlock(allocator, data, 0, 4) catch return null;
     if (version == '2' or version == '3') {
-        // Skip the v1 block and parse the 64-bit block that follows.
         const v1_len = tzifBlockLen(data, 0, 4) orelse return first;
         if (v1_len >= data.len) return first;
         if (data.len < v1_len + 44 or !std.mem.eql(u8, data[v1_len .. v1_len + 4], "TZif")) return first;
@@ -329,8 +297,8 @@ fn readCounts(data: []const u8, base: usize) TzifCounts {
     };
 }
 
-/// Byte length of the TZif block starting at `base` (header + body), used to
-/// step from the v1 block to the v2/v3 block. `time_size` is 4 (v1) or 8 (v2).
+/// Byte length of the TZif block at `base`, header plus body, used to step from
+/// the v1 block to the v2 or v3 block. `time_size` is 4 for v1, 8 for v2.
 fn tzifBlockLen(data: []const u8, base: usize, time_size: usize) ?usize {
     if (base + 44 > data.len) return null;
     const c = readCounts(data, base);
@@ -352,7 +320,6 @@ fn parseTzifBlock(allocator: std.mem.Allocator, data: []const u8, base: usize, t
     pos += c.typecnt * 6;
     if (pos > data.len) return error.Bad;
 
-    // ttinfo offsets (utoff is the first i32 of each 6-byte record).
     const type_offsets = try allocator.alloc(i32, @max(c.typecnt, 1));
     defer allocator.free(type_offsets);
     var ti: usize = 0;
@@ -373,7 +340,6 @@ fn parseTzifBlock(allocator: std.mem.Allocator, data: []const u8, base: usize, t
         entries[k] = .{ .transition = t, .offset = off };
     }
 
-    // Initial offset: the first ttinfo, else 0.
     const initial: i32 = if (c.typecnt > 0) type_offsets[0] else 0;
     return .{ .initial_offset = initial, .entries = entries };
 }
@@ -393,17 +359,11 @@ fn tzifOffsetLocal(data: []const u8, local_epoch: i64) ?i32 {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const table = parseTzif(arena.allocator(), data) orelse return null;
-    // Walk transitions in local time and pick the offset a local date-time
-    // maps through. A transition's two offsets disagree about where it sits
-    // on the local timeline, and BOTH ambiguous shapes resolve to the
-    // EARLIER offset, so the new one takes over only once the local time is
-    // past the transition under both readings:
-    //
-    //   * fall back (`new < prev`): the local hour repeats, and Kotlin picks
-    //     the first pass — `2007-10-28T02:30` in Europe/Paris is +02:00;
-    //   * spring forward (`new > prev`): the local hour does not exist, and
-    //     the result is the local time read with the offset BEFORE the gap
-    //     (equivalently, shifted later by the gap and read with the new one).
+    // Walk transitions in local time and pick the offset a local date-time maps
+    // through. A transition's two offsets disagree about where it sits on the
+    // local timeline, and both ambiguous shapes resolve to the earlier offset:
+    // on a fall back the local hour repeats and Kotlin picks the first pass, and
+    // on a spring forward the missing hour reads with the offset before the gap.
     var off = table.initial_offset;
     for (table.entries) |e| {
         const later = if (e.offset > off) e.offset else off;
@@ -413,10 +373,6 @@ fn tzifOffsetLocal(data: []const u8, local_epoch: i64) ?i32 {
     return off;
 }
 
-// -------------------------------------------------------------------------
-// Array result helper
-// -------------------------------------------------------------------------
-
 fn makeLongArray(allocator: std.mem.Allocator, values: []const i64) std.mem.Allocator.Error!Value {
     var list: std.ArrayList(Value) = .empty;
     defer list.deinit(allocator);
@@ -425,13 +381,8 @@ fn makeLongArray(allocator: std.mem.Allocator, values: []const i64) std.mem.Allo
     return try runtime.ArrayData.initPacked(allocator, PrimitiveArrayKind.Long, list.items);
 }
 
-// -------------------------------------------------------------------------
-// Bindings
-// -------------------------------------------------------------------------
-
 fn instantToLocalParts(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const epoch_sec = argLong(ctx, 0) catch return badLongArg(ctx.allocator, 0);
-    // Kotlin Int nanos reinterpreted as the u32 the conversion expects.
     const nanos: u32 = @bitCast(argI32(ctx, 1) catch return badLongArg(ctx.allocator, 1));
     const tz_id = argStr(ctx, 2) catch return badStrArg(ctx.allocator, 2);
     defer ctx.allocator.free(tz_id);
@@ -485,8 +436,8 @@ fn localToInstant(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(try makeLongArray(ctx.allocator, &.{ utc_epoch, @as(i64, local_parts.nano) }));
 }
 
-/// RFC-3339 / ISO-8601 rendering with chrono's `AutoSi` fractional digits:
-/// trailing zero groups are dropped, picking 0/3/6/9 fraction digits.
+/// RFC-3339 rendering with automatic fractional digits: trailing zero groups are
+/// dropped, leaving 0, 3, 6 or 9.
 fn instantToString(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const epoch_sec = argLong(ctx, 0) catch return badLongArg(ctx.allocator, 0);
     const nanos: u32 = @bitCast(argI32(ctx, 1) catch return badLongArg(ctx.allocator, 1));
@@ -527,10 +478,9 @@ fn validateTimeZone(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(.{ .Bool = valid });
 }
 
-/// Every IANA zone id the host's tz database offers, as a `List<String>`.
-/// Walks `/usr/share/zoneinfo` and keeps the entries whose file is TZif.
-/// The `posix/` and `right/` mirrors and the non-zone metadata files are
-/// skipped, matching what `TimeZone.availableZoneIds` reports elsewhere.
+/// Every IANA zone id the host's tz database offers. Walks `/usr/share/zoneinfo`
+/// keeping TZif files and skipping the `posix/` and `right/` mirrors plus
+/// metadata, so the result matches `TimeZone.availableZoneIds` elsewhere.
 fn availableZoneIds(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const allocator = ctx.allocator;
     var out: std.ArrayList(Value) = .empty;
@@ -551,8 +501,8 @@ fn availableZoneIds(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             for (skip) |s| {
                 if (std.mem.eql(u8, name, s)) return true;
             }
-            // Data files, not zones: they carry no directory separator and
-            // start lowercase or contain a dot.
+            // Data files rather than zones: no directory separator, and either a
+            // lowercase start or a dot.
             return std.mem.indexOfScalar(u8, name, '.') != null;
         }
         fn walk(
@@ -611,8 +561,8 @@ fn zoneExists(allocator: std.mem.Allocator, id: []const u8) bool {
     return data.len >= 4 and std.mem.eql(u8, data[0..4], "TZif");
 }
 
-/// Apply a calendar period in the given tz. Arguments: epochSeconds, nanos,
-/// years, months, days, hours, minutes, seconds, nanoAdjust, tzId. Returns
+/// Apply a calendar period in the given tz, taking epochSeconds, nanos, years,
+/// months, days, hours, minutes, seconds, nanoAdjust and tzId, and returning
 /// `[epochSeconds, nanos]`.
 fn addPeriod(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const epoch_sec = argLong(ctx, 0) catch return badLongArg(ctx.allocator, 0);
@@ -629,9 +579,9 @@ fn addPeriod(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 
     const total_months = @as(i64, years) * 12 + @as(i64, months);
 
-    // Shift in local wall-clock time, mirroring chrono's fixed-offset path:
-    // capture the zone offset at the source instant, apply months on the
-    // local civil date, then re-derive UTC via that same offset window.
+    // Shift in local wall-clock time: capture the zone offset at the source
+    // instant, apply months to the local civil date, then re-derive UTC through
+    // that same offset window.
     const offset = tzOffsetAtUtc(ctx.allocator, tz_id, epoch_sec) orelse 0;
     var local = partsFromEpoch(epoch_sec + @as(i64, offset), nanos);
 
@@ -656,8 +606,6 @@ fn addPeriod(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ok(try makeLongArray(ctx.allocator, &.{ utc_epoch, nano_total }));
 }
 
-/// Add (or subtract) whole months to a civil date, clamping the day to the
-/// target month's length, matching chrono's `checked_add_months` semantics.
 fn addMonths(p: Parts, total_months: i64) ?Parts {
     const m0: i64 = @as(i64, p.month) - 1 + total_months;
     const new_year = p.year + @divFloor(m0, 12);
@@ -675,10 +623,6 @@ fn addMonths(p: Parts, total_months: i64) ?Parts {
     };
 }
 
-// -------------------------------------------------------------------------
-// RFC-3339 parsing
-// -------------------------------------------------------------------------
-
 const ParsedInstant = struct { epoch_sec: i64, nanos: u32 };
 
 fn parseDigits(s: []const u8, n: usize) ?u32 {
@@ -691,8 +635,6 @@ fn parseDigits(s: []const u8, n: usize) ?u32 {
     return v;
 }
 
-/// Parse an RFC-3339 timestamp (date-time with `T`/space separator and a
-/// `Z`/numeric offset), returning the UTC epoch and sub-second nanos.
 fn parseRfc3339(input: []const u8) ?ParsedInstant {
     var s = input;
     if (s.len < 20) return null;
@@ -735,7 +677,6 @@ fn parseRfc3339(input: []const u8) ?ParsedInstant {
         nanos = parseDigits(&frac, 9) orelse return null;
     }
 
-    // Offset: Z/z or +-HH:MM.
     var offset_sec: i64 = 0;
     if (s.len == 0) return null;
     if (s[0] == 'Z' or s[0] == 'z') {
@@ -785,10 +726,6 @@ fn parseSignedYear(s: []const u8) ?YearParse {
     return .{ .year = sign * @as(i64, y), .consumed = i + 4 };
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
-
 const testing = std.testing;
 
 fn makeCtx(host: runtime.IntrinsicHost, out: runtime.Output, args: []const Value) CallCtx {
@@ -820,14 +757,10 @@ const Harness = struct {
 };
 
 fn freeArray(v: Value) void {
-    // Releasing the last handle deinits the backing buffer via the cell's own
-    // allocator; no manual inner deinit.
     v.Array.deinitStorage();
 }
 
 fn freeString(v: Value) void {
-    // The intrinsics mint these via `initOwned`, so the cell owns its byte
-    // buffer and frees it on the final `deinit` under reclaim.
     v.String.deinit();
 }
 
@@ -838,7 +771,6 @@ test "civil-day round trip across the epoch and a leap day" {
     try testing.expectEqual(@as(u32, 1), c.m);
     try testing.expectEqual(@as(u32, 1), c.d);
 
-    // 2024-02-29 is a real leap day.
     const d = daysFromCivil(2024, 2, 29);
     const back = civilFromDays(d);
     try testing.expectEqual(@as(i64, 2024), back.y);
@@ -888,19 +820,16 @@ test "localToInstant is the inverse in UTC" {
 }
 
 test "an ambiguous local time resolves to the earlier offset" {
-    // Europe/Paris 2007: spring forward 03-25 01:00Z (+1 -> +2), fall back
-    // 10-28 01:00Z (+2 -> +1). Both ambiguous shapes read through the
-    // EARLIER offset, so the repeated 02:30 is the first pass and the
-    // missing 02:30 lands one hour past the gap's start.
+    // Europe/Paris 2007 springs forward at 03-25 01:00Z and falls back at 10-28
+    // 01:00Z. Both ambiguous shapes read through the earlier offset, so the
+    // repeated 02:30 is the first pass and the missing 02:30 lands past the gap.
     var hh = Harness.init();
     defer hh.deinit();
     if (!zoneExists(testing.allocator, "Europe/Paris")) return error.SkipZigTest;
 
     const Case = struct { month: i32, expect: i64 };
     const cases = [_]Case{
-        // 2007-10-28T02:30 local, +02:00 -> 2007-10-28T00:30Z
         .{ .month = 10, .expect = 1193531400 },
-        // 2007-03-25T02:30 local, +01:00 -> 2007-03-25T01:30Z
         .{ .month = 3, .expect = 1174786200 },
     };
     for (cases) |c| {
@@ -991,7 +920,6 @@ test "parseInstant round-trips and normalizes offsets" {
         try testing.expectEqual(@as(i64, 0), items[1].Long);
     }
     {
-        // +02:00 wall clock is the same instant two hours earlier in UTC.
         var s = try runtime.strInit(testing.allocator, "2023-11-15T00:13:20+02:00");
         defer s.deinit();
         const args = [_]Value{.{ .String = s }};
@@ -1046,7 +974,6 @@ test "addPeriod adds calendar months with day clamping in UTC" {
     defer hh.deinit();
     var tz = try runtime.strInit(testing.allocator, "UTC");
     defer tz.deinit();
-    // 2023-01-31 + 1 month clamps to 2023-02-28.
     const start = epochFromCivil(.{
         .year = 2023, .month = 1, .day = 31,
         .hour = 0,    .minute = 0, .second = 0,
@@ -1085,7 +1012,6 @@ test "addPeriod applies a time delta with nano carry" {
     defer freeArray(r.ok);
     const items = try r.ok.Array.snapshot(testing.allocator);
     defer testing.allocator.free(items);
-    // +5s plus 0.6s nano on top of 0.5s carries one second.
     try testing.expectEqual(@as(i64, 1_006), items[0].Long);
     try testing.expectEqual(@as(i64, 100_000_000), items[1].Long);
 }

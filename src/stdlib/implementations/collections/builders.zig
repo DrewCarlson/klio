@@ -1,5 +1,4 @@
-//! Array constructors and the collection builder intrinsics
-//! (`listOf`, `setOf`, `mapOf`, `ArrayList`/`HashMap`/`HashSet` ctors).
+//! Array constructors and the collection builder intrinsics.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -49,10 +48,6 @@ const list_transforms_mod = @import("list_transforms.zig");
 const sortListHostAware = list_transforms_mod.sortListHostAware;
 const userMapPairs = list_transforms_mod.userMapPairs;
 
-// =====================================================================
-// Array constructors / isEmpty
-// =====================================================================
-
 fn arrayLen(recv: Value) ?usize {
     return switch (recv) {
         .Array => |arr| arr.len(),
@@ -77,8 +72,8 @@ const SizeOutcome = union(enum) { n: i64, err: EvalResult };
 
 fn arraySizeArg(a: Allocator, v: Value, what: []const u8) Error!SizeOutcome {
     const n = v.asI64() orelse return .{ .err = typeErr(try fmt(a, "{s} expects an Int size", .{what})) };
-    // A negative size is a catchable `NegativeArraySizeException`, not an
-    // interpreter `.Type` error (which unwinds past `assertFailsWith`).
+    // A negative size is a catchable `NegativeArraySizeException`, not a `.Type`
+    // error, which would unwind past `assertFailsWith`.
     if (n < 0) {
         const msg = try fmt(a, "{d}", .{n});
         const e = try thrown(a, "kotlin.NegativeArraySizeException", msg);
@@ -90,10 +85,9 @@ fn arraySizeArg(a: Allocator, v: Value, what: []const u8) Error!SizeOutcome {
 
 fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, default: Value) Error!EvalResult {
     const a = ctx.allocator;
-    // A bare ctor call inside an extension body routes through the member
-    // walk, which prepends the implicit receiver — the constructor takes
-    // none. Strip a leading array when the REMAINING args form a valid
-    // ctor shape ((size), (size, init), or the storage-wrapping array).
+    // A bare ctor call routes through the member walk, which prepends an implicit
+    // receiver the constructor does not take; strip it when the remaining args
+    // form a valid ctor shape.
     var call_args = ctx.args;
     if (call_args.len >= 2 and call_args[0] == .Array) {
         const rest = call_args[1..];
@@ -104,10 +98,8 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
     if (call_args.len == 0 or call_args.len > 2) {
         return arityErr(try fmt(a, "{s} expects (size) or (size, init)", .{name}));
     }
-    // Storage-wrapping unsigned-array constructor: `UIntArray(intArray)` (and
-    // the UByte/UShort/ULong siblings, what `asUIntArray()` lowers to) shares
-    // the signed array's packed buffer as an unsigned view — mutations through
-    // either alias, matching Kotlin's inline value-class storage.
+    // `UIntArray(intArray)` shares the signed array's packed buffer as an
+    // unsigned view, so mutations through either alias.
     if (call_args.len == 1 and prim != null and call_args[0] == .Array) {
         const arr = call_args[0].Array;
         if (arr.primKind()) |src| {
@@ -115,13 +107,9 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
                 (prim.? == .UShort and src == .Short) or
                 (prim.? == .UInt and src == .Int) or
                 (prim.? == .ULong and src == .Long) or
-                // Same-kind wrap (`UIntArray(uintArray)`) passes through.
                 prim.? == src;
             if (is_view) switch (arr.storage()) {
                 .scalars => |pb| return ok(.{ .Array = runtime.ArrayData.scalars(pb.clone(), prim.?) }),
-                // A boxed signed buffer (a `copyOf` that materialized
-                // Values) reinterprets element-wise: same bits, unsigned
-                // tags, packed storage so indexed reads come back tagged.
                 .boxed => {
                     const buf = try arr.snapshot(a);
                     defer if (runtime.freeScratch()) a.free(buf);
@@ -142,10 +130,8 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
         .err => |e| return e,
     };
 
-    // Primitive arrays store packed scalars directly — never materialize a boxed
-    // `Value` list (a 10M `IntArray` would otherwise transiently allocate ~560MB
-    // of 56-byte Values just to convert them away). The zeroed byte buffer is
-    // already the Kotlin default for every primitive (0, false, 0.0, NUL char).
+    // Primitive arrays store packed scalars, never boxed `Value`s, and a zeroed
+    // buffer is already the Kotlin default for every primitive.
     if (prim) |k| {
         const un: usize = @intCast(n);
         var pb = runtime.PrimBuf{ .kind = k };
@@ -173,10 +159,8 @@ fn arrayCtorImpl(ctx: *CallCtx, name: []const u8, prim: ?PrimitiveArrayKind, def
     }
     const block = call_args[1];
     var list: std.ArrayList(Value) = .empty;
-    // The accumulated results live only in `list` (no frame register holds
-    // them) and the per-element `invoke` reaches a GC safe point, so pin the
-    // accumulator across each call. Re-push after every append: the append may
-    // reallocate `list.items`.
+    // Only `list` holds the results and `invoke` reaches a GC safe point, so pin
+    // the accumulator across each call; an append may reallocate `list.items`.
     const ka = runtime.keepaliveMark();
     defer runtime.keepaliveRestore(ka);
     var i: i64 = 0;
@@ -231,10 +215,6 @@ pub fn array_ctor_ushort(ctx: *CallCtx) Error!EvalResult {
 pub fn array_ctor_ubyte(ctx: *CallCtx) Error!EvalResult {
     return arrayCtorImpl(ctx, "UByteArray", .UByte, .{ .UByte = 0 });
 }
-
-// =====================================================================
-// Collection builders
-// =====================================================================
 
 fn pairArgs(ctx: *CallCtx) union(enum) { pair: struct { a: Value, b: Value }, err: EvalResult } {
     if (ctx.args.len == 2) return .{ .pair = .{ .a = ctx.args[0], .b = ctx.args[1] } };
@@ -360,10 +340,7 @@ pub fn coll_array_as_array_list(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeList(a, items, true));
 }
 
-/// `Array<T>.asList()` / `IntArray.asList()` build a read-only, fixed-size List
-/// *view*: later array element writes show through. A reference array shares
-/// its boxed buffer outright (inherently live); a primitive array carries an
-/// `array` backing so each read re-reads the packed scalars.
+/// `asList()` is a read-only fixed-size view: later array writes show through.
 pub fn arrayAsListView(a: Allocator, arr: runtime.ArrayData) Error!Value {
     switch (arr.storage()) {
         .boxed => |vl| return try Value.newList(a, .{
@@ -411,11 +388,9 @@ pub fn coll_array_as_list(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeList(a, items, false));
 }
 
-// Shared empty read-only collection singletons: emptyList()/emptySet()/
-// emptyMap() and an empty build*/listOf() result all denote one object,
-// so `===`/`assertSame` hold across call sites (Kotlin's EmptyList/
-// EmptySet/EmptyMap objects). Reset at run boundaries — the cells belong
-// to the finished run's allocator.
+// Shared empty read-only singletons, so `===` holds across call sites as it does
+// for Kotlin's EmptyList. Reset at run boundaries, since the cells belong to the
+// finished run's allocator.
 var empty_singleton_lock: runtime.SpinMutex = .{};
 var empty_list_singleton: ?Value = null;
 var empty_set_singleton: ?Value = null;
@@ -423,10 +398,7 @@ var empty_map_singleton: ?Value = null;
 var empty_singleton_root_registered = std.atomic.Value(bool).init(false);
 
 fn gcMarkEmptySingletons(m: *runtime.gc.Marker) void {
-    // Mark through the Value: the boxed payloads live in their own cells
-    // now, and shading only the items/entries left the BOX unmarked — the
-    // sweep freed it and every later emptyList()/emptySet()/emptyMap()
-    // dereferenced a dead payload pointer.
+    // Mark through the Value: shading only the items leaves the box unmarked.
     if (empty_list_singleton) |v| v.gcMark(m);
     if (empty_set_singleton) |v| v.gcMark(m);
     if (empty_map_singleton) |v| v.gcMark(m);
@@ -438,9 +410,8 @@ fn registerEmptySingletonRoot() void {
 }
 
 pub fn sharedEmptyList(a: Allocator) Error!Value {
-    // Under refcount reclaim (unit tests, leak-checked allocators) the
-    // process cache would register as a leak; identity singletons serve
-    // the arena profile, fresh values elsewhere.
+    // Under refcount reclaim the process cache reads as a leak, so only the arena
+    // profile serves identity singletons.
     if (runtime.reclaimEnabled()) return makeList(a, &.{}, false);
     empty_singleton_lock.lock();
     defer empty_singleton_lock.unlock();
@@ -454,9 +425,6 @@ pub fn sharedEmptyList(a: Allocator) Error!Value {
 }
 
 pub fn sharedEmptySet(a: Allocator) Error!Value {
-    // Under refcount reclaim (unit tests, leak-checked allocators) the
-    // process cache would register as a leak; identity singletons serve
-    // the arena profile, fresh values elsewhere.
     if (runtime.reclaimEnabled()) return makeSet(a, &.{}, false);
     empty_singleton_lock.lock();
     defer empty_singleton_lock.unlock();
@@ -470,9 +438,6 @@ pub fn sharedEmptySet(a: Allocator) Error!Value {
 }
 
 pub fn sharedEmptyMap(a: Allocator) Error!Value {
-    // Under refcount reclaim (unit tests, leak-checked allocators) the
-    // process cache would register as a leak; identity singletons serve
-    // the arena profile, fresh values elsewhere.
     if (runtime.reclaimEnabled()) return makeMap(a, &.{}, false);
     empty_singleton_lock.lock();
     defer empty_singleton_lock.unlock();
@@ -515,13 +480,11 @@ fn mapOfImpl(ctx: *CallCtx, mutable: bool, who: []const u8) Error!EvalResult {
         if (v != .Pair) return typeErr(try fmt(a, "{s} expects Pair arguments (use `key to value` or `Pair(k, v)`)", .{who}));
         try entries.append(a, .{ .key = v.Pair.first.asPtr().*, .value = v.Pair.second.asPtr().* });
     }
-    // Entries hold borrowed key/value (read from the Pair args the caller owns).
-    // Dedupe over the still-borrowed entries, then makeMapBorrowed retains the
-    // survivors so the map owns one ref per key+value.
+    // Dedupe over the borrowed entries first; makeMapBorrowed then retains the
+    // survivors.
     return ok(try makeMapBorrowed(a, try dedupeMapInPlaceH(ctx.host, ctx.out, a, entries), mutable));
 }
 
-/// Apply make_map dedupe semantics to an already-collected entry list.
 fn dedupeMapInPlace(a: Allocator, entries: std.ArrayList(MapPair)) Error!std.ArrayList(MapPair) {
     var out: std.ArrayList(MapPair) = .empty;
     for (entries.items) |kv| {
@@ -534,7 +497,6 @@ fn dedupeMapInPlace(a: Allocator, entries: std.ArrayList(MapPair)) Error!std.Arr
     return out;
 }
 
-/// `dedupeMapInPlace` honouring a user key `equals` (dispatched through the VM).
 fn dedupeMapInPlaceH(host: IntrinsicHost, out_w: Output, a: Allocator, entries: std.ArrayList(MapPair)) Error!std.ArrayList(MapPair) {
     var out: std.ArrayList(MapPair) = .empty;
     for (entries.items) |kv| {
@@ -557,8 +519,6 @@ pub fn coll_empty_map(ctx: *CallCtx) Error!EvalResult {
     return ok(try sharedEmptyMap(ctx.allocator));
 }
 
-/// Drain any iterable `value` into a fresh slice. Native List/Set copy
-/// directly; a user class is driven through iterator()/hasNext()/next().
 pub fn materialiseIterableInstance(ctx: *CallCtx, value: Value) Error!ItemsOutcome {
     const a = ctx.allocator;
     switch (value) {
@@ -607,10 +567,8 @@ pub fn coll_to_typed_array(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 0) return typeErr("toTypedArray requires a receiver");
     const recv = ctx.args[0];
     if (recv == .Instance) {
-        // `collectionToArray` dispatches through the collection's `toArray()`
-        // override before falling back to iteration, so a user override
-        // observes the call (AbstractCollection subclasses may cache or
-        // instrument it).
+        // Dispatch through the collection's `toArray()` override before falling
+        // back to iteration, so a user override observes the call.
         if (try ctx.host.invokeMethod(&recv, "toArray", &.{}, ctx.out)) |r| switch (r) {
             .ok => |v| {
                 if (v == .Array) return ok(v);
@@ -657,7 +615,6 @@ pub fn coll_sorted_map_of(ctx: *CallCtx) Error!EvalResult {
     return ok(try makeMapH(ctx.host, ctx.out, a, entries.items, true));
 }
 
-/// Insertion sort a map's entries by key (natural order, optional reverse).
 pub fn sortMapByKey(a: Allocator, entries: []MapPair, descending: bool) Error!?EvalResult {
     var i: usize = 1;
     while (i < entries.len) : (i += 1) {
@@ -685,8 +642,6 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
             const arg = ctx.args[0];
             switch (arg) {
                 .Int => {
-                    // A negative initial capacity is a catchable
-                    // IllegalArgumentException (matching java.util.ArrayList).
                     if (arg.Int < 0) {
                         const msg = try fmt(a, "Illegal Capacity: {d}", .{arg.Int});
                         const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
@@ -699,9 +654,6 @@ pub fn coll_array_list_ctor(ctx: *CallCtx) Error!EvalResult {
                 },
                 .List => |l| return ok(try makeListVL(a, l.items, true)),
                 .Set => |s| return ok(try makeListVL(a, s.items, true)),
-                // An ARRAY collection argument: `ArrayList(this)` inside
-                // `toMutableList` receives the primitive/unsigned array
-                // value itself.
                 .Array => |arr| {
                     var list: std.ArrayList(Value) = .empty;
                     const n = arr.len();
@@ -734,22 +686,16 @@ pub fn coll_hash_map_ctor(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len == 1 and ctx.args[0] == .Map) {
         return ok(try makeMap(a, try snapshotEntries(a, ctx.args[0].Map.entries), true));
     }
-    // `HashMap(map)` over an INTERPRETED Map implementation (a
-    // SnapshotStateMap, a user class): copy through its `entries` view,
-    // exactly as `toMap` does.
+    // An interpreted Map implementation copies through its `entries` view.
     if (ctx.args.len == 1 and ctx.args[0] == .Instance) {
         switch (try userMapPairs(ctx, ctx.args[0], "HashMap")) {
             .entries => |pairs| return ok(try makeMap(a, pairs, true)),
             .err => |e| return e,
         }
     }
-    // `HashMap(initialCapacity)` / `(initialCapacity, loadFactor)` /
-    // `LinkedHashMap(initialCapacity, loadFactor, accessOrder)` — the capacity,
-    // load factor, and access-order flag do not change the observable behavior
-    // of klio's insertion-ordered map beyond construction.
     if (ctx.args[0] == .Int) {
-        // A negative initial capacity, or a non-positive load factor, is a
-        // catchable IllegalArgumentException (matching java.util.HashMap).
+        // A negative capacity or a non-positive load factor is a catchable
+        // IllegalArgumentException, as in java.util.HashMap.
         if (ctx.args[0].asI64()) |cap| {
             if (cap < 0) {
                 const msg = try fmt(a, "Negative initial capacity: {d}", .{cap});
@@ -786,8 +732,6 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
             const arg = ctx.args[0];
             switch (arg) {
                 .Int => {
-                    // HashSet delegates to a backing HashMap, so a negative
-                    // initial capacity is a catchable IllegalArgumentException.
                     if (arg.Int < 0) {
                         const msg = try fmt(a, "Illegal initial capacity: {d}", .{arg.Int});
                         const r = try thrown(a, "kotlin.IllegalArgumentException", msg);
@@ -813,9 +757,8 @@ pub fn coll_hash_set_ctor(ctx: *CallCtx) Error!EvalResult {
             }
         },
         else => {
-            // `HashSet(initialCapacity, loadFactor)` validates both like the
-            // backing HashMap: a negative capacity or a non-positive / NaN load
-            // factor is a catchable IllegalArgumentException.
+            // A negative capacity or a non-positive or NaN load factor is a
+            // catchable IllegalArgumentException.
             if (ctx.args.len == 2 and ctx.args[0] == .Int) {
                 if (ctx.args[0].Int < 0) {
                     const msg = try fmt(a, "Illegal initial capacity: {d}", .{ctx.args[0].Int});

@@ -1,8 +1,6 @@
 //! `kotlin.Result` intrinsics plus the `kotlin.coroutines` language-layer
 //! rendezvous primitives the suspend machinery drives.
 //!
-//! Each intrinsic is a `fn(*CallCtx) !EvalResult`. OOM surfaces as a Zig
-//! error; a `RuntimeError` surfaces as data via `EvalResult`.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -13,17 +11,9 @@ const Value = runtime.Value;
 const RuntimeError = runtime.RuntimeError;
 const StringRef = runtime.StringRef;
 
-// ============================================================
-// Result
-// ============================================================
 
-/// The `(ok, payload)` a `recvResult` extracts from a `Value::Result`
-/// receiver — `payload` is the result's own boxed payload pointer.
 const Recv = struct { ok: bool, payload: *Value };
 
-/// Extract the `(ok, payload)` of a `Value::Result` receiver, or `null`
-/// if `args[0]` is not a `Result` (the caller turns that into a
-/// `"{what} requires a Result receiver"` type error).
 fn recvResult(args: []const Value) ?Recv {
     if (args.len > 0) {
         switch (args[0]) {
@@ -34,7 +24,6 @@ fn recvResult(args: []const Value) ?Recv {
     return null;
 }
 
-/// Construct a `Value::Result { ok, payload }` with a heap-boxed payload.
 fn makeResult(allocator: std.mem.Allocator, ok: bool, payload: Value) std.mem.Allocator.Error!Value {
     return try Value.newResult(allocator, .{ .ok = ok, .payload = try Value.boxRef(allocator, payload) });
 }
@@ -65,9 +54,8 @@ fn runCatchingImpl(block: *const Value, ctx: *CallCtx) std.mem.Allocator.Error!E
 }
 
 pub fn result_run_catching(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
-    // Two forms:
-    //   runCatching { … }    -> 1 arg (block)
-    //   x.runCatching { … }  -> 2 args (receiver, block); receiver bound as `this`
+    // `runCatching { … }` passes one argument, the block, while
+    // `x.runCatching { … }` passes the receiver too, bound as `this`.
     if (ctx.args.len == 1) {
         const block = ctx.args[0];
         return runCatchingImpl(&block, ctx);
@@ -200,24 +188,17 @@ pub fn result_exception_or_null(ctx: *CallCtx) std.mem.Allocator.Error!EvalResul
     }
 }
 
-/// `kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED` — the
-/// singleton a `suspendCoroutineUninterceptedOrReturn` block
-/// returns to signal it parked rather than producing a value.
-/// One logical instance, so `x === COROUTINE_SUSPENDED` holds for
-/// any sentinel `x`.
+/// The singleton a `suspendCoroutineUninterceptedOrReturn` block returns to
+/// signal it parked. One logical instance, so `x === COROUTINE_SUSPENDED` holds.
 pub fn coroutine_suspended_sentinel(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     _ = ctx;
     return .{ .ok = Value.CoroutineSuspended };
 }
 
-/// Process-global monotonic rendezvous-slot counter for the
-/// `kotlin.coroutines` language layer. Process-global so cross-thread
-/// resume routing (slot → owning runBlocking driver) cannot alias a
-/// slot id minted on a different thread.
+/// Monotonic rendezvous-slot counter. Process-global so cross-thread resume
+/// routing cannot alias a slot id minted on another thread.
 var co_next_slot = std.atomic.Value(i64).init(1);
 
-/// `__klio_co_newSlot()` — a fresh slot id for a `suspendCoroutine`
-/// rendezvous.
 pub fn coro_new_slot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     _ = ctx;
     const id = co_next_slot.fetchAdd(1, .monotonic);
@@ -242,9 +223,6 @@ fn slotTypeErr(who: []const u8) RuntimeError {
     return .{ .Type = "slot must be Long" };
 }
 
-/// `__klio_co_park(slot)` — record the current activation as waiting
-/// on `slot`, then suspend indefinitely. On resume the call yields
-/// the `Result` delivered by `__klio_co_resume`.
 pub fn coro_park(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const slot = switch (slotArg(ctx.args, "__klio_co_park")) {
         .ok => |s| s,
@@ -255,10 +233,9 @@ pub fn coro_park(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .err = .{ .Suspend = -1 } };
 }
 
-/// `__klio_co_armSlot(slot)` — bind the next suspension (even a
-/// timed one) to `slot` without suspending now, so a suspend inside
-/// a `suspendCoroutineUninterceptedOrReturn` block stays reachable
-/// via the continuation's slot for preemptive cancellation.
+/// Bind the next suspension, a timed one included, to `slot` without suspending
+/// now, so a suspend inside a `suspendCoroutineUninterceptedOrReturn` block
+/// stays reachable through the continuation's slot for preemptive cancellation.
 pub fn coro_arm_slot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const slot = switch (slotArg(ctx.args, "__klio_co_armSlot")) {
         .ok => |s| s,
@@ -268,38 +245,29 @@ pub fn coro_arm_slot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = Value.Unit };
 }
 
-/// `__klio_co_disarmSlot()` — cancel a pending arm (the block
-/// returned a value without suspending).
 pub fn coro_disarm_slot(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     ctx.host.coroutineDisarmSlot();
     return .{ .ok = Value.Unit };
 }
 
-/// `__klio_co_lastRootParkedOnce()` — whether the root body the last
-/// `__klio_co_startRootOrSuspended` ran parked before it completed.
 pub fn coro_last_root_parked_once(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .{ .Bool = ctx.host.coroutineLastRootParkedOnce() } };
 }
 
-/// `__klio_co_pushScope(scope)` — make `scope` the active coroutine
-/// scope for an undispatched block running inline in the caller's
-/// activation (`startCoroutineUninterceptedOrReturn`), so the
-/// suspend-implicit `coroutineContext` inside the block resolves to the
-/// block's own coroutine. Balanced by `__klio_co_popScope`.
+/// Make `scope` the active coroutine scope for an undispatched block running
+/// inline in the caller's activation, so the suspend-implicit `coroutineContext`
+/// inside it resolves to the block's own coroutine. Balanced by the pop.
 pub fn coro_push_scope(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const scope: Value = if (ctx.args.len > 0) ctx.args[0] else Value.Unit;
     ctx.host.coroutinePushScope(&scope);
     return .{ .ok = Value.Unit };
 }
 
-/// `__klio_co_popScope()` — pop the scope pushed by `__klio_co_pushScope`.
 pub fn coro_pop_scope(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     ctx.host.coroutinePopScope();
     return .{ .ok = Value.Unit };
 }
 
-/// `__klio_co_resume(slot, ok, value)` — deliver a `Result` to the
-/// activation parked on `slot` and make it ready.
 pub fn coro_resume(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const slot = switch (slotArg(ctx.args, "__klio_co_resume")) {
         .ok => |s| s,
@@ -312,11 +280,9 @@ pub fn coro_resume(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = Value.Unit };
 }
 
-/// `__klio_co_runRoot(scope, block)` — drive `block` as a cooperative
-/// coroutine root to quiescence, returning its terminal value. The block
-/// is always the trailing arg; an optional leading arg is the coroutine
-/// the block belongs to, made the active scope while it runs (so a
-/// suspend-implicit `coroutineContext` read inside resolves to its `Job`).
+/// Drive `block` as a cooperative coroutine root to quiescence. The block is the
+/// trailing argument; an optional leading one is its coroutine, made the active
+/// scope so a `coroutineContext` read resolves to that `Job`.
 pub fn coro_run_root(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Type = "__klio_co_runRoot: missing block" } };
@@ -329,10 +295,9 @@ pub fn coro_run_root(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return ctx.host.coroutineRunRoot(null, &block, ctx.out);
 }
 
-/// `__klio_co_startRootOrSuspended(scope, block)` — run `block` as a
-/// fresh root when no driver pump encloses the call (DeepRecursive's
-/// plain loop driving suspend blocks). Returns the block's value, or
-/// COROUTINE_SUSPENDED when the root parked awaiting an external resume.
+/// Run `block` as a fresh root when no driver pump encloses the call, as in
+/// DeepRecursive's plain loop. Returns the block's value, or COROUTINE_SUSPENDED
+/// when the root parked awaiting an external resume.
 pub fn coro_start_root_or_suspended(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     if (ctx.args.len == 0) {
         return .{ .err = .{ .Type = "__klio_co_startRootOrSuspended: missing block" } };
@@ -345,14 +310,10 @@ pub fn coro_start_root_or_suspended(ctx: *CallCtx) std.mem.Allocator.Error!EvalR
     return ctx.host.coroutineStartRootOrSuspended(null, &block, ctx.out);
 }
 
-/// `__klio_co_hasDriver()` — whether a cooperative driver pump is live on
-/// this thread (the start intrinsics' in-pump / own-root branch).
 pub fn coro_has_driver(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .{ .Bool = ctx.host.coroutineHasDriver() } };
 }
 
-/// `Result.getOrThrow()` — the success value, or rethrow the
-/// captured failure. Core to `Continuation.resumeWith`.
 pub fn result_get_or_throw(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = recvResult(ctx.args) orelse
         return .{ .err = .{ .Type = "Result.getOrThrow requires a Result receiver" } };
@@ -367,10 +328,9 @@ pub fn result_get_or_throw(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     }
 }
 
-/// `Result.throwOnFailure()` — the internal helper the inline `getOrThrow`
-/// (spliced at declared-type call sites) delegates to. The interpreted source
-/// checks `value is Failure`, which the NATIVE Result representation never
-/// satisfies; this binding throws from the native payload directly.
+/// The internal helper the inline `getOrThrow` delegates to. The interpreted
+/// source checks `value is Failure`, which the native Result representation
+/// never satisfies, so this throws from the native payload directly.
 pub fn result_throw_on_failure(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = recvResult(ctx.args) orelse
         return .{ .err = .{ .Type = "throwOnFailure requires a Result receiver" } };
@@ -415,9 +375,8 @@ pub fn result_get_or_default(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
 pub fn result_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     const recv = recvResult(ctx.args) orelse
         return .{ .err = .{ .Type = "Result.toString requires a Result receiver" } };
-    // `Success($value)` / `Failure($exception)` interpolate the payload, so a
-    // value (commonly the thrown exception) with an overridden `toString()`
-    // must use it rather than the structural identity rendering.
+    // `Success($value)` interpolates the payload, so a value with an overridden
+    // `toString()`, commonly the thrown exception, uses it.
     const inner: []const u8 = blk: {
         if (recv.payload.* == .Instance) {
             if (try ctx.host.invokeMethod(recv.payload, "toString", &.{}, ctx.out)) |res| {
@@ -441,21 +400,12 @@ pub fn result_to_string(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
     return .{ .ok = .{ .String = try runtime.strInitOwned(ctx.allocator, s) } };
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
-
 const testing = std.testing;
 const NoopHost = runtime.NoopHost;
 const CaptureOutput = runtime.CaptureOutput;
 
-/// A test host whose `invoke_callable` returns a fixed `EvalResult`,
-/// recording the args/this it was handed. Lets the higher-order Result
-/// intrinsics be exercised without a full interpreter.
 const StubHost = struct {
-    /// What `invoke_callable` / `invoke_callable_with_this` hand back.
     reply: EvalResult = .{ .ok = Value.Unit },
-    /// Most recent first-arg / this seen by an invocation.
     last_arg: ?Value = null,
     last_this: ?Value = null,
     invoked: usize = 0,
@@ -500,9 +450,6 @@ fn ctxWith(args: []const Value, h: runtime.IntrinsicHost, out: runtime.Output, a
     return .{ .args = args, .out = out, .host = h, .allocator = allocator };
 }
 
-/// Test helper: box `v` into a `ValueBox` on `a` (an arena), for the
-/// component slots of hand-built `Value::Result` test receivers. OOM is
-/// unreachable in these tests; the arena frees the box on teardown.
 fn tbox(a: std.mem.Allocator, v: Value) runtime.ObjRef(Value) {
     return Value.boxRef(a, v) catch unreachable;
 }
@@ -692,7 +639,6 @@ test "runCatching wraps a returned value and a thrown one" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Block returns a value -> Success(value).
     stub.reply = .{ .ok = .{ .Int = 11 } };
     const args = [_]Value{Value.Unit};
     var c1 = ctxWith(&args, stub.host(), cap.output(), a);
@@ -700,14 +646,12 @@ test "runCatching wraps a returned value and a thrown one" {
     try testing.expect(r1.ok.Result.ok);
     try testing.expectEqual(@as(i32, 11), r1.ok.Result.payload.asPtr().Int);
 
-    // Block throws -> Failure(thrown).
     stub.reply = .{ .err = .{ .Thrown = .{ .Int = 13 } } };
     var c2 = ctxWith(&args, stub.host(), cap.output(), a);
     const r2 = try result_run_catching(&c2);
     try testing.expect(!r2.ok.Result.ok);
     try testing.expectEqual(@as(i32, 13), r2.ok.Result.payload.asPtr().Int);
 
-    // A non-Thrown runtime error propagates unchanged.
     stub.reply = .{ .err = .{ .Type = "boom" } };
     var c3 = ctxWith(&args, stub.host(), cap.output(), a);
     const r3 = try result_run_catching(&c3);
@@ -752,7 +696,6 @@ test "result_map maps success, passes failure through, mapCatching catches throw
     try testing.expectEqual(@as(i32, 100), r1.ok.Result.payload.asPtr().Int);
     try testing.expectEqual(@as(i32, 2), stub.last_arg.?.Int);
 
-    // map on a failure does not invoke the block.
     stub.invoked = 0;
     var c2 = ctxWith(&failure, stub.host(), cap.output(), a);
     const r2 = try result_map(&c2);
@@ -760,7 +703,6 @@ test "result_map maps success, passes failure through, mapCatching catches throw
     try testing.expectEqual(@as(i32, 7), r2.ok.Result.payload.asPtr().Int);
     try testing.expectEqual(@as(usize, 0), stub.invoked);
 
-    // mapCatching turns a thrown block into a Failure.
     stub.reply = .{ .err = .{ .Thrown = .{ .Int = 55 } } };
     var c3 = ctxWith(&success, stub.host(), cap.output(), a);
     const r3 = try result_map_catching(&c3);
@@ -779,7 +721,6 @@ test "result_fold dispatches to onSuccess or onFailure" {
 
     const ok_payload: Value = .{ .Int = 21 };
     const err_payload: Value = .{ .Int = 31 };
-    // (receiver, onSuccess, onFailure)
     const success = [_]Value{ try Value.newResult(a, .{ .ok = true, .payload = tbox(a, ok_payload) }), Value.Unit, Value.Unit };
     const failure = [_]Value{ try Value.newResult(a, .{ .ok = false, .payload = tbox(a, err_payload) }), Value.Unit, Value.Unit };
 
@@ -812,7 +753,6 @@ test "onSuccess / onFailure run the side effect then return the receiver" {
     try testing.expect(r1.ok == .Result and r1.ok.Result.ok);
     try testing.expectEqual(@as(usize, 1), stub.invoked);
 
-    // onFailure on a success does not invoke the block, returns receiver.
     stub.invoked = 0;
     var c2 = ctxWith(&success, stub.host(), cap.output(), a);
     const r2 = try result_on_failure(&c2);

@@ -1,5 +1,4 @@
-//! `Map` intrinsics: scope helpers, map algebra, access, key/value/entry
-//! views, mutation and the additional map members.
+//! `Map` intrinsics: scope helpers, map algebra, access, views and mutation.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -54,10 +53,6 @@ const userMapPairs = list_transforms_mod.userMapPairs;
 const sequence_mod = @import("sequence.zig");
 const materialiseSequence = sequence_mod.materialiseSequence;
 
-// =====================================================================
-// Map scope helpers
-// =====================================================================
-
 pub fn map_get_or_else(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len != 3) return arityErr("getOrElse expects (receiver, key, block)");
@@ -67,7 +62,7 @@ pub fn map_get_or_else(ctx: *CallCtx) Error!EvalResult {
         const g = ctx.args[0].Map.entries.borrowMut();
         defer g.deinit();
         // `getOrElse` is `get(key) ?: defaultValue()`: a present-but-null value
-        // falls through to the default just like an absent key.
+        // falls through to the default like an absent key.
         if (try g.get().find(a, &key)) |i| {
             const v = g.get().pairs.items[i].value;
             if (v != .Null) return okElem(v);
@@ -86,9 +81,8 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrowMut();
         defer g.deinit();
-        // `getOrPut` returns the stored value only when it is non-null; a
-        // present-but-null value is recomputed and stored (Kotlin's `value
-        // == null` branch).
+        // `getOrPut` returns a stored value only when non-null; a present-but-null
+        // value is recomputed and stored.
         if (try g.get().find(a, &key)) |i| {
             const v = g.get().pairs.items[i].value;
             if (v != .Null) return okElem(v);
@@ -102,12 +96,9 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries_rc.borrowMut();
         defer g.deinit();
-        // The map takes ownership of one ref to the stored value; the block's
-        // `new_v` is also returned, so retain it for the map and hand back the
-        // block's owned ref untouched.
+        // The map takes one ref to the stored value; the block's owned ref is
+        // handed back untouched.
         if (runtime.reclaimEnabled()) new_v.retain();
-        // A present key (its value was null, which is why we got here) is
-        // updated in place; a genuinely absent key appends a new entry.
         if (try g.get().find(a, &key)) |i| {
             const old = g.get().pairs.items[i].value;
             g.get().pairs.items[i].value = new_v;
@@ -121,10 +112,6 @@ pub fn map_get_or_put(ctx: *CallCtx) Error!EvalResult {
     return ok(new_v);
 }
 
-// =====================================================================
-// Map ops
-// =====================================================================
-
 pub fn coll_map_to_mutable_map(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Map) return typeErr("toMutableMap requires a Map receiver");
@@ -133,8 +120,7 @@ pub fn coll_map_to_mutable_map(ctx: *CallCtx) Error!EvalResult {
 pub fn coll_map_to_map(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     if (ctx.args.len == 0 or ctx.args[0] != .Map) return typeErr("toMap requires a Map receiver");
-    // `toMap(destination)`: merge into the supplied mutable map and
-    // return IT (live, mutable), never a read-only snapshot.
+    // `toMap(destination)` merges into the supplied map and returns it, live.
     if (ctx.args.len >= 2 and ctx.args[1] == .Map) {
         const src = try snapshotEntries(a, ctx.args[0].Map.entries);
         defer if (runtime.freeScratch()) a.free(src);
@@ -262,11 +248,8 @@ pub fn coll_map_is_not_empty(ctx: *CallCtx) Error!EvalResult {
     return ok(.{ .Bool = mapLen(entries) != 0 });
 }
 
-/// Index of `key`, honoring a class-instance key's custom `equals`.
 fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!?usize {
     if (key != .Instance) {
-        // `find` builds/uses the hash index (O(1) for large maps), falling back
-        // to a linear scan for small maps or non-hashable keys.
         const g = entries.borrowMut();
         defer g.deinit();
         return try g.get().find(ctx.allocator, &key);
@@ -278,7 +261,6 @@ fn mapKeyIndex(ctx: *CallCtx, entries: MapEntries, key: Value) Error!?usize {
         for (g.get().pairs.items, 0..) |kv, i| ks[i] = kv.key;
         break :blk ks;
     };
-    // Scratch key snapshot (the key Values themselves stay owned by the map).
     defer if (runtime.freeScratch()) ctx.allocator.free(keys);
     for (keys, 0..) |k, i| {
         if (try ctx.host.invokeMethod(&k, "equals", &.{key}, ctx.out)) |m| {
@@ -335,7 +317,6 @@ pub fn coll_map_contains_value(ctx: *CallCtx) Error!EvalResult {
 
 pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    // A read-only map's keys view is read-only too, mirroring `entries`.
     const writable = ctx.args.len > 0 and ctx.args[0] == .Map and ctx.args[0].Map.mutable;
     const entries = switch (try recvMapEntries(a, ctx.args, "Map.keys")) {
         .entries => |x| x,
@@ -345,9 +326,6 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        // The keys view owns one ref per element (its teardown releases them
-        // via releaseValueList regardless of `backing`); retain each borrowed
-        // key, mirroring `coll_map_entries`.
         for (g.get().pairs.items) |kv| {
             if (runtime.reclaimEnabled()) kv.key.retain();
             try keys.append(a, kv.key);
@@ -358,7 +336,6 @@ pub fn coll_map_keys(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    // A read-only map's values view is read-only too, mirroring `entries`.
     const writable = ctx.args.len > 0 and ctx.args[0] == .Map and ctx.args[0].Map.mutable;
     const entries = switch (try recvMapEntries(a, ctx.args, "Map.values")) {
         .entries => |x| x,
@@ -368,7 +345,6 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
     {
         const g = entries.borrow();
         defer g.deinit();
-        // The values view owns one ref per element; retain each borrowed value.
         for (g.get().pairs.items) |kv| {
             if (runtime.reclaimEnabled()) kv.value.retain();
             try values.append(a, kv.value);
@@ -379,8 +355,8 @@ pub fn coll_map_values(ctx: *CallCtx) Error!EvalResult {
 }
 pub fn coll_map_entries(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
-    // A read-only map's entries are read-only too: entries carry no
-    // backing (setValue throws) and the view set refuses mutation.
+    // A read-only map's entries are read-only too: they carry no backing, so
+    // `setValue` throws and the view set refuses mutation.
     const writable = ctx.args.len > 0 and ctx.args[0] == .Map and ctx.args[0].Map.mutable;
     const entries = switch (try recvMapEntries(a, ctx.args, "Map.entries")) {
         .entries => |x| x,
@@ -425,8 +401,7 @@ pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
     if (try mapKeyIndex(ctx, entries, key)) |i| {
         const g = entries.borrowMut();
         defer g.deinit();
-        // The map owns the new value; the replaced value's ownership transfers
-        // to the returned `prev` (Kotlin `put` returns the previous value).
+        // The replaced value's ownership transfers to the returned `prev`.
         if (runtime.reclaimEnabled()) value.retain();
         const prev = g.get().pairs.items[i].value;
         g.get().pairs.items[i].value = value;
@@ -434,7 +409,6 @@ pub fn coll_mut_map_put(ctx: *CallCtx) Error!EvalResult {
     }
     const g = entries.borrowMut();
     defer g.deinit();
-    // The map takes ownership of one ref to the stored key and value.
     if (runtime.reclaimEnabled()) {
         key.retain();
         value.retain();
@@ -459,9 +433,8 @@ pub fn coll_mut_map_remove(ctx: *CallCtx) Error!EvalResult {
         defer g.deinit();
         const kv = g.get().pairs.orderedRemove(pos);
         g.get().invalidate();
-        // `remove` transfers the entry out of the map: the value's owned ref
-        // moves to the returned result (no retain), and the removed key — which
-        // the map owned and which is not returned — must be released.
+        // The value's owned ref moves to the result; the removed key must be
+        // released.
         if (runtime.reclaimEnabled()) kv.key.release(a);
         return ok(kv.value);
     }
@@ -482,7 +455,6 @@ pub fn coll_mut_map_clear(ctx: *CallCtx) Error!EvalResult {
     return ok(Value.Unit);
 }
 
-// ----- Map scope helpers (merge / putIfAbsent / replace / compute*) -----
 
 fn mutMapEntriesRc(a: Allocator, recv: Value, who: []const u8) Error!MapEntriesOutcome {
     if (recv == .Map) return .{ .entries = recv.Map.entries };
@@ -503,8 +475,6 @@ fn mapSet(a: Allocator, entries: MapEntries, key: Value, value: Value) Error!voi
     defer g.deinit();
     for (g.get().pairs.items) |*kv| {
         if (eqBoxed(&kv.key, &key)) {
-            // Replace: the map owns the new value and drops the replaced one
-            // (the existing key is kept; the new key arg is discarded).
             if (runtime.reclaimEnabled()) {
                 value.retain();
                 kv.value.release(a);
@@ -513,7 +483,6 @@ fn mapSet(a: Allocator, entries: MapEntries, key: Value, value: Value) Error!voi
             return;
         }
     }
-    // Append: the map takes ownership of one ref to the stored key and value.
     if (runtime.reclaimEnabled()) {
         key.retain();
         value.retain();
@@ -569,7 +538,6 @@ pub fn map_put_if_absent(ctx: *CallCtx) Error!EvalResult {
     const key = ctx.args[1];
     if (ctx.args.len < 3) return arityErr("putIfAbsent requires a value");
     const value = ctx.args[2];
-    // The present value is borrowed from the map; retain before returning it.
     if (mapFind(entries, key)) |old| return okElem(old);
     try mapSet(a, entries, key, value);
     return ok(Value.Null);
@@ -597,9 +565,6 @@ pub fn map_replace(ctx: *CallCtx) Error!EvalResult {
     if (ctx.args.len < 3) return arityErr("replace requires a value");
     const value = ctx.args[2];
     if (mapFind(entries, key)) |old| {
-        // `replace` returns the previous value: retain it before `mapSet`
-        // releases the map's reference, so the returned result carries an
-        // owned ref instead of a freed one.
         if (runtime.reclaimEnabled()) old.retain();
         try mapSet(a, entries, key, value);
         return ok(old);
@@ -615,8 +580,6 @@ pub fn map_compute_if_absent(ctx: *CallCtx) Error!EvalResult {
     };
     if (ctx.args.len < 2) return arityErr("computeIfAbsent requires a key");
     const key = ctx.args[1];
-    // The present value is borrowed from the map; the register adopting the
-    // result must own its ref, so retain before returning.
     if (mapFind(entries, key)) |v| return okElem(v);
     if (ctx.args.len < 3) return arityErr("computeIfAbsent requires a block");
     const block = ctx.args[2];
@@ -674,10 +637,6 @@ pub fn map_compute(ctx: *CallCtx) Error!EvalResult {
     return ok(new_val);
 }
 
-// =====================================================================
-// Additional Map ops
-// =====================================================================
-
 pub fn coll_map_get_or_default(ctx: *CallCtx) Error!EvalResult {
     const a = ctx.allocator;
     const entries = switch (try recvMapEntries(a, ctx.args, "Map.getOrDefault")) {
@@ -701,9 +660,8 @@ pub fn coll_map_get_value(ctx: *CallCtx) Error!EvalResult {
         .err => |e| return e,
     };
     if (ctx.args.len < 2) return arityErr("getValue requires a key");
-    // Property-delegation form `getValue(thisRef, property)` keys by the
-    // property name (`Map<String,V>.getValue` -> getOrImplicitDefault(name));
-    // the plain `getValue(key)` form keys by the argument itself.
+    // The property-delegation form `getValue(thisRef, property)` keys by the
+    // property name, while plain `getValue(key)` keys by the argument.
     const key: Value = if (ctx.args.len >= 3 and ctx.args[2] == .PropertyRef) blk: {
         const g = ctx.args[2].PropertyRef.name.borrow();
         defer g.deinit();
@@ -830,10 +788,9 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
                 .err => |e| return e,
             }).items;
         },
-        // An Instance is either a user `Map` (drain its `entries`) or an
-        // `Iterable<Pair>` (e.g. an `asIterable()` view — drain it and read each
-        // Pair). `MutableMap.putAll(pairs: Iterable<Pair>)` reaches here with the
-        // latter, which has no `entries` property.
+        // An Instance is either a user `Map`, drained through `entries`, or an
+        // `Iterable<Pair>` with no `entries` property, which is what
+        // `MutableMap.putAll(pairs: Iterable<Pair>)` passes.
         .Instance => {
             const is_map = blk: {
                 const er = (try ctx.host.getProperty(&arg, "entries", ctx.out)) orelse break :blk false;
@@ -859,8 +816,7 @@ pub fn coll_mut_map_put_all(ctx: *CallCtx) Error!EvalResult {
     }
     const g = entries.borrowMut();
     defer g.deinit();
-    // `to_add` entries are borrowed (snapshotEntries of the source map, or
-    // Pair-component reads); the destination owns one ref per key+value.
+    // `to_add` entries are borrowed, so the destination retains each.
     for (to_add) |kv| {
         var found = false;
         for (g.get().pairs.items) |*slot| {

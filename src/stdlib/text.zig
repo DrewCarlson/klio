@@ -2,15 +2,11 @@
 
 const std = @import("std");
 
-/// Compare two UTF-8 strings the way Kotlin's `String.compareTo` does:
-/// lexicographically over UTF-16 code units. For BMP-only strings the result
-/// matches a UTF-8 byte comparison, but supplementary characters diverge
-/// because a UTF-16 surrogate pair starts with a high surrogate (D800-DBFF),
-/// while the same code point's UTF-8 encoding starts with a 4-byte lead
-/// (F0-F4) that sorts after every 3-byte lead (E0-EF) used for U+E000-U+FFFF.
-///
-/// Streams the UTF-16 view of each string in lockstep, never materialising a
-/// whole `[]u16`.
+/// Compare two UTF-8 strings as Kotlin's `String.compareTo` does,
+/// lexicographically over UTF-16 code units. BMP-only strings match a UTF-8 byte
+/// comparison, but a supplementary character diverges: its surrogate pair starts
+/// with a high surrogate (D800-DBFF) while its UTF-8 starts with a 4-byte lead
+/// (F0-F4), which sorts after every 3-byte lead.
 pub fn compareUtf16(a: []const u8, b: []const u8) std.math.Order {
     var ai = Utf16Iter{ .bytes = a };
     var bi = Utf16Iter{ .bytes = b };
@@ -30,8 +26,6 @@ pub fn compareUtf16(a: []const u8, b: []const u8) std.math.Order {
     }
 }
 
-/// The number of UTF-16 code units a UTF-8 string encodes to — the value
-/// Kotlin's `String.length` reports.
 pub fn utf16Len(a: []const u8) i32 {
     var it = Utf16Iter{ .bytes = a };
     var n: i32 = 0;
@@ -39,11 +33,10 @@ pub fn utf16Len(a: []const u8) i32 {
     return n;
 }
 
-/// `compareUtf16` returning the VALUE kotlinc produces rather than an
-/// ordering: the JVM's `String.compareTo` is the code-unit difference at the
-/// first mismatch, and the length difference when one string is a prefix of
-/// the other. `Comparable` contracts only for the sign, but a program that
-/// prints the result sees this number.
+/// `compareUtf16` returning kotlinc's value rather than an ordering: the JVM's
+/// `String.compareTo` is the code-unit difference at the first mismatch, or the
+/// length difference when one string is a prefix. `Comparable` contracts only
+/// for the sign, but a program printing the result sees this number.
 pub fn compareUtf16Difference(a: []const u8, b: []const u8) i32 {
     var ai = Utf16Iter{ .bytes = a };
     var bi = Utf16Iter{ .bytes = b };
@@ -64,9 +57,6 @@ pub fn compareUtf16Difference(a: []const u8, b: []const u8) i32 {
     }
 }
 
-/// Streams the UTF-16 code units of a UTF-8 string one at a time. A
-/// supplementary code point yields its high surrogate, then its low
-/// surrogate on the following call.
 const Utf16Iter = struct {
     bytes: []const u8,
     pos: usize = 0,
@@ -79,8 +69,6 @@ const Utf16Iter = struct {
         }
         if (self.pos >= self.bytes.len) return null;
         const len = std.unicode.utf8ByteSequenceLength(self.bytes[self.pos]) catch {
-            // Fall back to a single byte on malformed input; keeps the
-            // comparison total rather than erroring out.
             const unit: u16 = self.bytes[self.pos];
             self.pos += 1;
             return unit;
@@ -91,10 +79,9 @@ const Utf16Iter = struct {
             return unit;
         }
         const cp: u21 = std.unicode.utf8Decode(self.bytes[self.pos .. self.pos + len]) catch cp_blk: {
-            // A lone surrogate is stored as WTF-8 (`ED A0..BF 80..BF` for
-            // U+D800..DFFF), which strict UTF-8 decoding rejects. Decode the
-            // three-byte form by hand so it yields its true UTF-16 code-unit
-            // value (`"퟿" < "\uD800"`) rather than the leading byte.
+            // A lone surrogate is stored as WTF-8, which strict UTF-8 decoding
+            // rejects, so the three-byte form is decoded by hand to yield its
+            // true UTF-16 code-unit value.
             if (len == 3) {
                 const b0 = self.bytes[self.pos];
                 const b1 = self.bytes[self.pos + 1];
