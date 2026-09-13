@@ -2008,6 +2008,7 @@ fn bareCallTarget(
     arg_names: []const ?ir.ConstId,
 ) ?*const ir.Func {
     var best: ?*const ir.Func = null;
+    var best_score: u32 = 0;
     var tied = false;
     for (m.funcs.items) |*cand| {
         if (!cand.hasBody() or cand.has_receiver_param) continue;
@@ -2015,55 +2016,11 @@ fn bareCallTarget(
         if (cand.params.len < n) continue;
         const bnd = bindCallArgs(m, cand.params, base, n, arg_names) orelse continue;
         var fits = true;
-        for (cand.params, 0..) |p, i| {
-            if (p.is_vararg) {
-                fits = false;
-                break;
-            }
-            const reg = bnd.regs[i] orelse {
-                // Nothing bound it, so it has to have a default to run.
-                if (prog.defaultThunk(cand.id, @intCast(i)) == null) fits = false;
-                if (!fits) break;
-                continue;
-            };
-            const got = types[reg];
-            if (tyOf(p.ty)) |want| {
-                if (want != got) {
-                    fits = false;
-                    break;
-                }
-            }
-        }
-        if (!fits) continue;
-        if (best != null) tied = true;
-        best = cand;
-    }
-    // Two declarations the arguments fit equally is a question about scope and
-    // shadowing that this pass does not answer. Refuse rather than guess.
-    if (tied) return null;
-    return best;
-}
-
-/// Whether more than one top-level declaration of this name takes these
-/// arguments. The lowering records ONE of them on the call, but a name the
-/// arguments do not separate is re-resolved at run time from the values, so a
-/// compiled program must not freeze the lowering's pick.
-fn ambiguousOverload(
-    m: *const Module,
-    prog: Program,
-    name: []const u8,
-    types: []const Ty,
-    base: u32,
-    n: u32,
-    arg_names: []const ?ir.ConstId,
-) bool {
-    var fitting: u32 = 0;
-    for (m.funcs.items) |*cand| {
-        if (!cand.hasBody() or cand.has_receiver_param) continue;
-        if (!std.mem.eql(u8, cand.name, name)) continue;
-        if (cand.params.len < n) continue;
-        const bnd = bindCallArgs(m, cand.params, base, n, arg_names) orelse continue;
-        var fits = true;
+        // How SPECIFIC the declaration is: a parameter naming a machine type
+        // or a class is evidence, an erased type parameter is not. Kotlin
+        // prefers the more specific declaration, which is what separates
+        // `atomic(Int)` from `atomic(T)`.
+        var score: u32 = 0;
         for (cand.params, 0..) |p, i| {
             if (p.is_vararg) {
                 fits = false;
@@ -2079,10 +2036,48 @@ fn ambiguousOverload(
                     fits = false;
                     break;
                 }
+                score += 1;
+            } else if (classIndexOfName(m, p.ty) != null) {
+                score += 1;
             }
         }
-        if (fits) fitting += 1;
-        if (fitting > 1) return true;
+        if (!fits) continue;
+        if (best == null or score > best_score) {
+            best = cand;
+            best_score = score;
+            tied = false;
+        } else if (score == best_score) {
+            tied = true;
+        }
+    }
+    // Two declarations equally specific for these arguments is a question
+    // about scope this pass does not answer. Refuse rather than guess.
+    if (tied) return null;
+    return best;
+}
+
+/// Whether a name several declarations answer cannot be settled from these
+/// arguments. The lowering records ONE candidate on the call, but a name the
+/// arguments do not separate is re-resolved at run time from the values, so a
+/// compiled program must not freeze the lowering's pick.
+fn ambiguousOverload(
+    m: *const Module,
+    prog: Program,
+    name: []const u8,
+    types: []const Ty,
+    base: u32,
+    n: u32,
+    arg_names: []const ?ir.ConstId,
+) bool {
+    if (bareCallTarget(m, prog, name, types, base, n, arg_names) != null) return false;
+    // No unique answer. It is only a problem when more than one declaration
+    // owns the name at all.
+    var seen_one = false;
+    for (m.funcs.items) |*cand| {
+        if (!cand.hasBody() or cand.has_receiver_param) continue;
+        if (!std.mem.eql(u8, cand.name, name)) continue;
+        if (seen_one) return true;
+        seen_one = true;
     }
     return false;
 }
