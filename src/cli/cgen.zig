@@ -2082,6 +2082,34 @@ fn ambiguousOverload(
     return false;
 }
 
+/// Whether a class's primary constructor also takes these arguments, which is
+/// what makes a bare call a question of constructor versus factory. Types match
+/// EXACTLY here: Kotlin converts nothing implicitly when it picks an overload,
+/// so a `Long` argument does not reach a `ULong` parameter.
+fn ctorFits(
+    m: *const Module,
+    name: []const u8,
+    types: []const Ty,
+    base: u32,
+    n: u32,
+    arg_names: []const ?ir.ConstId,
+) bool {
+    const cid = classQualifierNamed(m, name) orelse return false;
+    const cdef = &m.classes.items[cid];
+    if (cdef.primary_params.len < n) return false;
+    const bnd = bindCallArgs(m, cdef.primary_params, base, n, arg_names) orelse return false;
+    for (cdef.primary_params, 0..) |p, i| {
+        const reg = bnd.regs[i] orelse {
+            if (p.default == null) return false;
+            continue;
+        };
+        if (tyOf(p.ty)) |want| {
+            if (want != types[reg]) return false;
+        }
+    }
+    return true;
+}
+
 fn classQualifierNamed(m: *const Module, name: []const u8) ?u32 {
     for (m.classes.items, 0..) |*c, i| {
         if (std.mem.eql(u8, c.name, name) or std.mem.eql(u8, c.fqn, name)) return @intCast(i);
@@ -2215,6 +2243,13 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     const elem_cls = try gpa.alloc(?u32, f.n_locals);
     errdefer gpa.free(elem_cls);
     @memset(elem_cls, null);
+    // The integer constant a register was JUST given. Any other instruction
+    // clears the whole table, because which register it wrote is not modelled
+    // here: a value still known to be constant is one nothing has touched.
+    const const_at = try gpa.alloc(?i64, f.n_locals);
+    defer gpa.free(const_at);
+    @memset(const_at, null);
+    var pending_const: ?struct { reg: u32, val: i64 } = null;
     const lam = try gpa.alloc(?LambdaInfo, f.n_locals);
     errdefer gpa.free(lam);
     @memset(lam, null);
@@ -2256,6 +2291,24 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
             known[h.exception_reg.int()] = true;
         }
         for (blk.insts) |*inst| {
+            // What the PREVIOUS instruction made constant, which is all this
+            // pass claims to know: anything else may have written any register.
+            @memset(const_at, null);
+            if (pending_const) |pc| const_at[pc.reg] = pc.val;
+            pending_const = null;
+            if (inst.* == .Const) {
+                const cv0 = inst.Const;
+                if (cv0.value.int() < m.consts.items.len and cv0.dst.int() < f.n_locals) {
+                    const kv0: ?i64 = switch (m.consts.items[cv0.value.int()]) {
+                        .Int => |x| @as(i64, x),
+                        .Long => |x| x,
+                        .Short => |x| @as(i64, x),
+                        .Byte => |x| @as(i64, x),
+                        else => null,
+                    };
+                    if (kv0) |v0| pending_const = .{ .reg = cv0.dst.int(), .val = v0 };
+                }
+            }
             switch (inst.*) {
                 .Trace => {},
                 // The enclosing-subject chain exists for the interpreter's
@@ -2401,7 +2454,8 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         // declaration is unambiguous.
                         const picked = bareCallTarget(m, prog, cn2.String, types, cg2.args.int(), cg2.n_args, cg2.arg_names);
                         if (picked == null) return noName(f, "bare call", cn2.String);
-                        if (classQualifierNamed(m, cn2.String) != null) return noName(f, "bare call", cn2.String);
+                        if (ctorFits(m, cn2.String, types, cg2.args.int(), cg2.n_args, cg2.arg_names))
+                            return noName(f, "bare call", cn2.String);
                         if (globalIndex(globals, cn2.String) != null) return noName(f, "bare call", cn2.String);
                         const gfid = picked.?.id;
                         const gfn9 = m.funcById(gfid) orelse return no(f, "bare call target");
@@ -3096,8 +3150,18 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         // A field that holds a REFERENCE takes any value: the
                         // call site boxes a machine type for it, which is what
                         // an erased type parameter needs.
-                        if (types[ar] != fd.ty and fd.ty != .object and !sameWidthKind(types[ar], fd.ty)) {
-                            if (traceOn()) std.debug.print("[cgen]   field `{s}` is {s}, argument is {s}\n", .{ fd.name, @tagName(fd.ty), @tagName(types[ar]) });
+                        // A narrower integer CONSTANT reaching a wider field
+                        // is the same value, which is what an overload the
+                        // lowering resolved to the constructor leaves behind.
+                        // A negative one is not: widening it would sign-extend
+                        // where the interpreter keeps the number it computed.
+                        const widen_ok = isNumericTy(fd.ty) and isNumericTy(types[ar]) and
+                            !fd.ty.isFloat() and !types[ar].isFloat() and
+                            (if (const_at[ar]) |kv2| kv2 >= 0 else false);
+                        if (types[ar] != fd.ty and fd.ty != .object and
+                            !sameWidthKind(types[ar], fd.ty) and !widen_ok)
+                        {
+                            if (traceOn()) std.debug.print("[cgen]   field `{s}` is {s}, argument r{d} is {s}\n", .{ fd.name, @tagName(fd.ty), ar, @tagName(types[ar]) });
                             return no(f, "ctor arg type");
                         }
                         // An argument whose class is not the field's is a call
