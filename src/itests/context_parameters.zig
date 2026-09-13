@@ -62,7 +62,7 @@ fn assertDiag(src: []const u8, factory_name: []const u8, msg_needle: []const u8)
     for (diags) |d| {
         const fname = if (d.factory) |f| f.name else continue;
         if (!std.mem.eql(u8, fname, factory_name)) continue;
-        if (std.mem.indexOf(u8, d.message, msg_needle) != null) return;
+        if (std.mem.find(u8, d.message, msg_needle) != null) return;
     }
     std.debug.print("expected `{s}` containing `{s}`; got:\n", .{ factory_name, msg_needle });
     for (diags) |d| {

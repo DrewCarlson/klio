@@ -1422,7 +1422,7 @@ fn lowerFirstFun(arena: Allocator, src: []const u8) ![]u8 {
 
 const expectContains = struct {
     fn f(haystack: []const u8, needle: []const u8) !void {
-        if (std.mem.indexOf(u8, haystack, needle) == null) {
+        if (std.mem.find(u8, haystack, needle) == null) {
             std.debug.print("expected to find:\n  {s}\nin:\n{s}\n", .{ needle, haystack });
             return error.NotFound;
         }
@@ -1432,7 +1432,7 @@ const expectContains = struct {
 fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
     var count: usize = 0;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, i, needle)) |pos| {
+    while (std.mem.findPos(u8, haystack, i, needle)) |pos| {
         count += 1;
         i = pos + needle.len;
     }

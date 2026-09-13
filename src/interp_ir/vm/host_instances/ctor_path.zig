@@ -141,7 +141,7 @@ pub fn samWrapForParamType(self: *VmHost, allocator: Allocator, v: *const Value,
     if (ty_name.len <= 2 or std.mem.startsWith(u8, ty_name, "Function")) return null;
     const bare = std.mem.trimEnd(u8, ty_name, "?");
     const simple = blk: {
-        const dot = std.mem.lastIndexOfScalar(u8, bare, '.') orelse break :blk bare;
+        const dot = std.mem.findScalarLast(u8, bare, '.') orelse break :blk bare;
         break :blk bare[dot + 1 ..];
     };
     const pd = classDefByName(self, simple) orelse return null;
@@ -167,7 +167,7 @@ pub fn paramTypeIsFunInterface(self: *VmHost, ty_name: []const u8) bool {
     if (ty_name.len <= 2 or std.mem.startsWith(u8, ty_name, "Function")) return false;
     const bare = std.mem.trimEnd(u8, ty_name, "?");
     const simple = blk: {
-        const dot = std.mem.lastIndexOfScalar(u8, bare, '.') orelse break :blk bare;
+        const dot = std.mem.findScalarLast(u8, bare, '.') orelse break :blk bare;
         break :blk bare[dot + 1 ..];
     };
     const pd = classDefByName(self, simple) orelse return false;
@@ -719,7 +719,7 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                 if (!(r == .err and r.err == .Unimplemented)) return r;
                 if (r.err == .Unimplemented) {
                     const m3 = r.err.Unimplemented;
-                    if (std.mem.indexOf(u8, m3, "Vm::call_member") != null and runtime.freeScratch()) {
+                    if (std.mem.find(u8, m3, "Vm::call_member") != null and runtime.freeScratch()) {
                         allocator.free(m3);
                     }
                 }
@@ -1109,13 +1109,13 @@ pub fn outerWalkMatch(v: *const Value, want: []const u8) ?Value {
 pub fn selectInnerOuter(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, outer_hint: ?*const Value) Allocator.Error!?Value {
     const want = enclosingClassNameOf(self, class_def, ir_name) orelse {
         if (runtime.envOnce("KLIO_OUTER_TRACE")) |w| {
-            if (std.mem.indexOf(u8, ir_name, w) != null) std.debug.print("[outer] {s}: no enclosing-class record, hint={}\n", .{ ir_name, outer_hint != null });
+            if (std.mem.find(u8, ir_name, w) != null) std.debug.print("[outer] {s}: no enclosing-class record, hint={}\n", .{ ir_name, outer_hint != null });
         }
         if (outer_hint) |h| return h.*;
         return null;
     };
     if (runtime.envOnce("KLIO_OUTER_TRACE")) |w| {
-        if (std.mem.indexOf(u8, ir_name, w) != null) std.debug.print("[outer] {s}: want={s} hint={}\n", .{ ir_name, want, outer_hint != null });
+        if (std.mem.find(u8, ir_name, w) != null) std.debug.print("[outer] {s}: want={s} hint={}\n", .{ ir_name, want, outer_hint != null });
     }
     if (outer_hint) |h| {
         if (instanceOfClassName(h, want)) return h.*;

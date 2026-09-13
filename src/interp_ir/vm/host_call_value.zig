@@ -50,7 +50,7 @@ fn isCompanionInstance(v: Value) bool {
     defer g.deinit();
     const cg = g.get().class.borrow();
     defer cg.deinit();
-    return std.mem.indexOf(u8, cg.get().name, "$Companion$") != null or
+    return std.mem.find(u8, cg.get().name, "$Companion$") != null or
         std.mem.endsWith(u8, cg.get().fqn, ".Companion");
 }
 
@@ -72,7 +72,7 @@ fn companionServesName(self: *VmHost, rv: *const Value, name: []const u8) bool {
         // Declared receiver form: the FQN's tail, `kotlin.Double.Companion` ->
         // `Double.Companion`.
         const owner = cls_fqn[0 .. cls_fqn.len - ".Companion".len];
-        const owner_simple = if (std.mem.lastIndexOfScalar(u8, owner, '.')) |d| owner[d + 1 ..] else owner;
+        const owner_simple = if (std.mem.findScalarLast(u8, owner, '.')) |d| owner[d + 1 ..] else owner;
         const recv = std.fmt.bufPrint(&simple_buf, "{s}.Companion", .{owner_simple}) catch break :blk null;
         break :blk .{ .fqn = fqn, .recv = recv };
     };
@@ -593,7 +593,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             if (compose.currentComposer()) |comp| {
                 if (runtime.freeScratch()) {
                     const m = inv.err.Unimplemented;
-                    if (std.mem.indexOf(u8, m, "Vm::call_member") != null) allocator.free(m);
+                    if (std.mem.find(u8, m, "Vm::call_member") != null) allocator.free(m);
                 }
                 const buf = try allocator.alloc(Value, args.len + 2);
                 defer allocator.free(buf);
@@ -609,7 +609,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
         {
             if (runtime.freeScratch()) {
                 const m = inv.err.Unimplemented;
-                if (std.mem.indexOf(u8, m, "Vm::call_member") != null) allocator.free(m);
+                if (std.mem.find(u8, m, "Vm::call_member") != null) allocator.free(m);
             }
             return host_call_member.callMember(self, allocator, callee, "run", args);
         }
@@ -941,7 +941,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             defer ig.deinit();
             const cg = ig.get().class.borrow();
             defer cg.deinit();
-            break :blk std.mem.indexOf(u8, cg.get().name, "Composer") != null;
+            break :blk std.mem.find(u8, cg.get().name, "Composer") != null;
         }) {
             const n_user = args.len - 2;
             var re: std.ArrayList(Value) = .empty;
@@ -1002,7 +1002,7 @@ pub fn callValue(self: *VmHost, allocator: Allocator, callee: *const Value, args
             // source-level name strips a file-private fn's rename (`over$f220`).
             const src_name = blk: {
                 const n = func.name;
-                const i = std.mem.lastIndexOfScalar(u8, n, '$') orelse break :blk n;
+                const i = std.mem.findScalarLast(u8, n, '$') orelse break :blk n;
                 if (i + 2 > n.len or n[i + 1] != 'f') break :blk n;
                 for (n[i + 2 ..]) |c| {
                     if (!std.ascii.isDigit(c)) break :blk n;

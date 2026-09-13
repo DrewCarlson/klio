@@ -210,7 +210,7 @@ pub noinline fn execInst(comptime H: type, allocator: Allocator, frame: *Frame, 
             const gf_step = try execArmGetField(H, allocator, frame, gf, host);
             if (gfTraceWant()) |w0| {
                 if (constStr(frame.module, gf.field)) |fname| {
-                    if (std.mem.indexOf(u8, fname, w0) != null and gf_step == .cont) {
+                    if (std.mem.find(u8, fname, w0) != null and gf_step == .cont) {
                         const rv = frame.read(gf.dst);
                         const rn: []const u8 = if (rv == .Instance) blk: {
                             const g = rv.Instance.borrow();
@@ -825,7 +825,7 @@ noinline fn execArmGetField(comptime H: type, allocator: Allocator, frame: *Fram
     const recv = frame.read(gf.receiver);
     if (gfTraceWant()) |w0| {
         if (constStr(frame.module, gf.field)) |fname| {
-            if (std.mem.indexOf(u8, fname, w0) != null) {
+            if (std.mem.find(u8, fname, w0) != null) {
                 const rn: []const u8 = if (recv == .Instance) blk: {
                     const g = recv.Instance.borrow();
                     const cg = g.get().class.borrow();
@@ -1639,7 +1639,7 @@ pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Mo
                 // class does — split at the last dot and read the member off
                 // the class value (which serves companion fields), so the
                 // import aliases the SAME value `X.Y` reads.
-                if (std.mem.lastIndexOfScalar(u8, name_str, '.')) |dot| {
+                if (std.mem.findScalarLast(u8, name_str, '.')) |dot| {
                     if (dot != 0 and dot + 1 < name_str.len) {
                         const owner_v: ?Value = switch (try host.lookupGlobalThrowing(allocator, name_str[0..dot])) {
                             .ok => |maybe| maybe,
@@ -1664,7 +1664,7 @@ pub fn loadGlobalValue(comptime H: type, allocator: Allocator, module: *const Mo
                 // splice that materialized the mangled name as a global —
                 // `Json.encodeToString(localValue)` -> `Local$lcmain.serializer()`
                 // — resolves through the simple name.
-                if (std.mem.indexOf(u8, name_str, "$lc")) |lci| {
+                if (std.mem.find(u8, name_str, "$lc")) |lci| {
                     const simple = name_str[0..lci];
                     if (simple.len != 0) {
                         switch (try host.lookupGlobalThrowing(allocator, simple)) {

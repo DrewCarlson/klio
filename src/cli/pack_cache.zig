@@ -252,8 +252,8 @@ fn loadEmbeddedStdlibSources(
     for (bundle.files) |sf| {
         // Sources whose interpreted declarations would shadow klio's intrinsics.
         if (stdlib.isConsumptionDeferredSource(sf.rel_path)) continue;
-        if (diag and (std.mem.indexOf(u8, sf.rel_path, "Maps.kt") != null or
-            std.mem.indexOf(u8, sf.rel_path, "Sets.kt") != null))
+        if (diag and (std.mem.find(u8, sf.rel_path, "Maps.kt") != null or
+            std.mem.find(u8, sf.rel_path, "Sets.kt") != null))
         {
             io.printStderr(allocator, "[embed source] {s}\n", .{sf.rel_path});
         }
@@ -445,7 +445,7 @@ fn packLibIdFromBasename(basename: []const u8) ?[]const u8 {
     else
         basename;
     var i: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, stem, i, '-')) |dash| {
+    while (std.mem.findScalarPos(u8, stem, i, '-')) |dash| {
         if (dash + 1 < stem.len and std.ascii.isDigit(stem[dash + 1])) {
             return if (dash == 0) null else stem[0..dash];
         }
@@ -1038,14 +1038,14 @@ fn loadInstalledPacksImpl(
                 for (c.manifest.features) |f| {
                     if (!active.contains(f.name)) continue;
                     for (f.deps) |dep| {
-                        const lib = if (std.mem.indexOfScalar(u8, dep, '/')) |slash| dep[0..slash] else dep;
+                        const lib = if (std.mem.findScalar(u8, dep, '/')) |slash| dep[0..slash] else dep;
                         if (!pre_prefixes.contains(lib)) {
                             const dup = try gpa.dupe(u8, lib);
                             const gop = try pre_prefixes.getOrPut(dup);
                             if (gop.found_existing) gpa.free(dup) else gop.value_ptr.* = {};
                             changed = true;
                         }
-                        if (std.mem.indexOfScalar(u8, dep, '/')) |slash| {
+                        if (std.mem.findScalar(u8, dep, '/')) |slash| {
                             if (try addFeatureReqsChanged(gpa, &feature_reqs, dep[0..slash], dep[slash + 1 ..])) changed = true;
                         }
                     }
@@ -1107,7 +1107,7 @@ fn loadInstalledPacksImpl(
             for (c.manifest.features) |f| {
                 if (active.contains(f.name)) {
                     for (f.deps) |dep| {
-                        if (std.mem.indexOfScalar(u8, dep, '/')) |slash| {
+                        if (std.mem.findScalar(u8, dep, '/')) |slash| {
                             const lib = dep[0..slash];
                             const feats = dep[slash + 1 ..];
                             try new_prefixes.append(gpa, try gpa.dupe(u8, lib));

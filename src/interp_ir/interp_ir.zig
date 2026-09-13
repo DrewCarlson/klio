@@ -57,12 +57,12 @@ const RuntimeError = runtime.RuntimeError;
 /// Normalized head of a declared parameter type. Every function-type spelling
 /// collapses to `Function`: `(T) -> R` as written, `Function1` once lowered.
 pub fn anonParamTypeHead(name: []const u8) []const u8 {
-    if (std.mem.indexOf(u8, name, "->") != null) return "Function";
+    if (std.mem.find(u8, name, "->") != null) return "Function";
     if (std.mem.startsWith(u8, name, "Function")) return "Function";
     if (std.mem.startsWith(u8, name, "suspend")) return "Function";
     if (std.mem.eql(u8, name, "<function>")) return "Function";
     const bare = std.mem.trimEnd(u8, name, "?");
-    const dot = std.mem.lastIndexOfScalar(u8, bare, '.') orelse return bare;
+    const dot = std.mem.findScalarLast(u8, bare, '.') orelse return bare;
     return bare[dot + 1 ..];
 }
 
@@ -562,7 +562,7 @@ pub const ProgramImage = struct {
             while (bk.next()) |fqn_k| {
                 const fqn = fqn_k.*;
                 const intrinsic = bindings.resolve(fqn) orelse continue;
-                const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
+                const simple = if (std.mem.findScalarLast(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
                 for (module.funcsBySimpleName(simple)) |cand| {
                     const cf = module.funcById(cand) orelse continue;
                     if (std.mem.eql(u8, cf.fqn, fqn)) {
@@ -574,7 +574,7 @@ pub const ProgramImage = struct {
                 // simple-name index, so settle it here like a top-level form.
                 // Concrete classes only: an interface or abstract method must
                 // dispatch virtually, its intrinsic serving only host receivers.
-                if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
+                if (std.mem.findScalarLast(u8, fqn, '.')) |dot| {
                     const owner_fqn = fqn[0..dot];
                     if (module.classIdByFqn(owner_fqn)) |cid| {
                         if (cid.int() < module.classes.items.len) {
@@ -654,7 +654,7 @@ pub const ProgramImage = struct {
 
     /// Everything before an FQN's last component: a member's class, or a package.
     fn declaringOwnerOfFqn(fqn: []const u8) []const u8 {
-        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return "";
+        const dot = std.mem.findScalarLast(u8, fqn, '.') orelse return "";
         return fqn[0..dot];
     }
 
@@ -732,11 +732,11 @@ pub const ProgramImage = struct {
     /// Record a package-level binding's bare-name alias. An uppercase parent
     /// segment is a member form a bare name cannot mean; smallest FQN wins.
     fn notePackAlias(map: *std.StringHashMap([]const u8), fqn: []const u8) Allocator.Error!void {
-        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return;
+        const dot = std.mem.findScalarLast(u8, fqn, '.') orelse return;
         const pkg = fqn[0..dot];
         const name = fqn[dot + 1 ..];
         if (name.len == 0 or pkg.len == 0) return;
-        const parent_start = if (std.mem.lastIndexOfScalar(u8, pkg, '.')) |d| d + 1 else 0;
+        const parent_start = if (std.mem.findScalarLast(u8, pkg, '.')) |d| d + 1 else 0;
         const parent = pkg[parent_start..];
         if (parent.len == 0 or std.ascii.isUpper(parent[0])) return;
         const gop = try map.getOrPut(name);
@@ -781,8 +781,8 @@ pub const ProgramImage = struct {
     fn redirectParamRefutes(pn: []const u8, v: runtime.Value) bool {
         if (v == .Null) return false;
         var h = pn;
-        if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
-        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+        if (std.mem.findScalarLast(u8, h, '.')) |d| h = h[d + 1 ..];
+        if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
         h = std.mem.trimEnd(u8, h, "?");
         const eq = std.mem.eql;
         if (eq(u8, h, "Boolean")) return v != .Bool;
@@ -1341,7 +1341,7 @@ pub fn primitiveParamAccepts(type_name: []const u8, v: *const Value) bool {
 }
 
 fn simpleName(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
 }
 
@@ -1421,7 +1421,7 @@ pub fn valueIsBuiltin(v: *const Value) bool {
 pub fn isFunctionType(ty: *const TypeRef) bool {
     const n = simpleName(ty.name);
     return std.mem.startsWith(u8, n, "Function") or
-        std.mem.indexOf(u8, ty.name, "->") != null;
+        std.mem.find(u8, ty.name, "->") != null;
 }
 
 pub fn valueIsCallable(v: *const Value) bool {

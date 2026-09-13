@@ -351,7 +351,7 @@ pub fn maybeReport() void {
                     break :blk false;
                 };
                 const nm: []const u8 = if (syms.items.len > 0 and syms.items[0].name != null) syms.items[0].name.? else "";
-                g.value_ptr.* = std.mem.indexOf(u8, nm, want) != null;
+                g.value_ptr.* = std.mem.find(u8, nm, want) != null;
                 break :blk g.value_ptr.*;
             };
             if (!is_leaf) continue;
@@ -453,13 +453,13 @@ const MapRanges = struct {
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
-            const dash = std.mem.indexOfScalar(u8, line, '-') orelse continue;
-            const sp = std.mem.indexOfScalar(u8, line, ' ') orelse continue;
+            const dash = std.mem.findScalar(u8, line, '-') orelse continue;
+            const sp = std.mem.findScalar(u8, line, ' ') orelse continue;
             const s = std.fmt.parseInt(usize, line[0..dash], 16) catch continue;
             const e = std.fmt.parseInt(usize, line[dash + 1 .. sp], 16) catch continue;
-            const base = if (std.mem.lastIndexOfScalar(u8, line, '/')) |i|
+            const base = if (std.mem.findScalarLast(u8, line, '/')) |i|
                 line[i + 1 ..]
-            else if (std.mem.lastIndexOfScalar(u8, line, ' ')) |i|
+            else if (std.mem.findScalarLast(u8, line, ' ')) |i|
                 line[i + 1 ..]
             else
                 "";

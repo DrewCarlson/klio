@@ -709,11 +709,11 @@ pub fn asRangeView(v: Value) ?RangeView {
             defer cg.deinit();
             const fqn = cg.get().fqn;
             if (!std.mem.startsWith(u8, fqn, "kotlin.ranges.")) return null;
-            const kind: RangeKind = if (std.mem.indexOf(u8, fqn, "Long") != null)
+            const kind: RangeKind = if (std.mem.find(u8, fqn, "Long") != null)
                 .Long
-            else if (std.mem.indexOf(u8, fqn, "Char") != null)
+            else if (std.mem.find(u8, fqn, "Char") != null)
                 .Char
-            else if (std.mem.indexOf(u8, fqn, "Int") != null)
+            else if (std.mem.find(u8, fqn, "Int") != null)
                 .Int
             else
                 return null;

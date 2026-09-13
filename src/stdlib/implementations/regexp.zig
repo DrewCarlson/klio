@@ -1075,7 +1075,7 @@ fn kotlinLiteralEscape(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
     var first = true;
     var rest = s;
     while (true) {
-        const idx = std.mem.indexOf(u8, rest, "\\E");
+        const idx = std.mem.find(u8, rest, "\\E");
         const part = if (idx) |k| rest[0..k] else rest;
         if (!first) try out.appendSlice(allocator, "\\E\\\\E\\Q");
         first = false;

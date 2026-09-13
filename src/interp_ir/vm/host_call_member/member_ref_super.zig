@@ -54,7 +54,7 @@ const instanceIsThrowable = stdlib_tail.instanceIsThrowable;
 /// `qualifiedName`, and FQN-keyed equality — used to give a builtin value or a
 /// classId-less type a class literal.
 pub fn syntheticClassFromFqn(allocator: Allocator, fqn: []const u8) Allocator.Error!Value {
-    const dot = std.mem.lastIndexOfScalar(u8, fqn, '.');
+    const dot = std.mem.findScalarLast(u8, fqn, '.');
     const simple = if (dot) |i| fqn[i + 1 ..] else fqn;
     const cd = try ObjRef(ClassDef).init(allocator, .{
         .name = try allocator.dupe(u8, simple),
@@ -189,7 +189,7 @@ pub fn memberRefResolved(
         // An unsigned-array TYPE literal lowers to its constructor
         // (`ULongArray::class`): recover the type name from the constructor.
         if (receiver.* == .Intrinsic) {
-            const dot = std.mem.lastIndexOfScalar(u8, receiver.Intrinsic.fqn, '.');
+            const dot = std.mem.findScalarLast(u8, receiver.Intrinsic.fqn, '.');
             const simple = if (dot) |i| receiver.Intrinsic.fqn[i + 1 ..] else receiver.Intrinsic.fqn;
             if (isUnsignedArrayName(simple)) return .{ .ok = try syntheticClassFromFqn(allocator, receiver.Intrinsic.fqn) };
             return .{ .ok = try syntheticClassFromFqn(allocator, receiver.typeFqn()) };
@@ -644,8 +644,8 @@ pub fn qtTraceWant() ?[]const u8 {
 }
 
 pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value, qualifier: []const u8) Allocator.Error!EvalResult {
-    const qt_trace = if (qtTraceWant()) |w0| std.mem.indexOf(u8, qualifier, w0) != null else false;
-    if (std.mem.indexOfScalar(u8, qualifier, '.') != null) {
+    const qt_trace = if (qtTraceWant()) |w0| std.mem.find(u8, qualifier, w0) != null else false;
+    if (std.mem.findScalar(u8, qualifier, '.') != null) {
         var walk: ?Value = receiver.*;
         var steps: usize = 0;
         while (walk) |value| {

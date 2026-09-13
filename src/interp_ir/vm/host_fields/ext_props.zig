@@ -222,7 +222,7 @@ pub fn extPropDeclaredCallable(self: *VmHost, allocator: Allocator, receiver: *c
 pub fn declaredTypeIsCallable(mod: *const ir.Module, ty: *const ir.TypeRef) bool {
     if (root.isFunctionType(ty)) return true;
     var head = std.mem.trimEnd(u8, ty.name, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     const cid = mod.classId(head) orelse mod.classIdByFqn(head) orelse return false;
     return mod.classHierarchyDeclaresMember(cid, "invoke");
 }
@@ -627,7 +627,7 @@ pub fn resolveExtensionPropImpl(
         // companion extension is unreachable from a companion instance.
         var comp_alias_buf: [256]u8 = undefined;
         const comp_alias: ?[]const u8 = blk: {
-            const at = std.mem.indexOf(u8, recv_simple, "$Companion") orelse break :blk null;
+            const at = std.mem.find(u8, recv_simple, "$Companion") orelse break :blk null;
             if (at == 0) break :blk null;
             break :blk std.fmt.bufPrint(&comp_alias_buf, "{s}.Companion", .{recv_simple[0..at]}) catch null;
         };
@@ -655,7 +655,7 @@ pub fn resolveExtensionPropImpl(
         // A file-mangled class (`KeyInfo$f352`, one of two same-simple-name
         // internal classes) registers its extension properties under the
         // SOURCE-WRITTEN receiver name: retry with the base name.
-        if (std.mem.indexOf(u8, recv_simple, "$f")) |dol| {
+        if (std.mem.find(u8, recv_simple, "$f")) |dol| {
             if (dol > 0 and dol + 2 < recv_simple.len and
                 std.ascii.isDigit(recv_simple[dol + 2]))
             {
@@ -725,7 +725,7 @@ pub fn resolveExtensionPropImpl(
     // lookup by its outer class's companion path.
     if (receiver.* == .Instance) {
         const cls = className(receiver.Instance);
-        if (std.mem.indexOf(u8, cls, "$Companion")) |i| {
+        if (std.mem.find(u8, cls, "$Companion")) |i| {
             const outer = cls[0..i];
             const comp_key = try std.fmt.allocPrint(allocator, "{s}.Companion", .{outer});
             defer allocator.free(comp_key);

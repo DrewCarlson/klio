@@ -385,7 +385,7 @@ const ShapeLock = struct {
     }
 };
 var shape_lock: ShapeLock = .{};
-var shape_table: std.HashMapUnmanaged(u64, std.ArrayListUnmanaged(*ShapeRec), std.hash_map.AutoContext(u64), 80) = .empty;
+var shape_table: std.HashMapUnmanaged(u64, std.ArrayList(*ShapeRec), std.hash_map.AutoContext(u64), 80) = .empty;
 var shape_count: usize = 0;
 const shape_cap: usize = 1 << 16;
 var shape_arena_state: ?std.heap.ArenaAllocator = null;

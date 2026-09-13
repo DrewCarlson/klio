@@ -945,9 +945,9 @@ pub fn delegatedInterfaceDeclares(self: *VmHost, allocator: Allocator, inst: Obj
     // The key carries the source-spelled supertype; strip generic args
     // (`Continuation<T>` -> `Continuation`).
     var iface_name = iface_name_raw;
-    if (std.mem.indexOfScalar(u8, iface_name, '<')) |lt| iface_name = iface_name[0..lt];
+    if (std.mem.findScalar(u8, iface_name, '<')) |lt| iface_name = iface_name[0..lt];
     iface_name = std.mem.trim(u8, iface_name, " ");
-    if (std.mem.lastIndexOfScalar(u8, iface_name, '.')) |dot| iface_name = iface_name[dot + 1 ..];
+    if (std.mem.findScalarLast(u8, iface_name, '.')) |dot| iface_name = iface_name[dot + 1 ..];
     if (iface_name.len == 0) return null;
 
     // Resolve lexically first (the class's captured declaration env), then

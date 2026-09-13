@@ -64,7 +64,7 @@ fn assertDiag(src: []const u8, factory_name: []const u8, msg_needle: []const u8)
     for (diags) |d| {
         const fname = if (d.factory) |f| f.name else continue;
         if (!std.mem.eql(u8, fname, factory_name)) continue;
-        if (std.mem.indexOf(u8, d.message, msg_needle) != null) return;
+        if (std.mem.find(u8, d.message, msg_needle) != null) return;
     }
     std.debug.print("expected `{s}` containing `{s}`; got:\n", .{ factory_name, msg_needle });
     for (diags) |d| {
@@ -80,7 +80,7 @@ fn assertDiagMsg(src: []const u8, msg_needle: []const u8) !void {
     const a = file_arena.allocator();
     const diags = try frontendDiags(a, src);
     for (diags) |d| {
-        if (std.mem.indexOf(u8, d.message, msg_needle) != null) return;
+        if (std.mem.find(u8, d.message, msg_needle) != null) return;
     }
     std.debug.print("expected message containing `{s}`; got:\n", .{msg_needle});
     for (diags) |d| std.debug.print("  {s}\n", .{d.message});

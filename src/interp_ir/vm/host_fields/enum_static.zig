@@ -165,7 +165,7 @@ pub fn enclosingEnumDef(self: *VmHost, receiver: *const Value) ?runtime.ObjRef(r
             const mg = self.module.borrow();
             defer mg.deinit();
             if (mg.get().registry.enclosing_class.get(current)) |e| break :blk e;
-            if (std.mem.lastIndexOfScalar(u8, current, '.')) |d| break :blk current[0..d];
+            if (std.mem.findScalarLast(u8, current, '.')) |d| break :blk current[0..d];
             return null;
         };
         const def: ?runtime.ObjRef(runtime.ClassDef) = blk: {
@@ -197,7 +197,7 @@ pub fn enclosingEnumEntryByOwner(self: *VmHost, owner: []const u8, name: []const
             const mg = self.module.borrow();
             defer mg.deinit();
             if (mg.get().registry.enclosing_class.get(current)) |e| break :blk e;
-            if (std.mem.lastIndexOfScalar(u8, current, '.')) |d| break :blk current[0..d];
+            if (std.mem.findScalarLast(u8, current, '.')) |d| break :blk current[0..d];
             return null;
         };
         if (enumEntryByOwner(self, enclosing, name)) |v| return v;

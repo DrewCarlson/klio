@@ -165,7 +165,7 @@ pub fn collectMemberCandidates(
 
 pub fn staticTypeHead(name: []const u8) []const u8 {
     var head = applicability.simpleName(name);
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     return std.mem.trimEnd(u8, head, "?");
 }
 
@@ -565,7 +565,7 @@ pub fn staticBuiltinIdentity(
         std.mem.eql(u8, head, "Sequence");
     if (!is_builtin) return .no;
     const qualified = overrideQualifiedPath(ty) orelse blk: {
-        if (std.mem.indexOfScalar(u8, ty.name, '.') != null) {
+        if (std.mem.findScalar(u8, ty.name, '.') != null) {
             break :blk ty.name;
         }
         break :blk null;
@@ -602,7 +602,7 @@ pub fn staticTypeClassId(self: *const Module, ty: TypeRef) ?ClassId {
     if (overrideQualifiedPath(ty)) |path| {
         return self.classIdByFqn(path) orelse self.classIdByQualifiedSuffix(path);
     }
-    if (std.mem.indexOfScalar(u8, ty.name, '.') != null) {
+    if (std.mem.findScalar(u8, ty.name, '.') != null) {
         return self.classIdByFqn(ty.name) orelse self.classIdByQualifiedSuffix(ty.name);
     }
     return self.uniqueClassIdBySimpleName(staticTypeHead(ty.name));
@@ -755,8 +755,8 @@ pub fn staticReceiverCompatibility(
         .no => .incompatible,
     };
     if (std.mem.eql(u8, actual, declared)) {
-        const actual_qualified = std.mem.indexOfScalar(u8, receiver.name, '.') != null;
-        const declared_qualified = std.mem.indexOfScalar(u8, param.name, '.') != null;
+        const actual_qualified = std.mem.findScalar(u8, receiver.name, '.') != null;
+        const declared_qualified = std.mem.findScalar(u8, param.name, '.') != null;
         if (!actual_alias.changed and !declared_alias.changed and
             actual_qualified and declared_qualified and
             !std.mem.eql(u8, receiver.name, param.name)) return .incompatible;
@@ -832,7 +832,7 @@ pub fn staticReceiverCompatibility(
         // authoritative one; the module-unique lookup is the fallback
         // for declarations with no recorded source.
         const decl_scoped: ?ClassId = blk: {
-            if (std.mem.indexOfScalar(u8, param.name, '.') != null) break :blk null;
+            if (std.mem.findScalar(u8, param.name, '.') != null) break :blk null;
             const decl_id = fid orelse break :blk null;
             const decl_source = self.decl_span.get(decl_id.int()) orelse break :blk null;
             const decl_pkg = if (self.funcById(decl_id)) |df| df.package else "";
@@ -926,7 +926,7 @@ pub fn scopedTypeAliasFqn(
         return if (self.registry.type_alias_types.contains(path)) path else null;
     }
     const name = staticTypeHead(ty.name);
-    if (std.mem.indexOfScalar(u8, ty.name, '.') != null and
+    if (std.mem.findScalar(u8, ty.name, '.') != null and
         self.registry.type_alias_types.contains(ty.name))
     {
         return ty.name;
@@ -1239,7 +1239,7 @@ pub fn staticBuiltinArgsNonRefuting(actual_args: []const TypeRef, declared_args:
         const h = staticTypeHead(a.name);
         const bare_param = h.len >= 1 and h.len <= 2 and
             std.ascii.isUpper(h[0]) and a.args.len == 0 and
-            std.mem.indexOfScalar(u8, a.name, '.') == null;
+            std.mem.findScalar(u8, a.name, '.') == null;
         if (!bare_param) return false;
     }
     return true;
@@ -1277,7 +1277,7 @@ pub fn rawBoundNamesDeclaredParam(
     params: []const ModuleRegistry.TypeParamBound,
     bound: []const u8,
 ) bool {
-    if (std.mem.indexOfScalar(u8, bound, '.') != null or
+    if (std.mem.findScalar(u8, bound, '.') != null or
         std.mem.startsWith(u8, bound, "#qual:")) return false;
     return isDeclaredTypeParam(params, staticTypeHead(bound));
 }
@@ -1287,7 +1287,7 @@ pub fn typeRefIsDeclaredParam(
     ty: TypeRef,
 ) bool {
     if (overrideQualifiedPath(ty) != null or
-        std.mem.indexOfScalar(u8, ty.name, '.') != null) return false;
+        std.mem.findScalar(u8, ty.name, '.') != null) return false;
     return isDeclaredTypeParam(params, staticTypeHead(ty.name));
 }
 
@@ -1914,7 +1914,7 @@ pub fn lambdaRefuteOn() bool {
 /// the surface).
 pub fn headIsFunctionSpelling(name: []const u8) bool {
     if (std.mem.eql(u8, name, "<function>")) return true;
-    if (std.mem.indexOf(u8, name, "->") != null) return true;
+    if (std.mem.find(u8, name, "->") != null) return true;
     var head = staticTypeHead(name);
     for ([_][]const u8{ "Function", "SuspendFunction", "KFunction", "KSuspendFunction" }) |p| {
         if (std.mem.startsWith(u8, head, p) and head.len > p.len) {
@@ -2165,7 +2165,7 @@ pub fn scopedClassId(
     name: []const u8,
     ctx: ExtensionResolveCtx,
 ) ?ClassId {
-    return if (std.mem.indexOfScalar(u8, name, '.') != null)
+    return if (std.mem.findScalar(u8, name, '.') != null)
         self.classIdByFqn(name)
     else
         self.classIdIndexed(name, ctx.caller_package, ctx.caller_file);
@@ -2187,7 +2187,7 @@ pub fn dispatchOwnerInChain(
                 if (self.classIdIsOrExtends(candidate_id, target)) return true;
             }
         } else if (std.mem.eql(u8, candidate, owner) or
-            (std.mem.indexOfScalar(u8, owner, '.') == null and
+            (std.mem.findScalar(u8, owner, '.') == null and
                 std.mem.eql(u8, staticTypeHead(candidate), staticTypeHead(owner))))
         {
             return true;
@@ -2289,7 +2289,7 @@ pub fn objectMemberExtensionInScope(
                 }
             }
         }
-        const dot = std.mem.lastIndexOfScalar(u8, f.fqn, '.') orelse return false;
+        const dot = std.mem.findScalarLast(u8, f.fqn, '.') orelse return false;
         break :blk f.fqn[0..dot];
     };
     return self.importWildcardIn(ctx.caller_file, owner_fqn);

@@ -715,7 +715,7 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
             const head = staticReceiverBindingHead(declared);
             if (head.len != 0) {
                 var fqn_buf: [256]u8 = undefined;
-                const fqn = if (std.mem.indexOfScalar(u8, head, '.') != null)
+                const fqn = if (std.mem.findScalar(u8, head, '.') != null)
                     std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ head, name }) catch null
                 else
                     std.fmt.bufPrint(&fqn_buf, "kotlin.{s}.{s}", .{ head, name }) catch null;
@@ -1777,8 +1777,8 @@ pub fn callMemberInnerStatic(self: *VmHost, allocator: Allocator, receiver: *con
                 // nested class rather than missing as a companion member.
                 if (std.mem.endsWith(u8, fqn, ".Companion"))
                     break :blk fqn[0 .. fqn.len - ".Companion".len];
-                if (std.mem.indexOf(u8, icg.get().name, "$Companion$") != null) {
-                    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| break :blk fqn[0..dot];
+                if (std.mem.find(u8, icg.get().name, "$Companion$") != null) {
+                    if (std.mem.findScalarLast(u8, fqn, '.')) |dot| break :blk fqn[0..dot];
                 }
                 // An object singleton used as a nested-class qualifier
                 // (`Object.Nested(args)`): the bare object name lowered to its

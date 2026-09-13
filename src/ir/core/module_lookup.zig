@@ -555,7 +555,7 @@ pub fn buildClassIdMap(self: *Module, allocator: Allocator) Allocator.Error!void
     var pm = std.AutoHashMap(ClassId, ClassId).init(allocator);
     var cm = std.AutoHashMap(ClassId, std.StringHashMap(ClassId)).init(allocator);
     for (self.classes.items) |c| {
-        const dot = std.mem.lastIndexOfScalar(u8, c.fqn, '.') orelse continue;
+        const dot = std.mem.findScalarLast(u8, c.fqn, '.') orelse continue;
         const parent_fqn = c.fqn[0..dot];
         const seg = c.fqn[dot + 1 ..];
         const pid = blk: {
@@ -603,10 +603,10 @@ pub fn eagerTypeOf(self: *const Module, sp: span.Span) ?EagerTypeHead {
     const et = &(self.eager_types orelse return null);
     const head = et.get(sp) orelse return null;
     var h = std.mem.trimEnd(u8, head.name, "?");
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
     if (h.len == 0) return null;
     if (types_mod.builtinByName(h) != null or applicability.builtinSupersOf(h).len != 0) return head;
-    if (std.mem.indexOfScalar(u8, h, '.') != null) {
+    if (std.mem.findScalar(u8, h, '.') != null) {
         if (self.classIdByFqn(h) != null) return head;
         return null;
     }
@@ -868,7 +868,7 @@ pub fn classIdNestedIn(self: *const Module, owner: ClassId, name: []const u8) ?C
 /// specific qualification). Returns null when the path is unqualified or
 /// no class FQN ends with it.
 pub fn classIdByQualifiedSuffix(self: *const Module, qualified: []const u8) ?ClassId {
-    if (std.mem.indexOfScalar(u8, qualified, '.') == null) return null;
+    if (std.mem.findScalar(u8, qualified, '.') == null) return null;
     var best: ?ClassId = null;
     var best_len: usize = std.math.maxInt(usize);
     for (self.class_index.items) |entry| {
@@ -1124,7 +1124,7 @@ pub fn funcIdByFqn(self: *const Module, fqn: []const u8) ?FuncId {
     // Match by simple name (lazy-friendly via the name index), then confirm
     // the full fqn — decoding only same-simple-name candidates rather than
     // sweeping the (possibly lazy) func table.
-    const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
+    const simple = if (std.mem.findScalarLast(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
     for (self.funcsBySimpleName(simple)) |id| {
         const f = self.funcById(id) orelse continue;
         if (std.mem.eql(u8, f.fqn, fqn)) return id;
@@ -1267,7 +1267,7 @@ pub fn addClass(self: *Module, allocator: Allocator, class_in: Class) Allocator.
     class.id = id;
     try self.class_index.append(allocator, .{ .name = class.name, .id = id });
     if (std.c.getenv("KLIO_CIDX_TRACE")) |w| {
-        if (std.mem.indexOf(u8, class.name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ class.name, id.int() });
+        if (std.mem.find(u8, class.name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ class.name, id.int() });
     }
     try self.classes.append(allocator, class);
     return id;
@@ -1406,7 +1406,7 @@ pub fn fixupStubClaimCaches(self: *Module, id: ClassId, stub_fqn: []const u8, ne
 /// a base class accepts a subclass receiver.
 pub fn classIsOrExtends(self: *const Module, sub: []const u8, super_name: []const u8) bool {
     if (std.mem.eql(u8, sub, super_name)) return true;
-    const sub_id = if (std.mem.indexOfScalar(u8, sub, '.') != null)
+    const sub_id = if (std.mem.findScalar(u8, sub, '.') != null)
         self.classIdByFqn(sub)
     else
         self.uniqueClassIdBySimpleName(staticTypeHead(sub));
@@ -1421,7 +1421,7 @@ pub fn classIsOrExtends(self: *const Module, sub: []const u8, super_name: []cons
             }
         }
     }
-    const super_id = if (std.mem.indexOfScalar(u8, super_name, '.') != null)
+    const super_id = if (std.mem.findScalar(u8, super_name, '.') != null)
         self.classIdByFqn(super_name)
     else
         self.uniqueClassIdBySimpleName(staticTypeHead(super_name));
@@ -1429,8 +1429,8 @@ pub fn classIsOrExtends(self: *const Module, sub: []const u8, super_name: []cons
         return sub_id != null and super_id != null and
             self.classIdIsOrExtends(sub_id.?, super_id.?);
     }
-    if (std.mem.indexOfScalar(u8, sub, '.') != null or
-        std.mem.indexOfScalar(u8, super_name, '.') != null) return false;
+    if (std.mem.findScalar(u8, sub, '.') != null or
+        std.mem.findScalar(u8, super_name, '.') != null) return false;
     const supers = self.registry.class_super_names.get(sub) orelse return false;
     for (supers) |s| {
         if (std.mem.eql(u8, s, super_name)) return true;
@@ -1450,7 +1450,7 @@ pub fn reserveClass(self: *Module, allocator: Allocator, name: []const u8, is_in
     const id = ClassId.from(@intCast(self.classes.items.len));
     try self.class_index.append(allocator, .{ .name = name, .id = id });
     if (std.c.getenv("KLIO_CIDX_TRACE")) |w| {
-        if (std.mem.indexOf(u8, name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
+        if (std.mem.find(u8, name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
     }
     try self.classes.append(allocator, .{
         .id = id,
@@ -1485,7 +1485,7 @@ pub fn reserveClassFqn(self: *Module, allocator: Allocator, name: []const u8, fq
     const id = ClassId.from(@intCast(self.classes.items.len));
     try self.class_index.append(allocator, .{ .name = name, .id = id });
     if (std.c.getenv("KLIO_CIDX_TRACE")) |w| {
-        if (std.mem.indexOf(u8, name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
+        if (std.mem.find(u8, name, std.mem.span(w)) != null) std.debug.print("[cidx] name={s} id={d}\n", .{ name, id.int() });
     }
     try self.classes.append(allocator, .{
         .id = id,

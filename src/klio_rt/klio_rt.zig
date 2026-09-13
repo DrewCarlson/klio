@@ -271,7 +271,7 @@ fn natAlloc() std.mem.Allocator {
     return std.heap.c_allocator;
 }
 
-var nat_classes: std.ArrayListUnmanaged(runtime.ObjRef(runtime.ClassDef)) = .empty;
+var nat_classes: std.ArrayList(runtime.ObjRef(runtime.ClassDef)) = .empty;
 
 /// Per-instance identity, the same monotonic counter the interpreter keeps.
 var nat_identity = std.atomic.Value(u64).init(1);
@@ -818,7 +818,7 @@ export fn klio_nat_member(fqn: [*:0]const u8, argv: [*]const CValue, argc: u32) 
     const name = std.mem.span(fqn);
     const dispatch = cli.interp_ir.member_dispatch;
     // A bare-name call site carries the member alone, with no qualifier to strip.
-    const member = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
+    const member = if (std.mem.findScalarLast(u8, name, '.')) |dot| name[dot + 1 ..] else name;
     if (argc == 0) natNoMember(name);
     const recv = fromC(argv[0]);
     const args = a.alloc(runtime.Value, argc - 1) catch @panic("klio_nat_member: out of memory");

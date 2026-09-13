@@ -87,7 +87,7 @@ fn check(stem: []const u8) !void {
             },
             .err => |m| {
                 for (want.err_contains) |needle| {
-                    if (std.mem.indexOf(u8, m, needle) == null) {
+                    if (std.mem.find(u8, m, needle) == null) {
                         std.debug.print("threaded litmus {s}: error message missing `{s}`\n got: {s}\n", .{ stem, needle, m });
                         return error.ErrorMessageMismatch;
                     }
@@ -582,7 +582,7 @@ test "eager pipeline output parity" {
         .{ .needle = "0 dynamic", .expect_present = true },
     };
     for (pins) |pin| {
-        const found = std.mem.indexOf(u8, eager_ir.stdout, pin.needle) != null;
+        const found = std.mem.find(u8, eager_ir.stdout, pin.needle) != null;
         if (found != pin.expect_present) {
             std.debug.print(
                 "eager parity: `{s}` {s} in dump-ir output\n--- stdout ---\n{s}\n--- stderr ---\n{s}\n",

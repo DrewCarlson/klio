@@ -288,7 +288,7 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
         cg.deinit();
         g.deinit();
     }
-    if (std.mem.indexOf(u8, cls_name, "$Companion$") != null) return null;
+    if (std.mem.find(u8, cls_name, "$Companion$") != null) return null;
     // The ordered ancestor-companion list is a pure function of the class
     // (supertype graph + lexical enclosing chain + companion registry, all
     // static); the walk that produced it per call was the dominant cost of
@@ -378,7 +378,7 @@ pub fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []cons
         // dotted or mangled nested name; a simple name resolves its owner
         // through the registry's enclosing-class map.
         const enclosing: ?[]const u8 = blk: {
-            if (std.mem.lastIndexOfAny(u8, cname, ".$")) |sep| {
+            if (std.mem.findLastAny(u8, cname, ".$")) |sep| {
                 if (sep > 0) break :blk cname[0..sep];
             }
             const g = self.module.borrow();

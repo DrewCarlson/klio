@@ -226,8 +226,8 @@ test "bench report serializes with skipped optionals" {
     buf = aw.toArrayList();
     defer buf.deinit(testing.allocator);
 
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"ref_kotlinc_jvm_ns\": 42") != null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, "allocs") == null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, "ref_kotlinc_native_ns") == null);
-    try testing.expect(std.mem.indexOf(u8, buf.items, "\"git_sha\": \"abc\"") != null);
+    try testing.expect(std.mem.find(u8, buf.items, "\"ref_kotlinc_jvm_ns\": 42") != null);
+    try testing.expect(std.mem.find(u8, buf.items, "allocs") == null);
+    try testing.expect(std.mem.find(u8, buf.items, "ref_kotlinc_native_ns") == null);
+    try testing.expect(std.mem.find(u8, buf.items, "\"git_sha\": \"abc\"") != null);
 }

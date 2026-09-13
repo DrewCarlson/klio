@@ -168,7 +168,7 @@ pub fn irTypeToAstInstantiated(a: Allocator, ty: ir.TypeRef, tps: []const []cons
     var nm = std.mem.trimEnd(u8, ty.name, "?");
     if (std.mem.startsWith(u8, nm, "in#")) nm = nm[3..];
     if (std.mem.startsWith(u8, nm, "out#")) nm = nm[4..];
-    if (std.mem.indexOfScalar(u8, nm, '<')) |lt| nm = nm[0..lt];
+    if (std.mem.findScalar(u8, nm, '<')) |lt| nm = nm[0..lt];
     // The parent's own type parameter: the written argument at its position.
     for (tps, 0..) |tp, i| {
         if (std.mem.eql(u8, tp, nm) and i < written.len and !written[i].is_star) {

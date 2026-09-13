@@ -172,7 +172,7 @@ pub fn resolveModuleWithNatives(
     var r = try Resolver.init(allocator);
     const builtins = ScopeId.from(0);
     for (native_fqns) |fqn| {
-        const leaf = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
+        const leaf = if (std.mem.findScalarLast(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
         if (leaf.len == 0) continue;
         if (r.scopes.items[builtins.int()].bindings.contains(leaf)) continue;
         const sym = try r.addSymbol(leaf, .Builtin, null);

@@ -149,7 +149,7 @@ fn cellTraceNote(ci: usize, ptr: usize, size: usize) void {
 
 const TraceSite = struct { addrs: [TRACE_FRAMES]usize, n: usize, bytes: usize, count: usize };
 
-fn mergeSite(sites: *std.ArrayListUnmanaged(TraceSite), r: *const MapRec) void {
+fn mergeSite(sites: *std.ArrayList(TraceSite), r: *const MapRec) void {
     for (sites.items) |*s| {
         if (s.n == r.n and std.mem.eql(usize, s.addrs[0..s.n], r.addrs[0..r.n])) {
             s.bytes += r.size;
@@ -163,7 +163,7 @@ fn mergeSite(sites: *std.ArrayListUnmanaged(TraceSite), r: *const MapRec) void {
 
 pub fn traceReport() void {
     if (!trace_enabled and !cell_trace_enabled) return;
-    var sites: std.ArrayListUnmanaged(TraceSite) = .empty;
+    var sites: std.ArrayList(TraceSite) = .empty;
     traceLock();
     var it = trace_map.iterator();
     while (it.next()) |e| mergeSite(&sites, e.value_ptr);

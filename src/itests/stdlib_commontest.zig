@@ -96,7 +96,7 @@ fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayL
 
 fn fileHasTest(a: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return false;
-    return std.mem.indexOf(u8, bytes, "@Test") != null;
+    return std.mem.find(u8, bytes, "@Test") != null;
 }
 
 /// The shard-balancing weight.
@@ -107,7 +107,7 @@ fn testCount(a: std.mem.Allocator, io: std.Io, path: []const u8) usize {
 
 /// Passed count from the child's "<n> tests, <p> passed, <f> failed" line.
 fn passedCount(stdout: []const u8) ?usize {
-    const idx = std.mem.indexOf(u8, stdout, " passed,") orelse return null;
+    const idx = std.mem.find(u8, stdout, " passed,") orelse return null;
     var end = idx;
     while (end > 0 and stdout[end - 1] == ' ') end -= 1;
     var start = end;
@@ -117,8 +117,8 @@ fn passedCount(stdout: []const u8) ?usize {
 }
 
 fn failedCount(stdout: []const u8) ?usize {
-    const idx = std.mem.indexOf(u8, stdout, " failed,") orelse
-        std.mem.lastIndexOf(u8, stdout, " failed") orelse return null;
+    const idx = std.mem.find(u8, stdout, " failed,") orelse
+        std.mem.findLast(u8, stdout, " failed") orelse return null;
     var end = idx;
     while (end > 0 and stdout[end - 1] == ' ') end -= 1;
     var start = end;
@@ -133,9 +133,9 @@ fn importedTestName(line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, t, "import ")) return null;
     var rest = std.mem.trim(u8, t["import ".len..], " \t\r");
     if (!std.mem.startsWith(u8, rest, "test.")) return null;
-    if (std.mem.indexOfAny(u8, rest, " \t")) |sp| rest = rest[0..sp];
+    if (std.mem.findAny(u8, rest, " \t")) |sp| rest = rest[0..sp];
     rest = std.mem.trimEnd(u8, rest, ";");
-    const dot = std.mem.lastIndexOfScalar(u8, rest, '.') orelse return null;
+    const dot = std.mem.findScalarLast(u8, rest, '.') orelse return null;
     const name = rest[dot + 1 ..];
     if (name.len == 0 or std.mem.eql(u8, name, "*")) return null;
     return name;
@@ -149,7 +149,7 @@ fn isIdentChar(c: u8) bool {
 fn hasWord(hay: []const u8, word: []const u8) bool {
     if (word.len == 0) return false;
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, hay, i, word)) |p| {
+    while (std.mem.findPos(u8, hay, i, word)) |p| {
         const before_ok = p == 0 or !isIdentChar(hay[p - 1]);
         const after = p + word.len;
         const after_ok = after >= hay.len or !isIdentChar(hay[after]);
@@ -239,7 +239,7 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     var shard_k: usize = 0;
     var shard_n: usize = 1;
     if (runtime.envOnce("KLIO_COMMONTEST_SHARD")) |s| {
-        if (std.mem.indexOfScalar(u8, s, '/')) |sep| {
+        if (std.mem.findScalar(u8, s, '/')) |sep| {
             const k = std.fmt.parseInt(usize, s[0..sep], 10) catch 0;
             const n = std.fmt.parseInt(usize, s[sep + 1 ..], 10) catch 1;
             if (n != 0 and k < n) {

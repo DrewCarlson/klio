@@ -846,7 +846,7 @@ fn parsePropertyReceiverResult(p: *Parser) ReceiverResult {
             if (ty) |*t| {
                 t.qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM");
             }
-        } else if (std.mem.indexOfScalar(u8, path.items, '.') != null) {
+        } else if (std.mem.findScalar(u8, path.items, '.') != null) {
             // Keep the full path of `A.B.foo` so the resolver targets the nested class.
             if (ty) |*t| {
                 t.qualified_path = p.allocator.dupe(u8, path.items) catch @panic("OOM");

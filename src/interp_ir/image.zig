@@ -370,7 +370,7 @@ fn decStat(comptime T: type, n: usize) void {
 pub fn dumpDecodeStats() void {
     if (!decode_stats_on) return;
     const E = struct { name: []const u8, bytes: u64, count: u64 };
-    var list: std.ArrayListUnmanaged(E) = .empty;
+    var list: std.ArrayList(E) = .empty;
     var it = decode_stats.iterator();
     while (it.next()) |kv| list.append(std.heap.page_allocator, .{ .name = kv.key_ptr.*, .bytes = kv.value_ptr.bytes, .count = kv.value_ptr.count }) catch {};
     std.mem.sort(E, list.items, {}, struct {
@@ -987,7 +987,7 @@ pub fn bake(
             if (f.deferred_offset == 0 and f.blocks.len == 0) try bodyless.append(a, @intCast(i));
             // Only a dotted fqn contributes a package head; recording a dotless
             // name would make every bare stdlib func name a "package".
-            if (std.mem.indexOfScalar(u8, f.fqn, '.')) |dot| {
+            if (std.mem.findScalar(u8, f.fqn, '.')) |dot| {
                 const h = f.fqn[0..dot];
                 if (h.len != 0) try heads.put(h, {});
             }
@@ -1094,8 +1094,8 @@ pub fn bake(
             if (f.kind != .plain) continue;
             if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
             var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
-            if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
-            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+            if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+            if (std.mem.findScalarLast(u8, head, '.')) |d| head = head[d + 1 ..];
             if (head.len == 0 or !classes.contains(head)) continue;
             if (ambiguous.contains(f.name)) continue;
             const gop = rets.getOrPut(f.name) catch continue;
@@ -1119,11 +1119,11 @@ pub fn bake(
             if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
             if (f.name.len == 0) continue;
             var rh = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
-            if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
-            if (std.mem.lastIndexOfScalar(u8, rh, '.')) |d| rh = rh[d + 1 ..];
+            if (std.mem.findScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+            if (std.mem.findScalarLast(u8, rh, '.')) |d| rh = rh[d + 1 ..];
             var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
-            if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
-            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+            if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+            if (std.mem.findScalarLast(u8, head, '.')) |d| head = head[d + 1 ..];
             if (rh.len == 0 or head.len == 0 or !classes.contains(head)) continue;
             const key = std.fmt.allocPrint(a, "{s}\x00{s}", .{ rh, f.name }) catch continue;
             if (eamb.contains(key)) continue;
@@ -2335,14 +2335,14 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
     for (img.extension_props) |entry| {
         try out.extension_props.put(.{ .a = entry.a, .b = entry.b }, entry.func);
         // Owner-qualified keys carry a NUL separator; rebuild the gate set.
-        if (std.mem.indexOfScalar(u8, entry.a, 0) != null) {
+        if (std.mem.findScalar(u8, entry.a, 0) != null) {
             try out.owner_keyed_ext_names.put(entry.b, {});
         }
     }
     for (img.nullable_ext_props) |entry| try out.nullable_ext_props.put(entry.name, entry.func);
     for (img.extension_prop_setters) |entry| {
         try out.extension_prop_setters.put(.{ .a = entry.a, .b = entry.b }, entry.func);
-        if (std.mem.indexOfScalar(u8, entry.a, 0) != null) {
+        if (std.mem.findScalar(u8, entry.a, 0) != null) {
             try out.owner_keyed_ext_names.put(entry.b, {});
         }
     }

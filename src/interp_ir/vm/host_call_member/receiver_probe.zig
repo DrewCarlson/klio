@@ -61,7 +61,7 @@ pub fn isCallable(v: *const Value) bool {
 /// A `TypeRef` denoting a Kotlin function type (`FunctionN` or `... -> ...`).
 pub fn isFunctionTypeRef(ty: *const TypeRef) bool {
     return std.mem.startsWith(u8, simpleName(ty.name), "Function") or
-        std.mem.indexOf(u8, ty.name, "->") != null;
+        std.mem.find(u8, ty.name, "->") != null;
 }
 
 /// `ty`'s name with `typealias` indirection resolved (bounded hops), so a
@@ -87,7 +87,7 @@ pub fn isFunctionTypeRefResolved(self: *VmHost, ty: *const TypeRef) bool {
     if (isFunctionTypeRef(ty)) return true;
     const resolved = resolveAliasName(self, ty.name);
     return std.mem.startsWith(u8, simpleName(resolved), "Function") or
-        std.mem.indexOf(u8, resolved, "->") != null;
+        std.mem.find(u8, resolved, "->") != null;
 }
 
 /// Pack trailing positional args into a single `Value::Array` when the
@@ -531,7 +531,7 @@ pub fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *
 /// its scope-keyed mangled name when the simple name collided at lift), or
 /// null when the name is not dotted / carries no mangle entry.
 pub fn mangledNestedKey(mod: *const Module, name: []const u8) ?[]const u8 {
-    if (std.mem.indexOfScalar(u8, name, '.') == null) return null;
+    if (std.mem.findScalar(u8, name, '.') == null) return null;
     // Last two segments (`a.b.C.D` -> `C.D`) key the mangle table.
     var last: ?usize = null;
     var prev: ?usize = null;
@@ -561,9 +561,9 @@ pub fn classHeadsMatch(self: *VmHost, a: []const u8, b: []const u8) bool {
 
 pub fn bareHead(name: []const u8) []const u8 {
     var sn = name;
-    if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
-    if (std.mem.indexOfScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
-    if (std.mem.lastIndexOfScalar(u8, sn, '$')) |i| {
+    if (std.mem.findScalarLast(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+    if (std.mem.findScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
+    if (std.mem.findScalarLast(u8, sn, '$')) |i| {
         if (i + 1 < sn.len) sn = sn[i + 1 ..];
     }
     return std.mem.trimEnd(u8, sn, "?");
@@ -619,7 +619,7 @@ pub fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name
         }
     }
     var sn = simpleName(static_name);
-    if (std.mem.indexOfScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
+    if (std.mem.findScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
     sn = std.mem.trimEnd(u8, std.mem.trim(u8, sn, " "), "?");
     if (std.mem.eql(u8, sn, pn)) return true;
     _ = allocator;
@@ -666,7 +666,7 @@ pub fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name
         // and the mangled entry itself may be the one that relates.
         const ehead = blk: {
             const sn2 = simpleName(entry.name);
-            if (std.mem.lastIndexOfScalar(u8, sn2, '$')) |i| {
+            if (std.mem.findScalarLast(u8, sn2, '$')) |i| {
                 if (i + 1 < sn2.len) break :blk sn2[i + 1 ..];
             }
             break :blk sn2;
@@ -877,7 +877,7 @@ pub fn fnTypeValueParams(ty: *const TypeRef) ?[]const TypeRef {
 
 pub fn fnParamHead(name: []const u8) []const u8 {
     var h = simpleName(std.mem.trimEnd(u8, name, "?"));
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
     return h;
 }
 
@@ -965,7 +965,7 @@ pub fn receiverViolatesTypeParamBound(self: *VmHost, fid: FuncId, param_ty: *con
     for (bounds) |b| {
         if (!std.mem.eql(u8, b.param, pn0)) continue;
         var bn = simpleName(b.bound);
-        if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
+        if (std.mem.findScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
         bn = std.mem.trimEnd(u8, std.mem.trim(u8, bn, " "), "?");
         if (std.mem.eql(u8, bn, "Any")) continue;
         // A bound that is itself one of the function's type parameters
@@ -1265,7 +1265,7 @@ pub fn receiverImplementsOwnerIdentity(
     receiver: *const Value,
     owner: []const u8,
 ) bool {
-    if (std.mem.indexOfScalar(u8, owner, '.') == null) {
+    if (std.mem.findScalar(u8, owner, '.') == null) {
         return receiverImplementsType(self, receiver, owner);
     }
     if (receiver.* != .Instance) return false;

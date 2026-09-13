@@ -166,16 +166,16 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
         std.debug.print("bundle_ui: bundling failed:\n{s}\n", .{bundled.stderr});
         return error.TestUnexpectedResult;
     }
-    try std.testing.expect(std.mem.indexOf(u8, bundled.stdout, ", ui)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bundled.stdout, "skia backend") != null);
+    try std.testing.expect(std.mem.find(u8, bundled.stdout, ", ui)") != null);
+    try std.testing.expect(std.mem.find(u8, bundled.stdout, "skia backend") != null);
 
     const abs = try cwd.realPathFileAlloc(io, out, a);
     try run_env.put("KLIO_BUNDLE_INSPECT", "1");
     const inspect = try runChild(a, io, &run_env, &.{abs});
     _ = run_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_INSPECT"));
     try std.testing.expectEqual(@as(u32, 0), inspect.code);
-    try std.testing.expect(std.mem.indexOf(u8, inspect.stdout, "flavor: ui\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inspect.stdout, "  skia-shim ") != null);
+    try std.testing.expect(std.mem.find(u8, inspect.stdout, "flavor: ui\n") != null);
+    try std.testing.expect(std.mem.find(u8, inspect.stdout, "  skia-shim ") != null);
 
     // First launch renders through the extracted shim, not the dev one.
     const first = try runChild(a, io, &run_env, &.{abs});

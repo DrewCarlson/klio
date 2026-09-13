@@ -1676,7 +1676,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 const inner = cls.int() < m.classes.items.len and
                                     m.classes.items[cls.int()].is_inner;
                                 if (f.kind != .plain or
-                                    std.mem.indexOfScalar(u8, f.fqn, '<') != null or
+                                    std.mem.findScalar(u8, f.fqn, '<') != null or
                                     cg.n_args > 8 or inner or
                                     !streamTailRet(code, pc + 2, cg.dst.int()))
                                 {
@@ -3629,18 +3629,18 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
         // A class constructor and a top-level property are declared entities too.
         if (module.classIdByFqn(fqn) != null) continue;
         {
-            const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+            const simple = if (std.mem.findScalarLast(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
             if (module.registry.top_level_prop_pkgs.get(simple) != null) continue;
         }
         missing += 1;
-        const pkg = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[0..d] else "";
+        const pkg = if (std.mem.findScalarLast(u8, fqn, '.')) |d| fqn[0..d] else "";
         // A receiver-qualified builtin member has no source declaration.
-        const owner_simple = if (std.mem.lastIndexOfScalar(u8, pkg, '.')) |d2| pkg[d2 + 1 ..] else pkg;
+        const owner_simple = if (std.mem.findScalarLast(u8, pkg, '.')) |d2| pkg[d2 + 1 ..] else pkg;
         if (owner_simple.len != 0 and std.ascii.isUpper(owner_simple[0])) {
             // A member-shaped key is usually the dispatch key for an extension
             // the module declares (`kotlin.Char.titlecase`), so it is aligned.
             {
-                const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+                const simple = if (std.mem.findScalarLast(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
                 const owner_cid: ?ir.ClassId = module.classIdByFqn(pkg) orelse
                     module.uniqueClassIdBySimpleName(owner_simple);
                 var ext_aligned = false;
@@ -3648,9 +3648,9 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
                     const f2 = module.funcById(fid2) orelse continue;
                     if (f2.params.len == 0 or !std.mem.eql(u8, f2.params[0].name, "this")) continue;
                     var rh = f2.params[0].ty.name;
-                    if (std.mem.lastIndexOfScalar(u8, rh, '.')) |rd| rh = rh[rd + 1 ..];
+                    if (std.mem.findScalarLast(u8, rh, '.')) |rd| rh = rh[rd + 1 ..];
                     rh = std.mem.trimEnd(u8, rh, "?");
-                    if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+                    if (std.mem.findScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
                     if (std.mem.eql(u8, rh, owner_simple)) {
                         ext_aligned = true;
                         break;
@@ -3688,7 +3688,7 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
             member_missing += 1;
             // An owner with no class row is audit blindness, not a gap.
             if (std.mem.eql(u8, runtime.envOnce("KLIO_DECL_AUDIT") orelse "", "members")) {
-                const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+                const simple = if (std.mem.findScalarLast(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
                 const owner_cid2: ?ir.ClassId = module.classIdByFqn(pkg) orelse
                     module.uniqueClassIdBySimpleName(owner_simple);
                 _ = simple;
@@ -3703,7 +3703,7 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
         }
         // The same callable under another package is unaligned, not missing.
         {
-            const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+            const simple = if (std.mem.findScalarLast(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
             var aligned_elsewhere = module.funcsBySimpleName(simple).len != 0;
             // A class declared under another package is the same mismatch.
             if (!aligned_elsewhere and module.uniqueClassIdBySimpleName(simple) != null) aligned_elsewhere = true;

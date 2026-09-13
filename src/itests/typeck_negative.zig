@@ -728,7 +728,7 @@ test "overload checker records its pick per call span" {
     var it = tc.resolved_calls.iterator();
     var found = false;
     while (it.next()) |e| {
-        if (std.mem.indexOf(u8, e.value_ptr.render, "p0=Int") != null) {
+        if (std.mem.find(u8, e.value_ptr.render, "p0=Int") != null) {
             found = true;
             // The record names the declaration, not just its shape.
             try std.testing.expect(e.value_ptr.decl_span != null);

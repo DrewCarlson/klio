@@ -171,7 +171,7 @@ pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
                     if (span.active_map) |am| {
                         if (am.getChecked(sp.file)) |sf| {
                             const lc = sf.lineCol(sp.start);
-                            const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
+                            const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
                             break :blk std.fmt.bufPrint(&buf, "<lambda>#{d}[{s}:{d}]", .{ fid, base, lc.line }) catch fqn;
                         }
                     }
@@ -187,7 +187,7 @@ pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
     var cbuf: [256]u8 = undefined;
     var caller_key: ?[]const u8 = null;
     if (callerStatsFilter()) |substr| {
-        if (std.mem.indexOf(u8, key, substr) != null) {
+        if (std.mem.find(u8, key, substr) != null) {
             const cfqn: []const u8 = if (ev_state.evtls.frame_chain) |fr| fr.func.fqn else "<top>";
             // The caller's current span IS the call site — it names which
             // literal/site invoked this body without any id correlation.
@@ -198,7 +198,7 @@ pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
                     if (span.active_map) |am| {
                         if (am.getChecked(sp.file)) |sf| {
                             const lc = sf.lineCol(sp.start);
-                            const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
+                            const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
                             site = std.fmt.bufPrint(&site_buf, "[{s}:{d}]", .{ base, lc.line }) catch "";
                         }
                     }
@@ -719,7 +719,7 @@ pub fn fnProfDump(module: *const Module) void {
                         if (span.active_map) |am| {
                             if (am.getChecked(sp.file)) |sf| {
                                 const lc = sf.lineCol(sp.start);
-                                const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
+                                const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |ix| sf.path[ix + 1 ..] else sf.path;
                                 site = std.fmt.bufPrint(&site_buf, " {s}:{d}", .{ base, lc.line }) catch "";
                             }
                         }

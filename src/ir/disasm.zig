@@ -316,7 +316,7 @@ fn dumpFunc(w: *std.Io.Writer, m: *const Module, f: *const Func, mod_tally: *Tal
 }
 
 fn matches(f: *const Func, filter: []const u8) bool {
-    return std.mem.indexOf(u8, f.name, filter) != null or std.mem.indexOf(u8, f.fqn, filter) != null;
+    return std.mem.find(u8, f.name, filter) != null or std.mem.find(u8, f.fqn, filter) != null;
 }
 
 pub fn dumpModule(w: *std.Io.Writer, m: *const Module, opts: Options) !void {

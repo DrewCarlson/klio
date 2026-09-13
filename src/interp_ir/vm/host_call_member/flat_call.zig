@@ -229,7 +229,7 @@ pub fn provideDelegateFor(self: *VmHost, allocator: Allocator, this_ref: Value, 
             // Only the dispatch miss for `provideDelegate` itself means the
             // convention does not apply; a miss raised inside an operator
             // that ran is the property's initialization failure.
-            if (e == .Unimplemented and std.mem.indexOf(u8, e.Unimplemented, "`provideDelegate`") != null) return .{ .ok = v };
+            if (e == .Unimplemented and std.mem.find(u8, e.Unimplemented, "`provideDelegate`") != null) return .{ .ok = v };
             return r;
         },
     }
@@ -354,7 +354,7 @@ pub fn debugClassNameOf(self: *VmHost, v: *const Value) []const u8 {
 /// and nullability stripped (`Flow<T>` -> `Flow`).
 pub fn supertypeHead(raw: []const u8) []const u8 {
     var h = raw;
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
     return std.mem.trimEnd(u8, std.mem.trim(u8, h, " "), "?");
 }
 
@@ -511,7 +511,7 @@ pub fn recvFnPropHeadOf(self: *VmHost, receiver: *const Value, name: []const u8)
         const chain = reg.class_super_names.get(cn) orelse break;
         if (chain.len == 0) break;
         var sn = chain[0];
-        if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+        if (std.mem.findScalarLast(u8, sn, '.')) |i| sn = sn[i + 1 ..];
         cur = sn;
     }
     return null;

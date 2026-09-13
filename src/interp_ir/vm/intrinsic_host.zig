@@ -349,7 +349,7 @@ fn isCompanionInstanceValue(v: Value) bool {
     defer g.deinit();
     const cg = g.get().class.borrow();
     defer cg.deinit();
-    return std.mem.indexOf(u8, cg.get().name, "$Companion$") != null or
+    return std.mem.find(u8, cg.get().name, "$Companion$") != null or
         std.mem.endsWith(u8, cg.get().fqn, ".Companion");
 }
 
@@ -737,7 +737,7 @@ pub fn allocInstanceId(self: *VmIntrinsicHost) u64 {
 
 pub fn newSynthInstance(self: *VmIntrinsicHost, class_fqn: []const u8, identity: u64, fields: []const InstanceData.Field) Allocator.Error!Value {
     const simple = blk: {
-        if (std.mem.lastIndexOfScalar(u8, class_fqn, '.')) |i| break :blk class_fqn[i + 1 ..];
+        if (std.mem.findScalarLast(u8, class_fqn, '.')) |i| break :blk class_fqn[i + 1 ..];
         break :blk class_fqn;
     };
     // A concrete data class has a registered ClassDef, so reuse it and the synth instance

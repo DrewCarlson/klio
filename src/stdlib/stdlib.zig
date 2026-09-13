@@ -199,14 +199,14 @@ pub fn noteBareNameMapping(
     packages: []const []const u8,
     fqn: []const u8,
 ) std.mem.Allocator.Error!void {
-    const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return;
+    const dot = std.mem.findScalarLast(u8, fqn, '.') orelse return;
     const pkg = fqn[0..dot];
     const name = fqn[dot + 1 ..];
     if (name.len == 0) return;
     const rank = bareNamePkgRank(packages, pkg) orelse return;
     const gop = try map.getOrPut(name);
     if (gop.found_existing) {
-        const cur_dot = std.mem.lastIndexOfScalar(u8, gop.value_ptr.*, '.').?;
+        const cur_dot = std.mem.findScalarLast(u8, gop.value_ptr.*, '.').?;
         const cur_rank = bareNamePkgRank(packages, gop.value_ptr.*[0..cur_dot]).?;
         if (rank >= cur_rank) return;
     }
@@ -281,7 +281,7 @@ fn isKnownPackageScan(package_path: []const u8) bool {
     }
     var it = implementations.allFqns();
     while (it.next()) |fqn| {
-        if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
+        if (std.mem.findScalarLast(u8, fqn, '.')) |dot| {
             if (std.mem.eql(u8, fqn[0..dot], package_path)) return true;
         }
         if (startsWithPrefixDot(fqn, package_path)) return true;
@@ -479,7 +479,7 @@ pub fn auditImplementationTable() TableAudit {
     var out: TableAudit = .{ .matched = 0, .unmatched = 0, .internal = 0, .receiver_form = 0 };
     var it = implementations.allFqns();
     while (it.next()) |fqn| {
-        if (std.mem.indexOf(u8, fqn, "__klio") != null) {
+        if (std.mem.find(u8, fqn, "__klio") != null) {
             out.internal += 1;
             continue;
         }
@@ -489,7 +489,7 @@ pub fn auditImplementationTable() TableAudit {
         }
         // The table may use the receiver-qualified form
         // (`kotlin.Double.roundToInt`) where upstream declares an extension.
-        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse {
+        const dot = std.mem.findScalarLast(u8, fqn, '.') orelse {
             out.unmatched += 1;
             continue;
         };

@@ -81,7 +81,7 @@ fn getEnvVar(allocator: std.mem.Allocator, io: std.Io, name: []const u8) std.mem
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
         if (std.mem.eql(u8, entry[0..eq], name)) {
             return try allocator.dupe(u8, entry[eq + 1 ..]);
         }
@@ -99,7 +99,7 @@ fn procEnvMap(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
         map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
     }
     return map;

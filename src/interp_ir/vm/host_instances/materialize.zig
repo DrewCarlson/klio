@@ -107,7 +107,7 @@ pub fn builtinCollectionBase(fqn: []const u8) ?BuiltinBaseName {
     const pkg = "kotlin.collections.";
     if (!std.mem.startsWith(u8, fqn, pkg)) return null;
     var simple = fqn[pkg.len..];
-    if (std.mem.indexOfScalar(u8, simple, '<')) |lt| simple = simple[0..lt];
+    if (std.mem.findScalar(u8, simple, '<')) |lt| simple = simple[0..lt];
     const bases = [_]BuiltinBaseName{
         .{ .name = "ArrayList", .key = "__delegate__ArrayList" },
         .{ .name = "HashMap", .key = "__delegate__HashMap" },

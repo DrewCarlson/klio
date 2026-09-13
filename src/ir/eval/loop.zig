@@ -1131,7 +1131,7 @@ pub fn LoopTramp(comptime H: type) type {
         /// method `FuncId` so the loop JIT can learn its return type. Run time
         /// still dispatches through `callMemberNamed`, so this never alters
         /// behavior — it only informs the slot's static type.
-        fn resolveMember(user: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value) ?FuncId {
+        pub fn resolveMember(user: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value) ?FuncId {
             if (comptime !@hasDecl(H, "resolveMemberFuncId")) return null;
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.resolveMemberFuncId(lc.allocator, receiver, name, args);
@@ -1140,7 +1140,7 @@ pub fn LoopTramp(comptime H: type) type {
         /// Compile-time virtual-slot resolver: the FuncId the slot dispatches
         /// to on the receiver's class, so a loop-invariant virtual call can
         /// inline its monomorphic target. Null keeps the site a trampoline.
-        fn resolveVirtual(user: *anyopaque, receiver: *const Value, slot: u32) ?FuncId {
+        pub fn resolveVirtual(user: *anyopaque, receiver: *const Value, slot: u32) ?FuncId {
             if (comptime !@hasDecl(H, "resolveVirtualFuncId")) return null;
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.resolveVirtualFuncId(receiver, ir.MethodSlotId.from(slot));
@@ -1149,7 +1149,7 @@ pub fn LoopTramp(comptime H: type) type {
         /// Compile-time field resolver: the stored-field index of `name` on the
         /// receiver, or null if it is not a plain stored property (so the read
         /// stays interpreted).
-        fn resolveField(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
+        pub fn resolveField(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
             if (comptime !@hasDecl(H, "plainStoredFieldIndex")) return null;
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.plainStoredFieldIndex(lc.allocator, receiver, name);
@@ -1158,7 +1158,7 @@ pub fn LoopTramp(comptime H: type) type {
         /// Like `resolveField`, but only for a non-nullable scalar stored field —
         /// the index where a member-inlined field read can never observe null (so
         /// the loop can inline a method that also writes a field).
-        fn resolveFieldNN(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
+        pub fn resolveFieldNN(user: *anyopaque, receiver: *const Value, name: []const u8) ?u32 {
             if (comptime !@hasDecl(H, "plainStoredScalarFieldNN")) return null;
             const lc: *Ctx = @ptrCast(@alignCast(user));
             return lc.host.plainStoredScalarFieldNN(lc.allocator, receiver, name);

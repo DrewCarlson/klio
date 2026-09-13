@@ -246,7 +246,7 @@ fn isSerializableIn(idx: *const Index, annotations: []const ast.Annotation) bool
 fn annotationCallText(a: Allocator, an: *const ast.Annotation) ?[]const u8 {
     const txt = sourceOf(an.span) orelse return null;
     const body = if (txt.len > 0 and txt[0] == '@') txt[1..] else txt;
-    if (std.mem.indexOfScalar(u8, body, '(') == null) return std.fmt.allocPrint(a, "{s}()", .{body}) catch null;
+    if (std.mem.findScalar(u8, body, '(') == null) return std.fmt.allocPrint(a, "{s}()", .{body}) catch null;
     return body;
 }
 
@@ -286,7 +286,7 @@ fn joinPath(a: Allocator, outer: []const u8, name: []const u8) []const u8 {
 
 fn simpleHead(name: []const u8) []const u8 {
     var h = name;
-    if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+    if (std.mem.findScalarLast(u8, h, '.')) |d| h = h[d + 1 ..];
     return h;
 }
 
@@ -501,13 +501,13 @@ const Gen = struct {
     }
 
     fn qualify(self: *const Gen, written: []const u8) Allocator.Error![]const u8 {
-        if (std.mem.indexOfScalar(u8, written, '.') != null) {
+        if (std.mem.findScalar(u8, written, '.') != null) {
             var scope = self.scope_path;
             while (true) {
                 const cand = if (scope.len == 0) written else try std.fmt.allocPrint(self.a, "{s}.{s}", .{ scope, written });
                 if (self.idx.all_paths.contains(cand)) return cand;
                 if (scope.len == 0) break;
-                scope = if (std.mem.lastIndexOfScalar(u8, scope, '.')) |d| scope[0..d] else "";
+                scope = if (std.mem.findScalarLast(u8, scope, '.')) |d| scope[0..d] else "";
             }
             return written;
         }
@@ -516,7 +516,7 @@ const Gen = struct {
             const cand = if (scope.len == 0) written else try std.fmt.allocPrint(self.a, "{s}.{s}", .{ scope, written });
             if (self.idx.all_paths.contains(cand)) return cand;
             if (scope.len == 0) break;
-            scope = if (std.mem.lastIndexOfScalar(u8, scope, '.')) |d| scope[0..d] else "";
+            scope = if (std.mem.findScalarLast(u8, scope, '.')) |d| scope[0..d] else "";
         }
         return written;
     }
@@ -605,7 +605,7 @@ const Gen = struct {
             const cand = if (scope.len == 0) written else std.fmt.allocPrint(a, "{s}.{s}", .{ scope, written }) catch return null;
             if (self.idx.by_path.get(cand)) |ci| return ci;
             if (scope.len == 0) break;
-            scope = if (std.mem.lastIndexOfScalar(u8, scope, '.')) |d| scope[0..d] else "";
+            scope = if (std.mem.findScalarLast(u8, scope, '.')) |d| scope[0..d] else "";
         }
         return null;
     }
@@ -1011,7 +1011,7 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
             if (!isSerialInfoAnnotation(g.idx, n)) continue;
             if (sourceOf(an.span)) |txt| {
                 const body = if (txt.len > 0 and txt[0] == '@') txt[1..] else txt;
-                const call = if (std.mem.indexOfScalar(u8, body, '(') == null) try std.fmt.allocPrint(a, "{s}()", .{body}) else body;
+                const call = if (std.mem.findScalar(u8, body, '(') == null) try std.fmt.allocPrint(a, "{s}()", .{body}) else body;
                 try wp(w, a, "        `$dd`.pushAnnotation({s})\n", .{call});
             }
         }
@@ -1187,7 +1187,7 @@ fn classAnnotationCalls(a: Allocator, idx: *const Index, path: []const u8) Alloc
             var sp: ?[]const u8 = null;
             var scope = cur;
             while (true) {
-                scope = if (std.mem.lastIndexOfScalar(u8, scope, '.')) |d| scope[0..d] else "";
+                scope = if (std.mem.findScalarLast(u8, scope, '.')) |d| scope[0..d] else "";
                 const cand = if (scope.len == 0) sh else try std.fmt.allocPrint(a, "{s}.{s}", .{ scope, sh });
                 if (idx.supers.contains(cand)) {
                     sp = cand;
@@ -1200,7 +1200,7 @@ fn classAnnotationCalls(a: Allocator, idx: *const Index, path: []const u8) Alloc
             try seen_paths.put(spath, {});
             if (idx.class_annotations.get(spath)) |anns| {
                 for (anns) |call| {
-                    const head = if (std.mem.indexOfScalar(u8, call, '(')) |lp| call[0..lp] else call;
+                    const head = if (std.mem.findScalar(u8, call, '(')) |lp| call[0..lp] else call;
                     if (!idx.inheritable.contains(simpleHead(head))) continue;
                     var dup = false;
                     for (out.items) |x| {
@@ -1272,7 +1272,7 @@ fn writeAnnotatedEnumSerializer(w: *std.ArrayList(u8), a: Allocator, c: *const a
             if (std.mem.eql(u8, n, "SerialName")) continue;
             if (sourceOf(an.span)) |txt| {
                 const body = if (txt.len > 0 and txt[0] == '@') txt[1..] else txt;
-                const call = if (std.mem.indexOfScalar(u8, body, '(') == null) try std.fmt.allocPrint(a, "{s}()", .{body}) else body;
+                const call = if (std.mem.findScalar(u8, body, '(') == null) try std.fmt.allocPrint(a, "{s}()", .{body}) else body;
                 try anns.append(a, call);
             }
         }
@@ -1970,7 +1970,7 @@ fn serializerForClassTarget(a: Allocator, annotations: []const ast.Annotation) ?
 /// keeping its own name and supertypes.
 fn genForClassObject(ctx: *Ctx, o: *ast.ObjectDecl, obj_path: []const u8, target_written: []const u8) Allocator.Error!void {
     const a = ctx.a;
-    const scope = if (std.mem.lastIndexOfScalar(u8, obj_path, '.')) |d| obj_path[0..d] else "";
+    const scope = if (std.mem.findScalarLast(u8, obj_path, '.')) |d| obj_path[0..d] else "";
     var g0 = Gen{ .a = a, .idx = ctx.idx, .pkg = ctx.pkg, .type_params = &.{}, .scope_path = obj_path };
     const target_path = try g0.qualify(target_written);
     _ = scope;
@@ -2195,7 +2195,7 @@ pub fn transformFiles(a: Allocator, files_in: []const ast.KotlinFile) Allocator.
                 const cand = if (scope.len == 0) rec.sup_head else try std.fmt.allocPrint(a, "{s}.{s}", .{ scope, rec.sup_head });
                 if (idx.all_paths.contains(cand)) break :blk cand;
                 if (scope.len == 0) break;
-                scope = if (std.mem.lastIndexOfScalar(u8, scope, '.')) |d| scope[0..d] else "";
+                scope = if (std.mem.findScalarLast(u8, scope, '.')) |d| scope[0..d] else "";
             }
             if (idx.all_paths.contains(rec.sup_head)) break :blk rec.sup_head;
             break :blk null;
@@ -2256,7 +2256,7 @@ fn fileMentionsSerializable(f: *const ast.KotlinFile) bool {
     if (declsMentionSerializable(f.decls)) return true;
     // A class in a lambda, a block or an expression body is local too; the
     // source-text scan catches nestings the decl walk misses.
-    if (sourceOf(f.span)) |txt| return std.mem.indexOf(u8, txt, "@Serializable") != null;
+    if (sourceOf(f.span)) |txt| return std.mem.find(u8, txt, "@Serializable") != null;
     return false;
 }
 

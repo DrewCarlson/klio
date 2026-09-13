@@ -38,8 +38,8 @@ const Missing = struct {
 
 /// Strips generic args and package qualifier: `kotlin.collections.List<T>` -> `List`.
 fn simpleName(allocator: std.mem.Allocator, n: []const u8) []const u8 {
-    const base = if (std.mem.indexOfScalar(u8, n, '<')) |lt| n[0..lt] else n;
-    const tail = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[dot + 1 ..] else base;
+    const base = if (std.mem.findScalar(u8, n, '<')) |lt| n[0..lt] else n;
+    const tail = if (std.mem.findScalarLast(u8, base, '.')) |dot| base[dot + 1 ..] else base;
     const trimmed = std.mem.trim(u8, tail, " \t\r\n");
     return allocator.dupe(u8, trimmed) catch trimmed;
 }
@@ -414,19 +414,19 @@ fn packageName(arena: std.mem.Allocator, f: *const KotlinFile) []const u8 {
 
 fn lastSegment(fqn: []const u8) ?[]const u8 {
     if (fqn.len == 0) return null;
-    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| return fqn[dot + 1 ..];
+    if (std.mem.findScalarLast(u8, fqn, '.')) |dot| return fqn[dot + 1 ..];
     return fqn;
 }
 
 fn secondToLastSegment(fqn: []const u8) ?[]const u8 {
-    const last_dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return null;
+    const last_dot = std.mem.findScalarLast(u8, fqn, '.') orelse return null;
     const head = fqn[0..last_dot];
-    if (std.mem.lastIndexOfScalar(u8, head, '.')) |prev_dot| return head[prev_dot + 1 ..];
+    if (std.mem.findScalarLast(u8, head, '.')) |prev_dot| return head[prev_dot + 1 ..];
     return head;
 }
 
 fn displayPkg(display: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, display, '.')) |dot| return display[0..dot];
+    if (std.mem.findScalarLast(u8, display, '.')) |dot| return display[0..dot];
     return "";
 }
 

@@ -64,7 +64,7 @@ fn scaleWallCapList(allocator: std.mem.Allocator, list: []const u8, factor: i64)
     while (it.next()) |item| {
         if (!first) try out.append(allocator, ',');
         first = false;
-        if (std.mem.lastIndexOfScalar(u8, item, '=')) |eq| {
+        if (std.mem.findScalarLast(u8, item, '=')) |eq| {
             if (std.fmt.parseInt(i64, item[eq + 1 ..], 10) catch null) |secs| {
                 const scaled = try std.fmt.allocPrint(allocator, "{s}={d}", .{ item[0..eq], secs * factor });
                 defer allocator.free(scaled);
@@ -167,7 +167,7 @@ fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayL
 
 fn fileHasTest(a: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return false;
-    return std.mem.indexOf(u8, bytes, "@Test") != null;
+    return std.mem.find(u8, bytes, "@Test") != null;
 }
 
 fn isIdentByte(c: u8) bool {
@@ -265,7 +265,7 @@ fn declaredName(tail: []const u8, is_fun: bool) ?[]const u8 {
 /// The first `class X` name in the file, the test class for `--filter`.
 fn classNameOf(src: []const u8) ?[]const u8 {
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, "class ")) |p| {
+    while (std.mem.findPos(u8, src, i, "class ")) |p| {
         i = p + 6;
         if (p != 0 and isIdentByte(src[p - 1])) continue;
         var e = i;
@@ -278,11 +278,11 @@ fn classNameOf(src: []const u8) ?[]const u8 {
 /// Every `fun NAME` following an `@Test`, tolerating modifier lines between.
 fn collectTestFns(a: std.mem.Allocator, src: []const u8, out: *std.ArrayList([]const u8)) !void {
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, "@Test")) |p| {
+    while (std.mem.findPos(u8, src, i, "@Test")) |p| {
         i = p + 5;
-        const fnp = std.mem.indexOfPos(u8, src, i, "fun ") orelse return;
+        const fnp = std.mem.findPos(u8, src, i, "fun ") orelse return;
         // The fn belongs to this annotation only if no further @Test precedes it.
-        if (std.mem.indexOfPos(u8, src, i, "@Test")) |nxt| {
+        if (std.mem.findPos(u8, src, i, "@Test")) |nxt| {
             if (nxt < fnp) continue;
         }
         const e = fnp + 4;
@@ -328,7 +328,7 @@ fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
                 while (e < src.len and (isIdentByte(src[e]) or src[e] == '.' or src[e] == '*')) e += 1;
                 const path = src[p..e];
                 // `import a.b.*` and `import a.b.Name` both scope package `a.b`.
-                if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| {
+                if (std.mem.findScalarLast(u8, path, '.')) |dot| {
                     try scopes.append(a, path[0..dot]);
                 }
             } else {
@@ -359,7 +359,7 @@ fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
 fn providerClosure(
     a: std.mem.Allocator,
     scans: []const DeclScan,
-    owner: *const std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)),
+    owner: *const std.StringHashMapUnmanaged(std.ArrayList(usize)),
     target: usize,
 ) ![]const usize {
     var out: std.ArrayList(usize) = .empty;
@@ -406,7 +406,7 @@ fn failedCount(stdout: []const u8) usize {
     var it = std.mem.splitScalar(u8, stdout, '\n');
     while (it.next()) |line| {
         const marker = " failed,";
-        const idx = std.mem.indexOf(u8, line, marker) orelse continue;
+        const idx = std.mem.find(u8, line, marker) orelse continue;
         var start = idx;
         while (start > 0 and line[start - 1] >= '0' and line[start - 1] <= '9') start -= 1;
         n += std.fmt.parseInt(usize, line[start..idx], 10) catch 0;
@@ -636,7 +636,7 @@ pub fn runSuite(cfg: Config) !void {
     }
 
     var scans: std.ArrayList(DeclScan) = .empty;
-    var owner: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
+    var owner: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
     for (targets.items, 0..) |t, ti| {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, t, a, .unlimited) catch "";
         const s = try scanDecls(a, bytes);
@@ -656,7 +656,7 @@ pub fn runSuite(cfg: Config) !void {
         var group_index = std.StringHashMap(usize).init(a);
         var group_files: std.ArrayList(std.ArrayList([]const u8)) = .empty;
         for (targets.items) |target| {
-            const key: []const u8 = if (std.mem.indexOf(u8, target, "/src/commonTest")) |ix|
+            const key: []const u8 = if (std.mem.find(u8, target, "/src/commonTest")) |ix|
                 target[0 .. ix + "/src/commonTest".len]
             else
                 std.fs.path.dirname(target) orelse target;
@@ -814,7 +814,7 @@ pub fn runSuite(cfg: Config) !void {
                         }
                     }
                 }
-                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
+                if (std.mem.find(u8, r.stdout, " passed,") == null) {
                     _ = phung.fetchAdd(1, .monotonic);
                     const tail_from = if (r.stderr.len > 400) r.stderr.len - 400 else 0;
                     std.debug.print("[census-nosummary] <- {s}\n{s}\n", .{ queue[i][queue[i].len - 1], r.stderr[tail_from..] });
@@ -903,7 +903,7 @@ test "top-level declarations provide for other files in the same package" {
     try std.testing.expectEqualStrings("FlattenConcatTest", s_sub.declares[0]);
 
     const scans = [_]DeclScan{ s_base, s_sub, s_other };
-    var owner: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
+    var owner: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
     for (scans, 0..) |s, i| {
         for (s.declares) |d| {
             const key = try std.fmt.allocPrint(aa, "{s}\x00{s}", .{ s.package, d });
@@ -937,7 +937,7 @@ test "top-level declarations provide for other files in the same package" {
     const s_imp = try scanDecls(aa, importer);
     const s_prov = try scanDecls(aa, provider);
     const scans2 = [_]DeclScan{ s_imp, s_prov };
-    var owner2: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(usize)) = .empty;
+    var owner2: std.StringHashMapUnmanaged(std.ArrayList(usize)) = .empty;
     for (scans2, 0..) |sc, i| {
         for (sc.declares) |d| {
             const key = try std.fmt.allocPrint(aa, "{s}\x00{s}", .{ sc.package, d });

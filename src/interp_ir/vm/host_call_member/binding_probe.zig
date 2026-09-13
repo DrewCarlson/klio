@@ -559,7 +559,7 @@ pub fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *con
                     .ok => return r,
                     .err => |e| switch (e) {
                         .Unimplemented => |m| {
-                            if (!(std.mem.indexOf(u8, m, "Vm::call_member") != null and std.mem.indexOf(u8, m, no_such) != null)) return r;
+                            if (!(std.mem.find(u8, m, "Vm::call_member") != null and std.mem.find(u8, m, no_such) != null)) return r;
                             // Top-level miss for `name` on the singleton: fall
                             // through to other dispatch; the miss message is
                             // discarded here, so free it.

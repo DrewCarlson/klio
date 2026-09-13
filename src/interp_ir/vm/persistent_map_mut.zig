@@ -457,7 +457,7 @@ const BuilderTmpl = struct {
 threadlocal var builder_tmpl: BuilderTmpl = .{};
 
 fn isViewCacheName(name: []const u8) bool {
-    const last = if (std.mem.lastIndexOfScalar(u8, name, 0x1f)) |i| name[i + 1 ..] else name;
+    const last = if (std.mem.findScalarLast(u8, name, 0x1f)) |i| name[i + 1 ..] else name;
     return std.mem.eql(u8, last, "_keys") or std.mem.eql(u8, last, "_values");
 }
 

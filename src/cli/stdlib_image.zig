@@ -420,8 +420,8 @@ fn publishBaseEagerCalls(gpa: std.mem.Allocator, sb: *const interp_ir.build.Stdl
 
 fn headOf(name: []const u8) []const u8 {
     var h = std.mem.trimEnd(u8, name, "?");
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
-    if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalarLast(u8, h, '.')) |d| h = h[d + 1 ..];
     return h;
 }
 

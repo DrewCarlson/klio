@@ -954,7 +954,7 @@ pub fn wtf8SurrogateUnit(bytes: []const u8, i: usize) u16 {
 /// Used when a String is built from individual `Char` units, so a high+low pair
 /// becomes valid UTF-8 while a genuinely lone surrogate keeps its 3-byte form.
 pub fn coalesceSurrogates(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    if (std.mem.indexOfScalar(u8, bytes, 0xED) == null) return allocator.dupe(u8, bytes);
+    if (std.mem.findScalar(u8, bytes, 0xED) == null) return allocator.dupe(u8, bytes);
     var out = try std.ArrayList(u8).initCapacity(allocator, bytes.len);
     errdefer out.deinit(allocator);
     var i: usize = 0;

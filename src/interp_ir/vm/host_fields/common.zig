@@ -93,7 +93,7 @@ pub fn withFieldResolvePair(
 
 /// Last `.`-delimited segment of a dotted name (`a.b.c` -> `c`).
 pub fn lastSegment(s: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, s, '.')) |i| return s[i + 1 ..];
+    if (std.mem.findScalarLast(u8, s, '.')) |i| return s[i + 1 ..];
     return s;
 }
 
@@ -186,7 +186,7 @@ pub fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiv
     // would otherwise sweep it — and everything transitively reachable through
     // it, which the getter is about to read.
     if (missTraceEnvCached()) |w| {
-        if (std.mem.indexOf(u8, func.name, w) != null) {
+        if (std.mem.find(u8, func.name, w) != null) {
             const rc: []const u8 = if (receiver == .Instance) className(receiver.Instance) else receiver.typeFqn();
             std.debug.print("[getter] {s}#{d} recv={s} site={s}\n", .{ func.name, fid.int(), rc, site });
             ir.eval.dumpFrameChainForDiagAlways();
@@ -310,8 +310,8 @@ pub fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, f
 
 pub fn typeHeadOf(name: []const u8) []const u8 {
     var h = std.mem.trimEnd(u8, name, "?");
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
-    if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalarLast(u8, h, '.')) |d| h = h[d + 1 ..];
     return h;
 }
 
@@ -353,8 +353,8 @@ pub fn receiverLabel(receiver: *const Value) []const u8 {
 /// (`Name$lc<fn>`); the simple name is the declared identifier alone.
 pub fn classSimpleName(name: []const u8) []const u8 {
     var n = name;
-    if (std.mem.indexOf(u8, n, "$lc")) |i| n = n[0..i];
-    if (std.mem.lastIndexOfAny(u8, n, "$.")) |i| {
+    if (std.mem.find(u8, n, "$lc")) |i| n = n[0..i];
+    if (std.mem.findLastAny(u8, n, "$.")) |i| {
         if (i + 1 < n.len) n = n[i + 1 ..];
     }
     return n;
@@ -364,8 +364,8 @@ pub fn classSimpleName(name: []const u8) []const u8 {
 /// `Root$Companion$Plugin` -> `Root`, `Outer$Inner` -> `Outer`. Null when the
 /// name has no nesting marker.
 pub fn enclosingNameOf(name: []const u8) ?[]const u8 {
-    if (std.mem.indexOf(u8, name, "$Companion$")) |i| return name[0..i];
-    if (std.mem.lastIndexOfScalar(u8, name, '$')) |i| return name[0..i];
+    if (std.mem.find(u8, name, "$Companion$")) |i| return name[0..i];
+    if (std.mem.findScalarLast(u8, name, '$')) |i| return name[0..i];
     return null;
 }
 
@@ -414,7 +414,7 @@ pub fn instanceIsHostSynth(inst: ObjRef(InstanceData)) bool {
     if (!cg.get().is_anonymous) return false;
     const fqn = cg.get().fqn;
     return fqn.len != 0 and
-        std.mem.indexOfScalar(u8, fqn, '.') != null and
+        std.mem.findScalar(u8, fqn, '.') != null and
         !std.mem.eql(u8, fqn, cg.get().name);
 }
 
@@ -433,7 +433,7 @@ pub fn firstSupertypeOf(inst: ObjRef(InstanceData)) ?[]const u8 {
 /// The simple name of a companion singleton from its mangled registry key
 /// (`Owner$Companion$Key` → `Key`).
 pub fn companionSimpleName(mangled: []const u8) []const u8 {
-    return if (std.mem.lastIndexOfScalar(u8, mangled, '$')) |i| mangled[i + 1 ..] else mangled;
+    return if (std.mem.findScalarLast(u8, mangled, '$')) |i| mangled[i + 1 ..] else mangled;
 }
 
 pub fn firstSupertype(self: *VmHost, cn: []const u8) ?[]const u8 {

@@ -559,7 +559,7 @@ fn searchRegistry(gpa: std.mem.Allocator, query: []const u8, registry_override: 
     for (entries) |e| {
         const lid = std.ascii.allocLowerString(gpa, e.library_id) catch continue;
         defer gpa.free(lid);
-        if (std.mem.indexOf(u8, lid, lq) == null) continue;
+        if (std.mem.find(u8, lid, lq) == null) continue;
         any = true;
         io.printStdout(gpa, "{s: <32}  {s: <12}  abi {d}  {s}\n", .{ e.library_id, e.version, e.abi_version, e.relative_path });
     }
@@ -929,9 +929,9 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
         // Fold a multi-line array or inline table into one logical line, as the
         // runtime loader's manifest reader does: absorb lines until one has `]`.
         if (line[0] != '[' and
-            std.mem.indexOfScalar(u8, line, '=') != null and
-            std.mem.indexOfScalar(u8, line, '[') != null and
-            std.mem.indexOfScalar(u8, line, ']') == null)
+            std.mem.findScalar(u8, line, '=') != null and
+            std.mem.findScalar(u8, line, '[') != null and
+            std.mem.findScalar(u8, line, ']') == null)
         {
             var buf: std.ArrayList(u8) = .empty;
             buf.appendSlice(a, line) catch return .{ .err = fail(a, "out of memory", .{}) };
@@ -940,7 +940,7 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
                 if (cont.len == 0) continue;
                 buf.append(a, ' ') catch return .{ .err = fail(a, "out of memory", .{}) };
                 buf.appendSlice(a, cont) catch return .{ .err = fail(a, "out of memory", .{}) };
-                if (std.mem.indexOfScalar(u8, cont, ']') != null) break;
+                if (std.mem.findScalar(u8, cont, ']') != null) break;
             }
             line = buf.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
         }
@@ -981,7 +981,7 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
             continue;
         }
 
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse
+        const eq = std.mem.findScalar(u8, line, '=') orelse
             return .{ .err = fail(a, "malformed line in klio.toml: `{s}`", .{line}) };
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
@@ -1166,7 +1166,7 @@ fn parseInlineFeatureDef(a: std.mem.Allocator, name: []const u8, val: []const u8
 /// included so it feeds `parseStrArray`. Null when the field is absent.
 fn sliceInlineArray(table: []const u8, field: []const u8) ?[]const u8 {
     var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, table, search_from, field)) |at| {
+    while (std.mem.findPos(u8, table, search_from, field)) |at| {
         const after = at + field.len;
         // Whole-key match only: `{`, `,` or space before, `=` after.
         const before_ok = at == 0 or table[at - 1] == '{' or table[at - 1] == ',' or table[at - 1] == ' ';
@@ -1176,8 +1176,8 @@ fn sliceInlineArray(table: []const u8, field: []const u8) ?[]const u8 {
             search_from = after;
             continue;
         }
-        const open = std.mem.indexOfScalarPos(u8, table, i, '[') orelse return null;
-        const close = std.mem.indexOfScalarPos(u8, table, open, ']') orelse return null;
+        const open = std.mem.findScalarPos(u8, table, i, '[') orelse return null;
+        const close = std.mem.findScalarPos(u8, table, open, ']') orelse return null;
         return table[open .. close + 1];
     }
     return null;
@@ -1195,7 +1195,7 @@ fn parseBindingPair(a: std.mem.Allocator, key: []const u8, val: []const u8) !Bin
         while (it.next()) |raw| {
             const field = std.mem.trim(u8, raw, " \t");
             if (field.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, field, '=') orelse continue;
             const fk = std.mem.trim(u8, field[0..eq], " \t");
             const fv = std.mem.trim(u8, field[eq + 1 ..], " \t");
             if (std.mem.eql(u8, fk, "host_symbol")) {
@@ -1736,7 +1736,7 @@ test "buildAstBundle fails loudly on a parse error" {
     // A broken file is reported as a fatal error naming the file, never silently
     // dropped.
     try std.testing.expect(err != null);
-    try std.testing.expect(std.mem.indexOf(u8, err.?, "bad/Broken.kt") != null);
+    try std.testing.expect(std.mem.find(u8, err.?, "bad/Broken.kt") != null);
     std.testing.allocator.free(err.?);
 }
 

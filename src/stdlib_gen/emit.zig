@@ -84,7 +84,7 @@ fn declToRecord(d: *const Decl, rel: []const u8) schema.SymbolRecord {
 }
 
 fn rsplitPackage(fqn: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |idx| {
+    if (std.mem.findScalarLast(u8, fqn, '.')) |idx| {
         return fqn[0..idx];
     }
     return "";

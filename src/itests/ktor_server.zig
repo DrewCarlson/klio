@@ -145,7 +145,7 @@ fn buildRequest(
 }
 
 fn statusOf(resp: []const u8) ?u16 {
-    const line_end = std.mem.indexOf(u8, resp, "\r\n") orelse return null;
+    const line_end = std.mem.find(u8, resp, "\r\n") orelse return null;
     var it = std.mem.tokenizeScalar(u8, resp[0..line_end], ' ');
     _ = it.next() orelse return null; // HTTP/1.1
     const code = it.next() orelse return null;
@@ -153,16 +153,16 @@ fn statusOf(resp: []const u8) ?u16 {
 }
 
 fn bodyOf(resp: []const u8) []const u8 {
-    const sep = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse return "";
+    const sep = std.mem.find(u8, resp, "\r\n\r\n") orelse return "";
     return resp[sep + 4 ..];
 }
 
 fn headerOf(resp: []const u8, name: []const u8) ?[]const u8 {
-    const sep = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse resp.len;
+    const sep = std.mem.find(u8, resp, "\r\n\r\n") orelse resp.len;
     var lines = std.mem.splitSequence(u8, resp[0..sep], "\r\n");
     _ = lines.next(); // status line
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), name)) {
             return std.mem.trim(u8, line[colon + 1 ..], " ");
         }
@@ -368,5 +368,5 @@ test "server: start(wait = false) is non-blocking and the daemon serve abandons 
         return error.RunFailed;
     };
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "served and exiting") != null);
+    try std.testing.expect(std.mem.find(u8, r.stdout, "served and exiting") != null);
 }

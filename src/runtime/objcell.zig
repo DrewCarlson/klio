@@ -255,7 +255,7 @@ fn procEnvironHas(comptime name: []const u8) bool {
     }
     var it = std.mem.splitScalar(u8, buf[0..len], 0);
     while (it.next()) |entry| {
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
         if (std.mem.eql(u8, entry[0..eq], name)) {
             const val = entry[eq + 1 ..];
             return val.len != 0 and !std.mem.eql(u8, val, "0");

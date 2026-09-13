@@ -340,7 +340,7 @@ test "corrupted payload refuses with the hash-mismatch message" {
     // The trailer sits at EOF-72 on ELF but at LC_CODE_SIGNATURE.dataoff-72 on
     // a re-signed Mach-O, so locate it by its magic.
     const bytes = try std.Io.Dir.cwd().readFileAlloc(c.io, bundle_path, c.a, .unlimited);
-    const tpos = std.mem.lastIndexOf(u8, bytes, "KBND\x00KL1") orelse return error.NoTrailer;
+    const tpos = std.mem.findLast(u8, bytes, "KBND\x00KL1") orelse return error.NoTrailer;
     const payload_off = std.mem.readInt(u64, bytes[tpos + 8 ..][0..8], .little);
     bytes[@intCast(payload_off + 16)] ^= 0x40;
     try std.Io.Dir.cwd().writeFile(c.io, .{ .sub_path = bundle_path, .data = bytes });
@@ -370,11 +370,11 @@ test "KLIO_BUNDLE_INSPECT prints the manifest and exits 0" {
     const got = try runChild(c.a, c.io, c.run_env, null, &.{abs});
     try std.testing.expectEqual(@as(u32, 0), got.code);
     try std.testing.expect(std.mem.startsWith(u8, got.stdout, "bundle: hello_inspect\n"));
-    try std.testing.expect(std.mem.indexOf(u8, got.stdout, "klio: ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got.stdout, "flavor: headless\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got.stdout, "entry: main\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got.stdout, "  program-image ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got.stdout, "  program-src ") != null);
+    try std.testing.expect(std.mem.find(u8, got.stdout, "klio: ") != null);
+    try std.testing.expect(std.mem.find(u8, got.stdout, "flavor: headless\n") != null);
+    try std.testing.expect(std.mem.find(u8, got.stdout, "entry: main\n") != null);
+    try std.testing.expect(std.mem.find(u8, got.stdout, "  program-image ") != null);
+    try std.testing.expect(std.mem.find(u8, got.stdout, "  program-src ") != null);
 }
 
 test "double-bundle output is byte-identical" {
@@ -435,9 +435,9 @@ test "project mode: [application] table, multi-file sources, includes, discovere
     const inspect = try runChild(c.a, c.io, c.run_env, null, &.{abs});
     try std.testing.expect(std.mem.startsWith(u8, inspect.stdout, "bundle: GreetTool\n"));
     const desktop = try cwd.readFileAlloc(c.io, try std.fmt.allocPrint(c.a, "{s}/GreetTool.desktop", .{desk}), c.a, .unlimited);
-    try std.testing.expect(std.mem.indexOf(u8, desktop, "[Desktop Entry]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, desktop, "Name=GreetTool\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, desktop, "Exec=") != null);
+    try std.testing.expect(std.mem.find(u8, desktop, "[Desktop Entry]") != null);
+    try std.testing.expect(std.mem.find(u8, desktop, "Name=GreetTool\n") != null);
+    try std.testing.expect(std.mem.find(u8, desktop, "Exec=") != null);
 }
 
 test "program-image is the default entry; the src fallback is byte-identical" {
@@ -446,9 +446,9 @@ test "program-image is the default entry; the src fallback is byte-identical" {
     const pi_abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, pi, c.a);
     try c.run_env.put("KLIO_BUNDLE_INSPECT", "1");
     const inspect_pi = try runChild(c.a, c.io, c.run_env, null, &.{pi_abs});
-    try std.testing.expect(std.mem.indexOf(u8, inspect_pi.stdout, "entry: main\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inspect_pi.stdout, "  program-image ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inspect_pi.stdout, "  base-image ") == null);
+    try std.testing.expect(std.mem.find(u8, inspect_pi.stdout, "entry: main\n") != null);
+    try std.testing.expect(std.mem.find(u8, inspect_pi.stdout, "  program-image ") != null);
+    try std.testing.expect(std.mem.find(u8, inspect_pi.stdout, "  base-image ") == null);
 
     try c.build_env.put("KLIO_BUNDLE_PROGRAM_IMAGE", "0");
     const src = try bundleProgram(c, "examples/hello.kt", "hello_srcboot", &.{});
@@ -457,9 +457,9 @@ test "program-image is the default entry; the src fallback is byte-identical" {
     const inspect_src = try runChild(c.a, c.io, c.run_env, null, &.{src_abs});
     // Disabling by env is a choice, not a bake refusal, so the base image
     // stays present.
-    try std.testing.expect(std.mem.indexOf(u8, inspect_src.stdout, "entry: program-src\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inspect_src.stdout, "  base-image ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, inspect_src.stdout, "  program-image ") == null);
+    try std.testing.expect(std.mem.find(u8, inspect_src.stdout, "entry: program-src\n") != null);
+    try std.testing.expect(std.mem.find(u8, inspect_src.stdout, "  base-image ") != null);
+    try std.testing.expect(std.mem.find(u8, inspect_src.stdout, "  program-image ") == null);
     _ = c.run_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_INSPECT"));
 
     const got_pi = try runChild(c.a, c.io, c.run_env, null, &.{pi_abs});
@@ -504,8 +504,8 @@ test "--dry-run prints the plan and writes nothing" {
         c.bin, "bundle", "examples/hello.kt", "-o", out, "--dry-run",
     });
     try std.testing.expectEqual(@as(u32, 0), r.code);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "flavor: headless\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "program-image ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r.stdout, "projected size: ") != null);
+    try std.testing.expect(std.mem.find(u8, r.stdout, "flavor: headless\n") != null);
+    try std.testing.expect(std.mem.find(u8, r.stdout, "program-image ") != null);
+    try std.testing.expect(std.mem.find(u8, r.stdout, "projected size: ") != null);
     try std.testing.expect((std.Io.Dir.cwd().statFile(c.io, out, .{}) catch null) == null);
 }

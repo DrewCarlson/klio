@@ -78,8 +78,8 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
             bin, "bundle", "examples/hello.kt", "-o", TMP_ROOT ++ "/nostub", "--target", FAKE_TARGET,
         });
         try std.testing.expectEqual(@as(u32, 1), r.code);
-        try std.testing.expect(std.mem.indexOf(u8, r.stderr, "no cached stub for linux-arm64") != null);
-        try std.testing.expect(std.mem.indexOf(u8, r.stderr, "--stub <path>") != null);
+        try std.testing.expect(std.mem.find(u8, r.stderr, "no cached stub for linux-arm64") != null);
+        try std.testing.expect(std.mem.find(u8, r.stderr, "--stub <path>") != null);
     }
 
     try env.put("KLIO_STUB_DIR", stub_dir);
@@ -104,7 +104,7 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
             bin, "bundle", "examples/hello.kt", "-o", TMP_ROOT ++ "/badtarget", "--target", "beos-ppc",
         });
         try std.testing.expectEqual(@as(u32, 2), r.code);
-        try std.testing.expect(std.mem.indexOf(u8, r.stderr, "unknown --target") != null);
+        try std.testing.expect(std.mem.find(u8, r.stderr, "unknown --target") != null);
     }
 
     {
@@ -133,7 +133,7 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
         const inspect = try runChild(a, io, &env, &.{ui_abs});
         _ = env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_INSPECT"));
         try std.testing.expectEqual(@as(u32, 0), inspect.code);
-        try std.testing.expect(std.mem.indexOf(u8, inspect.stdout, "flavor: ui\n") != null);
-        try std.testing.expect(std.mem.indexOf(u8, inspect.stdout, "  skia-shim ") != null);
+        try std.testing.expect(std.mem.find(u8, inspect.stdout, "flavor: ui\n") != null);
+        try std.testing.expect(std.mem.find(u8, inspect.stdout, "  skia-shim ") != null);
     }
 }

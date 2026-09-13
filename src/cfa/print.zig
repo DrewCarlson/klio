@@ -283,8 +283,8 @@ test "print empty-body cfg header" {
     defer cfg.blocks.items[0].succs.deinit(a);
     const s = try printCfg(a, &cfg);
     defer a.free(s);
-    try std.testing.expect(std.mem.indexOf(u8, s, "cfg: entry=b0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, s, "term: return") != null);
+    try std.testing.expect(std.mem.find(u8, s, "cfg: entry=b0") != null);
+    try std.testing.expect(std.mem.find(u8, s, "term: return") != null);
 }
 
 test "scalar types render as their tag name" {

@@ -64,7 +64,7 @@ fn assertKlioUnresolved(name: []const u8, src: []const u8, unresolved: []const u
             return error.KlioRunFailed;
         },
         .err => |m| {
-            if (std.mem.indexOf(u8, m, "unresolved") == null or std.mem.indexOf(u8, m, unresolved) == null) {
+            if (std.mem.find(u8, m, "unresolved") == null or std.mem.find(u8, m, unresolved) == null) {
                 std.debug.print("lambdas_and_dispatch {s}: expected unresolved `{s}`, got error: {s}\n", .{ name, unresolved, m });
                 return error.KlioRunFailed;
             }

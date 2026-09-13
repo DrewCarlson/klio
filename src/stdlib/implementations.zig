@@ -1747,13 +1747,13 @@ pub fn declarationHostSymbol(
     recv = std.mem.trim(u8, recv, " ");
     if (std.mem.startsWith(u8, recv, "in#")) recv = recv["in#".len..];
     if (std.mem.startsWith(u8, recv, "out#")) recv = recv["out#".len..];
-    if (std.mem.indexOfScalar(u8, recv, '<')) |lt| recv = recv[0..lt];
+    if (std.mem.findScalar(u8, recv, '<')) |lt| recv = recv[0..lt];
     recv = std.mem.trimEnd(u8, recv, "?");
     if (recv.len == 0) return null;
 
     var found: ?[]const u8 = null;
     for (TABLE) |entry| {
-        const name_at = std.mem.lastIndexOfScalar(u8, entry.fqn, '.') orelse continue;
+        const name_at = std.mem.findScalarLast(u8, entry.fqn, '.') orelse continue;
         if (!std.mem.eql(u8, entry.fqn[name_at + 1 ..], name)) continue;
         const owner = entry.fqn[0..name_at];
         if (!std.mem.eql(u8, owner, recv) and

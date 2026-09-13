@@ -84,7 +84,7 @@ pub fn threadedComposerArg(params: []const ir.Param, args: []const Value) ?Value
         const cls_name = cg.get().name;
         std.debug.print("[composer-bind] class={s} args={d} params={d} last={s}\n", .{ cls_name, args.len, params.len, @tagName(std.meta.activeTag(args[args.len - 1])) });
         // A non-Composer instance in the pair slot is a misbind; dump the frame chain.
-        const is_composer = std.mem.indexOf(u8, cls_name, "Composer") != null;
+        const is_composer = std.mem.find(u8, cls_name, "Composer") != null;
         cg.deinit();
         ig.deinit();
         if (!is_composer) ir.eval.dumpFrameChainForDiagAlways();

@@ -84,7 +84,7 @@ pub fn classDefByName(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
 /// from a same-simple-name class in scope — including a subtype named like its
 /// base. `null` when `qualified` is unqualified or unmatched.
 pub fn classDefByQualifiedSuffix(self: *VmHost, qualified: []const u8) ?ObjRef(ClassDef) {
-    if (std.mem.indexOfScalar(u8, qualified, '.') == null) return null;
+    if (std.mem.findScalar(u8, qualified, '.') == null) return null;
     const g = self.classes.borrow();
     defer g.deinit();
     var best: ?ObjRef(ClassDef) = null;
@@ -154,7 +154,7 @@ pub fn classSecondaryCtorCanBind(self: *VmHost, fqn: []const u8, name: []const u
 /// Simple runtime type-name head of a value (`IntArray`, `Int`).
 pub fn valueTypeHead(v: Value) []const u8 {
     const fqn = v.typeFqn();
-    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| return fqn[i + 1 ..];
+    if (std.mem.findScalarLast(u8, fqn, '.')) |i| return fqn[i + 1 ..];
     return fqn;
 }
 
@@ -814,8 +814,8 @@ pub fn scalarRetagName(name: []const u8) bool {
 /// arguments, or nullability.
 pub fn typeHeadOfName(name: []const u8) []const u8 {
     var t = std.mem.trimEnd(u8, name, "?");
-    if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
-    if (std.mem.lastIndexOfScalar(u8, t, '.')) |d| t = t[d + 1 ..];
+    if (std.mem.findScalar(u8, t, '<')) |lt| t = t[0..lt];
+    if (std.mem.findScalarLast(u8, t, '.')) |d| t = t[d + 1 ..];
     return t;
 }
 
@@ -925,7 +925,7 @@ pub fn initLocalParentChain(
         const g = cls.borrow();
         defer g.deinit();
         for (g.get().supertype_names) |sn| {
-            const simple = if (std.mem.lastIndexOfScalar(u8, sn, '.')) |d| sn[d + 1 ..] else sn;
+            const simple = if (std.mem.findScalarLast(u8, sn, '.')) |d| sn[d + 1 ..] else sn;
             if (isBuiltinThrowableName(simple)) break :blk true;
         }
         break :blk false;
@@ -970,7 +970,7 @@ pub fn initLocalParentChain(
         const pg = pd.borrow();
         const pn = pg.get().name;
         pg.deinit();
-        const simple = if (std.mem.lastIndexOfScalar(u8, pn, '.')) |d| pn[d + 1 ..] else pn;
+        const simple = if (std.mem.findScalarLast(u8, pn, '.')) |d| pn[d + 1 ..] else pn;
         if (isBuiltinThrowableName(simple)) try bindThrowableArgs(self, inst, cur_args.items, true);
     }
     while (cur_def) |pd| {

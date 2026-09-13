@@ -50,7 +50,7 @@ const CaptureOutput = struct {
     fn vtWrite(ctx: *anyopaque, s: []const u8) void {
         const self: *CaptureOutput = @ptrCast(@alignCast(ctx));
         self.cur.appendSlice(self.allocator, s) catch return;
-        while (std.mem.indexOfScalar(u8, self.cur.items, '\n')) |idx| {
+        while (std.mem.findScalar(u8, self.cur.items, '\n')) |idx| {
             const line = self.allocator.dupe(u8, self.cur.items[0..idx]) catch return;
             self.lines.append(self.allocator, line) catch {};
             const rest = self.cur.items[idx + 1 ..];

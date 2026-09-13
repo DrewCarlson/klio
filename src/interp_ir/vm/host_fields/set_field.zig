@@ -275,7 +275,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                     if (hit) |f| {
                         const mptr2: *const Module = self.module.asPtr();
                         const fp: []const u8 = if (mptr2.funcById(f)) |ff| ff.package else "";
-                        const rpkg: []const u8 = if (std.mem.lastIndexOfScalar(u8, rf, '.')) |d| rf[0..d] else "";
+                        const rpkg: []const u8 = if (std.mem.findScalarLast(u8, rf, '.')) |d| rf[0..d] else "";
                         if (rpkg.len == 0 or fp.len == 0 or std.mem.eql(u8, fp, rpkg)) break :blk f;
                     }
                 }

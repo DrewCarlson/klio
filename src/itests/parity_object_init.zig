@@ -46,7 +46,7 @@ fn assertKlioError(name: []const u8, src: []const u8, expected_fragment: []const
             return error.ExpectedRunFailure;
         },
         .err => |m| {
-            if (std.mem.indexOf(u8, m, expected_fragment) == null) {
+            if (std.mem.find(u8, m, expected_fragment) == null) {
                 std.debug.print("error for `{s}` missing `{s}`:\n{s}\n", .{ name, expected_fragment, m });
                 return error.WrongRunError;
             }
@@ -77,7 +77,7 @@ test "uncaught exception reports a stack trace with source positions" {
                 ".kt:",
             };
             for (needles) |n| {
-                if (std.mem.indexOf(u8, m, n) == null) {
+                if (std.mem.find(u8, m, n) == null) {
                     std.debug.print("trace missing `{s}`:\n{s}\n", .{ n, m });
                     return error.MissingTraceFragment;
                 }
@@ -102,11 +102,11 @@ test "stack trace is captured at construction, not at throw" {
             return error.ExpectedRunFailure;
         },
         .err => |m| {
-            if (std.mem.indexOf(u8, m, "at make (") == null) {
+            if (std.mem.find(u8, m, "at make (") == null) {
                 std.debug.print("trace missing construction frame `at make (`:\n{s}\n", .{m});
                 return error.MissingConstructionFrame;
             }
-            if (std.mem.indexOf(u8, m, "thrower") != null) {
+            if (std.mem.find(u8, m, "thrower") != null) {
                 std.debug.print("trace should not contain the throw site `thrower`:\n{s}\n", .{m});
                 return error.CapturedAtThrowNotConstruction;
             }
@@ -130,11 +130,11 @@ test "user exception subclass captures at construction" {
             return error.ExpectedRunFailure;
         },
         .err => |m| {
-            if (std.mem.indexOf(u8, m, "at make (") == null) {
+            if (std.mem.find(u8, m, "at make (") == null) {
                 std.debug.print("trace missing construction frame `at make (`:\n{s}\n", .{m});
                 return error.MissingConstructionFrame;
             }
-            if (std.mem.indexOf(u8, m, "thrower") != null) {
+            if (std.mem.find(u8, m, "thrower") != null) {
                 std.debug.print("trace should not contain the throw site `thrower`:\n{s}\n", .{m});
                 return error.CapturedAtThrowNotConstruction;
             }
@@ -163,7 +163,7 @@ test "uncaught exception reports the cause chain" {
                 "at root (",
             };
             for (needles) |n| {
-                if (std.mem.indexOf(u8, m, n) == null) {
+                if (std.mem.find(u8, m, n) == null) {
                     std.debug.print("cause-chain trace missing `{s}`:\n{s}\n", .{ n, m });
                     return error.MissingTraceFragment;
                 }

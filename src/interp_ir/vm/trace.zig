@@ -37,7 +37,7 @@ fn ensureFilter() void {
     if (readEnv("KLIO_TRACE_RESOLVE", &filter_buf)) |v| {
         filter_state = .{
             .present = true,
-            .all = std.mem.indexOf(u8, v, "*") != null,
+            .all = std.mem.find(u8, v, "*") != null,
             .raw = v,
         };
     } else {
@@ -125,7 +125,7 @@ pub fn recvLabel(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error
         .IrClosure, .Intrinsic, .BoundMethod => @tagName(v),
         else => blk: {
             const fqn = v.typeFqn();
-            break :blk if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
+            break :blk if (std.mem.findScalarLast(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
         },
     };
 }

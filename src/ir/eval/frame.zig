@@ -231,7 +231,7 @@ pub const Frame = struct {
         if (parent.frame_count_on) {
             frameCensusBump(func.id.int());
             fuseCensusBump(func);
-            if (parent.frame_watch_want.len != 0 and std.mem.indexOf(u8, func.name, parent.frame_watch_want) != null) {
+            if (parent.frame_watch_want.len != 0 and std.mem.find(u8, func.name, parent.frame_watch_want) != null) {
                 const caller: []const u8 = if (ev_state.evtls.frame_chain) |fr| fr.func.name else "<top>";
                 std.debug.print("[framewatch] {s} <- {s}\n", .{ func.name, caller });
             }

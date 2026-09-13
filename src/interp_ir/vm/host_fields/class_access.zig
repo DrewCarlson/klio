@@ -259,9 +259,9 @@ pub fn enclosingSimpleFromFqn(self: *VmHost, inst: ObjRef(InstanceData)) ?[]cons
         defer cg.deinit();
         break :blk cg.get().fqn;
     };
-    const last_dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return null;
+    const last_dot = std.mem.findScalarLast(u8, fqn, '.') orelse return null;
     const parent_fqn = fqn[0..last_dot];
-    const parent_simple = if (std.mem.lastIndexOfScalar(u8, parent_fqn, '.')) |d| parent_fqn[d + 1 ..] else parent_fqn;
+    const parent_simple = if (std.mem.findScalarLast(u8, parent_fqn, '.')) |d| parent_fqn[d + 1 ..] else parent_fqn;
     // Confirm the parent FQN names an actual class (not a package): the
     // class table is keyed by simple name, so verify the matching entry's
     // FQN equals the parent FQN before treating it as the enclosing class.
@@ -298,11 +298,11 @@ pub fn companionInstanceForDef(self: *VmHost, fqn: []const u8, simple: []const u
                 .err => null,
             };
         }
-        const dot = std.mem.indexOfScalarPos(u8, fqn, start, '.') orelse break;
+        const dot = std.mem.findScalarPos(u8, fqn, start, '.') orelse break;
         start = dot + 1;
         // Never the bare simple name: that key belongs to a top-level
         // class, and a nested class's own (mangled) name resolves below.
-        if (std.mem.indexOfScalarPos(u8, fqn, start, '.') == null) break;
+        if (std.mem.findScalarPos(u8, fqn, start, '.') == null) break;
     }
     return companionInstanceForClass(self, simple);
 }

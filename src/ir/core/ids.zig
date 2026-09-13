@@ -166,11 +166,11 @@ pub fn parseClassTypeParamIdentity(raw_name: []const u8) ?ClassTypeParamIdentity
     }
     const prefix = "$class$\x00";
     if (!std.mem.startsWith(u8, name, prefix)) return null;
-    const owner_end = std.mem.indexOfScalar(u8, name[prefix.len..], 0) orelse return null;
+    const owner_end = std.mem.findScalar(u8, name[prefix.len..], 0) orelse return null;
     const owner_text = name[prefix.len .. prefix.len + owner_end];
     const owner_int = std.fmt.parseInt(u32, owner_text, 10) catch return null;
     const length_start = prefix.len + owner_end + 1;
-    const colon = std.mem.indexOfScalar(u8, name[length_start..], ':') orelse return null;
+    const colon = std.mem.findScalar(u8, name[length_start..], ':') orelse return null;
     const length_text = name[length_start .. length_start + colon];
     const param_len = std.fmt.parseInt(usize, length_text, 10) catch return null;
     const param = name[length_start + colon + 1 ..];

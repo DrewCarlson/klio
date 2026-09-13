@@ -116,8 +116,8 @@ test "coverage prints implemented and total counts" {
     var w = std.Io.Writer.fixed(&buf);
     const code = try coverage(&w);
     try testing.expectEqual(SUCCESS, code);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "implemented") != null);
-    try testing.expect(std.mem.indexOf(u8, w.buffered(), "total") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "implemented") != null);
+    try testing.expect(std.mem.find(u8, w.buffered(), "total") != null);
 }
 
 test "build reports a missing stdlib root" {
@@ -134,5 +134,5 @@ test "build reports a missing stdlib root" {
     const cmd = Cmd{ .build = .{ .stdlib = "this/dir/does/not/exist", .out = "ignored" } };
     const code = try run(a, io, cmd, &out_w, &err_w);
     try testing.expectEqual(STDLIB_MISSING, code);
-    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "stdlib root not found") != null);
+    try testing.expect(std.mem.find(u8, err_w.buffered(), "stdlib root not found") != null);
 }

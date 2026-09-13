@@ -101,7 +101,7 @@ pub fn loadApplication(a: Allocator, dir: []const u8) ?Application {
 
     var includes: std.ArrayList([]const u8) = .empty;
     for (app.include) |inc| {
-        if (std.mem.lastIndexOfScalar(u8, inc, ':')) |colon| {
+        if (std.mem.findScalarLast(u8, inc, ':')) |colon| {
             const joined = std.fs.path.join(a, &.{ dir, inc[0..colon] }) catch continue;
             includes.append(a, std.fmt.allocPrint(a, "{s}:{s}", .{ joined, inc[colon + 1 ..] }) catch continue) catch {};
         } else {

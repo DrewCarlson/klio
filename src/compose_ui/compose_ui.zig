@@ -496,7 +496,7 @@ fn selfExeDir() ?[]const u8 {
         else => return null,
     }
     const path = self_exe_buf[0..len];
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/') orelse return null;
+    const slash = std.mem.findScalarLast(u8, path, '/') orelse return null;
     return path[0..slash];
 }
 

@@ -178,11 +178,11 @@ pub const Reg = enum(u4) {
 
 /// x86-64 instruction emitter, table-tested against known-good byte sequences.
 pub const X86Emitter = struct {
-    buf: std.ArrayListUnmanaged(u8) = .empty,
+    buf: std.ArrayList(u8) = .empty,
     /// Label slots; `null` until bound to a code offset.
-    labels: std.ArrayListUnmanaged(?usize) = .empty,
+    labels: std.ArrayList(?usize) = .empty,
     /// Pending forward-jump rel32 patches, applied at `bind`.
-    fixups: std.ArrayListUnmanaged(Fixup) = .empty,
+    fixups: std.ArrayList(Fixup) = .empty,
     a: std.mem.Allocator,
 
     pub fn init(a: std.mem.Allocator) X86Emitter {

@@ -212,9 +212,9 @@ pub fn evidenceSubtypeCb(ctx: *anyopaque, sub: []const u8, super: []const u8) bo
             continue;
         for (chain) |sup_raw| {
             var sn = sup_raw;
-            if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
-            if (std.mem.indexOfScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
-            if (std.mem.lastIndexOfScalar(u8, sn, '$')) |i| {
+            if (std.mem.findScalarLast(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+            if (std.mem.findScalar(u8, sn, '<')) |lt| sn = sn[0..lt];
+            if (std.mem.findScalarLast(u8, sn, '$')) |i| {
                 if (i + 1 < sn.len) sn = sn[i + 1 ..];
             }
             if (std.mem.eql(u8, sn, super)) return true;
@@ -258,7 +258,7 @@ pub fn extReceiverPlausible(self: *const Module, id: FuncId, f: *const Func, own
     if (f.params.len == 0) return true;
     var head = applicability.simpleName(f.params[0].ty.name);
     head = std.mem.trimEnd(u8, head, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (head.len == 0 or std.mem.eql(u8, head, "Any")) return true;
     if (std.mem.startsWith(u8, head, "Function")) return true;
     if (self.registry.func_type_params.get(id)) |tps| {
@@ -273,7 +273,7 @@ pub fn extReceiverPlausible(self: *const Module, id: FuncId, f: *const Func, own
     while (owner_cur) |oc| : (hops += 1) {
         if (hops > 16) break;
         const oc_head = applicability.simpleName(oc);
-        if (std.mem.indexOfScalar(u8, oc_head, '$') != null) {
+        if (std.mem.findScalar(u8, oc_head, '$') != null) {
             // A lifted nested class's mangled tail still names it.
             if (std.mem.endsWith(u8, oc_head, head)) return true;
         }
@@ -281,7 +281,7 @@ pub fn extReceiverPlausible(self: *const Module, id: FuncId, f: *const Func, own
         if (self.registry.class_super_names.get(oc)) |chain| {
             for (chain) |sup| {
                 var sn = applicability.simpleName(sup);
-                if (std.mem.indexOfScalar(u8, sn, '<')) |lt2| sn = sn[0..lt2];
+                if (std.mem.findScalar(u8, sn, '<')) |lt2| sn = sn[0..lt2];
                 sn = std.mem.trimEnd(u8, sn, "?");
                 if (std.mem.eql(u8, sn, head)) return true;
             }
@@ -454,7 +454,7 @@ pub fn applicableBarePick(
             if (kind == .top_level_extension) {
                 if (ctx.recv_ty) |rt0| {
                     var rh = applicability.simpleName(std.mem.trimEnd(u8, rt0, "?"));
-                    if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+                    if (std.mem.findScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
                     var plausible = self.extReceiverPlausible(id, f, rh);
                     if (!plausible and ctx.owner_class != null) plausible = self.extReceiverPlausible(id, f, ctx.owner_class);
                     if (!plausible) {
@@ -490,7 +490,7 @@ pub fn applicableBarePick(
             {
                 const inner_head = blk_ih: {
                     var h = applicability.simpleName(std.mem.trimEnd(u8, ctx.recv_ty.?, "?"));
-                    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
                     break :blk_ih h;
                 };
                 var plausible = self.extReceiverPlausible(id, f, inner_head);

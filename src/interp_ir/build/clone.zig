@@ -117,7 +117,7 @@ pub fn copyStrMap(comptime V: type, dst: *std.StringHashMap(V), src: *const std.
 /// shortest (least-nested) match. The table holds each class under both its
 /// simple name and FQN, so scanning values (not keys) avoids double-counting.
 pub fn classTableByQualifiedSuffix(classes: *const ClassTable, qualified: []const u8) ?ObjRef(ClassDef) {
-    if (std.mem.indexOfScalar(u8, qualified, '.') == null) return null;
+    if (std.mem.findScalar(u8, qualified, '.') == null) return null;
     var best: ?ObjRef(ClassDef) = null;
     var best_len: usize = std.math.maxInt(usize);
     var it = classes.valueIterator();

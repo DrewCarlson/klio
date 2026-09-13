@@ -321,7 +321,7 @@ pub fn dumpFnIfRequested(module: *const Module, func: *const Func) void {
     if (want.len > 1 and want[0] == '#') {
         const id = std.fmt.parseInt(u32, want[1..], 10) catch return;
         if (func.id.int() != id) return;
-    } else if (std.mem.indexOfScalar(u8, want, '.') != null) {
+    } else if (std.mem.findScalar(u8, want, '.') != null) {
         if (!std.mem.eql(u8, func.fqn, want)) return;
     } else if (!std.mem.eql(u8, func.name, want)) return;
     // A deferred body has no blocks yet; wait for the post-materialize call.
@@ -638,7 +638,7 @@ pub fn frameBoundary(func: *const Func, result_in: EvalResult) EvalResult {
                 // error surfaces, so this is the only record of the failing
                 // function.
                 if (runtime.envOnce("KLIO_AMP_TRACE")) |w| {
-                    if (std.mem.indexOf(u8, m, w) != null) {
+                    if (std.mem.find(u8, m, w) != null) {
                         std.debug.print("[amp] body={s} fqn={s} err={s} msg={s}\n", .{ func.name, func.fqn, @tagName(std.meta.activeTag(result.err)), m });
                         dumpFrameChainForDiagAlways();
                     }

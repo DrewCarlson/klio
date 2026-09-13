@@ -700,7 +700,7 @@ pub fn string_starts_with(ctx: *CallCtx) Allocator.Error!EvalResult {
         }
     }
     if (start_index < 0) return .{ .ok = .{ .Bool = false } };
-    if (!ignore_case and std.mem.indexOfScalar(u8, prefix, 0xED) == null) {
+    if (!ignore_case and std.mem.findScalar(u8, prefix, 0xED) == null) {
         const lo = utf16Boundary(s, @intCast(start_index));
         if (lo.u16_pos == start_index) {
             if (lo.byte_pos + prefix.len > s.len) return .{ .ok = .{ .Bool = false } };
@@ -1040,8 +1040,8 @@ pub fn string_contains(ctx: *CallCtx) Allocator.Error!EvalResult {
         defer ctx.allocator.free(lhay);
         const lneed = try mapCase(ctx.allocator, needle, false);
         defer ctx.allocator.free(lneed);
-        break :blk std.mem.indexOf(u8, lhay, lneed) != null;
-    } else std.mem.indexOf(u8, s, needle) != null;
+        break :blk std.mem.find(u8, lhay, lneed) != null;
+    } else std.mem.find(u8, s, needle) != null;
     return .{ .ok = .{ .Bool = found } };
 }
 
@@ -1082,7 +1082,7 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
         defer if (ignore_case and runtime.freeScratch()) ctx.allocator.free(ndl2);
         var best: i64 = -1;
         var search_from: usize = 0;
-        while (std.mem.indexOfPos(u8, hay2, search_from, ndl2)) |pos| {
+        while (std.mem.findPos(u8, hay2, search_from, ndl2)) |pos| {
             const start_char = utf16Len(s[0..pos]);
             if (start_char > upper) break;
             if (start_char >= lower) best = @intCast(start_char);
@@ -1107,9 +1107,9 @@ pub fn string_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
         defer ctx.allocator.free(lhay);
         const lneed = try mapCase(ctx.allocator, needle, false);
         defer ctx.allocator.free(lneed);
-        if (std.mem.indexOf(u8, lhay, lneed)) |off| found = start_byte + off;
+        if (std.mem.find(u8, lhay, lneed)) |off| found = start_byte + off;
     } else {
-        if (std.mem.indexOf(u8, hay, needle)) |off| found = start_byte + off;
+        if (std.mem.find(u8, hay, needle)) |off| found = start_byte + off;
     }
     if (found) |f| {
         if (f > end_start_byte) found = null;
@@ -1169,7 +1169,7 @@ pub fn string_last_index_of(ctx: *CallCtx) Allocator.Error!EvalResult {
     defer if (ignore_case and runtime.freeScratch()) ctx.allocator.free(ndl);
     var result: i64 = -1;
     var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, hay, search_from, ndl)) |pos| {
+    while (std.mem.findPos(u8, hay, search_from, ndl)) |pos| {
         const start_char = utf16Len(s[0..pos]);
         if (start_char > limit_char) break;
         result = @intCast(start_char);
@@ -1956,7 +1956,7 @@ pub fn string_substring_before(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(delim);
-    if (std.mem.indexOf(u8, s, delim)) |idx| {
+    if (std.mem.find(u8, s, delim)) |idx| {
         return .{ .ok = try newString(ctx.allocator, try ctx.allocator.dupe(u8, s[0..idx])) };
     }
     return .{ .ok = try newString(ctx.allocator, try missingArg(ctx.allocator, if (ctx.args.len > 2) ctx.args[2] else null, s)) };
@@ -1975,7 +1975,7 @@ pub fn string_substring_after(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(delim);
-    if (std.mem.indexOf(u8, s, delim)) |idx| {
+    if (std.mem.find(u8, s, delim)) |idx| {
         return .{ .ok = try newString(ctx.allocator, try ctx.allocator.dupe(u8, s[idx + delim.len ..])) };
     }
     return .{ .ok = try newString(ctx.allocator, try missingArg(ctx.allocator, if (ctx.args.len > 2) ctx.args[2] else null, s)) };
@@ -1994,7 +1994,7 @@ pub fn string_substring_before_last(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(delim);
-    if (std.mem.lastIndexOf(u8, s, delim)) |idx| {
+    if (std.mem.findLast(u8, s, delim)) |idx| {
         return .{ .ok = try newString(ctx.allocator, try ctx.allocator.dupe(u8, s[0..idx])) };
     }
     return .{ .ok = try newString(ctx.allocator, try missingArg(ctx.allocator, if (ctx.args.len > 2) ctx.args[2] else null, s)) };
@@ -2013,7 +2013,7 @@ pub fn string_substring_after_last(ctx: *CallCtx) Allocator.Error!EvalResult {
         .err => |e| return .{ .err = e },
     };
     defer ctx.allocator.free(delim);
-    if (std.mem.lastIndexOf(u8, s, delim)) |idx| {
+    if (std.mem.findLast(u8, s, delim)) |idx| {
         return .{ .ok = try newString(ctx.allocator, try ctx.allocator.dupe(u8, s[idx + delim.len ..])) };
     }
     return .{ .ok = try newString(ctx.allocator, try missingArg(ctx.allocator, if (ctx.args.len > 2) ctx.args[2] else null, s)) };
@@ -2761,7 +2761,7 @@ fn fmtWithCommas(allocator: Allocator, n: i64) Allocator.Error![]u8 {
 }
 
 fn insertCommasDecimal(allocator: Allocator, s: []const u8) Allocator.Error![]u8 {
-    const dot = std.mem.indexOfScalar(u8, s, '.');
+    const dot = std.mem.findScalar(u8, s, '.');
     const whole = if (dot) |d| s[0..d] else s;
     const frac: ?[]const u8 = if (dot) |d| s[d + 1 ..] else null;
     var out: std.ArrayList(u8) = .empty;
@@ -2778,7 +2778,7 @@ fn insertCommasDecimal(allocator: Allocator, s: []const u8) Allocator.Error![]u8
 }
 
 fn normalizeScientific(allocator: Allocator, s: []const u8, upper: bool) Allocator.Error![]u8 {
-    const epos = std.mem.indexOfScalar(u8, s, 'e') orelse std.mem.indexOfScalar(u8, s, 'E');
+    const epos = std.mem.findScalar(u8, s, 'e') orelse std.mem.findScalar(u8, s, 'E');
     const mantissa = if (epos) |p| s[0..p] else s;
     const exp_str = if (epos) |p| s[p + 1 ..] else "0";
     const exp_n: i32 = std.fmt.parseInt(i32, exp_str, 10) catch 0;
@@ -3193,7 +3193,7 @@ fn stripFloatSuffix(s: []const u8) []const u8 {
     const after_sign = if (body.len > 0 and (body[0] == '+' or body[0] == '-')) body[1..] else body;
     const is_hex = after_sign.len >= 2 and after_sign[0] == '0' and (after_sign[1] == 'x' or after_sign[1] == 'X');
     if (!is_hex) return body;
-    if (std.mem.indexOfScalar(u8, body, 'p') != null or std.mem.indexOfScalar(u8, body, 'P') != null) return body;
+    if (std.mem.findScalar(u8, body, 'p') != null or std.mem.findScalar(u8, body, 'P') != null) return body;
     return s;
 }
 
@@ -3204,7 +3204,7 @@ fn floatSymbolReject(s: []const u8) bool {
     // A hex float requires a `p`/`P` binary exponent; `std.fmt.parseFloat` also
     // accepts a bare hex integer, which Kotlin rejects.
     if (body.len >= 2 and body[0] == '0' and (body[1] == 'x' or body[1] == 'X')) {
-        return std.mem.indexOfScalar(u8, body, 'p') == null and std.mem.indexOfScalar(u8, body, 'P') == null;
+        return std.mem.findScalar(u8, body, 'p') == null and std.mem.findScalar(u8, body, 'P') == null;
     }
     return false;
 }

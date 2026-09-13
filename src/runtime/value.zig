@@ -190,7 +190,7 @@ pub const MapPair = struct {
 pub const MapStore = struct {
     pairs: std.ArrayList(MapPair) = .empty,
     head: std.AutoHashMapUnmanaged(u64, u32) = .empty,
-    chain: std.ArrayListUnmanaged(u32) = .empty,
+    chain: std.ArrayList(u32) = .empty,
     /// A mismatch with `pairs.len` means entries were appended without
     /// maintenance, so `find` rebuilds.
     indexed_len: usize = 0,
@@ -898,7 +898,7 @@ pub const PrimitiveArrayKind = enum {
 /// to 8 bytes per element, with no per-element retain, release or tracing.
 pub const PrimBuf = struct {
     kind: PrimitiveArrayKind,
-    bytes: std.ArrayListUnmanaged(u8) = .empty,
+    bytes: std.ArrayList(u8) = .empty,
 
     pub fn len(self: *const PrimBuf) usize {
         return self.bytes.items.len / self.kind.elemSize();
@@ -1531,7 +1531,7 @@ const KeepEntry = union(enum) {
 /// One threadlocal, not three: Darwin resolves each access through a
 /// `_tlv_get_addr` call, so this costs one fetch per host re-entry.
 const KeepaliveTls = struct {
-    stack: std.ArrayListUnmanaged(KeepEntry) = .empty,
+    stack: std.ArrayList(KeepEntry) = .empty,
     troot: objcell.gc.ThreadRoot = undefined,
     troot_inited: bool = false,
 };
@@ -1543,7 +1543,7 @@ inline fn keepaliveTls() *KeepaliveTls {
 }
 
 fn gcMarkKeepaliveCtx(ctx: *anyopaque, m: *objcell.gc.Marker) void {
-    const stack: *const std.ArrayListUnmanaged(KeepEntry) = @ptrCast(@alignCast(ctx));
+    const stack: *const std.ArrayList(KeepEntry) = @ptrCast(@alignCast(ctx));
     for (stack.items) |e| switch (e) {
         .one => |v| v.gcMark(m),
         .many => |vs| for (vs) |v| v.gcMark(m),
@@ -3226,12 +3226,12 @@ fn simpleNameMatchesIterator(name: []const u8, simple: []const u8) bool {
 }
 
 fn lastSegment(fqn: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| return fqn[i + 1 ..];
+    if (std.mem.findScalarLast(u8, fqn, '.')) |i| return fqn[i + 1 ..];
     return fqn;
 }
 
 fn lastDotSegment(name: []const u8) ?[]const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return null;
 }
 
@@ -3240,8 +3240,8 @@ fn lastDotSegment(name: []const u8) ?[]const u8 {
 /// last `$` then `.` is that name.
 fn classDisplayName(name: []const u8) []const u8 {
     var n = name;
-    if (std.mem.lastIndexOfScalar(u8, n, '$')) |i| n = n[i + 1 ..];
-    if (std.mem.lastIndexOfScalar(u8, n, '.')) |i| n = n[i + 1 ..];
+    if (std.mem.findScalarLast(u8, n, '$')) |i| n = n[i + 1 ..];
+    if (std.mem.findScalarLast(u8, n, '.')) |i| n = n[i + 1 ..];
     return n;
 }
 
@@ -3471,7 +3471,7 @@ fn coerceListElems(items: ValueList, head: []const u8) void {
 pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v: *Value) void {
     if (type_args.len == 0) return;
     if (!std.mem.startsWith(u8, fqn, "kotlin")) return;
-    const name = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
+    const name = if (std.mem.findScalarLast(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
     const elem_arg = type_args[0];
     if (elem_arg.len == 0) return;
     for (elem_typed_creators) |c| {

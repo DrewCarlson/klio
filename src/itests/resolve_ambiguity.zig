@@ -64,7 +64,7 @@ fn expectFilesErrContains(name: []const u8, srcs: []const []const u8, needle: []
             return error.ExpectedResolutionDiagnostic;
         },
         .err => |m| {
-            if (std.mem.indexOf(u8, m, needle) == null) {
+            if (std.mem.find(u8, m, needle) == null) {
                 std.debug.print("diagnostic for `{s}` missing `{s}`:\n{s}\n", .{ name, needle, m });
                 return error.WrongDiagnostic;
             }
@@ -102,7 +102,7 @@ fn expectExactErr(name: []const u8, src: []const u8, comptime expected_fmt: []co
 fn replaceAll(a: std.mem.Allocator, comptime fmt: []const u8, path: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var rest: []const u8 = fmt;
-    while (std.mem.indexOf(u8, rest, "%PATH%")) |i| {
+    while (std.mem.find(u8, rest, "%PATH%")) |i| {
         try out.appendSlice(a, rest[0..i]);
         try out.appendSlice(a, path);
         rest = rest[i + "%PATH%".len ..];

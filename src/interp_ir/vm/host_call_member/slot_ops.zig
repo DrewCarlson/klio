@@ -90,7 +90,7 @@ pub fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
 /// one table instead of keeping a second.
 pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
     return blk: {
-        const owner = fqn[0 .. std.mem.lastIndexOfScalar(u8, fqn, '.') orelse break :blk null];
+        const owner = fqn[0 .. std.mem.findScalarLast(u8, fqn, '.') orelse break :blk null];
         const name = fqn[owner.len + 1 ..];
         const iter_owner = std.mem.eql(u8, owner, "kotlin.collections.Iterator") or
             std.mem.eql(u8, owner, "kotlin.collections.MutableIterator") or
@@ -130,14 +130,14 @@ pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
         if (std.mem.eql(u8, name, "get") and
             std.mem.startsWith(u8, owner, "kotlin.") and
             std.mem.endsWith(u8, owner, "Array") and
-            std.mem.indexOfScalar(u8, owner["kotlin.".len..], '.') == null)
+            std.mem.findScalar(u8, owner["kotlin.".len..], '.') == null)
             break :blk .array_get;
         // An array iterates from its own storage, exactly as a collection
         // does, and no native is registered under the array type either.
         if (std.mem.eql(u8, name, "iterator") and
             std.mem.startsWith(u8, owner, "kotlin.") and
             std.mem.endsWith(u8, owner, "Array") and
-            std.mem.indexOfScalar(u8, owner["kotlin.".len..], '.') == null)
+            std.mem.findScalar(u8, owner["kotlin.".len..], '.') == null)
             break :blk .collection_iterator;
         if (std.mem.eql(u8, owner, "kotlin.sequences.Sequence") and
             std.mem.eql(u8, name, "iterator")) break :blk .sequence_iterator;
@@ -366,7 +366,7 @@ pub fn typeSafeBarrierAnswer(
     for (bounds) |bd| {
         if (std.mem.eql(u8, bd.param, tp_name)) {
             var h = std.mem.trimEnd(u8, bd.bound, "?");
-            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
             bound_head = h;
             break;
         }
@@ -416,9 +416,9 @@ pub fn slotOwnerSimpleName(self: *VmHost, slot: MethodSlotId) ?[]const u8 {
     defer mg.deinit();
     const f = mg.get().funcById(FuncId.from(slot.int())) orelse return null;
     const fqn = f.fqn;
-    const last_dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return null;
+    const last_dot = std.mem.findScalarLast(u8, fqn, '.') orelse return null;
     const owner = fqn[0..last_dot];
-    const owner_dot = std.mem.lastIndexOfScalar(u8, owner, '.');
+    const owner_dot = std.mem.findScalarLast(u8, owner, '.');
     const simple = if (owner_dot) |d| owner[d + 1 ..] else owner;
     return if (simple.len == 0) null else simple;
 }

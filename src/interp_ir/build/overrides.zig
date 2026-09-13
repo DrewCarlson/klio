@@ -201,7 +201,7 @@ pub fn buildModuleWithOverrides(
         };
         if (sp_simple) |ss| {
             if (fqn_overrides.get(ss.sp)) |f| {
-                if (std.mem.lastIndexOfScalar(u8, f, '.')) |dot| {
+                if (std.mem.findScalarLast(u8, f, '.')) |dot| {
                     const pkg = f[0..dot];
                     const gop = try pack_pkg_types.getOrPut(pkg);
                     if (!gop.found_existing) gop.value_ptr.* = StringSet.init(a);
@@ -286,7 +286,7 @@ pub fn buildModuleWithOverrides(
                     var synth = try lift.synthesizeClassFromObject(a, o);
                     synth.name = .{ .name = mangled, .span = o.name.span };
                     try all_decls.append(a, .{ .Class = synth });
-                    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
+                    if (std.mem.findScalarLast(u8, fqn, '.')) |dot| {
                         const pkg = fqn[0..dot];
                         if (pack_pkg_types.get(pkg)) |types| {
                             var it = types.keyIterator();
@@ -1176,7 +1176,7 @@ pub fn buildModuleWithOverrides(
             const type_params = try a.alloc([]const u8, ta.type_params.len);
             for (ta.type_params, type_params) |*param, *out| out.* = param.name.name;
             var target = try ir.lower.decl.loweredTypeRef(a, &ta.target, true);
-            if (std.mem.indexOfScalar(u8, target.name, '.') == null) {
+            if (std.mem.findScalar(u8, target.name, '.') == null) {
                 // The target is written in the class's scope: a nested class
                 // of the owner resolves to that class's index name.
                 if (module.classId(c.name.name)) |owner_id| {
@@ -1386,7 +1386,7 @@ pub fn buildModuleWithOverrides(
                 }
                 const hdr_skip = blk: {
                     const w = std.c.getenv("KLIO_HDR_BOUNDS_SKIP") orelse break :blk false;
-                    break :blk std.mem.indexOf(u8, std.mem.span(w), f.name.name) != null;
+                    break :blk std.mem.find(u8, std.mem.span(w), f.name.name) != null;
                 };
                 // Default ON. The armed roll-out list is empty: the
                 // contains loop was the smart-cast `this`-narrow being
@@ -2697,7 +2697,7 @@ pub fn buildModuleWithOverrides(
         // class declared in the body reaches the declaring class as
         // `this@<Owner>`.
         const dispatch_owner: ?[]const u8 = if (epd.owner) |o|
-            (if (std.mem.lastIndexOfScalar(u8, o, '.')) |dot| o[dot + 1 ..] else o)
+            (if (std.mem.findScalarLast(u8, o, '.')) |dot| o[dot + 1 ..] else o)
         else
             null;
         if (p.getter) |getter| {
@@ -2876,7 +2876,7 @@ pub fn buildModuleWithOverrides(
             continue;
         }
         const full = ta.target.name.name;
-        const target = if (std.mem.lastIndexOfScalar(u8, full, '.')) |dot| full[dot + 1 ..] else full;
+        const target = if (std.mem.findScalarLast(u8, full, '.')) |dot| full[dot + 1 ..] else full;
         if (target.len != 0 and !std.mem.eql(u8, target, ta.name.name)) {
             try module.registry.type_aliases.put(ta.name.name, target);
         }

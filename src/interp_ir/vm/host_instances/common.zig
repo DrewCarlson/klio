@@ -61,7 +61,7 @@ pub fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Al
 // breaks same-class shell recursion during secondary-ctor dispatch.
 // -------------------------------------------------------------------------
 
-pub threadlocal var ctor_guard: std.ArrayListUnmanaged([]const u8) = .empty;
+pub threadlocal var ctor_guard: std.ArrayList([]const u8) = .empty;
 
 /// `name`/`ordinal` for the enum-entry subclass instance about to be
 /// constructed: Kotlin's `Enum` constructor sets them before the entry's

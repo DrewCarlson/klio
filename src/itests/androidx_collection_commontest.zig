@@ -108,7 +108,7 @@ fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayL
 
 fn fileHasTest(a: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return false;
-    return std.mem.indexOf(u8, bytes, "@Test") != null;
+    return std.mem.find(u8, bytes, "@Test") != null;
 }
 
 /// Counts `<Class>.<method> PASSED` lines, so a killed file still counts.
@@ -146,7 +146,7 @@ const FailedNames = struct {
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
-            const at = std.mem.indexOf(u8, trimmed, " FAILED") orelse continue;
+            const at = std.mem.find(u8, trimmed, " FAILED") orelse continue;
             const name = std.mem.trim(u8, trimmed[0..at], " \t");
             if (name.len == 0) continue;
             self.mu.lock();
@@ -267,7 +267,7 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
                 _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
                 _ = pfailed.fetchAdd(failedLineCount(r.stdout), .monotonic);
                 pnames.addFrom(r.stdout);
-                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
+                if (std.mem.find(u8, r.stdout, " passed,") == null) {
                     _ = phung.fetchAdd(1, .monotonic);
                     std.debug.print("[androidx-nosummary] <- {s}\n", .{queue[i][queue[i].len - 1]});
                 }

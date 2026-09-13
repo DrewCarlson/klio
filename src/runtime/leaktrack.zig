@@ -124,7 +124,7 @@ pub fn installSignalDump() void {
 pub fn reportByFqn() void {
     if (!initialized) return;
     const Bucket = struct { fqn: []const u8, bytes: usize, count: usize };
-    var buckets: std.ArrayListUnmanaged(Bucket) = .empty;
+    var buckets: std.ArrayList(Bucket) = .empty;
     acquire();
     var it = live.iterator();
     outer: while (it.next()) |e| {
@@ -164,7 +164,7 @@ fn sameSite(a: *const Record, b: *const Site) bool {
 pub fn report() void {
     if (!initialized) return;
     acquire();
-    var sites: std.ArrayListUnmanaged(Site) = .empty;
+    var sites: std.ArrayList(Site) = .empty;
     var it = live.iterator();
     outer: while (it.next()) |e| {
         const rec = e.value_ptr;

@@ -261,7 +261,7 @@ pub fn resolveExtensionCall(
                         const owner_cid = (self.classIdByFqn(owner_name) orelse
                             self.classId(owner_name)) orelse continue;
                         const lex_name = ctx.lexical_owner orelse continue;
-                        const lex_cid = (if (std.mem.indexOfScalar(u8, lex_name, '.') != null)
+                        const lex_cid = (if (std.mem.findScalar(u8, lex_name, '.') != null)
                             self.classIdByFqn(lex_name)
                         else
                             self.classId(lex_name)) orelse continue;
@@ -397,7 +397,7 @@ pub fn resolveExtensionCall(
                 // are known classes with a provably absent relation.
                 var head_refuted = false;
                 const recv_head_name = staticTypeHead(std.mem.trimEnd(u8, scoped_receiver.name, "?"));
-                const recv_cid: ?ClassId = if (std.mem.indexOfScalar(u8, recv_head_name, '.') != null)
+                const recv_cid: ?ClassId = if (std.mem.findScalar(u8, recv_head_name, '.') != null)
                     self.classIdByFqn(recv_head_name)
                 else
                     self.classId(recv_head_name);
@@ -406,10 +406,10 @@ pub fn resolveExtensionCall(
                     for (declared_bounds) |db| {
                         if (!std.mem.eql(u8, db.param, recv_param_head)) continue;
                         var bh = staticTypeHead(db.bound);
-                        if (std.mem.indexOfScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
+                        if (std.mem.findScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
                         bh = std.mem.trimEnd(u8, std.mem.trim(u8, bh, " "), "?");
                         if (std.mem.eql(u8, bh, "Any") or std.mem.eql(u8, bh, "kotlin.Any")) continue;
-                        const bound_cid: ?ClassId = if (std.mem.indexOfScalar(u8, bh, '.') != null)
+                        const bound_cid: ?ClassId = if (std.mem.findScalar(u8, bh, '.') != null)
                             self.classIdByFqn(bh)
                         else
                             self.classId(bh);
