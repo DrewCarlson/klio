@@ -1,13 +1,9 @@
-//! Front-end-to-IR module builder for the IR-native interpreter.
-//!
-//! This module owns the AST → IR lowering driver: it takes a parsed
-//! Kotlin file and produces an `ir.Module` ready for `Vm.run`, along
-//! with the synthesised runtime `ClassDef` table and the side tables the
-//! Vm consults at dispatch time. Classes are lowered first so
-//! `Inst.NewInstance` lookups resolve, then a pre-pass registers stub
-//! Funcs for every top-level function so forward references and mutual
-//! recursion lower cleanly, then each function body lowers into its
-//! reserved slot.
+//! Front-end-to-IR module builder: a parsed Kotlin file becomes an `ir.Module`
+//! ready for `Vm.run`, with the synthesised runtime `ClassDef` table and the side
+//! tables the Vm consults at dispatch time. Phase order is load-bearing: classes
+//! lower first so `Inst.NewInstance` lookups resolve, then a pre-pass registers a
+//! stub Func per top-level function so forward references and mutual recursion
+//! lower cleanly, then each body lowers into its reserved slot.
 
 const std = @import("std");
 
@@ -43,12 +39,9 @@ const KotlinFile = ast.KotlinFile;
 const Decl = ast.Decl;
 const StringSet = std.StringHashMap(void);
 
-// -------------------------------------------------------------------------
-// The builder is split across `build/`; every declaration keeps its name
-// and visibility here so call sites read `build.<name>` unchanged.
-// -------------------------------------------------------------------------
+// The builder is split across `build/`; every declaration keeps its name and
+// visibility here so call sites read `build.<name>` unchanged.
 
-// The side tables a built module carries.
 const build_types = @import("build/types.zig");
 pub const StrPair = build_types.StrPair;
 pub const StrPairContext = build_types.StrPairContext;
@@ -70,7 +63,6 @@ const SpanContext = build_types.SpanContext;
 const SpanStrMap = build_types.SpanStrMap;
 const FileClasses = build_types.FileClasses;
 
-// AST-walk scanning helpers.
 const build_scan = @import("build/scan.zig");
 const boundTypeRecordComplete = build_scan.boundTypeRecordComplete;
 const collectClassTypeParamBounds = build_scan.collectClassTypeParamBounds;
@@ -114,7 +106,6 @@ pub const scalarNonNullProp = build_scan.scalarNonNullProp;
 pub const primitiveZeroFor = build_scan.primitiveZeroFor;
 const zeroForScalarName = build_scan.zeroForScalarName;
 
-// The file-set build drivers.
 const build_module = @import("build/module.zig");
 pub const buildModule = build_module.buildModule;
 pub const buildModuleFiles = build_module.buildModuleFiles;
@@ -122,11 +113,9 @@ pub const buildModuleFilesExtend = build_module.buildModuleFilesExtend;
 const collectUserComposableFiles = build_module.collectUserComposableFiles;
 const buildModuleFilesInner = build_module.buildModuleFilesInner;
 
-// The whole-file lowering pass.
 const build_overrides = @import("build/overrides.zig");
 const buildModuleWithOverrides = build_overrides.buildModuleWithOverrides;
 
-// Class and member registration.
 const build_classes = @import("build/classes.zig");
 const replaceDotWithDollar = build_classes.replaceDotWithDollar;
 const resolveMangled = build_classes.resolveMangled;
@@ -152,7 +141,6 @@ const retainDecl = build_classes.retainDecl;
 const sameExpectActualTypeHead = build_classes.sameExpectActualTypeHead;
 const transplantExpectMemberDefaults = build_classes.transplantExpectMemberDefaults;
 
-// The once-per-process dependency base.
 const build_base = @import("build/base.zig");
 pub const StdlibBase = build_base.StdlibBase;
 pub const buildStdlibBase = build_base.buildStdlibBase;
@@ -172,7 +160,6 @@ const noteBaseDeclNames = build_base.noteBaseDeclNames;
 pub const canExtendBase = build_base.canExtendBase;
 const extendRefused = build_base.extendRefused;
 
-// Per-run cloning of the dependency snapshot.
 const build_clone = @import("build/clone.zig");
 const cloneBuiltForRun = build_clone.cloneBuiltForRun;
 const copyPairMap = build_clone.copyPairMap;
@@ -181,9 +168,6 @@ const classTableByQualifiedSuffix = build_clone.classTableByQualifiedSuffix;
 const cloneClassTableForRun = build_clone.cloneClassTableForRun;
 const cloneBuildValue = build_clone.cloneBuildValue;
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -213,10 +197,8 @@ test "symbol-index default-import list matches the stdlib's canonical one" {
 }
 
 test "build_module produces an owned empty module shell" {
-    // The driver allocates many transient lowering tables (lift accumulators,
-    // the module registry, the process-global inline-state installs) from the
-    // build allocator; an arena frees them all at once, matching the CLI's
-    // per-run gpa whose memory is reclaimed on process exit.
+    // The driver allocates many transient lowering tables from the build allocator;
+    // an arena frees them at once, matching the CLI's per-run gpa.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

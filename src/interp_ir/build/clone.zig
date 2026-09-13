@@ -1,6 +1,5 @@
-//! Per-run cloning of the dependency snapshot: every runtime-mutable
-//! structure the base holds is deep-copied so nothing a run mutates is
-//! shared across programs.
+//! Per-run cloning of the dependency snapshot: every runtime-mutable structure
+//! the base holds is deep-copied so nothing a run mutates is shared across programs.
 
 const std = @import("std");
 
@@ -24,11 +23,8 @@ const PairFuncMap = build_types.PairFuncMap;
 const SecondaryCtorEntry = build_types.SecondaryCtorEntry;
 const StrFunc = build_types.StrFunc;
 
-/// Per-run clone of the base's BuiltModule onto `a`. Spines are copied;
-/// lowered leaf data (instructions, strings, thunk-id slices) is shared
-/// with the immutable base. Runtime-mutable graphs (the ClassDef table,
-/// enum-entry instances, companion/object/captured-env cells) are deep
-/// cloned so a run can never write through to the base.
+/// Spines are copied and lowered leaf data is shared with the immutable base; the
+/// runtime-mutable graphs (ClassDef table, enum-entry instances, companion cells) deep clone.
 pub fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!BuiltModule {
     const module_clone = blk: {
         const mg = base.module.borrow();
@@ -50,10 +46,8 @@ pub fn cloneBuiltForRun(a: Allocator, base: *const BuiltModule) Allocator.Error!
     try copyPairMap(&out.instance_prop_setters, &base.instance_prop_setters);
     try copyPairMap(&out.instance_prop_private, &base.instance_prop_private);
     try copyStrMap([]FuncId, &out.parent_ctor_args, &base.parent_ctor_args);
-    // Parallel to `parent_ctor_args`: without this a class inherited from the
-    // base loses its super-constructor argument labels, so a named super-ctor
-    // argument that skips an earlier defaulted parameter (`Operation(objects =
-    // 2)`) binds positionally onto the wrong parameter.
+    // Parallel to `parent_ctor_args`: without the labels a named super-constructor argument
+    // that skips an earlier defaulted parameter binds onto the wrong one.
     try copyStrMap([]const ?[]const u8, &out.parent_ctor_arg_names, &base.parent_ctor_arg_names);
     try copyStrMap([]FuncId, &out.init_blocks, &base.init_blocks);
     try out.top_level_props.appendSlice(a, base.top_level_props.items);
@@ -112,10 +106,8 @@ pub fn copyStrMap(comptime V: type, dst: *std.StringHashMap(V), src: *const std.
     while (it.next()) |e| try dst.put(e.key_ptr.*, e.value_ptr.*);
 }
 
-/// Resolve a class written with a dotted qualifier (`Outer.Inner`) by matching
-/// it as a `.`-aligned suffix of a registered class's FQN, preferring the
-/// shortest (least-nested) match. The table holds each class under both its
-/// simple name and FQN, so scanning values (not keys) avoids double-counting.
+/// Match `Outer.Inner` as a `.`-aligned suffix of a registered FQN, preferring the
+/// shortest match. Values are scanned, not keys: the table holds each class twice.
 pub fn classTableByQualifiedSuffix(classes: *const ClassTable, qualified: []const u8) ?ObjRef(ClassDef) {
     if (std.mem.findScalar(u8, qualified, '.') == null) return null;
     var best: ?ObjRef(ClassDef) = null;
@@ -136,15 +128,12 @@ pub fn classTableByQualifiedSuffix(classes: *const ClassTable, qualified: []cons
     return best;
 }
 
-/// Deep-clone the runtime ClassDef graph: a run mutates ClassDefs (startup
-/// patches enum-entry instance fields; companions and object singletons
-/// fill lazily), so per-run defs must be private. Lowered/AST leaf slices
-/// (methods, properties, ctor metadata) stay shared with the base.
+/// A run mutates ClassDefs (startup patches enum-entry fields, companions and object
+/// singletons fill lazily), so per-run defs must be private; leaf slices stay shared.
 pub fn cloneClassTableForRun(a: Allocator, src: *const ClassTable) Allocator.Error!ClassTable {
     var remap = std.AutoHashMap(usize, ObjRef(ClassDef)).init(a);
     defer remap.deinit();
 
-    // Pass 1: shells for every unique def cell.
     {
         var it = src.valueIterator();
         while (it.next()) |def| {
@@ -165,8 +154,6 @@ pub fn cloneClassTableForRun(a: Allocator, src: *const ClassTable) Allocator.Err
         }
     }
 
-    // Pass 2: re-link the graph through the remap and deep-clone the
-    // runtime-mutable payloads.
     {
         var it = src.valueIterator();
         while (it.next()) |def| {
@@ -231,10 +218,8 @@ pub fn cloneClassTableForRun(a: Allocator, src: *const ClassTable) Allocator.Err
     return out;
 }
 
-/// Clone a build-time Value reachable from an enum entry. Instances are
-/// deep-cloned (their fields are patched at startup); every other variant
-/// is shared — at build time those are immutable payloads (entry-name
-/// strings, ordinals) the run never writes through.
+/// Instances are deep-cloned (their fields are patched at startup); every other
+/// variant is an immutable build-time payload the run never writes through.
 pub fn cloneBuildValue(a: Allocator, remap: *const std.AutoHashMap(usize, ObjRef(ClassDef)), v: Value) Allocator.Error!Value {
     switch (v) {
         .Instance => |inst| {

@@ -1,6 +1,5 @@
-//! The loop compile gate: validates a natural loop candidate against every
-//! bail condition, infers its specialization, drives the emitter, and returns
-//! a `CompiledLoop` (or declines).
+//! The loop compile gate: validates a natural loop candidate against every bail condition, infers
+//! its specialization, drives the emitter, and returns a `CompiledLoop` or declines.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -89,10 +88,7 @@ const liveElementAt = type_infer.liveElementAt;
 const liveMapValueType = type_infer.liveMapValueType;
 const liveValueRegType = type_infer.liveValueRegType;
 
-/// Everything the loop gate threads between its passes: the call's inputs, the
-/// loop body it collected, and the tables each pass fills in for the next one.
-/// Allocation and release stay in `tryCompileWith`; the passes only read and
-/// append.
+/// What the loop gate threads between passes; allocation and release stay in `tryCompileWith`.
 const LoopCtx = struct {
     a: Allocator,
     module: *const Module,
@@ -143,8 +139,7 @@ const LoopCtx = struct {
     tags_ok: bool = false,
 };
 
-/// A method call on a loop-invariant receiver, held until the slot layout
-/// exists to give its callee a window.
+/// A method call on a loop-invariant receiver, held until the slot layout can give its callee a window.
 const DirectPre = struct {
     block: BlockId,
     inst: u32,
@@ -156,8 +151,7 @@ const DirectPre = struct {
     move: BodyInstPos,
 };
 
-/// Where a trampoline site sits and what its handler needs to know about the
-/// instruction's surroundings.
+/// Where a trampoline site sits and what its handler needs about the instruction's surroundings.
 const SiteAt = struct {
     bid: BlockId,
     i: usize,
@@ -166,8 +160,6 @@ const SiteAt = struct {
     blk_insts: []const ir.Inst,
 };
 
-/// Whether an inline clause consumed the instruction or left it for the next
-/// clause (and, later, for trampoline-site registration).
 const InlineStep = enum { next_inst, fall_through };
 
 fn skipCallAt(list: []const BodyInstPos, b: u32, i: u32) bool {
@@ -177,19 +169,14 @@ fn skipCallAt(list: []const BodyInstPos, b: u32, i: u32) bool {
     return false;
 }
 
-/// Compile the loop, preferring the native boxed-element subscript. Typing a
-/// `List` read as its element's scalar kind constrains every register downstream
-/// of it, so a body that will not compile under that typing is compiled again
-/// with boxed receivers left to the interpreted subscript, rather than losing the
-/// loop entirely.
+/// Compiles the loop, preferring the native boxed-element subscript. Typing a `List` read as its element
+/// kind constrains every register downstream, so a body that fails under it is retried with boxed receivers.
 pub fn tryCompile(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool) Allocator.Error!?CompiledLoop {
     if (try tryCompileWith(a, module, func, header, regs, resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user, transient, true)) |c| return c;
     return tryCompileWith(a, module, func, header, regs, resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user, transient, false);
 }
 
-/// Try to compile the natural loop whose header is `header`, specializing array
-/// accesses on the kinds observed in `regs` (the live frame). Returns a compiled
-/// loop, or null if the loop is not a supported shape.
+/// Tries to compile the natural loop headed by `header`, specialized on the kinds in the live frame.
 fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header: BlockId, regs: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque, transient: *bool, allow_boxed: bool) Allocator.Error!?CompiledLoop {
     const body = (try collectLoop(a, func, header)) orelse return null;
     defer a.free(body);
@@ -245,8 +232,7 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
     ctx.field_idx_of = try a.alloc(u32, n_regs);
     defer a.free(ctx.field_idx_of);
     @memset(ctx.field_idx_of, 0);
-    // Registers that are a `Map[key]` get result: a nullable scalar (the map's
-    // value type, or null when absent). Folded into the nullable set below.
+    // Registers holding a `Map[key]` result: a nullable scalar, folded into the nullable set below.
     ctx.map_get_dst = try a.alloc(bool, n_regs);
     defer a.free(ctx.map_get_dst);
     @memset(ctx.map_get_dst, false);
@@ -306,10 +292,8 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
     return emitLoop(&ctx);
 }
 
-
-/// Reject try-regions: deopt resumes mid-block, so we must not need to
-/// re-establish catch/finally scope. Also rejects any terminator or opcode the
-/// emitter has no form for.
+/// Rejects try-regions, a deopt resuming mid-block without re-establishing catch/finally scope, plus any
+/// terminator or opcode the emitter has no form for.
 fn rejectsLoopShape(ctx: *const LoopCtx) bool {
     const module = ctx.module;
     const func = ctx.func;
@@ -345,7 +329,6 @@ fn rejectsLoopShape(ctx: *const LoopCtx) bool {
     return unsupported_shape;
 }
 
-/// Discover indexed arrays, specializing on the kinds in the live frame.
 fn discoverArrays(ctx: *LoopCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -363,14 +346,11 @@ fn discoverArrays(ctx: *LoopCtx) Allocator.Error!bool {
             if (rr.int() >= n_regs or rr.int() >= regs.len) return false;
             if (array_info[rr.int()] != null) continue;
             const v = regs[rr.int()];
-            // A packed primitive array is indexed at its element width. A
-            // receiver holding objects, and a `Map`, are left for the
-            // object-subscript / map paths; a non-packed `set` is compilable
-            // only for a `Map`.
+            // A packed primitive array is indexed at its element width; an object receiver or a `Map` goes to the
+            // object-subscript or map path, and a non-packed `set` compiles only for a `Map`.
             const packed_ok = v == .Array and v.Array.primKind() != null and v.Array.storage() == .scalars;
             if (!packed_ok) {
-                // A `List` / reference `Array` of a uniform scalar kind is read
-                // natively too, at a whole-`Value` stride behind a tag guard.
+                // A `List` or reference `Array` of uniform scalar kind is read natively at a whole-`Value` stride.
                 if (allow_boxed and !op.is_set and !bodyStoresInto(module, func, body, rr)) {
                     if (boxedElemsOf(v)) |vl| if (boxedElemShape(vl)) |shape| {
                         const bk: u32 = @intCast(arrays.items.len);
@@ -406,9 +386,7 @@ fn discoverArrays(ctx: *LoopCtx) Allocator.Error!bool {
     return true;
 }
 
-/// Inline small pure-scalar top-level callees: their single block is spliced in
-/// place of the call, with registers shifted into an extended register space
-/// [n_regs .. total_regs).
+/// Inlines small pure-scalar top-level callees, registers shifted into [n_regs .. total_regs).
 fn collectInlineSites(ctx: *LoopCtx) Allocator.Error!bool {
     const module = ctx.module;
     const func = ctx.func;
@@ -419,17 +397,12 @@ fn collectInlineSites(ctx: *LoopCtx) Allocator.Error!bool {
                 if (!try inlineStaticCall(ctx, tc, bid, ii)) return false;
                 continue;
             }
-            // A loop-invariant VIRTUAL call resolves its monomorphic slot
-            // target at compile time and inlines it exactly like a member
-            // call (the entry class guard covers the invariant receiver, so
-            // the resolved body is the one the runtime dispatch would pick).
+            // A loop-invariant VIRTUAL call resolves its monomorphic slot target at compile time, the entry class guard covering the receiver.
             if (trampolinableVirtualOf(inst)) |vc| {
                 const step = (try inlineVirtualCall(ctx, vc, bid, ii)) orelse return false;
                 if (step == .next_inst) continue;
             }
-            // Member call to a small `this`-field/scalar method: inline it.
-            // Only for a loop-invariant receiver — inlining resolves one method
-            // body, so a varying (polymorphic) receiver must keep dynamic dispatch.
+            // A member call inlines only for a loop-invariant receiver: inlining resolves one body.
             if (trampolinableMemberOf(module, inst)) |mc| {
                 if (!try inlineMemberCall(ctx, mc, bid, ii)) return false;
             }
@@ -438,9 +411,8 @@ fn collectInlineSites(ctx: *LoopCtx) Allocator.Error!bool {
     return true;
 }
 
-/// A positional top-level call: spliced whole when the callee is a pure scalar
-/// body, or — when it is a member whose receiver the loop rebinds — spliced as a
-/// member over the register the receiver `Move` copies from.
+/// A positional top-level call: spliced whole for a pure scalar callee, or, for a member whose receiver
+/// the loop rebinds, over the register the receiver `Move` copies from.
 fn inlineStaticCall(ctx: *LoopCtx, tc: anytype, bid: BlockId, ii: usize) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -466,13 +438,8 @@ fn inlineStaticCall(ctx: *LoopCtx, tc: anytype, bid: BlockId, ii: usize) Allocat
         if (ctx.total_regs > 4096) return false;
         return true;
     }
-    // `node.m()` on a receiver the loop REBINDS each iteration
-    // lowers to a static call with the receiver moved into arg 0.
-    // Lowering already chose the body, so the splice needs no
-    // dispatch guard; its `this`-field accesses ride whatever the
-    // receiver register holds on the iteration that runs them.
-    // Without this the call is a plain trampoline the callee
-    // clause refuses outright, and the whole loop goes with it.
+    // `node.m()` on a receiver the loop REBINDS lowers to a static call with the receiver in arg 0, and
+    // lowering already chose the body, so the splice needs no dispatch guard.
     if (field_resolver != null and tc.n_args >= 1) blk2: {
         var this_reg: u32 = 0;
         if (!inlinableMemberCallee(module, callee, &this_reg)) break :blk2;
@@ -502,9 +469,8 @@ fn inlineStaticCall(ctx: *LoopCtx, tc: anytype, bid: BlockId, ii: usize) Allocat
     return true;
 }
 
-/// A virtual call: either one guarded arm per class the receiver's container
-/// holds, or — for a loop-invariant receiver — the monomorphic slot target
-/// spliced like a member call.
+/// A virtual call: one guarded arm per class the receiver's container holds, or, for a loop-invariant
+/// receiver, the monomorphic slot target spliced like a member call.
 fn inlineVirtualCall(ctx: *LoopCtx, vc: anytype, bid: BlockId, ii: usize) Allocator.Error!?InlineStep {
     const a = ctx.a;
     const module = ctx.module;
@@ -519,10 +485,8 @@ fn inlineVirtualCall(ctx: *LoopCtx, vc: anytype, bid: BlockId, ii: usize) Alloca
     blk: {
         if (virt_resolver == null or field_resolver == null) break :blk;
         if (vc.recv.int() >= regs.len or regs[vc.recv.int()] != .Instance) break :blk;
-        // A receiver the loop REWRITES each iteration is specialized
-        // per class instead: enumerate what its container holds and
-        // give each class an arm, guarded at run time. The call still
-        // registers its trampoline site, which the final miss uses.
+        // A receiver the loop REWRITES is specialized per class: each class its container holds gets a
+        // run-time-guarded arm, and the call still registers the site its final miss uses.
         if (regWrittenInBody(func, body, vc.recv)) {
             var reps_buf: [MAX_RECV_CLASSES]Value = undefined;
             const reps = receiverClassSet(func, body, vc.recv.int(), regs, &reps_buf) orelse break :blk;
@@ -533,9 +497,7 @@ fn inlineVirtualCall(ctx: *LoopCtx, vc: anytype, bid: BlockId, ii: usize) Alloca
                 var athis: u32 = 0;
                 if (!inlinableMemberCallee(module, acallee, &athis)) break :blk;
                 if (acallee.params.len != @as(usize, vc.n_args) + 1) break :blk;
-                // An arm that touches `this`-fields would need its
-                // field sites rebound to the base this guard loads
-                // per iteration; that is not built yet.
+                // An arm touching `this`-fields would need its field sites rebound to the base the guard loads.
                 for (acallee.blocks[0].insts) |*ci| {
                     if (trampolinableFieldOf(module, ci) != null or
                         trampolinableFieldSetOf(module, ci) != null) break :blk;
@@ -606,8 +568,7 @@ fn inlineVirtualCall(ctx: *LoopCtx, vc: anytype, bid: BlockId, ii: usize) Alloca
     return .fall_through;
 }
 
-/// A dynamic member call on a loop-invariant instance receiver: resolve it
-/// against the live receiver and splice the method body.
+/// A dynamic member call on a loop-invariant instance receiver, resolved against the live receiver.
 fn inlineMemberCall(ctx: *LoopCtx, mc: anytype, bid: BlockId, ii: usize) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -623,12 +584,7 @@ fn inlineMemberCall(ctx: *LoopCtx, mc: anytype, bid: BlockId, ii: usize) Allocat
     if (resolver == null or field_resolver == null) return true;
     if (mc.recv.int() >= regs.len or regs[mc.recv.int()] != .Instance) return true;
     if (regWrittenInBody(func, body, mc.recv)) return true;
-    // The resolver reads every argument it is handed, so the
-    // buffer must be FULLY filled at the length passed: a
-    // partial fill handed over at `n_args` let it read
-    // undefined Values, and a call past the buffer sliced off
-    // the end of it. Decline both rather than resolve on a
-    // truncated list, which could select another overload.
+    // The resolver reads every argument handed to it, so a truncated list could select another overload.
     var av: [6]Value = undefined;
     if (mc.n_args > av.len) return true;
     if (@as(usize, mc.args_reg) + mc.n_args > regs.len) return true;
@@ -638,9 +594,8 @@ fn inlineMemberCall(ctx: *LoopCtx, mc: anytype, bid: BlockId, ii: usize) Allocat
     var this_reg: u32 = 0;
     if (!inlinableMemberCallee(module, callee, &this_reg)) return true;
     if (callee.params.len != @as(usize, mc.n_args) + 1) return true; // receiver + args
-    // If the method writes a field, every field it reads must be a
-    // non-nullable scalar so the read can never deopt — otherwise a
-    // deopt would re-run the call and double an already-applied write.
+    // If the method writes a field, every field it reads must be a non-nullable scalar: a deopt would re-run
+    // the call and double an applied write.
     var has_write = false;
     for (callee.blocks[0].insts) |*ci| {
         if (trampolinableFieldSetOf(module, ci) != null) has_write = true;
@@ -678,9 +633,7 @@ fn inlineMemberCall(ctx: *LoopCtx, mc: anytype, bid: BlockId, ii: usize) Allocat
     return true;
 }
 
-/// The splice claims [n_regs .. total_regs) for the inlined callees' registers,
-/// so the array caches, provisionally placed straight after the loop's own
-/// registers, move above it.
+/// The splice claims [n_regs .. total_regs), so the array caches move above the loop's registers.
 fn shiftArrayCaches(ctx: *LoopCtx) void {
     const n_regs = ctx.n_regs;
     const total_regs = ctx.total_regs;
@@ -699,10 +652,8 @@ fn shiftArrayCaches(ctx: *LoopCtx) void {
     }
 }
 
-/// Discover capture cells, specializing on the scalar kind each box holds in
-/// the live frame. The cached scalar reuses the cell register's own slot, so
-/// no extra slots are needed. Reject if two cell registers alias the same box
-/// (caching + write-back would diverge from the shared-box interpreter).
+/// Discovers capture cells, specializing on the kind each box holds live; the cached scalar reuses the cell
+/// register's own slot. Two cell registers aliasing one box are rejected, write-back diverging otherwise.
 fn discoverCells(ctx: *LoopCtx) Allocator.Error!bool {
     const a = ctx.a;
     const func = ctx.func;
@@ -740,8 +691,7 @@ fn discoverCells(ctx: *LoopCtx) Allocator.Error!bool {
     return true;
 }
 
-/// Resolve each dynamic member call's result type against its live receiver;
-/// exact member calls carry the declaration identity in IR.
+/// Resolves each dynamic member call's result type against its live receiver.
 fn sampleRuntimeTypes(ctx: *LoopCtx) Allocator.Error!bool {
     const module = ctx.module;
     const func = ctx.func;
@@ -760,10 +710,8 @@ fn sampleRuntimeTypes(ctx: *LoopCtx) Allocator.Error!bool {
                 if (!sampleFieldResult(ctx, fld)) return false;
                 continue;
             }
-            // Object collection subscript / map subscript: a `get`/`set` on a
-            // non-packed receiver. A `Map` receiver routes to the map paths; a
-            // `List`/reference `Array` element that is an instance routes to the
-            // object subscript.
+            // Object or map subscript on a non-packed receiver: a `Map` routes to the map paths, an instance element
+            // to the object subscript.
             if (arrayOpOf(module, inst)) |op| {
                 if (!sampleSubscriptResult(ctx, op)) return false;
             }
@@ -799,9 +747,8 @@ fn sampleMemberResult(ctx: *LoopCtx, mc: anytype) bool {
             }
         }
     }
-    // Intrinsic/callable/continuation receivers have no FuncId to
-    // inspect. Specialize the boxed result from the live loop state;
-    // the callback validates that kind on every invocation.
+    // Intrinsic, callable and continuation receivers have no FuncId to inspect: the boxed result is specialized
+    // from live state, and the callback validates that kind per invocation.
     if (mc.dst.int() < n_regs and member_ret[mc.dst.int()] == .unknown and mc.dst.int() < regs.len) {
         if (liveValueRegType(regs[mc.dst.int()])) |rt| member_ret[mc.dst.int()] = rt;
     }
@@ -816,10 +763,7 @@ fn sampleVirtualResult(ctx: *LoopCtx, vc: anytype) bool {
     const resolver_user = ctx.resolver_user;
     const member_ret = ctx.member_ret;
     if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return false;
-    // Resolve the slot's target on the live receiver for a precise
-    // return type (also what the inline path splices); fall back to
-    // the live loop state — the callback's result write validates
-    // the kind on every invocation.
+    // Resolve the slot's target on the live receiver for a precise return type, else fall back to live state.
     if (vc.dst.int() < n_regs and regs[vc.recv.int()] == .Instance and virt_resolver != null) {
         if (virt_resolver.?(resolver_user.?, &regs[vc.recv.int()], vc.slot)) |fid| {
             if (module.funcById(fid)) |f| {
@@ -853,9 +797,8 @@ fn sampleFieldResult(ctx: *LoopCtx, fld: anytype) bool {
     const g = regs[fld.recv.int()].Instance.borrow();
     const fv: ?Value = if (idx < g.get().fields.items.len) g.get().fields.items[idx].value else null;
     g.deinit();
-    // A scalar field types its dst as that scalar; an instance field
-    // types it `.object` (the read writes the boxed value into regs). A
-    // null/unclassifiable snapshot is transient — retry later.
+    // A scalar field types its dst as that scalar and an instance field as `.object`; a null or unclassifiable
+    // snapshot is transient.
     const rt = if (fv) |v| (liveValueRegType(v) orelse {
         transient.* = true;
         return false;
@@ -879,8 +822,7 @@ fn sampleSubscriptResult(ctx: *LoopCtx, op: anytype) bool {
     if (op.recv.int() >= n_regs or array_info[op.recv.int()] != null) return true; // packed -> native
     if (op.recv.int() >= regs.len) return false;
     if (regs[op.recv.int()] == .Map) {
-        // Map get types its dst as a nullable scalar (the value type);
-        // map set has no result. Key/value must be scalar.
+        // Map get types its dst as a nullable scalar; map set has no result. Key and value must be scalar.
         const vt = liveMapValueType(regs[op.recv.int()]) orelse {
             transient.* = true; // empty map snapshot or non-scalar value
             return false;
@@ -911,8 +853,8 @@ fn sampleSubscriptResult(ctx: *LoopCtx, op: anytype) bool {
     return true;
 }
 
-/// Whole-function type inference must run before liveness so the read/def sets
-/// can recognize object registers (held in `regs`, not slots) and exclude them.
+/// Type inference runs before liveness so the read/def sets can exclude object registers, which live in
+/// `regs` rather than slots.
 fn inferLoopTypes(ctx: *LoopCtx) Allocator.Error!?[]RegType {
     const a = ctx.a;
     const module = ctx.module;
@@ -940,10 +882,8 @@ fn inferLoopTypes(ctx: *LoopCtx) Allocator.Error!?[]RegType {
     return types;
 }
 
-/// Original value kind each `.i32` register boxes back to (see `box_tags`).
-/// Live-in registers keep their sampled kind; an in-loop definition
-/// overrides it — `Int` unless the defining instruction names the kind (a
-/// resolved callee's declared `Char`/`Short`/`Byte` return, a `Const`).
+/// Original value kind each `.i32` register boxes back to: a live-in register keeps its sampled kind,
+/// an in-loop definition overrides it with `Int` unless the instruction names the kind.
 fn computeBoxTags(ctx: *LoopCtx) void {
     const module = ctx.module;
     const func = ctx.func;
@@ -1002,9 +942,7 @@ fn computeBoxTags(ctx: *LoopCtx) void {
     }
 }
 
-/// A cell register's slot caches a scalar, so it must not be read or written
-/// as a plain scalar anywhere in the loop (only via CellGet/CellSet). Reject
-/// if any other instruction (or a branch cond) touches a cell register.
+/// A cell register's slot caches a scalar, so only CellGet/CellSet may touch it; any other read rejects the loop.
 fn rejectsCellAliasUse(ctx: *const LoopCtx) bool {
     const module = ctx.module;
     const func = ctx.func;
@@ -1032,8 +970,6 @@ fn rejectsCellAliasUse(ctx: *const LoopCtx) bool {
     return false;
 }
 
-/// Live-in / live-out scalar registers for the loop, extended with the inlined
-/// callees' scratch registers.
 fn computeLoopSets(ctx: *LoopCtx) Allocator.Error!?LoopSets {
     const a = ctx.a;
     const module = ctx.module;
@@ -1051,8 +987,7 @@ fn computeLoopSets(ctx: *LoopCtx) Allocator.Error!?LoopSets {
             a.free(s.read);
             a.free(s.def);
         }
-        // Extend with the inlined-callee registers (always scratch: never unboxed
-        // from or reboxed to the frame's register array).
+        // Inlined-callee registers are always scratch: never unboxed from or reboxed to the frame array.
         const rd = a.alloc(bool, total_regs) catch return null;
         @memset(rd, false);
         @memcpy(rd[0..n_regs], s.read);
@@ -1064,27 +999,22 @@ fn computeLoopSets(ctx: *LoopCtx) Allocator.Error!?LoopSets {
     return sets;
 }
 
-/// Registers that do not live in a scalar slot leave the read/def sets: array
-/// receivers are unboxed as arrays, cells ride their box, and object registers
-/// stay in the frame's GC-rooted register array.
+/// Registers not living in a scalar slot leave the read/def sets: array receivers unbox as arrays, cells
+/// ride their box, object registers stay in the frame's GC-rooted array.
 fn excludeNonScalarFromSets(ctx: *LoopCtx) void {
     const n_regs = ctx.n_regs;
     const types = ctx.types;
     const sets = ctx.sets;
     const arrays = &ctx.arrays;
     const cells = &ctx.cells;
-    // Array-receiver regs are unboxed as arrays, not scalars; exclude them from
-    // the scalar read/def sets and the scalar type requirement.
     for (arrays.items) |au| {
         sets.read[au.reg.int()] = false;
         sets.def[au.reg.int()] = false;
     }
-    // Cell regs are unboxed/reboxed through their box, not the scalar sets.
     for (cells.items) |cu| {
         sets.read[cu.reg.int()] = false;
         sets.def[cu.reg.int()] = false;
     }
-    // Object regs live in `regs` (a GC root), never in a slot — exclude them.
     for (0..n_regs) |r| {
         if (types[r] == .object) {
             sets.read[r] = false;
@@ -1093,11 +1023,8 @@ fn excludeNonScalarFromSets(ctx: *LoopCtx) void {
     }
 }
 
-/// Nullable-scalar registers: a register merged from a `null` literal and a
-/// scalar value. It is typed as its scalar kind but may hold null at run time,
-/// tracked by a companion flag slot. Detect them (a `Move` from a `Const null`
-/// into a scalar-typed register) and exclude from the scalar read/def sets —
-/// a flag-aware unbox/rebox replaces the plain scalar one.
+/// Nullable-scalar registers: a scalar kind that may hold null, tracked by a companion flag slot and kept
+/// out of the scalar read/def sets.
 fn collectNullables(ctx: *LoopCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -1127,7 +1054,6 @@ fn collectNullables(ctx: *LoopCtx) Allocator.Error!bool {
             }
         };
     }
-    // A `Map[key]` result is also a nullable scalar.
     for (0..n_regs) |r| {
         if (map_get_dst[r] and isScalarRt(types[r])) nullable[r] = true;
     }
@@ -1140,7 +1066,6 @@ fn collectNullables(ctx: *LoopCtx) Allocator.Error!bool {
     return true;
 }
 
-/// A register the loop reads or writes as a scalar must have a known kind.
 fn rejectsUnknownScalarRegs(ctx: *const LoopCtx) bool {
     const func = ctx.func;
     const n_regs = ctx.n_regs;
@@ -1155,13 +1080,9 @@ fn rejectsUnknownScalarRegs(ctx: *const LoopCtx) bool {
     return false;
 }
 
-/// `c.bump(1)` lowers to a static call with the receiver MOVED into arg 0.
-/// When that receiver is a loop-invariant instance and the callee is a
-/// deopt-free compiled method, the loop calls straight into its code — so
-/// neither the Move nor the call may be registered as a trampoline site.
-/// Found before registration because the Move precedes the call.
-/// A direct call jumps straight into the callee's code, so nothing re-seeds the
-/// array cache on the way back; those loops keep the trampoline.
+/// `c.bump(1)` lowers to a static call with the receiver MOVED into arg 0. When that receiver is a
+/// loop-invariant instance and the callee a deopt-free compiled method, the loop calls straight into its code,
+/// so neither Move nor call becomes a trampoline site. A loop that indexes arrays keeps the trampoline.
 fn collectDirectCallPre(ctx: *LoopCtx, direct_pre: *std.ArrayList(DirectPre)) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -1202,12 +1123,8 @@ fn collectDirectCallPre(ctx: *LoopCtx, direct_pre: *std.ArrayList(DirectPre)) Al
     return true;
 }
 
-/// Collect and validate trampolined call sites. A call may run arbitrary code
-/// (and a GC), so a loop that also indexes arrays is rejected: the array buffer
-/// pointer is cached in a slot and a callee could resize the backing store,
-/// leaving the cache stale. Capture cells are safe to combine with calls — the
-/// callee receives reboxed scalar args, never a reference to the caller's box,
-/// and the cached scalar lives in a slot written back only at loop exit.
+/// Collects and validates trampolined call sites. A call may run arbitrary code and a GC, so a loop that also
+/// indexes arrays is rejected: a callee could leave the cached buffer pointer stale. Capture cells are safe.
 fn appendCallSiteFor(ctx: *LoopCtx, inst: *const ir.Inst, bid: BlockId, i: usize, blk_insts: []const ir.Inst) Allocator.Error!bool {
     const module = ctx.module;
     const func = ctx.func;
@@ -1215,12 +1132,9 @@ fn appendCallSiteFor(ctx: *LoopCtx, inst: *const ir.Inst, bid: BlockId, i: usize
     const n_regs = ctx.n_regs;
     const types = ctx.types;
     const skip_call_insts = &ctx.skip_call_insts;
-    // Consumed by a direct call: neither the receiver Move nor the call
-    // itself reaches the host.
+    // Consumed by a direct call: neither the receiver Move nor the call itself reaches the host.
     if (skipCallAt(skip_call_insts.items, bid.int(), @intCast(i))) return true;
-    // Same inline forms as the function tier: registering one as a
-    // member/virtual site trampolines to the host once per iteration
-    // for two instructions' worth of work.
+    // Same inline forms as the function tier: a site here would trampoline once per iteration.
     if (nativeScalarCallShape(module, inst, types, n_regs)) return true;
     const is_call = trampolinableCallOf(inst) != null;
     const is_member = trampolinableMemberOf(module, inst) != null;
@@ -1263,8 +1177,7 @@ fn appendCallSiteFor(ctx: *LoopCtx, inst: *const ir.Inst, bid: BlockId, i: usize
             break;
         }
     }
-    // Per-arg live-tag source through the move chain (see
-    // `CallSite.arg_tag_regs`).
+    // Per-arg live-tag source through the move chain (see `CallSite.arg_tag_regs`).
     var arg_tag_regs: [6]u32 = .{ 0, 0, 0, 0, 0, 0 };
     {
         var q: u8 = 0;
@@ -1332,7 +1245,6 @@ fn appendMapSetSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator.E
     const bid = at.bid;
     const i = at.i;
     const span = at.span;
-    // Map store `map[key] = value` (loop-invariant map, scalar key+value).
     const op = arrayOpOf(module, inst).?;
     if (op.recv.int() >= n_regs or op.index.int() >= n_regs or op.value.int() >= n_regs) return false;
     if (!isScalarRt(typeAt(types, op.index)) or !isScalarRt(typeAt(types, op.value))) return false;
@@ -1361,7 +1273,6 @@ fn appendMapGetSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator.E
     const bid = at.bid;
     const i = at.i;
     const span = at.span;
-    // Map load `map[key]` -> nullable scalar (loop-invariant map, scalar key).
     const op = arrayOpOf(module, inst).?;
     if (op.recv.int() >= n_regs or op.index.int() >= n_regs or op.dst.int() >= n_regs) return false;
     if (!isScalarRt(typeAt(types, op.index))) return false;
@@ -1391,7 +1302,6 @@ fn appendCallValueSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocato
     const i = at.i;
     const span = at.span;
     const arg_tag_regs = at.arg_tag_regs;
-    // Invoke a loop-invariant callable value; the result is discarded.
     const cvc = trampolinableCallValueOf(inst).?;
     if (cvc.callee.int() >= n_regs or cvc.callee.int() >= regs.len) return false;
     if (!isCallableValue(regs[cvc.callee.int()])) return false;
@@ -1412,9 +1322,7 @@ fn appendCallValueSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocato
     return true;
 }
 
-/// Object collection subscript: a `get` whose element is a boxed
-/// object. The collection is the (loop-invariant) receiver; the
-/// index is a scalar slot register.
+/// Object collection subscript on a loop-invariant receiver, the index a scalar slot register.
 fn appendObjIndexSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -1424,9 +1332,6 @@ fn appendObjIndexSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator
     const bid = at.bid;
     const i = at.i;
     const span = at.span;
-    // Object collection subscript: a `get` whose element is a boxed
-    // object. The collection is the (loop-invariant) receiver; the
-    // index is a scalar slot register.
     const op = arrayOpOf(module, inst).?;
     if (op.recv.int() >= n_regs or op.index.int() >= n_regs or op.dst.int() >= n_regs) return false;
     if (!isScalarRt(typeAt(types, op.index))) return false;
@@ -1444,7 +1349,6 @@ fn appendObjIndexSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator
     return true;
 }
 
-/// Copy a boxed register into another (both live in `regs`).
 fn appendObjMoveSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator.Error!bool {
     const a = ctx.a;
     const n_regs = ctx.n_regs;
@@ -1452,7 +1356,6 @@ fn appendObjMoveSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator.
     const bid = at.bid;
     const i = at.i;
     const span = at.span;
-    // Copy a boxed register into another (both live in `regs`).
     const m = inst.Move;
     if (m.dst.int() >= n_regs or m.src.int() >= n_regs) return false;
     call_sites.append(a, .{
@@ -1466,9 +1369,8 @@ fn appendObjMoveSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator.
     return true;
 }
 
-/// Boxed equality / identity test -> boolean slot. Both operands
-/// stay in the GC-rooted frame (a null literal is synthesized by
-/// the callback rather than read from its unused scalar slot).
+/// Boxed equality or identity test into a boolean slot; both operands stay in the GC-rooted frame,
+/// the callback synthesizing a null literal rather than reading an unused slot.
 fn appendNullCheckSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator.Error!bool {
     const a = ctx.a;
     const n_regs = ctx.n_regs;
@@ -1476,9 +1378,6 @@ fn appendNullCheckSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocato
     const bid = at.bid;
     const i = at.i;
     const span = at.span;
-    // Boxed equality / identity test -> boolean slot. Both operands
-    // stay in the GC-rooted frame (a null literal is synthesized by
-    // the callback rather than read from its unused scalar slot).
     const b = inst.BinOp;
     if (b.lhs.int() >= n_regs or b.rhs.int() >= n_regs or b.dst.int() >= n_regs) return false;
     call_sites.append(a, .{
@@ -1512,10 +1411,8 @@ fn appendFieldSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocator.Er
     const span = at.span;
     const fld = trampolinableFieldOf(module, inst).?;
     if (fld.recv.int() >= n_regs or fld.recv.int() >= regs.len or regs[fld.recv.int()] != .Instance) return false;
-    // A receiver the loop REASSIGNS (a chain cursor) re-checks its
-    // class on every read and reads through the callback. One the
-    // loop only reads is covered by the entry class guard, so its
-    // field buffer is cached at entry and read directly.
+    // A receiver the loop REASSIGNS re-checks its class per read through the callback; one only read is
+    // covered by the entry guard, so its field buffer is cached at entry.
     const recv_varies = regWrittenInBody(func, body, fld.recv);
     const rrt = member_ret[fld.dst.int()];
     if (rrt == .unknown or fld.dst.int() >= n_regs or types[fld.dst.int()] != rrt) return false;
@@ -1588,7 +1485,6 @@ fn appendStaticCallSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocat
     const i = at.i;
     const span = at.span;
     const arg_tag_regs = at.arg_tag_regs;
-    // An inlined call is emitted in place, not trampolined.
     var inlined = false;
     for (inline_sites.items) |s| {
         if (s.block.int() == bid.int() and s.inst == i) {
@@ -1599,9 +1495,8 @@ fn appendStaticCallSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocat
     if (inlined) return true;
     const tc = trampolinableCallOf(inst).?;
     const f = module.funcById(tc.func) orelse return false;
-    // The callee must run as a plain interpreted call: no suspend
-    // machinery, no implicit receiver to thread, and a REAL body
-    // (a bodyless abstract anchor re-dispatches in the arm).
+    // The callee must run as a plain interpreted call: no suspend machinery, no implicit receiver, and a
+    // REAL body, a bodyless abstract anchor re-dispatching in the arm.
     if (f.is_suspend or f.has_receiver_param or !f.hasBody()) {
         if (debugEnabled()) std.debug.print("[jit]   bail: callee {s} suspend/receiver in {s}\n", .{ f.name, func.name });
         return false;
@@ -1638,9 +1533,7 @@ fn appendVirtualCallSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Alloca
     const i = at.i;
     const span = at.span;
     const arg_tag_regs = at.arg_tag_regs;
-    // An inlined virtual call is emitted in place, not trampolined.
-    // Only an UNGUARDED splice consumes the call: guarded arms need
-    // this site as the fallback their final miss jumps to.
+    // Only an UNGUARDED splice consumes the call: guarded arms need this site as their miss fallback.
     var inlined_v = false;
     for (inline_sites.items) |s| {
         if (s.block.int() == bid.int() and s.inst == i and !s.guarded) {
@@ -1651,9 +1544,7 @@ fn appendVirtualCallSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Alloca
     if (inlined_v) return true;
     const vc = trampolinableVirtualOf(inst).?;
     if (vc.recv.int() >= n_regs or vc.recv.int() >= regs.len) return false;
-    // The receiver must be a boxed object register: virtual slots
-    // dispatch on instances, and the host reads it straight from
-    // the frame (no class guard — the dispatch itself is dynamic).
+    // The receiver must be a boxed object register read from the frame; no class guard, dispatch being dynamic.
     if (typeAt(types, vc.recv) != .object and typeAt(types, vc.recv) != .unknown) return false;
     const rrt = member_ret[vc.dst.int()];
     const has_result = rrt != .unknown;
@@ -1689,7 +1580,6 @@ fn appendMemberCallSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocat
     const span = at.span;
     const arg_tag_regs = at.arg_tag_regs;
     const blk_insts = at.blk_insts;
-    // An inlined member call is emitted in place, not trampolined.
     var inlined_m = false;
     for (inline_sites.items) |s| {
         if (s.block.int() == bid.int() and s.inst == i) {
@@ -1703,9 +1593,7 @@ fn appendMemberCallSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocat
     if (mc.dispatch_recv) |dispatch| {
         if (dispatch.int() >= n_regs or dispatch.int() >= regs.len) return false;
     }
-    // A loop-invariant receiver is validated once by the entry guard; a
-    // boxed receiver that varies (a chain cursor) re-checks its class on
-    // every call. Either way the host reads it straight from the frame.
+    // A loop-invariant receiver is validated once at entry; a varying one re-checks its class per call.
     const recv_varies = typeAt(types, mc.recv) == .object;
     const rrt = member_ret[mc.dst.int()];
     const has_result = rrt != .unknown;
@@ -1733,10 +1621,8 @@ fn appendMemberCallSite(ctx: *LoopCtx, inst: *const ir.Inst, at: SiteAt) Allocat
     return true;
 }
 
-/// Register the field-access call sites for each member inline (the body's
-/// `this`-field reads/writes), contiguously, so the inline emit can reference
-/// them by index. They share the call's (block, inst) — a field mismatch deopts
-/// to re-run the call.
+/// Registers each member inline's field sites contiguously, sharing the call's (block, inst), so a
+/// field mismatch deopts to re-run the call.
 fn registerInlineFieldSites(ctx: *LoopCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -1795,8 +1681,7 @@ fn registerInlineFieldSites(ctx: *LoopCtx) Allocator.Error!bool {
     return true;
 }
 
-/// Slot layout for the trampoline control words and one null-flag slot per
-/// nullable-scalar register, after the array and call slots.
+/// Slot layout for the trampoline control words and one null-flag slot per nullable-scalar register.
 fn assignNullFlagSlots(ctx: *LoopCtx, arr_slots: u32) void {
     const func = ctx.func;
     const nullables = &ctx.nullables;
@@ -1813,16 +1698,13 @@ fn assignNullFlagSlots(ctx: *LoopCtx, arr_slots: u32) void {
     }
     ctx.nullable_end = calls_base + @as(u32, @intCast(nullables.items.len));
     if (debugEnabled() and inline_sites.items.len != 0) std.debug.print("[jit]   inlined {d} call(s) in {s}\n", .{ inline_sites.items.len, func.name });
-    // A map-get site writes the nullable result; record its dst's flag slot.
     for (call_sites.items) |*site| {
         if (site.is_map_get) site.map_flag_slot = null_flag_slot[site.dst_reg];
     }
 }
 
-/// Native field access: a loop-invariant scalar field read/write is emitted as a
-/// direct memory access instead of a callback. One field-base pointer slot is
-/// cached per receiver (after the nullable slots); the field's expected Value tag
-/// is sampled from the live instance (a read deopts on a tag mismatch).
+/// Native field access: a loop-invariant scalar field read or write is a direct memory access, one field-base
+/// pointer slot cached per receiver and the expected `Value` tag sampled live, a read deopting on a mismatch.
 fn assignNativeFieldSites(ctx: *LoopCtx) Allocator.Error!bool {
     const a = ctx.a;
     const regs = ctx.regs;
@@ -1837,8 +1719,7 @@ fn assignNativeFieldSites(ctx: *LoopCtx) Allocator.Error!bool {
         const vreg: u32 = if (site.is_field) site.dst_reg else site.src_reg;
         const rt = typeAt(types, Reg.from(vreg));
         if (!isScalarRt(rt)) continue;
-        // A nullable-scalar value uses a companion null-flag the native path does
-        // not manage; keep it on the callback (which syncs the flag).
+        // A nullable-scalar value uses a companion null flag the native path does not manage; keep the callback.
         if (vreg < nullable.len and nullable[vreg]) continue;
         const tag: u8 = blk: {
             const g = regs[site.recv_reg].Instance.borrow();
@@ -1847,7 +1728,6 @@ fn assignNativeFieldSites(ctx: *LoopCtx) Allocator.Error!bool {
             break :blk @intFromEnum(@as(std.meta.Tag(Value), g.get().fields.items[site.field_idx].value));
         };
         if (tag == 0xff) continue;
-        // Reuse an existing base slot for the same receiver.
         var ptr_slot: u32 = 0;
         var found = false;
         for (field_bases.items) |fb| {
@@ -1872,11 +1752,8 @@ fn assignNativeFieldSites(ctx: *LoopCtx) Allocator.Error!bool {
     return true;
 }
 
-/// Point every guarded arm at the trampoline site its final miss falls to.
-/// An arm with no such site would have nowhere to go, so it is dropped and
-/// the call simply trampolines as before. A guarded arm reads its receiver's
-/// `Value` out of the FRAME (objects are not slot-backed), so it also needs the
-/// frame register base in a slot.
+/// Points every guarded arm at the trampoline site its final miss falls to; an arm with no such site
+/// is dropped. A guarded arm reads its receiver from the FRAME, so it needs the register base in a slot.
 fn bindGuardedArmFallbacks(ctx: *LoopCtx) void {
     const inline_sites = &ctx.inline_sites;
     const call_sites = &ctx.call_sites;
@@ -1908,13 +1785,8 @@ fn bindGuardedArmFallbacks(ctx: *LoopCtx) void {
     }
 }
 
-/// A member call on a LOOP-INVARIANT receiver whose target is a deopt-free
-/// compiled method goes straight into that method's code. Loop entry already
-/// proves the receiver's class (`recv_class`) and already caches its field
-/// buffer for native field access, so the call needs no per-iteration guard —
-/// it seeds the callee's argument slots and that cached base, and calls.
-/// Without this the loop paid a host round trip per iteration to reach a body
-/// that was already compiled.
+/// A member call on a LOOP-INVARIANT receiver whose target is a deopt-free compiled method goes
+/// straight into that code: entry already proves the class and caches the field buffer.
 fn buildDirectSitesFromPre(ctx: *LoopCtx, direct_pre: []const DirectPre) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -1979,9 +1851,7 @@ fn buildDirectSitesFromPre(ctx: *LoopCtx, direct_pre: []const DirectPre) Allocat
     return true;
 }
 
-/// The same direct-call route for an already-registered member site whose
-/// resolved target compiles: it replaces that site's per-iteration host round
-/// trip with a call into the callee's own code.
+/// The same direct-call route for an already-registered member site whose resolved target compiles.
 fn buildDirectMemberSites(ctx: *LoopCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -2005,14 +1875,12 @@ fn buildDirectMemberSites(ctx: *LoopCtx) Allocator.Error!bool {
             if (site.recv_reg >= regs.len or regs[site.recv_reg] != .Instance) continue;
             const cf = module.funcById(target) orelse continue;
             if (cf == func) continue;
-            // The emitter reads callee parameter `i` from `args_reg + i`, and a
-            // member site's arguments start at `args_reg`, so the base is biased
-            // by one — it must not wrap.
+            // The emitter reads callee parameter `i` from `args_reg + i` while a member site's arguments start at
+            // `args_reg`, so the base is biased by one and must not wrap.
             if (site.n_args != 0 and site.args_reg == 0) continue;
             const cl = directCallTarget(module, cf, site.n_args + 1, &regs[site.recv_reg], resolver, virt_resolver, field_resolver, field_nn_resolver, resolver_user) orelse continue;
             if (cl.guard_class != site.recv_class) continue;
-            // Arguments live in typed scalar slots and must be the kinds the
-            // callee was specialized on; the result likewise.
+            // Arguments live in typed scalar slots and must be the kinds the callee was specialized on.
             var ok_args = true;
             var k: u32 = 0;
             while (k < site.n_args) : (k += 1) {
@@ -2022,7 +1890,6 @@ fn buildDirectMemberSites(ctx: *LoopCtx) Allocator.Error!bool {
             if (!ok_args) continue;
             const wants_result = site.has_result and site.dst_reg < n_regs and isScalarRt(typeAt(types, Reg.from(site.dst_reg)));
             if (wants_result and typeAt(types, Reg.from(site.dst_reg)) != cl.result_rt) continue;
-            // Reuse (or mint) the loop-entry field base for this receiver.
             var base_slot: u32 = 0;
             var have_base = false;
             for (field_bases.items) |fb| {
@@ -2070,8 +1937,7 @@ fn buildDirectMemberSites(ctx: *LoopCtx) Allocator.Error!bool {
     return true;
 }
 
-/// Run the emitter over the validated loop and package the machine code with
-/// the side tables its trampoline sites read.
+/// Runs the emitter over the validated loop and packages the code with the side tables its sites read.
 fn emitLoop(ctx: *LoopCtx) Allocator.Error!?CompiledLoop {
     const a = ctx.a;
     const module = ctx.module;
@@ -2171,8 +2037,7 @@ fn emitLoop(ctx: *LoopCtx) Allocator.Error!?CompiledLoop {
     ctx.tags_ok = true;
     return CompiledLoop{
         .exec = exec,
-        // Inlined-callee registers extend the register space; the unbox/rebox
-        // loops range over all of them (the inline ones are scratch — skipped).
+        // Inlined-callee registers extend the register space; the unbox/rebox loops skip them as scratch.
         .n_regs = total_regs,
         .n_slots = n_slots,
         .reg_types = types,

@@ -1,6 +1,5 @@
-//! The whole-file lowering pass: registers every top-level declaration of
-//! a file set, then lowers each body into its reserved slot, resolving
-//! declarations through the per-declaration FQN override maps.
+//! The whole-file lowering pass: every top-level declaration of a file set is registered,
+//! then each body lowers into its reserved slot through the per-declaration FQN overrides.
 
 const std = @import("std");
 
@@ -99,28 +98,19 @@ const StrPair = build_types.StrPair;
 const StrPairContext = build_types.StrPairContext;
 const StrPairSet = build_types.StrPairSet;
 
-// -------------------------------------------------------------------------
-// The whole-file lowering pass.
-// -------------------------------------------------------------------------
 
-/// The alias a mangled pack-private object needs under every class that
-/// declares a namesake in the object's own package.
+/// The alias a mangled pack-private object needs under every class declaring a namesake.
 const PendingAlias = struct { cls: []const u8, simple: []const u8, mangled: []const u8 };
 
-/// An extension property awaiting lowering, with the declaration that
-/// owns it (`null` for a file-level one).
+/// An extension property awaiting lowering; `owner` is null for a file-level one.
 const ExtPropDecl = struct { p: *const ast.Property, owner: ?[]const u8, owner_type_params: []const ast.TypeParam = &.{} };
 
-/// The state one whole-file lowering pass threads through its phases.
-///
-/// The driver builds one of these and hands every phase a pointer to it.
-/// A value lives here only when more than one phase reads or writes it;
-/// scratch that a single phase owns stays a local of that phase.
+/// The state a whole-file lowering pass threads through its phases; a value lives here only
+/// when more than one phase reads or writes it.
 const BuildCtx = struct {
     /// The caller's allocator, which owns the returned `BuiltModule`.
     allocator: Allocator,
-    /// The module registry's allocator: the backing of every build-scoped
-    /// table, typically a per-run arena.
+    /// The module registry's allocator, backing every build-scoped table.
     a: Allocator,
     module_ref: ObjRef(Module),
     module: *Module,
@@ -130,12 +120,10 @@ const BuildCtx = struct {
     decl_pkg: *const SpanStrMap,
     base: ?*const StdlibBase,
     package_prefix: []const u8,
-    /// Funcs and object names the seed clone already carried; the registry
-    /// materialisation appends only past these marks.
+    /// Marks from the seed clone: registry materialisation appends only past these.
     base_funcs_len: usize,
     base_object_names_len: usize,
 
-    // The lift-time universe, settled before any registration.
     object_names: std.ArrayList([]const u8),
     object_spans: std.ArrayList(Span),
     nested_outer_members: lift.OuterMembers,
@@ -146,7 +134,6 @@ const BuildCtx = struct {
     expect_class_ctor_params: std.StringHashMap([]const ast.ClassParam),
     expect_class_members: std.StringHashMap([]const Decl),
 
-    /// The retained declarations every registration and lowering phase walks.
     decls: []Decl,
     /// Every class in scope: the base's plus this file set's.
     file_classes: FileClasses,
@@ -155,7 +142,6 @@ const BuildCtx = struct {
     /// Runtime class defs this build created, for the supertype backpatch.
     new_defs: std.ArrayList(ObjRef(ClassDef)),
 
-    // The side tables the built module carries.
     main_id: ?FuncId,
     classes: ClassTable,
     companion_singletons: std.StringHashMap([]const u8),
@@ -195,14 +181,10 @@ const BuildCtx = struct {
         file_modules: ?*const std.AutoHashMap(ir.FileId, u32),
         base: ?*const StdlibBase,
     ) Allocator.Error!BuildCtx {
-        // Extending build: start from a per-run clone of the base's lowered
-        // module and side tables; `file` then carries ONLY the user decls and
-        // every pass below appends on top of the seeded state.
         var seed: ?BuiltModule = if (base) |bs| try cloneBuiltForRun(allocator, &bs.built) else null;
         const module_ref = if (seed) |*s| s.module else try ObjRef(Module).init(allocator, Module.default(allocator));
-        // The ObjRef holds the only handle during the build and nothing else
-        // borrows it, so a raw pointer into the cell is a stable `*Module` for
-        // the lowering driver.
+        // The ObjRef holds the only handle during the build and nothing else borrows it, so a
+        // raw pointer into the cell is a stable `*Module` for the lowering driver.
         const module: *Module = &module_ref.cell.data;
         const a = module.registry.allocator;
         const base_funcs_len = module.funcs.items.len;
@@ -223,9 +205,8 @@ const BuildCtx = struct {
         const base_object_names_len = object_names.items.len;
         var nested_object_aliases = lift.AliasMap.init(a);
         if (base != null) {
-            // Seed the lift-time alias/mangle context from the cloned registry
-            // so user classes can extend base nested/mangled shapes. Inner maps
-            // are deep-copied: the lift loop appends into them per class key.
+            // The lift-time alias context seeds from the cloned registry so user classes can extend base
+            // nested shapes; inner maps are deep-copied, the lift appending per class key.
             var it = module.registry.nested_object_aliases.iterator();
             while (it.next()) |e| {
                 var inner = std.StringHashMap([]const u8).init(a);
@@ -295,8 +276,7 @@ const BuildCtx = struct {
         };
     }
 
-    /// Release what exists only for the length of the build; every table
-    /// the returned `BuiltModule` carries survives.
+    /// Release what exists only for the build; every table the `BuiltModule` carries survives.
     fn deinitScratch(self: *BuildCtx) void {
         self.object_spans.deinit(self.a);
         self.mangled_nested.deinit();
@@ -307,7 +287,6 @@ const BuildCtx = struct {
         self.new_defs.deinit(self.a);
     }
 
-    /// Hand the finished module and its side tables to the caller.
     fn finish(self: *BuildCtx) BuiltModule {
         return .{
             .module = self.module_ref,
@@ -368,17 +347,13 @@ pub fn buildModuleWithOverrides(
     );
     defer ctx.deinitScratch();
 
-    // Lift nested declarations to the top level, then settle the
-    // expect/actual substitutions; what survives is the declaration set
-    // every pass below walks.
     try liftFileDecls(&ctx);
     try repointMangledSupertypes(&ctx);
     try repointAliasedNestedSupertypes(&ctx);
     try applyExpectActualSubstitutions(&ctx, out_lifted);
 
-    // Register every declaration's identity and metadata. Nothing here
-    // lowers a body, so a body lowered below sees complete tables however
-    // its declaration is ordered in the source.
+    // Register every declaration's identity and metadata. Nothing here lowers a body, so a
+    // body lowered below sees complete tables however its declaration is ordered in source.
     try collectFileClasses(&ctx);
     try registerConstInitializers(&ctx);
     try registerHierarchyMethodNames(&ctx);
@@ -397,10 +372,8 @@ pub fn buildModuleWithOverrides(
     try reserveClassMemberHeaders(&ctx);
     try registerTypeAliasShapes(&ctx);
     try registerClassTypeAliasShapes(&ctx);
-    // Member signatures need the same source-order independence as top-level
-    // headers. Record the trailing receiver-lambda portion now, before any
-    // class body lowers, so inherited calls in earlier source files still
-    // receive their declaration-site lambda shape.
+    // Member signatures need the same source-order independence as top-level headers: the
+    // trailing receiver-lambda portion is recorded before any class body lowers.
     try collectMemberTrailingLambdaShapes(ctx.module, &ctx.file_classes);
     try fillReservedClassPrimaryParams(&ctx);
     try registerTopLevelFuncHeaders(&ctx);
@@ -431,12 +404,8 @@ pub fn buildModuleWithOverrides(
     return ctx.finish();
 }
 
-// -------------------------------------------------------------------------
-// Lifting and expect/actual substitution.
-// -------------------------------------------------------------------------
 
-/// Flatten the file set's nested declarations into `all_decls`, mangling
-/// the pack-private objects whose simple names collide with a user type.
+/// Flatten nested declarations into `all_decls`, mangling pack-private objects that collide.
 fn liftFileDecls(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const file = ctx.file;
@@ -458,8 +427,6 @@ fn liftFileDecls(ctx: *BuildCtx) Allocator.Error!void {
         }
     }
 
-    // User (package-less) top-level type names, used to detect pack-private
-    // object name collisions.
     var user_top_type_names = StringSet.init(a);
     defer user_top_type_names.deinit();
     for (file.decls) |*d| {
@@ -495,8 +462,7 @@ fn liftFileDecls(ctx: *BuildCtx) Allocator.Error!void {
         }
     }
 
-    // True top-level type names (any package), used to mangle nested types
-    // that would collide.
+    // True top-level type names in any package, used to mangle colliding nested types.
     var top_level_type_names = StringSet.init(a);
     defer top_level_type_names.deinit();
     if (base) |bs| {
@@ -532,7 +498,6 @@ fn liftFileDecls(ctx: *BuildCtx) Allocator.Error!void {
         .dup_nested_names = &dup_nested_names,
     };
 
-    // Pending aliases for mangled pack-private objects.
     var pending_object_aliases: std.ArrayList(PendingAlias) = .empty;
     defer pending_object_aliases.deinit(a);
 
@@ -559,7 +524,6 @@ fn liftFileDecls(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Lift one top-level `object`, synthesising the class that backs it.
 fn liftTopLevelObject(
     ctx: *BuildCtx,
     lift_ctx: *lift.LiftCtx,
@@ -605,8 +569,7 @@ fn liftTopLevelObject(
     try all_decls.append(a, .{ .Class = synth });
 }
 
-/// Lift one top-level `class`, recording the defaults of an `expect` the
-/// file's own `actual` supersedes.
+/// Lift one top-level `class`, recording the defaults of an `expect` its `actual` supersedes.
 fn liftTopLevelClass(
     ctx: *BuildCtx,
     lift_ctx: *lift.LiftCtx,
@@ -642,12 +605,10 @@ fn liftTopLevelClass(
     try all_decls.append(a, d.*);
 }
 
-/// Repoint supertype references onto the mangled name a nested class took.
 fn repointMangledSupertypes(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const all_decls = &ctx.all_decls;
     const mangled_nested = &ctx.mangled_nested;
-    // Repoint supertype references to a nested class that was mangled.
     if (mangled_nested.count() != 0) {
         for (all_decls.items) |*d| {
             if (d.* == .Class) {
@@ -661,16 +622,11 @@ fn repointMangledSupertypes(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Repoint a bare supertype reference onto the alias its declaring
-/// class's subtree sees for a mangled private nested class.
 fn repointAliasedNestedSupertypes(ctx: *BuildCtx) Allocator.Error!void {
     const all_decls = &ctx.all_decls;
     const enclosing_class = &ctx.enclosing_class;
     const nested_object_aliases = &ctx.nested_object_aliases;
-    // Repoint bare supertype references to a mangled private nested class
-    // from inside its declaring class's subtree: a lifted member whose
-    // enclosing chain reaches the aliasing outer sees the alias, exactly
-    // the scope Kotlin gives the private nested declaration.
+    // A lifted member whose enclosing chain reaches the aliasing outer sees the alias.
     if (nested_object_aliases.count() != 0) {
         for (all_decls.items) |*d| {
             if (d.* != .Class) continue;
@@ -693,15 +649,13 @@ fn repointAliasedNestedSupertypes(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Transplant every `expect` declaration's defaults onto the `actual`
-/// that supersedes it, then drop the superseded declarations.
+/// Transplant each `expect`'s defaults onto the `actual` that supersedes it, then drop it.
 fn applyExpectActualSubstitutions(ctx: *BuildCtx, out_lifted: ?*[]Decl) Allocator.Error!void {
     const a = ctx.a;
     const package_prefix = ctx.package_prefix;
     const fqn_overrides = ctx.fqn_overrides;
     const func_fqn_overrides = ctx.func_fqn_overrides;
     const all_decls = &ctx.all_decls;
-    // Pre-collect actual-name sets to drop superseded `expect` decls.
     var actual_func_names = StringSet.init(a);
     defer actual_func_names.deinit();
     var actual_class_names_set = StringSet.init(a);
@@ -712,13 +666,8 @@ fn applyExpectActualSubstitutions(ctx: *BuildCtx, out_lifted: ?*[]Decl) Allocato
     defer actual_prop_names.deinit();
     for (all_decls.items) |*d| {
         switch (d.*) {
-            // An `actual` supersedes the `expect` it implements, which Kotlin
-            // requires to share its package: key the function set by FQN, not
-            // by simple name. Keyed by name, ANY actual killed EVERY same-named
-            // expect in the program — `foundation.text.getString`'s actual
-            // dropped `material3.internal.getString`'s unrelated expect, and
-            // material3's own calls then saw no candidate but foundation's, in
-            // a package they do not import.
+            // An `actual` supersedes the `expect` it implements, which Kotlin requires to share its
+            // package, so the set is keyed by FQN, not by simple name.
             .Function => |*f| if (f.is_actual) {
                 const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
                 try actual_func_names.put(fqn, {});
@@ -745,15 +694,10 @@ fn applyExpectActualSubstitutions(ctx: *BuildCtx, out_lifted: ?*[]Decl) Allocato
     if (out_lifted) |out| out.* = ctx.decls;
 }
 
-/// Carry an `expect fun`'s parameter defaults onto its `actual`.
 fn inheritExpectFunctionDefaults(ctx: *BuildCtx) Allocator.Error!void {
     const all_decls = &ctx.all_decls;
-    // Kotlin declares default parameter values on the `expect` fn ONLY —
-    // the `actual` may not re-declare them and inherits them instead. The
-    // retain pass below drops the superseded expect wholesale, so first
-    // transplant its parameter defaults onto the matching actual (same
-    // name, user arity, and receiver shape); an actual that re-declares a
-    // default keeps its own.
+    // Kotlin declares default parameter values on the `expect` ONLY. The retain pass drops the
+    // superseded expect, so its defaults transplant first; an actual re-declaring one keeps its own.
     for (all_decls.items) |*d| {
         if (d.* != .Function) continue;
         const ef = &d.Function;
@@ -779,18 +723,11 @@ fn inheritExpectFunctionDefaults(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Carry a superseded `expect class`'s primary-constructor defaults onto
-/// the matching `actual class`.
 fn inheritExpectClassCtorDefaults(ctx: *BuildCtx) Allocator.Error!void {
     const all_decls = &ctx.all_decls;
     const expect_class_ctor_params = &ctx.expect_class_ctor_params;
-    // The same inheritance applies to an `expect class`'s primary
-    // constructor: the superseded expect was dropped during collection
-    // (recording its parameter list when it carried defaults), so
-    // transplant those defaults onto the matching `actual class` here
-    // (e.g. ktor's `expect class ConcurrentMap(initialCapacity: Int =
-    // INITIAL_CAPACITY)` makes the no-arg `ConcurrentMap()` shape
-    // construct through the actual).
+    // The superseded expect was dropped during collection, its parameter list recorded, so its
+    // defaults transplant onto the matching `actual class` here.
     if (expect_class_ctor_params.count() != 0) {
         for (all_decls.items) |*d| {
             if (d.* != .Class) continue;
@@ -805,15 +742,11 @@ fn inheritExpectClassCtorDefaults(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Carry a superseded `expect class`'s member defaults onto the
-/// signature-matching members of the `actual class`.
 fn inheritExpectClassMemberDefaults(ctx: *BuildCtx) Allocator.Error!void {
     const all_decls = &ctx.all_decls;
     const expect_class_members = &ctx.expect_class_members;
-    // Member defaults follow the same expect/actual rule as top-level
-    // functions and constructors. The expect class is absent from
-    // `all_decls`, so copy its defaults onto the signature-matching actual
-    // member before class lowering builds default thunks and arity metadata.
+    // The expect class is absent from `all_decls`, so its member defaults copy onto the actual
+    // before class lowering builds thunks and arity metadata.
     if (expect_class_members.count() != 0) {
         for (all_decls.items) |*d| {
             if (d.* != .Class) continue;
@@ -844,22 +777,13 @@ fn inheritExpectClassMemberDefaults(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-// -------------------------------------------------------------------------
-// Declaration registration: every table a body consults is filled here,
-// before the first body lowers.
-// -------------------------------------------------------------------------
 
-/// Map every class in scope by simple name: the base's first, then this
-/// file set's.
 fn collectFileClasses(ctx: *BuildCtx) Allocator.Error!void {
     const base = ctx.base;
     const decls = ctx.decls;
     const file_classes = &ctx.file_classes;
-    // Map every class declaration by simple name. In an extending build the
-    // base's lifted classes join the universe first: hierarchy walks, init
-    // own-member collection and inline splicing for USER classes reach
-    // through base supertypes, while base decls themselves are never
-    // re-lowered (their lowered forms arrived via the seed clone).
+    // In an extending build the base's lifted classes join the universe first, so hierarchy walks
+    // and inline splicing for USER classes reach through base supertypes; base decls never re-lower.
     if (base) |bs| {
         if (bs.file_classes.len != 0) {
             for (bs.file_classes) |kv| try file_classes.put(kv.k, FF(ast.Class).fromRef(kv.v));
@@ -874,11 +798,9 @@ fn collectFileClasses(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Record every class, companion and top-level `const val` literal.
 fn registerConstInitializers(ctx: *BuildCtx) Allocator.Error!void {
     const module = ctx.module;
     const decls = ctx.decls;
-    // Collect class / companion / top-level `const val name = <literal>`.
     {
         for (decls) |*d| {
             switch (d.*) {
@@ -896,21 +818,16 @@ fn registerConstInitializers(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Record each class's transitive member-function-name set.
 fn registerHierarchyMethodNames(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const fqn_overrides = ctx.fqn_overrides;
     const package_prefix = ctx.package_prefix;
     const file_classes = &ctx.file_classes;
-    // Per-class transitive member-function-name set. Seeded base classes
-    // already carry theirs in the cloned registry; only new keys compute.
+    // Per-class transitive member-function-name set; seeded base classes already carry theirs.
     {
-        // A top-level class also records its hierarchy's method names
-        // under its qualified name, so a reader holding the fqn gets an
-        // exact answer when two packages share a simple name (geometry's
-        // `Size` value class and the `androidx.annotation.Size`
-        // annotation). The simple-name entry keeps its first registration.
+        // A class also records its hierarchy's method names under its qualified name, so a reader
+        // holding the fqn gets an exact answer when two packages share a simple name.
         var it = file_classes.iterator();
         while (it.next()) |kv| {
             const cname = kv.key_ptr.*;
@@ -936,18 +853,12 @@ fn registerHierarchyMethodNames(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Record each class's transitive shadow-name set, with the completeness
-/// bit an unresolvable supertype chain leaves clear.
 fn registerHierarchyShadowNames(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const file_classes = &ctx.file_classes;
-    // Per-class transitive shadow-name set (all member kinds) for the
-    // receiver-type-precise member-shadow gate, with the completeness bit
-    // that keeps an unresolvable supertype chain conservative. Lookups fall
-    // back to the program-wide set when a class has no entry (image-loaded
-    // base classes: their method bodies' emissions were baked with the full
-    // tables, so they never consult this).
+    // The completeness bit keeps an unresolvable supertype chain conservative; a class with no
+    // entry falls back to the program-wide set.
     {
         var it = file_classes.keyIterator();
         while (it.next()) |cname| {
@@ -961,15 +872,11 @@ fn registerHierarchyShadowNames(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Record the program-wide set of names some class declares as a member.
 fn registerMemberNameUniverse(ctx: *BuildCtx) Allocator.Error!void {
     const module = ctx.module;
     const decls = ctx.decls;
-    // Program-wide member-name universe: every name some class declares
-    // as a member (function, property, primary-ctor property, companion /
-    // nested-object member). A bare name in a receiver context is only
-    // shadowable at runtime when it appears here, so lowering keeps the
-    // static classification for every other name.
+    // A bare name in a receiver context is shadowable at runtime only when it appears in this
+    // program-wide universe, so lowering keeps every other name static.
     for (decls) |*d| {
         if (d.* == .Class) {
             try collectClassMemberNamesInto(&module.registry.class_member_names, d.Class.primary_params, d.Class.members);
@@ -977,28 +884,16 @@ fn registerMemberNameUniverse(ctx: *BuildCtx) Allocator.Error!void {
             try collectClassMemberNamesInto(&module.registry.class_member_names, &.{}, d.Object.members);
         }
     }
-    // Builtin value-class members no user class declares: the unsigned types'
-    // backing `val data` (UByte/UShort/UInt/ULong). A bare `data` inside an
-    // unsigned extension (`UByte.toHexString = data.toHexString(...)`) is
-    // `this.data`, so it must shadow a same-named cross-package top-level the
-    // way a declared member would — otherwise the stdlib file fails to resolve
-    // whenever a test package happens to declare a top-level `data`.
+    // Builtin value-class members no user class declares: the unsigned types' backing `val data`.
+    // A bare `data` in an unsigned extension is `this.data`, so it must shadow a same-named
+    // cross-package top-level the way a declared member would.
     try module.registry.class_member_names.put("data", {});
 }
 
-/// Record every declaration's property type heads, the static types a
-/// member access on that property resolves against.
 fn registerPropertyTypeHeads(ctx: *BuildCtx) Allocator.Error!void {
     const decls = ctx.decls;
-    // Per-class property DECLARED type heads, with class type-parameter
-    // names substituted by their bound's head (`data: T` in
-    // `IterableTests<T : Iterable<String>>` records `Iterable`; an
-    // init-inferred property takes the declared return type of the member
-    // function its initializer calls, or the constructed class's head when
-    // the initializer / getter single-expression is a constructor call —
-    // `object Nodes { inline val Traversable get() = NodeKind<T>(...) }`
-    // records `NodeKind`). A call on the property then resolves against
-    // the STATIC type, as kotlinc does.
+    // Per-class property DECLARED type heads, class type-parameter names substituted by their
+    // bound's head, so a call on the property resolves against the STATIC type, as kotlinc does.
     for (decls) |*d| {
         if (d.* == .Class) {
             try registerClassPropTypeHeads(ctx, &d.Class);
@@ -1008,7 +903,6 @@ fn registerPropertyTypeHeads(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Record one class's own, nested and companion property type heads.
 fn registerClassPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -1017,11 +911,7 @@ fn registerClassPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!voi
     const cfqn = try declFqnAt(a, module, fqn_overrides, c.span, package_prefix, c.name.name);
     for (c.primary_params) |*pp| {
         if (pp.property == null) continue;
-        // A `vararg val` property's OBSERVED type is the materialized
-        // array (`vararg val elements: T` is an `Array<out T>`), never
-        // the element head — recording the element (or its bound)
-        // made `elements.any { ... }` resolve against the wrong
-        // receiver and decline the Array extension.
+        // A `vararg val` property's OBSERVED type is the materialized array, never the element head.
         if (pp.is_vararg) {
             try putClassPropHead(module, c.name.name, cfqn, pp.name.name, varargPropArrayHead(pp.ty.name.name));
         } else if (classPropHead(c, &pp.ty)) |head| {
@@ -1034,15 +924,11 @@ fn registerClassPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!voi
     try registerCompanionPropTypeHeads(ctx, c);
 }
 
-/// The type a class body property states, whether annotated or inferred
-/// from the shape of its initializer.
+/// The type a class body property states, annotated or inferred from its initializer.
 fn declaredMemberPropType(c: *const ast.Class, prop: *const ast.Property) ?*const ast.TypeRef {
     if (prop.ty) |*t| return t;
     const src = propHeadSourceExpr(prop) orelse return null;
-    // `private val _start = start` beside `class R(start: Double)`
-    // is the parameter's type. The stdlib's ranges and `Lazy`
-    // are written this way, and it was the whole of the
-    // enclosing-member bucket.
+    // `private val _start = start` beside `class R(start: Double)` is the parameter's type.
     if (src.* == .Path and src.Path.segments.len == 1 and
         !std.mem.eql(u8, runtime.envOnce("KLIO_FACTORY_PROP") orelse "1", "0"))
     {
@@ -1062,12 +948,7 @@ fn declaredMemberPropType(c: *const ast.Class, prop: *const ast.Property) ?*cons
         if (fm.Function.return_type) |*rt| return rt;
         return null;
     }
-    // A FUNCTION-TYPED ctor property invoked as the
-    // initializer: `val data = createFrom(...)` beside
-    // `class C<T>(val createFrom: (...) -> T)` is the
-    // function type's declared return — with the class's
-    // own parameter substituted by its bound below, the
-    // same rule an annotated `T` property already gets.
+    // A FUNCTION-TYPED ctor property invoked as the initializer takes the function type's return.
     for (c.primary_params) |*pp| {
         if (!std.mem.eql(u8, pp.name.name, fname)) continue;
         if (pp.ty.function) |ft| return &ft.ret;
@@ -1076,7 +957,6 @@ fn declaredMemberPropType(c: *const ast.Class, prop: *const ast.Property) ?*cons
     return null;
 }
 
-/// Record the type heads of one class's body properties.
 fn registerClassMemberPropTypeHeads(ctx: *BuildCtx, c: *ast.Class, cfqn: []const u8) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -1095,10 +975,6 @@ fn registerClassMemberPropTypeHeads(ctx: *BuildCtx, c: *ast.Class, cfqn: []const
         } else if (prop.init != null and memberSizedInitHead(c, &prop.init.?) != null) {
             try putClassPropHead(module, c.name.name, cfqn, prop.name.name, memberSizedInitHead(c, &prop.init.?).?);
         } else if (prop.init) |*init| {
-            // An unannotated property states its type through a
-            // literal initializer — `private var index = 0` in the
-            // array iterators — and a bare read of one was the whole
-            // enclosing-member block of the unbound census.
             if (literalTypeHead(init)) |head| {
                 try putClassPropHead(module, c.name.name, cfqn, prop.name.name, head);
             }
@@ -1106,16 +982,11 @@ fn registerClassMemberPropTypeHeads(ctx: *BuildCtx, c: *ast.Class, cfqn: []const
     }
 }
 
-/// Record the type heads a nested class's own properties register under.
 fn registerNestedClassPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
-    // A NESTED class's own properties register under its simple
-    // name, which is the head a receiver typed `HexFormat.BytesHexFormat`
-    // resolves to. The walk above only reaches top-level classes, so
-    // every nested declaration's properties were unknown — and the
-    // stdlib puts its option records there
-    // (`bytesFormat.byteSeparator`).
+    // A NESTED class's own properties register under its simple name; the walk above reaches only
+    // top-level classes.
     for (c.members) |*nm| {
         if (nm.* != .Class) continue;
         const nested = &nm.Class;
@@ -1145,14 +1016,11 @@ fn registerNestedClassPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Err
     }
 }
 
-/// Record the type heads a companion's properties register under.
 fn registerCompanionPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void {
     const allocator = ctx.allocator;
     const module = ctx.module;
     const decls = ctx.decls;
-    // COMPANION property heads register under the companion's
-    // lifted name (`Byte$Companion`) — the key a class-named read
-    // (`Byte.MAX_VALUE.toLong()`) consults.
+    // COMPANION property heads register under the companion's lifted name (`Byte$Companion`).
     for (c.members) |*cm| {
         if (cm.* != .Class) continue;
         const cobj = &cm.Class;
@@ -1167,9 +1035,6 @@ fn registerCompanionPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error
                 if (literalTypeHead(init)) |head| {
                     try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, head);
                 } else if (propCtorHeadEvidence(cprop, decls, module, c)) |head| {
-                    // `val iso = LongParser(MAX_MILLIS, allowSign = true)`
-                    // inside LongParser's own companion states the head
-                    // exactly as a top-level object's would.
                     try module.registry.class_prop_type_heads.put(.{ .a = ckey, .b = cprop.name.name }, head);
                 }
             }
@@ -1177,7 +1042,6 @@ fn registerCompanionPropTypeHeads(ctx: *BuildCtx, c: *ast.Class) Allocator.Error
     }
 }
 
-/// Record the type heads a top-level object's properties register under.
 fn registerObjectPropTypeHeads(ctx: *BuildCtx, o: *ast.ObjectDecl) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -1196,17 +1060,13 @@ fn registerObjectPropTypeHeads(ctx: *BuildCtx, o: *ast.ObjectDecl) Allocator.Err
     }
 }
 
-/// Record each class's transitive supertype-name chain and the declared
-/// bounds of its type parameters.
 fn registerClassSuperNameChains(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const fqn_overrides = ctx.fqn_overrides;
     const package_prefix = ctx.package_prefix;
     const file_classes = &ctx.file_classes;
-    // Per-class transitive supertype-name chain, nearest first, so body
-    // lowering can rank extension receivers against the enclosing class
-    // before the IR-side supertype slots are filled.
+    // Nearest first, so body lowering can rank extension receivers against the enclosing class.
     {
         var it = file_classes.iterator();
         while (it.next()) |e| {
@@ -1216,17 +1076,13 @@ fn registerClassSuperNameChains(ctx: *BuildCtx) Allocator.Error!void {
             defer seen.deinit();
             try seen.put(e.key_ptr.*, {});
             try collectHierarchySuperNames(a, e.value_ptr.get(), file_classes, &chain, &seen);
-            // Every enum class IS-A `kotlin.Enum` implicitly; record it so
-            // Enum-receiver ranking and enum recognition see the relation.
+            // Every enum class IS-A `kotlin.Enum` implicitly, so the relation is recorded.
             if (e.value_ptr.get().is_enum and !seen.contains("Enum")) {
                 try chain.append(a, "Enum");
             }
             const super_chain = try chain.toOwnedSlice(a);
             try module.registry.class_super_names.put(e.key_ptr.*, super_chain);
-            // Also key by fqn so a receiver whose simple name collides
-            // across packs (kotlinx.io.Buffer vs an okio stand-in named
-            // Buffer) resolves its OWN super chain (Buffer : Sink, Source)
-            // when the extension-receiver compatibility check walks it.
+            // Also keyed by fqn, so a receiver whose simple name collides across packs resolves its OWN chain.
             {
                 const cfqn = try resolveFqn(a, fqn_overrides, e.value_ptr.get().name.span, package_prefix, e.key_ptr.*);
                 if (!std.mem.eql(u8, cfqn, e.key_ptr.*) and
@@ -1235,13 +1091,9 @@ fn registerClassSuperNameChains(ctx: *BuildCtx) Allocator.Error!void {
                     try module.registry.class_super_names.put(cfqn, super_chain);
                 }
             }
-            // Declared upper bounds of the class's type parameters, for
-            // the collection-stub bridge disproof at method dispatch.
-            // Unbounded params are recorded with an `Any` bound (inert for
-            // the refute pass): dispatch needs the complete NAME list to
-            // tell a class-type-param-typed method param (`put(key: Key)`
-            // on `ConcurrentMap<Key, Value>`) from a nominal reference to
-            // an unrelated same-named class.
+            // Declared upper bounds of the class's type parameters, for the collection-stub bridge disproof
+            // at dispatch. Unbounded params record an inert `Any` bound: dispatch needs the complete NAME
+            // list to tell a class-type-param-typed method parameter from an unrelated same-named class.
             if (!module.registry.class_type_param_bounds.contains(e.key_ptr.*)) {
                 const class = e.value_ptr.get();
                 if (try collectClassTypeParamBounds(a, class)) |bounds| {
@@ -1252,16 +1104,12 @@ fn registerClassSuperNameChains(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Record the stored properties that shadow (or override) a supertype's
-/// same-named storage and so need their own cell.
 fn registerShadowedStorageProps(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const file_classes = &ctx.file_classes;
-    // Private stored properties shadowing a strict supertype's same-name
-    // declaration get their own storage cell (Kotlin semantics): record
-    // them so construction and the scope-qualified accessors use the
-    // owner-mangled key.
+    // Kotlin gives a private stored property shadowing a supertype's same-named declaration its own
+    // cell, so construction and the accessors use the owner-mangled key.
     {
         var it = file_classes.iterator();
         while (it.next()) |e| {
@@ -1283,9 +1131,7 @@ fn registerShadowedStorageProps(ctx: *BuildCtx) Allocator.Error!void {
                         for (sc.members) |*sm| {
                             if (sm.* != .Property) continue;
                             const sp = sm.Property;
-                            // Only a STORED supertype property forces distinct
-                            // cells; an abstract or getter-only declaration has
-                            // no backing field to protect.
+                            // Only a STORED supertype property forces distinct cells.
                             if (sp.getter != null or sp.delegate != null or sp.is_abstract) continue;
                             if (sp.init == null) continue;
                             if (std.mem.eql(u8, sp.name.name, pname)) declares = true;
@@ -1307,10 +1153,8 @@ fn registerShadowedStorageProps(ctx: *BuildCtx) Allocator.Error!void {
                 if (p.visibility == .Private) {
                     try record(module, a, cname, chain, file_classes, p.name.name, false);
                 } else {
-                    // A non-private ctor-param property matching a STORED
-                    // supertype property is necessarily an `override`
-                    // (kotlinc rejects the shadow form) — the parser does
-                    // not carry the modifier on params.
+                    // A non-private ctor-param property matching a stored supertype property is necessarily an
+                    // `override`: kotlinc rejects the shadow form, and the parser drops the modifier on params.
                     try record(module, a, cname, chain, file_classes, p.name.name, true);
                 }
             }
@@ -1328,8 +1172,7 @@ fn registerShadowedStorageProps(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Install the lift-time alias, mangle, enclosing-class and
-/// companion-singleton tables the lowerer reads.
+/// Install the lift-time alias, mangle, enclosing-class and companion-singleton tables.
 fn installLiftedNameTables(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -1337,7 +1180,6 @@ fn installLiftedNameTables(ctx: *BuildCtx) Allocator.Error!void {
     const mangled_nested = &ctx.mangled_nested;
     const enclosing_class = &ctx.enclosing_class;
     const companion_singletons = &ctx.companion_singletons;
-    // `nested_object_aliases` is needed by the lowerer; install on registry.
     {
         var it = nested_object_aliases.iterator();
         while (it.next()) |e| {
@@ -1347,18 +1189,12 @@ fn installLiftedNameTables(ctx: *BuildCtx) Allocator.Error!void {
             try module.registry.nested_object_aliases.put(e.key_ptr.*, inner);
         }
     }
-    // Mangled nested-class names, for qualified type references
-    // (`x is Outer.Inner` must bind the lifted class, not a
-    // same-simple-name top-level one).
+    // Mangled nested-class names, so `x is Outer.Inner` binds the lifted class.
     {
         var it = mangled_nested.iterator();
         while (it.next()) |e| try module.registry.mangled_nested.put(e.key_ptr.*, e.value_ptr.*);
     }
-    // The enclosing-class chain backs the lowerer's scope-true alias walk
-    // (a private nested class is visible throughout its declaring class's
-    // subtree), and the companion-singleton map backs the companion-
-    // receiver reified-inline splice gate; install both before any body
-    // lowers. The registry materialisation below re-puts the same entries.
+    // The enclosing-class chain backs the scope-true alias walk; both tables install before lowering.
     {
         var it = enclosing_class.iterator();
         while (it.next()) |e| try module.registry.enclosing_class.put(e.key_ptr.*, e.value_ptr.*);
@@ -1369,8 +1205,8 @@ fn installLiftedNameTables(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Register the member ASTs the lowerer resolves against: inline-member
-/// owners, member property ASTs, and class supertype references.
+/// Register the member ASTs the lowerer resolves against: inline-member owners, member property
+/// ASTs, and class supertype references.
 fn installMemberAstTables(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -1378,18 +1214,14 @@ fn installMemberAstTables(ctx: *BuildCtx) Allocator.Error!void {
     const fqn_overrides = ctx.fqn_overrides;
     const package_prefix = ctx.package_prefix;
     const file_classes = &ctx.file_classes;
-    // Record the owner class of every inline member fn, keyed by AST pointer,
-    // so a bare call to a name declared as an inline member in several
-    // unrelated classes binds the enclosing class's own-hierarchy overload
-    // (`file_classes` here spans user + base classes, materialised to the same
-    // AST pointers `candidatesFor` returns).
+    // The owner class of every inline member fn, keyed by AST pointer, so a bare call to a name
+    // declared inline in several unrelated classes binds the enclosing class's overload.
     {
         ir.lower.resetInlineMemberOwners();
         ir.lower.resetMemberPropAsts();
         ir.lower.resetClassSupertypeRefs();
         ir.lower.resetMemberExtPropRecv();
-        // Same lifetime rule as the two above: the registered expression-body
-        // member ASTs point into the PREVIOUS build's arena.
+        // Same lifetime rule: the registered expression-body member ASTs point into the previous build's arena.
         ir.lower.resetExprBodyMembers();
         var fcit = file_classes.iterator();
         while (fcit.next()) |e| {
@@ -1398,8 +1230,6 @@ fn installMemberAstTables(ctx: *BuildCtx) Allocator.Error!void {
             ir.lower.registerClassSupertypeRefs(e.value_ptr.get().name.name, e.value_ptr.get().supertypes);
             registerClassSupertypes(e.value_ptr.get().members);
         }
-        // Top-level objects (and any class the map above missed) from this
-        // build's decls — user files plus re-parsed pack sources.
         for (decls) |*d| {
             switch (d.*) {
                 .Object => |*o| registerMemberPropAsts(a, o.members, o.name.name, declFqnAt(a, module, fqn_overrides, o.span, package_prefix, o.name.name) catch null),
@@ -1411,33 +1241,18 @@ fn installMemberAstTables(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Make every `inline fun` body available to the lowerer by simple name.
 fn installInlineFnTables(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const base = ctx.base;
     const decls = ctx.decls;
-    // Make every `inline fun` body available to the lowerer by simple name.
-    //
-    // The three tables below are installed into the lowerer's
-    // build-scoped thread-locals (`setInlineFnAsts` &c.), each of which
-    // `deinit`s the table left by the *previous* build before storing the
-    // new one. A managed `StringHashMap` captures its allocator, so that
-    // teardown runs through whatever allocator backed the container — and
-    // the previous build's `a` is typically a per-run arena that has
-    // already been torn down by the time the next build installs its
-    // tables. Backing the *containers* with the process-lifetime page
-    // allocator keeps that cross-build teardown sound: the next build's
-    // `deinit` frees a still-valid block. Keys and value slices stay in
-    // the build arena `a` (only their inline slice headers live in the
-    // container; `deinit` never dereferences the freed contents), so the
-    // arena reclaims them and no growing leak accumulates.
+    // Every `inline fun` body, available to the lowerer by simple name. The three tables install
+    // into build-scoped thread-locals, each `deinit`ing the table left by the PREVIOUS build, whose
+    // `a` is typically an already-torn-down per-run arena, so the containers are backed by the
+    // process-lifetime page allocator while keys and value slices stay in the build arena.
     const tl = std.heap.page_allocator;
     {
         var inline_fns = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(a);
-        // Base inline fns first, preserving the whole-program declaration
-        // order of each overload list (base decls precede user decls). A loaded
-        // base carries the lazy `inline_by_name` refs (its `lifted_decls` may be
-        // empty); a freshly-built base walks its decls.
+        // Base inline fns first, preserving whole-program declaration order per overload list.
         if (base) |bs| {
             if (bs.inline_by_name.len != 0) {
                 for (bs.inline_by_name) |kv| {
@@ -1457,23 +1272,17 @@ fn installInlineFnTables(ctx: *BuildCtx) Allocator.Error!void {
         }
         inline_fns.deinit();
         ir.lower.setInlineFnAsts(frozen);
-        // setInlineFnAsts dropped the previous build's FuncId-keyed inline
-        // registrations; replay the base's so user calls the symbol index
-        // resolves to a base inline fn still splice its declaration.
+        // setInlineFnAsts dropped the previous build's FuncId-keyed registrations; replaying the base's
+        // keeps user calls resolving to a base inline fn splicing.
         if (base) |bs| {
             for (bs.inline_ids) |entry| try ir.lower.registerInlineFnId(entry.id, entry.f);
-            // Inline bodies in a loaded base are deferred markers; install the
-            // section + decoder so a splice materialises the real body on first
-            // use. Decoded into the base's own process-lifetime arena, since the
-            // patched `lifted_decls` are reused across per-program builds.
+            // Inline bodies in a loaded base are deferred markers, so the section and decoder install
+            // here, decoded into the base's process-lifetime arena.
             ir.lower.setDeferredSection(bs.deferred_bodies, bs.arena, image.decodeDeferredBody);
         }
 
-        // Default-import host bindings shadow same-simple-name inline
-        // fns. The name domain comes from the same constructor the
-        // link-time bare-name maps use (`stdlib.noteBareNameMapping`),
-        // restricted to the implicitly imported packages, so the
-        // "default-import owns this bare name" answer has one source.
+        // Default-import host bindings shadow same-simple-name inline fns. The name domain comes from
+        // `stdlib.noteBareNameMapping`, so the answer has one source.
         var owned = std.StringHashMap([]const u8).init(a);
         defer owned.deinit();
         var fqn_it = stdlib.implementations.allFqns();
@@ -1487,8 +1296,6 @@ fn installInlineFnTables(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Register the top-level property names and each declaration's scoping
-/// identity, so a bare read ranks the way a bare call does.
 fn installTopLevelPropNames(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const base = ctx.base;
@@ -1498,9 +1305,8 @@ fn installTopLevelPropNames(ctx: *BuildCtx) Allocator.Error!void {
     const decl_pkg = ctx.decl_pkg;
     const package_prefix = ctx.package_prefix;
     const tl = std.heap.page_allocator;
-    // Top-level (file-scope) property names, plus each declaration's
-    // scoping identity (FQN + package) so a bare read ranks under Kotlin
-    // scoping exactly as a bare call does.
+    // Top-level property names with each declaration's scoping identity, so a bare read ranks under
+    // Kotlin scoping exactly as a bare call does.
     {
         var top_props = StringSet.init(tl);
         if (base) |bs| {
@@ -1539,20 +1345,17 @@ fn installTopLevelPropNames(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Record the file's imports: leaf-keyed non-wildcard paths and the
-/// wildcard packages, both keyed by declaring file.
+/// Record the file's imports, keyed by declaring file: non-wildcard paths by leaf name,
+/// wildcard imports as dotted packages.
 fn registerFileImports(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const file = ctx.file;
-    // Non-wildcard imports keyed by declaring file then bound leaf name;
-    // wildcard imports keyed by declaring file as dotted package paths.
     for (file.imports) |*imp| {
         if (imp.path.len == 0) continue;
         if (imp.wildcard) {
-            // `import pkg.*`: record the package per file so the symbol
-            // index can rank wildcard-imported candidates above the
-            // implicitly-imported built-ins.
+            // `import pkg.*`: the package is recorded per file so the symbol index can rank
+            // wildcard-imported candidates above the implicitly-imported built-ins.
             var dotted: std.ArrayList(u8) = .empty;
             defer dotted.deinit(a);
             for (imp.path, 0..) |id, i| {
@@ -1577,9 +1380,8 @@ fn registerFileImports(ctx: *BuildCtx) Allocator.Error!void {
         if (!fgop.found_existing) fgop.value_ptr.* = std.StringHashMap(std.ArrayList(ir.ModuleRegistry.ImportPath)).init(a);
         const lgop = try fgop.value_ptr.getOrPut(leaf);
         if (!lgop.found_existing) lgop.value_ptr.* = .empty;
-        // Kotlin keeps every same-leaf import in scope (the second one
-        // is an ambiguity at the use site, not a shadow), so the leaf
-        // maps to ALL its import paths; only an exact repeat collapses.
+        // Kotlin keeps every same-leaf import in scope, a second one being an ambiguity at the use site
+        // rather than a shadow, so the leaf maps to ALL its paths.
         var already = false;
         for (lgop.value_ptr.items) |p| {
             if (std.mem.eql(u8, p.fqn, dotted.items)) {
@@ -1595,7 +1397,6 @@ fn registerFileImports(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Reserve a class shell per declaration, keyed by fully-qualified name.
 fn reserveClassShells(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -1604,12 +1405,8 @@ fn reserveClassShells(ctx: *BuildCtx) Allocator.Error!void {
     const decl_pkg = ctx.decl_pkg;
     const package_prefix = ctx.package_prefix;
     const object_spans = &ctx.object_spans;
-    // Pre-register every class by its FULLY-QUALIFIED name so resolution is
-    // order-independent AND a same-simple-name class in another package (an
-    // `internal` `kotlinx.coroutines...Segment` vs a public `kotlinx.io.Segment`)
-    // does not collapse onto a single slot — each keeps its own stub before any
-    // body lowers, so a bare `Name(args)` at its own construction site resolves
-    // to the package-local class through the scope-tiered index.
+    // Every class is pre-registered by its FULLY-QUALIFIED name, so resolution is
+    // order-independent and same-simple-name classes in different packages keep separate slots.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1621,7 +1418,6 @@ fn reserveClassShells(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Link every reserved shell to its exact superclass identities.
 fn linkReservedClassSupertypes(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -1629,9 +1425,8 @@ fn linkReservedClassSupertypes(ctx: *BuildCtx) Allocator.Error!void {
     const fqn_overrides = ctx.fqn_overrides;
     const decl_pkg = ctx.decl_pkg;
     const package_prefix = ctx.package_prefix;
-    // Link every reserved class shell to its exact superclass identities
-    // before any method body lowers. Static applicability can then prove
-    // subtype arguments for calls into forward top-level declarations.
+    // Linked before any method body lowers, so static applicability can prove subtype arguments
+    // for calls into forward top-level declarations.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1641,7 +1436,6 @@ fn linkReservedClassSupertypes(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Reserve complete member headers for every class.
 fn reserveClassMemberHeaders(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -1649,9 +1443,8 @@ fn reserveClassMemberHeaders(ctx: *BuildCtx) Allocator.Error!void {
     const fqn_overrides = ctx.fqn_overrides;
     const decl_pkg = ctx.decl_pkg;
     const package_prefix = ctx.package_prefix;
-    // Reserve complete member headers globally after every class shell exists
-    // but before any method body lowers. Forward references, inherited calls,
-    // and same-arity overloads then share stable declaration identities.
+    // Reserved after every class shell exists but before any method body lowers, so forward
+    // references, inherited calls and same-arity overloads share stable identities.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1661,19 +1454,14 @@ fn reserveClassMemberHeaders(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Register the file-level typealias shapes and function-type tags.
 fn registerTypeAliasShapes(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const decls = ctx.decls;
     const fqn_overrides = ctx.fqn_overrides;
     const package_prefix = ctx.package_prefix;
-    // Register typealias → head tags BEFORE phase-2 body lowering so the
-    // lambda-arity detection (`argFnArities`) resolves an aliased
-    // function-typed parameter (`RoutingHandler = RoutingContext.() -> Unit`)
-    // to its `Function{N}` tag while lowering the call site. The later pass
-    // (after lowering) re-registers and rewrites param-type names for the
-    // applicability/score consumers.
+    // Typealias head tags register BEFORE body lowering, so lambda-arity detection resolves an
+    // aliased function-typed parameter to its `Function{N}` tag at the call site.
     for (decls) |*d| {
         if (d.* != .TypeAlias) continue;
         const ta = &d.TypeAlias;
@@ -1702,16 +1490,12 @@ fn registerTypeAliasShapes(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Register the typealias shapes declared inside a class body, which are
-/// written in that class's own scope.
 fn registerClassTypeAliasShapes(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const file_classes = &ctx.file_classes;
-    // A `typealias` declared in a class body is in scope inside that class
-    // (and reachable as `Owner.Alias`); its target is written in the
-    // class's own scope, so `typealias TAtoInner = Inner` names the nested
-    // class.
+    // A `typealias` in a class body is in scope inside that class and reachable as `Owner.Alias`;
+    // its target is written in the class's own scope, so it can name a nested class.
     var alias_class_it = file_classes.valueIterator();
     while (alias_class_it.next()) |fc| {
         const c: *const ast.Class = fc.get();
@@ -1722,8 +1506,6 @@ fn registerClassTypeAliasShapes(ctx: *BuildCtx) Allocator.Error!void {
             for (ta.type_params, type_params) |*param, *out| out.* = param.name.name;
             var target = try ir.lower.decl.loweredTypeRef(a, &ta.target, true);
             if (std.mem.findScalar(u8, target.name, '.') == null) {
-                // The target is written in the class's scope: a nested class
-                // of the owner resolves to that class's index name.
                 if (module.classId(c.name.name)) |owner_id| {
                     if (module.classIdNestedIn(owner_id, target.name)) |nested_id| {
                         if (nested_id.int() < module.classes.items.len) target.name = module.classes.items[nested_id.int()].name;
@@ -1741,20 +1523,14 @@ fn registerClassTypeAliasShapes(ctx: *BuildCtx) Allocator.Error!void {
     ir.lower.setTypeAliasTags(&module.registry.type_aliases);
 }
 
-/// Fill every reserved class's primary-constructor parameters, which a
-/// constructor call in an earlier-lowered body already reads.
 fn fillReservedClassPrimaryParams(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const decls = ctx.decls;
     const fqn_overrides = ctx.fqn_overrides;
     const package_prefix = ctx.package_prefix;
-    // Fill every reserved class's primary-constructor parameters BEFORE any
-    // class method body is lowered. Class method bodies lower inside the loop
-    // below in declaration order, so a constructor call to a class declared
-    // later (`class A { fun f() = B("x") {} }; class B(d, flag, block)`) must
-    // already see B's parameter types for the argument-lambda arity and the
-    // trailing-lambda realignment (otherwise the lambda binds the wrong slot).
+    // Filled BEFORE any class method body lowers: bodies lower in declaration order, so a
+    // constructor call to a class declared later must already see its parameter types.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -1767,23 +1543,16 @@ fn fillReservedClassPrimaryParams(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Register every top-level function's header before any body lowers.
 fn registerTopLevelFuncHeaders(ctx: *BuildCtx) Allocator.Error!void {
     const decls = ctx.decls;
-    // Phase 1 of two-phase consumption: register every top-level
-    // function's HEADER — its package-qualified FQN, declaring package,
-    // and receiver type — into the complete header set BEFORE any body is
-    // lowered. Classes were reserved just above; together these phase-1
-    // headers span every pack, feature, and user file, so phase-2 body
-    // lowering resolves bare calls against the full package-qualified set
-    // through the symbol index rather than a partially-populated table.
+    // Phase 1 of two-phase consumption: every top-level function's HEADER registers before any body
+    // lowers, so phase-2 lowering resolves bare calls against the full package-qualified set.
     for (decls) |*d| {
         if (d.* == .Function) try registerTopLevelFuncHeader(ctx, &d.Function);
     }
 }
 
-/// Reserve one top-level function's declaration identity: its FQN,
-/// package, receiver, declared signature and type-parameter bounds.
+/// Reserve one top-level function's identity: FQN, package, receiver, signature, bounds.
 fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -1854,10 +1623,8 @@ fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!
     }
     var decl_sig: []ir.TypeRef = &.{};
     {
-        // Declared parameter types at full structural
-        // granularity, rendered by the SAME lowering body params
-        // use (`loweredTypeRef`), so the symbol index proves or
-        // refutes signature identity identically for a forward
+        // Declared parameter types at full structural granularity, rendered by the same `loweredTypeRef`
+        // body params use, so the symbol index judges signature identity identically for a forward
         // reference and for its later-lowered body.
         const sig = try a.alloc(ir.TypeRef, f.params.len);
         for (f.params, 0..) |*p, i| {
@@ -1880,25 +1647,18 @@ fn registerTopLevelFuncHeader(ctx: *BuildCtx, f: *ast.Function) Allocator.Error!
     try module.decl_span.put(id.int(), f.span);
     if (f.body != null) try module.decl_ast_body.put(id.int(), {});
     try registerHeaderTypeParams(ctx, f, id);
-    // Key the inline-fn AST by the header stub's FuncId, so a
-    // bare call the symbol index resolves to this declaration
-    // splices exactly this declaration.
+    // The inline-fn AST is keyed by the header stub's FuncId, so a bare call splices exactly the
+    // declaration the symbol index resolved.
     if (f.is_inline and f.body != null) {
         try ir.lower.registerInlineFnId(id.int(), FF(ast.Function).fromPtr(f));
     }
     try stub_ids.append(a, id);
 }
 
-/// The declared parameter list a header stub carries.
 fn headerStubParams(ctx: *BuildCtx, f: *const ast.Function, receiver_ty: ?ir.TypeRef) Allocator.Error![]Param {
     const a = ctx.a;
-    // The header stub carries the full declared parameter list (the
-    // same `loweredTypeRef` rendering the phase-2 body install uses),
-    // not just a receiver placeholder: class methods lower between
-    // phase 1 and phase 2, and their call-site shape decisions — a
-    // trailing lambda's expected arity, default-gap checks — read
-    // `Func.params` and must see the declared signature, not an
-    // empty stub.
+    // The header stub carries the full declared parameter list, not a receiver placeholder: class
+    // methods lower between phase 1 and phase 2 and read `Func.params` for their call-site shapes.
     var stub_params: []Param = &.{};
     const has_recv = f.receiver_type != null;
     const n = f.params.len + @intFromBool(has_recv);
@@ -1933,14 +1693,11 @@ fn headerStubParams(ctx: *BuildCtx, f: *const ast.Function, receiver_ty: ?ir.Typ
     return stub_params;
 }
 
-/// Register a header's type-parameter names and declared upper bounds.
 fn registerHeaderTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
-    // Type-parameter names, registered at header time so a body
-    // lowered before this declaration's own (a forward reference,
-    // or any earlier decl calling into it) already sees the
-    // generic signature through the registry.
+    // Type-parameter names register at header time, so a body lowered before this declaration's own
+    // already sees the generic signature.
     if (f.type_params.len != 0) {
         var tp_names: std.ArrayList([]const u8) = .empty;
         for (f.type_params) |*tp| try tp_names.append(a, tp.name.name);
@@ -1971,15 +1728,7 @@ fn registerHeaderTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId) 
             const w = std.c.getenv("KLIO_HDR_BOUNDS_SKIP") orelse break :blk false;
             break :blk std.mem.find(u8, std.mem.span(w), f.name.name) != null;
         };
-        // Default ON. The armed roll-out list is empty: the
-        // contains loop was the smart-cast `this`-narrow being
-        // invisible to bare-call resolution, ArrayDeque's was the
-        // enclosing method's `this` decl leaking through a
-        // receiver-less lambda, and the DeepRecursive slowdown was
-        // the same over-broad consult — all fixed by the genuine-
-        // narrow gate. Full armed sweep: 117/0 at 1:03 wall on the
-        // heaviest file. `KLIO_HDR_BOUNDS=0` disables for
-        // single-binary A/B; KLIO_HDR_BOUNDS_SKIP bisects by name.
+        // `KLIO_HDR_BOUNDS=0` disables this; `KLIO_HDR_BOUNDS_SKIP` bisects by name.
         const hdr_on = blk: {
             const w = std.c.getenv("KLIO_HDR_BOUNDS") orelse break :blk true;
             break :blk !std.mem.eql(u8, std.mem.span(w), "0");
@@ -1997,8 +1746,6 @@ fn registerHeaderTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId) 
     }
 }
 
-/// Register the callable extension-property headers, so
-/// `receiver.property(args)` keeps the extension getter.
 fn registerCallableExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2006,10 +1753,8 @@ fn registerCallableExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
     const fqn_overrides = ctx.fqn_overrides;
     const decl_pkg = ctx.decl_pkg;
     const package_prefix = ctx.package_prefix;
-    // Register callable extension-property headers before any body lowers.
-    // Kotlin permits `receiver.property(args)` when the property's value is a
-    // function. Without this declaration shape, the call is indistinguishable
-    // from a member call until runtime and loses the extension getter.
+    // Registered before any body lowers. Kotlin permits `receiver.property(args)` when the property's
+    // value is a function; without this shape the call is indistinguishable from a member call.
     for (decls) |*d| {
         if (d.* != .Property) continue;
         const p = d.Property;
@@ -2048,21 +1793,11 @@ fn registerCallableExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Record the receiver-function-typed property heads, which method
-/// bodies consult while they lower.
 fn registerReceiverFnPropHeads(ctx: *BuildCtx) Allocator.Error!void {
     const module = ctx.module;
     const file_classes = &ctx.file_classes;
-    // Receiver-function-typed property heads, recorded BEFORE any body
-    // lowering: method bodies (and their lambdas) consult the registry
-    // while they lower, so the entries must exist first.
-    //
-    // Walk `file_classes`, not `decls`: an EXTENDING build (a user program on
-    // top of a baked stdlib+packs base) only carries the user's declarations in
-    // `decls`, so registering from those alone left every PACK class out — the
-    // map came back empty for a compose program and every receiver-fn-property
-    // lookup silently missed. `file_classes` is the base's classes plus the
-    // user's, which is the universe the sibling registry tables already use.
+    // Recorded BEFORE any body lowering, since method bodies consult the registry as they lower.
+    // Walks `file_classes`, not `decls`, which in an extending build holds only user declarations.
     {
         var fc_it = file_classes.iterator();
         while (fc_it.next()) |e| {
@@ -2089,11 +1824,7 @@ fn registerReceiverFnPropHeads(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-// -------------------------------------------------------------------------
-// Body and thunk lowering.
-// -------------------------------------------------------------------------
 
-/// Lower every class body against the complete top-level header set.
 fn lowerClassBodies(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2103,11 +1834,8 @@ fn lowerClassBodies(ctx: *BuildCtx) Allocator.Error!void {
     const package_prefix = ctx.package_prefix;
     const file_classes = &ctx.file_classes;
     const nested_outer_members = &ctx.nested_outer_members;
-    // Lower each class after the top-level function headers are registered,
-    // so a class method body's bare call to a sibling top-level function
-    // resolves against the complete header set. The receiver-type member
-    // gate keeps a same-named implicit-receiver member preferred over the
-    // now-visible global.
+    // Classes lower after the top-level function headers register, so a method body's bare call to a
+    // sibling top-level function resolves against the complete header set.
     var empty_set = StringSet.init(a);
     defer empty_set.deinit();
     for (decls) |*d| {
@@ -2121,26 +1849,20 @@ fn lowerClassBodies(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Lower each top-level function body into the slot phase 1 reserved.
 fn lowerTopLevelFunctionBodies(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const decls = ctx.decls;
     const file_classes = &ctx.file_classes;
     const stub_ids = &ctx.stub_ids;
-    // Phase 2 of two-phase consumption: lower each function body into its
-    // reserved slot, resolving bodies and extension-receiver bindings
-    // against the now-complete phase-1 header set (above).
+    // Phase 2: each function body lowers into its reserved slot against the phase-1 header set.
     var stub_cursor: usize = 0;
     for (decls) |*d| {
         if (d.* == .Function) {
             const f = &d.Function;
-            // A header-only declaration (a retained `expect`) keeps its
-            // phase-1 stub — declared params, empty blocks — so
-            // `hasBody()` stays false and `linkBodyless` settles its
-            // executable form (native binding or body-sibling redirect).
-            // Lowering it would manufacture a one-block `return Unit`
-            // body that shadows the real dispatch.
+            // A header-only declaration (a retained `expect`) keeps its phase-1 stub, so `hasBody()` stays
+            // false and `linkBodyless` settles its executable form; lowering it would manufacture a
+            // `return Unit` body that shadows the real dispatch.
             if (f.body == null) {
                 stub_cursor += 1;
                 continue;
@@ -2153,13 +1875,11 @@ fn lowerTopLevelFunctionBodies(ctx: *BuildCtx) Allocator.Error!void {
             stub_cursor += 1;
             var placed = func;
             placed.id = id;
-            // Preserve the stub's FQN + package (carry the package prefix).
             placed.fqn = module.funcByIdMut(id).?.fqn;
             placed.package = module.funcByIdMut(id).?.package;
             module.funcByIdMut(id).?.* = placed;
-            // Kotlin scopes a private top-level declaration to its FILE:
-            // record it so dispatch never binds a private extension from
-            // another file.
+            // Kotlin scopes a private top-level declaration to its FILE, so dispatch never binds a private
+            // extension from another file.
             if (f.visibility == .Private) {
                 try module.registry.private_fn_files.put(id, f.name.span.file);
             }
@@ -2173,7 +1893,6 @@ fn lowerTopLevelFunctionBodies(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Record a lowered function's type-parameter names and declared bounds.
 fn registerBodyFuncTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2182,8 +1901,7 @@ fn registerBodyFuncTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId
         var names: std.ArrayList([]const u8) = .empty;
         for (f.type_params) |*tp| try names.append(a, tp.name.name);
         try func_type_params.put(id.int(), try names.toOwnedSlice(a));
-        // Declared upper bounds (`<T : Number>` and `where` clauses)
-        // for the strict extension-receiver prover.
+        // Declared upper bounds (`<T : Number>` and `where`) for the extension-receiver prover.
         var bounds: std.ArrayList(ir.ModuleRegistry.TypeParamBound) = .empty;
         for (f.type_params) |*tp| {
             const first = bounds.items.len;
@@ -2214,7 +1932,6 @@ fn registerBodyFuncTypeParams(ctx: *BuildCtx, f: *const ast.Function, id: FuncId
     }
 }
 
-/// Lower one default-argument thunk per parameter that declares a default.
 fn lowerFunctionDefaultThunks(ctx: *BuildCtx, f: *const ast.Function, id: FuncId) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2238,12 +1955,8 @@ fn lowerFunctionDefaultThunks(ctx: *BuildCtx, f: *const ast.Function, id: FuncId
             if (p.default) |default_expr| {
                 const bind_upto = @min(offset + idx, name_refs.items.len);
                 const widened = ir.lower.widenNumericLiteral(default_expr, &p.ty);
-                // A default that references a CONTEXT parameter
-                // (`context(a: C) fun f(b: C = a)`) resolves it the
-                // way the body does: the thunk runs at call time with
-                // the context on the stack, so stash the context
-                // params for the thunk's `consumePendingCtx` to bind
-                // via `CtxLoad` (cleared per thunk after it consumes).
+                // A default referencing a CONTEXT parameter resolves as the body does: the thunk runs at call
+                // time with the context on the stack, so the params are stashed for its `consumePendingCtx`.
                 if (f.context_params.len != 0) {
                     module.has_context_decls = true;
                     module.pending_ctx = .{ .params = f.context_params, .type_params = f.type_params };
@@ -2260,11 +1973,8 @@ fn lowerFunctionDefaultThunks(ctx: *BuildCtx, f: *const ast.Function, id: FuncId
     }
 }
 
-/// Lower every class's body-property initialisers, accessors and
-/// primary-constructor default thunks.
 fn lowerClassMemberThunks(ctx: *BuildCtx) Allocator.Error!void {
     const decls = ctx.decls;
-    // Body-property initialisers, getters, setters, ctor defaults.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         try lowerClassMemberThunksFor(ctx, &d.Class);
@@ -2294,10 +2004,8 @@ fn lowerClassMemberThunksFor(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void
             else => {},
         }
     }
-    // Companion-object members, enum entries, and nested-class names are
-    // visible under their bare names in a primary-ctor default value
-    // (`class Stroke(cap: StrokeCap = DefaultCap)` reads the companion's
-    // `DefaultCap`), the same as inside a method body.
+    // Companion members, enum entries and nested-class names are visible bare in a primary-ctor
+    // default value, as inside a method body.
     try ir.lower.decl.addVisibleMemberNames(c, &own_members);
     var prop_init_params: std.ArrayList([]const u8) = .empty;
     defer prop_init_params.deinit(a);
@@ -2311,11 +2019,7 @@ fn lowerClassMemberThunksFor(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void
     const body_prop_param_types: []const ir.Param = if (body_prop_class_id) |cid|
         module.classes.items[cid.int()].primary_params
     else blk: {
-        // A LOCAL class (declared in a function body) has no module class
-        // entry, but its body-property initializers still see the primary
-        // ctor params (`class N(property: String) { var property =
-        // property }` reads the PARAM). Derive the param list from the
-        // AST so the initializer thunks declare them.
+        // A LOCAL class has no module class entry, but its initializers still see the primary ctor params.
         if (c.primary_params.len == 0) break :blk &.{};
         const ps = try a.alloc(ir.Param, c.primary_params.len);
         for (c.primary_params, 0..) |*pp, pi| {
@@ -2329,20 +2033,14 @@ fn lowerClassMemberThunksFor(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void
         }
         break :blk ps;
     };
-    // For a nested class the lexically-enclosing class's (and its
-    // companion's) members are visible bare inside its body-property
-    // initializers; thread them so a bare `Default` referencing the
-    // enclosing companion does not bind a foreign global class.
+    // For a nested class the enclosing class's and its companion's members are visible bare inside
+    // body-property initializers, so a bare `Default` binds the enclosing companion.
     const body_enclosing: ?*const StringSet = nested_outer_members.getPtr(c.name.name);
     for (c.members) |*m| {
         if (m.* != .Property) continue;
         const p = m.Property;
-        // A MEMBER-EXTENSION property (`private val Any?.exceptionOrNull`
-        // inside JobSupport) is part of the extension surface (registered
-        // with its owner below), never an instance property of the class:
-        // registering its accessor as an instance getter made the walk
-        // treat every subtype instance as shadowed by a "member" the
-        // private-inheritance rule then skipped, so the read missed.
+        // A MEMBER-EXTENSION property belongs to the extension surface, never an instance property:
+        // registering its accessor as an instance getter makes the walk treat every subtype as shadowed.
         if (p.receiver_type != null) continue;
         try lowerBodyPropertyThunks(ctx, c, p, &own_members, .{
             .prop_init_params = prop_init_params.items,
@@ -2354,8 +2052,6 @@ fn lowerClassMemberThunksFor(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void
     }
 }
 
-/// Lower one primary-constructor default thunk per parameter that
-/// declares a default value.
 fn lowerPrimaryCtorDefaultThunks(ctx: *BuildCtx, c: *ast.Class, own_members: *StringSet) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2368,26 +2064,15 @@ fn lowerPrimaryCtorDefaultThunks(ctx: *BuildCtx, c: *ast.Class, own_members: *St
         if (p.default != null) any_ctor_default = true;
     }
     if (any_ctor_default) {
-        // A ctor default runs before `this` exists — the runtime passes a
-        // null receiver. Give the receiver slot a non-`this` name so a bare
-        // companion member (`cap = DefaultCap`) resolves against the
-        // companion object (the param-thunk path) rather than a null-`this`
-        // field read. Previous params still resolve by their own names.
-        //
-        // An INNER class's defaults DO have a lexical receiver: the
-        // enclosing instance (`val maxIndex: Int = size` reads the outer
-        // `size`; Kotlin forbids reading the class's own members here,
-        // and an inner class cannot declare a companion). The slot is
-        // named `this` so a bare name lowers through the method-body
-        // member-or-global walk, and the runtime passes the OUTER
-        // instance in that slot.
+        // A ctor default runs before `this` exists and the runtime passes a null receiver, so the receiver
+        // slot takes a non-`this` name and a bare companion member resolves against the companion object.
+        // An INNER class's defaults DO have a lexical receiver, so its slot is named `this`.
         var ctor_default_params: std.ArrayList([]const u8) = .empty;
         defer ctor_default_params.deinit(a);
         try ctor_default_params.append(a, if (c.is_inner) "this" else "$ctor_default_recv");
         for (c.primary_params) |*p| try ctor_default_params.append(a, p.name.name);
         var slots = try a.alloc(?FuncId, c.primary_params.len);
-        // Parallel to `ctor_default_params`, whose first slot is the
-        // synthesized receiver and has no declared type.
+        // Parallel to `ctor_default_params`, whose first slot is the synthesized receiver.
         const ctor_default_types = try a.alloc(?ast.TypeRef, c.primary_params.len + 1);
         ctor_default_types[0] = null;
         for (c.primary_params, 0..) |*p, i| ctor_default_types[i + 1] = p.ty;
@@ -2409,21 +2094,16 @@ fn lowerPrimaryCtorDefaultThunks(ctx: *BuildCtx, c: *ast.Class, own_members: *St
     }
 }
 
-/// The per-class context a body property's thunks lower against.
 const BodyPropScope = struct {
     /// The thunk's parameter names: `this`, then the ctor parameters.
     prop_init_params: []const []const u8,
-    /// The declared types parallel to the primary-ctor parameters.
     param_types: []const ir.Param,
-    /// A nested class's lexically-enclosing member names.
     enclosing: ?*const StringSet,
-    /// The class's fully-qualified name, and whether it differs from the
-    /// simple name (which then takes a second, aliasing key).
+    /// The class's FQN, and whether it differs from the simple name, which then aliases.
     cfqn: []const u8,
     dual: bool,
 };
 
-/// Lower one body property's storage initialiser, delegate and accessors.
 fn lowerBodyPropertyThunks(
     ctx: *BuildCtx,
     c: *ast.Class,
@@ -2443,8 +2123,7 @@ fn lowerBodyPropertyThunks(
     const body_enclosing = scope.enclosing;
     const body_prop_cfqn = scope.cfqn;
     const body_prop_dual = scope.dual;
-    // An explicit backing field's initializer IS the property's
-    // storage initializer.
+    // An explicit backing field's initializer IS the property's storage initializer.
     const storage_init: ?*const ast.Expr = if (p.init) |*init|
         init
     else if (p.explicit_field) |ef|
@@ -2457,12 +2136,8 @@ fn lowerBodyPropertyThunks(
         (ef.ty orelse p.ty)
     else
         p.ty;
-    // A PRIVATE stored property never participates in override
-    // dispatch (same rule as private accessors below): record it so
-    // the virtual property walk can skip a foreign class's private
-    // field — ktor's `HttpClientEngineBase.closed = atomic(false)`
-    // must never answer the HttpClientEngine interface's own
-    // private computed `closed`.
+    // A PRIVATE stored property never participates in override dispatch, so the virtual property walk
+    // can skip a foreign class's private field.
     if (p.visibility == .Private and p.getter == null) {
         const priv_fid = FuncId.from(0);
         try instance_prop_private.put(.{ .a = c.name.name, .b = p.name.name }, priv_fid);
@@ -2477,13 +2152,8 @@ fn lowerBodyPropertyThunks(
         try body_prop_inits.put(.{ .a = c.name.name, .b = p.name.name }, fid);
         if (body_prop_dual) try body_prop_inits.put(.{ .a = body_prop_cfqn, .b = p.name.name }, fid);
     } else if (p.delegate) |delegate| {
-        // Register the delegation marker under the FQN; the bare
-        // simple name only when it IS the FQN (a local/packageless
-        // class). A simple-name alias for a packaged class let a
-        // foreign namesake intercept an unrelated class's field read
-        // (ModelViewTests' \`Person { var name by mutableStateOf }\`
-        // routed a local test \`Person(val name, ...)\`'s plain field
-        // through delegate getValue on the stored String).
+        // The delegation marker registers under the FQN, and under the bare simple name only when it IS
+        // the FQN: a simple-name alias lets a foreign namesake intercept an unrelated class's field read.
         try delegated_body_props.put(.{ .a = body_prop_cfqn, .b = p.name.name }, {});
         const nm = try std.fmt.allocPrint(a, "__delegate_prop_{s}_{s}", .{ c.name.name, p.name.name });
         const fid = try ir.lower.lowerPropertyInitExpr(module, c.name.name, own_members, body_enclosing, prop_init_params, body_prop_param_types, delegate, nm, null);
@@ -2494,7 +2164,6 @@ fn lowerBodyPropertyThunks(
     try lowerBodyPropertySetter(ctx, c, p, own_members);
 }
 
-/// Lower a body property's custom getter and register its dispatch keys.
 fn lowerBodyPropertyGetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property, own_members: *StringSet) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2508,10 +2177,8 @@ fn lowerBodyPropertyGetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property
         const fid = switch (getter.body) {
             .Expr => |body| blk: {
                 const rewritten = try lift.substituteFieldWithThis(a, p.name.name, &body, c.name.name);
-                // The property's declared type is the expression body's
-                // expected type: a getter returning a lambda
-                // (`get() = { collectTo(it) }` typed `suspend (P) -> Unit`)
-                // needs it to prove the lambda's parameter shape.
+                // The property's declared type is the expression body's expected type, which a getter returning a
+                // lambda needs to prove the lambda's parameter shape.
                 break :blk try ir.lower.lowerAccessorExprWithExpected(module, c.name.name, own_members, &.{"this"}, rewritten, nm, p.ty);
             },
             .Block => |blk_body| blk: {
@@ -2519,12 +2186,8 @@ fn lowerBodyPropertyGetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property
                 break :blk try ir.lower.lowerAccessorBlock(module, c.name.name, own_members, &.{"this"}, &rewritten, nm);
             },
         };
-        // A PRIVATE class's accessors register under the FQN key
-        // only: the SIMPLE slot is shared program-wide, and a
-        // private namesake (kotlinx-coroutines-test's `private
-        // class AtomicBoolean`) must never capture dispatch for an
-        // unrelated public class. Instances of the private class
-        // itself resolve through the FQN-first probe.
+        // A PRIVATE class's accessors register under the FQN key only: the simple slot is shared
+        // program-wide, and a private namesake must never capture dispatch for an unrelated public class.
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         const class_private = c.visibility == .Private and !std.mem.eql(u8, cfqn, c.name.name);
         if (!class_private) {
@@ -2543,7 +2206,6 @@ fn lowerBodyPropertyGetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property
     }
 }
 
-/// Lower a body property's custom setter and register its dispatch keys.
 fn lowerBodyPropertySetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property, own_members: *StringSet) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2553,9 +2215,7 @@ fn lowerBodyPropertySetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property
     if (p.setter) |setter| {
         const setter_param_name = if (setter.params.len != 0) setter.params[0].name else "value";
         const nm = try std.fmt.allocPrint(a, "__set_{s}_{s}", .{ c.name.name, p.name.name });
-        // The value parameter's type is the property's declared
-        // type: `set(value) { if (value <= 0) ... }` resolves
-        // `value` statically.
+        // The value parameter's type is the property's declared type, so `value` resolves statically.
         const vty_head: ?[]const u8 = if (p.ty) |*t| t.name.name else null;
         const vty_nullable = if (p.ty) |*t| t.nullable else false;
         const fid = switch (setter.body) {
@@ -2579,8 +2239,6 @@ fn lowerBodyPropertySetter(ctx: *BuildCtx, c: *ast.Class, p: *const ast.Property
     }
 }
 
-/// Synthesise the runtime `ClassDef` of every class, FQN-keyed, with a
-/// simple-name view for callers holding no resolved identity.
 fn buildRuntimeClassDefs(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2591,18 +2249,11 @@ fn buildRuntimeClassDefs(ctx: *BuildCtx) Allocator.Error!void {
     const file_classes = &ctx.file_classes;
     const classes = &ctx.classes;
     const new_defs = &ctx.new_defs;
-    // Synthesise a runtime ClassDef for every class in the file. The
-    // table is FQN-keyed: every class registers under its fully-qualified
-    // name (which IS the simple name for a root-package class), and those
-    // entries are authoritative — they are written first and a simple-name
-    // alias can never displace one. The simple-name view exists only for
-    // callers that hold no resolved identity; where two packages declare
-    // the same simple name the first declaration claims the alias, so the
-    // view is declaration-order deterministic, and every identity-carrying
-    // path (NewInstance ClassId, `::Ctor`, copy) resolves by FQN instead.
+    // The class table is FQN-keyed: every class registers under its fully-qualified name (which IS the
+    // simple name for a root-package class), and those entries are authoritative, never displaced by
+    // an alias. The simple-name view serves callers holding no resolved identity.
     const globals_for_capture = try ObjRef(Env).init(a, Env.init(a));
-    // Defs created by THIS build: the parent/interface backpatch below
-    // links only these — seeded base defs arrive fully linked.
+    // Defs created by THIS build: the backpatch links only these, seeded base defs arriving linked.
     var simple_aliases: std.ArrayList(struct { name: []const u8, def: ObjRef(ClassDef) }) = .empty;
     defer simple_aliases.deinit(a);
     for (decls) |*d| {
@@ -2626,12 +2277,8 @@ fn buildRuntimeClassDefs(ctx: *BuildCtx) Allocator.Error!void {
             gop.value_ptr.* = alias.def;
             continue;
         }
-        // An authoritative entry (a root-package class whose FQN is the
-        // key) is never displaced. Among aliases, a user-package class
-        // outranks a shipped one — decl concatenation puts shipped
-        // sources first, so this preserves the binding user programs
-        // always had — and equally-ranked aliases keep the first
-        // declaration.
+        // An authoritative entry is never displaced. Among aliases a user-package class outranks a shipped
+        // one, and equally-ranked aliases keep the first declaration.
         const existing_fqn = blk: {
             const g = gop.value_ptr.borrow();
             defer g.deinit();
@@ -2654,13 +2301,10 @@ fn buildRuntimeClassDefs(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Populate every enum's entries, per-entry overrides and ctor-arg thunks.
 fn registerEnumEntries(ctx: *BuildCtx) Allocator.Error!void {
     const base = ctx.base;
     const decls = ctx.decls;
-    // Populate enum entries + per-entry overrides + ctor-arg thunks. An
-    // extending build continues the base's identity sequence so default
-    // toString/hashCode renderings match the whole-program numbering.
+    // An extending build continues the base's identity sequence so default toString/hashCode match.
     var next_id: u64 = if (base) |bs| bs.enum_id_next else 1;
     for (decls) |*d| {
         if (d.* != .Class) continue;
@@ -2691,7 +2335,6 @@ fn registerEnumClassEntries(ctx: *BuildCtx, c: *ast.Class, next_id: *u64) Alloca
     g.deinit();
 }
 
-/// Build one enum entry's singleton instance and its ctor-arg thunks.
 fn lowerEnumEntry(
     ctx: *BuildCtx,
     c: *ast.Class,
@@ -2728,16 +2371,9 @@ fn lowerEnumEntry(
         .annotation_records = entry_annotations,
     });
 
-    // Lower an init thunk per constructor slot: the entry's explicit
-    // args, then default values for any trailing primary-ctor params
-    // the entry omits (`enum E(val n:Int, val f:Boolean=false){A(1)}`
-    // must still initialize `f`). Kotlin requires the provided args to
-    // be a prefix, so defaults fill the suffix and stay index-aligned.
-    // A named entry argument binds its parameter (`B(b = 1, a = 0)`);
-    // a positional one takes the next unfilled slot. Every slot up to
-    // the last provided or defaulted parameter gets a thunk.
-    // An enum without a primary constructor passes its entry
-    // arguments to a secondary constructor: they stay positional.
+    // One init thunk per constructor slot: the entry's explicit args, then defaults for any trailing
+    // primary-ctor params it omits. Kotlin requires the args to be a prefix, so defaults fill the
+    // suffix index-aligned; a named argument binds its parameter, a positional one the next slot.
     const n_slots = @max(c.primary_params.len, entry.args.len);
     const slot_exprs = try a.alloc(?*const ast.Expr, n_slots);
     for (slot_exprs) |*se| se.* = null;
@@ -2749,9 +2385,8 @@ fn lowerEnumEntry(
     {}
     if (slot_count != 0) {
         var fids = try a.alloc(FuncId, slot_count);
-        // The arguments sit in the enum's static scope: an entry name
-        // or companion member is visible by its bare name (`FOO("O",
-        // { FOO.x })`), so the thunks take the enum class as `this`.
+        // The arguments sit in the enum's static scope, where an entry name or companion member is visible
+        // bare, so the thunks take the enum class as `this`.
         var enum_scope = StringSet.init(a);
         defer enum_scope.deinit();
         try ir.lower.decl.addVisibleMemberNames(c, &enum_scope);
@@ -2765,8 +2400,6 @@ fn lowerEnumEntry(
     }
 }
 
-/// Bind each entry argument to its constructor slot: a named argument to
-/// the parameter it names, a positional one to the next unfilled slot.
 fn mapEnumEntryArgSlots(c: *const ast.Class, entry: *const ast.EnumEntry, slot_exprs: []?*const ast.Expr) void {
     var next_slot: usize = 0;
     for (entry.args, 0..) |*arg, ai| {
@@ -2792,19 +2425,15 @@ fn mapEnumEntryArgSlots(c: *const ast.Class, entry: *const ast.EnumEntry, slot_e
     }
 }
 
-/// Backpatch every new class def's runtime parent and interface slots,
-/// then fill the nested-class tables.
+/// Backpatch every new class def's runtime parent and interface slots, then fill the nested-class
+/// tables.
 fn linkRuntimeSupertypes(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const decls = ctx.decls;
     const classes = &ctx.classes;
     const new_defs = &ctx.new_defs;
-    // Resolve runtime parent + interface references. The class headers are
-    // already registered; this is the second linker phase that backpatches
-    // each `parent`/`interfaces` slot once. After it returns the fields are
-    // immutable for the rest of the process and read lock-free on dispatch.
-    // Only defs created by this build link here; seeded base defs arrived
-    // fully linked from the per-run clone.
+    // The second linker phase backpatches each `parent`/`interfaces` slot once; afterwards the fields
+    // are immutable for the rest of the process and read lock-free on dispatch.
     {
         for (new_defs.items) |def| {
             const dg = def.borrow();
@@ -2814,14 +2443,8 @@ fn linkRuntimeSupertypes(ctx: *BuildCtx) Allocator.Error!void {
             dg.deinit();
             var ifaces: std.ArrayList(ObjRef(ClassDef)) = .empty;
             for (supertype_names, 0..) |sup_name, si| {
-                // A supertype name is written as a simple name in source;
-                // resolve it Kotlin-style — the subclass's own package
-                // before the cross-package simple-name view — so a
-                // same-simple-name class from another package cannot
-                // become the parent. A qualified reference (`Outer.Inner`)
-                // resolves by FQN suffix first, disambiguating a nested base
-                // from a same-simple-name class in scope (including a subtype
-                // named like its base).
+                // A supertype name is written simple in source and resolves Kotlin-style, the subclass's own
+                // package before the cross-package simple-name view. A qualified reference resolves by FQN suffix.
                 const qp: ?[]const u8 = if (si < supertype_paths.len) supertype_paths[si] else null;
                 const sup_def = blk: {
                     if (qp) |p| {
@@ -2854,17 +2477,12 @@ fn linkRuntimeSupertypes(ctx: *BuildCtx) Allocator.Error!void {
                 ifaces.deinit(a);
             }
         }
-        // Nested-class tables: a class's `nested_classes` names every class
-        // / object / interface declared in its body, resolved to the runtime
-        // defs registered above. The image loader restores this table for
-        // baked classes; a freshly built program must fill it the same way,
-        // or a reified `typeOf<Nested>()` inside the outer class cannot
-        // reach the nested def.
+        // A class's `nested_classes` names every class, object and interface declared in its body, or a
+        // reified `typeOf<Nested>()` inside the outer class cannot reach the nested def.
         try fillNestedClassTables(a, decls, classes, "");
     }
 }
 
-/// Lower each class's parent-constructor argument thunks.
 fn lowerParentCtorArgThunks(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2875,7 +2493,6 @@ fn lowerParentCtorArgThunks(ctx: *BuildCtx) Allocator.Error!void {
     const nested_outer_members = &ctx.nested_outer_members;
     const parent_ctor_args = &ctx.parent_ctor_args;
     const parent_ctor_arg_names = &ctx.parent_ctor_arg_names;
-    // Parent-ctor argument thunks.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -2889,8 +2506,7 @@ fn lowerParentCtorArgThunks(ctx: *BuildCtx) Allocator.Error!void {
             }
         }
         const parent_args = first_parent_args orelse continue;
-        // The argument labels for the same supertype (`: Base(objects = 2)`),
-        // parallel to `parent_args`; empty/`null` where all positional.
+        // Argument labels parallel to `parent_args`, null where the call is all positional.
         const parent_names: ?[]const ?[]const u8 =
             if (first_idx < c.supertype_arg_names.len) c.supertype_arg_names[first_idx] else null;
         var param_refs: std.ArrayList([]const u8) = .empty;
@@ -2931,8 +2547,6 @@ fn lowerParentCtorArgThunks(ctx: *BuildCtx) Allocator.Error!void {
         try parent_ctor_args.put(c.name.name, fids);
         const cfqn = try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name);
         if (!std.mem.eql(u8, cfqn, c.name.name)) try parent_ctor_args.put(cfqn, fids);
-        // Record labels only when at least one argument is named — a fully
-        // positional call keeps the empty default and binds by position.
         if (parent_names) |names| {
             var any_named = false;
             for (names) |n| {
@@ -2950,8 +2564,6 @@ fn lowerParentCtorArgThunks(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Lower each class's `init { … }` blocks as thunks over `this` and the
-/// constructor parameters.
 fn lowerInitBlockThunks(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -2961,7 +2573,7 @@ fn lowerInitBlockThunks(ctx: *BuildCtx) Allocator.Error!void {
     const package_prefix = ctx.package_prefix;
     const file_classes = &ctx.file_classes;
     const init_blocks = &ctx.init_blocks;
-    // Init blocks as 1-arg thunks taking `this` plus ctor params.
+    // Init blocks as thunks taking `this` plus the ctor params.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -2997,9 +2609,8 @@ fn lowerInitBlockThunks(ctx: *BuildCtx) Allocator.Error!void {
         for (c.primary_params, 0..) |*p, i| {
             if (i + 1 < ib_types.len) ib_types[i + 1] = p.ty;
         }
-        // The same typed signature the body-property thunks compile against:
-        // an init block reads the constructor's parameters, and a consumer
-        // reading `Func.params` has nowhere else to learn their types.
+        // The same typed signature the body-property thunks compile against: an init block reads the
+        // constructor's parameters, and a consumer reading `Func.params` has no other source.
         const ib_cid = module.classIdByFqn(try resolveFqn(a, fqn_overrides, c.span, package_prefix, c.name.name));
         const ib_param_types: []const ir.Param = if (ib_cid) |cid|
             module.classes.items[cid.int()].primary_params
@@ -3016,7 +2627,6 @@ fn lowerInitBlockThunks(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Lower each class's supertype delegation expressions.
 fn lowerClassDelegateThunks(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -3025,7 +2635,6 @@ fn lowerClassDelegateThunks(ctx: *BuildCtx) Allocator.Error!void {
     const decl_pkg = ctx.decl_pkg;
     const package_prefix = ctx.package_prefix;
     const class_delegates = &ctx.class_delegates;
-    // Per-class delegation expressions.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -3041,9 +2650,8 @@ fn lowerClassDelegateThunks(ctx: *BuildCtx) Allocator.Error!void {
             if (delegate_opt) |delegate_expr| {
                 const sup_name = if (sup_idx < c.supertypes.len) c.supertypes[sup_idx].name.name else "";
                 const nm = try std.fmt.allocPrint(a, "__class_delegate_{s}_{d}", .{ c.name.name, sup_idx });
-                // The delegate expression is written in the CLASS's scope: a
-                // nested class's `by StaticHolder.shared` names a sibling
-                // nested object that only the enclosing-class walk resolves.
+                // The delegate expression is written in the CLASS's scope, so a nested class's `by X.shared` names
+                // a sibling nested object only the enclosing walk resolves.
                 const fid = try ir.lower.lowerExprAsParamThunkScoped(module, param_refs.items, &delegate_expr, nm, c.name.name, null);
                 try entries.append(a, .{ .name = sup_name, .func = fid });
             }
@@ -3059,10 +2667,8 @@ fn lowerClassDelegateThunks(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Lower every class's secondary constructors.
 fn lowerSecondaryCtors(ctx: *BuildCtx) Allocator.Error!void {
     const decls = ctx.decls;
-    // Per-class secondary-ctor lowering.
     for (decls) |*d| {
         if (d.* != .Class) continue;
         const c = &d.Class;
@@ -3107,20 +2713,16 @@ fn lowerClassSecondaryCtors(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void 
             else => {},
         }
     }
-    // Inherited companion members: a delegation/default thunk references a
-    // superclass companion's constant/function by its bare name (`MinId`
-    // inside `Rgb`, from `ColorSpace.Companion`), and has no `this` to walk
-    // at runtime — resolve it statically as a companion access.
+    // A delegation or default thunk names a superclass companion's member bare and has no `this` to
+    // walk at runtime, so it resolves statically as a companion access.
     {
         var seen_sup = StringSet.init(a);
         defer seen_sup.deinit();
         for (c.supertypes) |*st| try collectHierarchyCompanionMemberNames(st.name.name, file_classes, &own_members, &seen_sup);
     }
-    // Which of those names a delegation/default thunk may CALL. Every
-    // function contributes its arity mask; a name that is only ever a
-    // property gets mask 0, so `: this(totalMonths(y, m), d)` next to a
-    // `val totalMonths` keeps binding the top-level `totalMonths(Int, Int)`
-    // instead of routing to a companion member that does not exist.
+    // Which of those names such a thunk may CALL: every function contributes its arity mask, and a
+    // name that is only ever a property gets mask 0, so a call beside a same-named `val` still binds
+    // the top-level function.
     var own_arity = std.StringHashMap(u64).init(a);
     defer own_arity.deinit();
     {
@@ -3155,8 +2757,6 @@ fn lowerClassSecondaryCtors(ctx: *BuildCtx, c: *ast.Class) Allocator.Error!void 
     if (!std.mem.eql(u8, cfqn, c.name.name)) try secondary_ctors.put(cfqn, entries);
 }
 
-/// Lower one secondary constructor: its parameter metadata, delegation
-/// argument thunks, parameter defaults and body.
 fn lowerSecondaryCtor(
     ctx: *BuildCtx,
     c: *ast.Class,
@@ -3168,17 +2768,14 @@ fn lowerSecondaryCtor(
     const a = ctx.a;
     const module = ctx.module;
     const nested_outer_members = &ctx.nested_outer_members;
-    // The entry outlives the declaration's AST (a pack's sources are
-    // released once their bindings are extracted), so its strings are
-    // the module's own copies, never slices into the parse.
+    // The entry outlives the declaration's AST, a pack's sources being released once their bindings
+    // are extracted, so its strings are the module's own copies.
     var param_names = try a.alloc([]const u8, sc.params.len);
     for (sc.params, 0..) |*p, i| param_names[i] = try a.dupe(u8, p.name.name);
     var param_type_heads = try a.alloc([]const u8, sc.params.len);
     for (sc.params, 0..) |*p, i| {
-        // A function-typed parameter's name field is empty; record
-        // the arity-tagged head (`FunctionN`) so ctor overload
-        // selection can prefer this slot for a lambda argument over
-        // a same-arity sibling's SAM-class slot.
+        // A function-typed parameter's name field is empty, so the arity-tagged head is recorded and ctor
+        // overload selection can prefer this slot for a lambda over a SAM-class slot.
         param_type_heads[i] = if (p.ty.function != null)
             try ir.lower.decl.loweredTypeName(a, &p.ty)
         else
@@ -3199,15 +2796,12 @@ fn lowerSecondaryCtor(
         },
         .None => {},
     }
-    // The delegation arguments and the defaults are expressions over
-    // the secondary constructor's OWN parameters, so they lower with
-    // the declared types those parameters carry.
+    // The delegation arguments and defaults are expressions over the secondary constructor's OWN
+    // parameters, so they lower with the types those parameters declare.
     const sc_param_types = try a.alloc(?ast.TypeRef, sc.params.len);
     for (sc.params, 0..) |*p, i| sc_param_types[i] = p.ty;
-    // An inner class's thunks take the enclosing instance as a
-    // leading receiver slot, like its primary constructor's default
-    // thunks; any other class's thunks see only the parameters, so a
-    // companion member named in a delegation stays a static call.
+    // An inner class's thunks take the enclosing instance as a leading receiver slot; any other
+    // class's see only the parameters, so a companion member named in a delegation stays a static call.
     var sc_thunk_params: []const []const u8 = param_names;
     var sc_thunk_types: []const ?ast.TypeRef = sc_param_types;
     if (c.is_inner) {
@@ -3220,13 +2814,9 @@ fn lowerSecondaryCtor(
         for (sc.params, 0..) |*p, i| with_recv_types[i + 1] = p.ty;
         sc_thunk_types = with_recv_types;
     }
-    // Named delegation arguments (`this(message = m, cause = c,
-    // missingFields = f, serialName = null)`) bind the target's
-    // parameters by NAME; the thunks run in the target's declared
+    // Named delegation arguments bind by NAME, and the thunks run in the target's declared order.
     const order = try secondaryCtorDelegationOrder(a, c, sc, delegation_args, is_this);
-    // An inner class's delegation arguments and defaults see the
-    // enclosing instance's members the way its primary defaults do
-    // (`constructor() : super({ ok })` reads `this@Outer.ok`).
+    // An inner class's delegation arguments and defaults see the enclosing instance's members.
     const sc_enclosing: ?*const StringSet = nested_outer_members.getPtr(c.name.name);
     var arg_fids = try a.alloc(FuncId, delegation_args.len);
     for (order, 0..) |src_idx, arg_idx| {
@@ -3280,9 +2870,8 @@ fn lowerSecondaryCtor(
     };
 }
 
-/// The order a `this(...)` delegation's arguments bind the target's
-/// parameters in: named arguments take the parameter they name, and only
-/// a call that fills every primary parameter is reordered.
+/// The order a `this(...)` delegation's arguments bind the target's parameters in: a named argument
+/// takes the parameter it names, and only a call filling every primary parameter is reordered.
 fn secondaryCtorDelegationOrder(
     a: Allocator,
     c: *const ast.Class,
@@ -3290,8 +2879,6 @@ fn secondaryCtorDelegationOrder(
     delegation_args: []const ast.Expr,
     is_this: bool,
 ) Allocator.Error![]usize {
-    // order. Only a `this(...)` that fills every primary parameter
-    // is reordered; anything else stays positional.
     var order = try a.alloc(usize, delegation_args.len);
     for (order, 0..) |*o, i| o.* = i;
     if (is_this and sc.delegation_arg_names.len == delegation_args.len and
@@ -3335,7 +2922,6 @@ fn lowerTopLevelConstProps(ctx: *BuildCtx) Allocator.Error!void {
     const decl_pkg = ctx.decl_pkg;
     const package_prefix = ctx.package_prefix;
     const top_level_props = &ctx.top_level_props;
-    // Top-level property initialisers — const first, then the rest.
     for (decls) |*d| {
         if (d.* != .Property) continue;
         const p = d.Property;
@@ -3351,8 +2937,6 @@ fn lowerTopLevelConstProps(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Lower the remaining top-level property initialisers, delegates and
-/// accessors.
 fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -3375,11 +2959,9 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
             (if (ef.init) |*finit| finit else null)
         else
             null;
-        // A custom accessor next to real storage moves the storage binding
-        // to the raw `__klio_topfield__<name>` key: a plain-name read then
-        // misses and re-runs the getter, and a plain-name write dispatches
-        // the setter; the accessor bodies' `field` reads/writes target the
-        // raw key directly.
+        // A custom accessor next to real storage moves the storage binding to the raw
+        // `__klio_topfield__<name>` key: a plain-name read misses and re-runs the getter, a plain-name
+        // write dispatches the setter, and the accessor bodies target the raw key.
         const accessorized = p.setter != null or (p.getter != null and storage_init != null);
         const storage_name = if (accessorized)
             try std.fmt.allocPrint(a, "__klio_topfield__{s}", .{p.name.name})
@@ -3388,11 +2970,8 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
         if (storage_init) |init| {
             const nm = try std.fmt.allocPrint(a, "__top_prop_init_{s}", .{p.name.name});
             const fid = try ir.lower.lowerExprAsThunkTyped(module, init, nm, p.ty);
-            // Annotated: default from the declared type. Unannotated: infer
-            // from a trivially-typed literal initializer so a forward read
-            // observes the typed field default (matching kotlinc) instead of
-            // driving the initializer out of order; non-literal unannotated
-            // initializers keep the on-demand path (`.none`).
+            // Annotated: default from the declared type. Unannotated: infer from a trivially-typed literal
+            // initializer so a forward read observes the typed field default, as kotlinc does.
             const dflt = if (p.ty) |*t| typedDefaultFor(t) else typedDefaultForInit(init);
             try top_level_props.append(a, .{ .name = storage_name, .func = fid, .default = dflt, .file = p.span.file.int() });
         } else if (p.delegate) |delegate| {
@@ -3406,9 +2985,8 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
         if (p.delegate == null) {
             if (p.context_params.len != 0) module.has_context_decls = true;
             if (p.getter) |getter| {
-                // With storage, the getter re-runs on each plain-name read
-                // (the miss path) and its `field` reads the raw key; without
-                // storage it is the field-less computed-property form.
+                // With storage the getter re-runs on each plain-name read and its `field` reads the raw key;
+                // without storage it is the field-less computed-property form.
                 if (p.context_params.len != 0)
                     module.pending_ctx = .{ .params = p.context_params, .type_params = &.{} };
                 const nm = try std.fmt.allocPrint(a, "__top_prop_get_{s}", .{p.name.name});
@@ -3447,14 +3025,12 @@ fn lowerTopLevelProps(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Lower every extension property: file-level, and the member extensions
-/// a class or object owns.
+/// Lower every extension property: file-level, and the member extensions a class owns.
 fn lowerExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const decls = ctx.decls;
     const fqn_overrides = ctx.fqn_overrides;
     const package_prefix = ctx.package_prefix;
-    // Top-level + companion/object extension properties.
     var ext_prop_decls: std.ArrayList(ExtPropDecl) = .empty;
     defer ext_prop_decls.deinit(a);
     for (decls) |*d| {
@@ -3498,11 +3074,8 @@ fn lowerExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
             else => {},
         }
     }
-    // Class-typed typealiases (`typealias Point = FloatFloatPair`). The shared
-    // `type_aliases` map records only function-typed aliases (for arity), so
-    // collect the class ones here to expand an extension receiver named by an
-    // alias to its underlying class — otherwise a `val Point.x` extension is
-    // keyed on `Point` and never dispatches on a `FloatFloatPair` value.
+    // Class-typed typealiases collect here, the shared `type_aliases` map recording only function-typed
+    // ones, so an extension receiver named by an alias expands to the class.
     var class_aliases = std.StringHashMap([]const u8).init(a);
     defer class_aliases.deinit();
     for (decls) |*d| {
@@ -3516,8 +3089,6 @@ fn lowerExtensionProps(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Lower one extension property's accessors under the receiver key its
-/// declaration resolves to.
 fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const std.StringHashMap([]const u8)) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -3527,10 +3098,7 @@ fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const st
     const package_prefix = ctx.package_prefix;
     const p = epd.p;
     const recv = p.receiver_type orelse return;
-    // Expand a typealias receiver (`typealias Point = FloatFloatPair`; then
-    // `val Point.x`) to the underlying type so the extension keys and
-    // dispatches on the concrete class, not the alias name — a member
-    // access on a `FloatFloatPair` value otherwise never finds `.x`.
+    // A typealias receiver expands to the underlying type, so the extension dispatches on the class.
     var recv_name = recv.name.name;
     {
         var hops: usize = 0;
@@ -3539,22 +3107,15 @@ fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const st
             recv_name = t;
         }
     }
-    // A member-extension property on the enclosing class's TYPE PARAMETER
-    // (`class LazyLayoutItemAnimator<T : LazyLayoutMeasuredItem> { private
-    // val T.hasAnimations }`) keys on the parameter's UPPER BOUND — every
-    // receiver it can dispatch on is a subtype of the bound, and the
-    // lookup walks the receiver's supertype chain by simple name.
+    // A member-extension property on the enclosing class's TYPE PARAMETER keys on the parameter's
+    // UPPER BOUND: every receiver it dispatches on is a subtype of the bound.
     for (epd.owner_type_params) |*tp| {
         if (!std.mem.eql(u8, tp.name.name, recv_name)) continue;
         recv_name = if (tp.upper_bound) |ub| ub.name.name else "Any";
         break;
     }
-    // A `val X.Companion.foo` records `qualified_path = "X.Companion"`; key
-    // it under that path so it never collides with a plain `val X.foo` type
-    // extension (which applies to instances of `X`, not its companion).
-    // A function-type receiver (`val (Int.() -> String).twice`) is keyed
-    // under `Function`, the runtime name of every callable value, so the
-    // walk from a closure receiver finds it.
+    // A `val X.Companion.foo` records `qualified_path = "X.Companion"` and is keyed under that path,
+    // so it never collides with a plain `val X.foo`. A function-type receiver keys under `Function`.
     if (recv.function != null) recv_name = "Function";
     const recv_key: []const u8 = if (recv.qualified_path) |qp|
         (if (std.mem.endsWith(u8, qp, ".Companion")) qp else recv_name)
@@ -3564,9 +3125,8 @@ fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const st
 
     const prev_ep_pkg = ir.lower.decl.setLowerSelfPackage(ep_pkg);
     defer _ = ir.lower.decl.setLowerSelfPackage(prev_ep_pkg);
-    // The accessor's receiver answers to `this@<prop>`, and a local
-    // class declared in the body reaches the declaring class as
-    // `this@<Owner>`.
+    // The accessor's receiver answers to `this@<prop>`, and a local class in the body reaches the
+    // declaring class as `this@<Owner>`.
     const dispatch_owner: ?[]const u8 = if (epd.owner) |o|
         (if (std.mem.findScalarLast(u8, o, '.')) |dot| o[dot + 1 ..] else o)
     else
@@ -3575,9 +3135,8 @@ fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const st
         try lowerExtensionPropGetter(ctx, epd, p, getter, recv, recv_name, recv_key, ep_pkg, dispatch_owner);
     }
     if (p.delegate) |delegate| {
-        // `val R.x by expr`: no accessor bodies — the delegate object
-        // (produced once by this thunk, cached per property) serves
-        // reads and writes through its getValue/setValue.
+        // `val R.x by expr` has no accessor bodies: the delegate object, produced once by this thunk and
+        // cached per property, serves reads and writes through getValue/setValue.
         const nm = try std.fmt.allocPrint(a, "__ext_prop_delegate_{s}_{s}", .{ recv_name, p.name.name });
         const fid = try ir.lower.lowerExprAsThunk(module, delegate, nm);
         try extension_prop_delegates.put(.{ .a = recv_key, .b = p.name.name }, fid);
@@ -3587,8 +3146,6 @@ fn lowerExtensionProp(ctx: *BuildCtx, epd: ExtPropDecl, class_aliases: *const st
     }
 }
 
-/// Lower an extension property's getter and register every key it
-/// dispatches under.
 fn lowerExtensionPropGetter(
     ctx: *BuildCtx,
     epd: ExtPropDecl,
@@ -3618,38 +3175,22 @@ fn lowerExtensionPropGetter(
         if (std.mem.eql(u8, w, p.name.name))
             std.debug.print("[extprop-reg] key=({s},{s}) fid={d} owner={s}\n", .{ recv_key, p.name.name, fid.int(), epd.owner orelse "<top>" });
     }
-    // A PRIVATE member-extension property is visible only where its
-    // owner class is a dispatch receiver, so it registers ONLY under
-    // the owner-qualified key — the plain pair would resolve it
-    // program-wide (`private val String.decorated` in one class
-    // served a bystander's `s.decorated`, which kotlinc rejects).
-    // The owner-keyed resolvers cover the legal scopes: the lexical
-    // receiver tower and the importing file (companion members).
-    // A NON-private member extension keeps the plain pair as well:
-    // kotlinc scopes those to the tower too, but the interpreter's
-    // tower emulation does not yet see every legal frame (lambda and
-    // inline splices inside the owner) — gating them cost the
-    // compose suite ~400 tests. Tightening that is recorded work.
+    // A PRIVATE member-extension property is visible only where its owner class is a dispatch receiver,
+    // so it registers ONLY under the owner-qualified key; a plain pair would resolve it program-wide,
+    // which kotlinc rejects. A non-private one keeps the plain pair, the tower emulation not yet
+    // seeing every legal frame.
     if (epd.owner) |owner| {
         const okey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ owner, recv_key });
         try extension_props.put(.{ .a = okey, .b = p.name.name }, fid);
-        // The receiver-tower probe reaches an owner through a frame
-        // class's supertype_names, which are SOURCE-WRITTEN simple
-        // names — an fqn-keyed entry alone is unreachable through an
-        // implemented interface (PersistentCompositionLocalMap's
-        // `CompositionLocal<T>.currentValue`). Key the classifier
-        // path without its package as an alias.
+        // The receiver-tower probe reaches an owner through a frame class's supertype_names, which are
+        // SOURCE-WRITTEN simple names, so the classifier path without its package is keyed as an alias.
         if (ownerSimplePath(owner)) |short| {
             const skey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ short, recv_key });
             try extension_props.put(.{ .a = skey, .b = p.name.name }, fid);
         }
         try owner_keyed_ext_names.put(p.name.name, {});
-        // kotlinc-exact scoping: a member extension — private or
-        // not — is visible only where its owner is a receiver (the
-        // tower) or via import, never program-wide, so NO plain
-        // (recv, name) pair. The legal scopes resolve through the
-        // owner-keyed entries: the receiver tower (fqn and
-        // simple-owner keys) and the importing file.
+        // kotlinc-exact scoping: a member extension is visible only where its owner is a receiver or via
+        // import, so there is NO plain (recv, name) pair.
     } else {
         try extension_props.put(.{ .a = recv_key, .b = p.name.name }, fid);
     }
@@ -3662,13 +3203,8 @@ fn lowerExtensionPropGetter(
         } else {
             gop2.value_ptr.* = fid;
         }
-        // A second, package-qualified key: same-name nullable
-        // extension properties in different packages (an internal
-        // `RowColumnParentData?.weight` and an internal
-        // `ButtonGroupParentData?.weight`) blank the bare-name
-        // entry, but the reading code sits in the declaring
-        // package, so the executing frame's package still
-        // disambiguates at the null-receiver dispatch.
+        // A second, package-qualified key: same-name nullable extension properties in different packages
+        // blank the bare-name entry, but the executing frame's package still disambiguates.
         const pkg_key = try std.fmt.allocPrint(a, "{s}\x1f{s}", .{ ep_pkg, p.name.name });
         const gop3 = try nullable_ext_props.getOrPut(pkg_key);
         if (gop3.found_existing) {
@@ -3679,16 +3215,13 @@ fn lowerExtensionPropGetter(
             gop3.value_ptr.* = fid;
         }
     }
-    // A member-extension property's accessor body has its
-    // declaring class's `this` in lexical scope; tag the owner so
-    // dispatch seeds the accessor frame with the owner instance.
+    // A member-extension accessor body has its declaring class's `this` in lexical scope, so dispatch
+    // seeds the accessor frame with the owner instance.
     if (epd.owner) |owner| {
         try module.registry.member_ext_owner_class.put(fid, owner);
     }
 }
 
-/// Lower an extension property's setter and register every key it
-/// dispatches under.
 fn lowerExtensionPropSetter(
     ctx: *BuildCtx,
     epd: ExtPropDecl,
@@ -3713,9 +3246,8 @@ fn lowerExtensionPropSetter(
         for (rg.get().body_properties) |*pp| try recv_members.put(pp.name, {});
         rg.deinit();
     }
-    // A `var X.Companion.x` setter's bare-name writes target the
-    // companion's own members; fold them in so they lower as `this`
-    // field writes rather than top-level bindings.
+    // A `var X.Companion.x` setter's bare-name writes target the companion's own members, so they lower
+    // as `this` field writes rather than top-level bindings.
     if (companion_singletons.get(recv_name)) |comp_name| {
         if (classes.get(comp_name)) |cdef| {
             const cgm = cdef.borrow();
@@ -3735,31 +3267,24 @@ fn lowerExtensionPropSetter(
     if (epd.owner) |owner| {
         const okey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ owner, recv_key });
         try extension_prop_setters.put(.{ .a = okey, .b = p.name.name }, fid);
-        // Same simple-owner alias as the getter above.
         if (ownerSimplePath(owner)) |short| {
             const skey = try std.fmt.allocPrint(a, "{s}\x00{s}", .{ short, recv_key });
             try extension_prop_setters.put(.{ .a = skey, .b = p.name.name }, fid);
         }
         try owner_keyed_ext_names.put(p.name.name, {});
         try module.registry.member_ext_owner_class.put(fid, owner);
-        // Same kotlinc-exact scoping as the getter: owner-keyed
-        // only, no program-wide plain pair.
     } else {
         try extension_prop_setters.put(.{ .a = recv_key, .b = p.name.name }, fid);
     }
 }
 
-// -------------------------------------------------------------------------
-// Finalisation: the cross-declaration links runtime dispatch reads.
-// -------------------------------------------------------------------------
 
-/// Fold the local-fn default thunks into `func_defaults`, then propagate
-/// supertype member defaults onto the overrides that lack their own.
+/// Fold the local-fn default thunks into `func_defaults`, then propagate supertype member defaults
+/// onto the overrides that lack their own.
 fn settleDefaultArgThunks(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const func_defaults = &ctx.func_defaults;
-    // Fold local-fn default thunks into func_defaults.
     {
         var it = module.registry.local_fn_defaults.iterator();
         while (it.next()) |e| {
@@ -3770,31 +3295,21 @@ fn settleDefaultArgThunks(ctx: *BuildCtx) Allocator.Error!void {
         }
     }
 
-    // Inherited default arguments: propagate supertype member default
-    // thunks onto overriding members lacking their own thunk.
     try propagateInheritedDefaults(a, module, func_defaults);
 }
 
-/// Map every typealias name to its target's head tag.
 fn registerTypeAliasTags(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     const decls = ctx.decls;
-    // typealias Name = Target → Name ↦ Target's simple head name. A
-    // function-type target (`typealias CompletionHandler = (Throwable?) ->
-    // Unit`) maps to its `Function{N}` tag so applicability checks
-    // recognise an aliased parameter as function-typed.
+    // `typealias Name = Target` maps Name to Target's simple head; a function-type target maps to its
+    // `Function{N}` tag so applicability sees an aliased parameter as function-typed.
     for (decls) |*d| {
         if (d.* != .TypeAlias) continue;
         const ta = &d.TypeAlias;
         if (ta.target.function) |ft| {
-            // Match the direct function-type lowering (`loweredTypeRef`),
-            // which tags by the VALUE-parameter count and tracks the
-            // receiver separately: a `T.() -> R` alias is `Function0`, not
-            // `Function1`. Counting the receiver here made an aliased
-            // receiver-lambda parameter (`RoutingHandler = RoutingContext.()
-            // -> Unit`) look like arity 1, so the trailing lambda kept a
-            // spurious `it` and its receiver never bound on invocation.
+            // Match the direct function-type lowering, which tags by VALUE-parameter count and tracks the
+            // receiver separately: a `T.() -> R` alias is `Function0`, not `Function1`.
             const arity = ft.params.len;
             const tag = try std.fmt.allocPrint(a, "Function{d}", .{arity});
             try module.registry.type_aliases.put(ta.name.name, tag);
@@ -3811,29 +3326,18 @@ fn registerTypeAliasTags(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Rewrite the function-type and scalar alias names in this build's
-/// lowered parameter types, so applicability and scoring see the target.
+/// Rewrite function-type and scalar alias names in this build's lowered parameter types, so
+/// applicability and scoring see the target.
 fn rewriteAliasedParamTypes(ctx: *BuildCtx) Allocator.Error!void {
     const module = ctx.module;
     const base_funcs_len = ctx.base_funcs_len;
-    // Rewrite function-type alias names in lowered param types so every
-    // applicability/score consumer sees the `Function{N}` tag — a param
-    // declared `handler: CompletionHandler` is function-typed for
-    // trailing-lambda alignment and overload scoring. In an extending build
-    // only this build's funcs rewrite: base params were settled at base
-    // build time, and their slices are shared with the immutable base (a
-    // user alias that WOULD match a base param type name is screened out by
-    // `canExtendBase`, which falls back to the whole-program build).
+    // In an extending build only this build's funcs rewrite: base param slices are shared with the
+    // immutable base, and a user alias matching a base param type name fails `canExtendBase`.
     for (module.funcs.items[base_funcs_len..]) |*f| {
         for (f.params) |*p| {
             const resolved = module.registry.type_aliases.get(p.ty.name) orelse continue;
-            // A function-typed alias becomes its `Function{N}` tag (trailing-lambda
-            // alignment); a SCALAR alias (`typealias SnapshotId = Long`) becomes its
-            // primitive target so overload applicability matches a scalar argument
-            // against it (a `Long` arg fits a `SnapshotId` param, since the alias is
-            // transparent). Without this the strict multi-candidate scorer sees an
-            // opaque `SnapshotId` param and rejects the Long, so a class with two
-            // same-named overloads (one taking the alias) resolves to none.
+            // A function-typed alias becomes its `Function{N}` tag for trailing-lambda alignment; a SCALAR
+            // alias becomes its primitive target, since the alias is transparent to the strict scorer.
             if (std.mem.startsWith(u8, resolved, "Function")) {
                 p.ty.name = resolved;
             } else if (@import("../vm/overload_match.zig").builtinParamKind(resolved) != null) {
@@ -3843,7 +3347,6 @@ fn rewriteAliasedParamTypes(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Materialise the module-scoped registry the Vm reads at dispatch time.
 fn materialiseRegistry(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
@@ -3854,11 +3357,8 @@ fn materialiseRegistry(ctx: *BuildCtx) Allocator.Error!void {
     const func_type_params = &ctx.func_type_params;
     const top_level_delegated_props = &ctx.top_level_delegated_props;
     const delegated_body_props = &ctx.delegated_body_props;
-    // Materialise the module-scoped registry the Vm reads at dispatch time.
-    // Object names, companion singletons, enclosing-class, func type params,
-    // delegated props (the lowering-only registry fields stay in place).
-    // Seeded base object names are already in the cloned registry; append
-    // only this build's.
+    // Object names, companion singletons, enclosing-class, func type params and delegated props; the
+    // lowering-only registry fields stay in place. Only this build's object names append.
     for (object_names.items[base_object_names_len..]) |n| try module.registry.object_names.append(a, n);
     {
         var it = companion_singletons.iterator();
@@ -3872,8 +3372,7 @@ fn materialiseRegistry(ctx: *BuildCtx) Allocator.Error!void {
         var it = func_type_params.iterator();
         while (it.next()) |e| {
             const fid = FuncId.from(e.key_ptr.*);
-            // Header-time registration (the phase-1 stub loop) already put
-            // this build's entries; only seed-carried ones land here.
+            // Header-time registration already put this build's entries; only seed-carried ones land here.
             if (module.registry.func_type_params.contains(fid)) continue;
             var list: std.ArrayList([]const u8) = .empty;
             try list.appendSlice(a, e.value_ptr.*);
@@ -3890,16 +3389,14 @@ fn materialiseRegistry(ctx: *BuildCtx) Allocator.Error!void {
     }
 }
 
-/// Settle the name index, the virtual override families, and the
-/// debug-only frame-dump hook.
 fn finishModule(ctx: *BuildCtx) Allocator.Error!void {
     const a = ctx.a;
     const module = ctx.module;
     // Rebuild the name index so funcId lookups see every registered stub.
     try module.rebuildFuncNameIndex(a);
 
-    // Settle virtual override families after every class/member header is
-    // complete. Runtime member dispatch can then use only class + slot ids.
+    // Virtual override families settle after every class and member header is complete, so runtime
+    // member dispatch can use class and slot ids alone.
     try module.linkMethodSlots(a);
 
     // Debug-only frame-dump hook for intrinsics below the ir layer.

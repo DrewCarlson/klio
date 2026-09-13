@@ -1,6 +1,6 @@
-//! Instruction shape recognition: constant classification and the matchers
-//! that decide whether a single IR instruction is an array access, a numeric
-//! conversion, a bitwise op, or one of the trampolinable call/field forms.
+//! Instruction shape recognition: constant classification and the matchers deciding
+//! whether an instruction is an array access, a numeric conversion, a bitwise op, or
+//! one of the trampolinable call and field forms.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -20,8 +20,6 @@ const FuncId = ir.FuncId;
 const RegType = common.RegType;
 const tagForRt = type_infer.tagForRt;
 
-// --- supported-shape predicates ---------------------------------------------
-
 pub fn constType(c: ir.Const) RegType {
     return switch (c) {
         .Int, .Char, .Short, .Byte => .i32,
@@ -35,8 +33,6 @@ pub fn constType(c: ir.Const) RegType {
     };
 }
 
-/// The float bit pattern a `Double`/`Float` const carries (raw in its slot;
-/// an f32 occupies the low 32 bits).
 pub fn constFloatBits(c: ir.Const) i64 {
     return switch (c) {
         .Double => |x| @bitCast(x),
@@ -64,8 +60,6 @@ pub fn isFloat(t: RegType) bool {
     return t == .f64 or t == .f32;
 }
 
-/// The scalar `RegType` a capture cell holds, or null for kinds the integer JIT
-/// does not cache (the cell stays interpreter-only).
 pub fn cellScalarType(v: Value) ?RegType {
     return switch (v) {
         .Int, .Char, .Short, .Byte => .i32,
@@ -77,10 +71,8 @@ pub fn cellScalarType(v: Value) ?RegType {
     };
 }
 
-/// The element buffer behind a `List` or a reference `Array<T>`, or null when the
-/// value is neither. A live view (`subList`, a map `values` view, `asList`) is
-/// excluded: its `items` is a window cache refreshed from the source on access,
-/// not the storage the source writes through.
+/// The element buffer behind a `List` or reference `Array<T>`; a live view (`subList`,
+/// a `values` view, `asList`) is excluded, its `items` being a refreshed window cache.
 pub fn boxedElemsOf(v: Value) ?runtime.ValueList {
     return switch (v) {
         .List => |l| if (l.backing != null) null else l.items,
@@ -89,9 +81,8 @@ pub fn boxedElemsOf(v: Value) ?runtime.ValueList {
     };
 }
 
-/// How many elements of a boxed buffer are sampled to pick its scalar kind. The
-/// per-read tag guard is what makes the compiled code correct, so the sample only
-/// has to name the kind the loop will actually see; a wrong guess deopts.
+/// Boxed elements sampled to pick a scalar kind; the per-read tag guard is what keeps
+/// the code correct, so a wrong guess only deopts.
 const BOXED_ELEM_SAMPLE: usize = 32;
 
 pub fn boxedElemShape(vl: runtime.ValueList) ?struct { rt: RegType, tag: u8 } {
@@ -116,8 +107,6 @@ pub fn isArithBinOp(op: ir.BinOp) bool {
 pub fn isDivBinOp(op: ir.BinOp) bool {
     return op == .Div or op == .Mod;
 }
-/// Integer bitwise / shift operators. Their result takes the LEFT operand's
-/// kind, the same rule `bitwiseOpOf` applies to the call-shaped spellings.
 pub fn isBitwiseBinOp(op: ir.BinOp) bool {
     return switch (op) {
         .And, .Or, .Xor, .Shl, .Shr, .UShr => true,
@@ -131,11 +120,8 @@ pub fn isCmpBinOp(op: ir.BinOp) bool {
     };
 }
 
-// --- array subscripts -------------------------------------------------------
-
-/// An array subscript recognized in the IR. Subscripts lower to `CallMember`
-/// "get"/"set" (the interpreter fast-paths them), not to `Index`/`IndexSet`,
-/// so the JIT matches that shape directly (and the dedicated instructions too).
+/// An array subscript. Subscripts lower to `CallMember` "get"/"set" rather than
+/// `Index`/`IndexSet`, so the JIT matches that shape and the dedicated instructions.
 pub const ArrayOp = struct { is_set: bool, recv: Reg, index: Reg, value: Reg, dst: Reg };
 
 pub fn arrayOpOf(module: *const Module, inst: *const Inst) ?ArrayOp {
@@ -158,9 +144,8 @@ pub fn arrayOpOf(module: *const Module, inst: *const Inst) ?ArrayOp {
     }
 }
 
-/// Whether any subscript in the body STORES through `recv`. A boxed element store
-/// would have to release the element it overwrites and retag the slot, so those
-/// receivers keep the interpreted subscript.
+/// Whether any subscript in the body STORES through `recv`: a boxed element store must
+/// release the overwritten element, so those receivers stay interpreted.
 pub fn bodyStoresInto(module: *const Module, func: *const Func, body: []const BlockId, recv: Reg) bool {
     for (body) |bid| {
         for (func.blocks[bid.int()].insts) |*inst| {
@@ -171,10 +156,9 @@ pub fn bodyStoresInto(module: *const Module, func: *const Func, body: []const Bl
     return false;
 }
 
-/// A zero-arg numeric conversion (`x.toDouble()`/`toLong()`/`toInt()`), which
-/// lowers to `CallMember`. The JIT compiles the always-exact directions
-/// (int→double, int width changes); double→int is left to the interpreter
-/// because `cvttsd2si` diverges from Kotlin on NaN/overflow (it clamps).
+/// A zero-arg numeric conversion (`x.toDouble()`), lowered as `CallMember`. Only the
+/// exact directions compile; double to int stays interpreted because `cvttsd2si` clamps
+/// where Kotlin does not, on NaN and overflow.
 const NumConv = struct { dst: Reg, src: Reg, to: RegType };
 
 pub fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
@@ -196,10 +180,8 @@ pub fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
                 return null;
             return .{ .dst = cm.dst, .src = cm.receiver, .to = to };
         },
-        // The same conversion on a scalar also lowers as a VIRTUAL call
-        // (`k.toLong()` did), and the slot is rooted at its declaring
-        // function — so the name comes from there. Only the builtin
-        // declarations count: a user class's own `toLong()` is a real call.
+        // The same conversion also lowers as a VIRTUAL call; only builtin declarations count,
+        // since a user class's own `toLong()` is a real call.
         .CallVirtual => |cv| {
             if (cv.arg_names.len != 0 or cv.n_args != 0) return null;
             if (cv.arg_params != null or cv.trailing_lambda) return null;
@@ -221,11 +203,8 @@ pub fn numericConvOf(module: *const Module, inst: *const Inst) ?NumConv {
     }
 }
 
-/// A bitwise infix operation (`a and b`, `a shl n`, …), which Kotlin lowers to a
-/// `CallMember` (these are infix member functions on `Int`/`Long`). The JIT
-/// emits a native bitwise/shift op. `ushr` (logical right shift) and `inv` are
-/// left to the interpreter — `ushr` needs width-aware zero-extension this fast
-/// path does not do.
+/// A bitwise infix operation (`a and b`, `a shl n`), lowered as `CallMember`. `ushr`
+/// and `inv` stay interpreted: `ushr` needs width-aware zero-extension this path lacks.
 const BitKind = enum { @"and", @"or", xor, shl, sar };
 const BitOp = struct { dst: Reg, lhs: Reg, rhs: Reg, kind: BitKind };
 
@@ -254,10 +233,9 @@ pub fn bitwiseOpOf(module: *const Module, inst: *const Inst) ?BitOp {
     }
 }
 
-/// A top-level `Call` the loop JIT can trampoline: a native call site invokes the
-/// host, which reboxes the scalar args, runs the callee interpreted, and reboxes a
-/// scalar result. v1 handles only the bare positional form (no named args, no
-/// reified type args) with at most three args.
+/// A top-level `Call` the loop JIT can trampoline: the native site invokes the host,
+/// which reboxes the scalar args, interprets the callee, and reboxes a scalar result.
+/// Bare positional form only, at most three args.
 const TrampCall = struct { func: FuncId, args_reg: u32, n_args: u32, dst: Reg };
 
 pub fn trampolinableCallOf(inst: *const Inst) ?TrampCall {
@@ -271,10 +249,8 @@ pub fn trampolinableCallOf(inst: *const Inst) ?TrampCall {
     }
 }
 
-/// A `CallValue` the loop JIT can trampoline: invocation of a loop-invariant
-/// callable value (a closure/function/bound reference) held in a register. v1
-/// handles the bare positional form with at most three scalar args and a result
-/// that is discarded (a side-effecting call).
+/// A `CallValue` on a loop-invariant callable register: at most three scalar args,
+/// result discarded.
 const TrampCallValue = struct { callee: Reg, args_reg: u32, n_args: u32, dst: Reg };
 
 pub fn trampolinableCallValueOf(inst: *const Inst) ?TrampCallValue {
@@ -293,9 +269,7 @@ const TrampGlobal = struct { dst: Reg, name: []const u8 };
 pub fn trampolinableGlobalOf(module: *const Module, inst: *const Inst) ?TrampGlobal {
     switch (inst.*) {
         .LoadGlobal => |lg| {
-            // An identity-resolved binding (a function/class value) reads by
-            // id, not by name — the by-name handler would find a different
-            // (or no) value.
+            // An identity-resolved binding reads by id, not by name; by-name would find another value.
             if (lg.func != null or lg.class != null or lg.ctor_ref) return null;
             if (lg.name.int() >= module.consts.items.len) return null;
             const name = module.consts.items[lg.name.int()];
@@ -313,7 +287,6 @@ pub fn isCallableValue(v: Value) bool {
     };
 }
 
-/// A positional `CallMember` the loop JIT can trampoline.
 const TrampMember = struct {
     recv: Reg,
     name: []const u8,
@@ -322,15 +295,12 @@ const TrampMember = struct {
     dst: Reg,
     resolved: ?FuncId,
     dispatch_recv: ?Reg,
-    /// Declared-receiver head for the dispatch (`callMemberNamedDeclared`);
-    /// empty = plain by-name dispatch. Dropping it re-resolved an interface
-    /// default's `this` call against the wrong surface.
+    /// Declared-receiver head for the dispatch (`callMemberNamedDeclared`), empty for plain
+    /// by-name. Without it an interface default's `this` call resolves against the wrong surface.
     declared: []const u8,
 };
 
 pub fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMember {
-    // Subscripts / numeric conversions / bitwise infix ops also lower to
-    // `CallMember` but are compiled natively, not trampolined — exclude them.
     if (arrayOpOf(module, inst) != null) return null;
     if (numericConvOf(module, inst) != null) return null;
     if (bitwiseOpOf(module, inst) != null) return null;
@@ -362,10 +332,8 @@ pub fn trampolinableMemberOf(module: *const Module, inst: *const Inst) ?TrampMem
     }
 }
 
-/// A slot-resolved `CallVirtual` the loop JIT can trampoline: the callback
-/// runs the host's virtual dispatch with the recorded slot. Positional only
-/// (a param map, named args, or a trailing lambda keeps the interpreted arm's
-/// binding machinery), at most three args like the other tramp forms.
+/// A slot-resolved `CallVirtual`: the callback runs the host's virtual dispatch with
+/// the recorded slot. Positional only, at most three args.
 const TrampVirtual = struct { recv: Reg, slot: u32, args_reg: u32, n_args: u32, dst: Reg };
 
 pub fn trampolinableVirtualOf(inst: *const Inst) ?TrampVirtual {
@@ -380,21 +348,14 @@ pub fn trampolinableVirtualOf(inst: *const Inst) ?TrampVirtual {
     }
 }
 
-/// `fn(user, receiver, method_name, args) -> resolved method FuncId | null`. The
-/// loop JIT calls this at compile time (with the live receiver/args) to learn a
-/// trampolined member call's return type; null means unresolvable/intrinsic, so
-/// the call is not trampolined.
+/// `fn(user, receiver, method_name, args) -> FuncId | null`, called at compile time to
+/// type a trampolined member call; null is not trampolined.
 pub const MemberResolver = *const fn (*anyopaque, *const Value, []const u8, []const Value) ?FuncId;
 
-/// `fn(user, receiver, slot) -> the FuncId the virtual slot dispatches to on
-/// the receiver's class | null`. Compile-time only, like `MemberResolver`:
-/// it lets a loop-invariant virtual call inline its (monomorphic) target
-/// natively; null keeps the site a trampoline.
+/// `fn(user, receiver, slot) -> FuncId | null`, compile-time only: a monomorphic
+/// loop-invariant virtual call inlines natively, null keeps the trampoline.
 pub const VirtResolver = *const fn (*anyopaque, *const Value, u32) ?FuncId;
 
-/// A `GetField` the loop JIT can trampoline: a property read on a loop-invariant
-/// boxed object, handled as a direct stored-field read (the receiver stays boxed
-/// in the frame's registers, exactly like a member call's receiver).
 const TrampField = struct { recv: Reg, name: []const u8, dst: Reg };
 
 pub fn trampolinableFieldOf(module: *const Module, inst: *const Inst) ?TrampField {
@@ -409,10 +370,8 @@ pub fn trampolinableFieldOf(module: *const Module, inst: *const Inst) ?TrampFiel
     }
 }
 
-/// Inside a method body, an own-field access lowers to a scope-qualified
-/// getter/setter sentinel `$sgetter$<owner>\u{1f}<field>` (resp. `$ssetter$`).
-/// Return the bare field name for such a sentinel (so it can be resolved as a
-/// plain stored field), or the name unchanged when it is already plain.
+/// An own-field access inside a method body lowers to the sentinel
+/// `$sgetter$<owner>\u{1f}<field>` (`$ssetter$` for a write); returns the bare field name.
 pub fn memberFieldName(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "$sgetter$") or std.mem.startsWith(u8, name, "$ssetter$")) {
         if (std.mem.findScalarLast(u8, name, 0x1f)) |i| return name[i + 1 ..];
@@ -420,8 +379,6 @@ pub fn memberFieldName(name: []const u8) []const u8 {
     return name;
 }
 
-/// A `SetField` the loop JIT can compile: a write of a scalar value to a plain
-/// stored field of a loop-invariant (or class-stable) boxed object.
 const TrampFieldSet = struct { recv: Reg, name: []const u8, value: Reg };
 
 pub fn trampolinableFieldSetOf(module: *const Module, inst: *const Inst) ?TrampFieldSet {
@@ -436,8 +393,6 @@ pub fn trampolinableFieldSetOf(module: *const Module, inst: *const Inst) ?TrampF
     }
 }
 
-/// `fn(user, receiver, field_name) -> stored field index | null`. The loop JIT
-/// calls this at compile time; a non-null index means `name` is a plain stored
-/// property (no custom getter) the trampoline can read directly. Null means the
-/// read must stay interpreted (computed getter / delegated / extension property).
+/// `fn(user, receiver, field_name) -> stored field index | null`. Null means the read
+/// stays interpreted: a computed, delegated or extension property.
 pub const FieldResolver = *const fn (*anyopaque, *const Value, []const u8) ?u32;

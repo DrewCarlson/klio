@@ -12,18 +12,13 @@ const TypeRef = ast.TypeRef;
 const epilogue = @import("epilogue.zig");
 const calleeSimpleName = epilogue.calleeSimpleName;
 
-/// Per-class stability classification. A composable whose value parameters and
-/// receiver are all STABLE gets the skip calculus; one with any unstable
-/// parameter is restartable but not skippable: it keeps its restart scope,
-/// emits no `changed()` probes, and never skips, so an invalidation of an
-/// enclosing scope re-runs it even when the parameter instance is unchanged.
-/// `stable_annotated` (`@Stable`/`@Immutable`) is unconditionally stable;
-/// inferred `stable` still requires stable type arguments at the use site.
+/// A composable whose value parameters and receiver are all STABLE gets the skip
+/// calculus; one with an unstable parameter keeps its restart scope but never skips.
+/// `stable_annotated` is unconditional; inferred `stable` needs stable type arguments.
 pub const Stability = enum { unstable, stable, stable_annotated };
 
-/// Delegate factories whose backing field is a stable snapshot-state object:
-/// `var x by mutableStateOf(…)` keeps the declaring class stable, since the
-/// field is a `MutableState`, itself `@Stable`.
+/// `var x by mutableStateOf(…)` keeps the declaring class stable, the field being a
+/// `MutableState`.
 const stable_delegate_factories = [_][]const u8{
     "mutableStateOf",
     "mutableIntStateOf",
@@ -59,9 +54,7 @@ fn isTypeParamName(name: []const u8, tps: []const ast.TypeParam) bool {
     return false;
 }
 
-/// Build the class-stability registry over every class, object, and typealias
-/// in `module_decls` and `base_decls`, nested declarations included. Caller owns
-/// the returned map. Same-simple-name collisions keep the weaker verdict.
+/// Caller owns the returned map; same-simple-name collisions keep the weaker verdict.
 pub fn collectClassStability(
     a: std.mem.Allocator,
     module_decls: []const Decl,
@@ -156,8 +149,7 @@ const StabilityClassifier = struct {
         if (c.is_enum) return .stable;
         if (c.is_interface or c.is_fun_interface or c.is_annotation) return .unstable;
         if (c.is_open or c.is_abstract or c.is_sealed) return .unstable;
-        // A class supertype (ctor-call form) folds its own stability in;
-        // interface supertypes carry no state and are ignored.
+        // A class supertype folds its own stability in; interfaces carry no state.
         for (c.supertypes, c.supertype_args) |*st, sa| {
             if (sa == null) continue;
             switch (try self.classifyName(st.name.name)) {
@@ -188,7 +180,6 @@ const StabilityClassifier = struct {
                 if (delegateFactoryStable(del)) continue;
                 return false;
             }
-            // Computed property (getter, no backing field) carries no state.
             if (p.getter != null and p.init == null and p.explicit_field == null) continue;
             if (p.mutable) return false;
             if (p.ty) |*ty| {
@@ -219,8 +210,7 @@ fn literalStable(e: *const Expr) bool {
     };
 }
 
-/// Registry-only stability check for a parameter type at transform time:
-/// `active_stability` is the finished map, with no recursion into declarations.
+/// Registry-only check at transform time: nothing recurses into declarations.
 fn typeStableFromMap(map: *const std.StringHashMap(Stability), t: *const TypeRef, tps: []const ast.TypeParam) bool {
     if (t.function != null) return true;
     const n = t.name.name;
@@ -239,16 +229,13 @@ fn typeStableFromMap(map: *const std.StringHashMap(Stability), t: *const TypeRef
     }
 }
 
-/// Whether `f` gets the skip calculus: every value parameter, the extension
-/// receiver, and the enclosing class of a member must be stable. A null
-/// `active_stability` treats every type as stable.
+/// Every value parameter, the extension receiver, and a member's enclosing class must
+/// be stable. A null `active_stability` treats every type as stable.
 pub fn fnIsSkippable(f: *const Function, in_class: bool, enclosing_class: ?[]const u8) bool {
     _ = in_class;
     _ = enclosing_class;
-    // Strong skipping: every restartable composable is skippable regardless of
-    // parameter stability. Unstable parameters and receivers compare by instance
-    // (`changedInstance`) while stable ones keep the structural `changed`. Only
-    // an explicit `@NonSkippableComposable` opts a function out.
+    // Strong skipping: every restartable composable is skippable regardless of parameter
+    // stability, and only `@NonSkippableComposable` opts out.
     for (f.annotations) |ann| {
         if (ann.path.len == 0) continue;
         if (std.mem.eql(u8, ann.path[ann.path.len - 1].name, "NonSkippableComposable")) return false;
@@ -256,9 +243,8 @@ pub fn fnIsSkippable(f: *const Function, in_class: bool, enclosing_class: ?[]con
     return true;
 }
 
-/// The probe method for a parameter under strong skipping: structural `changed`
-/// for a stable type, identity `changedInstance` for an unstable one, so a
-/// mutated model object with the same identity still skips.
+/// Structural `changed` for a stable type, identity `changedInstance` for an
+/// unstable one, so a mutated model object with the same identity still skips.
 pub fn probeMethodFor(ty: *const ast.TypeRef, tps: []const ast.TypeParam) []const u8 {
     const map = root.active_stability orelse return "changed";
     return if (typeStableFromMap(map, ty, tps)) "changed" else "changedInstance";

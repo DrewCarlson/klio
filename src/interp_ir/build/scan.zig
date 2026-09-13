@@ -1,6 +1,5 @@
-//! AST-walk scanning helpers: package prefixes and fully qualified names,
-//! property scope and type-head recording, constant folding of literal
-//! initializers, and member-name collection across the class hierarchy.
+//! AST-walk scanning helpers: package prefixes and fully qualified names, property
+//! scope and type-head recording, constant folding, and member-name collection.
 
 const std = @import("std");
 
@@ -67,15 +66,9 @@ pub fn collectClassTypeParamBounds(
     }
     return @as(?[]const ir.ModuleRegistry.TypeParamBound, try bounds.toOwnedSlice(allocator));
 }
-/// Map a declared property type annotation to its static-field default
-/// category. Nullable, function, and non-primitive heads are references
-/// (default null); a qualified head only counts as a builtin primitive
-/// when the qualifier is exactly `kotlin`.
-/// Simple type-name head for ctor-overload disambiguation: drop any package
-/// qualifier, generic arguments, and trailing nullability.
-/// The simple head of each class type parameter's upper bound, from the
-/// inline `<T : Int>` form or a `where T : Int` clause; empty when the
-/// parameter is unbounded or bounded by a function type.
+/// The simple head of each class type parameter's upper bound, from the inline
+/// `<T : Int>` form or a `where` clause; empty when the parameter is unbounded or
+/// bounded by a function type.
 pub fn classTypeParamBoundHeads(a: Allocator, type_params: []const ast.TypeParam, where_bounds: []const ast.WhereBound) Allocator.Error![]const []const u8 {
     if (type_params.len == 0) return &.{};
     const out = try a.alloc([]const u8, type_params.len);
@@ -133,14 +126,9 @@ pub fn typedDefaultFor(ty: ?*const ast.TypeRef) TypedDefault {
     return .null_ref;
 }
 
-/// Static-field default category for an unannotated top-level property,
-/// inferred from a trivially-typed initializer. kotlinc defaults a forward
-/// read of a not-yet-initialized property from the property's inferred type;
-/// without a type checker the only inferable shapes on the lowering path are
-/// the literal initializers whose type is fixed by the literal itself
-/// (`val n = 10` -> Int, `val s = "x"` -> reference). Non-literal
-/// initializers (a HOF call, an arithmetic expression) need full inference
-/// and keep the on-demand drive path (`.none`).
+/// Static-field default for an unannotated top-level property. kotlinc defaults a forward
+/// read from the inferred type; without a type checker only literal initializers are
+/// inferable, so anything else keeps `.none` and the on-demand drive path.
 pub fn typedDefaultForInit(init: *const ast.Expr) TypedDefault {
     return switch (init.*) {
         .IntLit => |lit| switch (lit.kind) {
@@ -155,8 +143,7 @@ pub fn typedDefaultForInit(init: *const ast.Expr) TypedDefault {
         },
         .BoolLit => .boolean,
         .CharLit => .char,
-        // A string literal / template is a non-null reference; its
-        // pre-init field default is null, matching kotlinc.
+        // A string literal or template is a non-null reference whose pre-init default is null.
         .StringTemplate => .null_ref,
         else => .none,
     };
@@ -212,14 +199,9 @@ pub fn collectClassifierFqns(allocator: Allocator, d: *const Decl, pkg: []const 
     }
 }
 
-/// Record the DECLARING package of every decl — including members of
-/// classes and objects at any nesting depth, whose lifted top-level
-/// forms keep their source spans. A nested class's FQN override is
-/// class-qualified (`pkg.Outer.Inner`), so the package cannot be
-/// recovered from it; this map carries the file's package directly.
-/// The no-package case records `""` for the same reason: a nested
-/// decl's class-qualified override (`Outer.Inner`) would otherwise be
-/// misread as a package prefix.
+/// The DECLARING package of every decl, members at any nesting depth included. A nested
+/// class's FQN override is class-qualified, so the package cannot be recovered from it;
+/// the no-package case records `""` so `Outer.Inner` is not misread as a package prefix.
 pub fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, out: *SpanStrMap) Allocator.Error!void {
     switch (d.*) {
         .Class => |*c| {
@@ -236,27 +218,15 @@ pub fn collectDeclPkgs(allocator: Allocator, d: *const Decl, pkg: []const u8, ou
     }
 }
 
-/// Package of one top-level decl in the combined multi-file program.
-/// Used to seed `setLowerSelfPackage` around accessor/thunk lowering
-/// that runs outside the class/function body drivers, so the symbol
-/// index keys those bodies on their declaring package too.
-/// Record one top-level property's scoping identity (FQN + declaring
-/// package) into the registry, so a bare read can be ranked under Kotlin
-/// scoping. Uses the property-FQN override map (which already carries the
-/// package-qualified FQN for packaged properties) and `decl_pkg` for the
-/// package, falling back to the package derived from the FQN.
-/// Record a top-level EXTENSION property's declared type head keyed by its
-/// receiver head, in the decl scan before any body lowers — the bare-read
-/// type channel (`extPropReturnHead`) answers from this map even while the
-/// declaring library itself is still lowering (`val IntArray.indices:
-/// IntRange` types the `indices` receiver inside `_Arrays.kt` bodies).
+/// A top-level EXTENSION property's declared type head, keyed by receiver head and
+/// recorded in the decl scan so the bare-read type channel answers while the declaring
+/// library is still lowering.
 pub fn noteExtPropTypeHead(module: *Module, p: *const ast.Property) Allocator.Error!void {
     const recv = &(p.receiver_type orelse return);
     const ty = &(p.ty orelse return);
     if (recv.name.name.len == 0) return;
-    // A function-typed property records the `<function>` marker: no class
-    // answers a bare read's type from it, but the member-call route knows
-    // `recv.name(args)` invokes the property's value.
+    // A function-typed property records the `<function>` marker: no class answers a bare
+    // read's type from it, but the member-call route knows `recv.name(args)` invokes it.
     if (ty.function != null) {
         try module.registry.ext_prop_type_heads.put(.{ .a = recv.name.name, .b = p.name.name }, "<function>");
         return;
@@ -278,9 +248,8 @@ pub fn notePropScope(
 ) Allocator.Error!void {
     const fqn = blk: {
         const resolved = try resolveFqn(a, func_fqn_overrides, p.span, package_prefix, p.name.name);
-        // A file-private collision rename (`prefix$f12`) happened after the
-        // span-keyed override was recorded: the registered fqn must carry
-        // the mangled simple name, or two files' consts share one key.
+        // A file-private collision rename (`prefix$f12`) lands after the span-keyed override
+        // is recorded, so the registered fqn must carry the mangled simple name.
         const last = if (std.mem.findScalarLast(u8, resolved, '.')) |d| resolved[d + 1 ..] else resolved;
         if (std.mem.eql(u8, last, p.name.name)) break :blk resolved;
         if (std.mem.findScalarLast(u8, resolved, '.')) |d| {
@@ -296,8 +265,7 @@ pub fn notePropScope(
         if (std.mem.eql(u8, existing.fqn, fqn)) return;
     }
     try gop.value_ptr.append(a, .{ .fqn = fqn, .package = pkg });
-    // The declared type head, so a bare read used as a receiver types
-    // statically (`asserter.assertEquals(...)`).
+    // The declared type head, so a bare read used as a receiver types statically.
     if (p.ty) |*ty| {
         if (ty.function == null and ty.name.name.len != 0) {
             try module.registry.top_level_prop_type_heads.put(fqn, ty.name.name);
@@ -315,24 +283,17 @@ pub fn notePropScope(
             }
         }
     } else if (p.init) |*init| {
-        // An UNANNOTATED property states its type through a literal
-        // initializer just as definitely as an annotation would, and the
-        // stdlib writes its file-level constants that way
-        // (`private const val NANOS_PER_SECOND = 1_000_000_000`). Without
-        // this, every member call on such a read resolved by name.
+        // An unannotated property states its type through a literal initializer as definitely
+        // as an annotation would, which is how the stdlib writes its file-level constants.
         if (constExprTypeHead(module, init)) |head| {
             try module.registry.top_level_prop_type_heads.put(fqn, head);
         } else if (initCalleeName(init)) |callee| {
-            // A factory or constructor call states the type as definitely as
-            // an annotation, but the name has to be RESOLVED to say what it
-            // returns, and nothing is registered yet. Record the name; the
-            // module answers when the whole declaration set is in.
+            // A factory or constructor call states the type too, but the name must be RESOLVED
+            // first: record it, and the module answers once every decl is in.
             try module.registry.top_level_prop_init_callees.put(fqn, callee);
         }
     }
-    // A `const val` with a literal initializer records its value so the
-    // lowering can inline the constant at reference sites, exactly as
-    // kotlinc does.
+    // A `const val` with a literal initializer records its value so references inline it.
     if (p.is_const) {
         if (p.init) |*init| {
             if (constLiteralOf(init)) |cv| {
@@ -342,16 +303,8 @@ pub fn notePropScope(
     }
 }
 
-/// The `ir.Const` for a compile-time-constant initializer expression: a
-/// plain literal, optionally under unary minus. Anything else (arithmetic,
-/// references, string templates with interpolation) returns null and the
-/// property keeps the ordinary global-read path.
-/// The type a literal initializer states outright. Deliberately literals
-/// only: a call or a name would need resolution this early pass does not
-/// have, and a wrong head is worse than none.
-/// `private val capacity = buffer.size` — a member-read initializer whose
-/// receiver is a primary param of a builtin SIZED container states Int as
-/// definitely as an annotation.
+/// `private val capacity = buffer.size`: a member-read initializer whose receiver is a
+/// primary param of a builtin SIZED container states Int as definitely as an annotation.
 pub fn memberSizedInitHead(c: *const ast.Class, init: *const ast.Expr) ?[]const u8 {
     if (init.* != .Member) return null;
     const m = init.Member;
@@ -394,10 +347,8 @@ pub fn promoteConstHeads(l: []const u8, r: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The type head of a CONST-EXPRESSION initializer: literals, unary +/-,
-/// arithmetic over foldable operands, and a bare Path naming an
-/// already-recorded top-level property whose every declaration agrees on
-/// one head (`DAYS_0000_TO_1970 = DAYS_PER_CYCLE * 5 - (30 * 365 + 7)`).
+/// The type head of a CONST-EXPRESSION initializer: literals, unary +/-, arithmetic over
+/// foldable operands, and a bare Path whose recorded declarations agree on one head.
 pub fn constExprTypeHead(module: *Module, e: *const ast.Expr) ?[]const u8 {
     if (literalTypeHead(e)) |h| return h;
     switch (e.*) {
@@ -445,9 +396,8 @@ pub fn literalTypeHead(e: *const ast.Expr) ?[]const u8 {
     };
 }
 
-/// The simple name an unannotated property initializer CALLS, seeing through
-/// the scope functions that return their own receiver
-/// (`IntArray(256).apply { … }` is an `IntArray`).
+/// The simple name an unannotated property initializer CALLS, seeing through the scope
+/// functions that return their own receiver (`IntArray(256).apply { … }` is an IntArray).
 pub fn initCalleeName(e: *const ast.Expr) ?[]const u8 {
     if (e.* != .Call) return null;
     const callee = e.Call.callee;
@@ -512,11 +462,8 @@ pub fn constLiteralOf(e: *const ast.Expr) ?ir.Const {
     }
 }
 
-/// The classifier path of an owner fqn without its package: the leading
-/// lowercase-initial dotted segments are the package by Kotlin convention
-/// (`androidx.compose.runtime.PersistentCompositionLocalMap` ->
-/// `PersistentCompositionLocalMap`, `kotlin.time.Duration.Companion` ->
-/// `Duration.Companion`). Null when stripping changes nothing.
+/// The classifier path of an owner fqn without its package: leading lowercase-initial
+/// dotted segments are the package by Kotlin convention. Null when nothing is stripped.
 pub fn ownerSimplePath(owner: []const u8) ?[]const u8 {
     var rest = owner;
     while (std.mem.findScalar(u8, rest, '.')) |dot| {
@@ -534,8 +481,7 @@ pub fn declPackage(a: Allocator, decl_pkg: *const SpanStrMap, overrides: *const 
     return packageOfFqn(fqn, simple);
 }
 
-/// Resolve a declaration's FQN: the per-span override if present, else
-/// the package-qualified name, else the bare simple name.
+/// The per-span override if present, else the package-qualified name, else the simple name.
 pub fn resolveFqn(allocator: Allocator, overrides: *const SpanStrMap, decl_span: Span, package_prefix: []const u8, simple: []const u8) Allocator.Error![]const u8 {
     if (overrides.get(decl_span)) |f| return f;
     if (package_prefix.len == 0) return simple;
@@ -544,14 +490,9 @@ pub fn resolveFqn(allocator: Allocator, overrides: *const SpanStrMap, decl_span:
 
 pub const packageOfFqn = ir.packageOfFqn;
 
-// -------------------------------------------------------------------------
-// AST-walk helpers (member-name collection across the class hierarchy).
-// -------------------------------------------------------------------------
 
-/// Record every member name a class/object declares — functions,
-/// properties, primary-ctor properties — recursing into nested classes
-/// and objects (companions included) so the flat program-wide
-/// member-name universe is complete.
+/// Every member name a class or object declares, recursing into nested classes and
+/// objects (companions included), so the program-wide member-name universe is complete.
 pub fn collectClassMemberNamesInto(out: *StringSet, primary_params: []const ast.ClassParam, members: []const ast.Decl) Allocator.Error!void {
     for (primary_params) |*p| {
         if (p.property != null) try out.put(p.name.name, {});
@@ -644,12 +585,9 @@ pub fn collectMemberTrailingLambdaShapes(module: *ir.Module, by_name: *const Fil
     }
 }
 
-/// Transitive member-NAME set for the member-shadow gate: every kind a bare
-/// name could bind through the implicit receiver (functions, properties,
-/// primary-ctor `val`/`var` params, nested-object/companion members), walked
-/// through the supertype chain. Returns false when any supertype in the
-/// chain is not resolvable from this build's class set — the set is then
-/// INCOMPLETE and must not be used to prove non-shadowability.
+/// Transitive member-NAME set for the member-shadow gate: every kind a bare name could
+/// bind through the implicit receiver, up the supertype chain. False when a supertype is
+/// unresolvable here, leaving the set INCOMPLETE and unusable as proof.
 pub fn collectHierarchyShadowNames(start: []const u8, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!bool {
     const gop = try seen.getOrPut(start);
     if (gop.found_existing) return true;
@@ -663,17 +601,8 @@ pub fn collectHierarchyShadowNames(start: []const u8, by_name: *const FileClasse
     return complete;
 }
 
-/// Collect a class's transitive supertype simple names, nearest first:
-/// each direct supertype, then that supertype's own chain. A supertype
-/// whose declaration is not in `by_name` (a pack-internal or built-in
-/// base) still records its name — its own ancestors are simply
-/// unknowable from here.
-/// The declared head of a class property's type, substituting a class
-/// type-parameter name with its upper bound's head. Null when nothing
-/// static is known (no bound, unresolvable).
-/// The single expression a property's static head may be inferred from: its
-/// initializer, or — for an accessor-only property — the getter's
-/// single-expression body.
+/// The single expression a property's static head may be inferred from: its initializer,
+/// or an accessor-only property's single-expression getter body.
 pub fn propHeadSourceExpr(prop: *const ast.Property) ?*const ast.Expr {
     if (prop.init) |*init| return init;
     if (prop.getter) |g| {
@@ -682,11 +611,8 @@ pub fn propHeadSourceExpr(prop: *const ast.Property) ?*const ast.Expr {
     return null;
 }
 
-/// Constructor-call head evidence for a property with no declared type: the
-/// initializer (or single-expression getter) constructs a class declared in
-/// this file set (`val Traversable get() = NodeKind<T>(mask)` -> `NodeKind`).
-/// Only a name that IS a declared class counts — a same-shaped factory call
-/// may return a different type, so an unknown callee proves nothing.
+/// Constructor-call head evidence for a property with no declared type. Only a name that
+/// IS a declared class counts: a same-shaped factory call may return a different type.
 pub fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, module: *const ir.Module, enclosing: ?*const ast.Class) ?[]const u8 {
     const src = propHeadSourceExpr(prop) orelse return null;
     if (src.* != .Call) return null;
@@ -700,13 +626,10 @@ pub fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, 
         for (decls) |*d| {
             if (d.* == .Class and std.mem.eql(u8, d.Class.name.name, nm)) return nm;
         }
-        // A class registered elsewhere (a pack's `Json { }` builder names
-        // its type exactly as its constructor would).
+        // A class registered elsewhere: a pack's `Json { }` builder names its type exactly.
         if (module.classId(nm) != null) return nm;
-        // A NESTED class of the enclosing class named exactly as its
-        // constructor (`val expected = MF(...)` where `MF` is nested in the
-        // property's own class): report the simple head; the reader qualifies
-        // it through the enclosing scope (`Outer$MF`).
+        // A NESTED class of the enclosing class named exactly as its constructor: report the
+        // simple head, and the reader qualifies it through the enclosing scope (`Outer$MF`).
         if (enclosing) |ec| {
             for (ec.members) |*m| {
                 if (m.* == .Class and std.mem.eql(u8, m.Class.name.name, nm)) return nm;
@@ -714,9 +637,8 @@ pub fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, 
         }
         return null;
     }
-    // A FACTORY call names its type just as a constructor does, as long as
-    // exactly one declaration answers to the name and it declares a return
-    // type: `val cache = newCache()` is whatever `newCache` returns.
+    // A FACTORY call names its type as a constructor does, as long as exactly one
+    // declaration answers to the name and it declares a return type.
     if (std.mem.eql(u8, runtime.envOnce("KLIO_FACTORY_PROP") orelse "1", "0")) return null;
     var found: ?[]const u8 = null;
     for (decls) |*d| {
@@ -728,8 +650,7 @@ pub fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, 
         found = rt.name.name;
     }
     if (found != null) return found;
-    // A registered top-level function (a pack factory): every same-named
-    // plain function must agree on a declared, concrete return head.
+    // For a registered top-level function, every same-named plain one must agree on a head.
     var agreed: ?[]const u8 = null;
     for (module.funcsBySimpleName(nm)) |fid| {
         const f = module.funcById(fid) orelse continue;
@@ -744,9 +665,8 @@ pub fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, 
     return agreed;
 }
 
-/// The materialized array head a `vararg` property has (mirrors the body-side
-/// mapping in ir/lower/decl.zig): a primitive-specialized array for primitive
-/// elements, `Array` otherwise (including generic elements).
+/// The materialized array head of a `vararg` property, mirroring the body-side mapping:
+/// a primitive-specialized array for primitive elements, `Array` otherwise.
 pub fn varargPropArrayHead(elem: []const u8) []const u8 {
     const eq = std.mem.eql;
     if (eq(u8, elem, "Byte")) return "ByteArray";
@@ -764,24 +684,8 @@ pub fn varargPropArrayHead(elem: []const u8) []const u8 {
     return "Array";
 }
 
-/// Record a class property's FULL declared type beside its head. Only a
-/// type with ARGUMENTS is worth storing — a head-only entry already answers
-/// through `class_prop_type_heads`, and the argument list is the whole point
-/// (`val items: List<Named>` says what iterating or indexing it yields).
-/// A type ARGUMENT that is one of the class's own parameters is KEPT: the
-/// read site substitutes it from the receiver's own arguments
-/// (`Map<K, V>.values: Collection<V>` on a `Map<String, Named>` receiver is
-/// a `Collection<Named>`). Where the receiver carries no arguments the
-/// substitution declines and the head-only answer stands.
-/// Records a class property's declared type head under the class's simple
-/// name and, when it differs, under its qualified name too. A reader that
-/// resolved the owner through file scope then gets the exact class when two
-/// packages share a simple name: `graphics.Shadow.offset` is an `Offset`
-/// while `graphics.shadow.Shadow.offset` is a `DpOffset`, and the simple
-/// key can only hold one of them.
-/// A declaration's qualified name in a merged multi-file build: the
-/// recorded override for its declaration span, else its own file's package
-/// (the primary file's prefix covers only that file's declarations).
+/// A declaration's qualified name in a merged multi-file build: the recorded override for
+/// its declaration span, else its own file's package.
 pub fn declFqnAt(a: Allocator, module: *const Module, overrides: *const SpanStrMap, decl_span: Span, package_prefix: []const u8, simple: []const u8) Allocator.Error![]const u8 {
     if (overrides.get(decl_span)) |f| return f;
     const prefix = if (package_prefix.len != 0) package_prefix else (module.packageOfFile(decl_span.file) orelse "");
@@ -812,18 +716,13 @@ pub fn notePropTypeRef(
 }
 
 pub fn classPropHead(c: *const ast.Class, ty: *const ast.TypeRef) ?[]const u8 {
-    // A type written qualified (`BytesHexFormat.Builder`) keeps its dotted
-    // path: `name` alone is the last segment, and recording just `Builder`
-    // made the receiver typing bind a same-named class from an enclosing
-    // scope. A qualified reference is never a type parameter.
+    // A type written qualified keeps its dotted path: `name` alone is the last segment, and
+    // recording just `Builder` binds a same-named class from an enclosing scope.
     if (ty.qualified_path) |qp| return qp;
     const head = ty.name.name;
     for (c.type_params) |*tp| {
-        // An UNBOUNDED class type parameter is still the property's type,
-        // and the bound record carries the `Any?` Kotlin gives it — so the
-        // head resolves through the bound rather than naming nothing.
-        // Dropping it left every `CompareContext<out T>.actual`-shaped
-        // receiver untyped inside a body that is lowered once.
+        // An UNBOUNDED class type parameter is still the property's type, and the bound record
+        // carries the `Any?` Kotlin gives it, so the head resolves through the bound.
         if (std.mem.eql(u8, tp.name.name, head)) return tp.name.name;
     }
     return head;
@@ -858,12 +757,9 @@ pub fn collectHierarchyMemberNames(start: []const u8, by_name: *const FileClasse
     for (c.supertypes) |*st| try collectHierarchyMemberNames(st.name.name, by_name, out, seen);
 }
 
-/// Collect the companion-object member names declared by `start` and each of
-/// its supertypes. A subclass sees an inherited companion's members under their
-/// bare names (Kotlin: `MinId` inside `Rgb` binds `ColorSpace.Companion.MinId`);
-/// a secondary-constructor delegation/default thunk has no `this` to walk at
-/// runtime, so those names must be in its static member set to resolve as a
-/// companion access rather than an unbound global.
+/// Companion members declared by `start` and each supertype. A subclass sees an inherited
+/// companion's members under bare names, and a secondary-ctor delegation or default thunk
+/// has no `this` to walk, so they must be in its static member set.
 pub fn collectHierarchyCompanionMemberNames(start: []const u8, by_name: *const FileClasses, out: *StringSet, seen: *StringSet) Allocator.Error!void {
     const gop = try seen.getOrPut(start);
     if (gop.found_existing) return;
@@ -886,23 +782,18 @@ pub fn collectHierarchyCompanionMemberNames(start: []const u8, by_name: *const F
     for (c.supertypes) |*st| try collectHierarchyCompanionMemberNames(st.name.name, by_name, out, seen);
 }
 
-/// Int literals narrow to i32 and Double literals narrow to f32, matching
-/// Kotlin's Int/Float literal types.
+/// Int literals narrow to i32 and Double literals to f32, matching Kotlin's literal types.
 pub fn literalToConst(e: *const ast.Expr) ?Const {
     return switch (e.*) {
         .IntLit => |lit| switch (lit.kind) {
-            // A suffix-less integer literal whose magnitude exceeds the `Int`
-            // range is a `Long` in Kotlin; mirror the IntLit-lowering widening
-            // in `ir/lower/expr.zig` so `const val` folding does not truncate.
+            // A suffix-less integer literal beyond the `Int` range is a `Long` in Kotlin; mirror the
+            // IntLit-lowering widening so `const val` folding does not truncate.
             .Int => if (lit.value >= std.math.minInt(i32) and lit.value <= std.math.maxInt(i32))
                 Const{ .Int = @truncate(lit.value) }
             else
                 Const{ .Long = lit.value },
-            // Unsigned literals keep their unsigned Const type, matching
-            // `constLiteralOf`; folding them to Int/Long made a `const val`
-            // materialise its global as the signed type, so a member call
-            // whose receiver read that global (`twoVal.plus(oneVal)`) hit a
-            // mixed Int/UInt BinOp.
+            // Unsigned literals keep their unsigned Const type: folding them to Int/Long materialises
+            // the global as the signed type, and a member call on it then hits a mixed BinOp.
             .UInt => blk: {
                 const wide: u64 = @bitCast(lit.value);
                 break :blk if (std.math.cast(u32, wide)) |v| Const{ .UInt = v } else null;
@@ -924,12 +815,9 @@ pub fn literalToConst(e: *const ast.Expr) ?Const {
     };
 }
 
-/// Default `Value` for a non-nullable primitive property with no
-/// initializer — so such a field starts as `0`/`false` instead of `Null`.
-/// Whether the property's type is a non-nullable scalar: an annotation says so
-/// directly, and an inferred type is read off a primitive literal initializer.
-/// A custom getter can return anything, and a delegate/lateinit has no plain
-/// stored field, so neither qualifies.
+/// Whether the property's type is a non-nullable scalar: an annotation says so directly,
+/// and an inferred type is read off a primitive literal initializer. A custom getter can
+/// return anything, and a delegate or lateinit has no plain stored field.
 pub fn scalarNonNullProp(p: *const ast.Property) bool {
     if (p.is_abstract or p.is_lateinit or p.delegate != null or p.getter != null) return false;
     if (p.ty) |ty| {
@@ -948,13 +836,9 @@ pub fn scalarNonNullProp(p: *const ast.Property) bool {
 
 /// The value a property's stored field holds BEFORE its initializer runs.
 ///
-/// A non-nullable scalar reads as its type's zero, exactly as it does on the
-/// JVM — a superclass `init` that calls an overridden method sees `0`, not an
-/// uninitialized slot. klio previously left such a field Null until the
-/// initializer ran (only an UNINITIALIZED declaration got a zero), so that
-/// program failed with "get_field `n` on `B`" instead of printing 0. It is also
-/// what lets the JIT prove a scalar field read non-null: the slot never holds
-/// Null at any point in the object's life.
+/// A non-nullable scalar reads as its type's zero, exactly as on the JVM: a superclass
+/// `init` calling an overridden method sees `0`, not an uninitialized slot. It is also
+/// what lets the JIT prove a scalar field read non-null.
 pub fn primitiveZeroFor(p: *const ast.Property) ?Value {
     if (p.is_abstract or p.is_lateinit or p.getter != null or p.delegate != null) return null;
     if (p.ty) |ty| {

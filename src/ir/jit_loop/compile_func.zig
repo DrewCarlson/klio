@@ -78,10 +78,7 @@ const retRegType = type_infer.retRegType;
 const setDefType = type_infer.setDefType;
 const setType = type_infer.setType;
 
-// --- whole-function JIT (function mode) -------------------------------------
-
-/// Every block reachable from the function entry (the compile covers the whole
-/// body, entry to `Return`). Caller frees.
+/// Every block reachable from the function entry. Caller frees.
 fn collectFunc(a: Allocator, func: *const Func) Allocator.Error!?[]BlockId {
     const nb = func.blocks.len;
     if (nb == 0) return null;
@@ -110,8 +107,7 @@ fn collectFunc(a: Allocator, func: *const Func) Allocator.Error!?[]BlockId {
     return try order.toOwnedSlice(a);
 }
 
-/// Type inference for a whole function: seed `LoadParam` dsts from the live
-/// argument kinds, then propagate (`setDefType`) over every block to a fixpoint.
+/// Seeds `LoadParam` dsts from the live argument kinds, then propagates over every block to a fixpoint.
 fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs: u32, params: []const Value) Allocator.Error![]RegType {
     const types = try a.alloc(RegType, n_regs);
     @memset(types, .unknown);
@@ -137,7 +133,6 @@ fn inferFuncTypes(a: Allocator, module: *const Module, func: *const Func, n_regs
     return types;
 }
 
-/// What the declared return type allows the function tier to do with the result.
 const ResultShape = struct {
     n_params: u32,
     rt: RegType,
@@ -149,9 +144,8 @@ const InstPos = BodyInstPos;
 const EscapePos = struct { b: u32, i: u32 };
 const FieldPre = struct { block: u32, inst: u32, idx: u32, rt: RegType, tag: u8, is_set: bool, dst_or_src: u32, nn: bool, name: []const u8 };
 
-/// Everything the whole-function gate threads between its passes: the call's
-/// inputs, the body it collected, and the tables each pass fills in for the
-/// next. Allocation and release stay in `tryCompileFunc`.
+/// Everything the whole-function gate threads between passes: the call's inputs, the collected body,
+/// and the tables each pass fills for the next. Allocation and release stay in `tryCompileFunc`.
 const FuncCtx = struct {
     a: Allocator,
     module: *const Module,
@@ -244,24 +238,16 @@ fn skippedAt(list: []const InstPos, b: u32, i: u32) bool {
     return false;
 }
 
-/// Try to compile the whole body of `func` to native code (function mode): a
-/// scalar function whose params/locals/return are scalar and whose only calls
-/// are positional top-level calls (so direct recursion stays native through the
-/// call trampoline). `params` are the live arguments at the hot call, used to
-/// specialize param kinds. Returns null for any unsupported shape.
+/// Tries to compile the whole body of `func` in function mode: a scalar function whose params, locals and
+/// return are scalar and whose calls are positional top-level ones, specialized on the live `params` kinds.
 pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, params: []const Value, captures: []const Value, resolver: ?MemberResolver, virt_resolver: ?VirtResolver, field_resolver: ?FieldResolver, field_nn_resolver: ?FieldResolver, resolver_user: ?*anyopaque) Allocator.Error!?CompiledLoop {
     const shape = resultShape(func, params) orelse return null;
 
     const body = (try collectFunc(a, func)) orelse { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4102\n", .{func.name}); return null; };
     defer a.free(body);
 
-    // Method mode: a `this`-receiver whose ONLY use is native field access.
-    // The receiver's class is guarded at entry (a different class declines to
-    // the interpreter) and its field-buffer pointer is seeded into a slot, so
-    // the body's `this.x` reads/writes compile to direct memory ops. The body
-    // has effects and holds an object, so it never native-recurses; every
-    // deopt resumes through the TOP-LEVEL activation's real frame, exactly
-    // like a loop deopt.
+    // Method mode: a `this` receiver whose ONLY use is native field access, its class guarded at entry and its
+    // field-buffer pointer seeded into a slot. The body has effects, so a deopt resumes through the real frame.
     const is_method = fjFieldsEnabled() and shape.n_params >= 1 and func.params.len >= 1 and
         std.mem.eql(u8, func.params[0].name, "this") and
         params[0] == .Instance and field_resolver != null and resolver_user != null;
@@ -300,8 +286,7 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     if (!try collectDirectCallSites(&ctx)) return null;
     if (!try validateBodyShape(&ctx)) return null;
 
-    // Each param must be a scalar value (the method receiver is `.object`);
-    // record its kind for the entry guard.
+    // Each param must be a scalar value, the method receiver being `.object`; record its kind for the guard.
     ctx.param_rt = try a.alloc(RegType, shape.n_params);
     defer if (!ctx.ok) a.free(ctx.param_rt);
     if (!collectParamKinds(&ctx)) return null;
@@ -315,7 +300,6 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     if (!try cascadeEscapes(&ctx)) return null;
     if (rejectsReturnOrBranchTypes(&ctx)) return null;
 
-    // Def set: every register written somewhere in the body (reboxed on deopt).
     ctx.def = try a.alloc(bool, n_regs);
     defer if (!ctx.ok) a.free(ctx.def);
     @memset(ctx.def, false);
@@ -336,56 +320,39 @@ pub fn tryCompileFunc(a: Allocator, module: *const Module, func: *const Func, pa
     return emitFunc(&ctx);
 }
 
-/// The environment gates plus the declared-result check: what the tier will and
-/// will not take before any body is collected.
+/// The environment gates plus the declared-result check, applied before any body is collected.
 fn resultShape(func: *const Func, params: []const Value) ?ResultShape {
     if (func.blocks.len == 0) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4075\n", .{func.name}); return null; }
     if (func.is_suspend or func.is_inline) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4076\n", .{func.name}); return null; }
-    // Bisect: KLIO_FJ_ONLY=name compiles only that body.
     if (runtime.envOnce("KLIO_FJ_ONLY")) |only| {
         if (!std.mem.eql(u8, only, func.name)) return null;
     }
-    // Bisect: KLIO_FJ_SKIP=a,b declines the named bodies.
     if (runtime.envOnce("KLIO_FJ_SKIP")) |skips| {
         var it2 = std.mem.splitScalar(u8, skips, ',');
         while (it2.next()) |nm| {
             if (std.mem.eql(u8, nm, func.name)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4081\n", .{func.name}); return null; }
         }
     }
-    // No package gate. This tier is entered from a frame that is ALREADY
-    // running the function's lowered body, so it can only ever replace a body
-    // the runtime chose to run — a symbol the link settled onto a native
-    // binding never reaches here, and `is_suspend` is refused above, which is
-    // what cooperative scheduling actually rides on. Excluding every `kotlin*`
-    // package instead left the whole stdlib interpreted for no mechanism.
-    // `KLIO_FJ_SKIP` still bisects a specific body.
+    // No package gate: this tier is entered from a frame ALREADY running the function's lowered body,
+    // so it can only replace a body the runtime chose to run. `KLIO_FJ_SKIP` still bisects one.
     const n_params: u32 = @intCast(func.params.len);
     if (n_params > 16 or params.len < n_params) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4089\n", .{func.name}); return null; }
-    // Result must be scalar or Unit.
     const result_rt: RegType = retRegType(func.return_ty);
-    // Only a return type whose boxed form `valueFromSlot` reproduces exactly:
-    // `Char`/`Short`/`Byte` map to `.i32` but rebox to `.Int`, so a function
-    // returning one would hand back a wrong-tagged value. Restrict to the exact
-    // kinds (or Unit).
+    // Only a return type whose boxed form `valueFromSlot` reproduces exactly: `Char`/`Short`/`Byte` map
+    // to `.i32` but rebox to `.Int`, so such a function would hand back a wrong-tagged value.
     const exact_ret = !func.return_ty.nullable and (std.mem.eql(u8, func.return_ty.name, "Int") or
         std.mem.eql(u8, func.return_ty.name, "Long") or std.mem.eql(u8, func.return_ty.name, "Double") or
         std.mem.eql(u8, func.return_ty.name, "Float") or std.mem.eql(u8, func.return_ty.name, "Boolean"));
     const result_scalar = isScalarRt(result_rt) and exact_ret;
-    // A declared-object (or Unit) result is served by the frame-resident
-    // return protocol: every value `Return` records its register index and
-    // `runFunc` reads the frame register the handlers populated. Only the
-    // in-between shapes decline: an inexact scalar (Char/Short/Byte rebox as
-    // Int) and a nullable scalar (its Null arm has no slot form).
+    // A declared-object or Unit result uses the frame-resident return protocol: every value `Return` records its
+    // register index and `runFunc` reads that frame register. An inexact or nullable scalar declines.
     const result_object = !result_scalar and !declaredScalarName(func.return_ty.name) and !isUnitReturn(func.return_ty);
     if (!result_scalar and !result_object and !(result_rt == .unknown and isUnitReturn(func.return_ty))) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4100\n", .{func.name}); return null; }
     return .{ .n_params = n_params, .rt = result_rt, .scalar = result_scalar, .object = result_object };
 }
 
-/// Object params (an Instance argument at the hot call): their LoadParam
-/// destinations are FRAME registers, seeded borrowed before native entry.
-/// The method receiver's loads are the param-0 subset (its field ops are
-/// native; every object reg is additionally usable as a member/virtual
-/// receiver, an object move, or a null test — all trampoline sites).
+/// Object params (an Instance argument at the hot call): their `LoadParam` destinations are FRAME
+/// registers, seeded borrowed before native entry. The method receiver's loads are the param-0 subset.
 fn collectObjParamLoads(ctx: *FuncCtx) bool {
     const func = ctx.func;
     const params = ctx.params;
@@ -410,11 +377,8 @@ fn collectObjParamLoads(ctx: *FuncCtx) bool {
     return true;
 }
 
-/// Lambda captures: every LoadCapture destination is a FRAME register
-/// seeded borrowed from the activation's capture vector (any value kind —
-/// a captured scalar stays boxed; a `var` capture's Cell declines at its
-/// CellGet). The capture INDEX layout is static per lambda body, so the
-/// compile-time snapshot only bounds the indexes.
+/// Lambda captures: every `LoadCapture` destination is a FRAME register seeded borrowed from the
+/// activation's capture vector. The capture INDEX layout is static per body.
 fn collectCaptureLoads(ctx: *FuncCtx) bool {
     const func = ctx.func;
     const captures = ctx.captures;
@@ -432,12 +396,8 @@ fn collectCaptureLoads(ctx: *FuncCtx) bool {
     return true;
 }
 
-/// Self-call inlining (opt-in): `this.helper(args)` lowers to a static Call
-/// with the receiver MOVED into arg 0, and that Move is what makes the whole
-/// method uncompilable — a receiver register may otherwise appear only as a
-/// field-op receiver. When the callee never touches `this`, the splice makes
-/// both the Move and the call disappear, so the receiver is never
-/// materialized and the method can still run frameless at the seam.
+/// Self-call inlining: `this.helper(args)` lowers to a static Call with the receiver MOVED into arg 0, and
+/// that Move alone makes the method uncompilable, a receiver register being allowed only as a field-op receiver.
 fn collectSelfInlineSites(ctx: *FuncCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -463,8 +423,7 @@ fn collectSelfInlineSites(ctx: *FuncCtx) Allocator.Error!bool {
                     .inst = @intCast(ii),
                     .callee = cf,
                     .base = ctx.total_regs,
-                    // Member convention: parameter 1 is the first real argument,
-                    // and parameter 0 (the receiver) is skipped by the emitter.
+                    // Member convention: parameter 1 is the first real argument, parameter 0 the receiver the emitter skips.
                     .args_reg = tc.args_reg + 1,
                     .n_args = tc.n_args - 1,
                     .dst = tc.dst,
@@ -486,12 +445,8 @@ fn collectSelfInlineSites(ctx: *FuncCtx) Allocator.Error!bool {
     return true;
 }
 
-/// A self call the splice cannot take — the helper is too big, loops, or
-/// reads something the splice refuses — becomes a DIRECT call into the
-/// callee's own compiled code. Without it that call is a trampoline site,
-/// which costs a boxed round trip per iteration AND makes this body able to
-/// deopt, so it loses the frameless seam. With it the receiver Move
-/// disappears the same way the splice's does, and both bodies stay native.
+/// A self call the splice cannot take becomes a DIRECT call into the callee's own compiled code: as a
+/// trampoline site it would cost a boxed round trip per iteration and give this body a deopt edge.
 fn collectDirectCallSites(ctx: *FuncCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -539,9 +494,8 @@ fn collectDirectCallSites(ctx: *FuncCtx) Allocator.Error!bool {
     return true;
 }
 
-/// Validate shape: no try-regions; Goto/Branch/Return terminators; scalar
-/// ops + positional top-level calls (+ `this`-field access in method mode).
-/// A method receiver register may appear ONLY as a field-op receiver.
+/// Validates the body shape: no try-regions, only Goto/Branch/Return terminators, scalar ops and positional
+/// top-level calls, plus `this`-field access in method mode, where the receiver may appear only as its receiver.
 fn validateBodyShape(ctx: *FuncCtx) Allocator.Error!bool {
     const func = ctx.func;
     const body = ctx.body;
@@ -581,8 +535,7 @@ fn acceptsBodyInst(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, inst_i: us
     const recv_regs = ctx.recv_regs;
     const inline_sites = &ctx.inline_sites;
     const skip_insts = &ctx.skip_insts;
-    // The receiver Move an inlined self-call consumed, and the call it
-    // fed, are spliced away — neither reaches the emitter.
+    // The receiver Move an inlined self-call consumed, and the call it fed, never reach the emitter.
     if (skippedAt(skip_insts.items, bid.int(), @intCast(inst_i))) return true;
     if (inlinedAt(inline_sites.items, bid.int(), @intCast(inst_i))) return true;
     if (numericConvOf(module, inst)) |nc| {
@@ -601,27 +554,12 @@ fn acceptsBodyInst(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, inst_i: us
         }
         return true;
     }
-    // Member / virtual calls trampoline; the receiver must be one of
-    // the seeded object registers (an object param — including the
-    // method receiver — whose value the handler reads from the frame).
-    // An UNRESOLVED bare-name member with no declared head keeps the
-    // interpreter: its resolution consults the executing frame's
-    // receiver tower and visibility surface (an interface default's
-    // `isEmpty()` resolved a file-private extension there), context
-    // the trampoline's by-name dispatch does not carry.
-    // Member/virtual trampoline sites (KLIO_FJ_MEMBER=0 bisects):
-    // the receiver must be a seeded object-param register. (Both
-    // launch repros — Changes.isNotEmpty, dataIndexToDataAnchor —
-    // were ONE bug: the object-param seed table was never copied
-    // into the CompiledLoop, so receivers read stale pooled-frame
-    // registers.)
+    // Member and virtual calls trampoline, and the receiver must be a seeded object register (`KLIO_FJ_MEMBER=0`
+    // bisects). An UNRESOLVED bare-name member keeps the interpreter: it needs the frame's receiver tower.
     if (trampolinableMemberOf(module, inst)) |mc| {
         if (!fjMemberEnabled()) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4205\n", .{func.name}); return false; }
-        // The receiver may be ANY object-typed register — a param, a
-        // prior call's boxed result, an object field read: every
-        // object def is handler-written, so its value is in the frame
-        // where the site handler reads it. The site build (post-
-        // typing) enforces the .object kind.
+        // The receiver may be ANY object-typed register: every object def is handler-written, so its value
+        // is in the frame where the site handler reads it. The site build enforces the `.object` kind.
         if (mc.dispatch_recv != null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4211\n", .{func.name}); return false; }
         return true;
     }
@@ -633,15 +571,8 @@ fn acceptsBodyInst(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, inst_i: us
     return acceptsScalarOrEscape(ctx, inst, bid, inst_i);
 }
 
-/// `/` and `%` divide: the deopt they can raise has no frame to
-/// resume into when the body runs as a native-recursed callee.
-/// That is survivable because such a body is PURE — it runs with
-/// no trampoline, so it cannot call out or touch anything — and
-/// the recursion site falls back to re-running it interpreted,
-/// which is where the real divide-by-zero is raised. Refusing
-/// division outright kept ordinary arithmetic helpers (anything
-/// with a `%`) uncompiled, and their callers then trampolined
-/// per iteration and ran slower than the plain interpreter.
+/// `/` and `%` can raise a deopt with no frame to resume into when the body runs as a native-recursed callee.
+/// Survivable because such a body is PURE: the recursion site re-runs it interpreted, raising the real error.
 fn acceptsScalarOrEscape(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, inst_i: usize) Allocator.Error!bool {
     const a = ctx.a;
     const func = ctx.func;
@@ -649,15 +580,6 @@ fn acceptsScalarOrEscape(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, inst
     const recv_regs = ctx.recv_regs;
     const escape_pos = &ctx.escape_pos;
     switch (inst.*) {
-        // `/` and `%` divide: the deopt they can raise has no frame to
-        // resume into when the body runs as a native-recursed callee.
-        // That is survivable because such a body is PURE — it runs with
-        // no trampoline, so it cannot call out or touch anything — and
-        // the recursion site falls back to re-running it interpreted,
-        // which is where the real divide-by-zero is raised. Refusing
-        // division outright kept ordinary arithmetic helpers (anything
-        // with a `%`) uncompiled, and their callers then trampolined
-        // per iteration and ran slower than the plain interpreter.
         .BinOp => |b| {
             if (isRecvReg(recv_regs, b.lhs.int()) or isRecvReg(recv_regs, b.rhs.int())) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4228\n", .{func.name}); return false; }
             if (isDivBinOp(b.op)) ctx.has_div = true;
@@ -685,10 +607,8 @@ fn acceptsScalarOrEscape(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, inst
         },
         .Const, .Trace, .LoadParam => {},
         else => {
-            // Anything the emitter has no native or trampoline form
-            // for runs as an ESCAPE: the interpreter's own arm
-            // against the live frame. Bounded per body so a mostly-
-            // escaped body stays interpreted.
+            // Anything the emitter has no native or trampoline form for runs as an ESCAPE: the interpreter's own
+            // arm against the live frame. Bounded per body, so a mostly-escaped body stays interpreted.
             if (!execEscapable(inst)) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4261 inst={s}\n", .{ func.name, @tagName(std.meta.activeTag(inst.*)) }); return false; }
             ctx.n_escapes += 1;
             escape_pos.append(a, .{ .b = bid.int(), .i = @intCast(inst_i) }) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4263\n", .{func.name}); return false; };
@@ -716,11 +636,8 @@ fn collectParamKinds(ctx: *FuncCtx) bool {
     return true;
 }
 
-/// Resolve every `this`-field op against the LIVE receiver: the stored
-/// index, the field's exact live scalar kind (only the exact-rebox kinds —
-/// a Char/Short/Byte field would rebox as Int on deopt), and the tag the
-/// native read guards on. These seed the type inference so field-read
-/// destinations type precisely.
+/// Resolves every `this`-field op against the LIVE receiver: the stored index, the field's exact live scalar
+/// kind (only exact-rebox kinds, a Char/Short/Byte field reboxing as Int), and the tag the read guards on.
 fn collectFieldPres(ctx: *FuncCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -742,9 +659,7 @@ fn collectFieldPres(ctx: *FuncCtx) Allocator.Error!bool {
                     .SetField => |sf| .{ .name_id = sf.field, .is_set = true, .reg = sf.value.int(), .recv = sf.receiver.int() },
                     else => continue,
                 };
-                // Only the receiver's OWN fields take the native fixed-index
-                // route (the entry guard pins their class); any other object's
-                // field op goes through the by-name trampoline site below.
+                // Only the receiver's OWN fields take the native fixed-index route, the entry guard pinning their class.
                 if (!isRecvReg(recv_regs, info.recv)) continue;
                 if (info.name_id.int() >= module.consts.items.len) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4309\n", .{func.name}); return false; }
                 const namec = module.consts.items[info.name_id.int()];
@@ -764,9 +679,7 @@ fn collectFieldPres(ctx: *FuncCtx) Allocator.Error!bool {
                     .Double => .f64,
                     .Float => .f32,
                     .Bool => .boolean,
-                    // An object-valued own field cannot live in a slot; its
-                    // READ is served by the by-name trampoline site (boxed
-                    // into the frame register). A store stays interpreted.
+                    // An object-valued own field cannot live in a slot: its READ goes through the by-name site.
                     else => {
                         if (!info.is_set) continue;
                         if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4327\n", .{func.name});
@@ -792,8 +705,7 @@ fn collectFieldPres(ctx: *FuncCtx) Allocator.Error!bool {
     return true;
 }
 
-/// Inlined callee registers live above the caller's, so the type array (and
-/// the slot space derived from it) covers both.
+/// Inlined callee registers live above the caller's, so the type array covers both.
 fn inferFuncRegTypes(ctx: *FuncCtx) Allocator.Error!?[]RegType {
     const a = ctx.a;
     const module = ctx.module;
@@ -802,8 +714,6 @@ fn inferFuncRegTypes(ctx: *FuncCtx) Allocator.Error!?[]RegType {
     const n_regs = ctx.n_regs;
     const total_regs = ctx.total_regs;
     const base_types = try inferFuncTypes(a, module, func, n_regs, params);
-    // Inlined callee registers live above the caller's, so the type array (and
-    // the slot space derived from it) covers both.
     const types = if (total_regs == n_regs) base_types else blk_t: {
         const t = a.alloc(RegType, total_regs) catch return null;
         @memcpy(t[0..n_regs], base_types);
@@ -814,9 +724,8 @@ fn inferFuncRegTypes(ctx: *FuncCtx) Allocator.Error!?[]RegType {
     return types;
 }
 
-/// Seed field-read destination types, object-param registers, and
-/// member/virtual result types, then re-run the fixpoint so they
-/// propagate into the arithmetic that consumes them.
+/// Seeds field-read destination types, object-param registers and member/virtual result types, then
+/// re-runs the fixpoint so they propagate into the arithmetic that consumes them.
 fn seedRegTypes(ctx: *FuncCtx) bool {
     const module = ctx.module;
     const func = ctx.func;
@@ -834,10 +743,8 @@ fn seedRegTypes(ctx: *FuncCtx) bool {
         if (cpl.reg >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: cap-reg\n", .{func.name}); return false; }
         _ = setType(types, Reg.from(cpl.reg), .object);
     }
-    // An escaped instruction's destination types by its statically known
-    // result kind where one exists, so consumers (a Branch condition, a
-    // scalar accumulate) stay native with the escape's unspill syncing
-    // the slot.
+    // An escaped instruction's destination takes its statically known result kind where one exists, so
+    // consumers stay native, the escape's unspill syncing the slot.
     for (escape_pos.items) |ep2| {
         const ei = &func.blocks[ep2.b].insts[ep2.i];
         switch (ei.*) {
@@ -874,10 +781,8 @@ fn seedRegTypes(ctx: *FuncCtx) bool {
     return true;
 }
 
-/// Member/virtual result registers: resolve against the live param
-/// receiver for a precise scalar kind; anything unresolved is a
-/// boxed object write (always sound — the handler boxes the result
-/// into the frame register).
+/// Member and virtual result registers: resolved against the live param receiver for a precise scalar
+/// kind; anything unresolved is a boxed object write, always sound since the handler boxes into the frame.
 fn seedSiteResultTypes(ctx: *FuncCtx) bool {
     const func = ctx.func;
     const body = ctx.body;
@@ -903,9 +808,7 @@ fn seedSiteResultType(ctx: *FuncCtx, inst2: *const ir.Inst, bid2: BlockId, ii2: 
         var dstr: ?Reg = null;
         var rt2: RegType = .object;
         if (inst2.* == .GetField) {
-            // Own-field reads seed their exact scalar kind below (the
-            // FieldPre pass); every other field read is a by-name
-            // trampoline site whose result boxes into the frame.
+            // Own-field reads seed their exact kind in the FieldPre pass; every other read boxes into the frame.
             var covered = false;
             for (field_pres.items) |fp2| {
                 if (fp2.block == bid2.int() and fp2.inst == ii2) covered = true;
@@ -920,12 +823,8 @@ fn seedSiteResultType(ctx: *FuncCtx, inst2: *const ir.Inst, bid2: BlockId, ii2: 
             } else if (resolver != null) {
                 for (obj_loads) |opl| {
                     if (opl.reg == mc2.recv.int()) {
-                        // Placeholder arguments: this asks which
-                        // overload the NAME and ARITY select, so the
-                        // values are stand-ins — but every slot the
-                        // resolver reads must exist. The partial fill
-                        // that used to break out early handed it
-                        // undefined Values and segfaulted under load.
+                        // Placeholder arguments: this asks which overload the NAME and ARITY select, so the values are
+                        // stand-ins, but every slot the resolver reads must exist.
                         var av2: [6]Value = undefined;
                         if (mc2.n_args <= av2.len) {
                             for (0..mc2.n_args) |k2| av2[k2] = .Unit;
@@ -949,13 +848,8 @@ fn seedSiteResultType(ctx: *FuncCtx, inst2: *const ir.Inst, bid2: BlockId, ii2: 
                     }
                 }
             }
-            // Receiver class outside the main module (the resolve memo
-            // only sees main-module classes): the slot ROOT's declared
-            // return type is still binding on every override — a
-            // primitive return has no covariant widening — so a scalar
-            // declaration types the destination without knowing the
-            // target. A lying override deopts at the site (the handler
-            // re-runs the instruction interpreted on a kind mismatch).
+            // Receiver class outside the main module, invisible to the resolve memo: the slot ROOT's declared return type
+            // still binds every override, so a scalar declaration types the destination and a lying override deopts.
             if (rt2 == .object) {
                 if (module.funcById(FuncId.from(vc2.slot))) |rootf| {
                     const drt = retRegType(rootf.return_ty);
@@ -971,10 +865,8 @@ fn seedSiteResultType(ctx: *FuncCtx, inst2: *const ir.Inst, bid2: BlockId, ii2: 
     return true;
 }
 
-/// Inlined callee registers are typed LAST: their parameters take the types
-/// of the caller registers feeding the call, and a field read only gets its
-/// type in the pass above — typing the splice before it left every callee
-/// parameter unknown and the emit refused the body.
+/// Inlined callee registers are typed LAST: their parameters take the types of the caller registers
+/// feeding the call, and a field read only gets its type in the pass above.
 fn fillInlineSiteTypes(ctx: *FuncCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -990,11 +882,8 @@ fn fillInlineSiteTypes(ctx: *FuncCtx) Allocator.Error!bool {
     return true;
 }
 
-/// CASCADE: any instruction reading a register the typing could not
-/// settle (an escaped producer's destination) escapes too — escaped
-/// instructions read the live frame, where the arm-written values are
-/// real. Fixpoint, bounded by the escape cap. A cascade that grows the set
-/// past the profitability ratio declines the body.
+/// CASCADE: any instruction reading a register the typing could not settle escapes too, escaped instructions
+/// reading the live frame. A fixpoint bounded by the escape cap; growing past the profit ratio declines.
 fn cascadeEscapes(ctx: *FuncCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -1038,7 +927,6 @@ fn cascadeEscapes(ctx: *FuncCtx) Allocator.Error!bool {
             }
         }
     }
-    // Post-cascade profitability re-check (the cascade grows the set).
     if (ctx.n_escapes != 0) {
         var total_insts2: u32 = 0;
         for (body) |bid2| total_insts2 += @intCast(func.blocks[bid2.int()].insts.len);
@@ -1050,10 +938,8 @@ fn cascadeEscapes(ctx: *FuncCtx) Allocator.Error!bool {
     return true;
 }
 
-/// The return register must carry the declared scalar kind — or, when the
-/// escape chain left it untyped, the return reads the LIVE FRAME (the
-/// escaped arm wrote the real value there). A Branch on an untyped
-/// condition has no such fallback: decline.
+/// The return register must carry the declared scalar kind, or, when the escape chain left it
+/// untyped, the return reads the LIVE FRAME. A Branch on an untyped condition has no such fallback.
 fn rejectsReturnOrBranchTypes(ctx: *const FuncCtx) bool {
     const func = ctx.func;
     const body = ctx.body;
@@ -1069,17 +955,14 @@ fn rejectsReturnOrBranchTypes(ctx: *const FuncCtx) bool {
                 if (rr.int() >= n_regs) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4478\n", .{func.name}); return true; }
                 const rt3 = typeAt(types, rr);
                 if (result_scalar) {
-                    // Slot-typed must match the declared kind; unknown reads
-                    // the frame (the escaped arm wrote the real value there).
+                    // Slot-typed must match the declared kind; unknown reads the frame.
                     if (rt3 != .unknown and rt3 != result_rt) {
                         if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: result-kind\n", .{func.name});
                         return true;
                     }
                 } else if (result_object) {
-                    // Every value return must be frame-resident: a scalar-
-                    // typed register's boxed form may not match the declared
-                    // type (e.g. Any with an Int arm), and `.null_` has no
-                    // frame-register backing.
+                    // Every value return must be frame-resident: a scalar register's boxed form may not match the
+                    // declared type, and `.null_` has no frame-register backing.
                     if (rt3 != .object and rt3 != .unknown) {
                         if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: result-kind\n", .{func.name});
                         return true;
@@ -1101,8 +984,6 @@ fn rejectsReturnOrBranchTypes(ctx: *const FuncCtx) bool {
     return false;
 }
 
-/// Positional top-level call sites, plus the def set every register write
-/// contributes to.
 fn collectStaticCallSites(ctx: *FuncCtx) Allocator.Error!bool {
     const func = ctx.func;
     const body = ctx.body;
@@ -1131,9 +1012,8 @@ fn appendStaticCallSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i: u
     const tc = trampolinableCallOf(inst) orelse return true;
     if (inlinedAt(inline_sites.items, bid.int(), @intCast(i))) return true; // spliced in place
     if (directAt(direct_sites.items, bid.int(), @intCast(i))) |ds| {
-        // Called straight into the callee's code, so no trampoline site
-        // and no boxing — but the argument kinds this body actually
-        // holds must be the ones the callee was compiled for.
+        // A direct call carries no trampoline site and no boxing, so this body's argument kinds must be
+        // the ones the callee was compiled for.
         var dk: u32 = 1;
         while (dk < ds.n_args) : (dk += 1) {
             const ar = ds.args_reg + dk;
@@ -1149,13 +1029,10 @@ fn appendStaticCallSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i: u
         }
         return true;
     }
-    // A suspend callee would park through the trampoline; every
-    // function-mode body must be suspension-free so a flat-driver
-    // native run's outcomes stay RETURN / throw / deopt only.
+    // A suspend callee would park through the trampoline; every function-mode body must be
+    // suspension-free so a native run's outcomes stay RETURN, throw or deopt.
     if (module.funcById(tc.func)) |cf| {
-        // A bodyless callee is an abstract-member static anchor: the
-        // interpreted Call arm re-dispatches it virtually on the
-        // receiver, which a raw callFunc cannot.
+        // A bodyless callee is an abstract-member anchor the interpreted Call arm re-dispatches virtually.
         if (cf.is_suspend or !cf.hasBody()) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4517\n", .{func.name}); return false; }
     } else { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4518\n", .{func.name}); return false; }
     // Args must already live in typed scalar slots.
@@ -1190,10 +1067,8 @@ fn appendStaticCallSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i: u
     return true;
 }
 
-/// Member / virtual trampoline sites (object receiver seeded in a frame
-/// register; scalar args from typed slots; an object result boxes into
-/// the frame register, a scalar one fills its slot). No entry class
-/// guard: dispatch is dynamic per receiver.
+/// Member and virtual trampoline sites: the object receiver is seeded in a frame register, scalar args come
+/// from typed slots, an object result boxes into the frame. No entry class guard, dispatch being dynamic.
 fn collectTrampolineSites(ctx: *FuncCtx) Allocator.Error!bool {
     const func = ctx.func;
     const body = ctx.body;
@@ -1211,9 +1086,8 @@ fn appendTrampolineSiteFor(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i:
     const types = ctx.types;
     const n_regs = ctx.n_regs;
     const skip_insts = &ctx.skip_insts;
-    // The receiver Move an inlined self-call consumed is spliced away:
-    // registering it as an object move would put a boxed copy back and
-    // make the method need a frame again.
+    // The receiver Move an inlined self-call consumed is spliced away: registering it as an object
+    // move would put a boxed copy back and make the method need a frame again.
     if (skippedAt(skip_insts.items, bid.int(), @intCast(i))) return true;
     if (inst.* == .Move) {
         return appendObjMoveSiteF(ctx, inst, bid, i, blk);
@@ -1224,27 +1098,19 @@ fn appendTrampolineSiteFor(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i:
     if (inst.* == .GetField) {
         return appendNamedFieldSiteF(ctx, inst, bid, i, blk);
     }
-    // A numeric conversion or a bitwise op spells as a member or
-    // virtual call on a SCALAR receiver, and the emitter lowers both
-    // inline. Reaching the member branch rejected the whole body for a
-    // non-object receiver, so a method doing `k.toLong()` or `x shl 3`
-    // never compiled.
+    // A numeric conversion or bitwise op spells as a call on a SCALAR receiver, lowered inline.
     if (nativeScalarCallShape(module, inst, types, n_regs)) return true;
     return appendMemberOrVirtualSiteF(ctx, inst, bid, i, blk);
 }
 
-/// An object move copies one boxed FRAME register into another
-/// — the handler does it; the native scalar Move would copy a
-/// garbage slot (object registers are not slot-backed).
+/// An object move copies one boxed FRAME register into another: the handler does it, since the
+/// native scalar Move would copy a garbage slot, object registers not being slot-backed.
 fn appendObjMoveSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i: usize, blk: *const ir.Block) Allocator.Error!bool {
     const a = ctx.a;
     const func = ctx.func;
     const n_regs = ctx.n_regs;
     const types = ctx.types;
     const call_sites = &ctx.call_sites;
-    // An object move copies one boxed FRAME register into another
-    // — the handler does it; the native scalar Move would copy a
-    // garbage slot (object registers are not slot-backed).
     const m = inst.Move;
     const obj_mv = typeAt(types, m.dst) == .object or typeAt(types, m.src) == .object or
         typeAt(types, m.src) == .null_;
@@ -1271,18 +1137,14 @@ fn appendObjMoveSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i: usiz
     return true;
 }
 
-/// Global read: the handler boxes the value into the frame
-/// register (a missing global deopts; the interpreter re-runs
-/// the read and raises properly).
+/// Global read: the handler boxes the value into the frame register; a missing global deopts and the
+/// interpreter re-runs the read.
 fn appendGlobalSiteF(ctx: *FuncCtx, lg: anytype, bid: BlockId, i: usize, blk: *const ir.Block) Allocator.Error!bool {
     const a = ctx.a;
     const func = ctx.func;
     const n_regs = ctx.n_regs;
     const types = ctx.types;
     const call_sites = &ctx.call_sites;
-    // Global read: the handler boxes the value into the frame
-    // register (a missing global deopts; the interpreter re-runs
-    // the read and raises properly).
     if (lg.dst.int() >= n_regs or typeAt(types, lg.dst) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: global-kind\n", .{func.name}); return false; }
     var span4: ?ir.Span = null;
     var bj4: usize = i;
@@ -1304,11 +1166,8 @@ fn appendGlobalSiteF(ctx: *FuncCtx, lg: anytype, bid: BlockId, i: usize, blk: *c
     return true;
 }
 
-/// By-name field read on a varying receiver: the handler
-/// resolves the stored index on the live receiver per call
-/// and boxes the value into the frame register; a getter
-/// property or non-Instance receiver deopts (the read is
-/// pure, so the interpreter re-runs it).
+/// By-name field read on a varying receiver: the handler resolves the stored index on the live receiver per
+/// call and boxes the value into the frame. A getter property or non-Instance receiver deopts, the read being pure.
 fn appendNamedFieldSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i: usize, blk: *const ir.Block) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -1323,11 +1182,6 @@ fn appendNamedFieldSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i: u
         if (fp3.block == bid.int() and fp3.inst == i) covered = true;
     }
     if (!covered) {
-        // By-name field read on a varying receiver: the handler
-        // resolves the stored index on the live receiver per call
-        // and boxes the value into the frame register; a getter
-        // property or non-Instance receiver deopts (the read is
-        // pure, so the interpreter re-runs it).
         if (field_resolver == null) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-host\n", .{func.name}); return false; }
         const tf = trampolinableFieldOf(module, inst) orelse { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-name\n", .{func.name}); return false; };
         if (tf.recv.int() >= n_regs or typeAt(types, tf.recv) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: field-recv\n", .{func.name}); return false; }
@@ -1357,10 +1211,8 @@ fn appendNamedFieldSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i: u
     return true;
 }
 
-/// The receiver register must be object-typed: the handler reads
-/// its value from the FRAME, which holds every object def (handler
-/// deliveries, object moves, seeded params). An unknown-typed one
-/// has an unclassified def; a scalar one lives in a slot.
+/// The receiver register must be object-typed: the handler reads its value from the FRAME, which
+/// holds every object def. An unknown-typed one has an unclassified def; a scalar one lives in a slot.
 fn appendMemberOrVirtualSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId, i: usize, blk: *const ir.Block) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -1369,10 +1221,6 @@ fn appendMemberOrVirtualSiteF(ctx: *FuncCtx, inst: *const ir.Inst, bid: BlockId,
     const types = ctx.types;
     const call_sites = &ctx.call_sites;
 const kind: enum { member, virt } = if (trampolinableMemberOf(module, inst) != null) .member else if (trampolinableVirtualOf(inst) != null) .virt else return true;
-// The receiver register must be object-typed: the handler reads
-// its value from the FRAME, which holds every object def (handler
-// deliveries, object moves, seeded params). An unknown-typed one
-// has an unclassified def; a scalar one lives in a slot.
 {
     const rreg: Reg = if (kind == .member) trampolinableMemberOf(module, inst).?.recv else trampolinableVirtualOf(inst).?.recv;
     if (rreg.int() >= n_regs or typeAt(types, rreg) != .object) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: recv-kind\n", .{func.name}); return false; }
@@ -1433,8 +1281,8 @@ if (kind == .member) {
     return true;
 }
 
-/// ESCAPE sites: one per instruction the scan marked; the callback runs
-/// the interpreter's own arm with a full scalar spill/unspill around it.
+/// One escape site per instruction the scan marked; the callback runs the interpreter's own arm with
+/// a full scalar spill and unspill around it.
 fn collectEscapeSites(ctx: *FuncCtx) Allocator.Error!bool {
     const a = ctx.a;
     const func = ctx.func;
@@ -1463,13 +1311,8 @@ fn collectEscapeSites(ctx: *FuncCtx) Allocator.Error!bool {
     return true;
 }
 
-/// Trampoline-density profitability: every non-native site is a host
-/// round-trip that costs about as much as the interpreted instruction it
-/// replaces, and a tiny body's native entry (slot setup, seeding, tag
-/// copy) costs more than its walk. Compile only when enough plain native
-/// instructions amortize the overhead; the measurement behind the
-/// thresholds is the compose replica, where the ungated tier ran a net
-/// ~3% SLOWER (KLIO_FJ_MINPROFIT=insts,K overrides for re-measurement).
+/// Trampoline-density profitability: every non-native site is a host round trip costing about what the
+/// interpreted instruction did, and a tiny body's entry costs more than its walk (`KLIO_FJ_MINPROFIT` overrides).
 fn rejectsTrampolineDensity(ctx: *const FuncCtx) bool {
     const func = ctx.func;
     const body = ctx.body;
@@ -1491,11 +1334,8 @@ fn rejectsTrampolineDensity(ctx: *const FuncCtx) bool {
     return false;
 }
 
-/// A spliced callee's `this`-field ops become the caller's own native field
-/// sites, contiguous per site so the inline emit can index them in body
-/// order. The receiver is the caller's `this` (a SELF call), so they ride the
-/// same entry field-base and stay native — no trampoline, so the method can
-/// still run frameless at the seam.
+/// A spliced callee's `this`-field ops become the caller's own native field sites, contiguous per site so the
+/// inline emit indexes them in body order; the receiver is the caller's `this`, riding the same field base.
 fn registerInlineFieldSitesF(ctx: *FuncCtx) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
@@ -1556,9 +1396,8 @@ fn registerInlineFieldSitesF(ctx: *FuncCtx) Allocator.Error!bool {
     return true;
 }
 
-/// `this`-field sites: native memory accesses through the entry-seeded
-/// field-buffer pointer (the slot index is filled in below, after the
-/// layout is settled).
+/// `this`-field sites: native memory accesses through the entry-seeded field-buffer pointer, whose
+/// slot index is filled in once the layout is settled.
 fn appendFieldPreSites(ctx: *FuncCtx) Allocator.Error!bool {
     const a = ctx.a;
     const func = ctx.func;
@@ -1597,8 +1436,8 @@ fn appendFieldPreSites(ctx: *FuncCtx) Allocator.Error!bool {
     return true;
 }
 
-/// Deopt-freedom: no tramp calls (the sites before `field_sites_base` are
-/// exactly the trampolined Calls), no division, every read NN-proven.
+/// Deopt-freedom: no trampolined calls (the sites before `field_sites_base` are exactly those), no
+/// division, every read NN-proven.
 fn computeDeoptFreedom(ctx: *FuncCtx) void {
     const func = ctx.func;
     const is_method = ctx.is_method;
@@ -1614,18 +1453,15 @@ fn computeDeoptFreedom(ctx: *FuncCtx) void {
     for (field_pres.items) |fp| {
         if (fp.is_set) writes_fields = true;
     }
-    // A direct call into a callee that can deopt gives THIS body a deopt edge
-    // of its own: the site re-runs the call from the interpreter, which needs a
-    // frame to resume into, so the body no longer qualifies for the frameless
-    // seam.
+    // A direct call into a callee that can deopt gives THIS body a deopt edge: the site re-runs the call
+    // from the interpreter, which needs a frame to resume into, so the frameless seam is out.
     var direct_may_deopt = false;
     for (direct_sites.items) |*ds| {
         if (ds.may_deopt) direct_may_deopt = true;
     }
     const can_deopt = direct_may_deopt or !(is_method and field_sites_base == 0 and !has_div and all_reads_nn);
     if (can_deopt and is_method and debugEnabled()) {
-        // Which condition refused this method the seam — the histogram that says
-        // where the next widening belongs.
+        // Which condition refused this method the seam.
         std.debug.print("[jit]   method {s} can deopt: tramp-calls={d} div={} reads-nn={}\n", .{
             func.name, field_sites_base, has_div, all_reads_nn,
         });
@@ -1634,9 +1470,8 @@ fn computeDeoptFreedom(ctx: *FuncCtx) void {
     ctx.can_deopt = can_deopt;
 }
 
-/// The slot layout: the caller's registers, then its params, the trampoline
-/// control words, the entry field base, the result slots, and last the window
-/// a direct callee runs on.
+/// The slot layout: the caller's registers, then its params, the trampoline control words, the entry
+/// field base, the result slots, and last the window a direct callee runs on.
 fn layoutFuncSlots(ctx: *FuncCtx) bool {
     const func = ctx.func;
     const is_method = ctx.is_method;
@@ -1654,10 +1489,8 @@ fn layoutFuncSlots(ctx: *FuncCtx) bool {
     ctx.fbase_slot = calls_base;
     ctx.result_slot = calls_base + (if (is_method) @as(u32, 1) else 0);
     ctx.result_reg_slot = ctx.result_slot + 1;
-    // A direct callee runs on a slot window carved out of this body's own slot
-    // array, so a call is a pointer bump: no allocation, no frame. One window
-    // serves every direct call here — only one is ever live at a time, and a
-    // callee's own nested calls already fit inside its `n_slots`.
+    // A direct callee runs on a slot window carved out of this body's own slot array, so a call is a
+    // pointer bump. One window serves every direct call, only one being live at a time.
     ctx.n_slots = ctx.result_reg_slot + 1;
     if (direct_sites.items.len != 0) {
         var window: u32 = 0;
@@ -1667,18 +1500,15 @@ fn layoutFuncSlots(ctx: *FuncCtx) bool {
             if (ds.callee.n_slots > window) window = ds.callee.n_slots;
         }
         ctx.n_slots += window;
-        // 192 is the seam's per-depth slot bank: a body that outgrows it falls
-        // off the frameless path, which costs more than the call it saves.
+        // 192 is the seam's per-depth slot bank; a body that outgrows it falls off the frameless path.
         if (ctx.n_slots > MAX_SLOTS) { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}: direct-slots\n", .{func.name}); return false; }
     }
     for (call_sites.items[field_sites_base..]) |*site| site.fbase_slot = ctx.fbase_slot;
     return true;
 }
 
-/// A direct callee reads and writes `this` through ITS OWN field indexes on
-/// the same receiver, and its entry guard never runs (the call bypasses it),
-/// so those (index, name) pairs join this body's — one entry check covers
-/// both bodies.
+/// A direct callee reads and writes `this` through ITS OWN field indexes on the same receiver, and
+/// its entry guard never runs, so those (index, name) pairs join this body's: one check covers both.
 fn buildMethodFieldChecks(ctx: *FuncCtx) Allocator.Error!?[]MethodFieldCheck {
     const a = ctx.a;
     const func = ctx.func;
@@ -1702,9 +1532,8 @@ fn buildMethodFieldChecks(ctx: *FuncCtx) Allocator.Error!?[]MethodFieldCheck {
     return method_fields_owned;
 }
 
-/// Re-verify every (index, name) pair and read the layout id under ONE
-/// borrow: an entry matching this shape at run time provably has each
-/// name at its index, so the per-entry loop is skipped.
+/// Re-verifies every (index, name) pair and reads the layout id under ONE borrow, so an entry matching
+/// this shape provably has each name at its index and can skip the per-entry loop.
 fn computeGuardShape(ctx: *const FuncCtx, method_fields_owned: []const MethodFieldCheck) u64 {
     const params = ctx.params;
     const is_method = ctx.is_method;
@@ -1730,8 +1559,8 @@ fn computeGuardShape(ctx: *const FuncCtx, method_fields_owned: []const MethodFie
     return guard_shape;
 }
 
-/// Run the emitter over the validated body and package the machine code with
-/// the entry guard, seed tables, and trampoline side tables `runFunc` reads.
+/// Runs the emitter over the validated body and packages the machine code with its entry guard, seed
+/// tables and the trampoline side tables `runFunc` reads.
 fn emitFunc(ctx: *FuncCtx) Allocator.Error!?CompiledLoop {
     const a = ctx.a;
     const module = ctx.module;
@@ -1813,8 +1642,8 @@ fn emitFunc(ctx: *FuncCtx) Allocator.Error!?CompiledLoop {
 
     const exec = jit.finalize(c.em.code()) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4733\n", .{func.name}); return null; };
     const sites_owned = call_sites.toOwnedSlice(a) catch { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4734\n", .{func.name}); return null; };
-    // Function mode restricts returns/params to exact `Int`-boxing kinds (see
-    // `exact_ret`), so the default `Int` tag is correct for every register.
+    // Function mode restricts returns and params to exact `Int`-boxing kinds, so the default `Int` tag is
+    // correct for every register.
     const fn_tags = a.alloc(u8, n_regs) catch {
         a.free(sites_owned);
         { if (debugEnabled()) std.debug.print("[jit]   fdecl {s}@L4739\n", .{func.name}); return null; }

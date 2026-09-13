@@ -1,6 +1,5 @@
-//! Declaration-level transform: composer/changed parameter threading, the
-//! defaulted-parameter prologue, the `$dirty` skip calculus, and the
-//! restartable-group bracket.
+//! Declaration-level transform: composer/changed threading, the defaulted-parameter
+//! prologue, the `$dirty` skip calculus, and the restartable-group bracket.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -46,10 +45,7 @@ const probeMethodFor = stability.probeMethodFor;
 const walker = @import("walker.zig");
 const Walker = walker.Walker;
 
-/// Transform every `@Composable` top-level function in `decls` in place,
-/// threading the composer per the plugin ABI. `composable_names` is the oracle
-/// set from `collectComposableNames`, optionally extended with names from a
-/// baked base.
+/// Transform every `@Composable` top-level function in `decls` in place.
 pub fn transformDecls(
     a: std.mem.Allocator,
     decls: []ast.Decl,
@@ -79,15 +75,12 @@ fn transformDecl(
                 }
             } else {
                 if (f.body == null) return;
-                // Not composable: still walk the body so a `compose { … }` or
-                // `setContent { … }` composable-lambda argument is transformed.
+                // Not composable: still walk the body so a `setContent { … }` lambda transforms.
                 const ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
                 const ret_fn_params: u8 = if (ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0;
                 const wrap_ret = ret_composable and std.mem.startsWith(u8, f.name.name, "movableContent");
-                // A non-composable fn can still take `@Composable`-typed lambda
-                // params (`movableContentOf(content)`), so a bare `content()`
-                // inside one of its composable lambdas is a composable call and
-                // must thread.
+                // A non-composable fn can still take `@Composable`-typed lambda params, so a bare
+                // `content()` inside one of its composable lambdas is a composable call.
                 const lp = a.create(std.StringHashMap(void)) catch @panic("oom");
                 lp.* = try composableLambdaParamNames(a, f);
                 var w = Walker{ .a = a, .b = .{ .a = a, .gen_span = f.span }, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false, .ret_composable = ret_composable, .ret_fn_params = ret_fn_params, .lambda_params = lp, .wrap_ret_lambda = wrap_ret };
@@ -109,13 +102,8 @@ fn transformDecl(
             var w = Walker{ .a = a, .b = pb, .oracle = NameSetOracle.isComposableCall, .oracle_ctx = oracle, .sinks = sinks, .thread = false };
             if (p.init) |*ini| try w.walkExpr(ini);
             if (p.delegate) |del| try w.walkExpr(del);
-            // A `@Composable` property getter composes with no `$composer` param
-            // of its own, so its body walks in ambient mode, where composer
-            // references go through the `__compose_currentComposer` intrinsic;
-            // the interpreter keeps that stack current around every
-            // transformed-composable call. The upstream `currentComposer`
-            // property is itself the intrinsic stub, a throwing body, so its
-            // getter body becomes the intrinsic read.
+            // A `@Composable` property getter has no `$composer` param, so its body walks in
+            // ambient mode through the `__compose_currentComposer` intrinsic.
             if (p.getter) |g| {
                 if (isComposable(g.annotations) or isComposable(p.annotations)) {
                     if (std.mem.eql(u8, p.name.name, "currentComposer")) {
@@ -134,19 +122,12 @@ fn transformDecl(
     }
 }
 
-/// `androidx.compose.runtime.klioComposableDefaultMarker()`, the absent-argument
-/// sentinel call.
 fn markerCall(b: B) Expr {
     return b.call(b.pathExprSegs(&default_marker_path), b.a.alloc(Expr, 0) catch @panic("oom"));
 }
 
-/// Guard a marker-defaulted param's skip-calculus probe with
-/// `if (p$arg !== marker()) { <probe> }`. A parameter that fell back to its
-/// default is NOT probed: kotlinc's `$default`-mask path sets the dirty bits
-/// directly and emits no `composer.changed()`, so probing would store a slot the
-/// compiler never stores. The default's own composition-local and
-/// snapshot-state reads still invalidate the scope, so no recomposition is lost.
-/// A defaulted param the caller did pass is probed normally.
+/// Guard a marker-defaulted param's probe with `if (p$arg !== marker())`: kotlinc's
+/// `$default`-mask path sets the dirty bits directly and stores no `changed` slot.
 fn dirtyProbeIfPassed(b: B, arg_name: []const u8, probe: Stmt, triple: u5) Stmt {
     const not_default = Expr{ .Binary = .{
         .op = .IdentNeq,
@@ -156,9 +137,8 @@ fn dirtyProbeIfPassed(b: B, arg_name: []const u8, probe: Stmt, triple: u5) Stmt 
     } };
     const then_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
     then_stmts[0] = probe;
-    // Default taken: the slot is certain-same for this composition, so the
-    // triple's same bit must set, or the `!= SAME` gate reads the empty triple
-    // as unknown and never skips a defaulted call.
+    // Default taken: the slot is certain-same for this composition, so the triple's
+    // same bit must set, or the `!= SAME` gate reads the empty triple as unknown.
     const else_stmts = b.a.alloc(Stmt, 1) catch @panic("oom");
     else_stmts[0] = dirtyOrConst(b, dirtySame(triple));
     return .{ .Expr = .{ .If = .{
@@ -169,16 +149,14 @@ fn dirtyProbeIfPassed(b: B, arg_name: []const u8, probe: Stmt, triple: u5) Stmt 
     } } };
 }
 
-/// Triple index for probed slot `i`. A Kotlin `Int` holds ten 3-bit triples
-/// above the forced bit; slots beyond that share the last triple, which only
-/// widens invalidation and never misses one.
+// Ten 3-bit triples fit above the forced bit in a Kotlin `Int`; slots beyond that
+// share the last triple, which only widens invalidation.
 fn tripleIdx(i: usize) u5 {
     return @intCast(@min(i, 9));
 }
 
-/// The changed and same values of skip-calculus triple `i`. kotlinc's `$dirty`
-/// layout is 3 bits per probed slot starting at bit 1; bit 0 is the
-/// restart-forced bit.
+/// The changed and same values of skip-calculus triple `i`. The `$dirty` layout is
+/// 3 bits per probed slot starting at bit 1; bit 0 is the restart-forced bit.
 pub fn dirtyChanged(triple: u5) i64 {
     return @as(i64, 4) << (3 * @as(u6, triple));
 }
@@ -190,11 +168,8 @@ pub fn dirtyMask(triple: u5) i64 {
     return @as(i64, 14) << (3 * @as(u6, triple));
 }
 
-/// `if ($changed and (0b110 << 3i) == 0) { <probe stmt> }`: the probe runs only
-/// when the caller claimed nothing for this slot. A site that passes certainty
-/// bits does so constantly, since they are a static property of the call site's
-/// argument shape, so slot-table usage stays position-stable across
-/// recompositions.
+/// `if ($changed and (0b110 << 3i) == 0) { <probe> }`: the probe runs only when the
+/// caller claimed nothing, which keeps slot-table usage position-stable.
 fn guardProbe(b: B, probe: Stmt, triple: u5) Stmt {
     const guard = Expr{ .Binary = .{
         .op = .Eq,
@@ -212,7 +187,6 @@ fn guardProbe(b: B, probe: Stmt, triple: u5) Stmt {
     } } };
 }
 
-/// `$dirty = $dirty or <v>`.
 fn dirtyOrConst(b: B, v: i64) Stmt {
     return .{ .Assign = .{
         .target = b.pathExpr(dirty_local),
@@ -222,11 +196,8 @@ fn dirtyOrConst(b: B, v: i64) Stmt {
     } };
 }
 
-/// `$dirty = $dirty or (if (<probe>) <changed_i> else <same_i>)`: one
-/// skip-calculus probe writing triple `i`. The probe runs every invocation,
-/// since call sites pass `$changed = 0` and claim nothing, so each probed slot
-/// lands on changed or same and the skip gate compares the triple region against
-/// all-same.
+/// `$dirty = $dirty or (if (<probe>) <changed_i> else <same_i>)`. The probe runs every
+/// invocation, so the skip gate compares the triple region against all-same.
 fn dirtyOrProbe(b: B, probe: Expr, triple: u5) Stmt {
     const pick = Expr{ .If = .{
         .cond = b.box(probe),
@@ -242,18 +213,11 @@ fn dirtyOrProbe(b: B, probe: Expr, triple: u5) Stmt {
     } };
 }
 
-/// The transformed signature plus the body prologue that re-evaluates composable
-/// defaults in composition context. Every original param keeps its slot; a
-/// defaulted param `p: T = D` is renamed to `p$arg` with the marker as its
-/// default, and the prologue declares `val p = if (p$arg === marker()) D else
-/// p$arg`, so `D` runs inside the body where the threaded `$composer` is in
-/// scope. The restart re-call passes `p$arg`, so a recomposition re-evaluates
-/// the default as upstream's `$default`-mask re-call does. `$composer` and
-/// `$changed` are appended last.
+/// Every original param keeps its slot; a defaulted `p: T = D` is renamed `p$arg` with
+/// the marker as its default and the prologue declares
+/// `val p = if (p$arg === marker()) D else p$arg`. `$composer`/`$changed` come last.
 const ParamsAndPrologue = struct { params: []Param, prologue: []Stmt };
 
-/// The enclosing function's `@Composable`-lambda-typed param names, for the
-/// walker's bare-invoke threading of `content()`. Arena-allocated.
 fn composableLambdaParamNames(a: std.mem.Allocator, f: *const Function) std.mem.Allocator.Error!std.StringHashMap(void) {
     var set = std.StringHashMap(void).init(a);
     for (f.params) |*p| {
@@ -313,10 +277,8 @@ fn buildParamsAndPrologue(a: std.mem.Allocator, b: B, f: *const Function) std.me
     return .{ .params = params, .prologue = try prologue.toOwnedSlice(a) };
 }
 
-/// The composable-function transform. Returns a NEW `Function`, leaving the
-/// input unmutated; fresh nodes are arena-allocated. `oracle`/`oracle_ctx`
-/// classify callees; `sinks` names functions with a `@Composable`-typed lambda
-/// parameter so a lambda bound to one is itself transformed, null for none.
+/// Returns a NEW `Function`, leaving the input unmutated; fresh nodes are
+/// arena-allocated. `sinks` names functions with a `@Composable`-typed lambda param.
 pub fn transformComposableFunction(
     a: std.mem.Allocator,
     f: *const Function,
@@ -328,20 +290,16 @@ pub fn transformComposableFunction(
     enclosing_class: ?[]const u8,
 ) std.mem.Allocator.Error!Function {
     const b = B{ .a = a, .gen_span = f.span };
-    // Any unstable value parameter or receiver makes the function restartable
-    // but NOT skippable: no probes, no skip branch.
+    // An unstable value parameter or receiver leaves the function restartable but NOT
+    // skippable: no probes, no skip branch.
     const skippable = root.emit_skip_calculus and fnIsSkippable(f, in_class, enclosing_class);
 
-    // Signature: append `$composer: Composer` and `$changed: Int`, and move
-    // composable defaults into the body prologue.
     const pp = try buildParamsAndPrologue(a, b, f);
     const params = pp.params;
 
-    // Body: thread the composer through `@Composable` calls, then bracket.
     const orig_stmts: []const Stmt = switch (f.body orelse return signatureOnly(f, params)) {
         .Block => |blk| blk.stmts,
         .Expr => |e| blk: {
-            // Single-expression body becomes a one-statement block.
             const s = try a.alloc(Stmt, 1);
             s[0] = .{ .Expr = e };
             break :blk s;
@@ -349,31 +307,24 @@ pub fn transformComposableFunction(
     };
 
     var out: std.ArrayList(Stmt) = .empty;
-    // `$composer.startRestartGroup(<key>)`
     try out.append(a, .{ .Expr = b.callMember(
         b.pathExpr(composer_param),
         "startRestartGroup",
         b.slice1(b.intLit(positionalKey(f.span))),
     ) });
-    // Threaded body: walk in place, replacing `currentComposer` with the
-    // threaded `$composer` and threading each `@Composable` call. The defaults
-    // prologue walks too, so a composable call inside a default expression is
-    // threaded against this body's `$composer`.
+    // The defaults prologue walks too, so a composable call in a default is threaded.
     const lp = try a.create(std.StringHashMap(void));
     lp.* = try composableLambdaParamNames(a, f);
     const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
     var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0 };
-    // The per-param triples let a memoized lambda derive its validity from
-    // `$dirty`, kotlinc's zero-key-slot shape. Only non-defaulted, non-vararg
-    // params participate: a defaulted param's triple can carry the default-taken
-    // same bit while the body sees a re-evaluated value.
+    // Only non-defaulted, non-vararg params get a triple: a defaulted param's triple can
+    // carry the default-taken same bit while the body sees a re-evaluated value.
     if (skippable) {
         const triples = try a.create(std.StringHashMap(u5));
         triples.* = std.StringHashMap(u5).init(a);
         for (f.params, 0..) |p, pi| {
             if (p.is_vararg or p.default != null) continue;
-            // Index 9 is the shared overflow triple; only exclusively owned
-            // triples drive a memo condition.
+            // Index 9 is the shared overflow triple; only owned triples drive a memo condition.
             if (pi >= 9) continue;
             try triples.put(p.name.name, tripleIdx(pi));
         }
@@ -384,15 +335,8 @@ pub fn transformComposableFunction(
         try w.walkStmt(s);
         try out.append(a, s.*);
     }
-    // Skip calculus: probe every value parameter through `$composer.changed(p)`.
-    // The probe also stores the value in the slot table, so it runs on every
-    // invocation regardless of the skip decision. The body executes when a probe
-    // reported a change, the scope was forced (`$changed` bit 0, set by the
-    // restart re-invoke), or the composer is not in a skippable state; otherwise
-    // the group skips wholesale. A vararg parameter is not probed element-wise
-    // and conservatively always recomposes; a member or extension receiver probes
-    // `this`. Probes run AFTER the defaults prologue so a defaulted parameter
-    // probes its resolved value.
+    // Skip calculus: probe every value parameter through `$composer.changed(p)`, which also
+    // stores the value. The body executes on a change, a forced scope, or a busy composer.
     if (skippable) {
         const dirty_prop = try a.create(ast.Property);
         dirty_prop.* = .{
@@ -400,9 +344,8 @@ pub fn transformComposableFunction(
             .name = b.ident(dirty_local),
             .receiver_type = null,
             .ty = null,
-            // Full copy, kotlinc's `$dirty = $changed`: the caller's per-arg
-            // certainty bits carry through, so a guarded-off probe still has its
-            // triple populated for the skip gate and memo conditions.
+            // Full copy, kotlinc's `$dirty = $changed`, so a guarded-off probe still has its
+            // triple populated from the caller's certainty bits.
             .init = b.pathExpr(changed_param),
             .delegate = null,
             .getter = null,
@@ -424,11 +367,8 @@ pub fn transformComposableFunction(
         for (f.params, 0..) |p, pi| {
             const triple = tripleIdx(pi);
             if (p.is_vararg) {
-                // A vararg packs a fresh array every call, so identity
-                // `changed(values)` never skips. Probing the contents with
-                // `changed(values.toList())` compares structurally against the
-                // remembered slot, matching the reference compiler's per-element
-                // dirty walk (b/286132194).
+                // A vararg packs a fresh array every call, so `changed(values.toList())` compares
+                // structurally against the slot instead of by identity.
                 try out.append(a, guardProbe(b, dirtyOrProbe(b, b.callMember(
                     b.pathExpr(composer_param),
                     "changed",
@@ -448,8 +388,7 @@ pub fn transformComposableFunction(
                 try out.append(a, guardProbe(b, probe, triple));
             }
         }
-        // The receiver's triple sits after the value params, kotlinc's slot
-        // order for a member or extension composable.
+        // The receiver's triple sits after the value params, kotlinc's slot order.
         if (f.receiver_type != null or in_class) {
             const recv_triple = tripleIdx(f.params.len);
             const recv_probe: []const u8 = if (f.receiver_type) |*rt|
@@ -463,18 +402,13 @@ pub fn transformComposableFunction(
             ), recv_triple), recv_triple));
         }
     }
-    // `if ($composer.shouldExecute($dirty != 0 || !$composer.skipping,
-    // $dirty and 1)) { <body> } else { $composer.skipToGroupEnd() }`. The
-    // shouldExecute wrapper gives PausableComposition its pause points, where the
-    // composer pauses inserting or reusing content when the shouldPause callback
-    // says so; ordinary composition returns the first argument unchanged.
+    // `if ($composer.shouldExecute($dirty != 0 || !$composer.skipping, $dirty and 1))`:
+    // the wrapper gives PausableComposition its pause points.
     var body_list: std.ArrayList(Stmt) = .empty;
     for (orig_stmts) |*s| {
         try w.walkStmt(@constCast(s));
         try body_list.append(a, s.*);
     }
-    // An early or conditional `return` closes the open groups on its way out,
-    // as the tail epilogue does on the normal path.
     {
         var inj = EpilogueInjector{ .a = a, .b = b, .fn_name = f.name.name, .value_params = params[0..f.params.len] };
         try inj.stmts(body_list.items);
@@ -487,11 +421,8 @@ pub fn transformComposableFunction(
     }
     const skip_stmts = try a.alloc(Stmt, 1);
     skip_stmts[0] = .{ .Expr = b.callMember(b.pathExpr(composer_param), "skipToGroupEnd", try a.alloc(Expr, 0)) };
-    // Skippable gate: `($dirty and <forced+same bits>) != <all same> ||
-    // !$composer.skipping`. Every probed triple landed on same and the
-    // restart-forced bit is clear, or the body runs. Non-skippable keeps the
-    // shouldExecute pause point but always executes (`true`), as the plugin emits
-    // for a restartable-but-not-skippable composable.
+    // Skippable gate: `($dirty and <forced+same bits>) != <all same> || !$composer.skipping`.
+    // Non-skippable keeps the pause point but always executes (`true`).
     var gate_same: i64 = 0;
     if (skippable) {
         var seen_triples: u16 = 0;
@@ -527,17 +458,14 @@ pub fn transformComposableFunction(
         .else_branch = b.box(.{ .Block = .{ .stmts = skip_stmts, .span = b.gen_span } }),
         .span = b.gen_span,
     } } });
-    // `$composer.endRestartGroup()?.updateScope { c, f -> App(args, c, $changed or 1) }`
     try out.append(a, .{ .Expr = try endRestartGroupExpr(a, b, f.name.name, params[0..f.params.len]) });
 
     const new_body = Block{ .stmts = try out.toOwnedSlice(a), .span = f.span };
     return withBody(f, params, .{ .Block = new_body });
 }
 
-/// Transform a non-restartable or inline `@Composable`: append
-/// `$composer`/`$changed` and thread the body, without a start/endRestartGroup
-/// bracket. The body's original form, block or single expression, is preserved so
-/// a value-returning composable keeps its result.
+/// Append `$composer`/`$changed` and thread the body with no restart bracket. The
+/// body's original form is preserved so a value-returning composable keeps its result.
 pub fn transformThreadedComposable(
     a: std.mem.Allocator,
     f: *const Function,
@@ -554,19 +482,13 @@ pub fn transformThreadedComposable(
     const w_ret_composable = f.return_type != null and isComposableFnType(&f.return_type.?);
     var w = Walker{ .a = a, .b = b, .oracle = oracle, .oracle_ctx = oracle_ctx, .sinks = sinks, .lambda_params = lp, .locals = locals, .ret_composable = w_ret_composable, .ret_fn_params = if (w_ret_composable) @intCast(@min(f.return_type.?.function.?.params.len, 255)) else 0, .explicit_groups = isExplicitGroups(f) };
     const body = f.body orelse return signatureOnly(f, params);
-    // A non-restartable composable still owns a replace group, as kotlinc wraps
-    // its body in startReplaceableGroup(key)/end. Each invocation's slots live
-    // inside that group, so repeated calls in a spliced loop
-    // (`people.forEach { it.collectAsState() … }`) reconcile as same-key siblings
-    // instead of splatting slots into the caller and colliding when the iteration
-    // content changes. `@ReadOnlyComposable` and `@ExplicitGroupsComposable`
-    // bodies stay groupless, and inline composables splice into their caller.
+    // A non-restartable composable still owns a replace group: repeated calls in a spliced
+    // loop then reconcile as same-key siblings instead of splatting slots into the caller.
     const value_returning = (f.return_type != null and
         !std.mem.eql(u8, f.return_type.?.name.name, "Unit")) or
         (f.body != null and f.body.? == .Expr and f.return_type == null);
-    // Engine slot primitives manage their own slot and bracket protocol: the
-    // memo wrap (`rememberComposableLambda`) stores into the CALLER's group by
-    // design, and `key`'s movable bracket is emitted at the call site.
+    // Engine slot primitives manage their own bracket: the memo wrap stores into the
+    // CALLER's group by design, and `key`'s movable bracket is emitted at the call site.
     const grpwrap_excluded = std.mem.eql(u8, f.name.name, "rememberComposableLambda") or
         std.mem.eql(u8, f.name.name, "key");
     const wrap_group = value_returning and !f.is_inline and !isExplicitGroups(f) and

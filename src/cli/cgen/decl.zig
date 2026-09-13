@@ -1,5 +1,4 @@
-//! Names, prototypes, literals and expression rendering: what a declaration
-//! looks like in the emitted C, and how a value is written into it.
+//! Names, prototypes, literals and expression rendering in the emitted C.
 const std = @import("std");
 const ir = @import("ir");
 const Func = ir.Func;
@@ -17,11 +16,7 @@ const paramTy = cgen.paramTy;
 const toStringOf = cgen.toStringOf;
 const tyOf = cgen.tyOf;
 
-/// A C identifier for the function. Derived from the fqn, never from the id:
-/// ids are not stable across bakes, and a name that moves between builds would
-/// silently link the wrong body.
-/// A name as a C identifier fragment: the same escaping `writeSymbol` uses,
-/// so two names that differ anywhere differ here too.
+/// A name as a C identifier fragment, escaped so distinct names stay distinct.
 pub fn mangleName(name: []const u8, buf: []u8) []const u8 {
     var n: usize = 0;
     for (name) |ch| {
@@ -47,29 +42,22 @@ pub fn writeSymbol(w: *std.Io.Writer, f: *const Func) !void {
             try w.print("_{x:0>2}", .{ch});
         }
     }
-    // The fqn alone is not unique: every lambda is named `<lambda>`. The id
-    // distinguishes them, and only has to hold within this one file.
+    // Every lambda is named `<lambda>`; the id disambiguates within this one file.
     try w.print("_{d}", .{f.id.int()});
 }
 
-/// A scalar as a `klio_value`, for the moment it crosses into the object world.
-/// A class's own constructor parameter types, as the emitted initializer
-/// declares them.
 pub fn ctorParamTy(c: *const ir.Class, i: usize) Ty {
     return tyOf(c.primary_params[i].ty) orelse .object;
 }
 
-/// The thunk that fills a primary-constructor parameter a construction omits.
 pub fn ctorDefault(layouts: []const ClassLayout, c: *const ir.Class, idx: usize) ?ir.FuncId {
     const l = layoutFor(layouts, c) orelse return null;
     if (idx >= l.ctor_defaults.len) return null;
     return l.ctor_defaults[idx];
 }
 
-/// The declarations a class contributes itself: its body properties in source
-/// order and the init blocks between them. The table is keyed by whatever name
-/// the built module used — the FQN for a class in a package, the simple name
-/// for one without — so a lookup has to accept either.
+/// The declarations a class contributes itself: body properties in source order with
+/// the init blocks between them, keyed by the FQN or simple name the module used.
 pub fn ownLayout(prog: Program, name: []const u8) ?*const ClassLayout {
     for (prog.layouts) |*l| {
         if (std.mem.eql(u8, l.name, name)) return l;
@@ -84,9 +72,8 @@ pub fn layoutFor(layouts: []const ClassLayout, c: *const ir.Class) ?*const Class
     return null;
 }
 
-/// The prototype of a class's initializer. It fills an instance the caller has
-/// already allocated, which is what lets a subclass hand its own instance to
-/// the superclass's initializer rather than building a second one.
+/// Prototype of a class's initializer. It fills an instance the caller already
+/// allocated, so a subclass can hand its own to the superclass's initializer.
 pub fn writeCtorProto(w: *std.Io.Writer, m: *const Module, cid: u32) !void {
     const c = &m.classes.items[cid];
     try w.print("static void kinit_{d}(klio_value self", .{cid});
@@ -96,9 +83,8 @@ pub fn writeCtorProto(w: *std.Io.Writer, m: *const Module, cid: u32) !void {
     try w.writeAll(")");
 }
 
-/// One call to a thunk the class table carries: a superclass-argument thunk
-/// reads the constructor's parameters, a body-property thunk reads the
-/// instance and then the parameters.
+/// One call to a class-table thunk: a superclass-argument thunk reads the constructor's
+/// parameters, a body-property thunk the instance and then the parameters.
 pub fn writeThunkCall(
     gpa: std.mem.Allocator,
     out: *std.Io.Writer,
@@ -119,8 +105,7 @@ pub fn writeThunkCall(
         first = false;
         const have = ctorParamTy(c, i);
         const pidx = i + @as(usize, if (ifn.has_receiver_param) 1 else 0);
-        // The thunk's own signature decides: a parameter it declares as a
-        // reference arrives boxed, whatever the constructor holds.
+        // The thunk's own signature decides: a parameter it declares as a reference arrives boxed.
         const want: Ty = if (pidx < ifn.params.len) (tyOf(ifn.params[pidx].ty) orelse .object) else have;
         var nb: [16]u8 = undefined;
         const arg = std.fmt.bufPrint(&nb, "p{d}", .{i}) catch unreachable;
@@ -134,8 +119,7 @@ pub fn writeThunkCall(
     try out.writeAll(")");
 }
 
-/// A class's initializer: the superclass's fields first, through its own
-/// initializer, then the fields this class declares.
+/// A class's initializer: the superclass's fields through its own initializer first.
 pub fn writeCtorBody(
     gpa: std.mem.Allocator,
     w: *std.Io.Writer,
@@ -147,8 +131,7 @@ pub fn writeCtorBody(
     const fields = prog.of(cid).?;
     try writeCtorProto(w, m, cid);
     try w.writeAll(" {\n");
-    // A class whose fields are all filled elsewhere (an enum, whose entries
-    // carry their own name and position) uses none of its arguments.
+    // A class whose fields are all filled elsewhere (an enum) uses none of its arguments.
     try w.writeAll("  (void)self;");
     for (c.primary_params, 0..) |_, vi| try w.print("  (void)p{d};", .{vi});
     try w.writeAll("\n");
@@ -172,15 +155,12 @@ pub fn writeCtorBody(
         }
         try w.writeAll(");\n");
     }
-    // The class's own declarations run in SOURCE order: an init block sits
-    // between the body properties it was written between, and Kotlin's rule is
-    // that each one sees the properties declared above it and the zeros of
-    // those below.
+    // The class's own declarations run in SOURCE order: Kotlin's rule is that each init
+    // block sees the properties declared above it and the zeros of those below.
     const own = ownLayout(prog, c.name);
     const n_props: usize = if (own) |o| o.props.len else 0;
     var prop_i: usize = 0;
     var field_i: usize = 0;
-    // The constructor's own properties are filled before any of it runs.
     for (fields, 0..) |fd, fi| {
         if (fd.from_parent or fd.preset) continue;
         const ai = fd.arg orelse continue;
@@ -203,7 +183,6 @@ pub fn writeCtorBody(
             }
         }
         if (prop_i == n_props) break;
-        // The field this declaration contributes, when it has one.
         const want_name = if (own) |o| o.props[prop_i].name else "";
         var fi2: ?usize = null;
         for (fields, 0..) |fd2, k| {
@@ -215,8 +194,7 @@ pub fn writeCtorBody(
         const fd = fields[fi3];
         var bb: [400]u8 = undefined;
         const ifid = fd.init orelse {
-            // A declared non-nullable primitive with no initializer starts at
-            // its type's zero, which is what the interpreter stores.
+            // A non-nullable primitive with no initializer starts at its type's zero.
             const z = if (fd.ty == .object) "klio_nat_null()" else boxExpr(fd.ty, "0", &bb);
             try w.print("  klio_nat_set(self, {d}, {s});\n", .{ fi3, z });
             continue;
@@ -230,9 +208,6 @@ pub fn writeCtorBody(
     try w.writeAll("}\n");
 }
 
-/// A register as a `klio_value` ready to be rendered: a value whose class
-/// declares `toString` renders as what that returns, which is what Kotlin
-/// means by printing it.
 pub fn renderExpr(
     gpa: std.mem.Allocator,
     m: *const Module,
@@ -256,8 +231,6 @@ pub fn renderExpr(
     _ = gpa;
 }
 
-/// The runtime entry that boxes a machine type, or an empty name when the
-/// value is already a reference.
 /// A field's declared type as the runtime's zero-kind byte.
 pub fn zeroKindOf(t: Ty) u8 {
     return switch (t) {
@@ -295,9 +268,8 @@ pub fn boxFnName(t: Ty) []const u8 {
     };
 }
 
-/// The compiled parameter type of an accepted body, which is what its C
-/// signature declares. A synthesized thunk and a lambda compile against a
-/// signature the emitter chose, so the declaration is not the authority.
+/// The compiled parameter type of an accepted body: a thunk or lambda compiles against
+/// a signature the emitter chose, not against a declaration.
 pub fn acceptedParamTy(accepted: []const Compiled, f: *const Func, idx: usize) ?Ty {
     for (accepted) |*cc| {
         if (cc.f != f) continue;
@@ -307,11 +279,8 @@ pub fn acceptedParamTy(accepted: []const Compiled, f: *const Func, idx: usize) ?
     return null;
 }
 
-/// An expression of type `have` as the C type `want` needs it: a machine type
-/// boxed into a reference, a reference unboxed into a machine type. The
-/// lowering reuses one register for values of both shapes, and the register's
-/// own type is what its C local declares, so the conversion belongs at the
-/// point of use.
+/// An expression of type `have` as the C type `want` needs it. The lowering reuses
+/// one register for values of both shapes, so the conversion belongs at the point of use.
 pub fn convExpr(have: Ty, want: Ty, expr: []const u8, buf: []u8) []const u8 {
     if (have == want) return expr;
     if (want == .object) return boxExpr(have, expr, buf);
@@ -333,16 +302,13 @@ pub fn boxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
         .u64 => "klio_nat_box_ulong",
         .u16 => "klio_nat_box_ushort",
         .u8 => "klio_nat_box_ubyte",
-        // Boxing a Unit result must still run what produced it: the comma
-        // keeps the expression and yields the Unit value. Returning a bare
-        // `klio_nat_box_unit()` dropped the call.
+        // Boxing a Unit result must still run what produced it: the comma keeps the expression.
         .unit => return std.fmt.bufPrint(buf, "((void)({s}), klio_nat_box_unit())", .{expr}) catch unreachable,
         .object => return std.fmt.bufPrint(buf, "{s}", .{expr}) catch unreachable,
     };
     return std.fmt.bufPrint(buf, "{s}({s})", .{ fname, expr }) catch unreachable;
 }
 
-/// The reverse: a `klio_value` known to hold `t`, back in a C local.
 pub fn unboxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
     const fname = switch (t) {
         .i32 => "klio_nat_int",
@@ -357,21 +323,17 @@ pub fn unboxExpr(t: Ty, expr: []const u8, buf: []u8) []const u8 {
         .u64 => "klio_nat_ulong",
         .u16 => "klio_nat_ushort",
         .u8 => "klio_nat_ubyte",
-        // A Unit result is still a result: the expression that produced it
-        // has to run. The comma keeps the call and yields the Unit register's
-        // zero, where returning a bare `0` dropped the call entirely.
+        // A Unit result is still a result: the comma keeps the call and yields zero.
         .unit => return std.fmt.bufPrint(buf, "((void)({s}), 0)", .{expr}) catch unreachable,
         .object => return std.fmt.bufPrint(buf, "{s}", .{expr}) catch unreachable,
     };
     return std.fmt.bufPrint(buf, "{s}({s})", .{ fname, expr }) catch unreachable;
 }
 
-/// Where a register lives: a C local for a scalar, a published frame slot for
-/// a reference.
+/// Where a register lives: a C local for a scalar, a published frame slot for a reference.
 pub fn regName(c: *const Compiled, r: u32, buf: []u8) []const u8 {
-    // A suspend function's registers live in a HEAP frame: the body can return
-    // in the middle and be re-entered later, so nothing may sit in a C local
-    // that the return would discard.
+    // A suspend function's registers live in a HEAP frame: the body can return in the
+    // middle and be re-entered, so nothing may sit in a C local the return discards.
     if (c.suspends) {
         if (c.types[r] == .object) {
             return std.fmt.bufPrint(buf, "fr->ks[{d}]", .{c.slot[r]}) catch unreachable;
@@ -385,8 +347,7 @@ pub fn regName(c: *const Compiled, r: u32, buf: []u8) []const u8 {
 }
 
 pub fn writeProto(w: *std.Io.Writer, c: *const Compiled) !void {
-    // A suspend body answers either its result or the SUSPENDED marker, so its
-    // C result is a value rather than the declared machine type.
+    // A suspend body answers its result or the SUSPENDED marker, so its C result is a value.
     try w.print("static {s} ", .{if (c.suspends) "klio_value" else c.ret.cName()});
     try writeSymbol(w, c.f);
     try w.writeByte('(');
@@ -424,9 +385,8 @@ pub fn writeConst(w: *std.Io.Writer, c: ir.Const) !void {
     }
 }
 
-/// A C string literal for arbitrary bytes. The source may hold anything,
-/// including embedded NULs and invalid UTF-8, so every byte outside the plain
-/// printable range is escaped numerically rather than passed through.
+/// A C string literal for arbitrary bytes. The source may hold embedded NULs and
+/// invalid UTF-8, so every byte outside the printable range is escaped numerically.
 pub fn emitCLiteral(w: *std.Io.Writer, bytes: []const u8) !void {
     try w.writeByte('"');
     for (bytes) |ch| {
@@ -440,11 +400,9 @@ pub fn emitCLiteral(w: *std.Io.Writer, bytes: []const u8) !void {
     try w.writeByte('"');
 }
 
-/// A C floating literal for `v`. The shortest round-trip decimal is exact, but
-/// it can come out with no decimal point at all (1e20 formats as
-/// "100000000000000000000"), which C reads as an integer literal too large for
-/// any integer type. A literal that carries neither a point nor an exponent
-/// gets ".0" so it stays a double.
+/// A C floating literal. The shortest round-trip decimal is exact but can carry no
+/// point or exponent (1e20 formats as "100000000000000000000", which C reads as an
+/// integer too large for any type), so such a literal gets ".0".
 pub fn writeFloatLit(w: *std.Io.Writer, v: f64, is_f32: bool) !void {
     if (std.math.isNan(v)) {
         try w.print("(({s})NAN)", .{if (is_f32) "float" else "double"});
@@ -454,10 +412,6 @@ pub fn writeFloatLit(w: *std.Io.Writer, v: f64, is_f32: bool) !void {
         try w.print("(({s}{s})INFINITY)", .{ if (v < 0) "-" else "", if (is_f32) "float" else "double" });
         return;
     }
-    // Scientific form, because plain decimal is neither always short (a
-    // denormal expands to three hundred digits) nor always a float literal
-    // (1e20 comes out as "100000000000000000000", which C reads as an integer
-    // too large for any type). The shortest form that round-trips is exact.
     var buf: [64]u8 = undefined;
     const txt = std.fmt.bufPrint(&buf, "{e}", .{v}) catch return error.WriteFailed;
     try w.writeAll(txt);
@@ -465,19 +419,14 @@ pub fn writeFloatLit(w: *std.Io.Writer, v: f64, is_f32: bool) !void {
     if (is_f32) try w.writeByte('f');
 }
 
-/// Integer division and remainder by zero throw in Kotlin; C makes them
-/// undefined. The emitted body traps explicitly so a compiled program reports
-/// the same failure rather than executing nonsense.
+/// Integer division and remainder by zero throw in Kotlin and are undefined in C, so
+/// the emitted body traps explicitly.
 pub fn writeDivGuard(w: *std.Io.Writer, rhs: u32) !void {
     try w.print("  if (r{d} == 0) klio_arith_zero();\n", .{rhs});
 }
 
-/// Blocks some terminator can actually reach. Every emitted block ends in an
-/// explicit `goto`/`return`, so nothing falls through and a block no edge names
-/// is dead: emitting it would only leave the C compiler warning about a label
-/// nothing jumps to.
-/// The `i`th block control can reach from this one: its handlers first, then
-/// wherever its terminator goes. Null once they are exhausted.
+/// The `i`th block control can reach from this one: its handlers first, then wherever
+/// its terminator goes. Null once they are exhausted.
 pub fn succOf(f: *const Func, blk: *const ir.Block, i: u32) ?u32 {
     _ = f;
     if (i < blk.catches.len) return blk.catches[i].handler.int();
@@ -493,8 +442,7 @@ pub fn succOf(f: *const Func, blk: *const ir.Block, i: u32) ?u32 {
     };
 }
 
-/// The reachable blocks in reverse postorder from the entry. Catch handlers
-/// are reached by a throw rather than a terminator, so they are edges too.
+/// The reachable blocks in reverse postorder; a catch handler is an edge too.
 pub fn blockOrder(gpa: std.mem.Allocator, f: *const Func) Error![]u32 {
     const n = f.blocks.len;
     var post: std.ArrayList(u32) = .empty;
@@ -502,8 +450,7 @@ pub fn blockOrder(gpa: std.mem.Allocator, f: *const Func) Error![]u32 {
     const seen = try gpa.alloc(bool, n);
     defer gpa.free(seen);
     @memset(seen, false);
-    // An explicit stack: a deeply nested function would otherwise recurse as
-    // deep as it has blocks.
+    // An explicit stack: a deeply nested function would otherwise recurse per block.
     const Frame = struct { bi: u32, next: u32 };
     var stack: std.ArrayList(Frame) = .empty;
     defer stack.deinit(gpa);
@@ -538,8 +485,8 @@ pub fn reachableBlocks(gpa: std.mem.Allocator, f: *const Func) Error![]bool {
         grew = false;
         for (f.blocks, 0..) |*blk, bi| {
             if (!hit[bi]) continue;
-            // A handler is reached by a throw, not by any terminator: without
-            // this edge the block it jumps to looks dead and is dropped.
+            // A handler is reached by a throw, not a terminator: without this edge its
+            // target looks dead.
             for (blk.catches) |h| {
                 if (h.handler.int() < hit.len and !hit[h.handler.int()]) {
                     hit[h.handler.int()] = true;
@@ -568,9 +515,7 @@ pub fn reachableBlocks(gpa: std.mem.Allocator, f: *const Func) Error![]bool {
     return hit;
 }
 
-/// The type a body the emitter accepted actually returns, which is what its C
-/// signature says. The DECLARED return type is not the authority: a thunk the
-/// lowering synthesized carries a placeholder.
+/// The type an accepted body actually returns; a synthesized thunk's declaration is a placeholder.
 pub fn acceptedRet(accepted: []const Compiled, f: *const Func) ?Ty {
     for (accepted) |*cc| {
         if (cc.f == f) return cc.ret;
@@ -578,9 +523,8 @@ pub fn acceptedRet(accepted: []const Compiled, f: *const Func) ?Ty {
     return null;
 }
 
-/// The suspending calls in a body, in emission order. Each is a point the
-/// function can return from and be re-entered at, so each gets a state number
-/// and a resume label.
+/// The suspending calls in a body, in emission order: each is a point the function can
+/// be re-entered at, so each gets a state number and a resume label.
 pub fn suspendPoints(gpa: std.mem.Allocator, m: *const Module, f: *const Func, live: []const bool) Error![]const *const ir.Inst {
     var out: std.ArrayList(*const ir.Inst) = .empty;
     errdefer out.deinit(gpa);
@@ -594,8 +538,7 @@ pub fn suspendPoints(gpa: std.mem.Allocator, m: *const Module, f: *const Func, l
     return out.toOwnedSlice(gpa);
 }
 
-/// Whether a body has to compile as a state machine: it is declared
-/// `suspend`, or it calls something that is.
+/// Whether a body has to compile as a state machine: declared `suspend`, or it calls one.
 pub fn bodySuspends(m: *const Module, f: *const Func) bool {
     if (f.is_suspend) return true;
     for (f.blocks) |*blk| {

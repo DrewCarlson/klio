@@ -1,6 +1,5 @@
-//! Class and member registration: runtime `ClassDef` synthesis, the
-//! member-AST / supertype / inline registries, annotation records,
-//! property anchors, and the expect/actual retain and default transplant.
+//! Class and member registration: `ClassDef` synthesis, the member-AST, supertype and
+//! inline registries, annotation records, property anchors, and the expect/actual rules.
 
 const std = @import("std");
 
@@ -37,9 +36,6 @@ const FileClasses = build_types.FileClasses;
 const Span = build_types.Span;
 const SpanStrMap = build_types.SpanStrMap;
 
-// -------------------------------------------------------------------------
-// buildModuleWithOverrides sub-helpers.
-// -------------------------------------------------------------------------
 
 pub fn replaceDotWithDollar(allocator: Allocator, s: []const u8) Allocator.Error![]const u8 {
     const out = try allocator.alloc(u8, s.len);
@@ -47,9 +43,8 @@ pub fn replaceDotWithDollar(allocator: Allocator, s: []const u8) Allocator.Error
     return out;
 }
 
-/// Resolve a supertype reference to its mangled top-level name when the
-/// nested type it names was mangled on a top-level collision. Matches the
-/// `qualified_path`'s last two segments against `mangled_nested`.
+/// A supertype reference resolves to the mangled top-level name when the nested type
+/// it names was mangled, matching the last two qualified segments.
 pub fn resolveMangled(allocator: Allocator, mangled_nested: *const lift.MangledMap, t: *const ast.TypeRef) ?[]const u8 {
     const qp = t.qualified_path orelse return null;
     var last: ?usize = null;
@@ -87,26 +82,19 @@ pub fn collectConsts(module: *Module, cls_name: []const u8, members: []const Dec
     }
 }
 
-/// Register each property AST in `members` under its owner class/object,
-/// recursing into nested types, so reified-type-argument inference can
-/// resolve a property-access argument's generic type.
+/// Registered under owner class or object, recursing into nested types, so
+/// reified-type-argument inference can resolve a property-access argument.
 pub fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []const u8, qualified: ?[]const u8) void {
     for (members) |*m| {
         switch (m.*) {
             .Property => |p| {
                 ir.lower.registerMemberPropAst(a, owner, p);
-                // The qualified owner too (`LinkComposer.CompositionContextImpl`):
-                // two inner classes of one package can share a simple name, and
-                // a read that resolved its owner lexically must find ITS
-                // initializer, not the other class's.
+                // The qualified owner too: two inner classes of one package can share a simple name.
                 if (qualified) |q| {
                     if (!std.mem.eql(u8, q, owner)) ir.lower.registerMemberPropAst(a, q, p);
                 }
-                // A member-EXTENSION property (`private val Composition.parent`)
-                // is recorded under a dedicated key so a same-named plain member
-                // of the same class does not hide it: a read whose static
-                // receiver type matches the extension receiver resolves to the
-                // extension getter, not an accidental runtime stored field.
+                // A member-EXTENSION property takes a dedicated key so a same-named plain member cannot
+                // hide it; a read whose static receiver type matches takes the extension getter.
                 if (p.receiver_type) |rt| {
                     ir.lower.registerMemberExtPropRecv(a, owner, p.name.name, rt.name.name);
                 }
@@ -118,9 +106,6 @@ pub fn registerMemberPropAsts(a: Allocator, members: []const Decl, owner: []cons
     }
 }
 
-/// Register the declared supertypes of every class/object in `decls`,
-/// recursing into nested types, so reified-type-argument inference can read
-/// an argument declaration's own type arguments.
 pub fn nestedQualified(a: Allocator, outer: ?[]const u8, simple: []const u8) ?[]const u8 {
     const o = outer orelse return null;
     return std.fmt.allocPrint(a, "{s}.{s}", .{ o, simple }) catch null;
@@ -142,9 +127,7 @@ pub fn registerClassSupertypes(members: []const Decl) void {
     }
 }
 
-/// Register each inline member fn in `members` as owned by class `owner`,
-/// recursing into nested classes/objects (whose members belong to the nested
-/// type). Mirrors `collectInline`'s recursion so the owner map covers exactly
+/// Mirrors `collectInline`'s recursion into nested types, so the owner map covers exactly
 /// the member inline fns the candidate table holds.
 pub fn registerInlineMemberOwners(members: []const Decl, owner: []const u8) void {
     for (members) |*m| {
@@ -153,9 +136,8 @@ pub fn registerInlineMemberOwners(members: []const Decl, owner: []const u8) void
                 if (f.is_inline and f.body != null) {
                     ir.lower.registerInlineMemberOwner(f, owner);
                 }
-                // Un-annotated expression bodies register for on-demand
-                // return derivation: a caller lowered before this member's
-                // own pass still types its locals from the inferred return.
+                // On-demand return derivation: a caller lowered before this member's own pass still types
+                // its locals from the inferred return.
                 if (f.body != null) {
                     ir.lower.registerExprBodyMember(owner, f) catch {};
                 }
@@ -199,10 +181,7 @@ pub fn collectCompanionOwnMembers(c: *const ast.Class, own: *StringSet) Allocato
     }
 }
 
-/// Resolve the `@Target` entry names of the annotation class `leaf` from
-/// the build's class universe (user files plus base/pack classes). `null`
-/// when the class is unknown or declares no `@Target` — both admit the
-/// default use-site set.
+/// Null when the class is unknown or declares no `@Target`, which admit the default set.
 pub fn annotationTargetEntries(
     a: Allocator,
     file_classes: *const FileClasses,
@@ -229,7 +208,6 @@ pub fn annotationTargetEntries(
     return null;
 }
 
-/// Whether these annotations include `@Serializer(forClass = …)`.
 pub fn serializerForClassAnnotated(annotations: []const ast.Annotation) bool {
     for (annotations) |*ann| {
         if (ann.path.len == 0) continue;
@@ -242,8 +220,7 @@ pub fn serializerForClassAnnotated(annotations: []const ast.Annotation) bool {
     return false;
 }
 
-/// Lower one source annotation entry to a runtime record: resolved FQN
-/// candidates plus resolved constructor arguments.
+/// Resolved FQN candidates plus resolved constructor arguments.
 pub fn annotationRecordFor(
     module: *Module,
     a: Allocator,
@@ -266,8 +243,7 @@ pub fn annotationRecordFor(
             else
                 .Other,
             .Member => |m| .{ .EnumEntry = m.name.name },
-            // `Foo::class` names the declaration the annotation is about
-            // (`@Serializer(forClass = Foo::class)`), not a value.
+            // `Foo::class` names the declaration the annotation is about, not a value.
             .MemberRef => |mr| blk: {
                 if (!std.mem.eql(u8, mr.name.name, "class")) break :blk .Other;
                 const recv = mr.receiver;
@@ -286,9 +262,7 @@ pub fn annotationRecordFor(
     };
 }
 
-/// Assign every annotation entry of one property declaration to its final
-/// anchors (`@all:` expansion, explicit use-site, or the LV 2.4 defaulting
-/// rule) and collect the per-anchor records.
+/// Anchors come from `@all:` expansion, an explicit use-site, or the LV 2.4 default.
 pub fn buildPropertyAnchors(
     module: *Module,
     a: Allocator,
@@ -339,12 +313,7 @@ pub fn buildPropertyAnchors(
     };
 }
 
-/// Backing-field presence for a body property, as target assignment sees
-/// it: an initializer, an explicit `field` clause, or any defaulted
-/// accessor supplies one; delegated / abstract properties and properties
-/// with only custom accessor bodies have none.
-/// Type head of an unannotated property whose initializer is a literal —
-/// the shapes where inference is unambiguous. Null for anything else.
+/// Type head of an unannotated property whose initializer is a literal; null otherwise.
 pub fn inferredPropTypeHead(p: *const ast.Property) ?[]const u8 {
     const init = if (p.init) |*e| e else return null;
     return switch (init.*) {
@@ -374,7 +343,6 @@ pub fn spanNamesObject(object_spans: []const Span, target: Span) bool {
     return false;
 }
 
-/// See the nested-class-table comment at the link site.
 pub fn fillNestedClassTables(a: Allocator, decls_in: []const Decl, classes: *const std.StringHashMap(ObjRef(ClassDef)), outer_fqn: []const u8) Allocator.Error!void {
     for (decls_in) |*d| {
         const members: []const Decl = switch (d.*) {
@@ -447,9 +415,7 @@ pub fn buildClassDef(
     for (c.members) |*m| {
         if (m.* != .Property) continue;
         const p = m.Property;
-        // A MEMBER-EXTENSION property belongs to the extension surface,
-        // never to the class's own property set (see the accessor
-        // registration loop's matching skip).
+        // A member-extension property belongs to the extension surface, not the class's own.
         if (p.receiver_type != null) continue;
         const storage_init: ?*const ast.Expr = if (p.init) |*e|
             e
@@ -478,8 +444,8 @@ pub fn buildClassDef(
         });
     }
 
-    // Matched by declaration span, never by simple name: a same-named
-    // `object` from another package must not mark this class an object.
+    // Matched by declaration span, never simple name: a same-named `object` elsewhere must not
+    // mark this class an object.
     const is_object = spanNamesObject(object_spans.items, c.span);
 
     // init-block property positions: count `Property` decls in members[0..pos].
@@ -488,8 +454,7 @@ pub fn buildClassDef(
         const upto = @min(pos, c.members.len);
         var count: usize = 0;
         for (c.members[0..upto]) |*m| {
-            // Mirror the body_props collection: member-extension properties
-            // are not body properties, so they do not shift init positions.
+            // Member-extension properties are not body properties, so they do not shift positions.
             if (m.* == .Property and m.Property.receiver_type == null) count += 1;
         }
         init_block_positions[i] = count;
@@ -501,16 +466,12 @@ pub fn buildClassDef(
     var secondary = try a.alloc(FF(ast.SecondaryCtor), c.secondary_ctors.len);
     for (c.secondary_ctors, 0..) |*sc, i| secondary[i] = FF(ast.SecondaryCtor).fromPtr(sc);
 
-    // `@Serializer(forClass = C::class)` is written on a declaration with no
-    // supertype at all; the kotlinx plugin makes it a `KSerializer<C>`. That
-    // supertype is what `is KSerializer` and `as KSerializer` read, and what
-    // a serializer lookup casts its answer to.
+    // `@Serializer(forClass = C::class)` is written on a declaration with no supertype; the
+    // kotlinx plugin makes it a `KSerializer<C>`, which `is`/`as KSerializer` read.
     const serializer_supertype = c.supertypes.len == 0 and serializerForClassAnnotated(c.annotations);
-    // An annotation class implicitly implements `kotlin.Annotation`: an
-    // instance passes an `Annotation`-typed parameter and `is Annotation`.
+    // An annotation class implicitly implements `kotlin.Annotation`.
     const annotation_supertype = c.is_annotation;
-    // A function-type supertype contributes its erased `FunctionN` names,
-    // the first in its own slot and the rest as extras.
+    // A function-type supertype contributes erased `FunctionN` names, first in its own slot.
     var fn_extra: usize = 0;
     for (c.supertypes) |*t| if (t.function) |ft| {
         const tags = try ir.lower.decl.functionSupertypeTags(a, ft);
@@ -544,9 +505,8 @@ pub fn buildClassDef(
     }
     for (c.supertypes, 0..) |*t, i| {
         if (t.function != null) continue;
-        // A supertype naming a renamed file-private class resolves to the
-        // mangled lift name; the rename is keyed by the reference's own
-        // span file, matching the file scope of the declaration.
+        // A renamed file-private supertype resolves to its mangled lift name, keyed by the
+        // reference's own span file.
         supertype_names[i] = if (t.qualified_path == null)
             ir.build.fileOrPkgTypeRename(t.name.name, t.span.file.int()) orelse
                 ir.lower.decl.importedPkgTypeRename(module, t.name.name, t.span.file) orelse
@@ -608,10 +568,8 @@ pub fn buildClassDef(
     });
 }
 
-/// Propagate each supertype member's default-thunk slots onto an overriding
-/// member that lacks its own thunk for that parameter.
+/// Propagate supertype default-thunk slots onto an override lacking its own thunk.
 pub fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: *std.AutoHashMap(u32, []?FuncId)) Allocator.Error!void {
-    // by_id: ClassId.int() -> index in module.classes.
     var by_id = std.AutoHashMap(u32, usize).init(a);
     defer by_id.deinit();
     for (module.classes.items, 0..) |*c, i| try by_id.put(c.id.int(), i);
@@ -621,17 +579,12 @@ pub fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: 
     defer inherited.deinit(a);
 
     for (module.classes.items) |*c| {
-        // Transitive supertype closure.
         var anc: std.ArrayList(usize) = .empty;
         defer anc.deinit(a);
         var seen = std.AutoHashMap(u32, void).init(a);
         defer seen.deinit();
-        // Ancestors in DECLARATION order: each direct supertype's whole chain
-        // in turn. A conflicting inherited default is resolved to the first
-        // supertype in declaration order that supplies it (`Impl : A2, B`
-        // where `A2 : A` takes A's default over B's), and the fold below is
-        // first-wins per slot — so the ancestor order must be declaration
-        // order, not a reverse breadth-first pop.
+        // Ancestors in DECLARATION order, each direct supertype's chain in turn: the fold is
+        // first-wins per slot, so `Impl : A2, B` with `A2 : A` takes A's default over B's.
         for (c.supertypes) |direct| {
             var stack: std.ArrayList(ClassId) = .empty;
             defer stack.deinit(a);
@@ -683,8 +636,7 @@ pub fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: 
                 }
             }
 
-            // Abstract/interface declarations: consult the abstract-defaults
-            // table keyed by (class name / simple name, method name).
+            // Abstract and interface declarations consult the abstract-defaults table.
             const self_idx = by_id.get(c.id.int());
             var consult: std.ArrayList(usize) = .empty;
             defer consult.deinit(a);
@@ -732,8 +684,6 @@ pub fn slotsEql(x: []const ?FuncId, y: []const ?FuncId) bool {
     return true;
 }
 
-/// Decide whether a declaration survives the `expect`/stub-drop retain
-/// pass.
 pub fn retainDecl(
     a: Allocator,
     d: *const Decl,
@@ -749,24 +699,18 @@ pub fn retainDecl(
     switch (d.*) {
         .Function => |*f| {
             if (!f.is_expect and std.mem.eql(u8, f.name.name, "suspendCoroutineUninterceptedOrReturn") and f.is_inline and f.is_suspend) return false;
-            // Intrinsic-backed declarations are RETAINED (the no-holes
-            // symbol table): the declaration lowers like any other source
-            // and `linkResolvedForms` binds its executable form to the
-            // host implementation (`resolved_native`), so resolution sees
-            // one complete declaration table and never needs to know the
-            // body is native.
+            // Intrinsic-backed declarations are RETAINED for a symbol table with no holes:
+            // `linkResolvedForms` binds the executable form to the host implementation.
             if (!f.is_expect) return true;
             const fqn = try resolveFqn(a, func_fqn_overrides, f.span, package_prefix, f.name.name);
-            // Superseded only by an `actual` in its OWN package (see the set's
-            // construction): a same-named actual elsewhere implements a
-            // different declaration.
+            // Superseded only by an `actual` in its OWN package: a same-named actual elsewhere
+            // implements a different declaration.
             if (actual_func_names.contains(fqn)) return false;
             const receiver_name: ?[]const u8 = if (f.receiver_type) |*rt|
                 rt.qualified_path orelse rt.name.name
             else
                 null;
-            // A declaration with an exact host ABI symbol survives with its
-            // ordinary FuncId identity, including receiver-formed expects.
+            // A declaration with an exact host ABI symbol survives with its ordinary FuncId identity.
             if (stdlib.declarationHostSymbol(fqn, receiver_name, f.name.name) != null) return true;
             if (f.receiver_type == null) {
                 const kotlin_fqn = try std.fmt.allocPrint(a, "kotlin.{s}", .{f.name.name});
@@ -796,8 +740,7 @@ pub fn sameExpectActualTypeHead(a: *const ast.TypeRef, b: *const ast.TypeRef) bo
     return true;
 }
 
-/// Copy defaults from an expect-class member to its matching actual member.
-/// Returns true when the declarations have the same callable signature.
+/// True when the two have the same callable signature.
 pub fn transplantExpectMemberDefaults(actual: *ast.Function, expected: *const ast.Function) bool {
     if (!std.mem.eql(u8, actual.name.name, expected.name.name)) return false;
     if (actual.params.len != expected.params.len) return false;

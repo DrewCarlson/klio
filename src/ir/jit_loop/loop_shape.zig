@@ -1,6 +1,5 @@
-//! Loop region analysis: successor/dominator walks, natural loop body
-//! collection, predecessor construction, and the read/def sets that decide
-//! which registers are live in and live out of the compiled region.
+//! Loop region analysis: successor and dominator walks, natural loop body collection,
+//! and the read/def sets deciding which registers are live in and out of the region.
 
 const std = @import("std");
 const ir = @import("../ir.zig");
@@ -31,8 +30,6 @@ const trampolinableMemberOf = shapes.trampolinableMemberOf;
 const trampolinableVirtualOf = shapes.trampolinableVirtualOf;
 const isScalarRt = type_infer.isScalarRt;
 
-// --- loop detection ---------------------------------------------------------
-
 pub fn succEach(term: ir.Terminator, out: *std.ArrayList(BlockId), a: Allocator) Allocator.Error!void {
     switch (term) {
         .Goto => |b| try out.append(a, b),
@@ -44,7 +41,7 @@ pub fn succEach(term: ir.Terminator, out: *std.ArrayList(BlockId), a: Allocator)
     }
 }
 
-/// Every CFG successor of a terminator (all kinds), for dominance analysis.
+/// Every CFG successor of a terminator, of all kinds, for dominance analysis.
 fn fullSucc(term: ir.Terminator, out: *std.ArrayList(BlockId), a: Allocator) Allocator.Error!void {
     switch (term) {
         .Goto => |b| try out.append(a, b),
@@ -60,9 +57,8 @@ fn fullSucc(term: ir.Terminator, out: *std.ArrayList(BlockId), a: Allocator) All
     }
 }
 
-/// `dom[i]` = `header` dominates block `i`: every path from the function entry
-/// to `i` goes through `header`. Computed as the complement of "reachable from
-/// entry without entering header". Caller frees.
+/// `dom[i]`: every path from the function entry to `i` goes through `header`, computed
+/// as the complement of reachable-without-entering-header. Caller frees.
 fn dominatedSet(a: Allocator, func: *const Func, nb: usize, header: BlockId) Allocator.Error![]bool {
     const reach_no_h = try a.alloc(bool, nb);
     defer a.free(reach_no_h);
@@ -161,10 +157,8 @@ pub fn collectLoop(a: Allocator, func: *const Func, header: BlockId) Allocator.E
         }
     }
 
-    // Single-entry check: a genuine natural loop is entered only through its
-    // header. If any non-header loop block has a predecessor outside the loop,
-    // `header` is not the real loop entry (e.g. it is a body block of an
-    // enclosing loop) — reject so we never compile a mis-rooted region.
+    // A natural loop is entered only through its header: if a non-header loop block has a
+    // predecessor outside the loop, `header` is not the real entry, so the region is rejected.
     for (0..nb) |i| {
         if (!inloop[i] or i == header.int()) continue;
         for (preds[i].items) |p| {
@@ -200,15 +194,12 @@ fn buildPreds(a: Allocator, func: *const Func, nb: usize, reach: []const bool) A
     return preds;
 }
 
-// --- liveness ---------------------------------------------------------------
-
 pub fn typeAt(types: []const RegType, r: Reg) RegType {
     return if (r.int() < types.len) types[r.int()] else .unknown;
 }
 
-/// Whether a `BinOp` is an object-vs-null comparison — recognized so the JIT
-/// emits a null-test callback (reading the boxed register) instead of a native
-/// scalar compare.
+/// An object-vs-null comparison, emitted as a null-test callback on the boxed register
+/// rather than a native scalar compare.
 pub fn isNullCheckBinOp(types: []const RegType, b: anytype) bool {
     if (b.op != .Eq and b.op != .NotEq and b.op != .IdentEq and b.op != .IdentNeq) return false;
     const lt = typeAt(types, b.lhs);
@@ -216,15 +207,12 @@ pub fn isNullCheckBinOp(types: []const RegType, b: anytype) bool {
     return (lt == .object and rt == .null_) or (lt == .null_ and rt == .object) or (lt == .object and rt == .object);
 }
 
-/// Instructions safe to run as an interpreter ESCAPE from a compiled
-/// function body: anything whose arm neither parks the coroutine machinery
-/// nor manipulates the try/finally stack (escaped bodies already exclude
-/// try-regions, and a non-suspend body's calls cannot suspend). `.flat_call`
-/// outcomes discard + deopt, so the flat driver forms are fine.
+/// Instructions safe to run as an interpreter ESCAPE from a compiled body: those whose
+/// arm neither parks the coroutine machinery nor manipulates the try/finally stack.
+/// Escaped bodies already exclude try-regions, and `.flat_call` outcomes discard and deopt.
 pub fn execEscapable(inst: *const Inst) bool {
     if (!fjEscapeEnabled()) return false;
     return switch (inst.*) {
-        // The suspension machinery and structured jumps stay interpreted.
         .SuspendResumePoint => false,
         else => true,
     };
@@ -236,15 +224,13 @@ pub fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[8]Reg, n_
     if (arrayOpOf(module, inst)) |op| {
         reads[0] = op.index;
         if (op.is_set) {
-            // A subscript store reads the index and value; its "dst" is a
-            // discarded result, never a scalar def.
             reads[1] = op.value;
             n_reads.* = 2;
             return;
         }
         n_reads.* = 1;
-        // An object-collection / map subscript writes a boxed or nullable register,
-        // not a plain scalar slot — only a packed-array element is a scalar def.
+        // Only a packed-array element is a scalar def: an object or map subscript writes a
+        // boxed or nullable register.
         if (typeAt(types, op.dst) == .object) return;
         def.* = op.dst;
         return;
@@ -262,9 +248,8 @@ pub fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[8]Reg, n_
         def.* = bo.dst;
         return;
     }
-    // A trampolined call reads its (≤3) consecutive arg registers; its dst is a
-    // def only when the callee returns a scalar (an unused/Unit result is not
-    // tracked, so it does not force the dst into the scalar type requirement).
+    // A trampolined call reads its consecutive arg registers; its dst is a def only when
+    // the callee returns a scalar, so an unused or Unit result forces no type requirement.
     if (trampolinableCallOf(inst)) |tc| {
         var k: u8 = 0;
         while (k < tc.n_args and k < 6) : (k += 1) reads[k] = Reg.from(tc.args_reg + k);
@@ -272,8 +257,6 @@ pub fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[8]Reg, n_
         if (isScalarRt(typeAt(types, tc.dst))) def.* = tc.dst;
         return;
     }
-    // A trampolined member call reads scalar args and a scalar receiver. Object
-    // receivers remain in frame registers for the host callback.
     if (trampolinableMemberOf(module, inst)) |mc| {
         const recv_scalar: usize = if (isScalarRt(typeAt(types, mc.recv))) 1 else 0;
         if (recv_scalar != 0) reads[0] = mc.recv;
@@ -285,9 +268,6 @@ pub fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[8]Reg, n_
         if (isScalarRt(typeAt(types, mc.dst))) def.* = mc.dst;
         return;
     }
-    // A trampolined virtual call reads scalar args (its receiver is an object
-    // register, boxed for the host callback); its dst is a scalar def only
-    // when the result types scalar.
     if (trampolinableVirtualOf(inst)) |vc| {
         var k: u8 = 0;
         while (k < vc.n_args and k < 6) : (k += 1) reads[k] = Reg.from(vc.args_reg + k);
@@ -295,22 +275,16 @@ pub fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[8]Reg, n_
         if (isScalarRt(typeAt(types, vc.dst))) def.* = vc.dst;
         return;
     }
-    // A trampolined field read takes no scalar inputs (the receiver stays boxed);
-    // its dst is a scalar def only for a scalar field (an object field's dst is a
-    // boxed register, not in the scalar sets).
     if (trampolinableFieldOf(module, inst)) |fld| {
         n_reads.* = 0;
         if (isScalarRt(typeAt(types, fld.dst))) def.* = fld.dst;
         return;
     }
-    // A field store reads the scalar value (the receiver stays boxed); no def.
     if (trampolinableFieldSetOf(module, inst)) |fs| {
         reads[0] = fs.value;
         n_reads.* = 1;
         return;
     }
-    // A trampolined value call reads its scalar args (the callee stays boxed in a
-    // register); its result is discarded, so it has no scalar def.
     if (trampolinableCallValueOf(inst)) |cvc| {
         var k: u8 = 0;
         while (k < cvc.n_args and k < 6) : (k += 1) reads[k] = Reg.from(cvc.args_reg + k);
@@ -321,15 +295,12 @@ pub fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[8]Reg, n_
     switch (inst.*) {
         .Const => |c| def.* = c.dst,
         .Move => |m| {
-            // An object move copies a boxed register; neither side is a scalar.
             if (typeAt(types, m.dst) == .object or typeAt(types, m.src) == .object) return;
             reads[0] = m.src;
             n_reads.* = 1;
             def.* = m.dst;
         },
         .BinOp => |b| {
-            // An object null test reads boxed registers (not scalars); only its
-            // boolean dst is a scalar def.
             if (isNullCheckBinOp(types, b)) {
                 def.* = b.dst;
                 return;
@@ -349,8 +320,8 @@ pub fn instReadsDef(module: *const Module, inst: *const Inst, reads: *[8]Reg, n_
             n_reads.* = 1;
             def.* = u.dst;
         },
-        // The cell register is unboxed at entry / reboxed at exit by the cell
-        // machinery (not the scalar read/def sets), so it is not reported here.
+        // The cell register is unboxed at entry and reboxed at exit by the cell machinery,
+        // not by the scalar read/def sets.
         .CellGet => |cg| def.* = cg.dst,
         .CellSet => |cs| {
             reads[0] = cs.value;
