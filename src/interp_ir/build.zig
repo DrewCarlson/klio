@@ -190,6 +190,7 @@ const testing = std.testing;
 test {
     testing.refAllDecls(@This());
     _ = lift;
+    inline for (.{ build_types, build_scan, build_module, build_overrides, build_classes, build_base, build_clone }) |m| testing.refAllDecls(m);
 }
 
 test "symbol-index default-import list matches the stdlib's canonical one" {
