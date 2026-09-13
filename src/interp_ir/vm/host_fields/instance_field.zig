@@ -1,6 +1,5 @@
-//! Field access on an instance receiver: the stored/getter resolution, the
-//! companion walks a bare name resolves through, and the inner-class
-//! outer-instance chain.
+//! Field access on an instance receiver: stored/getter resolution, the companion
+//! walks a bare name resolves through, and the inner-class outer-instance chain.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -55,11 +54,8 @@ const storedNullIsLateinit = field_cache.storedNullIsLateinit;
 pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, member_probe: bool) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     const class_name = className(inst);
-    // Field-read memo: one probe replaces the delegate walk, the getter
-    // BFS, and the stored-slot scan for a (class, name) already resolved
-    // once. Both cached facts derive from the static class graph; the
-    // stored index re-verifies by name because instances can define
-    // extra slots dynamically.
+    // Field-read memo: one probe replaces the delegate walk, the getter BFS and the
+    // stored-slot scan; the stored index re-verifies by name, since instances add slots.
     const cache_fqn = blk: {
         const g = inst.borrow();
         defer g.deinit();
@@ -69,17 +65,14 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
     };
     // Delegated body property: route through the delegate's `getValue`.
     const delegate_owner: bool = runtimeClassDelegatesProp(inst, name) or blk: {
-        // Almost every program declares zero `by`-delegated body properties;
-        // skip the per-access supertype walk + scratch allocation entirely then.
+        // With no `by`-delegated body properties at all, skip the supertype walk.
         {
             const g = self.module.borrow();
             const none = g.get().registry.delegated_body_props.count() == 0;
             g.deinit();
             if (none) break :blk false;
         }
-        // The receiver's OWN class adjudicates by its exact FQN only — a
-        // simple-name (or classId-resolved) probe would let a foreign
-        // namesake's delegated prop intercept this class's plain field.
+        // Exact FQN only: a simple-name probe lets a namesake's delegated prop intercept.
         if (blk2: {
             const g = self.module.borrow();
             defer g.deinit();
@@ -115,8 +108,7 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
         defer cg.deinit();
         break :blk cg.get().fqn;
     };
-    // Resolve the custom getter, honoring the most-derived-stored-prop
-    // override rule.
+    // Resolve the custom getter under the most-derived-stored-prop override rule.
     const getter_fid = try resolveInstanceGetter(self, allocator, inst, class_name, recv_fqn, name);
     if (getter_fid) |fid| {
         const mptr: *const Module = self.module.asPtr();
@@ -127,11 +119,8 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
         fieldReadCachePut(self, inst, cache_fqn, name, .{ .getter = fid.int(), .stored_idx = root.ProgramImage.FieldReadHit.NONE });
         return try evalGetterTagged(self, allocator, fid, receiver.*, "site2500");
     }
-    // Most-derived override cell: an initialized `override val/var` keeps
-    // its own backing cell under the owner-mangled key (JVM semantics);
-    // reads dispatch to the nearest class in the runtime chain that owns
-    // one. `super.x` reads the base's plain cell, which the override's
-    // store never touches.
+    // An initialized `override val/var` keeps its own backing cell under the owner-mangled
+    // key: a read takes the nearest owner in the chain, while `super.x` reads the base cell.
     if (blk: {
         const pg = self.module.borrow();
         defer pg.deinit();
@@ -190,25 +179,18 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
                 return try lateinitReadError(allocator, name);
             }
         }
-        // Auto-unwrap instance-level built-in delegates.
         if (v == .Delegate) {
             return try unwrapDelegate(self, allocator, v.Delegate, name);
         }
         return ok(v);
     }
-    // Companion / parent / interface chain walk for a companion-owned
-    // field. The member probe resolves companions and outer instances as
-    // the bare-name walk's own candidates instead.
+    // Companion / parent / interface walk; the member probe resolves those itself.
     if (!member_probe) {
         if (try companionParentWalk(self, allocator, inst, name)) |v| return v;
-        // Outer-instance chain fallback.
         if (try outerInstanceChain(self, allocator, inst, name)) |v| return v;
-        // A nested/companion object resolves a bare name against the
-        // enclosing class's superclass companions.
         if (try enclosingCompanionWalk(self, allocator, inst, name)) |v| return v;
     }
-    // Enum entry bare-name access. An entry declared with a body is an
-    // instance of its own subclass, whose entry table is the parent enum's.
+    // Enum entry bare name. An entry with a body is its own subclass, sharing the parent's table.
     {
         const table = blk: {
             const g = inst.borrow();
@@ -248,32 +230,21 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
         cg.deinit();
         g.deinit();
     }
-    // A member declared by a companion on this receiver's class / supertype /
-    // enclosing-class chain is in scope unqualified and must be resolved by the
-    // companion walk in `getFieldInner` (which runs after this returns null),
-    // not shadowed here by an unrelated global object / class of the same simple
-    // name (`Default` from a nested `Builder` is `HexFormat.Companion.Default`,
-    // not `kotlin.random.Random.Default`).
+    // A companion member on this class, supertype or enclosing-class chain is in scope
+    // unqualified; `getFieldInner`'s walk resolves it, so no same-named global shadows it.
     if (!member_probe and try enclosingCompanionDeclares(self, allocator, class_name, name)) {
         return null;
     }
-    // Nested-class fallback. An `object` declaration referenced by bare
-    // name in value position is its singleton instance, never the bare
-    // class value (kotlinc: `val c = EmptyCoroutineContext` binds the
-    // object). First access constructs it through the shared gate.
+    // Nested-class fallback. An `object` named in value position is its singleton
+    // instance, never the class value; first access constructs it through the gate.
     if (!member_probe) {
         const has_global_class = blk: {
             const cg = self.classes.borrow();
             defer cg.deinit();
             break :blk cg.get().get(name) != null;
         };
-        // The receiver's OWN nested classifier (or one of its enclosing
-        // classes') outranks a same-simple-name class elsewhere:
-        // `Irrelevant.Key` for `object Irrelevant : AbstractCoroutineContextElement(Key)
-        // { object Key : CoroutineContext.Key<Irrelevant> }` is the nested
-        // object, never `CoroutineContext.Key`. Leave it to the
-        // nested-classifier resolution in `getFieldInner` (which runs after
-        // this returns null). Checked only when the fallback would bind.
+        // The receiver's own nested classifier (or an enclosing class's) outranks a
+        // same-simple-name class elsewhere; `getFieldInner` resolves it after this null.
         if (has_global_class) {
             const own_nested = blk: {
                 const mg = self.module.borrow();
@@ -302,9 +273,7 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
         const cg = self.classes.borrow();
         defer cg.deinit();
         if (cg.get().get(name)) |def| {
-            // A runtime-registered LOCAL object (a nested object of a local
-            // class) publishes its singleton under its name at
-            // registration: the value is the instance, never the class.
+            // A runtime-registered local object publishes its singleton under its own name.
             const local_runtime = blk: {
                 const dg = def.borrow();
                 defer dg.deinit();
@@ -320,8 +289,8 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
             return ok(.{ .Class = def });
         }
     }
-    // Top-level global / module-scoped fallback. An implicit receiver outranks a
-    // top-level name, so the executing member-extension's declaring class goes first.
+    // Top-level global fallback. An implicit receiver outranks a top-level name, so
+    // the executing member extension's declaring class goes first.
     if (!member_probe) {
         if (try memberExtOwnerRead(self, allocator, receiver, name)) |r| return r;
         const gg = self.globals.borrow();
@@ -331,10 +300,8 @@ pub fn instanceField(self: *VmHost, allocator: Allocator, receiver: *const Value
     return null;
 }
 
-/// Whether a companion object on `class_name`'s class / supertype /
-/// lexically-enclosing-class chain declares a member named `name`. Keeps
-/// `instanceField`'s eager class / global fallback from shadowing an enclosing
-/// companion member with an unrelated same-named global classifier.
+/// Whether a companion on `class_name`'s class, supertype or enclosing-class chain
+/// declares `name`. Keeps the class/global fallback from shadowing such a member.
 pub fn enclosingCompanionDeclares(self: *VmHost, allocator: Allocator, class_name: []const u8, name: []const u8) Allocator.Error!bool {
     var cur: ?[]const u8 = class_name;
     var seen: std.ArrayList([]const u8) = .empty;
@@ -389,20 +356,13 @@ pub fn resolveInstanceGetter(
         found = lookupPairFunc(pg.get().instance_prop_getters, recv_fqn, name);
     }
     if (found != null) return found;
-    // Walk the FULL supertype closure breadth-first (nearest-first), not just
-    // the first supertype: `class D : I, B()` lists the interface `I` before
-    // the base class `B`, so following only `supertype_names[0]` would stop at
-    // `I` and never reach `B`'s inherited getter. Methods already BFS the
-    // hierarchy (`resolveInstanceMethod`); property getters must too.
+    // Breadth-first over the full supertype closure, nearest first: `class D : I, B()`
+    // lists interface `I` first, so `supertype_names[0]` alone never reaches `B`.
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
     defer seen.deinit();
-    // Seed with the receiver's own class and let the loop expand supers —
-    // nearest-first. Pre-pushing the first supertype's OWN supers ahead of
-    // it inverted the order: Route's default `selector get() = null` getter
-    // was found before RoutingNode's stored ctor-param property could break
-    // the walk, so the interface default shadowed the override's field.
+    // Seed with the receiver's own class; pre-pushing a supertype's supers inverts the order.
     try queue.append(allocator, class_name);
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
@@ -414,8 +374,7 @@ pub fn resolveInstanceGetter(
             defer cg.deinit();
             break :blk cg.get().get(cn);
         };
-        // A class in the chain that stores `name` overrides any higher
-        // base getter — stop and read its field.
+        // A class in the chain that stores `name` overrides any higher base getter.
         if (cdef) |d| {
             const dg = d.borrow();
             const stored = declaresStored(dg.get(), name);
@@ -425,33 +384,12 @@ pub fn resolveInstanceGetter(
         {
             const pg = self.prog.borrow();
             const hit = lookupPairFuncHop(self, pg.get().instance_prop_getters, cn, name);
-            // A PRIVATE property never participates in inheritance: a read
-            // that may bind a private getter arrives scope-qualified
-            // (`$sgetter$<owner>`) and resolves in that walk; the inherited
-            // chain here must skip it so a base/interface private getter
-            // cannot shadow a subclass's own stored field (ktor:
-            // HttpClientEngine's private `closed` getter vs
-            // HttpClientEngineBase's field-backed atomic `closed`).
-            // A private property never participates in INHERITANCE: a base or
-            // interface private getter must not shadow a subclass's own stored
-            // field (ktor: HttpClientEngine's private `closed` getter vs
-            // HttpClientEngineBase's field-backed atomic `closed`). But that
-            // reasoning is about SUPERTYPES. On the receiver's OWN class the
-            // getter is simply its declaration, and skipping it left a private
-            // custom getter unreachable through an EXPLICIT receiver even from
-            // inside the class that declares it (`o.orDefault` for a
-            // `private val orDefault get() = …` — which is how `KeyboardOptions`
-            // reads `Default.autoCorrectOrDefault`). `head == 0` is the receiver's
-            // own class; everything after it is inherited.
+            // A private property never participates in inheritance: an inherited private
+            // getter cannot shadow a subclass's stored field. `head == 0` is the own class.
             const inherited = head != 0;
             const private_here = lookupPairFunc(pg.get().instance_prop_private, cn, name) != null;
-            // On an ANONYMOUS receiver class an INHERITED member getter is a
-            // supertype-matched guess (the synth lists upstream classes for
-            // type checks), and the pack's shadowing EXTENSION property is
-            // the real implementation: `ch.onReceive` inside a select must
-            // reach the klio clause glue on ReceiveChannel, never upstream
-            // BufferedChannel's SelectClause machinery. Stand down when an
-            // extension property of the name is keyed on this chain entry.
+            // On an anonymous receiver class an inherited member getter is only a guess
+            // from supertype matching; a shadowing extension property on this entry wins.
             const ext_shadows = inherited and hit != null and blk: {
                 const ig = inst.borrow();
                 defer ig.deinit();
@@ -479,31 +417,22 @@ pub fn resolveInstanceGetter(
     return found;
 }
 
-/// True when `cdef` stores `name` as a ctor-param or backing-field body
-/// property *without* a custom getter / delegate (overriding any
-/// inherited `open val … get()`).
+/// True when `cdef` stores `name` as a ctor-param or backing-field body property
+/// without a custom getter or delegate, overriding any inherited `open val ... get()`.
 pub fn declaresStored(cdef: *const ClassDef, name: []const u8) bool {
-    // An interface stores no state — its `val`/`var` members are abstract
-    // declarations, never backing fields (a getter-less interface property is
-    // still implicitly abstract even when the parser leaves `is_abstract`
-    // unset). So an interface in the hierarchy never overrides a base getter.
+    // An interface stores no state: its `val`/`var` members are abstract declarations.
     if (cdef.is_interface) return false;
     for (cdef.primary_params) |p| {
         if (std.mem.eql(u8, p.name, name) and p.property != null) return true;
     }
     for (cdef.body_properties) |p| {
-        // An `abstract val`/`var` (notably an interface's `val isActive`)
-        // stores nothing — it is a declaration to be overridden, not a
-        // backing field. Only a concrete property with no getter/delegate is
-        // a real stored field that overrides an inherited getter.
+        // Only a concrete property with no getter or delegate overrides an inherited getter.
         if (std.mem.eql(u8, p.name, name) and p.getter == null and p.delegate == null and !p.is_abstract) return true;
     }
     return false;
 }
 
-/// Resolve a built-in property delegate read (`by lazy`, `observable`,
-/// `notNull`) to its underlying value, caching a `lazy` producer's
-/// result.
+/// Resolve a built-in delegate read (`by lazy`, `observable`, `notNull`), caching `lazy`.
 pub fn unwrapDelegate(self: *VmHost, allocator: Allocator, d: ObjRef(runtime.DelegateKind), name: []const u8) Allocator.Error!EvalResult {
     const state = blk: {
         const g = d.borrow();
@@ -537,8 +466,7 @@ pub fn unwrapDelegate(self: *VmHost, allocator: Allocator, d: ObjRef(runtime.Del
     }
 }
 
-/// Walk the instance's class parent + interface chain looking for a
-/// companion singleton that owns the field.
+/// Walk the instance's parent and interface chain for a companion singleton owning `name`.
 pub fn companionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8) Allocator.Error!?EvalResult {
     const seed = blk: {
         const g = inst.borrow();
@@ -549,15 +477,10 @@ pub fn companionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(Ins
     return companionWalkSeeded(self, allocator, seed, name);
 }
 
-/// An object/companion nested in a class resolves a bare name against the
-/// companion-object members of the enclosing class's superclass hierarchy
-/// (`RoutingRoot.Plugin` reads `Call` from `ApplicationCallPipeline`'s
-/// companion because `RoutingRoot : … : ApplicationCallPipeline`). Walk from
-/// the receiver class's enclosing class.
+/// An object or companion nested in a class resolves a bare name against the companion
+/// members of the enclosing class's superclass hierarchy, walked from that enclosing class.
 pub fn enclosingCompanionWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8) Allocator.Error!?EvalResult {
-    // The enclosing class: the resolved `enclosing_class` link when present,
-    // else derived from the receiver class's lift name (`Root$Companion$Plugin`
-    // / `Outer$Inner`).
+    // The resolved `enclosing_class` link, else derived from the lift name (`Outer$Inner`).
     var encl: ?ObjRef(ClassDef) = blk: {
         const g = inst.borrow();
         defer g.deinit();
@@ -580,8 +503,7 @@ pub fn enclosingCompanionWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(
     return companionWalkSeeded(self, allocator, seed, name);
 }
 
-/// Walk `seed` plus its parent / interface supertypes, returning the first
-/// companion-object field named `name`.
+/// Walk `seed` and its parent/interface supertypes for the first companion field `name`.
 pub fn companionWalkSeeded(self: *VmHost, allocator: Allocator, seed: ObjRef(ClassDef), name: []const u8) Allocator.Error!?EvalResult {
     var queue: std.ArrayList(ObjRef(ClassDef)) = .empty;
     defer {
@@ -637,8 +559,7 @@ pub fn companionWalkSeeded(self: *VmHost, allocator: Allocator, seed: ObjRef(Cla
     return null;
 }
 
-/// Outer-instance chain fallback for an inner-class method body
-/// referencing an enclosing-class field / getter / enum-static.
+/// Outer-instance chain fallback: an inner-class body naming an enclosing-class member.
 pub fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8) Allocator.Error!?EvalResult {
     var cur_outer: ?Value = blk: {
         const g = inst.borrow();
@@ -649,21 +570,13 @@ pub fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Inst
     while (cur_outer) |o| : (hops +|= 1) {
         switch (o) {
             .Instance => |outer_inst| {
-                // Resolve through getFieldInner first so an overriding custom
-                // getter on the outer instance's runtime (sub)class is invoked
-                // virtually, rather than short-circuiting on an inherited raw
-                // backing slot (e.g. an `abstract`/`open val` overridden by a
-                // getter-only `override`). getFieldInner itself falls back to
-                // the raw slot when no getter resolves, so legitimately stored
-                // fields still read correctly.
+                // Resolve through getFieldInner first so an overriding getter on the outer's
+                // runtime class is invoked virtually, not bypassed by an inherited raw slot.
                 const oid = outer_inst.identity();
                 if (try withFieldResolvePair(self, allocator, oid, name, &o, false, false)) |r| {
                     if (r == .ok and r.ok != .Unit) {
-                        // The outer read just filled the OUTER class's own
-                        // (class, name) memo; when it answers with a plain
-                        // stored slot, propagate an outer-hop route onto
-                        // the INNER class so the GetField site serves later
-                        // reads without re-walking the chain.
+                        // The outer read filled the outer class's memo; on a plain stored
+                        // slot, propagate an outer-hop route onto the inner class.
                         if (hops <= 63) prop: {
                             const ocls_id: u64 = blk2: {
                                 const g = outer_inst.borrow();
@@ -698,13 +611,8 @@ pub fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Inst
                     const b = g.get();
                     for (b.fields.items, 0..) |f, fi| {
                         if (!std.mem.eql(u8, f.name, name)) continue;
-                        // Memoize the outer-hop slot route on the INNER
-                        // class so the GetField site serves later reads
-                        // without re-walking the chain (the OpIterator
-                        // `operation` accessor read `opCodes` through
-                        // this fallback 1.5M times in one recompose
-                        // test). The outer's runtime class identity is
-                        // verified at serve time.
+                        // Memoize the outer-hop slot route on the inner class; the outer's
+                        // runtime class identity is verified at serve time.
                         if (fi <= 0xFFFFFF and hops <= 63) {
                             const inner_fqn = blk2: {
                                 const ig = inst.borrow();
@@ -735,7 +643,6 @@ pub fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Inst
                     .ok => |v| return ok(v),
                     .err => {},
                 }
-                // Step to the enclosing class.
                 const cls_name = blk: {
                     const g = cls.borrow();
                     defer g.deinit();
@@ -758,13 +665,8 @@ pub fn outerInstanceChain(self: *VmHost, allocator: Allocator, inst: ObjRef(Inst
     return null;
 }
 
-/// Whether the receiver instance declares (or already stores) a member
-/// property of this name, anywhere in its class hierarchy. A member
-/// property shadows a same-named extension property
-/// (`EXTENSION_SHADOWED_BY_MEMBER`), so the extension getter/setter must not
-/// fire when the member exists — otherwise `this.value` inside a class that
-/// has both a member `value` and an extension `value` re-enters the
-/// extension accessor and recurses (e.g. coroutines' `WorkaroundAtomicReference`).
+/// Whether the receiver declares or stores a member property of this name anywhere in its
+/// hierarchy. A member shadows a same-named extension, which would otherwise recurse.
 pub fn instanceDeclaresProperty(self: *VmHost, receiver: *const Value, name: []const u8) bool {
     if (receiver.* != .Instance) return false;
     const inst = receiver.Instance;

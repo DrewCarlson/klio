@@ -21,29 +21,14 @@ const root_mod = reflect_anon.root_mod;
 const virtual_tail = @import("virtual_tail.zig");
 const methodArgSig = virtual_tail.methodArgSig;
 
-// -------------------------------------------------------------------------
-// `hostHasMember`.
-// -------------------------------------------------------------------------
-
-/// One remembered `name slice -> canonical string` mapping. The canonical
-/// string is program-lifetime, so `canon` stays valid; `src` is only a hint
-/// and every hit is confirmed by comparing bytes, which keeps the entry sound
-/// even if a transient string is freed and its address reused.
+/// One remembered `name slice -> canonical string` mapping. The canonical string is
+/// program-lifetime; `src` is a hint, and every hit is byte-compared before it is used.
 pub const NameIdSlot = struct { src: usize = 0, gen: u32 = 0, canon: []const u8 = &.{} };
 pub threadlocal var name_id_cache: [8192]NameIdSlot = @splat(.{});
 
-/// Canonical pointer identity for a dispatch-cache method name. Runtime
-/// callable references carry collected String storage, so their raw byte
-/// address must never enter a program-lifetime cache key.
-///
-/// Almost every caller passes a name slice straight out of the IR, whose
-/// address is stable for the life of the program — so the mapping is
-/// remembered per source address (multiplicatively mixed: arena-allocated
-/// name storage repeats at fixed strides, which a modulo of the raw
-/// address turned into constant slot ping-pong) and confirmed with a byte
-/// compare, which takes the interning hash + shared-map probe off the
-/// dispatch path. A miss probes the intern under the SHARED borrow first;
-/// only a genuinely new spelling takes the exclusive insert path.
+/// Canonical pointer identity for a dispatch-cache method name. Runtime callable
+/// references carry collected String storage, so a raw byte address must never enter a
+/// program-lifetime key; the mapping is per source address, confirmed by byte compare.
 pub fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
     const src = @intFromPtr(name.ptr);
     const slot = &name_id_cache[((src *% 0x9E3779B97F4A7C15) >> 32) % name_id_cache.len];
@@ -65,9 +50,8 @@ pub fn memberNameIdentity(self: *VmHost, name: []const u8) ?usize {
 }
 
 pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bool {
-    // A CLASS receiver's members live on its companion (or object
-    // singleton): `X.serializer()` is a member call there, never a call of
-    // some same-named local value.
+    // A class receiver's members live on its companion or object singleton:
+    // `X.serializer()` is a member call there, never a call of a same-named local.
     if (receiver.* == .Class) {
         const comp = (host_fields.companionOfClassValue(self, receiver) catch null) orelse return false;
         if (comp == .Null) return false;
@@ -99,9 +83,8 @@ pub fn hostHasMember(self: *VmHost, receiver: *const Value, name: []const u8) bo
 
 pub fn cmgGlobalKey(self: *VmHost, receiver: *const Value, func_p: usize, name: []const u8, args: []const Value) ?root_mod.ProgramImage.CmgGlobalKey {
     if (receiver.* != .Instance) return null;
-    // The arg-type signature keys the entry: a global miss on `f(String)` must
-    // not skip the member dispatch of a sibling `f(Int)`. A non-primitive arg
-    // yields no signature, so such a call is never cached.
+    // The arg-type signature keys the entry: a global miss on `f(String)` must not
+    // skip the member dispatch of a sibling `f(Int)`. No signature, no caching.
     const sig = methodArgSig(self, args) orelse return null;
     const g = receiver.Instance.borrow();
     defer g.deinit();
@@ -114,8 +97,6 @@ pub fn cmgGlobalKey(self: *VmHost, receiver: *const Value, func_p: usize, name: 
     };
 }
 
-/// True when this `(enclosing func, receiver class, name, arg-sig)` was recorded
-/// as resolving to a global — the member-dispatch passes can be skipped.
 pub fn cmgGlobalSkip(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) bool {
     const key = cmgGlobalKey(self, receiver, func_p, name, args) orelse return false;
     const pg = self.prog.borrow();
@@ -123,8 +104,7 @@ pub fn cmgGlobalSkip(self: *VmHost, func_p: usize, receiver: *const Value, name:
     return pg.get().cmg_global_cache.contains(key);
 }
 
-/// Record that this call resolved to a global with a single implicit-receiver
-/// candidate, so a repeat skips the member passes.
+/// Record that this call resolved to a global with a single implicit-receiver candidate.
 pub fn cmgGlobalRecord(self: *VmHost, func_p: usize, receiver: *const Value, name: []const u8, args: []const Value) void {
     if (!ir.eval.dispatchCacheStable()) return;
     const key = cmgGlobalKey(self, receiver, func_p, name, args) orelse return;
@@ -176,9 +156,7 @@ pub fn hostHasMemberUncached(self: *VmHost, receiver: *const Value, name: []cons
                 }
             }
             for (d.primary_params) |p| {
-                // Only `val`/`var` ctor params (`property != null`) become
-                // accessible members; a plain ctor parameter is local to the
-                // initializer and is not a member of instances.
+                // Only `val`/`var` ctor params become members.
                 if (p.property != null and std.mem.eql(u8, p.name, name)) {
                     dg.deinit();
                     cg.deinit();
@@ -200,11 +178,8 @@ pub fn hostHasMemberUncached(self: *VmHost, receiver: *const Value, name: []cons
     return false;
 }
 
-/// Does the receiver's class hierarchy declare a *property* (primary-ctor
-/// property or body property) named `name`? The bare-name write resolver
-/// gates on this rather than `hostHasMember`: a Kotlin assignment LHS can
-/// only resolve to a property or variable, never to a function, so a
-/// method of this name must not capture the write.
+/// Whether the receiver's hierarchy declares a property named `name`. A Kotlin
+/// assignment LHS resolves only to a property or variable, never to a function.
 pub fn hostHasProperty(self: *VmHost, receiver: *const Value, name: []const u8) bool {
     const inst = switch (receiver.*) {
         .Instance => |inst| inst,
@@ -214,10 +189,8 @@ pub fn hostHasProperty(self: *VmHost, receiver: *const Value, name: []const u8) 
     var cls_name: []const u8 = undefined;
     {
         const g = inst.borrow();
-        // A property already materialized on the instance (default-initialized
-        // at construction) counts — covers pack/IR-backed classes whose defs
-        // aren't in the tree-walker class registry walked below (e.g. a
-        // builder receiver like `HexFormat.Builder`'s `upperCase`).
+        // A property already materialized on the instance counts: pack/IR-backed
+        // classes have no def in the registry walked below.
         if (g.get().get(name) != null) {
             g.deinit();
             return true;
@@ -242,8 +215,7 @@ pub fn hostHasProperty(self: *VmHost, receiver: *const Value, name: []const u8) 
             const dg = def.borrow();
             const d = dg.get();
             for (d.primary_params) |p| {
-                // Only `val`/`var` ctor params are properties; a plain ctor
-                // parameter (`property == null`) is not.
+                // Only `val`/`var` ctor params are properties.
                 if (p.property != null and std.mem.eql(u8, p.name, name)) {
                     dg.deinit();
                     cg.deinit();
@@ -265,14 +237,9 @@ pub fn hostHasProperty(self: *VmHost, receiver: *const Value, name: []const u8) 
     return false;
 }
 
-/// The companion-object singleton serving as an implicit receiver at this
-/// instance's class depth, when the class (or a supertype) declares a
-/// companion that owns a member named `name`. Kotlin puts a class's
-/// companion in scope inside the class's own members — below the instance
-/// receiver, above the next receiver out — so the bare-name resolver adds
-/// it as a candidate right after the dispatch receiver. The singleton is
-/// only materialised when its class really owns the member, so candidate
-/// enumeration for unrelated names stays side-effect free.
+/// The companion-object singleton serving as an implicit receiver at this instance's
+/// class depth. Kotlin scopes a class's companion inside the class's own members,
+/// below the instance receiver and above the next receiver out.
 pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?Value {
     const inst = switch (receiver.*) {
         .Instance => |inst| inst,
@@ -289,12 +256,8 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
         g.deinit();
     }
     if (std.mem.find(u8, cls_name, "$Companion$") != null) return null;
-    // The ordered ancestor-companion list is a pure function of the class
-    // (supertype graph + lexical enclosing chain + companion registry, all
-    // static); the walk that produced it per call was the dominant cost of
-    // every bare-name candidate build. Only the per-NAME membership check
-    // below stays dynamic. Most classes cache the empty list and return in
-    // two probes.
+    // The ordered ancestor-companion list is a pure function of the class, so it caches
+    // per class identity; only the per-name membership check below stays dynamic.
     const cached: ?[]const []const u8 = blk: {
         const pg = self.prog.borrow();
         defer pg.deinit();
@@ -316,7 +279,6 @@ pub fn companionWithMember(self: *VmHost, allocator: Allocator, receiver: *const
     return companionChainProbe(self, built.items, name);
 }
 
-/// Probe the ordered ancestor-companion list for a singleton owning `name`.
 pub fn companionChainProbe(self: *VmHost, chain: []const []const u8, name: []const u8) Allocator.Error!?Value {
     for (chain) |cn| {
         const singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
@@ -330,9 +292,7 @@ pub fn companionChainProbe(self: *VmHost, chain: []const []const u8, name: []con
     return null;
 }
 
-/// The BFS `companionWithMember` ran per call, producing the visit-ordered
-/// companion-singleton names of the class's ancestors (supertype graph +
-/// lexical enclosing classes).
+/// Visit-ordered companion-singleton names of the class's ancestors.
 pub fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []const u8) Allocator.Error!std.ArrayList([]const u8) {
     var out: std.ArrayList([]const u8) = .empty;
     errdefer out.deinit(allocator);
@@ -359,8 +319,7 @@ pub fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []cons
             break :blk g.get().registry.companion_singletons.get(cname);
         };
         if (comp_name) |cn| try out.append(allocator, cn);
-        // An enclosing `object` declaration reached through the lexical
-        // walk is itself a singleton in scope for the nested class's bodies.
+        // An enclosing `object` declaration is itself a singleton in scope here.
         if (head != 0 and classIsObjectDecl(self, cname)) try out.append(allocator, cname);
         {
             const cg = self.classes.borrow();
@@ -371,12 +330,8 @@ pub fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []cons
                 for (dg.get().supertype_names) |sn| try queue.append(allocator, sn);
             }
         }
-        // A nested class reaches the lexically ENCLOSING declaration's
-        // companion (AbstractList.ListIteratorImpl's init calls
-        // checkPositionIndex on AbstractList's companion) and an enclosing
-        // object's members. The runtime name carries the owner for a
-        // dotted or mangled nested name; a simple name resolves its owner
-        // through the registry's enclosing-class map.
+        // A nested class reaches the enclosing declaration's companion: a dotted or
+        // mangled name carries its owner, a simple name resolves through the registry.
         const enclosing: ?[]const u8 = blk: {
             if (std.mem.findLastAny(u8, cname, ".$")) |sep| {
                 if (sep > 0) break :blk cname[0..sep];
@@ -390,8 +345,6 @@ pub fn companionChainBuild(self: *VmHost, allocator: Allocator, cls_name: []cons
     return out;
 }
 
-/// Whether `name` is a registered `object` declaration (not an anonymous
-/// object's synthetic class).
 pub fn classIsObjectDecl(self: *VmHost, name: []const u8) bool {
     const g = self.classes.borrow();
     defer g.deinit();
@@ -401,17 +354,9 @@ pub fn classIsObjectDecl(self: *VmHost, name: []const u8) bool {
     return dg.get().is_object and !dg.get().is_anonymous;
 }
 
-// -------------------------------------------------------------------------
-// Enclosing-this stack accessors.
-// -------------------------------------------------------------------------
-
-// The enclosing-`this` chain is the *current eval frame's* live state
-// (`Frame.enclosing_this`), snapshotted into `FrameSnapshot` on suspend and
-// restored on resume, so it travels with a parked continuation instead of
-// living in process-global state. These thin wrappers delegate to the
-// frame-scoped primitives in `ir.eval`; a push made by member dispatch just
-// before invoking a callable is inherited by the invoked frame and removed by
-// the matching pop once the call returns.
+// The enclosing-`this` chain is the current eval frame's live state, snapshotted into
+// `FrameSnapshot` on suspend and restored on resume, so it travels with a parked
+// continuation. A push before a call is inherited by the invoked frame, popped after.
 
 pub fn enclosingThis(self: *VmHost) ?Value {
     _ = self;
@@ -428,8 +373,6 @@ pub fn pushAccessEnclosing(self: *VmHost, v: *const Value) void {
     ir.eval.pushEnclosing(v);
 }
 
-/// `pushAccessEnclosing` for a receiver-lambda subject; see
-/// `pushOuterSubject`.
 pub fn pushAccessEnclosingSubject(self: *VmHost, v: *const Value) void {
     _ = self;
     ir.eval.pushEnclosingSubject(v);
@@ -440,19 +383,16 @@ pub fn popAccessEnclosing(self: *VmHost) void {
     ir.eval.popEnclosing();
 }
 
-/// Push/pop the enclosing-`this` chain without a `VmHost` handle. Used by the
-/// intrinsic-host receiver-lambda dispatch, which displaces a lambda's
-/// captured `this` with an explicit receiver and must keep the displaced
-/// instance reachable as an outer implicit receiver for the lambda body.
+/// Push/pop the enclosing-`this` chain without a `VmHost` handle: receiver-lambda
+/// dispatch displaces a lambda's captured `this` and must keep it reachable as an outer
+/// implicit receiver.
 pub fn pushOuterThis(allocator: Allocator, v: *const Value) void {
     _ = allocator;
     ir.eval.pushEnclosing(v);
 }
 
-/// Push a receiver-lambda subject (`with(x) { … }`'s `x`). Tagged so
-/// inner-class outer selection knows the subject's own `outer` links are not
-/// receivers in scope inside the lambda body; bare-name resolution treats it
-/// like any other enclosing receiver.
+/// Push a receiver-lambda subject (`with(x) { … }`'s `x`). Tagged so inner-class outer
+/// selection knows the subject's own `outer` links are not receivers inside the body.
 pub fn pushOuterSubject(allocator: Allocator, v: *const Value) void {
     _ = allocator;
     ir.eval.pushEnclosingSubject(v);

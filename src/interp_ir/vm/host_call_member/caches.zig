@@ -1,5 +1,4 @@
-//! Thread-local L1 caches in front of the shared dispatch maps, and the small
-//! accessors that read and fill them.
+//! Thread-local L1 caches in front of the shared dispatch maps.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -17,28 +16,17 @@ const cacheGen = hcm.cacheGen;
 const reflect_anon = @import("reflect_anon.zig");
 const root_mod = reflect_anon.root_mod;
 
-/// Sentinel cache value: this (class, name, arg-sig) is known to resolve to NO
-/// user instance method, so the next call skips the resolution walk and falls
-/// straight to the stdlib/extension/field paths. Sound because the resolution is
-/// a pure function of the key (classes are static).
+/// Sentinel: no user instance method resolves for this (class, name, arg-sig).
 pub const METHOD_MISS: u32 = std.math.maxInt(u32);
 
-/// Thread-local L1 in front of the shared method-resolution caches. The
-/// shared maps live behind the program cell's reader lock, whose atomic
-/// state word ping-pongs between cores on every borrow — at millions of
-/// probes per second across two threads that coherence traffic dominated
-/// the background-thread stress profiles. Entries mirror the shared maps
-/// (which are add-only and never re-map a key to a different target), so a
-/// stale or evicted slot just falls through to the shared probe.
+/// Thread-local L1 in front of the shared method-resolution caches. Those maps
+/// are add-only, so a stale or evicted slot falls through to the shared probe.
 pub const TL_METHOD_CACHE_SIZE = 2048;
 
 pub const TlMethodEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u64 = 0, gen: u32 = 0, miss_ttl: u8 = 0 };
 
-/// `raw_plus` sentinel: the SHARED map had no entry for this key when last
-/// probed. The shared maps are add-only, so the only staleness is an entry
-/// appearing later; `miss_ttl` re-probes every 64th consult to pick it up,
-/// amortizing the program-cell borrow (whose atomic word ping-pongs between
-/// cores) instead of paying it on every miss forever.
+/// `raw_plus` sentinel: the shared map had no entry when last probed. The only
+/// staleness is a later insert, so `miss_ttl` re-probes every 64th consult.
 pub const TL_ABSENT: u64 = std.math.maxInt(u64);
 pub threadlocal var tl_method_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
 pub threadlocal var tl_ext_cache: [TL_METHOD_CACHE_SIZE]TlMethodEntry = @splat(.{});
@@ -75,12 +63,10 @@ pub inline fn tlPutAbsent(cache: *[TL_METHOD_CACHE_SIZE]TlMethodEntry, key: root
     cache[tlSlot(key)] = .{ .class_p = key.class_p, .name_p = key.name_p, .n_args = key.n_args, .sig = key.sig, .raw_plus = TL_ABSENT, .gen = cacheGen(), .miss_ttl = 63 };
 }
 
-/// Thread-local L1 for the named-binding permutation map.
 pub const TlPermEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, raw_plus: u8 = 0, gen: u32 = 0, perm: root_mod.ProgramImage.NamedPerm = .{ .n = 0xFF, .src = @splat(0xFF) } };
 pub threadlocal var tl_perm_cache: [TL_METHOD_CACHE_SIZE]TlPermEntry = @splat(.{});
 
-/// Thread-local L1 for the stdlib member-resolve cache. `state`: 0 empty,
-/// 1 confirmed-none, 2 resolved.
+/// Stdlib member-resolve L1. `state`: 0 empty, 1 confirmed-none, 2 resolved.
 pub const TlResolveEntry = struct { type_p: usize = 0, name_p: usize = 0, args_empty: bool = false, file: u32 = 0, argc: u32 = 0, state: u8 = 0, gen: u32 = 0, func: ?StdlibFn = null, fqn: []const u8 = "" };
 pub threadlocal var tl_resolve_cache: [TL_METHOD_CACHE_SIZE]TlResolveEntry = @splat(.{});
 
@@ -154,10 +140,7 @@ pub fn extMethodCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMetho
     pg.get().ext_method_cache.put(key, fid) catch {};
 }
 
-/// Thread-local L1 for the pack-binding inline cache: a member call served
-/// by a native binding (or its cached "no intrinsic" miss) otherwise pays a
-/// program-cell borrow plus a shared-map probe on every single call. `state`:
-/// 0 empty, 1 mirrored. Same add-only/gen-stamp discipline as the method L1s.
+/// Pack-binding inline cache L1. `state`: 0 empty, 1 mirrored, 2 known-miss.
 pub const TlIntrinsicEntry = struct { class_p: usize = 0, name_p: usize = 0, n_args: u32 = 0, sig: u64 = 0, state: u8 = 0, gen: u32 = 0, miss_ttl: u8 = 0, entry: root_mod.ProgramImage.MemberResolveEntry = .{ .func = null, .fqn = "" } };
 pub threadlocal var tl_intrinsic_cache: [TL_METHOD_CACHE_SIZE]TlIntrinsicEntry = @splat(.{});
 
@@ -186,9 +169,8 @@ pub fn instanceIntrinsicCacheGet(self: *VmHost, key: root_mod.ProgramImage.Insta
     return hit;
 }
 
-/// The member name a virtual slot stands for, but ONLY when the slot's root
-/// declaration belongs to an INTERFACE — the one case where a delegating
-/// receiver must re-decide the call.
+/// Member name a virtual slot stands for, only when its root declaration belongs
+/// to an interface: the one case where a delegating receiver must re-decide.
 pub fn virtualSlotInterfaceMember(self: *VmHost, slot: MethodSlotId) ?[]const u8 {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -202,10 +184,7 @@ pub fn virtualSlotInterfaceMember(self: *VmHost, slot: MethodSlotId) ?[]const u8
     return f.name;
 }
 
-/// The member name a lowering-resolved target stands for, but ONLY when its
-/// declaring class is an interface — the one case where a delegating receiver
-/// must re-decide the call. Everything else answers null so the resolved
-/// identity runs untouched.
+/// As `virtualSlotInterfaceMember`, for a lowering-resolved target.
 pub fn resolvedMemberName(self: *VmHost, fid: FuncId) ?[]const u8 {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -218,11 +197,8 @@ pub fn resolvedMemberName(self: *VmHost, fid: FuncId) ?[]const u8 {
     return f.name;
 }
 
-/// Simple name of the class that DECLARES `fid` in `module`'s class table,
-/// memoized per `(module, FuncId)`. An instance method's implicit-`this` bare
-/// call resolves against its declaring class's static member scope (Kotlin), so
-/// dispatch needs this static type; the this-param's nominal type is a
-/// placeholder that cannot serve it. `null` when no class owns the func.
+/// Simple name of the class declaring `fid`, memoized per `(module, FuncId)`;
+/// Kotlin resolves an implicit-`this` bare call against that class's static scope.
 pub fn declaringClassSimpleName(self: *VmHost, module: *const Module, fid: FuncId) ?[]const u8 {
     const key = root_mod.ProgramImage.FuncOwnerKey{ .module_p = @intFromPtr(module), .func_p = @intFromEnum(fid) };
     {
@@ -249,10 +225,8 @@ pub fn declaringClassSimpleName(self: *VmHost, module: *const Module, fid: FuncI
     return owner;
 }
 
-/// Memoize the `instanceBindingProbe` outcome for `key`. `func == null` caches
-/// "no intrinsic" so the next call returns immediately without rebuilding the
-/// probe FQNs or walking the supertype chain. The `fqn` (the winning probe, or
-/// "" for a miss) is duped into the image-owned allocator on first store.
+/// Memoize the `instanceBindingProbe` outcome; `func == null` caches "no
+/// intrinsic". `fqn` is duped into the image-owned allocator on first store.
 pub fn instanceIntrinsicCachePut(self: *VmHost, key: root_mod.ProgramImage.InstanceMethodKey, func: ?StdlibFn, fqn: []const u8) void {
     const pg = self.prog.borrowMut();
     defer pg.deinit();

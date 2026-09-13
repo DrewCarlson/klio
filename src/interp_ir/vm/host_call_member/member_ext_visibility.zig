@@ -1,5 +1,4 @@
-//! Member-extension visibility and shadowing rules, plus interface delegation
-//! lookups.
+//! Member-extension visibility and shadowing rules, and interface delegation.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -51,10 +50,7 @@ const missTraceEnv = static_tail.missTraceEnv;
 const missTraceWant = static_tail.missTraceWant;
 const nuTraceEnv = static_tail.nuTraceEnv;
 
-/// Whether `fid` is a member extension. Authoritative via the func's
-/// first-class `kind`; the `member_ext_owner_class` side table carries the
-/// owner-gating data (the kind selects which funcs are gated, the side
-/// table says by which owner class).
+/// Whether `fid` is a member extension, per the func's first-class `kind`.
 pub fn isMemberExtFid(self: *VmHost, fid: FuncId) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -66,22 +62,12 @@ pub fn isMemberExt(mod: *const Module, fid: FuncId) bool {
     return false;
 }
 
-/// Member-extension visibility gate: a member-extension `fid` is visible
-/// at a call site only when its declaring (owner) class is reachable
-/// through `visible_owners`. Non-member-extensions are unconditionally
-/// visible (this function gates nothing for them). Preserves the prior
-/// `member_ext_owner_class.get(fid)`-then-`visible_owners.contains(owner)`
-/// behavior exactly: the kind selects the gated funcs, the side table
-/// supplies the owner.
-/// Whether `fid` is a FILE-PRIVATE top-level function whose declaring file
-/// is not the currently executing frame's file — Kotlin scopes a private
-/// top-level declaration to its file, so such a candidate is invisible here
-/// (a file-private `Rect.size()` must never capture `changes.size()`).
+/// Whether `fid` is a file-private top-level function declared in a file other
+/// than the executing frame's. Kotlin scopes such a declaration to its file.
 pub fn privateFnHiddenHere(self: *VmHost, mod: *const Module, fid: FuncId) bool {
     _ = self;
     const decl_file = mod.registry.private_fn_files.get(fid) orelse return false;
-    // A dispatching bound reference carries its creation-site file; the
-    // reference site, not the dynamic caller, decides private visibility.
+    // A bound reference decides private visibility by its creation site.
     if (ir.eval.refSiteFile()) |f| return f.int() != decl_file.int();
     const sp = ir.eval.currentCallSiteSpan() orelse return false;
     if (missTraceEnv() != null) {
@@ -92,9 +78,8 @@ pub fn privateFnHiddenHere(self: *VmHost, mod: *const Module, fid: FuncId) bool 
     return sp.file.int() != decl_file.int();
 }
 
-/// A bound reference's creation-site file (`__bound_file__`), if recorded
-/// on its synth instance. The invoke arms re-install it around their
-/// by-name dispatch via `ir.eval.pushRefSiteFile`.
+/// A bound reference's creation-site file (`__bound_file__`), if its synth
+/// instance recorded one; the invoke arms reinstall it around by-name dispatch.
 pub fn boundRefFile(callee: *const Value) ?ir.FileId {
     if (callee.* != .Instance) return null;
     const g = callee.Instance.borrow();
@@ -104,6 +89,8 @@ pub fn boundRefFile(callee: *const Value) ?ir.FileId {
     return ir.FileId.from(@intCast(v.Int));
 }
 
+/// Whether member extension `fid` is visible here: its owner class, from the
+/// `member_ext_owner_class` table, must be in `visible_owners`. Others always are.
 pub fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_owners: *const OwnerSet) bool {
     if (!isMemberExt(mod, fid)) return true;
     const owner = mod.registry.member_ext_owner_class.get(fid) orelse return true;
@@ -121,30 +108,16 @@ pub fn memberExtVisible(self: *VmHost, mod: *const Module, fid: FuncId, visible_
         }
     }
     if (visible_owners.contains(owner)) return true;
-    // An interface implementation is not an importable extension. `private object
-    // EmptyMeasurePolicy : MeasurePolicy { override fun MeasureScope.measure(…) }`
-    // declares an interface method body, reachable only with the object as the
-    // dispatch receiver -- never by name from an unrelated site. Letting the
-    // singleton hatch below hand it out made EVERY `with(policy) { measure(…) }`
-    // run `BasicText`'s policy, which sizes to the incoming constraints: a text
-    // field then measured itself to the unbounded scroll height.
+    // An interface method body is not an importable extension.
     if (implementsSupertypeMemberExt(self, mod, owner, fid)) return false;
-    // A member extension declared in an `object`/companion is callable
-    // wherever the singleton is importable (`import C.Companion.f`): its
-    // dispatch receiver is the singleton itself, which is always
-    // materializable, so the enclosing-`this` chain need not carry it.
+    // A member extension in an `object` or companion is callable wherever the
+    // singleton is importable, so the enclosing-`this` chain need not carry it.
     return ownerIsObjectSingleton(self, owner);
 }
 
-/// Whether `owner`'s member extension `fid` implements a same-named member
-/// extension declared by one of `owner`'s supertypes -- i.e. it is an interface
-/// method body, not an importable extension. `object EmptyMeasurePolicy :
-/// MeasurePolicy` overriding `MeasureScope.measure` is the shape: the only way to
-/// reach it is with the object as the dispatch receiver.
-///
-/// Read off the supertypes rather than an `override` modifier: the lowering does
-/// not carry the modifier this far, and a supertype declaration is what `override`
-/// means anyway.
+/// Whether `owner`'s member extension `fid` implements a same-named one a supertype
+/// declares, an interface body reachable only as the dispatch receiver. Lowering
+/// drops `override`, so this reads the supertypes instead.
 pub fn implementsSupertypeMemberExt(self: *VmHost, mod: *const Module, owner: []const u8, fid: FuncId) bool {
     const f = funcAt(mod, fid) orelse return false;
     const runtime_owner = if (mod.classIdByFqn(owner)) |id|
@@ -159,23 +132,17 @@ pub fn implementsSupertypeMemberExt(self: *VmHost, mod: *const Module, owner: []
         defer dg.deinit();
         break :blk dg.get().supertype_names;
     };
-    // The supertype's declaration is ABSTRACT: it carries no body and lowers no
-    // func, so it cannot be found among the interface's methods. `iface_member_ext_recv`
-    // is where an abstract member EXTENSION is recorded -- keyed by (interface, name),
-    // which is exactly the question here.
+    // An abstract declaration lowers no func; `iface_member_ext_recv` keys it.
     for (sups) |sup| {
         if (mod.registry.iface_member_ext_recv.get(.{ .a = sup, .b = f.name }) != null) return true;
     }
     return false;
 }
 
-/// Whether a member-extension owner class is a registered `object` /
-/// companion singleton.
 pub fn ownerIsObjectSingleton(self: *VmHost, owner: []const u8) bool {
     return memberExtOwnerObjectClass(self, owner) != null;
 }
 
-/// Exact class identity for an object/companion member-extension owner.
 pub fn memberExtOwnerObjectClass(self: *VmHost, owner: []const u8) ?ir.ClassId {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -202,11 +169,8 @@ pub fn userMemberExtShadows(self: *VmHost, allocator: Allocator, receiver: *cons
         if (!owners.contains(owner)) continue;
         if (funcAt(mod, fid)) |f| {
             if (f.params.len == 0 or f.params.len < want) continue;
-            // The shadow holds only while the member-extension could
-            // actually bind this receiver: a definitely-disproven declared
-            // receiver (a private `IntRange.toLong()` against a `Long`)
-            // must leave the stdlib probe ladder in charge. Erased-generic
-            // receivers stay non-definite and keep shadowing.
+            // The shadow holds only while the member extension could bind this
+            // receiver; an erased generic receiver stays non-definite and shadows.
             if (argDefinitelyNotParamType(self, &f.params[0].ty, receiver)) continue;
             return true;
         }
@@ -214,18 +178,11 @@ pub fn userMemberExtShadows(self: *VmHost, allocator: Allocator, receiver: *cons
     return false;
 }
 
-/// A shipped-pack top-level extension the CALL SITE's file has in scope
-/// (same package, wildcard import, or named import) whose declared
-/// receiver provably holds shadows the stdlib type-name probe: Kotlin's
-/// scoping ranks an explicitly imported extension above the implicitly
-/// imported stdlib one (ktor's `Char.isLowerCase()` inside a ktor file
-/// importing `io.ktor.util.*` beats `kotlin.text.isLowerCase`). Returns
-/// `.shadows` when the ladder must stand down for THIS call site,
-/// `.potential` when such a candidate exists but is not in scope here
-/// (the resolution is file-dependent, so the caller must not memoize),
-/// and `.none` otherwise.
 pub const PackExtShadow = enum { none, potential, shadows };
 
+/// Whether a shipped-pack top-level extension the call site's file has in scope
+/// shadows the stdlib type-name probe, Kotlin ranking an explicit import above the
+/// implicit stdlib one. `.potential` is file-dependent: the caller must not cache.
 pub fn importedPackExtShadows(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, argc: usize) Allocator.Error!PackExtShadow {
     _ = allocator;
     const want = argc + 1;
@@ -254,10 +211,9 @@ pub fn importedPackExtShadows(self: *VmHost, allocator: Allocator, receiver: *co
         if (isMemberExt(mod, fid)) continue;
         if (!f.hasBody()) continue;
         if (f.package.len == 0) continue;
-        // The stdlib's own packages ARE the ladder's surface.
+        // The stdlib's own packages are the ladder's surface.
         if (std.mem.eql(u8, f.package, "kotlin") or std.mem.startsWith(u8, f.package, "kotlin.")) continue;
-        // Only shipped/pack packages here; plain user declarations are
-        // `userToplevelExtShadows`'s domain.
+        // Shipped and pack packages only; user ones are `userToplevelExtShadows`.
         if (dbg) std.debug.print("[shadow] cand fqn={s} pkg={s} known={} body={}\n", .{ f.fqn, f.package, stdlib.isKnownPackage(f.package), f.hasBody() });
         if (!stdlib.isKnownPackage(f.package)) continue;
         if (f.params.len < want) {
@@ -270,11 +226,7 @@ pub fn importedPackExtShadows(self: *VmHost, allocator: Allocator, receiver: *co
             }
             if (!has_vararg) continue;
         } else if (!extArityApplicable(self, &f, want)) continue;
-        // NOMINAL receiver match only: a generic / `Any` / function-shape
-        // receiver accepts anything and must not stand the whole ladder
-        // down (a pack `fun <T> T.get(...)` would otherwise shadow
-        // `String.get`). The declared head must be a concrete type the
-        // runtime receiver implements.
+        // Nominal match only: the declared head must be a type the receiver implements.
         {
             var rn = simpleName(f.params[0].ty.name);
             rn = std.mem.trimEnd(u8, rn, "?");
@@ -300,19 +252,9 @@ pub fn importedPackExtShadows(self: *VmHost, allocator: Allocator, receiver: *co
     return result;
 }
 
-/// A visible USER (non-shipped) top-level extension whose declared
-/// receiver type provably holds for this receiver shadows the stdlib
-/// type-name probe: a same-package extension (`fun Int.to(o: Int)`)
-/// outranks an implicitly imported stdlib extension of the same name
-/// (`kotlin.to`), so the stdlib probe ladder must stand down and let the
-/// extension fallback bind the user's declaration.
-/// Whether the user program declares ANY top-level extension named `name`
-/// whose receiver type accepts `receiver` (ignoring the arguments). When true,
-/// the `(type, name)` → stdlib-member resolution is ARGUMENT-dependent (the
-/// extension shadows the builtin only for arguments it applies to), so it must
-/// NOT be memoized by (type, name) alone — else the first call's winner
-/// (`1 or 2` → builtin `Int.or`) is wrongly replayed for a different argument
-/// shape (`1 or NodeKind` → must reach the extension).
+/// Whether any top-level extension named `name` accepts `receiver`, arguments
+/// aside. When true the `(type, name)` resolution is argument-dependent, so it
+/// must not be memoized on those alone.
 pub fn userToplevelExtNamedExists(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -321,11 +263,9 @@ pub fn userToplevelExtNamedExists(self: *VmHost, allocator: Allocator, receiver:
         const f = funcAt(mod, fid) orelse continue;
         if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
         if (isMemberExt(mod, fid)) continue;
-        // A pack/stdlib package's extension normally must not pre-empt the
-        // probe ladder it dispatches — EXCEPT on a builtin scalar receiver,
-        // where the builtin operators (`Int.or`, …) are host intrinsics, not
-        // FuncIds, so a pack's operator overload (`Int.or(NodeKind)`) is a
-        // genuine distinct overload that must apply for its own argument type.
+        // A pack or stdlib extension must not pre-empt the ladder it dispatches,
+        // except on a builtin scalar: those operators are host intrinsics, so a
+        // pack's overload is a genuinely distinct one.
         if (stdlib.isKnownPackage(f.package) and
             (std.mem.startsWith(u8, f.package, "kotlin") or !isBuiltinScalar(receiver))) continue;
         if (try strictReceiverProven(self, allocator, receiver, fid, &f.params[0].ty)) return true;
@@ -333,9 +273,8 @@ pub fn userToplevelExtNamedExists(self: *VmHost, allocator: Allocator, receiver:
     return false;
 }
 
-/// Whether the receiver type declares `name` and none of its declarations
-/// takes `argc` value arguments (defaults and varargs count as taking any
-/// count at or beyond their minimum).
+/// Whether the receiver type declares `name` but no declaration of it takes
+/// `argc` arguments; a default or vararg takes any count past its minimum.
 pub fn memberDeclArityMisfit(self: *VmHost, type_fqn: []const u8, name: []const u8, argc: usize) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -405,28 +344,17 @@ pub fn userToplevelExtShadows(self: *VmHost, allocator: Allocator, receiver: *co
     const mod = mg.get();
     for (mod.funcsBySimpleName(name)) |fid| {
         const f = funcAt(mod, fid) orelse continue;
-        // A top-level extension carries `this` as its leading param and is
-        // not a member-extension (those go through userMemberExtShadows).
         if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) continue;
         if (isMemberExt(mod, fid)) continue;
-        // Only the user's own program shadows the stdlib: a package the
-        // stdlib registry or an installed pack owns (kotlin.*, io.ktor.*,
-        // …) is the very surface the probe ladder dispatches, so its
-        // same-named extensions must not pre-empt it. A user declaration
-        // lives in a package no registry knows.
+        // Only user code shadows the stdlib; a registry or pack package is the
+        // surface the ladder dispatches to.
         if (stdlib.isKnownPackage(f.package) and
             (std.mem.startsWith(u8, f.package, "kotlin") or !isBuiltinScalar(receiver))) continue;
         if (f.params.len < want) continue;
         if (!extArityApplicable(self, &f, want)) continue;
-        // Only a proven receiver match shadows: an inapplicable namesake
-        // (a `String.to` against an `Int` receiver) leaves the stdlib path.
+        // Only a proven receiver match shadows; a namesake that cannot bind does not.
         if (!(try strictReceiverProven(self, allocator, receiver, fid, &f.params[0].ty))) continue;
-        // The ARGUMENTS must also be applicable, else this extension is not a
-        // candidate for THIS call and must not shadow a same-named stdlib
-        // member: `fun Int.or(NodeKind)` does not apply to `1 or 2`, so the
-        // builtin `Int.or(Int)` must still win (a member outranks an
-        // inapplicable extension). A scalar argument against a user-class
-        // parameter is a definite mismatch.
+        // Inapplicable arguments leave the same-named stdlib member the winner.
         var args_ok = true;
         for (args, 0..) |*arg, i| {
             if (i + 1 >= f.params.len) break;
@@ -440,15 +368,9 @@ pub fn userToplevelExtShadows(self: *VmHost, allocator: Allocator, receiver: *co
     return false;
 }
 
-/// Append `cls` and its full transitive supertype closure — the superclass
-/// chain AND every implemented interface, recursively — to `out` in
-/// innermost-first order, deduped by pointer identity through `seen`. A
-/// member-extension declared as a superclass or interface default body is in
-/// scope wherever an enclosing `this` carries that owner ANYWHERE in its
-/// hierarchy, so the closure (not just the single `parent` chain) is what
-/// gates its visibility. Class pointers are arena-backed and immutable after
-/// linking, so reading `name`/`fqn`/`parent`/`interfaces` off `asPtr()` needs
-/// no borrow (mirrors `ClassDef.findMethodWalk`).
+/// Append `cls` and its transitive supertype closure, superclasses and interfaces
+/// alike, to `out` innermost-first: member-extension visibility turns on the whole
+/// closure, not the `parent` chain. Class pointers are immutable, so take no borrow.
 pub fn collectClassClosure(
     cls: *const ClassDef,
     out: *std.ArrayList(*const ClassDef),
@@ -463,15 +385,9 @@ pub fn collectClassClosure(
     for (cls.interfaces) |iface| collectClassClosure(iface.asPtr(), out, seen, allocator);
 }
 
-/// The member EXTENSION named `name` with `nparams` parameters that
-/// `receiver`'s class declares or inherits, most-derived first. Answers from
-/// the module's per-class member index, so a bare member-extension dispatch
-/// costs a walk of the receiver's own supertypes instead of a scan of every
-/// same-named declaration in the program.
 pub const MEXT_OVERRIDE_MAX = 4;
-/// `gen` is the dispatch-cache generation the program boundary bumps: the key
-/// is a class identity plus a name's storage address, both of which the next
-/// program can mint again, and the entry holds that program's function ids.
+/// `gen` is the dispatch-cache generation a program boundary bumps: the key is a
+/// class identity plus a name's address, which the next program can mint again.
 pub const MextOverrideEntry = struct {
     cls: u64 = 0,
     name_p: usize = 0,
@@ -484,13 +400,8 @@ pub const MextOverrideEntry = struct {
 pub const MEXT_OVERRIDE_SLOTS = 1024;
 pub threadlocal var mext_override_cache: [MEXT_OVERRIDE_SLOTS]MextOverrideEntry = @splat(.{});
 
-/// The member EXTENSIONS named `name` with `nparams` parameters that
-/// `receiver`'s class declares or inherits, most-derived first (at most
-/// `out.len`). Answers from the module's per-class member index behind a
-/// direct-mapped per-thread cache, so a repeated bare member-extension
-/// dispatch — the changelist executes one operation per node update — costs
-/// a probe instead of a scan over every same-named declaration in the
-/// program. Returns how many entries of `out` were written.
+/// `memberExtOverrideLookup` behind a direct-mapped per-thread cache, writing at
+/// most `out.len` entries and returning how many.
 pub fn memberExtOverridesFor(self: *VmHost, receiver: *const Value, name: []const u8, nparams: usize, out: []ir.FuncId) usize {
     if (receiver.* != .Instance) return 0;
     const cls_id: u64 = blk: {
@@ -522,6 +433,8 @@ pub fn memberExtOverridesFor(self: *VmHost, receiver: *const Value, name: []cons
     return m;
 }
 
+/// The member extensions named `name` with `nparams` parameters that `receiver`'s
+/// class declares or inherits, most-derived first, from the per-class index.
 pub fn memberExtOverrideLookup(self: *VmHost, receiver: *const Value, name: []const u8, nparams: usize, out: []ir.FuncId) usize {
     const a = self.allocator;
     var closure: std.ArrayList(*const ClassDef) = .empty;
@@ -545,10 +458,8 @@ pub fn memberExtOverrideLookup(self: *VmHost, receiver: *const Value, name: []co
                 if (fp.kind != .member_extension) continue;
                 if (fp.params.len != nparams) continue;
                 if (fp.params.len == 0 or !std.mem.eql(u8, fp.params[0].name, "this")) continue;
-                // Pack functions are lazy-bodied: an unensured declaration
-                // reports no body and silently vanished from the pick
-                // (foundation-layout's Density.targetConstraints getter
-                // fell through to an unresolved global). Ensure first.
+                // Pack functions are lazy-bodied: ensure the body before the
+                // no-body test, else an unensured declaration drops out.
                 if (fp.blocks.len == 0) _ = mod.ensureFuncBody(@constCast(fp));
                 if (!fp.hasBody()) continue;
                 var dup = false;
@@ -566,21 +477,9 @@ pub fn memberExtOverrideLookup(self: *VmHost, receiver: *const Value, name: []co
     return n;
 }
 
-/// Set of class names (with the full supertype closure — superclasses AND
-/// interfaces) reachable through the enclosing-this chain, including each
-/// instance's `outer` links, and through the executing frames' own
-/// receivers, which the dynamic chain does not carry (an extension body
-/// binds its receiver in `params[0]`, never by pushing it; inside
-/// `ColumnMeasurePolicy.measure(MeasureScope)` the `MeasureScope` is a
-/// `Density`, which is what makes `Dp.roundToPx()` visible there).
-///
-/// Held as the chain's class identities; a membership probe asks each
-/// class's memoized closure-name set (`classClosureNames`). An extension
-/// call whose candidates include a member-extension is never served by the
-/// inline cache, so it asks for this set on every call, and building it —
-/// a closure walk per receiver plus a fresh hash map of every name — grew
-/// with the nesting depth of the composition it ran in. Nothing is
-/// allocated per call now beyond the chain snapshot.
+/// Class identities reachable through the enclosing-this chain, each instance's
+/// `outer` links, and the executing frames' own receivers, which the dynamic chain
+/// misses since an extension binds its receiver in `params[0]` rather than pushing.
 pub const OwnerSet = struct {
     sig: [OWNER_SIG_MAX]usize = @splat(0),
     n: u32 = 0,
@@ -605,10 +504,8 @@ pub const OwnerSet = struct {
     }
 };
 pub const OWNER_SIG_MAX = 48;
-/// One memoized closure-name set. Class definitions are arena-backed and
-/// immutable after linking, so the set is built once per class for the
-/// process and shared; the entry is validated by the class's `fqn` slice,
-/// which keeps it sound should a definition's address ever be reused.
+/// One memoized closure-name set, built once per class for the process since class
+/// definitions are immutable after linking; `fqn` validates a reused address.
 pub const ClosureNamesEntry = struct { fqn_p: usize, fqn_len: usize, set: *const std.StringHashMap(void) };
 pub const ClosureNamesFront = struct { cls: usize = 0, fqn_p: usize = 0, fqn_len: usize = 0, set: ?*const std.StringHashMap(void) = null };
 pub const CLOSURE_NAMES_FRONT_SLOTS = 512;
@@ -684,8 +581,7 @@ pub fn enclosingOwnerSet(self: *VmHost, allocator: Allocator) Allocator.Error!Ow
     out.owned = try enclosingOwnerSetWalk(self, allocator);
     return out;
 }
-/// The walked form of `enclosingOwnerSet`: every closure name of every
-/// receiver in scope, in one caller-owned map.
+/// The walked form of `enclosingOwnerSet`, as one caller-owned map.
 pub fn enclosingOwnerSetWalk(self: *VmHost, allocator: Allocator) Allocator.Error!std.StringHashMap(void) {
     var set: std.StringHashMap(void) = .init(allocator);
     const chain = try enclosingThisChain(self, allocator);
@@ -730,8 +626,7 @@ pub fn enclosingOwnerSetWalk(self: *VmHost, allocator: Allocator) Allocator.Erro
     return set;
 }
 
-/// `delegateForward` with argument names threaded through, so a delegated
-/// member invoked with named arguments binds its parameters by name.
+/// `delegateForward` binding the delegated member's parameters by argument name.
 pub fn delegateForwardNamed(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!?EvalResult {
     const inst = receiver.Instance;
     var delegates: std.ArrayList(Value) = .empty;
@@ -768,13 +663,8 @@ pub fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Val
         defer g.deinit();
         for (g.get().fields.items) |f| {
             if (!std.mem.startsWith(u8, f.name, "__delegate__")) continue;
-            // Kotlin class delegation forwards only the members the
-            // delegated interface itself declares. An extension function
-            // or an unrelated name must NOT fall through to the delegate:
-            // it would rebind `this` to the delegate object (e.g.
-            // `Continuation.resumeCancellableWithInternal` running against
-            // the wrapped continuation instead of the DispatchedContinuation
-            // wrapper, which silently skipped the dispatcher).
+            // Kotlin class delegation forwards only the delegated interface's own
+            // members; another name would rebind `this` to the delegate object.
             const iface = f.name["__delegate__".len..];
             if (delegatedInterfaceDeclares(self, allocator, inst, iface, name) == false) continue;
             try delegates.append(allocator, f.value);
@@ -788,8 +678,7 @@ pub fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Val
                 if (swallow_unimplemented_only) {
                     if (e != .Unimplemented) return r;
                 }
-                // else: swallow all errors and continue. The swallowed miss's
-                // `Vm::call_member` message is discarded here; free it.
+                // Swallow the miss and continue, freeing its discarded message.
                 freeDispatchMiss(allocator, r);
             },
         }
@@ -797,21 +686,9 @@ pub fn delegateForward(self: *VmHost, allocator: Allocator, receiver: *const Val
     return null;
 }
 
-/// Whether the interface a class delegates to (named by the suffix of a
-/// `__delegate__<iface>` field) declares a member `name` anywhere on its
-/// hierarchy. Returns `null` when the interface cannot be resolved (the
-/// caller keeps the legacy forward-anything behavior), `true`/`false`
-/// when membership is decidable.
 /// The delegate a `by` clause makes responsible for `name`, or null when the
-/// receiver answers it itself.
-///
-/// Kotlin generates a forwarding member for EVERY member of a delegated
-/// interface the class does not override — including members the interface
-/// supplies a default body for. Resolution reaches an inherited default first,
-/// so without this the default runs against the wrapper and the delegate is
-/// never consulted (`SerialDescriptor.annotations` has a default body, and a
-/// `ContextDescriptor(original) : SerialDescriptor by original` reported the
-/// empty default instead of the wrapped descriptor's annotations).
+/// receiver answers it itself. Kotlin forwards every unoverridden member of a
+/// delegated interface, including ones resolution would answer from a default.
 pub fn interfaceDelegateFor(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8) ?Value {
     var has_delegate = false;
     {
@@ -825,8 +702,7 @@ pub fn interfaceDelegateFor(self: *VmHost, allocator: Allocator, inst: ObjRef(In
         }
     }
     if (!has_delegate) return null;
-    // A member the receiver's own class chain declares is not forwarded —
-    // that is exactly the `override` the compiler skips generating for.
+    // A member the receiver's own class chain declares is an `override`.
     if (concreteChainDeclares(self, allocator, inst, name)) return null;
     const g = inst.borrow();
     defer g.deinit();
@@ -839,9 +715,8 @@ pub fn interfaceDelegateFor(self: *VmHost, allocator: Allocator, inst: ObjRef(In
     return null;
 }
 
-/// Whether the anon-method table holds a member `name` for `class_name`, at
-/// any arity or as an accessor. Entries are keyed `class\x1fname#arity` and
-/// `class\x1fname`, so a prefix scan answers "declared at all".
+/// Whether the anon-method table holds `name` for `class_name` at any arity.
+/// Keys are `class\x1fname#arity` and `class\x1fname`, so a prefix scan answers.
 pub fn anonClassDeclares(self: *VmHost, allocator: Allocator, class_name: []const u8, name: []const u8) bool {
     const tbl = self.anon_methods.borrow();
     defer tbl.deinit();
@@ -860,15 +735,14 @@ pub fn anonTableHasPrefix(tbl: anytype, prefix: []const u8) bool {
     var it = tbl.keyIterator();
     while (it.next()) |k| {
         if (!std.mem.startsWith(u8, k.*, prefix)) continue;
-        // Either an exact hit or the `name#arity` form — never a longer name.
+        // Either an exact hit or the `name#arity` form, never a longer name.
         if (k.len == prefix.len or k.*[prefix.len] == '#') return true;
     }
     return false;
 }
 
-/// Whether the receiver's own CLASS chain (never its interfaces) declares
-/// `name`. An interface's own body is exactly what a `by` clause replaces; a
-/// class's is an `override`, which the compiler honours over the delegate.
+/// Whether the receiver's own class chain, never its interfaces, declares `name`.
+/// A `by` clause replaces an interface body; a class's is an `override`.
 pub fn concreteChainDeclares(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8) bool {
     {
         const g = inst.borrow();
@@ -882,9 +756,7 @@ pub fn concreteChainDeclares(self: *VmHost, allocator: Allocator, inst: ObjRef(I
             if (std.mem.eql(u8, p.name, name)) return true;
         }
     }
-    // An anonymous / local class keeps its members in the anon-method table
-    // rather than on its `ClassDef`, and `object : I by d { override … }` is
-    // the shape that most often carries the override.
+    // An anonymous or local class keeps its members in the anon-method table.
     {
         const g = inst.borrow();
         const cg = g.get().class.borrow();
@@ -908,9 +780,7 @@ pub fn concreteChainDeclares(self: *VmHost, allocator: Allocator, inst: ObjRef(I
         hit.class.deinit();
         if (from_class) return true;
     }
-    // The runtime class def carries only what the class body lowered; the
-    // module's class table is the authority on which declaration owns a
-    // method, so walk the CLASS supertypes there too.
+    // The module's class table, not the runtime def, owns which class declares what.
     const mg = self.module.borrow();
     defer mg.deinit();
     const module = mg.get();
@@ -941,21 +811,18 @@ pub fn concreteChainDeclares(self: *VmHost, allocator: Allocator, inst: ObjRef(I
     return false;
 }
 
+/// Whether the interface named by a `__delegate__<iface>` field suffix declares
+/// `name`, or null when it does not resolve and the caller forwards anything.
 pub fn delegatedInterfaceDeclares(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), iface_name_raw: []const u8, name: []const u8) ?bool {
-    // The key carries the source-spelled supertype; strip generic args
-    // (`Continuation<T>` -> `Continuation`).
+    // The key carries the source-spelled supertype; strip generic arguments.
     var iface_name = iface_name_raw;
     if (std.mem.findScalar(u8, iface_name, '<')) |lt| iface_name = iface_name[0..lt];
     iface_name = std.mem.trim(u8, iface_name, " ");
     if (std.mem.findScalarLast(u8, iface_name, '.')) |dot| iface_name = iface_name[dot + 1 ..];
     if (iface_name.len == 0) return null;
 
-    // Resolve lexically first (the class's captured declaration env), then
-    // via the global class table.
-    // The lowered hierarchy registry covers what `ClassDef.findMethod`
-    // cannot see: abstract interface members have no lowered body, so
-    // they never appear in `methods`, yet Kotlin forwards exactly those
-    // through `by` delegation (`interface Greeter { fun greet(): String }`).
+    // An abstract interface member has no lowered body and never appears in
+    // `methods`, yet `by` delegation forwards exactly those.
     {
         const mg = self.module.borrow();
         defer mg.deinit();

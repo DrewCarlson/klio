@@ -1,6 +1,5 @@
-//! Argument/parameter type probing and overload scoring: the shared applicability
-//! engine's member and extension adapters, `argDefinitelyNotParamType`, and
-//! `pickMethodOverload`.
+//! Member and extension adapters for the shared applicability engine, the
+//! type-disproof adjudicator, and member overload selection.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -63,13 +62,8 @@ const funcAt = reflect_anon.funcAt;
 const static_tail = @import("static_tail.zig");
 const missTraceWant = static_tail.missTraceWant;
 
-// -------------------------------------------------------------------------
-// Overload scoring + method/extension selection.
-// -------------------------------------------------------------------------
-
-/// Direct dispatch of a lowering-resolved member extension. Both Kotlin
-/// receivers are explicit: `dispatch_receiver` is the declaring class/object
-/// instance and `receiver` is the extension receiver.
+/// Direct dispatch of a lowering-resolved member extension: `dispatch_receiver`
+/// is the declaring class/object instance, `receiver` the extension receiver.
 pub fn invokeMemberExtFuncId(
     self: *VmHost,
     allocator: Allocator,
@@ -91,13 +85,9 @@ pub fn invokeMemberExtFuncId(
     return try callFuncRec(self, allocator, mod, fid, all);
 }
 
-/// Distance from an instance's runtime class to `target` along the
-/// supertype graph, or `null` when unreachable.
-/// `instanceSubtypeDistance` for a target that may be an erased function
-/// name: the lowering names a receiver form `R.(P) -> T` by its value
-/// parameters alone (`Function{p}`), while a class extending the same
-/// type written `(R, P) -> T` records `Function{p+1}`; both spell one
-/// Kotlin type, so the receiver-form name also accepts the wider tag.
+/// `instanceSubtypeDistance` for an erased function-type target: the lowering
+/// names a receiver form `R.(P) -> T` by its value parameters alone, so that
+/// name also accepts the `Function{p+1}` tag a class written `(R, P) -> T` records.
 pub fn instanceFunctionDistance(self: *VmHost, arg: *const Value, target: []const u8) ?usize {
     if (instanceSubtypeDistance(self, arg, target)) |d| return d;
     const prefix: []const u8 = if (std.mem.startsWith(u8, target, "SuspendFunction"))
@@ -133,12 +123,8 @@ pub fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const
         g.deinit();
     }
     var head: usize = 0;
-    // Compare SOURCE simple names on both sides. A nested class lifts to a
-    // flat `Outer$Name`, which is what a subclass records as its supertype,
-    // while a parameter declared `Outer.Name` lowers its head to the bare
-    // `Name` — so a raw simple-name compare never matches the two, and every
-    // instance of a lifted nested type failed to prove its own supertype
-    // (`Modifier.Node` against a `SuspendingPointerInputModifierNodeImpl`).
+    // Compare source simple names: a nested class lifts to `Outer$Name` in a
+    // subclass's supertype list, while a param declared `Outer.Name` lowers to `Name`.
     const tn = classDisplayName(target);
     while (head < queue.items.len) : (head += 1) {
         const e = queue.items[head];
@@ -157,19 +143,8 @@ pub fn instanceSubtypeDistance(self: *VmHost, arg: *const Value, target: []const
     return null;
 }
 
-// -------------------------------------------------------------------------
-// Shared applicability engine — member / extension adapters.
-//
-// `pickMethodOverload` and `scoreExtCandidates` select through the shared
-// `applicable()` engine. These adapters project a runtime value into an
-// `ArgShape`, a `Func` into a `SigView`, and wrap the value-dependent
-// refinement / subtype / extension-ranking callbacks the engine invokes.
-// -------------------------------------------------------------------------
-
-/// `ArgShape` for one runtime value, in the MEMBER scorer's conventions:
-/// `lambda_arity` from an `IrClosure` only (never `Function`/`Class`), and
-/// `is_lambda` from `isCallable` (the trailing-lambda gate), not the broader
-/// `valueIsCallable`.
+/// `ArgShape` in the member scorer's conventions: `lambda_arity` from an
+/// `IrClosure` only, `is_lambda` from `isCallable`, not `valueIsCallable`.
 pub fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape {
     var arity_authoritative = false;
     const arity: ?u8 = switch (v.*) {
@@ -197,7 +172,6 @@ pub fn shapeOfValueMember(self: *VmHost, v: *const Value) applicability.ArgShape
     };
 }
 
-/// Per-candidate `SigView` for the shared scorer, read off the `Func`.
 pub fn sigViewOfMember(self: *VmHost, f: *const Func, is_ext: bool) applicability.SigView {
     const params = blk: {
         const mg = self.module.borrow();
@@ -216,15 +190,12 @@ pub fn sigViewOfMember(self: *VmHost, f: *const Func, is_ext: bool) applicabilit
     };
 }
 
-/// `ApplicabilityScope.refine`: wraps `refineByDeclaredArgs`.
 pub fn applicRefineCbM(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyopaque) ?i32 {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const v: *const Value = @ptrCast(@alignCast(value));
     return overload_match.refineByDeclaredArgs(self, param_ty, v);
 }
 
-/// `ApplicabilityScope.identity_conflict`: cross-package class-identity disproof
-/// for member overloads (same shared exact-name tier as the global scorer).
 pub fn applicIdentityConflictCbM(ctx: *anyopaque, param_ty: *const TypeRef, value: *const anyopaque) bool {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const v: *const Value = @ptrCast(@alignCast(value));
@@ -240,8 +211,6 @@ pub fn applicExactHeadCbM(ctx: *anyopaque, param_head: []const u8, arg_head: []c
     return std.mem.eql(u8, key, arg_head);
 }
 
-/// `ApplicabilityScope.subtype`: the member instance-subtype BFS
-/// (`instanceSubtypeDistance`, simple-name matched — unlike the global BFS).
 pub fn applicSubtypeCbM(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const arg: *const Value = @ptrCast(@alignCast(value));
@@ -261,26 +230,23 @@ pub fn applicSubtypeCbM(ctx: *anyopaque, value: *const anyopaque, target: []cons
     return @intCast(@min(dist, @as(usize, std.math.maxInt(i32))));
 }
 
-/// `ApplicabilityScope.func_type`: `isFunctionTypeRefResolved`.
 pub fn applicFuncTypeCbM(ctx: *anyopaque, ty: *const TypeRef) bool {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     return isFunctionTypeRefResolved(self, ty);
 }
 
-/// `ApplicabilityScope.ext_recv_match`: `extReceiverSpecificity`.
 pub fn applicExtRecvMatchCb(ctx: *anyopaque, value: *const anyopaque, ty_name: []const u8) i32 {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const v: *const Value = @ptrCast(@alignCast(value));
     return extReceiverSpecificity(self, v, ty_name);
 }
 
-/// `ApplicabilityScope.ext_is_subtype_name`: `isSubtypeName`.
 pub fn applicExtSubtypeNameCb(ctx: *anyopaque, a: []const u8, b: []const u8) bool {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     return isSubtypeName(self, self.allocator, a, b);
 }
 
-/// `ApplicabilityScope.ext_owner_rank`: member-extension enclosing-chain rank.
+/// Ranks a member extension by where its owner sits in the enclosing-`this` chain.
 pub fn applicExtOwnerRankCb(ctx: *anyopaque, fid: FuncId) i32 {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const owner: []const u8 = blk: {
@@ -304,11 +270,8 @@ pub fn applicExtOwnerRankCb(ctx: *anyopaque, fid: FuncId) i32 {
     return 0;
 }
 
-/// Whether the range's own `contains(element)` member takes this argument:
-/// the element kind of the range (Char for a Char range, an integral value
-/// otherwise). Any other argument (`10L in 1..10`, `"s" in 0..1`) resolves
-/// to an extension `contains`, which a user declaration may provide, so the
-/// host member yields to the extension tiers.
+/// Whether the range's own `contains(element)` member takes this argument: its
+/// element kind. Any other kind resolves to an extension `contains` instead.
 pub fn rangeContainsArgKindMatches(kind: runtime.RangeKind, arg: *const Value) bool {
     return switch (kind) {
         .Char => arg.* == .Char,
@@ -319,7 +282,6 @@ pub fn rangeContainsArgKindMatches(kind: runtime.RangeKind, arg: *const Value) b
     };
 }
 
-/// `ApplicabilityScope.ext_known_package`: `stdlib.isKnownPackage`.
 pub fn applicKnownPackageCb(pkg: []const u8) bool {
     return stdlib.isKnownPackage(pkg);
 }
@@ -347,8 +309,7 @@ pub fn runtimeMemberApplicability(
     arg_names: ?[]const ?[]const u8,
     named: bool,
 ) Allocator.Error!?applicability.Score {
-    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
-    // entry; >6 args fall to the heap branch below (rare).
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per entry.
     var shapes_buf: [6]applicability.ArgShape = undefined;
     const shapes = if (args.len <= shapes_buf.len)
         shapes_buf[0..args.len]
@@ -381,33 +342,15 @@ pub fn runtimeMemberApplicability(
     return applicability.applicable(&sig, shapes, scope);
 }
 
-/// Whether the parameter at lowered position `idx` (with the implicit
-/// `this` offset already folded in) is satisfiable by a defaulted slot.
 pub fn paramHasDefault(defaults: ?[]const ?FuncId, idx: usize) bool {
     const d = defaults orelse return false;
     if (idx >= d.len) return false;
     return d[idx] != null;
 }
 
-/// Conservative type-incompatibility check for a single instance arg
-/// against a user-class parameter. Returns `true` only when we can
-/// prove the argument's class is not the parameter type nor any of its
-/// supertypes; primitives, builtins, and generics are never adjudicated
-/// here (they are scored elsewhere). A function-typed parameter is
-/// definite against a plain data value: kotlinc drops such a candidate
-/// (String is no Function subtype), so a member `url(block: (T) -> Unit)`
-/// can't pre-empt the same-named `url(urlString: String)` extension.
-/// Whether an instance can stand in for a function-typed parameter:
-/// it carries a SAM-conversion target, or its supertype closure names a
-/// `Function*` type (kotlinc: assignability needs the type relation — a
-/// class merely declaring an `invoke` member is not a Function subtype).
-/// Whether the instance's class hierarchy names a function type as a
-/// supertype (an erased `FunctionN` / `SuspendFunctionN`), i.e. the class
-/// was declared `class A : (Int) -> Unit`. This is stricter than
-/// `instanceHasInvokeSurface`, which is true for any class merely
-/// declaring an `invoke` member (a compose `MovableContent`, a
-/// `ComposableLambdaImpl`); only a genuine function-type subtype should be
-/// invoked as a bare value in `CallValueOrMember`.
+/// Whether the instance's class hierarchy names an erased `FunctionN` /
+/// `SuspendFunctionN` supertype. Stricter than `instanceHasInvokeSurface`: only
+/// a genuine function-type subtype is invoked as a bare value.
 pub fn instanceExtendsFunctionType(self: *VmHost, v: *const Value) bool {
     if (v.* != .Instance) return false;
     const a = self.allocator;
@@ -447,22 +390,13 @@ pub fn instanceExtendsFunctionType(self: *VmHost, v: *const Value) bool {
 
 pub fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
     // A class declaring `operator fun invoke` is function-like whatever its
-    // nominal supertypes: a memo-wrapped ComposableLambdaImpl (22 invoke
-    // overloads, no Function* supertype in common code) satisfies a
-    // function-typed parameter exactly like a lambda. This runs under
-    // callers holding module borrows (some exclusive), so it may only read
-    // the instance's own class chain — ClassDef method tables. Pack-loaded
-    // classes keep their methods in the lowered registry and their
-    // ClassDef.methods EMPTY: an empty chain means the member surface is
-    // UNKNOWN here, and a disproof needs knowledge — report the invoke
-    // surface as possible so the candidate survives to real dispatch.
+    // supertypes. Callers hold module borrows, so only the instance's own ClassDef
+    // tables may be read; pack classes leave those empty, so empty means unknown.
     {
         const g = v.Instance.borrow();
         defer g.deinit();
-        // A pack-loaded ComposableLambdaImpl keeps its invoke overloads in
-        // the lowered module, which this fn must NOT borrow (callers hold
-        // exclusive module borrows — a consult deadlocks); the wrapper's
-        // class identity answers directly.
+        // A pack-loaded ComposableLambdaImpl keeps its invoke overloads in the
+        // module this must not borrow; its class identity answers directly.
         {
             const cg0 = g.get().class.borrow();
             defer cg0.deinit();
@@ -488,9 +422,8 @@ pub fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
         const g = v.Instance.borrow();
         defer g.deinit();
         if (g.get().get("__sam_target__") != null) return true;
-        // A `recv::method` / `::prop` callable reference is a synthetic
-        // instance carrying `__bound_name__`; it dispatches through the
-        // call_value path, so it satisfies a function-typed parameter.
+        // A `recv::method` / `::prop` reference is a synthetic instance carrying
+        // `__bound_name__`; it dispatches through call_value, so it is callable.
         if (g.get().get("__bound_name__") != null) return true;
     }
     var start: []const u8 = undefined;
@@ -524,12 +457,6 @@ pub fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
     return false;
 }
 
-/// Definite receiver disproof for the lenient extension pass: an
-/// instance whose known hierarchy excludes the declared receiver class
-/// (`argDefinitelyNotParamType`), or a class value against a concrete
-/// receiver class — a `KClass` is never an instance of `Pipeline`, so
-/// `Pipeline.execute` is not a candidate at that receiver (kotlinc drops
-/// it outright).
 /// The owner simple name of a companion-object type name (`kotlin.Char.Companion`
 /// → `Char`), or null when the name does not head a companion.
 pub fn companionOwnerName(name: []const u8) ?[]const u8 {
@@ -541,11 +468,8 @@ pub fn companionOwnerName(name: []const u8) ?[]const u8 {
 }
 
 /// A companion-object receiver type (`X.Companion`) is owner-specific: the
-/// runtime companion instance's class fqn names its own owner, so a candidate
-/// declared on a DIFFERENT owner's companion is inapplicable. Without this
-/// every `T.Companion.f()` extension in scope survives the lenient pass and the
-/// first-declared one wins (`String.serializer()` binding
-/// `Char.Companion.serializer`).
+/// runtime companion instance's class fqn names its owner, so a candidate
+/// declared on another owner's companion is inapplicable.
 pub fn companionOwnerMismatch(self: *VmHost, param_name: []const u8, receiver: *const Value) bool {
     const want = companionOwnerName(param_name) orelse return false;
     const g = receiver.Instance.borrow();
@@ -553,21 +477,18 @@ pub fn companionOwnerMismatch(self: *VmHost, param_name: []const u8, receiver: *
     const cg = g.get().class.borrow();
     defer cg.deinit();
     if (companionOwnerName(cg.get().fqn)) |got| return !std.mem.eql(u8, want, got);
-    // A NAMED companion (`companion object Named`) carries no `.Companion`
-    // fqn segment; the registry maps the owner to its companion class.
+    // A named companion carries no `.Companion` fqn segment; the registry maps
+    // the owner to its companion class.
     const mg = self.module.borrow();
     defer mg.deinit();
     if (mg.get().registry.companion_singletons.get(want)) |cn| {
         if (std.mem.eql(u8, cn, cg.get().name)) return false;
     }
-    // The receiver is not `want`'s companion under either naming, so a
-    // `want.Companion` receiver type cannot bind it.
     return true;
 }
 
-/// Whether the ClassDef `d` (or any supertype / resolved interface of it)
-/// is named `want`, walking the instance's REAL class rather than a
-/// name-keyed registry that collides across packs.
+/// Whether `d` or any of its supertypes and interfaces is named `want`, walked
+/// on the real ClassDef rather than a name registry that collides across packs.
 pub fn classDefIsA(d: *const ClassDef, want: []const u8) bool {
     return classDefIsAImpl(d, want, 0);
 }
@@ -589,22 +510,13 @@ pub fn classDefIsAImpl(d: *const ClassDef, want: []const u8, depth: u32) bool {
 
 pub fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, receiver: *const Value) bool {
     if (receiver.* == .Instance and companionOwnerMismatch(self, param_ty.name, receiver)) return true;
-    // `fun Unit.f()` applies to `Unit` alone. An interpreted instance is never
-    // `Unit`, so such an extension must not survive as a lenient candidate for
-    // it — `Unit.serializer()` otherwise answered `PlainObject.serializer()`.
+    // `fun Unit.f()` applies to `Unit` alone, which an interpreted instance never is.
     if (receiver.* == .Instance and !param_ty.nullable and
         std.mem.eql(u8, simpleName(param_ty.name), "Unit")) return true;
     if (argDefinitelyNotParamType(self, param_ty, receiver)) return true;
-    // A function value implements only the Function* surface (plus
-    // Any/type variables): a NOMINAL receiver type it does not satisfy
-    // is definite. Without this a sole lenient extension survivor like
-    // `Comparable<T>.compareTo` binds a lambda receiver, and its body's
-    // member re-dispatch loops back to the same pick forever (two
-    // lambdas compared through a pack's same-named member).
-    // A `receiver::method` reference is a function value too, even though it
-    // is carried as a synthetic Instance: `source::produce` satisfies
-    // `(() -> T).asFlow()` and nothing else, so `Iterable<T>.asFlow()` must
-    // not survive beside it.
+    // A function value implements only the Function* surface plus Any and type
+    // variables, so a nominal receiver type it does not satisfy is definite. A
+    // `receiver::method` reference is a function value carried as an Instance.
     const callable_like = switch (receiver.*) {
         .IrClosure, .BoundMethod => true,
         .Instance => isBoundReference(receiver),
@@ -616,20 +528,15 @@ pub fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, recei
             if (param_ty.nullable) return false;
             if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
             if (pn.len <= 2 and allUppercase(pn)) return false;
-            // Any function-shaped type name stays a candidate for a
-            // callable receiver: `Function*`, suspend forms, and the
-            // lowered `<function>` marker (`startCoroutineCancellable`
-            // on `(suspend () -> Unit)`).
+            // Any function-shaped type name stays a candidate for a callable
+            // receiver: `Function*`, suspend forms, the lowered `<function>` marker.
             if (std.mem.find(u8, pn, "Function") != null) return false;
             if (std.mem.find(u8, pn, "->") != null) return false;
             if (std.mem.startsWith(u8, pn, "suspend")) return false;
             if (std.mem.eql(u8, pn, "<function>")) return false;
             if (receiver.isRuntimeType(pn)) return false;
-            // A `fun interface` (SAM) receiver type: a lambda serves it
-            // (`emitAll` on a FlowCollector-shaped collector lambda), so
-            // it is never definite. A plain interface (`Comparable`) or
-            // class is: kotlinc converts lambdas only to fun interfaces.
-            // An UNKNOWN name (no registered ClassDef) stays a candidate.
+            // kotlinc converts a lambda only to a `fun interface`, so a plain
+            // interface or class is definite; an unregistered name is not.
             {
                 const cg = self.classes.borrow();
                 defer cg.deinit();
@@ -647,7 +554,6 @@ pub fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, recei
     if (receiver.* == .Class) {
         const pn = param_ty.name;
         if (param_ty.nullable) return false;
-        // A companion-owner mismatch is definite through the class value too:
         // `Foo.f()` may bind `fun Foo.Companion.f()`, never another owner's.
         if (companionOwnerName(pn)) |want| {
             const g = receiver.Class.borrow();
@@ -656,16 +562,12 @@ pub fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, recei
                 !std.mem.eql(u8, want, simpleName(g.get().fqn));
         }
         if (std.mem.eql(u8, pn, "Any")) return false;
-        // A class value is never `Unit`. Without this every `fun Unit.f()`
-        // extension in scope stays a lenient survivor for `X.f()`
-        // (`Unit.serializer()` answered `Foo.serializer()`).
+        // A class value is never `Unit`.
         if (std.mem.eql(u8, pn, "Unit")) return true;
         if (std.mem.startsWith(u8, pn, "Function")) return true;
         if (pn.len <= 2 and allUppercase(pn)) return false;
-        // A class value IS a `KClass` / `KClassifier`. The reflection heads it
-        // reports must not be disproven merely because the stdlib registers a
-        // ClassDef under that name — that dropped every `KClass<T>.f()`
-        // extension (`isInterface`, `serializerOrNull`) from the candidate set.
+        // A class value is a `KClass` / `KClassifier`: the reflection heads it
+        // reports stay candidates though the stdlib registers ClassDefs for them.
         if (receiver.isRuntimeType(simpleName(pn))) return false;
         const cg = self.classes.borrow();
         defer cg.deinit();
@@ -674,12 +576,8 @@ pub fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, recei
     return false;
 }
 
-/// Parameter-type names that can never bind a function-typed argument.
-/// Conservative: the builtin value types, `String`/`CharSequence`, and the
-/// concrete container types — none of which is ever a function type or a
-/// typealias to one. This lets a trailing-lambda call drop a same-named
-/// collection-typed member (`removeAll(elements: Collection)`) so the
-/// predicate extension (`removeAll(predicate: (T) -> Boolean)`) binds.
+/// Parameter-type names that can never bind a function-typed argument: builtin
+/// value types, `String`/`CharSequence`, and the concrete container types.
 pub fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     const names = [_][]const u8{
         "String",          "CharSequence", "Boolean",     "Char",       "Byte",              "Short",
@@ -694,9 +592,8 @@ pub fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     return false;
 }
 
-/// Nominal interfaces klio models a Kotlin array as satisfying (so the stdlib
-/// `Array<T>.first()` / iteration extensions bind). An array vs one of these is
-/// NOT a definite type mismatch, unlike an array vs an arbitrary user interface.
+/// Nominal interfaces a Kotlin array is modeled as satisfying, so the stdlib
+/// `Array<T>` extensions bind: an array against one of these is not definite.
 pub fn isArrayRelatedIface(pn: []const u8) bool {
     const set = [_][]const u8{
         "Iterable",  "MutableIterable", "Collection",   "MutableCollection",
@@ -709,9 +606,8 @@ pub fn isArrayRelatedIface(pn: []const u8) bool {
     return false;
 }
 
-/// The Kotlin type name of a scalar runtime value's kind, or null for
-/// non-scalars. Used to compare a scalar argument against a value class's
-/// underlying representation.
+/// The Kotlin type name of a scalar value's kind, or null for non-scalars. Used
+/// to compare a scalar argument against a value class's underlying representation.
 pub fn scalarKindName(arg: *const Value) ?[]const u8 {
     return switch (arg.*) {
         .Bool => "Boolean",
@@ -742,9 +638,8 @@ pub fn isScalarKindName(n: []const u8) bool {
     return false;
 }
 
-/// The source-level name behind a file-collision mangle (`X$f12` -> `X`).
-/// Nested-lift names (`Outer$Name`) keep their shape: the stripped suffix
-/// must be `$f` followed by digits only.
+/// The source name behind a file-collision mangle (`X$f12` -> `X`); the stripped
+/// suffix must be `$f` plus digits, so nested lifts (`Outer$Name`) keep their shape.
 pub fn stripFileMangle(n: []const u8) []const u8 {
     const i = std.mem.findScalarLast(u8, n, '$') orelse return n;
     if (i + 2 >= n.len or n[i + 1] != 'f') return n;
@@ -754,10 +649,8 @@ pub fn stripFileMangle(n: []const u8) []const u8 {
     return n[0..i];
 }
 
-/// Whether the class table registers any file-mangled variant of `name`
-/// (`name$f<digits>`). A private/internal classifier whose simple name
-/// collides across files registers ONLY under its mangled name, so a
-/// declared type spelled with the source name still names a known class.
+/// Whether the class table registers a file-mangled variant of `name`
+/// (`name$f<digits>`); a classifier colliding across files registers only so.
 pub fn anyFileMangledVariant(classes: *const ClassTable, name: []const u8) bool {
     var it = classes.keyIterator();
     while (it.next()) |k| {
@@ -768,11 +661,9 @@ pub fn anyFileMangledVariant(classes: *const ClassTable, name: []const u8) bool 
     return false;
 }
 
-/// Memo key for `argDefinitelyNotParamType`: the adjudication is a pure
-/// function of (param type, arg's runtime TYPE) for scalars, callables,
-/// Null, and Instances (whose arm reads only the class and its static
-/// hierarchy). Container/tuple/range args adjudicate their CONTENTS, so
-/// they stay unmemoized (null key).
+/// Memo key for `argDefinitelyNotParamType`: the verdict is a pure function of
+/// (param type, arg's runtime type) for scalars, callables, Null and Instances.
+/// Container, tuple and range args adjudicate contents, so they go unmemoized.
 pub fn admArgKey(arg: *const Value) ?usize {
     return switch (arg.*) {
         .Instance => |i| @intFromPtr(i.asPtrConst().class.asPtrConst()),
@@ -784,11 +675,8 @@ pub fn admArgKey(arg: *const Value) ?usize {
 pub const TlAdmEntry = struct { ty: usize = 0, akey: usize = 0, gen: u32 = 0, verdict: u8 = 0 };
 pub threadlocal var tl_adm_cache: [4096]TlAdmEntry = @splat(.{});
 
-/// Per-call front for the type-disproof adjudicator: overload resolution
-/// consults it per (candidate param, arg) on every dispatch that walks
-/// candidates, and the uncached ladder pays alias/class-registry string
-/// probes plus a heap-allocating supertype BFS each time — measured as the
-/// dominant string-eql source on recompose-heavy workloads.
+/// Memoized front for the type-disproof adjudicator: entries are keyed on the
+/// param-type pointer and `admArgKey`, stamped with the dispatch cache generation.
 pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     const akey = admArgKey(arg) orelse return argDefinitelyNotParamTypeUncached(self, param_ty, arg);
     const ty = @intFromPtr(param_ty);
@@ -803,48 +691,31 @@ pub fn argDefinitelyNotParamType(self: *VmHost, param_ty: *const TypeRef, arg: *
 
 pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef, arg: *const Value) bool {
     var pn = param_ty.name;
-    // A QUALIFIED function-type head (`kotlin.Function1`) must reach the
-    // Function arm below, not the qualified-name early-out: the callable
-    // disproof is head-shaped and package-independent.
+    // A qualified function-type head (`kotlin.Function1`) must reach the Function
+    // arm below, not the qualified-name early-out: that disproof is head-shaped.
     if (std.mem.findScalar(u8, pn, '.') != null and
         std.mem.startsWith(u8, simpleName(pn), "Function"))
     {
         pn = simpleName(pn);
     }
-    // A qualified reference (`Owner.Pocket`) names a lifted nested/inner
-    // class whose registered name the supertype walk cannot relate;
-    // decline to adjudicate.
+    // A qualified reference (`Owner.Pocket`) names a lifted nested class whose
+    // registered name the supertype walk cannot relate; decline to adjudicate.
     if (std.mem.findScalar(u8, pn, '.') != null) return false;
-    // A typealiased param type also adjudicates under its expansion. But the
-    // alias table is keyed by SIMPLE NAME globally, so a file-private
-    // `typealias` in one module shadows an unrelated real class of the same
-    // name in another (compose foundation's `internal typealias NodeList =
-    // MutableIntList` vs kotlinx.coroutines' real `class NodeList`). Adjudicate
-    // the arg against BOTH the original name and the expansion — a match on
-    // either is not a definite mismatch, so an ambiguous name never refutes a
-    // value that satisfies one of its readings.
+    // The alias table is keyed by simple name globally, so a file-private alias
+    // can shadow an unrelated real class: adjudicate against both the original
+    // name and the expansion, since a match on either is not definite.
     const orig = pn;
     pn = resolveAliasName(self, pn);
     if (std.mem.findScalar(u8, pn, '.') != null) return false;
 
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
-    // A nullable parameter (`TypeInfo?`) accepts `null` — that is never a
-    // definite mismatch — but a non-null argument must still match the
-    // underlying type, so a `User` does not satisfy `typeInfo: TypeInfo?`
-    // (which would otherwise let the engine's `respond(message, typeInfo)`
-    // shadow the reified `respond(status, message)` for `respond(Created,
-    // user)`). Adjudicate the non-null case against the underlying type below.
+    // A nullable parameter accepts `null`, never a definite mismatch; a non-null
+    // argument still adjudicates against the underlying type below.
     if (param_ty.nullable and arg.* == .Null) return false;
     if (pn.len <= 2 and allUppercase(pn)) return false;
-    // A callable argument definitely does not satisfy a primitive/String
-    // parameter: `logger.trace { … }` must drop the member `trace(String)`
-    // so the inline `Logger.trace(message: () -> String)` extension binds
-    // (kotlinc resolves the extension; the member is inapplicable). The same
-    // holds for any REGISTERED class that is not a `fun interface`: no SAM
-    // conversion exists, so a lambda never satisfies `FlowCollector` — the
-    // member `collect(FlowCollector)` stands aside for the extension
-    // `collect(action)` exactly as kotlinc binds it. A head naming no
-    // registered class (a typealias of a function type) stays non-definite.
+    // A callable argument satisfies no primitive/String parameter, and no
+    // registered class that is not a `fun interface`, since kotlinc offers SAM
+    // conversion only to fun interfaces. An unregistered head is not definite.
     if (isCallable(arg)) {
         if (runtime.envOnce("KLIO_ADM_TRACE") != null) {
             const cg2 = self.classes.borrow();
@@ -865,16 +736,9 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
         }
     }
     if (std.mem.startsWith(u8, pn, "Function")) {
-        // Callables and Null stay non-definite; a value kind that PLAINLY
-        // carries no invoke surface is definite — a `List` is not a
-        // predicate, so `removeAll(listOf(2, 4))` must fall past a
-        // subclass's lone `removeAll(predicate)` to the inherited
-        // `removeAll(Collection)` (SmallPersistentVector under
-        // SnapshotStateList was the live case). Kinds that CAN be invoked
-        // without being tagged callable — a `Class` constructor reference
-        // fed to a factory param, a bound member — stay non-definite
-        // (`FixupList.createAndInsertNode`'s factory broke on the broad
-        // form of this arm).
+        // Callables and Null stay non-definite; a value kind that plainly carries
+        // no invoke surface is definite. Kinds invocable without being tagged
+        // callable, a `Class` constructor reference or a bound member, are not.
         return switch (arg.*) {
             .String, .Bool, .Char, .Byte, .Short, .Int, .Long, .Float, .Double, .UByte, .UShort, .UInt, .ULong => true,
             .List, .Map, .Set, .Array, .Range, .Sequence, .Pair, .Triple, .MapEntry => true,
@@ -882,11 +746,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
             else => false,
         };
     }
-    // A Pair/Triple argument adjudicates its components against the declared
-    // generic arguments: `appendAll(vararg values: Pair<String, String>)`
-    // must decline a `Pair<String, List<String>>` so the sibling
-    // `Pair<String, Iterable<String>>` overload binds, exactly as kotlinc
-    // picks.
+    // A Pair/Triple adjudicates its components against the declared generic args.
     if (arg.* == .Pair and std.mem.eql(u8, pn, "Pair") and param_ty.args.len == 2) {
         if (argDefinitelyNotParamType(self, &param_ty.args[0], arg.Pair.first.asPtr())) return true;
         if (argDefinitelyNotParamType(self, &param_ty.args[1], arg.Pair.second.asPtr())) return true;
@@ -898,12 +758,8 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
         if (argDefinitelyNotParamType(self, &param_ty.args[2], arg.Triple.third.asPtr())) return true;
         return false;
     }
-    // A List argument adjudicates its RANGE content against a concrete
-    // declared element range type: Kotlin generics are invariant, so a
-    // List of LongRanges never binds `List<IntRange>` — RangesTest's
-    // private `assertEquals(List<IntRange>, List<LongRange>)` delegates
-    // to kotlin.test's on its mapped args instead of recursing into
-    // itself. Progressions and non-range elements stay non-definite.
+    // Kotlin generics are invariant, so a List of LongRanges never binds
+    // `List<IntRange>`. Progressions and non-range elements stay non-definite.
     if (arg.* == .List and param_ty.args.len == 1 and
         (std.mem.eql(u8, pn, "List") or std.mem.eql(u8, pn, "MutableList") or
             std.mem.eql(u8, pn, "Collection") or std.mem.eql(u8, pn, "Iterable")))
@@ -925,61 +781,36 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
             }
         }
     }
-    // A container/tuple value never satisfies a scalar or String parameter
-    // head (an `Array` head stays out: vararg packing hands pre-packed
-    // arrays through here).
+    // A container/tuple never satisfies a scalar or String head. `Array` heads
+    // stay out: vararg packing hands pre-packed arrays through here.
     if (overload_match.builtinParamKind(pn)) |pk| {
         if (pk != .array) switch (arg.*) {
             .List, .Map, .Set, .Sequence, .Pair, .Triple, .MapEntry => return true,
             else => {},
         };
     }
-    // Builtin value-kind disproof: a String argument can never bind an
-    // Int parameter (kotlinc does not consider the candidate at all, so
-    // the receiver walk must fall through to an outer receiver instead
-    // of executing it). Same-kind pairs stay non-definite — a lowered
-    // literal may carry a narrower tag than the declared type (`f(5)`
-    // binding `f(n: Long)`).
+    // A String never binds an Int parameter. Same-kind pairs stay non-definite:
+    // a lowered literal may carry a narrower tag than the declared type.
     if (builtinKindMismatch(pn, arg)) return true;
-    // A range/progression argument (`0..3`) is definitely not a scalar or array
-    // builtin parameter (Int/Long/String/Array/…). Without this, a class that
-    // overrides one overload — `get(Int, Int)` — of a method whose other
-    // overloads are inherited interface defaults — `get(IntRange, IntRange)` —
-    // captures a range-indexed call: the lone own candidate matches on arity, so
-    // the hierarchy walk never reaches the inherited range overload. Refuting the
-    // scalar param lets the walk fall through to it.
+    // A range argument is never a scalar or array builtin parameter; refuting it
+    // lets the hierarchy walk reach an inherited range overload of the method.
     if (arg.* == .Range and overload_match.builtinParamKind(pn) != null) return true;
-    // Builtin container/range-family parameter heads: a scalar/String/
-    // Bool/Char argument definitely does not satisfy them (a String is
-    // never a `List<IntRange>`), and a container argument whose element
-    // knowledge provably contradicts the declared generic arguments is
-    // definite too (`List<LongRange>` offered to `List<IntRange>`). A
-    // packed `Array` stays non-definite through `valueDefinitelyNot`
-    // (pre-packed varargs), as does a wrong-kind range (already decided
-    // above for scalar heads, and by the element walk here).
+    // Builtin container/range-family heads: a scalar never satisfies them, and a
+    // container whose elements contradict the declared generic args is definite.
     const container_or_range_head = overload_match.isContainerOrRangeHead(pn);
     if (container_or_range_head) {
         switch (arg.*) {
             .String, .Bool, .Char, .Byte, .Short, .Int, .Long, .Float, .Double, .UByte, .UShort, .UInt, .ULong => return true,
             .List, .Set, .Map, .Range => return overload_match.valueDefinitelyNot(self, param_ty, arg),
-            // An Array satisfies no non-array container head (an
-            // `Array<Pair>` is never a `Map`, so `putAll(pairs)` inside the
-            // stdlib `plusAssign` drops the builder's member `putAll(Map)`
-            // and the `Array<out Pair>` extension binds). The array-modeled
-            // interfaces (`Iterable`/`Collection`/...) and array-named
-            // params stay non-definite, same as the nominal arm below.
+            // An Array satisfies no non-array container head; the array-modeled
+            // interfaces and array-named params stay non-definite.
             .Array => return std.mem.find(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
-            // An Instance falls through to the hierarchy walk below: a
-            // user class that never reaches the container head in its
-            // supertype closure is definite (a `RangesSpecifier` is not a
-            // `List<IntRange>`), while an implementing class stays a
-            // candidate.
+            // An Instance falls to the hierarchy walk below: a class that never
+            // reaches the container head in its supertype closure is definite.
             .Instance => {},
             else => return false,
         }
     }
-    // Only adjudicate when the parameter names a known user class, or a
-    // builtin container/range head an Instance was offered to (above).
     if (!container_or_range_head) {
         const cg = self.classes.borrow();
         defer cg.deinit();
@@ -988,28 +819,15 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
     }
     const inst = switch (arg.*) {
         .Instance => |i| i,
-        // A Kotlin array satisfies no NOMINAL user/pack interface, so an
-        // `Array`/`XxxArray` argument offered such a parameter is a definite
-        // mismatch — decline the lone member `Buffer.readTo(RawSink, Long)` so
-        // the extension `Source.readTo(ByteArray, startIndex, endIndex)` binds.
-        // EXCEPT the collection interfaces klio DOES model arrays against
-        // (`Iterable`/`Collection`/`Sequence`, which back `Array.first()` and
-        // friends) and any array-named param — those stay non-definite.
+        // A Kotlin array satisfies no nominal user or pack interface, except the
+        // collection interfaces arrays are modeled against and array-named params.
         .Array => return std.mem.find(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
-        // A SCALAR against a known user class: definite — except a VALUE
-        // class whose underlying representation has the SAME kind, since
-        // value-class instances circulate unboxed (a Long could be an `Sz`
-        // over Long, but an Int could not). Without the definite arm, a
-        // private `Sz.compareTo` member-extension shadows the Int
-        // intrinsic inside its OWN body and the dispatch loops.
+        // A scalar against a known user class is definite, except a value class
+        // whose underlying kind matches: value-class instances circulate unboxed.
         .Bool, .Char, .Byte, .Short, .Int, .Long, .Float, .Double, .UByte, .UShort, .UInt, .ULong, .String => {
-            // The scalar may satisfy the param NOMINALLY (a String is a
-            // CharSequence/Comparable, an Int is a Number): non-definite.
             if (arg.isRuntimeType(pn)) return false;
-            // A param naming a DIFFERENT scalar kind stays non-definite
-            // too: kotlinc widens integer literals at the call site
-            // (`fromEpochMilliseconds(0)` binds the Long param), which
-            // the runtime tag cannot see.
+            // A param naming a different scalar kind stays non-definite:
+            // kotlinc widens integer literals at the call site.
             if (isScalarKindName(pn)) return false;
             const cg = self.classes.borrow();
             defer cg.deinit();
@@ -1019,9 +837,8 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
                 dg.deinit();
                 return true;
             }
-            // Chase the value class's underlying declared type (through
-            // nested value classes) to a scalar kind name; an unknown or
-            // generic underlying stays a candidate.
+            // Chase the underlying declared type through nested value classes;
+            // an unknown or generic underlying stays a candidate.
             var hops: u8 = 0;
             while (hops < 4) : (hops += 1) {
                 const params = dg.get().primary_params;
@@ -1057,8 +874,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
         const cg = g.get().class.borrow();
         start = cg.get().name;
         start_fqn = cg.get().fqn;
-        // The arg's own class must be known so its supertype closure is
-        // complete; otherwise we cannot be definite.
+        // Definiteness needs the arg's class known, so its closure is complete.
         const known = blk: {
             const ccg = self.classes.borrow();
             defer ccg.deinit();
@@ -1068,11 +884,8 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
         g.deinit();
         if (!known) return false;
     }
-    // Positive proof from the instance's OWN ClassDef, which carries the
-    // real supertype names and resolved interface handles. This is immune
-    // to the simple-name registry collision that defeats the name-keyed
-    // `class_super_names` lookup below (a receiver kotlinx.io.Buffer vs an
-    // unrelated okio Buffer both key "Buffer"): a Buffer really IS a Sink.
+    // Positive proof from the instance's own ClassDef: immune to the simple-name
+    // collision that defeats the name-keyed `class_super_names` lookup below.
     {
         const g = inst.borrow();
         const cd = g.get().class.clone();
@@ -1083,17 +896,13 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
         dg.deinit();
         if (isa) return false;
     }
-    // The lowering-recorded transitive chain includes interface links the
-    // runtime classes map never registers (interfaces are not instantiated),
-    // so it decides cases the BFS below would silently truncate: a companion
-    // implementing Plugin through the BaseApplicationPlugin interface IS-A
-    // Plugin.
+    // The lowering-recorded chain includes interface links the runtime classes
+    // map never registers, so it decides cases the BFS below would truncate.
     {
         const mg = self.module.borrow();
         defer mg.deinit();
-        // Prefer the fqn-keyed chain: a simple name that collides across
-        // packs (a receiver kotlinx.io.Buffer vs an unrelated okio Buffer)
-        // would otherwise read the wrong class's supers and miss Sink.
+        // Prefer the fqn-keyed chain: a simple name that collides across packs
+        // would otherwise read the wrong class's supertypes.
         const chain_by_fqn = if (start_fqn.len != 0) mg.get().registry.class_super_names.get(start_fqn) else null;
         if (chain_by_fqn orelse mg.get().registry.class_super_names.get(start)) |chain|
         {
@@ -1122,17 +931,14 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const cur = queue.items[head];
-        // arg IS-A param type (under either reading of an aliased name). A
-        // chain entry may carry a file-collision mangle (`X$f12`) the
-        // declared type's source spelling does not — compare its source
-        // name too.
+        // The arg satisfies the param type under either reading of an aliased
+        // name; a chain entry may carry a mangle the source spelling does not.
         if (std.mem.eql(u8, cur, pn) or std.mem.eql(u8, cur, orig)) return false;
         const cur_src = stripFileMangle(cur);
         if (cur_src.ptr != cur.ptr and
             (std.mem.eql(u8, cur_src, pn) or std.mem.eql(u8, cur_src, orig))) return false;
-        // A lifted nested/inner class is registered under `Outer$Name`;
-        // a type reference written `Outer.Name` collapses to `Name`, so
-        // match the mangled tail too.
+        // A lifted nested class registers as `Outer$Name` while a reference
+        // written `Outer.Name` collapses to `Name`, so match the mangled tail.
         if ((cur.len > pn.len and cur[cur.len - pn.len - 1] == '$' and
             std.mem.endsWith(u8, cur, pn)) or
             (cur.len > orig.len and cur[cur.len - orig.len - 1] == '$' and
@@ -1153,14 +959,8 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
     return true;
 }
 
-/// Pick the best-scoring method overload from `candidates` for `args`.
-/// Each candidate's slot 0 is the implicit `this` receiver, so value
-/// arguments score against params 1..n.
-/// Whether the runtime class chain of an Instance value declares an
-/// `invoke` member, answered from an ALREADY-BORROWED module's registry
-/// (pack classes keep their methods there; their ClassDef tables stay
-/// empty). Callers without a live borrow pass null and keep the
-/// conservative disproof.
+/// Whether the class chain of an Instance declares an `invoke` member, read from
+/// an already-borrowed module registry where pack classes keep their methods.
 pub fn classChainHasInvokeIn(mod: *const Module, v: *const Value) bool {
     if (v.* != .Instance) return false;
     const cls_name: []const u8 = blk: {
@@ -1187,17 +987,11 @@ pub fn classChainHasInvokeIn(mod: *const Module, v: *const Value) bool {
     return false;
 }
 
-/// Whether the call's ARG COUNT leaves exactly one of the collected
-/// same-name candidates able to bind: every other candidate has a plain
-/// (no-vararg) parameter list whose arity can never accept `n_args`. The
-/// arg count is folded into every method-cache key, so a pick forced this
-/// way is a pure function of the RELAXED key too — the single-candidate
-/// cacheability gate widens to it (`addAll(Collection)` beside
-/// `addAll(index, Collection)` re-walked on every call because the
-/// name-level candidate count read as ambiguous). A candidate with
-/// defaults or a vararg counts as viable at any arity (conservative), and
-/// a pass-threaded composable pair bails outright — its effective arity
-/// consults the ambient composer, which no key folds.
+/// Whether the call's arg count leaves exactly one same-name candidate able to
+/// bind. Arg count is folded into every method-cache key, so a pick forced this
+/// way stays cacheable under the relaxed key. A candidate with defaults or a
+/// vararg is viable at any arity; a pass-threaded composable pair bails, its
+/// effective arity being read from the ambient composer, which no key folds.
 pub fn pickArityForced(self: *VmHost, candidates: []const Func, n_args: usize) bool {
     var viable: usize = 0;
     for (candidates) |*f| {
@@ -1220,12 +1014,9 @@ pub fn pickArityForced(self: *VmHost, candidates: []const Func, n_args: usize) b
     return viable == 1;
 }
 
-/// Whether every argument's shape is fully discriminated by the RELAXED
-/// signature fold at the level the applicability tests consult: value
-/// tags, Instance class identities, closure bodies, primitive array
-/// kinds, and container KINDS (the tests are nominal/kind-level — they
-/// never inspect elements). Object arrays and every other value shape
-/// stay out: the fold cannot tell them apart as finely as a test might.
+/// Whether the relaxed signature fold discriminates every argument as finely as
+/// the applicability tests consult: value tags, Instance class identities,
+/// closure bodies, primitive array kinds and container kinds. Others stay out.
 pub fn argsRelaxedAdjudicable(args: []const Value) bool {
     for (args) |*a| {
         switch (a.*) {
@@ -1243,25 +1034,16 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
     if (candidates.len == 0) return null;
     const args = args_in;
     if (candidates.len == 1) {
-        // Even a lone same-named member must be *applicable*. By arity:
-        // when fewer args are supplied than it declares and an unsupplied
-        // parameter is neither defaulted nor a vararg, it can't bind
-        // (dispatch would pad the slot with Unit). Decline so an
-        // applicable extension overload wins — e.g. `buffer.readTo(bytes)`
-        // falls through the member `Buffer.readTo(RawSink, byteCount: Long)`
-        // to the extension `Source.readTo(ByteArray, startIndex = 0,
-        // endIndex = size)`.
+        // Even a lone same-named member must be applicable: an unsupplied param
+        // neither defaulted nor a vararg cannot bind, so decline and let an
+        // extension win.
         const f = candidates[0];
         const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         var effective = f.params[skip..];
         var eff_args = args_in;
-        // A pass-threaded composable MEMBER carries a trailing ($composer,
-        // $changed) pair the call site appended positionally
-        // (`consumer.Varargs(0, 1, 2, 3, $composer, $changed)` with
-        // `Varargs(vararg ints, $composer, $changed)`): judge the USER shape
-        // pair-trimmed — the mid-vararg check otherwise refuses on the
-        // undefaulted pair params. Only when the tail VALUES look like the
-        // pair (a Composer instance + the changed Int).
+        // A pass-threaded composable member carries a trailing ($composer,
+        // $changed) pair the call site appended positionally: judge the user shape
+        // pair-trimmed, or the mid-vararg check refuses on those undefaulted params.
         if (effective.len >= 2 and
             std.mem.eql(u8, effective[effective.len - 1].name, "$changed") and
             std.mem.eql(u8, effective[effective.len - 2].name, "$composer"))
@@ -1272,17 +1054,14 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
                 effective = effective[0 .. effective.len - 2];
                 eff_args = eff_args[0 .. eff_args.len - 2];
             } else if (compose.currentComposer() != null) {
-                // Pairless call in composition: the dispatch completes the
-                // pair from the ambient composer; judge the user shape.
+                // Pairless in composition: dispatch completes the pair from
+                // the ambient composer, so judge the user shape.
                 effective = effective[0 .. effective.len - 2];
             }
         }
-        // Non-final vararg (a vararg before trailing defaulted / named-only
-        // params): the prefix binds positionally, the vararg consumes the
-        // remaining positional eff_args, and the post-vararg params take their
-        // defaults. The naive eff_args[i]-vs-effective[i] pairing below would
-        // wrongly type-check a vararg-bound arg against a post-vararg param
-        // (e.g. `report("A", 1, 2)` checking `2` against `footer: String`).
+        // Non-final vararg: the prefix binds positionally, the vararg takes the
+        // remaining positional args, and post-vararg params take defaults. A naive
+        // args[i]-vs-params[i] pairing would check a vararg arg against a later param.
         var nf_vararg: ?usize = null;
         for (effective, 0..) |*p, k| {
             if (p.is_vararg) {
@@ -1292,21 +1071,18 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
         }
         if (nf_vararg) |vp| {
             const defaults = funcDefaults(self, &f);
-            // Prefix params not supplied positionally must be defaulted.
             if (eff_args.len < vp) {
                 var k: usize = eff_args.len;
                 while (k < vp) : (k += 1) {
                     if (!paramHasDefault(defaults, skip + k)) return null;
                 }
             }
-            // Post-vararg params can't be reached positionally → must default.
             var k: usize = vp + 1;
             while (k < effective.len) : (k += 1) {
                 if (!paramHasDefault(defaults, skip + k)) return null;
             }
-            // Prefix eff_args against prefix params; the rest against the vararg
-            // element type. A param typed as an in-scope type variable is
-            // never adjudicated nominally.
+            // Prefix args against prefix params, the rest against the vararg
+            // element type; a type-variable param is never adjudicated nominally.
             var i: usize = 0;
             while (i < eff_args.len and i < vp) : (i += 1) {
                 if (argDefinitelyNotParamType(self, &effective[i].ty, &eff_args[i]) and
@@ -1319,10 +1095,8 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
             }
             return f;
         }
-        // Over-supply with no vararg tail can't bind: decline so an
-        // applicable top-level/extension overload wins — e.g. the stdlib
-        // `buildString { … }` inside an extension on a class that declares
-        // its own zero-arg `buildString()` member (`URLBuilder.authority`).
+        // Over-supply with no vararg tail cannot bind: decline so an applicable
+        // top-level or extension overload wins.
         if (eff_args.len > effective.len and
             (effective.len == 0 or !effective[effective.len - 1].is_vararg))
         {
@@ -1331,13 +1105,8 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
         }
         if (eff_args.len < effective.len) {
             const defaults = funcDefaults(self, &f);
-            // Trailing-lambda rule: a final callable arg binds the LAST
-            // parameter when that parameter is function-typed; only the GAP
-            // parameters between it and the lead positional eff_args need
-            // defaults. `observe(readObserver) { block }` on
-            // `(readObserver = null, writeObserver = null, block)` is
-            // applicable -- block is filled by the lambda, writeObserver by
-            // its default.
+            // Trailing-lambda rule: a final callable arg binds the last param when
+            // that param is function-typed, so only the gap params need defaults.
             const trailing_bind = eff_args.len > 0 and
                 isFunctionTypeRef(&effective[effective.len - 1].ty) and
                 isCallable(&eff_args[eff_args.len - 1]);
@@ -1351,29 +1120,17 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
                 }
             }
         }
-        // By type: a definite argument-type mismatch must fall through so
-        // the hierarchy walk continues to the real target. A param typed as
-        // an in-scope type variable (the function's own, or the owning
-        // class's) is never adjudicated nominally. Under the trailing-lambda
-        // rule (undersupplied call whose final callable arg binds the LAST
-        // function-typed param), the final arg adjudicates against that last
-        // param, not the positional slot the defaulted gap left behind —
-        // `build { … }` on `build(flag: Boolean = false, builder: () -> T)`
-        // must judge the lambda against `builder`, not `flag`.
+        // A definite argument-type mismatch falls through so the hierarchy walk
+        // continues to the real target; a type-variable param is never adjudicated
+        // nominally. Under the trailing-lambda rule the final arg judges the last param.
         const tail_lambda_bind = eff_args.len > 0 and eff_args.len < effective.len and
             isFunctionTypeRef(&effective[effective.len - 1].ty) and
             isCallable(&eff_args[eff_args.len - 1]);
         var i: usize = 0;
         while (i < eff_args.len and i < effective.len) : (i += 1) {
             const pi = if (tail_lambda_bind and i == eff_args.len - 1) effective.len - 1 else i;
-            // A LONE member whose function-typed parameter meets an Instance
-            // argument whose class chain declares `invoke` stays applicable:
-            // a memo-wrapped ComposableLambdaImpl keeps its invoke overloads
-            // in the pack registry, which the borrow-free disproof cannot
-            // see, so `setContent(content)` was dropped on its only
-            // candidate. Answered from the caller's live module borrow; an
-            // invoke-less instance (a JobNode against a CompletionHandler
-            // parameter) still declines so the extension wins.
+            // A function-typed param meeting an Instance whose class chain declares
+            // `invoke` stays applicable, read from the caller's live module borrow.
             if (eff_args[i] == .Instance and std.mem.startsWith(u8, effective[pi].ty.name, "Function")) {
                 if (mod_opt) |m| {
                     if (classChainHasInvokeIn(m, &eff_args[i])) continue;
@@ -1388,8 +1145,7 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
         }
         return f;
     }
-    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
-    // entry; >6 args fall to the heap branch below (rare).
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array per entry.
     var shapes_buf: [6]applicability.ArgShape = undefined;
     var shapes_heap: ?[]applicability.ArgShape = null;
     defer if (shapes_heap) |h| self.allocator.free(h);
@@ -1426,9 +1182,8 @@ pub fn pickMethodOverload(self: *VmHost, mod_opt: ?*const Module, candidates: []
 
     var best: ?Func = null;
     var best_score: i32 = std.math.minInt(i32);
-    // Track candidates that scored equal to the current best, for the
-    // overload-uniqueness invariant (KLIO_TRACE_INVARIANTS). Only populated
-    // when the gate is on; otherwise stays empty and costs nothing.
+    // Candidates tied with the current best, for the overload-uniqueness
+    // invariant; populated only when KLIO_TRACE_INVARIANTS is on.
     const check_inv = trace.invariantsEnabled();
     var tied: std.ArrayList(Func) = .empty;
     defer tied.deinit(self.allocator);

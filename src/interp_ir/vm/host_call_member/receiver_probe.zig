@@ -1,6 +1,5 @@
 //! Receiver-shape probes: the pure `Value`/`Module` helpers, the declared-receiver
-//! specificity rules, and the class-head applicability checks the dispatch ladder
-//! consults before it commits to a candidate.
+//! specificity rules, and the class-head applicability checks dispatch consults.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -46,11 +45,6 @@ const missTraceWant = static_tail.missTraceWant;
 const virtual_tail = @import("virtual_tail.zig");
 const invokeMethodFuncId = virtual_tail.invokeMethodFuncId;
 
-// -------------------------------------------------------------------------
-// Pure helpers: pure functions over `Value` / `Module` that live here so
-// the member-dispatch file is self-contained.
-// -------------------------------------------------------------------------
-
 pub fn isCallable(v: *const Value) bool {
     return switch (v.*) {
         .IrClosure, .Intrinsic, .BoundMethod => true,
@@ -58,15 +52,12 @@ pub fn isCallable(v: *const Value) bool {
     };
 }
 
-/// A `TypeRef` denoting a Kotlin function type (`FunctionN` or `... -> ...`).
 pub fn isFunctionTypeRef(ty: *const TypeRef) bool {
     return std.mem.startsWith(u8, simpleName(ty.name), "Function") or
         std.mem.find(u8, ty.name, "->") != null;
 }
 
-/// `ty`'s name with `typealias` indirection resolved (bounded hops), so a
-/// param declared as `handler: CompletionHandler` (an alias for a function
-/// type) is recognised as function-typed by applicability checks.
+/// `ty`'s name with `typealias` indirection resolved, bounded to a few hops.
 pub fn resolveAliasName(self: *VmHost, name: []const u8) []const u8 {
     var cur = name;
     var hops: usize = 0;
@@ -82,7 +73,6 @@ pub fn resolveAliasName(self: *VmHost, name: []const u8) []const u8 {
     return cur;
 }
 
-/// `isFunctionTypeRef` with typealias indirection resolved.
 pub fn isFunctionTypeRefResolved(self: *VmHost, ty: *const TypeRef) bool {
     if (isFunctionTypeRef(ty)) return true;
     const resolved = resolveAliasName(self, ty.name);
@@ -114,8 +104,6 @@ pub fn packVarargArgs(self: *VmHost, allocator: Allocator, func: *const Func, ar
     return out[0 .. fixed + 1];
 }
 
-/// Whether `name` is a property (not a method) reachable from the
-/// receiver's class chain. Used by bound property-ref invocation.
 pub fn memberIsProperty(self: *VmHost, receiver: *const Value, name: []const u8) bool {
     var start: ObjRef(ClassDef) = undefined;
     switch (receiver.*) {
@@ -174,8 +162,7 @@ pub fn memberIsProperty(self: *VmHost, receiver: *const Value, name: []const u8)
     return false;
 }
 
-/// Permissive receiver/param-type compatibility used by extension
-/// overload pickers.
+/// Permissive receiver/param-type compatibility for extension overload pickers.
 pub fn receiverCompatibleWithParam(receiver: *const Value, param_ty: *const TypeRef) bool {
     if (receiver.* == .Instance) return true;
     const pn = simpleName(param_ty.name);
@@ -192,16 +179,9 @@ pub fn allUppercase(s: []const u8) bool {
     return true;
 }
 
-// Coarse builtin value kinds for definite argument-type disproof live in
-// overload_match.zig, shared with the declared-type scorer refinement.
 pub const builtinKindMismatch = overload_match.builtinKindMismatch;
 
-// -------------------------------------------------------------------------
-// Self-contained `VmHost` helpers.
-// -------------------------------------------------------------------------
-
-/// Default-arg thunk slots for `method` as declared on a supertype of the
-/// receiver, walking the supertype chain via the runtime class table.
+/// Default-arg thunk slots for `method` declared on a supertype of the receiver.
 pub fn inheritedMemberDefaults(self: *VmHost, allocator: Allocator, supertypes: []const []const u8, method: []const u8) Allocator.Error!?[]const ?FuncId {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -234,13 +214,8 @@ pub fn inheritedMemberDefaults(self: *VmHost, allocator: Allocator, supertypes: 
     return null;
 }
 
-/// Find a function-typed property `name` reachable from the enclosing-this
-/// chain or any of those instances' `outer` links.
-/// A fake override inheriting a default: the receiver's class inherits `name`'s
-/// BODY from a superclass (whose own parameters carry no default) and the
-/// DEFAULT from an interface (a bodyless declaration). An undersupplied call
-/// declines the superclass body, so fill the omitted parameters from the
-/// interface's default thunk and dispatch the inherited body.
+/// Fake override inheriting a default: the body comes from a superclass and the
+/// default from an interface, so an undersupplied call fills from that thunk.
 pub fn fakeOverrideInheritedDefault(
     self: *VmHost,
     allocator: Allocator,
@@ -267,11 +242,8 @@ pub fn fakeOverrideInheritedDefault(
     defer if (mg_open) mg.deinit();
     const mod = mg.get();
 
-    // Direct supertypes only: the fake-override shape declares the body
-    // superclass and the default interface side by side (`B : A(), I`),
-    // both direct parents. A deep hierarchy (a channel's many layers of
-    // Send/Receive channels) is NOT this shape, and intercepting a member
-    // there preempts the coroutine host dispatch it needs.
+    // Direct supertypes only: the shape declares the body superclass and default
+    // interface side by side (`B : A(), I`); deeper, it preempts host dispatch.
     var method_fid: ?FuncId = null;
     {
         var direct: std.ArrayList([]const u8) = .empty;
@@ -296,15 +268,12 @@ pub fn fakeOverrideInheritedDefault(
                 }
                 break :blk cn;
             };
-            // The inherited BODY comes from a superCLASS, not an interface.
             if (is_iface) continue;
             for (mod.memberDecls(fqn, name)) |fid| {
                 const f = funcAt(mod, fid) orelse continue;
                 if (!f.hasBody()) continue;
                 // A suspend member dispatches through the coroutine machinery.
                 if (f.is_suspend) continue;
-                // The interface default's slot layout must match the body
-                // method's parameters exactly (a genuine fake override).
                 if (defaults.len != f.params.len) continue;
                 const has_this = f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this");
                 const user_params = f.params.len - @intFromBool(has_this);
@@ -329,12 +298,9 @@ pub fn fakeOverrideInheritedDefault(
         .err => |e| return .{ .err = e },
     };
     defer allocator.free(padded);
-    // Release the module borrow before dispatching: `invokeMethodFuncId`
-    // takes its own.
+    // Release the module borrow: `invokeMethodFuncId` takes its own.
     mg.deinit();
     mg_open = false;
-    // `invokeMethodFuncId` takes the receiver separately; the value arguments
-    // are the padded list past the leading receiver slot.
     return try invokeMethodFuncId(self, allocator, receiver, fid, padded[1..]);
 }
 
@@ -376,9 +342,7 @@ pub fn enclosingCallableProperty(self: *VmHost, allocator: Allocator, name: []co
     return null;
 }
 
-/// Whether `ty_name` denotes a top type or a bare type parameter — a
-/// maximally-unspecific receiver/param type that every value satisfies but
-/// which loses to any concrete match during most-specific selection.
+/// A top type or bare type parameter: every value satisfies it, so it loses to any concrete match.
 pub fn isTopOrGenericType(ty_name: []const u8) bool {
     var pn = simpleName(ty_name);
     pn = std.mem.trimEnd(u8, pn, "?");
@@ -388,18 +352,9 @@ pub fn isTopOrGenericType(ty_name: []const u8) bool {
     return false;
 }
 
-/// Most-specific receiver ranking for overload selection. Returns how
-/// specifically the receiver's runtime type satisfies `ty_name`:
-///   * a positive rank when the receiver concretely IS-A `ty_name` — larger
-///     for a closer (smaller subtype-distance) match;
-///   * `0` for a top type or bare type parameter (`Any`, `T`, `FunctionN`):
-///     satisfied by everything, so least specific;
-///   * `-1` when the receiver definitely does not satisfy a concrete
-///     `ty_name`.
-/// This is the primary discriminator the most-specific rule ranks on: a
-/// `Flow` receiver prefers a `Flow` receiver param over the generic
-/// `Iterable`, and an `Iterable`-implementing collection prefers an
-/// `Iterable` param over an unrelated `CharSequence`/`Sequence`/`Array`.
+/// How specifically the receiver satisfies `ty_name`, ranking Kotlin's most-specific
+/// rule: larger for a closer IS-A match, `0` for a top type or bare type parameter,
+/// `-1` when the receiver definitely does not satisfy a concrete `ty_name`.
 pub fn extReceiverSpecificity(self: *VmHost, receiver: *const Value, ty_name: []const u8) i32 {
     if (isTopOrGenericType(ty_name)) return 0;
     const pn = std.mem.trimEnd(u8, simpleName(ty_name), "?");
@@ -408,8 +363,7 @@ pub fn extReceiverSpecificity(self: *VmHost, receiver: *const Value, ty_name: []
             const d: i32 = @intCast(@min(dist, @as(usize, 50)));
             return 100 - d;
         }
-        // Builtin interface (Iterable/Collection/CharSequence/…) reached
-        // through the instance's supertype names but not the user-class graph.
+        // A builtin interface reached through supertype names, not the class graph.
         if (receiverImplementsType(self, receiver, pn)) return 50;
         return -1;
     }
@@ -424,29 +378,12 @@ pub fn extReceiverSpecificity(self: *VmHost, receiver: *const Value, ty_name: []
     return -1;
 }
 
-/// Strict extension-receiver proof for the bare-name resolver's
-/// innermost-first walk: does the candidate's declared receiver type
-/// *provably* accept this runtime receiver? Unlike the lenient
-/// `receiverImplementsType`, nothing is assumed:
-///   * a function-shape receiver (`(() -> R).f()`) proves only against an
-///     actual function value (with the arity checked where the value
-///     carries one);
-///   * a declared type parameter proves unconditionally only when
-///     unbounded; a bounded one (`<T : Number>`) requires the receiver to
-///     satisfy every declared bound;
-///   * a typealias receiver is expanded through the registry before the
-///     head check;
-///   * generic arguments participate where the runtime value carries
-///     element knowledge (`List<String>.f()` on a list of Ints is
-///     disproven; on a list of Strings proven). An empty container
-///     proves through the declared element head its creation site
-///     recorded (`listOf<String>()`); where neither is available
-///     (untyped empty literals flowing through erased generics) the
-///     candidate is NOT proven and falls to the resolver's ordered
-///     lenient pass.
+/// Strict extension-receiver proof for the bare-name resolver's innermost-first walk:
+/// a function-shape receiver proves only against a function value, a bounded type
+/// parameter requires every bound, typealiases expand first, and generic arguments
+/// participate where elements are known. The unproven fall to the lenient pass.
 pub fn strictReceiverProven(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, ty: *const TypeRef) Allocator.Error!bool {
-    // A null receiver (a `with(t)` subject whose value is null) is
-    // provably accepted only by a nullable receiver type.
+    // A null receiver is provably accepted only by a nullable receiver type.
     if (receiver.* == .Null) return ty.nullable;
     return strictReceiverProvenName(self, allocator, receiver, fid, ty.name, ty.args, 0);
 }
@@ -456,12 +393,10 @@ pub fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *
     var pn = simpleName(ty_name);
     pn = std.mem.trimEnd(u8, pn, "?");
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
-    // Function-shape receivers prove only against function values.
     if (std.mem.startsWith(u8, pn, "Function")) {
         return receiverIsFunctionShaped(self, receiver, pn);
     }
-    // Declared type parameter of this candidate: unbounded accepts
-    // anything; bounded requires the receiver to satisfy every bound.
+    // Declared type parameter: unbounded accepts anything, bounded needs every bound.
     if (typeParamOf(self, fid, pn)) {
         const bounds: []const ir.ModuleRegistry.TypeParamBound = blk: {
             const mg = self.module.borrow();
@@ -474,15 +409,8 @@ pub fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *
         }
         return true;
     }
-    // A short all-uppercase head that is not a registered type parameter
-    // is still a type parameter in shapes the registry does not record
-    // (class-level generics, member extensions); no bound is knowable, so
-    // it proves like an unbounded one — UNLESS a class of that exact name
-    // is registered: `class I` + `fun I.offsetIn(...)` declares a receiver
-    // on the CLASS, and reading it as a type param proved every receiver
-    // (any subject satisfied any short-named extension). A class-level
-    // generic colliding with a registered 1-2-letter class name loses this
-    // trade; kotlinc resolves the same spelling to the class there too.
+    // A short all-uppercase head the registry does not record proves like an
+    // unbounded type parameter, unless a class of that name is registered.
     if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) {
         const registered = blk: {
             const cg = self.classes.borrow();
@@ -491,9 +419,7 @@ pub fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *
         };
         if (!registered) return true;
     }
-    // Typealias expansion (the registry stores the target's simple head
-    // name; its generic arguments are not recorded, so the expansion
-    // proves on the head alone).
+    // Typealias expansion: the registry records only the target's head name.
     {
         const target: ?[]const u8 = blk: {
             const mg = self.module.borrow();
@@ -508,28 +434,14 @@ pub fn strictReceiverProvenName(self: *VmHost, allocator: Allocator, receiver: *
     }
     if (!receiverImplementsHead(self, receiver, pn)) return false;
     if (ty_args.len == 0) return true;
-    // A user `Instance` carries no reified generic arguments, so the head
-    // match is the strongest provable check (kotlinc resolves the type
-    // arguments statically). Treat it as sufficient: an extension on a
-    // generic user class — `CompareContext<Collection<T>>.collectionBehavior`
-    // called on a `CompareContext<…>` lambda receiver — then proves strictly
-    // on the innermost receiver instead of deferring to the lenient pass,
-    // where a same-named member on an OUTER receiver would otherwise preempt
-    // it. `elementsProveArgs` only introspects the builtin container shapes.
+    // A user `Instance` carries no reified type arguments, so the head match is the
+    // strongest provable check; `elementsProveArgs` reads builtin containers only.
     if (receiver.* == .Instance) return true;
     return elementsProveArgs(self, allocator, receiver, fid, pn, ty_args, fuel);
 }
 
-/// Whether an extension whose declared receiver head is `ty` applies to
-/// a receiver whose STATIC (declared) type head is `static_name`. Kotlin
-/// resolves extension calls against the static receiver type, so inside
-/// `fun I.helper()` a bare extension call binds I's extensions even when
-/// the runtime value is a subtype carrying a same-name extension.
-/// `null` ⇒ undecidable statically (unresolvable static class); the
-/// caller falls back to the runtime-type proof.
-/// The lifted key for a dotted nested-class reference (`Modifier.Node` ->
-/// its scope-keyed mangled name when the simple name collided at lift), or
-/// null when the name is not dotted / carries no mangle entry.
+/// The lifted key for a dotted nested-class reference, or null when the name is
+/// not dotted or carries no mangle entry.
 pub fn mangledNestedKey(mod: *const Module, name: []const u8) ?[]const u8 {
     if (std.mem.findScalar(u8, name, '.') == null) return null;
     // Last two segments (`a.b.C.D` -> `C.D`) key the mangle table.
@@ -545,12 +457,8 @@ pub fn mangledNestedKey(mod: *const Module, name: []const u8) ?[]const u8 {
     return mod.registry.mangled_nested.get(name[start..]);
 }
 
-/// Whether two class-name strings name the same type head across the
-/// lift's spellings: literal match, mangle-table canonical match, or the
-/// bare head (dots and the `Outer$` lift prefix stripped) match. The head
-/// fallback carries the same simple-name semantics the rest of the
-/// hierarchy walks use — a dotted supertype (`Modifier.Node`) must satisfy
-/// a parameter lowered to its bare head (`Node`).
+/// Whether two class-name strings name the same type head: literal match, mangle-
+/// table canonical match, or bare head (dots and the `Outer$` lift prefix stripped).
 pub fn classHeadsMatch(self: *VmHost, a: []const u8, b: []const u8) bool {
     if (std.mem.eql(u8, a, b)) return true;
     const ka = mangledClassKeyOf(self, a) orelse a;
@@ -569,39 +477,31 @@ pub fn bareHead(name: []const u8) []const u8 {
     return std.mem.trimEnd(u8, sn, "?");
 }
 
-/// The lifted mangle key for a dotted class-name string via the module's
-/// mangle table, or null when none applies. Precise: only a table hit
-/// canonicalizes, so two unrelated same-simple-name classes never merge.
+/// Lifted mangle key for a dotted class name; only a table hit canonicalizes, so
+/// unrelated same-simple-name classes never merge.
 pub fn mangledClassKeyOf(self: *VmHost, name: []const u8) ?[]const u8 {
     const mg = self.module.borrow();
     defer mg.deinit();
     return mangledNestedKey(mg.get(), name);
 }
 
+/// Whether an extension with receiver head `ty` applies to a receiver whose static
+/// type head is `static_name`; Kotlin resolves extension calls against the static
+/// receiver type. Null is undecidable, and the caller proves against the runtime type.
 pub fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name: []const u8, fid: FuncId, ty: *const TypeRef) ?bool {
     var pn = simpleName(ty.name);
     pn = std.mem.trimEnd(u8, pn, "?");
-    // Receivers that accept anything statically, mirroring the runtime
-    // prover's universal cases.
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
     if (typeParamOf(self, fid, pn)) return true;
-    // A receiver that IS the owner class's type parameter (`C.collectionSize`
-    // inside `CollectionSerializer<E, C, B>`) accepts any static hint — the
-    // hint may itself be another class's type parameter that happens to
-    // spell a real class's name (upstream names one `Collection`).
+    // A receiver that is the owner class's own type parameter accepts any static hint.
     if (ir.parseClassTypeParamIdentity(std.mem.trimEnd(u8, ty.name, "?")) != null) return true;
-    // A dotted nested receiver whose class lifted under a mangled key
-    // (`Modifier.Node` when another `Node` exists) canonicalizes to that
-    // key, so it compares equal to a hint that resolved the same class
-    // through the lexical rename ladder.
+    // A dotted nested receiver canonicalizes to its mangled key.
     {
         const mg0 = self.module.borrow();
         defer mg0.deinit();
         if (mangledNestedKey(mg0.get(), std.mem.trimEnd(u8, ty.name, "?"))) |m| pn = m;
     }
-    // The short-all-uppercase type-param heuristic only applies to a
-    // head that is NOT a registered class (`W5` is a class, `T`/`TT`
-    // are type params).
+    // The short-all-uppercase heuristic applies only to a head that is not a class.
     const head_is_class = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -629,10 +529,7 @@ pub fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name
     // A dotted hint canonicalizes through the same mangle table as `pn`.
     if (mangledNestedKey(mod, std.mem.trimEnd(u8, static_name, "?"))) |m| sn = m;
     if (std.mem.eql(u8, sn, pn)) return true;
-    // The candidate scan below is O(classes) with per-entry hierarchy walks
-    // and depends only on (module, sn, pn); memoize its verdict. The class
-    // count folds into the key so a post-finalize class addition starts a
-    // fresh entry instead of serving a stale verdict.
+    // The scan below is O(classes); the class count in the key retires stale verdicts.
     const sra_key = blk: {
         var h = std.hash.Wyhash.init(0x53524143);
         const mp: usize = @intFromPtr(mod);
@@ -649,21 +546,12 @@ pub fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name
         1 => true,
         else => null,
     };
-    // Resolve `sn` against EVERY class sharing that simple name, not just the
-    // one the simple-name-keyed hierarchy map happens to hold. Compose vendors
-    // two distinct `Node` types (`Modifier.Node : DelegatableNode` and an
-    // unrelated `Node : NodeParent`); the map keeps only the first, so a lookup
-    // of the wrong one would claim a spurious mismatch. A definite `false` may
-    // be returned only when the name resolves unambiguously and still fails to
-    // reach `pn`; an ambiguous or unknown head is undecidable (`null`), which
-    // keeps the candidate for the runtime-type check to judge.
+    // Resolve `sn` against every class sharing that simple name. Only an unambiguous
+    // resolution that still fails to reach `pn` is a definite `false`.
     var matches: usize = 0;
     var relates = false;
     for (mod.class_index.items) |entry| {
-        // A lift-mangled nested class (`Modifier$Node`) still answers for its
-        // source simple name: a bare hint (`Node`) recorded where the rename
-        // ladder could not see the mangle is ambiguous across ALL variants,
-        // and the mangled entry itself may be the one that relates.
+        // A lift-mangled nested class also answers for its source simple name.
         const ehead = blk: {
             const sn2 = simpleName(entry.name);
             if (std.mem.findScalarLast(u8, sn2, '$')) |i| {
@@ -683,8 +571,7 @@ pub fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name
                     relates = true;
                     break;
                 }
-                // A dotted supertype whose class lifted mangled compares by
-                // its canonical key (`: Modifier.Node()` vs pn `Modifier$Node`).
+                // A dotted supertype that lifted mangled compares by canonical key.
                 if (mangledNestedKey(mod, s)) |m| {
                     if (std.mem.eql(u8, m, pn)) {
                         relates = true;
@@ -701,21 +588,17 @@ pub fn staticReceiverApplicable(self: *VmHost, allocator: Allocator, static_name
     return false;
 }
 
-/// Memoized verdicts of `staticReceiverApplicable`'s candidate scan, keyed by
-/// (module identity, class count, sn, pn). Thread-local: dispatch runs on
-/// several threads and the scan verdict is cheap to fill per thread.
+/// Memoized `staticReceiverApplicable` verdicts, keyed by (module identity, class
+/// count, sn, pn) and thread-local.
 pub threadlocal var sra_cache: std.AutoHashMapUnmanaged(u64, u8) = .empty;
 
-/// Drop this thread's memoized scan verdicts at a program-run boundary (an
-/// in-process re-run may mint a new module at a reused address).
+/// Drop this thread's verdicts: an in-process re-run may reuse a module address.
 pub fn resetStaticApplicabilityCache() void {
     sra_cache.clearRetainingCapacity();
 }
 
-/// Whether the DECLARED signature refuses `n_args` user args outright:
-/// fewer than the required count (params without defaults), or more
-/// than total without a vararg. Conservative — a missing `DeclSig`
-/// refuses nothing.
+/// Whether the declared signature refuses `n_args` outright: fewer than required,
+/// or more than total without a vararg. A missing `DeclSig` refuses nothing.
 pub fn declArityRefuses(self: *VmHost, fid: FuncId, n_args: usize) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -725,18 +608,14 @@ pub fn declArityRefuses(self: *VmHost, fid: FuncId, n_args: usize) bool {
     return false;
 }
 
-/// Can the candidate take `want` positional args (receiver included)?
-/// Exact arity fits; extra declared params must each carry a default or
-/// be a vararg; extra args only fit a trailing vararg.
+/// Can the candidate take `want` positional args (receiver included)? Extra params
+/// must each carry a default or be a vararg; extra args only fit a trailing vararg.
 pub fn extArityApplicable(self: *VmHost, f: *const Func, want: usize) bool {
     return extArityApplicableTL(self, f, want, false);
 }
 
-/// `extArityApplicable` with Kotlin's trailing-lambda rule: when the call's
-/// LAST argument is a callable and the candidate's LAST parameter is
-/// function-typed, that argument binds the last parameter and only the GAP
-/// parameters between them need defaults — `produce<Any> { … }` is
-/// applicable to `produce(context = …, capacity = …, block)`.
+/// `extArityApplicable` with Kotlin's trailing-lambda rule: a callable last argument
+/// binds a function-typed last parameter, so only the gap parameters need defaults.
 pub fn extArityApplicableTL(self: *VmHost, f: *const Func, want: usize, last_arg_callable: bool) bool {
     if (f.params.len == want) return true;
     if (f.params.len < want) {
@@ -754,23 +633,19 @@ pub fn extArityApplicableTL(self: *VmHost, f: *const Func, want: usize, last_arg
     return true;
 }
 
-/// Is the receiver an actual function value of the declared shape?
-/// `pn` is `"Function"` or `"FunctionN"`; the arity is checked where the
-/// value carries one (an AST function's params, an IR closure's declared
-/// param count) and accepted otherwise (intrinsics, bound methods).
+/// Is the receiver an actual function value of the declared shape? `pn` is
+/// `Function` or `FunctionN`; arity is checked where the value carries one.
 pub fn receiverIsFunctionShaped(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
     switch (receiver.*) {
         .IrClosure, .Intrinsic, .BoundMethod => {},
-        // An instance of a class that extends a function type carries the
-        // erased `FunctionN` name in its supertype chain.
+        // A class extending a function type carries the erased `FunctionN` name.
         .Instance => return instanceFunctionDistance(self, receiver, pn) != null,
         else => return false,
     }
     const digits = pn["Function".len..];
     if (digits.len == 0) return true;
     const n = std.fmt.parseInt(usize, digits, 10) catch return true;
-    // A parameterless lambda lowers with the synthetic implicit `it`
-    // slot, so a stored arity of 1 also proves `Function0`.
+    // A parameterless lambda lowers with the implicit `it` slot, so arity 1 proves `Function0`.
     return switch (receiver.*) {
         .IrClosure => |c| blk: {
             const info = self.closures.get(@intCast(c.asPtr().id)) orelse break :blk true;
@@ -780,21 +655,8 @@ pub fn receiverIsFunctionShaped(self: *VmHost, receiver: *const Value, pn: []con
     };
 }
 
-/// Is `pn` a declared type parameter of `fid`?
-/// A type-parameter extension receiver constrains dispatch by its declared
-/// bound: when the candidate's receiver head is one of its own type params
-/// and the runtime receiver's hierarchy provably excludes the bound head,
-/// the candidate is not applicable (kotlinc never considers
-/// `fun <P : Pipeline<...>> P.install` on a value that is not a Pipeline).
-/// Any positional value argument the candidate's declared parameter type
-/// definitely excludes (kotlinc applicability covers arguments, not just
-/// the receiver: `install(RoutingRoot, ...)` can never bind the overload
-/// whose plugin parameter is the unrelated ContentNegotiation object).
-/// Whether the instance's class hierarchy declares a member named `invoke`.
-/// klio accepts such an instance where a function-typed parameter is
-/// declared (`listOf("a","b").map(tagger)`), so the argument-applicability
-/// filter must not disprove it — the pre-existing dispatch arms keep their
-/// stricter surface (SAM targets and bound references only).
+/// Whether the instance's hierarchy declares `invoke`. klio accepts such an instance
+/// at a function-typed parameter, so the argument filter must not disprove it.
 pub fn instanceHierarchyHasInvoke(self: *VmHost, v: *const Value) bool {
     if (v.* != .Instance) return false;
     var cls: []const u8 = undefined;
@@ -822,15 +684,9 @@ pub fn valueNominalFqn(v: *const Value) []const u8 {
     return cg.get().fqn;
 }
 
-/// Whether a lambda ARGUMENT's own declared parameter types disprove a
-/// candidate's function-typed parameter. A literal that annotates its
-/// parameters states them, and kotlinc drops a candidate that cannot accept
-/// them: inside `buildString { … }` a bare
-/// `forEachIndexed { index: Int, element: TestValueClass -> … }` must not
-/// reach `CharSequence.forEachIndexed`, whose element is a `Char`. It did,
-/// and iterating the builder while the body appended to it never terminated.
-/// Refutes only on a DEFINITE mismatch: two different builtin scalars, or a
-/// builtin scalar against a class this build declares.
+/// Whether a lambda argument's declared parameter types disprove a candidate's
+/// function-typed parameter. Refutes only on a definite mismatch: two builtin
+/// scalars, or a builtin scalar against a class this build declares.
 pub fn closureParamsDisproveFnParam(self: *VmHost, pty: *const TypeRef, arg: *const Value) bool {
     if (arg.* != .IrClosure) return false;
     if (!std.mem.startsWith(u8, pty.name, "Function")) return false;
@@ -859,7 +715,7 @@ pub fn closureParamsDisproveFnParam(self: *VmHost, pty: *const TypeRef, arg: *co
     return false;
 }
 
-/// The declared VALUE parameter types of a lowered function type. Encoding:
+/// The declared value parameter types of a lowered function type. Encoding:
 /// `[#suspend?] [receiver?] params… ret [#markers]`.
 pub fn fnTypeValueParams(ty: *const TypeRef) ?[]const TypeRef {
     const want = std.fmt.parseInt(usize, ty.name["Function".len..], 10) catch return null;
@@ -893,8 +749,7 @@ pub fn scalarHeadOf(h: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Whether `h` names a class this build declares. A one-letter or
-/// unresolvable head is a type parameter and proves nothing.
+/// Whether `h` names a class this build declares; a shorter or unresolvable head is a type parameter.
 pub fn knownClassHead(module: *const Module, h: []const u8) bool {
     if (h.len <= 1) return false;
     if (std.mem.eql(u8, h, "Any")) return false;
@@ -902,13 +757,12 @@ pub fn knownClassHead(module: *const Module, h: []const u8) bool {
     return module.classId(h) != null;
 }
 
+/// Whether a positional argument's value is definitely excluded by the candidate's
+/// declared parameter type. Kotlin applicability covers arguments, not just the receiver.
 pub fn candidateArgsDisproven(self: *VmHost, f: *const Func, args: []const Value) bool {
     if (f.params.len <= 1 or args.len == 0) return false;
-    // A single TRAILING vararg adjudicates every remaining arg against its
-    // ELEMENT type — the `appendAll(vararg Pair<String, String>)` overload
-    // must decline a `Pair<String, List<String>>` argument so its
-    // `Pair<String, Iterable<String>>` sibling binds. A NON-final vararg
-    // repositions everything after it; decline as before.
+    // A single trailing vararg adjudicates each remaining arg against its element
+    // type. A non-final vararg repositions everything after it: decline.
     var vararg_trailing = false;
     for (f.params, 0..) |*pp, pi| {
         if (pp.is_vararg) {
@@ -931,9 +785,7 @@ pub fn candidateArgsDisproven(self: *VmHost, f: *const Func, args: []const Value
         return false;
     }
     var n = args.len;
-    // Trailing-lambda binding: a callable last argument bound to the LAST
-    // function-typed parameter over a defaulted gap (`joinTo(out, "&") {..}`)
-    // adjudicates the positional prefix only.
+    // Trailing-lambda binding leaves only the positional prefix to adjudicate.
     if (isCallable(&args[args.len - 1]) and
         isFunctionTypeRef(&f.params[f.params.len - 1].ty) and
         args.len < f.params.len - 1)
@@ -954,6 +806,8 @@ pub fn candidateArgsDisproven(self: *VmHost, f: *const Func, args: []const Value
     return false;
 }
 
+/// A type-parameter receiver constrains dispatch by its declared bound: a receiver
+/// whose hierarchy provably excludes the bound head is not applicable.
 pub fn receiverViolatesTypeParamBound(self: *VmHost, fid: FuncId, param_ty: *const TypeRef, receiver: *const Value) bool {
     const pn0 = std.mem.trimEnd(u8, simpleName(param_ty.name), "?");
     if (!typeParamOf(self, fid, pn0)) return false;
@@ -968,18 +822,10 @@ pub fn receiverViolatesTypeParamBound(self: *VmHost, fid: FuncId, param_ty: *con
         if (std.mem.findScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
         bn = std.mem.trimEnd(u8, std.mem.trim(u8, bn, " "), "?");
         if (std.mem.eql(u8, bn, "Any")) continue;
-        // A bound that is itself one of the function's type parameters
-        // (`fun <C, R> C.ifEmpty(...): R where C : Collection<*>, C : R`)
-        // names no class: it constrains the inferred `R`, not the receiver,
-        // and cannot be decided against a runtime value.
+        // A bound that is itself a type parameter names no class and cannot be decided.
         if (typeParamOf(self, fid, bn)) continue;
-        // Decide the bound for any receiver whose full type is known: an
-        // Instance carries its class chain, and a concrete builtin's
-        // `isRuntimeType` supertype set is authoritative (a `String` receiver
-        // is provably not a `Number`, so `<T : Number> T.f()` does not apply to
-        // it and the outer member wins). Only an erased function/lambda value
-        // against a functional-interface bound stays undecided — SAM conversion
-        // could satisfy it — so the strict prover owns those.
+        // Decidable when the receiver's full type is known; an erased callable
+        // against a functional-interface bound stays undecided (SAM conversion).
         const decidable = switch (receiver.*) {
             .Null, .IrClosure, .Intrinsic, .BoundMethod => false,
             else => true,
@@ -999,20 +845,14 @@ pub fn typeParamOf(self: *VmHost, fid: FuncId, pn: []const u8) bool {
     return false;
 }
 
-/// Whether a candidate's declared parameter type names a TYPE VARIABLE in
-/// scope for it: one of the function's own type parameters, or (for an
-/// instance method, receiver in `params[0]`) a type parameter of the owning
-/// class. Such a parameter never names a nominal class, so argument
-/// adjudication must not read it as one — `ConcurrentMap<Key, Value>.put(
-/// key: Key, value: Value)` accepts any key even when an unrelated class
-/// named `Key` is registered. Bound enforcement is separate
-/// (`classTypeParamRefutes` at the member candidate walk).
+/// Whether a declared parameter type names a type variable in scope: one of the
+/// function's own type parameters, or the owning class's for an instance method.
+/// It never names a nominal class, so argument adjudication must not read it as one.
 pub fn paramTypeIsTypeVar(self: *VmHost, f: *const Func, ty: *const TypeRef) bool {
     return fidTypeVar(self, f.id, ty);
 }
 
-/// `paramTypeIsTypeVar` keyed by `FuncId` (the shared applicability engine's
-/// `type_var` callback shape).
+/// `paramTypeIsTypeVar` keyed by `FuncId`, the applicability engine's callback shape.
 pub fn fidTypeVar(self: *VmHost, fid: FuncId, ty: *const TypeRef) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -1040,18 +880,13 @@ pub fn fidTypeVar(self: *VmHost, fid: FuncId, ty: *const TypeRef) bool {
     return typeParamOf(self, fid, raw);
 }
 
-/// `ApplicabilityScope.type_var`: wraps `fidTypeVar`.
 pub fn applicTypeVarCbM(ctx: *anyopaque, fid: FuncId, ty: *const TypeRef) bool {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     return fidTypeVar(self, fid, ty);
 }
 
-/// Generic-argument proof over the receiver's actual elements. Only
-/// builtin containers carry element knowledge; an empty container proves
-/// through the declared element head its creation site recorded (an
-/// explicit `listOf<String>()` type argument), and everything else is
-/// unprovable and reports false so the candidate falls to the lenient
-/// pass.
+/// Generic-argument proof over the receiver's elements: only builtin containers
+/// carry element knowledge, and an empty one proves through its recorded head.
 pub fn elementsProveArgs(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, pn: []const u8, ty_args: []const TypeRef, fuel: u8) Allocator.Error!bool {
     if (std.mem.eql(u8, pn, "Map") or std.mem.eql(u8, pn, "MutableMap")) {
         if (receiver.* != .Map or ty_args.len < 2) return false;
@@ -1103,9 +938,8 @@ pub fn isSetHead(pn: []const u8) bool {
         std.mem.eql(u8, pn, "Iterable") or std.mem.eql(u8, pn, "MutableIterable");
 }
 
-/// One element against one declared generic argument. A star projection
-/// or type-parameter argument accepts anything; a nullable argument
-/// accepts `null`.
+/// One element against one declared generic argument; a star projection or type
+/// parameter accepts anything, and a nullable argument accepts `null`.
 pub fn elementSatisfies(self: *VmHost, allocator: Allocator, elem: *const Value, fid: FuncId, arg: *const TypeRef, fuel: u8) Allocator.Error!bool {
     if (std.mem.eql(u8, arg.name, "*")) return true;
     var head = arg.name;
@@ -1116,16 +950,14 @@ pub fn elementSatisfies(self: *VmHost, allocator: Allocator, elem: *const Value,
     return strictReceiverProvenName(self, allocator, elem, fid, head, arg.args, fuel + 1);
 }
 
-/// Head-name check against the receiver's actual runtime type: the user
-/// class hierarchy for an `Instance`, the runtime type-name sets
-/// otherwise. No generosity for generics or function shapes — callers
-/// handle those.
 pub fn headNamesRegisteredClass(self: *VmHost, head: []const u8) bool {
     const cg = self.classes.borrow();
     defer cg.deinit();
     return cg.get().get(head) != null;
 }
 
+/// Head-name check against the receiver's runtime type: the class hierarchy for an
+/// Instance, the runtime type-name sets otherwise. Callers handle generics and shapes.
 pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const u8) bool {
     switch (receiver.*) {
         .Instance => |inst| {
@@ -1137,11 +969,8 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
             {
                 const g = inst.borrow();
                 const cg = g.get().class.borrow();
-                // Kotlin declares `Enum<E> : Comparable<E>`, so every enum
-                // entry satisfies a `Comparable` bound without the supertype
-                // appearing in its declaration. Without this,
-                // `<T : Comparable<T>> T.coerceAtMost(...)` and its siblings
-                // were skipped for an enum receiver and the call missed.
+                // Kotlin declares `Enum<E> : Comparable<E>`, so every enum entry
+                // satisfies a `Comparable` bound without declaring the supertype.
                 const is_enum = cg.get().is_enum;
                 cg.deinit();
                 g.deinit();
@@ -1159,12 +988,9 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
                 seen.put(c, {}) catch {};
                 const sn = simpleName(c);
                 if (std.mem.eql(u8, sn, pn)) return true;
-                // A file-collision mangle (`X$f12`) satisfies its source
-                // spelling `X`.
+                // A file-collision mangle (`X$f12`) satisfies its source spelling.
                 if (std.mem.eql(u8, stripFileMangle(sn), pn)) return true;
-                // A lifted nested class registers under its mangled name
-                // (`Modifier$Node`); a bound written `Modifier.Node` carries
-                // the simple head `Node`, so match the `$` tail too.
+                // A lifted nested class registers mangled (`Modifier$Node`), so a bare head matches the `$` tail.
                 if (sn.len > pn.len and sn[sn.len - pn.len - 1] == '$' and
                     std.mem.endsWith(u8, sn, pn)) return true;
                 const cg = self.classes.borrow();
@@ -1175,24 +1001,20 @@ pub fn receiverImplementsHead(self: *VmHost, receiver: *const Value, pn: []const
                 }
                 cg.deinit();
             }
-            // The name walk sees only the ClassTable's simple-name entries;
-            // a chain that crosses a host-synth class can break
-            // where a name is registered differently. `instanceOf` is the
-            // authoritative subtype answer — the same one `is` uses.
+            // `instanceOf` is the authoritative subtype answer, the same one `is`
+            // uses; the name walk sees only simple-name ClassTable entries.
             return host_classes.instanceOf(self, receiver, .{ .name = pn, .nullable = false, .args = &.{} });
         },
         else => return receiver.isRuntimeType(pn),
     }
 }
 
-/// Does the receiver's actual runtime type satisfy `ty_name`?
+/// Lenient check: does the receiver's runtime type satisfy `ty_name`?
 pub fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []const u8) bool {
     var pn = simpleName(ty_name);
     pn = std.mem.trimEnd(u8, pn, "?");
-    // Expand typealiases: a member extension declared on `TestResult`
-    // (= Unit) must accept a Unit receiver. The registry stores the
-    // target's simple head, so expansion iterates on heads; the bound
-    // guards a self-referential entry.
+    // Expand typealiases so an extension declared on an alias of Unit accepts a
+    // Unit receiver; the fuel bound guards a self-referential entry.
     var alias_fuel: u8 = 4;
     while (alias_fuel > 0) : (alias_fuel -= 1) {
         const target: ?[]const u8 = blk: {
@@ -1205,15 +1027,11 @@ pub fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []
         pn = std.mem.trimEnd(u8, simpleName(t), "?");
     }
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return true;
-    // A function type: `Function0`/`Function1`/... or the interpreter's
-    // `<function>` marker for a receiver written as `T.() -> R`. A member
-    // extension declared on a function type (a SAM whose abstract method is
-    // `(Int.() -> String).accept()`) records its receiver head this way, and
-    // any callable value satisfies it.
+    // A function type, or the `<function>` marker for a receiver written
+    // `T.() -> R`, is satisfied by any callable value.
     if (std.mem.startsWith(u8, pn, "Function") or std.mem.eql(u8, pn, "<function>")) return true;
-    // A short all-caps head is a TYPE PARAMETER (`T`, `R`, `E1`), which any
-    // receiver satisfies -- unless the program declares a class of that name,
-    // in which case it is that user type and must be proven like any other.
+    // A short all-caps head is a type parameter that any receiver satisfies, unless
+    // the program declares a class of that name.
     if (pn.len > 0 and pn.len <= 2 and allUppercase(pn)) {
         const declared = blk: {
             const mg = self.module.borrow();
@@ -1241,9 +1059,7 @@ pub fn receiverImplementsType(self: *VmHost, receiver: *const Value, ty_name: []
                 seen.put(c, {}) catch {};
                 const sn = simpleName(c);
                 if (std.mem.eql(u8, sn, pn)) return true;
-                // A lifted nested class registers under its mangled name
-                // (`Modifier$Node`); a bound written `Modifier.Node` carries
-                // the simple head `Node`, so match the `$` tail too.
+                // A lifted nested class registers mangled (`Modifier$Node`), so a bare head matches the `$` tail.
                 if (sn.len > pn.len and sn[sn.len - pn.len - 1] == '$' and
                     std.mem.endsWith(u8, sn, pn)) return true;
                 const cg = self.classes.borrow();

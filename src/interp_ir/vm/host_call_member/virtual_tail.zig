@@ -1,5 +1,4 @@
-//! The virtual-member tail: `invokeVirtualMember`, `invokeMethodFuncId`, and the
-//! argument-signature keys their caches are addressed by.
+//! The virtual-member dispatch tail and the argument-signature cache keys.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -94,9 +93,7 @@ pub fn invokeVirtualMember(
     arg_params: ?[]const u32,
     site: ?ir.VirtNativeSite,
 ) Allocator.Error!EvalResult {
-    // Vendored persistent-vector scans (see the callMemberInnerStatic
-    // intercept): the hot `readable.contains(element)` arrives as a
-    // virtual slot, so serve it here too.
+    // Vendored persistent-vector scans, as in the callMemberInnerStatic intercept.
     if (args.len == 1 and receiver.* == .Instance) {
         if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vname| {
             if (bridgeForReceiver(self, receiver, vname, args)) |dflt| return .{ .ok = dflt };
@@ -108,9 +105,6 @@ pub fn invokeVirtualMember(
             }
         }
     }
-    // Vendored persistent-vector builder bulk ops (see the
-    // callMemberInnerStatic intercept): `subList(...).clear()` reaches the
-    // builder's `removeRange` as a virtual slot, and `addAll` likewise.
     if ((args.len == 1 or args.len == 2) and receiver.* == .Instance) {
         if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vname| {
             if (args.len == 2 and std.mem.eql(u8, vname, "removeRange")) {
@@ -125,7 +119,6 @@ pub fn invokeVirtualMember(
             }
         }
     }
-    // Map-builder put/build/builder reached as virtual slots.
     if ((args.len == 0 or args.len == 2) and receiver.* == .Instance) {
         if (virtualSlotInterfaceMember(self, slot) orelse slotNameOrNull(self, slot)) |vname| {
             if (args.len == 2 and std.mem.eql(u8, vname, "put")) {
@@ -143,7 +136,6 @@ pub fn invokeVirtualMember(
                     return .{ .ok = v };
                 }
             }
-            // Whole-cycle SnapshotStateMap.put via its virtual slot.
             if (args.len == 2 and std.mem.eql(u8, vname, "put") and
                 persistent_map_mut.isSnapshotMapClass(receiver.Instance))
             {
@@ -153,10 +145,8 @@ pub fn invokeVirtualMember(
             }
         }
     }
-    // Replay a stamped host-receiver site: same interned type FQN means the
-    // walk below would reach the same verdict, so serve it without the
-    // registry probes. Verdicts are tagged in `site_native`'s low bits
-    // (see `stampVirtSite`).
+    // Replay a stamped host-receiver site: the same interned type FQN means the
+    // walk below reaches the same verdict. `stampVirtSite` tags it in low bits.
     if (site) |st| replay: {
         if (receiver.* == .Instance or isCallable(receiver)) break :replay;
         const key: u64 = @intFromPtr(receiver.typeFqn().ptr);
@@ -166,9 +156,8 @@ pub fn invokeVirtualMember(
         const np: [*]const u8 = @ptrFromInt(st.name_ptr.*);
         const mname = np[0..st.name_len.*];
         if (native_raw & 3 == 3) {
-            // Slot-op / by-name verdict: the host op first (a per-receiver
-            // decline falls through), then the member-name walk — the exact
-            // tail the probes below would have reached.
+            // Slot-op then by-name verdict, the exact tail the probes below
+            // reach: a per-receiver decline of the host op falls through.
             const opv = native_raw >> 2;
             if (opv != 0xFF) {
                 const op: HostSlotOp = @enumFromInt(@as(u8, @intCast(opv)));
@@ -185,11 +174,8 @@ pub fn invokeVirtualMember(
         @memcpy(argbuf[1..], args);
         return dispatchIntrinsic(self, allocator, member_fqn, native, argbuf);
     }
-    // Named arguments folded into `arg_params` at lowering must survive
-    // every re-dispatching arm below (the interface-delegate forward, an
-    // unlinked slot, a bodyless target): derive the names back from the
-    // slot root's declared params, or a delegated `emit(tag = ..., scale =
-    // ...)` re-binds its arguments positionally.
+    // Named arguments folded into `arg_params` at lowering must survive every
+    // re-dispatching arm below, so derive them back from the slot root's params.
     var derived_names: []?[]const u8 = &.{};
     defer if (derived_names.len != 0 and runtime.freeScratch()) allocator.free(derived_names);
     const arg_names: []const ?[]const u8 = blk: {
@@ -205,10 +191,8 @@ pub fn invokeVirtualMember(
         }
         break :blk derived_names;
     };
-    // A `by`-delegated interface member the class does not override belongs
-    // to the delegate. The slot resolves against the class hierarchy, which
-    // for a defaulted interface member lands on the interface's own body —
-    // Kotlin routes it to the delegate instead.
+    // The slot resolves against the class hierarchy and lands on a defaulted
+    // interface member's own body; Kotlin routes it to the delegate instead.
     if (receiver.* == .Instance) {
         if (virtualSlotInterfaceMember(self, slot)) |name| {
             if (interfaceDelegateFor(self, allocator, receiver.Instance, name)) |d| {
@@ -223,14 +207,8 @@ pub fn invokeVirtualMember(
     if (receiver.* != .Instance) {
         if (isCallable(receiver)) {
             const root = FuncId.from(slot.int());
-            // A CALLABLE-shaped receiver on a non-interface slot is not an
-            // interpreted instance, but it can still be a host value that
-            // serves the member natively — `kotlin.concurrent.thread` hands
-            // back a handle whose `join`/`isAlive`/`name` the host answers,
-            // and once that type carries a real declaration its member calls
-            // arrive here as virtual slots. The by-name dispatch is the one
-            // that knows those handles, and it re-borrows the module, so the
-            // decision is made under the borrow and acted on outside it.
+            // A callable receiver can still be a host value serving the member
+            // natively; by-name dispatch re-borrows, so act outside this borrow.
             const decided: union(enum) { by_name: []const u8, err: []const u8, call_iface } = blk_c: {
                 const mg = self.module.borrow();
                 defer mg.deinit();
@@ -262,9 +240,8 @@ pub fn invokeVirtualMember(
             switch (decided) {
                 .err => |msg| return .{ .err = .{ .Type = msg } },
                 .by_name => |mname| {
-                    // The slot's owner is the call's static receiver type:
-                    // `(this as ClosedRange<Int>).contains(value)` must bind the
-                    // `ClosedRange` extension, not a runtime subtype's twin.
+                    // The slot's owner is the call's static receiver type, so an
+                    // upcast receiver binds that type's member, not a subtype twin.
                     const named = try callMemberNamedDeclared(self, allocator, receiver, mname, args, arg_names, slotOwnerSimpleName(self, slot));
                     switch (named) {
                         .ok => return named,
@@ -280,12 +257,8 @@ pub fn invokeVirtualMember(
             }
             return host_call_value.callValue(self, allocator, receiver, args);
         }
-        // A virtual slot names an interface member, and an interface-typed value
-        // need not be an interpreted `Instance`: a `Sequence` is a host-backed
-        // generator, a `CharSequence` can be a string. Keep slot semantics by
-        // resolving the slot against the value's RUNTIME class rather than
-        // rejecting the receiver, and fall back to the member's name only when
-        // that class implements it natively and there is no body to enter.
+        // An interface-typed value need not be an interpreted `Instance`, so
+        // resolve the slot against its runtime class, then fall back to the name.
         const NonInstanceTarget = struct { target: ?FuncId, name: ?[]const u8 };
         const noinst: NonInstanceTarget = blk: {
             const mg = self.module.borrow();
@@ -293,36 +266,16 @@ pub fn invokeVirtualMember(
             const module = mg.get();
             const root = FuncId.from(slot.int());
             const mname: ?[]const u8 = if (module.funcById(root)) |f| f.name else null;
-            // `typeFqn` on a non-Instance value is a comptime literal, so the
-            // pointer-identity memo applies.
             const runtime_class = module.classIdByStaticFqn(receiver.typeFqn()) orelse
                 break :blk .{ .target = null, .name = mname };
-            // A host-backed receiver executes its members as native
-            // intrinsics keyed by its runtime class's FQN, and that binding
-            // is the most-derived override of the slot: the interpreted
-            // source body reads a source-level representation the host value
-            // never materializes (`Result.toString` matches on the `Failure`
-            // wrapper; the host Result stores a discriminant and the raw
-            // payload). Same rule as the host-synth Instance probe below.
+            // A host-backed receiver runs its members as native intrinsics keyed
+            // by its runtime class FQN, the slot's most-derived override.
             if (mname) |n| {
                 var fqn_buf: [192]u8 = undefined;
                 if (std.fmt.bufPrint(&fqn_buf, "{s}.{s}", .{ receiver.typeFqn(), n })) |member_fqn| {
                     if (lookupIntrinsic(self, member_fqn)) |native| {
-                        // A SCALAR receiver is its own representation: there
-                        // is no wrapper for the by-name walk to unpack, so
-                        // reaching the identical host symbol by FuncId is the
-                        // same call without the lookup. Wrapper-backed values
-                        // (`Result` stores a discriminant and a raw payload,
-                        // an `Iterator` is a host generator) keep the walk —
-                        // that is where the conversion lives, and binding
-                        // them by id returned `Success` for a `Failure`.
-                        // Only where the native IS the whole implementation.
-                        // A declaration that also carries a BODY is written
-                        // against the boxed representation — `UInt.toString()`
-                        // is `uintToString(data)`, and `data` does not exist on
-                        // a scalar — so reaching it by FuncId runs a body the
-                        // receiver cannot satisfy. The by-name walk is what
-                        // lands on the intrinsic for those.
+                        // A scalar is its own representation, so the same host
+                        // symbol by FuncId is the same call; a body is not.
                         if (isScalarValue(receiver)) {
                             if (module.methodSlotTarget(runtime_class, slot)) |slot_target| {
                                 if (!host_call_func.funcHasBody(self, module, slot_target)) {
@@ -333,23 +286,9 @@ pub fn invokeVirtualMember(
                                 }
                             }
                         }
-                        // A host COLLECTION is not a wrapper: `add`/`set`/
-                        // `get` take the value as it stands, so the intrinsic
-                        // already in hand IS what the walk would land on and
-                        // calling it here skips a name search that changes
-                        // nothing. Restricted to the container variants —
-                        // `Result` and the iterator generators are the shapes
-                        // whose conversion lives on the named path.
+                        // A host collection is not a wrapper, so the intrinsic
+                        // in hand is what the name walk would reach.
                         const direct = switch (receiver.*) {
-                            // `Array` holds its elements inline, a
-                            // `StringBuilder` its bytes, a `Comparator` its
-                            // comparison — none of them a discriminant over a
-                            // payload the intrinsic would have to unpack. A
-                            // `String` and every scalar are likewise their own
-                            // representation (the walk lands on this very
-                            // native; the FuncId hazard was running a BODY
-                            // written against the boxed form, which a direct
-                            // NATIVE dispatch never does).
                             .List, .Set, .Map, .Array, .StringBuilder, .Comparator, .String => true,
                             else => isScalarValue(receiver),
                         };
@@ -367,16 +306,12 @@ pub fn invokeVirtualMember(
                 } else |_| {}
             }
             const target = module.methodSlotTarget(runtime_class, slot) orelse {
-                // No entry for this class, but the ROOT still names the
-                // declaration the call was bound to, and for a builtin whose
-                // implementation is a host handler that is enough to settle
-                // it by id (`ListIterator.hasPrevious` on a host iterator).
+                // No entry for this class, but the root still names the bound
+                // declaration, enough to settle a host-handler builtin by id.
                 if (hostSlotOpFor(module, root)) |op| {
                     const nm2: []const u8 = if (module.funcById(root)) |f| f.name else (mname orelse "");
-                    // Replay must mirror this exact tail (op, then the name
-                    // walk), so a null `mname` — whose fall-through errors
-                    // rather than walking — must not stamp, and the op name
-                    // must be the walk name.
+                    // Replay must mirror this tail, op then name walk: a null
+                    // `mname` must not stamp, and the op name is the walk name.
                     if (mname != null and std.mem.eql(u8, nm2, mname.?))
                         stampVirtSite(site, receiver, (@as(u64, @intFromEnum(op)) << 2) | 3, mname.?);
                     if (try runHostSlotOp(self, allocator, op, receiver, nm2, args)) |r| return r;
@@ -387,10 +322,8 @@ pub fn invokeVirtualMember(
                     std.debug.print("[noinst-why] no-slot-entry recv={s} root={s}\n", .{ receiver.typeFqn(), if (module.funcById(root)) |f| f.fqn else "?" });
                 break :blk .{ .target = null, .name = mname };
             };
-            // A bodyless declaration linked to a host symbol is executable —
-            // as that symbol. Dispatching through it is the whole point of
-            // binding the slot: it reaches the implementation by FuncId
-            // instead of matching the member by string.
+            // A bodyless declaration linked to a host symbol is executable as
+            // that symbol, reached by FuncId instead of by member name.
             if (!virtualTargetExecutable(module, target) and
                 host_call_func.resolvedNativeForm(self, target) == null)
             {
@@ -470,13 +403,8 @@ pub fn invokeVirtualMember(
     const mg = self.module.borrow();
     defer mg.deinit();
     const module = mg.get();
-    // A slot is a static hint, not a guarantee that the runtime can honour it.
-    // When the receiver's class has no entry for it, or the entry names a
-    // declaration with nothing to execute, dispatch by the member's name — the
-    // same result the site produced before it was bound, rather than a failure.
-    // The slot's declaration may live in the calling frame's SIDE module: a
-    // call site lowered inside a local class's method (or a closure in it)
-    // reserved its header there, and the main module has no func at that id.
+    // A slot is a static hint: with no entry, or nothing to execute behind it,
+    // dispatch by name. The declaration may live in the frame's side module.
     const slot_name: ?[]const u8 = blk: {
         if (module.funcById(FuncId.from(slot.int()))) |f| break :blk f.name;
         const fm = ir.eval.currentFrameModule() orelse break :blk null;
@@ -484,13 +412,8 @@ pub fn invokeVirtualMember(
         if (fm.funcById(FuncId.from(slot.int()))) |f| break :blk f.name;
         break :blk null;
     };
-    // A host-synthesized class implements its members as native intrinsics
-    // keyed by its own FQN, and that binding is the most-derived override of
-    // the slot. The synth's `supertype_names` exist for type checks, so
-    // linking the slot through them would enter the supertype's Kotlin body —
-    // which reads internal fields the native implementation never
-    // materializes. Only anonymous (runtime-built) classes can carry such
-    // bindings, so named classes skip the probe.
+    // A host-synthesized class implements its members as native intrinsics keyed
+    // by its own FQN; its `supertype_names` exist only for type checks.
     if (slot_name) |n| {
         const anon = blk: {
             const class = runtime_def.borrow();
@@ -506,8 +429,7 @@ pub fn invokeVirtualMember(
         }
     }
     const memo_class_id: ?ir.ClassId = cid: {
-        // Replay the class's resolved-id memo before the string-keyed
-        // registry probe (see `ClassDef.resolve_mod`).
+        // Replay the class's resolved-id memo before the string-keyed probe.
         const class = runtime_def.borrow();
         defer class.deinit();
         const cdef = class.get();
@@ -535,10 +457,8 @@ pub fn invokeVirtualMember(
             if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);
             return .{ .err = .{ .Type = "virtual method slot is not linked for runtime class" } };
         };
-    // A runtime-defined or anonymous class can share the source interface's
-    // nominal FQN. The main-module table then identifies the correct slot
-    // family but lands on its bodyless declaration header; use the runtime
-    // class identity to locate the concrete override.
+    // An anonymous class can share the source interface's nominal FQN, so the
+    // main-module table lands on a bodyless header; use the runtime identity.
     switch (linked) {
         .main_func => |target| if (!virtualTargetExecutable(module, FuncId.from(target))) {
             linked = (try runtimeVirtualTarget(self, allocator, module, runtime_def, slot)) orelse linked;
@@ -558,13 +478,8 @@ pub fn invokeVirtualMember(
             arg_params,
         );
     }
-    // A main-module slot link on an ANONYMOUS receiver class is a
-    // supertype-matched guess: the synth lists upstream classes for type
-    // checks, and entering the supertype's Kotlin body bypasses the pack's
-    // shadowing extension properties. Dispatch by name so the full ladder
-    // (host bindings, extension properties, anon methods) serves; a SAM
-    // conversion keeps the slot path (its stored lambda is served below by
-    // target signature).
+    // A slot link on an anonymous receiver class is a supertype guess whose body
+    // bypasses shadowing extension properties; a SAM conversion keeps the path.
     if (linked == .main_func) {
         const anon_recv = blk: {
             const class = runtime_def.borrow();
@@ -593,9 +508,8 @@ pub fn invokeVirtualMember(
         }
     }
 
-    // The slot resolved, but to a declaration with nothing behind it: no
-    // body, no linked host symbol, and no SAM callable on the instance.
-    // Dispatch by name rather than entering an empty frame.
+    // The slot resolved to a declaration with no body, no linked host symbol and
+    // no SAM callable: dispatch by name rather than entering an empty frame.
     if (!virtualTargetExecutable(module, target) and
         host_call_func.resolvedNativeForm(self, target) == null)
     {
@@ -608,14 +522,8 @@ pub fn invokeVirtualMember(
             if (slot_name) |n| return callMemberNamed(self, allocator, receiver, n, args, arg_names);
         }
     }
-    // A bodyless header WITH a linked host symbol is executable — but only
-    // for receivers whose runtime REPR the intrinsic serves. An interpreted
-    // Instance whose class hierarchy declares the member has a MORE DERIVED
-    // interpreted override the name ladder finds; running the header's
-    // native form instead fed a `PersistentList` instance to
-    // `kotlin.collections.List.isEmpty` (host-List-only). The name ladder
-    // still reaches host bindings through its own tails when the hierarchy
-    // has no interpreted body.
+    // A bodyless header with a linked host symbol serves only receivers whose
+    // repr the intrinsic accepts; a declared member has a more derived override.
     if (!virtualTargetExecutable(module, target) and
         host_call_func.resolvedNativeForm(self, target) != null)
     {
@@ -656,8 +564,7 @@ pub fn invokeVirtualMember(
         break;
     };
 
-    // A synthetic fun-interface instance implements its abstract slot with
-    // the callable stored by SAM conversion, rather than an IR method body.
+    // A fun-interface instance implements its abstract slot with the SAM callable.
     if (!any_named) {
         const sig = module.decl_sigs.get(target.int());
         if (sig != null and !sig.?.has_body) {
@@ -686,9 +593,8 @@ pub fn invokeVirtualMember(
 }
 
 pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args_in: []const Value) Allocator.Error!?EvalResult {
-    // Vendored persistent-vector scans: a memoized contains/indexOf site
-    // replays straight to its FuncId, so the host walk must intercept at
-    // the invoker too (see the callMemberInnerStatic intercept).
+    // A memoized contains/indexOf site replays straight to its FuncId, so the
+    // vendored scan intercept repeats at the invoker.
     if (args_in.len == 1 and receiver.* == .Instance) {
         const fname = blk: {
             const mg = self.module.borrow();
@@ -708,9 +614,6 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
             }
         }
     }
-    // Vendored persistent-vector builder bulk ops (see the
-    // callMemberInnerStatic intercept): serve a memoized removeRange or
-    // addAll site replaying straight to its FuncId.
     if (args_in.len <= 2 and receiver.* == .Instance) {
         const fname2 = blk: {
             const mg = self.module.borrow();
@@ -744,10 +647,8 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
             }
         }
     }
-    // Scalar-replay leaf on the resolved member: the receiver rides as
-    // param 0 (opaque genre when non-scalar — a body that touches it
-    // bails); a bail falls through to the ordinary invoke, which re-runs
-    // the pure body exactly.
+    // Scalar-replay leaf on the resolved member: the receiver rides as param 0,
+    // opaque when non-scalar; a bail falls through to the ordinary invoke.
     leaf: {
         if (receiver.* == .Null) break :leaf;
         const mg2 = self.module.borrow();
@@ -769,9 +670,8 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
     defer mg.deinit();
     const mod = mg.get();
     const f = funcAt(mod, fid) orelse return null;
-    // A bodyless declaration linked to a host symbol runs as that intrinsic,
-    // not as an empty frame. Every fast path below enters a frame directly, so
-    // route it through the general call path, which consults the linkage.
+    // A bodyless declaration linked to a host symbol runs as that intrinsic; the
+    // fast paths below enter a frame directly, so route it through the linkage.
     if (!f.hasBody() and host_call_func.resolvedNativeForm(self, fid) != null) {
         const all = try prependReceiver(allocator, receiver, args_in);
         defer if (runtime.freeScratch()) allocator.free(all);
@@ -784,17 +684,14 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
             if (vmhost.host_fields.accessorFastGet(self, mod, fp, receiver)) |r| return r;
         }
     }
-    // The wider leaf-expression shape: a body that only reads its arguments
-    // and stored fields and combines them with primitive operators runs
-    // without a frame.
+    // The wider leaf shape: a body of argument and field reads combined with
+    // primitive operators runs without a frame.
     if (mod.funcById(fid)) |fp| {
         if (fp.has_receiver_param and args_in.len + 1 == fp.params.len and
             args_in.len < ir.LEAF_MAX_REGS)
         {
-            // Two tiers: safety builds 0xAA-fill an `undefined` stack array
-            // at its DECLARED size on every entry, and the 64-slot buffer's
-            // 2.5KB fill was a top profile frame across member-call-heavy
-            // suites. Nearly every call fits eight slots.
+            // Two tiers: safety builds fill an `undefined` stack array at its
+            // declared size on entry, and nearly every call fits eight slots.
             if (args_in.len + 1 <= 8) {
                 var argbuf: [8]Value = undefined;
                 argbuf[0] = receiver.*;
@@ -819,25 +716,14 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
         }
     }
 
-    // A pass-threaded `@Composable` member method re-invoked during recompose
-    // (`this.Child($composer, $changed)`) must publish its threaded composer as
-    // the ambient composer for the call, exactly like the free-function
-    // (`composableEval`) and value-call paths: a `@Composable` property getter
-    // reached from the body (e.g. `currentRecomposeScope`) reads it through the
-    // `__compose_currentComposer` intrinsic. Initial composition masks the miss
-    // because the enclosing composable's composer is still on the stack; a
-    // restart re-invocation runs the invalidated scope directly with an empty
-    // stack. A member `f.params` carries the receiver as an explicit leading
-    // `this` param, while `args` is receiver-excluded — `threadedComposerArg`
-    // handles that alignment.
+    // A pass-threaded `@Composable` member publishes its threaded composer as the
+    // ambient one: a recompose restart runs the scope with an empty stack.
     const threaded_composer: ?Value = compose.threadedComposerArg(f.params, args_in);
     if (threaded_composer) |c| compose.pushComposer(c);
     defer if (threaded_composer != null) compose.popComposer();
 
-    // Pairless composable member call accepted by the pair-trimmed pick
-    // (`ReadStringCompositionLocal(local)` against `(this, local, $composer,
-    // $changed)`): complete the pair from the ambient composer before
-    // binding, or the body runs with Unit in `$composer`.
+    // A pairless composable member call accepted by the pair-trimmed pick:
+    // complete the pair from the ambient composer, or `$composer` binds Unit.
     var pair_ext: ?[]Value = null;
     defer if (pair_ext) |pe| if (runtime.freeScratch()) allocator.free(pe);
     var args = args_in;
@@ -847,11 +733,8 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
         args.len + 3 <= f.params.len and threaded_composer == null)
     {
         if (compose.currentComposer()) |c| {
-            // Defaulted user params omitted at the call site (`Test()` against
-            // `(this, number$arg = marker, $composer, $changed)`): a positional
-            // append would land the composer in the first open user slot, so
-            // bind the pair BY NAME and let the named binder fill the middle
-            // defaults.
+            // A positional append would land the composer in the first open user
+            // slot, so bind the pair by name and let the binder fill the defaults.
             if (args.len + 3 < f.params.len) {
                 const all = try prependReceiver(allocator, receiver, args);
                 defer if (runtime.freeScratch()) allocator.free(all);
@@ -881,11 +764,8 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
     const pushed_completed = pair_ext != null;
     defer if (pushed_completed) compose.popComposer();
 
-    // Non-final vararg (a vararg before trailing defaulted / named-only params):
-    // the prepend + trailing-collapse path cannot bind it — the vararg must
-    // consume the mid-list positional args at its own position while the
-    // trailing parameters take their defaults. Route through the reorder-aware
-    // func binder (receiver prepended, all-positional), which handles it.
+    // A vararg before trailing defaulted parameters consumes the mid-list
+    // positional args at its own position, which only the func binder does.
     if (f.params.len > 1) {
         for (f.params[0 .. f.params.len - 1]) |*p| {
             if (p.is_vararg) {
@@ -896,11 +776,8 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
         }
     }
 
-    // Fast path: no vararg tail and the call is fully applied (no default
-    // padding), so the frame argument list is exactly `[receiver] ++ args`.
-    // Build it in one allocation directly into the frame-owned list, skipping
-    // the `prependReceiver` scratch slice + its copy/free (a per-call win on the
-    // hot member-dispatch path).
+    // No vararg tail and a fully applied call: the argument list is exactly
+    // `[receiver] ++ args`, built in one allocation into the frame-owned list.
     const has_vararg = f.params.len > 0 and f.params[f.params.len - 1].is_vararg;
     if (!has_vararg and args.len + 1 >= f.params.len) {
         var list = try ir.eval.acquireArgsCap(allocator, args.len + 1);
@@ -915,12 +792,8 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
     }
 
     var all = try prependReceiver(allocator, receiver, args);
-    // Kotlin trailing-lambda rule for an under-applied member call: the final
-    // supplied callable binds the LAST function-typed parameter, with the
-    // intervening defaulted parameters filled from their defaults rather than
-    // bound left-to-right. `padArgsWithDefaults` fills positionally (lambda →
-    // first gap param), so route this shape through the shared positional
-    // binder, which implements the rule uniformly (and varargs/defaults).
+    // Kotlin binds the final callable of an under-applied member call to the last
+    // function-typed parameter, the gaps taking defaults; the shared binder does.
     if (all.len < f.params.len and all.len != 0 and
         isFunctionTypeRefResolved(self, &f.params[f.params.len - 1].ty) and
         isCallable(&all[all.len - 1]) and (all.len - 1) < (f.params.len - 1))
@@ -963,19 +836,8 @@ pub fn invokeMethodFuncId(self: *VmHost, allocator: Allocator, receiver: *const 
     return try ir.eval.evalWith(VmHost, allocator, mod, &f, packed_list, self);
 }
 
-/// Build the inline-cache key for an instance method call, or `null` for a
-/// non-Instance receiver. Keyed by class-cell identity + interned method-name
-/// pointer + arity (all stable for the program lifetime).
-/// Compact signature of an argument run's primitive types, distinguishing the
-/// overloads a method-name resolution can depend on. Returns null for a
-/// non-primitive arg (or > 12 args), which means "do not cache this call" — the
-/// resolution then re-runs each time rather than risk a wrong cross-type hit.
-/// Relaxed argument signature for the NAMED member-walk memo: never null.
-/// Where the strict signature declines container shapes (their extension
-/// applicability inspects value content), member OVERLOADS cannot differ
-/// only by a generic element type (Kotlin erasure forbids it), so a
-/// container KIND tag discriminates every declarable member overload set.
-/// Instances still fold class identity; closures fold body identity.
+/// Relaxed argument signature for the named member-walk memo; never null. Kotlin
+/// erasure forbids overloads differing only by element type, so a kind tag serves.
 pub fn methodArgSigRelaxed(self: *VmHost, args: []const Value) u64 {
     var h = std.hash.Wyhash.init(0x452821e638d01377 +% args.len);
     for (args) |*a| {
@@ -1002,13 +864,8 @@ pub fn methodArgSigRelaxed(self: *VmHost, args: []const Value) u64 {
     return if (v == 0) 1 else v;
 }
 
-/// Arg-side RELAXED variant of `instanceMethodKeyScoped` for the MEMBER
-/// cache only: receiver keying rules are identical (identity-keyable
-/// receivers only — receiver-side relaxation is where the measured
-/// regressions lived), but the arg signature uses container-kind tags
-/// (see `methodArgSigRelaxed`), which fully discriminate any declarable
-/// member overload set under Kotlin erasure. Salted apart from strict
-/// entries. The extension caches never use this key.
+/// Arg-side relaxed variant of `instanceMethodKeyScoped` for the member cache:
+/// identical receiver keying, container-kind argument tags, salted apart.
 pub fn instanceMethodKeyRelaxed(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
     var k = instanceMethodKeyScoped(self, receiver, name, &.{}, static_recv, null) orelse return null;
     k.n_args = @intCast(args.len);
@@ -1017,16 +874,13 @@ pub fn instanceMethodKeyRelaxed(self: *VmHost, receiver: *const Value, name: []c
     return k;
 }
 
+/// Compact signature of an argument run's types, discriminating the overloads a
+/// resolution depends on. Null for an unkeyable argument or more than 12 of them.
 pub fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
     if (args.len == 0) return 0;
     if (args.len > 12) return null;
-    // Hash a per-arg type discriminator. Primitives contribute their tag;
-    // an `Instance` also folds in its class identity, so an overload picked
-    // by the argument's class (`LocalDate.plus(DatePeriod)` vs
-    // `LocalDate.plus(DateTimeUnit)`) gets a distinct, cacheable key rather
-    // than the pre-hash scheme's "non-primitive → no key" bail. Any other
-    // value shape yields no key (that call re-resolves) so the cache never
-    // conflates argument types the overload dispatch would distinguish.
+    // Hash a per-arg type discriminator; an `Instance` folds in its class
+    // identity. Any other shape yields no key, so no two types are conflated.
     var h = std.hash.Wyhash.init(0x9e3779b97f4a7c15 +% args.len);
     for (args) |*a| {
         const tag: u8 = switch (a.*) {
@@ -1044,37 +898,19 @@ pub fn methodArgSig(self: *VmHost, args: []const Value) ?u64 {
             .UByte => 12,
             .Instance => 13,
             // A `String` is always `kotlin.String` and a `Unit` always
-            // `kotlin.Unit`: their runtime shape fully fixes the type the
-            // overload walk sees, so folding a stable tag is sound and keeps
-            // the common String-argument calls (pervasive on the coroutine
-            // resume path) on the inline-cache fast path. `Null` stays
-            // uncacheable — it matches any nullable parameter, so its
-            // resolution is not a pure function of the value shape.
+            // `kotlin.Unit`, so the runtime shape fixes the type the walk sees.
             .String => 14,
             .Unit => 15,
-            // A closure argument keys by its BODY identity (folded below):
-            // overload applicability consults the declared shape, a pure
-            // function of the body, never the captured values. Without a
-            // tag every call carrying a lambda had no key at all, and
-            // extension-heavy lambda-argument code re-ran the full
-            // extension walk per call.
+            // A closure keys by its body identity, folded below: applicability
+            // consults the declared shape, never the captured values.
             .IrClosure => 16,
-                        // A `Null` argument at a fixed position keys soundly: the walk
-            // scores an identical tag vector identically every time (its
-            // null-compat check consults only the PARAM's declared
-            // nullability), so the resolution is a pure function of the
-            // key. Excluding it made every nullable-trailing-arg call
-            // (`resumeCancellableWithInternal`'s `onCancellation = null`)
-            // re-walk per call.
+            // A `Null` argument keys soundly: the null-compat check consults
+            // only the parameter's declared nullability, never the value.
             .Null => 18,
-            // A PRIMITIVE array argument keys by its prim kind — the same
-            // granularity the receiver-identity case uses; an object array
-            // (erased element type) stays uncacheable.
+            // A primitive array keys by prim kind; an object array, whose element
+            // type is erased, stays uncacheable.
             .Array => 19,
-            // A `Result` argument is `kotlin.Result` at exactly typeFqn
-            // granularity (the payload type is erased), mirroring the
-            // receiver-identity case. The coroutine resume path passes one
-            // on every `resumeWith`-family call.
+            // A `Result` keys at exactly typeFqn granularity; its payload is erased.
             .Result => 20,
             else => return null,
         };
@@ -1107,23 +943,11 @@ pub fn instanceMethodKey(self: *VmHost, receiver: *const Value, name: []const u8
     return instanceMethodKeyScoped(self, receiver, name, args, null, null);
 }
 
-/// Scope-aware cache key. A `static_recv`/`declared_recv`-directed call
-/// resolves in the STATIC type's scope, not the runtime class's, so its
-/// resolution must never be conflated with the unscoped one — `Map.getOrElse`'s
-/// inlined `get` must not be served a cached subtype `get<T>` (which
-/// self-recurses), nor vice versa. Folding the scope names into `sig` keeps
-/// both resolutions cached under distinct keys; resolution is a pure function
-/// of (class, name, arg-sig, scope), so each entry stays sound.
+/// Scope-aware cache key: a `static_recv`/`declared_recv`-directed call resolves
+/// in the static type's scope, so the scope names fold into `sig`.
 pub fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value, static_recv: ?[]const u8, declared_recv: ?[]const u8) ?root_mod.ProgramImage.InstanceMethodKey {
-    // Non-Instance receivers with a stable type identity key too: a
-    // closure's resolution is fixed by its BODY (the declared shape —
-    // arity, receiver head, suspendness — is a pure function of the body
-    // func), and a `Result`'s by its tag (extensions on `Result<T>` are
-    // erased). The synthesized identity is forced ODD so it can never
-    // collide with a real class-cell pointer (those are aligned). The
-    // hot coroutine boundary (`startCoroutineUninterceptedOrReturn` on a
-    // suspend block, `throwOnFailure` on a `Result`) re-ran the full
-    // extension walk per call without this.
+    // Non-Instance receivers with a stable type identity key too. A synthesized
+    // identity is forced odd so it never collides with an aligned class pointer.
     const class_identity: usize = switch (receiver.*) {
         .Instance => |inst| runtime.InstanceData.classIdentityUnlocked(inst),
         .IrClosure => |c| blk: {
@@ -1135,15 +959,10 @@ pub fn instanceMethodKeyScoped(self: *VmHost, receiver: *const Value, name: []co
             break :blk h.final() | 1;
         },
         .Result => 0x5261 | 1,
-        // A CLASS value (`Snapshot`'s companion-forwarding class receiver, a
-        // `::class`): member/extension resolution is a pure function of the
-        // referenced class cell — `currentSnapshot` on the snapshot companion
-        // class re-ran the full extension walk 90k times per benchmark.
+        // A class value resolves purely from the referenced class cell.
         .Class => |c| c.identity(),
-        // Runtime shapes whose extension resolution is fully fixed by the
-        // value's type tag, at exactly `typeFqn` granularity (prim kind for
-        // arrays, kind + step-refinement for ranges). Identities are forced
-        // ODD so they never collide with an aligned class-cell pointer.
+        // Runtime shapes whose extension resolution is fixed by the value's type
+        // tag at exactly `typeFqn` granularity, prim kind for arrays.
         .Array => |arr| blk: {
             const k: usize = if (arr.primKind()) |pk| @as(usize, @intFromEnum(pk)) + 1 else 0;
             break :blk (0xA100 + (k << 8)) | 1;

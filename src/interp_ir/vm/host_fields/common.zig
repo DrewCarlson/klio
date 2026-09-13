@@ -1,6 +1,6 @@
-//! Small shared helpers behind the field paths: the result constructors,
-//! the resolution-guard wrapper, getter evaluation, intrinsic lookup and
-//! dispatch, and the name/shape predicates every ladder consults.
+//! Shared helpers behind the field paths: result constructors, the
+//! resolution-guard wrapper, getter evaluation, intrinsic lookup and dispatch,
+//! and the name and shape predicates every ladder consults.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -41,27 +41,20 @@ pub inline fn errRes(e: EvalError) EvalResult {
     return .{ .err = e };
 }
 
-/// The active coroutine scope (top of the driver stack), if any. The
-/// driver stack lives with the coroutine machinery in `coroutines.zig`;
-/// a `driveRoot` activation pushes its scope there.
+/// Top of the driver stack a `driveRoot` activation pushes its scope onto.
 pub fn activeCoroScope() ?Value {
     return vmhost.coroutines.activeCoroScope();
 }
 
-/// The lexically enclosing `this` displaced by a receiver lambda, or
-/// `null`. Reports the top of the shared enclosing-`this` stack
-/// (`with_outer_this(|s| s.borrow().last().cloned())`), which member
-/// dispatch and the access-enclosing machinery push onto — so a bare
-/// member-property read inside a member-extension / receiver-lambda body
-/// can resolve against the lexically enclosing class instance.
+/// Top of the shared enclosing-`this` stack: the lexically enclosing `this` a
+/// receiver lambda displaced, so a bare member-property read inside a
+/// member-extension body resolves against the enclosing class instance.
 pub fn outerThisLast(self: *VmHost) ?Value {
     return vmhost.host_call_member.enclosingThis(self);
 }
 
-/// Run `f` only if `(id, name)` is not already being resolved through
-/// the `get_field` heuristic fallbacks; pushes/pops the pair so the
-/// recursion is bounded by the distinct instances on the stack. Returns
-/// `null` when the pair is already active.
+/// Runs `f` only when `(id, name)` is not already resolving through the
+/// `get_field` fallbacks, bounding that recursion to distinct instances.
 pub fn withFieldResolvePair(
     self: *VmHost,
     allocator: Allocator,
@@ -74,9 +67,8 @@ pub fn withFieldResolvePair(
     for (fldTls().field_resolve_stack.items) |k| {
         if (k.id == id and std.mem.eql(u8, k.name, name)) return null;
     }
-    // Back the process-global guard stack on `page_allocator` (it is cleared
-    // capacity-retaining at run boundaries; a per-run-arena backing would
-    // leave the retained capacity dangling once that arena is torn down).
+    // The guard stack is process-global and cleared capacity-retaining at run
+    // boundaries, so a per-run arena backing would leave that capacity dangling.
     fldTls().field_resolve_stack.append(std.heap.page_allocator, .{ .id = id, .name = name }) catch {};
     const r = try getFieldInner(self, allocator, receiver, name, suppress_cc_redirect, member_probe, false);
     var i: usize = fldTls().field_resolve_stack.items.len;
@@ -91,30 +83,20 @@ pub fn withFieldResolvePair(
     return r;
 }
 
-/// Last `.`-delimited segment of a dotted name (`a.b.c` -> `c`).
 pub fn lastSegment(s: []const u8) []const u8 {
     if (std.mem.findScalarLast(u8, s, '.')) |i| return s[i + 1 ..];
     return s;
 }
 
-/// Number of UTF-16 code units in `s` (Kotlin `String` length unit),
-/// falling back to the byte count for malformed UTF-8.
-/// UTF-16 code units, agreeing with what `String.length` reports.
-///
-/// Delegates to the stdlib's counter rather than
-/// `std.unicode.calcUtf16LeLen`, whose `catch s.len` fallback silently
-/// returns the BYTE length for any string kotlinc considers valid but UTF-8
-/// does not — a lone surrogate is stored WTF-8 (`ED A0 80`), so `"\ud800"`
-/// reported `length == 1` but `lastIndex == 2` and `indices == 0..2`.
-/// kotlinx-io's Utf8Test iterates `string.indices` and indexes the string,
-/// so the extra indices threw IndexOutOfBounds on every lone-surrogate case.
+/// UTF-16 code units, the unit `String.length` reports. The stdlib counter, not
+/// `std.unicode.calcUtf16LeLen`, whose fallback returns the byte length for a
+/// WTF-8 lone surrogate that kotlinc accepts.
 pub fn utf16Len(s: []const u8) usize {
     const n = stdlib.text.utf16Len(s);
     return if (n < 0) 0 else @intCast(n);
 }
 
-/// Build a frozen `List` value over `items`. `enum_entries` marks the
-/// `EnumName.entries` list. Consumes `items` into the backing cell.
+/// Consumes `items`; `enum_entries` marks an `EnumName.entries` list.
 pub fn frozenList(allocator: Allocator, items: std.ArrayList(Value), enum_entries: bool) Allocator.Error!Value {
     return try Value.newList(allocator, .{
         .items = try ValueList.init(allocator, items),
@@ -124,8 +106,8 @@ pub fn frozenList(allocator: Allocator, items: std.ArrayList(Value), enum_entrie
     });
 }
 
-/// Run the IR-lowered function `fid` with the receiver bound as the
-/// sole positional argument (custom getter / extension prop invocation).
+/// Runs `fid` with the receiver as its sole positional argument, the shape of a
+/// custom getter or extension property.
 pub fn evalGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value) Allocator.Error!EvalResult {
     return evalGetterTagged(self, allocator, fid, receiver, "untagged");
 }
@@ -136,11 +118,9 @@ pub fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiv
         const msg = try std.fmt.allocPrint(allocator, "getter FuncId {d} out of range", .{fid.int()});
         return errRes(.{ .Type = msg });
     };
-    // Frameless serve for the canonical getter shape on a claimed class.
     if (accessorFastGet(self, mptr, func, &receiver)) |r| return r;
-    // Host-served compose snapshot getters (`SnapshotState*.readable`,
-    // `Snapshot.current`): classified once per Func, exactly like the
-    // static-call routes in exec_call's hostStaticServe.
+    // Host-served compose snapshot getters, classified once per Func like the
+    // static-call routes in `hostStaticServe`.
     {
         if (func.host_route == 0) {
             const route: ir.snapshot_fast.Route = blk: {
@@ -168,23 +148,14 @@ pub fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiv
             else => {},
         }
     }
-    // Frameless serve for the wider leaf-expression shape (a getter that
-    // combines a couple of stored reads with primitive arithmetic).
+    // Frameless serve for the wider leaf shape: stored reads plus arithmetic.
     if (try ir.eval.leafExprServe(VmHost, allocator, mptr, func, &.{receiver}, self)) |r| return r;
-    // Compiled kl_ leaf gate: the getter path is a member-dispatch
-    // commit point like any other — a branchy accessor body the
-    // frameless evaluator declines (inWholeSeconds' unit chase) still
-    // serves natively when its leaf is registered.
+    // A branchy accessor the frameless evaluator declines still serves its
+    // compiled leaf; the getter path is a commit point like any other.
     if (try ir.eval.tryLeafValues(VmHost, allocator, mptr, func, &.{receiver}, self, null)) |lo| switch (lo) {
         .val => |v| return .{ .ok = v },
         .raise => |e| return errRes(e),
     };
-    // Pin the receiver as a GC root across the getter's re-entrant evaluation.
-    // A getter body allocates and hits safe points; the only handle to the
-    // receiver here is this native local (the frame-chain walk cannot see it
-    // until the new frame's params are installed), so a collection mid-getter
-    // would otherwise sweep it — and everything transitively reachable through
-    // it, which the getter is about to read.
     if (missTraceEnvCached()) |w| {
         if (std.mem.find(u8, func.name, w) != null) {
             const rc: []const u8 = if (receiver == .Instance) className(receiver.Instance) else receiver.typeFqn();
@@ -192,6 +163,8 @@ pub fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiv
             ir.eval.dumpFrameChainForDiagAlways();
         }
     }
+    // Pin the receiver as a GC root: until the new frame's params are installed
+    // this native local is the only handle the collector can see.
     const ka = self.ka.mark();
     defer self.ka.restore(ka);
     self.ka.push(receiver);
@@ -204,17 +177,13 @@ pub fn evalGetterTagged(self: *VmHost, allocator: Allocator, fid: FuncId, receiv
     return ir.eval.evalWith(VmHost, allocator, mptr, func, args_owned, self);
 }
 
-/// `instance_prop_getters.get((class, name))` -> `?FuncId`.
 pub fn lookupPairFunc(map: anytype, a: []const u8, b: []const u8) ?FuncId {
     return map.get(.{ .a = a, .b = b });
 }
 
-/// Accessor lookup for a HIERARCHY HOP: the simple key first, then the
-/// hop class's registered FQN key. A PRIVATE class registers its
-/// accessors under the FQN only (the shared simple slot must not let a
-/// private namesake capture unrelated dispatch), so an inherited getter
-/// from a private base (SnapshotMapSet's `size` behind
-/// SnapshotMapKeySet) resolves through the FQN alone.
+/// Accessor lookup across a hierarchy hop: simple key first, then the hop class's
+/// FQN key. A private class registers only under the FQN, so the shared simple
+/// slot cannot let a private namesake capture unrelated dispatch.
 pub fn lookupPairFuncHop(self: *VmHost, map: anytype, cn: []const u8, b: []const u8) ?FuncId {
     if (map.get(.{ .a = cn, .b = b })) |f| return f;
     const fqn: ?[]const u8 = blk: {
@@ -231,12 +200,10 @@ pub fn lookupPairFuncHop(self: *VmHost, map: anytype, cn: []const u8, b: []const
     return null;
 }
 
-/// Look up an intrinsic by FQN: the pack-supplied bindings overlay
-/// first, then the stdlib default implementation.
+/// The pack-supplied bindings overlay shadows the stdlib implementation.
 pub fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
-    // Post-link the bindings table is read-only; consult it unguarded
-    // (gated on the published link flag) instead of taking two shared
-    // reader locks per lookup.
+    // Post-link the bindings table is read-only, so the published link flag
+    // gates an unguarded read instead of two shared reader locks per lookup.
     {
         const img = self.prog.asPtrConst();
         if (@atomicLoad(bool, &img.resolved_linked, .acquire)) {
@@ -254,9 +221,7 @@ pub fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
     return stdlib.implementation(fqn);
 }
 
-/// Invoke a resolved stdlib intrinsic with `args`, mapping a thrown /
-/// non-local-return / suspend `RuntimeError` to the matching
-/// `EvalError`.
+/// Maps the intrinsic's `RuntimeError` onto the matching `EvalError`.
 pub fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(allocator, "intrinsic_fields", fqn, null, null, args);
     const keepalive = self.ka.mark();
@@ -293,8 +258,7 @@ pub fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, f
         .err => |e| switch (e) {
             .Thrown => |v| errRes(.{ .Throw = v }),
             .Return => |v| errRes(.{ .NonLocalReturn = v }),
-            // Keep each message-carrying kind intact: collapsing to the
-            // tag name buries the real failure text.
+            // Each message-carrying kind keeps its text; the tag name buries it.
             .Unbound => |s| errRes(.{ .Unbound = s }),
             .Type => |s| errRes(.{ .Type = s }),
             .Arity => |s| errRes(.{ .Arity = s }),
@@ -315,9 +279,8 @@ pub fn typeHeadOf(name: []const u8) []const u8 {
     return h;
 }
 
-/// A boxed capture (an anon-object method's captured outer `var` stored
-/// in its capture env as a shared Cell) reads THROUGH the cell — the cell
-/// is a carrier, never a user value.
+/// An anon-object method's captured outer `var` lives in a shared Cell, which is
+/// a carrier and never a user value, so the read goes through it.
 pub fn unwrapCellRead(r: EvalResult) EvalResult {
     if (r == .ok and r.ok == .Cell) {
         const cg = r.ok.Cell.borrow();
@@ -327,16 +290,15 @@ pub fn unwrapCellRead(r: EvalResult) EvalResult {
     return r;
 }
 
-/// A discarded dispatch-miss message from a probe. Host miss messages are
-/// `allocPrint`-built with a `Vm::` prefix; static literals never carry one.
+/// Frees a probe's discarded miss message: host misses are `allocPrint`-built
+/// with a `Vm::` prefix, which static literals never carry.
 pub fn freeMissErr(allocator: Allocator, e: EvalError) void {
     if (!runtime.freeScratch()) return;
     if (e != .Unimplemented) return;
     if (std.mem.startsWith(u8, e.Unimplemented, "Vm::")) allocator.free(e.Unimplemented);
 }
 
-/// The receiver's class fqn for diagnostics — an instance names its
-/// declaring class instead of the opaque `<instance>` tag.
+/// The receiver's class fqn, so a diagnostic names the declaring class.
 pub fn receiverLabel(receiver: *const Value) []const u8 {
     if (receiver.* == .Instance) {
         const g = receiver.Instance.borrow();
@@ -348,9 +310,8 @@ pub fn receiverLabel(receiver: *const Value) []const u8 {
     return receiver.typeFqn();
 }
 
-/// `KClass.simpleName` of a runtime class name: a nested class is stored
-/// lifted (`Outer$Inner`) and a local class under its function mangle
-/// (`Name$lc<fn>`); the simple name is the declared identifier alone.
+/// `KClass.simpleName` of a runtime class name: a nested class is stored lifted
+/// as `Outer$Inner` and a local class under the mangle `Name$lc<fn>`.
 pub fn classSimpleName(name: []const u8) []const u8 {
     var n = name;
     if (std.mem.find(u8, n, "$lc")) |i| n = n[0..i];
@@ -360,27 +321,19 @@ pub fn classSimpleName(name: []const u8) []const u8 {
     return n;
 }
 
-/// The enclosing-class lift name of a nested class / companion lift name:
-/// `Root$Companion$Plugin` -> `Root`, `Outer$Inner` -> `Outer`. Null when the
-/// name has no nesting marker.
+/// The enclosing-class lift name: `Root$Companion$Plugin` and `Outer$Inner` give
+/// `Root` and `Outer`; null when the name has no nesting marker.
 pub fn enclosingNameOf(name: []const u8) ?[]const u8 {
     if (std.mem.find(u8, name, "$Companion$")) |i| return name[0..i];
     if (std.mem.findScalarLast(u8, name, '$')) |i| return name[0..i];
     return null;
 }
 
-// -------------------------------------------------------------------------
-// Small shared helpers.
-// -------------------------------------------------------------------------
-
-/// Anon-method registry key `"<class>\u{1f}<method>"`. The registry is
-/// keyed on a single string, built as a unit-separated concatenation of
-/// `(class, name)` cached per-call.
+/// Anon-method registry key: the single string `"<class>\u{1f}<method>"`.
 pub fn anonKey(class_name: []const u8, method: []const u8) []const u8 {
     return std.fmt.bufPrint(&fldTls().anon_key_buf, "{s}\u{1f}{s}", .{ class_name, method }) catch class_name;
 }
 
-/// The runtime class simple name of an instance.
 pub fn className(inst: ObjRef(InstanceData)) []const u8 {
     const g = inst.borrow();
     defer g.deinit();
@@ -389,8 +342,7 @@ pub fn className(inst: ObjRef(InstanceData)) []const u8 {
     return cg.get().name;
 }
 
-/// The instance's class FQN (falling back to its simple name when no FQN
-/// is recorded). Used to key a native property-getter binding.
+/// The instance's class FQN, or its simple name when none is recorded.
 pub fn classFqnOf(inst: ObjRef(InstanceData)) []const u8 {
     const g = inst.borrow();
     defer g.deinit();
@@ -400,12 +352,9 @@ pub fn classFqnOf(inst: ObjRef(InstanceData)) []const u8 {
     return if (fqn.len != 0) fqn else cg.get().name;
 }
 
-/// Whether the instance's class is a host-synthesised class — anonymous
-/// (built through `newSynthInstance`) with a package-qualified FQN that
-/// differs from its simple name. The native `KlioChannel` qualifies; a
-/// source `object : I {}` literal does not (its FQN is its bare `$anon$N`
-/// name), so only host synth classes reach the native property-getter
-/// probe.
+/// Whether the class is host-synthesised: anonymous, from `newSynthInstance`,
+/// with a package-qualified FQN differing from its simple name. A source
+/// `object : I {}` has its `$anon$N` name as FQN and does not qualify.
 pub fn instanceIsHostSynth(inst: ObjRef(InstanceData)) bool {
     const g = inst.borrow();
     defer g.deinit();
@@ -418,7 +367,6 @@ pub fn instanceIsHostSynth(inst: ObjRef(InstanceData)) bool {
         !std.mem.eql(u8, fqn, cg.get().name);
 }
 
-/// The first declared supertype simple name of an instance's class.
 pub fn firstSupertypeOf(inst: ObjRef(InstanceData)) ?[]const u8 {
     const g = inst.borrow();
     defer g.deinit();
@@ -428,10 +376,7 @@ pub fn firstSupertypeOf(inst: ObjRef(InstanceData)) ?[]const u8 {
     return if (sts.len > 0) sts[0] else null;
 }
 
-/// The first declared supertype simple name of class `cn`, via the
-/// runtime class table.
-/// The simple name of a companion singleton from its mangled registry key
-/// (`Owner$Companion$Key` → `Key`).
+/// Companion singleton simple name: `Owner$Companion$Key` gives `Key`.
 pub fn companionSimpleName(mangled: []const u8) []const u8 {
     return if (std.mem.findScalarLast(u8, mangled, '$')) |i| mangled[i + 1 ..] else mangled;
 }
@@ -447,8 +392,7 @@ pub fn firstSupertype(self: *VmHost, cn: []const u8) ?[]const u8 {
             return if (sts.len > 0) sts[0] else null;
         }
     }
-    // A dotted nested name (`Modifier.Node`) may register under its lifted
-    // mangled key.
+    // A dotted nested name may register under its lifted mangled key.
     if (host_call_member.mangledClassKeyOf(self, cn)) |m| {
         const cg = self.classes.borrow();
         defer cg.deinit();
@@ -482,15 +426,12 @@ pub fn listLen(items: ValueList) usize {
     return g.get().items.len;
 }
 
-/// `len` (as `i64`) of an array / list / string receiver, or `null`.
 pub fn collectionLen(receiver: *const Value) ?i64 {
     return switch (receiver.*) {
         .Array => |a| @intCast(a.len()),
         .List => |l| @intCast(listLen(l.items)),
-        // `Collection<*>.indices` / `lastIndex` apply to sets too; without
-        // this arm `setOf(1).indices` was a runtime dispatch error. Views
-        // (`backing != null`) keep falling through — their length belongs
-        // to the view machinery.
+        // `Collection<*>.indices` and `lastIndex` apply to sets too; a view,
+        // with `backing != null`, falls through to the view machinery.
         .Set => |st| if (st.backing == null) blk: {
             const g = st.items.borrow();
             defer g.deinit();

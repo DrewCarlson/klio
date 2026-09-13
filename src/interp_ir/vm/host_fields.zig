@@ -1,10 +1,6 @@
-//! `VmHost` field access: reading and writing a named property on a
-//! receiver — stored fields, custom getters/setters, extension
-//! properties, and the inner-class outer-chain fallbacks.
-//!
-//! Free functions over `*VmHost`, aliased as `VmHost` methods by
-//! `vmhost.zig` and invoked directly by the generic IR evaluator.
-//! Implements the ordered field-resolution dispatch chain (get/set/member-ref).
+//! `VmHost` field access: the ordered get/set/member-ref resolution chain over
+//! stored fields, custom accessors, extension properties and the inner-class
+//! outer-chain fallbacks. Aliased as `VmHost` methods by `vmhost.zig`.
 
 const std = @import("std");
 
@@ -74,24 +70,7 @@ const matchAny = common.matchAny;
 const listLen = common.listLen;
 const collectionLen = common.collectionLen;
 
-// -------------------------------------------------------------------------
-// Thread-local resolution guards.
-//
-// Bound the heuristic field-resolution recursion and expose the
-// suspend-implicit coroutine scope / displaced enclosing `this`. They
-// are empty/false until the coroutine driver and the access-enclosing
-// machinery push onto them, matching the default state at process start.
-// -------------------------------------------------------------------------
-
-/// `(instance id, field name)` pairs currently being resolved through
-/// the `get_field` heuristic fallbacks. Bounds the recursion to the
-/// distinct instances on the stack.
-
-/// Re-entrancy flag for the inner-class outer-chain field fallback.
-
-/// Assert (Debug) the field-resolution stack and its re-entrancy flags are
-/// clear at a run boundary and reset them so leaked-across-runs state is a
-/// loud failure.
+/// Run-boundary reset; anything still set means a fallback leaked across runs.
 pub fn resetReceiverTls() void {
     std.debug.assert(fldTls().field_resolve_stack.items.len == 0);
     std.debug.assert(!fldTls().field_outer_active);
@@ -99,10 +78,11 @@ pub fn resetReceiverTls() void {
     fldTls().field_outer_active = false;
 }
 
-/// Every per-thread cache this module keeps, as ONE threadlocal. Darwin
-/// resolves a threadlocal access through a `_tlv_get_addr` CALL, and the
-/// field paths touch several of these per operation — as one struct the
-/// base is fetched once and each cache is an offset from it.
+/// Every per-thread cache this module keeps, as one threadlocal: a threadlocal
+/// access is a `_tlv_get_addr` call on Darwin and a field operation touches
+/// several, so one base fetch plus offsets replaces several calls.
+/// `field_resolve_stack` holds the `(instance id, name)` pairs the heuristic
+/// fallbacks are resolving, bounding that recursion to distinct instances.
 pub const FieldsTls = struct {
     field_resolve_stack: std.ArrayList(ResolvePair) = .empty,
     field_outer_active: bool = false,
@@ -114,28 +94,20 @@ pub const FieldsTls = struct {
     super_write_owner: ?[]const u8 = null,
     anon_key_buf: [512]u8 = undefined,
 };
-/// Owner thread reads the global copy, every other thread its own — see
-/// `runtime.tls_fast`.
+/// Owner thread reads the global copy, every other thread its own.
 var fld_tls_owner: FieldsTls = .{};
 threadlocal var fld_tls_other: FieldsTls = .{};
 pub inline fn fldTls() *FieldsTls {
     return if (runtime.tls_fast.isOwner()) &fld_tls_owner else &fld_tls_other;
 }
 
-/// This thread's field caches. Resolved ONCE when a `VmHost` view is built (a
-/// handful of times per run) and reached through `self.tls` afterwards: on
-/// Darwin a threadlocal access is a `_tlv_get_addr` CALL, and these caches sit
-/// on the per-field-operation path, so re-resolving them per operation put
-/// thread-local access at the top of the interpreter profile.
+/// Resolved once per `VmHost` view and reached through `self.tls` after that;
+/// re-resolving per field operation dominates the profile.
 pub fn currentTls() *FieldsTls {
     return fldTls();
 }
 
 const ResolvePair = struct { id: usize, name: []const u8 };
-
-// -------------------------------------------------------------------------
-// get_field
-// -------------------------------------------------------------------------
 
 pub fn getField(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     return lexicalReceiverFallback(self, allocator, receiver, name, unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, false, false)));
@@ -161,8 +133,8 @@ pub const memberRef = bound_ref.memberRef;
 
 var miss_trace_state: u8 = 0;
 var miss_trace_want: []const u8 = "";
-/// Cached KLIO_MISS_TRACE value; consulted on per-call paths (the getter
-/// runner, the field ladder), where a raw getenv is a spinlock + probe.
+/// Cached KLIO_MISS_TRACE, consulted on per-call paths where a raw getenv
+/// costs a spinlock and a probe.
 pub fn missTraceEnvCached() ?[]const u8 {
     if (miss_trace_state == 0) {
         if (runtime.envOnce("KLIO_MISS_TRACE")) |w| {
@@ -174,9 +146,6 @@ pub fn missTraceEnvCached() ?[]const u8 {
     }
     return if (miss_trace_state == 2) miss_trace_want else null;
 }
-
-/// Depth bound for the lexical-receiver fallback below: an object literal
-/// written inside another one chains, but a capture cycle must not.
 
 const read_paths = @import("host_fields/read_paths.zig");
 pub const getMemberField = read_paths.getMemberField;
@@ -238,25 +207,20 @@ const memberExtOwnerRead = ext_props.memberExtOwnerRead;
 const runtimeClassDelegatesProp = ext_props.runtimeClassDelegatesProp;
 const delegatedPropRegistered = ext_props.delegatedPropRegistered;
 
-/// Probe the owner-qualified extension-prop keys (`"<Owner>\x00<recv>"`)
-/// for every class on the lexical receiver tower — a PRIVATE member-ext
-/// property (`private val Placeable.mainAxisSize` in each lazy item type)
-/// shares its (receiver, name) pair across owners, and only the
-/// declaration whose owner is in scope is the one kotlinc bound.
-/// One `(owning class, receiver key, property name)` verdict. The registry
-/// and the class graph are both fixed once the program is loaded, so a class
-/// that does not own `name` for `recv_key` never starts owning it — the
-/// negative answer is as cacheable as the positive one.
+/// One verdict over the owner-qualified extension-prop keys
+/// `"<Owner>\x00<recv>"`: a private member-extension property shares its
+/// (receiver, name) pair across owners, so only the declaration whose owner is
+/// in lexical scope applies. Registry and class graph are fixed once the
+/// program loads, so a negative verdict caches as safely as a positive one.
 pub const OwnerKeyedSlot = struct { key: u64 = 0, gen: u32 = 0, fid: u32 = NO_FID, hit: bool = false };
 pub const NO_FID: u32 = std.math.maxInt(u32);
 
-/// Whether the exec-arm fast serve for the builtin `indices`/`lastIndex`
-/// extension properties is sound for this program: false as soon as ANY
-/// loaded declaration outside the known stdlib packages defines an
-/// extension property with either name — Kotlin scoping can then pick
-/// the user's shadow, which a receiver-shape serve cannot see. Computed
-/// once per dispatch-cache generation over the extension-prop tables
-/// (name-global, so it over-declines rather than ever mis-serving).
+/// Whether the fast serve for the builtin `indices`/`lastIndex` extension
+/// properties is sound here: false once any declaration outside the known
+/// stdlib packages defines either name, since Kotlin scoping may then pick the
+/// user's shadow and a receiver-shape serve cannot see it. Name-global and
+/// recomputed per dispatch-cache generation, so it over-declines, never
+/// mis-serves.
 var index_props_verdict = std.atomic.Value(u64).init(0);
 pub fn builtinIndexPropsServable(self: *VmHost) bool {
     const gen: u64 = host_call_member.dispatch_cache_gen.load(.monotonic);
@@ -304,15 +268,11 @@ const companionWalkSeeded = instance_field.companionWalkSeeded;
 const outerInstanceChain = instance_field.outerInstanceChain;
 const instanceDeclaresProperty = instance_field.instanceDeclaresProperty;
 
-/// Thread-local L1 in front of the shared field-resolution memos: the
-/// shared maps live behind the program cell's reader lock, whose atomic
-/// state word ping-pongs between cores on every borrow — the same
-/// coherence cost the method-cache L1 in `host_call_member` removes.
-/// A slot mirrors a shared-map entry; the hit site re-verifies stored
-/// slots by name anyway, so a stale slot is at worst a fall-through to
-/// the ladder. The generation stamp keeps entries from a finished
-/// in-process program (reused cell addresses) from ever hitting,
-/// including on still-parked pool worker threads.
+/// Thread-local L1 in front of the shared field-resolution memos, whose
+/// program-cell reader lock ping-pongs its state word between cores on every
+/// borrow. The hit site re-verifies a slot by name, so a stale one only falls
+/// through to the ladder; the generation stamp keeps a finished program's
+/// entries, whose cell addresses get reused, from hitting.
 pub const TL_FIELD_CACHE_SIZE = 1024;
 const TlFieldReadEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, state: u8 = 0, miss_ttl: u8 = 0, hit: root.ProgramImage.FieldReadHit = .{ .getter = 0, .stored_idx = 0 } };
 const TlFieldWriteEntry = struct { class_p: usize = 0, name_p: usize = 0, gen: u32 = 0, state: u8 = 0, miss_ttl: u8 = 0, hit: root.ProgramImage.FieldWriteHit = .{ .setter = 0, .store_name = "" } };
@@ -330,14 +290,9 @@ const sgetterCopyMemo = field_cache.sgetterCopyMemo;
 const storedNullIsLateinit = field_cache.storedNullIsLateinit;
 const lateinitReadError = field_cache.lateinitReadError;
 
-// -------------------------------------------------------------------------
-// set_field
-// -------------------------------------------------------------------------
-
-/// The class a `super.prop = v` write was made from, for the duration of that
-/// write. The setter search then starts at that class's SUPERTYPES: an
-/// overriding setter whose body writes `super.prop` must reach the base
-/// accessor, never itself.
+/// The class a `super.prop = v` write was made from, for that write's duration.
+/// The setter search starts at that class's supertypes, so an overriding setter
+/// whose body writes `super.prop` reaches the base accessor, not itself.
 
 const set_field = @import("host_fields/set_field.zig");
 pub const setField = set_field.setField;
@@ -345,13 +300,6 @@ pub const setFieldFrom = set_field.setFieldFrom;
 const setFieldInner = set_field.setFieldInner;
 const setCompanionParentWalk = set_field.setCompanionParentWalk;
 const evalSetter = set_field.evalSetter;
-
-// -------------------------------------------------------------------------
-// Tests
-//
-// These exercise dispatch-chain behaviors that do not require a fully
-// wired Vm (the foundation's stubbed siblings).
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -417,12 +365,10 @@ test "discarded field probes release their owned miss message" {
     freeFieldMiss(testing.allocator, .{ .Unimplemented = "nested: Vm::get_field is static" });
 }
 
-/// The module whose tables `func`'s body indexes against, when that is the
-/// program's own module. A flat request built without one is normally read
-/// against the CALLER's module, which is wrong whenever the callee was
-/// resolved elsewhere: an anonymous object's runtime module delegates base
-/// funcs through the shared lazy header section but carries only its own
-/// const pool, so the callee's const ids land outside it.
+/// The module `func`'s body indexes against when that is the program's own.
+/// A flat request without one reads against the caller's module, wrong when the
+/// callee came from elsewhere: an anonymous object's runtime module delegates
+/// base funcs but carries only its own const pool.
 pub fn ownerModuleForFunc(self: *VmHost, func: *const ir.Func) ?*const ir.Module {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -430,16 +376,12 @@ pub fn ownerModuleForFunc(self: *VmHost, func: *const ir.Func) ?*const ir.Module
     return if (m.funcById(func.id) == func) m else null;
 }
 
-/// A property read that answers from the receiver's own representation and
-/// consults nothing else. A compiled program has no module to dispatch through
-/// and reads these here, so there is one implementation rather than two.
+/// A property read answered from the receiver's own representation alone. A
+/// compiled program has no module to dispatch through and reads these here.
 pub fn hostFreeProperty(receiver: *const Value, name: []const u8) ?Value {
-    // Progression `first`/`last`/`step` *reads* (no parens): `first`/`last`
-    // return the stored bound even when empty (the `Iterable.first()`/`last()`
-    // *functions*, dispatched as calls, still throw on empty); `step` is always
-    // Int (Int/Char/UInt) or Long (Long/ULong) with its sign. Applies to a host
-    // `Value.Range` and to a source range `Instance` (e.g. `ULongRange.EMPTY`,
-    // whose `step` field would otherwise read back as Int).
+    // Progression `first`/`last` reads return the stored bound even when
+    // empty; the `Iterable.first()`/`last()` functions still throw there.
+    // `step` keeps its sign and is Int for Int/Char/UInt, Long for Long/ULong.
     if (std.mem.eql(u8, name, "first") or std.mem.eql(u8, name, "last") or std.mem.eql(u8, name, "step")) {
         if (stdlib.implementations.ranges.asRangeView(receiver)) |view| {
             if (std.mem.eql(u8, name, "step")) {

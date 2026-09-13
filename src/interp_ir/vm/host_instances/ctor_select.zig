@@ -1,6 +1,5 @@
-//! Constructor selection and the values a constructor call binds: the class
-//! lookups behind it, secondary-constructor ranking, the parent-chain argument
-//! thunks, and the local-class parent chain.
+//! Constructor selection and the values a call binds: class lookups, secondary
+//! ctor ranking, parent-chain argument thunks, the local-class parent chain.
 
 const std = @import("std");
 
@@ -65,12 +64,7 @@ const UnitOrErr = super_chain.UnitOrErr;
 const bindThrowableArgs = super_chain.bindThrowableArgs;
 const isBuiltinThrowableName = super_chain.isBuiltinThrowableName;
 
-// -------------------------------------------------------------------------
-// Small accessors over `self.classes` and `self.prog`. Each returns a
-// fresh handle / copy; the caller frees.
-// -------------------------------------------------------------------------
-
-/// Look up a runtime `ClassDef` by simple name, returning a fresh handle.
+/// Look up a runtime `ClassDef` by simple name; the handle is fresh, caller frees.
 pub fn classDefByName(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
     const g = self.classes.borrow();
     defer g.deinit();
@@ -78,11 +72,9 @@ pub fn classDefByName(self: *VmHost, name: []const u8) ?ObjRef(ClassDef) {
     return null;
 }
 
-/// Resolve a class written with a dotted qualifier (`Outer.Inner`) by
-/// matching it as a `.`-aligned suffix of a registered class's FQN, taking
-/// the shortest (least-nested) FQN among matches. Disambiguates a nested base
-/// from a same-simple-name class in scope — including a subtype named like its
-/// base. `null` when `qualified` is unqualified or unmatched.
+/// Resolve a dotted qualifier (`Outer.Inner`) as a `.`-aligned suffix of a
+/// registered FQN, shortest match winning, so a nested base is told apart from
+/// a same-simple-name class in scope. Fresh handle; caller frees.
 pub fn classDefByQualifiedSuffix(self: *VmHost, qualified: []const u8) ?ObjRef(ClassDef) {
     if (std.mem.findScalar(u8, qualified, '.') == null) return null;
     const g = self.classes.borrow();
@@ -106,11 +98,8 @@ pub fn classDefByQualifiedSuffix(self: *VmHost, qualified: []const u8) ?ObjRef(C
     return best;
 }
 
-/// Class-keyed side tables hold one entry under the class's simple name
-/// and (when it differs) one under its FQN. A caller that knows the
-/// resolved FQN resolves through it exclusively — the simple-name entry
-/// may belong to a same-simple-name class from another package — while a
-/// simple-name-only caller (synthesized classes) keeps the legacy view.
+/// Class-keyed side tables key on the FQN when there is one: the simple-name
+/// entry may belong to a same-named class in another package.
 pub fn sideTableKey(fqn: ?[]const u8, name: []const u8) []const u8 {
     const f = fqn orelse return name;
     return if (f.len != 0) f else name;
@@ -135,10 +124,8 @@ pub fn secondaryCtors(self: *VmHost, fqn: ?[]const u8, name: []const u8) []const
     return entries;
 }
 
-/// Whether any declared secondary constructor of the class can bind `n`
-/// arguments by count (required-without-defaults through total). Serves the
-/// dispatcher's ctor-applicability gate: a capitalized bare call whose class
-/// has no bindable constructor is not a construction.
+/// Whether a declared secondary ctor binds `n` arguments by count, required
+/// through total. Gates ctor applicability: no bindable ctor, no construction.
 pub fn classSecondaryCtorCanBind(self: *VmHost, fqn: []const u8, name: []const u8, n: usize) bool {
     const entries = secondaryCtors(self, if (fqn.len != 0) fqn else null, name);
     for (entries) |e| {
@@ -151,17 +138,12 @@ pub fn classSecondaryCtorCanBind(self: *VmHost, fqn: []const u8, name: []const u
     return false;
 }
 
-/// Simple runtime type-name head of a value (`IntArray`, `Int`).
 pub fn valueTypeHead(v: Value) []const u8 {
     const fqn = v.typeFqn();
     if (std.mem.findScalarLast(u8, fqn, '.')) |i| return fqn[i + 1 ..];
     return fqn;
 }
 
-/// Pick the secondary ctor for `args` by arity, disambiguating same-arity
-/// overloads by argument type (`AtomicIntArray(size: Int)` vs
-/// `AtomicIntArray(array: IntArray)`). Falls back to the first arity match when
-/// no parameter type distinguishes them.
 pub fn headInSet(head: []const u8, set: []const []const u8) bool {
     for (set) |h| {
         if (std.mem.eql(u8, head, h)) return true;
@@ -173,24 +155,14 @@ pub const integral_heads = [_][]const u8{ "Int", "Long", "Short", "Byte", "UInt"
 
 pub const collectionish_heads = [_][]const u8{ "Collection", "MutableCollection", "Iterable", "MutableIterable", "List", "MutableList", "Set", "MutableSet", "Sequence" };
 
-/// Whether a constructor parameter declared `declared` can accept `arg`. A
-/// class-instance argument must be a subtype of a concrete class-typed
-/// parameter; otherwise a `this(...)` / constructor delegation whose named args
-/// map to a differently-typed constructor (e.g. a `color: Color`/`Int`
-/// secondary vs the primary's `textForegroundStyle: TextForegroundStyle`) would
-/// silently bind the wrong slot. Type parameters (`T`, `E`) and `Any` accept
-/// anything; non-instance values (primitives, null, lambdas) are left to the
-/// arity/family logic.
+/// Whether a parameter declared `declared` accepts `arg`: a class-instance arg
+/// must subtype a concrete class-typed parameter; `Any` and type params take all.
 pub fn paramAcceptsArg(self: *VmHost, declared_in: []const u8, arg: *const Value) bool {
     const declared = boundHead(declared_in);
     if (std.mem.eql(u8, declared, "Any")) return true;
     if (declared.len <= 2 and isAllUpper(declared)) return true;
-    // A function-typed parameter accepts any callable argument regardless of
-    // the recorded arity head — a receiver-style suspend lambda's declared
-    // head (`Function0`) and the closure's own shape count receivers
-    // differently, and rejecting here let a `this(...)`-delegating secondary
-    // constructor lose its lambda to the primary's SAM slot
-    // (`SuspendingPointerInputModifierNodeImpl`'s deprecated handler ctor).
+    // A function-typed parameter accepts any callable regardless of arity head:
+    // a receiver-style lambda and its declared head count receivers differently.
     if (std.mem.startsWith(u8, declared, "Function")) {
         return switch (arg.*) {
             .IrClosure => true,
@@ -204,30 +176,21 @@ pub fn paramAcceptsArg(self: *VmHost, declared_in: []const u8, arg: *const Value
     }
     if (arg.* == .Instance) {
         if (instanceOfClassName(arg, declared)) return true;
-        // Only disqualify when `declared` is a class the argument is NOT: a
-        // typealias or otherwise-unresolved receiver name (a `Point` alias for
-        // `FloatFloatPair`) has no ClassDef, so the mismatch is unconfirmed and
-        // the candidate must not be rejected.
+        // Disqualify only when `declared` names a real class: a typealias has no
+        // ClassDef, so its mismatch is unconfirmed and must not reject.
         const kd = classDefByName(self, declared);
         if (kd) |d| d.deinit();
         return kd == null;
     }
-    // A non-instance builtin value (String, a list, an Int, …) offered to a
-    // parameter of a definitely-different builtin kind cannot match — a
-    // `String` param must not swallow a `List` argument, which would let an
-    // overloaded `this(...)` delegation pick a same-arity ctor with swapped
-    // parameters and recurse. Unknown kinds (0, e.g. a class type or a
-    // supertype like `Any`/`Number`) accept anything.
+    // A builtin value against a definitely-different builtin kind cannot match; kind 0 accepts.
     const gk = builtinTypeKind(valueTypeHead(arg.*));
     const dk = builtinTypeKind(declared);
     if (gk != 0 and dk != 0 and gk != dk) return false;
     return true;
 }
 
-/// Coarse bucket for a builtin type head, so a definite cross-kind argument
-/// mismatch (a list for a string param) disqualifies a constructor candidate.
-/// `0` means "not a recognised concrete builtin" (class, type parameter, or a
-/// supertype like `Number`/`CharSequence`) and matches anything.
+/// Coarse bucket for a builtin type head; a cross-kind mismatch disqualifies a
+/// candidate. `0` is not a recognised concrete builtin and matches anything.
 pub fn builtinTypeKind(head: []const u8) u8 {
     if (headInSet(head, &integral_heads)) return 1;
     if (std.mem.eql(u8, head, "Float") or std.mem.eql(u8, head, "Double")) return 2;
@@ -239,11 +202,9 @@ pub fn builtinTypeKind(head: []const u8) u8 {
     return 0;
 }
 
-/// Type-fit of one ctor candidate's declared param heads against the
-/// runtime args, on the shared scale `chooseSecondaryCtor` ranks with:
-/// exact head +2, family match +1 (+2 for a callable meeting a
-/// FunctionN head, which is Kotlin's more-specific pick vs a SAM slot),
-/// definite cross-family mismatch = null (disqualified).
+/// Type-fit of a candidate's declared param heads against the runtime args, on
+/// the scale `chooseSecondaryCtor` ranks with: exact head +2, family match +1, a
+/// callable meeting a FunctionN head +2, definite cross-family mismatch null.
 pub fn scoreCtorHeads(self: *VmHost, heads: []const []const u8, args: []const Value) ?i32 {
     var score: i32 = 0;
     var i: usize = 0;
@@ -251,10 +212,8 @@ pub fn scoreCtorHeads(self: *VmHost, heads: []const []const u8, args: []const Va
     while (i < args.len and i < heads.len) : (i += 1) {
         const declared = boundHead(heads[i]);
         const got = valueTypeHead(args[i]);
-        // The argument's DECLARED head, where the call site knew one. An
-        // interpreted instance reports no class of its own at run time, so
-        // this is the only evidence that can tell a subtype argument from a
-        // supertype-typed one — which is what Kotlin selects on.
+        // The call site's declared head, the only evidence separating a subtype
+        // argument from a supertype-typed one, which is what Kotlin selects on.
         if (static_heads) |sh| {
             if (i < sh.len) {
                 if (sh[i]) |declared_arg| {
@@ -273,10 +232,7 @@ pub fn scoreCtorHeads(self: *VmHost, heads: []const []const u8, args: []const Va
             score += 2;
             continue;
         }
-        // Confirmed subtype (superclass or interface chain) is positive
-        // evidence, below an exact head match: `TweenSpec` fits an
-        // `AnimationSpec<T>` slot and must outrank a candidate whose slot
-        // (`VectorizedAnimationSpec<V>`) merely fails to disqualify.
+        // A confirmed subtype ranks below an exact head but above a non-refutal.
         if (args[i] == .Instance and instanceOfClassName(&args[i], declared)) {
             score += 1;
             continue;
@@ -306,12 +262,8 @@ pub fn isCallableArg(v: *const Value) bool {
     };
 }
 
-/// A secondary constructor taking more parameters than arguments (the
-/// rest defaulted) is a candidate only where kotlinc would consider it:
-/// when no primary constructor takes the call. Exact-arity callers (a
-/// class with a zero-parameter primary, the super chain) keep
-/// `exact_arity`, so `LazyLayoutPrefetchState()` reaches its primary and
-/// not the two-default secondary whose delegation re-enters the same call.
+/// A secondary ctor with defaulted extra parameters is a candidate only when no
+/// primary takes the call; exact-arity callers keep `exact_arity`.
 pub fn chooseSecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
     return chooseSecondaryCtorArity(self, entries, args, true);
 }
@@ -321,10 +273,8 @@ pub fn chooseSecondaryCtorDefaulted(self: *VmHost, entries: []const root.build.S
 }
 
 pub fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value, exact_arity: bool) ?root.build.SecondaryCtorEntry {
-    // Two passes. A `@Deprecated(level = HIDDEN)` constructor is not a
-    // source-level candidate in kotlinc at all — it exists only for binary
-    // compatibility — so it must never beat an ordinary one. It stays reachable
-    // as a LAST resort (a class whose only secondary constructor is hidden).
+    // Two passes: a `@Deprecated(level = HIDDEN)` constructor is no source-level
+    // candidate, so it is reached only when the class has no other secondary.
     var pass: usize = 0;
     while (pass < 2) : (pass += 1) {
         const want_low = pass == 1;
@@ -332,11 +282,8 @@ pub fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.build.Secon
         var best_score: i32 = -1;
         for (entries) |e| {
             if (e.low_priority != want_low) continue;
-            // A `vararg` parameter takes any number of trailing arguments,
-            // none included, once the fixed prefix is supplied. Under an
-            // exact-arity pick (the primary can take the call) it needs at
-            // least one: kotlinc ranks the non-vararg candidate above it,
-            // and it never earns the exact-count bonus.
+            // A `vararg` takes any number of trailing arguments, none included,
+            // once the fixed prefix is supplied; an exact-arity pick needs one.
             if (e.vararg_index) |v| {
                 if (args.len < v) continue;
                 if (exact_arity and args.len < e.param_count) continue;
@@ -347,9 +294,7 @@ pub fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.build.Secon
                 }
                 continue;
             }
-            // A constructor whose trailing parameters all carry defaults
-            // takes fewer arguments (`constructor(arg1: String = global)`
-            // from `A()`); an exact count still outranks it.
+            // All-defaulted trailing parameters take fewer arguments; an exact count outranks.
             if (e.param_count < args.len) continue;
             if (e.param_count > args.len) {
                 if (exact_arity) continue;
@@ -366,8 +311,6 @@ pub fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.build.Secon
             const heads = e.param_type_heads[0..@min(args.len, e.param_type_heads.len)];
             const score = (scoreCtorHeads(self, heads, args) orelse continue) +
                 (if (e.param_count == args.len) @as(i32, 1000) else 0);
-            // Reached only when no parameter disqualified this candidate: it is a
-            // genuine arity+type match, so it is eligible as the fallback too.
             if (score > best_score) {
                 best_score = score;
                 best = e;
@@ -378,20 +321,8 @@ pub fn chooseSecondaryCtorArity(self: *VmHost, entries: []const root.build.Secon
     return null;
 }
 
-/// Expand a superclass constructor call that selects a secondary
-/// `this(...)` constructor into the primary arguments used to initialize that
-/// class. This is required when an expect constructor maps to an actual
-/// secondary constructor with a differently shaped primary constructor.
 pub const DeferredCtorBody = struct { fqn: ?[]const u8, name: []const u8, body: FuncId, args: []Value };
 
-/// Resolve a parent's header arguments through its secondary constructors:
-/// the constructor the arguments fit (by count, defaults, and argument
-/// type — `A(5)` reaches `constructor(n: Int)` even when the primary also
-/// takes one parameter) supplies, through its `this(…)` delegation, the
-/// arguments the primary constructor receives; a `super(…)` delegation
-/// supplies the grandparent's arguments instead (`super_args`); each chosen
-/// constructor's body is queued to run on the finished instance. Without a
-/// fitting secondary constructor the arguments stay the primary's.
 /// `chooseSecondaryCtor` restricted to the constructors source can name.
 pub fn chooseOrdinarySecondaryCtor(self: *VmHost, entries: []const root.build.SecondaryCtorEntry, args: []const Value) ?root.build.SecondaryCtorEntry {
     var ordinary: std.ArrayList(root.build.SecondaryCtorEntry) = .empty;
@@ -402,15 +333,11 @@ pub fn chooseOrdinarySecondaryCtor(self: *VmHost, entries: []const root.build.Se
     return chooseSecondaryCtorDefaulted(self, ordinary.items, args);
 }
 
-/// `scoreCtorHeads` where an integral value scores its full match against
-/// any integral head: a literal's runtime tag is not a type distinction
-/// between overloads whose parameters are both integral.
+/// `scoreCtorHeads` where an integral value scores a full match against any
+/// integral head: a literal's runtime tag is no distinction between them.
 pub fn scoreCtorHeadsWidening(self: *VmHost, heads: []const []const u8, args: []const Value) ?i32 {
-    // Per parameter: an exact head (or an exact typealias target) and an
-    // integral value against an integral head both score the full match, so
-    // `Long` and `Int` parameters tie for a Long argument and the primary
-    // keeps the call; everything else falls back to the ordinary scorer's
-    // verdict for that position.
+    // An exact head, an exact typealias target, and an integral pair all score
+    // the full match; every other position falls back to the ordinary scorer.
     var score: i32 = 0;
     var i: usize = 0;
     while (i < args.len and i < heads.len) : (i += 1) {
@@ -452,10 +379,8 @@ pub fn expandParentSecondaryThisArgs(
         defer common.ctor_bounds = prev_bounds;
         const primary_count = classDefPrimaryParamCount(def);
         const entries = secondaryCtors(self, class_fqn, class_name);
-        // Named header arguments (`A(y = 2, x = 4)`) bind to a secondary
-        // constructor's parameters by name; a parameter the call leaves out
-        // takes its default, evaluated in parameter order with the values
-        // bound so far. The first candidate every argument fits wins.
+        // Named header arguments bind by name; an omitted parameter takes its
+        // default, evaluated in parameter order with the values bound so far.
         var entry_opt: ?root.build.SecondaryCtorEntry = null;
         if (names) |nm| {
             var any_named = false;
@@ -524,17 +449,12 @@ pub fn expandParentSecondaryThisArgs(
                 }
             }
         }
-        // A header call resolves among the constructors source can name:
-        // a `@Deprecated(level = HIDDEN)` or low-priority secondary (kept for
-        // binary compatibility, `Snapshot(id: Int, …)`) is never a candidate.
+        // A header call resolves only among the constructors source can name.
         const entry = entry_opt orelse chooseOrdinarySecondaryCtor(self, entries, args.items) orelse {
             return .{ .ok = {} };
         };
         if (args.items.len == primary_count and primary_count != 0) {
-            // Same count as the primary: the primary keeps the call unless
-            // the secondary's parameter types fit strictly better. A scalar
-            // whose runtime tag narrows its declared type (an `Int`-tagged
-            // literal passed to a `Long` parameter) fits both equally.
+            // At the primary's count the primary keeps the call unless the secondary fits better.
             const dg = def.borrow();
             var primary_heads: std.ArrayList([]const u8) = .empty;
             defer primary_heads.deinit(allocator);
@@ -578,9 +498,8 @@ pub fn expandParentSecondaryThisArgs(
             if (scalarRetag(entry.param_type_heads[i], arg.Int)) |rv| arg.* = rv;
         }
         if (entry.body) |body_fid| {
-            // The body runs after initialization; its argument copy is pinned
-            // for the rest of the construction (the copy's storage outlives
-            // every list this loop frees).
+            // The body runs after initialization, so its argument copy is pinned
+            // for the rest of the construction; it outlives every list freed here.
             const body_args = try allocator.dupe(Value, full_args.items);
             self.ka.pushSlice(body_args);
             try bodies.append(allocator, .{ .fqn = class_fqn, .name = class_name, .body = body_fid, .args = body_args });
@@ -602,17 +521,14 @@ pub fn expandParentSecondaryThisArgs(
         }
         full_args.deinit(allocator);
         if (entry.is_super or !entry.is_this) {
-            // `super(…)` names the parent's arguments; no delegation at all is
-            // an implicit `super()` for a class without a primary constructor.
+            // `super(…)` names the parent's args; no delegation is an implicit `super()`.
             args.deinit(allocator);
             args.* = .empty;
             super_args.* = target;
             return .{ .ok = {} };
         }
-        // The delegated arguments become this class's arguments; the values
-        // are pinned once by the caller's chain once the loop settles (a pin
-        // taken here would outlive the backing store the next iteration
-        // frees).
+        // The delegated arguments become this class's; the caller's chain pins
+        // them once the loop settles, since a pin here would outlive its store.
         args.deinit(allocator);
         args.* = target;
     }
@@ -625,17 +541,15 @@ pub fn parentCtorArgThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[
     return g.get().parent_ctor_args.get(sideTableKey(fqn, name));
 }
 
-/// The argument labels for the super-constructor call in `class`'s primary
-/// delegation (`: Base(objects = 2)`), parallel to `parentCtorArgThunks`.
-/// `null` when the call was fully positional.
+/// Argument labels of the primary super-ctor delegation, parallel to
+/// `parentCtorArgThunks`. `null` when the call was fully positional.
 pub fn parentCtorArgNames(self: *VmHost, fqn: ?[]const u8, name: []const u8) ?[]const ?[]const u8 {
     const g = self.prog.borrow();
     defer g.deinit();
     return g.get().parent_ctor_arg_names.get(sideTableKey(fqn, name));
 }
 
-/// The index of `param_name` in `pp`, or null if none matches. Used to bind
-/// a named super-constructor argument to the base parameter of that name.
+/// Index of `param_name` in `pp`, binding a named super-ctor argument to its slot.
 pub fn paramIndexByName(pp: []const runtime.ClassParamDef, param_name: []const u8) ?usize {
     for (pp, 0..) |p, i| {
         if (std.mem.eql(u8, p.name, param_name)) return i;
@@ -643,12 +557,8 @@ pub fn paramIndexByName(pp: []const runtime.ClassParamDef, param_name: []const u
     return null;
 }
 
-/// The `this` slot for a primary-ctor default-arg thunk: an INNER class's
-/// default expressions evaluate with the enclosing instance as the lexical
-/// receiver (`val maxIndex: Int = size` inside `inner class ... ` reads the
-/// OUTER `size` — the instance under construction does not exist yet), so
-/// the constructing frame's outer hint fills the slot. Non-inner classes
-/// have no outer receiver in scope: their slot stays Null.
+/// The `this` slot for a primary-ctor default-arg thunk: an inner class's
+/// defaults evaluate against the outer hint's instance; other classes get Null.
 pub fn ctorThunkThisSlot(class_def: ObjRef(ClassDef), outer_hint: ?*const Value) Value {
     const oh = outer_hint orelse return .Null;
     const dg = class_def.borrow();
@@ -657,10 +567,8 @@ pub fn ctorThunkThisSlot(class_def: ObjRef(ClassDef), outer_hint: ?*const Value)
     return oh.*;
 }
 
-/// The argument vector of a secondary-constructor delegation or default
-/// thunk: an inner class's thunks declare a leading receiver slot holding
-/// the enclosing instance; any other class's thunks take the parameters
-/// only. `pad_to` is the thunk's parameter count without the slot.
+/// Argument vector for a secondary-ctor delegation or default thunk; an inner
+/// class's thunks lead with the enclosing instance. `pad_to` excludes that slot.
 pub fn ctorThunkArgs(allocator: Allocator, class_def: ?ObjRef(ClassDef), outer_hint: ?*const Value, args: []const Value, pad_to: usize) Allocator.Error![]Value {
     const inner = blk: {
         const d = class_def orelse break :blk false;
@@ -688,9 +596,8 @@ pub fn classDelegateThunks(self: *VmHost, fqn: ?[]const u8, name: []const u8) []
     return g.get().class_delegates.get(sideTableKey(fqn, name)) orelse &.{};
 }
 
-/// Serve a trivial property initializer (one constant, or one parameter
-/// echo) without a framed eval; null = not trivial, run the body.
-/// `all` is the initializer call vector `[this, ctor args...]`.
+/// Serve a trivial property initializer (one constant or parameter echo) with no
+/// framed eval; null means run the body. `all` is `[this, ctor args...]`.
 pub fn trivialInitServe(allocator: Allocator, m: *const ir.Module, func: *const ir.Func, all: []const Value) Allocator.Error!?Value {
     if (func.triv_init_state == 0) {
         const mut = @constCast(func);
@@ -703,10 +610,8 @@ pub fn trivialInitServe(allocator: Allocator, m: *const ir.Module, func: *const 
             if (blk.terminator != .Return) break :one;
             const ret_reg = blk.terminator.Return orelse break :one;
             if (blk.insts.len > 24) break :one;
-            // The lowered thunk prologue loads every ctor param; the body
-            // is trivial when each inst is a param load or a Const whose
-            // destination is the returned register. The LAST write to the
-            // return register decides the served value.
+            // Trivial when every inst is a param load or a Const writing the
+            // returned register; the last write to it decides the served value.
             var state: u8 = 0;
             var val: u32 = 0;
             for (blk.insts) |*inst| switch (inst.*) {
@@ -772,14 +677,8 @@ pub fn appendPrimaryCtorPropertyFields(
     }
 }
 
-/// kotlinc ADOPTS an integer literal to the declared type at the call site
-/// (`C(2)` with `val s: Short` stores a Short; `arrayOf(1, 2)` bound to
-/// `Array<Byte>` holds Bytes). klio's lowering adopts function parameters
-/// but not constructor properties, so the declared boundary retags here: an
-/// `.Int` value against a narrower declared scalar, and an array/list
-/// value's `.Int` elements against a declared `Array<scalar>`. Only the
-/// literal-compatible `.Int` repr converts — a genuinely Int-typed value
-/// cannot reach a `Short` slot in valid Kotlin.
+/// kotlinc adopts an integer literal to the declared type at the call site, so
+/// this retags `.Int` values, and `Array` elements, at the property boundary.
 pub fn adoptDeclaredNumeric(param: *const runtime.ClassParamDef, v: Value) Value {
     const shape = if (param.declared_shape) |*sh| sh else return v;
     if (v == .Int) {
@@ -810,8 +709,7 @@ pub fn scalarRetagName(name: []const u8) bool {
     return eq(u8, name, "Byte") or eq(u8, name, "Short") or eq(u8, name, "Long");
 }
 
-/// The simple head of a declared type name: no package qualifier, generic
-/// arguments, or nullability.
+/// Simple head of a declared type name: no package, type arguments, or `?`.
 pub fn typeHeadOfName(name: []const u8) []const u8 {
     var t = std.mem.trimEnd(u8, name, "?");
     if (std.mem.findScalar(u8, t, '<')) |lt| t = t[0..lt];
@@ -827,8 +725,7 @@ pub fn scalarRetag(name: []const u8, iv: i64) ?Value {
     return null;
 }
 
-/// The instance-identity counter for host modules that mint interpreted
-/// instances directly (the persistent-collection fast paths).
+/// Instance-identity counter for host modules that mint instances directly.
 pub fn mintInstanceId(self: *VmHost) u64 {
     return nextInstanceId(self);
 }
@@ -839,8 +736,6 @@ pub fn nextInstanceId(self: *VmHost) u64 {
     return g.get().fetchAdd(1, .monotonic) + 1;
 }
 
-/// Materialise a `*const Func` for `fid` against the host module, or an
-/// error result when the id is out of range.
 pub fn funcAt(self: *VmHost, fid: FuncId, comptime ctx: []const u8) Allocator.Error!union(enum) { ok: *const ir.Func, err: EvalError } {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -848,20 +743,14 @@ pub fn funcAt(self: *VmHost, fid: FuncId, comptime ctx: []const u8) Allocator.Er
     const f = m.funcById(fid) orelse {
         return .{ .err = try typeErr(self.allocator, ctx ++ " FuncId {d} out of range", .{fid.int()}) };
     };
-    // A function reached by id from a side table is about to be CALLED, and an
-    // image decodes bodies lazily: without this the call runs an empty body and
-    // returns Unit. That is how a defaulted secondary-constructor parameter read
-    // `null` in every bundled program while the same source ran correctly from
-    // the CLI, whose module was never deferred.
+    // An image decodes bodies lazily and this func is about to be called, so
+    // force the body: an undecoded one runs empty and returns Unit.
     if (f.blocks.len == 0) _ = m.ensureFuncBody(@constCast(f));
     return .{ .ok = f };
 }
 
-/// The storage key for `prop` declared by `cls`: the owner-mangled
-/// registry key when the property is a recorded private SHADOW of a
-/// supertype's same-name declaration (its own distinct cell, Kotlin
-/// semantics), else the plain name. The mangled slice is the registry's
-/// own stable key.
+/// Storage key for `prop`: the owner-mangled registry key when it privately
+/// shadows a supertype's same-name property, which Kotlin gives its own cell.
 pub fn shadowFieldKey(self: *VmHost, cls: []const u8, prop: []const u8) []const u8 {
     var buf: [256]u8 = undefined;
     const probe = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ cls, prop }) catch return prop;
@@ -871,9 +760,7 @@ pub fn shadowFieldKey(self: *VmHost, cls: []const u8, prop: []const u8) []const 
     return mg.get().registry.override_cell_props.getKey(probe) orelse prop;
 }
 
-/// Whether `cls`'s `prop` is a recorded private SHADOW of a supertype's
-/// same-name stored property — a distinct cell whose store must leave the
-/// base's plain cell untouched.
+/// Whether `cls`'s `prop` privately shadows a supertype's stored property.
 pub fn isPrivateShadowProp(self: *VmHost, cls: []const u8, prop: []const u8) bool {
     var buf: [256]u8 = undefined;
     const probe = std.fmt.bufPrint(&buf, "{s}\x1f{s}", .{ cls, prop }) catch return false;
@@ -882,8 +769,7 @@ pub fn isPrivateShadowProp(self: *VmHost, cls: []const u8, prop: []const u8) boo
     return mg.get().registry.private_shadow_props.getKey(probe) != null;
 }
 
-/// Evaluate `func` against `args`, returning its result. The module
-/// handle is borrowed for the call's duration.
+/// Evaluate `func` against `args`; the module handle is borrowed for the call.
 pub fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Allocator.Error!EvalResult {
     const module_ref = self.module.clone();
     defer module_ref.deinit();
@@ -898,12 +784,8 @@ pub fn evalThunk(self: *VmHost, func: *const ir.Func, args: []const Value) Alloc
     return ir.eval.evalWith(VmHost, self.allocator, mg.get(), func, args_list, self);
 }
 
-/// Initialize a runtime-registered LOCAL class instance's MODULE parent
-/// chain: evaluate the leaf's `$super$arg$<i>` thunks (registered by
-/// `registerClass`) against the constructor args, bind each module
-/// ancestor's primary-param fields, run its body-property init thunks, and
-/// continue up with that level's own parent-ctor-arg thunks. Parent
-/// `init { }` blocks are not yet replayed here.
+/// Initialize a local class instance's module parent chain from the leaf's
+/// `$super$arg$<i>` thunks, binding each ancestor's fields and init thunks.
 pub fn initLocalParentChain(
     self: *VmHost,
     allocator: Allocator,
@@ -936,7 +818,6 @@ pub fn initLocalParentChain(
         std.debug.print("[init-debug] local parent chain {s}: parent={} builtin_throwable={} supers={d}\n", .{ cls_name, cur_def != null, builtin_throwable_parent, g.get().supertype_names.len });
     }
     if (cur_def == null and !builtin_throwable_parent) return null;
-    // Leaf-level super args via the anon `$super$arg$<i>` thunks.
     var cur_args: std.ArrayList(Value) = .empty;
     defer cur_args.deinit(allocator);
     {
@@ -963,9 +844,7 @@ pub fn initLocalParentChain(
         try bindThrowableArgs(self, inst, cur_args.items, true);
         return null;
     }
-    // The parent may be the stdlib's own `Exception`/`Throwable` class def,
-    // whose message and cause are bound by name rather than by primary
-    // parameters.
+    // The stdlib `Exception`/`Throwable` binds message and cause by name.
     if (cur_def) |pd| {
         const pg = pd.borrow();
         const pn = pg.get().name;
@@ -978,7 +857,6 @@ pub fn initLocalParentChain(
         const pg = pd.borrow();
         const p_name = pg.get().name;
         const p_fqn = pg.get().fqn;
-        // Bind primary-param fields.
         for (pg.get().primary_params, 0..) |*pp, i| {
             if (i >= cur_args.items.len) break;
             const g = inst.borrowMut();
@@ -990,7 +868,6 @@ pub fn initLocalParentChain(
                 g.get().invalidateShape();
             }
         }
-        // Body-property init thunks (static build map).
         for (pg.get().body_properties) |*bp| {
             if (bodyPropInit(self, p_fqn, p_name, bp.name)) |fid| {
                 const fr = try funcAt(self, fid, "parent body prop init");
@@ -1035,7 +912,6 @@ pub fn initLocalParentChain(
                 }
             }
         }
-        // Next level's args via the module side table.
         var next_args: std.ArrayList(Value) = .empty;
         var have_next = false;
         if (parentCtorArgThunks(self, p_fqn, p_name)) |thunks| {
