@@ -1,12 +1,8 @@
-//! The transpiler hot-view layout: every offset/tag the emitted C's inline
-//! fast paths need to touch `runtime.Value` slots, instance fields, arrays,
-//! and the frame's `?Span` trace slot. One fill implementation serves both
-//! sides of the ABI: `klio_rt` fills the runtime slot the generated C
-//! registers, and `klio transpile` fills the same struct at EMIT time to
-//! freeze the values as compile-time constants in the generated header
-//! (the runtime fill then verifies the frozen copy and disables the view
-//! on any mismatch, so a .c linked against a different runtime falls back
-//! to the exported helpers instead of reading through wrong offsets).
+//! Offsets and tags the emitted C's inline fast paths need for `runtime.Value`
+//! slots, instance fields, arrays, and the frame's `?Span` trace slot. `klio
+//! transpile` freezes the values into the generated header; the runtime fill
+//! verifies that copy and disables the view on a mismatch, so a .c linked
+//! against a different runtime falls back to the exported helpers.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -31,43 +27,30 @@ pub const HotLayout = extern struct {
     tag_bool: u64,
     tag_unit: u64,
     usable: u8,
-    /// Frame `cur_span` (`?Span`) layout for the inlined trace store:
-    /// three u32 field offsets plus the optional's presence byte and
-    /// its set value. `span_usable == 0` keeps traces on the helper.
+    /// Zero keeps traces on the helper rather than the inlined store.
     span_usable: u8,
     span_file_off: u32,
     span_start_off: u32,
     span_end_off: u32,
     span_tag_off: u32,
     span_tag_set: u8,
-    /// Char payload location + tag, for fused loops over Char scalars.
     char_off: u32,
     tag_char: u64,
-    /// Object view: enough of the Instance layout for the emitted C to read
-    /// a plain stored field inline behind a class guard. `obj_usable == 0`
-    /// keeps every field read on the escape helper — it is set only under
-    /// the tracing GC, where copying a `Value` into a register needs no
-    /// retain. Offsets come from `@offsetOf` on the real structs, so a
-    /// layout change moves them with the runtime instead of drifting.
+    /// Set only under the tracing GC, where copying a `Value` into a register
+    /// needs no retain; zero routes every field read to the escape helper.
     obj_usable: u8,
     tag_instance: u64,
-    /// `Value.Instance` payload (the `ObjRef` cell pointer) inside a Value.
+    /// The `ObjRef` cell pointer carried by a `Value.Instance`.
     inst_ptr_off: u32,
-    /// `data` inside the cell's control block.
     cell_data_off: u32,
-    /// `class` / `fields` inside `InstanceData`.
     inst_class_off: u32,
     inst_fields_off: u32,
-    /// `items.ptr` / `items.len` inside the fields `ArrayList`.
     fields_ptr_off: u32,
     fields_len_off: u32,
-    /// One `Field` record: its size and the offset of its `value`.
     field_stride: u32,
     field_value_off: u32,
-    /// Array view: an `IntArray` element read, inline. `arr_prim_word` is
-    /// the 8 bytes at `arr_prim_off` that mean "primitive Int storage" —
-    /// the optional-enum encoding is compiler-chosen, so it is probed from
-    /// two constructed values rather than assumed.
+    /// `arr_prim_int_word` is the 8 bytes at `arr_prim_off` meaning primitive
+    /// Int storage, probed rather than assumed: the encoding is compiler-chosen.
     tag_array: u64,
     arr_cell_off: u32,
     arr_prim_off: u32,
@@ -77,17 +60,11 @@ pub const HotLayout = extern struct {
 };
 
 fn tagOffset() struct { off: u32, size: u32 } {
-    // The tag's location is compiler-chosen; find it by diffing values
-    // that differ only in tag (payload bytes zero in both). Undefined
-    // padding bytes are poisoned per-construction in safe builds, so a
-    // same-tag pair first yields the padding mask to ignore.
+    // The tag's location is compiler-chosen: diff two values differing only in
+    // tag, a same-tag pair first yielding the poisoned padding to ignore. Zero
+    // each backing store before constructing, since comparing the undefined
+    // padding a struct assignment leaves is UB the optimizer may lower to a trap.
     const N = @sizeOf(runtime.Value);
-    // Zero the backing bytes BEFORE constructing each probe value: the
-    // padding bytes of a struct assignment are undefined, and comparing
-    // undefined memory is UB the optimizer may lower to a trap (it did —
-    // the fill crashed the run thread and the hot view silently never
-    // engaged). With zeroed backing, padding compares equal and only the
-    // tag/payload fields differ.
     var z1: runtime.Value = undefined;
     var z2: runtime.Value = undefined;
     var a: runtime.Value = undefined;
@@ -127,8 +104,7 @@ fn readTag(v: *const runtime.Value, off: u32, size: u32) u64 {
     return out;
 }
 
-/// The 8 bytes at `off` inside `v`, for a probe whose encoding is
-/// compiler-chosen (an optional enum's niche).
+/// The 8 bytes at `off`, for a probe of a compiler-chosen niche encoding.
 fn readWord(v: *const runtime.Value, off: u32) u64 {
     var w: u64 = 0;
     const bytes = std.mem.asBytes(v);
@@ -137,10 +113,8 @@ fn readWord(v: *const runtime.Value, off: u32) u64 {
     return w;
 }
 
-/// Locate the fields of the frame's `?Span` slot by value probing:
-/// distinct u32 patterns find each field; the presence byte is the one
-/// that flips between null and set outside the payload (padding-masked
-/// by comparing two identical null values).
+/// Fields of the frame's `?Span` slot, located by value probing: distinct u32
+/// patterns find each field, the presence byte flips between null and set.
 const SpanProbe = struct {
     usable: u8,
     file_off: u32,
@@ -153,9 +127,7 @@ const SpanProbe = struct {
 fn spanProbe() SpanProbe {
     const OptSpan = ?ir.Span;
     const N = @sizeOf(OptSpan);
-    // Zero the backing bytes before construction: padding is undefined and
-    // comparing undefined memory is UB the optimizer may lower to a trap
-    // (the tagOffset probe crashed exactly this way).
+    // Zero the backing bytes before construction; see `tagOffset`.
     var set: OptSpan = undefined;
     var null1: OptSpan = undefined;
     var null2: OptSpan = undefined;
@@ -186,8 +158,8 @@ fn spanProbe() SpanProbe {
     const fo = found_file orelse return out;
     const so = found_start orelse return out;
     const eo = found_end orelse return out;
-    // Presence byte: differs between null and set, is stable across two
-    // nulls (excludes poisoned padding), and lies outside the payload.
+    // Presence byte: differs between null and set, stable across two nulls
+    // (which excludes poisoned padding), and outside the payload.
     var tag: ?u32 = null;
     i = 0;
     while (i < N) : (i += 1) {
@@ -208,11 +180,8 @@ fn spanProbe() SpanProbe {
     return out;
 }
 
-/// Fill every LAYOUT field of `out` from the live runtime structs.
-/// The policy gates come back as pure probe results (`usable`/`obj_usable`
-/// = 1, `span_usable` = the probe's verdict); the runtime caller ANDs its
-/// own policy (reclaim mode, `KLIO_OBJVIEW`) on top, and the emit-time
-/// caller ignores them (frozen constants carry layout only).
+/// Layout fields come from the live runtime structs; the policy gates come back
+/// as pure probe results for the runtime caller to AND its own policy onto.
 pub fn fillLayout(out: *HotLayout) void {
     const t = tagOffset();
     var vi: runtime.Value = undefined;
@@ -268,9 +237,9 @@ pub fn fillLayout(out: *HotLayout) void {
         .field_stride = @sizeOf(runtime.InstanceData.Field),
         .field_value_off = @offsetOf(runtime.InstanceData.Field, "value"),
         .tag_array = @intFromEnum(@as(std.meta.Tag(runtime.Value), .Array)),
-        // The cell pointer and its element-kind tag share one word: the
-        // pointer is the word with the low four bits masked off, and the tag
-        // is `kind + 1` (0 = a reference `Array<T>`).
+        // Cell pointer and element-kind tag share one word: the pointer is that
+        // word with the low four bits cleared, the tag is `kind + 1`, 0 meaning
+        // a reference `Array<T>`.
         .arr_cell_off = @intCast(@intFromPtr(&vai.Array.tagged) - @intFromPtr(&vai)),
         .arr_prim_off = @intCast(@intFromPtr(&vai.Array.tagged) - @intFromPtr(&vai)),
         .arr_prim_int_word = readWord(&vai, @intCast(@intFromPtr(&vai.Array.tagged) - @intFromPtr(&vai))),
@@ -279,8 +248,7 @@ pub fn fillLayout(out: *HotLayout) void {
     };
 }
 
-/// Whether every LAYOUT field of `frozen` matches `live` (the policy
-/// gates are excluded — they are runtime decisions, not layout).
+/// Layout fields only; the policy gates are runtime decisions, not layout.
 pub fn layoutMatches(frozen: *const HotLayout, live: *const HotLayout) bool {
     inline for (@typeInfo(HotLayout).@"struct".fields) |f| {
         comptime if (std.mem.eql(u8, f.name, "usable") or

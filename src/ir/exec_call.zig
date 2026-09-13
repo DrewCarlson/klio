@@ -1,19 +1,11 @@
-//! Call-shaped IR exec arms and the member/global dispatch route.
-//!
-//! Everything `runFrameExec` dispatches for an instruction that names a
-//! callee or a receiver: the call arms (plain, value, spread, super,
-//! virtual, member-or-value, context), the instance/lambda/class arms that
-//! build a receiver, the implicit-`this` and global load/store arms, and
-//! `execCallMemberOrGlobal` — the route that decides whether a bare name is
-//! a member on an implicit receiver, a companion member, a SAM invoke or a
-//! top-level function, and the candidate walk that feeds it. The argument
-//! readers and the index / subscript / primitive-member fast paths the arms
-//! share live here too.
+//! Call-shaped IR exec arms and the member/global dispatch route: the call arms,
+//! the arms that build a receiver, the implicit-`this` and global load/store
+//! arms, and `execCallMemberOrGlobal`, which decides whether a bare name is a
+//! member on an implicit receiver, a companion member, a SAM invoke or a
+//! top-level function. The shared argument readers and fast paths live here too.
 //!
 //! The frame register file, the activation and resume machinery, and the
-//! evaluator's threadlocal state all stay in `eval.zig`; this file holds no
-//! module state of its own beyond its two trace/audit gates and reaches the
-//! parent's only through the alias block below.
+//! evaluator's threadlocal state stay in `eval.zig`.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -62,14 +54,8 @@ const takeHostFlatArm = eval.takeHostFlatArm;
 const takeHostFlatReq = eval.takeHostFlatReq;
 const vcallFlatEnabled = eval.vcallFlatEnabled;
 
-/// Whether a prepared direct call is a plain one the leaf serve may take: no
-/// closure captures, no seeded receiver chain, no coroutine boundary, no
-/// type arguments, nothing the activation's open/teardown would have to
-/// carry. Anything the prepare pushed for the callee stays on the frame path.
-/// A flat request that carries nothing beyond its callee and arguments — no
-/// captures, receiver chain, closure identity, type arguments, keepalive,
-/// context mark, scope guard, composer push or coroutine boundary. Such a
-/// request is reproducible from the call site alone.
+/// Whether a flat request carries nothing beyond its callee and arguments, so
+/// the call is reproducible from the call site alone.
 fn leafPlainReq(req: FlatCallReq) bool {
     return req.captures.items.len == 0 and
         req.chain.len == 0 and
@@ -86,15 +72,10 @@ fn leafPlainReq(req: FlatCallReq) bool {
         req.owning == null;
 }
 
-/// Whether the named environment variable is present. Used only by the
-/// optional throw-trace diagnostic. Reads the process environment portably
-/// (see `runtime.procEnvIsSet`).
 pub fn envVarSet(name: []const u8) bool {
     return runtime.procEnvIsSet(std.heap.page_allocator, name);
 }
 
-/// Fetch the string text of a `Const.String` const, or `null` when the
-/// const is not a string.
 pub fn constStr(module: *const Module, id: ConstId) ?[]const u8 {
     return switch (module.consts.items[id.int()]) {
         .String => |s| s,
@@ -102,9 +83,8 @@ pub fn constStr(module: *const Module, id: ConstId) ?[]const u8 {
     };
 }
 
-/// A callable reference (`Long::toByte`, `recv::method`) is represented as a
-/// synth `Instance` whose class name is `$bound_ref$<name>`. Such a value is
-/// invocable even though it carries no `invoke` member declaration.
+/// A callable reference (`Long::toByte`, `recv::method`) is a synth `Instance`
+/// whose class name is `$bound_ref$<name>`, invocable with no `invoke` member.
 fn isBoundRefInstance(v: *const Value) bool {
     if (v.* != .Instance) return false;
     const g = v.Instance.borrow();
@@ -114,23 +94,14 @@ fn isBoundRefInstance(v: *const Value) bool {
     return std.mem.startsWith(u8, cg.get().name, "$bound_ref$");
 }
 
-/// Outlined `execInst` arm — see `execInst`.
-/// `allow_flat = false` masks the three flat-driver parks, forcing the
-/// recursive serving path (`KLIO_FLAT=0` semantics) for that site. A flat
-/// park is CORRECT from a transpiled native body — `afterStep` routes it
-/// and the driver serves the callee — but it unwinds the native function
-/// off the C stack on every call and resumes it through the stream; the
-/// transpiler's call op serves recursively instead so the native caller
-/// stays put, until `NATIVE_RECURSE_MAX_DEPTH`, where it reverts to the
-/// flat park to bound the C stack.
+/// `allow_flat = false` masks the flat-driver parks, forcing the recursive path.
+/// A flat park unwinds a transpiled native body off the C stack on every call, so
+/// the transpiler serves recursively until `NATIVE_RECURSE_MAX_DEPTH`.
 const snapshot_fast = @import("snapshot_fast.zig");
 const compose_fast = @import("compose_fast.zig");
 
-/// Classify `f` for host service (memoized on `Func.host_route`) and
-/// serve `args` on a routed hit. The shared core behind the static-call
-/// arm and the CMG global-replay arm — any dispatch path that has
-/// resolved a plain global target and its positional arguments can
-/// consult it.
+/// Classify `f` for host service, memoized on `Func.host_route`, and serve `args`
+/// on a routed hit.
 pub fn hostRouteServe(comptime H: type, allocator: Allocator, f: *const ir.Func, args: []const Value, host: *H) ?Value {
     if (f.host_route == 0) {
         const route: snapshot_fast.Route = blk: {
@@ -176,19 +147,13 @@ pub fn hostRouteServe(comptime H: type, allocator: Allocator, f: *const ir.Func,
     }
 }
 
-/// Compose's one-line helpers (`IntStack`, the composite-key rotation)
-/// answered by the host at the same seam. Classified once per body, and any
-/// shape the serve cannot prove falls through to the interpreted body.
 var compose_fast_state: u8 = 0;
 var compose_fast_mask: u8 = 255;
 
 /// `KLIO_COMPOSE_FAST` is a bisect mask over the compose serves: bit0 the
-/// stack/key helpers (IntStack and the generic `Stack<T>` family), bit1 the
-/// changelist push, bit2 its argument assertion, bit3 the write scope, bit4
-/// the slot-table index math, bit5 the reader / writer / drain-cursor
-/// family (and the observer-holder refresh), bit6 the throw-capable
-/// changelist wrapper serve, bit7 the whole `Operations.push(op) { args }`
-/// serve (boxed WriteScope receiver). 0 keeps every helper interpreted.
+/// stack/key helpers, bit1 the changelist push, bit2 its argument assertion, bit3
+/// the write scope, bit4 the slot-table index math, bit5 the reader/writer/drain
+/// family, bit6 the changelist wrapper, bit7 `Operations.push(op) { args }`.
 fn composeFastMask() u8 {
     if (compose_fast_state == 0) {
         const raw = runtime.envOnce("KLIO_COMPOSE_FAST") orelse "255";
@@ -198,17 +163,8 @@ fn composeFastMask() u8 {
     return compose_fast_mask;
 }
 
-/// Serves that can RAISE — reached from the same seams as `hostRouteServe`
-/// but with the full result channel. Null = decline (the framed body runs).
-/// One resident: the changelist wrapper `executeWithComposeStackTrace`,
-/// whose body with a NULL errorContext is exactly
-/// `getGroupAnchor(slots); execute(applier, slots, rememberManager, null)`
-/// with a catch that RETHROWS UNCHANGED (`attachComposeStackTrace` returns
-/// `this` for a null context) — so forwarding the two member dispatches
-/// preserves semantics while dropping the wrapper's frame. Both dispatches
-/// re-resolve against the live enclosing chain (the operation object the
-/// wrapper's own dispatch pushed), exactly as the interpreted body's
-/// CallMemberOrGlobal arms would. A non-null errorContext declines.
+/// Serves that can RAISE, from the same seams as `hostRouteServe` but with the
+/// full result channel. Null declines and the framed body runs.
 pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, module: *const Module, f: *const ir.Func, args: []const Value, host: *H) Allocator.Error!?EvalResult {
     if (comptime !@hasDecl(H, "callMemberNamed")) return null;
     const mask = composeFastMask();
@@ -223,10 +179,8 @@ pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, module: *c
             }
             if (f.params.len == 3) {
                 if (std.mem.endsWith(u8, f.fqn, "gapbuffer.changelist.Operations.push")) break :blk 4;
-                // The link-buffer push additionally aggregates the op's
-                // visibility into `requiresApplication` — it must ride its
-                // own pure serve, never the gap one (the recorded
-                // MovableContentTests trap).
+                // The link-buffer push aggregates the op's visibility into
+                // `requiresApplication`, so it rides its own serve, never the gap one.
                 if (std.mem.endsWith(u8, f.fqn, "linkbuffer.changelist.Operations.push")) break :blk 5;
             }
             if (f.params.len == 1) {
@@ -254,16 +208,8 @@ pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, module: *c
             return try host.callMemberNamed(allocator, &args[0], "execute", args[1..5], &.{});
         },
         4, 5 => {
-            // `Operations.push(operation) { args }` with the upstream debug
-            // checks compiled out is exactly `pushOp(operation);
-            // WriteScope(this).args()`. The pushOp half is the pure serve
-            // (which declines, side-effect free, when a stack must grow) —
-            // the LINK-buffer variant, which also aggregates the op's
-            // visibility into `requiresApplication`; the block then runs
-            // against a BOXED WriteScope — value-class member dispatch
-            // resolves on the instance, not on the wrapped Operations — so
-            // `setObject`/`setInt` inside it route to their own serves. A
-            // block throw propagates exactly as the inline body's would.
+            // `Operations.push(op) { args }` is `pushOp(op); WriteScope(this)
+            // .args()`, whose BOXED receiver resolves `setObject` on the instance.
             if (comptime !(@hasDecl(H, "callValueWithThis") and @hasDecl(H, "newInstanceNamed"))) return null;
             if (mask & 128 == 0) return null;
             if (args.len != 3) return null;
@@ -280,8 +226,7 @@ pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, module: *c
             else
                 compose_fast.servePushOpLink(allocator, args[0..2]);
             if (pushed == null) return null;
-            // The op is already pushed; from here nothing may decline —
-            // fail loud through the error channel instead.
+            // The op is already pushed, so nothing below may decline.
             const ws = switch (try host.newInstanceNamed(allocator, ws_cid, args[0..1], &.{}, null)) {
                 .ok => |v| v,
                 .err => |e| return .{ .err = e },
@@ -294,12 +239,8 @@ pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, module: *c
             return .{ .ok = .{ .Unit = {} } };
         },
         6 => {
-            // Non-root `CompositionObserverHolder.current()`: the parent
-            // context's `observerHolder` is usually the base class's
-            // COMPUTED null (the pure serve declines on field absence), so
-            // read it through the host's getter ladder, refresh the cached
-            // observer on change, and answer the parent's observer. The
-            // root arm is the pure serve's.
+            // The parent's `observerHolder` is usually a computed null, so it
+            // needs the host's getter ladder. The root arm is the pure serve's.
             if (comptime !@hasDecl(H, "getField")) return null;
             if (mask & 32 == 0) return null;
             if (args.len != 1) return null;
@@ -343,11 +284,6 @@ pub fn hostRouteServeThrowing(comptime H: type, allocator: Allocator, module: *c
             return .{ .ok = parent_obs };
         },
         7, 8 => {
-            // `Stack<T>.push` / `Stack<T>.pop` forward to the backing
-            // MutableList's own `add` / `removeAt` intrinsic, dropping the
-            // wrapper frame while keeping every list-mutation guard
-            // (read-only, view, comodification, mod-count) exactly as the
-            // interpreted body would hit them.
             if (mask & 1 == 0) return null;
             const want_args: usize = if (f.throw_route == 7) 2 else 1;
             if (args.len != want_args) return null;
@@ -437,8 +373,7 @@ fn composeRouteServe(allocator: Allocator, f: *const ir.Func, args: []const Valu
     };
 }
 
-/// Host-served static fns (the snapshot validity walk): classify once
-/// per Func, serve without any call machinery on a hit.
+/// Host-served static fns: classify once per Func, serve without call machinery.
 inline fn hostStaticServe(comptime H: type, allocator: Allocator, frame: *Frame, call: anytype, host: *H) Allocator.Error!?Value {
     const cf = frame.module.funcById(call.func) orelse return null;
     if (call.type_args.len != 0 or !argNamesAllNull(call.arg_names)) return null;
@@ -479,16 +414,11 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
         try frame.write(call.dst, served);
         return .cont;
     }
-    // Scalar-replay leaf (`kl_`): when a leaf library is registered
-    // (KLIO_LEAVES), a pure scalar callee runs as direct C — bail is a
-    // pure no-op and the ordinary paths below re-run the call exactly.
+    // With a leaf library registered (`KLIO_LEAVES`) a pure scalar callee runs
+    // as direct C; a bail is a no-op and the paths below re-run the call.
     if (try eval.tryLeafCall(H, allocator, frame, call, host, null)) |st| return st;
-    // Monomorphic fast path: a plain top-level user function (single
-    // overload, has body, non-extension, no varargs / defaults / type
-    // params / native binding) called positionally at exact arity needs
-    // none of the overload re-resolution, extension-receiver handling,
-    // reified-type binding, or redundant arg copying below. Dispatch it
-    // straight to the body with the arg buffer transferred as params.
+    // Monomorphic fast path: a single-overload non-extension top-level function
+    // with a body and no varargs, defaults, type params or native binding.
     if (comptime @hasDecl(H, "callFuncFast")) {
         if (call.type_args.len == 0 and argNamesAllNull(call.arg_names)) {
             if (frame.module.funcById(call.func)) |cf| {
@@ -497,12 +427,10 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                     plan = host.fastCallPlan(frame.module, call.func);
                     @constCast(cf).fast_call = plan;
                 }
-                // The low bits carry the eligible arity + 2; a positional,
-                // exact-arity call dispatches straight to the body.
+                // The low bits carry the eligible arity plus 2.
                 const plan_arity = plan & 0x1FFF;
-                // Same-name, same-arity peers: only this SITE's scope can say
-                // whether the baked target is the one resolution picks, so ask
-                // once and keep the verdict on the instruction.
+                // Same-name, same-arity peers: only this site's scope can say
+                // whether the baked target is the one resolution picks.
                 var ambig_ok = true;
                 if (plan & ir.FAST_CALL_AMBIG_FLAG != 0) {
                     if (comptime @hasDecl(H, "fuseSiteBinds")) {
@@ -519,10 +447,8 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                 }
                 if (ambig_ok and plan_arity >= 2 and plan_arity - 2 == call.n_args) {
                     const args_list = try readArgList(allocator, frame, call.args, call.n_args);
-                    // A receiver-carrying body: seed the caller's instance
-                    // `this` as the enclosing receiver exactly as the full
-                    // path below does (lexical scope for a member extension,
-                    // dispatch visibility for anything else).
+                    // The caller's `this` seeds the enclosing receiver: lexical
+                    // scope for a member extension, dispatch visibility else.
                     var pushed_enclosing = false;
                     if (plan & ir.FAST_CALL_EXT_FLAG != 0) {
                         if (frameThisParam(frame)) |ct_idx| {
@@ -542,8 +468,6 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                         }
                     }
                     if (plan & ir.FAST_CALL_EXT_FLAG != 0) dispatchBump(.static_flat_fuse_ext) else dispatchBump(.static_flat_fuse);
-                    // The flat driver runs the body as a pushed activation in
-                    // the same dispatch loop — no native recursion per call.
                     if (allow_flat and flatEnabled()) {
                         const composer_pushed = if (comptime @hasDecl(H, "flatPlainCallOpen"))
                             host.flatPlainCallOpen(cf, args_list.items)
@@ -579,11 +503,8 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
         try ta.append(allocator, constStr(frame.module, c) orelse "");
     }
 
-    // Undispatched-start boundary (`__klio_co_startRootOrSuspended` under
-    // an enclosing pump): run the block as a BARRIER activation on this
-    // driver — a suspension parks the segment into the pump and this frame
-    // continues with COROUTINE_SUSPENDED, with no native pump entry and no
-    // frame snapshots per call.
+    // Undispatched start under an enclosing pump: a barrier activation parks a
+    // suspension into the pump and this frame gets COROUTINE_SUSPENDED.
     if (comptime @hasDecl(H, "prepareUndispatchedStartFlatCall")) {
         if (allow_flat and flatEnabled() and argNamesAllNull(call.arg_names)) {
             if (try host.prepareUndispatchedStartFlatCall(allocator, frame.module, call.func, arg_values)) |prep0| {
@@ -604,11 +525,8 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
     }.f;
     const baked_is_ext = bakedExt(frame.module, call.func);
 
-    // Named-argument overload re-resolution. The lowerer baked the
-    // call to a positional-arity heuristic FuncId; a named call may
-    // really target a sibling overload (Kotlin resolves named calls
-    // by parameter name). The receiver is reachable here, so an
-    // implicit extension receiver can be supplied before dispatch.
+    // Kotlin resolves named calls by parameter name, so a sibling of the
+    // lowerer's positional-arity FuncId may be the real target.
     var eff_func = call.func;
     if (!call.exact) {
         var any_named = false;
@@ -616,10 +534,8 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
             if (n != null) any_named = true;
         }
         if (any_named) {
-            // The implicit extension receiver is in scope (a bare
-            // call inside an extension/method body) but absent from
-            // `args` only when the baked target is not itself an
-            // extension — otherwise the lowerer already prepended it.
+            // The implicit extension receiver is absent from `args` only when
+            // the baked target is not itself an extension.
             const caller_this = frameThisParam(frame);
             const recv_external = caller_this != null and !baked_is_ext;
             const recv_val: ?*const Value = if (recv_external) blk: {
@@ -635,17 +551,12 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                 const picked_is_ext = bakedExt(frame.module, picked);
                 if (picked_is_ext and !baked_is_ext) {
                     if (caller_this) |ct_idx| {
-                        // Supply the enclosing `this` as the leading
-                        // (unnamed) receiver argument the chosen
-                        // extension overload expects.
                         const recv = frame.params.items[ct_idx];
                         const na = try allocator.alloc(Value, arg_values.len + 1);
                         na[0] = recv;
                         @memcpy(na[1..], arg_values);
-                        // `arg_values`/`names` are owned by the
-                        // single `defer allocator.free(...)` above;
-                        // free the original buffers before replacing
-                        // the pointers so each is freed exactly once.
+                        // The defers above free `arg_values`/`names`: free the
+                        // originals before replacing the pointers.
                         allocator.free(arg_values);
                         arg_values = na;
                         const nn = try allocator.alloc(?[]const u8, names.len + 1);
@@ -659,9 +570,6 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
         }
     }
 
-    // Invoking an extension / member-extension function from
-    // inside a method: keep the caller's instance `this`
-    // reachable as the enclosing receiver.
     const callee_fn: ?*const Func = frame.module.funcById(eff_func);
     const callee_is_ext = callee_fn != null and callee_fn.?.params.len > 0 and
         std.mem.eql(u8, callee_fn.?.params[0].name, "this");
@@ -674,11 +582,8 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
                 const same = arg_values.len > 0 and arg_values[0] == .Instance and
                     ObjRef(InstanceData).ptrEq(p.Instance, arg_values[0].Instance);
                 if (!same) {
-                    // A member-extension's body has its declaring
-                    // class's `this` in lexical scope (the
-                    // dispatch receiver); a plain extension's body
-                    // does not — the push is then dispatch
-                    // visibility only.
+                    // A member-extension's body has its declaring class's `this` in
+                    // lexical scope; for a plain extension the push is visibility.
                     if (callee_fn.?.kind == .member_extension) {
                         pushEnclosing(&frame.params.items[ct_idx]);
                     } else {
@@ -689,10 +594,6 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
             }
         }
     }
-    // Flat typed call: the resolved plain shape runs as a pushed
-    // activation carrying its reified type-name bindings (restored at
-    // teardown/park) and the call's type args for the boundary
-    // transform. Special shapes decline to the recursive path.
     if (comptime @hasDecl(H, "prepareTypedFlatCall")) {
         if (allow_flat and flatEnabled() and ta.items.len > 0 and argNamesAllNull(call.arg_names)) {
             if (try host.prepareTypedFlatCall(allocator, frame.module, eff_func, arg_values, ta.items, call.exact)) |prep0| {
@@ -719,7 +620,6 @@ pub noinline fn execArmCall(comptime H: type, allocator: Allocator, frame: *Fram
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_value);
     const callee_v = frame.read(cv.callee);
@@ -749,8 +649,6 @@ pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: 
             std.debug.print("[cv-arg] in={s} #{d} kind={s}\n", .{ frame.func.name, ai, @tagName(std.meta.activeTag(av.*)) });
         }
     }
-    // Receiver-typed lambda bare invocation: prepend the calling
-    // frame's `this` when the closure expects a leading `this`.
     const caller_this = callerThisValue(frame);
     if (host.callableReceiverShape(&callee_v)) |shape| {
         if (shape.first_is_this and arg_values_list.items.len + 1 == shape.n_params) {
@@ -760,23 +658,13 @@ pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: 
             }
         }
     }
-    // Receiver lambda whose `this` arrives via a captured slot.
     if (host.closureNeedsThisCapture(&callee_v)) {
         if (caller_this) |ct| {
             host.overrideClosureThis(&callee_v, &ct);
         }
     }
-    // No caller-`this` push here: a closure's body resolves bare
-    // names against its creation-time receiver chain (lexical
-    // scope); a receiver-typed lambda gets its subject through the
-    // receiver-split / `this`-capture binding above. Pushing the
-    // dynamic caller's `this` would hand the body a receiver it
-    // never lexically saw.
-    //
-    // Flat closure dispatch: a plain positional exact-arity closure call
-    // runs as a pushed activation in the flat driver. The host performs the
-    // same resolution and binding the recursive path would, then hands back
-    // the ready call instead of invoking the evaluator itself.
+    // No caller-`this` push: a closure's body resolves bare names against its
+    // creation-time receiver chain, which the dynamic caller's `this` is not on.
     if (comptime @hasDecl(H, "prepareClosureFlatCall")) {
         if (flatEnabled() and callee_v == .IrClosure and cv.type_args.len == 0 and argNamesAllNull(cv.arg_names)) {
             if (try host.prepareClosureFlatCall(allocator, &callee_v, arg_values_list.items)) |prep0| {
@@ -788,9 +676,8 @@ pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: 
         }
     }
     const result = blk: {
-        // Explicit call-site type args reach the host so an
-        // unsigned element-type argument can coerce integral
-        // literals before the intrinsic (`arrayOf<ULong>(1u)`).
+        // Call-site type args reach the host so an unsigned element type
+        // coerces integral literals before the intrinsic (`arrayOf<ULong>(1u)`).
         if (cv.type_args.len != 0) {
             var ta_buf: [4][]const u8 = undefined;
             const n_ta = @min(cv.type_args.len, ta_buf.len);
@@ -804,9 +691,6 @@ pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: 
     switch (try result) {
         .ok => |rv| {
             var out = rv;
-            // A stdlib container creator dispatched as an
-            // intrinsic value records its call-site type-argument
-            // heads on the built container.
             if (cv.type_args.len != 0 and callee_v == .Intrinsic) {
                 var ta: std.ArrayList([]const u8) = .empty;
                 defer ta.deinit(allocator);
@@ -822,7 +706,6 @@ pub noinline fn execArmCallValue(comptime H: type, allocator: Allocator, frame: 
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_spread);
     const callee_v = frame.read(cs.callee);
@@ -891,8 +774,7 @@ pub noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame:
     } else if (cs.member) |mid| {
         const mname = constStr(frame.module, mid) orelse
             return raiseStep(frame, .{ .Type = "CallSpread: member not a string const" });
-        // The receiver is borrowed for the call's whole duration;
-        // pin it across dispatch (the body may drop other refs).
+        // Pin the borrowed receiver: the body may drop other references.
         callee_v.retain();
         defer callee_v.release(allocator);
         switch (try host.callMemberNamed(allocator, &callee_v, mname, arg_values.items, effective_names.items)) {
@@ -940,7 +822,6 @@ pub noinline fn execArmCallSpread(comptime H: type, allocator: Allocator, frame:
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: *Frame, csup: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_super);
     const recv = frame.read(csup.receiver);
@@ -962,9 +843,8 @@ pub noinline fn execArmCallSuper(comptime H: type, allocator: Allocator, frame: 
     return .cont;
 }
 
-/// Execute a statically selected virtual slot. Unlike `CallMember`, this arm
-/// has no name-based fallback: a missing slot is a link error in the program
-/// image and is reported by the host.
+/// Execute a statically selected virtual slot. Unlike `CallMember` this arm has
+/// no name-based fallback: a missing slot is a link error the host reports.
 pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame: *Frame, cv: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_virtual_slot);
     if (comptime !@hasDecl(H, "invokeVirtualMember")) {
@@ -975,10 +855,6 @@ pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame
     defer recv.release(allocator);
     const args = try readArgRun(allocator, frame, cv.args, cv.n_args);
     defer allocator.free(args);
-    // Flat virtual dispatch: a slot resolved against a named receiver class
-    // to an interpreted body at the fully-applied no-vararg shape runs as a
-    // pushed activation on this driver, skipping the recursive invoker's
-    // per-call frame ceremony. Everything else falls through unchanged.
     if (comptime @hasDecl(H, "prepareVirtualFlatCall")) {
         if (flatEnabled() and vcallFlatEnabled() and cv.arg_params == null and argNamesAllNull(cv.arg_names)) {
             if (try host.prepareVirtualFlatCall(allocator, &recv, cv.slot, args)) |prep0| {
@@ -996,8 +872,8 @@ pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame
         H.setTrailingMemberCall(true)
     else
         false;
-    // Host-receiver site memo handles: only a plain positional call may
-    // stamp or replay (the memoized direct dispatch binds positionally).
+    // Only a plain positional call may stamp or replay the site memo, whose
+    // memoized direct dispatch binds positionally.
     const site: ?ir.VirtNativeSite = if (cv.arg_params == null and argNamesAllNull(cv.arg_names))
         .{
             .cls = @constCast(&cv.site_cls),
@@ -1018,7 +894,6 @@ pub noinline fn execArmCallVirtual(comptime H: type, allocator: Allocator, frame
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator, frame: *Frame, cmv: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_member_or_value);
     const recv = frame.read(cmv.receiver);
@@ -1031,11 +906,7 @@ pub noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator,
     const name_str = constStr(frame.module, cmv.name) orelse
         return raiseStep(frame, .{ .Type = "CallMemberOrValue: name not a string const" });
     var fb = frame.read(cmv.fallback);
-    // A boxed capture holds the callable in a cell (a captured local fn's
-    // shared binding); classify and invoke the CONTENT — the sibling
-    // CallValueOrMember arm unwraps identically. Without this a captured
-    // `fun MockViewValidator.Composition()` fallback read as `.Cell`,
-    // was judged non-invocable, and the member miss surfaced.
+    // A boxed capture holds the callable in a cell; classify the CONTENT.
     if (fb == .Cell) {
         const cg = fb.Cell.borrow();
         fb = cg.get().*;
@@ -1052,50 +923,27 @@ pub noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator,
         } else @tagName(recv);
         std.debug.print("[pb] in={s}#{d} recv={s} fb={s}\n", .{ frame.func.name, frame.func.id.int(), rcls, @tagName(fb) });
     }
-    // The local/captured fallback only wins when the receiver has no
-    // such member AND the fallback is actually invocable (a function
-    // value or callable reference). A same-named non-callable local
-    // (e.g. a captured `info` next to `logger.info(...)`) must not
-    // shadow the real member.
+    // The fallback wins only when the receiver has no such member and the
+    // fallback is invocable: a non-callable local never shadows a real member.
     const fb_invocable = switch (fb) {
         .IrClosure, .Intrinsic, .BoundMethod, .PropertyRef => true,
         // A class value is its constructor (`::Char` bound to an
-        // `Int.() -> Char` param): invocable, receiver becomes the
-        // first positional argument below.
+        // `Int.() -> Char` param); the receiver becomes its first argument.
         .Class => true,
-        // A bound/unbound callable reference (`Long::toByte`,
-        // `recv::method`) is a `$bound_ref$<name>` synth instance: it
-        // is invocable, so `recv.refParam()` invokes the reference
-        // with `recv` as its receiver rather than dispatching a member
-        // named `refParam` on `recv`.
+        // A callable reference is invocable, so `recv.refParam()` invokes it
+        // with `recv` as receiver rather than dispatching a member.
         .Instance => isBoundRefInstance(&fb) or host.hostHasMember(&fb, "invoke") or host.callableReceiverShape(&fb) != null,
         else => false,
     };
-    // A local callable whose declared arity provably cannot take
-    // the supplied args is not the primary candidate — Kotlin
-    // resolves the member/extension instead
-    // (`subList(..).sortDescending()` next to a
-    // `sortDescending: TArray.(Int, Int) -> Unit` param must
-    // dispatch the extension, not Null-pad the local). The proof
-    // is conservative (closure shapes without a DeclSig can hide
-    // defaults), so a canonical member MISS still falls back to
-    // invoking the local.
+    // A local callable whose declared arity provably cannot take the supplied
+    // args is not the primary candidate; Kotlin resolves the member instead.
     const fb_misfit = fb_invocable and
         (host.callableAcceptsCall(&fb, &recv, user_args, names) orelse true) == false;
-    // A receiver whose STATIC type is an unbounded type parameter has no
-    // members to shadow the local: Kotlin compiles the body once against
-    // the bound (`Any?`), so `receiver.block()` inside
-    // `fun <T, R> with(receiver: T, block: T.() -> R)` always binds the
-    // `block` PARAMETER. Consulting the runtime class instead let a
-    // same-named member hijack it — `with(node) { … }` on a node owning a
-    // `block` field ran that field and skipped the whole with-body.
+    // A receiver whose STATIC type is an unbounded type parameter has no members
+    // to shadow the local: Kotlin compiles the body against the bound (`Any?`).
     const members_visible = !cmv.recv_erased and host.hostHasMember(&recv, name_str);
     if (fb_invocable and (!fb_misfit or cmv.recv_erased) and !members_visible) {
         orAudit("CallMemberOrValue", name_str, "value", -1, &recv);
-        // Flat dispatch for the closure fallback: the shape-known route is
-        // a plain value call, the shape-unknown route the with-this bind;
-        // the declared-receiver (`fallback_takes_receiver`) route keeps
-        // the recursive path.
         if (comptime @hasDecl(H, "prepareClosureWithThisFlatCall")) {
             if (flatEnabled() and fb == .IrClosure and !cmv.fallback_takes_receiver and argNamesAllNull(cmv.arg_names)) {
                 const maybe = if (cmv.fallback_receiver_shape_known)
@@ -1111,8 +959,8 @@ pub noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator,
             }
         }
         if (fb == .Class) {
-            // Constructors take no receiver: `65.f()` with
-            // `f = ::Char` is `Char(65)`.
+            // Constructors take no receiver: `65.f()` with `f = ::Char` is
+            // `Char(65)`.
             const adapted = try allocator.alloc(Value, user_args.len + 1);
             defer allocator.free(adapted);
             adapted[0] = recv;
@@ -1139,12 +987,8 @@ pub noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator,
         const r = try host.callMemberNamed(allocator, &recv, name_str, user_args, names);
         const member_missed = r == .err and r.err == .Unimplemented and
             std.mem.find(u8, r.err.Unimplemented, "Vm::") != null;
-        // The member exists by name but no overload serves this call
-        // (arity/type). When the same-named local is an invocable
-        // function value, it is the intended target — Kotlin resolves
-        // `up.update()` to a `Up.() -> Unit` param over the 2-arg member
-        // `update(value, block)`. Discard the member miss and invoke the
-        // value (its receiver is the call receiver).
+        // The member exists by name but no overload serves this call, so Kotlin
+        // resolves to the same-named invocable local instead.
         if (member_missed and fb_invocable) {
             freeDispatchMissMsg(allocator, r.err.Unimplemented);
             orAudit("CallMemberOrValue", name_str, "value_after_miss", -1, &recv);
@@ -1178,9 +1022,8 @@ pub noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator,
     return .cont;
 }
 
-/// Whether a value can serve as the callee of a call: closures, function
-/// references, intrinsics, classes (constructor call), bound references, and
-/// instances whose class hierarchy declares `invoke`.
+/// Whether a value can serve as a callee: closures, function references,
+/// intrinsics, classes, bound references, and instances declaring `invoke`.
 fn valueInvocable(module: *const Module, callee_v: Value) bool {
     return switch (callee_v) {
         .Intrinsic, .IrClosure, .BoundMethod => true,
@@ -1190,8 +1033,7 @@ fn valueInvocable(module: *const Module, callee_v: Value) bool {
             {
                 const g = i.borrow();
                 defer g.deinit();
-                // A bound member/constructor reference synth
-                // (`val lit = Expr::Lit`) is a callable value.
+                // A bound reference synth (`val lit = Expr::Lit`) is callable.
                 if (g.get().get("__bound_name__") != null) break :blk true;
             }
             const g = i.borrow();
@@ -1208,12 +1050,10 @@ fn valueInvocable(module: *const Module, callee_v: Value) bool {
     };
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator, frame: *Frame, cvm: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_value_or_member);
     var callee_v = frame.read(cvm.callee);
-    // A boxed capture holds the callable in a cell; classify the
-    // CONTENT (a captured local fn in a `var` slot is invokable).
+    // A boxed capture holds the callable in a cell; classify the CONTENT.
     if (callee_v == .Cell) {
         const cg = callee_v.Cell.borrow();
         callee_v = cg.get().*;
@@ -1224,19 +1064,15 @@ pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator,
     const names = try resolveArgNames(allocator, frame.module, cvm.arg_names);
     defer freeArgNames(allocator, names);
     var invocable = valueInvocable(frame.module, callee_v);
-    // A runtime-registered class that EXTENDS a function type (an object
-    // expression `object : (Int) -> Unit`) keeps its `invoke` outside the
-    // module registry. Gate on the function-type supertype, not a mere
-    // `invoke` member: a compose `MovableContent` invoked as
-    // `receiver.content()` must stay on the member arm.
+    // A runtime-registered class extending a function type keeps its `invoke`
+    // outside the module registry; the gate is the function-type supertype.
     if (!invocable and callee_v == .Instance) {
         if (comptime @hasDecl(H, "instanceExtendsFunctionType")) {
             invocable = host.instanceExtendsFunctionType(&callee_v);
         }
     }
-    // A callable whose DECLARED params definitely refute the runtime
-    // args is not the target — Kotlin resolved the call to the
-    // same-named enclosing member overload; fall to the member arm.
+    // A callable whose declared params refute the runtime args is not the
+    // target: Kotlin resolved the call to the same-named enclosing member.
     const refuted = invocable and (comptime @hasDecl(H, "closureParamsDisproven")) and
         host.closureParamsDisproven(&callee_v, arg_values);
     if (invocable and !refuted) {
@@ -1244,13 +1080,7 @@ pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator,
             const name_str = constStr(frame.module, cvm.name) orelse "?";
             orAudit("CallValueOrMember", name_str, "value", -1, null);
         }
-        // The member-fallback receiver is also the call site's
-        // innermost implicit receiver; a receiver-typed closure
-        // invoked bare binds it as dispatch context.
         const recv_ctx = frame.read(cvm.this_recv);
-        // Flat dispatch: the plain closure shapes run as a pushed
-        // activation; the host mirrors `callValueNamedRecvCtx`'s routing
-        // and declines every special shape to the recursive path.
         if (comptime @hasDecl(H, "prepareValueRecvCtxFlatCall")) {
             if (flatEnabled() and callee_v == .IrClosure and argNamesAllNull(cvm.arg_names)) {
                 if (try host.prepareValueRecvCtxFlatCall(allocator, &callee_v, &recv_ctx, arg_values)) |prep0| {
@@ -1275,11 +1105,8 @@ pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator,
             return raiseStep(frame, .{ .Type = "CallValueOrMember: name not a string const" });
         orAudit("CallValueOrMember", name_str, "member", 0, &recv);
         var r = try host.callMemberNamed(allocator, &recv, name_str, arg_values, names);
-        // A NON-callable capture is not a resolution candidate at all in
-        // Kotlin: `val pipeline = pipeline()` captured by a receiver lambda
-        // must not stop `pipeline()` from binding the ENCLOSING class's
-        // member. On the canonical member miss for the innermost receiver,
-        // walk the outer implicit receivers before giving up.
+        // A non-callable capture is not a resolution candidate in Kotlin, so the
+        // innermost receiver's canonical miss walks the outer receivers.
         if (r == .err and r.err == .Unimplemented and
             std.mem.find(u8, r.err.Unimplemented, "Vm::call_member") != null)
         {
@@ -1312,32 +1139,24 @@ pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator,
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame: *Frame, ni: anytype, host: *H) Allocator.Error!Step {
     const arg_values = try readArgRun(allocator, frame, ni.args, ni.n_args);
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, ni.arg_names);
     defer freeArgNames(allocator, names);
-    // A bare `Inner(args)` inside a member of the enclosing
-    // class is `this@Outer.Inner(args)`: pass the frame's own
-    // `this` — a method's `this` param or a lambda's `this`
-    // capture — as the outer hint for the construction dispatch.
-    // The host's outer selection is class-keyed, so a receiver
-    // lambda whose `this` slot was overridden with an unrelated
-    // subject falls through to the enclosing-receiver chain.
+    // A bare `Inner(args)` inside a member of the enclosing class is
+    // `this@Outer.Inner(args)`, so the frame's own `this` is the outer hint.
     var outer_hint: ?Value = callerThisValue(frame);
     const hint_ptr: ?*const Value = if (outer_hint) |*h| h else null;
-    // Kotlin selects the constructor overload from the arguments' STATIC
-    // types. Hand them to the host for this construction only; it consumes
-    // them once, so a delegation or default thunk that constructs further
-    // instances underneath ranks on its own terms.
+    // Kotlin selects the constructor overload from the arguments' STATIC types.
+    // The host consumes the heads once, so a nested construction ranks on its own.
     const static_heads = try resolveArgNames(allocator, frame.module, ni.arg_static_heads);
     defer freeArgNames(allocator, static_heads);
     if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
         host.setCtorArgStaticHeads(static_heads);
     }
-    // Cleared on every exit: a construction path that never takes the heads
-    // must not leave this thread pointing at the slice freed above.
+    // Cleared on every exit: the slice above is freed, and no construction path
+    // may leave this thread pointing at it.
     defer if (comptime @hasDecl(H, "clearCtorArgStaticHeads")) host.clearCtorArgStaticHeads();
     const result = switch (try host.newInstanceNamed(allocator, ni.class, arg_values, names, hint_ptr)) {
         .ok => |v| v,
@@ -1353,8 +1172,7 @@ pub noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame
             break :blk cg.get().is_inner and g.get().outer == null;
         };
         if (needs_outer and outer_hint != null) {
-            // The instance's `outer` is an owned field (its teardown
-            // releases it); `outer_hint` is the caller's borrow, so
+            // `outer` is an owned field and `outer_hint` a caller borrow, so
             // retain before storing. No-op under the arena.
             outer_hint.?.retain();
             const g = inst_ref.borrowMut();
@@ -1366,7 +1184,6 @@ pub noinline fn execArmNewInstance(comptime H: type, allocator: Allocator, frame
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmInstanceOf(comptime H: type, allocator: Allocator, frame: *Frame, io: anytype, host: *H) Allocator.Error!Step {
     _ = allocator;
     const v = frame.read(io.src);
@@ -1375,7 +1192,6 @@ pub noinline fn execArmInstanceOf(comptime H: type, allocator: Allocator, frame:
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmCtxScope(comptime H: type, allocator: Allocator, frame: *Frame, cs: anytype, host: *H) Allocator.Error!Step {
     if (comptime !@hasDecl(H, "ctxPush")) {
         try frame.write(cs.dst, .Null);
@@ -1397,7 +1213,6 @@ pub noinline fn execArmCtxScope(comptime H: type, allocator: Allocator, frame: *
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmCtxCall(comptime H: type, allocator: Allocator, frame: *Frame, cc: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.ctx_call);
     if (comptime !@hasDecl(H, "ctxPush")) {
@@ -1405,11 +1220,8 @@ pub noinline fn execArmCtxCall(comptime H: type, allocator: Allocator, frame: *F
         return .cont;
     }
     var callee_v = frame.read(cc.callee);
-    // A contextual function type is the flattened function type: a callee
-    // declared with every context as a leading parameter (`fun (g: G, n: N)`
-    // passed where `context(G) (N) -> R` is expected) takes them
-    // positionally; a context function (arity = its ordinary parameters)
-    // reads them from the context stack.
+    // A callee declared with every context as a leading parameter takes them
+    // positionally; a context function reads them from the context stack.
     const positional = blk: {
         if (cc.n_ctx == 0) break :blk false;
         if (comptime !@hasDecl(H, "callableDeclaredArity")) break :blk false;
@@ -1435,7 +1247,6 @@ pub noinline fn execArmCtxCall(comptime H: type, allocator: Allocator, frame: *F
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Frame, cast: anytype, host: *H) Allocator.Error!Step {
     const v = frame.read(cast.src);
     if (host.instanceOf(&v, cast.ty)) {
@@ -1456,9 +1267,8 @@ pub noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Fram
     } else if (cast.safe) {
         try frame.write(cast.dst, .Null);
     } else {
-        // A failed cast raises without passing through the
-        // `Throw` terminator, so trace it here too or
-        // KLIO_THROW_TRACE never sees ClassCastExceptions.
+        // A failed cast raises without passing through the `Throw` terminator,
+        // so KLIO_THROW_TRACE needs its own trace here.
         if (envVarSet("KLIO_THROW_TRACE")) {
             std.debug.print("[throw-trace] from fn {s} (fqn={s}): ClassCastException cast to {s} (value tag {s})\n", .{ frame.func.name, frame.func.fqn, cast.ty.name, @tagName(v) });
         }
@@ -1473,7 +1283,6 @@ pub noinline fn execArmCast(comptime H: type, allocator: Allocator, frame: *Fram
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmLambda(comptime H: type, allocator: Allocator, frame: *Frame, lam: anytype, host: *H) Allocator.Error!Step {
     const cap_values = try readRegSlice(allocator, frame, lam.captures);
     defer allocator.free(cap_values);
@@ -1484,7 +1293,6 @@ pub noinline fn execArmLambda(comptime H: type, allocator: Allocator, frame: *Fr
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmAstLambda(comptime H: type, allocator: Allocator, frame: *Frame, al: anytype, host: *H) Allocator.Error!Step {
     const cap_values = try readRegSlice(allocator, frame, al.captures);
     defer allocator.free(cap_values);
@@ -1495,7 +1303,6 @@ pub noinline fn execArmAstLambda(comptime H: type, allocator: Allocator, frame: 
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmRegisterClass(comptime H: type, allocator: Allocator, frame: *Frame, rc: anytype, host: *H) Allocator.Error!Step {
     const cap_values = try readRegSlice(allocator, frame, rc.captures);
     defer allocator.free(cap_values);
@@ -1503,10 +1310,8 @@ pub noinline fn execArmRegisterClass(comptime H: type, allocator: Allocator, fra
         .ok => {},
         .err => |e| return raiseStep(frame, e),
     }
-    // Bind the declaration name to the registered class value so a call
-    // to the local class in scope constructs it (shadowing a same-named
-    // top-level function). Only hosts that model a class table produce a
-    // value; others leave the slot at its default.
+    // Binding the declaration name to the registered class value makes a call to
+    // the local class construct it, shadowing a same-named top-level function.
     if (rc.dst) |d| {
         if (@hasDecl(H, "localClassValue")) {
             switch (try host.localClassValue(allocator, rc.class.get().name.name)) {
@@ -1518,7 +1323,6 @@ pub noinline fn execArmRegisterClass(comptime H: type, allocator: Allocator, fra
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmBuildObject(comptime H: type, allocator: Allocator, frame: *Frame, bobj: anytype, host: *H) Allocator.Error!Step {
     const cap_values = try readRegSlice(allocator, frame, bobj.captures);
     defer allocator.free(cap_values);
@@ -1529,23 +1333,14 @@ pub noinline fn execArmBuildObject(comptime H: type, allocator: Allocator, frame
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmStoreToThisOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, stg: anytype, host: *H) Allocator.Error!Step {
     const name_str = constStr(frame.module, stg.name) orelse
         return raiseStep(frame, .{ .Type = "StoreToThisOrGlobal: name not a string const" });
     const v = frame.read(stg.value);
-    // Kotlin scoping for a bare-name write mirrors the read side:
-    // the innermost implicit receiver owning a *property* of this
-    // name takes the write; only when no receiver owns one does
-    // the write land on the top-level binding (pinned by the
-    // `bare_write_*` kotlinc parity fixtures). An assignment LHS
-    // can only resolve to a property or variable — a member
-    // *function* of the name never captures the write.
+    // Kotlin scoping for a bare-name write mirrors the read side: the innermost
+    // implicit receiver owning a PROPERTY of this name takes it, and only with no
+    // such receiver does it land on the top-level binding.
     var routed = false;
-    // The statically supplied receiver is the innermost one, so it gets first
-    // refusal. Same ownership test as the walk: a receiver that declares
-    // neither a property nor an extension-property setter of this name does
-    // not take the write, and the walk (then the global) still runs.
     if (stg.recv) |rr| {
         const rv = frame.read(rr);
         if (rv == .Instance and
@@ -1561,24 +1356,15 @@ pub noinline fn execArmStoreToThisOrGlobal(comptime H: type, allocator: Allocato
         }
     }
     if (!routed) {
-        // `consult_param = true`: the implicit receiver owning the
-        // written property may be the frame's `this` *parameter* (a
-        // bare `receiveType = …` inside an interface/extension method),
-        // not a capture — matching the read side. A bare write also
-        // resolves to an extension-property *setter* (`var T.x set(…)`)
-        // declared on the receiver's type or a supertype, not only a
-        // stored member; `setField` dispatches both.
+        // `consult_param = true`: the written property's receiver may be the
+        // frame's `this` PARAMETER, and a bare write also binds a setter.
         var cands_l = try implicitCandidatesAlloc(H, allocator, frame, stg.this_idx, true, host, name_str, null);
         defer releaseCands(allocator, &cands_l);
         const cands = cands_l.items;
         const cands_keepalive = pinImplicitCandidates(cands);
         defer runtime.keepaliveRestore(cands_keepalive);
-        // Mirror the read side's capture shadow: a captured enclosing
-        // local (scoped-global layer) takes the write over any non-OWN
-        // receiver's property — `count++` inside a local class must
-        // mutate the captured `count`, not a same-named property on a
-        // dispatch-published chain receiver. `storeGlobal` then writes
-        // through the capture's Cell.
+        // Mirroring the read side: a captured enclosing local takes the write over
+        // any non-OWN receiver's property, writing through the capture's Cell.
         var w_capture_shadows = false;
         if (comptime @hasDecl(H, "scopedLocalBinds")) {
             w_capture_shadows = host.scopedLocalBinds(name_str);
@@ -1607,60 +1393,35 @@ pub noinline fn execArmStoreToThisOrGlobal(comptime H: type, allocator: Allocato
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, lt: anytype, host: *H) Allocator.Error!Step {
     const name_str = constStr(frame.module, lt.name) orelse
         return raiseStep(frame, .{ .Type = "LoadFromThisOrGlobal: name not a string const" });
     var resolved: ?Value = null;
     {
-        // `consult_param = true`: in a method / extension body the
-        // implicit receiver is the frame's `this` *parameter*, not
-        // a capture slot.
+        // `consult_param = true`: in a method or extension body the implicit
+        // receiver is the frame's `this` PARAMETER, not a capture slot.
         runtime.prof.opRoute(11);
         var cands_l = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, stripScopeGetter(name_str), null);
         defer releaseCands(allocator, &cands_l);
         const cands = cands_l.items;
         const cands_keepalive = pinImplicitCandidates(cands);
         defer runtime.keepaliveRestore(cands_keepalive);
-        // Per-candidate probes are member-only (`getMemberField`):
-        // a candidate must not "resolve" a global or an outer
-        // receiver's member and shadow a receiver further out —
-        // the walk's own order decides precedence, and the global
-        // tiers below decide the fallback. A probe hit is a hit
-        // even when the member's value IS `Unit` (`var u: Unit`):
-        // the strict probe reports misses as errors, never as a
-        // spurious `Unit`.
-        //
-        // The instruction's site memo short-circuits the walk when the
-        // candidate shape matches a prior execution: a member's presence
-        // on a candidate is a function of its class graph and stored
-        // field set, both folded into the shape word, so under an equal
-        // shape the recorded misses still miss and only the recorded
-        // winner (if any) needs its probe re-run.
+        // Per-candidate probes are member-only: a candidate must not resolve a
+        // global or an outer receiver's member and shadow a receiver further out.
+        // A member's presence is a function of the class graph and stored field
+        // set, both folded into the shape word, so an equal shape still misses.
         runtime.prof.opRoute(12);
-        // Kotlin lexical scoping: a captured enclosing local — materialized
-        // for a runtime-lowered method body as a scoped-global layer — is a
-        // NEARER binding than any implicit receiver's EXTENSION property.
-        // Real members stay nearer than the capture (the class-body scope
-        // encloses it), so the receiver walk is skipped only when every
-        // candidate is an Instance and none of their classes declares the
-        // name. Without this, AwaiterQueue's `private inline val Int.count`
-        // hijacked a captured `count` through any receiver chain holding an
-        // Int, and the read never reached the capture's cell.
+        // Kotlin lexical scoping: a captured enclosing local is a NEARER binding
+        // than any implicit receiver's EXTENSION property, but a real member is
+        // nearer still, so the walk is skipped only when no class declares it.
         var capture_shadows = false;
         if (comptime @hasDecl(H, "scopedLocalBinds") and @hasDecl(H, "hostHasMember")) {
             const bare0 = stripScopeGetter(name_str);
             if (host.scopedLocalBinds(bare0)) {
                 capture_shadows = true;
                 for (cands) |c| {
-                    // Only the OWN receiver run's members outrank the
-                    // capture: the class body encloses the captured
-                    // local's scope, but a dispatch-published chain
-                    // receiver's members do not — the local was declared
-                    // lexically inside/after those receivers' scopes
-                    // (`var count = 0; class C { init { count++ } }`
-                    // binds the local even when a chain instance owns a
-                    // `count` member).
+                    // Only the OWN receiver run's members outrank the capture:
+                    // its class body encloses the captured local's scope.
                     if (c.v != .Instance or (c.own and host.hostHasMember(&c.v, bare0))) {
                         capture_shadows = false;
                         break;
@@ -1701,13 +1462,8 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
         }
         if (full_walk and resolved == null) {
             var winner: ?usize = null;
-            // Two passes, Kotlin's lexical rule: an outer receiver's MEMBER
-            // outranks an inner receiver's IMPORTED extension property
-            // (imports are the outermost scope), so pass 1 probes members
-            // only; extensions serve in pass 2 only when no member answered
-            // anywhere on the chain (`job` inside a CoroutineScope lambda of
-            // a class declaring `val job` reads the field, not
-            // kotlinx.coroutines' CoroutineScope.job).
+            // Kotlin's lexical rule: an outer receiver's MEMBER outranks an inner
+            // receiver's IMPORTED extension property. Pass 0 probes members.
             var pass: u8 = 0;
             walk: while (pass < 2) : (pass += 1) {
             for (cands, 0..) |c, ci| {
@@ -1725,16 +1481,8 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                         winner = ci;
                         break :walk;
                     },
-                    // Only the dispatch-miss sentinel (`Unimplemented`)
-                    // means "this candidate has no such member" — discard
-                    // its `Vm::get_field` message and walk to the next
-                    // candidate / global tier. Any other error is a member
-                    // that resolved and whose accessor actually ran: a
-                    // throw from a delegated property's `getValue`
-                    // (`NoSuchElementException` on a missing map key), a
-                    // `CalleeFailed`, a `StackOverflow`. Those propagate —
-                    // swallowing them would mask the throw and fall through
-                    // to a spurious `unresolved global`.
+                    // Only `Unimplemented` means this candidate has no such member;
+                    // any other error came from an accessor that RAN.
                     .err => |e| {
                         if (e == .Unimplemented) {
                             freeMissErr(allocator, e);
@@ -1766,16 +1514,10 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
             }
         }
     }
-    // The scope-qualified form carries the lexical owner only for
-    // the getter reads above; the global fallback uses the bare
-    // name.
     runtime.prof.opRoute(13);
     const bare_name = stripScopeGetter(name_str);
-    // A lowering-resolved identity binds that exact declaration;
-    // the name string remains the unresolved-shape fallback. A
-    // runtime-scoped shadowing capture (a closed-over callable
-    // materialized as a scoped-global layer) outranks the static
-    // pick, mirroring the call form's shadow gate.
+    // A lowering-resolved identity binds that exact declaration; a
+    // runtime-scoped shadowing capture outranks it, as on the call form.
     const by_id: ?Value = if (resolved == null and (lt.func != null or lt.class != null) and
         !host.isShadowingCapture(bare_name))
         host.lookupGlobalById(allocator, lt.func, lt.class, false)
@@ -1794,11 +1536,8 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                     orAudit("LoadFromThisOrGlobal", bare_name, "global", -1, null);
                     v = gv;
                 } else {
-                    // A top-level `val` declared with only a custom getter
-                    // has no global binding; re-run its 0-arg getter, as
-                    // the plain LoadGlobal tail does — a receiver-context
-                    // read of `currentRecomposeScope` must resolve exactly
-                    // like a top-level one.
+                    // A top-level `val` with only a custom getter has no global
+                    // binding, so re-run its 0-arg getter.
                     if (comptime @hasDecl(H, "callFunc")) {
                         if (frame.module.registry.top_level_prop_getters.get(bare_name)) |getter_fid| {
                             switch (try host.callFunc(allocator, frame.module, getter_fid, &.{})) {
@@ -1811,19 +1550,8 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                             }
                         }
                     }
-                    // The scope-qualified read's lexical-owner premise can be
-                    // wrong for a lambda in a companion/static context (its
-                    // `$sgetter` owner names the OUTER class, which no live
-                    // subject owns — ktor's engine intercept lambda reading
-                    // `call`, a member of its own pipeline receiver). With
-                    // the lexical claim exhausted and the global tier empty,
-                    // an implicit receiver's own member is the only
-                    // Kotlin-legal binding left: retry the candidates with
-                    // the PLAIN property name before failing.
-                    // A read lowered inside an enum's entry body, companion
-                    // or nested object (the scoped getter names that owner)
-                    // reaches the enum's entries even from a lambda with no
-                    // live receiver: the enum's static scope encloses it.
+                    // A read lowered inside an enum's entry body, companion or
+                    // nested object reaches the enum's entries with no live receiver.
                     if (comptime @hasDecl(H, "enclosingEnumEntryByOwner")) {
                         if (scopeGetterOwner(constStr(frame.module, lt.name) orelse bare_name)) |owner| {
                             if (host.enclosingEnumEntryByOwner(owner, bare_name)) |ev| {
@@ -1834,6 +1562,8 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                             }
                         }
                     }
+                    // The scope-qualified read's lexical-owner premise can be wrong
+                    // for a lambda in a companion or static context.
                     if (!std.mem.eql(u8, bare_name, constStr(frame.module, lt.name) orelse bare_name)) {
                         var cands2_l = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, bare_name, null);
                         defer releaseCands(allocator, &cands2_l);
@@ -1857,14 +1587,8 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                             }
                         }
                     }
-                    // A scope-qualified read whose owner's property is a
-                    // MEMBER-EXTENSION property (`private val
-                    // Density.targetConstraints` inside SizeNode, read bare
-                    // in `MeasureScope.measure`) binds TWO receivers: the
-                    // owning candidate dispatches, and the innermost
-                    // candidate satisfying the getter's declared receiver
-                    // is `this`. Same bind as the bare member-extension
-                    // call arm, at arity zero.
+                    // A scope-qualified read of a MEMBER-EXTENSION property binds TWO
+                    // receivers: the owner dispatches, `this` is the innermost fit.
                     if (comptime @hasDecl(H, "memberExtOverridesFor") and @hasDecl(H, "receiverImplementsType")) {
                         var cands3_l = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, bare_name, null);
                         defer releaseCands(allocator, &cands3_l);
@@ -1899,9 +1623,8 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
                             }
                         }
                     }
-                    // A member of an ENCLOSING class's companion (or of a
-                    // companion that class inherits), read from a nested
-                    // class's body: the enclosing classes' static scope.
+                    // A member of an enclosing class's companion, or an inherited
+                    // one, read from a nested class's body.
                     if (comptime @hasDecl(H, "enclosingCompanionMember")) {
                         var cands5_l = try implicitCandidatesAlloc(H, allocator, frame, lt.this_idx, true, host, bare_name, null);
                         defer releaseCands(allocator, &cands5_l);
@@ -1944,9 +1667,7 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
             .err => |e| return raiseStep(frame, e),
         }
     }
-    // A boxed capture surfaced by the member walk (an anon-object
-    // method's captured outer `var` lands in the instance's capture
-    // env as a shared Cell) reads through the cell.
+    // A boxed capture surfaced by the member walk reads through its cell.
     if (v == .Cell) {
         const cg = v.Cell.borrow();
         v = cg.get().*;
@@ -1957,7 +1678,6 @@ pub noinline fn execArmLoadFromThisOrGlobal(comptime H: type, allocator: Allocat
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmIndex(comptime H: type, allocator: Allocator, frame: *Frame, ix: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(ix.receiver);
     const i = frame.read(ix.index);
@@ -1972,14 +1692,13 @@ pub noinline fn execArmIndex(comptime H: type, allocator: Allocator, frame: *Fra
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmIndexSet(comptime H: type, allocator: Allocator, frame: *Frame, ixs: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(ixs.receiver);
     const i = frame.read(ixs.index);
     const v = frame.read(ixs.value);
     if (fastIndexSet(allocator, &recv, &i, v)) |expr_val| {
-        // The assignment form discards the expression value; a List's
-        // returned PREVIOUS element carries ownership and must release.
+        // A List's returned PREVIOUS element carries ownership, and the
+        // assignment form discards it.
         if (runtime.reclaimEnabled()) expr_val.release(allocator);
         return .cont;
     }
@@ -1990,16 +1709,14 @@ pub noinline fn execArmIndexSet(comptime H: type, allocator: Allocator, frame: *
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmNewList(comptime H: type, allocator: Allocator, frame: *Frame, nl: anytype, host: *H) Allocator.Error!Step {
     _ = host;
     const items = try readArgRun(allocator, frame, nl.args, nl.n_args);
     var list: std.ArrayList(Value) = .empty;
     try list.appendSlice(allocator, items);
     allocator.free(items);
-    // The list owns one reference to each element (its teardown
-    // releases them); `readArgRun` handed back borrows of the source
-    // registers, so retain each. No-op under the arena fast path.
+    // The list owns one reference to each element, and `readArgRun` handed back
+    // borrows of the source registers. No-op under the arena fast path.
     if (runtime.reclaimEnabled()) for (list.items) |e| e.retain();
     try frame.write(nl.dst, try Value.newList(allocator, .{
         .items = try ValueList.init(allocator, list),
@@ -2010,7 +1727,6 @@ pub noinline fn execArmNewList(comptime H: type, allocator: Allocator, frame: *F
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmQualifiedThis(comptime H: type, allocator: Allocator, frame: *Frame, qt: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(qt.receiver);
     const qual_str = constStr(frame.module, qt.qualifier) orelse
@@ -2028,7 +1744,6 @@ pub noinline fn execArmQualifiedThis(comptime H: type, allocator: Allocator, fra
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmPropertyRef(comptime H: type, allocator: Allocator, frame: *Frame, pr: anytype, host: *H) Allocator.Error!Step {
     _ = host;
     const name_str = constStr(frame.module, pr.name) orelse
@@ -2037,7 +1752,6 @@ pub noinline fn execArmPropertyRef(comptime H: type, allocator: Allocator, frame
     return .cont;
 }
 
-/// Outlined `execInst` arm — see `execInst`.
 pub noinline fn execArmMemberRef(comptime H: type, allocator: Allocator, frame: *Frame, mr: anytype, host: *H) Allocator.Error!Step {
     const recv = frame.read(mr.receiver);
     const name_str = constStr(frame.module, mr.name) orelse
@@ -2064,33 +1778,22 @@ pub noinline fn execArmMemberRef(comptime H: type, allocator: Allocator, frame: 
     return .cont;
 }
 
-/// `name(args)` where lowering could not classify the bare callee as
-/// member-vs-global. Mirrors Kotlin's call resolution for an implicit
-/// receiver: each candidate receiver is searched innermost-first, members
-/// and applicable extensions per receiver (pinned by the
-/// `inner_ext_over_outer_member` kotlinc parity fixture), then the
-/// top-level tiers — runtime overload selection, the lowering-resolved
-/// constructor class, the global by name — and only then an error.
-/// Free a discarded member-dispatch-miss message (the host allocates a
-/// `Vm::call_member …` string on a total miss; the resolver discards it while
-/// walking to the next candidate / a global). Recognizable by its prefix, so a
-/// static `.Unimplemented` literal is never freed. No-op unless a freeing
-/// backend is active.
+/// Free a discarded member-dispatch-miss message. The host allocPrints a
+/// `Vm::`-prefixed string on a miss; a static literal never carries that prefix.
 pub fn freeDispatchMissMsg(allocator: Allocator, msg: []const u8) void {
     if (!runtime.freeScratch()) return;
-    // Every host dispatch-miss message is `allocPrint`-built with a `Vm::`
-    // prefix (`Vm::call_member`, `Vm::get_field`, …); static `.Unimplemented`
-    // literals never carry that prefix, so this frees only owned messages.
     if (std.mem.startsWith(u8, msg, "Vm::")) allocator.free(msg);
 }
 
-/// Free a discarded host dispatch-miss `EvalError` (the resolver tries many
-/// receiver candidates / fallback tiers and drops each miss). Only the
-/// `Unimplemented` arm carries an owned message.
+/// Free a discarded host dispatch-miss `EvalError`. Only the `Unimplemented`
+/// arm carries an owned message.
 fn freeMissErr(allocator: Allocator, e: EvalError) void {
     if (e == .Unimplemented) freeDispatchMissMsg(allocator, e.Unimplemented);
 }
 
+/// `name(args)` where lowering could not classify the bare callee as
+/// member-vs-global. Mirrors Kotlin's resolution for an implicit receiver: the
+/// candidates innermost-first, members then extensions, then the global tiers.
 pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Frame, cmg: anytype, host: *H) Allocator.Error!Step {
     dispatchBump(.call_member_or_global);
     const name_str = constStr(frame.module, cmg.name) orelse
@@ -2106,18 +1809,12 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
     defer allocator.free(arg_values);
     const names = try resolveArgNames(allocator, frame.module, cmg.arg_names);
     defer freeArgNames(allocator, names);
-    // A direct splice receiver (a bound `this` register) is the innermost
-    // implicit receiver when present; otherwise the lambda capture slot, or —
-    // when that is empty — the enclosing function's `this` *parameter*.
+    // A direct splice receiver is the innermost implicit receiver when present;
+    // otherwise the lambda capture slot, or the enclosing `this` PARAMETER.
     const direct_this: ?Value = if (cmg.recv) |r| frame.read(r) else null;
     const this_val = if (direct_this) |dt| dt else implicitThisValue(frame, cmg.this_idx, true);
-    // A lowering-committed INLINE INSTANCE METHOD with inferred reified
-    // type arguments: bind the stamped type-argument names as globals
-    // for the call's duration (the same channel the inline splice and
-    // `callFuncTyped` use), then let the NORMAL member walk dispatch —
-    // its enclosing-receiver pushes are what nested semantics blocks
-    // resolve against. `c.visitNodes(Kinds.OnRe) { … }` runs with
-    // `T = Lw` live so the framed body's `is T` checks the real class.
+    // A lowering-committed inline instance method with inferred reified type args
+    // binds the stamped names as globals for the call, then walks members normally.
     var mit_saved: std.ArrayList(struct { name: []const u8, prev: ?Value }) = .empty;
     defer mit_saved.deinit(allocator);
     defer {
@@ -2151,21 +1848,12 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             }
         }
     }
-    // A bare callee whose name starts uppercase is usually a constructor /
-    // type — but only when such a type exists. Kotlin has no capitalization
-    // rule: DSL-style functions are capitalized (ktor's
-    // `HttpResponseValidator { … }` is an extension on HttpClientConfig), so
-    // the member/extension passes are skipped only when the name really
-    // names a class.
+    // Kotlin has no capitalization rule and DSL-style functions are capitalized,
+    // so an uppercase bare callee skips the member passes only when it is a class.
     var is_ctor_name = name_str.len > 0 and std.ascii.isUpper(name_str[0]) and
         cmg.class != null;
-    // An INAPPLICABLE constructor is not a candidate at all: Kotlin filters
-    // by applicability before scope rank, so `Point(it)` against `data class
-    // Point(x: Int, y: Int)` never means construction — the member/extension
-    // walk must run and bind the receiver's `MockViewValidator.Point`
-    // extension. The class-carrying ctor tail stays the fallback for calls
-    // nothing else serves, so a bindable secondary constructor is still
-    // reachable when the walk misses.
+    // Kotlin filters by applicability before scope rank, so an inapplicable
+    // constructor is no candidate at all and the walk runs.
     if (is_ctor_name) applicable: {
         const cid = cmg.class.?;
         if (cid.int() >= frame.module.classes.items.len) break :applicable;
@@ -2187,14 +1875,9 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         is_ctor_name = false;
     }
     // A capitalized name that is ALSO a method of the implicit receiver is a
-    // nearer-scope member call, not a constructor (`Test(...)` inside a class
-    // declaring `fun Test(...)` next to an imported `kotlin.test.Test`): run
-    // the member passes; the constructor stays the fallback when no member
-    // binds.
+    // nearer-scope member call; the constructor stays the fallback.
     if (is_ctor_name and this_val != .Null and this_val != .Unit) refine: {
-        // The nearest receiver carrying the member may sit deeper in the
-        // implicit chain than the innermost `this` (a suspend block's
-        // innermost receiver is the coroutine, not the declaring class).
+        // The nearest receiver carrying the member may sit deeper than `this`.
         var rcands_l = try implicitCandidatesAlloc(H, allocator, frame, cmg.this_idx, true, host, name_str, direct_this);
         defer releaseCands(allocator, &rcands_l);
         const rcands = rcands_l.items;
@@ -2223,20 +1906,15 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
     var committed_recv_h: ?Value = null;
     var resolved: ?Value = null;
     var first_real_err: ?EvalError = null;
-    // A bare `name` bound to a captured callable in the innermost
-    // scoped-global layer is a closed-over parameter/local that shadows
-    // a same-named member, but a genuine member of the implicit receiver
-    // still wins over an over-captured scoped global.
+    // A bare name bound to a captured callable in the innermost scoped-global
+    // layer shadows a same-named member, but a genuine member still wins.
     const shadow_capture = host.isShadowingCapture(name_str) and
         ((this_val == .Null or this_val == .Unit) or !host.hostHasMember(&this_val, name_str));
 
-    // A prior call from this site with this receiver class resolved to a
-    // global (single candidate, no member/extension): skip the member passes.
     const func_p = @intFromPtr(frame.func);
     const cmg_skip = comptime @hasDecl(H, "cmgGlobalSkip");
-    // The site's own memo answers first: a u64 compare against the receiver's
-    // class identity, with no receiver borrow and no hash of the key. The
-    // host's map stays the general answer (it survives across sites).
+    // A prior call from this site with this receiver class that resolved to a
+    // global skips the member passes; the site memo answers with a u64 compare.
     const site_key: ?struct { cls: u64, sig: u64 } = blk: {
         if (!cmg_skip or is_ctor_name or shadow_capture) break :blk null;
         if (this_val != .Instance) break :blk null;
@@ -2257,16 +1935,12 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         false;
     const skip_member = site_skip or (cmg_skip and !is_ctor_name and !shadow_capture and
         host.cmgGlobalSkip(func_p, &this_val, name_str, arg_values)) or
-        // Call-site evidence PINNED the overload (`func_final`): a genuine
-        // member of the receiver still shadows, but the member leg's
-        // extension-fallback re-rank must not run the first-declared
-        // variant past the pin.
+        // Call-site evidence PINNED the overload: a genuine member still shadows,
+        // but the extension-fallback re-rank must not run past the pin.
         (cmg.func_final and !is_ctor_name and
             ((this_val == .Null or this_val == .Unit) or !host.hostHasMember(&this_val, name_str)));
-    // A pinned EXTENSION dispatches directly with the receiver prepended:
-    // the global leg cannot prepend a receiver, and the member leg's
-    // fallback would re-rank past the pin (the genuine-member shadow was
-    // judged just above).
+    // A pinned EXTENSION dispatches directly with the receiver prepended: the
+    // global leg cannot prepend one, and the member leg would re-rank past it.
     if (cmg.func_final and skip_member and !is_ctor_name and
         this_val != .Null and this_val != .Unit)
     direct: {
@@ -2291,26 +1965,19 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         }
     }
     // Full replay: this site already resolved, for this receiver class and
-    // argument shape, to a plain global whose dispatch was a fused
-    // activation. Rebuild that activation and skip both the member walk and
-    // the overload ranking.
+    // argument shape, to a plain global dispatched as a fused activation.
     if (site_skip and cmg.type_args.len == 0 and argNamesAllNull(cmg.arg_names)) {
         const claimed = @atomicLoad(u32, @constCast(&cmg.global_fid), .acquire);
         if (claimed != 0 and flatEnabled()) {
             const fid = FuncId.from(claimed - 1);
             if (frame.module.funcById(fid)) |gf| {
                 if (gf.params.len == arg_values.len) {
-                    // The claimed global may be a host-routed serve target
-                    // (the snapshot walk family): the write path's bare
-                    // `readable(...)` inside sync blocks reaches it through
-                    // this replay, never through the static-call arm.
+                    // The claimed global may be a host-routed serve target, which
+                    // this replay reaches instead of the static-call arm.
                     if (hostRouteServe(H, allocator, gf, arg_values, host)) |served| {
                         try frame.write(cmg.dst, served);
                         return .cont;
                     }
-                    // Scalar-replay leaf on the claimed global: a bail
-                    // falls through to the flat activation, which re-runs
-                    // the pure body exactly.
                     if (try eval.tryLeafValues(H, allocator, frame.module, gf, arg_values, host, null)) |lo| switch (lo) {
                         .val => |v| {
                             try frame.write(cmg.dst, v);
@@ -2341,21 +2008,14 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         const cands_keepalive = pinImplicitCandidates(cands);
         defer runtime.keepaliveRestore(cands_keepalive);
         single_cand = cands.len == 1;
-        // A bare MEMBER-EXTENSION call takes its two receivers from the
-        // implicit tower independently: the extension receiver is the
-        // innermost candidate satisfying the target's DECLARED receiver
-        // type, the dispatch receiver the innermost candidate whose class
-        // owns a member extension of this name. `with(node) { measure(m, c) }`
-        // otherwise landed the owner in `params[0]` — the coordinator that
-        // IS the `MeasureScope` never reached the callee — and a nested
-        // `with(other) { f() }` inside `f` re-entered the ENCLOSING
-        // declaration instead of `other`'s override, recursing forever.
+        // A bare MEMBER-EXTENSION call takes its two receivers from the implicit
+        // tower independently: the extension receiver is the innermost candidate
+        // satisfying the DECLARED type, the dispatch receiver the innermost owner.
         if (comptime @hasDecl(H, "receiverImplementsType")) mext: {
             if (!mextArmEnabled()) break :mext;
             if (!argNamesAllNull(cmg.arg_names)) break :mext;
-            // A committed target names the declared receiver outright; an
-            // interface call arrives uncommitted and each candidate's own
-            // declaration supplies it.
+            // A committed target names the declared receiver; an interface call
+            // arrives uncommitted, so each candidate supplies its own.
             var committed_rt: ?[]const u8 = null;
             if (cmg.func) |cfid| {
                 if (frame.module.funcById(cfid)) |cf| {
@@ -2365,9 +2025,8 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                     committed_rt = cf.params[0].ty.name;
                 }
             }
-            // Cheap early-out before any candidate scanning: when the
-            // innermost receiver already satisfies the committed target's
-            // declared receiver, the ordinary walk binds it correctly.
+            // When the innermost receiver already satisfies the committed
+            // target's receiver, the ordinary walk binds it correctly.
             if (committed_rt) |crt| {
                 if (cands.len != 0 and cands[0].v == .Instance and
                     host.receiverImplementsType(&cands[0].v, crt)) break :mext;
@@ -2377,10 +2036,6 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             var ext_recv: ?Value = null;
             for (cands) |c| {
                 if (c.v != .Instance) continue;
-                // The receiver's own class index answers "does this class
-                // declare or inherit a member extension of this name", so a
-                // dispatch costs a supertype walk instead of a scan over
-                // every same-named declaration in the program.
                 if (comptime !@hasDecl(H, "memberExtOverridesFor")) break :mext;
                 var fids: [4]ir.FuncId = @splat(@enumFromInt(0));
                 const nf = host.memberExtOverridesFor(&c.v, name_str, arg_values.len + 1, &fids);
@@ -2407,9 +2062,6 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             const t = target orelse break :mext;
             const er = ext_recv orelse break :mext;
             const tf = frame.module.funcById(t) orelse break :mext;
-            // Only a genuine mismatch is corrected: when the innermost
-            // candidate already satisfies the declared receiver the ordinary
-            // walk binds it correctly.
             if (cands.len != 0 and cands[0].v == .Instance and
                 host.receiverImplementsType(&cands[0].v, tf.params[0].ty.name)) break :mext;
             const all = try allocator.alloc(Value, arg_values.len + 1);
@@ -2427,77 +2079,45 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 .err => |e| return raiseStep(frame, e),
             }
         }
-        // Inside an extension body, the implicit `this` has the
-        // extension's DECLARED receiver type, and Kotlin resolves a bare
-        // extension call against that static type — not the runtime
-        // value's type, which may be a subtype carrying its own
-        // same-name extension. Hand the declared head to the strict
-        // probe for exactly that candidate.
+        // Inside an extension body the implicit `this` has the extension's DECLARED
+        // receiver type, which a bare call resolves against, not the runtime type.
         var static_from_instr = false;
         const static_recv_ty: ?[]const u8 = blk: {
-            // The lowering-recorded declared receiver wins: the executing
-            // frame may be a synthesized closure (a suspend body) whose own
-            // kind says nothing about the extension receiver.
+            // The lowering-recorded receiver wins: the executing frame may be a
+            // synthesized closure whose kind says nothing about it.
             if (cmg.static_recv) |sc| {
                 if (constStr(frame.module, sc)) |sname| {
                     static_from_instr = true;
                     break :blk sname;
                 }
             }
-            // Extension bodies resolve a bare call against the extension's
-            // DECLARED receiver type.
             switch (frame.func.kind) {
                 .top_level_extension, .member_extension => {
                     const idx = frameThisParam(frame) orelse break :blk null;
                     break :blk frame.func.params[idx].ty.name;
                 },
                 .instance_method => {
-                    // A plain instance method resolves a bare (implicit-`this`)
-                    // call against its DECLARING class's static member scope,
-                    // the same way: a runtime subtype's own same-name overload
-                    // that the declaring type cannot see must not shadow the
-                    // statically-bound member. `AbstractMap.containsEntry`'s
-                    // `get(key)` binds `Map.get(K): V?`, never a
-                    // `PersistentCompositionLocalHashMap.get<T>(
-                    // CompositionLocal<T>)` the subtype introduces (a read-value
-                    // overload that breaks the structural map `equals`). The
-                    // this-param's nominal type is a placeholder for stdlib
-                    // methods, so the declaring class is found by identity
-                    // (memoized per function by the host).
+                    // A plain instance method resolves a bare call against its
+                    // DECLARING class's scope, so no subtype overload shadows it.
                     break :blk host.declaringClassSimpleName(frame.module, frame.func.id);
                 },
                 else => break :blk null,
             }
         };
-        // A lowering-committed EXTENSION target: Kotlin selects extensions
-        // statically, so the runtime walk may only let true MEMBERS shadow
-        // it — the by-name extension fallback and the overload re-pick must
-        // not re-select a sibling the static evidence excluded (ktor's
-        // deprecated P.install delegates to its cast-picked sibling; a
-        // by-runtime-type re-pick binds the deprecated overload again and
-        // recurses without bound).
+        // Kotlin selects extensions statically, so a lowering-committed EXTENSION
+        // target may be shadowed only by true MEMBERS, never by a re-picked sibling.
         const committed_ext: ?FuncId = blk: {
             const fid = cmg.func orelse break :blk null;
-            // Engage the static commitment only for the self-name shape: a
-            // bare call to the very name of the function it sits in, where
-            // the by-name extension re-pick can re-enter the caller instead
-            // of the sibling the lowering (cast evidence, receiver match)
-            // committed — ktor's deprecated P.install delegating to its
-            // Pipeline sibling recursed without bound. Every other deferred
-            // call keeps the runtime walk's full re-selection.
+            // The commitment engages only for the self-name shape, a bare call to
+            // the name of its own function, where a re-pick could re-enter it.
             if (!std.mem.eql(u8, frame.func.name, name_str)) break :blk null;
             if (fid.int() == frame.func.id.int()) break :blk null;
             const cf = frame.module.funcById(fid) orelse break :blk null;
             if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk fid;
             break :blk null;
         };
-        // The committed target binds the FIRST candidate receiver (walk
-        // order, innermost first) its declared receiver does not exclude —
-        // a bare call inside a companion-scoped context must skip the
-        // companion and land on the outer instance exactly like the
-        // name-based walk would. No fitting receiver: fall back to the
-        // name-based resolution entirely (the lowering pick can be wrong;
-        // the runtime walk corrects it).
+        // The committed target binds the first candidate receiver, innermost first,
+        // its declared receiver does not exclude; with none, the name walk decides.
         committed_ext_h = null;
         if (committed_ext) |fid| {
             for (cands) |c| {
@@ -2517,20 +2137,13 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 }
             }
             if (committed_ext_h == null) {
-                // Every receiver disproves the committed target. The static
-                // commitment still LOCKS this self-name walk to members-only:
-                // unlocking the by-name extension re-pick is what let a body
-                // re-select ITSELF once bound refutation disproved its
-                // committed sibling on every receiver (`Iterable.contains`'s
-                // smart-cast `contains(element)` on a List). Members serve
-                // exactly as when the commitment merely failed its positive
-                // proof, and the terminal committed invoke keeps the
-                // pre-refuter fallback shape.
+                // Every receiver disproves the committed target, yet the commitment
+                // still locks this walk to members: a re-pick would re-select ITSELF.
                 committed_ext_h = fid;
             }
         }
-        // Strict pass: members and receiver-compatible extensions of each
-        // candidate, innermost first — the kotlinc candidate order.
+        // Strict pass in kotlinc candidate order: members, then
+        // receiver-compatible extensions, of each candidate innermost first.
         for (cands, 0..) |c, ci| {
             if (cmgTraceWant()) |w| {
                 if (std.mem.eql(u8, w, name_str)) {
@@ -2538,20 +2151,8 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                     std.debug.print("[cmg-cand] {s} ci={d} depth={d} tag={s} class={s}\n", .{ name_str, ci, c.depth, @tagName(std.meta.activeTag(c.v)), cn });
                 }
             }
-            // The lowering-recorded receiver type describes the innermost
-            // implicit receiver — the first candidate — regardless of the
-            // wrapper identity a suspend transform gave the value. A
-            // FRAME-derived hint (the enclosing extension's declared
-            // receiver) describes only the frame's own `this`: applying it
-            // to an inner receiver-lambda subject (`apply { minusAssign(k) }`
-            // inside `Map.minus`) refutes the very candidates the subject
-            // satisfies.
-            // With a DIRECT SPLICE RECEIVER on the instruction, `this_val`
-            // is the spliced SUBJECT — the frame-derived head must anchor to
-            // the frame's own `this` (a `with(period)` subject inside
-            // `Instant.plus` must not inherit the extension's `Instant`
-            // proof, or the strict probe binds the Instant extension to the
-            // period and its body reads the wrong fields).
+            // The lowering-recorded receiver type describes the first candidate; a
+            // FRAME-derived hint describes only the frame's own `this`.
             const hint_anchor: Value = if (!static_from_instr and cmg.recv != null)
                 implicitThisValue(frame, cmg.this_idx, true)
             else
@@ -2561,13 +2162,8 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 static_recv_ty
             else
                 null;
-            // A bare `invoke()` on a callable candidate is a fun-interface
-            // dispatch (`with(pointerInputEventHandler) { invoke() }`): the
-            // interface method may declare an extension receiver, which
-            // Kotlin resolves from the ENCLOSING implicit receivers — the
-            // plain invoke arm would run the lambda with no receiver at
-            // all and strand its bare-member calls. Route it through the
-            // receiver-carrying bridge below.
+            // A bare `invoke()` on a callable candidate is a fun-interface dispatch
+            // whose method may declare a receiver, from the ENCLOSING implicit ones.
             if ((c.v == .IrClosure) and std.mem.eql(u8, name_str, "invoke")) {
                 if (try samCandidateInvoke(H, allocator, frame, host, cands, ci, name_str, arg_values, names)) |sr| switch (sr) {
                     .done => |v| {
@@ -2578,12 +2174,9 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 };
                 continue;
             }
-            // Flat bare-member dispatch: when this candidate's resolved-method
-            // cache already names the target (the same entry the strict
-            // probe's ladder would fire-and-run first), run it as a pushed
-            // activation. The reified-type-binding shape keeps globals bound
-            // for the call's duration through this arm's defers, so it stays
-            // on the recursive path.
+            // Flat bare-member dispatch when this candidate's resolved-method cache
+            // already names the target. The reified-type-binding shape keeps its
+            // globals bound through this arm's defers, so it stays recursive.
             if (comptime @hasDecl(H, "prepareMemberFlatCall")) {
                 if (flatEnabled() and mit_saved.items.len == 0 and argNamesAllNull(cmg.arg_names)) {
                     if (try host.prepareMemberFlatCall(allocator, &c.v, name_str, arg_values, hint, null, false)) |prep0| {
@@ -2606,23 +2199,14 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 },
                 .err => |e| switch (e) {
                     .Suspended, .CalleeFailed => return raiseStep(frame, e),
-                    // Control flow out of a body that RAN: the candidate
-                    // was the real callee (a `synchronized { return x }`
-                    // non-local return, a thrown exception). Walking on
-                    // would re-execute its side effects on an outer
-                    // receiver — same doctrine as `CalleeFailed`.
+                    // Control flow out of a body that RAN means the candidate was
+                    // the real callee; walking on would re-execute its effects.
                     .Throw, .NonLocalReturn, .LabeledReturn => return raiseStep(frame, e),
                     .Unimplemented => |m| {
                         freeDispatchMissMsg(allocator, m);
-                        // A callable candidate is an unwrapped fun-interface
-                        // value: the bare name dispatches its single abstract
-                        // method to the lambda (`with(layoutNode.measurePolicy)
-                        // { measure(measurables, constraints) }` stores the
-                        // conversion-site lambda). Kotlin binds the INNERMOST
-                        // receiver, so the interface dispatch must win here —
-                        // before an outer receiver's same-name member (the
-                        // coordinator's 1-arg `measure`) grabs the call. A
-                        // closure has no real members, so nothing is shadowed.
+                        // A callable candidate is an unwrapped fun-interface value,
+                        // so the bare name dispatches its single abstract method to
+                        // the lambda. Kotlin binds the INNERMOST receiver.
                         if (c.v == .IrClosure) {
                             if (try samCandidateInvoke(H, allocator, frame, host, cands, ci, name_str, arg_values, names)) |sr| switch (sr) {
                                 .done => |v| resolved = v,
@@ -2638,8 +2222,7 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             }
         }
         // Lenient pass: receivers whose runtime type cannot prove the
-        // extension-receiver match. Runs only after every receiver missed
-        // strictly, so an unprovable pick never outranks a real member.
+        // extension-receiver match. It runs only after every receiver missed.
         if (resolved == null) {
             for (cands, 0..) |c, ci| {
                 const lhint: ?[]const u8 = if (static_recv_ty != null and
@@ -2660,8 +2243,7 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                     },
                     .err => |e| switch (e) {
                         .Suspended, .CalleeFailed => return raiseStep(frame, e),
-                        // Same as the strict pass: a body that ran owns
-                        // its control flow; never re-probe.
+                        // As in the strict pass, a body that ran owns its control.
                         .Throw, .NonLocalReturn, .LabeledReturn => return raiseStep(frame, e),
                         .Unimplemented => |m| freeDispatchMissMsg(allocator, m),
                         else => if (first_real_err == null) {
@@ -2671,15 +2253,8 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 }
             }
         }
-        // Smart-cast pass: a DEFERRED bare extension call (no committed target)
-        // inside an extension body pinned the DECLARED receiver type for the
-        // strict/lenient probes. When those found nothing, the receiver value
-        // may be a subtype the receiver was narrowed to by a smart-cast
-        // (`fun Source.f() { if (this is Buffer) commonReadUtf8CodePoint() }`,
-        // whose target is `fun Buffer.commonReadUtf8CodePoint()`), so retry by
-        // the receiver's RUNTIME type. Guarded to `resolved == null` and no
-        // committed extension: there is no static candidate to conflict with,
-        // so this cannot re-pick a sibling the static evidence excluded.
+        // Smart-cast pass: the probes above pinned the DECLARED receiver type, but a
+        // smart cast may have narrowed it to a subtype, so retry by RUNTIME type.
         if (resolved == null and static_recv_ty != null and committed_ext_h == null) {
             for (cands) |c| {
                 switch (try host.callMemberStrictExt(allocator, &c.v, name_str, arg_values, names, null)) {
@@ -2771,17 +2346,10 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
     if (resolved) |v| {
         result = v;
     } else {
-        // The member passes all missed on a single implicit-receiver
-        // candidate: record so a repeat call skips straight here. A pass
-        // that FAILED (first_real_err — an abort, a callee error) is not a
-        // miss: recording it taught the site to skip the member walk
-        // forever, so after one wall-capped test every later
-        // `removeKnownCompositionLocked` in the same process resolved as
-        // an unresolved global (the contamination cluster).
+        // Every member pass missed on a single implicit-receiver candidate, so
+        // record it and let a repeat call skip here. A pass that FAILED is no miss.
         if (cmg_skip and single_cand and !is_ctor_name and !shadow_capture and first_real_err == null) {
             host.cmgGlobalRecord(func_p, &this_val, name_str, arg_values);
-            // Claim the site's own shortcut for the same verdict, under the
-            // same stability gate the host cache uses.
             if (site_key) |k| {
                 if (dispatchCacheStable() and
                     @cmpxchgStrong(u64, @constCast(&cmg.skip_cls), 0, k.cls, .acq_rel, .monotonic) == null)
@@ -2790,28 +2358,18 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 }
             }
         }
-        // Overloaded top-level function: select by runtime arg types
-        // before falling back to the single global value baked in at
-        // lower time.
         const cno_file: ?ir.FileId = if (frame.cur_span) |sp| sp.file else null;
-        // A synthesized lambda/closure frame carries no declared package, so
-        // the overload re-pick runs with an empty caller scope and a same-name
-        // CROSS-PACKAGE twin can win a first-seen tie (the wrong same-signature
-        // `internal fun` binds). The lowering-resolved target (`cmg.func`)
-        // already settled scope; pass its package as a fallback anchor so the
-        // re-pick can exclude the out-of-scope twin. Only consulted when the
-        // frame package is empty, so the ordinary packaged-caller path is
-        // untouched.
+        // A synthesized lambda frame carries no declared package, so the re-pick
+        // would run with an empty caller scope and a same-name CROSS-PACKAGE twin
+        // could win a first-seen tie; the committed target's package anchors it.
         const cno_anchor: []const u8 = if (frame.func.package.len == 0) blk: {
             if (cmg.func) |bf| {
                 if (frame.module.funcById(bf)) |bfd| {
                     if (bfd.package.len != 0) break :blk bfd.package;
                 }
             }
-            // A ctor-name call resolved to a class carries no func hint; the
-            // class's package anchors the scope the same way (a property-init
-            // thunk calling `Color(red = …)` must see the ui.graphics
-            // factories as import-tier candidates, not other-package noise).
+            // A ctor-name call carries no func hint, so the class's package
+            // anchors the scope the same way.
             if (cmg.class) |cid| {
                 if (cid.int() < frame.module.classes.items.len) {
                     break :blk frame.module.classes.items[cid.int()].package;
@@ -2819,15 +2377,12 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             }
             break :blk "";
         } else "";
-        // Arm the host→driver flat handoff: the overload terminal may
-        // stash a prepared flat request instead of dispatching natively.
-        // Honour KLIO_FLAT: this lane bypasses every instrumented dispatch
-        // route, and an un-gated arm made the flat kill-switch a no-op for
-        // exactly the calls it exists to bisect.
+        // Arm the host-to-driver flat handoff: the overload terminal may stash a
+        // prepared flat request instead of dispatching natively. This lane bypasses
+        // every instrumented route, so it honours KLIO_FLAT itself.
         if (flatEnabled()) armHostFlatReq();
-        // A pinned overload family: call-site evidence committed cmg.func;
-        // the candidate slice narrows to it (the slice is authoritative by
-        // contract, so the value re-rank cannot widen back out).
+        // Call-site evidence committed `cmg.func`, so the candidate slice narrows
+        // to it; the slice is authoritative and the re-rank cannot widen it out.
         var pin_buf: [1]FuncId = undefined;
         const eff_candidates: ?[]const FuncId = blk: {
             if (cmg.func_final) if (cmg.func) |pf| {
@@ -2841,8 +2396,8 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
         if (takeHostFlatReq()) |req0| {
             var prep = req0;
             prep.dst = cmg.dst;
-            // Claim the site's global target when this dispatch was a plain
-            // one: nothing pushed, nothing rebound, no receiver prepended.
+            // Claim the site's global target only for a plain dispatch: nothing
+            // pushed, rebound, or prepended.
             if (site_key) |k| {
                 if (!is_ctor_name and !shadow_capture and first_real_err == null and
                     cmg.type_args.len == 0 and mit_saved.items.len == 0 and
@@ -2867,31 +2422,17 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
             orAudit("CallMemberOrGlobal", name_str, "overload", -1, null);
             result = v;
         } else {
-            // A lowering-resolved identity (constructor class or
-            // shadowable top-level function) binds exactly; the
-            // simple-name lookup remains the unresolved fallback. A
-            // runtime-scoped shadowing capture outranks the static pick,
-            // as on the load form.
-            // A committed EXTENSION func is not a plain global value — it
-            // needs its receiver prepended, which the committed-ext leg
-            // above handles (or declines). Only a non-extension func (or a
-            // class) may bind by id here; a receiverless value invocation
-            // of an extension misbinds every parameter.
+            // A lowering-resolved identity binds exactly, with the simple-name
+            // lookup as the fallback and a shadowing capture outranking it. Only a
+            // non-extension func or a class may bind by id.
             const by_id_func: ?FuncId = blk: {
-                // A bounded candidate set blocks the NAME fallback below, but
-                // not the lowering's own committed id: the restart lambda's
-                // `Defaults($rc, $changed or 1)` carries both a Unit-receiver
-                // candidate (which misses) and the committed global — the id
-                // is the lowering's resolution, not a same-simple-name
-                // widening, and the name/arity guards below still validate it.
+                // A bounded candidate set blocks the NAME fallback below, but not
+                // the lowering's own committed id, which is a resolution rather
+                // than a same-simple-name widening.
                 const fid = cmg.func orelse break :blk null;
                 const cf = frame.module.funcById(fid) orelse break :blk null;
-                // A committed id can belong to the MAIN module's table while
-                // this frame runs sub-module code (the same integer names an
-                // unrelated function there — a restart lambda served a
-                // CompositionLocalProvider call). A name mismatch in the
-                // frame's table re-validates against the main module, whose
-                // id space the host's by-id lookup resolves.
+                // A committed id can belong to the MAIN module's table while this
+                // frame runs sub-module code, so a name mismatch re-validates there.
                 if (!std.mem.eql(u8, cf.name, name_str)) {
                     if (comptime @hasDecl(H, "mainFuncNameMatches")) {
                         if (host.mainFuncNameMatches(fid, name_str)) break :blk fid;
@@ -2899,27 +2440,14 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                     break :blk null;
                 }
                 if (cf.params.len != 0 and std.mem.eql(u8, cf.params[0].name, "this")) break :blk null;
-                // First-wins commit vs overloads: a committed fn the call's
-                // ARITY cannot bind (a same-file private 3-arg picked for a
-                // 2-arg call whose true target is a public overload in
-                // another file) must not serve by id — decline so the
-                // overload leg ranks the full same-name set.
+                // A committed fn the call's ARITY cannot bind must not serve by
+                // id: decline so the overload leg ranks the full same-name set.
                 if (!frame.module.globalArityCanBind(fid, cf, arg_values.len)) break :blk null;
                 break :blk fid;
             };
-            // A constructor-name call (`Foo(args)` where `Foo` is a class) must
-            // bind the class for construction — never a published companion
-            // singleton. Pass `is_ctor_name` as `ctor_ref` so `lookupGlobalById`
-            // skips the class's companion-object singleton (which it otherwise
-            // returns for a class-value read); otherwise, once the companion has
-            // been published (e.g. a prior `Foo.member` access), `Foo(args)`
-            // resolves to `Companion.invoke` instead of constructing.
-            // A committed class that cannot CONSTRUCT (an interface/abstract
-            // classifier sharing the name with a callable — the pack's
-            // `interface Composition` vs a local `@Composable fun
-            // Composition`) never wins the by-id serve for a non-SAM call;
-            // the lexical name lookup and the overload leg resolve the real
-            // callable instead.
+            // A committed class that cannot CONSTRUCT, an interface or abstract
+            // classifier sharing its name with a callable, never wins the by-id
+            // serve for a non-SAM call; the name lookup resolves the callable.
             const ctor_class: ?ir.ClassId = blk: {
                 const cid = cmg.class orelse break :blk null;
                 if (cid.int() < frame.module.classes.items.len) {
@@ -2932,28 +2460,19 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 }
                 break :blk cid;
             };
-            // Binding by CLASS id with no function to bind IS a construction,
-            // even when the lowering did not classify the call as a
-            // ctor-name one: `Stamp(a, b, c, d, e)` reaches here after the
-            // overload leg declined in favour of the constructor
-            // (`ctor-decline ctor_pts=500 best=499`). Without treating it as
-            // a ctor reference, `lookupGlobalById` returns the class's
-            // published companion singleton and the call lands on
-            // `Companion.invoke` — exactly what the comment above warns
-            // about, which kotlinx-datetime's TimeZoneTest hits through its
-            // own `LocalDateTime(year, month, day)` helper.
+            // Binding by CLASS id with no function to bind IS a construction, even
+            // when lowering did not classify the call as a ctor-name one. `ctor_ref`
+            // makes `lookupGlobalById` skip the published companion singleton.
             const binding_ctor = is_ctor_name or (ctor_class != null and by_id_func == null);
             const by_id: ?Value = if ((ctor_class != null or by_id_func != null) and
                 !host.isShadowingCapture(name_str))
                 host.lookupGlobalById(allocator, by_id_func, ctor_class, binding_ctor)
             else
                 null;
-            // A bounded candidate set is authoritative. Once lowering has
-            // supplied it, a miss may not widen back to an unrelated
-            // same-simple-name global; only a runtime shadowing capture keeps
-            // the lexical name lookup. Host-only/incomplete-header symbols
-            // carry null and retain legacy lookup until their declarations
-            // are complete enough to rank.
+            // A bounded candidate set is authoritative: a miss may not widen back
+            // to an unrelated same-simple-name global, and only a runtime shadowing
+            // capture keeps the lexical name lookup. Host-only and
+            // incomplete-header symbols carry null and keep that lookup.
             const allow_name_global = cmg.candidates == null or shadow_capture;
             if (routeTraceOn(name_str)) std.debug.print("[evroute] by_id={} allow_name={}\n", .{ by_id != null, allow_name_global });
             const global = if (by_id != null)
@@ -2967,16 +2486,10 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 null;
             if (global) |found_callee| {
                 var callee = found_callee;
-                // Import rank for the by-name CLASS tier: the globals map
-                // holds ONE entry per simple name — whichever same-named
-                // class registered under the bake order in effect — while
-                // kotlinc scopes the pick to the call site's imports. A
-                // classifier serve whose fqn disagrees with an explicit
-                // import of this name in the executing file re-resolves
-                // through the imported fqn (functions got this rule in the
-                // explicit-import-wins fix; the class tier lacked it, and a
-                // bare `Size(w, h)` in ui-unit bound androidx.annotation.Size
-                // over the imported geometry factory's Size on some bakes).
+                // The globals map holds one entry per simple name, whichever
+                // same-named class the bake order registered, while kotlinc scopes
+                // the pick to the call site's imports, so a classifier serve
+                // disagreeing with an explicit import re-resolves through its fqn.
                 if (callee == .Class) reclass: {
                     const site_file = (frame.module.decl_span.get(frame.func.id.int()) orelse break :reclass).file;
                     const cur_fqn = blk_f: {
@@ -2988,10 +2501,8 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                         if (std.mem.eql(u8, path.fqn, cur_fqn)) break :reclass;
                     }
                     for (frame.module.importAliasPathsIn(site_file, name_str)) |path| {
-                        // The imported declaration may be a top-level
-                        // FACTORY FUNCTION sharing the class's name
-                        // (geometry's `fun Size(width, height)`): call it
-                        // directly — kotlinc's pick for this site.
+                        // The imported declaration may be a top-level FACTORY
+                        // FUNCTION sharing the class's name, which kotlinc picks.
                         for (frame.module.funcsBySimpleName(name_str)) |ifid| {
                             const inf = frame.module.funcById(ifid) orelse continue;
                             if (!std.mem.eql(u8, inf.fqn, path.fqn)) continue;
@@ -3014,12 +2525,9 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                         }
                     }
                 }
-                // A CALL is not served by a non-callable name binding: a
-                // captured `var key = 0` beside the `key(...) { }` composable
-                // does not shadow the function for an invocation — Kotlin
-                // binds the function; the scoped-global walk merely found the
-                // nearer non-callable capture. Re-bind through the function
-                // index before invoking the value.
+                // A CALL is not served by a non-callable name binding: a captured
+                // `var key = 0` beside the `key(...) { }` composable does not shadow
+                // the function, so re-bind through the function index first.
                 if (!valueInvocable(frame.module, callee) and cmg.candidates == null) {
                     if (frame.module.funcId(name_str)) |fid| {
                         if (host.lookupGlobalById(allocator, fid, null, false)) |fv| {
@@ -3029,9 +2537,8 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                     }
                 }
                 orAudit("CallMemberOrGlobal", name_str, if (by_id != null) "global_id" else "global", -1, null);
-                // Explicit call-site type args survive the deferred form;
-                // a typed value dispatch lets the host coerce unsigned
-                // literals / serve reified intrinsics by them.
+                // Explicit call-site type args survive the deferred form, so a typed
+                // value dispatch can coerce unsigned literals by them.
                 if (cmg.type_args.len != 0) {
                     var ta_buf: [4][]const u8 = undefined;
                     const n_ta = @min(cmg.type_args.len, ta_buf.len);
@@ -3066,10 +2573,8 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                 }
             } else {
                 if (first_real_err) |fre| return raiseStep(frame, fre);
-                // A committed header carrying reified type args serves
-                // through the typed func dispatch (the reified intrinsics
-                // live there) before the unsettled-header no-op —
-                // `enumEntriesIntrinsic()` spliced into a lambda body.
+                // A committed header carrying reified type args serves through the
+                // typed func dispatch, where the reified intrinsics live.
                 if (cmg.func != null and cmg.type_args.len != 0 and comptime @hasDecl(H, "callFuncTyped")) {
                     var ta_buf: [4][]const u8 = undefined;
                     const n_ta = @min(cmg.type_args.len, ta_buf.len);
@@ -3085,18 +2590,14 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
                         .err => |e| return raiseStep(frame, e),
                     }
                 }
-                // Every arm missed, but the name is a declared header the
-                // link could not settle (an `expect` with no compiled
-                // `actual`): the call is a no-op, the shape its
-                // manufactured empty body produced before header-only
-                // declarations stayed bodyless.
+                // Every arm missed and the name is a declared header the link could
+                // not settle (an `expect` with no `actual`), so the call is a no-op.
                 if (host.bareUnsettledHeaderNoOp(frame.module, name_str, arg_values.len)) {
                     orAudit("CallMemberOrGlobal", name_str, "unsettled_header_noop", -1, null);
                     result = .Unit;
                 } else if (enclosing_companion: {
-                    // A member of an ENCLOSING class's companion called from
-                    // a nested class's body (`getO()` inside `Outer.Nested`
-                    // where `Outer`'s supertype declares a companion `getO`).
+                    // A member of an enclosing class's companion, called from a
+                    // nested class's body.
                     if (comptime !@hasDecl(H, "enclosingCompanionMember")) break :enclosing_companion false;
                     if (this_val != .Instance) break :enclosing_companion false;
                     const r6 = (try host.enclosingCompanionMember(allocator, &this_val, name_str, arg_values)) orelse break :enclosing_companion false;
@@ -3141,11 +2642,10 @@ pub fn execCallMemberOrGlobal(comptime H: type, allocator: Allocator, frame: *Fr
     return .cont;
 }
 
-/// The enclosing-chain entry a method / extension frame contributes for
-/// its own bound receiver: a dispatch receiver carries its class-nesting
-/// tower and companion (`receiver`); an extension receiver brings only
-/// itself (`subject`). `null` for plain functions, lambdas (their
-/// receiver scope is the creation-time chain), and unbound frames.
+/// The enclosing-chain entry a method or extension frame contributes for its own
+/// bound receiver: a dispatch receiver carries its class-nesting tower and
+/// companion (`receiver`), an extension receiver brings only itself (`subject`).
+/// Null for plain functions, lambdas, and unbound frames.
 pub fn ownReceiverEntry(func: *const Func, params: []const Value) ?EnclosingEntry {
     const kind: EnclosingEntry.Kind = switch (func.kind) {
         .instance_method => .receiver,
@@ -3172,15 +2672,10 @@ fn instanceOuter(v: *const Value) ?Value {
     };
 }
 
-/// Index of the frame's *synthesized* `this` receiver parameter, if any.
-/// A leading `this` param is the frame's own dispatch receiver only when
-/// the lowerer injected it (`has_receiver_param`): a method / extension /
-/// local-extension receiver, or a constructor / init thunk's instance
-/// under construction. A user parameter that merely spells its name `this`
-/// (`fun f(\`this\`: T)`, written with backticks since `this` is a hard
-/// keyword) is NOT a dispatch receiver, so a bare call in its body
-/// resolves no implicit receiver — matching kotlinc, which rejects such a
-/// call. The synthesized receiver is always at index 0.
+/// Index of the frame's SYNTHESIZED `this` receiver parameter, always 0 when
+/// present. A leading `this` param is a dispatch receiver only when the lowerer
+/// injected it (`has_receiver_param`); a user parameter spelled ``this`` with
+/// backticks is not, so a bare call in its body resolves no implicit receiver.
 fn frameThisParam(frame: *const Frame) ?usize {
     if (!frame.func.has_receiver_param) return null;
     if (frame.func.params.len != 0 and std.mem.eql(u8, frame.func.params[0].name, "this")) {
@@ -3189,22 +2684,15 @@ fn frameThisParam(frame: *const Frame) ?usize {
     return null;
 }
 
-/// Simple name of the class that DECLARES `fid` as one of its methods, found
-/// by identity in `module`'s class table (the this-param's nominal type is a
-/// placeholder for stdlib methods, so it cannot serve here). Used to give an
-/// instance method's implicit-`this` call the static receiver type Kotlin
-/// resolves it against — its declaring class. `null` when no class owns it
-/// (a top-level / local function reached with an injected receiver).
 /// The head of a dotted class name (`a.b.C` -> `C`).
 fn simpleClassHead(name: []const u8) []const u8 {
     if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
 }
 
-/// The class that declares `fid`, over a lazily built reverse index. The
-/// linear scan this replaces is O(classes x methods) per lookup, which a
-/// dispatch arm consulting several candidate fids per call turned into the
-/// dominant cost of a compose recomposition (63% of one profile).
+/// Simple name of the class that declares `fid`, over a lazily built reverse
+/// index; a linear scan would be O(classes x methods) per lookup. Gives an
+/// instance method's implicit-`this` call the static receiver type Kotlin uses.
 var decl_class_cache: ?std.AutoHashMap(u32, []const u8) = null;
 var decl_class_module: ?*const Module = null;
 var decl_class_mutex: runtime.SpinMutex = .{};
@@ -3226,8 +2714,8 @@ pub fn declaringClassName(module: *const Module, fid: ir.FuncId) ?[]const u8 {
     return decl_class_cache.?.get(@intFromEnum(fid));
 }
 
-/// The calling frame's receiver, an Instance from either a `this`-named
-/// param or a `this`-named capture. `null` otherwise.
+/// The calling frame's receiver, an Instance from a `this`-named param or
+/// capture, else null.
 pub fn callerThisValue(frame: *const Frame) ?Value {
     if (frameThisParam(frame)) |i| {
         if (i < frame.params.items.len and frame.params.items[i] == .Instance) {
@@ -3254,43 +2742,27 @@ pub fn callerThisValue(frame: *const Frame) ?Value {
     return null;
 }
 
-// -------------------------------------------------------------------------
-// Implicit-receiver resolution choke point.
-//
-// The `*OrGlobal` instructions (`LoadFromThisOrGlobal`, `StoreToThisOrGlobal`,
-// `CallMemberOrGlobal`) all resolve a bare name against the *implicit*
-// receivers in scope — the lambda/method's own `this`, each
-// lexically-enclosing `this@…`, and (for dispatch receivers) the class-nesting
-// tower of `outer` links — before falling back to a top-level global. The
-// candidate list and its order are derived in exactly one place
-// (`implicitCandidatesAlloc`); the three handlers differ only in their
-// terminal operation (field read / member write / member call) and in the
-// call form's shadow/constructor gates. Kotlin's precedence, pinned by the
-// kotlinc parity fixtures (`receiver_lambda_*`, `bare_write_*`,
-// `inner_ext_over_outer_member`): candidates are searched innermost-first,
-// and *all* of a receiver's candidates — members first, then applicable
-// extensions — outrank any candidate of the next receiver out.
-// -------------------------------------------------------------------------
+// Implicit-receiver resolution choke point. The `*OrGlobal` instructions resolve
+// a bare name against the implicit receivers in scope (the lambda or method's own
+// `this`, each lexically-enclosing `this@…`, and, for dispatch receivers, the
+// class-nesting tower of `outer` links) before falling back to a top-level global;
+// `implicitCandidatesAlloc` derives the candidate list and its order for all
+// three. Kotlin's precedence: innermost-first, and ALL of a receiver's candidates,
+// members then applicable extensions, outrank the next receiver out.
 
-/// Recover the implicit receiver for an `*OrGlobal` instruction:
-/// The synthesized `this` parameter when this frame has one; otherwise
-/// `captures[this_idx]` if in range, else `Null`. A method/init/extension
-/// frame's receiver parameter is authoritative: its capture slot can hold an
-/// unrelated boxed local at the same numeric index, and treating that Cell as
-/// `this` both misresolves the bare name and leaves the real receiver behind it.
+/// The implicit receiver for an `*OrGlobal` instruction: the synthesized `this`
+/// parameter when this frame has one, else `captures[this_idx]` if in range, else
+/// `Null`. The parameter is authoritative, since the capture slot can hold an
+/// unrelated boxed local at the same numeric index.
 fn implicitThisValue(frame: *const Frame, this_idx: usize, consult_param: bool) Value {
     if (consult_param) {
         if (frameThisParam(frame)) |idx| {
             if (idx < frame.params.items.len) return frame.params.items[idx];
         }
     }
-    // The baked capture index is only trusted when it actually names the
-    // `this` capture: several emit arms bake `0` as a placeholder (the
-    // direct receiver register carries the real value), and `captures[0]`
-    // is then whatever capture happens to be first — a non-receiver local
-    // (`scope`) that must never enter the implicit-receiver walk. When the
-    // index does not name `this`, locate the real `this` capture by name;
-    // a frame with no `this` capture has no capture-borne receiver at all.
+    // The baked capture index is trusted only when it actually names the `this`
+    // capture: several emit arms bake 0 as a placeholder, and `captures[0]` is then
+    // whatever capture came first, which must never enter the walk.
     var idx = this_idx;
     const order = frame.func.capture_order;
     if (order.len != 0 and
@@ -3312,17 +2784,16 @@ fn implicitThisValue(frame: *const Frame, this_idx: usize, consult_param: bool) 
     return this_val;
 }
 
-/// One candidate receiver for a bare-name `*OrGlobal` resolution. `depth`
-/// is the candidate's position in the search order (0 = the frame's own
-/// implicit `this`), recorded for the KLIO_OR_AUDIT readout.
+/// One candidate receiver for a bare-name `*OrGlobal` resolution. `depth` is
+/// the candidate's position in the search order, 0 being the frame's own
+/// implicit `this`.
 const ImplicitCandidate = struct {
     v: Value,
     depth: u16,
-    /// True when this candidate belongs to the frame's OWN receiver run
-    /// (the dispatch `this`, its companion, its class-nesting tower):
-    /// the one run whose class-body scope lexically encloses the
-    /// executing body. Chain entries published by dispatch context are
-    /// not `own` — their members do not outrank a captured local.
+    /// True when this candidate belongs to the frame's OWN receiver run (the
+    /// dispatch `this`, its companion, its class-nesting tower), the one run whose
+    /// class-body scope lexically encloses the executing body. Entries published by
+    /// dispatch context are not `own`, so they do not outrank a captured local.
     own: bool = false,
 };
 
@@ -3332,12 +2803,10 @@ const SITE_SHAPE_MASK: u64 = ~@as(u64, 0x3FF);
 const SITE_MISS: u64 = 1;
 const SITE_WIN: u64 = 2;
 
-/// Fold the candidate list into a stable shape word for the bare-name
-/// site memo: an Instance contributes its class identity and stored
-/// field count (a dynamically defined field flips the shape), every
-/// other value contributes its tag. Null disables the memo for this
-/// execution — a candidate carrying lexical `this@` captures probes
-/// foreign receivers whose state the shape cannot cover.
+/// Fold the candidate list into a stable shape word for the bare-name site memo:
+/// an Instance contributes its class identity and stored field count, any other
+/// value its tag. Null disables the memo, since a candidate carrying lexical
+/// `this@` captures probes receivers whose state the shape cannot cover.
 fn implicitSiteShape(cands: []const ImplicitCandidate) ?u64 {
     var h: u64 = 0xcbf29ce484222325;
     for (cands) |c| {
@@ -3358,37 +2827,21 @@ fn implicitSiteShape(cands: []const ImplicitCandidate) ?u64 {
     return h;
 }
 
-/// Candidate walks are assembled in host scratch memory, but probing a
-/// property/getter or member can re-enter interpreted code and collect. Keep
-/// every receiver alive for the whole walk, including transient Cell and
-/// companion candidates that are not independently present in a frame.
+/// Keep every receiver alive for the whole walk, including transient Cell and
+/// companion candidates no frame holds: candidate walks live in host scratch
+/// memory, and probing a property or member can re-enter interpreted code.
 fn pinImplicitCandidates(cands: []const ImplicitCandidate) usize {
     const mark = runtime.keepaliveMark();
     for (cands) |c| runtime.keepalivePush(c.v);
     return mark;
 }
 
-/// The ordered implicit-receiver candidates a bare name is resolved
-/// against, innermost first: the frame's own implicit `this` (when
-/// present), then each lexically-enclosing `this@…`. A receiver that
-/// entered scope by dispatch (a method receiver or a displaced lexical
-/// `this`) is followed by its class's companion object (when that
-/// companion owns a member of the searched name — Kotlin puts the
-/// companion in scope at the class's own depth, below the instance
-/// receiver) and by its class-nesting tower of `outer` links — inside a
-/// member of `Inner`, `this@Outer` is in scope through `this@Inner` —
-/// while a `with`/`run`/`apply` subject brings only itself
-/// (`with(x) { … }` never puts `x`'s enclosing instances or companion in
-/// scope). Caller frees the returned slice.
 const SamInvokeOutcome = union(enum) { done: Value, raised: EvalError };
 
-/// Dispatch a bare name that missed (or is `invoke`) on a CALLABLE walk
-/// candidate as a fun-interface method: run the lambda with the next
-/// implicit receiver out handed as `this` (the interface method may be a
-/// member extension — `MeasurePolicy`'s `MeasureScope.measure` — whose
-/// body resolves bare names against that receiver). Returns null when the
-/// invocation itself reports a non-control-flow error, letting the walk
-/// continue.
+/// Dispatch a bare name that missed, or is `invoke`, on a CALLABLE walk candidate
+/// as a fun-interface method, running the lambda with the next implicit receiver
+/// out as `this`: the interface method may be a member extension whose body
+/// resolves bare names against it. Null on a non-control-flow error.
 fn samCandidateInvoke(
     comptime H: type,
     allocator: Allocator,
@@ -3400,14 +2853,9 @@ fn samCandidateInvoke(
     arg_values: []const Value,
     names: []const ?[]const u8,
 ) Allocator.Error!?SamInvokeOutcome {
-    // For any name other than `invoke`, the interface-method reading is
-    // only plausible when the callable's declared parameter count matches
-    // the call exactly, AND no top-level non-extension function serves
-    // the name — kotlinc resolves `probeCoroutineResumed(completion)` to
-    // the top-level helper even inside an extension on a function type,
-    // where the implicit `this` IS the coroutine block; invoking the
-    // block ran every UNDISPATCHED launch body twice. Names with only
-    // member/extension forms (`measure`, `emit`) keep the dispatch.
+    // For any name other than `invoke`, the interface-method reading holds only
+    // when the callable's declared parameter count matches the call exactly and no
+    // top-level non-extension function serves the name, which kotlinc binds first.
     if (!std.mem.eql(u8, name_str, "invoke")) {
         if (comptime @hasDecl(H, "callableFieldArity")) {
             const n = host.callableFieldArity(&cands[ci].v) orelse return null;
@@ -3418,12 +2866,8 @@ fn samCandidateInvoke(
             if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
             return null;
         }
-        // A DEEPER implicit receiver that can serve the name (a member of
-        // its hierarchy or an applicable extension) outranks the
-        // interface-method reading of this callable: `collect(this)`
-        // inside an `unsafeFlow { }` block binds the outer Flow receiver's
-        // `collect`, never the captured action lambda. Decline so the walk
-        // reaches that receiver.
+        // A deeper implicit receiver that can serve the name outranks the
+        // interface-method reading of this callable, so decline and let it through.
         if (comptime @hasDecl(H, "valueCouldServeName")) {
             var j = ci + 1;
             while (j < cands.len) : (j += 1) {
@@ -3463,11 +2907,9 @@ fn samCandidateInvoke(
     }
 }
 
-/// Free-list of candidate buffers: the walk runs on every dynamic member
-/// dispatch and its alloc/free pair showed in the gate's heaviest test.
-/// Buffers are allocator-owned (growth past the class frees them into the
-/// allocator exactly as the args pool's carriers do); release retains
-/// only exact-class capacities.
+/// Free-list of candidate buffers for the walk, which runs on every dynamic
+/// member dispatch. Buffers are allocator-owned, growth past the size class frees
+/// them back into the allocator, and release retains only exact capacities.
 const CAND_POOL_CAP = 32;
 const CAND_POOL_MAX = 8;
 threadlocal var cand_pool: struct { bufs: [CAND_POOL_MAX][]ImplicitCandidate, len: usize } = .{ .bufs = undefined, .len = 0 };
@@ -3499,13 +2941,9 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
     var depth: u16 = 0;
     const entries = try enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
-    // IN-FLIGHT chain pushes — entries this frame pushed DURING execution
-    // (a spliced `with`/`apply` subject via `EnclosingPush`, a dispatch
-    // access push) — are lexically INNER to the frame's own receiver: the
-    // subject of `toTypedArray().apply { sort() }` inside `List.sorted`
-    // outranks the extension's List `this`, exactly as the framed route's
-    // closure receiver would. `enclosingEntriesAlloc` reverses the chain,
-    // so the in-flight region is its PREFIX; rank it ahead of `inner`.
+    // In-flight chain pushes, entries this frame pushed DURING execution, are
+    // lexically INNER to the frame's own receiver, so they rank ahead of `inner`.
+    // `enclosingEntriesAlloc` reverses the chain, so they are its prefix.
     const in_flight: usize = blk: {
         if (frame.tls.active_chain != &frame.enclosing_this) break :blk 0;
         const total = frame.enclosing_this.items.len;
@@ -3515,11 +2953,10 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
     for (entries[0..@min(in_flight, entries.len)]) |e| {
         try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), false, &depth, host, bare_name);
     }
-    // The innermost candidate is the inline-splice's bound receiver when
-    // supplied (it lives in a local register, invisible to the frame `this`
-    // slot / capture lookup), otherwise the frame's own `this`. A supplied
-    // direct receiver is subject-like (its own value only, no class-nesting
-    // tower); it replaces, rather than precedes, the frame `this`.
+    // The innermost candidate is the inline splice's bound receiver when
+    // supplied, otherwise the frame's own `this`. A supplied direct receiver is
+    // subject-like, its own value only with no class-nesting tower, and it
+    // replaces rather than precedes the frame `this`.
     const inner: ?Value = if (direct_this) |dt|
         dt
     else blk: {
@@ -3528,43 +2965,27 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
     };
     if (inner) |iv| {
         if (iv != .Unit) {
-            // When the innermost receiver is also the innermost chain entry
-            // (a seeded method/extension receiver, or a receiver-split
-            // subject), the entry's own run covers it with the right kind.
-            // A subject-kind duplicate must not suppress a REAL receiver
-            // param's own run (the inner IteratorImpl's `remove` reaches
-            // the OUTER list only through its dispatch tower) — but a
-            // capture-received lambda `this` IS the subject (a `with`
-            // block's bare call must NOT see the subject's enclosing
-            // instances; kotlinc rejects `describe()` in
-            // `with(outer.Inner())`).
+            // When the innermost receiver is also the innermost chain entry, that
+            // entry's run already covers it. A subject-kind duplicate must not
+            // suppress a REAL receiver param's own run, but a capture-received
+            // lambda `this` IS the subject: a `with` block's bare call must not
+            // see the subject's enclosing instances, as kotlinc also rejects.
             const own_dispatch_shape = frame.func.params.len != 0 and
                 std.mem.eql(u8, frame.func.params[0].name, "this");
             const dup = entries.len > in_flight and sameReceiver(entries[in_flight].v, iv) and
                 (!entries[in_flight].isSubject() or !own_dispatch_shape);
             if (!dup) {
-                // The frame's own `this` brings its class-nesting tower (and
-                // companion) only when it is a *dispatch* receiver. An
-                // extension receiver — or a supplied splice receiver — is
-                // subject-like: `fun Owner.Inner.f()` does not put `Inner`'s
-                // enclosing `Owner` instance or companion in scope.
-                // A direct receiver that IS the frame's own `this` param
-                // is a dispatch receiver (an init-block/accessor thunk
-                // carries `this` explicitly), so its nesting tower and
-                // companion stay in scope; only a FOREIGN direct receiver
-                // (a splice/extension subject) suppresses them.
+                // The frame's own `this` brings its class-nesting tower and
+                // companion only as a DISPATCH receiver: `fun Owner.Inner.f()` does
+                // not put `Inner`'s enclosing `Owner` in scope. A direct receiver
+                // that IS the frame's `this` param is one; a foreign one is not.
                 const direct_is_frame_recv = if (direct_this) |dt| blk: {
                     if (frameThisParam(frame)) |ti| {
                         if (ti < frame.params.items.len and sameReceiver(frame.params.items[ti], dt)) break :blk true;
                     }
-                    // An INSTANCE METHOD's `this` param has no
-                    // has_receiver_param bit, and a flat activation may
-                    // route it through the capture slot: compare against
-                    // whatever the non-direct path would have used, so a
-                    // splice-bound register that holds the frame's OWN
-                    // dispatch receiver keeps its class-nesting tower
-                    // (`removeAt(...)` inside AbstractMutableList's inner
-                    // IteratorImpl.remove reaches the OUTER list).
+                    // An instance method's `this` param has no `has_receiver_param`
+                    // bit, and a flat activation may route it through the capture
+                    // slot, so compare against what the non-direct path would use.
                     const tv = implicitThisValue(frame, this_idx, consult_param);
                     if (tv != .Null and tv != .Unit and sameReceiver(tv, dt)) break :blk true;
                     break :blk false;
@@ -3573,27 +2994,16 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
                     .top_level_extension, .member_extension => true,
                     else => false,
                 };
-                // The same value may already sit on the chain as a spliced
-                // SUBJECT (an `iterator().apply { ... remove() }` splice
-                // pushes the iterator; `remove`'s own frame then re-sees it
-                // as its dispatch receiver). The subject entry's run has no
-                // class-nesting tower, so it must not suppress the own
-                // dispatch run — `removeAt(...)` inside the inner
-                // IteratorImpl reaches the OUTER list only through the own
-                // run's tower. The own kind still decides subject-ness.
+                // The same value may already sit on the chain as a spliced SUBJECT
+                // whose run has no class-nesting tower, so it must not suppress the
+                // own dispatch run; the own kind still decides subject-ness.
                 try appendCandidateRun(H, allocator, &out, iv, own_is_subject, true, &depth, host, bare_name);
             }
         }
     }
-    // A supplied direct receiver normally REPLACES the frame `this` — but
-    // when the frame carries its OWN receiver param bound to a DIFFERENT
-    // value, dropping the param strands every bare member of the declared
-    // receiver: the pausable pause/resume path was observed leaving a stale
-    // ComposableLambdaImpl in the lowered recv register (which then deduped
-    // against a leaked subject entry) while the receiver PARAM still held
-    // the real MockViewValidator. The param is dispatch truth for the
-    // declared receiver type; keep it in the walk between the direct
-    // receiver and the ambient chain.
+    // A supplied direct receiver replaces the frame `this`, but when the frame
+    // carries its OWN receiver param bound to a different value, dropping the param
+    // strands every bare member of the declared receiver, so it stays in the walk.
     if (direct_this != null and consult_param) {
         const pv = implicitThisValue(frame, this_idx, true);
         if (pv != .Null and pv != .Unit and !sameReceiver(pv, direct_this.?)) {
@@ -3614,9 +3024,6 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
         }
     }
     for (entries[@min(in_flight, entries.len)..], 0..) |e, ei| {
-        // The innermost chain entry is often the frame's own dispatch
-        // receiver seeded by the invoke path (the dup check above then
-        // skipped the frame-`this` run); it is still the OWN run.
         const e_own = ei == 0 and inner != null and sameReceiver(e.v, inner.?);
         try appendCandidateRun(H, allocator, &out, e.v, e.isSubject(), e_own, &depth, host, bare_name);
     }
@@ -3624,10 +3031,8 @@ fn implicitCandidatesAlloc(comptime H: type, allocator: Allocator, frame: *const
 }
 
 /// Append `v` and, unless it entered scope as a `with`/`run` subject, its
-/// class's member-owning companion and its class-nesting tower (`outer`
-/// links, each with its own companion). Consecutive duplicates collapse:
-/// a receiver-split invoke records the receiver both in the capture slot
-/// and as the innermost chain entry.
+/// class's member-owning companion and its class-nesting tower of `outer`
+/// links, each with its own companion. Consecutive duplicates collapse.
 fn appendCandidateRun(
     comptime H: type,
     allocator: Allocator,
@@ -3646,9 +3051,9 @@ fn appendCandidateRun(
         }
     }
     if (v == .Unit) return;
-    // A null `with`/`run` subject is a real receiver candidate — a
-    // nullable-receiver extension applies to it — but a null dispatch
-    // receiver just means "nothing bound".
+    // A null `with`/`run` subject is a real receiver candidate, since a
+    // nullable-receiver extension applies to it; a null dispatch receiver just
+    // means nothing is bound.
     if (v == .Null and !is_subject) return;
     if (v == .Null) {
         try out.append(allocator, .{ .v = v, .depth = depth.*, .own = own });
@@ -3671,9 +3076,9 @@ fn appendCandidateRun(
     }
 }
 
-/// Append the companion-object singleton of `v`'s class as a candidate at
-/// the class's own depth, when that companion owns a member named
-/// `bare_name`.
+/// Append the companion-object singleton of `v`'s class as a candidate at the
+/// class's own depth, when that companion owns a member named `bare_name`.
+/// Kotlin scopes the companion below the instance receiver, at that depth.
 fn appendCompanionCandidate(
     comptime H: type,
     allocator: Allocator,
@@ -3690,7 +3095,6 @@ fn appendCompanionCandidate(
     depth.* +|= 1;
 }
 
-/// Two receiver values denote the same instance.
 pub fn sameReceiver(a: Value, b: Value) bool {
     if (a == .Instance and b == .Instance) return ObjRef(InstanceData).ptrEq(a.Instance, b.Instance);
     return false;
@@ -3699,17 +3103,12 @@ pub fn sameReceiver(a: Value, b: Value) bool {
 var or_audit_checked: bool = false;
 var or_audit_enabled: bool = false;
 
-/// Opt-in arm-audit detector for the `*OrGlobal` instructions
-/// (`KLIO_OR_AUDIT`, same pattern as `KLIO_RESOLVE_AUDIT` /
-/// `KLIO_LINK_AUDIT`): every execution logs which arm bound the name —
-/// `member@<depth>` (with the winning receiver's type), `overload`,
-/// `global_id` (the lowering-resolved identity), `global` (name lookup),
-/// or the store/global-fallback variants — so a corpus sweep proves which
-/// runtime arms are live before an emit site is statically classified.
+/// `KLIO_OR_AUDIT` logs which arm bound the name on every `*OrGlobal` execution:
+/// `member@<depth>` with the winning receiver's type, `overload`, `global_id` for
+/// the lowering-resolved identity, `global` for the name lookup, or a store variant.
 var route_trace_init: bool = false;
 var route_trace_val: ?[]const u8 = null;
-/// KLIO_MEXT_ARM=0 disables the bare member-extension receiver arm, for
-/// single-binary A/B of its cost.
+/// `KLIO_MEXT_ARM=0` disables the bare member-extension receiver arm.
 fn mextArmEnabled() bool {
     const S = struct {
         var state: u8 = 0;
@@ -3751,8 +3150,7 @@ fn orAudit(inst_tag: []const u8, name: []const u8, arm: []const u8, depth: i32, 
     );
 }
 
-/// The owner class a scope-qualified getter name carries, or null for a
-/// plain name.
+/// The owner class a scope-qualified getter name carries, else null.
 fn scopeGetterOwner(name: []const u8) ?[]const u8 {
     const prefix = "$sgetter$";
     if (std.mem.startsWith(u8, name, prefix)) {
@@ -3775,17 +3173,15 @@ fn stripScopeGetter(name: []const u8) []const u8 {
     return name;
 }
 
-/// Pull `n_args` register values starting at `args_start` into a fresh
-/// owned slice. Caller frees.
 /// A positional call: no entry carries an argument name.
 pub fn argNamesAllNull(names: []const ?ConstId) bool {
     for (names) |n| if (n != null) return false;
     return true;
 }
 
-/// A call's argument run in a carrier list. The fused static-call site hands
-/// the list straight to the activation as its params, so the carrier follows
-/// the same acquire/release discipline as every other frame buffer.
+/// A call's argument run in a carrier list. The fused static-call site hands the
+/// list straight to the activation as its params, so the carrier follows the
+/// same acquire/release discipline as every other frame buffer.
 fn readArgList(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u32) Allocator.Error!std.ArrayList(Value) {
     var list = try acquireArgsCap(allocator, n);
     var i: u32 = 0;
@@ -3795,6 +3191,7 @@ fn readArgList(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u3
     return list;
 }
 
+/// Pull `n` register values from `args_start` into a fresh slice. Caller frees.
 pub fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n: u32) Allocator.Error![]Value {
     const out = try allocator.alloc(Value, n);
     var i: u32 = 0;
@@ -3804,13 +3201,7 @@ pub fn readArgRun(allocator: Allocator, frame: *const Frame, args_start: Reg, n:
     return out;
 }
 
-/// Indexed-load fast path shared by the `get` subscript forms. Serves the
-/// in-bounds, `Int`-index read on an `Array`/`List` directly — a plain indexed
-/// load with the intrinsics' ownership (`coll_array_get`/`coll_list_get`:
-/// retain the borrowed element). Returns `null` (fall through to the slow path,
-/// which reproduces the exact diagnostic) for any other shape.
-/// The element Value for a range cursor (mirrors the interp_ir `rangeElem`,
-/// kept here so the for-loop fast path needs no host round-trip).
+/// The element Value for a range cursor. Mirrors the interp_ir `rangeElem`.
 inline fn rangeElemEval(cur: i64, kind: runtime.RangeKind) Value {
     return switch (kind) {
         .Int => Value.newInt(cur),
@@ -3821,12 +3212,9 @@ inline fn rangeElemEval(cur: i64, kind: runtime.RangeKind) Value {
     };
 }
 
-/// Inline `hasNext()` / `next()` for a `.RangeIter` receiver. The for-loop over
-/// any integer/char range desugars to `iterator()` + per-iteration
-/// `hasNext()`/`next()` member calls; handling them here skips the full member
-/// dispatch (and its per-call hashmap probes), which dominates tight loops.
-/// Returns the result for hasNext/next, or null to fall through for any other
-/// method. Mirrors `builtin_members.rangeIterMember`.
+/// Inline `hasNext()`/`next()` for a `.RangeIter` receiver, skipping the member
+/// dispatch a desugared for-loop over an integer or char range would pay per
+/// iteration. Null for any other method; mirrors `builtin_members.rangeIterMember`.
 pub inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []const u8, n_args: u32) ?EvalResult {
     if (n_args != 0) return null;
     const is_has_next = std.mem.eql(u8, name, "hasNext");
@@ -3841,7 +3229,6 @@ pub inline fn rangeIterFast(allocator: Allocator, recv: *const Value, name: []co
     const cur = snap.cur;
     const more = !snap.done and snap.step != 0 and snap.kind.inBounds(cur, snap.end, snap.step);
     if (is_has_next) return ok(.{ .Bool = more });
-    // next()
     if (!more) {
         const exc = Value.newException(allocator, .{
             .fqn = runtime.strInit(allocator, "kotlin.NoSuchElementException") catch return null,
@@ -3872,9 +3259,8 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
                 const g = pb.borrow();
                 defer g.deinit();
                 if (ui >= g.get().len()) return null;
-                // View-aware: an unsigned array over signed backing
-                // (`UIntArray(intArray)`) tags elements by `arr.prim`,
-                // not the buffer's storage kind.
+                // An unsigned array over signed backing (`UIntArray(intArray)`)
+                // tags elements by `arr.prim`, not the buffer's storage kind.
                 return g.get().getAs(ui, arr.primKind() orelse g.get().kind); // fresh scalar
             },
             .boxed => |vl| {
@@ -3888,8 +3274,8 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             },
         },
         .List => |l| {
-            // A stale subList view must fail fast — leave it to the slow
-            // path, whose read guard throws ConcurrentModificationException.
+            // A stale subList view must fail fast: the slow path's read guard
+            // throws ConcurrentModificationException.
             if (recv.sublistViewStale()) return null;
             // An array `.asList()` view re-reads its scalar source so a later
             // array write shows through on this indexed load.
@@ -3907,10 +3293,9 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
             const g = s.borrow();
             defer g.deinit();
             const sd = g.get();
-            // ASCII in-bounds only: the UTF-16 unit at `ui` is byte `ui`.
-            // Multi-byte strings and out-of-bounds decline to the native,
-            // whose UTF-16 walk and IndexOutOfBoundsException are the
-            // contract.
+            // ASCII in-bounds only, where the UTF-16 unit at `ui` is byte `ui`.
+            // The native's UTF-16 walk and IndexOutOfBoundsException are the
+            // contract for everything else.
             if (!sd.ascii or ui >= sd.bytes.len) return null;
             return .{ .Char = sd.bytes[ui] };
         },
@@ -3919,14 +3304,10 @@ pub inline fn fastIndexGet(recv: *const Value, idx_v: *const Value) ?Value {
 }
 
 /// Indexed-store fast path for `a[i] = v` on an `Array` or a plain mutable
-/// `List` (mirrors the `coll_array_set` / `coll_mut_list_set` intrinsics:
-/// release the overwritten element, retain the incoming one under a
-/// reclaiming backend). Returns the SET-EXPRESSION's value — `Unit` for an
-/// array, the PREVIOUS element for a list (Kotlin's `MutableList.set`
-/// contract; the assignment arm discards it, the member-call arm writes it).
-/// Null when not handled: out-of-bounds, an immutable receiver, and a live
-/// view (subList / map-values / asList backing) all decline to the full
-/// member path, whose guards throw the right exceptions and write through.
+/// `List`, with the `coll_array_set` ownership: release the overwritten element,
+/// retain the incoming one. Returns the set-EXPRESSION's value, `Unit` for an
+/// array and the PREVIOUS element for a list per Kotlin's `MutableList.set`.
+/// Out-of-bounds, an immutable receiver and a live view return null.
 pub inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *const Value, new_val: Value) ?Value {
     if (idx_v.* != .Int) return null;
     const idx = idx_v.Int;
@@ -3969,22 +3350,10 @@ pub inline fn fastIndexSet(allocator: Allocator, recv: *const Value, idx_v: *con
     }
 }
 
-/// Subscript fast path: `a[i]` / `a[i] = v` lower to `a.get(i)` / `a.set(i, v)`
-/// member calls. Dispatching those through the full member-call machinery for
-/// every array element dominates the cost of any loop-heavy program, so the
-/// common case is served by the indexed-load/store primitives above. Returns
-/// the value to write to `dst`, or `null` when not handled.
-/// The bitwise and conversion MEMBERS of `Int` / `Long`, served inline.
-///
-/// `a shl b`, `a and b` and friends are ordinary infix member functions, not
-/// operators, so they lower to a member call and — with no static receiver
-/// type at the site — reach the name ladder on every execution. Bit math is
-/// the inner loop of the snapshot id sets and the persistent-map trie, where
-/// this was four out of every five slow-ladder dispatches.
-///
-/// A member always wins over an extension in Kotlin, so an `Int` receiver
-/// with an `Int` argument and one of these names can only mean the builtin;
-/// any other receiver/argument shape declines to the ladder unchanged.
+/// The bitwise and conversion MEMBERS of `Int`/`Long`, served inline: `a shl b`
+/// and friends are infix member functions, not operators, so they lower to a member
+/// call and reach the name ladder on every execution. A member always wins over an
+/// extension in Kotlin, so these names on an `Int` pair mean the builtin.
 pub inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
     if (cm.arg_names.len != 0 or cm.n_args > 1) return null;
     const recv = frame.read(cm.receiver);
@@ -3993,18 +3362,12 @@ pub inline fn primitiveMemberFast(frame: *const Frame, cm: anytype) ?Value {
     return primitiveMemberOp(&recv, nm, arg);
 }
 
-/// The value-level core of `primitiveMemberFast`, shared with the frameless
-/// leaf walk: a pure function of the receiver, the member name and at most one
-/// argument, so it needs no frame at all.
+/// The value-level core of `primitiveMemberFast`, shared with the frameless leaf
+/// walk: a pure function of the receiver, name and at most one argument.
 pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) ?Value {
     const recv = recv_in.*;
-    // `compareTo` on two same-kind primitives is a pure comparison, and it
-    // was the single hottest entry in the runtime member LADDER
-    // (`Char.compareTo` alone, 84,595 of 113,980) — a primitive has no
-    // vtable slot, so a `Comparable` receiver dispatched by name every time.
-    // Returns exactly what the host intrinsic does: the CODE DIFFERENCE for
-    // `Char` (kotlinc emits `Character.compare`), and -1/0/1 for `Int`/`Long`
-    // (`Integer.compare` / `Long.compare`).
+    // `compareTo` on two same-kind primitives answers what the host intrinsic does:
+    // the CODE DIFFERENCE for `Char`, and -1/0/1 for `Int`/`Long`.
     if (arg_in) |cmp_arg| {
         if (std.mem.eql(u8, nm, "compareTo")) {
             const ord: ?i64 = switch (recv) {
@@ -4025,11 +3388,8 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
             if (ord) |o| return Value.newInt(o);
         }
     }
-    // Backing-free container `isEmpty`, exactly the host member
-    // intrinsic's answer; a live view (`backing != null`) computes its
-    // length in the view machinery and stays on the framed path. Member
-    // only — `isNotEmpty` is a SHADOWABLE extension, but its `!isEmpty()`
-    // body leaf-serves through this arm anyway.
+    // Backing-free container `isEmpty` only: a live view computes its length in the
+    // view machinery. `isNotEmpty` is a SHADOWABLE extension, so it is not served.
     if (arg_in == null) {
         switch (recv) {
             .List => |l| if (l.backing == null) {
@@ -4096,8 +3456,7 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
             else => unreachable,
         };
     }
-    // `and` / `or` / `xor` are same-width members: `Int.and(Int)` and
-    // `Long.and(Long)`. A mixed pair is some other declaration.
+    // `and`/`or`/`xor` are same-width members; a mixed pair is another decl.
     const pair: ?struct { a: i64, b: i64 } = switch (recv) {
         .Int => |i| if (arg == .Int) .{ .a = i, .b = arg.Int } else null,
         .Long => |l| if (arg == .Long) .{ .a = l, .b = arg.Long } else null,
@@ -4116,9 +3475,8 @@ pub fn primitiveMemberOp(recv_in: *const Value, nm: []const u8, arg_in: ?Value) 
     return null;
 }
 
-/// Whether this site may serve a NULL stored slot. Asked of the host once and
-/// kept on the instruction: it is a property of the claiming class, which the
-/// site memo has already pinned.
+/// Whether this site may serve a NULL stored slot. Asked of the host once and kept
+/// on the instruction: it is a property of the class the site memo pinned.
 pub inline fn nullSiteOk(comptime H: type, host: *H, recv: *const Value, name: []const u8, slot: *u8) bool {
     const cached = @atomicLoad(u8, slot, .acquire);
     if (cached != 0) return cached == 2;
@@ -4137,8 +3495,6 @@ pub inline fn fastSubscript(allocator: Allocator, frame: *const Frame, cm: anyty
     const recv = frame.read(cm.receiver);
     if (is_get) return fastIndexGet(&recv, &idx_v);
     const new_val = frame.read(Reg.from(cm.args.int() + 1));
-    // The member-call form USES the expression value: Unit for an array,
-    // the previous element for a list.
     return fastIndexSet(allocator, &recv, &idx_v, new_val);
 }
 
@@ -4149,8 +3505,8 @@ fn readRegSlice(allocator: Allocator, frame: *const Frame, regs: []const Reg) Al
     return out;
 }
 
-/// Flatten an array / list / set into a slice of its items for
-/// spread-arg dispatch. Caller frees the returned slice.
+/// Flatten an array, list or set into its items for spread-arg dispatch.
+/// Caller frees the returned slice.
 fn spreadItems(allocator: Allocator, v: *const Value) Allocator.Error!union(enum) { ok: []Value, err: EvalError } {
     switch (v.*) {
         .Array => |a| return .{ .ok = try a.snapshot(allocator) },
@@ -4172,15 +3528,12 @@ fn spreadItems(allocator: Allocator, v: *const Value) Allocator.Error!union(enum
     }
 }
 
-/// Resolve a per-call `arg_names: []?ConstId` into a parallel
-/// `[]?[]const u8`. Empty input yields an empty output. Caller frees.
-/// All-null name runs for the positional shape, which is the overwhelming
-/// majority of calls: they carry no information beyond their length, so one
-/// shared constant run serves every arity up to the bound and the per-call
-/// allocation disappears. `freeArgNames` recognizes it and frees nothing.
+/// An all-null name run carries no information beyond its length, so one shared
+/// constant run serves every positional call up to this arity, and is never freed.
 const ARG_NAMES_NULL_MAX: usize = 32;
 const arg_names_null: [ARG_NAMES_NULL_MAX]?[]const u8 = @splat(null);
 
+/// Resolve `arg_names` into a parallel `[]?[]const u8`. Freed by `freeArgNames`.
 pub fn resolveArgNames(allocator: Allocator, module: *const Module, names: []const ?ConstId) Allocator.Error![]?[]const u8 {
     if (names.len <= ARG_NAMES_NULL_MAX and argNamesAllNull(names)) {
         return @constCast(arg_names_null[0..names.len]);
@@ -4198,9 +3551,7 @@ pub fn freeArgNames(allocator: Allocator, names: []?[]const u8) void {
     allocator.free(names);
 }
 
-/// Heuristic for an erased generic type-parameter name (`T`, `R`, `E`,
-/// `K`, `V`, `TT`, …): a one- or two-character all-uppercase
-/// identifier.
+/// Heuristic for an erased type-parameter name: one or two uppercase letters.
 fn isErasedTypeParamName(name: []const u8) bool {
     const n = std.mem.trimEnd(u8, name, "?");
     if (n.len == 0 or n.len > 2) return false;
@@ -4210,24 +3561,22 @@ fn isErasedTypeParamName(name: []const u8) bool {
     return true;
 }
 
-/// Whether a non-`instance_of` cast still passes because the target is
-/// an erased type parameter (unchecked cast on the JVM).
+/// Whether a non-`instance_of` cast still passes because the target is an erased
+/// type parameter, which the JVM leaves unchecked.
 fn typeParamCastPasses(comptime H: type, frame: *const Frame, ty: TypeRef, host: *H) bool {
     return typeParamCastPassesIn(H, frame.module, frame.func, ty, host);
 }
 
-/// Frame-free core of `typeParamCastPasses`, shared with the fused walker's
-/// Cast arm — the leniency for erased/type-parameter cast targets is part of
-/// Cast semantics, not of having a frame.
+/// Frame-free core of `typeParamCastPasses`, shared with the fused walker's Cast
+/// arm: the leniency for erased targets is part of Cast semantics, not of a frame.
 pub fn typeParamCastPassesIn(comptime H: type, module: *const Module, func: *const ir.Func, ty: TypeRef, host: *H) bool {
     if (module.registry.func_type_params.get(func.id)) |tps| {
         for (tps.items) |t| {
             if (std.mem.eql(u8, t, ty.name)) return true;
         }
     }
-    // A short uppercase name is an erased parameter unless the program
-    // DECLARES a class of that name (`a as? B` against `class B` is a real
-    // check); a reified binding published under the name still erases.
+    // A short uppercase name is an erased parameter unless the program DECLARES
+    // a class of that name; a reified binding published under it still erases.
     const declared = if (comptime @hasDecl(H, "isDeclaredClassNameFrom")) host.isDeclaredClassNameFrom(ty.name, func.package) else false;
     if (isErasedTypeParamName(ty.name) and !declared) return true;
     if (!host.isConcreteCastTarget(ty.name)) return true;

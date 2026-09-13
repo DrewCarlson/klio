@@ -1,13 +1,8 @@
-//! Human-readable IR dump (`klio dump-ir`). Prints a built `Module`'s functions
-//! as registers + instructions, classifying every call site as DIRECT (an exact
-//! `FuncId`/`ClassId` target), VIRTUAL (a numeric method slot), or DYNAMIC
-//! (resolved by name at runtime), and
-//! distinguishing a dynamic call the lowerer *did* resolve to a unique target
-//! but still left dynamic (BOUND) from one with no carried target (UNBOUND).
-//!
-//! This is the before/after oracle for static-binding work: the per-function
-//! and module Direct/Dynamic tally is the success metric for un-tainting bare
-//! calls. It reads a frozen module and never runs anything.
+//! Human-readable IR dump (`klio dump-ir`) over a frozen `Module`, running
+//! nothing. Every call site is classified DIRECT (an exact `FuncId`/`ClassId`
+//! target), VIRTUAL (a numeric method slot), or DYNAMIC (resolved by name at
+//! runtime); a dynamic call carrying a unique lowered target is BOUND, one
+//! carrying none is UNBOUND.
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -18,13 +13,12 @@ const Inst = ir.Inst;
 const Const = ir.Const;
 
 pub const Options = struct {
-    /// Substring filter on a function's `name`/`fqn`; null dumps the default set.
+    /// Substring filter on `name`/`fqn`; null dumps the default set.
     func_filter: ?[]const u8 = null,
     /// Dump every appended function, not just `module.top_level`.
     all: bool = false,
 };
 
-/// A call site's binding class, for the Direct/Dynamic tally.
 const Kind = enum { direct, virtual, dyn_bound, dyn_unbound };
 
 const Tally = struct {
@@ -46,7 +40,7 @@ const Tally = struct {
     }
 };
 
-/// Classify a call-form instruction, or null when it is not a call site.
+/// Null when the instruction is not a call site.
 fn classify(inst: *const Inst) ?Kind {
     return switch (inst.*) {
         .Call => .direct,
@@ -69,7 +63,7 @@ fn reg(r: ir.Reg) u32 {
     return r.int();
 }
 
-/// The string text of a `Const.String`, or a `<...>` placeholder.
+/// A `<...>` placeholder where the id is out of range or not a string.
 fn constStr(m: *const Module, id: ir.ConstId) []const u8 {
     const i = id.int();
     if (i >= m.consts.items.len) return "<oob>";
@@ -245,8 +239,7 @@ fn dumpInst(w: *std.Io.Writer, m: *const Module, inst: *const Inst, tally: *Tall
                 "r{d} <- AstLambda {s}#{d} captures={d}",
                 .{ reg(c.dst), if (c.body_func) |fid| funcName(m, fid) else "<deferred>", if (c.body_func) |fid| fid.int() else 0, c.captured_names.len },
             );
-            // The capture list, register and name paired, so a wrong `this`
-            // capture is visible at the creation site.
+            // Register paired with name, so a wrong `this` capture is visible.
             for (c.captures, 0..) |cr, i| {
                 try w.print("{s}r{d}:{s}", .{ if (i == 0) " [" else ", ", reg(cr), if (i < c.captured_names.len) c.captured_names[i] else "?" });
             }
@@ -336,15 +329,10 @@ pub fn dumpModule(w: *std.Io.Writer, m: *const Module, opts: Options) !void {
             dumped += 1;
         }
     } else {
-        // Default: the user program's own functions. `buildModuleFiles` links
-        // the whole stdlib + any gated packs into one module, so restrict to
-        // funcs with no package header (a user script). For a packaged file
-        // (a library/test source) use `--func NAME` to target by name.
+        // `buildModuleFiles` links the whole stdlib and any gated packs into one
+        // module, so the default set is the user script: no package header, no
+        // receiver, no synthesized thunk. Reach a packaged function by `--func`.
         for (m.funcs.items) |*f| {
-            // Package-less + not a receiver method + not a synthesized thunk
-            // ⇒ a top-level function of a user script (builtin `Pair.toString`
-            // is an instance method; `__enum_arg_*`/`__sec_ctor_*` are
-            // compiler-synthesized helpers).
             if (f.package.len != 0 or f.has_receiver_param or f.kind != .plain or
                 f.is_lambda or std.mem.startsWith(u8, f.name, "__")) continue;
             try dumpFunc(w, m, f, &mod_tally);

@@ -1,59 +1,47 @@
-//! The bytecode tier: dense per-block `u32` op streams replacing the
-//! tree-walker's per-instruction union dispatch for the hot simple ops,
-//! with an ESCAPE op executing everything else through the walker's own
-//! `execInst` — total coverage, shared semantics (see the frozen v1 spec
-//! in plans/bytecode-vm-plan.md (git history)). Always on; it
-//! the pure walker.
+//! Dense per-block `u32` op streams for the hot simple instructions, with an
+//! `escape` op running everything else through the walker's `execInst`.
 //!
-//! FUSED terminators: a function with no try/catch/finally metadata
-//! anywhere gets `jump`/`br`/`ret`/`term_exit` ops appended to each
-//! block's stream, so Goto/Branch/Return flow block-to-block inside the
-//! bytecode loop without surfacing to the frame loop's per-block
-//! bookkeeping. Fusion is only built when the loop JIT is off for the
-//! process — the JIT's compile trigger lives at the frame loop's block
-//! entry, and fused edges would starve it.
+//! Fused terminators: a function carrying no try/catch/finally metadata gets
+//! `jump`/`br`/`ret`/`term_exit` appended to each block's stream so flow stays
+//! inside the bytecode loop. Built only when the loop JIT is off for the
+//! process: the JIT's compile trigger sits at the frame loop's block entry,
+//! which fused edges would starve.
 
 const std = @import("std");
 const runtime = @import("runtime");
 const ir = @import("ir.zig");
 
 pub const Op = enum(u32) {
-    /// dst, const_id — load a constant.
+    /// dst, const_id.
     const_load,
-    /// dst, payload — load a small Int constant embedded in the stream
-    /// (no consts-table lookup, no conversion dispatch).
+    /// dst, payload: a small Int constant embedded in the stream.
     const_int,
-    /// dst, src — copy with retain.
+    /// dst, src: copy with retain.
     move,
-    /// dst, idx — parameter load.
+    /// dst, idx.
     load_param,
-    /// dst, cell — cell read (plain value passthrough included).
+    /// dst, cell.
     cell_get,
-    /// file, start, end — span bookkeeping, embedded (no Inst load).
+    /// file, start, end.
     trace,
-    /// inst_idx, kind, dst, lhs, rhs — arithmetic/compare. The operands
-    /// ride in the stream so the hot path never touches the Inst union;
-    /// the generic fallback reaches the original inst via inst_idx.
+    /// inst_idx, kind, dst, lhs, rhs. The generic fallback reaches the
+    /// original inst through inst_idx.
     bin,
-    /// inst_idx — every other instruction, via `execInst`.
+    /// inst_idx: every other instruction, via `execInst`.
     escape,
-    /// target_block — fused Goto: continue in the target block's stream.
+    /// target_block: fused Goto.
     jump,
-    /// cond_reg, t_block, f_block — fused Branch on a Bool register; a
-    /// non-Bool condition exits to the frame loop's terminator path.
+    /// cond_reg, t_block, f_block: fused Branch on a Bool register. A non-Bool
+    /// condition exits to the frame loop's terminator path.
     br,
-    /// has_val, reg — fused Return (no finally can intercept it in a
-    /// fusible function).
+    /// has_val, reg: fused Return.
     ret,
-    /// (no operands) — run this block's real terminator in the frame
-    /// loop (Throw, TailJump, suspension forms, ...).
+    /// No operands: run the block's real terminator in the frame loop.
     term_exit,
-    /// inst_idx, kind, dst, lhs, rhs, t_block, f_block — a fused
-    /// compare-and-branch: the block's LAST instruction is a BinOp
-    /// whose dst is exactly the Branch condition. The compare's result
-    /// is still written to dst (so semantics and register state match
-    /// the unfused form); non-scalar operands fall back to the generic
-    /// arm and then branch on dst.
+    /// inst_idx, kind, dst, lhs, rhs, t_block, f_block: the block's last
+    /// instruction is a BinOp whose dst is the Branch condition. The compare
+    /// still writes dst, so register state matches the unfused form;
+    /// non-scalar operands fall back to the generic arm and branch on dst.
     cmp_br,
 };
 
@@ -65,47 +53,34 @@ pub const Stream = struct {
 };
 
 
-/// The tier is ON by default; `KLIO_BC=0` restores the pure walker
-/// for bisection.
 pub fn enabled() bool {
     return true;
 }
 
-/// Per-FUNCTION stream tables (one entry per block, indexed by BlockId),
-/// so the frame loop pays one lookup per ACTIVATION and a plain array
-/// index per block entry. Process-lifetime code-cache data: built once,
-/// never freed. Keyed by the function's blocks pointer (stable once
-/// materialised; a lazily-decoded body gets a fresh table for its final
-/// blocks slice).
+/// One stream slot per block, indexed by BlockId. Process-lifetime cache data:
+/// built once, never freed; a lazily-decoded body gets a fresh table.
 pub const FuncStreams = struct {
     streams: []const ?*const Stream,
-    /// Whether these streams carry fused terminator ops.
     fused: bool,
 };
 
 var cache_mutex: runtime.SpinMutex = .{};
-/// Streams are cached per (function, fuse variant): the loop JIT takes single
-/// functions off fusion, so both variants can be live in one process.
+/// Keyed per (function, fuse variant): the loop JIT takes single functions off
+/// fusion, so both variants can be live in one process.
 const CacheKey = struct { blocks: usize, fuse: bool };
 var cache: ?std.AutoHashMap(CacheKey, *const FuncStreams) = null;
 
-/// Generation for the per-Func `bc_memo` fast path. `resetCacheForTest`
-/// FREES every cached FuncStreams; a Func that survives the reset (an
-/// in-process driver reusing one loaded module across programs) would
-/// otherwise serve its memoized pointer into freed memory.
+/// Generation for the per-Func `bc_memo` fast path: `resetCacheForTest` frees
+/// every cached FuncStreams, so a Func surviving the reset must not serve its
+/// memoized pointer into freed memory.
 var stream_gen = std.atomic.Value(u32).init(1);
 pub fn streamGen() u32 {
     return stream_gen.load(.monotonic);
 }
 
-/// Drop every cached stream table. The cache keys on the function's BLOCKS
-/// POINTER, which is stable for one program's life — an in-process driver
-/// that frees a program's module and runs another reuses those addresses,
-/// and a stale hit executes the PREVIOUS program's compiled stream against
-/// the new instructions (a tag-mismatch panic at best). Called from the
-/// per-program cache reset. Entries free their streams outright — the
-/// differential driver runs the whole corpus in one process, and leaked
-/// tables walked it into the RSS cap.
+/// Drop every cached stream table, freeing the streams. Keys are blocks
+/// pointers, stable only for one program's life: an in-process driver reuses
+/// those addresses and a stale hit would run the wrong stream.
 pub fn resetCacheForTest() void {
     cache_mutex.lock();
     defer cache_mutex.unlock();
@@ -128,16 +103,12 @@ pub fn resetCacheForTest() void {
     c.clearRetainingCapacity();
 }
 
-/// `allow_fuse` is process-constant (the loop JIT's enablement); the
-/// first call decides what the cache holds. `consts` is the owning
-/// module's constant table (for embedding small Int payloads).
+/// `allow_fuse` is process-constant, so the first call decides what the cache
+/// holds. `consts` is the owning module's table, for embedded Int payloads.
 pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Const) ?*const FuncStreams {
     if (func.blocks.len == 0) return null;
-    // Per-Func memo: the shared cache below takes a global mutex + hash
-    // probe on EVERY activation (and the leaf serve asks again) — a
-    // measured per-call compounder and a cross-thread contention point.
-    // The fill is final for a given allow_fuse; the other variant (a
-    // process flips KLIO_JIT between runs only) keeps the shared path.
+    // The shared cache below takes a global mutex and a hash probe on every
+    // activation. The memo holds one fuse variant; the other keeps that path.
     const want_fuse: u8 = if (allow_fuse) 2 else 1;
     const gen = stream_gen.load(.monotonic);
     {
@@ -146,8 +117,6 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
             return if (m == 1) null else @ptrFromInt(m);
         }
     }
-    // Keyed by the fuse variant as well: with per-function fusion a process
-    // holds both variants, and a ptr-only key hands back the wrong one.
     const key: CacheKey = .{ .blocks = @intFromPtr(func.blocks.ptr), .fuse = allow_fuse };
     cache_mutex.lock();
     defer cache_mutex.unlock();
@@ -175,10 +144,8 @@ pub fn funcStreams(func: *const ir.Func, allow_fuse: bool, consts: []const ir.Co
     return fs;
 }
 
-/// A function is fusible when NO block carries try machinery: with the
-/// try-stack provably empty and no pending-finally state possible, the
-/// frame loop's Goto/Branch/Return handling reduces to exactly what the
-/// fused ops do.
+/// Fusible when no block carries try machinery: with the try-stack provably
+/// empty, the frame loop's Goto/Branch/Return handling reduces to the fused ops.
 fn fusible(func: *const ir.Func) bool {
     for (func.blocks) |*blk| {
         if (blk.catches.len != 0 or blk.finally != null or
@@ -192,22 +159,18 @@ fn fusible(func: *const ir.Func) bool {
     return true;
 }
 
-/// Every register operand a dedicated op emits is validated `< n_locals`
-/// at build time; together with the frame loop's one entry check
-/// (`regs.len >= n_locals`, the frame-construction invariant) this
-/// PROVES the stream ops' register accesses in bounds, so the hot
-/// helpers index uncheck. An out-of-range operand demotes the
-/// instruction to an escape (the walker's checked path).
+/// Build-time bound on every register operand a dedicated op emits. With the
+/// frame loop's `regs.len >= n_locals` entry check this proves stream register
+/// accesses in bounds, so the hot helpers index unchecked. Out of range
+/// demotes the instruction to an escape.
 fn regOk(n_locals: u32, r: u32) bool {
     return r < n_locals;
 }
 
 fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const, n_locals: u32) ?*const Stream {
     const insts = blk.insts;
-    // A block with no dedicated ops gains nothing from the stream —
-    // running it as escapes would only add fetch+dispatch on top of
-    // the walker's own loop. Leave it to the walker. (A fused function
-    // keeps every block in-stream so jumps always land on a stream.)
+    // A block of pure escapes gains nothing over the walker's own loop. A
+    // fused function keeps every block in-stream so jumps always land on one.
     if (!fuse) {
         const dedicated = for (insts) |*inst| {
             switch (inst.*) {
@@ -217,8 +180,6 @@ fn build(blk: *const ir.Block, fuse: bool, consts: []const ir.Const, n_locals: u
         } else false;
         if (!dedicated) return null;
     }
-    // Fused compare-and-branch: the block's LAST inst is a BinOp whose
-    // dst is exactly the Branch condition register.
     var fuse_cmp_idx: ?usize = null;
     if (fuse and insts.len != 0) {
         switch (blk.terminator) {
@@ -380,7 +341,6 @@ test "stream encoding: dedicated ops, operand words, idx_pc, escape" {
     try std.testing.expectEqualSlices(u32, &want, st.code);
     try std.testing.expectEqualSlices(u32, &.{ 0, 3, 9, 12 }, st.idx_pc);
 
-    // An Int constant embeds its payload.
     const consts = [_]ir.Const{ .{ .Int = -42 }, .{ .String = "s" } };
     const st2 = build(&blk, false, &consts, 8) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@intFromEnum(Op.const_load), st2.code[0]);
@@ -441,10 +401,7 @@ test "stream encoding: an all-escape block builds no stream unfused" {
     try std.testing.expect(build(&blk, true, &.{}, 8) != null);
 }
 
-/// Human-readable decode of one block's stream — the decoder half of the C
-/// transpiler's emitter (`plans/c-transpiler-plan.md (git history)` stage 2): the emitter
-/// walks exactly these (op, operands) tuples and emits C statements instead
-/// of text lines.
+/// Human-readable decode of one block's stream.
 pub fn dumpStream(w: anytype, s: *const Stream) !void {
     var pc: usize = 0;
     const code = s.code;
