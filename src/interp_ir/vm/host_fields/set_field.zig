@@ -1,5 +1,5 @@
-//! The field-write ladder: the ordered resolution chain a property write
-//! walks, and the setter evaluation behind it.
+//! The field-write ladder: the ordered resolution chain a property write walks,
+//! and the setter evaluation behind it.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -75,15 +75,13 @@ pub fn setFieldFrom(
 }
 
 pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, value: Value) Allocator.Error!UnitResult {
-    // CONSUME the marker: it belongs to this write only. Writes made inside the
-    // base setter we are about to reach are ordinary ones.
+    // The marker belongs to this write; writes inside the base setter do not.
     const super_owner: ?[]const u8 = blk: {
         const o = self.tls.super_write_owner;
         self.tls.super_write_owner = null;
         break :blk o;
     };
-    // Companion forwarding for writes: `Foo.count = 1` routes to the
-    // companion singleton instance's field.
+    // `Foo.count = 1` routes to the companion singleton instance's field.
     if (receiver.* == .Class) {
         const cls_name = blk: {
             const g = receiver.Class.borrow();
@@ -107,9 +105,8 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
     }
     const bypass_setter = std.mem.startsWith(u8, name, "__klio_field__");
     const real_name = if (bypass_setter) name["__klio_field__".len..] else name;
-    // Field-write memo: one probe replaces the whole ext-setter / delegated /
-    // custom-setter / override-cell ladder below for a (class, name) pair the
-    // ladder has already classified from class-static facts alone.
+    // One memo probe replaces the ladder below for a (class, name) pair the
+    // ladder already classified from class-static facts.
     const write_cache_ok = receiver.* == .Instance and !bypass_setter and
         super_owner == null and ir.eval.dispatchCacheStable();
     if (write_cache_ok) {
@@ -134,13 +131,10 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
     }
     var write_cacheable = write_cache_ok;
     var plain_recordable = false;
-    // Extension-property setter — `var T.x set(value) {…}`. A member property
-    // of the same name shadows the extension, so skip it when the receiver
-    // declares its own `real_name` (else `this.x = …` recurses through the
-    // extension setter).
+    // A member property of the same name shadows the extension setter.
     if (!bypass_setter and !instanceDeclaresProperty(self, receiver, real_name)) {
-        // A `var X.Companion.x` setter registers under `X`'s simple name;
-        // its `this` is `X`'s companion instance, not the class value.
+        // A `var X.Companion.x` setter registers under `X`'s simple name and takes
+        // the companion instance as `this`, not the class value.
         const recv_simple: []const u8 = switch (receiver.*) {
             .Instance => |i| className(i),
             .Class => |c| blk: {
@@ -161,9 +155,8 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
             if (receiver.* == .Class) {
                 if (try companionInstanceForClass(self, recv_simple)) |comp| setter_recv = comp;
             }
-            // A member-extension property's setter body has its declaring
-            // class's `this` in lexical scope; seed the setter frame with
-            // the owner instance from the enclosing chain.
+            // A member-extension setter has its declaring class's `this` in scope,
+            // seeded from the enclosing chain.
             var pushed_owner = false;
             if (mptr.registry.member_ext_owner_class.get(f)) |owner| {
                 if (try host_call_member.memberExtOwnerInstance(self, allocator, &setter_recv, owner)) |inst| {
@@ -178,8 +171,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                 .err => |e| return .{ .err = e },
             }
         }
-        // Delegated extension property (`var R.x by expr`): write through
-        // the cached delegate's `setValue(thisRef, property, value)`.
+        // A delegated extension property writes through `setValue`.
         if (try resolveExtPropDelegate(self, allocator, receiver, recv_simple, real_name)) |hit| {
             const d = try extPropDelegateInstance(self, allocator, hit.key, real_name, hit.fid);
             const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, real_name) } };
@@ -194,7 +186,6 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
         const inst = receiver.Instance;
         const class_name = className(inst);
         if (!bypass_setter) {
-            // Delegated body property -> route through `setValue`.
             const is_delegated: bool = runtimeClassDelegatesProp(inst, real_name) or blk: {
                 var cur: ?[]const u8 = class_name;
                 var seen: std.ArrayList([]const u8) = .empty;
@@ -223,20 +214,13 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                     }
                 }
             }
-            // Custom property setter declared on the class or a base. Walk the
-            // FULL transitive supertype set, not a single `firstSupertype`
-            // chain: a class may inherit the setter from a base that is not its
-            // first-declared supertype (`MeasurePassDelegate : Placeable(),
-            // Measurable` — the `firstSupertype` chain follows the `Measurable`
-            // interface and never reaches `Placeable`, so the custom
-            // `measuredSize` setter was skipped and the write hit the backing
-            // field directly, its side effects lost).
+            // Custom setter on the class or a base. The walk covers the full
+            // transitive supertype set, since the declaring base need not be
+            // the first-declared one.
             const setter_fid: ?FuncId = blk: {
-                // `super.prop = v`: the writing class's own setter is exactly the
-                // one being overridden, so start the search at its SUPERTYPES. A
-                // base whose property is field-backed has no setter at all, and
-                // the store below writes the field — which is what `super.prop = v`
-                // means.
+                // For `super.prop = v` the writing class's own setter is the
+                // one overridden, so the search starts at its supertypes; a
+                // field-backed base has none and the store below runs.
                 if (super_owner) |owner| {
                     const mg = self.module.borrow();
                     defer mg.deinit();
@@ -250,10 +234,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                     }
                     break :blk null;
                 }
-                // FQN key first: distinct packs' same-simple-named classes
-                // keep distinct FQN keys even when the shared SIMPLE-name
-                // slot clobbers (kotlinx-coroutines-test's private `class
-                // AtomicBoolean` vs atomicfu's).
+                // FQN key first: it stays distinct where the simple slot clobbers.
                 const rf = classFqnOf(inst);
                 if (!std.mem.eql(u8, rf, class_name)) {
                     const pg = self.prog.borrow();
@@ -265,13 +246,9 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                     const pg = self.prog.borrow();
                     const hit = lookupPairFunc(pg.get().instance_prop_setters, class_name, real_name);
                     pg.deinit();
-                    // The simple slot is shared program-wide: accept its fid
-                    // for the receiver's OWN class only when the setter's
-                    // declaring package matches the receiver class's package
-                    // (a foreign namesake's accessor must not intercept a
-                    // field-backed write on an unrelated class; the
-                    // same-package hit keeps `var counter set(value)` custom
-                    // setters over their backing field).
+                    // The simple slot is shared program-wide, so its fid counts
+                    // only when the setter's declaring package matches the
+                    // receiver's; a foreign namesake must not intercept.
                     if (hit) |f| {
                         const mptr2: *const Module = self.module.asPtr();
                         const fp: []const u8 = if (mptr2.funcById(f)) |ff| ff.package else "";
@@ -279,10 +256,8 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                         if (rpkg.len == 0 or fp.len == 0 or std.mem.eql(u8, fp, rpkg)) break :blk f;
                     }
                 }
-                // The receiver's OWN class declaring the property as stored
-                // (a field-backed `override var x = 0`) shadows any inherited
-                // accessor: store the field directly, never reach a supertype's
-                // custom setter.
+                // The receiver's own class declaring the property as stored shadows
+                // any inherited accessor, so no supertype setter runs.
                 if (classDeclaresStoredProp(self, class_name, real_name)) break :blk null;
                 const rf2 = classFqnOf(inst);
                 if (!std.mem.eql(u8, rf2, class_name) and classDeclaresStoredProp(self, rf2, real_name)) break :blk null;
@@ -294,10 +269,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                         const hit = lookupPairFuncHop(self, pg.get().instance_prop_setters, cn, real_name);
                         pg.deinit();
                         if (hit) |f| break :blk f;
-                        // A stored override shadows any further-up accessor: an
-                        // `override var x = 0` on a middle class overrides a base
-                        // `open var x set(...)`, so a write stores the field
-                        // rather than reaching the base's custom setter.
+                        // A stored override shadows a base's `open var x set`.
                         if (classDeclaresStoredProp(self, cn, real_name)) break :blk null;
                     }
                 }
@@ -320,9 +292,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                     .err => |e| return .{ .err = e },
                 }
             }
-            // Anon-object / local-class custom setter: dispatch a `$set$<name>`
-            // anon method when one is registered for the receiver's class —
-            // the write-side mirror of the `$get$<name>` read path.
+            // An anon-object or local-class setter is a `$set$<name>` method.
             {
                 const setter_key = try std.fmt.allocPrint(allocator, "$set${s}", .{real_name});
                 defer allocator.free(setter_key);
@@ -338,8 +308,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                     }
                 }
             }
-            // Companion / parent / outer fallback for a write whose name
-            // is not an own member of this instance.
+            // Companion, parent and outer fallback for a non-member name.
             const has_own = blk: {
                 const g = inst.borrow();
                 defer g.deinit();
@@ -360,12 +329,9 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
             };
             if (is_own_member) plain_recordable = true;
             if (!has_own and !is_own_member) {
-                // Interface-delegation forwarding for writes: a `var` the
-                // delegated interface declares routes the write to the delegate
-                // object (`class Scope(s) : MutableState by s` — `scope.value = x`
-                // writes `s.value = x`). Mirrors the read-path forwarding; without
-                // it the write would fabricate an own backing field, diverging the
-                // delegator from its delegate.
+                // A `var` the delegated interface declares routes the write to the
+                // delegate, mirroring the read path; otherwise the write fabricates
+                // an own field and the two diverge.
                 const deleg_target: ?Value = blk: {
                     const g = inst.borrow();
                     defer g.deinit();
@@ -390,12 +356,9 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
         }
         {
             // A stored `override val/var` keeps its own backing cell under the
-            // owner-mangled key (JVM semantics); the read path resolves the
-            // nearest such cell in the runtime chain. A plain write must target
-            // that SAME cell — writing the base's plain `real_name` cell would
-            // leave the override read (which addresses the mangled cell) stale.
-            // `super.x = v` still targets the base's plain cell (super_owner
-            // set), so keep the plain name then.
+            // owner-mangled key, as on the JVM, and the read path resolves the
+            // nearest such cell, so a plain write must target that same cell.
+            // `super.x = v` keeps the plain name.
             const store_name: []const u8 = if (super_owner != null) real_name else blk: {
                 const any_cell = pglobal: {
                     const pg = self.module.borrow();
@@ -438,8 +401,7 @@ pub fn setFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
     return .{ .err = .{ .Unimplemented = msg } };
 }
 
-/// Walk an instance's class chain (parents + interfaces) and write the
-/// field through the first companion singleton that already declares it.
+/// Writes through the first companion singleton in the class chain declaring it.
 pub fn setCompanionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), name: []const u8, value: Value) Allocator.Error!?UnitResult {
     var queue: std.ArrayList(ObjRef(ClassDef)) = .empty;
     defer {
@@ -496,7 +458,6 @@ pub fn setCompanionParentWalk(self: *VmHost, allocator: Allocator, inst: ObjRef(
     return null;
 }
 
-/// Run an IR-lowered setter `fid` with `(receiver, value)` bound.
 pub fn evalSetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value, value: Value) Allocator.Error!UnitResult {
     const mptr: *const Module = self.module.asPtr();
     const func = mptr.funcById(fid) orelse return .{ .err = .{ .Type = "setter FuncId out of range" } };

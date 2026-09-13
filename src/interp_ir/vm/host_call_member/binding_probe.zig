@@ -58,10 +58,6 @@ const isDispatchMissFor = static_tail.isDispatchMissFor;
 const virtual_tail = @import("virtual_tail.zig");
 const instanceMethodKey = virtual_tail.instanceMethodKey;
 
-// -------------------------------------------------------------------------
-// callMember sub-handlers.
-// -------------------------------------------------------------------------
-
 pub fn delegateMember(self: *VmHost, allocator: Allocator, d: ObjRef(DelegateKind), name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     if (std.mem.eql(u8, name, "getValue")) {
         const state = blk: {
@@ -112,10 +108,8 @@ pub fn delegateMember(self: *VmHost, allocator: Allocator, d: ObjRef(DelegateKin
     return null;
 }
 
-/// The declared parameter names of `name` on the receiver's class (or a
-/// supertype), from the Kotlin declaration the pack ships. A pack-installed
-/// host binding carries no parameter names of its own, so this is what a
-/// named-argument call is matched against.
+/// Declared parameter names of `name` on the receiver's class or a supertype.
+/// A pack host binding carries none, so named arguments match against these.
 pub fn classMethodParamNames(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?[][]const u8 {
     if (receiver.* != .Instance) return null;
     var cname: []const u8 = "";
@@ -146,13 +140,8 @@ pub fn classMethodParamNames(self: *VmHost, allocator: Allocator, receiver: *con
     return null;
 }
 
-/// A named-argument call into a pack-installed host binding. The binding takes
-/// its arguments positionally, so the names are matched against the Kotlin
-/// declaration's parameters and the call is re-issued in declaration order.
-/// Without this the call fell through to the Kotlin body the pack ships, which
-/// for atomicfu is a stub that the host binding is meant to shadow — so
-/// `compareAndSet(expect = false, update = true)` always answered `false` while
-/// `compareAndSet(false, true)` worked.
+/// A named-argument call into a pack-installed host binding: the binding takes
+/// arguments positionally, so names match the Kotlin declaration's parameters.
 pub fn instanceBindingNamedProbe(
     self: *VmHost,
     allocator: Allocator,
@@ -199,11 +188,8 @@ pub fn instanceBindingNamedProbe(
         const v = s orelse return null;
         try filled.append(allocator, v);
     }
-    // The reorder is a pure function of (class, name, arg shape, name
-    // vector); memoize it so later calls of this shape rewrite to a
-    // POSITIONAL dispatch up front and skip the whole named ladder
-    // (the stdlib named probes, the per-call param-name walk, and this
-    // slot binding).
+    // The reorder is a pure function of (class, name, arg shape, name vector),
+    // so memoize it: later calls of this shape dispatch positionally up front.
     if (params.len <= 15 and args.len == params.len and args.len <= 15) {
         if (namedOrderKey(self, receiver, name, args, arg_names)) |k| {
             const perm = root_mod.ProgramImage.NamedPerm{ .n = @intCast(params.len), .src = src };
@@ -233,11 +219,8 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
         g.deinit();
     }
 
-    // Inline cache: a prior resolution of this (class, name, arg-sig) returns
-    // straight to its intrinsic (or to a cached "no intrinsic" miss) without
-    // rebuilding the probe FQNs or walking the supertype chain. Only a
-    // primitive-arg call is keyed (`instanceMethodKey`); anything else falls
-    // through to the full probe below.
+    // Inline cache on (class, name, arg-sig) holding a resolved intrinsic or a
+    // recorded miss. Only a primitive-arg call is keyed.
     const ib_key = instanceMethodKey(self, receiver, name, args);
     if (ib_key) |k| {
         if (instanceIntrinsicCacheGet(self, k)) |entry| {
@@ -249,15 +232,13 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
     }
 
     var probes: std.ArrayList([]const u8) = .empty;
-    // Probe FQNs are per-call scratch (all `allocPrint`ed below); free them and
-    // the list. No-op under the arena; reclaims under a freeing allocator.
+    // Probe FQNs are per-call scratch; freeing is a no-op under the arena.
     defer {
         if (runtime.freeScratch()) for (probes.items) |p| allocator.free(p);
         probes.deinit(allocator);
     }
     try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name }));
     try probes.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_name, name }));
-    // Walk supertype chain.
     {
         var queue: std.ArrayList([]const u8) = .empty;
         defer queue.deinit(allocator);
@@ -291,9 +272,7 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
             break :blk bg.get().resolve(p);
         };
         if (installed) |func| {
-            // A binding that declares itself inapplicable to this call shape
-            // (a property getter handed arguments) is not the target; keep
-            // walking so the library extension of the same name binds.
+            // A binding inapplicable to this call shape is not the target.
             if (stdlib.implementationApplicable(p, args)) |applies| {
                 if (!applies) continue;
             }
@@ -310,9 +289,7 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name }),
             try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_name, name }),
         };
-        // The synthesized lookup keys are scratch; free them once probed (a
-        // per-anon-method-call leak — the ktor pipeline calls anon-object
-        // methods on every request).
+        // The synthesized lookup keys are scratch; free them once probed.
         defer if (runtime.freeScratch()) {
             allocator.free(synth[0]);
             allocator.free(synth[1]);
@@ -326,8 +303,7 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
         }
     }
 
-    // Built-in Any/AutoCloseable extension probes, unless a real
-    // user/source extension on the receiver type chain exists.
+    // Builtin Any/AutoCloseable probes, unless a user extension on the chain exists.
     const recv_chain = try receiverClassChain(self, allocator, inst);
     defer {
         var it = recv_chain.keyIterator();
@@ -350,9 +326,8 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
         break :blk false;
     };
     if (!has_recv_ext) {
-        // Link-settled name → FQN map over the builtin kotlin.io /
-        // AutoCloseable / Any member surfaces; replaces the per-call
-        // probe loop with one deterministic edge per name.
+        // Link-settled name-to-FQN map over the builtin kotlin.io,
+        // AutoCloseable and Any surfaces: one deterministic edge per name.
         const mapped: ?[]const u8 = blk: {
             const pg = self.prog.borrow();
             defer pg.deinit();
@@ -367,8 +342,7 @@ pub fn instanceBindingProbe(self: *VmHost, allocator: Allocator, receiver: *cons
             }
         }
     }
-    // No intrinsic for this (class, name, arg-sig) through any probe stage:
-    // cache the miss so the next call returns immediately.
+    // No intrinsic through any probe stage: cache the miss.
     if (ib_key) |k| instanceIntrinsicCachePut(self, k, null, "");
     return null;
 }
@@ -432,12 +406,8 @@ pub fn extWithThisLongerThanArgs(self: *VmHost, name: []const u8, argc: usize) b
     const mod = mg.get();
     for (mod.funcsBySimpleName(name)) |fid| {
         if (mod.funcById(fid)) |f| {
-            // Only true EXTENSIONS gate the SAM arm. An interface's own
-            // method also leads with `this` (`ShouldPauseCallback.
-            // shouldPause()`), but for a CALLABLE receiver that method IS
-            // the SAM dispatch — invoking the callable is the reading
-            // kotlinc takes, exactly like `FlowCollector.emit` on a
-            // collector that arrived as a plain lambda.
+            // Only true extensions gate the SAM arm: an interface's own method
+            // also leads with `this` but is the SAM dispatch on a callable.
             if (f.kind != .top_level_extension and f.kind != .member_extension) continue;
             if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this") and f.params.len > argc) return true;
         }
@@ -451,8 +421,6 @@ pub fn lookupGlobalValue(self: *VmHost, name: []const u8) ?Value {
     return g.get().lookup(name);
 }
 
-/// Whether some user extension function named `name` declares a receiver
-/// (`this` param) whose simple type name matches one of `targets`.
 pub fn extensionTargetsAny(self: *VmHost, name: []const u8, targets: []const []const u8) bool {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -506,12 +474,8 @@ pub fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *con
         }
         cg.deinit();
     }
-    // Companion-extension receiver: `fun LocalDate.Companion.Format(...)` called
-    // as `LocalDate.Format { }`. Its declared receiver is `<Class>.Companion`,
-    // so add that probe name; `extensionTargetsAny` then matches it (by the
-    // "Companion" simple name), the companion singleton is constructed, and the
-    // extension dispatches on it. A false match against another class's
-    // companion extension simply misses on this companion and falls through.
+    // A companion-extension receiver is declared as `<Class>.Companion`, so add
+    // that probe name; the companion singleton is then built and dispatched on.
     var comp_probe_buf: [160]u8 = undefined;
     const comp_probe = std.fmt.bufPrint(&comp_probe_buf, "{s}.Companion", .{cls_name}) catch cls_name;
     try probe_classes.append(allocator, comp_probe);
@@ -532,18 +496,12 @@ pub fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *con
         }
     }
     if (comp_name) |cn| {
-        // First access through a companion member constructs the
-        // companion (once, thread-safe); a miss probe for a non-member
-        // (an enum entry, a nested class) leaves it uninitialized.
+        // The first access through a companion member constructs the companion.
         var singleton: ?Value = switch (try host_globals.objectSingletonForMember(self, cn, name)) {
             .ok => |maybe| maybe,
             .err => |e| return .{ .err = e },
         };
-        // A user extension whose declared receiver is the class (or an
-        // ancestor) also dispatches through the companion value:
-        // `Json.encodeToString(x)` binds `fun Json.encodeToString(...)`
-        // with the companion (`Json.Default`, an instance of `Json`) as
-        // its receiver, so construct the companion for it too.
+        // An extension on the class or an ancestor dispatches through it too.
         if (singleton == null and extensionTargetsAny(self, name, probe_classes.items)) {
             singleton = switch (try host_globals.ensureObjectSingleton(self, cn)) {
                 .ok => |maybe| maybe,
@@ -560,13 +518,9 @@ pub fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *con
                     .err => |e| switch (e) {
                         .Unimplemented => |m| {
                             if (!(std.mem.find(u8, m, "Vm::call_member") != null and std.mem.find(u8, m, no_such) != null)) return r;
-                            // Top-level miss for `name` on the singleton: fall
-                            // through to other dispatch; the miss message is
-                            // discarded here, so free it.
+                            // The discarded miss message is freed here.
                             freeDispatchMiss(allocator, r);
-                            // A companion property holding a callable
-                            // (`A.handler(x)` with `val handler = Handler()`
-                            // in the companion) calls the value's `invoke`.
+                            // A companion property holding a callable calls its `invoke`.
                             const field: ?Value = blk: {
                                 const ig = s.Instance.borrow();
                                 defer ig.deinit();
@@ -586,9 +540,7 @@ pub fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *con
             }
         }
     }
-    // An enum entry as the callee (`A.ONE(42)`, or `ONE(42)` through
-    // `import A.ONE`): the entry's `operator fun invoke`. Naming an entry
-    // is an active use, so the enum initializes first.
+    // An enum entry as callee runs its `invoke`; naming one initializes the enum.
     if (is_enum and !std.mem.eql(u8, name, "values") and !std.mem.eql(u8, name, "valueOf")) {
         const names_entry = blk: {
             const cg = cls.borrow();
@@ -617,14 +569,12 @@ pub fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *con
             }
         }
     }
-    // `values()` / `valueOf()` are static uses of the enum class: its first
-    // one initializes it.
+    // `values()`/`valueOf()` are static uses, so the first one initializes it.
     if (is_enum and ((std.mem.eql(u8, name, "values") and args.len == 0) or
         (std.mem.eql(u8, name, "valueOf") and args.len == 1 and args[0] == .String)))
     {
         if (try host_globals.ensureEnumInit(self, cls)) |e| return .{ .err = e };
     }
-    // Enum.values()
     if (is_enum and std.mem.eql(u8, name, "values") and args.len == 0) {
         const cg = cls.borrow();
         var items: std.ArrayList(Value) = .empty;
@@ -640,7 +590,6 @@ pub fn classCompanionAndEnum(self: *VmHost, allocator: Allocator, receiver: *con
             .backing = null,
         }) };
     }
-    // Enum.valueOf("X")
     if (is_enum and std.mem.eql(u8, name, "valueOf") and args.len == 1 and args[0] == .String) {
         const cg = cls.borrow();
         const sg = args[0].String.borrow();
@@ -689,11 +638,7 @@ pub fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const
             break :blk true;
         };
         if (dispatch_lambda) {
-            // A SAM method declared with `context(A, …)` parameters passes
-            // each context, resolved from the call site's context scope, as
-            // a leading argument of the wrapped callable (kotlinc's adapted
-            // reference `valueParamFun(a: A, i: String)` for
-            // `context(i: A) fun accept(s: String)`).
+            // A `context(...)` SAM method takes each resolved context as a leading arg.
             var with_ctx: std.ArrayList(Value) = .empty;
             defer with_ctx.deinit(allocator);
             const call_args: []const Value = blk: {
@@ -707,13 +652,8 @@ pub fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const
                 try with_ctx.appendSlice(allocator, args);
                 break :blk with_ctx.items;
             };
-            // A fun interface whose single abstract method is a MEMBER
-            // EXTENSION (`fun interface MeasurePolicy { fun
-            // MeasureScope.measure(...) }`): kotlinc scopes the SAM lambda's
-            // body with the extension receiver as `this`, so a bare
-            // `layout(...)` inside `MeasurePolicy { ... }` resolves against
-            // the MeasureScope. Bind the innermost enclosing receiver that
-            // implements the declared extension-receiver type.
+            // When the abstract method is a member extension, kotlinc scopes the
+            // lambda body with the innermost enclosing receiver of that type as `this`.
             if (samMemberExtRecvType(self, cls_name, name)) |recv_ty| {
                 const entries = try ir.eval.enclosingEntriesAlloc(allocator);
                 defer allocator.free(entries);
@@ -730,11 +670,8 @@ pub fn samInstanceDispatch(self: *VmHost, allocator: Allocator, receiver: *const
     return null;
 }
 
-/// Dispatch `receiver.name(args)` through an enclosing anonymous-object
-/// instance whose class declares a member-extension method of this name
-/// accepting the receiver: the anon-site method runs with the receiver
-/// bound as its extension `this` and the anon instance as the enclosing
-/// dispatch receiver.
+/// Dispatch through an enclosing anonymous-object instance declaring a
+/// member-extension `name`: the receiver becomes its extension `this`.
 pub fn enclosingAnonMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
@@ -751,9 +688,7 @@ pub fn enclosingAnonMemberExtDispatch(self: *VmHost, allocator: Allocator, recei
             cg.deinit();
         }
         const hit = lookupAnonMethod(self, allocator, cls_name, arity_name, name) orelse continue;
-        // Only a member-EXTENSION method serves this arm; its lowered form
-        // binds the extension receiver as `this` (params[0]) with the
-        // declared receiver type.
+        // Only a member extension serves this arm; params[0] is its receiver.
         const hg = hit.module.borrow();
         const hf = funcAt(hg.get(), hit.func);
         const is_member_ext = hf != null and hf.?.kind == .member_extension and
@@ -769,12 +704,8 @@ pub fn enclosingAnonMemberExtDispatch(self: *VmHost, allocator: Allocator, recei
     return null;
 }
 
-/// A member EXTENSION declared by a NAMED class on the enclosing receiver
-/// tower (`class T { private fun List<Annotation>.getCustom() = … }`). The
-/// lowerer binds such a call statically when it can name the receiver's type;
-/// when the receiver's static type is unknown — a property read whose declared
-/// type comes from another module — the call arrives here instead, and without
-/// this tail it reports a member miss on the builtin receiver.
+/// A member extension declared by a named class on the enclosing receiver tower.
+/// The lowerer binds it statically unless the receiver's static type is unknown.
 pub fn enclosingNamedMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const mptr: *const Module = self.module.asPtr();
     const candidates = mptr.funcsBySimpleName(name);
@@ -807,9 +738,7 @@ pub fn enclosingNamedMemberExtDispatch(self: *VmHost, allocator: Allocator, rece
             defer ir.eval.popEnclosing();
             return try callFuncRec(self, allocator, mptr, fid, all);
         }
-        // `class Test : IFoo by impl` forwards the interface's member
-        // extensions to the delegate: inside `with(test)`, `S("O").f()`
-        // runs `impl`'s override with `impl` as the dispatch receiver.
+        // `class Test : IFoo by impl` forwards member extensions to the delegate.
         var di: usize = 0;
         while (delegateFieldAt(&e.v, di)) |d| : (di += 1) {
             if (d != .Instance) continue;
@@ -856,17 +785,13 @@ pub fn delegateFieldAt(v: *const Value, idx: usize) ?Value {
     return null;
 }
 
-/// Both memo slices point into the module's own name storage, so they are
-/// dangling once its program ends; the generation the program boundary bumps
-/// is what keeps a later `mem.eql` from reading freed IR.
+/// Both slices point into the module's name storage and dangle once its program
+/// ends; the generation bumped at that boundary keeps later reads off freed IR.
 pub threadlocal var sam_ext_memo_name: ?[]const u8 = null;
 pub threadlocal var sam_ext_memo_ty: ?[]const u8 = null;
 pub threadlocal var sam_ext_memo_gen: u32 = 0;
 
-/// The extension-receiver type of `name` when some `fun interface` declares it as
-/// its abstract member-EXTENSION method, else null. `fun interface MeasurePolicy`
-/// declares `fun MeasureScope.measure(measurables, constraints)`, so `measure`
-/// answers `MeasureScope`.
+/// The receiver type when a `fun interface` declares `name` as a member extension.
 pub fn samAbstractExtRecvType(self: *VmHost, name: []const u8) ?[]const u8 {
     if (sam_ext_memo_gen != cacheGen()) {
         sam_ext_memo_name = null;
@@ -883,11 +808,7 @@ pub fn samAbstractExtRecvType(self: *VmHost, name: []const u8) ?[]const u8 {
         var it = mg.get().registry.iface_member_ext_recv.iterator();
         while (it.next()) |e| {
             if (!std.mem.eql(u8, e.key_ptr.b, name)) continue;
-            // Only a FUN interface can be served by a lambda. An ordinary
-            // interface's abstract member extension (`Density.toPx`) never is, and
-            // matching one would hand the call to whatever same-arity lambda happens
-            // to sit on the receiver tower -- every no-arg `toPx()` would find some
-            // `() -> Unit` content lambda.
+            // Only a fun interface can be served by a lambda.
             if (!classIsFunInterface(self, e.key_ptr.a)) continue;
             found = e.value_ptr.*;
             break;
@@ -898,26 +819,8 @@ pub fn samAbstractExtRecvType(self: *VmHost, name: []const u8) ?[]const u8 {
     return found;
 }
 
-/// Dispatch `name(args)` where the dispatch receiver is a LAMBDA that was SAM-converted
-/// to a fun interface whose abstract method is a member extension.
-///
-/// `with(measurePolicy) { measure(measurables, constraints) }` is the shape: when the
-/// policy came from `Layout(modifier, content) { measurables, constraints -> … }` the
-/// receiver is the lambda itself, and the lambda IS the method body. Without this arm
-/// the callable had no member of that name, and the walk fell through to a
-/// same-named member extension on an unrelated class -- every SAM-lambda layout ran
-/// `BasicText`'s private `EmptyMeasurePolicy`, which sizes to the incoming
-/// constraints, so a text field measured itself to the unbounded scroll height.
-///
-/// The extension receiver comes off the enclosing tower: the innermost `this` that
-/// implements the interface method's declared receiver type (the coordinator, a
-/// `MeasureScope`).
-/// Whether the enclosing `this` chain holds a fun-interface (SAM) instance
-/// whose abstract member extension is `name`. When one is present the call
-/// belongs to `enclosingSamMemberExtDispatch` — the callable receiver is the
-/// abstract method's EXTENSION receiver, not a SAM-converted body — so
-/// `samMemberExtOnCallable` (which would invoke the receiver as the body)
-/// must stand down.
+/// Whether the enclosing `this` chain holds a fun-interface (SAM) instance whose
+/// abstract member extension is `name`; `samMemberExtOnCallable` then stands down.
 pub fn enclosingSamInstanceHandles(self: *VmHost, allocator: Allocator, name: []const u8) Allocator.Error!bool {
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
@@ -939,10 +842,8 @@ pub fn enclosingSamInstanceHandles(self: *VmHost, allocator: Allocator, name: []
 
 pub fn samMemberExtOnCallable(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8,args: []const Value) Allocator.Error!?EvalResult {
     const recv_ty = samAbstractExtRecvType(self, name) orelse return null;
-    // Stand down when an enclosing SAM instance owns this abstract method:
-    // the callable receiver is then the extension receiver, not the body,
-    // and `enclosingSamMemberExtDispatch` serves it through the instance's
-    // wrapped target.
+    // Stand down when an enclosing SAM instance owns this abstract method: the
+    // callable receiver is then the extension receiver, not the body.
     if (try enclosingSamInstanceHandles(self, allocator, name)) return null;
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
@@ -954,9 +855,7 @@ pub fn samMemberExtOnCallable(self: *VmHost, allocator: Allocator, receiver: *co
     return null;
 }
 
-/// Dispatch `receiver.name(args)` through an enclosing SAM instance whose
-/// fun interface declares `name` as an abstract member extension accepting
-/// this receiver: the stored lambda runs with the receiver bound as `this`.
+/// Dispatch through an enclosing SAM instance's stored lambda, receiver as `this`.
 pub fn enclosingSamMemberExtDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
@@ -975,10 +874,7 @@ pub fn enclosingSamMemberExtDispatch(self: *VmHost, allocator: Allocator, receiv
         }
         const recv_ty = samMemberExtRecvType(self, cls_name, name) orelse continue;
         if (!receiverImplementsType(self, receiver, recv_ty)) continue;
-        // The abstract slot's extension receiver maps to the wrapped
-        // callable. A bound callable reference (`x::foo`) or plain function
-        // value takes it as the leading ARGUMENT; a receiver lambda
-        // (`F { … this … }`) takes it as `this`.
+        // A bound reference takes the extension receiver as a leading argument.
         if (isBoundReference(&target.?)) {
             const call_args = try allocator.alloc(Value, args.len + 1);
             defer allocator.free(call_args);
@@ -991,19 +887,8 @@ pub fn enclosingSamMemberExtDispatch(self: *VmHost, allocator: Allocator, receiv
     return null;
 }
 
-/// Dispatch `receiver.name(args)` through a LAMBDA on the enclosing receiver tower
-/// that stands in for a fun interface whose abstract member extension is `name`.
-///
-/// `with(measurePolicy) { measure(measurables, constraints) }`: the policy came from
-/// `Layout(modifier, content) { measurables, constraints -> … }` and is still a raw
-/// closure, so it carries no `__sam_target__` for the SAM-instance arm to find. The
-/// closure IS the method body, and the call's receiver (a `MeasureScope`) is the
-/// extension receiver the abstract slot declares.
-///
-/// Without this the walk fell through to the by-name extension fallback, which
-/// answered with a same-named member extension on an unrelated class -- every
-/// SAM-lambda layout ran `BasicText`'s `EmptyMeasurePolicy`, sizing itself to the
-/// incoming constraints.
+/// Dispatch through a lambda on the enclosing receiver tower standing in for a
+/// fun interface whose abstract member extension is `name`: the closure is the body.
 pub fn enclosingSamLambdaDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const recv_ty = samAbstractExtRecvType(self, name) orelse return null;
     if (!receiverImplementsType(self, receiver, recv_ty)) return null;
@@ -1024,9 +909,7 @@ pub fn enclosingSamLambdaDispatch(self: *VmHost, allocator: Allocator, receiver:
     return null;
 }
 
-/// The declared extension-receiver type head of `cls`'s abstract member
-/// extension named `name`, when the class (a fun interface serving a SAM
-/// conversion) declares one — null otherwise.
+/// The `context(...)` parameter types of `cls`'s abstract member `name`, `|`-separated.
 pub fn samMemberCtxTypes(self: *VmHost, cls: []const u8, name: []const u8) ?[]const u8 {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -1038,8 +921,7 @@ pub fn samMemberExtRecvType(self: *VmHost, cls: []const u8, name: []const u8) ?[
     return mg.get().registry.iface_member_ext_recv.get(.{ .a = cls, .b = name });
 }
 
-/// A `receiver::member` reference is carried as a synthetic Instance holding
-/// the captured receiver and the member name.
+/// A `receiver::member` reference is a synthetic Instance holding both parts.
 pub fn isBoundReference(receiver: *const Value) bool {
     if (receiver.* != .Instance) return false;
     const g = receiver.Instance.borrow();

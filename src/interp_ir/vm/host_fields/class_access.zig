@@ -35,20 +35,16 @@ const field_cache = @import("field_cache.zig");
 const lateinitReadError = field_cache.lateinitReadError;
 const storedNullIsLateinit = field_cache.storedNullIsLateinit;
 
-/// Companion forwarding + nested-class/singleton resolution on a
-/// `Value::Class` receiver (the early companion path of `get_field`).
-/// Resolve `name` from `class_name`'s own companion object — the companion
-/// singleton itself for a `Foo.Companion` access, else a companion
-/// `const`/`val`/getter member. Returns null when the class has no companion or
-/// the companion has no such member (so a caller can keep walking the class
-/// hierarchy); `.err` on an init failure.
+/// The early companion path of `get_field`: the companion singleton itself for a
+/// `Foo.Companion` access, else a companion `const`, `val` or getter member. Null
+/// when there is neither, so the caller keeps walking the hierarchy.
 pub fn companionMemberOfClass(self: *VmHost, allocator: Allocator, class_name: []const u8, name: []const u8) Allocator.Error!?EvalResult {
     const cn: []const u8 = blk: {
         const g = self.module.borrow();
         defer g.deinit();
         break :blk g.get().registry.companion_singletons.get(class_name) orelse return null;
     };
-    // `Counter.Factory` — the companion name resolves to the singleton itself.
+    // A named companion resolves to the singleton itself.
     const suffix = try std.fmt.allocPrint(allocator, "$Companion${s}", .{name});
     defer allocator.free(suffix);
     if (std.mem.endsWith(u8, cn, suffix)) {
@@ -63,11 +59,8 @@ pub fn companionMemberOfClass(self: *VmHost, allocator: Allocator, class_name: [
     };
     if (singleton) |s| {
         if (s == .Instance) {
-            // A property with a CUSTOM GETTER runs its getter, even when a
-            // backing field is also present (`var p = 1; get() = field++`):
-            // reading the stored slot directly would skip the getter's body
-            // and its side effects. Only a property with no getter reads the
-            // slot below.
+            // A custom getter runs even with a backing field present; only a
+            // getterless property reads the slot below.
             const comp_cls0 = className(s.Instance);
             const custom_getter: ?FuncId = blk: {
                 const pg = self.prog.borrow();
@@ -89,16 +82,14 @@ pub fn companionMemberOfClass(self: *VmHost, allocator: Allocator, class_name: [
                 if (v == .Null and storedNullIsLateinit(s.Instance, name)) {
                     return try lateinitReadError(allocator, name);
                 }
-                // A `by`-delegated companion property stores its delegate
-                // in the slot; the read is the delegate's `getValue`.
+                // A `by`-delegated property holds its delegate in the slot.
                 if (runtimeClassDelegatesProp(s.Instance, name)) {
                     const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInit(allocator, name) } };
                     return try self.callMember(allocator, &v, "getValue", &.{ s, prop_ref });
                 }
                 return ok(v);
             }
-            // No plain backing field — the companion member may be a
-            // `val` with a custom getter.
+            // No backing field, so the member may be a `val` with a getter.
             const comp_cls = className(s.Instance);
             const getter: ?FuncId = blk: {
                 const pg = self.prog.borrow();
@@ -122,9 +113,7 @@ pub fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const 
         defer g.deinit();
         break :blk g.get().name;
     };
-    // Companion member — the class's own companion first, then inherited ones
-    // up the superclass chain: `Sub.MinId` binds `Base.Companion.MinId` when
-    // `MinId` is a `const`/`val` on the superclass's companion.
+    // Own companion first, then inherited ones up the superclass chain.
     {
         var cur: ?[]const u8 = cls_name;
         var seen: std.ArrayList([]const u8) = .empty;
@@ -136,13 +125,9 @@ pub fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const 
             cur = firstSupertype(self, cn);
         }
     }
-    // A nested class registered under its enclosing-qualified FQN
-    // (`Outer.Nested`): the exact declaration resolves before the
-    // lifted-simple-name probes below. Those keys are ambiguous when two
-    // packages declare same-named nested members (gapbuffer's vs
-    // linkbuffer's `Operation.Ups` both lift as `Operation$Ups`), and the
-    // name-keyed singleton gate would construct whichever twin registered
-    // the name — so a nested object resolves its singleton BY CLASS ID.
+    // The enclosing-qualified FQN resolves the exact declaration before the
+    // lifted-simple-name probes below, whose keys collide across packages, so a
+    // nested object resolves its singleton by class id and not by name.
     {
         const cls_fqn = blk: {
             const g = receiver.Class.borrow();
@@ -150,11 +135,8 @@ pub fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const 
             break :blk g.get().fqn;
         };
         if (cls_fqn.len != 0) {
-            // A classifier nested in the class's COMPANION is reachable
-            // through the class name too (`A.Serializer` for
-            // `class A { companion object { object Serializer } }`); probe
-            // it here, before the bare-name fallbacks below can answer with
-            // an unrelated imported classifier of the same simple name.
+            // A classifier nested in the companion is reachable through the class
+            // name too, and is probed before the bare-name fallbacks.
             const direct_fqn = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ cls_fqn, name });
             defer allocator.free(direct_fqn);
             const companion_fqn = try std.fmt.allocPrint(allocator, "{s}.Companion.{s}", .{ cls_fqn, name });
@@ -204,9 +186,7 @@ pub fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const 
             }
         }
     }
-    // A nested object lifted as `Outer$Name`: resolve the mangled
-    // singleton (then class) for a qualified `Outer.Name` access. First
-    // access constructs the singleton through the gate.
+    // A qualified `Outer.Name` resolves the lifted `Outer$Name` singleton.
     const mangled = try std.fmt.allocPrint(allocator, "{s}${s}", .{ cls_name, name });
     defer allocator.free(mangled);
     switch (try host_globals.ensureObjectSingleton(self, mangled)) {
@@ -220,8 +200,7 @@ pub fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const 
         defer cg.deinit();
         if (cg.get().get(mangled)) |def| return ok(.{ .Class = def });
     }
-    // Nested singleton object (lifted under its simple name) wins over
-    // the class.
+    // A nested singleton lifted under its simple name wins over the class.
     switch (try host_globals.ensureObjectSingleton(self, name)) {
         .ok => |maybe| if (maybe) |v| {
             if (v == .Instance) return ok(v);
@@ -235,7 +214,6 @@ pub fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const 
             if (v == .Instance) return ok(v);
         }
     }
-    // Nested-class access on a class receiver.
     {
         const cg = self.classes.borrow();
         defer cg.deinit();
@@ -244,13 +222,9 @@ pub fn classReceiverField(self: *VmHost, allocator: Allocator, receiver: *const 
     return null;
 }
 
-/// The simple name of the lexically-enclosing class of a nested-class
-/// instance, derived from its FQN (`a.b.Outer.Inner` -> the class whose
-/// FQN is `a.b.Outer`, returning `Outer`). Null when the receiver's FQN
-/// has no parent class (a top-level class, whose parent segment is a
-/// package). The FQN nesting is unambiguous where the simple-name
-/// `enclosing_class` map collides for nested classes that share a simple
-/// name across different enclosing classes.
+/// Simple name of the lexically-enclosing class from the receiver's FQN:
+/// `a.b.Outer.Inner` gives `Outer`, null when the parent segment is a package.
+/// FQN nesting disambiguates what the simple-name `enclosing_class` map cannot.
 pub fn enclosingSimpleFromFqn(self: *VmHost, inst: ObjRef(InstanceData)) ?[]const u8 {
     const fqn: []const u8 = blk: {
         const g = inst.borrow();
@@ -262,9 +236,8 @@ pub fn enclosingSimpleFromFqn(self: *VmHost, inst: ObjRef(InstanceData)) ?[]cons
     const last_dot = std.mem.findScalarLast(u8, fqn, '.') orelse return null;
     const parent_fqn = fqn[0..last_dot];
     const parent_simple = if (std.mem.findScalarLast(u8, parent_fqn, '.')) |d| parent_fqn[d + 1 ..] else parent_fqn;
-    // Confirm the parent FQN names an actual class (not a package): the
-    // class table is keyed by simple name, so verify the matching entry's
-    // FQN equals the parent FQN before treating it as the enclosing class.
+    // The class table is keyed by simple name, so the entry's FQN must equal the
+    // parent FQN before it counts as the enclosing class.
     const cg = self.classes.borrow();
     defer cg.deinit();
     const def = cg.get().get(parent_simple) orelse return null;
@@ -274,14 +247,8 @@ pub fn enclosingSimpleFromFqn(self: *VmHost, inst: ObjRef(InstanceData)) ?[]cons
     return null;
 }
 
-/// Reflection-style accessors on a `Value::Class` value (`simpleName`,
-/// `isData`, `members`, `supertypes`, `sealedSubclasses`, …).
-/// The companion-object singleton instance for class `cls_simple`, or
-/// null when the class has no companion. Used to seed a companion
-/// extension property's getter `this`.
-/// The companion for a class DEF: its fqn's dotted suffixes longest-first
-/// (`a.b.Outer.C` -> `b.Outer.C`, `Outer.C`, `C`) so a nested class with a
-/// same-named cousin in another outer finds its own companion.
+/// The companion singleton for a class def, probing its fqn's dotted suffixes
+/// longest-first so a nested class with a same-named cousin finds its own one.
 pub fn companionInstanceForDef(self: *VmHost, fqn: []const u8, simple: []const u8) Allocator.Error!?Value {
     var start: usize = 0;
     while (true) {
@@ -300,8 +267,7 @@ pub fn companionInstanceForDef(self: *VmHost, fqn: []const u8, simple: []const u
         }
         const dot = std.mem.findScalarPos(u8, fqn, start, '.') orelse break;
         start = dot + 1;
-        // Never the bare simple name: that key belongs to a top-level
-        // class, and a nested class's own (mangled) name resolves below.
+        // Never the bare simple name: that key belongs to a top-level class.
         if (std.mem.findScalarPos(u8, fqn, start, '.') == null) break;
     }
     return companionInstanceForClass(self, simple);
@@ -320,9 +286,8 @@ pub fn companionInstanceForClass(self: *VmHost, cls_simple: []const u8) Allocato
     };
 }
 
-/// The companion object (or object singleton) a CLASS value carries its
-/// static members on: `X.serializer()` dispatches there. Null when the
-/// class has neither.
+/// The companion or object singleton a class value carries its static members
+/// on, where `X.serializer()` dispatches. Null when it has neither.
 pub fn companionOfClassValue(self: *VmHost, cls_val: *const Value) Allocator.Error!?Value {
     if (cls_val.* != .Class) return null;
     const g = cls_val.Class.borrow();
@@ -348,28 +313,23 @@ pub fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Val
     const g = cls.borrow();
     defer g.deinit();
     const cd = g.get();
-    // `$companion`: the class's companion instance whatever it is named
-    // (`companion object Named`), initialized on read — the lookup the
-    // serialization runtime's KClass -> generated serializer path needs.
+    // `$companion` is the companion instance whatever its name, initialized on
+    // read, which the KClass to generated-serializer path needs.
     if (std.mem.eql(u8, name, "$companion")) {
         if (runtime.envOnce("KLIO_COMPANION_TRACE") != null) std.debug.print("[companion] fqn={s} name={s}\n", .{ cd.fqn, cd.name });
-        // A nested class registers under its lifted name and its
-        // enclosing-chain-qualified name; the bare simple name belongs to
-        // a top-level class and must never answer for a nested one
-        // (`Tst$B` without a companion is not `pb.B`).
+        // A nested class registers under its lifted and enclosing-qualified
+        // names; the bare simple name belongs to a top-level one.
         if (try companionInstanceForDef(self, cd.fqn, cd.name)) |v| return ok(v);
         if (try companionInstanceForClass(self, cd.name)) |v| return ok(v);
-        // A LOCAL class's companion is not in the build-time
-        // `companion_singletons`; registerNestedClasses publishes it as the
-        // runtime global `$companion:<class>` instead.
+        // A local class's companion is not in the build-time
+        // `companion_singletons`; it is the global `$companion:<class>`.
         var cbuf: [192]u8 = undefined;
         if (std.fmt.bufPrint(&cbuf, "$companion:{s}", .{cd.name}) catch null) |ck| {
             if (host_globals.lookupGlobal(self, ck)) |v| return ok(v);
         }
         return ok(.Null);
     }
-    // An anonymous object's class has no name: both reflective names
-    // are null, matching kotlinc.
+    // An anonymous object's class has no name, so both reflective names are null.
     if (std.mem.eql(u8, name, "simpleName")) {
         if (cd.is_anonymous) return ok(.Null);
         return ok(.{ .String = try runtime.strInit(allocator, classSimpleName(cd.name)) });
@@ -400,9 +360,7 @@ pub fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Val
     if (std.mem.eql(u8, name, "isInterface")) return ok(.{ .Bool = cd.is_interface });
     if (std.mem.eql(u8, name, "isFun")) return ok(.{ .Bool = cd.is_fun_interface });
     if (std.mem.eql(u8, name, "objectInstance")) {
-        // Reading `objectInstance` initializes the object, matching the
-        // JVM (the read reaches the INSTANCE static field through class
-        // initialization).
+        // Reading `objectInstance` initializes the object, as the JVM does.
         if (cd.is_object) {
             switch (try host_globals.ensureObjectSingleton(self, cd.name)) {
                 .ok => |maybe| if (maybe) |v| return ok(v),
@@ -471,9 +429,7 @@ pub fn classReflective(self: *VmHost, allocator: Allocator, receiver: *const Val
                 }
             }
             if (!matches) continue;
-            // The class table keys a lifted nested class under more than one
-            // name, so the same definition can be reached twice; report each
-            // subclass once.
+            // A lifted nested class is keyed under more than one name.
             var seen = false;
             for (items.items) |prev| {
                 const pg = prev.Class.borrow();

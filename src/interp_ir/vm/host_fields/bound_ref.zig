@@ -1,5 +1,4 @@
-//! Bound callable references (`recv::name`): their parts, the adaptation
-//! stamp a reference carries, and the `member_ref` entry point.
+//! Bound callable references (`recv::name`): their parts, adaptation stamp, and construction.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -18,8 +17,6 @@ const common = @import("common.zig");
 const ok = common.ok;
 const typeHeadOf = common.typeHeadOf;
 
-/// The parts of a bound/qualified callable reference synth
-/// (`recv::name`): its name, receiver and adaptation stamp.
 pub const BoundRefParts = struct { name: []const u8, receiver: Value, adapt: []const u8 };
 
 pub fn boundRefParts(v: *const Value) ?BoundRefParts {
@@ -49,10 +46,8 @@ pub fn boundRefParts(v: *const Value) ?BoundRefParts {
     return .{ .name = name, .receiver = recv, .adapt = adapt };
 }
 
-/// A reference taken at a function-typed slot whose shape differs from the
-/// target's signature (fewer values through defaults or a vararg, more
-/// through a vararg, or a result coerced to Unit) is an adapted reference:
-/// stamp the synth so equality tells the adaptations apart.
+/// Stamp a reference whose shape differs from the target signature (defaults, a
+/// vararg, or a result coerced to Unit) so equality tells the adaptations apart.
 pub fn stampRefAdaptation(self: *VmHost, allocator: Allocator, v: *const Value, name: []const u8, exact: ?ir.FuncId, arity: i16, unit: bool, heads: ?[]const u8) Allocator.Error!void {
     if (v.* != .Instance) return;
     const parts = boundRefParts(v) orelse return;
@@ -95,8 +90,7 @@ pub fn stampRefAdaptation(self: *VmHost, allocator: Allocator, v: *const Value, 
                     vararg_at = i + @as(usize, if (bound) 0 else 1);
                 };
             } else {
-                // A module class keeps its methods in the IR module: walk the
-                // class chain by fqn through the member index.
+                // A module class keeps its methods in the IR module: walk the chain by fqn.
                 const mg = self.module.borrow();
                 defer mg.deinit();
                 var cur: ?runtime.ObjRef(runtime.ClassDef) = c.clone();
@@ -152,20 +146,10 @@ pub fn stampRefAdaptation(self: *VmHost, allocator: Allocator, v: *const Value, 
     try g.get().define(allocator, "__adapt__", .{ .String = try runtime.strInitOwned(allocator, stamp) });
 }
 
-/// Per-candidate probe for the bare-name resolver's innermost-first walk:
-/// resolves only what the receiver itself owns — instance fields,
-/// declared properties and their getters, applicable extension
-/// properties, builtin member properties. Every global / outer-receiver /
-/// companion adoption tail is disabled, so a candidate cannot "resolve" a
-/// name it does not own and shadow a real member of a receiver further
-/// out; the walk's own terminal arm decides the global fallback, and
-/// companions ride the walk as their own candidates.
-/// Does class `cn` declare property `name` as a STORED member — a body
-/// `val`/`var` or a constructor-parameter property — as opposed to a custom
-/// accessor? Such a declaration overrides an inherited accessor-based property,
-/// so the setter walk must store the field directly rather than fall through to
-/// a supertype's custom setter (`override var x = 0` shadowing `open var x
-/// set(...)`).
+/// Whether `cn` declares `name` as a stored member, a body `val`/`var` or a
+/// constructor-parameter property, rather than a custom accessor. A stored
+/// declaration overrides an inherited accessor, so the setter walk stores the
+/// field directly instead of falling through to a supertype's custom setter.
 pub fn classDeclaresStoredProp(self: *VmHost, cn: []const u8, name: []const u8) bool {
     const cg = self.classes.borrow();
     defer cg.deinit();
@@ -181,21 +165,14 @@ pub fn classDeclaresStoredProp(self: *VmHost, cn: []const u8, name: []const u8) 
     return false;
 }
 
-/// Whether stored-field `fname` is the property a scope-qualified
-/// `$sgetter$<owner>\u{1f}<prop>` read named: the full name ends with the
-/// separator + the field name. Used by the (class, name) memo and the
-/// GetField site memo so entries keyed by the FULL scoped name can serve a
-/// stored slot whose field is stored under the bare property name.
+/// Whether `fname` is the property a scope-qualified `$sgetter$<owner>\u{1f}<prop>`
+/// name reads: the full name ends with the separator plus the field name.
 pub fn sgetterNameMatches(full: []const u8, fname: []const u8) bool {
     if (!std.mem.startsWith(u8, full, "$sgetter$")) return false;
     if (full.len <= fname.len) return false;
     if (!std.mem.endsWith(u8, full, fname)) return false;
     return full[full.len - fname.len - 1] == '\u{1f}';
 }
-
-// -------------------------------------------------------------------------
-// member_ref
-// -------------------------------------------------------------------------
 
 pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     // `X::class` is a class reference, not a member ref.
@@ -207,8 +184,7 @@ pub fn memberRef(self: *VmHost, allocator: Allocator, receiver: *const Value, na
         }
         return ok(receiver.*);
     }
-    // `recv::method` -> a tiny synth Instance whose `__bound_receiver__` /
-    // `__bound_name__` fields drive the call_value path.
+    // A synth Instance whose `__bound_receiver__`/`__bound_name__` fields drive call_value.
     const identity = blk: {
         const g = self.instance_id_counter.borrowMut();
         defer g.deinit();

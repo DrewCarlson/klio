@@ -1,5 +1,5 @@
-//! The field-read entry points and their fast paths: the accessor-getter
-//! serve, the field-site route claims, and the plain stored-slot lookups.
+//! Field-read entry points and their fast paths: the accessor-getter serve, the
+//! field-site route claims, and the plain stored-slot lookups.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -51,24 +51,19 @@ pub fn getMemberField(self: *VmHost, allocator: Allocator, receiver: *const Valu
     return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true, false));
 }
 
-/// `getMemberField` with IMPORTED extension properties suppressed: the
-/// implicit-receiver walk's first pass, so an outer receiver's MEMBER wins
-/// over an inner receiver's imported extension (Kotlin resolves by lexical
-/// scope — a class member outranks an import). The walk retries with the
-/// plain form when no member answers anywhere.
+/// `getMemberField` with imported extension properties suppressed: a class member
+/// outranks an import, so on the implicit-receiver walk's first pass an outer
+/// receiver's member beats an inner receiver's imported extension.
 pub fn getMemberFieldNoExt(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!EvalResult {
     return unwrapCellRead(try getFieldInner(self, allocator, receiver, name, false, true, true));
 }
 
 pub const FieldSiteClaim = struct { cls: u64, route: u64 };
 
-/// Frameless accessor-getter serve: when `f`'s body is the canonical
-/// `LoadParam #0; GetField; return` shape and the receiver's class claimed
-/// the func's single-fill route as a plain stored slot, read the slot
-/// directly — no frame, no activation, no chain seeding. The slot serve is
-/// exactly what the (class, name) memo would return inside the frame's
-/// GetField, re-verified by name; lateinit/delegate shapes decline to the
-/// frame path, as does a getter-routed or unclaimed (class, name).
+/// Frameless accessor-getter serve: a `LoadParam #0; GetField; return` body
+/// whose class claimed the func's route as a plain stored slot reads that slot
+/// with no frame, returning what the (class, name) memo would inside GetField,
+/// re-verified by name. Every other shape takes the frame path.
 pub fn accessorFastGet(self: *VmHost, mod: *const Module, f: *const ir.Func, receiver: *const Value) ?EvalResult {
     if (receiver.* != .Instance) return null;
     const fc = f.accessorFieldConstIn(mod) orelse return null;
@@ -86,10 +81,8 @@ pub fn accessorFastGet(self: *VmHost, mod: *const Module, f: *const ir.Func, rec
         cls = @intCast(g.get().class.identity());
     }
     if (claimed == 0) {
-        // First resolution claims the func for this class when the memo
-        // already routes the read to a stored slot; the claiming call
-        // itself still runs the frame path (the memo may not be filled
-        // until that run completes).
+        // First resolution claims the func once the memo routes the read to a
+        // stored slot; that call itself still takes the frame path.
         if (fieldSiteRoute(self, receiver, fname)) |r| {
             if (r.route & 3 == 1) {
                 if (@cmpxchgStrong(u64, @constCast(&f.acc_cls), 0, r.cls, .acq_rel, .monotonic) == null) {
@@ -117,25 +110,16 @@ pub fn accessorFastGet(self: *VmHost, mod: *const Module, f: *const ir.Func, rec
     return ok(v);
 }
 
-/// The packed field-read route a `GetField` instruction may claim for the
-/// receiver's class: {stored slot index | getter FuncId} + a 2-bit verdict,
-/// sourced from the (class, name) memo `getFieldInner` maintains — so a
-/// claim exists only for reads that resolved as a plain stored slot or a
-/// class getter, with every earlier ladder arm already declined. Null when
-/// the memo has no entry for the pair.
-/// Whether a stored slot's NULL value is a plain null rather than an unset
-/// `lateinit` (whose read must throw) — decided from the class, so a site memo
-/// can serve nulls instead of declining every one of them to the ladder.
+/// Whether a stored null is plain and not an unset `lateinit`, whose read must
+/// throw. Decided from the class, so a site memo can serve nulls.
 pub fn storedNullServable(self: *VmHost, receiver: *const Value, name: []const u8) bool {
     _ = self;
     if (receiver.* != .Instance) return false;
     return !storedNullIsLateinit(receiver.Instance, name);
 }
 
-/// The WRITE-side sibling of `fieldSiteRoute`: a plain stored-slot verdict for
-/// a `SetField`, from the write memo the interpreter's own store fills. A
-/// custom setter, an unfilled memo or a name that resolves to no field
-/// declines, so the caller keeps the full store path.
+/// The write-side `fieldSiteRoute`, off the write memo the store fills; anything
+/// but a plain stored slot declines.
 pub fn fieldWriteSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?FieldSiteClaim {
     if (receiver.* != .Instance) return null;
     const inst = receiver.Instance;
@@ -157,15 +141,16 @@ pub fn fieldWriteSiteRoute(self: *VmHost, receiver: *const Value, name: []const 
     return null;
 }
 
+/// The packed field-read route a `GetField` may claim for the receiver's class:
+/// a stored slot index or getter FuncId plus a 2-bit verdict, from the
+/// (class, name) memo, so a claim exists only where every earlier rung declined.
 pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?FieldSiteClaim {
     if (receiver.* != .Instance) return null;
     if (std.mem.eql(u8, name, "coroutineContext")) return null;
-    // A property getter reading its own backing store carries the SCOPED
-    // name (`$sgetter$<owner>\u{1f}<prop>`), which no (class, name) memo
-    // holds — so every such read declined a route and sent the whole body
-    // to a frame. When the receiver really is the scoped owner the read is
-    // the plain property on the receiver's own class, which is what Kotlin's
-    // virtual dispatch resolves it to.
+    // A property getter reading its own backing store carries the scoped name
+    // `$sgetter$<owner>\u{1f}<prop>`, which no (class, name) memo holds. When
+    // the receiver is that owner, Kotlin's virtual dispatch resolves the read
+    // to the plain property on the receiver's own class.
     if (std.mem.startsWith(u8, name, "$sgetter$")) {
         const rest = name["$sgetter$".len..];
         if (std.mem.findScalar(u8, rest, '\u{1f}')) |sep| {
@@ -192,9 +177,9 @@ pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?
     const NONE = root.ProgramImage.FieldReadHit.NONE;
     if (hit.getter != NONE) return .{ .cls = cls, .route = (@as(u64, hit.getter) << 2) | 2 };
     if (hit.stored_idx != NONE) {
-        // An outer-hop slot read packs [63:32]=outer class identity (low
-        // 32 bits, exact for identity-counter values), [31:8]=slot index,
-        // [7:2]=hop count, tag 3.
+        // An outer-hop slot read packs [63:32] outer class identity (low 32
+        // bits, exact for identity-counter values), [31:8] slot index,
+        // [7:2] hop count, tag 3.
         if (hit.outer_hops != 0) {
             if (hit.stored_idx > 0xFFFFFF or hit.outer_hops > 63) return null;
             return .{ .cls = cls, .route = (@as(u64, @truncate(hit.outer_cls)) << 32) |
@@ -205,28 +190,21 @@ pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?
     return null;
 }
 
-/// Run a class property getter claimed by a `GetField` site memo.
 pub fn runFieldGetter(self: *VmHost, allocator: Allocator, fid: FuncId, receiver: Value) Allocator.Error!EvalResult {
     return evalGetterTagged(self, allocator, fid, receiver, "site-memo");
 }
 
-/// Whether the getter behind a claimed field-read route is itself a leaf
-/// expression. A leaf body only reads fields and does primitive arithmetic,
-/// so running one is repeatable — which is what lets the frameless leaf
-/// evaluator chain through a property whose backing is another property
-/// (`SlotWriter.size` reads `capacity`, which divides `groups.size`).
+/// Whether the getter behind a claimed route is a leaf expression: field reads and
+/// arithmetic only, so running it is repeatable and the leaf evaluator may chain
+/// through a property backed by another property.
 pub fn fieldGetterIsLeaf(self: *VmHost, fid: FuncId) bool {
     const mptr: *const Module = self.module.asPtr();
     const f = mptr.funcById(fid) orelse return false;
     return f.leafExprBody() and funcRunsItsBody(self, fid);
 }
 
-/// Whether calling `fid` really runs its lowered body. A symbol the link
-/// step settled onto a native binding, or one that redirects to a sibling
-/// declaration, resolves elsewhere — the frameless leaf evaluator must not
-/// interpret the body in either case.
-/// The module as a stable plain pointer (the leaf gate's field-route
-/// thunk chases trivial accessor getters through it).
+/// Whether calling `fid` runs its lowered body; a symbol the link step settled on
+/// a native binding, or one redirecting elsewhere, must not be interpreted.
 pub fn hostModulePtr(self: *VmHost) *const Module {
     return self.module.asPtr();
 }
@@ -238,13 +216,9 @@ pub fn funcRunsItsBody(self: *VmHost, fid: FuncId) bool {
         pg.get().resolvedRedirects(fid).len == 0;
 }
 
-/// Kotlin's implicit receivers stack. A bare name inside an object literal's
-/// member that the object does not own resolves against the receivers in scope
-/// where the literal was WRITTEN — `testScheduler`, read inside an
-/// `object : CompositionTestScope { … }` written in a `runTest { }` lambda, is
-/// that lambda's `TestScope`. The literal closed over those receivers as its
-/// `this` / `this@…` captures, so probe them on a miss. Only a dispatch MISS
-/// reaches here, so a name that already resolves keeps its path.
+/// Kotlin's implicit receivers stack, so a bare name an object literal does not
+/// own resolves against the receivers in scope where the literal was written,
+/// which it closed over as `this` and `this@` captures. Only a miss gets here.
 pub fn lexicalReceiverFallback(
     self: *VmHost,
     allocator: Allocator,
@@ -266,8 +240,7 @@ pub fn lexicalReceiverFallback(
     fldTls().anon_recv_depth += 1;
     defer fldTls().anon_recv_depth -= 1;
     for (caps) |c| {
-        // Only the LABELLED receivers: the plain `this` capture is the object's
-        // `outer` link, already on the normal lookup path.
+        // Labelled receivers only; the plain `this` capture is the `outer` link.
         if (!std.mem.startsWith(u8, c.name, "this@")) continue;
         if (c.value == .Null or c.value == .Unit) continue;
         switch (try getField(self, allocator, &c.value, name)) {
@@ -289,18 +262,13 @@ pub fn lexicalReceiverFallback(
 }
 
 /// For the loop JIT: the index of `name` in the receiver's instance field list,
-/// but only when `name` is a fully plain stored property — an Instance receiver, a
-/// stored field of that name, and no custom getter *or setter* for it anywhere in
-/// the class hierarchy. Returns null otherwise (a computed getter/setter,
-/// delegated, or extension property is not a direct field access and must stay
-/// interpreted), so the index is safe for both direct reads and direct writes. The
-/// field order is fixed per class, so the index is stable for any instance of the
-/// class the call site was compiled against (re-checked by the entry class guard).
+/// only for a fully plain stored property with no custom accessor anywhere in
+/// the hierarchy, so it serves direct reads and writes alike. Field order is
+/// fixed per class, so it holds for any instance of the compiled-against class.
 pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) ?u32 {
     if (receiver.* != .Instance) return null;
-    // Reject if any class in the hierarchy declares a custom getter/setter or
-    // DELEGATES the property (`by lazy` stores the delegate object under the
-    // property's name — a raw read would leak the wrapper).
+    // Reject a custom accessor anywhere in the hierarchy, or a delegated
+    // property: `by lazy` stores the delegate under the property's name.
     if (runtimeClassDelegatesProp(receiver.Instance, name)) return null;
     {
         var cur: ?[]const u8 = className(receiver.Instance);
@@ -330,10 +298,8 @@ pub fn plainStoredFieldIndex(self: *VmHost, allocator: Allocator, receiver: *con
     return null;
 }
 
-/// The zero a DECLARED backing-field property of the receiver's class (or an
-/// ancestor's) holds before its initializer runs. Null when the class declares
-/// no such property, or when the property has no backing field — `lateinit`,
-/// delegated and accessor-only properties must still fail their read.
+/// The zero a declared backing-field property of the class or an ancestor holds
+/// before its initializer runs; null without one, so a `lateinit` read fails.
 pub fn declaredBackingZero(self: *VmHost, receiver: *const Value, name: []const u8) ?Value {
     var cur: ?[]const u8 = className(receiver.Instance);
     var depth: usize = 0;
@@ -374,11 +340,9 @@ pub fn isScalarTypeName(n: []const u8) bool {
     return false;
 }
 
-/// Like `plainStoredFieldIndex`, but only when the field's declared type is a
-/// non-nullable scalar. The loop JIT requires this before inlining a method that
-/// also writes a field: a non-nullable scalar read never deopts, so a re-run of
-/// the inlined call (on some other deopt) can never double an already-applied
-/// write. Returns null for a nullable or non-scalar field (keep it interpreted).
+/// `plainStoredFieldIndex` restricted to a non-nullable scalar field, which the
+/// loop JIT requires before inlining a method that also writes a field: such a
+/// read never deopts, so re-running the call cannot double an applied write.
 pub fn plainStoredScalarFieldNN(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) ?u32 {
     const idx = plainStoredFieldIndex(self, allocator, receiver, name) orelse return null;
     var cur: ?[]const u8 = className(receiver.Instance);
@@ -402,11 +366,8 @@ pub fn plainStoredScalarFieldNN(self: *VmHost, allocator: Allocator, receiver: *
             }
             for (dg.get().body_properties) |p| {
                 if (std.mem.eql(u8, p.name, name)) {
-                    // Non-nullable scalar by declaration (or by a primitive
-                    // literal initializer). `primitive_zero` alone answered
-                    // only for a property with NO initializer, so `var n = 0`
-                    // — the ordinary shape — was never provably non-null and
-                    // every method touching one compiled deopt-capable.
+                    // Non-nullable scalar by declaration or by a primitive
+                    // literal initializer; `primitive_zero` covers neither.
                     const nn = p.scalar_nn or p.primitive_zero != null;
                     cg.deinit();
                     return if (nn) idx else null;
@@ -419,21 +380,9 @@ pub fn plainStoredScalarFieldNN(self: *VmHost, allocator: Allocator, receiver: *
     return null;
 }
 
-/// `suppress_cc_redirect` skips the suspend-implicit `coroutineContext`
-/// redirect for this one resolution (an explicit `recv.coroutineContext`
-/// read, lowered to the `$coroutineContext$explicit` sentinel). A
-/// parameter scoped to the resolution, threaded through the fallback
-/// ladder's own recursion, so it cannot leak into a dispatched getter
-/// body or across a re-entrant dispatch.
-/// `member_probe` restricts resolution to what the receiver itself owns
-/// (see `getMemberField`); the adoption tails — globals, enclosing
-/// receivers, outer chain, companions — are skipped so the bare-name
-/// walk's candidate order decides precedence.
-/// Free a discarded field-resolution-miss message. `getFieldInner` allocates a
-/// `Vm::get_field …` string on a total miss; the delegate / companion / outer
-/// fallbacks discard it while probing the next receiver. Recognizable by its
-/// prefix, so a static `.Unimplemented` literal is never freed. No-op unless a
-/// freeing backend is active.
+/// Frees a discarded field-miss message: `getFieldInner` allocates a
+/// `Vm::get_field ...` string the fallbacks drop while probing the next receiver,
+/// and the prefix keeps static literals unfreed.
 pub fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
     if (!runtime.freeScratch()) return;
     if (e == .Unimplemented and std.mem.startsWith(u8, e.Unimplemented, "Vm::get_field")) {
@@ -441,9 +390,8 @@ pub fn freeFieldMiss(allocator: Allocator, e: EvalError) void {
     }
 }
 
-/// The properties a builtin receiver declares as MEMBERS (as opposed to the
-/// stdlib's extension properties, such as `indices` / `lastIndex`, which a user
-/// extension may legitimately shadow).
+/// Properties a builtin receiver declares as members, unlike stdlib extension
+/// properties such as `indices`, which a user extension may shadow.
 pub fn builtinMemberProperty(receiver: *const Value, name: []const u8) bool {
     return switch (receiver.*) {
         .Array => std.mem.eql(u8, name, "size"),
@@ -457,10 +405,7 @@ pub fn builtinMemberProperty(receiver: *const Value, name: []const u8) bool {
     };
 }
 
-/// Fill the class's `<class-companion-or-self>` memo with the resolved
-/// singleton. A losing concurrent filler re-retains the same immortal
-/// singleton — benign. The memo's copy is retained once for the class's
-/// lifetime.
+/// Fills the companion-or-self memo; its copy is retained for the class's life.
 pub fn fillCompanionReadMemo(cls: ObjRef(ClassDef), v: Value) void {
     const g = cls.borrow();
     defer g.deinit();

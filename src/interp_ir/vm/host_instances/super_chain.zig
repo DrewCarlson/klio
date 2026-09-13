@@ -1,6 +1,5 @@
-//! Running the superclass constructor chain: the intrinsic constructors, the
-//! throwable argument binding, the chain walk itself, and the init blocks a
-//! class and an anonymous object run.
+//! The superclass constructor chain: intrinsic constructors, throwable argument
+//! binding, the chain walk, and the init blocks a class or object runs.
 
 const std = @import("std");
 
@@ -83,15 +82,9 @@ const scalarRetag = ctor_select.scalarRetag;
 const secondaryCtors = ctor_select.secondaryCtors;
 const sideTableKey = ctor_select.sideTableKey;
 
-// -------------------------------------------------------------------------
-// Methods this flow depends on, kept here so the construction path is
-// self-contained; they read shared `VmHost` state.
-// -------------------------------------------------------------------------
-
 pub fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
-    // Post-link the bindings table is read-only; consult it unguarded
-    // (gated on the published link flag) instead of taking two shared
-    // reader locks per lookup.
+    // Post-link the bindings table is read-only, so the published link flag
+    // gates an unguarded read instead of two shared reader locks per lookup.
     {
         const img = self.prog.asPtrConst();
         if (@atomicLoad(bool, &img.resolved_linked, .acquire)) {
@@ -192,7 +185,6 @@ pub fn isBuiltinThrowableName(name: []const u8) bool {
     return false;
 }
 
-/// Whether the instance already carries a non-null field under `key`.
 pub fn hasNonNullField(inst: ObjRef(InstanceData), key: []const u8) bool {
     const g = inst.borrow();
     defer g.deinit();
@@ -221,14 +213,10 @@ pub fn pushField(g: *InstanceData, allocator: Allocator, key: []const u8, v: Val
     g.invalidateShape();
 }
 
-/// Bind the conventional `(message[, cause])` super-args onto a leaf
-/// Throwable instance.
 pub fn bindThrowableArgs(self: *VmHost, inst: ObjRef(InstanceData), args: []const Value, only_when_unset: bool) Allocator.Error!void {
-    // The unset probe runs before the exclusive borrow below: the
-    // instance lock is not reentrant, so a read taken under the held
-    // write borrow deadlocks the constructing thread against itself.
-    // A sole throwable argument is the cause, and the message is its
-    // rendering, as the JVM constructor defines it.
+    // The unset probe runs before the exclusive borrow below: the instance lock
+    // is not reentrant. A sole throwable argument is the `cause`, and `message`
+    // is its rendering, as the JVM constructor defines it.
     const single_cause = args.len == 1 and (args[0] == .Exception or
         (args[0] == .Instance and host_call_member.instanceIsThrowable(self, self.allocator, args[0].Instance)));
     const skip_single = only_when_unset and args.len == 1 and
@@ -262,7 +250,6 @@ pub fn bindThrowableArgs(self: *VmHost, inst: ObjRef(InstanceData), args: []cons
 
 pub const UnitOrErr = union(enum) { ok: void, err: EvalError };
 
-/// Dispatch the parent's matching secondary-ctor chain on the same leaf.
 pub fn runSuperCtorChain(
     self: *VmHost,
     leaf: *const Value,
@@ -272,9 +259,7 @@ pub fn runSuperCtorChain(
     arg_names: ?[]const ?[]const u8,
     outer_hint: ?*const Value,
 ) Allocator.Error!UnitOrErr {
-    // An omitted trailing vararg is the empty array on this route too: an
-    // entry body class `OK { … }` of `enum class Test(vararg xs: Int)`
-    // delegates with no arguments and `xs` must still be empty, not absent.
+    // An omitted trailing vararg is the empty array on this route too.
     const args: []const Value = blk: {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -298,8 +283,7 @@ pub fn runSuperCtorChain(
     if (isBuiltinThrowableName(class_name)) {
         if (leaf.* == .Instance) {
             try bindThrowableArgs(self, leaf.Instance, args, true);
-            // fillInStackTrace at construction (JVM order): the throwable's
-            // super-chain just established it as a Throwable, so capture here.
+            // JVM order fills the stack trace at construction.
             var tv = leaf.*;
             try ir.eval.attachStackTrace(self.allocator, &tv);
         }
@@ -310,8 +294,7 @@ pub fn runSuperCtorChain(
     defer if (chain_def) |d| d.deinit();
     const prev_bounds = if (chain_def) |d| installCtorBounds(d) else common.ctor_bounds;
     defer common.ctor_bounds = prev_bounds;
-    // A secondary constructor takes the call when the primary cannot (its
-    // arity, defaults and vararg considered); otherwise only an exact fit.
+    // A secondary ctor takes the call when the primary cannot, else exact fit.
     const primary_takes = if (chain_def) |d| primaryCanTake(self, d, args.len) else true;
     const chosen: ?root.build.SecondaryCtorEntry = if (primary_takes)
         chooseSecondaryCtor(self, entries, args)
@@ -320,8 +303,7 @@ pub fn runSuperCtorChain(
     const packed_args: ?[]Value = if (chosen) |e| try packSecondaryVarargs(self, self.allocator, e, args) else null;
     defer if (packed_args) |pk| self.allocator.free(pk);
     const sargs: []const Value = packed_args orelse args;
-    // The chosen constructor's declared numeric parameter types retag
-    // integer arguments the same way the primary path does.
+    // Declared numeric parameter types retag integer args as on the primary.
     var args_typed_list: std.ArrayList(Value) = .empty;
     defer args_typed_list.deinit(self.allocator);
     try args_typed_list.appendSlice(self.allocator, sargs);
@@ -331,7 +313,6 @@ pub fn runSuperCtorChain(
             if (arg.* != .Int) continue;
             if (scalarRetag(e.param_type_heads[i], arg.Int)) |rv| arg.* = rv;
         }
-        // Parameters the call omits take their defaults, in order.
         var idx = args_typed_list.items.len;
         while (idx < e.param_count) : (idx += 1) {
             const dfid = (if (idx < e.default_arg_thunks.len) e.default_arg_thunks[idx] else null) orelse break;
@@ -351,12 +332,8 @@ pub fn runSuperCtorChain(
     }
     const args_typed: []Value = args_typed_list.items;
     const entry = chosen orelse {
-        // No secondary ctor takes this shape: the class delegates through
-        // its PRIMARY ctor (`open class A(msg: String) : B(msg)`). Bind
-        // its property params onto the leaf where the leaf does not
-        // already carry them (child overrides win), evaluate the
-        // supertype-call args against the primary params, and continue
-        // the chain with the parent.
+        // No secondary ctor fits, so the class delegates through its primary:
+        // bind its property params only where the leaf lacks them, child wins.
         const def = classDefByName(self, sideTableKey(class_fqn, class_name)) orelse return .{ .ok = {} };
         defer def.deinit();
         if (leaf.* == .Instance) {
@@ -364,9 +341,8 @@ pub fn runSuperCtorChain(
             const pp = dg.get().primary_params;
             var k: usize = 0;
             while (k < args.len) : (k += 1) {
-                // A named super-constructor argument (`: Base(objects = 2)`)
-                // binds to the base parameter of that name, not by position;
-                // an unnamed argument keeps its positional slot.
+                // A named super-constructor argument binds to the base
+                // parameter of that name; an unnamed one keeps its slot.
                 const target: usize =
                     if (arg_names) |names|
                         (if (k < names.len) (if (names[k]) |nm| (paramIndexByName(pp, nm) orelse k) else k) else k)
@@ -399,8 +375,7 @@ pub fn runSuperCtorChain(
         }
         const pref = firstNonInterfaceSuper(self, def) orelse return .{ .ok = {} };
         if (std.mem.eql(u8, pref.name, class_name)) return .{ .ok = {} };
-        // The labels of this class's super-constructor call apply to the
-        // parent's parameters, so thread them into the parent's frame.
+        // This class's super-call labels name the parent's parameters.
         const parent_names = parentCtorArgNames(self, class_fqn, class_name);
         return try runSuperCtorChain(self, leaf, pref.fqn, pref.name, parent_args.items, parent_names, outer_hint);
     };
@@ -427,8 +402,7 @@ pub fn runSuperCtorChain(
             .err => |e| return .{ .err = e },
         }
     } else if (entry.is_super) {
-        // The `super(...)` target is the parent of the class whose ctor
-        // we're currently running.
+        // `super(...)` targets the parent of the class whose ctor is running.
         var parent_name: ?[]const u8 = null;
         var parent_fqn: ?[]const u8 = null;
         if (classDefByName(self, sideTableKey(class_fqn, class_name))) |def| {
@@ -470,10 +444,9 @@ pub fn runSuperCtorChain(
 
 pub const ChainEntry = struct { name: []const u8, fqn: ?[]const u8 = null, args: []Value };
 
-/// Evaluate every named class-to-class delegation below the direct
-/// superclass of an object expression. The direct call has already been
-/// evaluated in the enclosing lexical scope; subsequent calls use each
-/// class's primary-constructor parameters, just like named construction.
+/// Evaluates every class-to-class delegation below an object expression's direct
+/// superclass, which the enclosing lexical scope already evaluated; the rest bind
+/// against each class's primary-ctor parameters.
 pub fn extendAnonymousParentCtorArgs(
     self: *VmHost,
     allocator: Allocator,
@@ -561,9 +534,6 @@ pub fn extendAnonymousParentCtorArgs(
     return .{ .ok = {} };
 }
 
-/// Whether a chain entry denotes the same class as (`fqn`, `name`):
-/// resolved-FQN identity when both sides carry one, written-name
-/// equality otherwise.
 pub fn chainEntryIs(entry: *const ChainEntry, fqn: ?[]const u8, name: []const u8) bool {
     if (entry.fqn) |ef| {
         if (fqn) |f| return std.mem.eql(u8, ef, f);
@@ -571,10 +541,8 @@ pub fn chainEntryIs(entry: *const ChainEntry, fqn: ?[]const u8, name: []const u8
     return std.mem.eql(u8, entry.name, name);
 }
 
-/// Resolve a supertype written as a simple name from `child_fqn`'s
-/// perspective: the child's own package first (Kotlin scoping), then the
-/// program-wide simple-name view — so a same-simple-name class from
-/// another package cannot become the parent.
+/// Resolves a simple-name supertype from `child_fqn`: own package first, as
+/// Kotlin scoping requires, then the program-wide simple-name view.
 pub fn classDefForSuper(self: *VmHost, child_fqn: []const u8, child_name: []const u8, sup_name: []const u8) ?ObjRef(ClassDef) {
     const pkg = ir.packageOfFqn(child_fqn, child_name);
     if (pkg.len != 0) {
@@ -588,15 +556,13 @@ pub fn classDefForSuper(self: *VmHost, child_fqn: []const u8, child_name: []cons
 
 pub const SuperRef = struct { name: []const u8, fqn: ?[]const u8 };
 
-/// First supertype of `def` that is not a known interface — the parent
-/// the ctor chain delegates to. Resolution is package-aware via
-/// `classDefForSuper`; a name with no runtime def (a builtin Throwable
-/// parent) is returned with a null fqn, preserving the written name.
+/// First supertype of `def` that is not a known interface, the parent the ctor
+/// chain delegates to. A name with no runtime def gets a null fqn, so a builtin
+/// Throwable parent keeps its written name.
 pub fn firstNonInterfaceSuper(self: *VmHost, def: ObjRef(ClassDef)) ?SuperRef {
     const dg = def.borrow();
     defer dg.deinit();
-    // Single-fill memo: the answer is a pure function of the (immutable)
-    // class graph, and this runs on every instance construction.
+    // Single-fill memo over the immutable class graph; on every construction.
     switch (@atomicLoad(u8, @constCast(&dg.get().first_super_state), .acquire)) {
         1 => return null,
         2 => {
@@ -627,17 +593,15 @@ pub fn firstNonInterfaceSuper(self: *VmHost, def: ObjRef(ClassDef)) ?SuperRef {
             }
             return .{ .name = n, .fqn = sfqn };
         }
-        // NOT memoized: the runtime class table can still grow, and a
-        // parent that registers later must be found by the next call.
+        // Unmemoized: the class table can still grow a later-registered parent.
         return .{ .name = n, .fqn = null };
     }
-    // Every supertype resolved and none was a class: stable — memoize.
+    // Every supertype resolved and none was a class, so this answer is stable.
     @atomicStore(u8, &@constCast(dg.get()).first_super_state, 1, .release);
     return null;
 }
 
-/// Run the class's `init { … }` blocks whose source position equals
-/// `before_prop_idx`. Each block takes `this` plus the class's args.
+/// Runs the `init { }` blocks at position `before_prop_idx` over `this` + args.
 pub fn runInitBlocksAt(
     self: *VmHost,
     cls: ObjRef(ClassDef),
@@ -657,9 +621,7 @@ pub fn runInitBlocksAt(
         defer g.deinit();
         break :blk g.get().init_blocks.get(sideTableKey(cls_fqn, cls_name)) orelse {
             // A runtime-registered local class has no build-time side-table
-            // entry; its init blocks lowered as `$init$block$<idx>` anon
-            // thunks at registration (with the enclosing scope's captured
-            // cells bound). Run the ones due at this property position.
+            // entry: its init blocks lowered as `$init$block$<idx>` thunks.
             return runAnonInitBlocksAt(self, cls, cls_name, before_prop_idx, inst_value, fallback_args);
         };
     };
@@ -688,9 +650,8 @@ pub fn runInitBlocksAt(
         switch (fr) {
             .err => {},
             .ok => |f| {
-                // See the body-prop-init note: an `init { }` block is class-body
-                // scope too, so a lambda created inside it must snapshot the
-                // instance as an enclosing receiver.
+                // An `init { }` block is class-body scope, so a lambda made
+                // inside it snapshots the instance as enclosing receiver.
                 var encl_v = inst_value.*;
                 ir.eval.pushEnclosing(&encl_v);
                 defer ir.eval.popEnclosing();
@@ -708,17 +669,11 @@ pub fn runInitBlocksAt(
     return .{ .ok = {} };
 }
 
-/// Run a runtime-registered local class's `$init$block$<idx>` anon thunks
-/// whose declaration position matches `before_prop_idx`. The ClassDef's
-/// `init_block_property_positions` (filled by `synthLocalClassDef`) carries
-/// each block's body-property index; a block declared after every property
-/// has position == body_properties.len, matching the terminal call.
-/// `ctor_args` are the constructor arguments, forwarded so an `init` block can
-/// read a primary-constructor PARAMETER that is not a property. The thunks
-/// declare the primary params (see `lowerAndRegisterMethods`), so without the
-/// arguments a bare `key` in `init { require(key.isNotEmpty()) }` fell through
-/// to a field read on `this` — `Vm::get_field key on RC4Key` in kotlinx-io's
-/// rawSourceSample.
+/// Runs a local class's `$init$block$<idx>` thunks declared at
+/// `before_prop_idx`; `init_block_property_positions` holds each block's
+/// body-property index, and a block after every property sits at
+/// `body_properties.len`. `ctor_args` lets an `init` block read a ctor
+/// parameter that is not a property, since the thunks declare the primary params.
 pub fn runAnonInitBlocksAt(
     self: *VmHost,
     cls: ObjRef(ClassDef),

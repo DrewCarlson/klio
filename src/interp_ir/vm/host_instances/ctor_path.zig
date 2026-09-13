@@ -1,7 +1,6 @@
-//! Choosing a construction path for a class: the `ClassDef` accessors the
-//! choice reads, SAM conversion, interface and companion construction,
-//! secondary-constructor dispatch, super delegation, the primary constructor
-//! path, and the outer instance an inner class captures.
+//! Choosing a construction path for a class: SAM conversion, interface and
+//! companion construction, secondary-constructor dispatch, super delegation,
+//! the primary ctor, and the outer instance an inner class captures.
 
 const std = @import("std");
 
@@ -90,8 +89,6 @@ const pushField = super_chain.pushField;
 const retainField = super_chain.retainField;
 const runSuperCtorChain = super_chain.runSuperCtorChain;
 
-// --- ClassDef accessors (each takes a borrowed handle) ---
-
 pub fn classDefName(d: ObjRef(ClassDef)) []const u8 {
     const g = d.borrow();
     defer g.deinit();
@@ -128,14 +125,9 @@ pub fn classDefIsInner(d: ObjRef(ClassDef)) bool {
     return g.get().is_inner;
 }
 
-/// Wrap a callable into an instance of the `fun interface` named by a
-/// parameter's declared type — Kotlin's SAM conversion, which happens at the
-/// call boundary, so the value the callee sees IS an instance of the
-/// interface. The caller's reference MOVES into the wrapper (the argument slot
-/// it came from is overwritten with the wrapper), so nothing is retained here.
-///
-/// Null when no conversion applies: not a callable, a `Function` slot, a type
-/// parameter, or a name that is not a `fun interface`.
+/// Kotlin's SAM conversion at the call boundary: wrap a callable into an
+/// instance of the `fun interface` a parameter declares. The caller's reference
+/// moves into the wrapper, so nothing is retained; null when nothing applies.
 pub fn samWrapForParamType(self: *VmHost, allocator: Allocator, v: *const Value, ty_name: []const u8) Allocator.Error!?Value {
     if (v.* != .IrClosure) return null;
     if (ty_name.len <= 2 or std.mem.startsWith(u8, ty_name, "Function")) return null;
@@ -162,7 +154,6 @@ pub fn samWrapForParamType(self: *VmHost, allocator: Allocator, v: *const Value,
     return .{ .Instance = inst };
 }
 
-/// Whether `ty_name` names a `fun interface`, for the per-func mask below.
 pub fn paramTypeIsFunInterface(self: *VmHost, ty_name: []const u8) bool {
     if (ty_name.len <= 2 or std.mem.startsWith(u8, ty_name, "Function")) return false;
     const bare = std.mem.trimEnd(u8, ty_name, "?");
@@ -197,11 +188,9 @@ pub fn throwInstantiation(self: *VmHost, allocator: Allocator, comptime fmt: []c
     }) } };
 }
 
-/// Interface "construction": `List(size){init}`, SAM conversion, or a
-/// same-named factory function.
+/// Interface "construction": `List(size){init}`, SAM conversion, or a factory.
 pub fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), args: []const Value) Allocator.Error!EvalResult {
     const class_name = classDefName(class_def);
-    // `List(size){init}` / `MutableList(size){init}`.
     if ((std.mem.eql(u8, class_name, "List") or std.mem.eql(u8, class_name, "MutableList")) and args.len == 2) {
         if (args[0].asI64()) |size| {
             const init = args[1];
@@ -223,7 +212,6 @@ pub fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef
             }) };
         }
     }
-    // SAM conversion: `FunInterface(lambda)`.
     if (classDefIsFunInterface(class_def) and args.len == 1) {
         const identity = nextInstanceId(self);
         var fields: std.ArrayList(InstanceData.Field) = .empty;
@@ -239,7 +227,6 @@ pub fn interfaceConstruct(self: *VmHost, allocator: Allocator, class_def: ObjRef
         });
         return .{ .ok = .{ .Instance = inst } };
     }
-    // Same-named factory function.
     if (try pickFactory(self, allocator, class_name, args)) |fid| {
         const module_ref = self.module.clone();
         defer module_ref.deinit();
@@ -284,8 +271,7 @@ pub fn funcParamHasDefault(self: *VmHost, fid: FuncId, idx: usize) bool {
     return false;
 }
 
-/// Returns the constructed instance value, or `null` to fall through to
-/// the primary-ctor path.
+/// Returns null to fall through to the primary-ctor path.
 pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), args: []const Value, outer_hint: ?*const Value) Allocator.Error!?EvalResult {
     const ctor_keepalive = self.ka.mark();
     defer self.ka.restore(ctor_keepalive);
@@ -294,24 +280,17 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
     defer common.ctor_bounds = prev_bounds;
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
-    // A defaulted secondary is a candidate only when the primary cannot
-    // take the call (a class without a primary, or an arity the primary and
-    // its own defaults do not cover).
+    // A defaulted secondary is a candidate only when the primary cannot take the call.
     const primary_takes = primaryCanTake(self, class_def, args.len);
     var chosen: ?root.build.SecondaryCtorEntry = if (primary_takes)
         chooseSecondaryCtor(self, entries, args)
     else
         chooseSecondaryCtorDefaulted(self, entries, args);
-    // Everything below constructs further values; the site's static heads
-    // describe THIS call's arguments only.
+    // Below constructs further values; the site's heads describe this call.
     common.ctor_static_heads = null;
     if (chosen == null) {
         for (entries) |e| {
-            // A hidden binary-compat constructor must not swallow an
-            // under-applied call the PRIMARY constructor serves:
-            // `KeyboardOptions()` was picking the hidden
-            // `constructor(autoCorrect: Boolean = Default.autoCorrectOrDefault, …)`
-            // over the primary, and then evaluating its default expressions.
+            // A hidden binary-compat ctor must not swallow a call the primary serves.
             if (e.low_priority) continue;
             if (e.param_count > args.len) {
                 var all_default = true;
@@ -323,10 +302,7 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
                     }
                 }
                 if (!all_default) continue;
-                // The provided args must type-match this larger candidate's
-                // params (same subtype guard as chooseSecondaryCtor), so the
-                // fallback does not bind a class value to a mismatched slot and
-                // re-select the wrong ctor a `this(...)` delegation should skip.
+                // Type-match first, so the fallback cannot bind a mismatched slot.
                 var typ_ok = true;
                 var j: usize = 0;
                 while (j < args.len and j < e.param_type_heads.len) : (j += 1) {
@@ -346,8 +322,6 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
     defer if (packed_args) |pk| allocator.free(pk);
     const sargs: []const Value = packed_args orelse args;
 
-    // Materialize the full positional argument list, filling trailing
-    // params the caller omitted from their default thunks.
     var full_args: std.ArrayList(Value) = .empty;
     defer full_args.deinit(allocator);
     try full_args.appendSlice(allocator, sargs);
@@ -379,7 +353,6 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
     }
     self.ka.pushSlice(full_args.items);
 
-    // Evaluate the delegation args.
     var target_args: std.ArrayList(Value) = .empty;
     defer target_args.deinit(allocator);
     const full_with_recv = try ctorThunkArgs(allocator, class_def, outer_hint, full_args.items, 0);
@@ -425,7 +398,6 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
     }
     self.ka.push(inst_v);
 
-    // Body block.
     if (entry.body) |body_fid| {
         const fr = try funcAt(self, body_fid, "secondary ctor body");
         switch (fr) {
@@ -445,13 +417,10 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
     return EvalResult{ .ok = inst_v };
 }
 
-/// The `: super(...)` arm. Returns the constructed leaf instance, or an
-/// error (including `Unimplemented` when no parent class def exists for a
-/// non-Throwable parent).
+/// The `: super(...)` arm; `Unimplemented` when a non-Throwable parent has no
+/// class def.
 pub fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, class_def: ObjRef(ClassDef), target_args: []const Value, outer_hint: ?*const Value) Allocator.Error!EvalResult {
     const class_name = classDefName(class_def);
-    // Resolve the parent def: prefer the resolved `parent`, else the
-    // first supertype name.
     var parent_def: ?ObjRef(ClassDef) = null;
     {
         const dg = class_def.borrow();
@@ -467,8 +436,7 @@ pub fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, clas
 
     if (parent_def) |pdef| {
         const pname = classDefName(pdef);
-        // The labels of this class's super-constructor call apply to the
-        // parent's parameters, so a named argument binds by parameter name.
+        // A super-ctor call's labels name the parent's parameters, not this class's.
         const cur_names = parentCtorArgNames(self, classDefFqn(class_def), class_name);
         ctorGuardPush(class_name);
         const leaf_res = try newInstance(self, allocator, class, &.{}, outer_hint);
@@ -505,7 +473,7 @@ pub fn superDelegation(self: *VmHost, allocator: Allocator, class: ClassId, clas
         return .{ .ok = leaf };
     }
 
-    // No user ClassDef for the parent — a builtin (Throwable hierarchy).
+    // No user ClassDef for the parent: a builtin in the Throwable hierarchy.
     var parent_name: []const u8 = "";
     {
         const dg = class_def.borrow();
@@ -552,7 +520,6 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
     defer effective.deinit(allocator);
     try effective.appendSlice(allocator, args_in);
 
-    // Pack trailing positional args into the primary ctor's vararg slot.
     {
         const owned = try allocator.dupe(Value, effective.items);
         const packed_args = try packPrimaryCtorVarargs(self, classDefFqn(class_def), class_name, owned);
@@ -595,13 +562,8 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             }
         }
         if (ctor_unsatisfiable) {
-            // The primary ctor cannot take these argument TYPES, but a
-            // secondary ctor might: `LocalDate(Int, Month, Int)` matches the
-            // secondary `(year, month: Month, day)`, not the primary
-            // `(year, monthNumber: Int, day)`. Dispatch the secondary BEFORE
-            // falling to a same-named factory function — a deprecated
-            // `@LowPriorityInOverloadResolution fun Name(...) = Name(...)`
-            // factory would otherwise self-recurse without bound.
+            // A secondary ctor may take argument types the primary cannot, and
+            // is tried before a same-named factory, which would self-recurse.
             if (!ctorGuardContains(class_name)) {
                 const cid: ?ClassId = blk: {
                     const mg = self.module.borrow();
@@ -623,7 +585,6 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         }
     }
 
-    // Fill omitted trailing params from default thunks.
     if (effective.items.len < n_primary) {
         const default_thunks = primaryDefaultThunks(self, classDefFqn(class_def), class_name);
         var idx = effective.items.len;
@@ -677,7 +638,6 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
     }
 
     if (effective.items.len != n_primary) {
-        // Same-named factory with matching arity.
         if (try pickFactory(self, allocator, class_name, effective.items)) |fid| {
             const module_ref = self.module.clone();
             defer module_ref.deinit();
@@ -685,11 +645,8 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
             defer mg.deinit();
             return self.callFunc(allocator, mg.get(), fid, effective.items);
         }
-        // Compose ABI completion: a same-named COMPOSABLE factory (a
-        // file-private `@Composable fun Stack(...)` shadowed by a pack's
-        // internal `class Stack`) carries the pass-appended ($composer,
-        // $changed) pair the ctor-shaped call site never wrote. With a
-        // composer ambient, complete the pair and re-pick.
+        // A same-named `@Composable` factory carries the pass-appended
+        // ($composer, $changed) pair the ctor-shaped call site never wrote.
         {
             if (@import("../compose.zig").currentComposer()) |c| {
                 var ext: std.ArrayList(Value) = .empty;
@@ -706,10 +663,8 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
                 }
             }
         }
-        // A same-named member EXTENSION on an enclosing implicit receiver is
-        // Kotlin's target when the ctor shape does not fit: `validate {
-        // Stack(h) { ... } }` calls the file's `MockViewValidator.Stack`,
-        // never the pack's internal `class Stack` constructor.
+        // A same-named member extension on an enclosing implicit receiver is
+        // Kotlin's target when the ctor shape does not fit.
         {
             const encl = ir.eval.enclosingEntriesAlloc(allocator) catch &.{};
             defer allocator.free(@constCast(encl));
@@ -733,13 +688,8 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
         return .{ .err = try typeErr(allocator, "{s}() expects {d} args, got {d}", .{ class_name, n_primary, effective.items.len }) };
     }
 
-    // Implicit SAM conversion at the constructor boundary: a raw callable
-    // bound to a parameter whose declared type is a fun interface wraps
-    // into a SAM instance, exactly as the explicit `Iface { … }` form
-    // does. The wrapped value is what dispatch relies on for the
-    // interface's method identity — a receiver-typed single method
-    // (`PointerInputEventHandler`'s `PointerInputScope.invoke()`) can
-    // only bind its extension receiver through the instance's class.
+    // Implicit SAM conversion at the constructor boundary: a raw callable bound
+    // to a fun-interface parameter wraps, so its method binds through the class.
     for (effective.items, 0..) |a, i| {
         if (a != .IrClosure) continue;
         const declared: ?[]const u8 = blk: {
@@ -770,13 +720,9 @@ pub fn primaryCtorPath(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
     return materializeInstance(self, allocator, class_def, ir_name, effective.items, outer_hint);
 }
 
-/// Reorder a named super-constructor call's arguments (`: Base(objects = 2)`)
-/// into the parent's declared parameter order. `arg_names[k]`, when non-null,
-/// names the base parameter argument `k` binds to; unnamed arguments keep
-/// their position. Gaps opened by named binding are filled with the
-/// parameter default so the downstream positional field-binding is correct.
-/// No-op when nothing is named. `args` is rewritten in place to length
-/// `n_primary`.
+/// Reorder a named super-constructor call's arguments into the parent's declared
+/// parameter order, unnamed arguments keeping their position and gaps taking the
+/// parameter default. `args` is rewritten in place to length `n_primary`.
 pub fn reorderNamedSuperArgs(
     self: *VmHost,
     allocator: Allocator,
@@ -870,11 +816,8 @@ pub fn reorderNamedSuperArgs(
     return .{ .ok = {} };
 }
 
-/// Pad a parent class's super-delegation args with the defaults for any
-/// trailing primary-ctor params the subclass omitted. A subclass that writes
-/// `: Base(a)` for `Base(a, b = default)` delegates only `a`; without this the
-/// `b` slot would materialize as Unit instead of running its default. Mirrors
-/// the direct-construction default fill. `args` is grown in place.
+/// Pad a parent's super-delegation args with defaults for trailing primary-ctor
+/// params the subclass omitted, so `: Base(a)` runs `b`'s default, not Unit.
 pub fn padParentCtorDefaults(
     self: *VmHost,
     allocator: Allocator,
@@ -944,10 +887,8 @@ pub fn padParentCtorDefaults(
     return .{ .ok = {} };
 }
 
-/// The companion's `operator fun invoke` is a constructor-shaped call's
-/// target when neither a constructor nor a same-named function fits:
-/// `A(42)` beside `class A { companion object { operator fun invoke(i: Int) } }`.
-/// Null when the class has no companion or the companion's `invoke` misses.
+/// The companion's `operator fun invoke` serves a constructor-shaped call when
+/// neither a constructor nor a same-named function fits; null when it misses.
 pub fn companionInvoke(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), args: []const Value) Allocator.Error!?EvalResult {
     const cls_val = Value{ .Class = class_def };
     const comp = (try host_fields.companionOfClassValue(self, &cls_val)) orelse return null;
@@ -958,7 +899,6 @@ pub fn companionInvoke(self: *VmHost, allocator: Allocator, class_def: ObjRef(Cl
     return null;
 }
 
-/// Among same-named factory overloads pick the best applicable declaration.
 pub fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, args: []const Value) Allocator.Error!?FuncId {
     const module_ref = self.module.clone();
     defer module_ref.deinit();
@@ -991,10 +931,8 @@ pub fn pickFactory(self: *VmHost, allocator: Allocator, class_name: []const u8, 
     return best_ord orelse best_low;
 }
 
-/// The lexically enclosing class name for an inner/nested class: the
-/// build registry's `enclosing_class` map (filled when nested classes are
-/// lifted to the top level), falling back to the runtime def's resolved
-/// enclosing-class handle.
+/// The lexically enclosing class name for an inner/nested class: the build
+/// registry's map, else the runtime def's resolved enclosing-class handle.
 pub fn enclosingClassNameOf(self: *VmHost, class_def: ObjRef(ClassDef), ir_name: []const u8) ?[]const u8 {
     {
         const mg = self.module.borrow();
@@ -1018,9 +956,8 @@ pub fn enclosingClassNameOf(self: *VmHost, class_def: ObjRef(ClassDef), ir_name:
     return null;
 }
 
-/// True when `v` is an `Instance` whose class is `want` or a subtype of it
-/// (simple name or FQN, walking the resolved parent chain and each class's
-/// transitive interface supertypes).
+/// True when `v` is an `Instance` of `want` or a subtype, by simple name or FQN,
+/// walking the parent chain and each class's transitive interfaces.
 pub fn instanceOfClassName(v: *const Value, want: []const u8) bool {
     if (v.* != .Instance) return false;
     const g = v.Instance.borrow();
@@ -1043,11 +980,8 @@ pub fn instanceOfClassName(v: *const Value, want: []const u8) bool {
     return false;
 }
 
-/// Whether `d` names `want` among its (transitive) interface supertypes.
-/// Walks resolved `interfaces` refs recursively and falls back to the raw
-/// `supertype_names` for interfaces never resolved into refs (builtin or
-/// cross-pack names) — an interface-typed parameter must accept a class
-/// implementing it (`TweenSpec` for `AnimationSpec<T>`).
+/// Whether `d` reaches `want` among its transitive interface supertypes, falling
+/// back to raw `supertype_names` for interfaces never resolved into refs.
 pub fn classDefImplements(d: *const ClassDef, want: []const u8, depth: u32) bool {
     if (depth > 16) return false;
     for (d.supertype_names) |sn| {
@@ -1063,7 +997,6 @@ pub fn classDefImplements(d: *const ClassDef, want: []const u8, depth: u32) bool
     return false;
 }
 
-/// The `outer` link of an `Instance` value, `null` otherwise.
 pub fn instanceOuterOf(v: *const Value) ?Value {
     if (v.* != .Instance) return null;
     const g = v.Instance.borrow();
@@ -1071,10 +1004,8 @@ pub fn instanceOuterOf(v: *const Value) ?Value {
     return g.get().outer;
 }
 
-/// First instance of `want` reachable through `v`'s `outer` links,
-/// excluding `v` itself. The walk is Kotlin's class-nesting rule: inside a
-/// member of `Inner`, `this@Outer` is in scope as the receiver reachable
-/// through the dispatch receiver's captured outer.
+/// First instance of `want` through `v`'s `outer` links, excluding `v`: Kotlin's
+/// nesting rule puts `this@Outer` in scope through the receiver's captured outer.
 pub fn outerWalkMatch(v: *const Value, want: []const u8) ?Value {
     var cur = instanceOuterOf(v);
     while (cur) |c| {
@@ -1084,28 +1015,10 @@ pub fn outerWalkMatch(v: *const Value, want: []const u8) ?Value {
     return null;
 }
 
-/// Pick the outer instance a freshly-materialized inner-class instance
-/// captures, keyed on the inner class's lexically enclosing class. The
-/// receivers in scope at the construction site are, innermost first: the
-/// constructing frame's own `this` (the hint) with its class-nesting tower
-/// (`this`, `this.outer`, …), then the enclosing-receiver chain, where each
-/// dispatch-receiver entry carries its own tower but a `with`/`run` subject
-/// contributes only itself. The first receiver that is an instance of the
-/// enclosing class (or a subtype) supplies the outer:
-///
-/// 1. the hint itself — the bare `Inner()`-inside-a-member case, and the
-///    receiver-lambda case where the subject is of the enclosing class
-///    (`with(other) { Inner() }` constructs `other.Inner()`);
-/// 2. the hint's outer walk — a member of `Inner` constructing a sibling
-///    `Inner()` reaches `this@Outer` through its own outer link, never
-///    through an unrelated receiver inherited from a caller frame. Skipped
-///    when the hint IS the innermost receiver-lambda subject: a displaced
-///    `with(x) { … }` subject brings only itself into scope, and the
-///    lambda's lexical tower continues on the chain (the displaced `this`);
-/// 3. the chain, innermost first, each entry checked directly and — for
-///    non-subject entries — through its outer walk;
-/// 4. else the explicit hint as given (no class data, or no candidate of
-///    the enclosing class — matches the pre-class-keyed behavior).
+/// Pick the outer instance an inner-class instance captures, keyed on the
+/// enclosing class. Candidates innermost first: the hint, its outer walk, then
+/// the enclosing-receiver chain with each non-subject entry's walk, else the
+/// hint. A receiver-lambda subject brings only itself, so its own walk is skipped.
 pub fn selectInnerOuter(self: *VmHost, allocator: Allocator, class_def: ObjRef(ClassDef), ir_name: []const u8, outer_hint: ?*const Value) Allocator.Error!?Value {
     const want = enclosingClassNameOf(self, class_def, ir_name) orelse {
         if (runtime.envOnce("KLIO_OUTER_TRACE")) |w| {

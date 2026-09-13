@@ -1,6 +1,5 @@
-//! Materializing an instance: the builtin collection base a class extends,
-//! the field table its primary parameters and body properties produce, and
-//! the delegate a `by` property provides.
+//! Materializing an instance: the builtin collection base a class extends, the
+//! field table primary parameters and body properties produce, and `by` delegates.
 
 const std = @import("std");
 
@@ -96,13 +95,8 @@ pub const BuiltinBase = struct { key: []const u8, value: Value };
 
 pub const BuiltinBaseName = struct { name: []const u8, key: []const u8 };
 
-/// A stdlib collection class a user class extends (`class N :
-/// ArrayList<Any>()`), named by its resolved fqn. The stdlib declares it as
-/// an `expect` header with no bodies and klio implements it as a host
-/// value, so the supertype's constructor call builds the host collection
-/// and the instance keeps it as the delegate for that supertype: members
-/// the class does not declare forward to it and `super.add(x)` dispatches
-/// on it.
+/// A stdlib collection class a user class extends, by resolved fqn: the header
+/// is bodiless, so the host collection becomes that supertype's delegate.
 pub fn builtinCollectionBase(fqn: []const u8) ?BuiltinBaseName {
     const pkg = "kotlin.collections.";
     if (!std.mem.startsWith(u8, fqn, pkg)) return null;
@@ -122,9 +116,8 @@ pub fn builtinCollectionBase(fqn: []const u8) ?BuiltinBaseName {
     return null;
 }
 
-/// Construct the host collection for a builtin collection supertype from
-/// the supertype call's evaluated arguments, through the stdlib factory of
-/// the same name (`ArrayList(initialCapacity)`, `HashMap(original)`).
+/// Build the host collection for a builtin collection supertype from the
+/// supertype call's arguments, through the stdlib factory of the same name.
 pub fn buildBuiltinBase(self: *VmHost, allocator: Allocator, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
     const factory = host_globals.lookupGlobal(self, name) orelse
         return .{ .err = try typeErr(allocator, "`{s}` has no constructor", .{name}) };
@@ -138,10 +131,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
     const ctor_keepalive = self.ka.mark();
     defer self.ka.restore(ctor_keepalive);
 
-    // Build the parent ctor-arg chain top-down. Each entry carries the
-    // resolved FQN alongside the written name, so every per-class side
-    // table (ctor args, init blocks, body-prop inits) is read for the
-    // exact class, never a same-simple-name twin.
+    // A chain entry's resolved FQN keys the per-class side tables, not a twin.
     var chain: std.ArrayList(ChainEntry) = .empty;
     defer {
         for (chain.items) |c| allocator.free(c.args);
@@ -160,7 +150,6 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
     var throwable_cause: ?Value = null;
     var is_throwable = false;
 
-    // Direct-parent Throwable message/cause recovery.
     {
         const parent_ref = firstNonInterfaceSuper(self, class_def);
         if (parent_ref) |pref| {
@@ -187,7 +176,6 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         }
     }
 
-    // Walk the parent ctor chain.
     var deferred_bodies: std.ArrayList(DeferredCtorBody) = .empty;
     defer {
         for (deferred_bodies.items) |d| allocator.free(d.args);
@@ -213,10 +201,8 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         const pref = parent_ref orelse break;
         const pname = pref.name;
 
-        // Evaluate this level's super-args.
         var parent_args: std.ArrayList(Value) = .empty;
-        // A parent secondary constructor's `super(…)` delegation named this
-        // class's arguments already; the header thunks do not apply.
+        // A parent secondary ctor's `super(…)` already named these arguments.
         const override = pending_super_args;
         pending_super_args = null;
         if (override) |o| parent_args = o;
@@ -283,9 +269,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                 return .{ .err = e };
             },
         }
-        // Reorder any named super-constructor arguments into the parent's
-        // parameter order before the positional field-binding below reads
-        // them (`: Base(objects = 2)` must set `objects`, not the first slot).
+        // Reorder named super-ctor args before the positional field-binding.
         if (parent_def) |d| {
             switch (try reorderNamedSuperArgs(self, allocator, d, pref.fqn, pname, parentCtorArgNames(self, cur_fqn, cur_class), &parent_args, outer_hint)) {
                 .ok => {},
@@ -295,12 +279,9 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                     return .{ .err = e };
                 },
             }
-            // The handle stays live for the defaults-padding block below,
-            // which releases it on every path — a second deinit here
-            // double-freed the class def under the reclaim profile.
+            // The defaults-padding block below releases this handle on every path.
         }
-        // Fill any trailing primary-ctor params the subclass omitted from
-        // its `super(...)` delegation with the parent's defaults.
+        // Pad trailing primary-ctor params the subclass omitted from `super(...)`.
         if (parent_def) |d| {
             switch (try padParentCtorDefaults(self, allocator, d, pref.fqn, pname, &parent_args, outer_hint)) {
                 .ok => {},
@@ -312,11 +293,8 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
             }
             d.deinit();
         }
-        // Pack the delegation args for the parent's vararg primary param.
         const packed_parent = try packPrimaryCtorVarargs(self, pref.fqn, pname, try parent_args.toOwnedSlice(allocator));
-        // `chain` owns this duped copy (freed on chain teardown) and it
-        // outlives the loop, so the next iteration reads its super-args from
-        // it. The packed buffer is a dead full allocation once duped.
+        // `chain` owns the duped copy the next iteration reads; the packed dies.
         const chain_args = try allocator.dupe(Value, packed_parent);
         try chain.append(allocator, .{ .name = pname, .fqn = pref.fqn, .args = chain_args });
         self.ka.pushSlice(chain_args);
@@ -357,12 +335,8 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                 while (k < pp.len and k < cls_args.len) : (k += 1) {
                     if (pp[k].property != null) {
                         const fv = adoptDeclaredNumeric(&pp[k], cls_args[k]);
-                        // Dedup on the STORAGE key: a subclass's private
-                        // SHADOW of a base ctor property lives in its own
-                        // owner-mangled cell and must not displace the base's
-                        // plain cell (base-class code reads it by plain name).
-                        // An OVERRIDE cell keeps the old behavior — the
-                        // child's cell supersedes the plain one.
+                        // Dedup on the storage key: a private shadow of a base
+                        // ctor property must not displace the plain cell.
                         const store_key = shadowFieldKey(self, cls_name, pp[k].name);
                         retainFieldList(&fields, allocator, store_key);
                         if (store_key.len != pp[k].name.len and !isPrivateShadowProp(self, cls_name, pp[k].name)) {
@@ -378,14 +352,8 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         }
     }
 
-    // A plain (non-property) primary-ctor parameter a member body reads is
-    // captured by Kotlin as a synthesized field. Seed each under its name when
-    // nothing else owns it: a property param (seeded above, own or inherited)
-    // or a same-class body property (seeded from its initializer below) holds
-    // the name instead, so skip those — else a duplicate/shadowing cell would
-    // displace the real property. Runs after the whole property pass so an
-    // inherited property (a base `val root` under a subclass's plain `root`
-    // param) is already present and wins.
+    // Kotlin captures a plain primary-ctor parameter a member body reads as a
+    // synthesized field; seed it only when no property already owns that name.
     {
         var ci: usize = chain.items.len;
         while (ci > 0) {
@@ -477,7 +445,6 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         if (runtime.reclaimEnabled()) bb.value.retain();
         try fields.append(allocator, .{ .name = bb.key, .value = bb.value });
     }
-    // Materialise the instance.
     const inst = try ObjRef(InstanceData).init(allocator, .{
         .class = class_def.clone(),
         .fields = fields,
@@ -486,25 +453,18 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         .native_state = null,
     });
     const inst_value = Value{ .Instance = inst };
-    // An enum entry's own initializers (its inner classes included) may
-    // name the entry while it is under construction; kotlinc binds that
-    // reference to the instance itself, so the entry table holds the shell
-    // before any of them runs.
+    // An enum entry's initializers may name the entry while it is under
+    // construction, so the entry table holds the shell before any of them runs.
     if (entry_slot) |slot| {
         if (runtime.reclaimEnabled()) inst_value.retain();
         slot.* = inst_value;
     }
-    // The instance under construction is reachable only through this host local
-    // until it is returned and bound; its body-property/init-block initializers
-    // run user code (safe points), so pin it across construction or a collection
-    // there sweeps the half-built shell and frees its field list out from under
-    // us. (Object/companion singletons are additionally pinned via the in-flight
-    // object-state table, but regular instances have no such anchor.)
+    // The half-built instance is reachable only through this host local and its
+    // initializers cross safe points, so pin it against a sweep.
     const ka_inst = self.ka.mark();
     defer self.ka.restore(ka_inst);
     self.ka.push(inst_value);
 
-    // Attach a stored default-outer.
     {
         const has_outer = blk: {
             const g = inst.borrow();
@@ -516,8 +476,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
             const default_outer = og.get().get(class_name);
             og.deinit();
             if (default_outer) |o| {
-                // `outer` is an owned field (teardown releases it); the value
-                // read from the default-outer table is a borrow, so retain.
+                // `outer` is owned and the table value is a borrow, so retain.
                 o.retain();
                 const g = inst.borrowMut();
                 g.get().outer = o;
@@ -525,7 +484,6 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
             }
         }
     }
-    // Inner-class outer selection.
     if (classDefIsInner(class_def)) {
         const has_outer = blk: {
             const g = inst.borrow();
@@ -534,8 +492,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         };
         if (!has_outer) {
             if (try selectInnerOuter(self, allocator, class_def, ir_name, outer_hint)) |outer_v| {
-                // `selectInnerOuter` hands back a borrow of the outer-hint /
-                // capture; `outer` is an owned field, so retain before storing.
+                // `selectInnerOuter` returns a borrow and `outer` is owned.
                 outer_v.retain();
                 const g = inst.borrowMut();
                 g.get().outer = outer_v;
@@ -544,14 +501,8 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         }
     }
 
-    // Make an object / companion singleton shell visible before its init
-    // runs. A gate-driven construction records the in-flight instance in
-    // the shared object-init table, so re-entrant reads from the
-    // constructing thread (the object referencing itself during its own
-    // init) observe it while other threads keep waiting — the singleton
-    // only publishes into `globals` after construction completes. A
-    // construction NOT driven through the gate (a runtime-registered
-    // local object) publishes directly, as before.
+    // Publish an object/companion shell before its init runs, so the constructing
+    // thread's re-entrant reads see it while other threads wait.
     if (classDefIsObject(class_def)) {
         if (!host_globals.noteObjectInFlight(self, class_name, inst_value)) {
             const g = self.globals.borrowMut();
@@ -560,28 +511,17 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         }
     }
 
-    // Evaluate class-delegation expressions. A `by <expr>` interface
-    // delegation declared on any class in the chain forwards the
-    // delegated interface's members, so each level's delegate thunks run
-    // against that level's resolved super-args — not only the leaf's, so a
-    // subclass of a delegating base inherits its delegate fields. Leaf
-    // first: a more-derived class's delegation for an interface overrides
-    // a base's, so the first delegate field for a given interface wins and
-    // a later (base-level) one is skipped. The leaf is keyed on its
-    // runtime `class_name` (the side table's key), not the IR name the
-    // chain records, which can differ when the def was resolved through a
-    // sibling/fqn lookup.
+    // Class-delegation expressions. A `by <expr>` on any class in the chain
+    // forwards that interface's members against that level's super-args. Leaf
+    // first, so a more-derived delegation wins; the leaf keys on its runtime name.
     {
         for (chain.items, 0..) |c, idx| {
             const lookup_name = if (idx == 0) class_name else c.name;
             const delegates = classDelegateThunks(self, c.fqn, lookup_name);
             for (delegates) |sf| {
                 const fr = try funcAt(self, sf.func, "class delegate");
-                // The delegation expression evaluates in the class body's
-                // scope: an inner class's `Density by this@Outer` reaches
-                // the enclosing instance through the under-construction
-                // instance's outer link. Make the instance an enclosing
-                // receiver for the thunk so the labeled-this walk finds it.
+                // The delegation expression evaluates in the class body's scope,
+                // so the instance must be an enclosing receiver for the thunk.
                 var inst_v = Value{ .Instance = inst };
                 ir.eval.pushEnclosing(&inst_v);
                 defer ir.eval.popEnclosing();
@@ -607,8 +547,8 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
             }
         }
     }
-    // `Throwable(cause)`: the single argument is the cause and the message
-    // is its rendering, as the JVM constructor defines it.
+    // `Throwable(cause)`: the single argument is the cause and the message is
+    // its rendering, as the JVM constructor defines it.
     if (throwable_cause == null) {
         if (throwable_message) |m| {
             const is_cause = m == .Exception or (m == .Instance and host_call_member.instanceIsThrowable(self, allocator, m.Instance));
@@ -633,8 +573,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         g.get().invalidateShape();
         g.deinit();
     }
-    // fillInStackTrace at construction (JVM order) for a user Throwable
-    // subclass: its parent chain bottomed out at a builtin Throwable.
+    // JVM order: fill in the stack trace at construction for a user Throwable.
     if (is_throwable) {
         var tv = Value{ .Instance = inst };
         try ir.eval.attachStackTrace(allocator, &tv);
@@ -691,17 +630,8 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                     switch (fr) {
                         .err => |e| return .{ .err = e },
                         .ok => |func| {
-                            // The initializer runs in the class body's
-                            // scope, so a lambda created inside it must see
-                            // the instance as an enclosing receiver — a
-                            // closure snapshots the chain at creation, and
-                            // without this a bare name inside
-                            // `Job(..).apply { invokeOnCompletion { stateLock } }`
-                            // saw only the `apply` receiver and fell through to
-                            // the global. Same treatment the class DELEGATE
-                            // thunk already gets below; the instance is passed
-                            // as the thunk's `this` PARAMETER, which is not the
-                            // same as being on the enclosing chain.
+                            // A lambda made in the initializer must see the
+                            // instance as an enclosing receiver.
                             var encl_v = inst_value;
                             ir.eval.pushEnclosing(&encl_v);
                             defer ir.eval.popEnclosing();
@@ -735,8 +665,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                     };
                     if (init_expr) |ie| {
                         const v = (try simpleLiteral(allocator, ie.get())) orelse blk: {
-                            // A local class's complex initializer was lowered
-                            // as a runtime `$init$` thunk at registration.
+                            // A local class's complex initializer lowers to a thunk.
                             const init_name = try std.fmt.allocPrint(allocator, "$init${s}", .{prop_name});
                             defer allocator.free(init_name);
                             const has = hblk: {
@@ -758,11 +687,8 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                         try g.get().define(allocator, shadowFieldKey(self, cls_name, prop_name), v);
                         g.deinit();
                     } else {
-                        // A local class's delegated property: the delegate
-                        // expression was lowered as a `$init$` thunk at
-                        // registration; evaluate it and store the delegate
-                        // under the property name (the shape the getValue/
-                        // setValue read/write routes expect).
+                        // A local class's delegate lowers to a `$init$` thunk;
+                        // store it under the name getValue/setValue route on.
                         const has_delegate = blk: {
                             const g = cls.borrow();
                             defer g.deinit();
@@ -815,9 +741,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
                 .ok => {},
                 .err => |e| return .{ .err = e },
             }
-            // A parent secondary-constructor body chosen for the header chain
-            // runs here, after its class's initializers and before the
-            // subclass's.
+            // A parent secondary-ctor body runs after its class's initializers.
             for (deferred_bodies.items) |*d| {
                 if (d.body.int() == 0 and d.args.len == 0) continue;
                 if (!std.mem.eql(u8, d.name, cls_name)) continue;
@@ -843,8 +767,7 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
         }
     }
 
-    // The parent secondary-constructor bodies chosen for the header chain
-    // run on the finished instance, ancestors first.
+    // Parent secondary-ctor bodies run on the finished instance, ancestors first.
     {
         var bi: usize = deferred_bodies.items.len;
         while (bi > 0) {
@@ -870,7 +793,6 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
     return .{ .ok = inst_value };
 }
 
-/// `provideDelegate` hook for a delegated body property.
 pub fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []const u8, prop_name: []const u8, inst_value: *const Value, v: Value) Allocator.Error!EvalResult {
     const is_delegated = blk: {
         const mg = self.module.borrow();
@@ -886,9 +808,8 @@ pub fn maybeProvideDelegate(self: *VmHost, allocator: Allocator, cls_name: []con
         break :blk false;
     };
     if (!is_delegated) return .{ .ok = v };
-    // A member operator (including a SAM-converted `PropertyDelegateProvider`)
-    // or an extension operator in scope provides the delegate; a plain
-    // `ReadOnlyProperty` has neither and keeps the value.
+    // A member or extension `provideDelegate` operator in scope supplies the
+    // delegate; a plain `ReadOnlyProperty` has neither and keeps the value.
     const prop_ref = Value{ .PropertyRef = .{ .name = try runtime.strInitOwned(allocator, try allocator.dupe(u8, prop_name)) } };
     return host_call_member.provideDelegateFor(self, allocator, inst_value.*, prop_ref, v);
 }

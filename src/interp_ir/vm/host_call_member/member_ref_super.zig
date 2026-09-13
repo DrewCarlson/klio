@@ -1,5 +1,4 @@
-//! Member references, `super.foo(...)`, `this@Outer`, and the serializer target a
-//! `@Serializer(forClass = ...)` declaration stands for.
+//! Member references, `super.foo(...)`, `this@Outer`, and `@Serializer` targets.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -49,10 +48,8 @@ const stdlib_tail = @import("stdlib_tail.zig");
 const inheritedInstanceToString = stdlib_tail.inheritedInstanceToString;
 const instanceIsThrowable = stdlib_tail.instanceIsThrowable;
 
-/// A minimal `KClass` value carrying just a simple name (the last FQN
-/// segment) and the fully-qualified name. Enough for `simpleName`,
-/// `qualifiedName`, and FQN-keyed equality — used to give a builtin value or a
-/// classId-less type a class literal.
+/// A minimal `KClass` value carrying only the simple and qualified names, enough
+/// for `simpleName`, `qualifiedName` and FQN-keyed equality.
 pub fn syntheticClassFromFqn(allocator: Allocator, fqn: []const u8) Allocator.Error!Value {
     const dot = std.mem.findScalarLast(u8, fqn, '.');
     const simple = if (dot) |i| fqn[i + 1 ..] else fqn;
@@ -93,8 +90,7 @@ pub fn syntheticClassFromFqn(allocator: Allocator, fqn: []const u8) Allocator.Er
     return .{ .Class = cd };
 }
 
-/// True when `simple` names an unsigned primitive-array type, whose bare name
-/// lowers to a constructor value (no IR classId) rather than a class.
+/// An unsigned primitive-array type name, whose bare form lowers to a constructor.
 pub fn isUnsignedArrayName(simple: []const u8) bool {
     const known = [_][]const u8{ "UIntArray", "ULongArray", "UByteArray", "UShortArray" };
     for (known) |k| {
@@ -117,9 +113,8 @@ pub fn memberRefExact(
     return memberRefResolved(self, allocator, receiver, name, func);
 }
 
-/// The value-parameter count of the member a bound reference names, so the
-/// reference can report the `FunctionN` it satisfies. Null when the target
-/// cannot be identified (an unbound/type-form reference, a dynamic name).
+/// Value-parameter count of the member a bound reference names, so it can report
+/// the `FunctionN` it satisfies. Null when the target is unidentifiable.
 pub fn boundRefArity(self: *VmHost, receiver: *const Value, name: []const u8, func: ?FuncId) ?usize {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -156,8 +151,6 @@ pub fn memberRefResolved(
     name: []const u8,
     func: ?FuncId,
 ) Allocator.Error!EvalResult {
-    // `X::class` is a class reference — return the class itself. For an
-    // instance receiver, reach into the runtime ClassDef.
     if (std.mem.eql(u8, name, "class")) {
         if (receiver.* == .Instance) {
             const cls: ObjRef(ClassDef) = blk: {
@@ -165,10 +158,8 @@ pub fn memberRefResolved(
                 defer ig.deinit();
                 break :blk ig.get().class.clone();
             };
-            // `A::class` on a class that has a companion reaches here with
-            // the COMPANION instance (the bare name's global is the
-            // companion); the class literal is the owner, never the
-            // companion's own class.
+            // `A::class` on a class with a companion arrives with the companion
+            // instance, but the class literal is the owner, not the companion.
             const cv = Value{ .Class = cls };
             const is_companion = blk: {
                 const cg = cls.borrow();
@@ -184,10 +175,7 @@ pub fn memberRefResolved(
             }
             return .{ .ok = cv };
         }
-        // A `Type::class` value is already a class literal.
         if (receiver.* == .Class) return .{ .ok = receiver.* };
-        // An unsigned-array TYPE literal lowers to its constructor
-        // (`ULongArray::class`): recover the type name from the constructor.
         if (receiver.* == .Intrinsic) {
             const dot = std.mem.findScalarLast(u8, receiver.Intrinsic.fqn, '.');
             const simple = if (dot) |i| receiver.Intrinsic.fqn[i + 1 ..] else receiver.Intrinsic.fqn;
@@ -201,12 +189,10 @@ pub fn memberRefResolved(
             defer g.deinit();
             return .{ .ok = try syntheticClassFromFqn(allocator, g.get().bytes) };
         }
-        // `value::class` — the runtime KClass of a plain value or callable.
         return .{ .ok = try syntheticClassFromFqn(allocator, receiver.typeFqn()) };
     }
-    // `recv::method` produces a callable wrapper backed by a synthetic
-    // Instance carrying `__bound_receiver__` + `__bound_name__`; the
-    // call_value path dispatches through them.
+    // `recv::method` wraps a synthetic Instance holding `__bound_receiver__` and
+    // `__bound_name__`, which `callValue` dispatches on.
     const identity = blk: {
         const g = self.instance_id_counter.borrowMut();
         defer g.deinit();
@@ -214,12 +200,7 @@ pub fn memberRefResolved(
     };
     const cls_name = try std.fmt.allocPrint(allocator, "$bound_ref${s}", .{name});
     const env = try ObjRef(runtime.Env).init(allocator, runtime.Env.init(allocator));
-    // A bound reference IS a function value: `s::produce` satisfies
-    // `() -> Int`, answers `is Function0<*>`, and takes every extension
-    // declared on a function type (`(() -> T).asFlow()`). Name the
-    // function supertypes so the dispatch walk and `is` see them; without
-    // them a member call on the reference found no candidate and fell back
-    // to invoking the bound method itself.
+    // A bound reference is a function value, so name the function supertypes.
     const supers: []const []const u8 = blk: {
         const arity = boundRefArity(self, receiver, name, func) orelse
             break :blk try allocator.dupe([]const u8, &.{"kotlin.Function"});
@@ -267,9 +248,8 @@ pub fn memberRefResolved(
     if (func) |fid| {
         try fields.append(allocator, .{ .name = "__bound_func__", .value = .{ .Int = @intCast(fid.int()) } });
     }
-    // The reference's creation-site file: visibility of a file-private
-    // target is decided where the reference is written, so the invoke
-    // path re-installs this file while it dispatches by name.
+    // Visibility of a file-private target is decided where the reference is
+    // written, so the invoke path re-installs this file while dispatching.
     if (ir.eval.currentCallSiteSpan()) |sp| {
         try fields.append(allocator, .{ .name = "__bound_file__", .value = .{ .Int = @intCast(sp.file.int()) } });
     }
@@ -283,8 +263,7 @@ pub fn memberRefResolved(
     return .{ .ok = .{ .Instance = inst } };
 }
 
-/// First supertype name registered for `class_name` in the runtime class
-/// table (the head of the inheritance chain), if any. Caller owns nothing.
+/// First supertype name registered for `class_name`; the caller owns nothing.
 pub fn firstSupertypeName(self: *VmHost, allocator: Allocator, class_name: []const u8) ?[]const u8 {
     const g = self.classes.borrow();
     defer g.deinit();
@@ -293,24 +272,13 @@ pub fn firstSupertypeName(self: *VmHost, allocator: Allocator, class_name: []con
     defer dg.deinit();
     const sups = dg.get().supertype_names;
     if (sups.len == 0) return null;
-    // Class-table-owned (program-lifetime); returned borrowed per the contract.
     _ = allocator;
     return sups[0];
 }
 
-/// Whether the RECEIVER's own accessor-backed property `name` could hold a callable.
-///
-/// `getter_prop_names` is keyed by NAME alone, so ANY class with a getter-backed
-/// property of that name arms the probe for EVERY receiver. That is how
-/// `TextRange.min` -- `val min: Int get() = min(start, end)`, where the call is the
-/// imported `kotlin.math.min` -- ended up reading itself: the member method missed,
-/// the probe read the property, and the property's getter called `min` again,
-/// forever.
-///
-/// The receiver's own getter decides. A declared function type can hold a callable;
-/// a scalar or a registered concrete class cannot. A type parameter or a typealias
-/// (`typealias Handler = () -> Unit`) names no registered class, so it stays
-/// permissive -- either can be a function at runtime.
+/// Whether the receiver's own accessor-backed property `name` could hold a
+/// callable. Its own getter decides: a declared function type can, a scalar or
+/// registered class cannot, a type parameter or typealias stays permissive.
 pub fn receiverPropCanHoldCallable(self: *VmHost, receiver: *const Value, name: []const u8) bool {
     if (receiver.* != .Instance) return true;
     var cur: ?[]const u8 = blk: {
@@ -334,13 +302,10 @@ pub fn receiverPropCanHoldCallable(self: *VmHost, receiver: *const Value, name: 
             defer mg.deinit();
             const func = mg.get().funcById(f) orelse return true;
             const rt = func.return_ty;
-            // An unrecorded getter return lowers as Unit — no knowledge, so
-            // no refutation (a real property getter is never Unit-typed).
+            // An unrecorded getter return lowers as Unit, so it refutes nothing.
             if (std.mem.eql(u8, rt.name, "kotlin.Unit") or std.mem.eql(u8, rt.name, "Unit") or rt.name.len == 0) return true;
             if (isFunctionTypeRefResolved(self, &rt)) return true;
-            // A TYPE-PARAMETER return (`State<T>.value: T`) says nothing —
-            // and its short name can collide with a registered class
-            // (a test's `class T`), which wrongly refuted the probe.
+            // A type-parameter return says nothing, and can collide with a class.
             if (rt.name.len <= 2 and blk: {
                 for (rt.name) |ch| {
                     if (!std.ascii.isUpper(ch)) break :blk false;
@@ -361,8 +326,6 @@ pub fn receiverPropCanHoldCallable(self: *VmHost, receiver: *const Value, name: 
     return true;
 }
 
-/// Whether `class_name` names a registered `fun interface` (one abstract method,
-/// so a lambda SAM-converts to it).
 pub fn classIsFunInterface(self: *VmHost, class_name: []const u8) bool {
     const g = self.classes.borrow();
     defer g.deinit();
@@ -372,7 +335,6 @@ pub fn classIsFunInterface(self: *VmHost, class_name: []const u8) bool {
     return dg.get().is_fun_interface;
 }
 
-/// Whether `class_name` names a registered interface.
 pub fn classIsInterface(self: *VmHost, class_name: []const u8) bool {
     const g = self.classes.borrow();
     defer g.deinit();
@@ -382,15 +344,9 @@ pub fn classIsInterface(self: *VmHost, class_name: []const u8) bool {
     return dg.get().is_interface;
 }
 
-/// `class_name`'s supertypes with the superclass ahead of the interfaces.
-///
-/// A supertype list keeps source order, and Kotlin does not require the
-/// superclass to come first: `class FocusRequesterNode : FocusRequesterModifierNode,
-/// Modifier.Node()` names the interface first. `super.onAttach()` there means
-/// `Modifier.Node`'s, so a search that follows the list as written walks into the
-/// interface and never reaches the class that actually declares the method.
-/// Names are class-table-owned (program-lifetime); the returned slice is the
-/// caller's.
+/// `class_name`'s supertypes with the superclass ahead of the interfaces. Kotlin
+/// lets a source list name an interface first, but `super.m()` means the
+/// superclass's. Names are class-table owned; the returned slice is the caller's.
 pub fn supertypesClassFirst(self: *VmHost, allocator: Allocator, class_name: []const u8) Allocator.Error![]const []const u8 {
     const sups: []const []const u8 = blk: {
         const g = self.classes.borrow();
@@ -411,15 +367,13 @@ pub fn supertypesClassFirst(self: *VmHost, allocator: Allocator, class_name: []c
     return out.toOwnedSlice(allocator);
 }
 
-/// Whether the class table holds an entry named `class_name`.
 pub fn classIsRegistered(self: *VmHost, class_name: []const u8) bool {
     const g = self.classes.borrow();
     defer g.deinit();
     return g.get().get(class_name) != null;
 }
 
-/// The registered supertype of `class_name` whose dotted name ends in
-/// `.simple`, when the qualifier was written with the simple name only.
+/// The registered supertype of `class_name` whose dotted name ends in `.simple`.
 pub fn ownerSupertypeBySuffix(self: *VmHost, class_name: []const u8, simple: []const u8) ?[]const u8 {
     const g = self.classes.borrow();
     defer g.deinit();
@@ -432,7 +386,6 @@ pub fn ownerSupertypeBySuffix(self: *VmHost, class_name: []const u8, simple: []c
     return null;
 }
 
-/// Whether `q` is one of `class_name`'s registered supertypes.
 pub fn ownerHasSupertype(self: *VmHost, class_name: []const u8, q: []const u8) bool {
     const g = self.classes.borrow();
     defer g.deinit();
@@ -445,11 +398,8 @@ pub fn ownerHasSupertype(self: *VmHost, class_name: []const u8, q: []const u8) b
     return false;
 }
 
-/// `[PATH]` record for a super-qualified dispatch, labelled with the
-/// resolved static target class (`super(Base)`) rather than the runtime
-/// receiver — super dispatch is static, so keying on the runtime class
-/// would collide with the virtual call's key while legitimately selecting
-/// a different declaration.
+/// `[PATH]` record for a super-qualified dispatch, labelled with the static
+/// target class: a runtime-class label would collide with the virtual call's key.
 pub fn emitSuperPath(allocator: Allocator, decl_fqn: []const u8, fid: FuncId, target_class: []const u8, args: []const Value) void {
     if (!trace.pathEnabled()) return;
     const label = std.fmt.allocPrint(allocator, "super({s})", .{target_class}) catch return;
@@ -459,16 +409,13 @@ pub fn emitSuperPath(allocator: Allocator, decl_fqn: []const u8, fid: FuncId, ta
 
 pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, owner_class: []const u8, qualifier: ?[]const u8, name: []const u8, args: []const Value, arg_names: []const ?[]const u8) Allocator.Error!EvalResult {
     _ = arg_names;
-    // `super.method()` walks the supertypes of owner_class (the class the
-    // call is written in, or the labeled `super@Outer`); `super<Q>` starts
-    // the walk at Q itself.
+    // `super.m()` walks the supertypes of `owner_class`, the class the call is
+    // written in; `super<Q>` starts the walk at Q itself.
     var pending: std.ArrayList([]const u8) = .empty;
     defer pending.deinit(allocator);
     if (qualifier) |q| {
-        // `q` is the const-pool super qualifier (program-lifetime); borrow it.
-        // A simple qualifier naming a nested supertype registered under its
-        // dotted name (`super<Base>` for `Outer.Base`) resolves through the
-        // owner's supertype list.
+        // `q` is the const-pool super qualifier, borrowed for the program's
+        // lifetime. A simple qualifier for a nested supertype resolves by suffix.
         if (ownerHasSupertype(self, owner_class, q) or classIsRegistered(self, q)) {
             try pending.append(allocator, q);
         } else if (ownerSupertypeBySuffix(self, owner_class, q)) |full| {
@@ -481,16 +428,12 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
         defer allocator.free(sups);
         try pending.appendSlice(allocator, sups);
     }
-    // A class with no declared supertype still has `Any` above it:
-    // `super.hashCode()` / `super.toString()` / `super.equals(x)` in a
-    // value class reach the identity implementations below.
+    // A class with no declared supertype still has `Any` above it.
     var visited: std.StringHashMap(void) = .init(allocator);
     defer visited.deinit();
 
     // Search the supertypes, superclass before interfaces at every level, and
-    // dispatch the first one that declares the method. Falling through to
-    // call_member would re-enter virtual dispatch on the original
-    // receiver and recurse forever for overriding methods.
+    // dispatch the first that declares the method: the member ladder would recurse.
     var step: usize = 0;
     while (pending.items.len != 0) {
         if (step > 128) break;
@@ -498,18 +441,14 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
         const cname = pending.orderedRemove(0);
         if (visited.contains(cname)) continue;
         try visited.put(cname, {});
-        // First, an IR class method named `name` on this class.
         {
             const mg = self.module.borrow();
             const m = mg.get();
             var found_fid: ?FuncId = null;
             for (m.classes.items) |*cls_ir| {
                 if (!std.mem.eql(u8, cls_ir.name, cname)) continue;
-                // Collect every same-named method, then pick the overload that
-                // matches the call's arity/types. Resolving by name alone binds
-                // `super.listIterator(index)` to a no-arg `listIterator()` whose
-                // body re-dispatches `listIterator(0)` virtually — an infinite
-                // super/override cycle (AbstractMutableList$SubList).
+                // Pick by arity and types: a wrong-arity binding re-dispatches
+                // virtually into an infinite super cycle.
                 var cands: std.ArrayList(Func) = .empty;
                 defer cands.deinit(allocator);
                 for (cls_ir.methods) |fid| {
@@ -535,10 +474,8 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
             }
             mg.deinit();
         }
-        // `super.<prop>` (a property read, lowered as a 0-arg CallSuper):
-        // no method named `name` on this class — look for its property
-        // getter. Walking from the parent skips the overriding subclass's
-        // getter, so `override val x get() = super.x` reads the base.
+        // A property read lowers to a 0-arg CallSuper; the search starts at the
+        // parent, so `override val x get() = super.x` reads the base getter.
         if (args.len == 0) {
             const getter_fid: ?FuncId = blk: {
                 const pg = self.prog.borrow();
@@ -560,9 +497,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                 mg.deinit();
             }
         }
-        // A builtin collection supertype has no IR class: the instance holds
-        // the host collection as its delegate for that supertype, and
-        // `super<ArrayList>.add(el)` dispatches on it.
+        // A builtin collection supertype has no IR class; the instance delegates it.
         if (receiver.* == .Instance) {
             var kb: [96]u8 = undefined;
             if (std.fmt.bufPrint(&kb, "__delegate__{s}", .{simpleName(cname)}) catch null) |key| {
@@ -574,24 +509,19 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
                 if (delegate) |d| return callMemberRec(self, allocator, &d, name, args);
             }
         }
-        // Not here: continue through this class's own supertypes.
         const sups = try supertypesClassFirst(self, allocator, cname);
         defer allocator.free(sups);
         try pending.appendSlice(allocator, sups);
     }
 
-    // `super.<prop>` where the base property has no custom getter (a stored
-    // val/var): read the backing field off the receiver instance directly.
+    // A base property with no custom getter: read its backing field directly.
     if (args.len == 0 and receiver.* == .Instance) {
         const ig = receiver.Instance.borrow();
         defer ig.deinit();
         if (ig.get().get(name)) |v| return .{ .ok = v };
     }
 
-    // The chain bottomed out at a builtin (`Any` / `Throwable`), which
-    // declares no IR method. Supply the inherited `Any`/`Throwable`
-    // semantics so `override fun toString() = "${super.toString()} …"`
-    // works through the exception hierarchy.
+    // The chain bottomed out at `Any` or `Throwable`: supply their semantics.
     if (receiver.* == .Instance) {
         const inst = receiver.Instance;
         if (std.mem.eql(u8, name, "toString") and args.len == 0) {
@@ -611,8 +541,7 @@ pub fn callSuper(self: *VmHost, allocator: Allocator, receiver: *const Value, ow
             return .{ .ok = .{ .Bool = same } };
         }
     }
-    // `super.Inner(args)`: an inner class of a supertype constructs
-    // through `this` as its outer instance.
+    // `super.Inner(args)`: an inner class of a supertype takes `this` as outer.
     if (receiver.* == .Instance) {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -681,9 +610,7 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
             .{qualifier},
         ) };
     }
-    // Walk parent chain on the receiver's class for direct matches, then
-    // traverse the `outer` chain for inner-class / local-class scenarios.
-    // `this@Outer` from an Inner method walks to the captured outer.
+    // Match the class parent chain first, then the captured `outer` chain.
     if (receiver.* == .Instance) {
         var cur: ?ObjRef(ClassDef) = blk: {
             const ig = receiver.Instance.borrow();
@@ -707,7 +634,6 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
             if (matched) return .{ .ok = receiver.* };
             cur = next;
         }
-        // Walk the `outer` chain (inner-class / local-class capture).
         var outer: ?Value = blk: {
             const ig = receiver.Instance.borrow();
             defer ig.deinit();
@@ -748,18 +674,12 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
             };
         }
     }
-    // No class match — `this@<fn-label>` (extension/lambda label) resolves
-    // to the immediate receiver if the qualifier isn't a known class.
-    // First try matching the qualifier against the enclosing-`this` chain.
+    // No class match: try the enclosing-`this` chain before the receiver.
     const chain = try enclosingThisChain(self, allocator);
     defer allocator.free(chain);
     for (chain) |encl_v| {
         if (encl_v != .Instance) continue;
-        // Each enclosing receiver is checked through its own OUTER links
-        // too: `this@Outer` inside an inner-class context (a delegation
-        // expression, a nested lambda) reaches the enclosing instance
-        // through the inner instance's outer chain — the enclosing
-        // receiver itself is the inner instance, not the target.
+        // Each enclosing receiver is walked through its own outer links too.
         var walk: ?Value = encl_v;
         var outer_step: usize = 0;
         while (walk) |wv| {
@@ -796,12 +716,8 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
             };
         }
     }
-    // `this@MeasureScope` where the label names an INTERFACE a candidate
-    // implements (an interface default method's labeled receiver, captured
-    // by a nested anon): the parent-class name chains above never list
-    // interfaces. A SECOND pass keeps the supertype-graph walk off the
-    // name-match fast path (`this@DeepRecursiveScopeImpl` resolves by name
-    // every `callRecursive`).
+    // A label can name an interface, which the parent chains above never list.
+    // A second pass keeps the supertype walk off the name-match fast path.
     for (chain) |encl_v| {
         if (encl_v != .Instance) continue;
         var walk: ?Value = encl_v;
@@ -826,9 +742,7 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
         break :blk g.get().contains(qualifier);
     };
     if (!known_class and receiver.* != .Null) {
-        // `this@<fn-label>` — the qualifier is an extension/fn label.
-        // When the receiver isn't a real bound Instance, prefer the
-        // enclosing receiver if it differs from the lambda's own `this`.
+        // With no bound Instance receiver, prefer a differing enclosing receiver.
         const receiver_is_bound_instance = receiver.* == .Instance;
         if (!receiver_is_bound_instance and chain.len > 0) {
             const encl = chain[0];
@@ -862,11 +776,8 @@ pub fn qualifiedThis(self: *VmHost, allocator: Allocator, receiver: *const Value
     return .{ .err = try typeErr(allocator, "`this@{s}` is not bound in this scope", .{qualifier}) };
 }
 
-/// The serializer a `@Serializer(forClass = C::class)` declaration stands for.
-/// The kotlinx plugin generates that declaration's whole body from `C`; klio
-/// answers the members it never wrote by forwarding to `C`'s own serializer.
-/// Null unless the receiver's class carries the annotation with a resolvable
-/// class argument that is not the receiver itself.
+/// The serializer a `@Serializer(forClass = C::class)` declaration stands for:
+/// its unwritten members forward to `C`'s own. Null when `C` is the receiver.
 pub fn serializerForClassTarget(self: *VmHost, allocator: Allocator, receiver: *const Value) Allocator.Error!?Value {
     const cls: ObjRef(ClassDef) = switch (receiver.*) {
         .Class => |c| c.clone(),
@@ -918,8 +829,7 @@ pub fn serializerForClassTarget(self: *VmHost, allocator: Allocator, receiver: *
     }
 }
 
-/// The class a companion object belongs to, as a `Value.Class`. Null when the
-/// argument is not a registered companion.
+/// The class a companion object belongs to; null when it is not a companion.
 pub fn companionOwnerClassValue(self: *VmHost, kc: *const Value) Allocator.Error!?Value {
     if (kc.* != .Class) return null;
     const comp_name = blk: {
@@ -931,9 +841,7 @@ pub fn companionOwnerClassValue(self: *VmHost, kc: *const Value) Allocator.Error
         const mg = self.module.borrow();
         defer mg.deinit();
         const reg = &mg.get().registry;
-        // The instance's class may carry the `$Companion` suffix once more
-        // than the registered singleton name does; peel it until a
-        // registered owner appears.
+        // The class may carry `$Companion` once more than the registered name.
         var probe = comp_name;
         var hops: usize = 0;
         while (hops < 3) : (hops += 1) {
@@ -952,9 +860,7 @@ pub fn companionOwnerClassValue(self: *VmHost, kc: *const Value) Allocator.Error
         break :blk null;
     };
     const name = owner orelse return null;
-    // The class table is the authority for the owner's class value: a
-    // by-name global may be a same-named property of another package
-    // (`kotlin.math.E` beside a user `enum class E`).
+    // The class table is the authority over a same-named by-name global.
     {
         const cg = self.classes.borrow();
         defer cg.deinit();

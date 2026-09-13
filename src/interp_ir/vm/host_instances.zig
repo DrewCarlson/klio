@@ -1,10 +1,7 @@
 //! `VmHost` instance construction: allocating a `Value.Instance` for a
-//! `ClassId` (running primary/secondary ctors, init blocks, body-property
-//! init, delegation), building anonymous-object instances, and selecting
-//! the outer instance an inner-class instance captures.
-//!
-//! Free functions over `*VmHost`, aliased as `VmHost` methods by
-//! `vmhost.zig` and invoked directly by the generic IR evaluator.
+//! `ClassId` (primary and secondary constructors, init blocks, body-property
+//! init, delegation), anonymous-object instances, and the outer instance an
+//! inner-class instance captures. Aliased as `VmHost` methods by `vmhost.zig`.
 
 const std = @import("std");
 
@@ -49,11 +46,6 @@ const StrPair = ir.StrPair;
 const StringSet = std.StringHashMap(void);
 const AnonMethodEntry = root.AnonMethodEntry;
 const NameValue = root.NameValue;
-
-// -------------------------------------------------------------------------
-// Instance construction is split across `host_instances/`; each import below
-// is followed by the aliases that keep every call site addressing this file.
-// -------------------------------------------------------------------------
 
 const common = @import("host_instances/common.zig");
 const unsupported = common.unsupported;

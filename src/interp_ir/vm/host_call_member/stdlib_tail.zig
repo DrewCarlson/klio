@@ -75,14 +75,10 @@ const instanceMethodKeyRelaxed = virtual_tail.instanceMethodKeyRelaxed;
 const instanceMethodKeyScoped = virtual_tail.instanceMethodKeyScoped;
 const invokeMethodFuncId = virtual_tail.invokeMethodFuncId;
 
-/// Whether a lambda argument makes the resolved MEMBER inapplicable while a
-/// same-arity extension declares that slot as a function type. Kotlin ranks
-/// members over extensions only among APPLICABLE candidates, so
-/// `DateTimeFormat<DateTimeComponents>.format { … }` is the extension taking
-/// a `DateTimeComponents.() -> Unit`, never the member `format(value: T)`.
-/// Restricted to a member slot declared as a bare TYPE VARIABLE: a nominal
-/// parameter can still take the lambda by SAM conversion, and there the
-/// member keeps its precedence.
+/// Whether a lambda argument makes the resolved member inapplicable while a
+/// same-arity extension declares that slot as a function type: Kotlin ranks
+/// members over extensions only among applicable candidates. A bare type
+/// variable only, since a nominal slot can still take the lambda by SAM.
 pub fn lambdaArgPrefersExtension(
     self: *VmHost,
     allocator: Allocator,
@@ -131,9 +127,8 @@ pub fn lambdaArgPrefersExtension(
     return false;
 }
 
-/// The indexing convention binds `a[i, j] = v` to `set(i, j, v)` with the
-/// VALUE in the last parameter: parameters between the indices and the value
-/// take their defaults, and a vararg index parameter absorbs every index.
+/// The indexing convention binds `a[i, j] = v` to `set(i, j, v)` with the value
+/// last: intervening parameters default, and a vararg index absorbs the indices.
 pub fn conventionSetCall(self: *VmHost, allocator: Allocator, receiver: *const Value, args: []const Value) Allocator.Error!?EvalResult {
     if (receiver.* != .Instance or args.len < 2) return null;
     const mg = self.module.borrow();
@@ -171,7 +166,6 @@ pub fn conventionSetCall(self: *VmHost, allocator: Allocator, receiver: *const V
     const value_param = params.len - 1;
     if (params[value_param].is_vararg) return null;
     const n_idx = args.len - 1;
-    // Already positionally exact with no vararg to pack: nothing to adapt.
     if (vararg_at == null and n_idx == value_param) return null;
     var adapted: std.ArrayList(Value) = .empty;
     defer adapted.deinit(allocator);
@@ -188,8 +182,7 @@ pub fn conventionSetCall(self: *VmHost, allocator: Allocator, receiver: *const V
             try adapted.append(allocator, .Null);
         }
     } else {
-        // Defaults between the indices and the value: bind the value by
-        // NAME so the gap takes its declared defaults.
+        // Bind the value by name so the gap before it takes its declared defaults.
         if (n_idx > value_param) return null;
         var k: usize = n_idx;
         while (k < value_param) : (k += 1) {
@@ -221,30 +214,17 @@ pub fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value,
         std.debug.print("[ir-walk] {s} on {s} static={s}\n", .{ name, receiver.typeFqn(), static_recv orelse "-" });
     }
     runtime.prof.opRoute(9);
-    // Inline cache: memoize the (class, method-name, arg-type-signature) →
-    // FuncId resolution. The signature captures the argument primitive types the
-    // overload pick depends on, so a hit returns the same target the full walk
-    // would (a non-primitive arg yields no key, so those calls re-resolve rather
-    // than risk a wrong cross-type hit). Only an unambiguous resolution is
-    // cached; a call that declines to an extension is never stored. The fast
-    // path at `callMemberInnerStatic`'s entry consults this same cache before the
-    // probe ladder, so a repeat call skips the binding/builtin probes too.
-    //
-    // A `static_recv`-directed call keys with the scope folded in (see
-    // `instanceMethodKeyScoped`): its resolution depends on the static receiver
-    // type, so it caches apart from the ordinary call's entry — never served
-    // one, never serves one.
+    // Inline cache from (class, method name, arg-type signature) to FuncId. A
+    // `static_recv`-directed call folds the static receiver type into the key,
+    // so it neither serves nor is served by the ordinary call's entry.
     const strict_key = instanceMethodKeyScoped(self, receiver, name, args, static_recv, null);
-    // A container-typed argument makes the strict signature unbuildable;
-    // the RELAXED key (kind tags — see `instanceMethodKeyRelaxed`) keys the
-    // member resolution then, so those calls stop re-walking per call.
+    // A container-typed argument leaves only the relaxed, kind-tag key.
     const key = strict_key orelse instanceMethodKeyRelaxed(self, receiver, name, args, static_recv);
     if (key) |k| {
         if (instanceMethodCacheGetRaw(self, k)) |raw| {
             if (raw == METHOD_MISS) return null;
             const cached: FuncId = @enumFromInt(raw);
-            // The lambda-argument decline is a property of the CALL, not of
-            // the cached resolution, so it applies on the hit path too.
+            // The decline is a property of the call, not the cached resolution.
             if (try lambdaArgPrefersExtension(self, allocator, receiver, cached, name, args)) return null;
             return try invokeMethodFuncId(self, allocator, receiver, cached, args);
         }
@@ -254,20 +234,12 @@ pub fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value,
         if (try lambdaArgPrefersExtension(self, allocator, receiver, r0.fid, name, args)) return null;
     }
     const resolved = resolved0 orelse {
-        // Cache the miss: a member-accessed field (`obj.field`) re-runs this
-        // walk every read otherwise. Only a proven, key-stable miss is stored.
+        // Cache the miss, or a member-accessed field re-walks on every read.
         if (key) |k| instanceMethodCachePutRaw(self, k, METHOD_MISS);
         return null;
     };
-    // The STRICT key folds every discriminator the overload pick consults:
-    // each argument's tag plus its class identity, closure body, or function
-    // decl pointer, alongside the receiver class and name that fix the
-    // candidate set. For a fixed strict key the pick is therefore a pure
-    // function of the key, and storing it cannot serve an overload the walk
-    // would not have chosen — so a resolution that had SEVERAL candidates is
-    // still cacheable. Only the RELAXED key (container kind tags, no
-    // identity) needs the single-candidate guarantee, since two overloads can
-    // share its coarser signature.
+    // The strict key folds every discriminator the pick consults, so even an
+    // ambiguous resolution caches; the relaxed key stores only a lone candidate.
     if (resolved.unambiguous or strict_key != null) {
         if (key) |k| instanceMethodCachePutRaw(self, k, @intFromEnum(resolved.fid));
     }
@@ -277,9 +249,7 @@ pub fn irMethodWalk(self: *VmHost, allocator: Allocator, receiver: *const Value,
     return try invokeMethodFuncId(self, allocator, receiver, resolved.fid, args);
 }
 
-/// `builtinBridgeDefault` for a virtual-slot call: the receiver class's
-/// own declaration of `name` (or the nearest ancestor's) is the override
-/// whose parameter type the bridge checks.
+/// `builtinBridgeDefault` against the receiver's own or nearest inherited `name`.
 pub fn bridgeForReceiver(self: *VmHost, receiver: *const Value, name: []const u8, args: []const Value) ?Value {
     if (args.len != 1 or receiver.* != .Instance) return null;
     const mg = self.module.borrow();
@@ -313,11 +283,9 @@ pub fn bridgeForReceiver(self: *VmHost, receiver: *const Value, name: []const u8
     return null;
 }
 
-/// The JVM's type-checking bridges on a user collection or map: an
-/// argument outside the override's declared parameter type never reaches
-/// the override. `get`/`remove` on a map answer null, `contains`,
-/// `containsKey`, `containsValue` and a collection's `remove` answer
-/// false, `indexOf`/`lastIndexOf` answer -1.
+/// The JVM type-checking bridges on a user collection or map: an argument
+/// outside the override's declared parameter type never reaches it. Map
+/// `get`/`remove` answer null, `contains` and `remove` false, `indexOf` -1.
 pub fn builtinBridgeDefault(self: *VmHost, receiver: *const Value, f: *const Func, args: []const Value) ?Value {
     const name = f.name;
     if (args.len != 1 or receiver.* != .Instance) return null;
@@ -334,10 +302,8 @@ pub fn builtinBridgeDefault(self: *VmHost, receiver: *const Value, f: *const Fun
     const skip: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     if (f.params.len != skip + 1) return null;
     const pty = &f.params[skip].ty;
-    // Only a CONCRETE narrower parameter type has a bridge: a type
-    // parameter of the class or the method (`contains(element: T)`,
-    // `ConcurrentSet<Key : Any>.contains(element: Key)`) takes every
-    // argument; `Any` excludes only null.
+    // Only a concrete narrower parameter type has a bridge: a class or method
+    // type parameter accepts every argument, and `Any` excludes only null.
     var head = std.mem.trimEnd(u8, pty.name, "?");
     if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (head.len == 0 or head[0] == '#' or ir.parseClassTypeParamIdentity(head) != null) return null;
@@ -371,19 +337,12 @@ pub fn builtinBridgeDefault(self: *VmHost, receiver: *const Value, f: *const Fun
     return .{ .Bool = false };
 }
 
-/// A SAM-converted `Sequence { ... }` / `Iterable { ... }` instance: its
-/// `iterator` is served through `__sam_target__` rather than an IR
-/// method, so `hostHasMember(.., "iterator")` cannot see it. The
-/// iterable fallback drains these like any other iterator-bearing
-/// instance.
+/// A SAM-converted `Sequence`/`Iterable` serves `iterator` through
+/// `__sam_target__`, where `hostHasMember` cannot see it, yet still drains.
 pub fn samIterableInstance(self: *VmHost, allocator: Allocator, receiver: *const Value) bool {
     const class_name = blk: {
         const g = receiver.Instance.borrow();
         defer g.deinit();
-        // A SAM conversion carries the lambda under `__sam_target__`; a
-        // lowered fun-interface object carries `iterator` as a callable
-        // field; a full anon `object : Sequence<T>` registers `iterator`
-        // in the anon-method table. Any of them can be drained.
         if (g.get().get("__sam_target__") != null) break :blk null;
         if (g.get().get("iterator")) |f| {
             if (isCallable(&f)) break :blk null;
@@ -491,9 +450,7 @@ pub fn ktypeRender(self: *VmHost, allocator: Allocator, v: *const Value, buf: *s
 }
 
 pub fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
-    // A `KType` (`typeOf<T>()`) compares structurally: same classifier,
-    // same arguments, same nullability; it renders as its classifier's
-    // name with `?` for a nullable type.
+    // A `KType` compares structurally on classifier, arguments and nullability.
     if (isKTypeSynth(receiver)) {
         if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
             return .{ .ok = boolVal(try ktypeEquals(self, allocator, receiver, &args[0])) };
@@ -508,8 +465,7 @@ pub fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const
             return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, try buf.toOwnedSlice(allocator)) } };
         }
     }
-    // A bound or qualified callable reference (`v::m`, `V::m`, `Foo::ext`)
-    // compares by name, receiver and adaptation, and hashes the same way.
+    // A callable reference compares and hashes by name, receiver and adaptation.
     if (host_fields.boundRefParts(receiver)) |mine| {
         if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
             const other = host_fields.boundRefParts(&args[0]) orelse return .{ .ok = boolVal(false) };
@@ -554,9 +510,7 @@ pub fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const
     }
     if (args.len == 0 and std.mem.eql(u8, name, "hashCode")) {
         const g = inst.borrow();
-        // A data/value class without a hashCode override hashes
-        // structurally, not by identity — a value class implementing an
-        // interface that redeclares hashCode still has value semantics.
+        // A data/value class hashes structurally, whatever an interface redeclares.
         const structural = blk: {
             const cg = g.get().class.borrow();
             defer cg.deinit();
@@ -571,15 +525,10 @@ pub fn anyInstanceFallback(self: *VmHost, allocator: Allocator, receiver: *const
         return .{ .ok = Value.newInt(@bitCast(g2.get().identity)) };
     }
     if (args.len == 1 and std.mem.eql(u8, name, "equals")) {
-        // A user `Map.Entry` implementation with no `equals` override follows
-        // the `Map.Entry` contract: equal iff keys and values are equal,
-        // regardless of the other operand's concrete type (a builtin
-        // `MapEntry` or another `Map.Entry` instance).
+        // The `Map.Entry` contract: equal iff keys and values are, any operand type.
         if (Value.mapEntryContractEq(receiver, &args[0])) |eq| {
             return .{ .ok = boolVal(eq) };
         }
-        // Data/value classes compare structurally even when an interface
-        // in their hierarchy redeclares equals (ValueTimeMark).
         {
             const g = inst.borrow();
             const cg = g.get().class.borrow();
@@ -618,23 +567,12 @@ pub fn renderStructuralLocked(allocator: Allocator, inst: *const InstanceData, c
     return .{ .String = try runtime.strInitOwned(allocator, try buf.toOwnedSlice(allocator)) };
 }
 
-/// Format `"{prefix}.{name}"` into `buf` (stack scratch), returning the slice.
-/// Probe FQNs are short and bounded, so this avoids the per-call heap churn of
-/// `allocPrint` — member dispatch builds up to ~6 of these on every call.
 pub inline fn probeFqn(buf: []u8, prefix: []const u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}.{s}", .{ prefix, name }) catch buf[0..0];
 }
 
-/// Whether the call selects a DECLARED lambda-taking overload the
-/// member-form intrinsic cannot represent: the last arg is callable, a
-/// body-bearing receiver-formed declaration named `name` fits the call
-/// arity exactly with a function-typed last parameter, AND a shorter
-/// non-lambda sibling declaration also exists (the shape the intrinsic
-/// actually implements — `copyOf(newSize)` vs
-/// `copyOf(newSize, init)`). Without the sibling requirement every HOF
-/// intrinsic (`map`, `filter`) would fall off its fast path.
-/// Element kinds whose arithmetic differs per declared width — the only
-/// erased receiver-type-arg ties resolution must refuse to guess.
+/// Element kinds whose arithmetic differs per declared width: the only erased
+/// receiver-type-arg ties resolution refuses to guess.
 pub fn numericWidthKind(name: []const u8) bool {
     const kinds = [_][]const u8{
         "Int",  "Long",  "Short",  "Byte",  "Double", "Float",
@@ -646,6 +584,8 @@ pub fn numericWidthKind(name: []const u8) bool {
     return false;
 }
 
+/// Whether a declared lambda-taking overload the intrinsic surface cannot
+/// express fits the call, judged by a shorter non-lambda sibling declaration.
 pub fn declaredLambdaOverloadWins(self: *VmHost, name: []const u8, args: []const Value) bool {
     if (args.len == 0 or !isCallable(&args[args.len - 1])) return false;
     const mg = self.module.borrow();
@@ -670,7 +610,6 @@ pub fn declaredLambdaOverloadWins(self: *VmHost, name: []const u8, args: []const
 
 pub threadlocal var charseq_fallback_active: bool = false;
 
-/// Whether the instance's class chain implements `CharSequence`.
 pub fn instanceImplementsCharSequence(self: *VmHost, receiver: *const Value) bool {
     if (receiver.* != .Instance) return false;
     const cname = blk: {
@@ -690,8 +629,7 @@ pub fn instanceImplementsCharSequence(self: *VmHost, receiver: *const Value) boo
     return false;
 }
 
-/// Whether the instance's class (or its recorded supertype chain)
-/// implements `Sequence` — such receivers keep sequence laziness.
+/// Whether the instance implements `Sequence`; such receivers keep laziness.
 pub fn instanceImplementsSequence(self: *VmHost, receiver: *const Value) bool {
     if (receiver.* != .Instance) return false;
     const cname = blk: {
@@ -711,16 +649,13 @@ pub fn instanceImplementsSequence(self: *VmHost, receiver: *const Value) bool {
     return false;
 }
 
-/// Whether a declared extension with receiver type `Sequence` and a real
-/// body exists for `name` — the lazy source implementation that must win
-/// over eager collection intrinsics for Sequence receivers.
+/// Whether a body-bearing `Sequence`-receiver extension exists for `name`.
 pub fn declaredSequenceExtBody(self: *VmHost, name: []const u8) bool {
     return sequenceExtBodyFid(self, name, null) != null;
 }
 
-/// The declared Sequence-receiver extension with a body for `name` whose
-/// arity accepts `n_args` value arguments (receiver excluded); any arity
-/// when `n_args` is null.
+/// The `Sequence`-receiver extension for `name` taking `n_args` value
+/// arguments, receiver excluded; any arity when `n_args` is null.
 pub fn sequenceExtBodyFid(self: *VmHost, name: []const u8, n_args: ?usize) ?FuncId {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -731,11 +666,9 @@ pub fn sequenceExtBodyFid(self: *VmHost, name: []const u8, n_args: ?usize) ?Func
         const rt = sig.receiver_ty orelse continue;
         if (!std.mem.eql(u8, rt.name, "Sequence")) continue;
         const f = mod.funcById(fid) orelse continue;
-        // Headers decode lazily: judge executability by the settled form
-        // (body, sibling redirect, or native binding), not hasBody().
+        // Headers decode lazily, so judge by the settled form, not `hasBody()`.
         if (n_args) |n| {
             if (!host_call_func.executableForm(self, mod, fid, n + 1)) continue;
-            // DeclSig arity counts value params only (receiver excluded).
             if (n < sig.arity.required) continue;
             if (n > sig.arity.total and !sig.arity.has_vararg) continue;
             if (best == null or f.params.len < (mod.funcById(best.?) orelse f).params.len) best = fid;
@@ -750,37 +683,16 @@ pub fn sequenceExtBodyFid(self: *VmHost, name: []const u8, n_args: ?usize) ?Func
 pub fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     ir.eval.dispatchNote(.served_intrinsic);
     runtime.prof.opRoute(6);
-    // A declared lambda-taking overload the intrinsic surface cannot
-    // express wins resolution; decline so the walk's extension fallback
-    // runs its body (declaration decides, the registry only serves).
+    // A declared lambda-taking overload outranks the intrinsic surface.
     if (declaredLambdaOverloadWins(self, name, args)) return null;
-    // A multi-index `a[i, j]` / `a[i, j] = v` desugars to `a.get(i, j)` /
-    // `a.set(i, j, v)`, which only a user-declared operator provides — the
-    // builtin indexed `get` takes ONE index and `set` takes (index, value).
-    // Decline the over-arity call (args exclude the receiver) so the
-    // extension fallback resolves the user operator instead of the builtin
-    // silently dropping the extra index. Returned BEFORE the resolution
-    // cache so the normal 1-index / (index,value) forms are unaffected.
+    // Multi-index `a[i, j]` needs a user-declared operator: the builtin `get`
+    // takes one index and `set` takes (index, value). Decline before the cache.
     if (std.mem.eql(u8, name, "get") and args.len > 1) return null;
     if (std.mem.eql(u8, name, "set") and args.len > 2) return null;
     const type_fqn = receiver.typeFqn();
-    // Resolution cache: the winning intrinsic (or "none") is a pure function
-    // of (type, name, args-empty), so memoize it and skip the per-call probe
-    // building + repeated `lookupIntrinsic` borrows. A non-Instance receiver
-    // keys by its (static) type-fqn pointer. An Instance's typeFqn is not
-    // class-specific, so it keys by class-cell identity instead — the same
-    // identity `host_has_member_cache` uses, and everything the uncached body
-    // consults for an Instance (hostHasMember, the shadow probes) is a
-    // function of the class, not the individual instance. Array builders use
-    // a different (no-prepend) dispatch and are excluded.
-    // The resolution cache is keyed by exactly what decides the answer — the
-    // receiver's class (or its static type-fqn), the name, and whether the
-    // call has arguments — so it is probed FIRST. Everything that decides
-    // whether an entry may be STORED (`isArrayBuilder`, and the top-level
-    // extension probe, which borrows the module and hashes the name) is a
-    // pure function of the same inputs, so a hit already proves it; computing
-    // it ahead of the probe put a module borrow and a name-index lookup on
-    // every intrinsic member dispatch.
+    // Resolution cache: the winning intrinsic, or a recorded miss, is a pure
+    // function of (receiver class identity or static type-fqn pointer, name,
+    // args-empty), so it is probed before the work that decides storability.
     const name_p_opt = memberNameIdentity(self, name);
     if (name_p_opt) |name_p| {
         const type_p: usize = if (receiver.* == .Instance) blk: {
@@ -793,12 +705,8 @@ pub fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *cons
             .name_p = name_p,
             .args_empty = args.len == 0,
         };
-        // File-qualified sibling key: when an imported pack extension shadows
-        // the stdlib surface the answer is a function of the call site's
-        // import scope and the call's arity too, so those resolutions cache
-        // under (file+1, argc) rather than not at all (`writable` /
-        // `withCurrent` on a snapshot record re-ran the whole ladder tens of
-        // thousands of times per state-list stress rep).
+        // An imported pack extension makes the answer depend on the call site's
+        // import scope and arity too, so those key on (file + 1, argc).
         const key_f: ?root_mod.ProgramImage.MemberResolveKey = blk: {
             const sp = ir.eval.currentCallSiteSpan() orelse break :blk null;
             var k = key;
@@ -806,8 +714,7 @@ pub fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *cons
             k.argc = @intCast(args.len);
             break :blk k;
         };
-        // Thread-local L1 (see `tl_method_cache`): a hit avoids the shared
-        // program cell's reader lock and its cross-core coherence traffic.
+        // Thread-local L1: a hit avoids the shared program cell's reader lock.
         for ([2]?root_mod.ProgramImage.MemberResolveKey{ key, key_f }) |k_opt| {
             const k = k_opt orelse continue;
             const e = &caches.tl_resolve_cache[tlResolveSlot(k)];
@@ -839,21 +746,14 @@ pub fn stdlibMemberDispatch(self: *VmHost, allocator: Allocator, receiver: *cons
 pub fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, type_fqn: []const u8, cache_key: ?root_mod.ProgramImage.MemberResolveKey, cache_key_file: ?root_mod.ProgramImage.MemberResolveKey) Allocator.Error!?EvalResult {
     if (runtime.envOnce("KLIO_SDU_TRACE") != null)
         std.debug.print("[sdu] type={s} name={s} cacheable={}\n", .{ type_fqn, name, cache_key != null });
-    // A Sequence receiver with a DECLARED Sequence-receiver extension body
-    // must run that lazy source implementation — the package probes below
-    // would bind an eager collection intrinsic (`kotlin.collections.chunked`
-    // materializes the receiver, breaking Kotlin's sequence laziness).
-    // Terminal names never reach here (the sequence arm handles them).
+    // A Sequence receiver with a declared Sequence-receiver extension body runs
+    // that lazy implementation; the probes below would bind an eager intrinsic.
     if (receiver.* == .Sequence and declaredSequenceExtBody(self, name)) return null;
-    // Probe FQNs in priority order, formatted into per-call stack buffers (no
-    // heap traffic). `kotlin.<name>` etc. are formatted too so one code path
-    // builds them all; the storage outlives the loop below.
+    // Probe FQNs in priority order; the stack storage outlives the loop below.
     var bufs: [8][128]u8 = undefined;
     var probes: [8][]const u8 = undefined;
-    // Which probes name a MEMBER of the receiver's type (keyed by the type's
-    // FQN) rather than one of the stdlib's package-level EXTENSIONS. Kotlin
-    // resolves a member before any extension, so a user extension shadows the
-    // extension probes and never the member ones.
+    // Which probes name a member of the receiver's type rather than a stdlib
+    // package extension: a user extension shadows the latter, never the former.
     var probe_is_member: [8]bool = @splat(false);
     var n: usize = 0;
     const type_probe = probeFqn(&bufs[0], type_fqn, name);
@@ -874,9 +774,7 @@ pub fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receive
         probes[4] = probeFqn(&bufs[4], "kotlin", name);
         n = 5;
     }
-    // Sibling read-only/mutable collection type, inserted right after the
-    // receiver-type probe so a `MutableList` op can resolve a `List`-declared
-    // intrinsic (and vice versa).
+    // Sibling read-only/mutable type, probed right after the receiver's own.
     const sibling: ?[]const u8 = blk: {
         if (std.mem.eql(u8, type_fqn, "kotlin.collections.MutableList")) break :blk "kotlin.collections.List";
         if (std.mem.eql(u8, type_fqn, "kotlin.collections.MutableSet")) break :blk "kotlin.collections.Set";
@@ -888,7 +786,6 @@ pub fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receive
     };
     if (sibling) |sib| {
         const sib_probe = probeFqn(&bufs[5], sib, name);
-        // Find the receiver-type probe and insert the sibling right after it.
         var at: usize = n;
         for (probes[0..n], 0..) |p, idx| {
             if (std.mem.eql(u8, p, type_probe)) {
@@ -905,7 +802,6 @@ pub fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receive
         probe_is_member[at] = true;
         n += 1;
     }
-    // Throwable family probe.
     if (receiver.* == .Instance) {
         if (instanceIsThrowable(self, allocator, receiver.Instance)) {
             probes[n] = probeFqn(&bufs[6], "kotlin.Throwable", name);
@@ -916,21 +812,16 @@ pub fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receive
 
     const member_shadows_stdlib = receiver.* == .Instance and hostHasMember(self, receiver, name);
     const user_member_ext_shadows = try userMemberExtShadows(self, allocator, receiver, name, args.len);
-    // Scope-aware pack-extension shadowing: an in-scope (imported) pack
-    // extension outranks the implicit stdlib surface for this call site;
-    // a merely-POTENTIAL one makes the resolution file-dependent, so the
-    // (type, name) memoization below must stand down.
+    // An imported pack extension outranks the implicit stdlib surface here; a
+    // merely potential one makes the answer file-dependent, so the key changes.
     const pack_ext_shadow = try importedPackExtShadows(self, allocator, receiver, name, args.len);
     const effective_cache_key: ?root_mod.ProgramImage.MemberResolveKey =
         if (pack_ext_shadow == .none) cache_key else cache_key_file;
-    // `range in range`: the builtin `Range.contains` intrinsic takes an
-    // ELEMENT, so a Range argument is inapplicable to every probe the
-    // ladder could hit — leave it for the extension fallback, where a
-    // range-over-range operator (`LongRange.contains(LongRange)`) binds.
+    // The builtin `Range.contains` takes an element, so `range in range` fits no
+    // probe; the extension fallback binds the range-over-range operator.
     const range_in_range = receiver.* == .Range and args.len == 1 and
         args[0] == .Range and std.mem.eql(u8, name, "contains");
 
-    // Array builder global factory direct dispatch.
     if (stdlib.isArrayBuilder(name) and !hostHasMember(self, receiver, name)) {
         const probe = probeFqn(&bufs[7], "kotlin", name);
         if (lookupIntrinsic(self, probe)) |func| {
@@ -942,14 +833,10 @@ pub fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receive
         pack_ext_shadow != .shadows and
         !stdlib.isToplevelFunction(name))
     {
-        // A user extension shadows the stdlib's EXTENSIONS — but never its
-        // MEMBERS. Kotlin resolves a member first, so `fun Long.toInt(): Int`
-        // does not capture `7L.toInt()`; the member does, and the extension's
-        // own `this.toInt()` reaches it (rather than calling itself for ever).
+        // A user extension shadows the stdlib's extensions, never its members:
+        // `fun Long.toInt()` does not capture `7L.toInt()`, the member does.
         const user_ext_shadows = try userToplevelExtShadows(self, allocator, receiver, name, args);
-        // A member is applicable only at its declared arity: `list[i, j]`
-        // with `operator fun ArrayList<T>.get(i: Int, j: Int)` declared is
-        // the extension's call, never the one-index member's.
+        // A member is applicable only at its declared arity.
         const decl_owner: []const u8 = if (receiver.* == .Instance) blk: {
             const g = receiver.Instance.borrow();
             defer g.deinit();
@@ -960,13 +847,9 @@ pub fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receive
         const member_arity_misfit = user_ext_shadows and memberDeclArityMisfit(self, decl_owner, name, args.len);
         for (probes[0..n], probe_is_member[0..n]) |probe, is_member| {
             if (user_ext_shadows and (!is_member or member_arity_misfit)) continue;
-            // A member outranks an extension only while its host binding is
-            // applicable. Intrinsics whose Kotlin declarations are pruned
-            // from the runtime image carry this small predicate alongside
-            // the binding, so `Int.or(Int)` cannot capture the distinct
-            // `Int.or(NodeKind)` overload, and `String.repeat(Int)` cannot
-            // capture a bare `repeat(times) { … }` reaching a String through
-            // the enclosing-receiver walk.
+            // A member outranks an extension only while its binding applies;
+            // intrinsics pruned from the runtime image carry this predicate so
+            // `Int.or(Int)` cannot capture a distinct `Int.or(NodeKind)`.
             if (stdlib.implementationApplicable(probe, args)) |applies| {
                 if (!applies) continue;
             }
@@ -976,15 +859,13 @@ pub fn stdlibMemberDispatchUncached(self: *VmHost, allocator: Allocator, receive
             }
         }
     }
-    // No intrinsic resolved: memoize the miss so the next identical call skips
-    // the probe build + lookups and falls straight through to extension/global.
+    // Memoize the miss so the next identical call skips the probe build.
     if (effective_cache_key) |key| memberCachePut(self, key, null, "");
     return null;
 }
 
-/// Store a member-resolution result on the shared program image. `func == null`
-/// records a confirmed miss; a non-empty `fqn` is duped into the program's
-/// allocator (lives for the program; bounded by distinct resolved members).
+/// Store a member-resolution result on the shared program image; `func == null`
+/// records a miss. A non-empty `fqn` is duped into the program's allocator.
 pub fn memberCachePut(self: *VmHost, key: root_mod.ProgramImage.MemberResolveKey, func: ?StdlibFn, fqn: []const u8) void {
     const pg = self.prog.borrowMut();
     defer pg.deinit();
@@ -999,9 +880,8 @@ pub fn memberCachePut(self: *VmHost, key: root_mod.ProgramImage.MemberResolveKey
     };
 }
 
-/// `Throwable.printStackTrace()` / `.stackTraceToString()` rendered from the
-/// stack captured at throw time. Returns null for a name these do not handle or
-/// a receiver that is not a throwable, so normal dispatch proceeds.
+/// `printStackTrace` / `stackTraceToString` rendered from the stack captured at
+/// throw time; null for any other name or a non-throwable receiver.
 pub fn throwableStackMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     if (args.len != 0) return null;
     const is_print = std.mem.eql(u8, name, "printStackTrace");
@@ -1026,17 +906,13 @@ pub fn throwableStackMember(self: *VmHost, allocator: Allocator, receiver: *cons
         std.debug.print("{s}\n", .{buf.items});
         return .{ .ok = .Unit };
     }
-    // Adopt a private copy: `buf` is freed on return, and `strInit`'s
-    // arena fast path would otherwise alias (then dangle) `buf.items`.
+    // `buf` is freed on return, so adopt a private copy rather than alias it.
     const owned = try allocator.dupe(u8, buf.items);
     return .{ .ok = .{ .String = try runtime.strInitOwned(allocator, owned) } };
 }
 
-/// `addSuppressed`/`getSuppressed` on an INTERPRETED throwable instance. The
-/// suppressed list lives in a hidden `__suppressed__` field on the instance
-/// (a user throwable is a plain Instance until thrown), so every alias of
-/// the instance observes the same set. Host `Exception` values carry their
-/// list in the value itself and dispatch through the stdlib binding instead.
+/// `addSuppressed`/`getSuppressed` on an interpreted throwable: the list lives
+/// in the hidden `__suppressed__` field, so every alias sees the same set.
 pub fn throwableSuppressedMember(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const is_add = std.mem.eql(u8, name, "addSuppressed") and args.len == 1;
     const is_get = std.mem.eql(u8, name, "getSuppressed") and args.len == 0;
@@ -1062,7 +938,6 @@ pub fn throwableSuppressedMember(self: *VmHost, allocator: Allocator, receiver: 
     return .{ .ok = .Unit };
 }
 
-/// The instance's `__suppressed__` list value, if one was created.
 pub fn instanceSuppressedList(inst: ObjRef(InstanceData)) ?Value {
     const g = inst.borrow();
     defer g.deinit();
@@ -1071,7 +946,6 @@ pub fn instanceSuppressedList(inst: ObjRef(InstanceData)) ?Value {
     return v;
 }
 
-/// Append to the instance's hidden suppressed list, creating it on first use.
 pub fn appendInstanceSuppressed(inst: ObjRef(InstanceData), allocator: Allocator, e: Value) Allocator.Error!void {
     const list: Value = blk: {
         if (instanceSuppressedList(inst)) |l| break :blk l;

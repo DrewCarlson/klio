@@ -1,11 +1,8 @@
-//! `VmHost` member dispatch — the largest slice of host behaviour:
-//! resolving a named member on a receiver (instance / class / builtin),
-//! member references, `super.foo(...)` and `this@Outer` resolution, the
-//! enclosing-`this` chain, and the member-only probe Kotlin's member-vs-
-//! extension precedence rule needs.
-//!
-//! Free functions over `*VmHost`, aliased as `VmHost` methods by
-//! `vmhost.zig` and invoked directly by the generic IR evaluator.
+//! `VmHost` member dispatch: a named member on a receiver (instance, class or
+//! builtin), member references, `super.foo(...)`, `this@Outer`, the
+//! enclosing-`this` chain, and the member-only probe Kotlin's
+//! member-before-extension rule needs. Aliased as `VmHost` methods by
+//! `vmhost.zig`.
 
 const std = @import("std");
 
@@ -56,7 +53,6 @@ const TypeRef = ir.TypeRef;
 const EvalResult = ir.eval.EvalResult;
 const EvalError = ir.eval.EvalError;
 
-// The builtin-receiver member surface, lifted to builtin_members.zig.
 const Ordering = builtin_members.Ordering;
 const arrayShapeOps = builtin_members.arrayShapeOps;
 const builtinIterator = builtin_members.builtinIterator;
@@ -83,11 +79,6 @@ const seqIterMember = builtin_members.seqIterMember;
 const sequenceMember = builtin_members.sequenceMember;
 const sortedInstances = builtin_members.sortedInstances;
 const valueStructuralHash = builtin_members.valueStructuralHash;
-
-// -------------------------------------------------------------------------
-// Member dispatch is split across `host_call_member/`; each import below is
-// followed by the aliases that keep every call site addressing this file.
-// -------------------------------------------------------------------------
 
 const receiver_probe = @import("host_call_member/receiver_probe.zig");
 const isCallable = receiver_probe.isCallable;
@@ -538,19 +529,13 @@ pub const serializerForClassTarget = member_ref_super.serializerForClassTarget;
 const companionOwnerClassValue = member_ref_super.companionOwnerClassValue;
 
 
-// -------------------------------------------------------------------------
-// Thread-local resolution state kept here for the member-dispatch
-// fallbacks below.
-// -------------------------------------------------------------------------
-
 /// Guards `materializeUserMap` re-entry while the Map fallback runs.
 pub threadlocal var map_fallback_active: bool = false;
 
 /// Guards `drainIterableToList` re-entry while the Iterable fallback runs.
 pub threadlocal var iterable_fallback_active: bool = false;
 
-/// Assert (Debug) the member-dispatch re-entrancy flags are clear at a run
-/// boundary and reset them so leaked-across-runs state is a loud failure.
+/// Run-boundary reset; a flag still set means a fallback leaked across runs.
 pub fn resetReceiverTls() void {
     std.debug.assert(!map_fallback_active);
     std.debug.assert(!iterable_fallback_active);
@@ -588,7 +573,6 @@ pub fn boolVal(b: bool) Value {
     return .{ .Bool = b };
 }
 
-/// Whether a value is a primitive number (integer or floating tag).
 pub fn isNumericValue(v: *const Value) bool {
     return switch (v.*) {
         .Int, .Long, .Short, .Byte, .Double, .Float, .UInt, .ULong, .UShort, .UByte => true,
@@ -596,8 +580,7 @@ pub fn isNumericValue(v: *const Value) bool {
     };
 }
 
-/// The binary operator a numeric type's named operator member maps to
-/// (`x.rem(y)` → `%`), or null when the name is not such a member.
+/// The binary operator a numeric operator member maps to, `x.rem(y)` to `%`.
 pub fn numericOpMethod(name: []const u8) ?ir.BinOp {
     const eql = std.mem.eql;
     if (eql(u8, name, "plus")) return .Add;
@@ -605,21 +588,19 @@ pub fn numericOpMethod(name: []const u8) ?ir.BinOp {
     if (eql(u8, name, "times")) return .Mul;
     if (eql(u8, name, "div")) return .Div;
     if (eql(u8, name, "rem")) return .Mod;
-    // `mod` is NOT mapped to `%`: Kotlin's `mod` differs from `rem` for
-    // negative operands (mod matches the divisor's sign), so it must keep the
-    // stdlib implementation. Bitwise/shift members (and/or/xor/shl/shr/ushr)
-    // likewise fall through — `applyBinop` implements only arithmetic.
+    // `mod` stays on the stdlib implementation: for negative operands it takes
+    // the divisor's sign and `rem` does not. Bitwise and shift members fall
+    // through too, since `applyBinop` covers only arithmetic.
     return null;
 }
 
-/// Simple-name tail of a possibly-qualified name (`a.b.C` -> `C`).
 pub fn simpleName(name: []const u8) []const u8 {
     if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
 }
 
-/// Remove nullability and type arguments from a declared receiver name so it
-/// can address the host binding registered for the receiver's class.
+/// Declared receiver name minus nullability and type arguments, so it addresses
+/// the host binding registered for the receiver's class.
 pub fn staticReceiverBindingHead(name: []const u8) []const u8 {
     var head = std.mem.trim(u8, name, " ");
     head = std.mem.trimEnd(u8, head, "?");
@@ -627,30 +608,20 @@ pub fn staticReceiverBindingHead(name: []const u8) []const u8 {
     return std.mem.trim(u8, head, " ");
 }
 
-/// The Kotlin simple name shown by `toString`/`KClass.simpleName` for a
-/// class whose internal `name` may be a lifted-nested mangle. A nested
-/// class lifts to a flat top-level name like `Outer$Data`; Kotlin reports
-/// just `Data`. `$` cannot appear in a source class name, so the segment
-/// after the last `$` (then the last `.`) is the source simple name.
+/// The name `toString` and `KClass.simpleName` report: a nested class lifts to
+/// a flat `Outer$Data` but Kotlin shows `Data`, and `$` cannot occur in a
+/// source class name, so the segment after the last `$` is that name.
 pub fn classDisplayName(name: []const u8) []const u8 {
     var n = name;
     if (std.mem.findScalarLast(u8, n, '$')) |i| n = n[i + 1 ..];
     return simpleName(n);
 }
 
-// -------------------------------------------------------------------------
-// Dispatch invariants (KLIO_TRACE_INVARIANTS, default OFF). These detect — but
-// never repair — structural dispatch hazards at the candidate-selection choke
-// point (execution-architecture §5.3). A violation emits one machine-readable
-// `[INVARIANT]` line through the tracer; it is not a panic, so the default
-// build stays green.
-// -------------------------------------------------------------------------
+// Dispatch invariants, gated on KLIO_TRACE_INVARIANTS (default off): they
+// report a hazard as one `[INVARIANT]` tracer line and never repair it.
 
-/// Invariant (i): the overload candidate set must select a unique winner.
-/// When two distinct candidates tie on the chosen score, declaration order
-/// silently breaks the tie — a non-deterministic resolution hazard. Called
-/// with the candidates that scored equal to the winner; emits a violation
-/// when more than one (distinct) function ties.
+/// Candidate selection must have a unique winner; two distinct candidates tied
+/// on the chosen score means declaration order broke the tie.
 pub fn checkOverloadUnique(name: []const u8, winner: *const Func, tied: []const Func) void {
     if (!trace.invariantsEnabled()) return;
     var distinct: usize = 0;
@@ -664,9 +635,7 @@ pub fn checkOverloadUnique(name: []const u8, winner: *const Func, tied: []const 
     );
 }
 
-/// Invariant (ii): a selected `FuncId` must be in range for the module's func
-/// table and its `params` slice must be addressable. Emits a violation and
-/// returns when out of range.
+/// A selected `FuncId` must index the module's func table.
 pub fn checkFuncInRange(self: *VmHost, site: []const u8, fid: FuncId) void {
     if (!trace.invariantsEnabled()) return;
     const mg = self.module.borrow();
@@ -680,8 +649,6 @@ pub fn checkFuncInRange(self: *VmHost, site: []const u8, fid: FuncId) void {
     }
 }
 
-/// Instance identity (control-block pointer) of a `Value`, or `null` for
-/// non-instances.
 fn instancePtr(v: *const Value) ?*const anyopaque {
     return switch (v.*) {
         .Instance => |i| @ptrCast(i.cell),
@@ -689,11 +656,8 @@ fn instancePtr(v: *const Value) ?*const anyopaque {
     };
 }
 
-/// Invariant (iii): receiver-chain consistency. When both a `"this"` param and
-/// a `"this"` capture are present they must refer to the same `Instance`, and
-/// the enclosing-`this` chain must have no interior `Null`/`Unit` entries
-/// (those indicate a receiver that was lost or never set). Emits one violation
-/// line per inconsistency found; never repairs.
+/// A `"this"` param and a `"this"` capture must name the same `Instance`, and
+/// an interior `Null`/`Unit` in the enclosing-`this` chain is a lost receiver.
 pub fn checkReceiverChain(self: *VmHost, allocator: Allocator, site: []const u8, this_param: ?*const Value, this_capture: ?*const Value) void {
     if (!trace.invariantsEnabled()) return;
     if (this_param != null and this_capture != null) {
@@ -709,8 +673,6 @@ pub fn checkReceiverChain(self: *VmHost, allocator: Allocator, site: []const u8,
     const chain = enclosingThisChain(self, allocator) catch return;
     defer allocator.free(chain);
     if (chain.len < 2) return;
-    // Interior entries are everything but the outermost element; a Null/Unit
-    // interior receiver is a hole in the enclosing-`this` chain.
     for (chain[0 .. chain.len - 1], 0..) |v, i| {
         switch (v) {
             .Null, .Unit => trace.invariant(
@@ -722,22 +684,13 @@ pub fn checkReceiverChain(self: *VmHost, allocator: Allocator, site: []const u8,
     }
 }
 
-// -------------------------------------------------------------------------
-// Recursive dispatch in this file routes back through `VmHost`'s own
-// host methods (the same ones the generic IR evaluator invokes).
-// -------------------------------------------------------------------------
-
-/// Recursive `callMember` — used for the many self-forwarding branches
-/// (`map.containsKey`, delegation, companion forwarding, range
-/// materialisation, …).
 pub fn callMemberRec(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!EvalResult {
     return callMember(self, allocator, receiver, name, args);
 }
 
-/// Whether a closure's body is compose-pass threaded: its declared params
-/// end with the synthetic `($composer, $changed)` pair. Such a closure
-/// invoked without the pair completes it from the ambient composer inside
-/// `callValue`, so arity checks must accept the pair-less shape too.
+/// Whether the closure body is compose-threaded: its params end with the
+/// synthetic `($composer, $changed)` pair. `callValue` completes that pair from
+/// the ambient composer, so arity checks must also accept the pair-less shape.
 pub fn closurePairTailed(self: *VmHost, info: anytype) bool {
     const module: *const Module = info.module orelse self.module.asPtr();
     const func = module.funcById(info.body_func) orelse return false;
@@ -747,11 +700,9 @@ pub fn closurePairTailed(self: *VmHost, info: anytype) bool {
 }
 
 pub fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, args: []const Value) Allocator.Error!EvalResult {
-    // A receiver-typed callable invoked function-style with the receiver
-    // as its first argument (`content.item(itemScope, localIndex)` where
-    // `item: LazyItemScope.(Int) -> Unit`): one arg more than the
-    // declared params plus a `this` capture slot is that shape — bind
-    // args[0] as the receiver, not as the first parameter.
+    // A receiver-typed callable invoked function-style passes its receiver as
+    // arg 0: one arg over the declared params plus a `this` capture is that
+    // shape, so bind args[0] as the receiver rather than as param 0.
     if (callee.* == .IrClosure and args.len >= 1) {
         if (self.closures.get(@intCast(callee.IrClosure.asPtr().id))) |info| {
             if (args.len == info.n_params + 1 or
@@ -767,11 +718,8 @@ pub fn callValueRec(self: *VmHost, allocator: Allocator, callee: *const Value, a
                 if (has_this) {
                     return self.callValueWithThis(allocator, callee, &args[0], args[1..], &.{});
                 }
-                // No `this` slot: the lambda never READS its receiver —
-                // bind the declared params without it. The receiver still
-                // scopes the body's dispatch (a member-extension declared
-                // on its class resolves through it), so it rides along as
-                // the innermost subject, exactly like the value-call path.
+                // No `this` slot means the body never reads the receiver, but
+                // it still scopes dispatch: push it as innermost subject.
                 const pushed = args[0] == .Instance or args[0] == .Null;
                 if (pushed) pushAccessEnclosingSubject(self, &args[0]);
                 const r = self.callValue(allocator, callee, args[1..]);
@@ -807,10 +755,8 @@ pub fn getFieldRec(self: *VmHost, allocator: Allocator, receiver: *const Value, 
 }
 
 pub fn callFuncRec(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value) Allocator.Error!EvalResult {
-    // Forward the member call's trailing-lambda syntax bit to the
-    // function binder: every member-dispatch route funnels here, so the
-    // under-applied default-fill in `callFunc` binds the lambda to the
-    // LAST param exactly when the source used trailing syntax.
+    // Every member route funnels here, so forwarding the trailing-lambda bit
+    // makes `callFunc`'s default fill bind the lambda to the last param.
     if (reflect_anon.trailing_member_call) host_call_func.setTrailingLambdaCall(true);
     const r = self.callFunc(allocator, module, func, args);
     host_call_func.setTrailingLambdaCall(false);
@@ -840,16 +786,10 @@ pub fn callFuncIndexedRec(
     return r;
 }
 
-// -------------------------------------------------------------------------
-// Intrinsic resolution / dispatch.
-// -------------------------------------------------------------------------
-
-/// Resolve a stdlib intrinsic by FQN: a pack-installed binding shadows the
-/// shipped implementation.
+/// A pack-installed binding shadows the shipped implementation.
 pub fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
-    // Post-link the bindings table is read-only; consult it unguarded
-    // (gated on the published link flag) instead of taking two shared
-    // reader locks per lookup.
+    // Post-link the bindings table is read-only, so the published link flag
+    // gates an unguarded read instead of two shared reader locks per lookup.
     {
         const img = self.prog.asPtrConst();
         if (@atomicLoad(bool, &img.resolved_linked, .acquire)) {
@@ -865,9 +805,6 @@ pub fn lookupIntrinsic(self: *VmHost, fqn: []const u8) ?StdlibFn {
     return stdlib.implementation(fqn);
 }
 
-/// Build a `VmIntrinsicHost` bound to this host's shared handles, run the
-/// intrinsic, and map any `RuntimeError` into the IR evaluator's
-/// `EvalError`. Mirrors `dispatch_intrinsic`.
 pub fn dispatchIntrinsic(self: *VmHost, allocator: Allocator, fqn: []const u8, func: StdlibFn, args: []const Value) Allocator.Error!EvalResult {
     vmhost.emitPath(allocator, "intrinsic_call_member", fqn, null, null, args);
     const keepalive = self.ka.mark();
@@ -940,9 +877,8 @@ pub fn mapRuntimeError(allocator: Allocator, e: RuntimeError) Allocator.Error!Ev
             break :blk .{ .Suspended = ss };
         },
         .CalleeFailed => |m| .{ .CalleeFailed = m },
-        // Preserve each message-carrying variant's TEXT: collapsing to the
-        // tag name (`@tagName`) buries the real failure ("IR eval: Type"
-        // instead of the actual diagnostic), which hides the true bug.
+        // Each message-carrying variant keeps its text; collapsing to the tag
+        // name would report "IR eval: Type" instead of the real diagnostic.
         .Type => |s| .{ .Type = s },
         .Unbound => |s| .{ .Unbound = s },
         .Unimplemented => |s| .{ .Unimplemented = s },
@@ -951,15 +887,11 @@ pub fn mapRuntimeError(allocator: Allocator, e: RuntimeError) Allocator.Error!Ev
     };
 }
 
-/// Generation stamp for every process-global / thread-local dispatch cache.
-/// An in-process driver that runs MANY programs in one process (the parity
-/// itests, e2e, the fuzzer) frees each program's module and arena; pointer
-/// identities (class cells, name storage) are then reused by the next
-/// program, and a surviving cache entry keyed on them replays the PREVIOUS
-/// program's resolution — wrong overloads at best, calls into freed IR at
-/// worst (the census's cross-test contamination family). Such drivers bump
-/// the generation at each program boundary; entries from an older
-/// generation never hit.
+/// Generation stamp for every process-global and thread-local dispatch cache.
+/// A driver running many programs per process frees each program's module and
+/// arena, and the next program reuses those pointer identities, so an entry
+/// keyed on them would replay the earlier resolution or call into freed IR.
+/// Such drivers bump the generation per program; older stamps never hit.
 pub var dispatch_cache_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 pub fn dispatchCacheGen() u32 {
     return dispatch_cache_gen.load(.monotonic);
@@ -980,9 +912,8 @@ pub var ext_fb_walk: u64 = 0;
 const testing = std.testing;
 
 test "unsigned prim-array kinds resolve to their ARRAY receiver name" {
-    // builtinReceiverDisproven compares a declared unsigned-array receiver
-    // against simpleName(view.typeFqn()); the kind's own simpleName is the
-    // ELEMENT name and must never be used for that comparison.
+    // builtinReceiverDisproven compares against simpleName(view.typeFqn());
+    // the kind's own simpleName is the element name.
     const kinds = [_]runtime.PrimitiveArrayKind{ .UInt, .ULong, .UShort, .UByte };
     const names = [_][]const u8{ "UIntArray", "ULongArray", "UShortArray", "UByteArray" };
     for (kinds, names) |k, n| {
@@ -1013,7 +944,7 @@ test "kotlinHashCode matches Kotlin for builtins" {
     try testing.expectEqual(@as(i32, 0), kotlinHashCode(&.Null));
     try testing.expectEqual(@as(i32, 1231), kotlinHashCode(&.{ .Bool = true }));
     try testing.expectEqual(@as(i32, 1237), kotlinHashCode(&.{ .Bool = false }));
-    // The unsigned value classes hash their SIGNED storage: 65535u is -1.
+    // The unsigned value classes hash their signed storage: 65535u is -1.
     try testing.expectEqual(@as(i32, -1), kotlinHashCode(&.{ .UShort = 65535 }));
     try testing.expectEqual(@as(i32, -1), kotlinHashCode(&.{ .UByte = 255 }));
     try testing.expectEqual(@as(i32, 1), kotlinHashCode(&.{ .UShort = 1 }));

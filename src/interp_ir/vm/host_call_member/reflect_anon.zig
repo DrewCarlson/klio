@@ -87,14 +87,8 @@ pub fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
     if (std.mem.eql(u8, name, "name") or std.mem.eql(u8, name, "simpleName")) {
         return null; // handled by get_field
     }
-    // `KMutableProperty.set` / `KProperty.get`: an UNBOUND property
-    // reference (`T::prop`, captured receiver = the class) takes the target
-    // first; a bound one uses the captured receiver.
     if (std.mem.eql(u8, name, "set") or std.mem.eql(u8, name, "get")) {
-        // Arity decides bound vs unbound: `T::prop` captures the CLASS (or
-        // its companion stand-in) and takes the target first; `x::prop`
-        // captures the instance. `set` is 2 args unbound / 1 bound; `get`
-        // is 1 / 0.
+        // Arity decides bound vs unbound: `set` is 2 args unbound / 1 bound.
         if (std.mem.eql(u8, name, "set")) {
             if (args.len == 2) {
                 switch (try host_fields.setField(self, allocator, &args[0], n, args[1])) {
@@ -117,8 +111,7 @@ pub fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
             }
         }
     }
-    // Dispatch under the reference's creation-site file (private
-    // visibility is decided where the reference was written).
+    // Private visibility is decided where the reference was written.
     var ref_pushed = false;
     var ref_prev: ?ir.eval.RefSiteOverride = null;
     if (boundRefFile(receiver)) |bf| {
@@ -147,10 +140,7 @@ pub fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
             );
         }
     }
-    // Property-delegation protocol on a bound property reference
-    // (`var x by data::prop` / `by Data::prop`): read/write the
-    // referenced property. A Class-bound ref takes the instance from
-    // the delegation call's thisRef argument.
+    // Property delegation: a Class-bound ref takes the instance from thisRef.
     if (std.mem.eql(u8, name, "getValue") and args.len >= 2) {
         const target: *const Value = if (recv_capt == .Class) &args[0] else &recv_capt;
         var r = try getFieldRec(self, allocator, target, n);
@@ -164,7 +154,6 @@ pub fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
             .err => |e| .{ .err = e },
         };
     }
-    // `ref.set(v)` on a bound mutable property reference.
     if (std.mem.eql(u8, name, "set") and recv_capt != .Class and args.len == 1) {
         return switch (try host_fields.setField(self, allocator, &recv_capt, n, args[0])) {
             .ok => .{ .ok = .Unit },
@@ -184,15 +173,13 @@ pub fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
             if (rest.len == 0 and (memberIsProperty(self, &first, n) or
                 (!host_call_value.extensionFnNamed(self, n) and host_fields.hostHasExtProp(self, allocator, &first, n))))
             {
-                // getFieldRec returns the field borrowed; this escapes as a
-                // callMember return whose register takes ownership, so retain.
+                // The borrowed field escapes as a callMember return, so retain.
                 var r = try getFieldRec(self, allocator, &first, n);
                 if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
                 return r;
             }
             const r = try callMemberRec(self, allocator, &first, n, rest);
-            // `Int::extProp` invoked with its receiver reads the extension
-            // property once the member forward has missed the name itself.
+            // An extension property is read once the member forward has missed.
             if (rest.len == 0 and isDispatchMissFor(r, n)) {
                 var r2 = try getFieldRec(self, allocator, &first, n);
                 if (runtime.envOnce("KLIO_ERR_TRACE") != null) std.debug.print("[boundref-unbound] {s} on {s}: field read {s}\n", .{ n, first.typeFqn(), if (r2 == .ok) "ok" else "miss" });
@@ -214,11 +201,7 @@ pub fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
         if (r == .ok and runtime.reclaimEnabled()) r.ok.retain();
         return r;
     }
-    // A bound EXTENSION-property reference (`local::extVal`): the name is
-    // not a member of the receiver's class, but `get()` still reads the
-    // property — the field path resolves extension getters and delegated
-    // extension properties. Only a clean read wins; a miss falls through
-    // to the bound-method forward below.
+    // On a bound extension-property reference only a clean field read wins.
     if (std.mem.eql(u8, name, "get") and args.len == 0) {
         var r = try getFieldRec(self, allocator, &recv_capt, n);
         if (r == .ok) {
@@ -226,19 +209,13 @@ pub fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
             return r;
         }
     }
-    // An EXTENSION declared on a function type serves the reference itself,
-    // not the member it names: `source::produce` is a `() -> Int`, so
-    // `.asFlow()` on it is `(() -> T).asFlow()`. Forwarding every unknown
-    // name to the bound member turned that into `produce()`'s value. Decline
-    // so the ordinary member/extension walk runs; `invoke`/`call` are the
-    // reference's own surface and keep forwarding.
+    // An extension declared on a function type serves the reference itself, not
+    // the member it names; `invoke`/`call` keep forwarding to the member.
     if (!std.mem.eql(u8, name, "invoke") and !std.mem.eql(u8, name, "call") and
         extWithThisLongerThanArgs(self, name, args.len)) return null;
-    // Bound method reference: forward the call.
     const r = try callMemberRec(self, allocator, &recv_capt, n, args);
     if ((std.mem.eql(u8, name, "invoke") or std.mem.eql(u8, name, "call")) and r == .err and r.err == .Unimplemented) {
-        // A bound EXTENSION-property reference invoked (`(::extProp)()`)
-        // reads the property once the member forward has missed the name.
+        // An invoked extension-property reference reads the property on a miss.
         if (args.len == 0 and isDispatchMissFor(r, n)) {
             var r2 = try getFieldRec(self, allocator, &recv_capt, n);
             if (r2 == .ok) {
@@ -247,11 +224,8 @@ pub fn boundRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const Va
                 return r2;
             }
         }
-        // The receiver's class declares no such member: the reference
-        // names a top-level function (a `::fn` lowered as a member ref
-        // before the function's header was registered). Resolve it
-        // through the full global probe chain — the raw env holds no
-        // top-level functions.
+        // No such member: the reference names a top-level function, which only
+        // the global probe chain resolves (the raw env holds none).
         if (host_globals.lookupGlobal(self, n)) |callable| {
             switch (callable) {
                 .IrClosure => return try callValueRec(self, allocator, &callable, args),
@@ -319,12 +293,7 @@ pub fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const
             return try callValueRec(self, allocator, &callable.?, args);
         }
     }
-    // Unbound `KProperty0` / `KMutableProperty0`: `get()` (and the
-    // `() -> V` `invoke()`/`call()` forms) read the referenced top-level
-    // property, and `set(v)` writes it. The reference carries only the
-    // property name, so resolve the value the same way a bare read does —
-    // a stored `val`/`var` from globals (driving a deferred initializer on
-    // demand), otherwise a custom `get()` accessor's 0-arg getter func.
+    // Unbound `KProperty0`: `get`/`invoke`/`call` read the top-level property.
     if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and args.len == 0) {
         if (try topLevelPropertyGet(self, allocator, pname)) |r| return r;
     }
@@ -338,9 +307,7 @@ pub fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const
     if ((std.mem.eql(u8, name, "get") or std.mem.eql(u8, name, "call") or std.mem.eql(u8, name, "invoke")) and args.len == 1) {
         return try getFieldRec(self, allocator, &args[0], pname);
     }
-    // Property-delegation protocol on an unbound reference
-    // (`var x by ::topVar`, `val y by ::intVar` in a class body): a
-    // member of the delegation thisRef wins, else the top-level slot.
+    // On an unbound reference a member of the thisRef wins, else the global slot.
     if (std.mem.eql(u8, name, "getValue") and args.len >= 2) {
         if (args[0] == .Instance and memberIsProperty(self, &args[0], pname)) {
             var r = try getFieldRec(self, allocator, &args[0], pname);
@@ -379,12 +346,7 @@ pub fn propertyRefDispatch(self: *VmHost, allocator: Allocator, receiver: *const
     return null;
 }
 
-/// Read the top-level property `pname` for an unbound property reference's
-/// `get()`. Mirrors the `LoadGlobal` resolution: a stored `val`/`var` comes
-/// from globals (driving a deferred initializer and resolving delegates),
-/// and a property declared with only a custom `get()` re-runs its 0-arg
-/// getter func on each read. Returns `null` when `pname` names no top-level
-/// property, leaving the remaining dispatch branches to handle it.
+/// Read the top-level property `pname`, mirroring `LoadGlobal` resolution.
 pub fn topLevelPropertyGet(self: *VmHost, allocator: Allocator, pname: []const u8) Allocator.Error!?EvalResult {
     switch (try self.lookupGlobalThrowing(allocator, pname)) {
         .ok => |maybe| if (maybe) |v| {
@@ -439,12 +401,8 @@ pub fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const 
     };
 
     if (lookupAnonMethod(self, allocator, class_name, arity_name, name)) |hit| {
-        // Param-type disproof, mirroring the named-class member walk: an
-        // anon-object `trace(message: String)` declines a trailing-lambda
-        // call so the inline `Logger.trace(() -> String)` extension binds.
-        // One module borrow serves both the param-type disproof and the
-        // member-extension receiver gate (this path is hot enough that a
-        // second borrow per anon hit showed up in DeepRecursive timing).
+        // Param-type disproof, mirroring the named-class member walk, so an anon
+        // method declines a call whose argument cannot bind its parameter.
         const hit_info: struct { disproven: bool, ext_recv_ty: ?[]const u8 } = blk: {
             const hg = hit.module.borrow();
             defer hg.deinit();
@@ -457,11 +415,8 @@ pub fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const 
             break :blk .{ .disproven = dis, .ext_recv_ty = rt };
         };
         if (!hit_info.disproven) {
-            // A MEMBER-EXTENSION override binds its extension receiver from
-            // the enclosing implicit receivers, never from the dispatch
-            // owner itself: `with(policy) { measure(...) }` inside a
-            // MeasureScope runs the anon policy's `MeasureScope.measure`
-            // with the scope as `this` and the policy in dispatch scope.
+            // A member-extension override binds its extension receiver from the
+            // enclosing implicit receivers, never from the dispatch owner.
             if (hit_info.ext_recv_ty) |rt| {
                 if (!receiverImplementsType(self, receiver, rt)) {
                     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
@@ -473,18 +428,15 @@ pub fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const 
                         defer ir.eval.popEnclosing();
                         return try invokeAnonMethodFrom(self, allocator, &e.v, receiver, hit, args, inst);
                     }
-                    // No satisfying receiver in scope: decline so the walk
-                    // can try the next candidate.
+                    // No satisfying receiver in scope: decline to the next candidate.
                     return null;
                 }
             }
             return try invokeAnonMethod(self, allocator, receiver, hit, args, inst);
         }
     }
-    // A method inherited from a runtime-local supertype (`inner class
-    // Inner : Local()` with `Local` a local class): its body is registered
-    // under the ancestor's name and runs with the ancestor's captured
-    // scope, the receiver staying the instance.
+    // A method inherited from a runtime-local supertype runs in the ancestor's
+    // captured scope, the receiver staying the instance.
     var cur: ?ObjRef(ClassDef) = blk: {
         const g = inst.borrow();
         defer g.deinit();
@@ -523,9 +475,8 @@ pub fn anonMethodDispatch(self: *VmHost, allocator: Allocator, receiver: *const 
     return null;
 }
 
-/// Run a thunk registered under a runtime-local class (`$default$<i>`)
-/// in the class's captured scope, before any instance of it exists.
-/// `receiver` is the enclosing receiver the class captured (or Null).
+/// Run a thunk registered under a runtime-local class (`$default$<i>`) in the
+/// class's captured scope, before any instance of it exists.
 pub fn invokeLocalClassThunk(self: *VmHost, allocator: Allocator, cls: ObjRef(ClassDef), name: []const u8, receiver: *const Value, args: []const Value) Allocator.Error!EvalResult {
     const cls_name = blk: {
         const g = cls.borrow();
@@ -539,9 +490,8 @@ pub fn invokeLocalClassThunk(self: *VmHost, allocator: Allocator, cls: ObjRef(Cl
     return invokeAnonMethodFrom(self, allocator, receiver, &src, hit, args, null);
 }
 
-/// Whether some supplied argument definitely cannot bind the anon method's
-/// corresponding declared parameter (so the candidate must decline and the
-/// dispatch walk continue to extensions).
+/// Whether some argument definitely cannot bind its declared parameter, so the
+/// candidate declines and the walk continues to extensions.
 pub fn anonMethodDisproven(self: *VmHost, hit: AnonMethodEntry, args: []const Value) bool {
     const mg = hit.module.borrow();
     defer mg.deinit();
@@ -552,25 +502,16 @@ pub fn anonMethodDisproven(self: *VmHost, hit: AnonMethodEntry, args: []const Va
 pub fn anonMethodDisprovenFn(self: *VmHost, f: *const ir.Func, args: []const Value) bool {
     const skip: usize = if (f.params.len > 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
     const effective = f.params[skip..];
-    // Over-application: more args than the method declares and no trailing
-    // vararg to absorb them cannot bind. Without this, `lookupAnonMethod`'s
-    // arity-agnostic fallback answers a call with the wrong-arity member --
-    // an `object : Iterable` whose 0-arg `override fun iterator()` would answer
-    // the stdlib `iterator { block }` builder call and self-recurse forever.
-    // Mirrors the named-class `pickMethodOverload` over-supply guard.
+    // Over-application cannot bind: `lookupAnonMethod`'s arity-agnostic fallback
+    // would otherwise answer with a wrong-arity member.
     if (args.len > effective.len and
         (effective.len == 0 or !effective[effective.len - 1].is_vararg)) return true;
     var i: usize = 0;
     while (i < args.len and i < effective.len) : (i += 1) {
-        // A type-variable-typed param (the method's own, or one inherited
-        // from the object expression's enclosing declaration) never names a
-        // nominal class; adjudicating it as one would let an unrelated
-        // registered class of the same simple name refute valid arguments.
+        // A type-variable-typed param names no nominal class, so never adjudicate it.
         if (fidTypeVar(self, f.id, &effective[i].ty)) continue;
-        // A LOCAL class's own type parameter (`Target` in a function-body
-        // `class PropertyAndItsValue<Target, Value>`) is registered on the
-        // synthesized ClassDef, not the method fid; reading it as a nominal
-        // class refuted every argument (`set(target: Target)` missed).
+        // A local class's type parameter is registered on the synthesized
+        // ClassDef, not the method fid.
         if (localClassTypeParam(self, f, &effective[i].ty)) continue;
         if (argDefinitelyNotParamType(self, &effective[i].ty, &args[i])) return true;
     }
@@ -580,8 +521,7 @@ pub fn anonMethodDisprovenFn(self: *VmHost, f: *const ir.Func, args: []const Val
 pub fn localClassTypeParam(self: *VmHost, f: *const ir.Func, ty: *const ir.TypeRef) bool {
     const head = std.mem.trimEnd(u8, simpleName(ty.name), "?");
     if (head.len == 0) return false;
-    // A runtime-lowered local-class member's params[0] is `this`, typed by
-    // the class; that names the ClassDef holding the declared type params.
+    // params[0] is `this`, typed by the class holding the declared type params.
     if (f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this")) return false;
     const cls_name = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
     const cg = self.classes.borrow();
@@ -609,9 +549,7 @@ pub fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const
     const tbl = self.anon_methods.borrow();
     defer tbl.deinit();
     if (tbl.get().count() == 0) return null;
-    // Probe keys live in a stack buffer — this runs per dynamic dispatch, and
-    // the old per-probe allocPrint pair was measurable in the profile. The
-    // heap fallback covers pathological name lengths.
+    // Probe keys live in a stack buffer; the heap fallback covers long names.
     var kb: [256]u8 = undefined;
     if (std.fmt.bufPrint(&kb, "{s}\u{1f}{s}", .{ class_name, arity_name })) |ak| {
         if (tbl.get().get(ak)) |e| return e;
@@ -630,9 +568,7 @@ pub fn lookupAnonMethod(self: *VmHost, allocator: Allocator, class_name: []const
     return null;
 }
 
-/// Exact anonymous/local-class method lookup used while linking a numeric
-/// virtual slot. Unlike the legacy named-member path, this never falls back to
-/// the arity-agnostic key.
+/// Exact lookup for linking a numeric virtual slot: no arity-agnostic fallback.
 pub fn lookupAnonMethodExact(self: *VmHost, allocator: Allocator, class_name: []const u8, arity_name: []const u8) ?AnonMethodEntry {
     const tbl = self.anon_methods.borrow();
     defer tbl.deinit();
@@ -650,10 +586,8 @@ pub fn invokeAnonMethod(self: *VmHost, allocator: Allocator, receiver: *const Va
     return invokeAnonMethodFrom(self, allocator, receiver, receiver, hit, args, padding_inst);
 }
 
-/// `invokeAnonMethod` with the CAPTURE SOURCE decoupled from the bound
-/// receiver: a member-extension override runs with the EXTENSION receiver
-/// as `this` (params[0]) while its captures still live on the anon OWNER
-/// instance (`capture_src`).
+/// `invokeAnonMethod` with the capture source decoupled from the receiver: a
+/// member-extension override keeps its captures on the anon owner instance.
 pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *const Value, capture_src: *const Value, hit: AnonMethodEntry, args: []const Value, padding_inst: ?ObjRef(InstanceData)) Allocator.Error!EvalResult {
     const mg = hit.module.borrow();
     const module_rc = mg.get();
@@ -666,12 +600,9 @@ pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *cons
     try all.append(allocator, receiver.*);
     try all.appendSlice(allocator, args);
 
-    // Scalar-replay leaf on the anon/companion method (receiver rides as
-    // opaque param 0); a bail falls through to the framed invoke, which
-    // re-runs the pure body exactly. The gate takes the MODULE'S Func
-    // record, not the local copy — the leaf_route memo written through a
-    // copy is discarded, re-pricing every companion dispatch with the
-    // registry mutex + fqn lookup the memo exists to kill.
+    // Scalar-replay leaf, receiver riding as opaque param 0; a bail falls through
+    // to the framed invoke. The gate takes the module's own Func record so the
+    // leaf_route memo it writes survives.
     if (receiver.* != .Null and all.items.len == f.params.len) {
         const lfp = module_rc.funcById(hit.func) orelse unreachable;
         if (try ir.eval.tryLeafValues(VmHost, allocator, module_rc, lfp, all.items, self, null)) |lo| {
@@ -683,7 +614,6 @@ pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *cons
         }
     }
 
-    // Pad omitted trailing args from inherited defaults.
     if (padding_inst) |inst| {
         if (all.items.len < f.params.len) {
             var supertypes: [][]const u8 = &.{};
@@ -710,12 +640,9 @@ pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *cons
     }
     const packed_args = try packVarargArgs(self, allocator, &f, try all.toOwnedSlice(allocator));
 
-    // Captures come from the instance for an anonymous-object expression
-    // (`buildObject` stores them per-instance, registry entry empty), or from
-    // the registry entry for a local class (`registerClassCaptured` registers
-    // once per declaration — site-stable, no leak). Prefer the instance; fall
-    // back to the entry. `InstanceData.Capture` and `NameValue` are the same
-    // shape, so the instance slice reinterprets as `[]const NameValue`.
+    // Captures come from the instance for an anonymous-object expression, else
+    // from the registry entry for a local class. `InstanceData.Capture` and
+    // `NameValue` share a shape, so the instance slice reinterprets as one.
     comptime std.debug.assert(@sizeOf(InstanceData.Capture) == @sizeOf(NameValue));
     const inst_caps: []const InstanceData.Capture = blk: {
         if (capture_src.* != .Instance) break :blk &.{};
@@ -723,11 +650,8 @@ pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *cons
         defer g.deinit();
         break :blk g.get().anon_captures;
     };
-    // A runtime-local class carries its declaration scope on its def
-    // (`ClassDef.local_captures`, one registration = one scope), so an
-    // instance reads the scope it was declared in even after the same
-    // declaration ran again; a `.Class` source is a thunk running before
-    // any instance exists (a constructor default).
+    // A runtime-local class carries its declaration scope on its def, so an
+    // instance reads the scope it was declared in.
     const class_caps: []const InstanceData.Capture = blk: {
         if (inst_caps.len != 0) break :blk &.{};
         const cls: ObjRef(ClassDef) = switch (capture_src.*) {
@@ -780,9 +704,8 @@ pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *cons
         sg.deinit();
         self.globals = scoped;
     }
-    // The host's active globals scope is only held in this stack-local VmHost
-    // field; pin it so a collection during the body eval cannot sweep the
-    // transient capture-layer env (its parent chain reaches the rooted globals).
+    // The active globals scope lives only in this stack-local VmHost field; pin
+    // it so a collection during body eval cannot sweep the capture-layer env.
     const ka = self.ka.mark();
     defer self.ka.restore(ka);
     runtime.keepalivePushCell(&self.globals.cell.hdr);
@@ -799,31 +722,22 @@ pub fn invokeAnonMethodFrom(self: *VmHost, allocator: Allocator, receiver: *cons
         }
     }
     var packed_list = try argsListFromSlice(allocator, packed_args);
-    // `argsListFromSlice` copied the args into the frame-owned list; the
-    // `packed_args` buffer (a full allocation from `packVarargArgs`) is dead.
+    // The args are copied into the frame-owned list, so `packed_args` is dead.
     if (runtime.freeScratch()) allocator.free(packed_args);
     _ = &packed_list;
     vmhost.emitPath(allocator, "member_anon", f.fqn, f.id, receiver, args);
     return ir.eval.evalWithCapturesChained(VmHost, allocator, module_rc, module_rc, &f, packed_list, cap_vec, chain_seed, null, self);
 }
 
-/// Build the `n_params`-length argument vector, filling positions past
-/// the provided args from default-arg thunks.
-/// Either the filled argument vector or the error raised while evaluating a
-/// default. Named so the two entry points share one return type.
+/// The filled argument vector, or the error raised while evaluating a default.
 pub const PaddedArgs = union(enum) { ok: []Value, err: EvalError };
 
 pub fn padArgsWithDefaults(self: *VmHost, allocator: Allocator, module: *const Module, n_params: usize, provided: []const Value, defaults: ?[]const ?FuncId) Allocator.Error!PaddedArgs {
     return padArgsWithDefaultsFor(self, allocator, module, n_params, provided, defaults, &.{});
 }
 pub fn padArgsWithDefaultsFor(self: *VmHost, allocator: Allocator, module: *const Module, n_params: usize, provided: []const Value, defaults: ?[]const ?FuncId, params: []const ir.Param) Allocator.Error!PaddedArgs {
-    // Kotlin binds a trailing lambda to the LAST parameter. When the
-    // positional layout would leave a default-less last parameter empty
-    // while the last provided arg is callable, the call was the
-    // trailing-lambda form over defaulted middle params
-    // (`items(3) { … }` against `items(count, key = …, type = …,
-    // itemContent)`) — a straight positional fill would be a kotlinc
-    // compile error, so the shift never changes a legal layout.
+    // Kotlin binds a trailing lambda to the last parameter, so a callable last
+    // argument facing a default-less last parameter is the trailing-lambda form.
     var last_shift: ?Value = null;
     var pos_len = provided.len;
     if (provided.len > 0 and provided.len < n_params) {
@@ -847,8 +761,7 @@ pub fn padArgsWithDefaultsFor(self: *VmHost, allocator: Allocator, module: *cons
             try call_args.append(allocator, provided[i]);
             continue;
         }
-        // An omitted vararg with no default of its own is the empty array —
-        // never a placeholder the packer would take as an element.
+        // An omitted vararg with no default of its own is the empty array.
         if (i < params.len and params[i].is_vararg and
             (defaults == null or i >= defaults.?.len or defaults.?[i] == null))
         {
@@ -881,12 +794,8 @@ pub fn padArgsWithDefaultsFor(self: *VmHost, allocator: Allocator, module: *cons
     return .{ .ok = try call_args.toOwnedSlice(allocator) };
 }
 
-/// Trailing-lambda syntax bit of the member call currently dispatching
-/// (`recv.f(x) { … }` vs `recv.f(x, { … })`) — see `Inst.CallMember.
-/// trailing_lambda`. Saved/restored by the exec sites around each dispatch
-/// so nested member calls (walk probes running accessors) cannot clobber
-/// the outer call's bit. Read non-destructively by the under-applied
-/// trailing-lambda arm in `irMethodWalk`.
+/// Trailing-lambda syntax bit of the member call currently dispatching. Saved
+/// and restored by the exec sites so a nested call cannot clobber it.
 pub threadlocal var trailing_member_call: bool = false;
 
 pub fn setTrailingMemberCall(on: bool) bool {
@@ -895,9 +804,7 @@ pub fn setTrailingMemberCall(on: bool) bool {
     return prev;
 }
 
-/// `unambiguous` = the pick is a pure function of the RELAXED method-cache
-/// key: the resolving class collected exactly one candidate, or the call's
-/// arg count forced the pick among several (see `pickArityForced`) with
-/// every argument relaxed-adjudicable. Gates whether a relaxed-key cache
-/// entry may be stored.
+/// `unambiguous` means the pick is a pure function of the relaxed method-cache
+/// key: one candidate, or an arity-forced pick with every argument
+/// relaxed-adjudicable. Gates whether a relaxed-key entry may be stored.
 pub const ResolvedMethod = struct { fid: FuncId, unambiguous: bool };

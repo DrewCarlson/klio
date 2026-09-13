@@ -1,6 +1,5 @@
 //! Enum static access: the entry table behind `Enum.values()`/`valueOf`, leaf
-//! static members, and the enclosing-enum lookups a bare entry name resolves
-//! through.
+//! static members, and the enclosing-enum lookup a bare entry name takes.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -9,16 +8,8 @@ const VmHost = vmhost.VmHost;
 const host_globals = @import("../host_globals.zig");
 const Value = runtime.Value;
 
-/// Leaf statics route backing: resolve `Owner.member` for a genre-9
-/// class handle inside a leaf body. ENUM ENTRIES ONLY — an entry is an
-/// eager singleton stored on the ClassDef itself (language-mandated
-/// identity), so its cell is rooted for the class's lifetime and
-/// borrow-safe for the leaf's duration. Anything else (companion vals,
-/// computed statics) returns null and the leaf bails to the exact
-/// re-run.
-/// The class whose `enum_entries` describe `cls`'s entries: `cls` itself,
-/// or its parent when `cls` is the subclass synthesized for an entry with a
-/// body (`is_enum`, no entries of its own, an enum parent).
+/// The class whose `enum_entries` describe `cls`'s entries: `cls` itself, or
+/// its parent when `cls` is the subclass synthesized for an entry with a body.
 pub fn enumTableClass(cls: runtime.ObjRef(runtime.ClassDef)) @TypeOf(cls.borrow()) {
     const g = cls.borrow();
     if (g.get().is_enum and g.get().enum_entries.len == 0) {
@@ -43,8 +34,7 @@ pub fn leafStaticMember(self: *VmHost, owner: []const u8, member: []const u8) ?V
     const dg = def.borrow();
     defer dg.deinit();
     if (!dg.get().is_enum) return null;
-    // An enum not yet initialized has no entries to serve: the leaf bails
-    // to the interpreted read, which drives the initialization.
+    // An uninitialized enum has no entries; the interpreted read initializes.
     if (!host_globals.enumInitDone(def)) return null;
     for (dg.get().enum_entries) |*e| {
         if (std.mem.eql(u8, e.name, member)) return e.value;
@@ -52,8 +42,6 @@ pub fn leafStaticMember(self: *VmHost, owner: []const u8, member: []const u8) ?V
     return null;
 }
 
-/// The class whose `enum_entries` describe `cls`'s entries (see
-/// `enumTableClass`), as an owned handle.
 pub fn enumTableDef(cls: runtime.ObjRef(runtime.ClassDef)) runtime.ObjRef(runtime.ClassDef) {
     const g = cls.borrow();
     defer g.deinit();
@@ -67,8 +55,7 @@ pub fn enumTableDef(cls: runtime.ObjRef(runtime.ClassDef)) runtime.ObjRef(runtim
     return cls.clone();
 }
 
-/// Whether `name` is an entry of the enum `cls` or its `entries` list —
-/// the static members whose first read initializes the enum class.
+/// Entry of `cls` or its `entries` list; reading either initializes the enum.
 pub fn enumStaticNameHits(cls: runtime.ObjRef(runtime.ClassDef), name: []const u8) bool {
     const g = cls.borrow();
     defer g.deinit();
@@ -80,10 +67,8 @@ pub fn enumStaticNameHits(cls: runtime.ObjRef(runtime.ClassDef), name: []const u
     return false;
 }
 
-/// The entry `member` of the enum class `owner`, initializing the enum on
-/// this first use. The bare-name read paths that reach here carry no
-/// error channel, so a failed initializer surfaces on the next throwing
-/// use of the enum instead.
+/// The entry `member` of enum `owner`, initializing it on first use. The callers
+/// have no error channel, so a failed initializer surfaces on the next use.
 pub fn enumEntryByOwner(self: *VmHost, owner: []const u8, member: []const u8) ?Value {
     const def = blk: {
         const cg = self.classes.borrow();
@@ -110,11 +95,9 @@ pub fn enumEntryByOwner(self: *VmHost, owner: []const u8, member: []const u8) ?V
     return null;
 }
 
-/// A bare name read inside an enum's companion object, nested object, or
-/// entry body resolves to the enum's entry of that name: the enum's static
-/// scope encloses those bodies. `receiver` is an implicit-receiver
-/// candidate of the read; the enclosing enum is found through the
-/// companion link, the dotted class name, or the registry's enclosing map.
+/// A bare name read inside an enum's companion, nested object or entry body
+/// resolves to the enum's entry of that name, since the static scope encloses
+/// those bodies. `receiver` is an implicit-receiver candidate of the read.
 pub fn enclosingEnumEntry(self: *VmHost, receiver: *const Value, name: []const u8) ?Value {
     if (receiver.* != .Instance) return null;
     var cls_name: []const u8 = undefined;
@@ -139,8 +122,7 @@ pub fn enclosingEnumEntry(self: *VmHost, receiver: *const Value, name: []const u
     return enclosingEnumEntryByOwner(self, cls_name, name);
 }
 
-/// The enum whose static scope encloses `receiver`'s class (a companion,
-/// nested object or entry body of the enum), if any.
+/// The enum whose static scope encloses `receiver`'s class, if any.
 pub fn enclosingEnumDef(self: *VmHost, receiver: *const Value) ?runtime.ObjRef(runtime.ClassDef) {
     if (receiver.* != .Instance) return null;
     var current: []const u8 = undefined;
@@ -185,9 +167,8 @@ pub fn enclosingEnumDef(self: *VmHost, receiver: *const Value) ?runtime.ObjRef(r
     return null;
 }
 
-/// The entry `name` of the enum whose static scope encloses the class
-/// `owner` (the owner itself when it is the enum, else its enclosing
-/// classes by the registry's map or the dotted class name).
+/// The entry `name` of the enum enclosing `owner`: `owner` itself when it is the
+/// enum, else its enclosing classes by registry map or dotted name.
 pub fn enclosingEnumEntryByOwner(self: *VmHost, owner: []const u8, name: []const u8) ?Value {
     if (enumEntryByOwner(self, owner, name)) |v| return v;
     var current: []const u8 = owner;

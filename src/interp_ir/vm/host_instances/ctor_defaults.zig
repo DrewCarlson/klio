@@ -1,6 +1,5 @@
-//! Primary-constructor defaults and vararg packing: the literal forms a
-//! default expression serves without evaluation, the empty collections, and
-//! the vararg-aware argument packing.
+//! Primary-constructor defaults and vararg packing: the literal forms a default
+//! expression serves without evaluation, and the vararg-aware arg packing.
 
 const std = @import("std");
 
@@ -50,10 +49,6 @@ const ctor_select = @import("ctor_select.zig");
 const scalarRetag = ctor_select.scalarRetag;
 const scoreCtorHeads = ctor_select.scoreCtorHeads;
 const typeHeadOfName = ctor_select.typeHeadOfName;
-
-// -------------------------------------------------------------------------
-// Free helpers used only by the construction flow.
-// -------------------------------------------------------------------------
 
 pub fn simpleLiteral(allocator: Allocator, e: *const ast.Expr) Allocator.Error!?Value {
     switch (e.*) {
@@ -139,8 +134,6 @@ pub fn defaultValueForPrimary(allocator: Allocator, e: *const ast.Expr) Allocato
     return null;
 }
 
-/// Resolve a single-segment `Path` default against the const registry,
-/// returning its `Value` when present.
 pub fn pathConstDefault(self: *VmHost, e: *const ast.Expr) Allocator.Error!?Value {
     if (e.* != .Path) return null;
     const segs = e.Path.segments;
@@ -154,9 +147,8 @@ pub fn pathConstDefault(self: *VmHost, e: *const ast.Expr) Allocator.Error!?Valu
     return null;
 }
 
-/// The primary constructor's `vararg` parameter (index and element type
-/// name), if it declares one. Reads the module class: the runtime param
-/// defs do not record the modifier.
+/// Index and element type of the primary constructor's `vararg` parameter.
+/// Read from the module class; the runtime param defs drop the modifier.
 pub fn primaryVarargParam(self: *VmHost, class_fqn: ?[]const u8, class_name: []const u8) struct { ?usize, []const u8 } {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -169,9 +161,7 @@ pub fn primaryVarargParam(self: *VmHost, class_fqn: ?[]const u8, class_name: []c
     return .{ null, "" };
 }
 
-/// Whether the primary constructor takes a call of `nargs` positional
-/// arguments: every parameter past them carries a default, or is the
-/// `vararg` (which also absorbs any surplus).
+/// Every parameter past `nargs` must have a default or be the absorbing vararg.
 pub fn primaryCanTake(self: *VmHost, class_def: ObjRef(ClassDef), nargs: usize) bool {
     const dg = class_def.borrow();
     defer dg.deinit();
@@ -187,9 +177,8 @@ pub fn primaryCanTake(self: *VmHost, class_def: ObjRef(ClassDef), nargs: usize) 
     return true;
 }
 
-/// `scoreCtorHeads` for a candidate whose parameter `vararg_at` is a
-/// `vararg`: the arguments from that position score against the element
-/// type. A lone array already in the slot (a spread) scores the prefix only.
+/// `scoreCtorHeads` where parameter `vararg_at` is a `vararg`: args from there
+/// score against the element type, but a lone array (a spread) scores nothing.
 pub fn scoreCtorHeadsVararg(self: *VmHost, heads: []const []const u8, vararg_at: usize, args: []const Value) ?i32 {
     if (vararg_at >= heads.len) return scoreCtorHeads(self, heads, args);
     if (args.len == vararg_at + 1 and args[vararg_at] == .Array) {
@@ -201,10 +190,8 @@ pub fn scoreCtorHeadsVararg(self: *VmHost, heads: []const []const u8, vararg_at:
     return scoreCtorHeads(self, buf[0..args.len], args);
 }
 
-/// Pack the trailing arguments of a chosen `vararg` secondary constructor
-/// into its array slot (the element type names a primitive array where it
-/// is one). Null when the constructor has no vararg or the slot already
-/// holds a lone array (a spread).
+/// Packs a `vararg` secondary constructor's trailing args into its array slot,
+/// primitive-typed where the element type is. Null for a spread or no vararg.
 pub fn packSecondaryVarargs(self: *VmHost, allocator: Allocator, e: root.build.SecondaryCtorEntry, args: []const Value) Allocator.Error!?[]Value {
     _ = self;
     const v = e.vararg_index orelse return null;
@@ -222,9 +209,8 @@ pub fn packSecondaryVarargs(self: *VmHost, allocator: Allocator, e: root.build.S
     return try out.toOwnedSlice(allocator);
 }
 
-/// Pack trailing positional args into the primary ctor's `vararg` slot.
-/// `class_fqn`, when known, keys the module class exactly so a
-/// same-simple-name class from another package cannot supply the params.
+/// Packs trailing positional args into the primary ctor's `vararg` slot;
+/// `class_fqn` keys the module class exactly, excluding same-named classes.
 pub fn packPrimaryCtorVarargs(self: *VmHost, class_fqn: ?[]const u8, class_name: []const u8, args: []Value) Allocator.Error![]Value {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -235,11 +221,8 @@ pub fn packPrimaryCtorVarargs(self: *VmHost, class_fqn: ?[]const u8, class_name:
     const ir_cls = &m.classes.items[cid.int()];
     const params = ir_cls.primary_params;
     if (params.len == 0) return args;
-    // Declared numeric parameter typing (kotlinc literal typing): an Int
-    // reaching a `Long`/`Short`/`Byte` parameter can only have been an
-    // integer literal, so it takes the declared type before the init body
-    // and the property stores see it (`LongRange(1, 0)` hands
-    // `LongProgression` two Longs).
+    // An Int reaching a `Long`/`Short`/`Byte` parameter can only have been an
+    // integer literal, so it retags before the init body and stores see it.
     for (args, 0..) |*arg, i| {
         if (i >= params.len) break;
         if (arg.* != .Int) continue;

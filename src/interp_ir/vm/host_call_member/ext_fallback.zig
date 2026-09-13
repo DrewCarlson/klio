@@ -110,10 +110,8 @@ const invokeMethodFuncId = virtual_tail.invokeMethodFuncId;
 
 pub const Candidate = struct { fid: FuncId, func: Func };
 
-/// A candidate whose declared receiver names a specific BUILTIN shape a
-/// builtin runtime value definitely is not (UIntArray.fill offered a
-/// plain Array, String.x offered a List). Instances stay unproven —
-/// their hierarchies decide elsewhere.
+/// Whether the declared receiver names a builtin shape this value definitely
+/// is not. Instances stay unproven; their hierarchies decide elsewhere.
 pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bool {
     const unsigned_arrays = [_][]const u8{ "UIntArray", "ULongArray", "UShortArray", "UByteArray" };
     switch (receiver.*) {
@@ -121,23 +119,19 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
             for (unsigned_arrays) |ua| {
                 if (std.mem.eql(u8, declared, ua)) {
                     const view = arr.primKind() orelse return true;
-                    // Compare against the ARRAY type name: the kind's
-                    // simpleName is the element ("UByte"), never the
-                    // declared receiver ("UByteArray").
+                    // `typeFqn` names the array type; the kind's own
+                    // simpleName is the element name.
                     return !std.mem.eql(u8, simpleName(view.typeFqn()), declared);
                 }
             }
             return false;
         },
-        // A user instance can never be a builtin array (array types are
-        // final): a `TestCollection` receiver must not bind
-        // `UIntArray.toTypedArray`.
+        // Array types are final, so a user instance is never one.
         .Instance => |inst| {
             if (overload_match.builtinParamKind(declared)) |pk| {
                 if (pk != .array) return false;
-                // A user class spelled like a builtin array
-                // (`value class UIntArray(private val intArray: IntArray)`)
-                // is the declared receiver of its own extensions.
+                // A user class spelled like a builtin array is the declared
+                // receiver of its own extensions.
                 const ig = inst.borrow();
                 defer ig.deinit();
                 const cg = ig.get().class.borrow();
@@ -150,35 +144,27 @@ pub fn builtinReceiverDisproven(receiver: *const Value, declared: []const u8) bo
     }
 }
 
-/// Resolve an extension candidate's declared receiver-type simple name to a
-/// fully-qualified class, in the candidate's OWN declaration-file scope: its
-/// non-wildcard imports first, then its declaring package, then its wildcard
-/// imports. Returns the canonical FQN of the resolved class, or null when the
-/// name resolves to no known class (a generic / `Any` / builtin receiver, or
-/// a name klio cannot place). Two same-simple-name receivers declared against
-/// classes in different packages resolve to DISTINCT FQNs here — the key to
-/// telling cross-package extension twins apart from the runtime receiver.
+/// Resolve a candidate's declared receiver simple name to a class FQN in the
+/// candidate's own declaration-file scope: named imports, then its package,
+/// then wildcard imports. Null when no known class matches. Receivers of the
+/// same simple name in different packages resolve to distinct FQNs.
 pub fn resolveExtReceiverFqn(allocator: Allocator, mod: *const Module, c: *const Candidate) ?[]const u8 {
     if (c.func.params.len == 0) return null;
     const nm = std.mem.trimEnd(u8, c.func.params[0].ty.name, "?");
-    // An already-qualified receiver reference resolves directly.
     if (std.mem.findScalar(u8, nm, '.') != null) {
         if (mod.classIdByFqn(nm)) |cid| return mod.classFqnById(cid);
     }
     const simple = simpleName(nm);
     const ds = mod.decl_span.get(c.fid.int()) orelse return null;
     const file = ds.file;
-    // Named imports of this leaf (file-scoped) take precedence.
     for (mod.importAliasPathsIn(file, simple)) |p| {
         if (mod.classIdByFqn(p.fqn)) |cid| return mod.classFqnById(cid);
     }
-    // The candidate's own package.
     if (c.func.package.len != 0) {
         const cand = std.fmt.allocPrint(allocator, "{s}.{s}", .{ c.func.package, simple }) catch return null;
         defer if (runtime.freeScratch()) allocator.free(cand);
         if (mod.classIdByFqn(cand)) |cid| return mod.classFqnById(cid);
     }
-    // Wildcard imports of the file.
     if (mod.registry.import_wildcards.get(file)) |list| {
         for (list.items) |pkg| {
             const cand = std.fmt.allocPrint(allocator, "{s}.{s}", .{ pkg, simple }) catch return null;
@@ -189,19 +175,9 @@ pub fn resolveExtReceiverFqn(allocator: Allocator, mod: *const Module, c: *const
     return null;
 }
 
-/// When the surviving extension candidates include cross-package twins whose
-/// declared receiver types share a simple name but resolve to different
-/// classes, the RUNTIME receiver's actual class decides which twin Kotlin
-/// binds. klio stores the receiver type as its simple name, so a
-/// `gapbuffer.SlotTable` receiver and a `linkbuffer.SlotTable` receiver both
-/// read as `SlotTable` and either same-named extension looks applicable — the
-/// wrong twin then runs against fields it lacks (`unresolved global root`).
-/// When the runtime object's class FQN exactly equals one twin's resolved
-/// receiver FQN, every OTHER same-simple-name candidate resolving to a
-/// different concrete class is inapplicable: drop it. A no-op unless a genuine
-/// same-name twin conflict exists AND the runtime class picks a winner, so an
-/// ordinary single-receiver-type overload set (every candidate resolving to
-/// the same FQN, or to none) is left untouched.
+/// Drop cross-package extension twins the runtime receiver rules out: when one
+/// candidate's resolved receiver FQN equals the receiver's class FQN, every
+/// other candidate of that receiver simple name resolving elsewhere is dropped.
 pub fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receiver: *const Value, candidates: *std.ArrayList(Candidate)) void {
     if (receiver.* != .Instance) return;
     if (candidates.items.len < 2) return;
@@ -226,8 +202,6 @@ pub fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receive
     for (candidates.items, 0..) |*c, i| {
         if (c.func.params.len == 0) continue;
         const simple_i = simpleName(std.mem.trimEnd(u8, c.func.params[0].ty.name, "?"));
-        // Does candidate i's same-simple-name group contain a sibling whose
-        // resolved receiver FQN is EXACTLY the runtime class?
         var exact_present = false;
         for (candidates.items, 0..) |*o, j| {
             if (o.func.params.len == 0) continue;
@@ -240,7 +214,7 @@ pub fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receive
             }
         }
         if (!exact_present) continue;
-        const fi = fqns[i] orelse continue; // unresolvable → undecidable, keep
+        const fi = fqns[i] orelse continue; // unresolvable, keep
         if (!std.mem.eql(u8, fi, recv_fqn)) {
             remove[i] = true;
             any_removed = true;
@@ -255,21 +229,9 @@ pub fn narrowSameNameExtensionTwins(self: *VmHost, allocator: Allocator, receive
     candidates.* = filtered;
 }
 
-/// Extension-fn resolution with scope-aware memoization. The winner (or a
-/// confirmed miss) is a pure function of (receiver identity, name, arg sig,
-/// static/declared scope, strict-probe bit) whenever no member-extension
-/// competes for the name — member-extension applicability depends on the
-/// enclosing-`this` chain, so `saw_member_ext` vetoes the store both ways.
-/// The strict bare-name probe folds a scope bit rather than being excluded:
-/// bare accessor calls inside engine methods took the full candidate walk on
-/// every single call (half of a recompose workload's runtime), and a walk
-/// MISS memoizes as METHOD_MISS so non-extension calls stop re-walking.
-/// Serve a memoized MEMBER-EXTENSION winner: re-find its owner on the
-/// enclosing chain and invoke it with that owner pushed, exactly as the walk
-/// does. The cache entry is keyed by the chain SHAPE, so the owner sits at
-/// the same position with the same class; only the instance differs per
-/// call. Declines (null) whenever the shape is not the plain one the walk
-/// resolved, and the caller re-walks.
+/// Serve a memoized member-extension winner: re-find its owner on the
+/// enclosing chain and invoke it with that owner pushed. The entry is keyed on
+/// chain shape, so it declines when the shape differs from the resolved one.
 pub fn serveCachedMemberExt(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId, args: []const Value) Allocator.Error!?EvalResult {
     const mg = self.module.borrow();
     const mod = mg.get();
@@ -311,7 +273,9 @@ pub fn extFbCounts() [4]u64 {
 }
 
 pub fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8) Allocator.Error!?EvalResult {
-
+    // The winner is a pure function of (receiver identity, name, arg sig,
+    // scope, strict bit) unless a member-extension competes: its applicability
+    // rides the enclosing-`this` chain, so `saw_member_ext` vetoes the store.
     runtime.prof.opRoute(3);
     hcm.ext_fb_total += 1;
     var cache_key: ?root_mod.ProgramImage.InstanceMethodKey =
@@ -328,12 +292,9 @@ pub fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const
             if (try invokeMethodFuncId(self, allocator, receiver, @enumFromInt(fid), args)) |r| return r;
         }
     }
-    // Chain-folded key: when a member-extension competes for the name the
-    // resolution is a pure function of (key, enclosing-chain shape) instead
-    // of the key alone. Folding the chain hash keys those calls too — but
-    // only PLAIN winners (a top-level pick, no owner push) and misses store
-    // under it; a member-extension winner needs its owner-instance push and
-    // stays walk-resolved.
+    // Chain-folded key: with a member-extension in play the resolution is a
+    // pure function of (key, enclosing-chain shape), so folding the chain hash
+    // keys those calls too.
     const chain_key: ?root_mod.ProgramImage.InstanceMethodKey = blk: {
         var ck = cache_key orelse break :blk null;
         ck.sig ^= ir.eval.enclosingChainClassHash() *% 0x9E3779B97F4A7C15;
@@ -366,10 +327,9 @@ pub fn extensionFnFallback(self: *VmHost, allocator: Allocator, receiver: *const
     return r;
 }
 
-/// The full extension-candidate walk. `cache_key` is the scope-folded key the
-/// shell computed (null = uncacheable call); `saw_member_ext_out` reports
-/// whether any candidate was a member-extension, which makes the resolution
-/// context-dependent and vetoes both positive and negative memoization.
+/// The full candidate walk. `cache_key` is the scope-folded key (null when the
+/// call is uncacheable); `saw_member_ext_out` reports whether a member-extension
+/// competed, which vetoes both positive and negative memoization.
 pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value, strict_ext: bool, static_recv: ?[]const u8, declared_recv: ?[]const u8, cache_key: ?root_mod.ProgramImage.InstanceMethodKey, chain_key: ?root_mod.ProgramImage.InstanceMethodKey, saw_member_ext_out: *bool) Allocator.Error!?EvalResult {
     var bound_thinned = false;
     ir.eval.callStatsProbe(name);
@@ -390,26 +350,9 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         });
     }
 
-    // Inline-cache fast path. A prior *owner-independent* resolution of this
-    // (receiver class, name, arg types) to a top-level extension dispatches
-    // straight through `callFuncRec`, skipping the candidate collection, the
-    // enclosing-owner set allocation, and the filter/score passes below —
-    // the dominant cost of extension-heavy hot loops. Only keyed when no
-    // receiver override is in play (a static/declared receiver, or the strict
-    // bare-name probe, can resolve the same names differently).
-    // A `declared_recv`-directed call keys with the scope FOLDED into the
-    // sig (`instanceMethodKeyScoped`): its resolution is a pure function of
-    // (receiver identity, name, arg-sig, declared scope), so it caches
-    // apart from the unscoped call — never served one, never serves one.
-    // The hot coroutine boundary (`fn.startCoroutineUninterceptedOrReturn`
-    // lowered with declared receiver `Function1`) re-walked per call when
-    // any declared scope disabled the key outright.
     var visible_owners = try enclosingOwnerSet(self, allocator);
     defer visible_owners.deinit();
 
-    // Whether any candidate for this name is a member-extension (its
-    // visibility/selection depends on the enclosing-`this` chain). When one
-    // exists the resolution is context-dependent and must not be cached.
     saw_member_ext_out.* = false;
 
     var candidates: std.ArrayList(Candidate) = .empty;
@@ -430,10 +373,6 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                 if (mtrace) std.debug.print("[extfb]  fid={d} shape-skip nparams={d}\n", .{ fid.int(), f.params.len });
                 continue;
             }
-            // Shape gate: enough declared params for the supplied args, OR
-            // a vararg param absorbing the surplus (`appendPathSegments
-            // (vararg components, encodeSlash = ...)` takes any number of
-            // positional components).
             const has_vararg = blk: {
                 for (f.params) |*p| {
                     if (p.is_vararg) break :blk true;
@@ -444,22 +383,12 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                 if (mtrace) std.debug.print("[extfb]  fid={d} shape-skip nparams={d}\n", .{ fid.int(), f.params.len });
                 continue;
             }
-            // Surplus declared params beyond the supplied args are only
-            // fillable when every one carries a default (or is a
-            // vararg). Without this, the 3-user-param
-            // `(suspend R.(P) -> T).startCoroutineUninterceptedOrReturn`
-            // ranked for a 2-arg call, ran the coroutine block with the
-            // completion slot empty, failed late, and the walk re-ran
-            // the block through the right overload — every UNDISPATCHED
-            // launch body executed twice.
+            // Surplus declared params beyond the supplied args are fillable
+            // only when each carries a default or is a vararg.
             if (f.params.len > want) {
                 const defaults = funcDefaults(self, &f);
-                // A trailing callable argument binds the LAST declared
-                // parameter (the trailing-lambda convention), so the
-                // default-fillable gap sits between the positional args
-                // and that last slot (`launch(context, start, block)`
-                // called as `launch { }` needs defaults on context/start
-                // only). Otherwise the gap is everything past the args.
+                // A trailing callable binds the last declared parameter, so
+                // the fillable gap sits between the args and that slot.
                 const last_arg_callable = args.len > 0 and switch (args[args.len - 1]) {
                     .IrClosure => true,
                     else => false,
@@ -494,11 +423,8 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                 if (mtrace) std.debug.print("[extfb]  fid={d} owner-skip\n", .{fid.int()});
                 continue;
             }
-            // An unsettled bodyless header is not executable — selecting
-            // it would re-enter `callFunc`'s bodyless ladder and cycle,
-            // and it must not outrank a real serving in a later walk arm.
-            // A call statically bound to such a header no-ops in
-            // `callFunc`'s bodyless arm; here it simply never competes.
+            // A bodyless header is not executable: selecting it re-enters
+            // `callFunc`'s bodyless ladder and cycles.
             if (!host_call_func.executableForm(self, mod, fid, want)) {
                 if (mtrace) std.debug.print("[extfb]  fid={d} bodyless-skip\n", .{fid.int()});
                 continue;
@@ -509,12 +435,7 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
     }
 
     // A low-priority candidate (`@Deprecated(level = ERROR/HIDDEN)`,
-    // `@LowPriorityInOverloadResolution`) is only a candidate when no ordinary
-    // overload applies — kotlinc hides it from resolution. Drop them up front
-    // when any ordinary candidate exists, for BOTH the strict and lenient
-    // passes below. Without this, the lenient pass can bind a HIDDEN
-    // binary-compat stub that delegates to a sibling overload but self-recurses
-    // (`buffer(capacity) = buffer(capacity)`, conflate → stack overflow).
+    // `@LowPriorityInOverloadResolution`) applies only when no ordinary one does.
     {
         var any_ordinary = false;
         for (candidates.items) |c| {
@@ -534,28 +455,15 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
     }
 
     // Receiver-type filter. The strict probe (the bare-name resolver's
-    // innermost-first walk) demands a *proven* receiver match — the
-    // declared receiver type (or a generic / `Any` / function-shape
-    // receiver, which accepts anything) must hold for this receiver's
-    // class hierarchy — so an inapplicable extension cannot bind at an
-    // inner receiver and pre-empt a real member of an outer one. The
-    // lenient form keeps the score-anyway pick for receivers whose
-    // runtime type cannot prove the match.
+    // innermost-first walk) demands a proven receiver match so an inapplicable
+    // extension cannot bind at an inner receiver and pre-empt a member of an
+    // outer one. The lenient form scores anyway.
     if (strict_ext) {
         var filtered: std.ArrayList(Candidate) = .empty;
         for (candidates.items) |c| {
-            // A low-priority candidate (`@LowPriorityInOverloadResolution`
-            // / deprecated-ERROR guard stub) is never a strict pick: it
-            // only applies when no ordinary candidate does, which the
-            // resolver's later tiers decide.
             if (c.func.low_priority) continue;
-            // Both the receiver AND the value-argument arity must
-            // provably fit — an extension whose extra params carry no
-            // defaults is not applicable to this call. With a known
-            // STATIC receiver type, applicability is decided against it
-            // (Kotlin extension resolution is static): an extension on a
-            // runtime subtype is not a candidate inside an extension
-            // body whose `this` is declared as the supertype.
+            // Extension resolution is static, so a known static receiver type
+            // decides applicability; the value-argument arity must fit too.
             const recv_fits = if (static_recv) |sname|
                 staticReceiverApplicable(self, allocator, sname, c.fid, &c.func.params[0].ty) orelse
                     try strictReceiverProven(self, allocator, receiver, c.fid, &c.func.params[0].ty)
@@ -565,11 +473,8 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                 if (missTraceWant(name)) std.debug.print("[extfb]  fid={d} strict recv-unproven static_recv={s}\n", .{ c.fid.int(), static_recv orelse "-" });
                 continue;
             }
-            // A type-parameter receiver's declared bounds bind in the strict
-            // pass too: `fun <T> T.observeReads where T : Modifier.Node`
-            // never takes a ContentDrawScope receiver, however generically
-            // the bare head reads. The static-hint shortcut above cannot see
-            // the bounds, so re-check them against the runtime receiver.
+            // Type-parameter bounds bind here too; the static-hint shortcut
+            // cannot see them, so re-check against the runtime receiver.
             if (receiverViolatesTypeParamBound(self, c.fid, &c.func.params[0].ty, receiver)) {
                 if (missTraceWant(name)) std.debug.print("[extfb]  fid={d} strict bound-thinned\n", .{c.fid.int()});
                 bound_thinned = true;
@@ -596,13 +501,9 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                 if (missTraceWant(name)) std.debug.print("[extfb]  fid={d} strict args-disproven\n", .{c.fid.int()});
                 continue;
             }
-            // Kotlin selects extensions against the receiver's DECLARED
-            // type: a definite static mismatch drops the candidate. But a
-            // COMPANION extension (`fun X.Companion.f`) invoked through the
-            // class value `X.f` has declared receiver `X` and receiver type
-            // `X.Companion`: the class-value access forwards to the companion,
-            // which `strictReceiverProven` above already confirmed for this
-            // receiver, so do not drop it on the class-vs-companion mismatch.
+            // A definite static mismatch drops the candidate, except for a
+            // companion extension reached through the class value: `X.f`
+            // carries declared receiver `X` against an `X.Companion` type.
             if (declared_recv) |dn| {
                 const rty = &c.func.params[0].ty;
                 const is_companion_recv = std.mem.endsWith(u8, rty.name, ".Companion") or
@@ -616,10 +517,8 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         if (missTraceWant(name)) std.debug.print("[extfb] strict survivors={d}\n", .{candidates.items.len});
         if (candidates.items.len == 0) return null;
     } else {
-        // With a known static receiver type, drop candidates that are
-        // statically inapplicable before any runtime-type ranking: an
-        // extension on a runtime subtype is not a candidate at all when
-        // `this` is declared as the supertype.
+        // Drop statically inapplicable candidates before any runtime-type
+        // ranking; extension resolution is static.
         if (static_recv) |sname| {
             var filtered: std.ArrayList(Candidate) = .empty;
             for (candidates.items) |c| {
@@ -630,12 +529,8 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
             candidates = filtered;
             if (candidates.items.len == 0) return null;
         }
-        // Lenient pass: keep candidates whose receiver match cannot be
-        // proven (erased generics) — but a definite DISPROOF still drops
-        // the candidate: when the declared receiver heads a known class
-        // and the runtime receiver's full hierarchy excludes it, kotlinc
-        // never considers the extension (`Pipeline.execute` is not a
-        // candidate on a coroutine receiver).
+        // Lenient pass: keep candidates whose receiver match cannot be proven
+        // (erased generics), but a definite disproof still drops one.
         {
             const mtr = missTraceWant(name);
             var filtered: std.ArrayList(Candidate) = .empty;
@@ -653,41 +548,26 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                     if (mtr) std.debug.print("[extfb]  fid={d} lenient args-disproof\n", .{c.fid.int()});
                     continue;
                 }
-                // Arity applicability holds in the lenient pass too: a
-                // candidate that REQUIRES more args than supplied cannot
-                // take this call — Null-padding it silently runs the
-                // wrong overload (`subList(..).sortDescending()` bound
-                // the `(fromIndex, toIndex)` variant with Null indices).
-                // Judged by the DECLARED arity (required/vararg), which
-                // is authoritative where per-fid default thunks are not.
+                // Judged by the declared arity (required/vararg), which is
+                // authoritative where per-fid default thunks are not.
                 if (declArityRefuses(self, c.fid, args.len)) {
                     if (mtr) std.debug.print("[extfb]  fid={d} lenient arity-refuse\n", .{c.fid.int()});
                     continue;
                 }
                 if (declared_recv) |dn| {
-                    // A companion extension (`fun X.Companion.f`) called through
-                    // the class value (`X.f`) has declared receiver `X` but a
-                    // `X.Companion` receiver type; the class-value access
-                    // forwards to the companion, so the class-vs-companion
-                    // mismatch must not drop it.
+                    // A companion extension reached through the class value
+                    // survives the class-vs-companion mismatch.
                     const rty = &c.func.params[0].ty;
                     const is_companion_recv = std.mem.endsWith(u8, rty.name, ".Companion") or
                         std.mem.eql(u8, rty.name, "Companion");
-                    // The RUNTIME receiver proving the declared receiver type
-                    // outranks a mismatched static hint: an explicit
-                    // `this.SimulatedIf(...)` inside a headerless receiver
-                    // lambda carries the ENCLOSING scope's declared receiver
-                    // (CompositionTestScope) while the value is the lambda's
-                    // own MockViewListValidator — a proven subtype match must
-                    // not be refused on that stale evidence.
+                    // A runtime receiver proving the declared type outranks a
+                    // mismatched static hint, which can name an outer scope.
                     const self_repick = blk: {
                         const cf = ir.eval.currentFrameFunc() orelse break :blk false;
                         break :blk cf.id.int() == c.fid.int();
                     };
-                    // A class-value receiver (`TopE.serializer()`) records the
-                    // CLASS as its declared receiver, but the value flowing in
-                    // is a `KClass`. An extension declared on `KClass` is
-                    // exactly what such a call binds, so the value's own
+                    // A class-value receiver records the class as its declared
+                    // receiver while the value is a `KClass`, whose own
                     // reflection heads outrank the class-shaped hint.
                     const class_reflection_proves = receiver.* == .Class and
                         receiver.isRuntimeType(simpleName(rty.name));
@@ -720,8 +600,6 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
             candidates.deinit(allocator);
             candidates = filtered;
         } else {
-            // Every candidate is either incompatible or definitely
-            // disproven: nothing to pick leniently.
             var any_undisproven = false;
             for (candidates.items) |c| {
                 if (!receiverDefinitelyNotParam(self, &c.func.params[0].ty, receiver)) any_undisproven = true;
@@ -730,15 +608,9 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         }
     }
 
-    // Kotlin resolves scope level by scope level, and a class body is an
-    // A function-typed receiver's DECLARED head decides which member of a
-    // same-named extension family binds. `suspend R.() -> T` lowers to
-    // `Function0` (its receiver rides in the type args) while
-    // `suspend (P) -> T` lowers to `Function1`; both are the same runtime
-    // class, so nothing below can separate them, and the receiver form won
-    // every call — `block.startCoroutineUninterceptedOrReturn(value, cont)`
-    // on a `suspend (V) -> T` ran the block with `value` bound as `this`
-    // and its value parameter left null.
+    // A function-typed receiver's declared head picks among a same-named
+    // family: `suspend R.() -> T` lowers to `Function0` and `suspend (P) -> T`
+    // to `Function1`, one runtime class that nothing below can split.
     if (candidates.items.len > 1) {
         if (declared_recv) |dn| {
             if (std.mem.startsWith(u8, dn, "Function")) {
@@ -760,15 +632,9 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         }
     }
 
-    // INNER scope relative to its file: a member extension of an enclosing
-    // class outranks a same-named top-level extension for calls inside the
-    // class. Surviving member-ext candidates already passed
-    // `memberExtVisible`, so their owner is on the enclosing-`this` chain —
-    // exactly the calls where kotlinc binds the member extension. Without
-    // this tier a same-shape pair ties in scoring and the pick falls to
-    // declaration order (SlotWriter's gap-aware `IntArray.nodeIndex` lost
-    // to the file-level raw-anchor accessor, correct for positive anchors
-    // and silently wrong for end-relative ones).
+    // A class body is an inner scope relative to its file: a member extension
+    // of an enclosing class outranks a same-named top-level one, and survivors
+    // passed `memberExtVisible`, so their owner is on the enclosing chain.
     if (candidates.items.len > 1) {
         const mg2 = self.module.borrow();
         defer mg2.deinit();
@@ -787,13 +653,9 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         }
     }
 
-    // Kotlin gathers candidates scope level by scope level — the call
-    // site's own file (its file-privates included) before anything from
-    // another file — and resolution stops at the innermost level with an
-    // applicable candidate. With several receiver-fitting candidates,
-    // keep the call-site file's own when any exist: a file-private
-    // `MockViewValidator.Text` outranks another package's same-signature
-    // extension the file never imported.
+    // Kotlin gathers candidates scope level by scope level and stops at the
+    // innermost applicable one, so the call site's own file wins where it has
+    // any candidate.
     if (candidates.items.len > 1) {
         const site_file: ?ir.FileId = ir.eval.refSiteFile() orelse
             if (ir.eval.currentCallSiteSpan()) |csp| csp.file else null;
@@ -801,15 +663,9 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
             const smg = self.module.borrow();
             defer smg.deinit();
             const smod = smg.get();
-            // The file tier orders TOP-LEVEL declarations only. A MEMBER
+            // The file tier orders top-level declarations only: a member
             // extension's scope level is its owner's position in the
-            // implicit-receiver chain (the scorer's owner rank), not its
-            // declaring file: `with(focusableNode) { applySemantics() }`
-            // written in Clickable.kt must reach FocusableNode's override
-            // in Focusable.kt over the enclosing node's own same-file
-            // member — filtering by file inverted that into infinite
-            // recursion. Skip the tier when every surviving candidate is
-            // a member extension.
+            // implicit-receiver chain, so skip the tier when all are members.
             var all_member_ext = true;
             for (candidates.items) |c| {
                 if (!isMemberExt(smod, c.fid)) {
@@ -834,18 +690,15 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         }
     }
 
-    // Cross-package same-simple-name extension twins: the runtime receiver's
-    // actual class FQN, not the shared receiver simple name, decides which
-    // twin binds. Runs after the scope tiers so it only adjudicates a residual
-    // genuine twin conflict.
+    // Runs after the scope tiers, so it adjudicates only a residual twin
+    // conflict that the receiver's own class FQN settles.
     if (candidates.items.len > 1) {
         narrowSameNameExtensionTwins(self, allocator, receiver, &candidates);
         if (candidates.items.len == 0) return null;
     }
 
-    // A Range receiver carries its element kind, which decides between
-    // extensions on `ClosedRange<Int>` and `ClosedRange<UInt>` (an erased
-    // type-argument twin pair for any other receiver).
+    // A Range receiver carries its element kind, which separates
+    // `ClosedRange<Int>` from `ClosedRange<UInt>` where erasure cannot.
     if (candidates.items.len > 1 and receiver.* == .Range) {
         const elem = rangeElemTypeName(receiver.Range.kind);
         var n_match: usize = 0;
@@ -868,12 +721,8 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         }
     }
 
-    // Unique-exact-arity pick — only when every supplied argument can
-    // bind its parameter. An arity-exact candidate whose param types the
-    // args definitely don't satisfy is inapplicable (kotlinc drops it),
-    // so a defaulted-arity sibling can win on type fit instead:
-    // `fetch("url")` must reach `fetch(urlString, block = {})`, not the
-    // arity-exact `fetch(block: () -> Unit)`.
+    // Unique-exact-arity pick, taken only when every argument binds its
+    // parameter, so a defaulted-arity sibling can win on type fit instead.
     var unique_exact: ?Candidate = null;
     {
         var count: usize = 0;
@@ -903,13 +752,9 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
 
     if (chosen == null) return null;
 
-    // An erased receiver-TYPE-ARG tie is undecidable here: sibling
-    // overloads that differ ONLY in the receiver's element type
-    // (`Sequence<UInt>.sum()` vs `Sequence<Int>.sum()` — same head, same
-    // params) select by a static type argument the runtime receiver does
-    // not carry. Picking one silently runs the wrong element arithmetic;
-    // decline instead so the walk's element-tag-aware arms (the
-    // iterable/list intrinsic fallbacks) serve the call dynamically.
+    // Siblings differing only in the receiver's element type select on a
+    // static type argument the runtime receiver does not carry: decline, and
+    // the element-tag-aware intrinsic fallbacks serve the call dynamically.
     {
         const c = chosen.?;
         const crt = &c.func.params[0].ty;
@@ -920,10 +765,8 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
                 if (!std.mem.eql(u8, ort.name, crt.name)) continue;
                 if (o.func.params.len != c.func.params.len) continue;
                 if (ort.args.len != crt.args.len or ort.args.len == 0) continue;
-                // Only a NUMERIC-WIDTH element difference is undecidable
-                // (the arithmetic changes per width); container-kind
-                // differences (Sequence<Sequence> vs Sequence<Iterable>
-                // for `flatten`) dispatch fine per element at runtime.
+                // Only a numeric-width element difference is undecidable;
+                // container kinds dispatch per element at runtime.
                 if (!numericWidthKind(ort.args[0].name) or !numericWidthKind(crt.args[0].name)) continue;
                 if (!std.mem.eql(u8, ort.args[0].name, crt.args[0].name)) {
                     if (trace.enabled(name)) {
@@ -935,8 +778,6 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         }
     }
 
-    // Defer to a function-typed enclosing property when the chosen
-    // member-extension's receiver doesn't accept the actual receiver.
     const defer_to_property = blk: {
         const c = chosen.?;
         const is_member_ext = isMemberExt(self.module.borrow().get(), c.fid);
@@ -964,20 +805,10 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         break :blk (lookupIntrinsic(self, ip) != null) or (lookupIntrinsic(self, lp) != null);
     };
 
-    // Kotlin gives a receiver MEMBER precedence over any extension. When
-    // bound refutation THINNED this walk's candidate set, a pick that used
-    // to decline on a tie can newly commit — and `Iterable.contains`'s own
-    // `if (this is Collection) return contains(element)` then re-enters
-    // itself instead of reaching the List member. Scoped to the thinned
-    // case so unarmed behavior is unchanged.
-    // `range in range` never defers: the builtin `Range.contains` member
-    // surface takes an ELEMENT, so a Range argument leaves the chosen
-    // extension (`operator LongRange.contains(LongRange)`) as the only
-    // applicable candidate — same predicate as the ladder's
-    // `range_in_range` standdown.
-    // A range's own `contains(element)` member takes only its element kind;
-    // any other argument (a Range, a Long on an Int range, a String) is the
-    // extension's to serve.
+    // A receiver member takes precedence over any extension, scoped to the
+    // case where bound refutation thinned the candidate set. A Range is the
+    // exception: its `contains` member takes only its own element kind, so any
+    // other argument is the chosen extension's to serve.
     const member_could_take_args = !(receiver.* == .Range and args.len == 1 and
         std.mem.eql(u8, name, "contains") and
         (args[0] == .Range or !rangeContainsArgKindMatches(receiver.Range.kind, &args[0])));
@@ -1003,22 +834,15 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         defer if (runtime.freeScratch()) allocator.free(all);
         const mg = self.module.borrow();
         const mod = mg.get();
-        // A member-extension's body has its declaring class's `this` in
-        // lexical scope (the dispatch receiver that made it visible
-        // here). Seed the callee frame with that owner instance: push it
-        // as a transferable enclosing receiver for the duration of the
-        // call.
+        // A member-extension body has its declaring class's `this` in scope:
+        // push that owner as an enclosing receiver for the call.
         var pushed_owner = false;
         var sam_target: ?Value = null;
         if (mod.registry.member_ext_owner_class.get(c.fid)) |owner| {
             if (try memberExtOwnerInstance(self, allocator, receiver, owner)) |inst| {
-                // A bodyless member-extension declaration whose owner is a
-                // SAM conversion (`MeasurePolicy { measurables, constraints
-                // -> ... }`): the fun interface's single method IS the
-                // member-extension, so the stored lambda serves the call —
-                // with the EXTENSION receiver bound as the lambda's `this`,
-                // exactly as kotlinc scopes the lambda body (`layout(...)`
-                // inside it resolves against the MeasureScope receiver).
+                // When the owner is a SAM conversion the fun interface's one
+                // method is the member-extension, so the stored lambda serves
+                // the call with the extension receiver as its `this`.
                 if (funcAt(mod, c.fid) != null and !funcAt(mod, c.fid).?.hasBody()) {
                     if (inst == .Instance) {
                         const g = inst.Instance.borrow();
@@ -1038,13 +862,9 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
             return r2;
         }
         if (!pushed_owner) maybeWarnLenientExtBind(self, mod, c.fid);
-        // Memoize an owner-independent pick: no member-extension competes for
-        // this name and the winner is itself top-level, so the (receiver
-        // class, name, arg types) key fully determines the target. When a
-        // member-extension DID compete but lost to a top-level pick, the
-        // chain-folded key captures the full resolution input instead. A
-        // future call hits the fast path above and skips this whole
-        // resolution.
+        // Memoize an owner-independent pick under the plain key; when a
+        // member-extension competed and lost, the chain-folded key captures
+        // the full resolution input instead.
         if (!pushed_owner) {
             if (!saw_member_ext_out.*) {
                 if (cache_key) |k| extMethodCachePut(self, k, @intFromEnum(c.fid));
@@ -1054,9 +874,7 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
         } else if (sam_target == null and c.func.params.len == args.len + 1) {
             // A member-extension winner is owner-dependent, but the owner is
             // recovered from the chain at serve time and the key folds the
-            // chain SHAPE, so the resolution is still a pure function of the
-            // key. Without this every such call re-ran the whole ladder
-            // (3.0us vs 0.37us for a plain member call).
+            // chain shape, so the key still determines the resolution.
             if (chain_key) |k| extMethodCachePut(self, k, @intFromEnum(c.fid));
         }
         const r = try callFuncRec(self, allocator, mod, c.fid, all);
@@ -1071,15 +889,9 @@ pub fn extensionFnFallbackWalk(self: *VmHost, allocator: Allocator, receiver: *c
 pub var lenient_warned_mutex: runtime.SpinMutex = .{};
 pub var lenient_warned: ?std.AutoHashMap(u32, void) = null;
 
-/// The extension fallback bound a shipped pack's top-level extension for a
-/// call whose file never imports it. Kotlin rejects that call (an extension
-/// resolves only when imported or same-package), so the program runs on
-/// klio's leniency alone — and the trailing lambdas of such calls lower
-/// without their declared receiver, which surfaces later as baffling
-/// unresolved bare members inside the handler. Say so once, with the exact
-/// import to add. Quiet for pack-internal callers (their own resolution
-/// legitimately spans a pack's packages) and for `kotlin.*` (default
-/// imports).
+/// Warn once when the fallback binds a shipped pack's extension the call site
+/// never imports: Kotlin resolves an extension only when imported or
+/// same-package, and such a call's lambdas lower without a declared receiver.
 pub fn maybeWarnLenientExtBind(self: *VmHost, mod: *const Module, fid: FuncId) void {
     _ = self;
     const f = funcAt(mod, fid) orelse return;
@@ -1105,10 +917,8 @@ pub fn maybeWarnLenientExtBind(self: *VmHost, mod: *const Module, fid: FuncId) v
     );
 }
 
-/// The lenient-bind warning prints once per function per PROGRAM RUN. The
-/// memo is process-global, so an in-process harness running many programs
-/// must reset it at each run boundary or later programs lose the warning
-/// their pinned output carries.
+/// The memo is process-global, so a driver running many programs per process
+/// resets it at each run boundary to keep the warning once per run.
 pub fn resetLenientWarned() void {
     lenient_warned_mutex.lock();
     defer lenient_warned_mutex.unlock();
@@ -1116,9 +926,8 @@ pub fn resetLenientWarned() void {
 }
 
 /// The instance serving as a member-extension's dispatch receiver: the
-/// innermost enclosing receiver (including access entries pushed for this
-/// dispatch) whose class hierarchy carries `owner`, else the explicit
-/// receiver itself when it does.
+/// innermost enclosing receiver whose hierarchy carries `owner`, else the
+/// explicit receiver when it does.
 pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *const Value, owner: []const u8) Allocator.Error!?Value {
     const entries = try ir.eval.enclosingEntriesAlloc(allocator);
     defer allocator.free(entries);
@@ -1152,10 +961,8 @@ pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *co
     }
     if (receiver.* == .Instance and
         receiverImplementsOwnerIdentity(self, receiver, owner)) return receiver.*;
-    // The lexical receiver tower of the executing call stack: a getter
-    // reached through nested lambdas (`placeable.mainAxisSize` inside a
-    // `with(scope) { repeat { … } }` body) has its owner bound as an
-    // outer frame's `this`, never on the dynamic enclosing chain.
+    // The executing call stack's lexical receiver tower: a getter reached
+    // through nested lambdas binds its owner as an outer frame's `this`.
     {
         const lex = try ir.eval.frameThisChainAlloc(allocator);
         defer allocator.free(lex);
@@ -1198,7 +1005,6 @@ pub fn memberExtOwnerInstance(self: *VmHost, allocator: Allocator, receiver: *co
     return null;
 }
 
-/// The captured/constructed `outer` link of an `Instance` value.
 pub fn instanceOuterLink(v: *const Value) ?Value {
     return switch (v.*) {
         .Instance => |i| blk: {
@@ -1210,30 +1016,13 @@ pub fn instanceOuterLink(v: *const Value) ?Value {
     };
 }
 
-/// Kotlin-faithful most-specific extension-overload selection.
-///
-/// Each candidate is ranked by a strict, total ordering so the winner is
-/// unique and deterministic (no declaration-order tie-break). Ranked, in
-/// descending priority:
-///   0. subtype specificity — how many other candidates' receiver types are
-///      supertypes of this one. Kotlin's most-specific rule is decided by the
-///      subtyping lattice, not by runtime hierarchy distance: with a receiver
-///      that satisfies several unrelated extension-receiver types (a coroutine
-///      is both a `Job` and a `CoroutineScope`), the candidate whose receiver
-///      is a subtype of another candidate's (`Job` <: `CoroutineContext`) is
-///      the more specific one even when an unrelated sibling sits nearer in
-///      the runtime class graph. When the lattice cannot decide (no candidate
-///      is a subtype of another) this ties at zero and the runtime-distance
-///      tier below breaks it;
-///   1. receiver specificity — the candidate whose receiver param most
-///      specifically matches the receiver's runtime type (a `Flow` receiver
-///      selects `Flow.forEach`, not the generic `Iterable.forEach`);
-///   2. applicability score — the numeric arg/param compatibility;
-///   3. owner rank — a member extension visible nearer on the enclosing-`this`
-///      chain;
-///   4. parameter specificity — the most-specific declared parameter types
-///      for the supplied value args;
-///   5. a stable key (lowest `FuncId`) so the winner is always unique.
+/// Ranking key for most-specific extension selection, compared field by field
+/// so the winner is unique without a declaration-order tie-break:
+///   0. subtype specificity, Kotlin's most-specific rule decided by the
+///      subtyping lattice rather than runtime hierarchy distance;
+///   1. receiver specificity against the receiver's runtime type;
+///   2. applicability score; 3. owner rank, a member extension nearer on the
+///      enclosing-`this` chain; 4. parameter specificity; 5. lowest `FuncId`.
 pub const ExtKey = [9]i32;
 
 pub fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
@@ -1244,8 +1033,8 @@ pub fn extKeyGreater(a: ExtKey, b: ExtKey) bool {
 }
 
 pub fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const Value, candidates: []const Candidate, args: []const Value) Allocator.Error!?Candidate {
-    // [6] not [24]: safety builds 0xAA-fill the whole declared array per
-    // entry; >6 args fall to the heap branch below (rare).
+    // [6] not [24]: safety builds 0xAA-fill the whole declared array; more
+    // than 6 args take the heap branch below.
     var shapes_buf: [6]applicability.ArgShape = undefined;
     const shapes: []applicability.ArgShape = if (args.len <= shapes_buf.len)
         shapes_buf[0..args.len]
@@ -1284,10 +1073,6 @@ pub fn scoreExtCandidates(self: *VmHost, allocator: Allocator, receiver: *const 
     var best: ?Candidate = null;
     var best_key: ExtKey = .{std.math.minInt(i32)} ** 9;
     for (candidates, 0..) |c, idx| {
-        // The per-candidate ExtKey — applicability is Kotlin's hard gate
-        // (`ext_key[0]`), then user-vs-shipped, subtype specificity, receiver
-        // specificity, the numeric score, owner rank, parameter specificity,
-        // and the stable lowest-FuncId discriminator.
         const applied = applicability.applicable(&all_sigs[idx], shapes, scope);
         if (candidates.len > 0 and missTraceWant(candidates[0].func.name)) {
             const mg = self.module.borrow();
@@ -1350,9 +1135,8 @@ pub fn enclosingChainClassOrder(self: *VmHost, allocator: Allocator) Allocator.E
     defer allocator.free(chain);
     var closure: std.ArrayList(*const ClassDef) = .empty;
     defer closure.deinit(allocator);
-    // Persistent across the whole chain: a supertype shared by an inner and
-    // an outer `this` is ranked at its innermost occurrence (first match
-    // wins in `applicExtOwnerRankCb`), so it must appear only once.
+    // Persistent across the whole chain: a supertype shared by an inner and an
+    // outer `this` must appear once, at its innermost occurrence.
     var seen: std.ArrayList(*const ClassDef) = .empty;
     defer seen.deinit(allocator);
     for (chain) |value| {
@@ -1372,9 +1156,8 @@ pub fn enclosingChainClassOrder(self: *VmHost, allocator: Allocator) Allocator.E
     return v;
 }
 
-/// A runtime-registered LOCAL class publishes its companion instance under
-/// the `$companion:<name>` global at registration; a member call on the
-/// class value forwards there.
+/// A runtime-registered local class publishes its companion instance under the
+/// `$companion:<name>` global, and a member call on the class value goes there.
 pub fn localClassCompanionForward(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     const cname: []const u8 = blk: {
         const cg = receiver.Class.borrow();
@@ -1403,9 +1186,8 @@ pub fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *con
     {
         const cg = cls.borrow();
         cname = cg.get().name;
-        // An enum's synthetic statics (`values()`, `valueOf`, `entries`)
-        // belong to the enum class, never to its companion — `Color.values()`
-        // is legal with a companion present and must not forward there.
+        // An enum's synthetic statics belong to the enum class, never to its
+        // companion, so `Color.values()` must not forward there.
         if (cg.get().is_enum and (std.mem.eql(u8, name, "values") or std.mem.eql(u8, name, "valueOf") or std.mem.eql(u8, name, "entries"))) {
             cg.deinit();
             return null;
@@ -1423,8 +1205,8 @@ pub fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *con
         const mg = self.module.borrow();
         defer mg.deinit();
         const comp = &mg.get().registry.companion_singletons;
-        // Dotted fqn suffixes longest-first: a nested class with a
-        // same-named cousin elsewhere resolves its OWN companion.
+        // Dotted fqn suffixes longest-first: a nested class with a same-named
+        // cousin elsewhere resolves its own companion.
         var start: usize = 0;
         while (true) {
             if (comp.get(cfqn[start..])) |c| break :blk c;
@@ -1466,9 +1248,8 @@ pub fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: 
         cg.deinit();
         g.deinit();
     }
-    // Walk the full supertype graph (not just the first supertype): a
-    // class may list an interface ahead of the superclass whose companion
-    // declares `name`.
+    // Walk the full supertype graph: a class may list an interface ahead of
+    // the superclass whose companion declares `name`.
     var queue: std.ArrayList([]const u8) = .empty;
     defer queue.deinit(allocator);
     var seen: std.StringHashMap(void) = .init(allocator);
@@ -1497,8 +1278,8 @@ pub fn instanceCompanionFallback(self: *VmHost, allocator: Allocator, receiver: 
                     if (sid != recv_id) {
                         const r = try callMemberRec(self, allocator, &s, name, args);
                         if (r == .ok) return r;
-                        // The companion probe missed; free its discarded
-                        // `Vm::call_member` message before trying the next.
+                        // The companion probe missed: free its discarded
+                        // dispatch message before trying the next.
                         freeDispatchMiss(allocator, r);
                     }
                 }

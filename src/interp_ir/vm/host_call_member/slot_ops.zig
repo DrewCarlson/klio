@@ -32,30 +32,16 @@ const receiverImplementsType = receiver_probe.receiverImplementsType;
 const reflect_anon = @import("reflect_anon.zig");
 const isIteratorNext = reflect_anon.isIteratorNext;
 
-/// `KLIO_NOINST_TRACE=1`: report each virtual slot resolved against the runtime
-/// class of a host-backed (non-`Instance`) receiver. Resolved once — this sits
-/// on the member-dispatch path, where the env cache's mutex would show up.
-/// Counts every time a STATICALLY BOUND virtual slot call degrades to a
-/// by-name member walk. `execArmCallVirtual` documents that arm as having no
-/// name-based fallback — "a missing slot is a link error in the program
-/// image" — and this host has one. Both cannot be true, and a bytecode VM or
-/// a C backend needs the unlinked slot to be a build error rather than a
-/// walk. Counting it is the prerequisite for making that so.
+/// Counts statically bound virtual slot calls that degrade to a by-name walk.
 pub var slot_by_name_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 pub fn slotByNameFallbacks() u64 {
     return slot_by_name_count.load(.monotonic);
 }
 
-/// A builtin member whose implementation is a host function reached by
-/// RECEIVER VARIANT rather than by FQN, so `linkBodyless` finds no native for
-/// it and a statically bound slot call declines to a member-name walk
-/// (`KLIO_NOINST_WHY` reports `target-not-executable`). Binding the target
-/// `FuncId` to the handler settles the call by id instead.
-///
-/// The FQN comparison happens ONCE per `FuncId` per thread; every later call
-/// on that slot is an integer probe. The handlers are the existing ones — a
-/// second implementation here is exactly the duplication this avoids.
+/// A builtin member whose implementation is a host function reached by receiver
+/// variant rather than by FQN, so `linkBodyless` finds no native and a statically
+/// bound slot call would decline to a name walk. Binding the id settles it here.
 pub const HostSlotOp = enum {
     iterator_protocol,
     collection_iterator,
@@ -84,10 +70,8 @@ pub fn hostSlotOpFor(module: *const Module, target: FuncId) ?HostSlotOp {
     return op;
 }
 
-/// The same classification off the declaration's name alone, so a consumer
-/// that holds the declaration rather than a live module (the native backend,
-/// deciding at compile time which member calls the runtime serves) reads the
-/// one table instead of keeping a second.
+/// The same classification from a declaration's name alone, for a consumer that
+/// holds a declaration rather than a live module.
 pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
     return blk: {
         const owner = fqn[0 .. std.mem.findScalarLast(u8, fqn, '.') orelse break :blk null];
@@ -96,16 +80,14 @@ pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
             std.mem.eql(u8, owner, "kotlin.collections.MutableIterator") or
             std.mem.eql(u8, owner, "kotlin.collections.ListIterator") or
             std.mem.eql(u8, owner, "kotlin.collections.MutableListIterator") or
-            // The primitive-iterator abstract classes: their `next()` source
-            // body delegates to `nextInt()`-family members the host serves
-            // through the same protocol handler.
+            // The primitive-iterator abstract classes: their `next()` body
+            // delegates to `nextInt()`-family members the same handler serves.
             (std.mem.startsWith(u8, owner, "kotlin.collections.") and
                 std.mem.endsWith(u8, owner, "Iterator"));
         if (iter_owner and (isIteratorProtocol(name) or isIteratorNext(name)))
             break :blk .iterator_protocol;
-        // `iterator()` on a collection: the host builds the iterator from the
-        // receiver's own representation, and no native is registered under
-        // the interface's FQN either.
+        // The host builds a collection's iterator from the receiver's own
+        // representation, and no native is registered under the interface FQN.
         if (std.mem.eql(u8, name, "iterator") and
             (std.mem.eql(u8, owner, "kotlin.collections.Iterable") or
                 std.mem.eql(u8, owner, "kotlin.collections.MutableIterable") or
@@ -119,10 +101,6 @@ pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
                 std.mem.eql(u8, owner, "kotlin.collections.HashSet") or
                 std.mem.eql(u8, owner, "kotlin.collections.LinkedHashSet")))
             break :blk .collection_iterator;
-        // The remaining interface members the host serves from the value's
-        // own representation, measured off the noinst-why decline tally:
-        // KClass.isInstance, Comparator.compare, indexed array get, and a
-        // Sequence's lazy iterator.
         if (std.mem.eql(u8, owner, "kotlin.reflect.KClass") and
             std.mem.eql(u8, name, "isInstance")) break :blk .kclass_is_instance;
         if (std.mem.eql(u8, owner, "kotlin.Comparator") and
@@ -132,8 +110,7 @@ pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
             std.mem.endsWith(u8, owner, "Array") and
             std.mem.findScalar(u8, owner["kotlin.".len..], '.') == null)
             break :blk .array_get;
-        // An array iterates from its own storage, exactly as a collection
-        // does, and no native is registered under the array type either.
+        // An array iterates from its own storage, with no native either.
         if (std.mem.eql(u8, name, "iterator") and
             std.mem.startsWith(u8, owner, "kotlin.") and
             std.mem.endsWith(u8, owner, "Array") and
@@ -145,14 +122,10 @@ pub fn hostSlotOpOfFqn(fqn: []const u8) ?HostSlotOp {
     };
 }
 
-/// The builtin members a caller with no module can serve, selected by the
-/// receiver's own representation and the member's NAME: the iteration protocol
-/// and the collection `iterator()`. `callMemberInner` reaches the same handlers
-/// on the same receivers, so there is one implementation of each.
+/// The builtin members a caller with no module serves, chosen by the receiver's
+/// representation and the member name; `callMemberInner` shares these handlers.
 pub fn hostFreeMemberByName(allocator: Allocator, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     if (std.mem.eql(u8, name, "iterator") and args.len == 0) {
-        // The self-iterator convention first, then the builtin collection or
-        // range iterator.
         switch (receiver.*) {
             .Iterator, .RangeIter, .SeqIter => return .{ .ok = receiver.* },
             else => {},
@@ -168,19 +141,13 @@ pub fn hostFreeMemberByName(allocator: Allocator, receiver: *const Value, name: 
     return null;
 }
 
-/// What such a member answers, as a KIND rather than a runtime type: a caller
-/// that has to choose a machine type for the result reads the protocol from
-/// where it is implemented instead of keeping a second copy of it.
+/// What such a member answers, as a kind rather than a runtime type, so a
+/// caller choosing a machine type for the result reads it from here.
 pub const HostFreeAnswer = enum {
-    /// An iterator over the receiver.
     iterator,
-    /// Whether the iteration can step again.
     boolean,
-    /// One element of what is being iterated.
     element,
-    /// A position within the iteration.
     index,
-    /// Nothing: the member is performed for its effect.
     unit,
 };
 
@@ -193,11 +160,9 @@ pub fn hostFreeMemberAnswer(name: []const u8) ?HostFreeAnswer {
     return null;
 }
 
-/// The host slot ops whose handlers read only the receiver's own
-/// representation, so they answer with no interpreter host behind them. A
-/// compiled program has no module to dispatch through and serves its builtin
-/// member calls from here; the interpreter reaches the same bodies through
-/// `runHostSlotOp`, so there is one implementation rather than two.
+/// The host slot ops whose handlers read only the receiver's own representation,
+/// so they answer with no interpreter host behind them and serve a compiled
+/// program, which has no module to dispatch through.
 pub fn runHostFreeSlotOp(allocator: Allocator, op: HostSlotOp, receiver: *const Value, name: []const u8, args: []const Value) Allocator.Error!?EvalResult {
     switch (op) {
         .iterator_protocol, .collection_iterator => return hostFreeMemberByName(allocator, receiver, name, args),
@@ -248,7 +213,6 @@ pub fn runHostSlotOp(self: *VmHost, allocator: Allocator, op: HostSlotOp, receiv
     }
 }
 
-/// Names the builtin iterator variants own outright.
 pub fn isIteratorProtocol(name: []const u8) bool {
     return std.mem.eql(u8, name, "hasNext") or std.mem.eql(u8, name, "next") or
         std.mem.eql(u8, name, "hasPrevious") or std.mem.eql(u8, name, "previous") or
@@ -271,8 +235,6 @@ pub fn noteSlotByName2(self: *VmHost, slot: MethodSlotId, name: []const u8, rece
     });
 }
 
-/// A value that IS its own representation — no host wrapper for the by-name
-/// walk to unpack on the way in.
 pub fn isScalarValue(v: *const Value) bool {
     return switch (v.*) {
         .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char => true,
@@ -291,15 +253,9 @@ pub fn noinstTraceOn() bool {
     return k;
 }
 
-/// Invoke a statically resolved virtual family by numeric slot. The runtime
-/// receiver contributes its exact class identity; named and runtime-defined
-/// classes both resolve to an O(1) `(class, slot)` target.
-/// kotlinc's type-safe collection bridges, by member name. A generic
-/// collection member called through an erased signature (`indexOf(Object)`)
-/// checks the argument against the class type parameter's bound and answers
-/// a fixed default for a foreign value instead of running the body against a
-/// representation the value does not have. The member set and defaults are
-/// kotlinc's BuiltinSpecialBridges.
+/// Kotlin's type-safe collection bridges, by member name: a generic collection
+/// member called through an erased signature checks the argument against the
+/// class type parameter's bound and answers a fixed default for a foreign value.
 pub const BarrierKind = enum { bool_false, int_neg1, null_or_false, second_arg };
 
 pub fn barrierSpec(name: []const u8) ?BarrierKind {
@@ -312,9 +268,8 @@ pub fn barrierSpec(name: []const u8) ?BarrierKind {
     return null;
 }
 
-/// The bridge's answer when the first argument fails the class type
-/// parameter's erased-bound check, or null when the bridge admits the call
-/// (no tp-typed param, no bound, or the value passes `is Bound`).
+/// The bridge's answer when the first argument fails the class type parameter's
+/// erased-bound check, or null when the bridge admits the call.
 pub fn typeSafeBarrierAnswer(
     self: *VmHost,
     module: *const ir.Module,
@@ -371,8 +326,7 @@ pub fn typeSafeBarrierAnswer(
             break;
         }
     }
-    // Bounds may be recorded fqn-qualified; the instance check and the
-    // Any-universal test both speak simple heads.
+    // Bounds may be recorded fqn-qualified; both checks speak simple heads.
     const bh_raw = bound_head orelse return null;
     const bh = simpleName(bh_raw);
     if (bh.len == 0 or std.mem.eql(u8, bh, "Any")) return null;
@@ -391,12 +345,11 @@ pub fn typeSafeBarrierAnswer(
     };
 }
 
-/// Claim and fill a CallVirtual host-receiver site memo (single-fill; the
-/// tagged `site_native` release store is the validity gate, so a concurrent
-/// replayer either sees the whole memo or takes the slow path). `name` must
-/// be module-owned so its pointer outlives every replay. Verdict encoding:
-/// low bits 00 = a direct StdlibFn pointer, tag 3 = (op << 2) with 0xFF
-/// meaning "no host op, member-name walk only".
+/// Claim and fill a CallVirtual host-receiver site memo: single-fill, the tagged
+/// `site_native` release store being the validity gate, so a concurrent replayer
+/// sees either the whole memo or the slow path. `name` must be module-owned so
+/// its pointer outlives every replay. Verdict encoding: low bits 00 is a direct
+/// StdlibFn pointer, tag 3 is (op << 2), 0xFF meaning member-name walk only.
 pub fn stampVirtSite(site: ?ir.VirtNativeSite, receiver: *const Value, encoded: u64, name: []const u8) void {
     const st = site orelse return;
     if (encoded == 0 or (encoded & 3 != 0 and encoded & 3 != 3)) return;
@@ -409,8 +362,6 @@ pub fn stampVirtSite(site: ?ir.VirtNativeSite, receiver: *const Value, encoded: 
 }
 
 
-/// The simple name of the class or interface declaring a virtual slot's
-/// method (`ClosedRange` for `kotlin.ranges.ClosedRange.contains`).
 pub fn slotOwnerSimpleName(self: *VmHost, slot: MethodSlotId) ?[]const u8 {
     const mg = self.module.borrow();
     defer mg.deinit();
@@ -423,7 +374,6 @@ pub fn slotOwnerSimpleName(self: *VmHost, slot: MethodSlotId) ?[]const u8 {
     return if (simple.len == 0) null else simple;
 }
 
-/// The element type name of a host Range value's kind.
 pub fn rangeElemTypeName(kind: runtime.RangeKind) []const u8 {
     return switch (kind) {
         .Int => "Int",

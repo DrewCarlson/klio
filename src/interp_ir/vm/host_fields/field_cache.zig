@@ -1,5 +1,5 @@
-//! The field-site caches: the thread-local L1 in front of the shared
-//! read/write memos, the plain-slot store, and the synthetic-getter memo.
+//! Field-site caches: the thread-local L1 over the shared read/write memos, the
+//! plain-slot store, and the synthetic-getter memo.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -35,9 +35,8 @@ pub fn fieldReadCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.Pro
     const gen = host_call_member.dispatch_cache_gen.load(.monotonic);
     const e = &self.tls.tl_field_read_cache[tlFieldSlot(class_p, name_p)];
     if (e.state != 0 and e.class_p == class_p and e.name_p == name_p and e.gen == gen) {
-        // state 2: the shared map had no entry at last probe. It is
-        // add-only, so re-probe every 64th consult rather than paying
-        // the program-cell borrow on every miss forever.
+        // State 2 means the add-only shared map had no entry at the last
+        // probe, so `miss_ttl` re-probes every 64th consult, not every miss.
         if (e.state == 2) {
             if (e.miss_ttl > 0) {
                 e.miss_ttl -= 1;
@@ -82,14 +81,11 @@ pub fn fieldWriteCacheGet(self: *VmHost, class_p: usize, name_p: usize) ?root.Pr
     return hit;
 }
 
-/// Insert into the field-read memo, capped so synthesized per-evaluation
-/// anonymous classes cannot grow it unboundedly.
+/// Capped, so per-evaluation anonymous classes cannot grow it unboundedly.
 pub fn fieldReadCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldReadHit) void {
     if (!ir.eval.dispatchCacheStable()) return;
-    // Main-module classes only, exactly like the WRITE memo below: a
-    // runtime / anonymous class can be reclaimed mid-program, and a later
-    // class cell landing at the same address would alias its identity key.
-    // Main-module class cells stay registry-held for the program's life.
+    // Main-module classes only: their cells stay registry-held for the whole
+    // program, so no later cell can alias the identity key.
     {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -102,24 +98,16 @@ pub fn fieldReadCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const
     };
     const pg = self.prog.borrowMut();
     defer pg.deinit();
-    // The interned name identity keys the entry: the caller's slice can be
-    // side-module or scratch memory, and only the image-interned id is
-    // stable (and unique per spelling) for the image's lifetime.
+    // The interned name id keys the entry; the caller's slice may be scratch.
     const name_p = pg.get().memberNameIdentity(name) orelse return;
     if (pg.get().field_read_cache.count() >= 65536) return;
     pg.get().field_read_cache.put(.{ .class_p = class_p, .name_p = name_p }, hit) catch {};
 }
 
-/// Insert into the field-WRITE memo. Main-module classes only: a runtime /
-/// anonymous class can gain `$set$` overrides after the first write, and its
-/// class cell (the identity key) does not outlive the class def.
-///
-/// `hit.store_name` is re-anchored onto `member_names`: a write reached
-/// through a callable reference (`Class::prop`, a delegate's `setValue`)
-/// resolves its name from a runtime String's bytes, and storing that slice
-/// leaves the entry pointing at freed memory once the String is collected.
-/// A later hit then stores the value under a garbage key, and the property
-/// reads back null.
+/// Main-module classes only: a runtime class can gain `$set$` overrides after
+/// the first write, and its class cell dies with the def. `hit.store_name`
+/// re-anchors onto `member_names`, since a write through a callable reference
+/// names its property from a String's bytes, which dangle.
 pub fn fieldWriteCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []const u8, name: []const u8, hit: root.ProgramImage.FieldWriteHit) void {
     if (!ir.eval.dispatchCacheStable()) return;
     {
@@ -143,13 +131,11 @@ pub fn fieldWriteCachePut(self: *VmHost, inst: ObjRef(InstanceData), fqn: []cons
     pg.get().field_write_cache.put(.{ .class_p = class_p, .name_p = name_p }, stable) catch {};
 }
 
-/// The terminal plain store: write through a boxed-capture Cell when the
-/// slot holds one, else (re)define the field owning its own reference.
+/// Stores through a boxed-capture Cell when the slot holds one, else defines the
+/// field, which owns its own reference.
 pub fn storePlainField(self: *VmHost, allocator: Allocator, inst: ObjRef(InstanceData), store_name: []const u8, value: Value) Allocator.Error!UnitResult {
     _ = self;
-    // One borrow, one scan: the probe-then-define shape paid two of each per
-    // plain write on the memo-hit path (`define` re-scanned what `get` had
-    // already located).
+    // One borrow and one scan; probe-then-define would pay two of each.
     value.retain();
     const g = inst.borrowMut();
     defer g.deinit();
@@ -174,13 +160,10 @@ pub fn storePlainField(self: *VmHost, allocator: Allocator, inst: ObjRef(Instanc
     return .{ .ok = {} };
 }
 
-/// Whether a `$sgetter$` resolution for (receiver class, scoped name) is a
-/// pure function of the class — every execution mode (member probe or
-/// direct read) reaches the same terminal — so the (class, name) memo may
-/// serve it. Every consulted fact is class-static: the foreign-receiver
-/// probe reject must be inapplicable (the class owns `owner`, or `owner`
-/// does not declare the property), and no private-shadow cell may claim
-/// the read under either key.
+/// Whether a `$sgetter$` resolution is a pure function of the receiver class, so
+/// the (class, name) memo may serve it: a member probe and a direct read reach
+/// the same terminal only when the foreign-receiver reject is inapplicable and no
+/// private-shadow cell claims the read under either key.
 pub fn sgetterMemoSafe(self: *VmHost, rcn: []const u8, rest: []const u8, owner: []const u8, prop: []const u8) bool {
     const owns = std.mem.eql(u8, rcn, owner) or blk: {
         const mg = self.module.borrow();
@@ -213,8 +196,6 @@ pub fn sgetterMemoSafe(self: *VmHost, rcn: []const u8, rest: []const u8, owner: 
     return true;
 }
 
-/// Record a `$sgetter$` getter terminal in the (class, name) memo under the
-/// FULL scoped name.
 pub fn sgetterPutGetter(self: *VmHost, receiver: *const Value, full_name: []const u8, fid: FuncId) void {
     if (receiver.* != .Instance) return;
     const fqn = blk: {
@@ -227,9 +208,6 @@ pub fn sgetterPutGetter(self: *VmHost, receiver: *const Value, full_name: []cons
     fieldReadCachePut(self, receiver.Instance, fqn, full_name, .{ .getter = @intCast(fid.int()), .stored_idx = root.ProgramImage.FieldReadHit.NONE });
 }
 
-/// After a `$sgetter$` terminal recursed on the bare property and resolved,
-/// mirror the bare-name memo entry under the FULL scoped name so later
-/// reads (and the GetField site memo) skip the arm's per-read walks.
 pub fn sgetterCopyMemo(self: *VmHost, receiver: *const Value, prop: []const u8, full_name: []const u8) void {
     if (receiver.* != .Instance) return;
     const inst = receiver.Instance;
@@ -249,8 +227,7 @@ pub fn sgetterCopyMemo(self: *VmHost, receiver: *const Value, prop: []const u8, 
     fieldReadCachePut(self, inst, fqn, full_name, hit);
 }
 
-/// Whether a stored `.Null` in `name`'s slot means an uninitialized
-/// `lateinit` property (class-declared).
+/// Whether a stored `.Null` means an uninitialized class-declared `lateinit`.
 pub fn storedNullIsLateinit(inst: ObjRef(InstanceData), name: []const u8) bool {
     const g = inst.borrow();
     defer g.deinit();

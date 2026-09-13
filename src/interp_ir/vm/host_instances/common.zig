@@ -1,6 +1,5 @@
-//! Shared pieces of instance construction: the two error constructors every
-//! path uses, the per-thread constructor guard and argument-head hints, the
-//! enum-entry preset, and the anonymous-object site caches.
+//! Shared instance-construction pieces: the constructor guard, argument-head
+//! hints, the enum-entry preset, and the anonymous-object site caches.
 
 const std = @import("std");
 
@@ -54,28 +53,20 @@ pub fn typeErr(allocator: Allocator, comptime fmt: []const u8, args: anytype) Al
     return .{ .Type = try std.fmt.allocPrint(allocator, fmt, args) };
 }
 
-// -------------------------------------------------------------------------
-// Per-thread constructor-shell recursion guard for secondary-ctor shell
-// construction. Lazy `object` re-entrancy is handled separately by the
-// shared object-init state table in `host_globals.zig`; this stack only
-// breaks same-class shell recursion during secondary-ctor dispatch.
-// -------------------------------------------------------------------------
+// Breaks same-class shell recursion during secondary-ctor dispatch; lazy
+// `object` re-entrancy uses the object-init state table in `host_globals.zig`.
 
 pub threadlocal var ctor_guard: std.ArrayList([]const u8) = .empty;
 
-/// `name`/`ordinal` for the enum-entry subclass instance about to be
-/// constructed: Kotlin's `Enum` constructor sets them before the entry's
-/// own initializers and `init` blocks run (`init { println(this.name) }`
-/// inside an entry body sees the name). Set by the enum's initialization,
-/// consumed once by the matching class's materialization, which also
-/// publishes the shell into the entry's table slot (`slot`).
+/// `name`/`ordinal` for the enum-entry subclass about to be constructed;
+/// Kotlin's `Enum` constructor sets them before the entry's own initializers
+/// and `init` blocks run. Materialization consumes it once and fills `slot`.
 pub const EnumEntryPreset = struct { class_fqn: []const u8, name: Value, ordinal: Value, slot: ?*Value = null };
 
 pub threadlocal var enum_entry_preset: ?EnumEntryPreset = null;
 
-/// The enum whose entries are being constructed: its companion waits until
-/// every entry exists (kotlinc initializes the entries first, then the
-/// companion), so the first entry's construction must not trigger it.
+/// The enum whose entries are being constructed: its companion initializes
+/// only after every entry exists, so the first entry must not trigger it.
 pub threadlocal var enum_under_init: ?[]const u8 = null;
 
 pub fn setEnumUnderInit(fqn: ?[]const u8) ?[]const u8 {
@@ -88,14 +79,11 @@ pub fn setEnumEntryPreset(p: ?EnumEntryPreset) void {
     enum_entry_preset = p;
 }
 
-/// Assert (Debug) the constructor-shell guard is clear at a run boundary
-/// and reset it so leaked-across-runs state is a loud failure.
 pub fn resetReceiverTls() void {
     std.debug.assert(ctor_guard.items.len == 0);
     ctor_guard.clearRetainingCapacity();
 }
 
-/// True while `name`'s constructor shell is being built on this thread.
 pub fn ctorGuardContains(name: []const u8) bool {
     for (ctor_guard.items) |n| {
         if (std.mem.eql(u8, n, name)) return true;
@@ -111,17 +99,12 @@ pub fn ctorGuardPop() void {
     _ = ctor_guard.pop();
 }
 
-/// The static argument heads the current construction site supplied, set by
-/// the eval arm and consumed ONCE: a delegation or a default thunk builds
-/// further instances underneath and must rank on its own terms.
+/// Static argument heads the current construction site supplied, consumed once:
+/// a delegation or default thunk builds further instances and ranks on its own.
 pub threadlocal var ctor_static_heads: ?[]const ?[]const u8 = null;
 
-/// The construction site's static heads live in this thread-owned buffer:
-/// the array a site hands over is freed when the site returns (the bytecode
-/// tier's NewInstance arm never takes it back), and a later secondary-ctor
-/// ranking on the same thread read the freed array. The head strings are
-/// module constants, so copying the slice array is enough. A site with more
-/// arguments than the buffer holds ranks without static heads.
+/// Heads live in a thread-owned buffer: the array a site hands over is freed
+/// when the site returns. A site with more arguments ranks without static heads.
 pub const CTOR_HEADS_MAX = 32;
 
 pub threadlocal var ctor_static_heads_buf: [CTOR_HEADS_MAX]?[]const u8 = undefined;
@@ -136,19 +119,15 @@ pub fn setCtorArgStaticHeads(self: *VmHost, heads: []const ?[]const u8) void {
     ctor_static_heads = ctor_static_heads_buf[0..heads.len];
 }
 
-/// Forget any construction-site heads left installed by a path that never
-/// took them (a host class, a factory, a value-class shortcut): the slice
-/// they name is freed when the site returns, and the next secondary-ctor
-/// ranking on this thread would read it.
+/// Forget heads left installed by a path that never took them: the slice they
+/// name is freed when the site returns.
 pub fn clearCtorArgStaticHeads(self: *VmHost) void {
     _ = self;
     ctor_static_heads = null;
 }
 
-/// The class under construction's type-parameter bounds, so a constructor
-/// parameter declared as a class type parameter (`Z<T : Int>(val x: T)`)
-/// ranks as its bound: `this(n as T)` from a `constructor(vararg ys: Long)`
-/// must reach the primary, not re-select the vararg secondary.
+/// Type-parameter bounds of the class under construction, so a constructor
+/// parameter declared as a class type parameter ranks as its bound.
 pub const CtorBounds = struct { names: []const []const u8, bounds: []const []const u8 };
 
 pub threadlocal var ctor_bounds: ?CtorBounds = null;
@@ -181,14 +160,8 @@ pub fn takeCtorStaticHeads() ?[]const ?[]const u8 {
     return v;
 }
 
-/// Stable synthetic class name for an anonymous-object expression, keyed by the
-/// AST node address (the program is immutable, so the address is a stable site
-/// id). The first instantiation of a site mints `$anon$<n>` and registers the
-/// site's class + methods under it; later instantiations of the same site reuse
-/// that name, so the `classes`/`anon_methods` registries stay bounded by the
-/// number of `object` expressions in the program instead of growing per instance
-/// (a per-request leak for a server). Names are permanent (page-allocator) since
-/// they are used as long-lived map keys.
+/// Stable synthetic class name per anonymous-object expression, keyed by AST
+/// node address; page-allocated and permanent, bounding the registries by site.
 pub var anon_site_names: std.AutoHashMapUnmanaged(usize, []const u8) = .empty;
 
 pub var anon_site_lock: runtime.SpinMutex = .{};
@@ -204,14 +177,8 @@ pub fn anonSiteName(expr: *const ast.Expr) []const u8 {
     return name;
 }
 
-/// An `object` literal's field/init/super-arg initializers that need real
-/// evaluation are lowered into side modules. Those modules are site-stable
-/// (pure functions of the AST site — captures resolve at run time, not lowering
-/// time), so they are lowered once per site and cached here, keyed by the
-/// site's AST address. Reused by every instantiation: a per-request `object`
-/// literal evaluates the cached thunks instead of re-lowering them into fresh
-/// Module cells that, when swept, free only their header and leak the lowered
-/// IR they own.
+/// Side-module lowerings of an `object` literal's initializers; pure functions
+/// of the AST site, so each site is lowered once and cached by its address.
 pub const AnonComplexInit = struct { name: []const u8, module: ObjRef(Module), func: FuncId };
 
 pub const AnonInitThunk = struct { module: ObjRef(Module), func: FuncId, prop_pos: usize };
@@ -219,8 +186,7 @@ pub const AnonInitThunk = struct { module: ObjRef(Module), func: FuncId, prop_po
 pub const AnonSuperArgThunk = struct { module: ObjRef(Module), func: FuncId };
 
 /// One `object : Iface by <expr> {}` delegate initializer, parallel to the
-/// site's supertype list; null when the slot has no delegate or a bare
-/// captured name serves it directly.
+/// site's supertype list; null when no delegate or a captured name serves it.
 pub const AnonDelegateThunk = struct { module: ObjRef(Module), func: FuncId };
 
 pub const AnonSiteThunks = struct {
@@ -234,11 +200,8 @@ pub var anon_site_thunks: std.AutoHashMapUnmanaged(usize, AnonSiteThunks) = .emp
 
 pub var anon_site_thunks_root_registered = std.atomic.Value(bool).init(false);
 
-/// GC root: shade every cached anon-site thunk sub-module so the cached lowered
-/// IR is never swept (it is reused across all instantiations of the site). Read
-/// without locking: the stop-the-world handshake parks every mutator at a safe
-/// point and neither `get` nor `put` spans a safe point, so the map is stable
-/// here.
+/// GC root: shade every cached anon-site thunk module so reused lowered IR is
+/// never swept. Lockless: neither `get` nor `put` spans a safe point.
 pub fn gcMarkAnonSites(m: *runtime.gc.Marker) void {
     var it = anon_site_thunks.valueIterator();
     while (it.next()) |t| {
@@ -257,13 +220,8 @@ pub fn anonSiteThunksGet(key: usize) ?AnonSiteThunks {
     return anon_site_thunks.get(key);
 }
 
-/// Clear the process-global anon-`object` site caches at a program-run
-/// boundary. Both are keyed by AST-node address, which is only stable within a
-/// single run; a later run can reuse a freed address, so a stale entry would
-/// dispatch through a thunk sub-module owned by the finished run's allocator
-/// (a cross-run use-after-free). Frees the permanent (page-allocator) site
-/// names and thunk-list spines; the thunk sub-module cells are GC cells the
-/// collector reclaims once unrooted. Run-boundary only (no workers live).
+/// Drop the anon-`object` site caches at a run boundary: keyed by AST address,
+/// which a later run can reuse, so a stale entry names a dead thunk module.
 pub fn resetAnonSiteCache() void {
     const pa = std.heap.page_allocator;
     anon_site_lock.lock();
@@ -285,10 +243,7 @@ pub fn resetAnonSiteCache() void {
         anon_site_thunks.clearAndFree(pa);
     }
     // The shared side-module clone must not cross a program boundary: its
-    // identity gate compares run-module CELL ADDRESSES, and an arena-reusing
-    // driver hands the next program's module the same address — the stale
-    // clone then serves classes whose shallow-shared method slices point
-    // into the finished program's freed storage.
+    // identity gate compares run-module cell addresses, which get reused.
     if (shared_anon_module != null) {
         runtime.gc.forgetCell(&shared_anon_module.?.cell.hdr);
         shared_anon_module = null;
@@ -300,9 +255,8 @@ pub fn resetAnonSiteCache() void {
     }
 }
 
-/// Publish a site's thunks (first publisher wins). A racing second build of the
-/// same site loses; the loser's modules are left unrooted and GC reclaims them.
-/// Returns the entry now in the cache.
+/// Publish a site's thunks, first publisher wins; the loser's modules are left
+/// unrooted for the GC. Returns the entry now in the cache.
 pub fn anonSiteThunksPut(key: usize, entry: AnonSiteThunks) AnonSiteThunks {
     anon_site_lock.lock();
     defer anon_site_lock.unlock();
@@ -311,32 +265,16 @@ pub fn anonSiteThunksPut(key: usize, entry: AnonSiteThunks) AnonSiteThunks {
     return entry;
 }
 
-/// The side module a runtime-synthesized class's members lower into: a
-/// `cloneForExtend` of the main module, built lazily ONCE per synthesis call
-/// and shared by every member/thunk lowering of that site. The clone sees the
-/// whole image — classes, registries, the shared lazy func-id space — so a
-/// member body's calls resolve and bind statically exactly as build-time
-/// lowering would, and an emitted main-space FuncId/slot resolves both
-/// through the host and through the side module itself (the cloned header
-/// section serves ids below the append range). `Module.default` (the old
-/// empty side module) left every call in every anon body name-dynamic.
-/// `KLIO_ANON_BASE=0` restores the empty side module.
-/// One process-wide side module shared by every synthesis site: a compose
-/// run synthesizes hundreds of sites, and per-site clones of the image's
-/// registry/indices blew the RSS cap. Appends serialize under
-/// `anonLowerEnter`/`anonLowerExit`, held by callers around LOWERING
-/// sections only (never around thunk execution).
+/// The side module a runtime-synthesized class's members lower into: one
+/// process-wide `cloneForExtend` of the main module, so member bodies resolve
+/// and bind statically as build-time lowering would. Appends serialize under
+/// `anonLowerEnter`/`anonLowerExit`, held around lowering, never around a thunk.
 pub var shared_anon_module: ?ObjRef(Module) = null;
 
 pub var shared_anon_arena: ?*std.heap.ArenaAllocator = null;
 
-/// Cell identity of the run module `shared_anon_module` was cloned from.
-/// An in-process driver that builds and frees a module PER PROGRAM (the
-/// parity itests) must not serve a later program from a side module whose
-/// shallow-shared tables point into the freed earlier module — the stale
-/// clone's appended-class method slices dangle and the first anon-method
-/// bare call segfaults. A base-identity mismatch drops the cache and
-/// re-clones from the live module.
+/// Cell identity of the run module `shared_anon_module` was cloned from; a
+/// mismatch re-clones, since the clone's shallow-shared tables would dangle.
 pub var shared_anon_base_identity: usize = 0;
 
 pub var anon_lower_mutex: runtime.SpinMutex = .{};
@@ -368,24 +306,13 @@ pub fn anonLowerExit() void {
 /// `lowerMethod` into the returned module.
 pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Module)) Allocator.Error!ObjRef(Module) {
     if (cache.*) |m| return m.clone();
-    // Default ON: the image-clone side module makes anon bodies resolve
-    // and bind statically. The historical RSS blowup was the shared
-    // clone renting the RUN ARENA — with the side module on its own real
-    // allocator (below), a full compose suite measures RSS-neutral
-    // against the empty-module mode, and single classes measure neutral
-    // or better. `KLIO_ANON_BASE=0` restores the empty side module.
+    // `KLIO_ANON_BASE=0` selects an empty side module, leaving bodies dynamic.
     if (std.mem.eql(u8, runtime.envOnce("KLIO_ANON_BASE") orelse "1", "0")) {
         return ObjRef(Module).init(allocator, Module.default(allocator));
     }
     if (shared_anon_module != null and shared_anon_base_identity != self.module.identity()) {
-        // A real free, not the refcount-gated `deinit` (a no-op under the
-        // arena and tracing-GC modes): the retired clone is a whole deep
-        // Module (~tens of MB) and a multi-program harness swaps it every
-        // program — leaking it ratcheted the process into the RSS cap.
-        // `Module.deinit` cannot free a cloneForExtend product (it would
-        // free base buffers the clone only borrows), so the clone lives in
-        // its OWN arena and retirement drops the arena wholesale. Handles
-        // the finished program handed out are dead with it.
+        // `Module.deinit` cannot free a `cloneForExtend` product, which borrows
+        // base buffers, so the clone owns an arena dropped wholesale here.
         runtime.gc.forgetCell(&shared_anon_module.?.cell.hdr);
         shared_anon_module = null;
         if (shared_anon_arena) |holder| {
@@ -398,14 +325,8 @@ pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Modul
         shared_anon_base_identity = self.module.identity();
         const mg = self.module.borrow();
         defer mg.deinit();
-        // The shared side module owns a REAL allocator, never the run
-        // arena: every lowering's scratch (candidate lists, type clones,
-        // solved bindings) rents from `module.registry.allocator` and
-        // frees on the way out — frees that were no-ops against the
-        // harness arena, which is what accumulated an entire suite's
-        // lowering scratch into the RSS cap. Persistent appends (the
-        // lowered funcs themselves) stay bounded and live for the
-        // process, matching the module's own lifetime.
+        // The side module owns a real allocator, never the run arena: lowering
+        // scratch rents from `module.registry.allocator` and frees on exit.
         const holder = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
         holder.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         shared_anon_arena = holder;
@@ -414,10 +335,8 @@ pub fn anonSiteModule(self: *VmHost, allocator: Allocator, cache: *?ObjRef(Modul
         // Every anon site lowers into this one module while earlier sites'
         // bodies run in it: a growing func table must not move their funcs.
         cloned.funcs_live = true;
-        // PERMANENT cell, and never on the program-perm list: this cache
-        // outlives programs and is freed only by the identity swap above.
-        // A nursery mint here was swept by the next unrelated major (no
-        // root shades it) — the swap's arena teardown is the sole owner.
+        // Permanent cell, never on the program-perm list: this cache outlives
+        // programs and the identity swap above is its sole owner.
         const saved_perm = runtime.gc.alloc_perm;
         const saved_ppc = runtime.gc.program_perm_collect;
         runtime.gc.alloc_perm = true;

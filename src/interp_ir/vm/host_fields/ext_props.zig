@@ -1,6 +1,5 @@
-//! Extension-property resolution: the declared getter/setter lookup, the
-//! owner-keyed scoping probe a private member-extension property needs, the
-//! delegate forms, and the runtime-delegation registry.
+//! Extension-property resolution: declared getter/setter lookup, the
+//! owner-keyed scoping probe a private member extension needs, delegate forms.
 
 const std = @import("std");
 const ir = @import("ir");
@@ -41,9 +40,7 @@ const getMemberField = read_paths.getMemberField;
 const class_access = @import("class_access.zig");
 const companionInstanceForClass = class_access.companionInstanceForClass;
 
-/// Resolve a top-level / supertype / `Type.Companion` / `Any` extension
-/// property `FuncId` for `(recv_simple, name)`. Mirrors the chained
-/// `.or_else` probe in `get_field`.
+/// Resolve the in-scope extension-property `FuncId` for `(recv_simple, name)`.
 pub fn resolveExtensionProp(
     self: *VmHost,
     allocator: Allocator,
@@ -56,14 +53,8 @@ pub fn resolveExtensionProp(
     return fid;
 }
 
-/// A MEMBER extension property (`class C { val R.p get() = … }`) is in scope
-/// only while an implicit receiver of its owner class is. For a BUILTIN
-/// receiver that already answers the name itself, applying an out-of-scope
-/// member extension shadows the member — which Kotlin never does. Upstream
-/// kotlinx-serialization's `MapEntrySerializer` declares
-/// `override val Map.Entry<K, V>.value get() = this.value`; without this guard
-/// every `entry.value` read anywhere binds that getter, and the getter's own
-/// `this.value` re-enters it without bound.
+/// A member extension property (`class C { val R.p get() = ... }`) is in scope only
+/// while an implicit receiver of its owner class is; otherwise it would shadow a member.
 pub fn memberExtOutOfScope(self: *VmHost, allocator: Allocator, receiver: *const Value, fid: FuncId) Allocator.Error!bool {
     switch (receiver.*) {
         .Instance, .Class => return false,
@@ -74,10 +65,7 @@ pub fn memberExtOutOfScope(self: *VmHost, allocator: Allocator, receiver: *const
     return (try host_call_member.memberExtOwnerInstance(self, allocator, receiver, owner)) == null;
 }
 
-/// Whether a class-value receiver's resolved extension property was
-/// registered under the COMPANION key (`X.Companion`). Only that registration
-/// runs its getter with the companion instance as `this`; a `KClass`/`Any`
-/// keyed extension keeps the class value itself.
+/// Whether the receiver's extension property is registered under the companion key.
 pub fn classExtPropUsesCompanion(self: *VmHost, allocator: Allocator, recv_simple: []const u8, name: []const u8) Allocator.Error!bool {
     const comp_key = try std.fmt.allocPrint(allocator, "{s}.Companion", .{recv_simple});
     defer allocator.free(comp_key);
@@ -86,11 +74,8 @@ pub fn classExtPropUsesCompanion(self: *VmHost, allocator: Allocator, recv_simpl
     return lookupPairFunc(pg.get().extension_props, comp_key, name) != null;
 }
 
-/// Resolve and evaluate a (member-)extension property getter for `receiver`,
-/// or a delegated extension property. Mirrors the extension arm of the field
-/// ladder (`resolveExtensionProp` + owner-`this` seeding) but is entered
-/// directly from the `$extread$` marker, so it never consults the
-/// stored-field / member-getter-shadow arms. Null when no extension applies.
+/// Evaluate an extension or delegated extension property getter for `receiver`.
+/// Entered from `$extread$`, so it skips the stored-field and member-getter arms.
 pub fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
     const recv_simple: []const u8 = switch (receiver.*) {
         .Instance => |i| className(i),
@@ -104,16 +89,12 @@ pub fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const V
     if (try resolveExtensionProp(self, allocator, receiver, recv_simple, name)) |fid| {
         const mptr: *const Module = self.module.asPtr();
         if (fid.int() >= mptr.funcCount()) return null;
-        // A companion extension's getter `this` is the class's companion
-        // instance; route the class value to it. A KClass/Any keyed
-        // extension keeps the class value itself.
+        // A companion extension's getter runs with the companion instance as `this`.
         var getter_recv = receiver.*;
         if (receiver.* == .Class and try classExtPropUsesCompanion(self, allocator, recv_simple, name)) {
             if (try companionInstanceForClass(self, recv_simple)) |comp| getter_recv = comp;
         }
-        // A member-extension property's getter body has its declaring class's
-        // `this` in lexical scope; seed the getter frame with the owner
-        // instance from the enclosing chain.
+        // A member extension's getter body has its declaring class's `this` in scope.
         var pushed_owner = false;
         if (mptr.registry.member_ext_owner_class.get(fid)) |owner| {
             if (try host_call_member.memberExtOwnerInstance(self, allocator, &getter_recv, owner)) |inst| {
@@ -133,11 +114,8 @@ pub fn extensionPropRead(self: *VmHost, allocator: Allocator, receiver: *const V
     return null;
 }
 
-/// The setter half of `resolveExtensionProp`: walks the same
-/// receiver/supertype/companion/`Any` candidate set against the registered
-/// extension-property *setters*, so `var T.x set(value)` resolves for a
-/// subtype receiver (`var ApplicationCall.receiveType` on a
-/// `RoutingPipelineCall`) — not just the exact declared receiver type.
+/// The setter half of `resolveExtensionProp`: the same receiver, supertype, companion
+/// and `Any` candidate set against the registered extension-property setters.
 pub fn resolveExtensionPropSetter(
     self: *VmHost,
     allocator: Allocator,
@@ -148,13 +126,8 @@ pub fn resolveExtensionPropSetter(
     return resolveExtensionPropImpl(self, allocator, receiver, recv_simple, name, true);
 }
 
-/// Whether `name` is settable on `receiver` through an extension-property
-/// setter (`var T.name set(value)`) declared on the receiver's type or any
-/// supertype. Used by the bare-name write path to route an implicit-`this`
-/// assignment to the extension setter instead of a top-level binding.
-/// `getValue`/`setValue` on a delegate, with the delegated property's owner
-/// pushed as an enclosing receiver: the operator may be a MEMBER EXTENSION
-/// of the owner (`class A { operator fun Delegate.getValue(...) }`).
+/// `getValue`/`setValue` on a delegate, with the delegated property's owner pushed
+/// as an enclosing receiver: the operator may be a member extension of the owner.
 pub fn delegateCall(self: *VmHost, allocator: Allocator, d: *const Value, name: []const u8, args: []const Value, owner: *const Value) Allocator.Error!EvalResult {
     const pushed = owner.* == .Instance;
     if (pushed) host_call_member.pushAccessEnclosing(self, owner);
@@ -173,11 +146,8 @@ pub fn hostHasExtProp(self: *VmHost, allocator: Allocator, receiver: *const Valu
     return delegated != null;
 }
 
-/// Whether the extension property `name` on this receiver is DECLARED with
-/// a callable type (a function type, or a class declaring `invoke`), so
-/// that `recv.name(args)` is `recv.name.invoke(args)`. Decided from the
-/// declaration alone: reading the property to look at its value would run
-/// its getter.
+/// Whether the extension property `name` is declared with a callable type, so
+/// `recv.name(args)` is `recv.name.invoke(args)`. Reading it would run its getter.
 pub fn extPropDeclaredCallable(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) bool {
     const recv_simple: []const u8 = switch (receiver.*) {
         .Instance => |i| className(i),
@@ -191,8 +161,6 @@ pub fn extPropDeclaredCallable(self: *VmHost, allocator: Allocator, receiver: *c
     const mg = self.module.borrow();
     defer mg.deinit();
     const mod = mg.get();
-    // The declaration's own type, keyed by the declared receiver head: the
-    // receiver's class and each supertype the property could bind through.
     var head: ?[]const u8 = recv_simple;
     var depth: usize = 0;
     while (head) |h| : (depth += 1) {
@@ -218,7 +186,6 @@ pub fn extPropDeclaredCallable(self: *VmHost, allocator: Allocator, receiver: *c
     return declaredTypeIsCallable(mod, &f.return_ty);
 }
 
-/// A function type, or a class whose hierarchy declares `invoke`.
 pub fn declaredTypeIsCallable(mod: *const ir.Module, ty: *const ir.TypeRef) bool {
     if (root.isFunctionType(ty)) return true;
     var head = std.mem.trimEnd(u8, ty.name, "?");
@@ -227,11 +194,8 @@ pub fn declaredTypeIsCallable(mod: *const ir.Module, ty: *const ir.TypeRef) bool
     return mod.classHierarchyDeclaresMember(cid, "invoke");
 }
 
-/// A bare name inside a nested class's body that names a member of an
-/// ENCLOSING class's companion object (or of a companion the enclosing class
-/// inherits): Kotlin's static scope of the enclosing classes. Walks the
-/// nesting chain outward from the instance's class; null when no companion
-/// on the chain declares `name`.
+/// A bare name in a nested class's body can name a member of an enclosing class's
+/// companion: Kotlin's static scope of the enclosing classes, walked outward.
 pub fn enclosingCompanionMember(self: *VmHost, allocator: Allocator, inst: *const Value, name: []const u8, args: ?[]const Value) Allocator.Error!?EvalResult {
     if (inst.* != .Instance) return null;
     var cur: ?[]const u8 = className(inst.Instance);
@@ -289,10 +253,8 @@ pub fn hostHasExtPropSetter(self: *VmHost, allocator: Allocator, receiver: *cons
 
 pub const ExtDelegateHit = struct { key: []const u8, fid: FuncId };
 
-/// Resolve a delegated extension property (`val R.x by expr`) for this
-/// receiver: exact declared receiver, then the instance supertype chain.
-/// Returns the DECLARING registry key alongside the thunk so the cached
-/// delegate object is shared across subtype receivers.
+/// Resolve a delegated extension property (`val R.x by expr`): exact receiver, then
+/// the supertype chain. Returns the declaring key so one cached delegate serves subtypes.
 pub fn resolveExtPropDelegate(
     self: *VmHost,
     allocator: Allocator,
@@ -348,9 +310,8 @@ pub fn resolveExtPropDelegate(
     return null;
 }
 
-/// The materialised delegate object for a delegated extension property:
-/// run the delegate thunk once and cache the result as a hidden global
-/// keyed by the declaring receiver + property name.
+/// Run the delegate thunk once; cache the result as a hidden global keyed by
+/// declaring receiver and property name.
 pub fn extPropDelegateInstance(
     self: *VmHost,
     allocator: Allocator,
@@ -393,12 +354,10 @@ pub fn ownerKeyedSlotKey(cls_ident: usize, recv_key: []const u8, name: []const u
     return if (v == 0) 1 else v;
 }
 
-/// Probe the owner-qualified extension-prop keys (`"<Owner>\x00<recv>"`)
-/// for one class on the lexical receiver tower.
+/// Probe the owner-qualified extension-prop keys (`"<Owner>\x00<recv>"`) for one class.
 pub fn ownerKeyedForClass(cls: ObjRef(runtime.ClassDef), map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
-    // Probe the WHOLE resolved parent chain, not one supertype level: a
-    // coroutine instance's class is several classes below JobSupport, and a
-    // member extension declared there is in scope for every subclass body.
+    // The whole parent chain, not one supertype level: a member extension declared
+    // on an ancestor is in scope for every subclass body.
     var kb: [512]u8 = undefined;
     var cur: ObjRef(runtime.ClassDef) = cls;
     var depth: usize = 0;
@@ -433,8 +392,7 @@ pub fn ownerKeyedProbeOne(owner: []const u8, kb: []u8, map: anytype, recv_key: [
     if (std.fmt.bufPrint(kb, "{s}\x00{s}", .{ owner, recv_key })) |okey| {
         return lookupPairFunc(map, okey, name);
     } else |_| {
-        // A key longer than the inline buffer is vanishingly rare but must
-        // still resolve — the probe decides which declaration binds.
+        // An oversized key still has to resolve: the probe decides which declaration binds.
         const heap = std.heap.page_allocator;
         const okey = std.fmt.allocPrint(heap, "{s}\x00{s}", .{ owner, recv_key }) catch return null;
         defer heap.free(okey);
@@ -442,11 +400,8 @@ pub fn ownerKeyedProbeOne(owner: []const u8, kb: []u8, map: anytype, recv_key: [
     }
 }
 
-/// Probe the owner-qualified extension-prop keys (`"<Owner>\x00<recv>"`)
-/// for every class on the lexical receiver tower — a PRIVATE member-ext
-/// property (`private val Placeable.mainAxisSize` in each lazy item type)
-/// shares its (receiver, name) pair across owners, and only the
-/// declaration whose owner is in scope is the one kotlinc bound.
+/// Probe the owner-qualified keys for every class on the lexical receiver tower:
+/// private member extensions share a (receiver, name) pair, and only the in-scope owner binds.
 pub fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
     const memo: *[1024]OwnerKeyedSlot = if (setters) &fldTls().owner_keyed_memo_set else &fldTls().owner_keyed_memo;
     var it = ir.eval.frameThisChainIter();
@@ -469,11 +424,8 @@ pub fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const
         }
         if (ownerKeyedViaDelegates(&v, map, recv_key, name)) |fid| return fid;
     }
-    // The bare member-extension call arm passes its DISPATCH OWNER by
-    // pushing it on the enclosing chain, never as a frame `this` — inside
-    // `MeasureScope.measure` reached via `with(node) { measure(...) }`,
-    // the node (which owns `private val Density.targetConstraints`) is
-    // only there. Probe those receivers with the same memo.
+    // The bare member-extension call arm pushes its dispatch owner on the enclosing
+    // chain, never as a frame `this`; probe those receivers with the same memo.
     var eit = ir.eval.enclosingChainIter();
     while (eit.next()) |v| {
         if (v != .Instance) continue;
@@ -497,10 +449,8 @@ pub fn ownerKeyedExtProp(comptime setters: bool, map: anytype, recv_key: []const
     return null;
 }
 
-/// A member-extension property declared by a `by`-delegate of the receiver
-/// (`class Test : IFoo by impl`, `impl` overriding `val S.extVal`) is in
-/// scope through the wrapper. The delegate's runtime class can differ per
-/// instance, so this probe is never memoized by the wrapper's class.
+/// A member extension declared by a `by`-delegate of the receiver is in scope through
+/// the wrapper. The delegate's runtime class varies per instance, so this is not memoized.
 pub fn ownerKeyedViaDelegates(v: *const Value, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
     var di: usize = 0;
     while (host_call_member.delegateFieldAt(v, di)) |d| : (di += 1) {
@@ -515,11 +465,8 @@ pub fn ownerKeyedViaDelegates(v: *const Value, map: anytype, recv_key: []const u
     return null;
 }
 
-/// An IMPORTED companion/member extension property (`import
-/// kotlin.time.Duration.Companion.seconds`) is in scope in its importing
-/// file without the owner on the receiver tower. Probe the owner-keyed
-/// entries named by the executing frame's file imports: the import's fqn
-/// minus its leaf IS the declaring owner the registration keyed.
+/// An imported companion/member extension property is in scope in its importing file
+/// without the owner on the receiver tower: the import's fqn minus its leaf is the owner.
 pub fn importOwnedExtProp(self: *VmHost, map: anytype, recv_key: []const u8, name: []const u8) ?FuncId {
     const f = ir.eval.currentFrameFunc() orelse {
         if (missTraceEnvCached()) |w| {
@@ -562,45 +509,30 @@ pub fn resolveExtensionPropImpl(
             return if (setters) p.extension_prop_setters else p.extension_props;
         }
     };
-    // A class-value receiver (`X.name`) matches only a companion extension
-    // (`val X.Companion.name`, keyed `X.Companion`), never a plain type
-    // extension `val X.name` (which applies to instances of `X`). Falling back
-    // to the bare `X` key would invoke an instance extension's getter with the
-    // class/companion as `this` and recurse.
+    // A class-value receiver matches only a companion extension (keyed `X.Companion`),
+    // never `val X.name`: the bare key would run an instance getter with the class as `this`.
     if (receiver.* == .Class) {
         const comp_key = try std.fmt.allocPrint(allocator, "{s}.Companion", .{recv_simple});
         defer allocator.free(comp_key);
         const pg = self.prog.borrow();
         defer pg.deinit();
         if (lookupPairFunc(Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
-        // A PRIVATE member extension on the companion registers ONLY under
-        // the owner-qualified key, so the plain pair above cannot see it:
-        // `class H { private val Float.Companion.p get() = … }` is reached
-        // from `Float.p` through these two.
+        // A private member extension registers only under the owner-qualified key.
         if (pg.get().owner_keyed_ext_names.contains(name)) {
             if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
             if (importOwnedExtProp(self, Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
         }
-        // A class value IS a `KClass`: a `val KClass<*>.x` extension applies
-        // to it directly (`qualifiedOrSimpleName` behind `KClass.cast`'s
-        // error message). The getter runs with the class value as `this`,
-        // never the companion.
+        // A class value is a `KClass`: `val KClass<*>.x` applies with the class as `this`.
         if (lookupPairFunc(Pick.map(pg.get().*), "KClass", name)) |fid| return fid;
         if (lookupPairFunc(Pick.map(pg.get().*), "Any", name)) |fid| return fid;
         return null;
     }
-    // A null receiver dispatches an extension property declared on a NULLABLE
-    // receiver type (`val RowColumnParentData?.weight get() = this?.weight ?:
-    // 0f`) — kotlinc resolves that statically, so `parentData.weight` with a
-    // null parentData runs the getter, never a field read. Only an
-    // unambiguous single declaration binds by bare name.
+    // A null receiver dispatches an extension declared on a nullable receiver type;
+    // kotlinc resolves that statically. Only an unambiguous declaration binds by bare name.
     if (receiver.* == .Null and !setters) {
         const pg = self.prog.borrow();
         defer pg.deinit();
-        // The executing frame's package first: same-name nullable
-        // extension properties in different packages blank the bare-name
-        // entry, but internal visibility means the reading code sits in
-        // the declaring package.
+        // The frame's package first: same-name nullable extensions elsewhere blank the bare-name entry.
         if (ir.eval.currentFramePackage()) |pkg| {
             var buf: [256]u8 = undefined;
             if (pkg.len + 1 + name.len <= buf.len) {
@@ -620,11 +552,8 @@ pub fn resolveExtensionPropImpl(
     {
         const pg = self.prog.borrow();
         defer pg.deinit();
-        // A companion-object receiver arrives under its MANGLED runtime class
-        // name (`Target$Companion$Companion`); extension properties on a
-        // companion are registered under the SOURCE-WRITTEN receiver type
-        // (`Target.Companion`). Every lookup below has to try both, or a
-        // companion extension is unreachable from a companion instance.
+        // A companion receiver arrives mangled (`Target$Companion$Companion`) but
+        // registers under the source-written type (`Target.Companion`); try both.
         var comp_alias_buf: [256]u8 = undefined;
         const comp_alias: ?[]const u8 = blk: {
             const at = std.mem.find(u8, recv_simple, "$Companion") orelse break :blk null;
@@ -635,10 +564,7 @@ pub fn resolveExtensionPropImpl(
         if (pg.get().owner_keyed_ext_names.contains(name)) {
             if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
             if (importOwnedExtProp(self, Pick.map(pg.get().*), recv_simple, name)) |fid| return fid;
-            // A PRIVATE member extension registers ONLY under the
-            // owner-qualified key, so the companion alias must be tried here
-            // too — this is the arm that resolves
-            // `class H { private val T.Companion.p get() = … }`.
+            // The companion alias needs the owner-qualified probe too.
             if (comp_alias) |alias| {
                 if (ownerKeyedExtProp(setters, Pick.map(pg.get().*), alias, name)) |fid| return fid;
                 if (importOwnedExtProp(self, Pick.map(pg.get().*), alias, name)) |fid| return fid;
@@ -652,9 +578,7 @@ pub fn resolveExtensionPropImpl(
         if (comp_alias) |alias| {
             if (lookupPairFunc(Pick.map(pg.get().*), alias, name)) |fid| return fid;
         }
-        // A file-mangled class (`KeyInfo$f352`, one of two same-simple-name
-        // internal classes) registers its extension properties under the
-        // SOURCE-WRITTEN receiver name: retry with the base name.
+        // A file-mangled class (`KeyInfo$f352`) registers under the source-written receiver name.
         if (std.mem.find(u8, recv_simple, "$f")) |dol| {
             if (dol > 0 and dol + 2 < recv_simple.len and
                 std.ascii.isDigit(recv_simple[dol + 2]))
@@ -663,8 +587,6 @@ pub fn resolveExtensionPropImpl(
             }
         }
     }
-    // A builtin scalar receiver has builtin supertypes: `val Number.half`
-    // applies to an `Int`, `val CharSequence.n` to a `String`.
     if (receiver.* != .Instance) {
         const sups: []const []const u8 = switch (receiver.*) {
             .Int, .Long, .Short, .Byte, .Float, .Double => &.{ "Number", "Comparable" },
@@ -681,7 +603,6 @@ pub fn resolveExtensionPropImpl(
             if (lookupPairFunc(Pick.map(pg.get().*), sup, name)) |fid| return fid;
         }
     }
-    // An extension property on a supertype applies to a subtype receiver.
     if (receiver.* == .Instance) {
         var queue: std.ArrayList([]const u8) = .empty;
         defer queue.deinit(allocator);
@@ -720,9 +641,8 @@ pub fn resolveExtensionPropImpl(
             }
         }
     }
-    // A `Type.Companion` extension property registers under `<outer>.Companion`;
-    // a companion-instance receiver (the synthetic `$Companion` class) keys the
-    // lookup by its outer class's companion path.
+    // A `Type.Companion` extension registers under `<outer>.Companion`; a companion
+    // instance keys the lookup by its outer class's companion path.
     if (receiver.* == .Instance) {
         const cls = className(receiver.Instance);
         if (std.mem.find(u8, cls, "$Companion")) |i| {
@@ -734,11 +654,7 @@ pub fn resolveExtensionPropImpl(
             if (lookupPairFunc(Pick.map(pg.get().*), comp_key, name)) |fid| return fid;
         }
     }
-    // An `Any` extension property applies to every receiver — including an
-    // owner-gated member extension (`private val Any?.exceptionOrNull` in
-    // JobSupport) whose registration recv key is "Any" while the receiver's
-    // own head is anything at all; the tower probe above only tried that
-    // head.
+    // An "Any"-keyed extension applies to every receiver, owner-gated ones included.
     {
         const pg = self.prog.borrow();
         defer pg.deinit();
@@ -750,22 +666,9 @@ pub fn resolveExtensionPropImpl(
     return null;
 }
 
-/// Resolve a field on an `Value::Instance` receiver: delegate getValue,
-/// custom getter (with override rules), raw slot (lateinit / built-in
-/// delegate auto-unwrap), companion/parent walk, outer-chain, enum
-/// entries, nested classes, globals.
-/// A member of the DECLARING class of the member-extension the innermost frame is
-/// executing, read off the instance that made the extension visible.
-///
-/// `fun Dp.toPx(): Float = value * density` is declared inside `interface Density`:
-/// `this` is the `Dp`, and `density` is a member of the enclosing `Density`. That
-/// enclosing receiver is in scope for the body and OUTRANKS a top-level name, so
-/// both global fallbacks below consult it first. Without this, a `density` reachable
-/// as a global -- a lambda's captured parameter, materialised into the global env
-/// when the lambda runs as a real closure -- answered the read, and `Dp.toPx` inside
-/// `with(density) { size.toPx() }` multiplied by the Density OBJECT instead of its
-/// `density: Float`. The probe is member-only, so it cannot recurse back into the
-/// global tiers.
+/// A member of the declaring class of the member extension the innermost frame is
+/// executing, read off the instance that made the extension visible. That receiver
+/// outranks a top-level name; the probe is member-only, so it cannot reach the global tiers.
 pub fn memberExtOwnerRead(self: *VmHost, allocator: Allocator, receiver: *const Value, name: []const u8) Allocator.Error!?EvalResult {
     const f = ir.eval.currentFrameFunc() orelse return null;
     if (f.kind != .member_extension) return null;
@@ -789,10 +692,8 @@ pub fn memberExtOwnerRead(self: *VmHost, allocator: Allocator, receiver: *const 
     }
 }
 
-/// Whether the instance's RUNTIME class chain declares `name` as a
-/// `by`-delegated body property. Local classes register at runtime and never
-/// reach the module registry's `delegated_body_props`, so the classdef chain
-/// is the authority for them.
+/// Whether the instance's runtime class chain declares `name` as a `by`-delegated body
+/// property. Local classes never reach the module registry, so the chain decides for them.
 pub fn runtimeClassDelegatesProp(inst: anytype, name: []const u8) bool {
     var cur: ?ObjRef(ClassDef) = blk: {
         const g = inst.borrow();
@@ -821,10 +722,8 @@ pub fn runtimeClassDelegatesProp(inst: anytype, name: []const u8) bool {
     return false;
 }
 
-/// Whether (class, prop) is a registered `by`-delegated body property. The
-/// registry keys packaged classes by FQN (a bare simple-name alias let a
-/// foreign namesake intercept an unrelated class's field), so a simple-name
-/// hop also consults the class-index FQN.
+/// Whether (class, prop) is a registered `by`-delegated body property. The registry keys
+/// packaged classes by FQN, so a simple-name hop also consults the class-index FQN.
 pub fn delegatedPropRegistered(self: *VmHost, cn: []const u8, prop: []const u8) bool {
     const g = self.module.borrow();
     defer g.deinit();
