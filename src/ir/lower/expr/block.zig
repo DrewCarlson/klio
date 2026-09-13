@@ -25,9 +25,6 @@ const loweredCheckTypeName = paths_mod.loweredCheckTypeName;
 const arg_shape_mod = @import("arg_shape.zig");
 const narrowNullCheckAll = arg_shape_mod.narrowNullCheckAll;
 
-// -------------------------------------------------------------------------
-// Block lowering.
-// -------------------------------------------------------------------------
 
 /// Lower a block expression, returning the register holding its tail value.
 pub fn lowerBlock(b: *FuncBuilder, block: *const AstBlock) Allocator.Error!Reg {
@@ -35,18 +32,17 @@ pub fn lowerBlock(b: *FuncBuilder, block: *const AstBlock) Allocator.Error!Reg {
     // Hoist the local-fn names an earlier-declared sibling references, so a
     // mutually-recursive forward reference resolves through a shared cell.
     try hoistMutualLocalFns(b, block);
-    // An early-return guard narrows the REST of the block: after
-    // `if (a == null) return`, `a` is not null for everything below it,
-    // because the only path that reaches them is the one where the check
-    // failed. Kotlin narrows there and the guard is the idiomatic shape.
+    // An early-return guard narrows the rest of the block: after
+    // `if (a == null) return`, `a` is not null below, the only path reaching
+    // those statements being the one where the check failed.
     var guarded: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
     defer guarded.deinit(b.allocator);
     var last: ?Reg = null;
     const block_tail = b.tail_pos;
     b.tail_pos = false;
     for (block.stmts, 0..) |*stmt, si| {
-        // The last statement, or one followed only by a bare `return`, is
-        // in tail position when the block is.
+        // The last statement, or one followed only by a bare `return`, is in tail
+        // position when the block is.
         const is_last = si + 1 == block.stmts.len;
         const before_bare_return = si + 2 == block.stmts.len and
             block.stmts[si + 1] == .Expr and block.stmts[si + 1].Expr == .Return and
@@ -62,9 +58,9 @@ pub fn lowerBlock(b: *FuncBuilder, block: *const AstBlock) Allocator.Error!Reg {
     return result;
 }
 
-/// Narrowings an already-lowered guard statement proves for the statements
-/// that FOLLOW it. Only an `if` whose then-branch cannot fall through, and
-/// only the non-null facts its condition's negation proves.
+/// Narrowings an already-lowered guard statement proves for the statements that
+/// follow it: only an `if` whose then-branch cannot fall through, and only the
+/// non-null facts its condition's negation proves.
 fn narrowAfterExitGuard(
     b: *FuncBuilder,
     stmt: *const ast.Stmt,
@@ -78,13 +74,10 @@ fn narrowAfterExitGuard(
     try narrowNegatedIsCheckAll(b, f.cond, out);
 }
 
-/// Every `!is` fact a failed exit guard proves for the code below it. The
-/// negation of `x !is T || y !is U` proves both `x is T` and `y is U`,
-/// mirroring the null walk's `||` polarity. Kotlin narrows here and stdlib
-/// leans on it: `ValueTimeMark.minus(ComparableTimeMark)` throws unless
-/// `other is ValueTimeMark`, then calls `this.minus(other)` meaning the
-/// ValueTimeMark overload — without the narrow the static bind resolved the
-/// call back to the enclosing overload and recursed.
+/// Every `!is` fact a failed exit guard proves for the code below it. The negation
+/// of `x !is T || y !is U` proves both `x is T` and `y is U`, mirroring the null
+/// walk's `||` polarity. Without it a stdlib overload that throws unless
+/// `other is ValueTimeMark` resolves its follow-up call back to itself.
 fn narrowNegatedIsCheckAll(
     b: *FuncBuilder,
     cond: *const Expr,
@@ -107,8 +100,8 @@ fn narrowNegatedIsCheckAll(
     }
 }
 
-/// Whether control cannot fall out of this expression: it returns, throws,
-/// breaks or continues on every path.
+/// Whether control cannot fall out of this expression: it returns, throws, breaks
+/// or continues on every path.
 fn exprAlwaysExits(e: *const Expr) bool {
     return switch (e.*) {
         .Return, .Throw, .Break, .Continue => true,
@@ -167,9 +160,6 @@ pub fn hoistMutualLocalFns(b: *FuncBuilder, block: *const AstBlock) Allocator.Er
     }
 }
 
-// -------------------------------------------------------------------------
-// Small generic utilities.
-// -------------------------------------------------------------------------
 
 /// Index into a slice by a `u32` id, returning a const pointer or null.
 pub fn idGet(comptime T: type, items: []const T, idx: u32) ?*const T {
@@ -177,32 +167,26 @@ pub fn idGet(comptime T: type, items: []const T, idx: u32) ?*const T {
     return &items[idx];
 }
 
-/// Decide whether a dotted head `head` is a package-qualified global
-/// (flatten the dotted path to a `LoadGlobal`-of-FQN) rather than a member
-/// of an implicit receiver (walk `this`).
-///
-/// A head is a package head when it is a real package root (`kotlin`, `io`,
-/// `org`, …) or names a package the program contributes a top-level symbol
-/// to (`head.<rest>` is a declared FQN prefix). This is the one principled
-/// predicate that replaces the former `isLambdaBody()` resolution axis: a
-/// member/captured/local name shadows a package head (the caller filters
-/// those with `resolve`/`knowsOuter`/`classId` guards at the use site), and
-/// a name resolving to a package/imported/stdlib FQN resolves globally —
-/// the same answer whether or not the reference is lexically inside a
-/// lambda.
+/// Whether a dotted head is a package-qualified global, flattened to a
+/// `LoadGlobal` of its FQN, rather than a member of an implicit receiver. A head
+/// is a package head when it is a real package root (`kotlin`, `io`, `org`, …) or
+/// names a package the program contributes a top-level symbol to. A member,
+/// captured or local name shadows a package head, which the caller filters with
+/// `resolve`/`knowsOuter`/`classId` guards; the answer is the same whether or not
+/// the reference is lexically inside a lambda.
 pub fn headIsPackage(b: *FuncBuilder, head: []const u8) bool {
     return isPkgRoot(head) or b.module.packageHeadDeclared(head);
 }
 
 /// The last segment after the final `sep`, or the whole string when absent.
 pub fn rsplitLast(s: []const u8, sep: u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, s, sep)) |i| return s[i + 1 ..];
+    if (std.mem.findScalarLast(u8, s, sep)) |i| return s[i + 1 ..];
     return s;
 }
 
 /// The first segment before the first `.`, or the whole string when absent.
 pub fn firstSegment(s: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, s, '.')) |i| return s[0..i];
+    if (std.mem.findScalar(u8, s, '.')) |i| return s[0..i];
     return s;
 }
 

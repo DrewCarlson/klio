@@ -43,18 +43,16 @@ const block_mod = @import("block.zig");
 const firstSegment = block_mod.firstSegment;
 const headIsPackage = block_mod.headIsPackage;
 
-/// `Member` lowering: safe member access (`recv?.x`), `super.<prop>`, FQN
-/// flatten, explicit `coroutineContext`, and the plain GetField.
+/// `Member` lowering: safe member access, `super.<prop>`, FQN flatten, explicit
+/// `coroutineContext`, and the plain GetField.
 pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const m = expr.Member;
     const receiver = m.receiver;
     const name = m.name;
 
     if (m.safe) {
-        // `recv?.x` — null-guard. An explicit `recv?.coroutineContext` is a
-        // literal member read exactly like the non-safe arm below: without the
-        // sentinel the runtime's suspend-implicit redirect served the AMBIENT
-        // coroutine's context instead of the receiver's own.
+        // `recv?.x` null-guard. An explicit `recv?.coroutineContext` is a literal
+        // member read, or the suspend-implicit redirect serves the ambient context.
         const recv = try lowerReceiver(b, receiver);
         const null_r = try b.emitConst(.Null);
         const is_null = b.allocReg();
@@ -82,7 +80,7 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return dst;
     }
 
-    // `super.<prop>` — dispatch its getter via the parent chain.
+    // `super.<prop>`: dispatch its getter via the parent chain.
     if (receiver.* == .Super) {
         const sup = receiver.Super;
         if (try superBase(b, sup)) |base| {
@@ -109,9 +107,8 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (try collectDottedFqn(b.allocator, expr)) |fqn| {
         defer b.allocator.free(fqn);
         const head = firstSegment(fqn);
-        // A real package root (`kotlin.math.PI`) flattens to an FQN LoadGlobal
-        // even inside a class method; only an ambiguous head defers to a member
-        // when `this` is in scope. Mirrors the call path (lowerFqnGlobalCall).
+        // A real package root flattens to an FQN LoadGlobal even inside a class
+        // method; only an ambiguous head defers to a member when `this` is in scope.
         const head_is_real_pkg = isPkgRoot(head);
         if (isPackageHead(head) and
             headIsPackage(b, head) and
@@ -126,20 +123,12 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const n = try b.module.internConst(b.allocator, .{ .String = fqn });
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = n } });
             // A fully-qualified class-with-companion in value position yields its
-            // companion singleton (Kotlin: `C` yields `C.Companion`), matching the
-            // bare-name arm. Without it `pkg.C` loaded the class value while bare
-            // `C` loaded the companion, so `pkg.C === C` was false and
-            // `context[ContinuationInterceptor]` (an interface with a named
-            // companion Key) missed the dispatcher element. The
-            // `<class-companion-or-self>` sentinel returns the companion when one
-            // exists and the class/object value otherwise, leaving a plain object
-            // or a companion-less class unchanged.
-            const fqn_simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
-            // A same-FQN factory function (`kotlinx.coroutines.Job` is both an
-            // interface with a companion `Key` AND a `fun Job()` factory) keeps
-            // the class value: as a call callee it is the factory, and a bare
-            // reference reaches its companion through explicit `.Key`. Only a
-            // companioned classifier with no such function forwards.
+            // companion singleton, matching the bare-name arm, so `pkg.C === C` holds.
+            // The sentinel returns the class or object value when none exists.
+            const fqn_simple = if (std.mem.findScalarLast(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+            // A same-FQN factory function keeps the class value: as a call callee it
+            // is the factory, and a bare reference reaches its companion through
+            // explicit `.Key`.
             if (classWithCompanion(b, fqn_simple) and b.module.funcIdByFqn(fqn) == null) {
                 const comp = b.allocReg();
                 const sentinel = try b.module.internConst(b.allocator, .{ .String = "<class-companion-or-self>" });
@@ -159,11 +148,8 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return dst;
     }
 
-    // `c.code` on a STATIC Char receiver is the scalar identity read â
-    // emit it as `c - NUL` (Char minus Char is Int in Kotlin, and the
-    // subtrahend is code zero), a plain BinOp instead of a dynamic field
-    // read: it stays in fused loop regions and skips the runtime
-    // extension-getter dispatch per read.
+    // `c.code` on a static Char receiver is the scalar identity read, emitted as
+    // `c - NUL` since Char minus Char is Int, which stays in fused loop regions.
     if (std.mem.eql(u8, name.name, "code")) {
         const recv_head: ?[]const u8 = blk: {
             const t = staticExprTypeRef(b, receiver) catch null;
@@ -181,12 +167,9 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // Static-type-directed extension-property read. When the receiver's
-    // STATIC type resolves `name` to an in-scope member-extension property
-    // rather than a member of that type, Kotlin runs the extension getter —
-    // a same-named stored field the runtime object happens to carry is
-    // irrelevant. Emit an extension-read marker so dispatch resolves the
-    // extension property instead of that accidental field.
+    // When the receiver's static type resolves `name` to an in-scope
+    // member-extension property rather than a member, Kotlin runs the extension
+    // getter, so emit a marker and let dispatch resolve the property.
     if (try staticExtPropReadField(b, receiver, name.name)) |marker| {
         const recv = try lowerReceiver(b, receiver);
         const dst = b.allocReg();
@@ -194,9 +177,8 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return dst;
     }
 
-    // Explicit `this.x` where the enclosing class declares `x` as a private
-    // SHADOW of a supertype's same-name stored property reads ITS OWN
-    // owner-mangled cell, matching the bare-name read and the shadow write.
+    // Explicit `this.x` where the enclosing class declares `x` as a private shadow
+    // of a supertype's stored property reads its own owner-mangled cell.
     if (receiver.* == .This and receiver.This.qualifier == null) {
         if (b.ownerClass()) |owner| {
             var kb: [256]u8 = undefined;
@@ -219,18 +201,10 @@ pub fn lowerMember(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     return dst;
 }
 
-/// The statically known type-head of a bare single-name receiver: a typed
-/// local/param, else an enclosing-class member (property / constructor-
-/// parameter property) walked over the owner's supertype chain. Null when the
-/// name has no statically known type here (an untyped local, an outer
-/// capture, or a name the enclosing class does not declare as a typed member).
-/// The full declared TYPE of a bare name that reads a property of the
-/// enclosing class or the extension receiver — the argument-carrying half of
-/// `staticBareReceiverType`. Only recorded for a property whose declared
-/// type has arguments that name real classes, so a `null` here simply means
-/// the head-only answer stands.
-/// A class property's FULL declared type, following the supertype chain the
-/// head lookup follows.
+/// The statically known type head of a bare single-name receiver: a typed local or
+/// param, else an enclosing-class member walked over the supertype chain.
+/// `staticBareReceiverTypeRef` is the argument-carrying half, recorded only for a
+/// property whose declared type has arguments naming real classes.
 pub fn propTypeRefOn(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?ir.TypeRef {
     if (b.module.registry.class_prop_type_refs.get(.{ .a = owner, .b = name })) |t| return t;
     const chain: []const []const u8 = b.module.registry.class_super_names.get(owner) orelse &.{};
@@ -240,9 +214,8 @@ pub fn propTypeRefOn(b: *const FuncBuilder, owner: []const u8, name: []const u8)
     return null;
 }
 
-/// A declared property type with the OWNER's type parameters replaced by the
-/// receiver's own type arguments. Null when any argument stays a parameter —
-/// a partial answer says nothing the head does not already say.
+/// A declared property type with the owner's type parameters replaced by the
+/// receiver's type arguments. Null when any argument stays a parameter.
 pub fn substitutedPropType(
     b: *FuncBuilder,
     owner: []const u8,
@@ -279,13 +252,12 @@ pub fn substitutedPropType(
     return ir.TypeRef{ .name = declared.name, .nullable = declared.nullable, .args = owned };
 }
 
-/// A bare type-parameter head is not a property owner; its declared BOUND
-/// is. `entries` inside `<K, V, M : Map<out K, V>> M.onEachIndexed` reads a
-/// Map property, so the owner lookups chase `M -> Map`.
+/// A bare type-parameter head is not a property owner; its declared bound is, so
+/// the owner lookups chase `M -> Map`.
 fn boundOwnerHead(b: *const FuncBuilder, head: []const u8) []const u8 {
     if (b.typeParamBoundRef(head)) |bref| {
         var h = std.mem.trimEnd(u8, bref.name, "?");
-        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+        if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
         if (h.len != 0) return typeHead(h);
     }
     return head;
@@ -310,24 +282,21 @@ pub fn staticBareReceiverTypeRef(b: *const FuncBuilder, recv_name: []const u8) ?
 }
 
 pub fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]const u8 {
-    // Inside `val writer = writer`'s initializer the local's own name is
-    // free (recorded at the decl), so the reference is the enclosing
-    // member, never the shadow being declared.
+    // Inside `val writer = writer`'s initializer the local's own name is free, so
+    // the reference is the enclosing member, never the shadow being declared.
     const self_shadowed = expr_mod.init_self_name != null and std.mem.eql(u8, expr_mod.init_self_name.?, recv_name);
     // A local/param binding shadows an enclosing member of the same name.
     if (!self_shadowed) {
         if (b.resolve(recv_name) != null) return b.localDeclType(recv_name);
         if (b.knowsOuter(recv_name)) return null;
     }
-    // The enclosing class, else the EXTENSION RECEIVER — a bare name inside
-    // `fun UByteArray.indices()` is a member of the receiver, and a top-level
-    // extension has no enclosing class at all, so the search stopped there.
+    // The enclosing class, else the extension receiver: a bare name inside
+    // `fun UByteArray.indices()` is a member of the receiver.
     const tr = if (runtime.envOnce("KLIO_EXT_TRACE")) |w| std.mem.eql(u8, w, recv_name) else false;
     const owner = b.ownerClass() orelse blk: {
         if (std.mem.eql(u8, runtime.envOnce("KLIO_EXT_RECV_PROP") orelse "1", "0")) return null;
-        // The splice-receiver hint serves the same role inside an inline
-        // extension splice, where the body's builder has no recvTy of its
-        // own.
+    // The splice-receiver hint serves the same role inside an inline extension
+    // splice, where the body's builder has no `recvTy` of its own.
         const head = b.recvTy() orelse b.spliceRecvTy() orelse {
             if (tr) std.debug.print("[sbrt] {s}: no owner, no recvTy\n", .{recv_name});
             return null;
@@ -338,10 +307,7 @@ pub fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]c
     if (propTypeHeadOn(b, owner, recv_name)) |h| return h;
     if (extPropReturnHead(b, owner, recv_name)) |h| return h;
     // A receiver lambda rebinds `this`, so a bare name inside it can be the
-    // RECEIVER's member rather than the enclosing class's:
-    // `Duration(raw).apply { … value … }` sits in Duration's companion, whose
-    // own surface has no `value` at all. Consulted only after the enclosing
-    // class declines, so no answer this walk already gives can change.
+    // receiver's member. Consulted only after the enclosing class declines.
     const recv_head = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse return null;
     const rh = boundOwnerHead(b, typeHead(std.mem.trimEnd(u8, recv_head, "?")));
     if (rh.len == 0 or std.mem.eql(u8, rh, owner)) return null;
@@ -349,12 +315,9 @@ pub fn staticBareReceiverType(b: *const FuncBuilder, recv_name: []const u8) ?[]c
     return extPropReturnHead(b, rh, recv_name);
 }
 
-/// The declared return head of an EXTENSION PROPERTY named `name` on
-/// `head` (or its builtin/declared supertypes): the lowered getter follows
-/// the stable `__ext_get_<Head>_<name>` naming contract, and its return
-/// type is the bare read's static type — `indices` inside a `ShortArray`
-/// extension body is an `IntRange`, so the desugared `for (i in indices)`
-/// iterator call binds.
+/// The declared return head of an extension property named `name` on `head` or its
+/// supertypes: the lowered getter follows the `__ext_get_<Head>_<name>` contract,
+/// and its return type is the bare read's static type.
 pub fn extPropReturnHead(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
     if (extPropDeclHead(b, head, name)) |h| return h;
     if (extPropGetterReturn(b, head, name)) |h| return h;
@@ -371,16 +334,14 @@ pub fn extPropReturnHead(b: *const FuncBuilder, head: []const u8, name: []const 
     return null;
 }
 
-/// The declaration-scan channel: `(receiver head, name)` recorded before
-/// any body lowers, so the answer exists while the declaring library is
-/// itself still lowering. The head must still name a class to be useful
-/// dispatch evidence.
+/// The declaration-scan channel: `(receiver head, name)` recorded before any body
+/// lowers, so the answer exists while the declaring library is itself lowering.
 fn extPropDeclHead(b: *const FuncBuilder, head: []const u8, name: []const u8) ?[]const u8 {
     const raw = b.module.registry.ext_prop_type_heads.get(.{ .a = head, .b = name }) orelse return null;
     var h = std.mem.trimEnd(u8, raw, "?");
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
     if (h.len == 0 or std.mem.eql(u8, h, "Unit")) return null;
-    const cid = (if (std.mem.indexOfScalar(u8, h, '.') != null)
+    const cid = (if (std.mem.findScalar(u8, h, '.') != null)
         b.module.classIdByFqn(h)
     else
         b.module.uniqueClassIdBySimpleName(typeHead(h)));
@@ -397,10 +358,10 @@ fn extPropGetterReturn(b: *const FuncBuilder, head: []const u8, name: []const u8
     if (fids.len == 0) return null;
     const f = b.module.funcById(fids[0]) orelse return null;
     var h = std.mem.trimEnd(u8, f.return_ty.name, "?");
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
     if (tr) std.debug.print("[extpget] ret head={s}\n", .{h});
     if (h.len == 0 or std.mem.eql(u8, h, "Unit")) return null;
-    const cid = (if (std.mem.indexOfScalar(u8, h, '.') != null)
+    const cid = (if (std.mem.findScalar(u8, h, '.') != null)
         b.module.classIdByFqn(h)
     else
         b.module.uniqueClassIdBySimpleName(typeHead(h)));
@@ -410,13 +371,10 @@ fn extPropGetterReturn(b: *const FuncBuilder, head: []const u8, name: []const u8
 }
 
 /// The property-head key for `owner` as the site's file sees it: the
-/// scope-resolved class's qualified name, which is exact when two packages
-/// share the simple name. Null when the simple key already is the class.
-/// An unqualified nested-class name resolves LEXICALLY first: written inside
-/// `LinkComposer`, `CompositionContextImpl` is LinkComposer's own nested
-/// class, never the same-named one nested in `GapComposer` of the same
-/// package (which the package-tiered index cannot tell apart). Walks the
-/// enclosing class's qualified name outwards, trying `<outer>.<simple>`.
+/// scope-resolved class's qualified name, exact when two packages share the
+/// simple name. Null when the simple key already is the class. An unqualified
+/// nested-class name resolves lexically first, so the walk tries
+/// `<outer>.<simple>` outwards along the enclosing class's qualified name.
 fn lexicalNestedClassFqn(b: *const FuncBuilder, simple: []const u8, file: ir.FileId) ?[]const u8 {
     const oc = b.ownerClass() orelse return null;
     const cid = b.module.classIdIndexed(oc, b.self_package, file) orelse b.module.classId(oc) orelse return null;
@@ -425,14 +383,14 @@ fn lexicalNestedClassFqn(b: *const FuncBuilder, simple: []const u8, file: ir.Fil
     while (fqn.len > b.self_package.len) {
         const cand = std.fmt.bufPrint(&buf, "{s}.{s}", .{ fqn, simple }) catch return null;
         if (b.module.classIdByFqn(cand)) |nid| return b.module.classFqnById(nid);
-        const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return null;
+        const dot = std.mem.findScalarLast(u8, fqn, '.') orelse return null;
         fqn = fqn[0..dot];
     }
     return null;
 }
 
 fn scopedPropOwnerKey(b: *const FuncBuilder, owner: []const u8, site_file: ?ir.FileId) ?[]const u8 {
-    if (std.mem.indexOfScalar(u8, owner, '.') != null) return null;
+    if (std.mem.findScalar(u8, owner, '.') != null) return null;
     const file = site_file orelse (b.self_decl_span orelse return null).file;
     if (lexicalNestedClassFqn(b, owner, file)) |nf| {
         if (runtime.envOnce("KLIO_CIX_TRACE")) |w| {
@@ -449,17 +407,15 @@ fn scopedPropOwnerKey(b: *const FuncBuilder, owner: []const u8, site_file: ?ir.F
     return fqn;
 }
 
-/// A declared receiver type's own property-head key: the written qualified
-/// name when the declaration spelled one (`r: kotlin.text.Regex` reads
-/// Regex's `pattern`, never a same-named user class's), else the head as
-/// the site's file resolves it.
+/// A declared receiver type's own property-head key: the written qualified name
+/// when the declaration spelled one, else the head as the site's file resolves it.
 pub fn declTypePropOwnerKey(b: *const FuncBuilder, ty: *const ir.TypeRef, site_file: ?ir.FileId) ?[]const u8 {
     for (ty.args) |*a| {
         if (std.mem.startsWith(u8, a.name, "#qual:")) return a.name["#qual:".len..];
     }
     var t = std.mem.trimEnd(u8, ty.name, "?");
-    if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
-    if (std.mem.indexOfScalar(u8, t, '.') != null) return t;
+    if (std.mem.findScalar(u8, t, '<')) |lt| t = t[0..lt];
+    if (std.mem.findScalar(u8, t, '.') != null) return t;
     return scopedPropOwnerKey(b, t, site_file);
 }
 
@@ -473,22 +429,21 @@ pub fn propTypeHeadOn(b: *const FuncBuilder, owner: []const u8, name: []const u8
     for (chain) |cls| {
         if (heads.get(.{ .a = cls, .b = name })) |h| return h;
     }
-    // A property typed only by its initializer call (`val json = Json {
-    // … }`): the class registration could not see a pack's factory or
-    // class, so the head is read from the initializer here, where every
-    // declaration is registered.
+    // A property typed only by its initializer call: the class registration could
+    // not see a pack's factory or class, so the head is read from the initializer
+    // here, where every declaration is registered.
     if (propInitCallHead(b, owner, name)) |h| return h;
     for (chain) |cls| {
         if (propInitCallHead(b, cls, name)) |h| return h;
     }
     // A runtime anon-object member body's own property heads travel in the
-    // installed snapshot — the synthesized class has no registry entries.
+    // installed snapshot; the synthesized class has no registry entries.
     return build.anonPropHead(owner, name);
 }
 
-/// The class a member property's initializer call names: a constructor
-/// (`Json { }` resolves to the class of that name) or a plain function
-/// whose same-named overloads agree on a declared, concrete return head.
+/// The class a member property's initializer call names: a constructor, or a
+/// plain function whose same-named overloads agree on a declared, concrete
+/// return head.
 pub fn propInitCallHead(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?[]const u8 {
     const p = inline_state.memberPropAst(owner, name) orelse {
         if (std.c.getenv("KLIO_PROPHEAD_TRACE") != null) std.debug.print("[prophead-lazy] no ast for {s}.{s}\n", .{ owner, name });
@@ -508,7 +463,7 @@ pub fn propInitCallHead(b: *const FuncBuilder, owner: []const u8, name: []const 
         const f = b.module.funcById(fid) orelse continue;
         if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
         var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
-        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
         if (head.len == 0 or std.mem.eql(u8, head, "Unit") or (head.len <= 2 and std.ascii.isUpper(head[0]))) return null;
         if (agreed) |g| {
             if (!std.mem.eql(u8, g, head)) return null;
@@ -517,9 +472,9 @@ pub fn propInitCallHead(b: *const FuncBuilder, owner: []const u8, name: []const 
     return agreed;
 }
 
-/// Whether `ty` (or a supertype) declares a member property named `name`.
-/// Keyed on `class_prop_type_heads`, which records member and constructor-
-/// parameter properties by declaring class.
+/// Whether `ty` or a supertype declares a member property named `name`. Keyed on
+/// `class_prop_type_heads`, which records member and constructor-parameter
+/// properties by declaring class.
 pub fn staticTypeDeclaresProp(b: *const FuncBuilder, ty: []const u8, name: []const u8) bool {
     const heads = b.module.registry.class_prop_type_heads;
     if (heads.get(.{ .a = ty, .b = name }) != null) return true;
@@ -530,10 +485,10 @@ pub fn staticTypeDeclaresProp(b: *const FuncBuilder, ty: []const u8, name: []con
     return false;
 }
 
-/// When a qualified read `recv.name` resolves — by the STATIC type of `recv`
-/// — to an in-scope member-extension property whose getter must win over any
-/// same-named stored field on the runtime object, return the interned
-/// `$extread$<name>` marker. Null when the ordinary field read applies.
+/// The interned `$extread$<name>` marker when a qualified read resolves, by the
+/// static type of the receiver, to an in-scope member-extension property whose
+/// getter must win over a same-named stored field. Null when the ordinary field
+/// read applies.
 fn staticExtPropReadField(b: *FuncBuilder, receiver: *const Expr, name: []const u8) Allocator.Error!?ConstId {
     const recv_name = switch (receiver.*) {
         .Path => |p| if (p.segments.len == 1) p.segments[0].name else return null,
@@ -541,20 +496,20 @@ fn staticExtPropReadField(b: *FuncBuilder, receiver: *const Expr, name: []const 
     };
     const static_ty = staticBareReceiverType(b, recv_name) orelse return null;
     const owner = b.ownerClass() orelse return null;
-    // An in-scope member-extension property `name` on the enclosing class
-    // whose extension-receiver type the static type satisfies.
+    // An in-scope member-extension property whose extension-receiver type the
+    // static type satisfies.
     const ext_recv = inline_state.memberExtPropRecv(owner, name) orelse return null;
     if (!b.module.classIsOrExtends(static_ty, ext_recv)) return null;
-    // A member of the static type outranks the extension (Kotlin); the
+    // A member of the static type outranks the extension in Kotlin, so the
     // ordinary field read is then correct.
     if (staticTypeDeclaresProp(b, static_ty, name)) return null;
     const marker = try std.fmt.allocPrint(b.allocator, "$extread${s}", .{name});
     return try b.module.internConst(b.allocator, .{ .String = marker });
 }
 
-/// The `<Q>` of `super<Q>`: the supertype the call dispatches on. A
-/// `super@Label` names the class whose supertypes are walked and is carried
-/// by the owner/receiver pair (`superBase`), never by the qualifier.
+/// The `<Q>` of `super<Q>`: the supertype the call dispatches on. A `super@Label`
+/// names the class whose supertypes are walked and is carried by the owner and
+/// receiver pair, never by the qualifier.
 pub fn superQualifier(b: *FuncBuilder, qualifier: ?ast.TypeRef) Allocator.Error!?ConstId {
     if (qualifier) |t| {
         return try b.module.internConst(b.allocator, .{ .String = t.name.name });
@@ -564,10 +519,10 @@ pub fn superQualifier(b: *FuncBuilder, qualifier: ?ast.TypeRef) Allocator.Error!
 
 const SuperBase = struct { this_reg: Reg, owner: []const u8 };
 
-/// The instance and class a `super` expression starts from. Unlabeled
-/// `super` starts at the enclosing class on `this`; `super@Outer` written in
-/// an inner class starts at `Outer` on `this@Outer`, so `super<K>@A.foo()`
-/// runs K's implementation against the A instance and its overrides.
+/// The instance and class a `super` expression starts from. Unlabeled `super`
+/// starts at the enclosing class on `this`; `super@Outer` in an inner class starts
+/// at `Outer` on `this@Outer`, so `super<K>@A.foo()` runs K's implementation
+/// against the A instance.
 pub fn superBase(b: *FuncBuilder, sup: anytype) Allocator.Error!?SuperBase {
     const this_reg = (try resolveSuperThisReg(b)) orelse return null;
     const owner = b.ownerClass() orelse return null;

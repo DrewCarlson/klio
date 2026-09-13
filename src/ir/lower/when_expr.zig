@@ -1,5 +1,4 @@
-//! `when` expression lowering. Free functions over the shared
-//! `FuncBuilder`; filled in alongside the expression dispatch.
+//! `when` expression lowering. Free functions over the shared `FuncBuilder`.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -23,9 +22,8 @@ const TypeRef = ir.TypeRef;
 
 const lowerExpr = expr_lower.lowerExpr;
 
-/// Switch-lowering layout for a subject-bound `when`: the constant cases
-/// and their target blocks, the optional `else` block, and the body block
-/// per branch in branch order.
+/// Switch-lowering layout for a subject-bound `when`: the constant cases and target
+/// blocks, the optional `else` block, and the body block per branch.
 const SwitchArms = struct {
     cases: []SwitchArm,
     default: ?BlockId,
@@ -62,8 +60,8 @@ pub fn collectSwitchArms(
             }
             const value_expr = pat.kind.Value;
             const const_id: ConstId = switch (value_expr) {
-                // The literal's declared kind (`42L`, `42u`, `42UL`) is the
-                // key's kind; an unsuffixed i32-representable literal is Int.
+                // The literal's declared kind is the key's kind; an unsuffixed
+                // i32-representable literal is Int.
                 .IntLit => |lit| switch (lit.kind) {
                     .Long => try b.module.internConst(b.allocator, .{ .Long = lit.value }),
                     .UInt => try b.module.internConst(b.allocator, .{ .UInt = @intCast(lit.value) }),
@@ -108,8 +106,8 @@ pub fn collectSwitchArms(
     };
 }
 
-/// Lower a `when` expression, returning the register holding its value.
-/// `subject` is non-null for the subject-bound form `when (x) { … }`.
+/// Lower a `when` expression, returning the register holding its value; `subject`
+/// is non-null for the subject-bound form.
 pub fn lowerWhen(
     b: *FuncBuilder,
     subject: ?*const Expr,
@@ -119,10 +117,9 @@ pub fn lowerWhen(
     return lowerWhenWithSubjectReg(b, subject, null, branches, when_span);
 }
 
-/// `lowerWhen` over an already-lowered subject register. The subject-
-/// binding form `when (val v = expr)` lowers `expr` exactly once for the
-/// binding and passes the register here — Kotlin evaluates a `when`
-/// subject once, so a side-effecting subject must not be re-lowered.
+/// `lowerWhen` over an already-lowered subject register. The subject-binding form
+/// lowers its expression once for the binding and passes the register here, Kotlin
+/// evaluating a `when` subject exactly once.
 pub fn lowerWhenWithSubjectReg(
     b: *FuncBuilder,
     subject: ?*const Expr,
@@ -181,11 +178,9 @@ pub fn lowerWhenWithSubjectReg(
                 continue;
             }
             if (subject_r) |subj| {
-                // Kotlin evaluates a branch's comma-separated conditions
-                // left to right and stops at the first match: each pattern
-                // gets its own block, true jumps straight to the body, so
-                // a later condition (`Source::class, Input::class ->`)
-                // never evaluates once an earlier one matched.
+                // Kotlin evaluates a branch's comma-separated conditions left to
+                // right and stops at the first match, so each pattern gets its own
+                // block and a true jumps straight to the body.
                 var i: usize = 0;
                 while (i < branch.patterns.len) : (i += 1) {
                     const p = &branch.patterns[i];
@@ -216,10 +211,9 @@ pub fn lowerWhenWithSubjectReg(
             .f = next_blk,
         } });
         b.switchTo(body_blk);
-        // A subjectless branch narrows by EVERY proof its condition
-        // establishes, `&&`-chains included (`v1 is ByteArray && v2 is
-        // ByteArray -> v1 contentEquals v2` smart-casts both), plus the
-        // truthy null-checks — the same collection an `if` guard applies.
+        // A subjectless branch narrows by every proof its condition establishes,
+        // `&&`-chains and truthy null-checks included, the same collection an `if`
+        // guard applies.
         var cond_narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
         defer cond_narrowed.deinit(b.allocator);
         const narrowed = if (subject != null)
@@ -228,10 +222,9 @@ pub fn lowerWhenWithSubjectReg(
             try narrowConditionForBranchAll(b, &branch, &cond_narrowed);
             break :blk null;
         };
-        // `when (this) { is T -> ... }` smart-casts the implicit receiver:
-        // the branch body's calls resolve extensions against T (kotlinc
-        // resolves statically, so `is List -> this.single()` must select
-        // `List.single`, not recurse into the enclosing `Iterable.single`).
+        // `when (this) { is T -> ... }` smart-casts the implicit receiver, so the
+        // branch body's calls resolve extensions against T; kotlinc resolves
+        // statically, so `is List -> this.single()` must select `List.single`.
         const narrowed_this: ?(?[]const u8) = blk: {
             const subj = subject orelse break :blk null;
             if (subj.* != .This) break :blk null;
@@ -258,10 +251,10 @@ pub fn lowerWhenWithSubjectReg(
     return result;
 }
 
-/// A subjectless `when` branch's condition carries the same smart-cast
-/// evidence as an `if` condition: every `is` check in its `&&` chain and
-/// every truthy null-check narrows for the branch body. Applied in source
-/// order; the caller restores in reverse.
+/// A subjectless `when` branch's condition carries the same smart-cast evidence as
+/// an `if` condition: every `is` check in its `&&` chain and every truthy
+/// null-check narrows for the branch body. Applied in source order; the caller
+/// restores in reverse.
 fn narrowConditionForBranchAll(
     b: *FuncBuilder,
     branch: *const ast.WhenBranch,
@@ -274,24 +267,21 @@ fn narrowConditionForBranchAll(
     try expr_lower.narrowNullCheckAll(b, &p.kind.Value, true, out);
 }
 
-/// A single `is T` pattern over a bare-name subject smart-casts that name to
-/// `T` for the branch body. Kotlin resolves extensions against the STATIC type,
-/// and lowering hands the receiver's declared head to the extension filter, so
-/// without the narrowing `when (any) { is String -> any.isEmpty() }` refutes
-/// `CharSequence.isEmpty` on the declared `Any?` and the call misses entirely.
-/// A multi-pattern branch (`is A, is B ->`) narrows to no single type, and a
-/// non-name subject has no binding to narrow.
+/// A single `is T` pattern over a bare-name subject smart-casts that name to `T`
+/// for the branch body. Kotlin resolves extensions against the static type, and
+/// lowering hands the receiver's declared head to the extension filter, so without
+/// the narrowing the declared `Any?` refutes every extension of the narrowed type.
+/// A multi-pattern branch narrows to no single type, and a non-name subject has no
+/// binding to narrow.
 fn narrowSubjectForBranch(
     b: *FuncBuilder,
     subject: ?*const Expr,
     branch: *const ast.WhenBranch,
 ) Allocator.Error!?build.FuncBuilder.NarrowedLocal {
     const subj = subject orelse return null;
-    // `when (this)` smart-casts the implicit receiver: the branch body's
-    // member/extension calls on `this` resolve against the narrowed type
-    // (argDeclTypeRefLazy consults `localDeclTypeRef("this")` first), so
-    // `is List -> this.single()` selects `List.single` instead of
-    // recursing into the enclosing `Iterable.single`.
+    // `when (this)` smart-casts the implicit receiver, so the branch body's member
+    // and extension calls on `this` resolve against the narrowed type;
+    // `argDeclTypeRefLazy` consults `localDeclTypeRef("this")` first.
     const bind_name: []const u8 = blk: {
         if (subj.* == .This and subj.This.qualifier == null) break :blk "this";
         if (subj.* == .Path and subj.Path.segments.len == 1) break :blk subj.Path.segments[0].name;
@@ -305,8 +295,8 @@ fn narrowSubjectForBranch(
     return try b.narrowLocal(bind_name, head);
 }
 
-/// Lower one `when` pattern of a subject-bound branch into a Boolean
-/// condition register comparing it against `subj`.
+/// Lower one `when` pattern of a subject-bound branch into a Boolean condition
+/// register comparing it against `subj`.
 fn lowerSubjectPatternCond(
     b: *FuncBuilder,
     p: *const ast.WhenPattern,
@@ -353,10 +343,9 @@ fn lowerSubjectPatternCond(
             return neg;
         },
         .InRange, .NotInRange => |*e| {
-            // `in y` on the subject is the `y.contains(subject)` the binary
-            // form desugars to; lowering that form binds `contains` the way
-            // any call does (a local extension operator included). The
-            // subject register is bound under a synthetic name so the
+            // `in y` on the subject is the `y.contains(subject)` the binary form
+            // desugars to, and lowering that form binds `contains` the way any call
+            // does. The subject register is bound under a synthetic name so the
             // synthesized call can name it.
             const subj_name = try std.fmt.allocPrint(b.allocator, "$when_subject_{d}", .{subj.int()});
             try b.bind(subj_name, subj);

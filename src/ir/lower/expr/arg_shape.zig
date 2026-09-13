@@ -29,13 +29,13 @@ const tyMemoEnter = static_type_mod.tyMemoEnter;
 const probe_mod = @import("probe.zig");
 const typeHead = probe_mod.typeHead;
 
-/// Whether a single-segment class-name call resolves to the constructor
-/// rather than a same-named factory function.
+/// Whether a single-segment class-name call resolves to the constructor rather
+/// than a same-named factory function.
 pub const LitKind = enum { numeric, string, boolean, char };
 
-/// Whether an expression's STATIC type head is definitely a list-family
-/// value: a call to a list factory, or a `listOf(...) + x` chain. Used to
-/// route `list + (rhs as Any)` through `plusElement`.
+/// Whether an expression's static type head is definitely a list-family value: a
+/// call to a list factory, or a `listOf(...) + x` chain. Routes
+/// `list + (rhs as Any)` through `plusElement`.
 pub fn staticListHead(e: *const Expr) bool {
     return switch (e.*) {
         .Call => |c| blk: {
@@ -49,41 +49,27 @@ pub fn staticListHead(e: *const Expr) bool {
     };
 }
 
-/// Definite builtin value kind of a literal argument expression, or null when
-/// the argument's type is not a known literal (so it can never *disprove* a
-/// candidate parameter type).
+/// Definite builtin value kind of a literal argument expression, or null when the
+/// argument's type is not a known literal, so it can never disprove a candidate.
 pub fn argLitKind(e: *const Expr) ?LitKind {
     return switch (e.*) {
         .IntLit, .FloatLit => .numeric,
         .BoolLit => .boolean,
         .CharLit => .char,
         .StringTemplate => .string,
-        // A signed literal is a literal: `nextInt(-1)` carries numeric
-        // evidence exactly as `nextInt(1)` does.
+    // A signed literal is a literal: `nextInt(-1)` carries numeric evidence.
         .Unary => |u| if ((u.op == .Neg or u.op == .Pos) and
             (u.expr.* == .IntLit or u.expr.* == .FloatLit)) .numeric else null,
         else => null,
     };
 }
 
-/// Whether a local's initializer is a constructor call of a concrete class
-/// that provably has no `invoke` operator — member (own or inherited) or
-/// applicable extension — making the local's value non-invokable, so a bare
-/// call of its name must bind a same-named function or member instead.
-/// Answers false whenever anything is unknown (qualified callee, abstract
-/// classifier, absent hierarchy entry): unknown keeps the local binding.
-/// Whether a local initialized by an ordinary FUNCTION call is non-invocable,
-/// judged from that function's declared return type. `ctorInitNonInvocable`
-/// answers only `val x = X(...)`; this answers `val box = mk()` and, the shape
-/// that matters across kotlinx's flow tests, `val flow = flowOf(1, 2)` — a
-/// `Flow` declares no `invoke`, so the call `flow { … }` written beside it
-/// names the `flow { … }` builder, exactly as Kotlin resolves it.
-/// The same non-invokable test over the initializer's STATIC TYPE, so a
-/// local initialised by anything the deriver can type — a member call
-/// (`val flow = listOf(1).asFlow()`), a property read, a chain — shadows a
-/// same-named function only when its own type could actually take the call.
-/// `Flow` declares no `invoke`, so `flow { emit(42) }` beside such a local
-/// is the BUILDER.
+/// Whether a local's initializer names a value that provably has no `invoke`
+/// operator, member or applicable extension, so a bare call of the local's name
+/// must bind a same-named function or member instead. Three entry points cover a
+/// constructor call, a plain function call judged by its declared return, and any
+/// initializer the static deriver can type. Anything unknown answers false and
+/// keeps the local binding.
 pub fn initTypeNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) Allocator.Error!bool {
     var ty = (staticExprTypeRef(b, init_e) catch null) orelse return false;
     defer ty.deinit(b.allocator);
@@ -114,7 +100,7 @@ pub fn callInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) b
     const f = b.module.funcById(fid) orelse return false;
     if (!f.return_ty_declared) return false;
     const head = typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
-    if (std.mem.indexOf(u8, f.return_ty.name, "->") != null) return false;
+    if (std.mem.find(u8, f.return_ty.name, "->") != null) return false;
     if (std.mem.startsWith(u8, head, "Function")) return false;
     const cid = b.module.classId(head) orelse return false;
     if (cid.int() >= b.module.classes.items.len) return false;
@@ -125,11 +111,10 @@ pub fn callInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) b
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
 }
 
-/// The last dotted segment of a type head (`kotlin.text.StringBuilder` ->
-/// `StringBuilder`), so a qualified and an unqualified spelling of the same
-/// class compare equal.
+/// The last dotted segment of a type head, so a qualified and an unqualified
+/// spelling of the same class compare equal.
 pub fn simpleTail(h: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, h, '.')) |i| return h[i + 1 ..];
+    if (std.mem.findScalarLast(u8, h, '.')) |i| return h[i + 1 ..];
     return h;
 }
 
@@ -154,19 +139,16 @@ pub fn ctorInitNonInvocable(b: *FuncBuilder, init_e: *const Expr, argc: usize) b
     return b.module.extCouldApplyWhy(b.allocator, cls.name, "invoke", argc) == .none;
 }
 
-/// Declared parameter arity of a single lambda / anon-fun argument
-/// expression, or null when it is neither. A zero-`->` `{ … }` (its `it`
-/// injected by the parser) reports 0 — the literal declares no parameters,
-/// so overload resolution treats it as a `() -> R` handler.
+/// Declared parameter arity of a single lambda or anon-fun argument expression,
+/// or null when it is neither. A zero-`->` `{ … }` reports 0, so overload
+/// resolution treats it as a `() -> R` handler.
 fn astArgLambdaArity(arg: *const Expr) ?u8 {
     return switch (arg.*) {
         .Lambda => |l| blk: {
             if (l.implicit_it) break :blk @as(u8, 0);
-            // The compose plugin threads every composable lambda BEFORE
-            // lowering, appending `($composer, $changed)`. Those are not
-            // source params: overload selection must rank the literal by
-            // its DECLARED header, or the +2 shift binds `{ d -> }` to a
-            // 3-param overload (`movableContentOf`'s P3 form).
+            // The compose plugin threads every composable lambda before lowering,
+            // appending `($composer, $changed)`. Those are not source params, so
+            // overload selection ranks the literal by its declared header.
             var n = l.params.len;
             if (n >= 2 and std.mem.eql(u8, l.params[n - 1].name, "$changed") and
                 std.mem.eql(u8, l.params[n - 2].name, "$composer"))
@@ -177,8 +159,8 @@ fn astArgLambdaArity(arg: *const Expr) ?u8 {
         },
         .AnonFun => |af| @intCast(af.params.len),
         else => blk: {
-            // A memo-wrapped sink lambda ranks by the inner literal's
-            // declared header, exactly like the bare literal above.
+            // A memo-wrapped sink lambda ranks by the inner literal's declared
+            // header, exactly like the bare literal above.
             const lam = compose_pass.memoWrappedLambda(@constCast(arg)) orelse break :blk null;
             if (lam.implicit_it) break :blk @as(u8, 0);
             var n = lam.params.len;
@@ -192,18 +174,12 @@ fn astArgLambdaArity(arg: *const Expr) ?u8 {
     };
 }
 
-/// One argument's applicability `ArgShape` at LOWERING time. Only the
-/// fields lowering can prove cheaply and soundly are populated — named /
-/// spread / lambda binding shape, a literal kind, and the declared-type
-/// head of a plain local/param argument; `runtime_class` /
-/// `lambda_param_types` / `value` stay null, so the shared scorer treats
-/// the arg as UNKNOWN (base points, never disproven) wherever the type is
-/// not statically decidable. Declared-type evidence is additive-only in
-/// the scorer: it can promote a head-matching candidate but never
-/// disqualify one.
-/// Head-only `TypeRef`s for a lambda literal's ANNOTATED parameters, or null
-/// when it annotates none. Only the head matters: the consumer refutes on a
-/// definite mismatch and stays silent otherwise.
+/// One argument's applicability `ArgShape` at lowering time. Only the fields
+/// lowering can prove cheaply and soundly are populated: named, spread and lambda
+/// binding shape, a literal kind, and the declared-type head of a plain local or
+/// param. `runtime_class`, `lambda_param_types` and `value` stay null, so the
+/// shared scorer treats the arg as unknown, never disproven. Declared-type
+/// evidence is additive only: it can promote a candidate but never disqualify one.
 fn lambdaDeclaredParamTypes(b: *FuncBuilder, arg: *const Expr) ?[]const ir.TypeRef {
     if (arg.* != .Lambda) return null;
     const tys = arg.Lambda.param_tys;
@@ -227,8 +203,8 @@ pub fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) appli
     const lazy_ty = argDeclTypeRefLazy(b, arg);
     const ty = argDeclTypeRef(b, arg);
     const declared_fn_arity = if (ty) |t| fnTypeArityAlias(b, t) else null;
-    // A memo-wrapped sink lambda is the trailing functional argument for
-    // overload selection — the wrap is transparent to the shape.
+    // A memo-wrapped sink lambda is the trailing functional argument for overload
+    // selection; the wrap is transparent to the shape.
     const literal_callable = arg.* == .Lambda or arg.* == .AnonFun or
         compose_pass.memoWrappedLambda(@constCast(arg)) != null;
     const sh: applicability.ArgShape = .{
@@ -247,9 +223,8 @@ pub fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) appli
         } else null,
         .ty = ty,
         .ty_authoritative = lazy_ty != null,
-        // Explicitly annotated lambda parameters are programmer-stated types,
-        // and kotlinc drops a candidate whose function parameter cannot accept
-        // them.
+        // Explicitly annotated lambda parameters are programmer-stated types, and
+        // kotlinc drops a candidate whose function parameter cannot accept them.
         .lambda_param_types = lambdaDeclaredParamTypes(b, arg),
     };
     if (runtime.envSetOnce("KLIO_ARGSHAPE_UNK") and
@@ -260,10 +235,9 @@ pub fn shapeOfAstArg(b: *FuncBuilder, arg: *const Expr, name: ?[]const u8) appli
     return sh;
 }
 
-/// Diagnostic: which argument SHAPES stay unknown to the applicability
-/// scorer (no type, no literal kind, not callable). Those are the shapes
-/// that make `memberPromotionProven` answer `arg-unauthoritative`, so the
-/// tag histogram names the expression forms worth typing next.
+/// Diagnostic: which argument shapes stay unknown to the applicability scorer,
+/// having no type, no literal kind, and not being callable. Those are the shapes
+/// that make `memberPromotionProven` answer `arg-unauthoritative`.
 pub fn noteUnknownArgShape(tag: []const u8, arg: *const Expr) void {
     const detail: []const u8 = switch (arg.*) {
         .Path => |p| if (p.segments.len != 0) p.segments[p.segments.len - 1].name else "-",
@@ -275,9 +249,9 @@ pub fn noteUnknownArgShape(tag: []const u8, arg: *const Expr) void {
     std.debug.print("[{s}] {s} {s}\n", .{ tag, @tagName(arg.*), detail });
 }
 
-/// Literal-kind evidence for an argument: the argument itself is a literal,
-/// or it names a local whose recorded initializer is one (`val x = 1.0;
-/// f(x)`). Evidence only, never disproving.
+/// Literal-kind evidence for an argument: the argument itself is a literal, or it
+/// names a local whose recorded initializer is one. Evidence only, never
+/// disproving.
 pub fn argEvidenceLitKind(b: *FuncBuilder, arg: *const Expr) ?LitKind {
     if (argLitKind(arg)) |k| return k;
     if (arg.* == .Path and arg.Path.segments.len == 1) {
@@ -288,22 +262,15 @@ pub fn argEvidenceLitKind(b: *FuncBuilder, arg: *const Expr) ?LitKind {
     return null;
 }
 
-/// Declared-type head of a single-segment Path argument naming a local /
-/// parameter whose declared type is known (`b.localDeclType`), as a `TypeRef`
-/// for the shared scorer's declared-type evidence. Null for anything else.
-/// An `if (x is T)` condition over a bare name smart-casts `x` to `T` for the
-/// then-arm. Kotlin resolves extensions against the STATIC type, and lowering
-/// hands the receiver's declared head to the extension filter, so without the
-/// narrowing the declared head (`Any?`) refutes every `CharSequence` extension
-/// and `x.isEmpty()` misses. A negated check narrows nothing here (its
-/// information is on the else path).
-/// Every smart cast a condition proves for its TRUE branch. Kotlin narrows on
-/// each `is` check in an `&&` chain, not only on a condition that is itself an
-/// `is` check: `if (!ignoreCase && this is String && prefix is String)` narrows
-/// both. Without walking the chain, `CharSequence.startsWith` resolved its own
-/// `this.startsWith(prefix)` — written under exactly that guard — back to the
-/// CharSequence extension instead of `String.startsWith`, and recursed until
-/// the stack ran out.
+/// Declared-type head of a single-segment Path argument naming a local or
+/// parameter whose declared type is known, as a `TypeRef` for the shared scorer.
+/// Null for anything else.
+/// `narrowIsCheck` applies every smart cast a condition proves for its true
+/// branch. Kotlin narrows on each `is` check in an `&&` chain, not only on a
+/// condition that is itself one, and lowering hands the receiver's declared head
+/// to the extension filter, so without the narrowing the declared head refutes
+/// every extension of the narrowed type. A negated check narrows nothing here,
+/// its information being on the else path.
 ///
 /// Applied in source order; the caller restores in reverse, because each
 /// narrowing saves the binding the previous one left.
@@ -335,12 +302,9 @@ pub fn narrowIsCheck(b: *FuncBuilder, cond: *const Expr) Allocator.Error!?build.
     return null;
 }
 
-/// Every non-null narrowing a condition proves for the branch it guards.
-/// Kotlin narrows on each `!= null` in an `&&` chain, exactly as it does for
-/// each `is` check — `if (a != null && b != null)` narrows both — and on each
-/// `== null` in an `||` chain for the ELSE branch. Only a condition that was
-/// itself the whole check narrowed anything, so the common guarded shape got
-/// no narrowing at all and its member calls stayed off the static path.
+/// Every non-null narrowing a condition proves for the branch it guards. Kotlin
+/// narrows on each `!= null` in an `&&` chain, exactly as for each `is` check,
+/// and on each `== null` in an `||` chain for the else branch.
 ///
 /// Applied in source order; the caller restores in reverse, because each
 /// narrowing saves the binding the previous one left.
@@ -363,10 +327,9 @@ pub fn narrowNullCheckAll(
     if (try narrowNullCheck(b, cond, truthy)) |n| try out.append(b.allocator, n);
 }
 
-/// Whether `cond` narrows the bare `this` receiver to non-null under
-/// `truthy` (`if (this != null) ...`), including through `&&`/`||` chains.
-/// Used to set the this-narrow so a member call in the branch resolves
-/// against the non-null receiver type.
+/// Whether `cond` narrows the bare `this` receiver to non-null under `truthy`,
+/// including through `&&` and `||` chains, so a member call in the branch
+/// resolves against the non-null receiver type.
 pub fn condNarrowsThisNotNull(cond: *const Expr, truthy: bool) bool {
     if (cond.* == .Binary) {
         const op = cond.Binary.op;
@@ -413,29 +376,23 @@ pub fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             std.debug.print("[valty] READ {s} decl={s} b={x} fn={s} ndecl={d}\n", .{ w, if (b.localDeclTypeRef(w)) |t| t.name else "<unset>", @intFromPtr(b) & 0xffff, build.currentRealFn() orelse "-", b.localDeclTypeCount() });
         }
     }
-    // The E2.1 type-head channel exists (Module.eagerTypeOf) but does
-    // NOT feed evidence yet: typeck's permissive inference can hand back
-    // a wrong container head (a ByteArray value typed Iterable), and a
-    // wrong head DISPROVES valid candidates downstream. The seam flips
-    // only after the type-head audit below reaches zero disagreement,
-    // mirroring the call channel's per-class trust discipline.
-    // A bare `this` narrowed non-null by an enclosing `if (this != null)`
-    // resolves member calls against the non-null receiver type: inside
-    // `operator fun Int?.inc()`, `this.inc()` in the non-null branch binds
-    // the builtin `Int.inc`, not the nullable extension (a recursion).
-    // Only the narrowed case answers; an un-narrowed `this` keeps its
-    // declared (possibly nullable) type from the ordinary receiver path.
+    // The `Module.eagerTypeOf` type-head channel does not feed evidence: typeck's
+    // permissive inference can hand back a wrong container head, which disproves
+    // valid candidates downstream. The seam flips once the audit below reaches
+    // zero disagreement.
+    // A bare `this` narrowed non-null by an enclosing `if (this != null)` resolves
+    // member calls against the non-null receiver type, so `this.inc()` inside
+    // `Int?.inc()` binds the builtin rather than recursing. An un-narrowed `this`
+    // keeps its declared, possibly nullable, type.
     if (arg.* == .This and arg.This.qualifier == null) {
         if (b.thisNarrow()) |h| {
             return .{ .name = b.allocator.dupe(u8, std.mem.trimEnd(u8, h, "?")) catch h, .nullable = false, .args = &.{} };
         }
-        // Un-narrowed `this`: fall through to the normal derivation below
-        // (returning null here would strip the receiver type from every
-        // `this.method()` call).
+        // Un-narrowed `this` falls through to the normal derivation; returning
+        // null would strip the receiver type from every `this.method()` call.
     }
-    // `x!!` has `x`'s type made NON-null: a member call on it resolves
-    // against the non-null type, so `this!!.inc()` inside `Int?.inc` binds
-    // the builtin `Int.inc`, not the nullable extension (a recursion).
+    // `x!!` has `x`'s type made non-null, so a member call on it resolves against
+    // the non-null type rather than recursing into the nullable extension.
     if (arg.* == .Postfix and arg.Postfix.op == .NotNull) {
         if (argDeclTypeRef(b, arg.Postfix.expr)) |inner| {
             var out = inner;
@@ -448,30 +405,22 @@ pub fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
         return null;
     }
     var lazy_ans = argDeclTypeRefLazy(b, arg);
-    // E2.1, ADDITIVE-ONLY: typeck's head fills in where the AST probes
-    // have no answer; the declared (AST) answer always wins when both
-    // exist — kotlinc resolves overloads against the STATIC DECLARED
-    // type, and the audit shows the only both-exist deltas are the
-    // legitimate declared-wider-vs-inferred-narrower class.
+    // Additive only: typeck's head fills in where the AST probes have no answer,
+    // and the declared answer always wins when both exist, since kotlinc resolves
+    // overloads against the static declared type.
     if (lazy_ans == null) {
         if (b.module.eagerTypeOf(arg.span())) |th| {
-            // `EagerTypeHead` carries a head and nullability, no type
-            // ARGUMENTS. For a generic type that makes the answer worse than
-            // none: extension selection needs the element type to choose
-            // between `Iterable<T>.minOrNull` (total order) and
-            // `Iterable<Double>.minOrNull` (IEEE), and a head-only `List`
-            // disproves the generic candidate that a null receiver type would
-            // have found by the broader walk. Measured: with the head,
-            // `minOrNull` on Array/List/Sequence resolves to target=null and
-            // falls to runtime dispatch, which picks the IEEE overload and
-            // returns NaN where 0.0 is correct.
+            // `EagerTypeHead` carries a head and nullability but no type arguments,
+            // which for a generic type is worse than no answer: extension
+            // selection needs the element type to choose between a total-order and
+            // an IEEE `minOrNull`, and a head-only `List` disproves the generic
+            // candidate a null receiver type would have found.
             const th_head = typeHead(std.mem.trimEnd(u8, th.name, "?"));
             const bare_tp_head = (th_head.len > 0 and th_head.len <= 2 and std.ascii.isUpper(th_head[0])) or
                 b.isTypeParam(th_head) or ir.parseClassTypeParamIdentity(th_head) != null;
             if (headDeclaresTypeParams(b, th.name) or bare_tp_head) {
-                // A bare TYPE-PARAMETER answer (`expected: T` read on a
-                // typed receiver) blocks the substituting deriver behind
-                // it, which would answer the instantiated type.
+                // A bare type-parameter answer blocks the substituting deriver
+                // behind it, which would answer the instantiated type.
                 if (typeheadAuditOn()) {
                     const sp = arg.span();
                     std.debug.print("[TYPEHEAD-SKIP] f{d}:{d} generic head {s} has no args\n", .{ sp.file.int(), sp.start, th.name });
@@ -485,11 +434,9 @@ pub fn argDeclTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
             }
         }
     }
-    // `KLIO_ARGTY_TRACE=<name>` — the static type this resolution actually
-    // used for a named expression, and whether it came from an inline
-    // splice's declared parameter type. This is what separates "lowering has
-    // no type" from "lowering has the wrong type", which look identical from
-    // a failing test.
+    // `KLIO_ARGTY_TRACE=<name>`: the static type this resolution used for a named
+    // expression, and whether it came from an inline splice's declared parameter
+    // type. Separates "lowering has no type" from "lowering has the wrong type".
     if (runtime.envOnce("KLIO_ARGTY_TRACE")) |w| {
         if (arg.* == .Path and arg.Path.segments.len == 1 and std.mem.eql(u8, arg.Path.segments[0].name, w)) {
             if (lazy_ans) |la| {
@@ -524,10 +471,9 @@ fn typeheadAuditOn() bool {
     return on;
 }
 
-/// Whether the class named by an eager type HEAD declares type parameters,
-/// in which case a head without arguments is incomplete evidence. Builtin
-/// container heads are listed explicitly: they are not user classes, so the
-/// class table cannot answer for them.
+/// Whether the class named by an eager type head declares type parameters, in
+/// which case a head without arguments is incomplete evidence. Builtin container
+/// heads are listed explicitly, the class table not answering for them.
 fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
     const generic_builtins = [_][]const u8{
         "Array",           "List",                    "MutableList", "Set",               "MutableSet",
@@ -539,7 +485,7 @@ fn headDeclaresTypeParams(b: *FuncBuilder, head: []const u8) bool {
     for (generic_builtins) |g| {
         if (std.mem.eql(u8, g, head)) return true;
     }
-    const cid = if (std.mem.indexOfScalar(u8, head, '.') != null)
+    const cid = if (std.mem.findScalar(u8, head, '.') != null)
         b.module.classIdByFqn(head)
     else
         b.module.uniqueClassIdBySimpleName(head);
@@ -559,9 +505,9 @@ pub fn argDeclTypeRefLazy(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     return r;
 }
 
-/// A bare name that denotes an `object` declaration visible from this
-/// scope (the enclosing class's nested object first, then the indexed
-/// top-level one) types as that object's class.
+/// A bare name that denotes an `object` declaration visible from this scope, the
+/// enclosing class's nested object first and then the indexed top-level one,
+/// types as that object's class.
 pub fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
     if (arg.* != .Path or arg.Path.segments.len != 1) return null;
     const seg = arg.Path.segments[0];
@@ -604,8 +550,8 @@ pub fn objectRefTypeRef(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef {
 }
 
 /// The IR class of `name` as seen from the builder's scope: a nested class
-/// resolves through its enclosing declaration first, so a same-named
-/// top-level class cannot stand in for it.
+/// resolves through its enclosing declaration first, so a same-named top-level
+/// class cannot stand in for it.
 fn classIdInScope(b: *FuncBuilder, name: []const u8, file: anytype) ?ir.ClassId {
     if (b.module.registry.enclosing_class.get(name)) |enc| {
         var qb: [192]u8 = undefined;
@@ -616,13 +562,12 @@ fn classIdInScope(b: *FuncBuilder, name: []const u8, file: anytype) ?ir.ClassId 
     return b.module.classIdIndexed(name, b.self_package, file) orelse b.module.classId(name);
 }
 
-/// The enclosing `object` declaration whose hierarchy declares `name`, for
-/// a bare reference written in a class nested inside it. Kotlin puts an
-/// object's members in the static scope of everything declared in it, so
-/// `class Foo : Base(::foo)` inside `object obj` passes `obj::foo` — bound
-/// at lowering, since no instance exists while a super-constructor argument
-/// evaluates. A member the owner class hierarchy declares itself is the
-/// nearer scope and stays on receiver dispatch.
+/// The enclosing `object` declaration whose hierarchy declares `name`, for a bare
+/// reference written in a class nested inside it. Kotlin puts an object's members
+/// in the static scope of everything declared in it, and the reference binds at
+/// lowering, since no instance exists while a super-constructor argument
+/// evaluates. A member the owner class hierarchy declares itself is nearer and
+/// stays on receiver dispatch.
 pub fn enclosingObjectDeclaring(b: *FuncBuilder, name: []const u8, file: anytype) ?ir.ClassId {
     var cur = b.ownerClass() orelse build.currentOwnerClass() orelse return null;
     if (classIdInScope(b, cur, file)) |own| {

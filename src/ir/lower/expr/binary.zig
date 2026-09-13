@@ -1,5 +1,4 @@
-//! Binary operator lowering, with the numeric promotion and operand shape
-//! probes it consults.
+//! Binary operator lowering, with the numeric promotion and operand shape probes.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -53,10 +52,9 @@ const member_call_mod = @import("member_call.zig");
 const lowerResolvedExtensionCall = member_call_mod.lowerResolvedExtensionCall;
 const lowerResolvedMemberCall = member_call_mod.lowerResolvedMemberCall;
 
-/// `Binary` lowering: the short-circuiting operators (`&&`, `||`, `?:`),
-/// the `in`/`!in` desugars, generic-operand comparisons, and the eager
-/// primitive operators.
-/// Numeric/string/char/bool simple type heads whose `+`/`-` stay primitive.
+/// `Binary` lowering: the short-circuiting operators, the `in`/`!in` desugars,
+/// generic-operand comparisons, and the eager primitive operators.
+/// `primitivePlusHead` lists the heads whose `+`/`-` stay primitive.
 pub fn isPrimitiveTypeName(name: []const u8) bool {
     const prims = [_][]const u8{ "Int", "Long", "Short", "Byte", "Double", "Float", "Char", "Boolean", "String", "UInt", "ULong", "UShort", "UByte", "Number" };
     for (prims) |p2| {
@@ -66,14 +64,13 @@ pub fn isPrimitiveTypeName(name: []const u8) bool {
 }
 
 /// Whether a nominal receiver carries enough structural arguments to prove an
-/// overload choice. Head-only evidence for a generic class (`List`) cannot
-/// substitute its declaration parameters and must not displace a complete
-/// declaration-derived type (`List<Int>`).
+/// overload choice: head-only evidence for a generic class cannot substitute its
+/// declaration parameters and must not displace a declaration-derived type.
 pub fn staticClassifierArgsComplete(b: *FuncBuilder, ty: TypeRef) bool {
     var identity = std.mem.trimEnd(u8, ty.name, "?");
-    if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+    if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     const head = typeHead(identity);
-    const cid = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+    const cid = if (std.mem.findScalar(u8, identity, '.') != null)
         b.module.classIdByFqn(identity)
     else
         b.module.uniqueClassIdBySimpleName(head);
@@ -83,10 +80,9 @@ pub fn staticClassifierArgsComplete(b: *FuncBuilder, ty: TypeRef) bool {
     return ty.args.len >= class.type_params.len;
 }
 
-/// Resolve a non-primitive binary operator through the same member/extension
-/// declaration engine as its explicit-call form (`a + b` is `a.plus(b)`).
-/// The static argument type is essential for overloads such as
-/// `Collection<T>.plus(element: T)` versus `.plus(elements: Sequence<T>)`.
+/// Resolve a non-primitive binary operator through the same engine as its
+/// explicit-call form, `a + b` being `a.plus(b)`. The static argument type separates
+/// overloads such as `Collection<T>.plus(element)` from `.plus(elements: Sequence<T>)`.
 fn lowerResolvedBinaryOperator(
     b: *FuncBuilder,
     op: AstBinOp,
@@ -171,10 +167,9 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         return reg;
     }
 
-    // Compatibility path for a known `this` receiver whose declaration set
-    // is not yet complete enough for exact resolution. The shared resolver
-    // runs first so smart casts and overload applicability can select the
-    // precise static extension before this name-based fallback.
+    // Compatibility path for a known `this` receiver whose declaration set is not
+    // complete enough for exact resolution. The shared resolver runs first so smart
+    // casts and applicability select the precise extension.
     if ((op == .Add or op == .Sub) and lhs.* == .This and lhs.This.qualifier == null) {
         const sty: ?[]const u8 = b.recvTy() orelse b.enclosingRecvTy();
         if (sty) |ty| {
@@ -198,10 +193,9 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         }
     }
 
-    // `list + (x as Any)`: kotlinc resolves `plus(element: T)` from the
-    // RHS's STATIC type, appending the value as one element even when it
-    // is itself a list at runtime. Route a statically list-headed LHS
-    // with an Any-cast RHS through `plusElement`.
+    // `list + (x as Any)`: kotlinc resolves `plus(element: T)` from the rhs's static
+    // type, appending the value as one element even when it is itself a list, so
+    // route such a call through `plusElement`.
     if (op == .Add and staticListHead(lhs) and ast_scan.isBoxedToAnyForm(rhs)) {
         const l = try lowerExpr(b, lhs);
         const r = try lowerExpr(b, rhs);
@@ -218,9 +212,8 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         return dst;
     }
 
-    // `==` on a boxed operand (an `Any`-typed or generic type-parameter value,
-    // e.g. `assertEquals(expected: T, actual: T)`) uses total-order equality —
-    // `NaN == NaN` is true and `0.0 != -0.0`, matching boxed `Double.equals`.
+    // `==` on a boxed operand uses total-order equality, `NaN == NaN` true and
+    // `0.0 != -0.0`, matching boxed `Double.equals`.
     if ((op == .Eq or op == .Neq) and
         (isBoxedToAnyForm(lhs) or isBoxedToAnyForm(rhs) or
             isAnyTypedPath(b, lhs) or isAnyTypedPath(b, rhs) or
@@ -239,19 +232,17 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
 
     // `x in haystack` / `x !in haystack`.
     if (op == .In or op == .NotIn) {
-        // `x in lo..hi` / `x in lo..<hi` with a range *literal* on the right
-        // lowers to `lo <= x && x <(=) hi` — but only when `x` is provably a
-        // scalar element. A range-valued `x` dispatches `contains` instead
-        // (an in-scope `operator LongRange.contains(LongRange)` decides
-        // range-in-range; the element compare would be wrong for it).
+        // `x in lo..hi` with a range literal on the right lowers to
+        // `lo <= x && x <(=) hi`, but only when `x` is provably a scalar element; a
+        // range-valued `x` dispatches `contains`, which decides range-in-range.
         if (rhs.* == .Binary and (rhs.Binary.op == .Range or rhs.Binary.op == .RangeUntil) and
             !lhsIsRangeShaped(b, lhs) and try rangeCompareApplies(b, lhs, rhs.Binary.lhs, rhs.Binary.rhs))
         {
             const r_op = rhs.Binary.op;
             const lo = rhs.Binary.lhs;
             const hi = rhs.Binary.rhs;
-            // `(lo..hi).contains(x)`: the bounds are evaluated before the
-            // element, as kotlinc orders the desugared call.
+            // The bounds evaluate before the element, as kotlinc orders the
+            // desugared call.
             const lo_r = try lowerExpr(b, lo);
             const hi_r = try lowerExpr(b, hi);
             const x = try lowerExpr(b, lhs);
@@ -269,9 +260,8 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             }
             return both;
         }
-        // `x in y` is `y.contains(x)`: lower the written-out member call so
-        // it binds statically like the explicit form (a user extension
-        // `IntRange.contains(String)` is a direct call, not a name walk).
+        // `x in y` is `y.contains(x)`: lower the written-out member call so it binds
+        // statically like the explicit form.
         const callee_node = try b.allocator.create(Expr);
         callee_node.* = .{ .Member = .{
             .receiver = @constCast(rhs),
@@ -334,9 +324,9 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         b.terminate(.{ .Branch = .{ .cond = l, .t = then_b, .f = else_b } });
         if (op == .And) {
             b.switchTo(then_b);
-            // The right operand sees every proof the left one establishes:
-            // `it is UByte && it.toByte() ...` smart-casts `it` for the
-            // member call, exactly as an `if` guard narrows its then-arm.
+            // The right operand sees every proof the left establishes, so
+            // `it is UByte && it.toByte() ...` smart-casts `it`, as an `if` guard
+            // narrows its then-arm.
             var narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer narrowed.deinit(b.allocator);
             try narrowIsCheckAll(b, lhs, &narrowed);
@@ -361,8 +351,8 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             try b.push(.{ .Move = .{ .dst = dst, .src = true_r } });
             b.terminate(.{ .Goto = join });
             b.switchTo(else_b);
-            // `x == null || x.m()` runs its right operand only when the
-            // left is false, which proves the null-checks' falsy side.
+            // `x == null || x.m()` runs its right operand only when the left is
+            // false, which proves the null-checks' falsy side.
             var else_not_null: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer else_not_null.deinit(b.allocator);
             try narrowNullCheckAll(b, lhs, false, &else_not_null);
@@ -377,14 +367,10 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
         return dst;
     }
 
-    // Comparison on a generic type-parameter operand → `a.compareTo(b) <op> 0`.
-    // Inside a function that declares its own type parameters, an operand
-    // with no concrete static type (`var min = iterator.next()` in the
-    // generic `minOrNull` body) is `T`-typed under Kotlin's inference, so
-    // the comparison also follows the `compareTo` total order — the IEEE
-    // primitive comparison applies only where a numeric static type is
-    // established (a literal, or a local with a numeric declared type or
-    // literal initializer).
+    // Comparison on a generic type-parameter operand becomes `a.compareTo(b) <op> 0`.
+    // Inside a function declaring its own type parameters an operand with no concrete
+    // static type is `T`-typed under Kotlin's inference, so it follows the total
+    // order; the IEEE comparison applies only where a numeric static type is known.
     if ((op == .Lt or op == .Le or op == .Gt or op == .Ge) and
         (isGenericOperand(b, lhs) or isGenericOperand(b, rhs) or
             (b.hasOwnTypeParams() and
@@ -411,10 +397,9 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     }
 
     const l0 = try lowerExpr(b, lhs);
-    // `it + x` / `it - x` where `it` is statically a broad collection
-    // (`Iterable`/`Collection`) produces a `List` even when the runtime value
-    // is a `Set`; coerce the receiver to a list so the `List`-returning
-    // `plus`/`minus` is dispatched rather than the `Set`-returning one.
+    // `it + x` where `it` is statically a broad collection produces a `List` even
+    // over a runtime `Set`, so coerce the receiver and dispatch the `List`-returning
+    // operator.
     const l = if (op == .Add or op == .Sub)
         try helpers.coerceBroadCollectionToList(b, lhs, l0)
     else
@@ -431,25 +416,23 @@ fn isGenericOperand(b: *FuncBuilder, e: *const Expr) bool {
         isComparableCast(e);
 }
 
-/// A local or parameter declared as `Comparable<…>` orders by `compareTo`
-/// and compares by `equals`, like a value read through a `Comparable` cast.
+/// A local or parameter declared `Comparable<…>` orders by `compareTo` and compares
+/// by `equals`, like a value read through a `Comparable` cast.
 fn comparableTypedLocal(b: *FuncBuilder, name: []const u8) bool {
     const t = b.localDeclType(name) orelse return false;
     return std.mem.eql(u8, simpleTypeHead(t), "Comparable");
 }
 
-/// `(x as Comparable<Double>) >= y`: a value read through `Comparable`
-/// orders by `compareTo` (the total order) and compares by `equals`.
+/// `(x as Comparable<Double>) >= y`: a value read through `Comparable` orders by
+/// `compareTo` and compares by `equals`.
 fn isComparableCast(e: *const Expr) bool {
     if (e.* != .As) return false;
     return std.mem.eql(u8, simpleTypeHead(e.As.ty.name.name), "Comparable");
 }
 
-/// A comparison operand with an established concrete static type: a literal,
-/// or a plain local/param whose declared type is a known builtin value head
-/// or whose recorded initializer is a literal. Such an operand keeps the
-/// primitive `BinOp` comparison inside a generic function; everything else
-/// there is `T`-typed under Kotlin's inference and dispatches `compareTo`.
+/// A comparison operand with an established concrete static type: a literal, or a
+/// plain local or param whose declared type is a known builtin value head or whose
+/// initializer is a literal. Such an operand keeps the primitive `BinOp` comparison.
 fn staticallyOrderedOperand(b: *FuncBuilder, e: *const Expr) bool {
     if (argLitKind(e) != null) return true;
     if (e.* == .Path and e.Path.segments.len == 1) {
@@ -460,18 +443,15 @@ fn staticallyOrderedOperand(b: *FuncBuilder, e: *const Expr) bool {
     return false;
 }
 
-/// Write `val` back to the lvalue `target` (shared by prefix ++/-- and the
-/// postfix path's pre-snapshot path). Delegates to the single write-back
-/// decision in `stmt_mod.storeCombinedToTarget` so compound-assign, prefix,
-/// and postfix never diverge on where a bare name lands (local / cell /
-/// capture / own-member / lambda-this / top-level global).
+/// Write `val` back to the lvalue `target`, shared by prefix `++`/`--` and the
+/// postfix path, through `stmt_mod.storeCombinedToTarget` so the three never diverge.
 pub fn writeBackLvalue(b: *FuncBuilder, target: *const Expr, val: Reg) Allocator.Error!void {
     try stmt_mod.storeCombinedToTarget(b, target, val);
 }
 
-/// Kotlin's promotion for arithmetic over the built-in numeric types: the
-/// wider operand wins, with the unsigned family kept separate (mixing signed
-/// and unsigned is not an operator Kotlin defines).
+/// Kotlin's promotion for arithmetic over the built-in numeric types: the wider
+/// operand wins, the unsigned family staying separate since Kotlin defines no mixed
+/// operator.
 pub fn numericPromotion(a: []const u8, c: []const u8) ?[]const u8 {
     const order = [_][]const u8{ "Double", "Float", "Long", "Int", "Short", "Byte" };
     const uorder = [_][]const u8{ "ULong", "UInt", "UShort", "UByte" };
@@ -485,7 +465,7 @@ pub fn numericPromotion(a: []const u8, c: []const u8) ?[]const u8 {
     }.f;
     if (rank(&order, a)) |ra| {
         const rc = rank(&order, c) orelse return null;
-        // Byte/Short arithmetic yields Int in Kotlin — there is no
+        // Byte/Short arithmetic yields Int in Kotlin; there is no
         // `Byte.plus(Byte): Byte`.
         const winner = order[@min(ra, rc)];
         if (std.mem.eql(u8, winner, "Short") or std.mem.eql(u8, winner, "Byte")) return "Int";
@@ -500,17 +480,12 @@ pub fn numericPromotion(a: []const u8, c: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The static-type head of a call argument when it is a plain local whose
-/// declared type is known — used to disambiguate cast-rebound overloads by
-/// parameter type (an `Iterable<Int>` arg must not bind an `IntRange` param).
-/// Whether `lhs` of an `in` test is provably a RANGE value (a range
-/// literal, or a binding declared with a range-family type), so the
-/// element-compare inline for `x in lo..hi` must stand down in favor of a
-/// `contains` dispatch.
-/// Whether `x in lo..hi` may lower to the scalar compare `lo <= x && x <= hi`:
-/// every operand is provably a non-null numeric scalar and no user operator
-/// `rangeTo`/`contains` is declared that could take the call instead. Any
-/// other shape dispatches `contains` on the range value.
+/// The static-type head of a call argument when it is a plain local whose declared
+/// type is known, to disambiguate cast-rebound overloads by parameter type.
+/// `inLhsIsRangeValue` tells whether an `in` test's lhs is provably a range value,
+/// so the element-compare inline stands down for a `contains` dispatch, and
+/// `rangeInlineAllowed` whether every operand is a provably non-null numeric scalar
+/// with no user `rangeTo`/`contains` operator.
 fn rangeCompareApplies(b: *FuncBuilder, x: *const Expr, lo: *const Expr, hi: *const Expr) Allocator.Error!bool {
     if (userFunctionDeclared(b, "rangeTo") or userFunctionDeclared(b, "contains")) return false;
     return try scalarNumericShaped(b, x, 0) and try scalarNumericShaped(b, lo, 0) and try scalarNumericShaped(b, hi, 0);

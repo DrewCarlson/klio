@@ -19,10 +19,9 @@ const inReceiverContext = probe_mod.inReceiverContext;
 var or_audit_checked: bool = false;
 var or_audit_enabled: bool = false;
 
-/// Compile-side half of the `KLIO_OR_AUDIT` detector (the runtime half
-/// lives in `ir/eval.zig`): logs every member-vs-global emission decision
-/// so a corpus sweep can join emit context against the runtime arm that
-/// actually won.
+/// Compile-side half of the `KLIO_OR_AUDIT` detector, whose runtime half lives in
+/// `ir/eval.zig`: logs every member-vs-global emission decision so a sweep can join
+/// emit context against the runtime arm that won.
 pub fn orAuditOn() bool {
     if (!or_audit_checked) {
         or_audit_checked = true;
@@ -61,19 +60,15 @@ pub fn resolveAuditOn() bool {
 var resolve_strict_checked: bool = false;
 var resolve_strict_enabled: bool = false;
 
-/// Test hook: force KLIO_RESOLVE_STRICT on for the current process,
-/// bypassing the once-per-process environment read, so an in-process
-/// integration test can pin strict mode's verdict on a specific
-/// program.
+/// Test hook: force `KLIO_RESOLVE_STRICT` on for the process, bypassing the
+/// once-per-process environment read.
 pub fn setResolveStrictForTest(on: bool) void {
     resolve_strict_checked = true;
     resolve_strict_enabled = on;
 }
 
-/// Test hook: undo `setResolveStrictForTest` — the next strict-mode
-/// read consults the environment again, so a forced setting never
-/// leaks past the test that installed it (including under a
-/// KLIO_RESOLVE_STRICT=1 suite run).
+/// Test hook: undo `setResolveStrictForTest`, so a forced setting never leaks past
+/// the test that installed it.
 pub fn resetResolveStrictForTest() void {
     resolve_strict_checked = false;
     resolve_strict_enabled = false;
@@ -91,11 +86,8 @@ pub fn resolveStrictOn() bool {
     return resolve_strict_enabled;
 }
 
-/// Audit one value-position bare reference: the index's pick against
-/// the order-based `funcId` pick the runtime's bare-name closure path
-/// binds. A divergence where both resolve is the index correcting (or,
-/// unexplained, mis-binding) the reference target; the corpus sweep
-/// proves zero unexplained before the FQN emission is trusted.
+/// Audit one value-position bare reference: the index's pick against the
+/// order-based `funcId` pick the runtime's bare-name closure path binds.
 pub fn refAudit(b: *FuncBuilder, name: []const u8, index_pick: ?FuncId) void {
     if (!resolveAuditOn()) return;
     const heur = b.module.funcId(name);
@@ -108,30 +100,25 @@ pub fn refAudit(b: *FuncBuilder, name: []const u8, index_pick: ?FuncId) void {
     );
 }
 
-/// Per-site census of the static member-call gate (`KLIO_DISPATCH_STATS`),
-/// so the coverage of static binding is a number rather than an impression.
+/// Per-site census of the static member-call gate, under `KLIO_DISPATCH_STATS`.
 pub var lm_sites: [7]u64 = @splat(0);
-/// `KLIO_DISPATCH_STATS`: unbound member sites the checker DID resolve, and
-/// why each was refused. [0] map hit, [1] no such func, [2] not an
-/// extension, [3] arity mismatch. A zero at [0] means the two sets — what
-/// the checker answered and what lowering could not bind — do not intersect
-/// at all, which is a different problem from a guard being too strict.
+/// Unbound member sites the checker did resolve, and why each was refused:
+/// [0] map hit, [1] no such func, [2] not an extension, [3] arity mismatch. A zero
+/// at [0] means the two sets do not intersect at all.
 pub var lm_eager_norecv: [4]u64 = @splat(0);
 pub const LmReason = enum(u8) { no_receiver_type, nullable_or_generic, no_class_id, resolver_declined, bound_static, bound_virtual, dynamic_by_design };
 pub fn lmNote(comptime r: LmReason) void {
     lm_sites[@intFromEnum(r)] += 1;
 }
 
-/// Breakdown of the `no_receiver_type` bucket by the SHAPE of the receiver
-/// expression, indexed by its `ast.Expr` tag. The bucket is ~73% of all member
-/// call sites, so "lowering has no receiver type" is the whole static-dispatch
-/// problem; which expressions those are decides whether the fix belongs in
-/// typeck's inference, in an AST probe lowering is not consulting, or nowhere.
+/// Breakdown of the `no_receiver_type` bucket by receiver-expression shape, indexed
+/// by `ast.Expr` tag, which decides whether the fix belongs in typeck's inference or
+/// in an AST probe lowering is not consulting.
 pub var lm_norecv: [@typeInfo(@typeInfo(ast.Expr).@"union".tag_type.?).@"enum".fields.len]u64 = @splat(0);
 
-/// Whether the `no_receiver_type` breakdown is being collected. Classifying a
-/// site walks same-named declarations, which is real lowering-time work, so it
-/// happens only when the census is asked for. Resolved once per process.
+/// Whether the `no_receiver_type` breakdown is being collected. Classifying a site
+/// walks same-named declarations, so it happens only when asked for. Resolved once
+/// per process.
 var norecv_census: ?bool = null;
 pub fn norecvCensusOn() bool {
     if (norecv_census) |v| return v;
@@ -140,14 +127,12 @@ pub fn norecvCensusOn() bool {
     return v;
 }
 
-/// Of the `no_receiver_type` sites, how many typeck DID record a type head for
-/// (it is simply not consulted for the receiver position) versus how many it
-/// has no answer for at all.
+/// Of the `no_receiver_type` sites, how many typeck did record a type head for,
+/// simply not consulted for the receiver position, versus how many it cannot answer.
 pub var lm_norecv_eager: [2]u64 = @splat(0);
 
-/// Sub-census of the `Path` shape (the largest `no_receiver_type` bucket):
-/// what KIND of name the untyped receiver is, which decides where the missing
-/// type has to come from.
+/// Sub-census of the `Path` shape: what kind of name the untyped receiver is, which
+/// decides where the missing type has to come from.
 pub const NoRecvPath = enum(u8) {
     /// A live local/parameter register whose declared type was never recorded.
     local_no_decl_type,
@@ -160,18 +145,16 @@ pub const NoRecvPath = enum(u8) {
 };
 pub var lm_norecv_path: [4]u64 = @splat(0);
 
-/// Of the locals with no recorded declared type, whether an initializer
-/// expression was recorded for the name at all. No initializer means the
-/// binding form never registered one (loop variable, lambda parameter,
-/// destructured component, catch parameter); an initializer that still yields
+/// Of the locals with no recorded declared type, whether an initializer was
+/// recorded at all. None means the binding form registered none (loop variable,
+/// lambda parameter, destructured component, catch parameter); one that still yields
 /// no type means the initializer's own type is unknown.
 pub const NoRecvInit = enum(u8) { no_init_recorded, init_yields_no_type };
 pub var lm_norecv_init: [2]u64 = @splat(0);
 
-/// Why a `Call` initializer yields no type. `argDeclTypeRefLazy` has channels
-/// for a local function, a function-typed parameter, and a constructor, but
-/// none for a module-level function's DECLARED return type, so this measures
-/// what such a channel would be worth and how often it could not be trusted.
+/// Why a `Call` initializer yields no type. `argDeclTypeRefLazy` has channels for a
+/// local function, a function-typed parameter, and a constructor, but none for a
+/// module-level function's declared return type.
 pub const NoRecvCall = enum(u8) {
     /// Callee is not a plain single-name call (a member or complex callee).
     not_simple_callee,
@@ -181,20 +164,15 @@ pub const NoRecvCall = enum(u8) {
     ambiguous_return,
     /// Unique concrete declared return type: a channel would answer here.
     unique_concrete,
-    /// Unique, but the return type names nothing resolvable to a class — a
-    /// type parameter or an unknown head, which the declaration alone does not
-    /// fix.
+    /// Unique, but the return type names nothing resolvable to a class.
     unique_unresolvable,
 };
 pub var lm_norecv_call: [5]u64 = @splat(0);
 
-/// Breakdown of the `resolver_declined` bucket — sites where lowering DID have
-/// a receiver type and the resolver still refused to name a declaration. It is
-/// the second-largest bucket and, unlike `no_receiver_type`, needs nothing from
-/// typeck, so it is the cheapest remaining coverage to reason about.
+/// Breakdown of the `resolver_declined` bucket: sites where lowering had a receiver
+/// type and the resolver still refused to name a declaration.
 pub const DeclineKind = enum(u8) {
-    /// The resolver identified the declaration but withheld a dispatch
-    /// commitment. The identity is already proven here.
+    /// The resolver identified the declaration but withheld a dispatch commitment.
     target_known_deferred,
     /// A visible member accepts the call shape but more than one could.
     ambiguous_applicable,
@@ -214,8 +192,8 @@ pub const DeclineKind = enum(u8) {
     virtual_owner_abi,
     /// A virtual target declaring no receiver parameter.
     virtual_no_receiver_param,
-    /// A named or vararg argument list that could not be mapped onto the
-    /// target's parameters.
+    /// A named or vararg argument list that could not be mapped onto the target's
+    /// parameters.
     arg_mapping_failed,
 };
 pub var lm_decline: [11]u64 = @splat(0);
@@ -225,14 +203,12 @@ pub fn declineNote(k: DeclineKind) void {
     if (norecvCensusOn()) lm_decline[@intFromEnum(k)] += 1;
 }
 
-/// Why a `target_known_deferred` site had to ASK the extension question at
-/// all — the identity is proven at every one of these. Most go on to be
-/// promoted by the proof; the variant names which reachable extension the
-/// proof then has to refute. Counted before the proof runs, so this total
-/// is larger than `resolver_declined`.
+/// Why a `target_known_deferred` site had to ask the extension question at all, the
+/// identity being proven at every one; the variant names which reachable extension
+/// the proof must refute. Counted before the proof runs.
 pub const PromoBlock = enum(u8) {
-    /// An extension whose receiver is a TYPE PARAMETER declares this name, so
-    /// the index cannot say which receivers it serves. The blunt one.
+    /// An extension whose receiver is a type parameter declares this name, so the
+    /// index cannot say which receivers it serves.
     ext_generic_receiver,
     /// An extension on the receiver's own head declares this name.
     ext_own_head,
@@ -245,8 +221,8 @@ pub const PromoBlock = enum(u8) {
 };
 pub var lm_promo: [6]u64 = @splat(0);
 
-/// Why `localInitTypeRef` did or did not answer: no initializer, a constructor,
-/// no derivable return type, incomplete type arguments, derived.
+/// Why `localInitTypeRef` did or did not answer: no initializer, a constructor, no
+/// derivable return type, incomplete type arguments, derived.
 pub var lm_localinit: [5]u64 = @splat(0);
 
 pub fn lowerLocalInitDump() void {
@@ -271,23 +247,21 @@ pub fn lowerPromoDump() void {
     }
 }
 
-/// Breakdown of `no_class_id` — lowering HAS a receiver type and cannot map its
-/// head to a declared class. Nothing here needs typeck; it is name resolution.
+/// Breakdown of `no_class_id`: lowering has a receiver type and cannot map its head
+/// to a declared class. Name resolution, not typeck.
 pub const NoClassKind = enum(u8) {
     /// A dotted name that `classIdByFqn` does not know.
     fqn_unknown,
     /// A bare head that no class declares.
     simple_unknown,
-    /// A bare head that SEVERAL classes declare, so the simple-name lookup
-    /// refuses to pick — the ambiguity a fully qualified answer would settle.
+    /// A bare head several classes declare, so the simple-name lookup refuses.
     simple_ambiguous,
 };
 pub var lm_noclass: [3]u64 = @splat(0);
 
-/// The heads behind the `no_class_id` count, captured at the site into a
-/// fixed buffer so the dump can name them — the per-site env trace loses
-/// rows that fire before diagnostics settle, and a count with no names sent
-/// a whole scoping pass guessing.
+/// The heads behind the `no_class_id` count, captured into a fixed buffer so the
+/// dump can name them; the per-site env trace loses rows that fire before
+/// diagnostics settle.
 var lm_noclass_heads: [32][64]u8 = undefined;
 var lm_noclass_head_lens: [32]u8 = @splat(0);
 var lm_noclass_head_counts: [32]u32 = @splat(0);
@@ -333,8 +307,8 @@ pub fn lowerDeclineDump() void {
     }
 }
 
-/// Classify a `Call` expression against the strict condition a return-type
-/// channel would need: the name must identify one function whose declared
+/// Classify a `Call` expression against the strict condition a return-type channel
+/// would need: the name must identify one function whose declared
 
 pub fn classifyCallReturn(b: *FuncBuilder, e: *const ast.Expr) NoRecvCall {
     if (e.* != .Call) return .not_simple_callee;
@@ -379,8 +353,8 @@ pub fn lowerNoRecvDump() void {
     }
 }
 
-/// Report the static member-call gate's per-site coverage. Called at the end
-/// of a run alongside the executed-dispatch census.
+/// Report the static member-call gate's per-site coverage, at the end of a run
+/// alongside the executed-dispatch census.
 pub fn lowerSitesDump() void {
     var total: u64 = 0;
     for (lm_sites) |n| total += n;

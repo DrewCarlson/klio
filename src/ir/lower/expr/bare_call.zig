@@ -145,17 +145,10 @@ pub fn lowerPathCall(
     const segments = callee.Path.segments;
     const name0 = segments[0].name;
 
-    // Secondary-ctor delegation / default-value thunk: a bare own-member call
-    // with no `this` in scope is a companion access — the enclosing instance
-    // does not exist yet, so `generateOetf(x)` inside `: this(generateOetf(x))`
-    // binds the companion's `generateOetf`, never an instance method. Dispatch
-    // it as a member call on the owner class value; the VM forwards a class
-    // receiver to its companion singleton, walking the superclass chain so an
-    // inherited companion member (declared on a superclass's companion) resolves
-    // too — `Sub.mk()` lowers to exactly this `LoadGlobal + CallMember` pair.
-    // Mirrors the value-read handling of the same case (a bare own-member read
-    // in a param thunk); `own_members` already includes own + inherited
-    // companion members, so a plain member name is filtered by `hasOwnMember`.
+    // A bare own-member call with no `this` in scope (secondary-ctor delegation,
+    // default-value thunk) is a companion access, so dispatch it as a member call
+    // on the owner class value; the VM forwards a class receiver to its companion
+    // singleton, walking the superclass chain for an inherited companion member.
     if (b.isParamThunk() and b.resolve("this") == null and
         b.hasOwnMember(name0) and b.ownMemberApplicable(name0, args.len) and
         !ownMemberRejectsLambdas(b, name0, args) and !classWithCompanion(b, name0))
@@ -181,11 +174,8 @@ pub fn lowerPathCall(
         }
     }
 
-    // A captured outer that also names a top-level fn: route through value.
-    // Unless the outer is a local FUNCTION that cannot take this call — a
-    // local `fun validate()` does not shadow the top-level `validate(block)`
-    // for `validate { … }`, and routing through the captured self-cell made
-    // the local call itself.
+    // A captured outer that also names a top-level fn routes through value,
+    // unless the outer is a local function that cannot take this call.
     const local_fn_takes_call = if (b.localFnDecls(name0)) |decls|
         try anyLocalFnOverloadApplicable(b, decls, args, ast_arg_names)
     else
@@ -193,18 +183,14 @@ pub fn lowerPathCall(
     const shadowed_by_local = b.knowsOuter(name0) and b.resolve(name0) == null and
         b.module.hasBareCallCandidate(name0, segments[0].span.file) and
         local_fn_takes_call and
-        // A captured local with definite NON-callable evidence (`var key = 0`
-        // beside the `key(...) {}` composable) never serves a CALL — the
-        // function wins, as in Kotlin.
+        // A captured local with definite non-callable evidence never serves a
+        // call; the function wins, as in Kotlin.
         !b.isNonFnLocal(name0);
     if (shadowed_by_local) {
         const callee_r = try resolveCapture(b, name0);
-        // Only a captured local *extension* function or a receiver-lambda param
-        // takes the enclosing receiver as a leading `this`; a plain captured
-        // local function (`fun check(a, b)` called from inside a `repeat { }`
-        // lambda) must dispatch as a bare value, or `callValueWithThis`'s
-        // receiver-fills-param heuristic shifts the enclosing `this` into the
-        // first value parameter.
+        // Only a captured local extension function or a receiver-lambda param
+        // takes the enclosing receiver as a leading `this`; for a plain one,
+        // `callValueWithThis` would shift `this` into the first value parameter.
         const wants_this = b.isLocalExtFn(name0) or b.isReceiverLambdaParam(name0);
         const this_reg: ?Reg = if (wants_this)
             (if (b.knowsOuter("this") or b.capturesThisSlot())
@@ -237,9 +223,8 @@ pub fn lowerPathCall(
         return dst;
     }
 
-    // Bare-call resolution through the unified resolver. `resolveCall` folds
-    // applicability, scope, and the member-vs-global emission decision into
-    // one query; the switch below routes its verdict to a single emitter.
+    // `resolveCall` folds applicability, scope, and the member-vs-global
+    // emission decision into one query; the switch below routes its verdict.
     const want = args.len;
     const cands = try b.module.bareCallCandidates(
         b.allocator,
@@ -278,21 +263,18 @@ pub fn lowerPathCall(
     const last_arg_lambda = lastArgIsLambda(args);
 
     // An own member applicable to this call outranks a same-named top-level
-    // function: defer to the member-dispatch path (`lowerImplicitThisCall`). A
-    // cast at the call site commits to a specific overload and overrides.
+    // function, so defer to `lowerImplicitThisCall`. A call-site cast overrides.
     const prefer_member = b.resolve("this") != null and b.hasOwnMember(name0) and
         b.ownMemberApplicable(name0, args.len) and !ownMemberRejectsLambdas(b, name0, args) and
         b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0);
 
-    // Call-site evidence pre-picks a same-tier overload: an `as` cast names
-    // the parameter type outright, and a trailing lambda's derived return
-    // discriminates a return-variant family (the sumOf shape).
+    // Call-site evidence pre-picks a same-tier overload: an `as` cast names the
+    // parameter type, a trailing lambda's derived return picks a return variant.
     const cast_pick: ?FuncId = (try overloadPickByCast(b, cands, args, want)) orelse
         try overloadPickByLambdaReturn(b, cands, args, want);
 
-    // The index classification, for the ambiguity / out-of-scope diagnostics.
-    // A cast at the call site pre-picks a same-tier overload, so an ambiguity
-    // or type-overload deferral is not reported.
+    // The index classification, for the ambiguity and out-of-scope diagnostics.
+    // A cast pre-picks a same-tier overload, so no ambiguity is reported.
     var index_res = b.module.resolveBareCallIndexed(
         name0,
         b.self_package,
@@ -311,12 +293,8 @@ pub fn lowerPathCall(
 
     const shapes = try buildArgShapes(b, args, ast_arg_names);
     defer b.allocator.free(shapes);
-    // An argument written with an EXPLICIT type-argument list carries
-    // programmer-stated types the raw shape pass cannot see
-    // (`pick(emptyList<Int>())` — the call-return record instantiates
-    // `List<Int>`). Derive exactly those args so the emission pick judges
-    // the same evidence the derivation passes did; anything else keeps the
-    // raw shape (cost and behavior unchanged).
+    // An argument with an explicit type-argument list carries stated types the
+    // raw shape pass cannot see, so derive exactly those args.
     var explicit_shape_owned: [8]?ir.TypeRef = @splat(null);
     defer for (&explicit_shape_owned) |*t| {
         if (t.*) |*owned| owned.deinit(b.allocator);
@@ -325,13 +303,8 @@ pub fn lowerPathCall(
         if (i >= explicit_shape_owned.len) break;
         if (sh.ty != null) continue;
         if (a.* != .Call) continue;
-        // A stdlib collection FACTORY names its own result head, and for a
-        // bare call that head is often the only evidence there is. Without
-        // it `combine(listOf(this, other)) { … }` inside a `Flow<T>`
-        // extension gave its first argument no type at all, the binary
-        // extension `Flow<T1>.combine(flow, transform)` was not disproved,
-        // and the enclosing receiver bound it — passing the list itself as
-        // `flow`, which then failed collecting a `List`.
+    // A stdlib collection factory names its own result head, often the only
+    // evidence a bare call has; without it a wrong overload survives unrefuted.
         if (a.Call.type_args.len == 0) {
             if (a.Call.callee.* != .Path or a.Call.callee.Path.segments.len != 1) continue;
             const head = factoryResultHead(a.Call.callee.Path.segments[0].name) orelse continue;
@@ -340,10 +313,8 @@ pub fn lowerPathCall(
             continue;
         }
         if (try staticCallReturnTypeRef(b, a)) |t| {
-            // Only a FULLY CONCRETE record is disproof-grade: a derivation
-            // still carrying a bare type parameter anywhere (`Core<E>(...)`
-            // inside the declaring class) names the wrong scope's parameter
-            // and refuted every applicable overload of `atomic(...)`.
+            // Only a fully concrete record is disproof-grade: a derivation still
+            // carrying a bare type parameter names the wrong scope's parameter.
             var concrete = blk: {
                 const th = typeHead(std.mem.trimEnd(u8, t.name, "?"));
                 if (bareTypeParamHead(th) or ir.parseClassTypeParamIdentity(th) != null) break :blk false;
@@ -374,11 +345,9 @@ pub fn lowerPathCall(
         owned_type_param_bounds orelse &.{},
     );
     ctx.nonlocal_return_lambda = inline_call.argLambdaHasNonlocalReturn(args) or blk: {
-        // A spliced forwarder passes the original lambda along as a
-        // parameter Path (`synchronized(lock, block)` inside another
-        // inline wrapper): follow the splice's lambda-argument map so a
-        // non-local `return` in the ORIGINAL literal still pins the
-        // static inline resolution.
+        // A spliced forwarder passes the original lambda along as a parameter
+        // Path, so follow the splice's lambda-argument map and let a non-local
+        // `return` in the original literal still pin the inline resolution.
         for (args) |*a| {
             if (a.* != .Path or a.Path.segments.len != 1) continue;
             const lam = b.inlineLambdaFor(a.Path.segments[0].name) orelse continue;
@@ -400,18 +369,15 @@ pub fn lowerPathCall(
         last_arg_lambda,
         ctx,
     );
-    // Eager audit: where typeck recorded a pick for this call site,
-    // compare it against the engine's answer. Audit-only — behavior
-    // flips seam by seam once disagreement is at zero.
+    // Compare the engine's answer against typeck's recorded pick. Audit only.
     if (eagerAuditOn() and runtime.envOnce("KLIO_EAGER_HITS") != null) {
         std.debug.print("[EAGER-PROBE] '{s}' f{d}:{d}-{d} map={}\n", .{ name0, segments[0].span.file.int(), segments[0].span.start, segments[0].span.end, b.module.eager_calls != null });
     }
     var res_final = res;
     if (b.module.eagerCallTarget(segments[0].span)) |eager_fid| eager: {
-        // A pick that resolves the call back to the ENCLOSING declaration
-        // while the lazy engine chose otherwise is distrusted: stdlib
-        // overload families delegate to same-name siblings, and a
-        // mis-picked self-target recurses forever.
+    // A pick resolving the call back to the enclosing declaration while the lazy
+    // engine chose otherwise is distrusted: stdlib overload families delegate to
+    // same-name siblings, and a mis-picked self-target recurses forever.
         if (b.self_decl_span) |sds| {
             const ec = &(b.module.eager_calls.?);
             if (ec.get(segments[0].span)) |decl| {
@@ -422,10 +388,8 @@ pub fn lowerPathCall(
                 }
             }
         }
-        // Consumption: the typeck-decided target is type-derived and
-        // overload-precise where the lazy engine is shape-based; prefer
-        // it. `target_final` pins the pick against runtime value-typed
-        // re-picks, matching a cast-disambiguated call.
+    // The typeck pick is type-derived and overload-precise where the lazy engine
+    // is shape-based. `target_final` pins it against runtime value-typed re-picks.
         if (res.target == null or res.target.?.int() != eager_fid.int()) {
             res_final.target = eager_fid;
             res_final.target_final = true;
@@ -448,12 +412,9 @@ pub fn lowerPathCall(
     defer b.allocator.free(res_final.candidate_set);
     const was_cast = cast_pick != null and res_final.target != null and cast_pick.?.int() == res_final.target.?.int();
 
-    // Kotlin ranks an implicit receiver's FUNCTION-TYPED property — the
-    // invoke convention — above an outer-scope top-level function:
-    // `with(Host()) { handler() }` calls the Host property's lambda even
-    // when a top-level `handler()` exists. The static engine ranks
-    // functions only, so a top-level pick with such a peer re-routes to
-    // the member-or-global walk, whose runtime tail prefers the member.
+    // Kotlin ranks an implicit receiver's function-typed property, through the
+    // invoke convention, above an outer-scope top-level function. The static
+    // engine ranks functions only, so such a pick re-routes to the walk.
     if (res_final.target != null and !was_cast) peer: {
         const tgt = res_final.target.?;
         const tf = b.module.funcById(tgt) orelse break :peer;
@@ -465,8 +426,8 @@ pub fn lowerPathCall(
             const h = mh orelse continue;
             const ph = propTypeHeadOn(b, typeHead(std.mem.trimEnd(u8, h, "?")), name0) orelse continue;
             // Function-typed property heads register as `FunctionN` from a
-            // lowered ref or the `<function>` placeholder from an AST
-            // function-type annotation; only the former proves an arity.
+            // lowered ref or `<function>` from an AST annotation; only the
+            // former proves an arity.
             if (std.mem.startsWith(u8, ph, "Function")) {
                 const n = std.fmt.parseInt(usize, ph["Function".len..], 10) catch continue;
                 if (n != args.len) continue;
@@ -476,10 +437,9 @@ pub fn lowerPathCall(
         }
     }
 
-    // A known stdlib host-intrinsic global (alias) whose user overloads do not
-    // apply to this call still resolves to the intrinsic global. In a receiver
-    // context, bind it directly — no class declares the name as a member, so a
-    // `this.<name>` redispatch would invoke the receiver itself.
+    // A host-intrinsic global whose user overloads do not apply still resolves to
+    // the intrinsic. Bind it directly in a receiver context: no class declares
+    // the name, so a `this.<name>` redispatch would invoke the receiver itself.
     if (res_final.target == null and !shadowed_by_class and inReceiverContext(b) and
         ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0) and
         !extensionCandidateFitsArity(b, name0, args.len) and
@@ -488,10 +448,8 @@ pub fn lowerPathCall(
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
     }
 
-    // KLIO_BARE_TRACE=<name>: print the static resolution for a bare call —
-    // which overload bound (or that none did), the emit form, and the
-    // receiver context the decision saw. The static complement of
-    // KLIO_MISS_TRACE.
+    // `KLIO_BARE_TRACE=<name>`: print the static resolution for a bare call,
+    // the static complement of `KLIO_MISS_TRACE`.
     if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
         if (std.mem.eql(u8, w, name0) and res_final.target == null) {
             std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={} known_none={} at=f{d}:{d}\n", .{
@@ -506,12 +464,9 @@ pub fn lowerPathCall(
             });
         }
     }
-    // A TYPE-DISPATCHED overload set the index deferred to runtime must
-    // reach an emit form whose runtime tail re-ranks by value types.
-    // Falling through to the bare-name value read handed the call to the
-    // global lookup's first-wins pick — the deprecated 9-param
-    // ActualParagraph sibling ran with a TextOverflow in its Boolean
-    // `ellipsis` slot.
+    // A type-dispatched overload set deferred to runtime must reach an emit form
+    // whose tail re-ranks by value types; a bare-name value read would take the
+    // global lookup's first-wins pick.
     if (res_final.target == null and !shadowed_by_class and
         indexDeferReason(index_res) == .type_overload)
     {
@@ -520,14 +475,9 @@ pub fn lowerPathCall(
             return try emitMemberOrGlobal(b, expr, first_cand, false);
         }
     }
-    // RESOLUTION PARITY for spliced receiver-lambda regions: a PLAIN
-    // top-level pick may be shadowed by the subject's members/extensions
-    // (the framed route's runtime walk would rank them first — static
-    // `sort()` inside `toTypedArray().apply { }` bound a wrong top-level
-    // where Array.sort must win). Defer those to the member-first walk.
-    // An EXTENSION pick stands: it is receiver-compatible evidence the
-    // walk can only weaken (`putAll(this@toMap)` must keep the
-    // Iterable-pairs extension, not fall to the member `putAll(Map)`).
+    // In a spliced receiver-lambda region a plain top-level pick may be shadowed
+    // by the subject's members, which the framed route's walk ranks first. An
+    // extension pick stands: receiver-compatible evidence the walk can only weaken.
     if (inline_call.rfsEnabled() and b.encl_tower_depth > 0 and
         res_final.target != null and !nameHasReifiedInlineCandidate(name0))
     plain_defer: {
@@ -572,12 +522,9 @@ pub fn lowerPathCall(
             }
         }
         if (!shadowed_by_class) {
-            // Constructors do not yet occupy a `resolveCall` candidate slot,
-            // but their classifier scope tier is shared with callables. A
-            // nearer class constructs immediately; a nearer function commits;
-            // only an equal-tier constructor/factory family needs the
-            // class-carrying runtime comparison. An explicit argument cast
-            // already disambiguated the factory overload.
+            // Constructors occupy no `resolveCall` candidate slot but share the
+            // classifier scope tier. A nearer class constructs, a nearer function
+            // commits, and only an equal-tier family needs the runtime comparison.
             if (class_competes and !was_cast) {
                 const caller_pkg = b.module.packageOfFile(
                     segments[0].span.file,
@@ -597,22 +544,15 @@ pub fn lowerPathCall(
                 try recordAmbiguousCall(b, name0, segments[0].span, index_res);
             }
             // A target in a package the caller cannot see is an unresolved
-            // reference (kotlinc rejects the call); the diagnostic fails the
-            // program before it runs.
+            // reference; the diagnostic fails the program before it runs.
             _ = try recordOutOfScopeCall(b, name0, segments[0].span, target, index_res);
-            // A per-file import alias (`import ... unsafeFlow as flow`)
-            // resolves through the symbol index to a target the NAME-keyed
-            // inline table cannot see — it holds declared names only. When
-            // that committed target is an inline header stub, emitting the
-            // call would enter a bodyless frame at runtime; splice its
-            // registered AST by id instead.
+            // A per-file import alias resolves to a target the name-keyed inline
+            // table cannot see; when that target is an inline header stub, splice
+            // its registered AST by id rather than enter a bodyless frame.
             if (b.module.funcById(target)) |tfi| {
-                // Alias calls only (`import ... unsafeFlow as flow` spells
-                // `flow`): when the call-site name matches the declared name,
-                // the NAME-keyed inline path already made its splice-or-defer
-                // decision and forcing a second splice here re-lowers bodies
-                // in foreign file scopes (a compose body's package-private
-                // reference failed at its splice site).
+                // Alias calls only: on a matching name the name-keyed inline path
+                // already decided, and a second splice re-lowers bodies in
+                // foreign file scopes.
                 if (tfi.is_inline and !tfi.hasBody() and !std.mem.eql(u8, name0, tfi.name)) {
                     if (inline_state.inlineAstById(target.int())) |inline_ast| {
                         inline_state.ensureInlineBody(inline_ast);
@@ -635,8 +575,8 @@ pub fn lowerPathCall(
                 }
             }
             return switch (res_final.emit_form) {
-                // A finalized pick is as definitive as a cast pick: the
-                // runtime's value-typed overload re-pick must not override it.
+                // A finalized pick is as definitive as a cast pick; the runtime's
+                // value-typed re-pick must not override it.
                 .Call => try emitCall(b, expr, target, was_cast or res_final.target_final),
                 .CallMember => try emitCallMember(b, expr, target, was_cast),
                 .CallMemberOrGlobal => try emitMemberOrGlobal(b, expr, target, was_cast),
@@ -648,14 +588,9 @@ pub fn lowerPathCall(
     return null;
 }
 
-/// The receiver-context bits `resolveCall` folds into its emit-form decision,
-/// read once from the builder. Shared by the live path and the audit shadow so
-/// both query `resolveCall` identically.
-/// The active inline splice's receiver head, for a name the spliced body
-/// does NOT bind itself. A spliced inline function's own parameter shadows
-/// its receiver's extensions exactly as it does before splicing — `mp`'s
-/// `crossinline transform` against `Flw.transform` — so a name the splice
-/// substituted keeps resolving as that parameter.
+/// The active inline splice's receiver head, for a name the spliced body does
+/// not bind itself. A spliced function's own parameter shadows its receiver's
+/// extensions exactly as it does before splicing.
 fn spliceRecvForName(b: *const FuncBuilder, name0: []const u8) ?[]const u8 {
     if (b.resolve(name0) != null or b.knowsOuter(name0)) return null;
     if (b.inlineLambdaFor(name0) != null) return null;
@@ -684,32 +619,10 @@ pub fn resolveCtxFor(
         .has_type_args = ast_type_args.len != 0,
         .has_composer = b.resolve("$composer") != null,
         .cast_pick = cast_pick,
-        // Inside an inline SPLICE the frame's own `recv_ty` is the CALLER's,
-        // so a spliced extension body would resolve its bare calls with no
-        // receiver at all and lose its own receiver's extensions
-        // (`serializer(type)` inside `SerializersModule.serializer()` bound
-        // the module-less overload). The splice channel carries the spliced
-        // declaration's receiver; consult it only when the frame has none.
-        // During an ACTIVE splice the spliced body's bare calls resolve
-        // against the spliced declaration's OWN receiver, ahead of the
-        // frame's `recv_ty` — which is the CALLER's. A receiver-bearing
-        // caller (an inline fn spliced into an EXTENSION function) would
-        // otherwise shadow the splice receiver and a bare extension call in
-        // the spliced body (`transform { }` = `Flow.unsafeTransform` inside
-        // `Flow.map`, spliced into `List<T>.ext`) would resolve against the
-        // caller's receiver and miss. Mirrors `bareStaticRecvHead`: this
-        // narrow, then the splice receiver, then the frame's own.
-        // During an ACTIVE splice the frame's own `recv_ty` is the CALLER's
-        // (the inline body is hygienic). When the caller is itself a
-        // receiver-bearing function (an inline fn spliced into an EXTENSION
-        // function), that caller receiver would shadow the spliced
-        // declaration's own receiver and a bare extension call in the body
-        // (`transform { }` = `Flow.unsafeTransform` inside `Flow.map`,
-        // spliced into `List<T>.ext`) would resolve against the wrong
-        // receiver and miss. Prefer the splice receiver over the caller's,
-        // mirroring `bareStaticRecvHead`; `spliceRecvForName`'s local gate
-        // cannot serve here because the collided name (`transform`) is also
-        // a bound param, so consult the splice receiver directly.
+        // During an active splice the frame's `recv_ty` is the caller's, since
+        // the inline body is hygienic, and a receiver-bearing caller would shadow
+        // the spliced declaration's own receiver. Order, mirroring
+        // `bareStaticRecvHead`: `thisNarrow`, splice receiver, frame's own.
         .recv_ty = blk_recv: {
             const chosen = b.thisNarrow() orelse
                 (if (b.spliceHintActive() and b.recvTy() != null) b.spliceRecvTy() else b.recvTy()) orelse
@@ -739,18 +652,16 @@ pub fn resolveCtxFor(
     };
 }
 
-/// A lambda/thunk body's receiver scope is complete when its
-/// implicit-receiver TOWER enumerates every level and each entry's class is
-/// free of the outer-receiver escapes (enclosing-class instances, companion
-/// pairing) with a complete hierarchy shadow set — the same tests the
-/// plain-method owner path applies, per tower entry.
+/// A lambda or thunk body's receiver scope is complete when its implicit-receiver
+/// tower enumerates every level and each entry's class is free of outer-receiver
+/// escapes with a complete hierarchy shadow set.
 fn towerScopeComplete(b: *FuncBuilder) bool {
     const items = b.implicit_receiver_tower.items;
     if (items.len == 0) return false;
     for (items) |entry| {
         var head = std.mem.trimEnd(u8, entry.head, "?");
-        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
-        const cid = (if (std.mem.indexOfScalar(u8, head, '.') != null)
+        if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+        const cid = (if (std.mem.findScalar(u8, head, '.') != null)
             b.module.classIdByFqn(head)
         else
             b.module.uniqueClassIdBySimpleName(typeHead(head))) orelse return false;
@@ -821,9 +732,9 @@ pub fn allNull(names: []const ?[]const u8) bool {
     return true;
 }
 
-/// Resolve an own private method against the complete predeclared overload
-/// set. Private members cannot be overridden, so a unique applicability winner
-/// is a direct target even when its declaration appears after the caller.
+/// Resolve an own private method against the complete predeclared overload set.
+/// Private members cannot be overridden, so a unique applicability winner is a
+/// direct target even when declared after the caller.
 pub fn resolvePrivateMemberCall(
     b: *FuncBuilder,
     name: []const u8,
@@ -865,30 +776,19 @@ pub fn lowerImplicitThisCall(
     if (segments.len != 1) return null;
     const name0 = segments[0].name;
     if (b.resolve(name0) != null or b.knowsOuter(name0) or !b.hasOwnMember(name0)) return null;
-    // A call written with EXPLICIT type arguments cannot be answered by an own
-    // member that declares no type parameters, so that member does not shadow
-    // the same-named top-level function. androidx.collection's own test
-    // declares `@Test fun emptyObjectIntMap()` and calls the imported
-    // `fun <K> emptyObjectIntMap()` inside it; routing through implicit-this
-    // dispatch bound the enclosing method and recursed until the eval depth
-    // blew. Declining here returns the call to the normal resolution path,
-    // which is what the same call in initializer position always took.
+    // A call with explicit type arguments cannot be answered by an own member
+    // declaring none, so that member does not shadow the top-level function.
     if (ast_type_args.len != 0 and !b.ownMemberAcceptsTypeArgs(name0)) return null;
-    // E4: when the eager channel committed this call to a PLAIN top-level
-    // function, the same-named own member does not shadow it — kotlin
-    // scoping resolved the other way, and the record gate now checks the
-    // full declared+inherited member surface, so a surviving record means
-    // no member (own or inherited) shadows. The redirect stands where the
-    // channel is silent or names a method.
+    // Where the eager channel committed this call to a plain top-level function,
+    // the same-named own member does not shadow it; the gate checks the full
+    // declared and inherited member surface.
     if (b.module.eagerCallTarget(segments[0].span)) |efid| {
         if (b.module.funcById(efid)) |ef| {
             if (ef.kind == .plain) return null;
         }
     }
-    // A same-named member that cannot bind this call's arity (a 0-arg
-    // `requireNotNull()` for a 1-arg `requireNotNull(x)`) does not shadow the
-    // top-level function: defer to the global-resolution path instead of
-    // emitting a `this.<member>` call that can't dispatch.
+    // A same-named member that cannot bind this call's arity does not shadow the
+    // top-level function, so defer rather than emit an undispatchable call.
     if (!b.ownMemberApplicable(name0, args.len)) return null;
     if (ownMemberRejectsLambdas(b, name0, args)) return null;
     const this_reg0 = b.resolve("this") orelse return null;
@@ -903,10 +803,9 @@ pub fn lowerImplicitThisCall(
     else
         null;
 
-    // Broad-collection mask: a trailing lambda bound to this member's
-    // function-typed parameter whose declared type is `Iterable`/`Collection`
-    // marks the lambda's matching params broad, so `it + x` over a runtime
-    // `Set` yields a `List` (the declared, not runtime, receiver type).
+    // A trailing lambda bound to an `Iterable`/`Collection`-declared parameter
+    // marks the lambda's matching params broad, so `it + x` over a runtime `Set`
+    // yields a `List`, the declared receiver type.
     const itc_broad: ?[]u32 = blk: {
         const fid = member_lambda_fid orelse break :blk null;
         const f = b.module.funcById(fid) orelse break :blk null;
@@ -925,11 +824,9 @@ pub fn lowerImplicitThisCall(
     );
     if (private_resolution.dispatch == .direct and ast_type_args.len == 0) {
         const fid = private_resolution.target.?;
-        // Reserve the receiver slot first, then lower the arguments into a
-        // contiguous run immediately after it. `lowerArgRun` reserves every
-        // argument slot before lowering any argument, so an argument's own
-        // scratch registers can never clobber an already-lowered slot (a bug
-        // the previous hand-rolled loop had, dropping local-variable args).
+        // Reserve the receiver slot first, then lower arguments into a contiguous
+        // run after it. `lowerArgRun` reserves every argument slot before lowering
+        // any, so scratch registers cannot clobber an already-lowered slot.
         const args_start = b.allocReg();
         b.pending_arg_broad_masks = itc_broad;
         if (b.module.funcById(fid)) |pf| {
@@ -985,12 +882,9 @@ pub fn lowerImplicitThisCall(
         } });
         return dst;
     }
-    // A member the receiver type PROVABLY declares wins over any same-named
-    // top-level in Kotlin's scope order, so a resolved target commits
-    // statically here — direct for final/private, a virtual slot otherwise.
-    // Only an UNPROVEN member keeps the OrGlobal fallback below (a
-    // non-callable property, an arity miss the runtime resolves to the
-    // global). `KLIO_ITC_MEMBER=0` disables for single-binary A/B.
+    // A member the receiver type provably declares wins over any same-named
+    // top-level in Kotlin's scope order: direct for final or private, a virtual
+    // slot otherwise. Only an unproven member keeps the OrGlobal fallback.
     const itc_gate = runtime.envOnce("KLIO_ITC_MEMBER") orelse "1";
     const itc_on = blk: {
         if (std.mem.eql(u8, itc_gate, "0")) break :blk false;
@@ -1003,16 +897,14 @@ pub fn lowerImplicitThisCall(
     };
     if (itc_on) attempt: {
         const head_name = bareStaticRecvHead(b) orelse b.ownerClass() orelse break :attempt;
-        // A same-named FUNCTION-TYPED property on the receiver is an
-        // invoke-convention peer the member resolver cannot rank (it ranks
-        // functions only): `class C(val f: (A) -> T) { fun f(vararg s: A) =
-        // f(s) }` binds the PROPERTY's invoke in Kotlin when the member's
-        // vararg refuses the array. Leave such calls to the runtime walk.
+    // A same-named function-typed property is an invoke-convention peer the
+    // member resolver cannot rank, and Kotlin binds its invoke when the member's
+    // vararg refuses the array, so leave such calls to the runtime walk.
         if (b.module.registry.class_prop_type_heads.get(.{ .a = typeHead(head_name), .b = name0 })) |ph| {
             if (std.mem.startsWith(u8, ph, "Function")) break :attempt;
         }
         {
-            const guard_cid = if (std.mem.indexOfScalar(u8, head_name, '.') != null)
+            const guard_cid = if (std.mem.findScalar(u8, head_name, '.') != null)
                 b.module.classIdByFqn(head_name)
             else
                 b.module.classIdIndexed(typeHead(head_name), b.self_package, segments[0].span.file) orelse
@@ -1036,7 +928,7 @@ pub fn lowerImplicitThisCall(
                 if (std.mem.eql(u8, typeHead(declared.name), head_name)) break :blk declared;
             }
             const head_fqn = blk2: {
-                if (std.mem.indexOfScalar(u8, head_name, '.') != null) break :blk2 head_name;
+                if (std.mem.findScalar(u8, head_name, '.') != null) break :blk2 head_name;
                 const cid = b.module.classIdIndexed(head_name, b.self_package, segments[0].span.file) orelse
                     b.module.classId(head_name) orelse break :attempt;
                 if (cid.int() >= b.module.classes.items.len) break :attempt;
@@ -1106,9 +998,8 @@ pub fn lowerImplicitThisCall(
         const trailing = &args[args.len - 1];
         b.recordLambdaArgArity(trailing.span(), shape.value_arity);
         if (shape.receiver_head) |recv| {
-            // An UNINSTANTIATED declared head (a type param or a class
-            // param's identity mangle) must not clobber an instantiated
-            // record another resolution pass already made for this slot.
+            // An uninstantiated declared head (a type param or a class param's
+            // identity mangle) must not clobber an instantiated record.
             const uninstantiated = bareTypeParamHead(recv) or
                 ir.parseClassTypeParamIdentity(recv) != null;
             if (!(uninstantiated and b.lambdaArgRecv(trailing.span()) != null)) {
@@ -1135,14 +1026,10 @@ pub fn lowerImplicitThisCall(
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
-    // When a same-named top-level function exists, the own member may be a
-    // non-callable *property* (`val allStatusCodes = allStatusCodes()`),
-    // which kotlinc skips for a call — emit the OrGlobal form so member
-    // dispatch still wins when callable but a miss falls through to the
-    // function instead of erroring. The same applies when the name is a
-    // known top-level stdlib function (a host intrinsic, absent from
-    // `funcsBySimpleName`): a `@Test fun listOfNotNull()` method calling the
-    // top-level `listOfNotNull(...)` must fall through on the arity miss.
+    // With a same-named top-level function in play, the own member may be a
+    // non-callable property or miss on arity, both of which kotlinc skips for a
+    // call, so OrGlobal lets member dispatch win when callable and fall through
+    // otherwise. Same for a host intrinsic absent from `funcsBySimpleName`.
     if (b.module.hasBareCallCandidate(name0, segments[0].span.file) or
         ir.isAliasName(name0))
     {
@@ -1184,12 +1071,9 @@ pub fn lowerUnresolvedBareCall(
     static_ext: ?FuncId,
 ) Allocator.Error!?Reg {
     const name0 = callee.Path.segments[0].name;
-    // Inside its own inline splice, a bare call of the SPLICED FUNCTION'S
-    // name resolves through the receiver walk — kotlinc binds the
-    // receiver's member (`ClosedRange.contains` inside the ranges
-    // `contains` body), never the enclosing extension itself. Keeping the
-    // self hint re-enters the splice at the global tier whenever every
-    // receiver probe misses, which is an unconditional recursion.
+    // Inside its own inline splice, a bare call of the spliced function's name
+    // binds the receiver's member, never the enclosing extension; keeping the
+    // self hint re-enters the splice on every receiver miss.
     var ext_hint = static_ext;
     if (ext_hint) |hint| {
         if (b.currentInlineDecl()) |decl| {
@@ -1215,13 +1099,9 @@ pub fn lowerUnresolvedBareCall(
         } });
         return dst;
     }
-    // A stdlib container creator (`emptyList<String>()`) called with type
-    // args inside a method body. The name is a host-intrinsic global, never
-    // a class member, so the runtime `this.<name>()` redispatch the general
-    // receiver-context path would emit cannot apply — and that path drops
-    // the type args, losing the element head the value needs for receiver
-    // proofs. Bind the global value directly and carry the type args so the
-    // creation-site stamp (`runtime.attachDeclaredElemTypes`) runs.
+    // A stdlib container creator called with type args inside a method body is a
+    // host-intrinsic global, never a class member, and the receiver-context path
+    // drops the type args, so bind the global directly and carry them.
     if (ast_type_args.len != 0 and emptyContainerCreatorArity(name0) != 0 and
         b.module.funcId(name0) == null and !anyReceiverClassDeclares(b, name0))
     {
@@ -1243,23 +1123,14 @@ pub fn lowerUnresolvedBareCall(
         } });
         return dst;
     }
-    // Outside any receiver context no member can serve the call (kotlinc
-    // rejects resolving a bare call against a caller's receiver), and
-    // `funcId == null` here means the overload tier has no candidates
-    // either — the callee is a static global value.
+    // Outside any receiver context no member can serve the call, and
+    // `funcId == null` here means the overload tier has no candidates either.
     if (!inReceiverContext(b)) {
-        // A name with no local, no capture, no global candidate, no
-        // classifier, and no top-level property is PROVABLY unresolved
-        // here — kotlinc rejects it (`fun probe(`this`: Box) { show() }`
-        // has no receiver for `show`). Restricted to PACKAGE-LESS files
-        // (the user-script shape): pack sources lower in stages where a
-        // sibling classifier or a native binding is not yet visible
-        // (`PathBuilder`, `__skia_c_draw_text2` false-fired), and a
-        // runtime side module resolves against a wider universe. A named
-        // import of the leaf also defeats provability: an intrinsic-only
-        // function (`kotlin.concurrent.thread`) has a host impl but no
-        // declaration, so the candidate probe cannot see it — the
-        // runtime global universe serves the call.
+        // A name with no local, capture, global candidate, classifier, or
+        // top-level property is provably unresolved and kotlinc rejects it.
+        // Package-less files only: pack sources lower in stages where a sibling
+        // classifier is not yet visible. A named import of the leaf also defeats
+        // provability, since an intrinsic-only function has no declaration.
         const file0 = callee.Path.segments[0].span.file;
         if (!b.module.anon_side and b.module.packageOfFile(file0) == null and
             b.resolve(name0) == null and !b.knowsOuter(name0) and
@@ -1294,11 +1165,9 @@ pub fn lowerUnresolvedBareCall(
         } });
         return dst;
     }
-    // A known top-level stdlib function (`listOfNotNull`, `buildList`,
-    // `compareBy`, …) that no class declares as a member is never a member of
-    // the implicit receiver. Bind the global directly: routing it through
-    // `CallMemberOrGlobal` would let the member/extension probe treat it as an
-    // extension on `this` and prepend the receiver into its varargs.
+    // A known top-level stdlib function no class declares is never a member of
+    // the implicit receiver, and `CallMemberOrGlobal` would let the extension
+    // probe prepend the receiver into its varargs.
     if (ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0) and
         !extensionCandidateFitsArity(b, name0, args.len))
     {
@@ -1320,26 +1189,18 @@ pub fn lowerUnresolvedBareCall(
         } });
         return dst0;
     }
-    // When `this` is bound locally (the frame's own receiver param — a
-    // top-level/member extension's receiver, not an outer closure capture),
-    // pass it as the explicit innermost receiver. A `recordCapture("this")`
-    // here is wrong: a non-closure extension function has no capture frame,
-    // so the capture slot is empty and the bare member misses its own
-    // receiver. This is the `is JobSupport -> invokeOnCompletionInternal(…)`
-    // shape — a bare member call on the extension's smart-cast receiver.
-    // The only `this` in scope is an ordinary user parameter named `this`:
-    // no implicit receiver exists, so the bare name binds a global or is an
-    // unresolved reference at runtime — never a member of the parameter.
+    // When `this` is the frame's own receiver param rather than an outer closure
+    // capture, pass it explicitly: a non-closure extension has no capture frame,
+    // so `recordCapture("this")` would leave the slot empty. Where the only
+    // `this` is an ordinary parameter of that name, the bare name binds a global.
     if (b.this_is_plain_param and b.recvTy() == null and b.ownerClass() == null and
         !b.capturesThisSlot())
     {
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
     }
-    // A runtime-relowered body calling a LOCAL FN captured under its
-    // MANGLED overload name (`Composition$ovl0`): route through the
-    // captured value. The CMG name walk cannot see frame captures, so it
-    // fell to a same-named classifier — the pack's `interface Composition`
-    // instead of the test's local `@Composable fun Composition`.
+    // A relowered body calling a local fn captured under its mangled overload
+    // name routes through the captured value; the CMG name walk cannot see frame
+    // captures and would fall to a same-named classifier.
     {
         var ovl_i: usize = 0;
         while (ovl_i < 4) : (ovl_i += 1) {
@@ -1350,13 +1211,9 @@ pub fn lowerUnresolvedBareCall(
             }
         }
     }
-    // A bare call in a receiver context is usually a MEMBER call written
-    // without `this.` — measured, the names reaching here are `isEmpty`,
-    // `get`, `contains`, `append`, not top-level functions. When the implicit
-    // receiver's head names a class, the member has the same static answer the
-    // explicit-receiver path computes. The receiver itself may be a CAPTURE
-    // rather than a bound parameter, which is the case at most of these sites,
-    // so materialise it through the closure's slot before asking.
+    // A bare call in a receiver context is usually a member call written without
+    // `this.`, with the same static answer the explicit-receiver path computes.
+    // The receiver may be a capture, so materialise it before asking.
     if (runtime.envOnce("KLIO_CHAN")) |w| {
         if (std.mem.eql(u8, w, name0)) {
             std.debug.print("[chan] {s} narrow={?s} hint_active={} hint={?s} splice_recv={?s} recv_ty={?s} owner={?s} lam_splice={} this_decl={?s} head={?s}\n", .{
@@ -1375,7 +1232,7 @@ pub fn lowerUnresolvedBareCall(
     }
     if (bareStaticRecvHead(b)) |head_name| bare_member: {
         const head_fqn = blk: {
-            if (std.mem.indexOfScalar(u8, head_name, '.') != null) break :blk head_name;
+            if (std.mem.findScalar(u8, head_name, '.') != null) break :blk head_name;
             const cid = b.module.classIdIndexed(head_name, b.self_package, callee.Path.segments[0].span.file) orelse
                 b.module.classId(head_name) orelse {
                 if (runtime.envOnce("KLIO_BAREARM") != null)
@@ -1385,25 +1242,19 @@ pub fn lowerUnresolvedBareCall(
             if (cid.int() >= b.module.classes.items.len) break :bare_member;
             break :blk b.module.classes.items[cid.int()].fqn;
         };
-        // The head's type ARGUMENTS are usually absent here, and that is fine
-        // for this arm: the scorer already ranks a bare head, and refusing one
-        // rules out every bare call in a generic body — which is most of them.
-        // Prefer the enclosing declaration's own receiver type when it names
-        // this head, since that one carries the arguments.
+        // The head's type arguments are usually absent, which is fine: refusing a
+        // bare head would rule out every bare call in a generic body. Prefer the
+        // enclosing declaration's receiver type when it names this head.
         var owned_recv_ty: ?TypeRef = null;
         defer if (owned_recv_ty) |*t| t.deinit(b.allocator);
         const recv_ty = blk: {
             // Inside a splice the enclosing declaration's receiver is the
-            // CALLER's, not the spliced body's. Use the spliced declaration's
-            // own receiver type, which carries the type arguments an overload
-            // set that differs by element type needs.
+            // caller's, so use the spliced declaration's own, which carries the
+            // type arguments.
             if (b.spliceHintActive()) {
-                // The window's ACTUAL receiver record wins when its head
-                // is (or extends) the declared one: `List<List<String>>`
-                // carries the instantiation the declared `Collection<T>`
-                // quotes as the callee's own parameter — and that
-                // parameter NAME can capture into an inner callee's
-                // same-named one.
+                // The window's actual receiver record wins when its head is or
+                // extends the declared one, since it carries the instantiation
+                // the declared type quotes as the callee's own parameter.
                 if (b.spliceRecvTyRef()) |art| {
                     const ah = typeHead(std.mem.trimEnd(u8, art.name, "?"));
                     const fits = std.mem.eql(u8, ah, head_name) or fit: {
@@ -1458,17 +1309,9 @@ pub fn lowerUnresolvedBareCall(
             },
             .deferred, .none => {},
         }
-        // No member serves it. Kotlin tries this receiver's EXTENSIONS before
-        // moving outwards, so ask for them here rather than deferring the
-        // whole walk: `plus(element)` written inside `Iterable<T>.plusElement`
-        // is an extension on the body's own receiver, and leaving it dynamic
-        // is what makes that body pick the concatenating overload at run time.
-        // An applicable-but-DEFERRED member blocks the static extension
-        // commit exactly as on the explicit-receiver path: a member the
-        // receiver declares beats every extension in Kotlin, and committing
-        // the extension here bound `Iterable.contains`'s own smart-cast
-        // `contains(element)` back to itself once bound refutation pruned
-        // the candidate tie down to it.
+        // Kotlin tries this receiver's extensions before moving outwards, so ask
+        // here rather than defer the whole walk. An applicable but deferred
+        // member blocks the static extension commit, as on the explicit path.
         member_call_mod.ext_route_tag = "lowerUnresolvedBareCall:18047";
         if (bare_member != .deferred) if (try lowerResolvedExtensionCall(
             b,
@@ -1482,22 +1325,20 @@ pub fn lowerUnresolvedBareCall(
             orEmitAudit(b, "unresolved_bare_call", "Call/bare-extension", name0);
             return reg;
         };
-        // Kotlin then tries the OUTER implicit receivers, innermost first.
-        // An extension serving an outer tower entry commits statically with
-        // its receiver bound through the entry's `this@<label>` slot — the
-        // same capture channel an explicit `this@drop` reference lowers
-        // through — so the call needs no runtime receiver walk. Entries
-        // without a reachable label stay dynamic.
+        // Kotlin then tries the outer implicit receivers, innermost first. An
+        // extension serving a tower entry commits statically with its receiver
+        // bound through the entry's `this@<label>` slot; entries without a
+        // reachable label stay dynamic.
         if (bare_member != .deferred and
             !std.mem.eql(u8, runtime.envOnce("KLIO_TOWER_EMIT") orelse "1", "0"))
         {
-            const inner_tail = if (std.mem.lastIndexOfScalar(u8, head_name, '.')) |i|
+            const inner_tail = if (std.mem.findScalarLast(u8, head_name, '.')) |i|
                 head_name[i + 1 ..]
             else
                 head_name;
             for (b.implicit_receiver_tower.items) |entry| {
                 const lbl = entry.label orelse continue;
-                const entry_tail = if (std.mem.lastIndexOfScalar(u8, entry.head, '.')) |i|
+                const entry_tail = if (std.mem.findScalarLast(u8, entry.head, '.')) |i|
                     entry.head[i + 1 ..]
                 else
                     entry.head;
@@ -1507,17 +1348,15 @@ pub fn lowerUnresolvedBareCall(
                 if (b.resolve(slot) == null and !b.knowsOuter(slot) and
                     !decl_mod.isLowerAnonCapture(slot)) continue;
                 const outer_fqn = blk2: {
-                    if (std.mem.indexOfScalar(u8, entry.head, '.') != null) break :blk2 entry.head;
+                    if (std.mem.findScalar(u8, entry.head, '.') != null) break :blk2 entry.head;
                     const cid = b.module.classIdIndexed(entry.head, b.self_package, callee.Path.segments[0].span.file) orelse
                         b.module.classId(entry.head) orelse break :blk2 entry.head;
                     if (cid.int() >= b.module.classes.items.len) break :blk2 entry.head;
                     break :blk2 b.module.classes.items[cid.int()].fqn;
                 };
                 const outer_ty = TypeRef{ .name = outer_fqn, .nullable = false, .args = &.{} };
-                // A member the outer receiver declares beats every extension
-                // at its own level. An applicable (even unproven) member
-                // keeps the call dynamic AND stops the walk: this level owns
-                // the call.
+                // A member the outer receiver declares beats every extension at
+                // its own level, so it keeps the call dynamic and stops the walk.
                 if (b.module.classIdByFqn(outer_fqn) orelse b.module.classId(entry_tail)) |ocid| {
                     var outer_shapes = try buildStaticReturnArgShapes(b, args, ast_arg_names);
                     defer outer_shapes.deinit(b.allocator);
@@ -1553,7 +1392,7 @@ pub fn lowerUnresolvedBareCall(
                 if (span.active_map) |m| {
                     if (m.getChecked(cs.file)) |sf| {
                         const lc = sf.lineCol(cs.start);
-                        const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                        const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
                         break :blk2 std.fmt.bufPrint(&loc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
                     }
                 }
@@ -1568,12 +1407,8 @@ pub fn lowerUnresolvedBareCall(
             }
         }
     }
-    // A call written with EXPLICIT type arguments cannot be answered by a
-    // same-named own member that declares none, so the deferred member-first
-    // form would bind the wrong target: androidx.collection's own
-    // `@Test fun emptyObjectIntMap()` calling the imported
-    // `fun <K> emptyObjectIntMap()` bound itself and recursed until the eval
-    // depth blew. Commit the top-level function instead.
+    // A call with explicit type arguments cannot be answered by a same-named own
+    // member declaring none, so commit the top-level function.
     if (ast_type_args.len != 0 and !b.ownMemberAcceptsTypeArgs(name0)) {
         if (b.module.funcId(name0)) |gid| {
             if (b.module.funcById(gid)) |gf| {
@@ -1602,35 +1437,22 @@ pub fn lowerUnresolvedBareCall(
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
-    // No committed target, but a trailing lambda's expected shape still has
-    // a static answer: read the per-arg lambda arities from the same-name
-    // overload that hosts it at this arity, so a `T.() -> R` handler drops
-    // its synthetic `it` here too (`launch { … }` deferred inside a
-    // receiver context) and `it` resolves to the enclosing lambda's.
+    // A trailing lambda's expected shape still has a static answer with no
+    // committed target: read the per-arg arities from the same-name overload
+    // hosting it at this arity, so a `T.() -> R` handler drops its synthetic `it`.
     const bare_arity: ?[]const i16 = blk: {
         if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
             if (overloadHostingTrailingLambda(b, name0, args.len)) |fid| {
                 if (b.module.funcById(fid)) |f| {
-                    // The receiver offset depends on the candidate's own
-                    // shape: a top-level fn has no leading `this`, and a
-                    // blanket offset misaligned every arity (the trailing
-                    // `() -> T` block read past the params, kept its
-                    // synthetic `it`, and shadowed the enclosing one).
+                    // The receiver offset depends on the candidate's own shape:
+                    // a top-level fn has no leading `this`.
                     const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-                    // The arity alone is not the whole lambda shape: a
-                    // `T.() -> R` parameter also owns the block's `this`.
-                    // Without the receiver record the block lowers
-                    // receiverless and its bare `this` captures the
-                    // ENCLOSING instance — `SnapshotStateMap.mutate`'s
-                    // `withCurrent { this }` returned the outer map instead
-                    // of the bound record. Record ONLY when the pick came
-                    // from the owner-scoped member walk (it is absent from
-                    // the top-level name index): a member's signature is
-                    // scope-proven, while a top-level namesake pick is
-                    // declaration-order heuristic and a wrong receiver
-                    // stamp OVERRIDES the correct shape other sources
-                    // supply (a same-name `g`/`group` twin re-shaped the
-                    // SlotTable builder blocks and shifted every binding).
+                    // A `T.() -> R` parameter also owns the block's `this`, and
+                    // without the receiver record the block lowers receiverless
+                    // and captures the enclosing instance. Recorded only for an
+                    // owner-scoped member pick, whose signature is scope-proven;
+                    // a top-level namesake pick is declaration-order heuristic
+                    // and a wrong stamp overrides correct shapes from elsewhere.
                     const member_pick = blk2: {
                         const tl = b.module.func_name_index.get(name0) orelse break :blk2 true;
                         for (tl.items) |tfid| {
@@ -1638,14 +1460,9 @@ pub fn lowerUnresolvedBareCall(
                         }
                         break :blk2 true;
                     };
-                    // A SINGLE-candidate top-level pick is equally
-                    // scope-proven: there is no namesake whose shape the
-                    // stamp could override, and skipping it strands a
-                    // receiver lambda's `this` on the creation-time
-                    // lexical receiver — `createTestResult { launch {…} }`
-                    // bound the runner to the OUTER TestScope, whose
-                    // dispatcher queues onto the very scheduler only the
-                    // runner pumps, deadlocking every `runTest`.
+                    // A single-candidate top-level pick is equally scope-proven,
+                    // and skipping it strands a receiver lambda's `this` on the
+                    // creation-time lexical receiver.
                     const single_toplevel = blk2: {
                         const tl = b.module.func_name_index.get(name0) orelse break :blk2 false;
                         break :blk2 tl.items.len == 1 and tl.items[0] == fid;
@@ -1658,19 +1475,11 @@ pub fn lowerUnresolvedBareCall(
         }
         break :blk null;
     };
-    // Lambda params still type from the RESOLVED extension hint on the
-    // deferred form: `all { it.isWhitespace() }` inside `isBlank` defers
-    // (the lazy-relower scope cannot prove the member-shadow negative),
-    // but `kotlin.text.all`'s `predicate: (Char) -> Boolean` is the
-    // engine's committed candidate, so `it` is Char exactly as on the
-    // static path. Only the resolved hint is trusted — the
-    // trailing-lambda namesake pick above stays arity/receiver-only (a
-    // wrong namesake type stamp is worse than none).
-    // A return-variant family discriminates by the trailing lambda's
-    // derived return even when the resolution declined outright: the
-    // picked fid rides the deferred CMG as a PINNED global leg — the
-    // runtime re-rank runs the first-declared variant otherwise (the
-    // Double sumOf, 3.0 where kotlinc prints 3).
+    // Lambda params still type from the resolved extension hint on the deferred
+    // form, so `it` gets the committed candidate's declared parameter type. Only
+    // the resolved hint is trusted; the namesake pick above stays arity- and
+    // receiver-only. A return-variant family still discriminates by the trailing
+    // lambda's derived return, riding the deferred CMG as a pinned global leg.
     var ext_hint_final = false;
     if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
         const pcands = try b.module.bareCallCandidates(b.allocator, name0, callee.Path.segments[0].span.file);
@@ -1687,10 +1496,8 @@ pub fn lowerUnresolvedBareCall(
         const off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] unresolvedBare fn={s}\n", .{f.name});
-        // The IMPLICIT receiver (the enclosing extension's declared
-        // receiver, args included) instantiates the slot — `sumOf
-        // { it.size.toLong() }` inside Array.flatten binds T2 :=
-        // Array<out T>, so `it` types and the body binds statically.
+        // The implicit receiver, the enclosing extension's declared receiver with
+        // its arguments, instantiates the slot.
         const recv_ptr: ?*const ir.TypeRef = if (off == 1)
             (if (bare_recv_ref) |*r| substitutionRecv(b, r) else null)
         else
@@ -1806,12 +1613,10 @@ pub fn lowerCompanionShortcut(
     return null;
 }
 
-/// Package-qualified constructor call: the dotted callee (`app.sub.Widget()`)
-/// names a class by its fully-qualified name. Rewrite it to a bare constructor
-/// call on the class's simple name so the ordinary class-name path constructs
-/// it — otherwise the member fallback reads the package head as a field of the
-/// implicit receiver. Only fires when the head is genuinely a package (not a
-/// local/captured/enclosing-member in scope) and the FQN names a class.
+/// Package-qualified constructor call: the dotted callee names a class by FQN.
+/// Rewritten to a bare constructor call so the class-name path constructs it,
+/// since the member fallback would read the package head as a field of the
+/// implicit receiver. Fires only when the head is genuinely a package.
 pub fn lowerFqnCtorCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
     const callee = expr.Call.callee;
     const fqn = (try collectDottedFqn(b.allocator, callee)) orelse return null;
@@ -1821,14 +1626,12 @@ pub fn lowerFqnCtorCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg
     const cid = b.module.classIdByFqn(fqn) orelse return null; // FQN is not a class
     const head = firstSegment(fqn);
     // The head must be a real package the reference qualifies through, not a
-    // name that resolves in scope (which would be a member/local access).
+    // name that resolves in scope.
     if (!headIsPackage(b, head)) return null;
     if (b.resolve(head) != null or b.knowsOuter(head) or b.hasEnclosingMember(head)) return null;
     if (b.module.classId(head) != null) return null; // head names a class: nested-class path handles it
-    // Construct the EXACT class the FQN names. Rewriting to the bare simple
-    // name and re-lowering would re-resolve it by simple name and pick the
-    // first same-named class from another package (`gapbuffer.SlotTable` vs
-    // `linkbuffer.SlotTable`) — the package qualifier must decide.
+    // Construct the exact class the FQN names: re-lowering a bare simple name
+    // would pick the first same-named class from another package.
     const args = expr.Call.args;
     const ast_arg_names = expr.Call.arg_names;
     const ctor_arity = try ctorArgFnArities(b, cid, args, ast_arg_names);
@@ -1875,21 +1678,16 @@ pub fn lowerFqnFlattenCall(
     {
         const want = args.len;
         const cands = b.module.funcsBySimpleName(tail);
-        // A fully-qualified callee binds the one declaration whose FQN
-        // matches exactly. It must never fall back to a same-tail-named
-        // function in another package (a user `println` cannot answer a
-        // `kotlin.io.println` call) — when no lowered declaration owns the
-        // FQN the call belongs to global/intrinsic resolution, so decline
-        // the flatten and let `lowerFqnGlobalCall` load it by FQN.
+        // A fully-qualified callee binds the one declaration whose FQN matches
+        // exactly, never a same-tail-named function in another package; with no
+        // such declaration, `lowerFqnGlobalCall` loads it by FQN.
         var pick: ?FuncId = null;
         var fqn_arity_matches: usize = 0;
         for (cands) |fid| {
             const f = b.module.funcById(fid) orelse continue;
             if (std.mem.eql(u8, f.fqn, fqn) and f.params.len == want) {
-                // A vararg declaration's param count is not an exact arity
-                // (`remember(vararg keys, calc)` at 4 params ties the
-                // 1-key fixed overload); Kotlin prefers the fixed-arity
-                // declaration, so only those count as exact here.
+                // A vararg declaration's param count is not an exact arity, and
+                // Kotlin prefers the fixed-arity declaration.
                 var has_vararg = false;
                 for (f.params) |p| {
                     if (p.is_vararg) {
@@ -1902,14 +1700,9 @@ pub fn lowerFqnFlattenCall(
                 fqn_arity_matches += 1;
             }
         }
-        // A UNIQUE FQN+arity match is THE target, so the call is EXACT —
-        // the runtime overload re-pick ranks across every same-simple-name
-        // candidate in the program, and a user fn with a more specific
-        // parameter type would hijack the qualified call (a user
-        // `synchronized(lock: Lock, block)` delegating to
-        // `kotlin.synchronized` re-picked back to ITSELF and recursed).
-        // Same-arity FQN overloads stay ambiguous here and fall to the
-        // shape-checked arm below.
+        // A unique FQN-plus-arity match is the target, so mark the call exact:
+        // the runtime re-pick ranks across every same-simple-name candidate and a
+        // user fn with a more specific parameter type would hijack it.
         if (fqn_arity_matches == 1) {
             const func_id = pick.?;
             const run = try lowerArgRun(b, args);
@@ -1943,20 +1736,16 @@ pub fn lowerFqnGlobalCall(
     defer b.allocator.free(fqn);
     const head = firstSegment(fqn);
     const head_is_real_pkg = isPkgRoot(head);
-    // A fully-qualified property access followed by a member call
-    // (`kotlin.math.PI.toFloat()`): the prefix names a top-level property, so
-    // the call is a member call on that property's value, not a global
-    // function whose FQN is the whole dotted path. Decline and let the
-    // member-call fallback lower the property load + `CallMember`.
-    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
+    // A fully-qualified property access followed by a member call is a member
+    // call on that property's value, not a global whose FQN is the whole dotted
+    // path, so let the member-call fallback lower the load plus `CallMember`.
+    if (std.mem.findScalarLast(u8, fqn, '.')) |dot| {
         const prefix = fqn[0..dot];
         const prefix_name = rsplitLast(prefix, '.');
-        // A single-segment prefix that scope binds first (a local, an own or
-        // enclosing member, a receiver's member, the smart-cast `this`'s
-        // member) is that binding, not the same-named top-level property,
-        // whose qualified name equals its simple name in the default package:
-        // `items.sum()` inside `is Wrapper ->` read the global `items`.
-        if (std.mem.indexOfScalar(u8, prefix, '.') == null and !head_is_real_pkg) {
+        // A single-segment prefix that scope binds first is that binding, not the
+        // same-named top-level property, whose qualified name equals its simple
+        // name in the default package.
+        if (std.mem.findScalar(u8, prefix, '.') == null and !head_is_real_pkg) {
             const pfile = exprSpan(callee).file;
             if (b.resolve(prefix) != null or b.knowsOuter(prefix) or b.hasOwnMember(prefix) or
                 b.hasEnclosingMember(prefix) or narrowedThisDeclares(b, prefix, pfile) or
@@ -1965,10 +1754,8 @@ pub fn lowerFqnGlobalCall(
                 return null;
             }
         }
-        // The suspend-intrinsic property has no registry row of its own; a
-        // qualified call through it (`kotlin.coroutines.coroutineContext
-        // .cancel()`) is a member call on the property's value exactly like
-        // the registered-property case below.
+        // The suspend-intrinsic property has no registry row, but a qualified call
+        // through it is a member call on its value like the registered case below.
         const intrinsic_prop = std.mem.eql(u8, prefix, "kotlin.coroutines.coroutineContext");
         if (b.module.topLevelPropFqn(prefix_name) orelse
             (if (intrinsic_prop) @as(?[]const u8, prefix) else null)) |pfqn|
@@ -2007,13 +1794,9 @@ pub fn lowerFqnGlobalCall(
         (head_is_real_pkg or !isTopLevelProp(head)) and
         (head_is_real_pkg or b.resolve("this") == null))
     {
-        // An exact-FQN name can cover a whole OVERLOAD SET
-        // (`kotlin.test.assertTrue` is (Boolean, String?) AND (String?,
-        // () -> Boolean)); the runtime value load binds the first by
-        // declaration order regardless of the call's arguments. With the
-        // arguments in hand, bind the UNIQUE overload whose declared
-        // signature the argument shapes fit; only an undecidable tie keeps
-        // the value-call fallback.
+        // An exact FQN can cover a whole overload set, and the runtime value load
+        // binds the first by declaration order. With the arguments in hand, bind
+        // the unique overload they fit; a tie keeps the value-call fallback.
         {
             const last = rsplitLast(fqn, '.');
             const shapes = try buildArgShapes(b, args, ast_arg_names);
@@ -2069,8 +1852,8 @@ pub fn lowerFqnGlobalCall(
 }
 
 /// Whether `fid` can take `want` positional args: at least the required
-/// (non-defaulted, non-vararg) count, at most the declared total unless a
-/// vararg absorbs the excess.
+/// (non-defaulted, non-vararg) count, at most the declared total unless a vararg
+/// absorbs the excess.
 fn fqnCallArityFits(b: *FuncBuilder, fid: FuncId, want: usize) bool {
     const arity = b.module.decl_user_arity.get(fid.int()) orelse return false;
     if (want < arity.required) return false;

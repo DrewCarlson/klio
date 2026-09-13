@@ -24,31 +24,24 @@ const simpleTypeHead = type_probe_mod.simpleTypeHead;
 const probe_mod = @import("probe.zig");
 const eagerLambdaRecvHead = probe_mod.eagerLambdaRecvHead;
 
-/// Sibling-arg reified inference: when an argument of a resolved call is
-/// itself a bare 0-arg call to a single-type-param fn with no type args
-/// (`enumEntries()`), and a SIBLING argument bound to the same declared
-/// type variable statically names an enum (`EmptyEnum.entries`,
-/// `EmptyEnum.values().toList()`), the enum solves the nested call's
-/// reified argument. Records the solution keyed by the nested call's AST
-/// node; `emitCall` consumes it when that node lowers with no type args
-/// of its own.
-/// `::name` in a slot whose DECLARED function type solves the referenced
-/// fn's single reified type parameter (`val empty: () -> EnumEntries<E> =
-/// ::enumEntries`): the reference lowers as a zero-arg closure over the
-/// call with the solved type argument stamped — a plain function value
-/// carries no type args, so invoking it later would lose the reification.
-/// AST synthesized from the MODULE allocator (lambda bodies are
-/// runtime-read).
-/// Eta-expand a bare `::localExt` reference into
-/// `{ p0..pN -> localExt(p0..pN) }`: the synthesized bare call resolves
-/// the local extension through the ordinary local-ext machinery (its
-/// receiver supplied by the enclosing `this`), and the closure carries
-/// the value-parameter arity the reference's use site applies.
+/// Sibling-arg reified inference: when an argument of a resolved call is itself a
+/// bare 0-arg call to a single-type-param fn with no type args, and a sibling
+/// argument bound to the same declared type variable statically names an enum,
+/// that enum solves the nested call's reified argument. Recorded by the nested
+/// call's AST node; `emitCall` consumes it when that node lowers with no type args.
+/// `::name` in a slot whose declared function type solves the referenced fn's
+/// single reified type parameter lowers as a zero-arg closure over the call with
+/// the solved type argument stamped, since a plain function value carries no type
+/// args and would lose the reification. The synthesized AST comes from the module
+/// allocator, lambda bodies being read at runtime.
+/// A bare `::localExt` eta-expands into `{ p0..pN -> localExt(p0..pN) }`: the
+/// synthesized bare call resolves the local extension through the ordinary
+/// machinery, its receiver supplied by the enclosing `this`, and the closure
+/// carries the value-parameter arity the use site applies.
 pub fn localExtRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
-    // Value-parameter count: the declaring builder recorded the local fn's
-    // positional params; inside a nested lambda builder that record is not
-    // inherited, so the use site's expected callable arity (the
-    // function-typed parameter slot the reference fills) supplies it.
+    // The declaring builder recorded the local fn's positional params, but a
+    // nested lambda builder does not inherit that record, so the use site's
+    // expected callable arity supplies it.
     const n: usize = blk: {
         if (b.localExtFnArity(name)) |a| break :blk @intCast(a);
         if (b.localFnParamTys(name)) |tys| break :blk tys.len;
@@ -93,15 +86,14 @@ pub fn localExtRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Alloc
     return try lowerExpr(b, boxed);
 }
 
-/// A callable reference used as a function type that differs from the
-/// target's signature — fewer parameters through defaults or a vararg, or
-/// a result coerced to Unit — is an adapted reference: a distinct callable
-/// per adaptation, equal to any other adaptation of the same kind of the
-/// same target. Lower it as a forwarding lambda of the expected arity,
-/// keyed by target and shape; a reference whose shape matches keeps the
+/// A callable reference used as a function type differing from the target's
+/// signature, through defaults, a vararg, or a result coerced to Unit, is an
+/// adapted reference: a distinct callable per adaptation, equal to any other
+/// adaptation of the same kind of the same target. Lowered as a forwarding lambda
+/// of the expected arity, keyed by target and shape; a matching shape keeps the
 /// plain function value.
-/// The expected parameter type heads at a reference site (`Int|String`),
-/// interned for the instruction; null when the site has no function type.
+/// `refExpectedParamHeads` interns the expected parameter type heads at a
+/// reference site; null when the site has no function type.
 pub fn expectedHeadsConst(b: *FuncBuilder) Allocator.Error!?ConstId {
     const types = b.pending_ref_lambda_param_types orelse return null;
     var buf: std.ArrayList(u8) = .empty;
@@ -113,8 +105,8 @@ pub fn expectedHeadsConst(b: *FuncBuilder) Allocator.Error!?ConstId {
     return try b.module.internConst(b.allocator, .{ .String = try b.allocator.dupe(u8, buf.items) });
 }
 
-/// Whether the expected type head at a vararg parameter's position is an
-/// array (`(Array<String>) -> Unit` takes the vararg as written).
+/// Whether the expected type head at a vararg parameter's position is an array,
+/// which takes the vararg as written.
 fn isArrayHead(head: []const u8) bool {
     return std.mem.eql(u8, head, "Array") or std.mem.endsWith(u8, head, "Array");
 }
@@ -132,8 +124,8 @@ pub fn isVarargIntrinsicName(name: []const u8) bool {
     return false;
 }
 
-/// `{ p0 -> arrayOf(*p0) }`: the reference's single slot is the array a
-/// vararg intrinsic would otherwise wrap again.
+/// `{ p0 -> arrayOf(*p0) }`: the reference's single slot is the array a vararg
+/// intrinsic would otherwise wrap again.
 pub fn varargIntrinsicRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
     const slot_is_array = blk: {
         if (b.pending_ref_lambda_param_types) |types| {
@@ -181,9 +173,9 @@ pub fn varargIntrinsicRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span
     return try lowerExpr(b, boxed);
 }
 
-/// `{ p0, … -> value.localExt(p0, …) }` for a bound reference to a local
-/// extension function; the arity is the expected function type's, else the
-/// local's declared parameter count.
+/// `{ p0, … -> value.localExt(p0, …) }` for a bound reference to a local extension
+/// function; the arity is the expected function type's, else the local's declared
+/// parameter count.
 pub fn boundLocalExtRefClosure(b: *FuncBuilder, receiver: *const Expr, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
     const n: usize = if (b.pending_lambda_arity >= 0)
         @intCast(b.pending_lambda_arity)
@@ -229,10 +221,9 @@ pub fn isArrayCtorRefName(name: []const u8) bool {
     return std.mem.endsWith(u8, name, "Array") and isPrimitiveTypeName(name[0 .. name.len - "Array".len]);
 }
 
-/// `{ p0, p1 -> Array(p0, p1) }` for `::Array` (or `{ p0 -> IntArray(p0) }`
-/// for a size-only reference): the arity is the expected function type's,
-/// else the (size, init) form for `Array` and the size form for a
-/// primitive array.
+/// `{ p0, p1 -> Array(p0, p1) }` for `::Array`, or `{ p0 -> IntArray(p0) }` for a
+/// size-only reference; the arity is the expected function type's, else the
+/// (size, init) form for `Array` and the size form for a primitive array.
 pub fn arrayCtorRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allocator.Error!?Reg {
     const n: usize = if (b.pending_lambda_arity >= 0)
         @intCast(b.pending_lambda_arity)
@@ -273,10 +264,10 @@ pub fn arrayCtorRefClosure(b: *FuncBuilder, name: []const u8, sp: ast.Span) Allo
     return try lowerExpr(b, boxed);
 }
 
-/// When every declaration named `name` is an extension function, the
-/// innermost implicit receiver class whose hierarchy satisfies one of
-/// their receiver types: the current extension receiver, the owner class,
-/// then each enclosing class outward. Null when none does.
+/// When every declaration named `name` is an extension function, the innermost
+/// implicit receiver class whose hierarchy satisfies one of their receiver types:
+/// the current extension receiver, the owner class, then each enclosing class
+/// outward.
 pub fn bareRefExtensionReceiverClass(b: *FuncBuilder, name: []const u8) ?[]const u8 {
     const cands = b.module.funcsBySimpleName(name);
     if (cands.len == 0) return null;
@@ -297,8 +288,8 @@ pub fn bareRefExtensionReceiverClass(b: *FuncBuilder, name: []const u8) ?[]const
     if (b.recvTy()) |rt| {
         if (Match.any(b.module, cands, rt)) return rt;
     }
-    // Receiver lambdas (`with(a) { ::ext }`) contribute their receivers,
-    // innermost first, ahead of the lexical owner chain.
+    // Receiver lambdas contribute their receivers, innermost first, ahead of the
+    // lexical owner chain.
     const tower = b.collectImplicitReceiverTower(b.allocator, eagerLambdaRecvHead(b)) catch &.{};
     defer b.allocator.free(tower);
     for (tower) |head| {
@@ -325,8 +316,8 @@ pub fn bareRefNamesOnlyExtensions(b: *const FuncBuilder, name: []const u8) bool 
     return true;
 }
 
-/// The innermost class among the owner and its enclosing classes whose
-/// hierarchy declares a member named `name`; null when none does.
+/// The innermost class among the owner and its enclosing classes whose hierarchy
+/// declares a member named `name`.
 pub fn enclosingClassDeclaringMember(b: *const FuncBuilder, name: []const u8) ?[]const u8 {
     var cur: ?[]const u8 = b.ownerClass();
     var depth: usize = 0;

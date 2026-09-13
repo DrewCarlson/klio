@@ -1,5 +1,5 @@
-//! Expression lowering tests: argument shapes, lambdas, compose ABI
-//! threading and call emission.
+//! Expression lowering tests: argument shapes, lambdas, compose ABI threading
+//! and call emission.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -1089,8 +1089,7 @@ test "unbound path in a plain body is a static global read" {
     b.terminate(.{ .Return = r });
     const func = try b.finish("f", "f", build.typeUnit());
     defer freeFunc(func);
-    // No receiver context: nothing can shadow the global, so the read
-    // is statically classified.
+    // No receiver context, so nothing can shadow the global.
     try testing.expect(func.blocks[0].insts[0] == .LoadGlobal);
 }
 
@@ -1106,8 +1105,8 @@ test "unbound path in a lambda body resolves member-vs-global at runtime" {
     b.terminate(.{ .Return = r });
     const func = try b.finish("f", "f", build.typeUnit());
     defer freeFunc(func);
-    // The lambda's bound receiver is unknowable statically; the Or form
-    // keeps the runtime member arm.
+    // The lambda's bound receiver is unknowable statically, so the Or form keeps
+    // the runtime member arm.
     try testing.expect(func.blocks[0].insts[0] == .LoadFromThisOrGlobal);
 }
 

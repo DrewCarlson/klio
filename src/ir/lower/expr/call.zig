@@ -1,5 +1,4 @@
-//! Call lowering: the entry ladder, spread and vararg packing, and the
-//! inline expansion attempts.
+//! Call lowering: the entry ladder, spread and vararg packing, inline expansion.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -108,9 +107,6 @@ const lowerResolvedMemberCall = member_call_mod.lowerResolvedMemberCall;
 const block_mod = @import("block.zig");
 const lowerBlock = block_mod.lowerBlock;
 
-// -------------------------------------------------------------------------
-// Call lowering — the long overload-resolution ladder.
-// -------------------------------------------------------------------------
 
 pub fn lastArgIsLambda(args: []const Expr) bool {
     if (args.len == 0) return false;
@@ -119,25 +115,12 @@ pub fn lastArgIsLambda(args: []const Expr) bool {
 
 /// Last `.`-separated segment of a (possibly qualified) type name.
 fn lastTypeSegment(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
 }
 
-/// Whether any same-simple-name function is an extension whose declared
-/// receiver type is compatible with the spliced receiver's type chain
-/// (`chain`, the receiver simple-name plus its supertypes). Distinguishes
-/// a bare member/extension call on the spliced receiver
-/// (`receiveNullable(...)` — applies to that receiver) from a bare call
-/// whose extension namesakes target unrelated types (`maxOf(a, b)` inside
-/// `Buffer.indexOf` — its only extension overloads are `Iterable.maxOf` /
-/// array `maxOf`, none applies to `Buffer`, so the call binds the
-/// package-level `maxOf(Int, Int)`). Only the former dispatches on the
-/// splice's bound `this`; the latter falls through to the bare-name path.
-/// A null `chain` (no receiver type narrowing available) admits any
-/// extension namesake, preserving the prior receiver-agnostic behavior.
-/// Whether any inline candidate for `name` declares a REIFIED type
-/// parameter. Such a call can only run as a SPLICE (the runtime walk
-/// cannot instantiate `T`), so no dispatch-deferring arm may claim it.
+/// Whether any inline candidate for `name` declares a reified type parameter.
+/// Such a call can only splice, so no dispatch-deferring arm may claim it.
 pub fn nameHasReifiedInlineCandidate(name: []const u8) bool {
     const cands = inline_state.candidatesForName(name) orelse return false;
     for (cands) |cf| {
@@ -168,10 +151,8 @@ pub fn lastArgIsLambdaOrAnon(args: []const Expr) bool {
     return last == .Lambda or last == .AnonFun;
 }
 
-/// Declared parameter arity of a trailing lambda/anon-fun argument, or
-/// `null` when the last argument is neither. A zero-`->` `{ … }` (its `it`
-/// injected by the parser) reports 0 — the literal declares no parameters,
-/// so overload resolution treats it as a `() -> R` handler.
+/// Declared parameter arity of a trailing lambda or anon-fun argument, null
+/// when the last argument is neither. A zero-`->` `{ … }` reports 0.
 fn trailingLambdaArity(args: []const Expr) ?usize {
     if (args.len == 0) return null;
     return switch (args[args.len - 1]) {
@@ -181,14 +162,13 @@ fn trailingLambdaArity(args: []const Expr) ?usize {
     };
 }
 
-/// The local `name` holds a value whose declared type is never invokable:
-/// a primitive/String/Unit, or a class whose complete hierarchy record
-/// declares no `invoke`. An unknown or function-typed local stays callable.
+/// The local's declared type is never invokable: a primitive, String, Unit, or
+/// a class whose complete hierarchy record declares no `invoke`.
 pub fn localValueNotInvokable(b: *FuncBuilder, name: []const u8) bool {
     const t = b.localDeclTypeRef(name) orelse return false;
     if (std.mem.startsWith(u8, t.name, "Function") or std.mem.startsWith(u8, t.name, "kotlin.Function")) return false;
     var head = std.mem.trimEnd(u8, t.name, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (std.mem.startsWith(u8, head, "kotlin.")) head = head["kotlin.".len..];
     const plain = [_][]const u8{ "Int", "Long", "Short", "Byte", "Double", "Float", "Boolean", "Char", "String", "Unit", "UInt", "ULong", "UShort", "UByte" };
     for (plain) |p| {
@@ -201,9 +181,8 @@ pub fn localValueNotInvokable(b: *FuncBuilder, name: []const u8) bool {
     return !hs.names.contains("invoke");
 }
 
-/// The receiver's statically known class resolves a member named `name`
-/// that binds these arguments (the registered member resolution proves a
-/// unique target).
+/// The receiver's statically known class resolves a unique member named `name`
+/// that binds these arguments.
 fn receiverConcreteMemberTakes(b: *FuncBuilder, receiver: *const Expr, name: []const u8, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!bool {
     const head = (try inline_call.gateReceiverHead(b, receiver)) orelse {
         if (runtime.envOnce("KLIO_INLINE_PICK")) |w| {
@@ -212,7 +191,7 @@ fn receiverConcreteMemberTakes(b: *FuncBuilder, receiver: *const Expr, name: []c
         return false;
     };
     var h = std.mem.trimEnd(u8, head, "?");
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
     const file = exprSpan(receiver).file;
     const cid = b.module.classIdIndexed(h, b.self_package, file) orelse b.module.classId(h) orelse return false;
     if (cid.int() >= b.module.classes.items.len) return false;
@@ -236,32 +215,27 @@ fn receiverConcreteMemberTakes(b: *FuncBuilder, receiver: *const Expr, name: []c
         }
     }
     // An applicable member shadows every same-named extension even when the
-    // overload set stays ambiguous for the statically known argument shapes
-    // (`matrix.map(Offset(1f, 1f))` among `map(Offset)`/`map(Rect)`/
-    // `map(MutableRect)` with the factory call's type unproven).
+    // overload set stays ambiguous for the known argument shapes.
     return res.target != null or res.applicable;
 }
 
 pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call_tail = b.call_tail;
-    // `c.TA(args)` where `TA` aliases a nested or inner class of `c`'s
-    // class constructs the aliased class: the member call takes the
-    // target's own name, which the inner-constructor route serves.
+    // `c.TA(args)` where `TA` aliases a nested or inner class of `c`'s class
+    // constructs the aliased class, which the inner-constructor route serves.
     if (expr.Call.callee.* == .Member and !expr.Call.callee.Member.safe) {
         const mn = expr.Call.callee.Member.name.name;
         if (b.module.registry.type_alias_types.get(mn)) |shape| {
             const target = shape.target.name;
-            const simple = if (std.mem.lastIndexOfScalar(u8, target, '.')) |dot| target[dot + 1 ..] else target;
+            const simple = if (std.mem.findScalarLast(u8, target, '.')) |dot| target[dot + 1 ..] else target;
             const fn_alias = if (b.module.registry.type_aliases.get(mn)) |tag| std.mem.startsWith(u8, tag, "Function") else false;
-            // Only an alias whose target is a NESTED class of some owner
-            // (an inner or nested class reached through an instance), and
-            // never one whose target name is itself an alias (a rewrite
-            // chain would loop).
+            // Only an alias onto a nested class, and never one whose target is
+            // itself an alias: a rewrite chain would loop.
             const nested_target = blk: {
                 if (b.module.registry.type_alias_types.contains(simple)) break :blk false;
                 const cid = b.module.classIdIndexed(simple, b.self_package, expr.Call.callee.Member.name.span.file) orelse break :blk false;
                 if (cid.int() >= b.module.classes.items.len) break :blk false;
-                break :blk std.mem.indexOfScalar(u8, b.module.classes.items[cid.int()].fqn, '.') != null;
+                break :blk std.mem.findScalar(u8, b.module.classes.items[cid.int()].fqn, '.') != null;
             };
             if (!std.mem.eql(u8, simple, mn) and !fn_alias and nested_target) {
                 const callee_copy = try b.allocator.create(Expr);
@@ -273,9 +247,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
     }
-    // A bare call of a delegated local (`val handler by rememberUpdatedState(f)`
-    // then `handler()`) invokes the value the delegate's `getValue` yields,
-    // never the delegate object bound under the plain name.
+    // A bare call of a delegated local invokes the value the delegate's
+    // `getValue` yields, never the delegate object bound under the plain name.
     if (expr.Call.callee.* == .Path and expr.Call.callee.Path.segments.len == 1 and expr.Call.type_args.len == 0) {
         const dn = expr.Call.callee.Path.segments[0].name;
         if (b.resolve(dn) != null or b.knowsOuter(dn) or isLowerAnonCapture(dn) or build.anonCaptureBinds(dn)) {
@@ -294,18 +267,12 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
     }
-    // The call's tail flag for everything this call lowers (an inline
-    // splice, the general path), saved and restored across nested calls.
+    // Saved and restored across nested calls.
     const prev_tail_ok = b.tail_call_ok;
     b.tail_call_ok = call_tail;
     defer b.tail_call_ok = prev_tail_ok;
-    // Sibling-arg expected type: `assertEquals(EmptyEnum.entries,
-    // enumEntries())` — a sibling argument bound to the same declared type
-    // variable statically names an enum, which solves the nested reified
-    // call's expected type. Recorded per-arg-node; the arg-lowering loops
-    // surface it as THAT argument's expected type so the nested inline
-    // splice's return-type unification (the existing reified oracle)
-    // stamps the type argument.
+    // A sibling argument bound to the same declared type variable can name an
+    // enum statically, solving a nested reified call's expected type.
     const sib_prev_site = b.sib_expected_site;
     const sib_prev_ty = b.sib_expected_ty;
     if (solveSiblingExpected(b, expr.Call.callee, expr.Call.args)) |solved| {
@@ -328,11 +295,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const call = expr.Call;
     const prev_trailing = b.setCallTrailingLambda(call.has_trailing_lambda);
     defer _ = b.setCallTrailingLambda(prev_trailing);
-    // `dep!!()` calls the value a not-null-asserted BARE NAME holds: keep
-    // the bare-name call machinery (member-vs-global walk, and with it the
-    // receiver-function-typed property arm) by unwrapping the assertion at
-    // the callee — a null value still fails at the invoke, matching the
-    // assertion's intent.
+    // `dep!!()` calls the value the bare name holds, so unwrap the assertion at
+    // the callee to keep the bare-name machinery. A null still fails at invoke.
     const callee = blk: {
         var c = call.callee;
         while (c.* == .Postfix and c.Postfix.op == .NotNull and
@@ -349,19 +313,14 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const ast_arg_names = call.arg_names;
     const ast_type_args = call.type_args;
     const is_infix = call.is_infix;
-    // Scalar bitwise infix: `a and b` / `shl` / `shr` / `ushr` / `or` /
-    // `xor` over statically-typed Int/Long (Bool for the logical trio)
-    // are Int members with intrinsic semantics; lowering them as member
-    // calls sent every bit of hot trie arithmetic through the virtual
-    // dispatch ladder with a full frame per op. Emit the BinOp the
-    // evaluator already serves. Members always outrank extensions on
-    // these final receivers, so the reduction can never shadow user code.
+    // Scalar bitwise infix on Int/Long (Bool for the logical trio) are Int
+    // members with intrinsic semantics, so emit the BinOp. Members outrank
+    // extensions on these final receivers, so no user code is shadowed.
     if (is_infix and args.len == 2 and callee.* == .Path and
         callee.Path.segments.len == 1 and ast_type_args.len == 0)
     {
-        // An infix self-call in tail position (`(this - 1) test x` in
-        // `tailrec infix fun Int.test`) is a jump: the written receiver is
-        // the leading `this` parameter.
+        // An infix self-call in tail position is a jump; the written receiver
+        // is the leading `this` parameter.
         if (call_tail) if (b.tailrecSelf()) |ts| if (std.mem.eql(u8, ts, callee.Path.segments[0].name)) {
             if (try emitTailJumpRun(b, null, args, expr.Call.arg_names)) |run| {
                 b.terminate(.{ .TailJump = .{ .args = run[0], .n_args = @intCast(run[1].int()) } });
@@ -393,22 +352,14 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return dst;
         }
     }
-    // Record each lambda argument's expected value-parameter arity by span,
-    // taken from the resolved callee's parameter types, BEFORE the args are
-    // lowered. `lowerLambda` reads it authoritatively, so a receiver lambda
-    // (`T.() -> R`, arity 0) drops its `it` no matter which emit branch lowers
-    // the argument — the per-arg `pending_lambda_arity` is set only on some
-    // paths, which is why a non-trailing receiver-lambda argument otherwise
-    // stays an `it`-lambda and its bare member calls fall through to globals.
+    // Record each lambda argument's expected value-parameter arity by span
+    // before the args lower; `lowerLambda` reads it authoritatively, so a
+    // receiver lambda drops its `it` on every emit branch.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const cnm = callee.Path.segments[0].name;
-        // A bare call to an OWN MEMBER resolves to the member, not any
-        // same-named top-level fn — and the member is absent from
-        // func_name_index, so without this branch no arity is ever
-        // recorded and a `() -> Unit` trailing lambda keeps a phantom
-        // `it` that shadows the enclosing lambda's (`mrun { println(it) }`
-        // printed null). The registered member AST, keyed by (owner,
-        // name, arity), is the signature source; positional args only.
+    // A bare call to an own member resolves to the member, which is absent from
+    // `func_name_index`. The registered member AST, keyed by (owner, name,
+    // arity), is the signature source; positional args only.
         if (b.ownerClass() != null and b.hasOwnMember(cnm)) {
             var any_named = false;
             for (ast_arg_names) |n| {
@@ -427,16 +378,11 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
         }
-        // Only when the callee name is UNAMBIGUOUS (a single same-named
-        // function): the arity then definitely matches the resolved overload.
-        // With overloads, `funcId` is a heuristic that may name the wrong one,
-        // whose arity would wrongly drop a needed `it`.
+        // Only for an unambiguous callee name. With overloads `funcId` is a
+        // heuristic that may name the wrong one and drop a needed `it`.
         const unambiguous = if (b.module.func_name_index.get(cnm)) |ids| ids.items.len == 1 else false;
-        // An APPLICABLE own member shadows the same-named top-level function
-        // in Kotlin's scope order (`private fun Json(arrays: Boolean, build:
-        // PolymorphicModuleBuilder<Any>.() -> Unit)` beside the library's
-        // `Json { … }` builder): its lambda shapes come from the member, not
-        // from the global this pre-record would commit.
+        // An applicable own member shadows the same-named top-level function in
+        // Kotlin's scope order, so its lambda shapes come from the member.
         const own_shadows = b.ownerClass() != null and b.resolve("this") != null and
             b.hasOwnMember(cnm) and b.ownFunctionApplicable(cnm, args.len) and
             !ownMemberRejectsLambdas(b, cnm, args);
@@ -445,11 +391,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         else if (unambiguous)
             b.module.funcId(cnm)
         else
-            // Ambiguous name (`withCurrent` has a `SnapshotStateList.() ->` and a
-            // `StateRecord.() ->` overload): disambiguate by the enclosing
-            // receiver type so a receiver-lambda argument's arity (0) is still
-            // recorded and its `it` dropped — otherwise its bare member reads
-            // fall through to globals.
+            // Ambiguous name: disambiguate by the enclosing receiver type so a
+            // receiver-lambda argument's arity (0) is still recorded.
             disambiguateByReceiver(b, cnm);
         if (chosen) |fid| {
             if (b.module.funcById(fid)) |f| {
@@ -466,11 +409,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, recv_off);
             }
         } else if (args.len != 0 and (args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun)) {
-            // Ambiguous name, no receiver disambiguation: when EVERY overload
-            // declares the SAME receiver head for its trailing function-typed
-            // parameter (`runTest`'s block is `TestScope.() -> Unit` in every
-            // overload), that head is safe to record — `this + dispatcher`
-            // inside the lambda then dispatches against the static type.
+            // Ambiguous with no receiver disambiguation: a receiver head common
+            // to every overload's trailing fn-typed parameter is safe to record.
             if (b.module.func_name_index.get(cnm)) |ids| {
                 var common: ?ir.TypeRef = null;
                 defer if (common) |receiver| {
@@ -523,10 +463,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // Context parameters: the stdlib `context(v..., block)` scope function
-    // and `contextOf<T>()` accessor lower to dedicated context-stack ops so
-    // implicit resolution is driven by the runtime stack, not overload
-    // resolution. Only when the name is not shadowed by a local/outer.
+    // `context(v..., block)` and `contextOf<T>()` lower to context-stack ops, so
+    // implicit resolution is driven by the runtime stack. Only when unshadowed.
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1) {
         const cname = callee.Path.segments[0].name;
         if (b.resolve(cname) == null and !b.knowsOuter(cname)) {
@@ -554,12 +492,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // Fully-positional call of a contextual function-type value:
-    // `f(c0, c1, a0)` where `f: context(C0, C1) (A0) -> R`. When the arg
-    // count matches the flattened `n_ctx + n_regular`, split the leading
-    // context args onto the context stack (`CtxCall`); the implicit form
-    // `f(a0)` (contexts from scope) has only `n_regular` args and falls
-    // through to the ordinary value-call path.
+    // Fully-positional call of a contextual function-type value: when the arg
+    // count matches the flattened `n_ctx + n_regular`, split the leading context
+    // args onto the context stack; the implicit form falls to the value path.
     if (!is_infix and callee.* == .Path and callee.Path.segments.len == 1 and ast_type_args.len == 0) {
         const cname = callee.Path.segments[0].name;
         if (b.contextFnParam(cname)) |shape| {
@@ -582,12 +517,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     } });
                     return dst;
                 }
-                // The implicit form `f(a..)`: each context argument is the
-                // innermost implicit receiver of that type when one is in
-                // scope (a spliced receiver-lambda subject such as
-                // `with(2) { f(false) }`, the enclosing `this`), else the
-                // runtime context stack (`context(...)` scopes, contextual
-                // function parameters).
+                // Implicit form: each context argument is the innermost implicit
+                // receiver of that type in scope, else the runtime context stack.
                 if (implicit) {
                     b.module.has_context_decls = true;
                     const total = shape.n_ctx + shape.n_regular;
@@ -622,10 +553,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // Scope-true callee rewrite: a bare ctor/factory head naming a mangled
-    // nested class (`Node(...)` inside its declaring class's subtree) or a
-    // renamed file-private class/typealias resolves to the mangled lift
-    // name. Locals and own members keep shadowing it (Kotlin scope order).
+    // A bare head naming a mangled nested class or a renamed file-private
+    // class/typealias resolves to the lift name; locals and own members shadow it.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const head = callee.Path.segments[0];
         if (scopeTypeRename(b, head.name, head.span.file.int())) |renamed| {
@@ -639,14 +568,10 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // A bare call to a file-private top-level function mangled per file (two
-    // files in one package each declaring the same-signature `private fun`)
-    // resolves to the calling file's mangled name. Locals / outer captures /
-    // own members still shadow it (Kotlin scope order). An applicable
-    // EXTENSION on an in-scope implicit receiver also shadows it: Kotlin
-    // resolves the implicit-receiver candidate group before any no-receiver
-    // candidate, so `Text(…)` inside `fun MockViewValidator.value()` binds
-    // the validator extension, never the file's private plain fn.
+    // A bare call to a per-file mangled private top-level function resolves to
+    // the calling file's name. Locals, outer captures, own members, and an
+    // applicable extension on an in-scope implicit receiver all shadow it:
+    // Kotlin ranks the implicit-receiver group before any no-receiver candidate.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const head = callee.Path.segments[0];
         if (build.filePrivateFuncRename(head.name, head.span.file.int())) |renamed| {
@@ -662,12 +587,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // A bare call to a companion member imported by name
-    // (`import X.Companion.member` then `member(args)`) dispatches on X's
-    // companion: rewrite the callee to the qualified `X.member` the same way a
-    // bare companion-imported name expression is rewritten, so the call reaches
-    // the companion method instead of an unresolved global. A local / captured /
-    // own-member binding of the name shadows the import (Kotlin scope order).
+    // A bare call to a name-imported companion member dispatches on the owner's
+    // companion, so rewrite the callee to `X.member`; local bindings shadow it.
     if (callee.* == .Path and callee.Path.segments.len == 1) {
         const head = callee.Path.segments[0];
         if (b.resolve(head.name) == null and !b.knowsOuter(head.name) and !b.hasOwnMember(head.name)) {
@@ -689,15 +610,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // Empty stdlib container creator (`emptyList()`, `setOf()`, `mapOf()`)
-    // typed only by its binding annotation. With no explicit creation-site
-    // type argument the runtime value cannot carry its element head, so a
-    // receiver proof (`List<String>.describe()`) cannot bind. When the
-    // tail-position expected type names the container's element/entry heads
-    // (`val xs: List<String> = emptyList()`), synthesize those heads as the
-    // call's type args so the existing creation-site path stamps
-    // `declared_elem` on the built value, exactly as an explicit
-    // `emptyList<String>()` would.
+    // An empty stdlib container creator carries no element head at run time, so
+    // pass the tail-position expected type's element or entry heads as type args
+    // and let the creation-site path stamp `declared_elem`.
     if (!is_infix and ast_type_args.len == 0 and args.len == 0 and
         callee.* == .Path and callee.Path.segments.len == 1)
     {
@@ -717,19 +632,12 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // A member call onto an inline `reified` extension (`xs.filterIsInstance<T>()`).
-    // Explicit type args or an expected type let the splice bind the
-    // reified parameters. Without either — a lambda body has no expected
-    // type, the `Json.encodeToString(user)` hook shape — a call through a
-    // companioned class name still splices; the splice itself declines
-    // when the body reads a reified parameter it cannot bind, falling
-    // back to runtime dispatch.
+    // A member call onto an inline `reified` extension. Explicit type args or an
+    // expected type let the splice bind the reified parameters.
     if (!is_infix and callee.* == .Member and !callee.Member.safe and gate: {
         if (ast_type_args.len != 0 or b.peekExpected() != null) break :gate true;
-        // A trailing-lambda call whose name has a monomorphic member-inline
-        // candidate enters regardless of receiver form — the strict pick
-        // inside re-validates everything, and a decline falls through to
-        // the ordinary member lowering.
+        // A trailing-lambda call with a monomorphic member-inline candidate
+        // enters regardless of receiver form; the strict pick inside revalidates.
         if (args.len != 0 and switch (args[args.len - 1]) {
             .Lambda, .AnonFun => true,
             else => false,
@@ -741,21 +649,12 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
         }
-        // Statement position with no type args: splice anyway when the value
-        // arguments alone bind every reified parameter (a generic-class
-        // argument like `Nodes.Draw : NodeKind<DrawModifierNode>`), so the
-        // spliced `is T` checks the real class — runtime dispatch of the
-        // inline body would read a stale/unbound `T`.
-        // EXCEPT when the receiver's own static type serves the name at
-        // this arity: kotlinc resolves members before extensions, so
-        // `pipelineCall.respond(message, typeInfo)` binds the interface
-        // member — splicing the reified two-parameter respond EXTENSION
-        // here committed the message into its HttpStatusCode parameter.
+    // Statement position with no type args: splice when the value arguments alone
+    // bind every reified parameter, unless the receiver's static type serves the
+    // name, since kotlinc resolves members before extensions.
         if (inline_call.argsBindAllReified(b.allocator, callee.Member.name.name, args, b)) {
-            // The receiver's own applicable member wins over the inline
-            // extensions, unless that member IS a reified inline function
-            // (`Json.encodeToString(value)`): the image keeps it bodiless,
-            // so only the splice honors it.
+            // The receiver's applicable member wins over the inline extensions,
+            // unless it is itself reified inline and so bodiless in the image.
             if (try receiverMemberIsReifiedInline(b, callee.Member.receiver, callee.Member.name.name, args.len)) break :gate true;
             break :gate !(try receiverStaticMemberApplies(b, callee.Member.receiver, callee.Member.name.name, args, ast_arg_names, callee.Member.name.span.file));
         }
@@ -767,17 +666,12 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }) {
         const mname = callee.Member.name.name;
         if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s} cands={d}\n", .{ mname, if (inline_state.candidatesForName(mname)) |c| c.len else 0 });
-        // A MONOMORPHIC member `inline fun` taking a lambda splices like its
-        // reified siblings — kotlinc inlines every inline fun, and the framed
-        // form pays an activation for the wrapper AND one for the lambda
-        // (`Operations.push(op) { setInt(...) }` is two frames per
-        // changelist push). The pick is strict: no type parameters, no
-        // defaults or varargs, arity matched, the declared callback shape
-        // matched against the site's lambda, owner on the receiver chain,
-        // and exactly one survivor. `KLIO_MEMBER_INLINE=0` bisects.
+    // A monomorphic member `inline fun` taking a lambda splices like its reified
+    // siblings. The pick is strict: no type parameters, no defaults or varargs,
+    // arity matched, callback shape matched, owner on the receiver chain.
         const plain_member_inline: ?*const ast.Function = blk: {
-            // `KLIO_MEMBER_INLINE`: "0" disables; a comma list allows ONLY
-            // those names; a list starting with '!' allows all BUT those.
+            // `KLIO_MEMBER_INLINE`: "0" disables; a comma list allows only those
+            // names; a list starting with '!' allows all but those.
             if (runtime.envOnce("KLIO_MEMBER_INLINE")) |sel| {
                 if (std.mem.eql(u8, sel, "0")) break :blk null;
                 if (!std.mem.eql(u8, sel, "1")) {
@@ -810,11 +704,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 if (cf.receiver_type != null) continue;
                 const owner = inline_state.inlineMemberOwner(cf) orelse continue;
                 if (cf.type_params.len != 0) continue;
-                // The OWNER must be monomorphic too: a generic class's
-                // member body (`MutableVector<T>.forEach`) casts through the
-                // class parameter, and a splice leaves `T` reading the
-                // process-global slot — unbound or stale. An owner the
-                // module cannot name declines conservatively.
+                // The owner must be monomorphic too: a generic class's member
+                // body casts through the class parameter, which a splice leaves
+                // reading a stale process-global slot.
                 const owner_cid = b.module.uniqueClassIdBySimpleName(owner) orelse
                     b.module.classIdByFqn(owner) orelse continue;
                 if (owner_cid.int() >= b.module.classes.items.len) continue;
@@ -825,11 +717,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     if (p.default != null or p.is_vararg) irregular = true;
                 }
                 if (irregular) continue;
-                // Callback-shape discrimination: same-name same-arity
-                // member-inline overloads can differ only here (Duration's
-                // LongParser vs FractionalParser `parse`). A receiver
-                // lambda matches a parameterless site block; an implicit-it
-                // site block matches a declared arity of at most one.
+                // Same-name same-arity member-inline overloads can differ only in
+                // callback shape: a receiver lambda matches a parameterless site
+                // block, an implicit-`it` block matches arity 0 or 1.
                 const decl_fn = cf.params[cf.params.len - 1].ty.function orelse continue;
                 const shape_ok = if (decl_fn.receiver != null)
                     (sl.implicit or sl.n == decl_fn.params.len)
@@ -849,16 +739,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (inlineFnAst(mname)) |f| {
                 if (f.receiver_type != null and anyReified(f.type_params)) break :blk true;
             }
-            // A reified MEMBER-inline fn is invisible to the top-level
-            // stub index: a qualified call (`CC(e, a).pfw<E> { … }`) must
-            // still splice, or the reified parameter dies at runtime. The
-            // same holds for a reified EXTENSION that the single-pick above
-            // missed because a same-named top-level overload outranked it
-            // (`SerializersModule.serializer<T>()` next to the top-level
-            // `serializer<T>()`). Only an EXPLICITLY type-argumented call
-            // qualifies on that route: without `<…>` the widened scan would
-            // pull same-named non-reified overloads (`Int.serializer()`) into
-            // a splice their call shape does not select.
+            // A reified member-inline fn is invisible to the top-level stub index
+            // and a reified extension can be outranked there, yet both must
+            // splice or the reified parameter dies. Type-argumented calls only.
             if (ast_type_args.len != 0) {
                 if (inline_state.candidatesForName(mname)) |cands| {
                     for (cands) |cf| {
@@ -881,14 +764,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const receiver = callee.Member.receiver;
             const expected = b.peekExpected();
             const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
-            // A member-inline overload set is invisible to the stub index
-            // the general resolution consults, and its receiver-blind
-            // shape pick cannot tell `visitNodes(mask: Int, block)` from
-            // the reified `visitNodes(type: NodeKind<T>, block)`. Pick
-            // here: the reified candidate whose type parameters the call
-            // can actually bind (explicit `<…>`, or inference from the
-            // value arguments) wins; otherwise leave the resolution to
-            // the general path.
+            // A member-inline overload set is invisible to the stub index, whose
+            // receiver-blind shape pick cannot separate the reified overload. The
+            // candidate whose type parameters the call can bind wins.
             var member_target: ?*const ast.Function = null;
             if (ast_type_args.len != 0) {
                 if (inline_state.candidatesForName(mname)) |cands| {
@@ -899,35 +777,27 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         if (!anyReified(cf.type_params)) continue;
                         if (inlineEvidenceRejects(b, cf, args, ast_arg_names)) continue;
                         if (cf.receiver_type) |crt| {
-                            // A reified member EXTENSION declared by an
-                            // enclosing class (`json.decodeFromString<B>(text,
-                            // mode)` against the test base's
-                            // `Json.decodeFromString`): the receiver's static
-                            // type must fit its extension receiver and the
-                            // owner must be in the enclosing hierarchy.
+                            // For a reified member extension declared by an
+                            // enclosing class, the receiver's static type must
+                            // fit its extension receiver and the owner must be
+                            // in the enclosing hierarchy.
                             const enclosing = b.ownerClass() orelse build.currentOwnerClass() orelse continue;
                             if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-x] {s}: inHier={}\n", .{ mname, inlineOwnerInEnclosingHierarchy(b, enclosing, cf) });
                             if (!inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) continue;
                             if (cf.params.len != args.len) continue;
-                            // A receiver whose static head is unknown (a
-                            // local bound from an expression-bodied helper)
-                            // still reaches the splice: its own receiver
-                            // gates decide, and the alternative is a
-                            // dynamic call that cannot honor the explicit
-                            // type arguments.
+                            // An unknown static head still reaches the splice:
+                            // its own receiver gates decide, and a dynamic call
+                            // cannot honor the explicit type arguments.
                             if (try inline_call.gateReceiverHead(b, receiver)) |head| {
                                 var h = std.mem.trimEnd(u8, head, "?");
-                                if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                                if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
                                 const want = typeHead(std.mem.trimEnd(u8, crt.name.name, "?"));
                                 if (!std.mem.eql(u8, typeHead(h), want) and !b.module.classIsOrExtends(typeHead(h), want)) continue;
                             }
                         } else {
                             if (!try memberOwnerOnReceiverChain(b, receiver, cf)) continue;
                             // A member overload that cannot take this many
-                            // arguments must not preempt a sibling that can
-                            // (`Json.decodeFromString<T>(string)` beside the
-                            // test base's `Json.decodeFromString<T>(source,
-                            // mode)`).
+                            // arguments must not preempt a sibling that can.
                             if (cf.params.len < args.len) continue;
                             var required: usize = 0;
                             for (cf.params) |*cp| {
@@ -943,35 +813,27 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (ast_type_args.len == 0) blk_mit: {
                 const cands = inline_state.candidatesForName(mname) orelse break :blk_mit;
                 if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm-n] {s}: cands={d} enc={?s}\n", .{ mname, cands.len, b.ownerClass() orelse build.currentOwnerClass() });
-                // Inference-bound reified MEMBER-inline call: the splice's
-                // runtime-enclosing parity is not established, so dispatch
-                // it as a statically-bound TYPED member call instead — the
-                // lowered instance method runs framed with its reified
-                // parameters bound from the inferred type-argument names
-                // (`c.visitNodes(Kinds.OnRe) { … }` binds `T = Lw`).
+                // Inference-bound reified member-inline call: dispatch a
+                // statically bound typed member call, which binds the reified
+                // parameters from the inferred type-argument names.
                 for (cands) |cf| {
                     if (!anyReified(cf.type_params)) continue;
-                    // Argument evidence that refutes the candidate (a `List`
-                    // argument for a `JsonTestingMode` parameter) leaves the
+                    // Argument evidence refuting the candidate leaves the
                     // receiver's own applicable member to the general path.
                     if (inlineEvidenceRejects(b, cf, args, ast_arg_names)) continue;
-                    // The receiver's own applicable MEMBER outranks a member
-                    // extension declared elsewhere (`Json.encodeToString(
-                    // serializer, value)` is Json's member, never the test
-                    // base's `encodeToString(value, mode)` extension).
+                    // The receiver's own applicable member outranks a member
+                    // extension declared elsewhere.
                     if (cf.receiver_type != null and try receiverConcreteMemberTakes(b, receiver, mname, args, ast_arg_names)) continue;
                     if (cf.receiver_type) |crt| {
-                        // A reified member EXTENSION on the receiver's static
-                        // type (`json.decodeFromString(text, mode)` against
-                        // the test base's `Json.decodeFromString`): its
-                        // owner must be in the enclosing hierarchy.
+                        // For a reified member extension on the receiver's static
+                        // type, the owner must be in the enclosing hierarchy.
                         if (inline_state.inlineMemberOwner(cf) == null) continue;
                         const enclosing = b.ownerClass() orelse build.currentOwnerClass() orelse continue;
                         if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: ext-cand owner={s} enclosing={s} inHier={}\n", .{ mname, inline_state.inlineMemberOwner(cf).?, enclosing, inlineOwnerInEnclosingHierarchy(b, enclosing, cf) });
                         if (!inlineOwnerInEnclosingHierarchy(b, enclosing, cf)) continue;
                         const head = (try inline_call.gateReceiverHead(b, receiver)) orelse continue;
                         var h = std.mem.trimEnd(u8, head, "?");
-                        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                        if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
                         const want = typeHead(std.mem.trimEnd(u8, crt.name.name, "?"));
                         if (!std.mem.eql(u8, typeHead(h), want) and !b.module.classIsOrExtends(typeHead(h), want)) continue;
                         if (cf.params.len != args.len) continue;
@@ -993,12 +855,10 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                                 break :blk cand_fid;
                             }
                         }
-                        // Instance methods are not in the simple-name index;
-                        // match by declaration span over the full table.
-                        // User-file instance methods carry no decl-span
-                        // record; identify the overload by its declared
-                        // parameter-name sequence (`type, block` vs
-                        // `mask, block`) behind the implicit `this`.
+                        // Instance methods are not in the simple-name index, so
+                        // match by declaration span; a user-file method has none,
+                        // so identify the overload by its parameter-name sequence
+                        // behind the implicit `this`.
                         var fi: u32 = 0;
                         const appended: u32 = @intCast(b.module.appendedFuncCount());
                         const base_n: u32 = @intCast(b.module.func_header_offsets.len);
@@ -1023,18 +883,15 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         }
                         break :blk null;
                     } orelse {
-                        // No registered function for the member (a pack's
-                        // reified inline member is a header stub): splice
-                        // its AST, the only form that honors it.
+                        // No registered function for the member (a pack's reified
+                        // inline member is a header stub), so splice its AST.
                         if (runtime.envOnce("KLIO_SAM_TRACE") != null) std.debug.print("[marm] {s}: fid=null -> splice\n", .{mname});
                         inline_call.splice_route_tag = "lowerCall:6578";
                         if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
                         continue;
                     };
-                    // A registered function that carries no type-parameter
-                    // record cannot bind the stamped names at runtime (the
-                    // image's header stub for a reified inline member): the
-                    // splice is the only form that honors `T` there.
+                    // A registered function with no type-parameter record cannot
+                    // bind the stamped names at runtime, leaving only the splice.
                     {
                         const tp_rec = b.module.registry.func_type_params.get(fid);
                         const n_rec: usize = if (tp_rec) |l| l.items.len else 0;
@@ -1044,22 +901,18 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                             if (try tryInlineCallWithTypeArgs(b, mname, cf, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| return r;
                         }
                     }
-                    // A REIFIED inline callee with no written type arguments
-                    // (`Json.encodeToString(origin)`) binds `T` only through the
-                    // splice: the typed member call below stamps the written
-                    // names, and with none the frame would read whatever
-                    // process-global `T` an earlier splice left behind.
+                    // A reified inline callee with no written type arguments binds
+                    // `T` only through the splice; the typed member call below
+                    // stamps written names and would otherwise read a stale one.
                     reified_splice: {
                         var any_reified = false;
                         for (cf.type_params) |*tp| {
                             if (tp.is_reified) any_reified = true;
                         }
                         if (!any_reified) break :reified_splice;
-                        // Only when the registered target IS this declaration:
-                        // `cf` was found by simple name, and a same-named inline
-                        // member of another class (`LaunchFlowBuilder.catch`
-                        // beside `Flow.catch`) must not be spliced onto this
-                        // receiver. The receiver heads decide.
+                    // Only when the registered target is this declaration: `cf`
+                    // came from a simple-name lookup, and another class's
+                    // same-named inline member must not splice onto this receiver.
                         const cf_recv: ?[]const u8 = if (cf.receiver_type) |*rt|
                             typeHead(std.mem.trimEnd(u8, rt.name.name, "?"))
                         else
@@ -1075,11 +928,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                             break :blk_same std.mem.eql(u8, typeHead(cr), mr);
                         };
                         if (!same_target) break :reified_splice;
-                        // And the CALL-SITE receiver must be that type (or a
-                        // subtype): `flow.catch { }` is not a `LaunchFlowBuilder`
-                        // call even though that class declares a reified inline
-                        // `catch`. An untyped receiver keeps the typed member
-                        // call below.
+                        // And the call-site receiver must be that type or a
+                        // subtype; an untyped receiver keeps the typed call.
                         const site_ty: ?ir.TypeRef = staticExprTypeRef(b, receiver) catch null;
                         const recv_ok = blk_recv: {
                             const mr = mf_recv orelse break :blk_recv site_ty == null;
@@ -1123,12 +973,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 std.debug.print("[pmi] {s}\n", .{mname});
             }
             inline_call.splice_route_tag = "lowerCall:6623";
-            // A receiver whose static class declares a MEMBER that binds this
-            // call outranks any extension in Kotlin's resolution order:
-            // `Json.decodeFromString(serial, source)` is Json's own
-            // `(deserializer, string)` member, never the test base's reified
-            // `Json.decodeFromString(source, mode)` extension the name-only
-            // narrowing would splice.
+            // A receiver whose static class declares a member that binds this
+            // call outranks any extension in Kotlin's resolution order.
             const member_binds = member_target == null and try receiverConcreteMemberTakes(b, receiver, mname, args, ast_arg_names);
             if (!member_binds) {
                 if (try tryInlineCallWithTypeArgs(b, mname, member_target, args, ast_arg_names, receiver, ast_type_args, exp_ptr)) |r| {
@@ -1141,12 +987,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             if (runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
                 if (std.mem.eql(u8, w, mname)) std.debug.print("[splice-bail] {s} span={}:{}\n", .{ mname, exprSpan(callee).file, exprSpan(callee).start });
             }
-            // Splice bailed: fall back to a plain member dispatch. The
-            // reified parameters then have no binding of their own, and the
-            // body reads them from the process-wide slot the splice writes —
-            // which still holds whatever an UNRELATED earlier splice left
-            // there. The call knows its own type arguments, so write them
-            // where the body looks before dispatching.
+            // Splice bailed, so dispatch plainly. The body then reads the reified
+            // parameters from the process-wide slot the splice writes, so write
+            // this call's type arguments there first.
             try storeExplicitReifiedGlobals(b, mname, ast_type_args);
             const recv = try lowerReceiver(b, receiver);
             const bail_arity: ?[]const i16 = try memberCallArgArities(b, receiver, mname, args, ast_arg_names);
@@ -1154,12 +997,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
             const nm = try b.module.internConst(b.allocator, .{ .String = mname });
             const dst = b.allocReg();
-            // An unsafe-cast receiver fixes the static type for overload
-            // resolution even on this dynamic bail: `(this as Flow<T>)
-            // .catch(action)` in the deprecated SharedFlow.catch stub must
-            // never re-bind the stub on the runtime SharedFlow receiver
-            // (kotlinc binds the general Flow.catch through the cast; the
-            // re-bind self-recursed to stack overflow).
+            // An unsafe cast's target fixes the static type for overload
+            // resolution even on this bail, so a deprecated stub cast to its
+            // supertype does not re-bind itself and self-recurse.
             const bail_declared: ?ir.ConstId = blk: {
                 if (receiver.* != .As or receiver.As.safe) break :blk null;
                 const t = argDeclTypeRef(b, receiver) orelse break :blk null;
@@ -1181,12 +1021,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // An explicit-receiver call to a NO-LAMBDA inline EXTENSION on a
-    // SCALAR receiver (`value.countOneBits()`, `mask.rotateLeft(n)`)
-    // splices exactly as kotlinc inlines it: the ladder otherwise
-    // dispatches a frame per call (193k countOneBits activations in one
-    // vpd window). Scoped to scalar heads with no member namesake
-    // anywhere in the program — a member would outrank the extension.
+    // An explicit-receiver call to a no-lambda inline extension on a scalar
+    // receiver splices as kotlinc inlines it. Scalar heads with no member
+    // namesake in the program only, since a member would outrank it.
     if (!is_infix and callee.* == .Member and !callee.Member.safe and
         ast_type_args.len == 0 and args.len <= 2 and
         inline_call.rfsEnabled() and
@@ -1205,12 +1042,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         };
         const h = typeHead(std.mem.trimEnd(u8, head, "?"));
         if (sxt) std.debug.print("[sext] {s}: head={s} in {s}\n", .{ mname, h, build.currentRealFn() orelse "-" });
-        // Member-namesake decline, hierarchy-scoped: the global
-        // `class_member_names` set is owner-blind — ANY class declaring a
-        // member of this name suppressed the splice program-wide (a pack
-        // class's `countOneBits` member kept every scalar call framed).
-        // On a scalar head only the scalar's own hierarchy can outrank
-        // the extension; when its shadow set is complete, decide by it.
+        // `class_member_names` is owner-blind, so any class declaring the name
+        // would suppress the splice program-wide; on a scalar head only the
+        // scalar's own hierarchy can outrank the extension.
         if (b.module.registry.class_member_names.contains(mname)) {
             const shadowed = blk: {
                 const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse break :blk true;
@@ -1236,13 +1070,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
             if (has_fn_or_vararg) continue;
             if (anyReified(cf.type_params)) continue;
-            // Scalar overload sets differ ONLY by parameter width
-            // (`Long.mod(Int)` vs `Long.mod(Long)`), and picking the
-            // first arity match computed `Instant.fromEpochMilliseconds`'
-            // millisecond remainder with the wrong overload. Every
-            // argument's derived head must equal the declared param head;
-            // an underivable argument declines the splice (the framed
-            // path resolves it).
+            // Scalar overload sets differ only by parameter width, so every
+            // argument's derived head must equal the declared param head.
             var args_match = true;
             for (cf.params, 0..) |*p, pi| {
                 const want = typeHead(std.mem.trimEnd(u8, p.ty.name.name, "?"));
@@ -1272,13 +1101,9 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // A qualified member-inline call whose lambda (literal or forwarded)
-    // carries a labeled return TARGETING AN OPEN INLINE SPLICE must splice:
-    // kotlinc inlines these, and the label targets a frameless spliced
-    // scope in the caller, so the dynamic member dispatch can never deliver
-    // the return (`slots.table.traverseGroupAndParents(target) {
-    // … return@apply … }` otherwise unwinds a LabeledReturn past every
-    // frame). Everything else keeps the dynamic path.
+    // A qualified member-inline call whose lambda carries a labeled return
+    // targeting an open splice must splice: the label names a frameless scope in
+    // the caller, which a dynamic dispatch cannot deliver a return to.
     if (!is_infix and callee.* == .Member and !callee.Member.safe and
         inline_call.argLambdaTargetsSplicedLabel(b, args))
     {
@@ -1287,21 +1112,17 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         const expected = b.peekExpected();
         const exp_ptr: ?*const ast.TypeRef = if (expected) |*_e| _e else null;
         if (inline_state.candidatesForName(mname)) |cands| {
-            // STRICT owner evidence only: the receiver's static type must be
-            // known and carry the candidate's owner in its hierarchy. The
-            // lenient unknown-receiver keep would splice an unrelated
-            // same-named member (`values.forEach` on a Set binding
-            // LockFreeLinkedListNode.forEach).
+            // Strict owner evidence only: a lenient unknown-receiver keep would
+            // splice an unrelated same-named member.
             const head = try inline_call.gateReceiverHead(b, receiver);
             if (head != null) {
                 for (cands) |cf| {
                     if (cf.receiver_type != null) continue;
                     const owner = inline_state.inlineMemberOwner(cf) orelse continue;
-                    // A duplicated class name is uniquified per file at
-                    // registration (`SlotTable$f356`); the inferred head
-                    // carries the source-level name, so also accept a
-                    // base-name match.
-                    const owner_base = if (std.mem.indexOf(u8, owner, "$f")) |i| owner[0..i] else owner;
+                // A duplicated class name is uniquified per file at registration
+                // (`SlotTable$f356`) while the inferred head keeps the
+                // source-level name, so accept a base-name match too.
+                    const owner_base = if (std.mem.find(u8, owner, "$f")) |i| owner[0..i] else owner;
                     if (!classIsOrExtendsHosted(b, head.?, owner) and
                         !std.mem.eql(u8, head.?, owner_base)) continue;
                     inline_call.splice_route_tag = "lowerCall:6794";
@@ -1314,15 +1135,11 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // An explicit-receiver call to a top-level inline EXTENSION whose last
-    // param is fn-typed, fed a lambda literal or a forwarded inline-lambda
-    // param (`record.withCurrent(block)`, `(firstStateRecord as
-    // StateMapStateRecord).writable(this, block)`) splices as kotlinc
-    // inlines it. The declared receiver may be a concrete head or a
-    // BOUNDED fn type param (`T : StateRecord`) the derived head extends;
-    // an unbounded `T` (the scope-function family) keeps its existing
-    // routes. A member of the head's own hierarchy outranks the extension
-    // and declines the splice; unknown heads decline.
+    // An explicit-receiver call to a top-level inline extension with an fn-typed
+    // last param fed a lambda splices. The declared receiver may be a concrete
+    // head or a bounded fn type param the derived head extends; unbounded `T` and
+    // unknown heads keep other routes, and a member of the head's own hierarchy
+    // outranks the extension.
     if (!is_infix and callee.* == .Member and !callee.Member.safe and
         ast_type_args.len == 0 and args.len >= 1 and
         !std.mem.eql(u8, runtime.envOnce("KLIO_XLE") orelse "1", "0") and
@@ -1339,12 +1156,10 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.inlineLambdaFor(last.Path.segments[0].name) != null;
         if (last.* != .Lambda and last.* != .AnonFun and !last_forwarded) break :ext_lambda;
         const cands = inline_state.candidatesForName(mname) orelse break :ext_lambda;
-        // DECLARED evidence only: an unsafe cast's target, a declared
-        // local/param type, a constructor call, or the enclosing
-        // extension's declared receiver for `this`. The general derivation
-        // chain resolves overloaded-call returns heuristically and once
-        // handed this tier `Iterable` for a Sequence expression — which
-        // spliced the EAGER `Iterable.filter` onto an infinite sequence.
+        // Declared evidence only: an unsafe cast's target, a declared local or
+        // param type, a constructor call, or the enclosing extension's receiver
+        // for `this`. The general chain resolves overloaded returns heuristically
+        // and can hand back a supertype whose eager overload misfits.
         const head0: []const u8 = blk: {
             switch (receiver.*) {
                 .As => |a| {
@@ -1416,7 +1231,7 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
 
-    // `recv?.m(args)` — null-guard the whole call.
+    // `recv?.m(args)`: null-guard the whole call.
     if (callee.* == .Member and callee.Member.safe) {
         const receiver = callee.Member.receiver;
         const name = callee.Member.name;
@@ -1434,10 +1249,8 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         try b.push(.{ .Move = .{ .dst = dst, .src = n } });
         b.terminate(.{ .Goto = join });
         b.switchTo(else_b);
-        // On this branch the receiver is proven non-null, so its declared
-        // nullability no longer disqualifies a member. Bind statically when
-        // the declaration is provable; the receiver is already in a register,
-        // so hand it over rather than let it be evaluated a second time.
+        // The receiver is proven non-null here, so declared nullability no longer
+        // disqualifies a member, and it is already in a register.
         const declared_from_expr = argDeclTypeRef(b, receiver);
         // The full static deriver, matching the plain member path.
         var inferred_ty: ?ir.TypeRef = if (declared_from_expr == null)
@@ -1463,13 +1276,10 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             },
             .deferred, .none => {},
         }
-        // The member resolver could not commit, but the ORDINARY call path
-        // has more to try — an inline splice above all. `x?.let { it.f() }`
-        // gives `it` the non-null receiver type in Kotlin; dispatching the
-        // whole thing as a runtime member call gives it none, and every
-        // member call inside the lambda then resolves by name. Rewrite the
-        // proven-non-null branch as a plain call on a temporary that HOLDS
-        // the already-lowered receiver, so nothing is evaluated twice.
+        // The ordinary call path has more to try, an inline splice above all:
+        // `x?.let { it.f() }` gives `it` the non-null receiver type in Kotlin,
+        // which a runtime member call does not. Rewrite onto a temporary holding
+        // the already-lowered receiver.
         if (declared_from_expr orelse inferred_ty) |rty| non_null_rewrite: {
             const nn_name = std.mem.trimEnd(u8, rty.name, "?");
             if (nn_name.len == 0) break :non_null_rewrite;
@@ -1518,7 +1328,7 @@ pub fn lowerCall(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         return dst;
     }
 
-    // `repeat(n) { … }` — inline-desugar to a counted loop.
+    // `repeat(n) { … }`: inline-desugar to a counted loop.
     if (!is_infix and args.len == 2 and args[1] == .Lambda and
         callee.* == .Path and callee.Path.segments.len == 1 and
         std.mem.eql(u8, callee.Path.segments[0].name, "repeat") and
@@ -1567,11 +1377,9 @@ pub fn anyReified(type_params: []const ast.TypeParam) bool {
     return false;
 }
 
-/// Number of element/entry heads a bare stdlib container creator carries
-/// (`emptyList` -> 1, `emptyMap` -> 2), or 0 when the name is not one of
-/// them. Mirrors `runtime.attachDeclaredElemTypes`'s creator sets so a
-/// binding-typed empty creation stamps the same `declared_elem`/`declared_*`
-/// fields an explicit creation-site type argument would.
+/// Number of element or entry heads a bare stdlib container creator carries
+/// (`emptyList` -> 1, `emptyMap` -> 2), 0 otherwise. Mirrors
+/// `runtime.attachDeclaredElemTypes`'s creator sets.
 pub fn emptyContainerCreatorArity(name: []const u8) u8 {
     const elem_creators = [_][]const u8{
         "listOf",      "mutableListOf", "emptyList", "arrayListOf",
@@ -1591,10 +1399,8 @@ pub fn emptyContainerCreatorArity(name: []const u8) u8 {
     return 0;
 }
 
-/// True when `name` is a concrete type head (a stdlib value type or a
-/// lowered user class) rather than an erased type-parameter name. Used to
-/// gate the binding-typed empty-container element stamp so the
-/// erased-generic-return shape (`List<T>`) is left to on-demand dispatch.
+/// True when `name` is a concrete type head rather than an erased
+/// type-parameter name. Gates the binding-typed empty-container element stamp.
 fn isConcreteTypeHead(b: *FuncBuilder, name: []const u8) bool {
     const value_type_heads = [_][]const u8{
         "Int",        "Long",     "Short",       "Byte",       "UInt",       "ULong",
@@ -1610,9 +1416,8 @@ fn isConcreteTypeHead(b: *FuncBuilder, name: []const u8) bool {
 }
 
 /// Build `want` synthetic call-site type-arg `TypeRef`s from the expected
-/// container type `exp` (`List<String>` -> `[String]`). Returns null when
-/// `exp` does not name `want` concrete (non-star, non-type-parameter) heads,
-/// so an unannotated or partially-erased binding keeps the on-demand path.
+/// container type (`List<String>` -> `[String]`). Null when it does not name
+/// `want` concrete, non-star, non-type-parameter heads.
 fn synthesizeContainerTypeArgs(
     b: *FuncBuilder,
     exp: ast.TypeRef,
@@ -1625,11 +1430,8 @@ fn synthesizeContainerTypeArgs(
         const ta = exp.type_args[i];
         if (ta.is_star) return null;
         if (ta.ty.name.name.len == 0) return null;
-        // Only a concrete head carries runtime element identity. A bare
-        // type-parameter head (`List<T>` from a generic function's declared
-        // return) is erased — stamping the parameter name would forge a
-        // proof — so that erased-generic-return shape keeps the on-demand
-        // path rather than a synthesized element type.
+        // Only a concrete head carries runtime element identity; stamping a bare
+        // type-parameter head would forge a proof, so leave it on-demand.
         if (!isConcreteTypeHead(b, ta.ty.name.name)) return null;
         out[i] = ta.ty;
     }
@@ -1674,8 +1476,8 @@ fn lowerRepeat(b: *FuncBuilder, n_arg: *const Expr, lam_arg: *const Expr) Alloca
     return b.emitConst(.Unit);
 }
 
-/// Compact a list of registers into a contiguous run, returning the start
-/// reg (or reg 0 when empty).
+/// Compact registers into a contiguous run, returning the start reg, or reg 0
+/// when empty.
 pub fn packContiguous(b: *FuncBuilder, regs: []const Reg) Allocator.Error!Reg {
     if (regs.len == 0) return Reg.from(0);
     const start = b.allocReg();
@@ -1699,9 +1501,8 @@ pub fn lowerSpreadParts(b: *FuncBuilder, args: []const Expr) Allocator.Error![]S
     return parts;
 }
 
-/// Resolve a `this` reg for a bare extension call: bound local, else a
-/// capture inside a lambda body, else null. Binds the recovered capture
-/// locally so later references reuse it.
+/// Resolve a `this` reg for a bare extension call: bound local, else a capture
+/// inside a lambda body, else null. Binds the capture so later refs reuse it.
 pub fn resolveThisForBareCall(b: *FuncBuilder) Allocator.Error!?Reg {
     return resolveThisRegKind(b, true, true);
 }
@@ -1717,11 +1518,9 @@ fn lowerCallSpread(
     args: []const Expr,
     ast_arg_names: []const ?[]const u8,
 ) Allocator.Error!Reg {
-    // `recv.method(*array)` dispatches the spread-flattened args through
-    // member resolution on the receiver, not by invoking `recv.method` as a
-    // first-class value (which a member like `split` is not). Lower the
-    // receiver and carry the method name so the evaluator routes through
-    // `callMemberNamed`.
+    // `recv.method(*array)` dispatches the flattened args through member
+    // resolution, not by invoking `recv.method` as a value, so carry the method
+    // name and route through `callMemberNamed`.
     var member_id: ?ConstId = null;
     var spread_name: ?ConstId = null;
     var spread_candidates: ?[]const FuncId = null;
@@ -1734,20 +1533,13 @@ fn lowerCallSpread(
                 break :blk try lowerReceiver(b, m.receiver);
             }
         }
-        // A bare callee naming an enclosing-class member fn
-        // (`checkContents(context, *es)` inside another member) dispatches
-        // through `this`, not as a first-class value read (a member fn is
-        // not a field, so the value path dies on `get_field`). A name that
-        // is also a known top-level fn (`maxOf(a, *rest)`) keeps the
-        // global path — the member set over-approximates.
+        // A bare callee naming an enclosing-class member fn dispatches through
+        // `this`: a member fn is not a field, so the value path dies on
+        // `get_field`. A known top-level namesake keeps the global path.
         if (callee.* == .Path and callee.Path.segments.len == 1) {
             const name = callee.Path.segments[0].name;
-            // Only a PLAIN top-level namesake keeps the global path. An
-            // EXTENSION namesake cannot answer this bare call — it needs a
-            // receiver of its own type — so it must not divert the call away
-            // from the enclosing class's member and into the value-read path
-            // below, which dies on `get_field` because a member fn is not a
-            // field.
+            // Only a plain top-level namesake keeps the global path; an extension
+            // namesake needs a receiver of its own type.
             if (b.resolve(name) == null and !b.isLocalFn(name) and b.hasEnclosingMember(name) and
                 !b.module.hasNonExtensionBareCallCandidate(name, callee.Path.segments[0].span.file))
             {
@@ -1756,11 +1548,9 @@ fn lowerCallSpread(
                     break :blk this_reg;
                 }
             }
-            // A bare global with overloads: the spread can only bind a
-            // `vararg` parameter, so pick among the vararg-bearing
-            // candidates explicitly — the generic value read below is
-            // arg-blind and can hand back a zero-arg overload, silently
-            // dropping the spread's elements.
+            // A spread can only bind a `vararg` parameter, so pick among the
+            // vararg-bearing candidates; the arg-blind value read below could
+            // hand back a zero-arg overload and drop the elements.
             if (b.resolve(name) == null and !b.knowsOuter(name) and !b.isLocalFn(name) and
                 !b.hasOwnMember(name) and
                 b.module.hasBareCallCandidate(name, callee.Path.segments[0].span.file))
@@ -1772,13 +1562,9 @@ fn lowerCallSpread(
                     b.self_package,
                     callee.Path.segments[0].span.file,
                 )) |ids| {
-                    // Every candidate an EXTENSION: the bare call binds the
-                    // implicit receiver, so it must route as a member-form
-                    // dispatch on `this` — the global-value invoke below
-                    // passes only the flattened args, and the extension's
-                    // receiver slot then swallowed the first spread element
-                    // (`constructSerializerForGivenTypeArgs(*arr)` inside a
-                    // KClass extension bound `this = IntSerializer`).
+                    // Every candidate an extension: the bare call binds the
+                    // implicit receiver, so route it as a member-form dispatch or
+                    // the receiver slot swallows the first spread element.
                     const all_ext = ids.len != 0 and blk_ext: {
                         for (ids) |fid| {
                             const f = b.module.funcById(fid) orelse break :blk_ext false;
@@ -1807,11 +1593,9 @@ fn lowerCallSpread(
                     }
                 }
                 if (b.module.funcIdForSpreadCall(name, b.ownerClass())) |fid| {
-                    // An EXTENSION picked for a bare spread call binds the
-                    // implicit receiver; invoking it as a global value passes
-                    // only the flattened args and the receiver slot swallows
-                    // the first spread element. Route it as a member-form
-                    // dispatch on `this`.
+                    // An extension binds the implicit receiver, so route it as a
+                    // member-form dispatch rather than let the receiver slot
+                    // swallow the first spread element.
                     const is_ext = blk_ext2: {
                         const f = b.module.funcById(fid) orelse break :blk_ext2 false;
                         break :blk_ext2 f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
@@ -1827,12 +1611,9 @@ fn lowerCallSpread(
                     break :blk dst;
                 }
             }
-            // No local, no global, and no recorded enclosing member: a bare
-            // call can only be a member of the implicit receiver. The
-            // smart-cast `this` inside `when (this) { is Abs -> va(*a) }` of
-            // an extension on a TYPE PARAMETER is the live shape — no static
-            // member set records `Abs.va` there, and the value read below
-            // dies on `get_field`.
+            // No local, global, or recorded enclosing member: a bare call can only
+            // be a member of the implicit receiver, and a smart-cast `this` in an
+            // extension on a type parameter records no static member set.
             if (b.resolve(name) == null and !b.knowsOuter(name) and !b.isLocalFn(name) and
                 !b.module.hasBareCallCandidate(name, callee.Path.segments[0].span.file))
             {
@@ -1860,16 +1641,9 @@ fn lowerCallSpread(
     return dst;
 }
 
-/// The general call path: inline expansion, infix, scope-fn markers, tailrec,
-/// value invocation, class constructors, member dispatch, and the long
-/// overload-selection ladder.
-/// True when the enclosing class declares a primary-ctor *property* param
-/// named `name` and also a same-named `vararg` method. In that case a bare
-/// call `name(args)` inside the class body (notably a field initializer, where
-/// the param is in scope as a local) must resolve by argument shape — the
-/// vararg method for several args, the property's `invoke` for one matching
-/// array — rather than blindly invoking the param's lambda. Routing such calls
-/// through member dispatch lets `varargShadowedFieldInvoke` make that pick.
+/// True when the enclosing class declares a primary-ctor property param named
+/// `name` and a same-named `vararg` method. A bare `name(args)` must then resolve
+/// by argument shape, so route it through member dispatch.
 pub fn ctorParamShadowsVarargMethod(b: *FuncBuilder, name: []const u8) bool {
     const owner = b.ownerClass() orelse return false;
     const cid = b.module.classId(owner) orelse return false;
@@ -1892,10 +1666,9 @@ pub fn ctorParamShadowsVarargMethod(b: *FuncBuilder, name: []const u8) bool {
     return false;
 }
 
-/// A plain function parameter is inapplicable to a trailing-lambda call when
-/// its own final value parameter is not function-typed. Inline splices retain
-/// this declaration shape through `currentInlineDecl`; the substituted lambda
-/// value alone does not carry it.
+/// A plain function parameter is inapplicable to a trailing-lambda call when its
+/// own final value parameter is not function-typed. Inline splices keep this
+/// shape through `currentInlineDecl`; the substituted lambda value does not.
 pub fn plainFnParamRejectsTrailingLambda(
     b: *const FuncBuilder,
     name: []const u8,
@@ -1914,11 +1687,9 @@ pub fn plainFnParamRejectsTrailingLambda(
     return false;
 }
 
-/// Bare-path inline expansion: splice an inline-lambda parameter's body,
-/// the reified overload an explicit `<T>` argument binds, or the resolved
-/// inline target of a bare call. Returns null when the callee is not a
-/// bare path or no splice applies, leaving the call to the normal
-/// dispatch paths.
+/// Bare-path inline expansion: splice an inline-lambda parameter's body, the
+/// reified overload an explicit `<T>` binds, or the resolved inline target of a
+/// bare call.
 pub fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -1936,18 +1707,11 @@ pub fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Erro
             return try spliceInlineLambda(b, nm, lam, args);
         }
     }
-    // A local binding of a function-typed value (a plain fn param like
-    // `body: () -> T`, a local val) shadows every top-level namesake for a
-    // bare call — the call invokes the value, never an inline splice of an
-    // unrelated extension. A NON-function-typed local does not shadow a
-    // call (the `flow`-param case), matching the bare-function path.
+    // A local binding of a function-typed value shadows every top-level namesake
+    // for a bare call. A non-function-typed local does not shadow.
     if (b.resolve(nm) != null and !b.isNonFnParam(nm)) return null;
-    // A constructible same-named class that shadows this call per the scope
-    // rules (an own-scope constructor, or no applicable same-named factory)
-    // is the Kotlin target: never splice an inline factory over it —
-    // `MutableVector(arr, size)` inside the class body binds the internal
-    // constructor, not the reified `MutableVector(size, init)` factory that
-    // happens to fit the arity.
+    // A constructible same-named class that shadows per the scope rules is the
+    // Kotlin target, so never splice an inline factory over it.
     if (try shadowedByClass(b, callee, args, ast_arg_names)) return null;
     const inline_call_shape = CallShape{
         .want = args.len,
@@ -1957,10 +1721,9 @@ pub fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Erro
         .arg0_class_literal = args.len != 0 and args[0] == .MemberRef and
             std.mem.eql(u8, args[0].MemberRef.name.name, "class"),
     };
-    // An explicit `<T>` argument binds a reified parameter, so a reified
-    // inline overload of this shape outranks a non-reified `KClass<T>`
-    // namesake (which would lower `<T>` as a constructor value instead of
-    // binding `T::class`). Splice the reified overload directly.
+    // An explicit `<T>` binds a reified parameter, so a reified inline overload
+    // outranks a non-reified `KClass<T>` namesake, which would lower `<T>` as a
+    // constructor value instead.
     if (ast_type_args.len != 0) {
         if (inline_state.reifiedInlineFnAstFor(nm, inline_call_shape)) |rf| {
             if (bareInlineNeedsSplice(b, nm, rf, args)) {
@@ -1991,14 +1754,9 @@ pub fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Erro
             const last_stmts: usize = if (args.len > 0 and args[args.len - 1] == .Lambda) args[args.len - 1].Lambda.body.stmts.len else 999;
             std.debug.print("[tbie] synchronized file={d} in_fn={s} target-found needs={} nlr={} nstmts={d}\n", .{ callee.Path.segments[0].span.file.int(), build.currentRealFn() orelse "-", bareInlineNeedsSplice(b, nm, f, args), inline_call.argLambdaHasNonlocalReturn(args), last_stmts });
         }
-        // A reified inline overload whose type parameter lives only in
-        // the trailing lambda's parameter list (`T.(R) -> Unit`) cannot
-        // bind that parameter from a lambda that declares fewer
-        // arguments — `post("/p") { … }` against
-        // `post<reified R>(path, RoutingContext.(R) -> Unit)`. Kotlin
-        // drops such an overload (R unconstrained) and resolves the call
-        // to a non-reified namesake; decline the splice so the normal
-        // call path picks the plain `post(path, RoutingHandler)`.
+        // A reified inline overload whose type parameter appears only in the
+        // trailing lambda's parameter list cannot bind it from a lambda declaring
+        // fewer arguments; Kotlin drops such an overload, so decline.
         const reified_underfilled = ast_type_args.len == 0 and
             anyReified(f.type_params) and
             inline_call_shape.trailing_lambda_arity != null and
@@ -2030,22 +1788,15 @@ pub fn tryBareInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Erro
     return null;
 }
 
-/// Package-qualified inline expansion: `kotlin.synchronized(lock) { ... }`,
-/// `kotlinx.atomicfu.locks.synchronized(lock, block)`. Kotlin inlines an
-/// inline fun at every call spelling; the bare-path tier alone left
-/// package-qualified wrapper chains framed (the compose sync chain
-/// materialized a closure per block through three forwarding wrappers).
-/// Applies only when the WHOLE dotted prefix equals the candidate's
-/// declaring package, so a value/class/companion prefix never matches and
-/// those calls keep their existing routes.
+/// Package-qualified inline expansion: `kotlin.synchronized(lock) { ... }`.
+/// Kotlin inlines an inline fun at every call spelling. Applies only when the
+/// whole dotted prefix equals the candidate's declaring package.
 fn tryQualifiedInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Error!?Reg {
     const call = expr.Call;
     const callee = call.callee;
     const args = call.args;
-    // Flatten the callee into a dotted name run: either a multi-segment
-    // Path, or a Member chain (`kotlin.synchronized(...)` parses as
-    // Member(receiver=Path(kotlin), name=synchronized)) whose links are
-    // all plain non-safe accesses over a Path head.
+    // Flatten the callee into a dotted name run: a multi-segment Path, or a
+    // Member chain whose links are all plain non-safe accesses over a Path head.
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(b.allocator);
     {
@@ -2069,8 +1820,8 @@ fn tryQualifiedInlineExpansion(b: *FuncBuilder, expr: *const Expr) Allocator.Err
     const segs = names.items;
     const nm = segs[segs.len - 1];
     const qtrace = if (runtime.envOnce("KLIO_QIE_TRACE")) |w| std.mem.eql(u8, w, nm) else false;
-    // A resolvable head names a value chain, not a package path; a class
-    // head is a companion/static route.
+    // A resolvable head names a value chain, not a package path; a class head is
+    // a companion or static route.
     if (b.resolve(segs[0]) != null) {
         if (qtrace) std.debug.print("[qie] {s}: head resolves\n", .{nm});
         return null;
@@ -2145,11 +1896,9 @@ fn qualifiedInlineArityFits(f: *const ast.Function, want: usize) bool {
     return true;
 }
 
-/// Whether any registered class's fqn ends in `.{name}` or `${name}` (a
-/// nested/companion class reachable by simple name from some scope).
-/// The nesting tree's conservative complement: splice windows whose owner
-/// chain is unknown cannot walk the tree, so this module-wide probe keeps
-/// a capitalized bare call from being mis-claimed as a member call.
+/// Whether any registered class's fqn ends in `.{name}` or `${name}`. Splice
+/// windows with an unknown owner chain cannot walk the nesting tree, so this
+/// probe keeps a capitalized bare call from being read as a member.
 pub fn anyClassNamed(b: *FuncBuilder, name: []const u8) bool {
     for (b.module.classes.items) |*c| {
         const fqn = c.fqn;
@@ -2173,18 +1922,14 @@ pub fn eagerAuditOn() bool {
     return on;
 }
 
-/// Lower a self-call as an ordinary call when it cannot become a jump.
 /// Whether a member self-call's written receiver names the function's own
-/// dispatch: for a top-level extension any receiver (the function is the
-/// same declaration), for a member `this`, `this@Owner`, or the owner
-/// object itself — `this@Outer.h2(…)` from an inner class calls the
-/// outer class's `h2`, not this one.
+/// dispatch: any receiver for a top-level extension, `this`, `this@Owner`, or
+/// the owner object for a member.
 pub fn tailrecReceiverIsSelf(b: *FuncBuilder, receiver: *const Expr) bool {
     const owner = b.ownerClass() orelse return true;
-    const simple = if (std.mem.lastIndexOfScalar(u8, owner, '.')) |dot| owner[dot + 1 ..] else owner;
-    // kotlinc does not treat a companion member called through its outer
-    // class (`C.rec(…)` inside `C.Companion`) as a self-call; neither does
-    // this.
+    const simple = if (std.mem.findScalarLast(u8, owner, '.')) |dot| owner[dot + 1 ..] else owner;
+    // kotlinc does not treat a companion member called through its outer class
+    // as a self-call; neither does this.
     return switch (receiver.*) {
         .This => |t| t.qualifier == null or std.mem.eql(u8, t.qualifier.?.name, simple),
         .Path => |p| std.mem.eql(u8, p.segments[p.segments.len - 1].name, simple),

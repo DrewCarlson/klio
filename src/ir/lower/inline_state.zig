@@ -1,11 +1,8 @@
 //! Process-global registries for the inline-expansion machinery: the
-//! `suspend inline fun` AST table and the inline-nesting depth guard.
-//! Kept apart from the main lowering module because they are pure state
-//! primitives — no `FuncBuilder` or IR-side dependency.
-//!
-//! These use module-level state under a single-build-at-a-time contract:
-//! the driver installs the tables once per build, then lowers bodies
-//! serially.
+//! `suspend inline fun` AST table and the inline-nesting depth guard. Pure state
+//! primitives with no `FuncBuilder` or IR-side dependency, under a
+//! single-build-at-a-time contract: the driver installs the tables once per build,
+//! then lowers bodies serially.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -17,31 +14,27 @@ const Allocator = std.mem.Allocator;
 const StringSet = std.StringHashMap(void);
 const FnField = runtime.forest.ForestField(ast.Function);
 
-// --- Deferred inline-body decode --------------------------------------------
-//
-// A stdlib image holds `inline`, object-free function bodies in a side section,
-// decoded on first splice. The skeleton's marker is an empty block whose
-// `span.file == span.DEFERRED_BODY_FILE` and `span.start` is the body's byte
-// offset. The decoder lives in `interp_ir` (which depends on this module), so it
-// is injected here as a function pointer at base-install time.
+// Deferred inline-body decode. A stdlib image holds `inline`, object-free function
+// bodies in a side section, decoded on first splice. The marker is an empty block
+// whose `span.file == span.DEFERRED_BODY_FILE` and whose `span.start` is the body's
+// byte offset. The decoder lives in `interp_ir`, which depends on this module, so
+// it is injected as a function pointer at base-install time.
 const DeferredDecodeFn = *const fn (Allocator, []const u8, u32) ?ast.FunctionBody;
 threadlocal var deferred_section: []const u8 = &.{};
 threadlocal var deferred_alloc: Allocator = undefined;
 threadlocal var deferred_decode: ?DeferredDecodeFn = null;
 
-/// Install the loaded base's deferred-body section, the process-lifetime
-/// allocator a decoded body must persist in, and the decoder. Called once per
-/// build that uses a base. A freshly-built base passes an empty section (its
-/// bodies are not deferred), so this is a no-op there.
+/// Install the loaded base's deferred-body section, the process-lifetime allocator
+/// a decoded body must persist in, and the decoder. Once per build that uses a
+/// base; a freshly built base passes an empty section.
 pub fn setDeferredSection(section: []const u8, alloc: Allocator, decode: DeferredDecodeFn) void {
     deferred_section = section;
     deferred_alloc = alloc;
     deferred_decode = decode;
 }
 
-/// If `f`'s body is a deferred marker, decode the real body from the side
-/// section and patch it in place (idempotent: the patched body is no longer a
-/// marker). Call before reading an inline function's body for splicing.
+/// If `f`'s body is a deferred marker, decode the real body from the side section
+/// and patch it in place, idempotently. Call before reading a body for splicing.
 pub fn ensureInlineBody(f: *const ast.Function) void {
     const decode = deferred_decode orelse return;
     const body = f.body orelse return;
@@ -54,43 +47,34 @@ pub fn ensureInlineBody(f: *const ast.Function) void {
 }
 
 /// A call's shape at a candidate site: `(positional_arg_count,
-/// last_arg_is_lambda)`. `null` when the caller has no shape hint.
+/// last_arg_is_lambda)`. Null when the caller has no shape hint.
 pub const CallShape = struct {
     want: usize,
     last_is_lambda: bool,
-    /// Declared parameter arity of the trailing lambda/anon-fun argument
-    /// (a zero-`->` `{ … }` is 0, not 1 — the injected `it` does not count),
-    /// or `null` when the last argument is not a lambda. Used to break a
-    /// trailing-lambda overload tie toward the candidate whose trailing
-    /// function-type parameter arity matches: a bare `{ … }` handler picks
-    /// the `T.() -> R` (0-param) overload over a reified `T.(X) -> R` one
-    /// whose type argument a bare lambda cannot supply.
+    /// Declared parameter arity of the trailing lambda or anon-fun argument, a
+    /// zero-`->` `{ … }` being 0 since the injected `it` does not count; null when
+    /// the last argument is not a lambda. Breaks a trailing-lambda overload tie
+    /// toward the candidate whose trailing fn-type parameter arity matches, a bare
+    /// `{ … }` handler being unable to supply a reified `T.(X) -> R`'s argument.
     trailing_lambda_arity: ?usize = null,
-    /// The call site's file. A `private` inline declaration is scoped to
-    /// its own file; the simple-name candidate table spans the whole
-    /// program, so without this a file-private `List.fastForEach` in one
-    /// pack file spliced into an unrelated caller. Null keeps every
-    /// candidate (callers that predate the field).
+    /// The call site's file. A `private` inline declaration is scoped to its own
+    /// file while the candidate table spans the program; null keeps every candidate.
     call_file: ?span.FileId = null,
-    /// The first argument is a class literal (`subclass(C::class)`). Breaks
-    /// a same-arity reified overload tie toward the candidate whose first
-    /// parameter is a `KClass` (`subclass(clazz)` over
-    /// `subclass(serializer)`), which registration order otherwise decides.
+    /// The first argument is a class literal, breaking a same-arity reified overload
+    /// tie toward the candidate whose first parameter is a `KClass`.
     arg0_class_literal: bool = false,
 };
 
-/// Whether `f` is visible to a call in `call_file`: a `private`
-/// declaration only from its own file. Unknown call file keeps the
-/// candidate (conservative — the old behavior).
+/// Whether `f` is visible to a call in `call_file`: a `private` declaration only
+/// from its own file. An unknown call file keeps the candidate.
 fn candVisibleFrom(f: *const ast.Function, call_file: ?span.FileId) bool {
     if (f.visibility != .Private) return true;
     const cf = call_file orelse return true;
     return f.name.span.file.int() == cf.int();
 }
 
-/// `cands` minus the file-private declarations the call site cannot see.
-/// Returns a slice into `buf`; falls back to the unfiltered slice when
-/// there are more candidates than `buf` holds.
+/// `cands` minus the file-private declarations the call site cannot see. Returns a
+/// slice into `buf`, falling back to the unfiltered slice when it does not fit.
 fn visibleCands(cands: []const *const ast.Function, call_file: ?span.FileId, buf: []*const ast.Function) []const *const ast.Function {
     if (call_file == null) return cands;
     if (cands.len > buf.len) return cands;
@@ -104,34 +88,27 @@ fn visibleCands(cands: []const *const ast.Function, call_file: ?span.FileId, buf
     return buf[0..n];
 }
 
-/// `suspend inline fun` ASTs by simple name, set by the build driver
-/// before body lowering. A `suspend inline` builder's
-/// `suspendCoroutineUninterceptedOrReturn` must capture the *caller's*
-/// continuation — only correct when the body is truly inlined.
-/// Non-suspend inline fns keep the normal call path and klio's
-/// frame-kind non-local-return mechanism, so the inline blast radius
-/// stays minimal.
+/// `suspend inline fun` ASTs by simple name, set by the build driver before body
+/// lowering. A `suspend inline` builder's `suspendCoroutineUninterceptedOrReturn`
+/// must capture the caller's continuation, correct only when the body is truly
+/// inlined. Non-suspend inline fns keep the normal call path.
 threadlocal var inline_fn_asts: ?std.StringHashMap([]const FnField) = null;
 
-/// Lazy per-name cache of `inline_fn_asts` candidates resolved to plain
-/// pointers, so the picking logic stays pointer-based and a name's forest decls
-/// decode only on first lookup of that name.
+/// Lazy per-name cache of `inline_fn_asts` candidates resolved to plain pointers,
+/// so the picking logic stays pointer-based and a name's decls decode once.
 threadlocal var inline_fn_asts_resolved: ?std.StringHashMap([]const *const ast.Function) = null;
 
 /// Function-typed `typealias` tags by alias name (`RoutingHandler` ->
-/// `"Function0"`), borrowed from `module.registry.type_aliases`. Lets the
-/// shape-based overload pick recognise a parameter whose declared type is a
-/// typealias for a function type — `body: RoutingHandler` is a trailing
-/// lambda slot even though its `TypeRef.function` is `null`.
+/// `"Function0"`), borrowed from `module.registry.type_aliases`, so the shape-based
+/// pick recognises a parameter whose declared type aliases a function type.
 threadlocal var type_alias_tags: ?*const std.StringHashMap([]const u8) = null;
 
 pub fn setTypeAliasTags(m: *const std.StringHashMap([]const u8)) void {
     type_alias_tags = m;
 }
 
-/// Non-receiver parameter arity of `ty` when it denotes a function type,
-/// resolving a function-typed `typealias` by its `Function{N}` tag. `null`
-/// when `ty` is not (directly or via alias) a function type.
+/// Non-receiver parameter arity of `ty` when it denotes a function type, resolving
+/// a function-typed `typealias` by its `Function{N}` tag.
 fn fnArityOfType(ty: ast.TypeRef) ?usize {
     if (ty.function) |ft| return ft.params.len;
     const tags = type_alias_tags orelse return null;
@@ -140,56 +117,41 @@ fn fnArityOfType(ty: ast.TypeRef) ?usize {
     return std.fmt.parseInt(usize, tag["Function".len..], 10) catch null;
 }
 
-/// Simple names that a default-imported host binding owns (e.g.
-/// `kotlin.synchronized`, `kotlin.arrayOf`). An inline declaration sharing
-/// one of these names cannot be selected from the ad-hoc simple-name table;
-/// ordinary calls fall through to the host binding, while scope-aware exact
-/// resolution can still recover the corresponding source declaration.
+/// Simple names a default-imported host binding owns. An inline declaration sharing
+/// one cannot be selected from the ad-hoc simple-name table, so ordinary calls fall
+/// through to the host binding while scope-aware resolution still finds the source.
 threadlocal var shadowed_inline_names: ?StringSet = null;
 
-/// `inline fun` ASTs keyed by the phase-1 header stub's `FuncId`, so a
-/// bare call the symbol index resolves to a unique top-level target can
-/// splice exactly that declaration — no simple-name re-resolution. The
-/// build driver registers each top-level inline fn as it emits the
-/// fn's header stub; class/object member inline fns carry no stub and
-/// stay reachable only through the simple-name candidate table (the
-/// index never resolves them, so a member splice always goes through
-/// the receiver/shape narrowing).
+/// `inline fun` ASTs keyed by the phase-1 header stub's `FuncId`, so a bare call the
+/// symbol index resolves to a unique top-level target splices exactly that
+/// declaration. Member inline fns carry no stub and stay reachable only through the
+/// simple-name candidate table.
 threadlocal var inline_fn_ids: ?std.AutoHashMap(u32, FnField) = null;
 
-/// Reverse index `fn-address -> id`, filled lazily as `inlineAstById` resolves a
-/// `FnField`. Lets `inlineIdByAst` answer from an already-resolved fn pointer
-/// without iterating + resolving every registered inline fn (which would decode
-/// the whole inline forest under the lazy path).
+/// Reverse index from fn address to id, filled lazily as `inlineAstById` resolves a
+/// `FnField`, so `inlineIdByAst` answers without decoding the whole inline forest.
 threadlocal var inline_id_by_fn: ?std.AutoHashMap(usize, u32) = null;
 
-/// Owner class simple name for each inline MEMBER fn AST pointer. Member
-/// inline fns carry no `FuncId` stub (the index never resolves them), so a
-/// bare call to a name declared as a member in several unrelated classes
-/// cannot pick the enclosing-hierarchy overload from the id registry. The
-/// build driver fills this by walking the class universe (user + base),
-/// keyed by the same AST pointers `candidatesFor` returns. Backed by the
-/// process-lifetime allocator so it survives cross-build teardown; the value
-/// strings live in the build arena and are replaced each build via `reset`.
+/// Owner class simple name for each inline member fn AST pointer. Member inline fns
+/// carry no `FuncId` stub, so a bare call to a name several unrelated classes
+/// declare cannot pick the enclosing-hierarchy overload from the id registry. The
+/// build driver fills this by walking the class universe, keyed by the same AST
+/// pointers `candidatesFor` returns. Process-lifetime backed so it survives
+/// cross-build teardown; the value strings live in the build arena.
 threadlocal var inline_member_owner: ?std.AutoHashMap(usize, []const u8) = null;
 
-/// Hard ceiling on combined inline nesting (fn-body + lambda-arg
-/// splices) so transitive expansion cannot recurse without bound; past
-/// it, callers fall back to a normal call.
+/// Hard ceiling on combined inline nesting, fn-body plus lambda-arg splices, so
+/// transitive expansion cannot recurse without bound; past it, callers fall back.
 threadlocal var inline_expand_depth: u32 = 0;
 
-/// Simple names of *top-level* (file-scope) properties — `val`/`var`
-/// declared outside any class. A bare reference to such a name inside a
-/// method/lambda body must resolve as a global property read, not an
-/// implicit `this.<name>` field access.
+/// Simple names of top-level properties. A bare reference to one inside a method or
+/// lambda body resolves as a global read, not an implicit `this.<name>` access.
 threadlocal var top_level_prop_names: ?StringSet = null;
 
 const INLINE_EXPAND_MAX: u32 = 8;
 
-/// Install the set of top-level property simple names for the current
-/// build, so bare-name lowering routes them to a global read instead of
-/// an implicit `this.<name>` field access. Takes ownership of `names`;
-/// any previously-installed set is freed.
+/// Install the set of top-level property simple names for the current build. Takes
+/// ownership of `names`; any previously installed set is freed.
 pub fn setTopLevelPropNames(names: StringSet) void {
     if (top_level_prop_names) |*old| old.deinit();
     top_level_prop_names = names;
@@ -201,12 +163,10 @@ pub fn isTopLevelProp(name: []const u8) bool {
     return false;
 }
 
-/// Install the suspend-inline-fn AST table for the current build. Each
-/// simple name maps to all its inline overloads (declaration order) so a
-/// call site can disambiguate a function-param overload from a
-/// value-param one by the trailing-arg shape. Takes ownership of `m`.
-/// Also drops the previous build's `FuncId`-keyed entries; the driver
-/// re-registers them while emitting the new build's header stubs.
+/// Install the suspend-inline-fn AST table for the current build, each simple name
+/// mapping to its inline overloads in declaration order so a call site can
+/// disambiguate by trailing-arg shape. Takes ownership of `m` and drops the previous
+/// build's `FuncId`-keyed entries, which the driver re-registers.
 pub fn setInlineFnAsts(m: std.StringHashMap([]const FnField)) void {
     if (inline_fn_asts) |*old| old.deinit();
     inline_fn_asts = m;
@@ -218,20 +178,15 @@ pub fn setInlineFnAsts(m: std.StringHashMap([]const FnField)) void {
     inline_id_by_fn = null;
 }
 
-/// Record one top-level `inline fun`'s AST under its phase-1 header
-/// stub `FuncId`. Called by the build driver inside the stub loop, so
-/// every id the symbol index can resolve has its AST on file before
-/// phase-2 body lowering starts (class-method bodies lower earlier, but
-/// the index sees no top-level candidates there and always defers). The
-/// map container outlives the build arena (same process-lifetime
-/// backing as the other tables here); the AST pointers share the build
-/// arena's lifetime exactly like `inline_fn_asts`.
+/// Record one top-level `inline fun`'s AST under its phase-1 header stub `FuncId`,
+/// called inside the stub loop so every id the symbol index can resolve has its AST
+/// on file before phase-2 body lowering. The container outlives the build arena; the
+/// AST pointers share it, exactly like `inline_fn_asts`.
 var expr_body_members: ?std.StringHashMap(FnField) = null;
 
-/// Record an expression-bodied member with NO return annotation under
-/// its (owner, name, arity) key, so a caller lowered BEFORE the member's
-/// own decl pass can derive the inferred return on demand (declaration
-/// order must not decide whether a local types).
+/// Record an expression-bodied member with no return annotation under its
+/// (owner, name, arity) key, so a caller lowered before the member's own decl pass
+/// derives the inferred return on demand.
 pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem.Allocator.Error!void {
     if (expr_body_members == null) {
         expr_body_members = std.StringHashMap(FnField).init(std.heap.page_allocator);
@@ -242,10 +197,9 @@ pub fn registerExprBodyMember(owner: []const u8, f: *const ast.Function) std.mem
     try expr_body_members.?.put(key, FnField.fromPtr(f));
 }
 
-/// Drop every registered expression-body member AST (and free the owned
-/// keys). The pointers share ONE program's build arena; an in-process
-/// driver must clear them at the run boundary or the next program's
-/// same-named lookups read freed memory.
+/// Drop every registered expression-body member AST and free the owned keys. The
+/// pointers share one program's build arena, so an in-process driver must clear them
+/// at the run boundary.
 pub fn resetExprBodyMembers() void {
     if (expr_body_members) |*m| {
         var it = m.keyIterator();
@@ -263,9 +217,9 @@ pub fn exprBodyMemberAst(owner: []const u8, name: []const u8, nparams: usize) ?*
     if (expr_body_members) |*m| {
         const key = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner, name, nparams }) catch return null;
         if (m.get(key)) |ff| return ff.get();
-        // A LIFTED nested class spells `Outer$Inner`; the registration walk
-        // spells the source-simple `Inner`. Normalize on miss.
-        if (std.mem.lastIndexOfScalar(u8, owner, '$')) |d| {
+        // A lifted nested class spells `Outer$Inner` while the registration walk
+        // spells the source-simple `Inner`; normalize on miss.
+        if (std.mem.findScalarLast(u8, owner, '$')) |d| {
             const key2 = std.fmt.bufPrint(&buf, "{s}\x1f{s}\x1f{d}", .{ owner[d + 1 ..], name, nparams }) catch return null;
             if (m.get(key2)) |ff| return ff.get();
         }
@@ -280,11 +234,9 @@ pub fn registerInlineFnId(id: u32, f: FnField) std.mem.Allocator.Error!void {
     try inline_fn_ids.?.put(id, f);
 }
 
-/// The inline-fn AST registered under a resolved top-level `FuncId`, or
-/// null when the id's target is not an inline fn (or carries no stub —
-/// a member fn the index never resolves). Resolves the (possibly lazy)
-/// `FnField` and records the reverse `fn-addr -> id` mapping for
-/// `inlineIdByAst`.
+/// The inline-fn AST registered under a resolved top-level `FuncId`, or null when
+/// the target is not an inline fn or carries no stub. Resolves the possibly lazy
+/// `FnField` and records the reverse fn-address mapping for `inlineIdByAst`.
 pub fn inlineAstById(id: u32) ?*const ast.Function {
     if (inline_fn_ids) |*m| {
         if (m.get(id)) |ff| {
@@ -299,19 +251,15 @@ pub fn inlineAstById(id: u32) ?*const ast.Function {
     return null;
 }
 
-/// The phase-1 stub `FuncId` under which `f` was registered, or null
-/// for a member inline fn (no stub, never index-resolved). The reverse
-/// of `inlineAstById`; lets the resolve audit rank a simple-name pick
-/// in the same scope tiers the index ranks its candidates in. `f` is an
-/// already-resolved fn pointer (from a prior `inlineAstById`/candidate
-/// lookup), so the reverse map already holds it.
+/// The phase-1 stub `FuncId` under which `f` was registered, or null for a member
+/// inline fn: the reverse of `inlineAstById`, letting the resolve audit rank a
+/// simple-name pick in the index's own scope tiers.
 pub fn inlineIdByAst(f: *const ast.Function) ?u32 {
     if (inline_id_by_fn) |*m| {
         if (m.get(@intFromPtr(f))) |id| return id;
     }
-    // Miss: `f` was resolved by name (not through `inlineAstById`). Only the
-    // resolve audit / strict mode (both off by default) calls this, so the
-    // one-time resolve of the id registry is acceptable here.
+    // Miss: `f` was resolved by name rather than through `inlineAstById`. Only the
+    // resolve audit and strict mode call this, so a one-time resolve is acceptable.
     if (inline_fn_ids) |*m| {
         var it = m.iterator();
         while (it.next()) |e| {
@@ -321,9 +269,8 @@ pub fn inlineIdByAst(f: *const ast.Function) ?u32 {
     return null;
 }
 
-/// Install the set of simple names owned by default-imported host bindings.
-/// Ad-hoc name lookup is skipped for these names so ordinary calls dispatch
-/// through the binding. Takes ownership of `names`.
+/// Install the set of simple names owned by default-imported host bindings, for
+/// which ad-hoc name lookup is skipped. Takes ownership of `names`.
 pub fn setShadowedInlineNames(names: StringSet) void {
     if (shadowed_inline_names) |*old| old.deinit();
     shadowed_inline_names = names;
@@ -340,19 +287,16 @@ pub fn candidatesForName(name: []const u8) ?[]const *const ast.Function {
     return candidatesFor(name);
 }
 
-/// Drop the previous build's member-owner map and start a fresh one. Call
-/// once per build, before registering owners.
+/// Drop the previous build's member-owner map and start a fresh one, once per
+/// build before registering owners.
 pub fn resetInlineMemberOwners() void {
     if (inline_member_owner) |*m| m.deinit();
     inline_member_owner = std.AutoHashMap(usize, []const u8).init(std.heap.page_allocator);
 }
 
-/// Member/object property ASTs by `owner\x1fname`, so reified-type-argument
-/// inference can resolve a property-access argument's declared generic type
-/// (`Nodes.Draw` -> its getter's `NodeKind<DrawModifierNode>(…)`). Keys live in
-/// the build arena; the container follows the same cross-build teardown
-/// discipline as the other threadlocal tables (deinit never dereferences the
-/// arena-owned keys).
+/// Member and object property ASTs by `owner\x1fname`, so reified-type-argument
+/// inference can resolve a property-access argument's declared generic type. Keys
+/// live in the build arena, under the same teardown discipline as the other tables.
 threadlocal var member_prop_asts: ?std.StringHashMap(*const ast.Property) = null;
 
 /// Drop the previous build's property-AST map and start a fresh one.
@@ -361,8 +305,8 @@ pub fn resetMemberPropAsts() void {
     member_prop_asts = std.StringHashMap(*const ast.Property).init(std.heap.page_allocator);
 }
 
-/// Record that class/object `owner` declares property `p`. First
-/// registration wins (mirrors `class_index` collision semantics).
+/// Record that class or object `owner` declares property `p`. First registration
+/// wins, mirroring `class_index` collision semantics.
 pub fn registerMemberPropAst(a: std.mem.Allocator, owner: []const u8, p: *const ast.Property) void {
     if (member_prop_asts == null) resetMemberPropAsts();
     const key = std.fmt.allocPrint(a, "{s}\x1f{s}", .{ owner, p.name.name }) catch return;
@@ -379,13 +323,11 @@ pub fn memberPropAst(owner: []const u8, name: []const u8) ?*const ast.Property {
     return m.get(key);
 }
 
-/// Member-EXTENSION property receiver-type heads by `owner\x1fname`. Distinct
-/// from `member_prop_asts` (first-registration-wins) because a class can
-/// declare BOTH a same-named member (e.g. `override val parent`) AND a
-/// member-extension property (`private val Composition.parent`); the member
-/// would otherwise hide the extension in that map. Used at a property-read
-/// site to detect that the receiver's STATIC type resolves the read to the
-/// in-scope extension getter rather than the runtime object's stored field.
+/// Member-extension property receiver-type heads by `owner\x1fname`. Distinct from
+/// the first-registration-wins `member_prop_asts`, since a class can declare both a
+/// same-named member and a member-extension property and the member would hide it.
+/// Used at a read site to detect that the receiver's static type resolves the read
+/// to the in-scope extension getter rather than a stored field.
 threadlocal var member_ext_prop_recv: ?std.StringHashMap([]const u8) = null;
 
 pub fn resetMemberExtPropRecv() void {
@@ -393,8 +335,8 @@ pub fn resetMemberExtPropRecv() void {
     member_ext_prop_recv = std.StringHashMap([]const u8).init(std.heap.page_allocator);
 }
 
-/// Record that class `owner` declares a member-extension property `name`
-/// whose extension-receiver type head is `recv_head`.
+/// Record that class `owner` declares a member-extension property `name` whose
+/// extension-receiver type head is `recv_head`.
 pub fn registerMemberExtPropRecv(a: std.mem.Allocator, owner: []const u8, name: []const u8, recv_head: []const u8) void {
     if (member_ext_prop_recv == null) resetMemberExtPropRecv();
     const key = std.fmt.allocPrint(a, "{s}\x1f{s}", .{ owner, name }) catch return;
@@ -404,7 +346,7 @@ pub fn registerMemberExtPropRecv(a: std.mem.Allocator, owner: []const u8, name: 
 }
 
 /// The extension-receiver type head of the member-extension property `owner`
-/// declares under `name`, or null when `owner` declares no such extension.
+/// declares under `name`, or null when it declares no such extension.
 pub fn memberExtPropRecv(owner: []const u8, name: []const u8) ?[]const u8 {
     const m = member_ext_prop_recv orelse return null;
     var buf: [512]u8 = undefined;
@@ -412,11 +354,9 @@ pub fn memberExtPropRecv(owner: []const u8, name: []const u8) ?[]const u8 {
     return m.get(key);
 }
 
-/// Declared supertype references (with their type arguments) by class/object
-/// simple name. Reified-type-argument inference reads them so an argument
-/// naming a declaration (`serializersModuleOf(BSerializer)` where
-/// `object BSerializer : KSerializer<B>`) solves the parameter's type
-/// argument from the declaration's own supertype list.
+/// Declared supertype references, with their type arguments, by class or object
+/// simple name, so reified-type-argument inference can solve a parameter's type
+/// argument from the supertype list of a declaration an argument names.
 threadlocal var class_supertype_refs: ?std.StringHashMap([]const ast.TypeRef) = null;
 
 pub fn resetClassSupertypeRefs() void {
@@ -446,8 +386,8 @@ pub fn registerInlineMemberOwner(f: *const ast.Function, owner: []const u8) void
     inline_member_owner.?.put(@intFromPtr(f), owner) catch {};
 }
 
-/// The class that declares inline member fn `f`, or null for a top-level
-/// inline fn (or a member the build driver did not walk).
+/// The class that declares inline member fn `f`, or null for a top-level inline fn
+/// or a member the build driver did not walk.
 pub fn inlineMemberOwner(f: *const ast.Function) ?[]const u8 {
     const m = inline_member_owner orelse return null;
     return m.get(@intFromPtr(f));
@@ -458,17 +398,13 @@ fn candidatesFor(name: []const u8) ?[]const *const ast.Function {
         if (r.get(name)) |cached| return cached;
     }
     const fields = (if (inline_fn_asts) |*c| c.get(name) else null) orelse return null;
-    // Resolve this name's candidates once (decoding only their forest decls) and
-    // cache the pointer slice; the picking logic stays pointer-based. Also record
-    // the reverse fn-addr -> id map entries via inlineAstById-style population is
-    // not needed here (ids come from the id registry).
+    // Resolve this name's candidates once, decoding only their forest decls, and
+    // cache the pointer slice so the picking logic stays pointer-based.
     const a = std.heap.page_allocator;
     var buf = a.alloc(*const ast.Function, fields.len) catch return null;
-    // A `@Deprecated(level = ERROR|HIDDEN)` / `@LowPriorityInOverloadResolution`
-    // inline overload is not a source-level candidate (kotlinc hides it): the
-    // HIDDEN `Flow.collect(action)` binary-compat form was the SOLE inline
-    // candidate for `collect`, so `collect(NopCollector)` spliced it and
-    // wrapped the collector in its action-invoking anon object.
+    // A `@Deprecated(level = ERROR|HIDDEN)` or `@LowPriorityInOverloadResolution`
+    // inline overload is not a source-level candidate, yet a binary-compat form can
+    // be the sole inline candidate for a name and get spliced.
     var n: usize = 0;
     for (fields) |ff| {
         const f = ff.get();
@@ -488,12 +424,10 @@ pub fn inlineFnAst(name: []const u8) ?*const ast.Function {
     return inlineFnAstFor(name, null);
 }
 
-/// Like [`inlineFnAstFor`] but, when several overloads share the name,
-/// prefer the one whose extension `receiver_type` matches the call's
-/// receiver. `recv_chain` carries the statically-known receiver type
-/// followed by its transitive supertypes, most-derived first, so an
-/// extension declared on a base class still matches a subclass
-/// receiver — and a subclass's own extension outranks the base one.
+/// Like `inlineFnAstFor` but, with several overloads sharing the name, prefer the
+/// one whose extension `receiver_type` matches the call's receiver. `recv_chain`
+/// carries the known receiver type then its transitive supertypes, most-derived
+/// first, so a base-class extension matches a subclass and its own outranks it.
 pub fn inlineFnAstForRecv(
     name: []const u8,
     call: ?CallShape,
@@ -502,10 +436,9 @@ pub fn inlineFnAstForRecv(
     return inlineFnAstForRecvExt(name, call, recv_chain, false);
 }
 
-/// As [`inlineFnAstForRecv`], with `require_receiver`: when the call is a
-/// qualified member call (`recv.f(...)`) the inline target must be an
-/// extension with a `this` receiver — a same-named *top-level* overload
-/// is not a valid target and must not win the shape-based tie.
+/// As `inlineFnAstForRecv`, with `require_receiver`: for a qualified member call the
+/// inline target must be an extension with a `this` receiver, so a top-level
+/// overload cannot win the shape-based tie.
 pub fn inlineFnAstForRecvExt(
     name: []const u8,
     call: ?CallShape,
@@ -525,12 +458,9 @@ pub fn inlineFnAstForRecvExt(
     }
     if (cands.len < 2) return inlineFnAstFor(name, call);
 
-    // Determine whether overloads span different receiver types and
-    // whether any candidate is a top-level (no-receiver) overload. A
-    // member-inline fn's owner class is its receiver type for this
-    // purpose: a bare `traverseChildren(...)` inside an extension on
-    // `SlotTableAddressSpace` must bind that class's own member, not a
-    // same-named member of an unrelated class that registered first.
+    // Determine whether overloads span different receiver types and whether any
+    // candidate is top-level. A member-inline fn's owner class is its receiver type
+    // here, so a bare call inside an extension binds that class's own member.
     var first_recv: ?[]const u8 = null;
     var have_first = false;
     var multi_recv = false;
@@ -548,18 +478,14 @@ pub fn inlineFnAstForRecvExt(
         }
     }
 
-    // No receiver evidence at the call site at all: an extension-only
-    // overload set cannot be narrowed — splicing one binds a receiver
-    // the scope may not even contain (`get(it)` inside a plain lambda
-    // must fall to the receiver walk, not splice `HttpClient.get`).
-    // Decline; the normal dispatch paths decide against the real
-    // runtime receivers.
+    // With no receiver evidence an extension-only overload set cannot be narrowed,
+    // and splicing one binds a receiver the scope may not contain. Decline; the
+    // normal dispatch paths decide against the real runtime receivers.
     if (recv_chain == null and !has_toplevel) return null;
 
-    // The effective receiver type: the most-derived chain entry that
-    // any candidate declares as its receiver. A subclass extension
-    // outranks a base-class one for a subclass receiver; when nothing
-    // matches, the head keeps the narrowing's mismatch fallback intact.
+    // The effective receiver type: the most-derived chain entry any candidate
+    // declares. A subclass extension outranks a base-class one, and when nothing
+    // matches the head keeps the narrowing's mismatch fallback.
     const recv_ty: ?[]const u8 = blk: {
         const chain = recv_chain orelse break :blk null;
         if (chain.len == 0) break :blk null;
@@ -585,9 +511,9 @@ pub fn inlineFnAstForRecvExt(
     return pickByShapeNarrowed(cands, call, recv_ty, require_receiver, multi_recv);
 }
 
-/// Narrowing filter predicate: drop top-level overloads for a member
-/// call, and (when overloads differ by receiver and the call's receiver
-/// type is known) keep only matching-receiver overloads.
+/// Narrowing filter: drop top-level overloads for a member call, and when overloads
+/// differ by receiver and the call's receiver type is known, keep only the matching
+/// ones.
 fn keepNarrowed(
     f: *const ast.Function,
     recv_ty: ?[]const u8,
@@ -604,8 +530,7 @@ fn keepNarrowed(
 }
 
 /// A candidate's effective receiver class name: an extension's declared
-/// `receiver_type`, or the owner class for a member-inline fn. Null only
-/// for a plain top-level inline fn.
+/// `receiver_type`, or the owner class for a member-inline fn.
 fn candRecvName(f: *const ast.Function) ?[]const u8 {
     if (f.receiver_type) |rt| return rt.name.name;
     return inlineMemberOwner(f);
@@ -653,12 +578,9 @@ fn pickByShapeNarrowed(
         }
     }
     if (count == 1) return match;
-    // Several overloads fit the trailing-lambda shape. Prefer the one whose
-    // trailing function-type parameter arity matches the lambda's declared
-    // arity: a bare `{ … }` handler (arity 0) resolves to the
-    // `T.() -> R` overload, not a reified `T.(X) -> R` one whose `X` a
-    // parameterless lambda cannot infer. Mirrors Kotlin dropping a generic
-    // overload whose type argument is unconstrained by the call.
+    // Several overloads fit the trailing-lambda shape, so prefer the one whose
+    // trailing fn-type parameter arity matches the lambda's, mirroring Kotlin
+    // dropping a generic overload the call leaves unconstrained.
     if (shape.trailing_lambda_arity) |want_arity| {
         var arity_match: ?*const ast.Function = null;
         var arity_count: usize = 0;
@@ -675,9 +597,8 @@ fn pickByShapeNarrowed(
     return first;
 }
 
-/// A pass-threaded composable declaration carries a trailing
-/// `($composer, $changed)` pair the CALL SITE does not write; every
-/// shape judgment runs on the user-visible params.
+/// A pass-threaded composable declaration carries a trailing `($composer, $changed)`
+/// pair the call site does not write, so shape judgments run on the user params.
 fn userParams(f: *const ast.Function) []const ast.Param {
     const p = f.params;
     if (p.len >= 2 and std.mem.eql(u8, p[p.len - 1].name.name, "$changed") and
@@ -688,9 +609,8 @@ fn userParams(f: *const ast.Function) []const ast.Param {
     return p;
 }
 
-/// Parameter arity of `f`'s trailing function-typed parameter (the
-/// non-receiver parameters of `T.(A, B) -> R`), or `null` when the last
-/// parameter is not a function type.
+/// Parameter arity of `f`'s trailing function-typed parameter, the non-receiver
+/// parameters of `T.(A, B) -> R`.
 fn trailingFnTypeArity(f: *const ast.Function) ?usize {
     const params = userParams(f);
     if (params.len == 0) return null;
@@ -731,10 +651,9 @@ fn fitsTrailingLambda(f: *const ast.Function, lead: usize) bool {
     return lead >= required and (lead <= leading.len or last_lead_vararg);
 }
 
-/// Disambiguate a call whose last argument is *not* a lambda among
-/// same-name overloads. When exactly one overload has *no* required
-/// function-typed parameter, it is the applicable one. Returns `null`
-/// (defer to first-declared) when the filter is not decisive.
+/// Disambiguate a call whose last argument is not a lambda among same-name
+/// overloads: when exactly one has no required function-typed parameter it is the
+/// applicable one. Null defers to first-declared.
 fn pickNonlambdaShape(cands: []const *const ast.Function) ?*const ast.Function {
     var only: ?*const ast.Function = null;
     var count: usize = 0;
@@ -756,20 +675,14 @@ fn noRequiredFnParam(f: *const ast.Function) bool {
     return true;
 }
 
-/// Whether `f` can take `want` positional arguments: at least the required
-/// (non-defaulted, non-vararg) count, and no more than the declared total —
-/// unless a vararg absorbs the excess.
-/// Whether several overloads fit the call's arity but declare DIFFERENT
-/// value-parameter types. Shape cannot separate those, so the first-declared
-/// fallback below is a coin flip. androidx.collection declares
-/// `ArraySet<E>.addAllInternal(ArraySet<out E>)` beside
-/// `ArraySet<E>.addAllInternal(Collection<E>)`; a bare `addAllInternal(elements)`
-/// inside `ArraySet.addAll` spliced the ArraySet body and read `.array` off a
-/// List. Declining to splice hands the call to normal dispatch, which ranks by
-/// argument type and picks correctly — the same call written `this.addAllInternal(…)`
-/// always resolved, because it never reached the splice path.
-/// Among arity-fitting candidates, the unique one whose first parameter is
-/// declared `KClass` — the overload a class-literal first argument selects.
+/// Whether `f` can take `want` positional arguments: at least the required,
+/// non-defaulted, non-vararg count, and no more than the declared total unless a
+/// vararg absorbs the excess.
+/// `ambiguousParamTypes` reports several overloads fitting the arity but declaring
+/// different value-parameter types, which shape cannot separate; declining to splice
+/// hands the call to normal dispatch, which ranks by argument type.
+/// `kclassFirstParamPick` is the unique arity-fitting candidate whose first
+/// parameter is declared `KClass`.
 fn pickKClassParam(cands: []const *const ast.Function, want: usize) ?*const ast.Function {
     var hit: ?*const ast.Function = null;
     for (cands) |f| {
@@ -788,9 +701,8 @@ fn ambiguousByParamTypes(cands: []const *const ast.Function, want: usize) bool {
     var seen: ?[]const u8 = null;
     for (cands) |f| {
         if (!fitsArity(f, want)) continue;
-        // A reified type parameter can only be honoured by splicing, so an
-        // ambiguous set containing one keeps the existing behaviour rather
-        // than losing the type argument to the runtime walk.
+        // A reified type parameter can only be honoured by splicing, so an ambiguous
+        // set containing one keeps its behaviour rather than losing the type argument.
         for (f.type_params) |tp| if (tp.is_reified) return false;
         const params = userParams(f);
         if (params.len == 0) return false;
@@ -817,10 +729,9 @@ fn fitsArity(f: *const ast.Function, want: usize) bool {
     return has_vararg or want <= params.len;
 }
 
-/// The single overload whose arity fits the call's argument count, or null
-/// when zero or several fit. The last-resort discriminator before blind
-/// first-declared: a plugin-threaded `remember(k1..k4, calc, $composer,
-/// $changed)` (7 args, lambda NOT last) only fits the vararg overload.
+/// The single overload whose arity fits the call's argument count. The last-resort
+/// discriminator before blind first-declared: a plugin-threaded
+/// `remember(k1..k4, calc, $composer, $changed)` fits only the vararg overload.
 fn pickUniqueArityFit(cands: []const *const ast.Function, want: usize) ?*const ast.Function {
     var only: ?*const ast.Function = null;
     var count: usize = 0;
@@ -835,13 +746,10 @@ fn pickUniqueArityFit(cands: []const *const ast.Function, want: usize) ?*const a
     return null;
 }
 
-/// Resolve the inline overload of `name` for a call whose shape is
-/// `call = (positional_arg_count, last_arg_is_lambda)`.
-///
-/// Deliberately conservative: returns the first-declared overload in
-/// every case *except* a trailing-lambda call for which exactly one
-/// arity-fitting overload has a function-typed last parameter — then that
-/// overload wins.
+/// Resolve the inline overload of `name` for a call shaped
+/// `(positional_arg_count, last_arg_is_lambda)`. Conservative: first-declared wins
+/// except for a trailing-lambda call where exactly one arity-fitting overload has a
+/// function-typed last parameter.
 pub fn inlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
     if (isShadowed(name)) return null;
     const all = candidatesFor(name) orelse return null;
@@ -872,13 +780,10 @@ pub fn inlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
     return pickUniqueArityFit(cands, shape.want) orelse first;
 }
 
-/// Among the inline overloads of `name` that fit the call shape, return the
-/// one declaring a `reified` type parameter (if any). A call with an explicit
-/// `<T>` argument binds that argument to a reified parameter, so a reified
-/// overload outranks a non-reified `KClass<T>`-parameter namesake of the same
-/// shape — without this, `assertFailsWith<E>(msg) { … }` resolves to the
-/// `assertFailsWith(KClass<E>, …)` overload and the type argument lowers as a
-/// constructor value rather than binding `T::class`.
+/// Among the inline overloads of `name` fitting the call shape, the one declaring a
+/// `reified` type parameter. An explicit `<T>` argument binds such a parameter, so a
+/// reified overload outranks a non-reified `KClass<T>` namesake, whose type argument
+/// would lower as a constructor value instead of binding `T::class`.
 pub fn reifiedInlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Function {
     if (isShadowed(name)) return null;
     const cands = candidatesFor(name) orelse return null;
@@ -886,10 +791,8 @@ pub fn reifiedInlineFnAstFor(name: []const u8, call: ?CallShape) ?*const ast.Fun
     const shape = call orelse return null;
     if (!shape.last_is_lambda) return null;
     const lead = shape.want -| 1;
-    // The first reified overload of this shape. Sibling reified overloads that
-    // differ only in the block's return type (`() -> Any?` vs `() -> Unit`)
-    // splice the same body, so the first fitting one is sufficient to bind the
-    // type argument as `T::class`.
+    // The first reified overload of this shape: siblings differing only in the
+    // block's return type splice the same body.
     for (cands) |f| {
         if (fitsTrailingLambda(f, lead) and fnHasReified(f)) return f;
     }
@@ -907,9 +810,9 @@ pub fn inlineExpandEnter() bool {
     return true;
 }
 
-/// A REIFIED inline callee past the ordinary depth still splices: unspliced,
-/// its body would read the process-global `T` of some outer splice. The
-/// higher cap only bounds runaway recursion.
+/// A reified inline callee past the ordinary depth still splices, an unspliced body
+/// reading the process-global `T` of some outer splice. The higher cap only bounds
+/// runaway recursion.
 pub fn inlineExpandEnterReified() bool {
     if (inline_expand_depth >= INLINE_EXPAND_MAX * 3) return false;
     inline_expand_depth += 1;
@@ -920,8 +823,8 @@ pub fn inlineExpandLeave() void {
     inline_expand_depth -|= 1;
 }
 
-/// Release any installed tables. Used by tests and by a build driver
-/// tearing down between builds.
+/// Release any installed tables, for tests and for a build driver tearing down
+/// between builds.
 pub fn resetForTest() void {
     if (inline_fn_asts) |*m| {
         m.deinit();
@@ -950,9 +853,6 @@ pub fn resetForTest() void {
     inline_expand_depth = 0;
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -985,8 +885,8 @@ test "inline fn ids register, look up, and reset with the table" {
     try registerInlineFnId(7, FnField.fromPtr(&f));
     try testing.expect(inlineAstById(7) == @as(?*const ast.Function, &f));
     try testing.expect(inlineAstById(8) == null);
-    // Installing the next build's simple-name table drops the previous
-    // build's FuncId entries.
+    // Installing the next build's simple-name table drops the previous build's
+    // FuncId entries.
     setInlineFnAsts(std.StringHashMap([]const FnField).init(testing.allocator));
     try testing.expect(inlineAstById(7) == null);
 }

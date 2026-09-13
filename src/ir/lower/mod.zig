@@ -1,10 +1,6 @@
-//! AST → IR lowering.
-//!
-//! Lowering entry point + the wiring that lets the per-construct lower
-//! files operate as free functions over a shared `FuncBuilder`. Covers
-//! literals, binary / unary primitive operations, paths (as parameter /
-//! local reads), if-expression, block expressions, and the remaining
-//! expression / statement / declaration forms across the sibling files.
+//! AST to IR lowering: the entry point plus the wiring that lets the
+//! per-construct lower files operate as free functions over a shared
+//! `FuncBuilder`.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -32,8 +28,8 @@ pub const UnOp = ir.UnOp;
 pub const Module = ir.Module;
 pub const TypeRef = ir.TypeRef;
 
-// Sibling lower files. Each contributes free functions over the shared
-// `FuncBuilder` / context established here.
+// Sibling lower files, each contributing free functions over the shared
+// `FuncBuilder` and context established here.
 pub const ast_scan = @import("ast_scan.zig");
 pub const helpers = @import("helpers.zig");
 pub const inline_state = @import("inline_state.zig");
@@ -48,7 +44,6 @@ pub const expr = @import("expr.zig");
 pub const static_call_type = @import("static_call_type.zig");
 pub const stmt = @import("stmt.zig");
 
-// AST-scan helpers (pure AST walks, no FuncBuilder dependency).
 pub const collectDottedFqn = ast_scan.collectDottedFqn;
 pub const collectPathIdents = ast_scan.collectPathIdents;
 pub const collectPathIdentsStmt = ast_scan.collectPathIdentsStmt;
@@ -57,7 +52,6 @@ pub const isBoxedToAnyForm = ast_scan.isBoxedToAnyForm;
 pub const namesReferencedInLambdas = ast_scan.namesReferencedInLambdas;
 pub const collectVarDecls = ast_scan.collectVarDecls;
 
-// Builder-side helpers.
 pub const isAnyTypedPath = helpers.isAnyTypedPath;
 pub const lambdaWritesOuterVar = helpers.lambdaWritesOuterVar;
 pub const boxedCellReg = helpers.boxedCellReg;
@@ -68,8 +62,7 @@ pub const internTypeArgs = helpers.internTypeArgs;
 pub const astBinop = helpers.astBinop;
 pub const exprSpan = helpers.exprSpan;
 
-// Inline-state registries (thread-local equivalents installed by the
-// build driver before body lowering).
+// Inline-state registries, installed by the build driver before body lowering.
 pub const setInlineFnAsts = inline_state.setInlineFnAsts;
 pub const setTypeAliasTags = inline_state.setTypeAliasTags;
 pub const registerInlineFnId = inline_state.registerInlineFnId;
@@ -91,10 +84,8 @@ pub const ensureInlineBody = inline_state.ensureInlineBody;
 pub const setShadowedInlineNames = inline_state.setShadowedInlineNames;
 pub const setTopLevelPropNames = inline_state.setTopLevelPropNames;
 
-// Literal lowering surface.
 pub const widenNumericLiteral = literals.widenNumericLiteral;
 
-// Thunk lowering surface.
 pub const lowerAccessorBlock = thunks.lowerAccessorBlock;
 pub const lowerAccessorBlockRet = thunks.lowerAccessorBlockRet;
 pub const lowerSetterBlockTyped = thunks.lowerSetterBlockTyped;
@@ -118,23 +109,20 @@ pub const lowerInitBlock = thunks.lowerInitBlock;
 pub const lowerInitBlockWithParams = thunks.lowerInitBlockWithParams;
 pub const lowerUnaryExprAsThunk = thunks.lowerUnaryExprAsThunk;
 
-// when / for lowering surface.
 pub const lowerWhen = when_expr.lowerWhen;
 pub const lowerFor = for_loop.lowerFor;
 pub const lowerForLabeled = for_loop.lowerForLabeled;
 
-// Lambda-body lowering surface.
 pub const lowerLambdaBodyCapturing = lambda_body.lowerLambdaBodyCapturing;
 pub const lowerLambdaBodyCapturingKind = lambda_body.lowerLambdaBodyCapturingKind;
 pub const lowerLambdaBodyCapturingKindWith = lambda_body.lowerLambdaBodyCapturingKindWith;
 pub const resolveCapture = lambda_body.resolveCapture;
 
-// Inline-call lowering surface.
 pub const argLambdaHasNonlocalReturn = inline_call.argLambdaHasNonlocalReturn;
 pub const spliceInlineLambda = inline_call.spliceInlineLambda;
 pub const tryInlineCallWithTypeArgs = inline_call.tryInlineCallWithTypeArgs;
 
-// Declaration lowering surface (the build driver's main entry points).
+// Declaration lowering surface: the build driver's main entry points.
 pub const bindParams = decl.bindParams;
 pub const lowerClass = decl.lowerClass;
 pub const lowerClassWithFile = decl.lowerClassWithFile;
@@ -150,8 +138,8 @@ pub const setLowerAnonCaptures = decl.setLowerAnonCaptures;
 pub const takeLowerAnonCaptures = decl.takeLowerAnonCaptures;
 pub const resolveAnnotationNames = decl.resolveAnnotationNames;
 
-// Expression / statement lowering surface — the central recursive
-// dispatch that every sibling calls back into.
+// Expression and statement lowering surface: the central recursive dispatch every
+// sibling calls back into.
 pub const lowerExpr = expr.lowerExpr;
 pub const lowerReceiver = expr.lowerReceiver;
 pub const lowerBlock = expr.lowerBlock;

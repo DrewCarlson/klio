@@ -42,18 +42,12 @@ const block_mod = @import("block.zig");
 const hoistMutualLocalFns = block_mod.hoistMutualLocalFns;
 const lowerBlock = block_mod.lowerBlock;
 
-/// Replay the `finally { … }` bodies pushed above `base` inline, innermost
-/// first, ahead of a jump that leaves their try regions (an inline `return`
-/// to its join, a `break`/`continue` crossing a `try`). While one finally
-/// replays, only the finallys strictly outside it stay active, so a jump
-/// within the finally body still unwinds correctly. The bypassed try
-/// regions' runtime `TryFrame`s are popped when the current block exits —
-/// the jump bypasses the finally sentinel that would pop them.
-/// A `break`/`continue` leaves every try entered inside the loop: their
-/// runtime frames are popped when the current block exits, and the finally
-/// bodies replayed for the jump then run OUTSIDE them, so an exception one
-/// of them throws is neither caught by a catch the jump already left nor
-/// routed back into the finally itself.
+/// Replay the `finally { … }` bodies pushed above `base` inline, innermost first,
+/// ahead of a jump leaving their try regions. While one replays, only the finallys
+/// strictly outside it stay active, so a jump within it still unwinds correctly.
+/// The bypassed regions' runtime `TryFrame`s pop when the block exits, the jump
+/// having skipped the finally sentinel, so a replayed body runs outside them and an
+/// exception it throws reaches neither a left catch nor the finally itself.
 pub fn leaveTryFramesForJump(b: *FuncBuilder, finally_base: usize, catch_base: usize) Allocator.Error!void {
     const fin = try b.finallyBodiesFrom(finally_base);
     defer b.allocator.free(fin);
@@ -67,9 +61,8 @@ pub fn leaveTryFramesForJump(b: *FuncBuilder, finally_base: usize, catch_base: u
     b.switchTo(next);
 }
 
-/// Among same-named LOCAL function overloads (`f`, `f$ovl0`, …) the
-/// declaration whose parameter count matches the call; the plain name when
-/// it fits or when nothing does.
+/// Among same-named local function overloads the declaration whose parameter count
+/// matches the call; the plain name when it fits or nothing does.
 pub fn localOverloadPick(b: *FuncBuilder, name: []const u8, argc: usize) []const u8 {
     if (!b.isLocalFn(name)) return name;
     var buf: [4][96]u8 = undefined;
@@ -100,10 +93,8 @@ pub fn replayFinallysForJump(b: *FuncBuilder, base_raw: usize) Allocator.Error!v
     const base = @min(base_raw, b.finally_stack.items.len);
     const pop_bodies = try b.finallyBodiesFrom(base);
     if (b.finally_stack.items.len > base) {
-        // Each finally body re-lowers under the splice-resolve context that
-        // was active when its `try` was lowered, not the jump site's: a
-        // spliced body's finally replayed inside a spliced lambda otherwise
-        // resolves the body's own params against the lambda's caller region.
+        // Each finally body re-lowers under the splice-resolve context active when
+        // its `try` was lowered, not the jump site's.
         const windows = try b.finallyWindowsSnapshot();
         defer b.allocator.free(windows);
         const prior = try b.swapFinallyStack(&.{});
@@ -116,10 +107,8 @@ pub fn replayFinallysForJump(b: *FuncBuilder, base_raw: usize) Allocator.Error!v
             const dropped = try b.swapFinallyStack(outer);
             b.allocator.free(dropped);
             const saved_window = b.lambda_splice_resolve;
-            // The band list is restored by VALUE: a nested splice inside the
-            // replayed body appends at the truncated length and would
-            // otherwise overwrite the outer bands a bare length restore
-            // re-exposes.
+        // The band list is restored by value: a nested splice inside the replayed
+        // body appends at the truncated length and would overwrite outer bands.
             const saved_bands = try b.allocator.dupe(
                 @TypeOf(b.splice_hidden_bands.items[0]),
                 b.splice_hidden_bands.items,
@@ -150,8 +139,8 @@ pub fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const label = ret.label;
     var r: ?Reg = null;
     if (ret.value) |e| {
-        // `return …` puts the declared return type in tail position; only a
-        // bare `return` targets the enclosing fn.
+        // `return …` puts the declared return type in tail position; only a bare
+        // `return` targets the enclosing fn.
         var prev: ?(?ast.TypeRef) = null;
         if (label == null) prev = b.pushExpected(b.declaredReturn());
         if (label == null) b.tail_pos = true;
@@ -159,23 +148,17 @@ pub fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (prev) |p| b.restoreExpected(p);
         r = lowered;
     }
-    // An unlabeled `return` inside an inlined body returns from that inline
-    // fn — the call's value.
+    // An unlabeled `return` inside an inlined body returns from that inline fn,
+    // producing the call's value.
     if (label == null) {
         if (b.inlineActiveReturn()) |ar| {
             if (r) |rr| try b.push(.{ .Move = .{ .dst = ar.reg, .src = rr } });
-            // Replay the `finally { … }` blocks pushed *inside* this inline
-            // frame before jumping to its join. Finallys from an enclosing
-            // inline frame belong to that frame's own return and must not run
-            // here: `composing { try { return snap.enter(block) } finally { apply } }`
-            // inlines `enter { try { return block() } finally { restore } }`, so
-            // at `return block()` the stack holds [apply, restore]; replaying
-            // both would apply the snapshot twice.
+            // Replay only the `finally { … }` blocks pushed inside this inline frame
+            // before jumping to its join; an enclosing frame's belong to its own
+            // return, and replaying both would run the outer one twice.
             try replayFinallysForJump(b, ar.finally_base);
-            // Also pop the CATCH-ONLY try frames opened inside this inline body:
-            // the jump to the join bypasses their `catch_done` exit, so without
-            // this the catch stays armed over the code after the inlined call
-            // (`parseString("double") { toDouble() }` then rejecting NaN).
+            // Also pop the catch-only try frames opened inside this inline body: the
+            // jump bypasses their `catch_done` exit, leaving the catch armed.
             const catch_pops = try b.catchBodiesFrom(ar.catch_base);
             defer b.allocator.free(catch_pops);
             try b.appendPopOnExit(b.cur, catch_pops);
@@ -194,11 +177,9 @@ pub fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.switchTo(dead);
             return b.emitConst(.Unit);
         }
-        // `return@<inlineFnName>` targeting an inline body currently being
-        // SPLICED — reached from inside a lambda spliced by a nested inline
-        // call (`accept { … }.otherwise { return@tryParseTime }`). The
-        // target has no runtime frame, so the return resolves here to the
-        // splice frame's join, replaying its own finallys first.
+        // `return@<inlineFnName>` targeting an inline body currently being spliced,
+        // reached from a lambda spliced by a nested inline call. The target has no
+        // runtime frame, so it resolves to the splice frame's join.
         if (if (runtime.envOnce("KLIO_NO_LR_STATIC") == null) b.inlineReturnFor(lbl.name) else null) |ar| {
             if (r) |rr| try b.push(.{ .Move = .{ .dst = ar.reg, .src = rr } });
             try replayFinallysForJump(b, ar.finally_base);
@@ -209,23 +190,14 @@ pub fn lowerReturn(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         }
     }
     if (label) |lbl| {
-        // A labeled return unwinds at runtime to the frame whose function /
-        // lambda carries this label (`frameMatchesLabel`). That is correct
-        // whether the target is the current lambda (a local `return@self`,
-        // absorbed at this frame) or an enclosing one reached through a
-        // non-inlined call — e.g. `run sc@{ once { return@sc } }`, where the
-        // lambda passed to the inline `once` is itself lowered outside any
-        // inline context. Emitting a plain `Return` there returned from the
-        // lambda locally and silently dropped the non-local return.
+        // A labeled return unwinds at runtime to the frame whose function or lambda
+        // carries the label, whether the target is the current lambda or an enclosing
+        // one reached through a non-inlined call; a plain `Return` would drop it.
         b.terminate(.{ .LabeledReturn = .{ .label = lbl.name, .value = r } });
     } else if (b.isLambdaBody() and !b.isNamedLocalFn()) {
-        // A bare `return` in an argument lambda returns from the function
-        // the lambda is WRITTEN in. When the enclosing inline callee runs
-        // as a real frame (image-deferred / cross-pack body), the labeled
-        // form unwinds exactly to that frame (`frameMatchesLabel`); an
-        // untargeted non-local return would be absorbed by the first HOF
-        // boundary — `fastFirstOrNull`'s `return it` escaped its own body
-        // and became its CALLER's return value.
+        // A bare `return` in an argument lambda returns from the function the lambda
+        // is written in. With the enclosing inline callee running as a real frame the
+        // labeled form unwinds to it, where an untargeted return would be absorbed.
         if (build.currentRealFn()) |ename| {
             b.terminate(.{ .LabeledReturn = .{ .label = ename, .value = r } });
         } else {
@@ -244,9 +216,9 @@ pub fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const result = b.allocReg();
     const exit = try b.allocBlock();
     const finally_entry: ?BlockId = if (t.finally != null) try b.allocBlock() else null;
-    // The post-finally sentinel is allocated up front so catch handlers can be
-    // protected by the finally before their bodies are lowered (a throw in a
-    // catch must run the finally, then re-raise past this sentinel).
+    // The post-finally sentinel is allocated up front so catch handlers are
+    // protected by the finally before their bodies lower: a throw in a catch runs
+    // the finally, then re-raises past this sentinel.
     const finally_done: ?BlockId = if (finally_entry != null) try b.allocBlock() else null;
 
     // Pre-allocate each catch handler's entry block + exception register.
@@ -271,8 +243,8 @@ pub fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (finally_done) |done| b.setFinallyDoneFor(cur_id, done);
     if (finally_entry == null and t.catches.len != 0) b.setCatchDoneFor(cur_id, exit);
     if (t.finally) |blk| try b.pushFinally(blk, cur_id);
-    // A catch-only try (no finally) needs its body tracked so an inline
-    // `return` inside it pops the runtime catch frame on the way to its join.
+    // A catch-only try needs its body tracked so an inline `return` inside it pops
+    // the runtime catch frame on the way to its join.
     const catch_only = finally_entry == null and t.catches.len != 0;
     if (catch_only) try b.pushCatchBody(cur_id);
     const body_val = try lowerBlock(b, &t.body);
@@ -291,11 +263,8 @@ pub fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (finally_entry) |fin| b.protectCatchWithFinally(h.blk, fin, finally_done.?);
         try b.pushScope();
         try b.bind(h.c.binding.name, h.exc);
-        // A catch parameter's type is always written in the source, so it is
-        // static evidence for every member call on it in the handler. Binding
-        // the register without recording the type left those calls with no
-        // receiver type — the largest single reason static member dispatch
-        // declines is locals lowering has in scope but has no type for.
+        // A catch parameter's type is always written in the source, so it is static
+        // evidence for every member call in the handler.
         try b.setLocalDeclTypeOwned(
             h.c.binding.name,
             try decl_mod.loweredTypeRef(b.allocator, &h.c.ty, true),
@@ -326,11 +295,9 @@ pub fn lowerTry(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     return result;
 }
 
-/// `x++`/`--x` on a local declared NULLABLE (`var i: Int? = …`): the
-/// builtin `inc`/`dec` members do not take a nullable receiver, so the
-/// program's `T?.inc()`/`T?.dec()` extension is the target — lowered as the
-/// call it is. Null when the operand is not such a local or no extension is
-/// declared.
+/// `x++`/`--x` on a local declared nullable: the builtin `inc`/`dec` members take no
+/// nullable receiver, so the program's `T?.inc()` extension is the target, lowered
+/// as the call it is.
 pub fn nullableIncDecCall(b: *FuncBuilder, operand: *const Expr, inc: bool) Allocator.Error!?Reg {
     if (operand.* != .Path or operand.Path.segments.len != 1) return null;
     const name = operand.Path.segments[0].name;
@@ -345,8 +312,7 @@ pub fn nullableIncDecCall(b: *FuncBuilder, operand: *const Expr, inc: bool) Allo
     return try lowerExpr(b, &call);
 }
 
-/// A `recv.member` target whose receiver is an expression with possible
-/// side effects (a call, an index, a nested member), so it must be
+/// A `recv.member` target whose receiver has possible side effects, so it must be
 /// evaluated exactly once for a read-modify-write.
 pub fn sideEffectingMemberTarget(e: *const Expr) bool {
     if (e.* != .Member or e.Member.safe) return false;
@@ -392,10 +358,8 @@ pub fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 b.localDeclNullable(inner.Path.segments[0].name) and
                 (userFunctionDeclared(b, if (pf.op == .Inc) "inc" else "dec") or b.isLocalExtFn(if (pf.op == .Inc) "inc" else "dec")))
             {
-                // Snapshot the OLD value into a fresh register: `inner` is
-                // a mutable var whose register the write-back below
-                // reassigns, so returning the live load would yield the NEW
-                // value (post-increment must return the old one).
+                // Snapshot the old value: `inner` is a mutable var whose register the
+                // write-back reassigns, so the live load would yield the new value.
                 const old_src = try lowerExpr(b, inner);
                 const old = b.allocReg();
                 try b.push(.{ .Move = .{ .dst = old, .src = old_src } });
@@ -444,10 +408,8 @@ pub fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 } });
                 return old;
             }
-            // Safe-target postfix (`parent?.count++`): the receiver
-            // evaluates ONCE and a null receiver skips the whole
-            // get/inc/store (Kotlin's `?.` short-circuit) — running the
-            // unguarded sequence incremented `null` at the chain's root.
+            // Safe-target postfix (`parent?.count++`): the receiver evaluates once
+            // and a null receiver skips the whole get/inc/store.
             if (inner.* == .Member and inner.Member.safe) {
                 const m = inner.Member;
                 const recv = try lowerReceiver(b, m.receiver);
@@ -481,8 +443,8 @@ pub fn lowerPostfix(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             try b.push(.{ .Move = .{ .dst = old, .src = s } });
             const new = b.allocReg();
             try b.push(.{ .UnOp = .{ .dst = new, .op = uo, .operand = old } });
-            // Postfix `x++` evaluates to the OLD value but writes the NEW
-            // value back through the shared write-back decision.
+            // Postfix `x++` evaluates to the old value but writes the new value
+            // back through the shared write-back decision.
             try stmt_mod.storeCombinedToTarget(b, inner, new);
             return old;
         },
@@ -522,11 +484,9 @@ pub fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.terminate(.{ .Goto = body_blk });
             b.switchTo(body_blk);
             try b.pushLoop(label.name, body_blk, exit);
-            // Kotlin scopes the do-body's declarations into the `while`
-            // condition, so when the body is a block, lower its statements and
-            // the condition in one shared scope; otherwise the block's own
-            // scope closes first and a `do { val x = … } while (x …)` local
-            // resolves as a stray global.
+            // Kotlin scopes the do-body's declarations into the `while` condition, so
+            // a block body and the condition lower in one shared scope; otherwise the
+            // block's scope closes first and its locals resolve as stray globals.
             if (w.body) |body| {
                 if (body.* == .Block) {
                     const block = &body.Block;
@@ -548,10 +508,8 @@ pub fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.switchTo(exit);
             return b.emitConst(.Unit);
         },
-        // An explicit label on a lambda / anonymous function literal
-        // (`sc@ { … }`) names that body for `return@sc`. It overrides any
-        // implicit callee-derived label `lowerExpr` would otherwise arm,
-        // so the lambda's own `implicit_label` is the explicit one.
+        // An explicit label on a lambda or anonymous function literal names that body
+        // for `return@sc`, overriding the implicit callee-derived label.
         .Lambda, .AnonFun => {
             b.pending_lambda_label = label.name;
             return lowerExpr(b, inner);
@@ -560,10 +518,9 @@ pub fn lowerLabeled(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     }
 }
 
-/// Unwind the spliced-subject tower down to `base` before a jump that
-/// leaves the regions (`break`/`continue` past a spliced `sync {}`):
-/// every skipped region's `EnclosingPop` is emitted here, or the CAS
-/// retry loop leaks one chain entry per iteration.
+/// Unwind the spliced-subject tower to `base` before a jump leaving the regions,
+/// emitting every skipped region's `EnclosingPop`, or a retry loop leaks one chain
+/// entry per iteration.
 pub fn emitTowerPopsForJump(b: *FuncBuilder, base: u32) Allocator.Error!void {
     var d = b.encl_tower_depth;
     while (d > base) : (d -= 1) {
