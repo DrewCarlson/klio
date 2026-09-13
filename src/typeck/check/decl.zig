@@ -1192,8 +1192,10 @@ fn checkMemberPrivateModifiers(self: *Checker, c: *const Class) Allocator.Error!
 fn inheritedMemberFlags(self: *Checker, c: *const Class) Allocator.Error!std.StringHashMap(MemberFlags) {
     var inherited = try collectInheritedMemberFlags(self, c);
     errdefer inherited.deinit();
+    // The injected `invoke` sig owns its parameter and return types, so the
+    // map needs the value-freeing teardown, not just the spine.
     var sigs_tmp = std.StringHashMap(MemberSig).init(self.allocator);
-    defer sigs_tmp.deinit();
+    defer deinitMemberSigMap(self, &sigs_tmp);
     try injectFunctionTypeSupertypes(self, c, &inherited, &sigs_tmp);
     return inherited;
 }
