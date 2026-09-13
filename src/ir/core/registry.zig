@@ -12,253 +12,121 @@ const StrPairMap = core_class.StrPairMap;
 const StrPairSet = core_class.StrPairSet;
 const TypeRef = core_ids.TypeRef;
 
-/// Module-scoped side tables consumed by the Vm at dispatch time.
-/// Populated by `interp_ir`'s build pass; serialized into pack files
-/// so a pre-built pack can ship its registry alongside the frozen IR
-/// module.
+/// Module-scoped side tables the Vm consults at dispatch time. Serialized into
+/// pack files, so a pre-built pack ships its registry beside its frozen IR.
 pub const ModuleRegistry = struct {
-    /// Names of `object` singletons. The Vm allocates one instance
-    /// per name at startup and publishes it as a global so bare-name
-    /// reads resolve.
+    /// Names of `object` singletons; the Vm publishes one instance of each as a global.
     object_names: std.ArrayList([]const u8) = .empty,
-    /// Outer-class → companion-singleton global name. Reads on
-    /// `Foo.X` fall through to the companion instance when `X` is
-    /// not a member of `Foo` itself.
+    /// Outer class -> companion-singleton global name; `Foo.X` falls through to it.
     companion_singletons: std.StringHashMap([]const u8),
-    /// Fqns whose installed HOST BINDING is authoritative over any
-    /// interpreted body (a pack's stub declarations — atomicfu's atomics).
-    /// Populated at bindings install from the non-stdlib overlay keys; a
-    /// static member bind must not commit a BODY-BEARING target listed
-    /// here — the runtime walk's binding preference arbitrates instead.
+    /// Fqns whose installed host binding outranks any interpreted body (a pack's stub declarations).
     host_shadowed_fqns: std.StringHashMap(void),
-    /// Inner class → outer class name. Resolves `this@Outer` and
-    /// outer-chain field reads for nested classes lifted to top level.
+    /// Inner class -> outer class name; resolves `this@Outer` and outer-chain field reads.
     enclosing_class: std.StringHashMap([]const u8),
-    /// Per-function type-parameter names (in source order). Used by
-    /// reified-call dispatch to bind `T` → `Value.Class(arg)` as a
-    /// global for the call's lifetime.
+    /// Per-function type-parameter names in source order; reified dispatch binds each.
     func_type_params: std.AutoHashMap(FuncId, std.ArrayList([]const u8)),
-    /// Declared upper bounds of a function's type parameters (`<T : Number>`
-    /// inline bounds plus `where` clauses), one entry per (param, bound)
-    /// pair. The strict extension-receiver prover consults these: a
-    /// bounded type-parameter receiver is proven only when the actual
-    /// receiver satisfies every bound; an unbounded one accepts anything.
+    /// Declared upper bounds of a function's type parameters, one entry per (param, bound).
     func_type_param_bounds: std.AutoHashMap(FuncId, []const TypeParamBound),
-    /// Declared upper bounds of each CLASS's type parameters
-    /// (`class EnumEntriesList<T : Enum<T>>`), keyed by class simple name.
-    /// Method dispatch disproves a wrong-typed argument against a param
-    /// declared as the class type param (the Kotlin collection-stub
-    /// bridge: `indexOf(nonEnum)` on an `EnumEntries` answers -1 through
-    /// the inherited implementation instead of running the override).
+    /// Declared upper bounds of each class's type parameters, keyed by class simple name.
+    /// Dispatch disproves an argument whose type violates the bound on a class parameter.
     class_type_param_bounds: std.StringHashMap([]const TypeParamBound),
-    /// Top-level property names declared with `by <delegate>`.
-    /// Reads/writes route through the stored delegate's `getValue` /
-    /// `setValue` methods.
+    /// Top-level properties declared `by`; reads and writes route through `getValue`/`setValue`.
     top_level_delegated_props: std.StringHashMap(void),
-    /// Top-level `lateinit var` names. Such a property has no initializer
-    /// and no global binding until its first write; a read that finds no
-    /// binding throws `UninitializedPropertyAccessException`, and
-    /// `::name.isInitialized` answers from the binding's presence.
+    /// Top-level `lateinit var` names: no binding until the first write, so a read that finds
+    /// none throws `UninitializedPropertyAccessException` and `isInitialized` answers from it.
     top_level_lateinit_props: std.StringHashMap(void),
-    /// Class simple name → the set of member *function* names it
-    /// declares or inherits (transitively over supertypes). Lets the
-    /// lowerer honor Kotlin's separate function/property namespaces.
+    /// Class -> member FUNCTION names declared or inherited transitively; Kotlin keeps the namespaces apart.
     hierarchy_methods: std.StringHashMap(std.StringHashMap(void)),
-    /// Private stored properties that SHADOW a same-name declaration in a
-    /// strict supertype, keyed "Class\x1fprop". Kotlin gives a shadow its
-    /// own storage cell (a private base field and a private derived field
-    /// are distinct); construction stores these under the owner-mangled
-    /// key and the scope-qualified read/write paths address exactly that
-    /// cell, so the base class's cell is never clobbered. Lowering-only.
+    /// Private stored properties that shadow a same-name supertype declaration, keyed
+    /// "Class\x1fprop". Each gets its own cell, addressed owner-mangled. Lowering-only.
     private_shadow_props: std.StringHashMap(void),
-    /// Initialized `override val/var` properties whose supertype STORES the
-    /// same name, keyed "Class\x1fprop". Each class keeps its own backing
-    /// cell (JVM semantics): reads dispatch to the most-derived cell,
-    /// `super.x` reads the base's plain cell. Lowering-only.
+    /// Initialized `override val/var` whose supertype also stores the name, keyed "Class\x1fprop".
+    /// Each class keeps its own cell: a read takes the most-derived, `super.x` the base. Lowering-only.
     override_cell_props: std.StringHashMap(void),
-    /// Per-class transitive member-NAME set for the member-shadow gate —
-    /// every kind a bare name could bind through the implicit receiver —
-    /// plus whether the supertype chain fully resolved (`complete`). An
-    /// incomplete set must not prove non-shadowability. Lowering-only.
+    /// Per-class transitive member-name set for the member-shadow gate, plus whether the supertype
+    /// chain resolved; an incomplete set cannot prove non-shadowability. Lowering-only.
     hierarchy_shadow_names: std.StringHashMap(HierarchyShadowSet),
-    /// `(declaring class, method name)` → trailing-lambda shapes collected
-    /// from every member declaration before any body lowers. This keeps
-    /// receiver-lambda typing independent of source order when a subclass
-    /// calls an inherited method whose body has not produced a `FuncId` yet.
-    /// Lowering-only; installed packs use their serialized lowered methods.
+    /// (declaring class, method) -> trailing-lambda shapes, collected from every member declaration
+    /// before any body lowers, so receiver-lambda typing does not depend on source order.
     member_trailing_lambda_shapes: StrPairMap(std.ArrayList(MemberTrailingLambdaShape)),
-    /// `"<class>\x00<method>\x00<userArity>"` → the lowered method's FuncId,
-    /// populated incrementally as each class's method bodies are lowered. Lets
-    /// a method body statically reach a SIBLING member method's lowered
-    /// signature (e.g. the declared parameter types of `testPlus`) at lower
-    /// time, when `Class.methods` is not yet patched and members are absent
-    /// from the simple-name / fqn indexes. Owner-scoped, so a same-named member
-    /// in an unrelated class is never confused for it.
+    /// `"<class>\x00<method>\x00<userArity>"` -> the lowered method's FuncId, filled as each body
+    /// lowers, so a body reaches a sibling member's signature before `Class.methods` is patched.
     member_method_fids: std.StringHashMap(FuncId),
-    /// Every member name (function, property, primary-ctor property,
-    /// companion member) declared by ANY class in the program. A bare
-    /// name in a receiver context can only be shadowed by a runtime
-    /// receiver when some class declares a member of that name, so
-    /// lowering keeps the static classification for everything else.
+    /// Every member name declared by any class: only these can be shadowed by a runtime receiver.
     class_member_names: std.StringHashMap(void),
-    /// Class simple name → its transitive supertype simple names,
-    /// nearest first (each direct supertype followed by its own chain).
-    /// Recorded from the AST hierarchy before body lowering, so a
-    /// method body can rank extension receivers against the enclosing
-    /// class — including extensions declared on a base class — while
-    /// the IR-side `Class.supertypes` slots are still being filled.
+    /// Class -> transitive supertype simple names, nearest first, recorded from the AST before body
+    /// lowering so extension receivers rank while the `Class.supertypes` slots are still filling.
     class_super_names: std.StringHashMap([]const []const u8),
     /// Body-property `(class, prop)` pairs declared with `by`.
     delegated_body_props: StrPairSet,
-    /// (class, property) pairs whose declared type is a RECEIVER function
-    /// type (`suspend Scope.() -> Unit`): a bare invocation of the stored
-    /// value inside a receiver context binds the implicit `this` as the
-    /// lambda's receiver (`_deprecatedPointerInputHandler!!()` inside the
-    /// pointer-input node runs the handler on the node's scope). The value
-    /// is the DECLARED receiver type's simple head (`Scope`), so dispatch
-    /// binds the innermost implicit receiver of that type — the owning
-    /// instance when it implements the head, an enclosing receiver
-    /// otherwise (`block()` inside `with(cacheDrawScope) { … }` where
-    /// `block: CacheDrawScope.() -> DrawResult` lives on the node).
+    /// (class, property) pairs whose declared type is a receiver function type; the value is the
+    /// receiver's simple head, so a bare invoke binds the innermost implicit receiver of that type.
     recv_fn_props: StrPairMap([]const u8),
-    /// `(class simple name, property name)` → the property's DECLARED
-    /// type head, with a class type-parameter name substituted by its
-    /// bound's head (`data: T` in `IterableTests<T : Iterable<String>>`
-    /// records `Iterable`). Consumed by the binop/member lowering so a
-    /// call on the property resolves against the static type, as
-    /// kotlinc does.
+    /// (class, property) -> declared type head, a class type parameter replaced by its bound's head.
     class_prop_type_heads: StrPairMap([]const u8),
-    /// The same key, carrying the property's FULL declared type rather than
-    /// its head — `val items: List<Named>` records `List<Named>`, not `List`.
-    /// A head alone cannot answer what iterating or indexing the property
-    /// yields, which left `items[0].tag()`, `for (i in items)` and
-    /// `items.map { it.tag() }` with no receiver type in ordinary code.
-    /// Borrowed from the lowering arena, like every other registry string.
+    /// Same key with the FULL declared type (`List<Named>`, not `List`): a head alone cannot say what
+    /// iterating or indexing yields. Borrowed from the lowering arena, like every registry string.
     class_prop_type_refs: StrPairMap(TypeRef),
-    /// `(extension-receiver head, property name)` -> declared type head for
-    /// TOP-LEVEL extension properties (`val IntArray.indices: IntRange`
-    /// records `(IntArray, indices) -> IntRange`). Recorded in the decl
-    /// scan, before any body lowers, so a bare `indices` read inside an
-    /// array extension body types statically even while the stdlib itself
-    /// is still lowering.
+    /// (ext receiver head, property) -> declared type head for top-level extension properties.
     ext_prop_type_heads: StrPairMap([]const u8),
-    /// `FuncId` → declaring-class simple name for *member extension
-    /// functions* (`class C { fun R.f(...) { … } }`). Empty for
-    /// top-level extensions.
+    /// `FuncId` -> declaring class for MEMBER extension functions; empty for top-level ones.
     member_ext_owner_class: std.AutoHashMap(FuncId, []const u8),
-    /// `FuncId` → declaring FILE of a `private` top-level function. Kotlin
-    /// scopes a private top-level declaration to its file, so a dispatch
-    /// walk must never pick a private extension from another file (a
-    /// file-private `Rect.size()` capturing `LongSparseArray.size()`).
+    /// `FuncId` -> declaring file of a `private` top-level function, which Kotlin scopes to that file.
     private_fn_files: std.AutoHashMap(FuncId, FileId),
-    /// (interface, method) → declared extension-receiver type head for
-    /// ABSTRACT member-extension declarations (`fun interface
-    /// MeasurePolicy { fun MeasureScope.measure(...) }`). The abstract
-    /// slot lowers no func, so the SAM dispatch reads the receiver type
-    /// here to bind the lambda's implicit `this`.
+    /// (interface, method) -> declared extension-receiver head for ABSTRACT member extensions.
+    /// The abstract slot lowers no func, so SAM dispatch binds the lambda's `this` from here.
     iface_member_ext_recv: StrPairMap([]const u8),
-    /// (interface, method) -> the method's declared `context(...)` parameter
-    /// type names joined by `|`: a SAM conversion of the fun interface supplies
-    /// each context from the call site's context scope as a leading argument.
+    /// (interface, method) -> the method's `context(...)` parameter type names joined by `|`; a SAM
+    /// conversion supplies each from the call site's context scope as a leading argument.
     iface_member_ctx_types: StrPairMap([]const u8),
-    /// (class simple name, member name) → arity BITMASK (bit n = declared
-    /// with n params, capped at 63) for BODYLESS member declarations
-    /// (abstract interface/class members). The abstract slot lowers no
-    /// func and joins no class-row method list, so overload picks that
-    /// must rank members above extensions (a bare `respond(a, b)` inside
-    /// an `ApplicationCall` extension binding the interface's
-    /// `respond(message, typeInfo)` member, never a reified 2-arg
-    /// extension splice) consult this record.
+    /// (class, member) -> arity bitmask (bit n = declared with n params, capped at 63) for BODYLESS
+    /// members, which lower no func and join no class method list but must still outrank extensions.
     abstract_member_arity: StrPairMap(u64),
-    /// Top-level `const val` literal values keyed by declaration FQN.
-    /// Kotlin inlines compile-time constants at every reference, so the
-    /// lowering reads the value here and emits the literal directly — a
-    /// bare `Empty` inside androidx.collection can never be captured by a
-    /// same-simple-name global another module published.
+    /// Top-level `const val` literals by FQN; Kotlin inlines constants, so lowering emits the literal.
     top_level_const_vals: std.StringHashMap(Const),
-    /// Per-local-function default-arg thunks. Keyed by the local fn's
-    /// lowered body `FuncId`; each slot holds the `FuncId` of a 0-arg
-    /// thunk producing that parameter's default, or `null` for a
-    /// required param.
+    /// Per-local-function default-arg thunks keyed by body `FuncId`; a null slot is a required parameter.
     local_fn_defaults: std.AutoHashMap(FuncId, std.ArrayList(?FuncId)),
-    /// Default-arg thunks for *bodyless* (abstract / interface) member
-    /// declarations, keyed by `(class simple name, method name)`.
+    /// Default-arg thunks for bodyless members, keyed `(class, method)`.
     abstract_member_defaults: StrPairMap(std.ArrayList(?FuncId)),
-    /// `typealias Name = Target` → `Name` ↦ `Target`'s simple head
-    /// name.
+    /// `typealias Name = Target` -> `Name` mapped to `Target`'s simple head name.
     type_aliases: std.StringHashMap([]const u8),
     /// Structural alias targets used by static applicability proofs.
     type_alias_types: std.StringHashMap(TypeAliasShape),
-    /// Function-type aliases whose target declares an extension RECEIVER
-    /// (`typealias Workflow = suspend WScope.() -> Unit`) → the target's
-    /// VALUE-parameter count. The `Function{N}` tag in `type_aliases`
-    /// deliberately drops the receiver; a bare call through a param of
-    /// such an alias must still bind the enclosing `this`.
+    /// Function-type aliases whose target declares an extension receiver -> the target's VALUE-parameter
+    /// count. The `Function{N}` tag in `type_aliases` drops the receiver; a bare call still binds `this`.
     recv_fn_aliases: std.StringHashMap(u8),
-    /// Per-file (`FileId`) non-wildcard import leaf → every import in
-    /// the file bound to that leaf, in declaration order. Keyed by file
-    /// because a Kotlin named import is file-scoped; a list because
-    /// Kotlin keeps every same-leaf import in scope (a second import of
-    /// the same leaf is an ambiguity at the use site, not a shadow).
+    /// Per-file non-wildcard import leaf -> every import bound to that leaf, in declaration order:
+    /// named imports are file-scoped, and same-leaf imports all stay in scope (ambiguity at the use site).
     import_aliases: std.AutoHashMap(FileId, std.StringHashMap(std.ArrayList(ImportPath))),
-    /// Per-file (`FileId`) wildcard-import package paths (dotted,
-    /// owned). A `import pkg.*` makes every `pkg` declaration visible
-    /// to the file, outranking the implicitly-imported built-ins in
-    /// bare-call preference.
+    /// Per-file wildcard-import packages, dotted and owned; `import pkg.*` outranks the built-ins.
     import_wildcards: std.AutoHashMap(FileId, std.ArrayList([]const u8)),
-    /// Per-file (`FileId`) declared package path. A spliced inline body
-    /// carries the DONOR file's spans, so bare-call scope judgments must
-    /// follow the span's file — its package and imports — not the
-    /// recipient function's package.
+    /// Per-file declared package. A spliced inline body carries the DONOR file's spans, so bare-call
+    /// scope follows the span's file and its imports, not the recipient function's package.
     file_packages: std.AutoHashMap(FileId, []const u8),
-    /// Kotlin compilation-module identity for each source file. `internal`
-    /// declarations are visible across files carrying the same identity and
-    /// inaccessible across dependency/program boundaries.
+    /// Kotlin compilation-module identity per file: `internal` is visible only within one identity.
     file_modules: std.AutoHashMap(FileId, u32),
-    /// Nested-object simple-name aliases, keyed by enclosing class
-    /// name.
+    /// Nested-object simple-name aliases, keyed by enclosing class name.
     nested_object_aliases: std.StringHashMap(std.StringHashMap([]const u8)),
-    /// Qualified nested-class name (`Outer.Inner`) → mangled lift name,
-    /// for nested classes the lift renamed (private, or colliding with
-    /// a top-level type). A qualified type reference (`x is
-    /// Outer.Inner`, `x as Outer.Inner`) resolves through this so it
-    /// binds the lifted class, never a same-simple-name top-level one.
+    /// Qualified nested class (`Outer.Inner`) -> mangled lift name, for nested classes the lift renamed.
+    /// A qualified type reference resolves through this, never to a same-simple-name top-level class.
     mangled_nested: std.StringHashMap([]const u8),
-    /// `(class_name, member_name) → Const` for class / companion
-    /// `const val name = <literal>`.
+    /// `(class, member)` -> `Const` for a class or companion `const val`.
     class_const_inits: StrPairMap(Const),
-    /// Top-level (file-scope) property simple name → every declaration of
-    /// that name, each carrying its FQN and declaring package. A bare read
-    /// of such a property resolves under Kotlin scoping, so the lowerer
-    /// ranks the read's tier the same way it ranks a bare call: a read
-    /// whose only declaration is in an unimported package is unresolved.
+    /// Top-level property simple name -> every declaration of it, with FQN and package. A bare read
+    /// ranks scope tiers like a bare call: a declaration only in an unimported package is unresolved.
     top_level_prop_pkgs: std.StringHashMap(std.ArrayList(PropDecl)),
-    /// Top-level property FQN -> declared type head, so a bare read used as
-    /// a RECEIVER (`asserter.assertEquals(...)`) types statically. Only
-    /// annotated declarations record; the head is the annotation as written.
+    /// Top-level property FQN -> declared type head, as annotated; unannotated declarations record none.
     top_level_prop_type_heads: std.StringHashMap([]const u8),
-    /// The same key, carrying the FULL declared type where it has arguments
-    /// (`val topItems: List<Named>`). The head alone cannot say what
-    /// iterating or indexing the property yields.
+    /// Same key with the full declared type, which alone says what iterating or indexing yields.
     top_level_prop_type_refs: std.StringHashMap(TypeRef),
-    /// Top-level property FQN -> the simple name its UNANNOTATED initializer
-    /// calls (`private val base64EncodeMap = byteArrayOf(...)`). Resolved to
-    /// a head only at query time, when every declaration is registered: a
-    /// user function of the same name is then visible and either agrees or
-    /// makes the answer ambiguous, so a shadowed factory cannot mistype the
-    /// property.
+    /// Top-level property FQN -> the simple name its UNANNOTATED initializer calls, resolved to a head
+    /// only at query time, when a same-named user function is visible and can instead make it ambiguous.
     top_level_prop_init_callees: std.StringHashMap([]const u8),
-    /// Top-level extension properties whose values are directly callable.
-    /// Registered before body lowering so `receiver.property(args)` can be
-    /// classified as a property read followed by `invoke`.
+    /// Top-level extension properties whose values are callable: `recv.p(args)` is a read plus `invoke`.
     callable_extension_props: std.StringHashMap(std.ArrayList(CallableExtensionProp)),
-    /// Top-level property simple name → 0-arg getter `FuncId`, for a
-    /// `val`/`var` declared with only a custom getter (no initializer,
-    /// no backing field, no delegate). A `LoadGlobal` of such a name
-    /// re-invokes the getter on every read.
+    /// Top-level property -> 0-arg getter `FuncId`; a `LoadGlobal` of the name re-invokes it per read.
     top_level_prop_getters: std.StringHashMap(FuncId),
-    /// Top-level `var` custom setters. A `StoreGlobal` of the property
-    /// name invokes the setter thunk; the thunk's own `field =` write
+    /// Top-level `var` custom setters: a `StoreGlobal` invokes the thunk, whose own `field =` write
     /// lands on the `__klio_topfield__<name>` storage binding.
     top_level_prop_setters: std.StringHashMap(FuncId),
 
@@ -269,7 +137,6 @@ pub const ModuleRegistry = struct {
         target: TypeRef,
     };
 
-    /// One top-level property declaration's scoping identity.
     pub const PropDecl = struct {
         fqn: []const u8,
         package: []const u8,
@@ -284,9 +151,8 @@ pub const ModuleRegistry = struct {
         is_private: bool,
     };
 
-    /// One non-wildcard import: its full dotted path (owned by the
-    /// registry allocator) and the same path as segments (an owned
-    /// slice of name slices borrowed from the AST).
+    /// One non-wildcard import: the full dotted path (owned by the registry allocator) and the same
+    /// path as segments (an owned slice of name slices borrowed from the AST).
     pub const ImportPath = struct {
         fqn: []const u8,
         segs: []const []const u8,
@@ -295,31 +161,23 @@ pub const ModuleRegistry = struct {
     pub const TypeParamBound = struct {
         param: []const u8,
         bound: []const u8,
-        /// False when the string-only record dropped intersection or
-        /// structural type information and cannot support a negative proof.
+        /// False when the string-only record dropped intersection or structural detail: no negative proof.
         complete: bool = true,
-        /// True when `bound` still names the single classifier the parameter
-        /// is bounded by, even if the record dropped its type ARGUMENTS. That
-        /// is enough to answer "which class owns a member call on this
-        /// parameter", which is all the receiver-owner lookup asks.
+        /// True when `bound` still names the single classifier the parameter is bounded by, even with its
+        /// type ARGUMENTS dropped: enough to answer which class owns a member call on the parameter.
         head_only: bool = true,
-        /// The bound's type-argument heads, kept ONLY when every argument is
-        /// concrete (`T : Iterable<String>` keeps ["String"];
-        /// `C : MutableCollection<in T>` keeps nothing — an argument naming
-        /// another parameter substitutes nothing). Lets a receiver typed by
-        /// the parameter instantiate a generic callee's lambda params.
+        /// The bound's type-argument heads, kept ONLY when every argument is concrete
+        /// (`T : Iterable<String>` keeps ["String"]; `C : MutableCollection<in T>` keeps nothing).
         args: []const []const u8 = &.{},
     };
 
-    /// One class's transitive shadow-name set + chain completeness.
     pub const HierarchyShadowSet = struct {
         names: std.StringHashMap(void),
         complete: bool,
     };
 
     pub const MemberTrailingLambdaShape = struct {
-        /// Bit `n` is set when `n` positional user arguments, including the
-        /// trailing lambda, can bind this declaration.
+        /// Bit `n` is set when `n` positional user arguments, trailing lambda included, can bind this.
         accepted_arities: u64,
         value_arity: i16,
         receiver_head: ?[]const u8,
@@ -503,13 +361,9 @@ pub const ModuleRegistry = struct {
         self.top_level_prop_setters.deinit();
     }
 
-    /// Clone for extension (see `Module.cloneForExtend`). Outer container
-    /// spines are copied onto `a`; inner containers and value slices are
-    /// SHARED with the original by value-copy. That is sound because the
-    /// extending build only ever inserts NEW keys (new files, new classes,
-    /// new FuncIds — cross-boundary name collisions fall back to a full
-    /// rebuild) and replaces whole entries; it never appends into an inner
-    /// container reached through an existing key.
+    /// Clone for extension: outer container spines are copied onto `a`, while inner containers and
+    /// value slices are SHARED with the original by value-copy. Sound because the extending build only
+    /// inserts new keys and replaces whole entries, never appending into a container reached by an old key.
     pub fn cloneForExtend(self: *const ModuleRegistry, a: Allocator) Allocator.Error!ModuleRegistry {
         var out = ModuleRegistry.init(a);
         try out.object_names.appendSlice(a, self.object_names.items);

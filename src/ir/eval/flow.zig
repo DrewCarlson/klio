@@ -24,121 +24,76 @@ const EvalError = ev_state.EvalError;
 const Frame = ev_frame.Frame;
 const TryFrame = ev_snapshot.TryFrame;
 
-/// `Result<Value, EvalError>` as data. OOM stays a Zig `error`; this
-/// carries the `EvalError` data path.
+/// `Result<Value, EvalError>` as data; OOM stays a Zig `error`.
 pub const EvalResult = union(enum) {
     ok: Value,
     err: EvalError,
 };
 
-/// Per-instruction control signal from `execInst`. `cont` = the instruction
-/// completed (its result, if any, was written to a register); `raised` = a
-/// control-flow event occurred and its `EvalError` is in `frame.step_err`;
-/// `flat_call` = the instruction is a direct interpreted call the flat driver
-/// should run as a pushed activation (request in `frame.flat_call`).
-/// A 1-byte return keeps the hot dispatch loop from copying an `EvalResult` per
-/// instruction (whose `.ok` is always the ignored `.Unit`).
+/// Per-instruction control signal from `execInst`: `cont` completed, `raised` left an `EvalError` in
+/// `frame.step_err`, `flat_call` left a request in `frame.flat_call` for the driver to push.
 pub const Step = enum { cont, raised, flat_call };
 
-/// A direct interpreted call the flat driver runs by pushing an activation
-/// instead of recursing natively. Carries the resolved callee and the arg
-/// buffer (ownership transfers to the new frame's params, exactly as the
-/// host fast path transferred it). A closure invocation additionally carries
-/// its capture vector, creation-time receiver chain, owning sub-module and
-/// closure id — the exact seed `evalWithCapturesChained` would receive.
+/// A direct interpreted call the flat driver runs by pushing an activation instead of recursing. Arg-buffer
+/// ownership passes to the new frame's params; a closure also carries its captures, chain, module and id.
 pub const FlatCallReq = struct {
     func: *const Func,
-    /// The module the body resolves against (a closure body always resolves
-    /// against its creation module, never the caller's). Null = the calling
-    /// frame's module (a same-module direct call).
+    /// The module the body resolves against (a closure body's creation module); null = the caller's module.
     run_module: ?*const Module = null,
-    /// Owning sub-module for a body lowered into one (anon object / local
-    /// class); null for a main-module body. Recorded as the frame's
-    /// `module_arc` so a suspension resumes against the right module.
+    /// Owning sub-module for a body lowered into one, kept as the frame's `module_arc` so a suspension resumes there.
     owning: ?*const Module = null,
     args: std.ArrayList(Value),
     captures: std.ArrayList(Value) = .empty,
-    /// Creation-time receiver-chain seed (borrowed; copied into the frame's
-    /// chain at activation open).
+    /// Creation-time receiver-chain seed, borrowed; copied into the frame's chain at activation open.
     chain: []const EnclosingEntry = &.{},
     closure_id: ?u64 = null,
-    /// The host pushed an ambient composer for this call; the activation's
-    /// teardown must pop it.
+    /// The host pushed an ambient composer for this call; the activation's teardown must pop it.
     composer_pushed: bool = false,
-    /// Access-enclosing entries the call site / prepare pushed for the
-    /// dispatch (the caller's `this`, a displaced prior receiver, the
-    /// receiver subject); the activation's teardown pops them LIFO after
-    /// the frame unwinds, when the caller's chain is active again.
+    /// Access-enclosing entries the dispatch pushed; teardown pops them LIFO once the caller's chain is active again.
     pop_enclosing_n: u8 = 0,
-    /// The context-parameter mark taken BEFORE the prepare pushed a
-    /// receiver as a context source (`callValueWithThis` feeds the
-    /// receiver into the context stack for the block's duration); the
-    /// activation adopts it so its close truncates the push away. Null =
-    /// the activation reads the stack length itself at open.
+    /// The context-parameter mark taken BEFORE the prepare pushed a receiver as a context source, so the
+    /// activation's close truncates that push away. Null: the activation reads the stack length at open.
     ctx_mark_override: ?usize = null,
-    /// A value the activation must keep alive for its whole life (the
-    /// receiver-BOUND closure a with-this prepare builds: the frame's
-    /// captures borrow its capture vector). Released at teardown or
-    /// parked-drop; GC-marked while live-parked.
+    /// A value the activation must keep alive for its whole life (the receiver-bound closure whose capture
+    /// vector the frame's captures borrow). Released at teardown or parked-drop, GC-marked while live-parked.
     keepalive: ?Value = null,
-    /// Undispatched-start boundary (`startCoroutineUninterceptedOrReturn`
-    /// under an enclosing pump): a suspension crossing this activation
-    /// parks the segment into the pump via the host hook and the CALLER
-    /// continues with the hook's value instead of unwinding.
+    /// Undispatched-start boundary: a suspension crossing this activation parks the segment into the pump
+    /// through the host hook, and the CALLER continues with the hook's value instead of unwinding.
     suspend_barrier: bool = false,
-    /// The active-scope depth captured BEFORE the prepare's scope push;
-    /// the barrier park hands it to the pump so the scope delta travels
-    /// with the parked segment.
+    /// Active-scope depth captured BEFORE the prepare's scope push; the barrier park hands it to the pump.
     barrier_scope_base: usize = 0,
-    /// Identity of the active-scope entry the prepare pushed (0 = none);
-    /// teardown removes it by identity. Cleared at park — the parked
-    /// delta owns the entry from then on.
+    /// Identity of the active-scope entry the prepare pushed (0 = none); teardown removes it, a park hands it on.
     scope_guard_ident: usize = 0,
-    /// This barrier activation owns a fresh pump (the no-driver root
-    /// branch): its completion or suspension must run the pump loop and
-    /// exit through the host hooks. `keepalive` carries the scope value
-    /// the pump drives under.
+    /// This barrier activation owns a fresh pump; its completion or suspension runs the pump loop.
     root_pump: bool = false,
-    /// Reified type-name globals the typed-call prepare bound for the
-    /// call's duration (opaque host payload); restored via the host hook
-    /// at teardown or park, exactly where the recursive path's restore
-    /// loop ran (including across a suspension).
+    /// Reified type-name globals bound for the call's duration; the host hook restores them at teardown or park.
     typed_saved: ?*anyopaque = null,
-    /// The call site's type arguments (module-owned strings) for the
-    /// result transform at the frame boundary (`attachDeclaredElemTypes`).
+    /// The call site's type arguments (module-owned strings) for `attachDeclaredElemTypes` at the frame boundary.
     type_args: []const []const u8 = &.{},
     dst: Reg,
 };
 
-/// A `FlatCallReq` plus the caller's resume point: the block/instruction the
-/// caller continues at once the callee's result lands in `req.dst`.
+/// A `FlatCallReq` plus the caller's resume point: where the caller continues once the result lands in `req.dst`.
 pub const FlatCallSite = struct {
     req: FlatCallReq,
     ret_block: BlockId,
     ret_idx: usize,
 };
 
-/// The suspension point of the frame a `Suspended` escape left: where the
-/// frame resumes and which register receives the resume value. Set by the
-/// executor for the driver, which parks the frame (live for a flat
-/// activation, snapshot for a native root).
+/// Where the frame a `Suspended` escape left resumes, and which register receives the resume value.
 pub const ParkPoint = struct {
     block: BlockId,
     inst_idx: usize,
     resume_reg: ?Reg,
 };
 
-/// One interpreted activation on the flat driver's call stack. Heap-allocated
-/// (`allocator.create`) so the Frame's address stays stable on the GC frame
-/// chain while the stack list grows. `ret_*` is the resume point in the
-/// CALLER frame where this activation's result is delivered.
+/// One interpreted activation on the flat driver's call stack, heap-allocated so the Frame's address stays
+/// stable on the GC frame chain while the stack list grows. `ret_*` is the resume point in the CALLER frame.
 pub const Activation = struct {
     frame: Frame,
     try_stack: std.ArrayList(TryFrame),
     ctx_mark: usize,
-    /// The context-parameter mark is live and must be truncated when this
-    /// activation unwinds or parks. Cleared at the first park — a resumed
-    /// activation has no host-entry effects left to unwind.
+    /// The context-parameter mark is live and must be truncated when this activation unwinds or parks.
     ctx_armed: bool,
     composer_pushed: bool,
     pop_enclosing_n: u8,
@@ -154,8 +109,7 @@ pub const Activation = struct {
     ret_dst: Reg,
 };
 
-/// `KLIO_FLAT=0` falls back to native recursion for every call — the bisect
-/// switch for the flat driver.
+/// `KLIO_FLAT=0` falls back to native recursion for every call.
 var flat_enabled_cached: ?bool = null;
 
 pub fn flatEnabled() bool {
@@ -166,8 +120,7 @@ pub fn flatEnabled() bool {
     return b;
 }
 
-/// `KLIO_FLAT_VCALL=0` keeps slot-bound and lowering-resolved member calls on
-/// the recursive invoker — the bisect switch for the fused virtual path.
+/// `KLIO_FLAT_VCALL=0` keeps slot-bound and lowering-resolved member calls on the recursive invoker.
 var vcall_flat_cached: ?bool = null;
 
 pub fn vcallFlatEnabled() bool {
@@ -178,8 +131,7 @@ pub fn vcallFlatEnabled() bool {
     return b;
 }
 
-/// `KLIO_MEMBER_SITE=0` disables the CallMember instruction-site memo — the
-/// bisect switch for the by-name replay path.
+/// `KLIO_MEMBER_SITE=0` disables the CallMember instruction-site memo.
 var member_site_cached: ?bool = null;
 
 pub fn memberSiteEnabled() bool {
@@ -190,9 +142,7 @@ pub fn memberSiteEnabled() bool {
     return b;
 }
 
-/// Cached hot-path trace gates: the memoized `getenvSlice` still takes a
-/// lock + hashmap probe per consult, which prices every dispatch arm when
-/// consulted per executed instruction. The env never changes mid-run.
+/// Trace gates cached once: `getenvSlice` locks and probes a hashmap per consult, and the env never changes mid-run.
 var cv_trace_cached: ?bool = null;
 
 pub fn cvTraceOn() bool {
@@ -208,8 +158,7 @@ var gf_trace_init: bool = false;
 
 var gf_trace_val: ?[]const u8 = null;
 
-/// `KLIO_GF_TRACE` — cached once: the raw getenv is a full environ scan
-/// and this gate sits on EVERY GetField execution.
+/// `KLIO_GF_TRACE`, cached once: the raw getenv is a full environ scan and this gate sits on every GetField.
 pub fn gfTraceWant() ?[]const u8 {
     if (!gf_trace_init) {
         gf_trace_val = if (std.c.getenv("KLIO_GF_TRACE")) |w| std.mem.span(w) else null;
@@ -294,11 +243,8 @@ pub fn nuTraceWant() ?[]const u8 {
     return nu_trace_val;
 }
 
-/// Host→driver flat-call handoff for resolution ladders whose PICK lives
-/// deep in host code (the CMG global-overload terminal): the exec arm arms
-/// the slot, the host's terminal takes the arm (one-shot — inner calls see
-/// it disarmed), prepares the flat request instead of dispatching, and
-/// stashes it here; the arm consumes the stash and pushes the activation.
+/// Host-to-driver flat-call handoff for ladders whose pick lives deep in host code: the exec arm arms the slot,
+/// the host terminal takes the arm (one-shot) and stashes a flat request, and the arm pushes the activation.
 pub fn armHostFlatReq() void {
     ev_state.evtls.host_flat_armed = true;
 }
@@ -333,9 +279,7 @@ pub inline fn errResult(e: EvalError) EvalResult {
     return .{ .err = e };
 }
 
-/// The throw for reading a `lateinit` property or local before its first
-/// assignment: `kotlin.UninitializedPropertyAccessException` with kotlinc's
-/// message naming the property.
+/// Reading a `lateinit` before its first assignment: `UninitializedPropertyAccessException`, kotlinc's message.
 pub fn lateinitThrow(allocator: Allocator, name: []const u8) Allocator.Error!EvalError {
     const m = try std.fmt.allocPrint(allocator, "lateinit property {s} has not been initialized", .{name});
     return .{ .Throw = try Value.newException(allocator, .{
@@ -345,16 +289,8 @@ pub fn lateinitThrow(allocator: Allocator, name: []const u8) Allocator.Error!Eva
     }) };
 }
 
-/// One active try-region recorded on the eval's try-stack. Separates
-/// the *entry* (where to jump to start running finally / catch) from
-/// the *done sentinel* (the synthesized block whose entry signals
-/// the finally body has run to completion regardless of any internal
-/// control flow in the user finally body).
-
-/// Restore the frame's enclosing-receiver chain to its try-entry length
-/// when a throw routes to a catch or finally: the unwind skipped any
-/// `EnclosingPop` inside the try body, and the stale spliced subject
-/// would otherwise shadow reads for the rest of the frame.
+/// Restore the frame's enclosing-receiver chain to its try-entry length: an unwind into a catch or finally
+/// skipped every `EnclosingPop` inside the try body, and the stale subject would shadow later reads.
 pub fn truncChainTo(frame: *Frame, chain_len: usize) void {
     if (frame.enclosing_this.items.len > chain_len) {
         frame.enclosing_this.shrinkRetainingCapacity(chain_len);

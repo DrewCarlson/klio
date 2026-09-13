@@ -58,13 +58,7 @@ const runFlatLoop = ev_loop.runFlatLoop;
 const snapshotRegisters = ev_snapshot.snapshotRegisters;
 const traceEnclosingEntries = ev_chain.traceEnclosingEntries;
 
-/// Resume a parked coroutine. `resume_value` is written into the
-/// innermost frame's resume register, then that frame runs to
-/// completion (or re-suspends). When it returns, its value feeds the
-/// next-outer frame's resume register, and so on up the stack.
-/// Start or extend the suspension a compiled body is building. Called by the
-/// native runtime as each emitted frame unwinds, innermost first, which is the
-/// order the driver replays them in.
+/// Start or extend the suspension a compiled body is building; called per emitted frame as it unwinds, innermost first, the order the driver replays.
 pub fn pushNativePark(
     allocator: Allocator,
     call: *const fn (?*anyopaque, runtime.CValue) callconv(.c) runtime.CValue,
@@ -94,7 +88,6 @@ pub fn pushNativePark(
     });
 }
 
-/// Take the suspension a compiled body left behind, if any.
 pub fn takeInFlightSuspend(allocator: Allocator) ?*SuspendState {
     _ = allocator;
     const st = ev_state.evtls.in_flight_suspend;
@@ -102,11 +95,8 @@ pub fn takeInFlightSuspend(allocator: Allocator) ?*SuspendState {
     return st;
 }
 
-/// Replay a suspension whose frames are ALL compiled continuations. It needs no
-/// host: there is no frame to rebuild, no module to resolve a FuncId against,
-/// and no interpreted body to re-enter — each entry is a call. A compiled
-/// program's suspensions are only ever this shape, so it drives the shared
-/// scheduler without instantiating the evaluator against a stub host.
+/// Replay a suspension whose frames are all compiled continuations. Each entry is a call, so
+/// there is no frame to rebuild and no host needed to resolve a FuncId or re-enter a body.
 pub fn resumeNativeContinuation(
     allocator: Allocator,
     state: *SuspendState,
@@ -123,10 +113,8 @@ pub fn resumeNativeContinuation(
         if (produced == .CoroutineSuspended) {
             const st = takeInFlightSuspend(allocator) orelse
                 return errResult(.{ .Type = "compiled body suspended without a continuation" });
-            // The frames OUTSIDE this one have not run yet: they are still
-            // waiting on the value it will eventually produce, so they belong
-            // to the new suspension, outermost last. Dropping them stranded
-            // every caller of a function that suspends twice.
+            // The frames OUTSIDE this one have not run yet: they still wait on the value it will produce,
+            // so they belong to the new suspension, outermost last.
             for (frames.items[i + 1 ..]) |outer| try st.frames.append(allocator, outer);
             return errResult(.{ .Suspended = st });
         }
@@ -135,6 +123,8 @@ pub fn resumeNativeContinuation(
     return ok(carry);
 }
 
+/// Resume a parked coroutine: `resume_value` lands in the innermost frame's resume register,
+/// and each frame's return value then feeds the next-outer frame's resume register.
 pub fn resumeContinuation(
     comptime H: type,
     allocator: Allocator,
@@ -144,33 +134,21 @@ pub fn resumeContinuation(
     host: *H,
 ) Allocator.Error!EvalResult {
     var carry = resume_value;
-    // The replay activates and deactivates a rebuilt frame per snapshot;
-    // the per-frame prev-chain captures are only coherent while the replay
-    // runs, and a deactivation cascade could leave the thread's active
-    // chain pointing at a rebuilt frame's list AFTER that frame was torn
-    // down — the next fresh call on this thread then merged its enclosing
-    // chain from freed memory (the cross-thread yield GPF). Pin the
-    // pre-replay chain and restore it on every exit.
+    // Per-frame prev-chain captures are coherent only while the replay runs, so a deactivation
+    // cascade can leave the thread's active chain pointing into a torn-down frame's list.
     const saved_chain = ev_state.evtls.active_chain;
     const saved_chain_base = ev_state.evtls.active_chain_base;
     defer {
         ev_state.evtls.active_chain = saved_chain;
         ev_state.evtls.active_chain_base = saved_chain_base;
     }
-    // `frames` is innermost-first (the deepest activation snapshots
-    // itself first as `Suspended` unwinds). Resume the innermost, then
-    // feed its return value to the next-outer frame, and so on. When the
-    // fresh list is drained, consumption continues through the inherited
-    // `tails` segments (see `TailSeg`) — one segment at a time, promoting
-    // each into `frames`/`head` so the loop and the GC root see one shape.
+    // `frames` is innermost-first, so resume the innermost and feed its value to the next-outer.
+    // A drained list continues through the inherited `tails` segments, promoted one at a time.
     var frames = state.frames;
     var tails: ?*TailSeg = state.tails;
-    // Ownership of both moves into this resume; the state must not tear
-    // them down (or double-free segments a re-suspend hands to the inner
-    // continuation).
+    // Ownership of both moves into this resume; the state must not tear them down.
     state.tails = null;
-    // The state is live again: resume writes carry values into its frames,
-    // so it no longer qualifies for the minor-mark quiescent skip.
+    // The state is live again, so it no longer qualifies for the minor-mark quiescent skip.
     state.gc_quiesced = false;
     defer frames.deinit(allocator);
     defer {
@@ -183,10 +161,8 @@ pub fn resumeContinuation(
         }
     }
     var head: usize = 0;
-    // Root the not-yet-rebuilt outer snapshots (`frames.items[head..]` and
-    // the unconsumed tail segments) for the duration of the resume: they are
-    // out of the park registry and not yet on the frame chain, so an inner
-    // frame's collection would otherwise sweep them.
+    // Root the not-yet-rebuilt outer snapshots for the resume's duration: they are out of the park
+    // registry and not yet on the frame chain, so an inner frame's collection would sweep them.
     var resume_node = ResumeFrames{ .prev = ev_state.evtls.resuming, .frames = &frames, .head = &head, .tails = &tails };
     if (runtime.gc.gc_enabled) {
         gcInstallFrameRoot();
@@ -201,7 +177,6 @@ pub fn resumeContinuation(
     _ = &parent.resume_route;
     while (true) {
         if (head >= frames.items.len) {
-            // Promote the next inherited segment.
             const seg = tails orelse break;
             tails = seg.next;
             frames.deinit(allocator);
@@ -212,11 +187,7 @@ pub fn resumeContinuation(
         }
         const snap = frames.items[head];
         head += 1;
-        // A COMPILED continuation resumes by calling it: there is no frame to
-        // rebuild, because the emitted body keeps its own on the heap. It
-        // answers with the result, or suspends again — in which case it has
-        // already pushed its next continuation onto the in-flight state, which
-        // the caller parks exactly as it parks an interpreted one.
+        // A compiled continuation resumes by calling it; a re-suspension has already pushed its next continuation onto the in-flight state.
         if (snap.native) |nr| {
             const produced = runtime.fromC(nr.call(nr.frame, runtime.toC(carry)));
             if (produced == .CoroutineSuspended) return .{ .err = .{ .Suspended = takeInFlightSuspend(allocator) orelse state } };
@@ -224,9 +195,7 @@ pub fn resumeContinuation(
             first = false;
             continue;
         }
-        // A live-parked flat activation resumes by reinstalling the intact
-        // frame — no rebuild, no copies. Its result routes exactly like a
-        // rebuilt frame's.
+        // A live-parked flat activation resumes by reinstalling the intact frame: no rebuild, no copies.
         if (snap.live) |act| {
             var resume_throw: ?Value = null;
             var resume_unwind: ?EvalError = null;
@@ -258,16 +227,11 @@ pub fn resumeContinuation(
                 .done => |out| return out,
             }
         }
-        // Resolve the frame's `FuncId` against the module it was lowered
-        // into — a per-method sub-module for an anon-object / local /
-        // nested class, the passed-in (main) module otherwise.
+        // Resolve the `FuncId` against the module the frame was lowered into, a per-method sub-module for a local or anonymous class.
         const snap_module = snap.module;
         const m: *const Module = snap_module orelse module;
         const func = m.funcById(snap.func).?;
-        // KLIO_RESUME_TRACE: name every frame a resume drive re-runs — the
-        // instrument that finds a tail executing twice in one unwind. The
-        // route tag says which delivery path drove it (set by the host's
-        // resumeRaw call sites).
+        // KLIO_RESUME_TRACE: name every frame a resume drive re-runs, with the route tag for the delivery path.
         if (resumeTraceOn()) {
             const loc = funcFirstLoc(func);
             std.debug.print("[resume-frame] {s}#{d} ({s}:{d}) at={d}:{d} throw={} pending={}/{}/{} caps={d} enc={d} via={s} id={x}\n", .{
@@ -299,19 +263,14 @@ pub fn resumeContinuation(
         gcPushFrame(&frame);
         defer gcPopFrame(&frame);
         frame.module_arc = snap_module;
-        // This frame adopts the references the snapshot retained on suspend:
-        // its params/captures (and regs, always owned) are released by its
-        // teardown, balancing the suspend-time retain.
+        // The frame adopts the references the snapshot retained on suspend; its teardown balances them.
         frame.owns_params_caps = true;
-        // Restore the frame's enclosing-`this` chain verbatim so implicit
-        // receivers resolved before the park resolve identically after it.
+        // Restore the chain verbatim so implicit receivers resolve identically after the park.
         try frame.activateChainFrom(snap.enclosing_this);
         defer frame.deactivateChain();
         switch (snap.regs) {
             .sparse => |entries| {
-                // The sparse snapshot recorded only live registers over a
-                // Unit base; a no-fill frame must materialize that base
-                // before the entries land on it.
+                // The sparse snapshot recorded only live registers over a Unit base, which a no-fill frame must materialize first.
                 frame.materializeRegs();
                 for (entries) |entry| {
                     if (entry.id < frame.regs.items.len) frame.regs.items[entry.id] = entry.value;
@@ -323,12 +282,8 @@ pub fn resumeContinuation(
                 frame.wmask.setAll();
             },
         }
-        // Kotlin `Continuation.resumeWith(Result.failure(e))` means
-        // "resume by throwing `e` at the suspension point". Only the
-        // innermost (suspending) frame sees the raw failure Result;
-        // route it as a throw there instead of delivering it as the
-        // suspending call's value, so a cancellation preempts a parked
-        // `delay`/acquire rather than letting it complete.
+        // Kotlin `Continuation.resumeWith(Result.failure(e))` means resume by throwing `e` at the
+        // suspension point, so only the innermost frame sees it, as a throw and not as a value.
         var resume_throw: ?Value = null;
         var resume_unwind: ?EvalError = null;
         if (pending_throw_from_inner) |exc| {
@@ -351,10 +306,7 @@ pub fn resumeContinuation(
         var try_stack: std.ArrayList(TryFrame) = .empty;
         defer try_stack.deinit(allocator);
         try try_stack.appendSlice(allocator, snap.try_stack);
-        // Everything the snapshot held is now copied into frame-owned buffers
-        // (regs/params/captures/chain/try-stack); the frame owns the value
-        // references (released by its teardown). Free the snapshot's own slice
-        // buffers — but not its values, which moved into the frame.
+        // Every value moved into a frame-owned buffer; free the snapshot's slice buffers, not its values.
         freeSnapshotBuffers(snap, allocator);
         const r = try runFrameInner(
             H,
@@ -378,13 +330,9 @@ pub fn resumeContinuation(
 
 const ResumeRoute = union(enum) { next, done: EvalResult };
 
-/// Route one resumed frame's result within `resumeContinuation`'s drive
-/// loop: a value carries outward; a re-suspension links the still-pending
-/// outer snapshots as an inherited segment in O(1) (copying them made deep
-/// recursion quadratic in the parked depth); a throw / non-local return
-/// re-enters the next-outer frame so its restored try-stack (and label
-/// match) can take it; a resolution-class failure of a RAN frame re-tags as
-/// `CalleeFailed` so no walker retries it.
+/// Route one resumed frame's result: a value carries outward, a re-suspension links the pending
+/// outer snapshots as an inherited segment in O(1), a throw or non-local return re-enters the
+/// next-outer frame for its restored try-stack, and a ran frame's escape re-tags as `CalleeFailed`.
 fn routeResumedResult(
     allocator: Allocator,
     r: EvalResult,
@@ -404,17 +352,12 @@ fn routeResumedResult(
                     seg.* = .{ .frames = frames.*, .head = head, .next = tails.* };
                     frames.* = .empty;
                     tails.* = null;
-                    // Append to the END of inner's (short) existing chain:
-                    // inner's own inherited segments are deeper (inner-more)
-                    // than ours.
+                    // Append to the END of inner's chain: inner's own inherited segments are inner-more than these.
                     var slot: *?*TailSeg = &inner.tails;
                     while (slot.*) |t| slot = &t.next;
                     slot.* = seg;
                 } else if (tails.* != null) {
-                    // This list is drained: hand the inherited chain through
-                    // WITHOUT wrapping an empty segment around it — every
-                    // park/resume cycle of a suspending loop otherwise grew
-                    // the parked state's chain by one dead segment, forever.
+                    // This list is drained: hand the inherited chain through without wrapping an empty segment around it.
                     var slot: *?*TailSeg = &inner.tails;
                     while (slot.*) |t| slot = &t.next;
                     slot.* = tails.*;
@@ -441,9 +384,7 @@ fn routeResumedResult(
     return .next;
 }
 
-/// Run (or resume) a single activation's block loop. `resume_idx` is the
-/// instruction index to begin at within `cur` (0 for a fresh call, the
-/// post-suspension index on resume).
+/// Run or resume one activation's block loop. `resume_idx` is the instruction index within `cur`: 0 for a fresh call.
 pub fn runFrame(
     comptime H: type,
     allocator: Allocator,
@@ -454,10 +395,7 @@ pub fn runFrame(
     resume_idx: usize,
     host: *H,
 ) Allocator.Error!EvalResult {
-    // Every nested Kotlin call re-enters here (the host invokes a callable by
-    // calling back into the evaluator). Bounding this depth converts an
-    // unbounded recursion into a catchable `StackOverflowError` before the
-    // native stack faults.
+    // Every nested Kotlin call re-enters here, so bounding this depth raises a catchable `StackOverflowError` before the native stack faults.
     if (ev_state.evtls.eval_depth >= maxEvalDepth()) {
         dumpFrameChainForDiag();
         return errResult(.{ .StackOverflow = "Stack overflow: evaluation recursion exceeded the configured depth (raise KLIO_MAX_EVAL_DEPTH if intentional)" });
@@ -466,8 +404,7 @@ pub fn runFrame(
     ev_state.evtls.eval_depth += 1;
     defer {
         ev_state.evtls.eval_depth -= 1;
-        // Safe point: back at the outermost activation, no native JIT frame is on
-        // the stack, so the JIT cache can be trimmed if it has grown past its cap.
+        // Back at the outermost activation with no native JIT frame on the stack, so the JIT cache may be trimmed.
         if (ev_state.evtls.eval_depth == 0) {
             _ = parent.threads_in_eval.fetchSub(1, .monotonic);
             jit_loop.evictIfOverBudget();
@@ -476,10 +413,8 @@ pub fn runFrame(
     return runFrameInner(H, allocator, module, frame, try_stack, cur, resume_idx, null, null, host);
 }
 
-/// Snapshot `frame` (evtls.resuming at `block`:`inst_idx`, resume value delivered
-/// into `resume_reg`) and append it to `state`'s frame list. Ownership of the
-/// frame's pending-finally payload moves into the snapshot; the frame's own
-/// teardown must then run (it releases regs the snapshot has retained).
+/// Snapshot `frame` at `block`:`inst_idx` and append it to `state`. The pending-finally payload's
+/// ownership moves into the snapshot, and the frame's own teardown must then run.
 pub fn snapshotSuspendedFrame(
     allocator: Allocator,
     frame: *Frame,
@@ -489,8 +424,7 @@ pub fn snapshotSuspendedFrame(
     resume_reg: ?Reg,
     state: *SuspendState,
 ) Allocator.Error!void {
-    // The snapshot copies (and under reclaim retains) the whole file, and
-    // the collector traces the copy; give it a fully-defined file.
+    // The snapshot copies the whole register file and the collector traces the copy, so define it fully.
     frame.materializeRegs();
     const saved_regs = try snapshotRegisters(
         allocator,
@@ -541,23 +475,14 @@ pub fn snapshotSuspendedFrame(
         });
         traceEnclosingEntries("suspend-enclosing", frame.enclosing_this.items);
     }
-    // The snapshot now holds the only references that will survive this
-    // frame's teardown (its regs are released as the stack unwinds; its
-    // params/captures alias caller regs / closure captures the unwind also
-    // releases).
+    // The snapshot now holds the only references surviving this frame's teardown and the unwind above it.
     retainSnapshotValues(snap);
     try state.frames.append(allocator, snap);
-    // Ownership of the pending control-flow payload moved into `snap`;
-    // frame teardown must not release it.
+    // Ownership of the pending control-flow payload moved into `snap`; teardown must not release it.
     frame.pending_finally = .{};
 }
 
-/// Per-thread activation freelist. Direct interpreted calls open one
-/// activation each; without the pool every call paid an allocator
-/// create/destroy for a ~300-byte struct. Pooled only under the tracing GC
-/// (whose stable `c_allocator` backing the regs pool also uses); the
-/// refcounting/arena backends keep plain create/destroy. Entries are inert
-/// storage — no Values, nothing the GC must see.
+/// Per-thread activation freelist, pooled only under the tracing GC. Entries are inert storage holding no Values.
 pub const ACT_POOL_MAX = 128;
 
 inline fn actPoolOn() bool {
@@ -588,17 +513,13 @@ pub fn actFree(ev: *EvalTls, allocator: Allocator, act: *Activation) void {
     allocator.destroy(act);
 }
 
-/// Open a flat activation for a direct interpreted call: the same entry
-/// sequence `evalWithCapturesChained` performs for a recursive call (frame
-/// construction with the arg buffer transferred as params, GC chain push,
-/// lexical receiver-chain activation, context-parameter seeding).
+/// Open a flat activation for a direct interpreted call: the entry sequence `evalWithCapturesChained` performs recursively.
 pub fn openActivation(comptime H: type, allocator: Allocator, caller_module: *const Module, req: FlatCallReq, host: *H) Allocator.Error!*Activation {
     const ev: *EvalTls = &ev_state.evtls;
     boolThisTrap(req.func, req.args.items);
     const module = req.run_module orelse caller_module;
     dumpFnIfRequested(module, req.func);
-    // SAM conversion at the call boundary, as `evalWithCapturesChained` does
-    // for the recursive path — the flat activation is the other way in.
+    // SAM conversion at the call boundary; the flat activation is the other way in.
     if (comptime @hasDecl(H, "samConvertActivationArgs")) {
         try host.samConvertActivationArgs(allocator, req.func, req.args.items);
     }
@@ -639,11 +560,7 @@ pub fn openActivation(comptime H: type, allocator: Allocator, caller_module: *co
     return act;
 }
 
-/// Tear down a flat activation: the exact exit sequence of
-/// `evalWithCapturesChained`'s defers, in their LIFO order, then the host's
-/// post-call unwinds (ambient composer pop) that wrapped the recursive call.
-/// A previously-parked activation carries no live host-entry effects (its
-/// flags were cleared at park), so only the frame itself unwinds.
+/// Tear down a flat activation: `evalWithCapturesChained`'s exit defers in LIFO order, then the host's post-call unwinds.
 pub fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activation, host: *H) void {
     if (act.ctx_armed) {
         if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(act.ctx_mark);
@@ -676,11 +593,8 @@ pub fn teardownActivation(comptime H: type, allocator: Allocator, act: *Activati
     }
 }
 
-/// Park a flat activation live: unwind its host-entry effects and thread
-/// links, then hand the intact activation (frame, registers, try-stack,
-/// receiver chain — no copies, no retains) to the suspend state. Ownership
-/// moves to the state; `resumeLiveActivation` reinstalls it, and
-/// `SuspendState.deinit` destroys it if the coroutine is dropped unresumed.
+/// Park a flat activation live: unwind its host-entry effects and thread links, then hand the
+/// intact activation to the suspend state, which owns it until resume or drop.
 pub fn liveParkActivation(
     comptime H: type,
     allocator: Allocator,
@@ -704,9 +618,7 @@ pub fn liveParkActivation(
     while (act.pop_enclosing_n > 0) : (act.pop_enclosing_n -= 1) popEnclosing();
     // The park's scope-delta capture owns the guard entry from here on.
     act.scope_guard_ident = 0;
-    // Reified bindings restore across a suspension exactly as the
-    // recursive path's unconditional restore loop did; the resumed body
-    // reads no type-name globals (its reified reads were lowering-bound).
+    // Reified bindings restore across a suspension; the resumed body's reified reads were lowering-bound.
     if (act.typed_saved) |ts| {
         if (comptime @hasDecl(H, "typedBindingsRestore")) host.typedBindingsRestore(allocator, ts);
         act.typed_saved = null;
@@ -739,9 +651,7 @@ pub fn liveParkActivation(
     });
 }
 
-/// Destroy a live-parked activation that is being dropped without a resume
-/// (a cancelled or abandoned coroutine). The frame owns its register
-/// references; params/captures are borrows, exactly as during execution.
+/// Destroy a live-parked activation dropped without a resume. The frame owns its register references; params and captures are borrows.
 pub fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
     act.frame.deinit();
     act.try_stack.deinit(allocator);
@@ -752,11 +662,7 @@ pub fn destroyParkedActivation(allocator: Allocator, act: *Activation) void {
     actFree(&ev_state.evtls, allocator, act);
 }
 
-/// Reinstall a live-parked activation and run it to its next completion or
-/// suspension. `block`/`inst_idx`/`resume_reg` come from the park entry.
-/// On suspension the driver has already re-parked the activation into the
-/// new state (ownership moved); on completion the activation is torn down
-/// here and the boundary-transformed result returned.
+/// Reinstall a live-parked activation and run it on. A suspension is re-parked by the driver; a completion is torn down here.
 fn resumeLiveActivation(
     comptime H: type,
     allocator: Allocator,
@@ -769,11 +675,8 @@ fn resumeLiveActivation(
     resume_unwind: ?EvalError,
     host: *H,
 ) Allocator.Error!EvalResult {
-    // A live-parked activation may resume on a DIFFERENT worker thread than
-    // the one that parked it (the pool rotates, and the parker may already
-    // have exited — the daemon-abandon teardown races exactly this way).
-    // Rebind the frame to the RESUMING thread's eval TLS first; the parked
-    // pointer otherwise dereferences a dead thread's storage.
+    // A live-parked activation may resume on a different worker thread than the one that parked it,
+    // so rebind the frame to the resuming thread's eval TLS before the parked pointer is used.
     act.frame.tls = &ev_state.evtls;
     gcPushFrame(&act.frame);
     act.frame.activateAs();
@@ -788,9 +691,7 @@ fn resumeLiveActivation(
     return out;
 }
 
-/// Discard a flat call request without running it (depth-cap rejection):
-/// free the transferred buffers (values are borrows) and unwind any host
-/// side effect the prepare step applied.
+/// Discard a flat call request unrun: free the transferred buffers (values are borrows) and unwind the prepare step's host effects.
 pub fn discardFlatReq(comptime H: type, allocator: Allocator, req: FlatCallReq, host: *H) void {
     var args = req.args;
     args.deinit(allocator);
@@ -813,13 +714,9 @@ pub fn discardFlatReq(comptime H: type, allocator: Allocator, req: FlatCallReq, 
     if (req.type_args.len > 0) allocator.free(req.type_args);
 }
 
-/// The flat call driver. Runs `frame` through `runFrameExec`; when the
-/// executor surfaces a direct interpreted call, pushes the callee as a new
-/// heap activation and continues in the same loop instead of recursing
-/// natively. Results, throws, non-local returns and suspensions re-enter the
-/// calling frame through the executor's resume machinery — the same routes a
-/// coroutine resume uses — so control-flow semantics are identical to the
-/// recursive path.
+/// The flat call driver: a direct interpreted call the executor surfaces becomes a new heap
+/// activation in this same loop rather than a native recursion, with control flow routed
+/// through the executor's resume machinery so semantics match the recursive path.
 fn runFrameInner(
     comptime H: type,
     allocator: Allocator,

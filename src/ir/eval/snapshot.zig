@@ -27,25 +27,15 @@ const gcMarkFrameRegs = ev_state.gcMarkFrameRegs;
 const markFrameClosure = ev_state.markFrameClosure;
 
 pub const TryFrame = struct {
-    /// The try body's entry block — the key for matching pop /
-    /// pending-return / pending-rethrow against `Block.finally_done_for`.
+    /// Try body entry block; matches pop and pending return/rethrow against `Block.finally_done_for`.
     body: BlockId,
-    /// The frame's enclosing-receiver chain length at try entry: an
-    /// exception unwinding out of a spliced receiver-lambda region skips
-    /// its `EnclosingPop`, and a caught throw would otherwise leave the
-    /// stale subject on the chain for everything after the catch
-    /// (`assertFails { ... }` inside a spliced test-DSL region polluted
-    /// every later test in the runner's frame). Restored on catch.
+    /// The frame's enclosing-receiver chain length at try entry. An exception unwinding out of a spliced
+    /// receiver-lambda region skips its `EnclosingPop`, so catch restores the chain to this length.
     chain_len: usize = 0,
     catches: []ir.CatchHandler,
-    /// Where to jump to start running the finally / first catch.
-    /// `null` for a try with only catches and no finally.
+    /// Where to jump to start the finally or first catch; null for a try with only catches.
     finally_entry: ?BlockId,
-    /// The post-finally sentinel block: control reaches this only
-    /// after the user finally body has finished, no matter what its
-    /// internal control flow looked like. The eval keys its pop /
-    /// pending-return / pending-rethrow checks against this rather
-    /// than `finally_entry`.
+    /// Post-finally sentinel block; pop and pending return/rethrow key off this, not `finally_entry`.
     finally_done: ?BlockId,
     /// Labeled-return absorption for a splice region (see `ir.LrAbsorb`).
     lr_absorb: ?ir.LrAbsorb = null,
@@ -57,9 +47,8 @@ const PendingReturn = struct { key: BlockId, val: Value, depth: usize };
 
 const PendingUnwind = struct { key: BlockId, err: EvalError, depth: usize };
 
-/// Control flow paused while a `finally` body runs. It belongs to the active
-/// frame so the GC can trace it, and moves into/out of a frame snapshot when
-/// that finally body suspends.
+/// Control flow paused while a `finally` body runs. The active frame owns it so the GC can trace it,
+/// and it moves into and out of a frame snapshot when that finally body suspends.
 pub const PendingFinallyState = struct {
     rethrow: ?PendingRethrow = null,
     return_value: ?PendingReturn = null,
@@ -95,54 +84,33 @@ pub const PendingFinallyState = struct {
     }
 };
 
-/// One paused `evalWithCaptures` activation. Enough to re-enter the
-/// block loop exactly where it left off.
+/// One paused `evalWithCaptures` activation: enough to re-enter the block loop where it left off.
 pub const FrameSnapshot = struct {
     func: FuncId,
-    /// The sub-module this frame's `func` was lowered into, when it is a
-    /// per-method sub-module (anonymous object / local / nested class).
-    /// `null` for the main module. On resume the `FuncId` is resolved
-    /// against this module so the right function body re-enters.
+    /// The sub-module `func` was lowered into, null for the main module; resume resolves `FuncId` against it.
     module: ?*const Module,
     block: BlockId,
     /// Index of the *next* instruction to run within `block.insts`.
     inst_idx: usize,
-    /// Register values needed after the suspension point. The resume path
-    /// always recreates the full register file, filling dead slots with Unit.
+    /// Registers live after the suspension point; resume recreates the full file, filling dead slots with Unit.
     regs: SnapshotRegisters,
     params: []Value,
     captures: []Value,
-    /// The frame's enclosing-`this` chain (innermost last) at the suspension
-    /// point. Restored verbatim on resume so implicit-receiver resolution
-    /// (bare member / `this@Outer`) inside a receiver-lambda / `with` /
-    /// member-extension body sees the same receivers after the park that it saw
-    /// before: the chain travels with the parked continuation instead of being
-    /// recovered from process-global state the evtls.resuming thread happens to hold.
+    /// The frame's enclosing-`this` chain (innermost last) at the suspension point, restored verbatim so a
+    /// bare member or `this@Outer` inside the body resolves to the same receivers after the park.
     enclosing_this: []EnclosingEntry,
     try_stack: []TryFrame,
     pending_finally: PendingFinallyState = .{},
     is_lambda: bool,
-    /// Register the resumed value is written into before execution
-    /// continues (the destination of the suspending call site).
+    /// Register the resumed value is written into before execution continues (the suspending call's destination).
     resume_reg: ?Reg,
-    /// The closure side-table id when the suspended frame is a closure body
-    /// (mirrors `Frame.closure_id`). A parked coroutine keeps its closure slot
-    /// rooted through this so a collection while it sleeps cannot reclaim the
-    /// slot or sweep its capture store.
+    /// Closure side-table id of a suspended closure body, rooting the slot and its captures while parked.
     closure_id: ?u64 = null,
-    /// A LIVE-parked flat activation: the intact frame (registers, params,
-    /// captures, try-stack, receiver chain) parked by pointer move with no
-    /// copies or retains — the frame's ownership graph is exactly what it was
-    /// during execution. When set, the slice fields above are empty and
-    /// `block`/`inst_idx`/`resume_reg` describe the resume point; the entry
-    /// resumes through `resumeLiveActivation` instead of a frame rebuild.
+    /// A LIVE-parked flat activation, moved by pointer with no copies or retains, so its ownership graph is
+    /// what execution left. The slice fields above are then empty and resume goes through `resumeLiveActivation`.
     live: ?*Activation = null,
-    /// A COMPILED continuation: the emitted resume function and the heap frame
-    /// it resumes into. A compiled program has no interpreter frames, so when
-    /// one of its suspend functions parks it pushes this instead. Resuming it
-    /// calls the function; the answer is the result or `CoroutineSuspended`
-    /// when it suspended again. Everything above — the driver, the scheduler,
-    /// the clock, the Job graph — is shared with the interpreter.
+    /// A COMPILED continuation: the emitted resume function and the heap frame it resumes into. Resuming
+    /// calls the function, which answers with the result or `CoroutineSuspended` if it suspended again.
     native: ?runtime.NativeResume = null,
 };
 
@@ -187,10 +155,8 @@ const SuspendLiveKey = struct {
     inst_idx: usize,
 };
 
-/// Per-thread because evaluation and its suspend/resume chain stay on one
-/// mutator until an explicit dispatcher handoff. Each site is analysed once;
-/// the cache is cleared at the program boundary before its Func pointers can
-/// expire.
+/// Per-thread because evaluation and its suspend/resume chain stay on one mutator until an explicit
+/// dispatcher handoff. Cleared at the program boundary, before its `Func` pointers can expire.
 threadlocal var suspend_live_cache: std.AutoHashMapUnmanaged(SuspendLiveKey, []u32) = .empty;
 
 threadlocal var suspend_stats_enabled: ?bool = null;
@@ -290,11 +256,8 @@ fn blockSuccessorLive(func: *const Func, block: *const ir.Block, reg: usize, liv
     };
 }
 
-/// Registers whose current values can be read after `inst_idx` in `block`.
-/// This is ordinary backwards dataflow over the complete normal CFG. A frame
-/// with active catch/finally state deliberately uses a dense snapshot instead:
-/// exceptional successors are represented by the runtime try stack rather than
-/// explicit CFG edges, so retaining all registers there is the exact fallback.
+/// Registers readable after `inst_idx` in `block`, by backwards dataflow over the normal CFG. A frame with
+/// active catch/finally takes a dense snapshot: exceptional successors are the try stack, not CFG edges.
 pub fn suspendLiveRegs(func: *const Func, block: BlockId, inst_idx: usize) Allocator.Error![]const u32 {
     const key: SuspendLiveKey = .{ .func = func, .block = block.int(), .inst_idx = inst_idx };
     if (suspend_live_cache.get(key)) |ids| return ids;
@@ -443,57 +406,34 @@ pub fn snapshotRegisters(
     return .{ .dense = values };
 }
 
-/// Layer 1 — a parked activation: a stack of frame snapshots
-/// (outermost first, innermost last) plus the token the interceptor
-/// uses to resume it. Pure suspend mechanism: it carries no thread,
-/// dispatcher, or timing policy of its own.
-/// One inherited segment of not-yet-resumed outer frame snapshots. When a
-/// resumed activation re-suspends, the remaining outer snapshots are NOT
-/// copied into the new state (that copy made deep recursion quadratic —
-/// every DeepRecursive level re-copied the whole parked chain); the
-/// segment is linked here in O(1) and consumed by the next resume.
+/// One inherited segment of not-yet-resumed outer frame snapshots. A re-suspending activation links its
+/// remaining outer snapshots here in O(1) rather than copying them; the next resume consumes the segment.
 pub const TailSeg = struct {
     frames: std.ArrayList(FrameSnapshot),
     /// First unconsumed index into `frames`.
     head: usize,
     next: ?*TailSeg,
-    /// Set by the GC after a collection has fully traced this segment: every
-    /// cell it references is tenured from then on, and the segment is frozen
-    /// (no Value slot is written while parked), so a minor mark skips it.
-    /// Cleared whenever the segment becomes live again (promotion into a
-    /// resume). Majors always retrace.
+    /// Fully traced by a prior collection and frozen while parked, so a minor mark skips it; cleared on resume.
     gc_quiesced: bool = false,
 };
 
+/// A parked activation: the stack of frame snapshots (outermost first) plus the token that resumes it.
 pub const SuspendState = struct {
     token: u64,
     frames: std.ArrayList(FrameSnapshot) = .empty,
     /// Inherited outer segments, innermost-first (resumed after `frames`).
     tails: ?*TailSeg = null,
-    /// Opaque Layer-2 resume directive, set by the suspending API and
-    /// interpreted only by the interceptor — never by Layer 1. The
-    /// default cooperative interceptor reads it as virtual-time
-    /// millis: `>= 0` resumes after that much virtual time, `< 0`
-    /// parks indefinitely until an explicit resume.
+    /// Opaque resume directive, set by the suspending API and read only by the interceptor. The default
+    /// cooperative one reads virtual-time millis: `>= 0` resumes after that long, `< 0` parks until resumed.
     wake_in_millis: i64 = 0,
-    /// Transient: set by the suspending call instruction to its
-    /// destination register, consumed by the enclosing block loop when
-    /// it records the frame snapshot. Always `null` once a frame has
-    /// been pushed.
+    /// Set by the suspending call to its destination register; null once a frame snapshot has been pushed.
     pending_resume_reg: ?Reg = null,
-    /// Set by the GC once a collection has fully traced this parked state:
-    /// every cell it references is tenured from then on, and the snapshots
-    /// are frozen while parked (no Value slot is written until resume), so a
-    /// minor mark skips the whole state. Cleared on every path that hands the
-    /// state back to a mutator (take/adopt/resume). Majors always retrace.
+    /// Set by the GC once a collection has fully traced this parked state: it is frozen until resume, so a minor
+    /// mark skips it. Cleared on every path handing it back to a mutator (take/adopt/resume); majors retrace.
     gc_quiesced: bool = false,
 
-    /// Release every value reference this state's snapshots retained on
-    /// suspend and free the snapshot slice buffers. Call this exactly once
-    /// when a parked state is dropped *without* being resumed (a cancelled
-    /// or abandoned coroutine) — `resumeContinuation` instead transfers the
-    /// retained references into the rebuilt frames. No-op under the arena.
-    /// The caller still owns the `frames` ArrayList itself.
+    /// Release every value reference these snapshots retained on suspend and free their slice buffers. Call it
+    /// exactly once for a state dropped without resuming; a resume transfers the references into rebuilt frames.
     pub fn deinit(self: *SuspendState, allocator: Allocator) void {
         for (self.frames.items) |snap| dropSnapshot(snap, allocator);
         self.frames.deinit(allocator);
@@ -508,13 +448,9 @@ pub const SuspendState = struct {
         }
     }
 
-    /// Drop one parked frame entry without evtls.resuming it: destroy a live
-    /// activation outright (it owns its register references), or release
-    /// and free a copied snapshot.
+    /// Drop one parked entry without resuming it; a live activation owns its registers and is destroyed outright.
     fn dropSnapshot(snap: FrameSnapshot, allocator: Allocator) void {
-        // A compiled continuation owns nothing the interpreter allocated: its
-        // frame is the native runtime's, released when the park registry drops
-        // it.
+        // A compiled continuation owns nothing the interpreter allocated; the park registry releases its frame.
         if (snap.native != null) return;
         if (snap.live) |act| {
             destroyParkedActivation(allocator, act);
@@ -525,12 +461,8 @@ pub const SuspendState = struct {
     }
 };
 
-/// Retain the value references a freshly-built snapshot copies out of a
-/// suspending frame: regs (the frame owns them and releases them as it
-/// unwinds), and params/captures (aliases of caller registers / closure
-/// captures that the unwinding stack will release). The receiver chain is a
-/// borrow kept alive by those owners, so it is not retained here. No-op
-/// under the arena.
+/// Retain the value references a fresh snapshot copies out of a suspending frame: regs, params and captures,
+/// all released by the unwinding stack. The receiver chain is a borrow kept alive by those owners.
 pub fn retainSnapshotValues(snap: FrameSnapshot) void {
     if (!runtime.reclaimEnabled()) return;
     switch (snap.regs) {
@@ -541,15 +473,8 @@ pub fn retainSnapshotValues(snap: FrameSnapshot) void {
     for (snap.captures) |v| v.retain();
 }
 
-/// GC: mark every Value a parked suspend state keeps live — each frame
-/// snapshot's regs, params, captures, and enclosing-receiver chain. Mirrors the
-/// `retainSnapshotValues` set plus the receiver chain (the GC owns the view of
-/// it: a parked continuation is the chain's sole keeper while parked). Driven by
-/// the coroutine root provider for every persisted/active parked activation.
+/// GC: mark each frame snapshot's `retainSnapshotValues` set plus the receiver chain the parked state keeps.
 pub fn gcMarkSuspendState(state: *SuspendState, m: *runtime.gc.Marker) void {
-    // Quiescent skip: a state a prior collection fully traced references only
-    // tenured cells and is frozen while parked, so a minor mark has nothing to
-    // find in it. A major must retrace (tenured cells are sweep candidates).
     if (m.minor and state.gc_quiesced) return;
     for (state.frames.items) |snap| gcMarkSnapshot(snap, m);
     var seg = state.tails;
@@ -583,24 +508,20 @@ pub fn gcMarkSnapshot(snap: FrameSnapshot, m: *runtime.gc.Marker) void {
     markFrameClosure(snap.closure_id, m);
 }
 
-/// `runtime.gc.markSuspendHook` thunk: mark a builder continuation held as an
-/// opaque `*SuspendState` by a `Sequence`'s `Builder` source.
+/// `runtime.gc.markSuspendHook` thunk: mark a builder continuation held as an opaque `*SuspendState`.
 pub fn gcMarkSuspendStateOpaque(cont: *anyopaque, m: *runtime.gc.Marker) void {
     const st: *SuspendState = @ptrCast(@alignCast(cont));
     gcMarkSuspendState(st, m);
 }
 
-/// `runtime.gc.freeSuspendHook` thunk: release and free an abandoned builder
-/// continuation box. The frames were never resumed, so their retained snapshot
-/// values must be released and the slice buffers freed before the box itself.
+/// `runtime.gc.freeSuspendHook` thunk: release and free an abandoned builder continuation box.
 pub fn freeSuspendStateOpaque(cont: *anyopaque, allocator: Allocator) void {
     const st: *SuspendState = @ptrCast(@alignCast(cont));
     st.deinit(allocator);
     allocator.destroy(st);
 }
 
-/// Release what `retainSnapshotValues` retained (the drop-without-resume
-/// path). Mirrors the retain set exactly.
+/// Release what `retainSnapshotValues` retained, mirroring that set exactly.
 fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
     switch (snap.regs) {
         .dense => |values| for (values) |v| v.release(allocator),
@@ -612,11 +533,7 @@ fn releaseSnapshotValues(snap: FrameSnapshot, allocator: Allocator) void {
     pending.release(allocator);
 }
 
-/// Free the dupe'd slice buffers a snapshot owns. These are raw host arrays
-/// (not GC cells), so the tracing collector never reclaims them — they must be
-/// freed explicitly whenever a real freeing allocator is active. Gated on
-/// `freeScratch` (reclaim mode or GC on); only the legacy arena fast path,
-/// where `free` would rewind a bump pointer, leaves them.
+/// The slice buffers a snapshot owns are raw host arrays, not GC cells, so a freeing allocator must free them.
 pub fn freeSnapshotBuffers(snap: FrameSnapshot, allocator: Allocator) void {
     if (!runtime.freeScratch()) return;
     if (runtime.gc.gc_enabled and runtime.gc.external_accounting) {

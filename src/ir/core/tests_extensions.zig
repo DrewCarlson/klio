@@ -23,9 +23,6 @@ test "a bare call never binds a member extension of an unrelated class" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // `kotlin.with(receiver, block)` and, in another library, the member
-    // extension `KeyframeEntity.with(easing)` declared inside
-    // `KeyframesSpecConfig`.
     const std_with = try pushTestFuncOpts(&m, a, "with", "kotlin.with", "kotlin", 2, .{ .stub = true });
     const member_with = try pushTestFuncOpts(&m, a, "with", "with", "", 1, .{ .stub = true, .extension = true });
     m.funcs.items[std_with.int()].params[0].ty.name = "Any";
@@ -58,8 +55,7 @@ test "a bare call never binds a member extension of an unrelated class" {
         .{ .ty = .{ .name = "String", .nullable = false, .args = &.{} } },
         .{ .is_lambda = true, .lambda_arity = 1 },
     };
-    // A caller inside an unrelated class has no `KeyframesSpecConfig`
-    // receiver, so the member extension is not a candidate: `kotlin.with`.
+    // A caller inside an unrelated class has no `KeyframesSpecConfig` receiver, so the member extension is not a candidate.
     const res = try m.resolveCall(a, "with", "androidx.compose.ui.text", FileId.from(0), &global_args, true, .{
         .in_receiver_context = true,
         .owner_class = "MultiParagraph",
@@ -257,8 +253,7 @@ test "extension resolver proves receiver, scope, and overload identity" {
         .ty = .{ .name = "Int", .nullable = false, .args = &.{} },
         .literal_kind = .numeric,
     }};
-    // kotlinc: an integer literal materializes as Long in a Long slot, and
-    // the Long overload is more specific than Any — the pick is static.
+    // kotlinc: an integer literal materializes as Long in a Long slot, and the Long overload is more specific than Any.
     try testing.expectEqual(long_literal.int(), m.resolveExtensionCall("literalPick", .{
         .name = "String",
         .nullable = false,
@@ -1276,10 +1271,7 @@ test "a tie on the lambda return alone still lends the lambda param types" {
     var m = Module.default(a);
     defer m.deinit(a);
 
-    // Two `Iterable<T>.flatMapX(transform)` overloads whose lambdas differ
-    // only in RETURN type (`Iterable<R>` vs `Sequence<R>`) — the
-    // `flatMapIndexed` shape. The tie is genuine, but both candidates hand
-    // the closure the same parameter types, so param_rep names one of them.
+    // Two overloads differing only in the lambda's RETURN type tie genuinely, but both hand the closure the same parameter types.
     const fids = [_]FuncId{
         try pushTestFuncOpts(&m, a, "flatMapX", "kotlin.collections.flatMapX", "kotlin.collections", 1, .{ .extension = true }),
         try pushTestFuncOpts(&m, a, "flatMapX", "kotlin.collections.flatMapX", "kotlin.collections", 1, .{ .extension = true }),
@@ -1319,8 +1311,7 @@ test "a tie on the lambda return alone still lends the lambda param types" {
     try testing.expect(res.applicable);
     try testing.expectEqual(fids[0], res.param_rep.?);
 
-    // Overloads that also differ in a lambda PARAMETER position lend
-    // nothing: whichever wins changes what the closure body sees.
+    // Overloads that also differ in a lambda PARAMETER position lend nothing: whichever wins changes what the closure body sees.
     const third = try pushTestFuncOpts(&m, a, "flatMapY", "kotlin.collections.flatMapY", "kotlin.collections", 1, .{ .extension = true });
     const fourth = try pushTestFuncOpts(&m, a, "flatMapY", "kotlin.collections.flatMapY", "kotlin.collections", 1, .{ .extension = true });
     const param_heads = [_][]const u8{ "Int", "Long" };
@@ -1356,9 +1347,7 @@ test "named arguments may skip defaulted parameters and still resolve" {
     var m = Module.default(a);
     defer m.deinit(a);
 
-    // The rangesDelimitedBy shape: `f(x, ignoreCase = ..., limit = ...)`
-    // skips the defaulted `startIndex`, and the CharArray/Array overload
-    // pair is discriminated by the first positional argument.
+    // `f(x, ignoreCase = ..., limit = ...)` skips the defaulted `startIndex`; the overload pair is discriminated by the first positional argument.
     const heads = [_][]const u8{ "CharArray", "IntArray" };
     var fids: [2]FuncId = undefined;
     for (heads, 0..) |head, idx| {
@@ -1384,8 +1373,6 @@ test "named arguments may skip defaulted parameters and still resolve" {
         &shapes,
         .{ .caller_file = FileId.from(0), .caller_package = "app" },
     );
-    // The skip COMMITS: the emitted call carries the names and the host
-    // boundary binds them by declaration parameter.
     try testing.expectEqual(fids[0], res.target.?);
 
     // A named argument no parameter carries still drops the candidate.
@@ -1401,8 +1388,7 @@ test "named arguments may skip defaulted parameters and still resolve" {
     );
     try testing.expect(res2.target == null);
 
-    // A skipped parameter WITHOUT a default keeps the strict rule: naming
-    // `limit` past a required `mustGive` defers rather than committing.
+    // A skipped parameter WITHOUT a default keeps the strict rule: naming `limit` past a required `mustGive` defers.
     const strict = try pushTestFuncOpts(&m, a, "strictRanges", "app.strictRanges", "app", 3, .{ .extension = true });
     m.funcs.items[strict.int()].kind = .top_level_extension;
     m.funcs.items[strict.int()].params[0].ty = .{ .name = "CharSequence", .nullable = false, .args = &.{} };
@@ -1430,10 +1416,8 @@ test "dependent bound with unbound referenced parameter does not refute" {
     var m = Module.default(a);
     defer m.deinit(a);
 
-    // `fun <S, T : S> Iterable<T>.reduce(op: (S, T) -> S)` against an
-    // `Iterable<String>` receiver: binding produces only `T := String`, and
-    // `S` (value-parameter and return positions only) stays free for the
-    // call's inference, so `T <: S` cannot refute the candidate.
+    // `fun <S, T : S> Iterable<T>.reduce(op: (S, T) -> S)` on an `Iterable<String>` binds only `T := String`; `S` appears
+    // in value-parameter and return positions only, so it stays free for call inference and `T <: S` cannot refute.
     const type_vars = [_]TypeRef{.{ .name = "T", .nullable = false, .args = &.{} }};
     const strings = [_]TypeRef{.{ .name = "String", .nullable = false, .args = &.{} }};
     const pattern = TypeRef{ .name = "Iterable", .nullable = false, .args = @constCast(&type_vars) };
@@ -1449,8 +1433,7 @@ test "dependent bound with unbound referenced parameter does not refute" {
         &declared,
         &.{},
     ));
-    // A dependent bound whose referenced parameter IS bound still proves:
-    // `Map<K, V>.getRid(k: K)` shapes bind both sides from the receiver.
+    // A dependent bound whose referenced parameter IS bound still proves: `Map<K, V>.getRid(k: K)` binds both sides from the receiver.
     const bound_both = [_]ModuleRegistry.TypeParamBound{
         .{ .param = "T", .bound = "V" },
         .{ .param = "V", .bound = "kotlin.Any" },
@@ -1637,12 +1620,10 @@ test "symbol index prefers the caller's own package" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Two same-name, same-arity funcs in different packages.
     const own = try pushTestFunc(&m, a, "greet", "app.greet", "app", 0);
     _ = try pushTestFunc(&m, a, "greet", "lib.greet", "lib", 0);
     try m.rebuildFuncNameIndex(a);
 
-    // A caller in package `app` resolves its own `greet`, not lib's.
     const got = m.resolveBareCallIndexed("greet", "app", FileId.from(0), 0, false);
     try testing.expect(got.outcome == .resolved);
     try testing.expectEqual(own.int(), got.outcome.resolved.int());
@@ -1654,8 +1635,7 @@ test "symbol index ranks a named import above the caller's own package" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Kotlin's scoping: an explicit `import lib.greet` outranks even a
-    // declaration in the caller's own package (and file).
+    // Kotlin scoping: an explicit `import lib.greet` outranks a declaration in the caller's own package and file.
     _ = try pushTestFunc(&m, a, "greet", "app.greet", "app", 0);
     const imported = try pushTestFunc(&m, a, "greet", "lib.greet", "lib", 0);
     var paths: std.ArrayList(ModuleRegistry.ImportPath) = .empty;
@@ -1673,7 +1653,7 @@ test "symbol index ranks a named import above the caller's own package" {
     try testing.expectEqual(imported.int(), got.outcome.resolved.int());
     try testing.expectEqual(@as(u8, 0), got.tier);
 
-    // From a file without the import the own-package declaration wins.
+    // Imports are file-scoped, so from a file without it the own-package declaration wins.
     const got2 = m.resolveBareCallIndexed("greet", "app", FileId.from(1), 0, false);
     try testing.expect(got2.outcome == .resolved);
     try testing.expectEqual(@as(u8, 1), got2.tier);
@@ -1750,11 +1730,7 @@ test "symbol index defers an out-of-scope pick when an in-scope extension exists
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // The only non-extension candidate lives in a package the caller
-    // (kotlin.text) cannot see; a same-package extension also exists.
-    // The call may bind the extension via an implicit receiver, so the
-    // index must defer to the receiver-aware heuristic instead of
-    // resolving (and later rejecting) the invisible function.
+    // The only non-extension candidate is invisible to the caller and a same-package extension exists, so the index must defer to the receiver-aware heuristic.
     _ = try pushTestFunc(&m, a, "firstOrNull", "firstOrNull", "", 1);
     _ = try pushTestFuncOpts(&m, a, "firstOrNull", "kotlin.text.firstOrNull", "kotlin.text", 1, .{ .extension = true });
     try m.rebuildFuncNameIndex(a);
@@ -1762,8 +1738,7 @@ test "symbol index defers an out-of-scope pick when an in-scope extension exists
     const got = m.resolveBareCallIndexed("firstOrNull", "kotlin.text", FileId.from(0), 1, false);
     try testing.expectEqual(Module.ResolveDeferReason.extension_form, deferReasonOf(got).?);
 
-    // Without the extension, the invisible candidate still resolves (the
-    // out-of-scope diagnostic is the lowering's call), tier 5.
+    // Without the extension the invisible candidate still resolves at tier 5; the out-of-scope diagnostic is lowering's call.
     var m2 = Module.default(a);
     defer freeTestModule(&m2, a);
     _ = try pushTestFunc(&m2, a, "firstOrNull", "firstOrNull", "", 1);
@@ -1777,9 +1752,7 @@ test "symbol index defers when the preferred tier is ambiguous" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Two same-name, same-arity, same-signature funcs in the CALLER's
-    // package: in scope and indistinguishable, the index must defer as
-    // ambiguous rather than pick one.
+    // Two in-scope, indistinguishable candidates in the caller's own package: defer as ambiguous rather than pick one.
     const p_id = try pushTestFunc(&m, a, "h", "user.h", "user", 1);
     const q_id = try pushTestFunc(&m, a, "h", "user.x.h", "user", 1);
     try m.rebuildFuncNameIndex(a);
@@ -1795,9 +1768,7 @@ test "symbol index classifies an out-of-scope identical set as unimported" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Two identical funcs in two packages the caller neither declares
-    // nor imports: Kotlin would resolve neither, so klio's lenient
-    // cross-package pick stays with the heuristic instead of erroring.
+    // Two identical funcs in packages the caller neither declares nor imports: Kotlin resolves neither, so the lenient cross-package pick stays with the heuristic.
     _ = try pushTestFunc(&m, a, "h", "p.h", "p", 1);
     _ = try pushTestFunc(&m, a, "h", "q.h", "q", 1);
     try m.rebuildFuncNameIndex(a);
@@ -1810,9 +1781,7 @@ test "symbol index ranks a default-import package above other built-ins" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // `kotlin.collections` is implicitly imported in every file; a
-    // same-name sibling in a non-default kotlinx package is not in
-    // scope, so the default-import candidate resolves uniquely.
+    // `kotlin.collections` is implicitly imported in every file and a kotlinx sibling is not, so the default-import candidate resolves uniquely.
     const dflt = try pushTestFunc(&m, a, "chk", "kotlin.collections.chk", "kotlin.collections", 1);
     _ = try pushTestFunc(&m, a, "chk", "kotlinx.other.chk", "kotlinx.other", 1);
     try m.rebuildFuncNameIndex(a);
@@ -1827,9 +1796,7 @@ test "symbol index prefers a wildcard-imported package over other packages" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Same name/arity in two non-caller packages; the caller's file
-    // wildcard-imports one of them, which disambiguates (real Kotlin
-    // scoping: explicit imports outrank everything but the own package).
+    // A file's wildcard import disambiguates two otherwise-tied non-caller packages.
     const imported = try pushTestFunc(&m, a, "sync", "locks.sync", "locks", 1);
     _ = try pushTestFunc(&m, a, "sync", "other.sync", "other", 1);
     var wl: std.ArrayList([]const u8) = .empty;
@@ -1842,8 +1809,7 @@ test "symbol index prefers a wildcard-imported package over other packages" {
     try testing.expectEqual(imported.int(), got.outcome.resolved.int());
     try testing.expectEqual(@as(u8, 2), got.tier);
 
-    // From a different file (no wildcard import) neither candidate is in
-    // scope; the identical tie defers to the lenient heuristic.
+    // From a file without the wildcard import neither candidate is in scope, and the identical tie defers to the heuristic.
     const got2 = m.resolveBareCallIndexed("sync", "user", FileId.from(1), 1, false);
     try testing.expectEqual(Module.ResolveDeferReason.unimported_set, deferReasonOf(got2).?);
 }
@@ -1852,8 +1818,7 @@ test "symbol index classifies a type-distinguishable overload set" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer freeTestModule(&m, a);
-    // Same package, same arity, DIFFERENT parameter types: runtime
-    // argument types pick the overload, so this is never an ambiguity.
+    // Same package and arity, DIFFERENT parameter types: runtime argument types pick the overload, so this is never an ambiguity.
     _ = try pushTestFuncOpts(&m, a, "f", "app.f", "app", 1, .{ .param_ty = "Int" });
     _ = try pushTestFuncOpts(&m, a, "f", "app.f", "app", 1, .{ .param_ty = "String" });
     try m.rebuildFuncNameIndex(a);

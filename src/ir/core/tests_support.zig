@@ -12,24 +12,17 @@ const Module = root_ir.Module;
 const Param = core_func.Param;
 const TypeRef = core_ids.TypeRef;
 
-/// Options for the symbol-index test func pusher.
 pub const TestFuncOpts = struct {
-    /// `null` = body-bearing; otherwise a header stub with no blocks.
     stub: bool = false,
     low_priority: bool = false,
-    /// Mark the last parameter `vararg`.
     last_vararg: bool = false,
-    /// Give every parameter but the last a default, and type the last
-    /// parameter `Function0` (the trailing-lambda gap shape).
+    /// All but the last parameter get a default; the last is typed `Function0`.
     fn_tail_with_defaults: bool = false,
     /// First parameter is a synthesized receiver `this`.
     extension: bool = false,
-    /// Type name for every user parameter (default `Int`).
     param_ty: []const u8 = "Int",
 };
 
-/// Push a top-level func with the given simple name, FQN, package, and
-/// user-parameter count, returning its id. Used by the symbol-index tests.
 pub fn pushTestFuncOpts(m: *Module, a: Allocator, name: []const u8, fqn: []const u8, package: []const u8, user_params: usize, opts: TestFuncOpts) !FuncId {
     const id = m.nextFuncId();
     const n_params = user_params + @as(usize, if (opts.extension) 1 else 0);
@@ -89,8 +82,7 @@ pub fn freeTestModule(m: *Module, a: Allocator) void {
     m.deinit(a);
 }
 
-/// Record a declared-signature entry (all params `ty_name`, non-null,
-/// no generic args) for a stub, mirroring phase-1 header registration.
+/// Record a declared-signature entry for a stub: `n` parameters all typed `ty_name`.
 pub fn putTestDeclSig(m: *Module, a: Allocator, id: FuncId, ty_name: []const u8, n: usize) !void {
     const sig = try a.alloc(TypeRef, n);
     for (sig) |*ty| ty.* = .{ .name = try a.dupe(u8, ty_name), .nullable = false, .args = &.{} };

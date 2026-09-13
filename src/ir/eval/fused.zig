@@ -86,11 +86,7 @@ const FUSED_MAX_BLOCKS: usize = 64;
 
 const FUSED_MAX_INSTS: usize = 256;
 
-/// The fused walker's per-thread state lives in ONE threadlocal: Darwin resolves
-/// every threadlocal access through a `_tlv_get_addr` CALL, and the walker
-/// touched four separate variables per activation, which put thread-local
-/// access at the top of an interpreter profile. As one struct the base is
-/// fetched once and every bank is an offset from it.
+/// All per-thread walker state in one threadlocal, so the base resolves once per activation.
 const FusedTls = struct {
     bank: [FUSED_BANK_DEPTH][FUSED_MAX_REGS]Value = undefined,
     chain: [FUSED_BANK_DEPTH]std.ArrayList(EnclosingEntry) = @splat(.empty),
@@ -98,9 +94,7 @@ const FusedTls = struct {
     depth: usize = 0,
 };
 
-/// Owner thread reads the global copy, every other thread its own — see
-/// `runtime.tls_fast`. Same per-thread guarantee, without a `_tlv_get_addr`
-/// call on every helper that touches the walker's banks.
+/// The owner thread reads this copy, every other thread `fused_tls_other`; see `runtime.tls_fast`.
 var fused_tls_owner: FusedTls = .{};
 
 threadlocal var fused_tls_other: FusedTls = .{};
@@ -115,9 +109,8 @@ var fused_enabled_val: bool = true;
 
 var fused_sel: ?[]const u8 = null;
 
-/// `KLIO_FUSED=0` disables the tier; a comma list fuses ONLY those simple
-/// names; a list starting with `!` fuses all BUT those — the same bisect
-/// grammar as KLIO_MEMBER_INLINE.
+/// `KLIO_FUSED=0` disables the tier; a comma list fuses ONLY those simple names, and a
+/// leading `!` fuses all but those.
 pub fn fusedEnabled() bool {
     if (fused_enabled_state == 0) {
         const raw = runtime.envOnce("KLIO_FUSED") orelse "1";
@@ -142,29 +135,16 @@ fn fusedNameSelected(name: []const u8) bool {
     return inverted;
 }
 
-/// Transitive closed-world classification, memoized on the Func. A cycle
-/// (mutual recursion) reads as eligible while the root classification runs
-/// and settles with the root's verdict. The host is part of the verdict: a
-/// body that (transitively) calls a HOST-OWNED function must not fuse —
-/// `KlioContinuation.resumeWith` runs its own lowered body but calls the
-/// host's `__klio_co_resume`, and the resume machinery assumes a framed
-/// caller (fusing it stalled the pump).
-/// fuse_state: 0 unasked, 1 FULL (every op in the fast set, callees
-/// transitively full — flat and recursive seams), 2 no, 3 in progress,
-/// 4 PARTIAL (structurally sound; runs fused until the first heavy op,
-/// then MATERIALIZES a real frame and continues framed — recursive seam
-/// only, because a flat caller cannot adopt the materialized remainder's
-/// suspension).
+/// Transitive closed-world verdict, memoized on the Func as `fuse_state`: 0 unasked, 1 full
+/// (every op fusable, callees transitively full), 2 no, 3 in progress (reads eligible, so a
+/// recursion cycle settles with the root's verdict), 4 partial (fused prefix, then materializes
+/// a frame). A host-owned callee forces 2: the resume bridge assumes a framed caller.
 fn fusedEligible(comptime H: type, host: *H, module: *const Module, func: *const Func) bool {
     return fusedVerdict(H, host, module, func) == 1;
 }
 
-/// Funcs THIS thread is currently classifying, so a self-recursive body's
-/// own call site resolves optimistically (the fixpoint that lets fused
-/// recursion classify FULL) while ANOTHER thread's in-progress marker is
-/// a plain decline — handing the optimistic verdict across threads let a
-/// second core run a body fused before the classifying thread had even
-/// ensured its blocks were decoded (the dispatched_delay corpus panic).
+/// Funcs THIS thread is classifying, so a self-recursive call site reads eligible. Another
+/// thread's in-progress marker declines instead: its blocks may not be decoded yet.
 threadlocal var classify_stack: [128]u32 = undefined;
 
 threadlocal var classify_depth: usize = 0;
@@ -205,12 +185,8 @@ fn bareTypeVarHead(name: []const u8) bool {
 
 fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const Func) u8 {
     if (func.is_suspend or func.is_lambda) return 2;
-    // A generic body's `as T` / `is T` consults the frame's reified
-    // context (`typeParamCastPasses`), which the fused walker does not
-    // carry — kotlinx's `systemProp<T>` silently failed its cast and the
-    // DEFAULT_TIMEOUT initializer died with it. Func carries no type-param
-    // list, so a parameter or return typed as a bare type variable is the
-    // generic marker, and the Cast/InstanceOf ops are guarded below too.
+    // A bare type variable marks a generic body, whose `as T` / `is T` consults the frame's
+    // reified context; the walker carries none. The Cast and InstanceOf ops are guarded below.
     if (bareTypeVarHead(func.return_ty.name)) return 2;
     for (func.params) |*p| {
         if (bareTypeVarHead(p.ty.name)) return 2;
@@ -222,11 +198,7 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
     }
     var heavy = false;
     var total: usize = 0;
-    // How much fused progress the ENTRY block makes before its first heavy
-    // op. A body whose entry hits a heavy op almost immediately gains
-    // nothing from a fused prefix — materialization then pays walker entry
-    // PLUS the full frame build on nearly every call (the observed
-    // [fused-mat] b0:1..b0:5 family) — so it runs framed outright.
+    // Fusable instructions the ENTRY block runs before its first heavy op.
     var entry_prefix: usize = 0;
     var entry_heavy = false;
     for (func.blocks, 0..) |*b, bi| {
@@ -256,15 +228,9 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
                 .CellGet, .CellSet, .EnclosingPush, .EnclosingPop => {},
                 .Cast => |ct| if (bareTypeVarHead(ct.ty.name)) return 2,
                 .InstanceOf => |io| if (bareTypeVarHead(io.ty.name)) return 2,
-                // Non-suspending open-world ops: a global read may run a
-                // lazy initializer and a construction runs ctor bodies, but
-                // neither can suspend (Kotlin forbids suspend there), so no
-                // materialization is needed beneath them.
+                // Open-world but non-suspending, so nothing beneath needs materialization.
                 .LoadGlobal => {},
-                // Dynamic member dispatch stays framed: the recursive host
-                // entries lose the flat path's site memos (fused-first
-                // execution never stamps them), which measured ~5% slower
-                // on the recomposition replica.
+                // Dynamic dispatch stays framed: fused-first execution never stamps the site memos.
                 .CallVirtual, .CallMember => heavy = true,
                 .NewInstance => |ni| {
                     if (ni.arg_names.len != 0) {
@@ -289,8 +255,7 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
                     }
                     if (fusedVerdict(H, host, module, callee) != 1) heavy = true;
                 },
-                // A SuspendResumePoint marks a resumable body: never fused,
-                // never materialized mid-flight.
+                // A resumable body: never fused, never materialized mid-flight.
                 .SuspendResumePoint => return 2,
                 else => heavy = true,
             }
@@ -300,8 +265,7 @@ fn fusedClassify(comptime H: type, host: *H, module: *const Module, func: *const
     return if (heavy) 4 else 1;
 }
 
-/// A heavy body whose fusable entry prefix is shorter than this runs
-/// framed: the prefix win cannot pay for the materialize handoff.
+/// A heavy body whose fusable entry prefix is shorter than this runs framed outright.
 const fused_min_prefix: usize = 24;
 
 const FusedFail = error{ Raise, Materialize } || Allocator.Error;
@@ -313,9 +277,8 @@ inline fn fusedRaise(e: EvalError) FusedFail {
     return error.Raise;
 }
 
-/// The tier's entry: null when the body is ineligible (caller proceeds to
-/// the framed path), an EvalResult otherwise — `.ok` or a genuinely raised
-/// `.err`, never an abandon.
+/// The tier's entry: null when the body is ineligible and the caller must take the framed
+/// path, else an `.ok` or a genuinely raised `.err`, never an abandon.
 pub fn fusedExec(
     comptime H: type,
     allocator: Allocator,
@@ -327,10 +290,8 @@ pub fn fusedExec(
     return fusedExecOpt(H, allocator, module, func, args, host, false);
 }
 
-/// `allow_materialize`: a PARTIAL body runs its fused prefix and then
-/// builds the real Frame and continues framed — only the recursive seam
-/// may allow it (a flat caller cannot adopt the remainder's suspension,
-/// and a fused .Call parent must never sit above a parkable callee).
+/// `allow_materialize`: a partial body runs its fused prefix and continues framed. Only the
+/// recursive seam may allow it, since a flat caller cannot adopt the remainder's suspension.
 pub fn fusedExecOpt(
     comptime H: type,
     allocator: Allocator,
@@ -342,20 +303,13 @@ pub fn fusedExecOpt(
 ) Allocator.Error!?EvalResult {
     if (comptime !@hasDecl(H, "fieldSiteRoute")) return null;
     if (!fusedEnabled()) return null;
-    // A symbol the host settled onto a native binding or a redirect does
-    // not run its lowered body — fusing it executes a stub the host never
-    // intended to run. The coroutine bridge (`__klio_co_resume`,
-    // `KlioContinuation.resumeWith`) is exactly this shape, and fusing it
-    // leaked the pump's per-resume state until the RSS cap fired.
     if (!fusedNameSelected(if (func.fqn.len != 0) func.fqn else func.name)) return null;
     const verdict = fusedVerdict(H, host, module, func);
     if (verdict == 2) return null;
     if (verdict == 4 and !allow_materialize) return null;
     if (args.len != func.params.len) return null;
-    // An INNER-class member's bare reads reach the enclosing instance
-    // (`hasNext(): Boolean = index < size` reads the OUTER list's size),
-    // context the walker does not model — the framed path resolves it
-    // through the enclosing chain. A receiver carrying an outer declines.
+    // An inner-class member's bare reads reach the enclosing instance, which the walker does
+    // not model, so a receiver carrying an outer declines.
     if (args.len > 0 and args[0] == .Instance) {
         const g = args[0].Instance.borrow();
         const has_outer = g.get().outer != null;
@@ -363,13 +317,10 @@ pub fn fusedExecOpt(
         if (has_outer) return null;
     }
     if (fusedTls().depth >= FUSED_BANK_DEPTH) return null;
-    // Function-tier handshake: a hot fully-fusable body yields to the framed
-    // path so the JIT can count and compile it (the walker otherwise starves
-    // the tier — a fused body never opens a frame).
+    // A hot fully-fusable body yields so the function JIT can count it; a fused body opens no frame.
     if (jit_loop.fusedShouldYieldToFuncTier(func)) return null;
-    // A memoized verdict travels between threads without ordering against
-    // the body's lazy decode; re-ensure here (idempotent, serialized) so
-    // the walker never indexes an empty block table.
+    // A memoized verdict reaches this thread without ordering against the body's lazy decode;
+    // re-ensure (idempotent) so the walker never indexes an empty block table.
     if (func.blocks.len == 0 and !module.ensureFuncBody(@constCast(func))) return null;
     if (parent.frame_count_on) parent.frame_count_total += 1;
     if (runtime.envOnce("KLIO_FUSED_TRACE") != null) {
@@ -386,13 +337,8 @@ fn fusedRun(
     args_in: []const Value,
     host: *H,
 ) Allocator.Error!EvalResult {
-    // Both per-thread bases resolved ONCE for the activation: on Darwin every
-    // threadlocal access is a `_tlv_get_addr` CALL, and this function touched
-    // them fifteen times per activation.
     const ft = fusedTls();
     const ev: *EvalTls = &ev_state.evtls;
-    // One handle for the activation's pins: mark + push + restore were three
-    // separate threadlocal resolutions, and on Darwin each is a call.
     const ka = runtime.keepaliveHandle();
     const reclaim = runtime.reclaimEnabled();
     var eff_args = args_in;
@@ -410,14 +356,9 @@ fn fusedRun(
     const regs: []Value = ft.bank[ft.depth][0..nlive];
     ft.depth += 1;
     defer ft.depth -= 1;
-    // Unlike the leaf bank there is no def-before-use proof here: fill the
-    // bank so the register file is always well-formed, and pin it for the
-    // collector for the whole run (fused bodies allocate and call).
+    // No def-before-use proof here, unlike the leaf bank: fill the bank so the register file is
+    // always well-formed, and keep it pinned for the collector for the whole run.
     for (regs) |*v| v.* = .Unit;
-    // Resolved once for the whole walk: on Darwin each threadlocal access is a
-    // `_tlv_get_addr` CALL, so re-reading this per instruction (the `Trace` arm
-    // ran on nearly every statement) put thread-local access at the top of the
-    // profile.
     const mark: *FusedMark = &ft.marks[ft.depth - 1];
     mark.* = .{
         .func = func,
@@ -428,22 +369,15 @@ fn fusedRun(
     if (runtime.gc.gc_enabled) gcInstallFrameRoot();
     const pin_mark = ka.mark();
     ka.pushSlice(regs);
-    // The args slice is NOT otherwise a root: a dispatch that assembled it
-    // in a scratch buffer (a defaulted call's argv) may hold the only
-    // reference to a value in it, and unlike a framed call — which moves
-    // argv into rooted params before any safe point — the fused body runs
-    // through safe points with argv still in the scratch buffer.
+    // The args slice is not otherwise a root: a dispatch that assembled it in a scratch buffer
+    // may hold the only reference, and the fused body crosses safe points off that buffer.
     ka.pushSlice(eff_args);
     defer ka.restore(pin_mark);
     defer if (reclaim) {
         for (regs) |*v| v.release(allocator);
     };
-    // The fused body OWNS an enclosing chain exactly as a frame does
-    // (seeded from the caller's in-flight pushes plus its own receiver,
-    // then activated). Without this, a body invoked with the chain
-    // DETACHED (host trampolines null it) lost its own subject pushes —
-    // `apply { add(...) }`'s subject silently vanished and the framed
-    // remainder resolved `add` against the test instance.
+    // The fused body owns an enclosing chain exactly as a frame does, seeded from the caller's
+    // in-flight pushes plus its own receiver, then activated.
     const chain = &ft.chain[ft.depth - 1];
     chain.clearRetainingCapacity();
     if (ev.active_chain) |caller| {
@@ -468,8 +402,7 @@ fn fusedRun(
     var pushed_enclosing: usize = 0;
     defer while (pushed_enclosing > 0) : (pushed_enclosing -= 1) popEnclosing();
 
-    // KLIO_FN_PROF: a fused body is the executing function — without this
-    // stamp its samples billed to the last FRAMED caller.
+    // KLIO_FN_PROF: the fused body is the executing function, not its last framed caller.
     const fn_prof_prev = runtime.prof.current_fn;
     if (runtime.prof.fn_prof_active) runtime.prof.current_fn = func.id.int();
     defer if (runtime.prof.fn_prof_active) {
@@ -477,34 +410,21 @@ fn fusedRun(
     };
 
     var cur: BlockId = func.entry;
-    // A hot loop inside a fused body reaches no tier that can compile it: the
-    // walker follows its own back edges, so the loop JIT — which counts block
-    // entries in the framed loop — never sees the code it exists for. Count the
-    // back edges here and, once hot, materialize a real frame at the loop
-    // header and continue framed (no replay: the header's instructions have not
-    // run yet). The framed loop then counts, compiles, and runs it natively.
+    // The loop JIT counts block entries in the framed loop and never sees a fused body's own
+    // back edges: count them here and materialize at the loop header, before it runs.
     const jit_yield_on = jit_loop.enabled();
     var back_edges: u32 = 0;
     walk: while (true) {
-        // The framed loop's GC safe point, once per block, UNCONDITIONAL:
-        // `pending()` never sees another thread's stop_flag, so gating on it
-        // let a fused spin-loop (JobSupport's state machine waiting on a
-        // sibling thread) skip the stop-the-world rendezvous — the collector
-        // waited on this thread while this thread waited on a parked mutator.
-        // `safePoint()` itself parks on a raised stop and no-ops otherwise;
-        // a fused-only hot loop also needs it so allocations ever collect
-        // (DeepRecursiveTest grew past the RSS cap). The bank is pinned, so
-        // stopping here is root-exact.
+        // Once per block, UNCONDITIONAL: `pending()` never sees another thread's stop flag, so
+        // gating on it lets a fused spin loop skip the rendezvous. The pinned bank keeps it root-exact.
         if (runtime.gc.gc_enabled) runtime.gc.safePoint();
         const blk = &func.blocks[cur.int()];
         const blk_id = cur.int();
         for (blk.insts, 0..) |*inst, idx| {
             fusedInst(H, allocator, module, func, eff_args, host, inst, regs, reclaim, &pushed_enclosing, mark) catch |e| switch (e) {
                 error.Raise => return .{ .err = fused_err },
-                // A heavy op: build the real Frame from the bank and run
-                // the remainder framed, starting AT this instruction (no
-                // side effect of it has run). The framed machinery then
-                // owns the heavy op — including any suspension beneath it.
+                // A heavy op: build the real Frame from the bank and run the remainder framed, starting AT
+                // this instruction, no side effect of which has run. The frame owns any suspension beneath it.
                 error.Materialize => {
                     const moved_pushes = pushed_enclosing;
                     pushed_enclosing = 0;
@@ -561,17 +481,12 @@ fn fusedRun(
             back_edges +|= 1;
             if (back_edges >= jit_loop.FUSED_YIELD_BACK_EDGES) {
                 if (jit_loop.loopDeclined(func, cur.int())) {
-                    // The tier already refused this loop: stay fused rather
-                    // than pay a materialization to be refused again.
+                    // Already refused: stay fused rather than pay a materialization to be refused again.
                     back_edges = 0;
                     continue :walk;
                 }
-                // Leaving the bank for a frame is one-way, so commit only to
-                // compiled code: compile FIRST and stay on the walk when the
-                // tier refuses. The compile-time resolvers need no frame, so
-                // they are offered here too: without them a loop that reads a
-                // field cannot be typed at all, and every such loop stayed on
-                // the walk.
+                // Leaving the bank for a frame is one-way, so commit only to compiled code: compile first
+                // and stay on the walk when the tier refuses. The compile-time resolvers need no frame.
                 var rctx: LoopTramp(H).ResolveCtx = .{ .host = host, .allocator = allocator };
                 const pre_member: ?jit_loop.MemberResolver =
                     if (comptime @hasDecl(H, "resolveMemberFuncId")) &LoopTramp(H).preMember else null;
@@ -607,13 +522,8 @@ fn fusedRun(
     }
 }
 
-/// Build the real Frame from the bank at (cur, idx) and run the remainder
-/// through the framed engine — the same startup sequence the recursive
-/// seam performs, resumed mid-body. Bank slots are copied with their own
-/// retains (the bank's teardown and the frame's teardown each release
-/// one), and subject pushes the fused prefix made are mirrored onto the
-/// frame's own chain, with the walker's caller-chain originals still
-/// popped by its defer.
+/// Build the real Frame from the bank at (cur, idx) and run the remainder through the framed
+/// engine, resumed mid-body.
 fn fusedMaterializeAndRun(
     comptime H: type,
     allocator: Allocator,
@@ -641,21 +551,12 @@ fn fusedMaterializeAndRun(
     defer frame.deinit();
     gcPushFrame(&frame);
     defer gcPopFrame(&frame);
-    // The frame inherits the walker's chain window WHOLE — the window IS
-    // what activateChain would have built for this frame (caller in-flight
-    // copies + own receiver), and the walker's own subject pushes sit above
-    // its base exactly as framed in-flight pushes would. Re-deriving via
-    // activateChain here dropped the seeded portion (it lives BELOW the
-    // window's base, invisible to the in-flight copy): the member-extension
-    // owner vanished and `this@Outer` in the remainder missed. The base is
-    // restored to the window's seed length so a callee of the remainder
-    // still sees the prefix's pushes as in-flight.
+    // The frame inherits the walker's chain window WHOLE: the window IS what activateChain would
+    // build here, and re-deriving drops the seeded portion that sits below the window's base.
     const wbase = ev.active_chain_base;
     if (ev.active_chain) |wchain| {
         try frame.enclosing_this.appendSlice(chainAllocator(), wchain.items);
-        // The frame owns the entries now; a populated window would keep
-        // rooting them (it is marked as a thread root) long after the
-        // remainder dropped them.
+        // The frame owns the entries now; the window is a thread root and would keep rooting them.
         wchain.clearRetainingCapacity();
     }
     frame.activateAs();
@@ -671,11 +572,8 @@ fn fusedMaterializeAndRun(
         }
     }
     defer if (comptime @hasDecl(H, "ctxStackTruncate")) host.ctxStackTruncate(ctx_mark);
-    // Bank slots MOVE into the frame (no retain): the walker never resumes
-    // after a materialization, so the frame takes the bank's reference and
-    // the bank is zeroed behind it. Leaving the values in the pinned bank
-    // kept re-rooting objects the remainder had already dropped — the
-    // keepalive pin shaded swept cells collection after collection.
+    // Bank slots MOVE into the frame with no retain: the walker never resumes after a
+    // materialization, and the pinned bank is zeroed behind it so it stops rooting them.
     const n = @min(regs.len, frame.regs.items.len);
     for (regs[0..n], 0..) |v, i| {
         if (runtime.reclaimEnabled()) frame.regs.items[i].release(allocator);
@@ -720,17 +618,10 @@ fn fusedInst(
     regs: []Value,
     reclaim: bool,
     pushed_enclosing: *usize,
-    /// This walk's mark, resolved ONCE by the caller. Reading it from the
-    /// threadlocal here cost two `_tlv_get_addr` calls per `Trace` — and a
-    /// `Trace` precedes nearly every statement, which made thread-local
-    /// access the single hottest leaf in a member-call profile on Darwin,
-    /// where each threadlocal access is a call rather than a register offset.
     mark: *FusedMark,
 ) FusedFail!void {
     switch (inst.*) {
-        // The walker's cur_span: recorded on the mark so span-derived
-        // context (file-private scoping, diagnostics) sees the executing
-        // call site, exactly as a frame tracks it.
+        // The walker's cur_span, so span-derived context sees the executing call site.
         .Trace => |t| mark.span = t.span,
         .LoadParam => |lp| {
             const v = if (lp.idx < args.len) args[lp.idx] else Value.Unit;
@@ -778,10 +669,8 @@ fn fusedInst(
                 fusedWrite(allocator, regs, gf.dst, bv, reclaim, false);
                 return;
             }
-            // Framed parity: the executing body's receiver stays reachable as
-            // an enclosing `this` while the field/property resolves — a
-            // member-extension property on another receiver (the negative-zero
-            // `Double.Companion.NegativeZero` shape) needs it as its owner.
+            // Framed parity: the executing body's receiver stays reachable as an enclosing `this` while
+            // the field resolves, so a member-extension property on another receiver finds its owner.
             var pushed_access = false;
             if (func.has_receiver_param and args.len > 0 and args[0] == .Instance) {
                 const same = recv == .Instance and ObjRef(InstanceData).ptrEq(args[0].Instance, recv.Instance);
@@ -947,9 +836,7 @@ fn fusedInst(
             if (comptime @hasDecl(H, "setCtorArgStaticHeads")) {
                 host.setCtorArgStaticHeads(static_heads);
             }
-            // A bare `Inner(args)` inside a member is `this@Outer.Inner`:
-            // the fused body's own `this` parameter is the outer hint,
-            // exactly as the framed arm passes its frame's `this`.
+            // A bare `Inner(args)` inside a member is `this@Outer.Inner`: `this` is the outer hint.
             var outer_hint: ?Value = null;
             if (args.len > 0 and func.params.len > 0 and
                 std.mem.eql(u8, func.params[0].name, "this")) outer_hint = args[0];
@@ -988,12 +875,8 @@ fn fusedInst(
         .Call => |c| {
             const callee = module.funcById(c.func) orelse
                 return error.Materialize;
-            // Same-name same-arity peers: the baked DIRECT id is only the
-            // target when this SITE's scope binds it — framed re-resolves
-            // otherwise (a host binding beat the pack body for
-            // convertDurationUnit, Long vs Double). Ask exactly as the
-            // framed fast path does and hand ambiguous sites to the framed
-            // machinery.
+            // Same-name same-arity peers: the baked direct id is the target only when THIS site's scope
+            // binds it, so ask as the framed fast path does and hand an ambiguous site to the frame.
             if (comptime @hasDecl(H, "callFuncFast")) {
                 var plan = callee.fast_call;
                 if (plan == 0) {
@@ -1019,9 +902,7 @@ fn fusedInst(
             }
             if (c.arg_names.len != 0 or c.type_args.len != 0 or callee.params.len != c.n_args)
                 return error.Materialize;
-            // Scalar-replay leaf: a registered pure callee runs as direct
-            // C; a bail falls through to fusedExec, which re-runs the
-            // pure body exactly.
+            // A registered pure callee runs as direct C; a bail falls through and re-runs the body exactly.
             const leaf_served: ?Value = if (try tryLeafValues(H, allocator, module, callee, argv[0..c.n_args], host, null)) |lo| switch (lo) {
                 .val => |v| v,
                 .raise => |e| return fusedRaise(e),
@@ -1032,11 +913,8 @@ fn fusedInst(
             }
             const direct = try fusedExec(H, allocator, module, callee, argv[0..c.n_args], host);
             const r = direct orelse blk: {
-                // The runtime gates (bank depth, a host-owned callee, a
-                // PARTIAL callee) can decline what the classifier admitted.
-                // A FULL-classified callee run framed stays non-suspending
-                // (its calls are transitively full), so the seam fallback
-                // is sound; anything else materializes this body instead.
+                // A runtime gate (bank depth, a host-owned or partial callee) can decline what the classifier
+                // admitted. A full callee run framed stays non-suspending, so the seam fallback is sound.
                 if (fusedVerdict(H, host, module, callee) != 1) return error.Materialize;
                 var arg_list: std.ArrayList(Value) = .empty;
                 try arg_list.appendSlice(allocator, argv[0..c.n_args]);

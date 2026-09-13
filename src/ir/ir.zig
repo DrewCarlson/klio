@@ -1,19 +1,10 @@
-//! `ir` — compact linear IR for the klio interpreter.
+//! Compact linear IR for the klio interpreter: a flat instruction stream instead of a
+//! tree walk. Each `Func` carries a `[]Block`, each `Block` a `[]Inst` plus a
+//! `Terminator`, and operands are `Reg` indices rather than stack slots. The IR reuses
+//! `runtime.Value` directly.
 //!
-//! Replaces the tree-walking interpreter with a flat instruction
-//! stream. Each `Func` carries a `[]Block`; each `Block` carries a
-//! `[]Inst` plus a `Terminator`. Operands are `Reg` indices, not
-//! stack slots. The IR reuses `runtime.Value` so migration can
-//! happen function-by-function without forking the runtime
-//! representation.
-//!
-//! This file is the module root: it owns the `Module` registry struct and
-//! re-exports the rest of the IR from `core/`. `ids.zig` holds the register,
-//! block, func and class ids plus `TypeRef`; `inst.zig` the instruction and
-//! terminator sets; `func.zig` functions, blocks and params; `class.zig`,
-//! `consts.zig`, `names.zig` and `registry.zig` the class, constant, name and
-//! import tables; `module_*.zig` the `Module` method groups; `tests_*.zig`
-//! the module's tests.
+//! This file is the module root: it owns the `Module` registry struct and re-exports
+//! the rest of the IR from `core/`.
 
 const std = @import("std");
 const span = @import("span");
@@ -29,8 +20,6 @@ const Allocator = std.mem.Allocator;
 pub const Span = span.Span;
 pub const FileId = span.FileId;
 
-/// AST → IR lowering, IR builders, and the IR evaluator. Filled in
-/// alongside the type definitions in this file.
 pub const build = @import("build.zig");
 pub const eval = @import("eval.zig");
 pub const bc = @import("bc.zig");
@@ -71,7 +60,6 @@ pub const ConstId = core_ids.ConstId;
 pub const ScopeRename = core_ids.ScopeRename;
 pub const ScopeClassRef = core_ids.ScopeClassRef;
 
-/// One IR instruction. Drives the per-frame evaluator switch.
 pub const snapshot_fast = @import("snapshot_fast.zig");
 
 pub const Inst = core_inst.Inst;
@@ -107,17 +95,12 @@ pub const FuncIndexEntry = core_class.FuncIndexEntry;
 pub const StrPair = core_class.StrPair;
 const StrPairMap = core_class.StrPairMap;
 
-/// Top-level container.
-/// The eager pipeline's hand-off: the driver computes the per-call
-/// resolution BEFORE the module exists (lowering starts inside the build),
-/// parks it here, and the next module created on this thread adopts it.
+/// The eager pipeline's hand-off: the driver computes the per-call resolution before
+/// the module exists and parks it here; the next module on this thread adopts it.
 pub threadlocal var pending_eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null;
-/// Companion to `pending_eager_calls` for picks whose declaration came from
-/// a prebuilt image: those carry a FuncId, never a span.
+/// Companion for picks whose declaration came from a prebuilt image: a FuncId, not a span.
 pub threadlocal var pending_eager_call_fids: ?std.AutoHashMap(span.Span, u32) = null;
-/// Companion channel: per-expression static TYPE HEADS from typeck
-/// (`Span(expr) -> {head, nullable}`), the declared-type evidence the
-/// applicability engine otherwise reconstructs from AST string probes.
+/// Per-expression static type heads from typeck: `Span(expr) -> {head, nullable}`.
 pub threadlocal var pending_eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null;
 
 pub const EagerTypeHead = struct { name: []const u8, nullable: bool };
@@ -128,25 +111,21 @@ pub threadlocal var pending_eager_param_shapes: ?std.AutoHashMap(span.Span, Eage
 
 pub const EagerParamShape = struct { has_receiver: bool, arity: u16 };
 
-/// A local contextual function's context parameters, threaded from
-/// declaration lowering into the shared lambda-body lowering.
+/// Context parameters of a local contextual function, threaded into its body lowering.
 pub const PendingCtx = struct {
     params: []const ast.ContextParam,
     type_params: []const ast.TypeParam,
 };
 
-/// A local `fun`'s identity carried into its body's builder (and nested
-/// lambdas): the declared name plus the mangled overload-cell binding a bare
-/// self-reference must call through.
+/// A local `fun`'s name plus the mangled overload cell a bare self-reference calls through.
 pub const SelfLocalFn = struct {
     name: []const u8,
     mangled: []const u8,
 };
 
-/// One full type-parameter bound ref (with type arguments) carried into a
-/// pending lambda/local-fn body. Owned by the module allocator.
 pub const RecvHeadKV = struct { name: []const u8, head: ?[]const u8 };
 
+/// One type-parameter bound ref with type arguments; owned by the module allocator.
 pub const PendingBoundRef = struct {
     param: []const u8,
     ref: TypeRef,
@@ -159,383 +138,207 @@ pub const PendingLocalDeclTypes = struct {
 };
 
 pub const Module = struct {
-    /// REQUIREMENT, not merely an observation: a `Module` may be written
-    /// only during single-threaded setup, before any interpreter thread
-    /// runs. Today the sole such writer is the class-id overlay built by
-    /// `linkProgramForms` at `Vm` init. Anything that needs to mutate a
-    /// module once execution has started must arrange its own
-    /// synchronisation — the cell no longer provides any.
-    ///
-    /// The reader lock this drops was guarding against a writer that cannot
-    /// exist concurrently, at a cost of a `cmpxchg` plus a `fetchSub` on
-    /// every borrow, and the module is borrowed on most dispatches. It was
-    /// never protecting the per-`Func` dispatch memos anyway: those are
-    /// written through `@constCast` under their own single-fill/atomic
-    /// discipline, deliberately outside the cell's borrow rules.
+    /// A `Module` may be written only during single-threaded setup, before any interpreter
+    /// thread runs; the sole writer is the class-id overlay `linkProgramForms` builds at `Vm`
+    /// init. Mutating one after execution starts needs its own synchronisation.
     pub const objref_immutable = true;
 
-    /// Direct-mapped pointer-identity memo for `classIdByFqn` probes whose
-    /// key is a STATIC string (the comptime `Value.typeFqn` literals the
-    /// virtual-dispatch fallback hashes per call). Keys claim a slot by
-    /// pointer CAS from 0; the value (0 = unset, 1 = no class, else
-    /// ClassId + 2) is release-stored after the claim as the validity gate.
-    /// Written through `@constCast` under the same single-fill discipline as
-    /// the per-`Func` dispatch memos (`classIdByStaticFqn`). Callers must
-    /// guarantee the key pointer's content can never change (a
-    /// stack-composed FQN must NOT use this).
+    /// Direct-mapped pointer-identity memo for `classIdByFqn` probes keyed by a STATIC
+    /// string. Keys claim a slot by pointer CAS from 0; the value (0 = unset, 1 = no class,
+    /// else ClassId + 2) is release-stored after the claim as the validity gate. The key
+    /// pointer's content must never change, so a stack-composed FQN must not use this.
     cid_memo_keys: [cid_memo_slots]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0)),
     cid_memo_vals: [cid_memo_slots]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0)),
 
     funcs: std.ArrayList(Func) = .empty,
-    /// Funcs appended after the module went live (a side module whose
-    /// earlier funcs are already executing), each in its own allocation:
-    /// an append never moves a `Func` a running frame points at, whereas
-    /// `funcs` reallocates on growth.
+    /// Funcs appended after the module went live, each in its own allocation: an append
+    /// never moves a `Func` a running frame points at, whereas `funcs` reallocates.
     late_funcs: std.ArrayList(*Func) = .empty,
-    /// Route `appendFunc` to `late_funcs` from now on. Set when frames may
-    /// hold `*const Func` into this module while it still grows.
+    /// Route `appendFunc` to `late_funcs`: frames may hold `*const Func` while it grows.
     funcs_live: bool = false,
-    /// True when any declaration in this module has a `context(...)`
-    /// parameter clause. Gates the per-frame receiver push that feeds the
-    /// context-resolution stack, so non-context programs pay nothing.
+    /// Some declaration has a `context(...)` clause; gates the per-frame context-receiver push.
     has_context_decls: bool = false,
-    /// Lowering-only scratch: a local contextual function's context
-    /// parameters, stashed just before its body lowers through the shared
-    /// lambda-body path and consumed there to emit the context-load
-    /// prologue. Not serialized.
+    /// Lowering scratch: a local contextual function's context parameters for its body prologue.
     pending_ctx: ?PendingCtx = null,
-    /// The reference key the next lowered lambda receives (an adapted
-    /// callable reference's wrapper); consumed at that lambda's finish.
+    /// Reference key for the next lowered lambda (an adapted callable reference's wrapper).
     pending_ref_key: ?[]const u8 = null,
-    /// Lowering-only scratch: the DECLARED types of the parameters a
-    /// synthesized parameter thunk is about to bind, parallel to its name
-    /// list. A constructor-delegation argument or a default-value
-    /// expression is lowered in its own builder, which knew the parameter
-    /// NAMES only, so `seed1.inv()` inside `: this(..., seed1.inv(), ...)`
-    /// had no receiver type at all. Not serialized.
+    /// Lowering scratch: declared types of a synthesized parameter thunk's params, by position.
     pending_param_types: ?[]const ?ast.TypeRef = null,
-    /// The EXPECTED type of the next parameter-thunk expression (a parent
-    /// constructor argument's declared parameter type, instantiated by the
-    /// written supertype arguments), consumed by the thunk lowering.
+    /// Expected type of the next parameter-thunk expression, instantiated by the supertype args.
     pending_thunk_expected: ?ast.TypeRef = null,
-    /// A member extension property accessor's own receiver label (the
-    /// property name) and its dispatch owner, stashed by the declaration
-    /// lowering for the accessor builder: `this@<prop>` binds the
-    /// receiver, and a local class declared in the body captures
-    /// `this@<Owner>`. Not serialized.
+    /// A member extension property accessor's receiver label (the property name): `this@<prop>`
+    /// binds the receiver, and a local class in the body captures `this@<Owner>`.
     pending_accessor_this_label: ?[]const u8 = null,
     pending_accessor_dispatch_owner: ?[]const u8 = null,
-    /// Lowering-only scratch: the callable arity mask of the owner class's
-    /// members, for a synthesized parameter thunk that also gets an
-    /// `own_members` set. A member name that is a PROPERTY and never a
-    /// function carries mask 0, so a bare CALL of that name in a
-    /// constructor-delegation argument is not mistaken for a companion
-    /// call on the owner class. Not serialized.
+    /// Lowering scratch: callable arity mask of the owner class's members. A name that is only
+    /// ever a property carries mask 0, so a bare call of it is not read as a companion call.
     pending_own_member_arity: ?*const std.StringHashMap(u64) = null,
-    /// Lowering-only scratch: the implicit label of the argument lambda whose
-    /// body is about to lower (`runTest { … }` → "runTest"). The body binds
-    /// `this@<label>` to its receiver so a reference from a nested scope — an
-    /// anonymous object's accessor, a further lambda — reaches THAT receiver
-    /// instead of the innermost `this`. Not serialized.
+    /// Implicit label of the argument lambda about to lower. Its body binds `this@<label>` so
+    /// a reference from a nested scope reaches THAT receiver, not the innermost `this`.
     pending_lambda_this_label: ?[]const u8 = null,
-    /// The receiver type in scope at the site of the lambda body about to
-    /// lower, carried into that body's builder as `enclosing_recv_ty` so a
-    /// bare call inside a nested `() -> R` block can still disambiguate a
-    /// receiver-lambda argument's arity by the enclosing receiver. Not
-    /// serialized.
+    /// Receiver type in scope at the lambda body about to lower, carried in as `enclosing_recv_ty`.
     pending_lambda_enclosing_recv: ?[]const u8 = null,
-    /// Full implicit receiver tower for the lambda body about to lower,
-    /// innermost first. Not serialized.
+    /// Full implicit receiver tower for the lambda body about to lower, innermost first.
     pending_lambda_receiver_tower: ?[]const ReceiverTowerEntry = null,
-    /// Structural type of `pending_lambda_own_recv`, transferred into the
-    /// lambda body's builder. Not serialized.
+    /// Structural type of `pending_lambda_own_recv`, transferred into the body's builder.
     pending_lambda_own_recv_type: ?TypeRef = null,
-    /// The DECLARED extension receiver of the local function whose body is
-    /// about to lower (`fun MockViewValidator.value() { … }` inside another
-    /// body), carried into that body's builder as its own `recv_ty` so bare
-    /// calls resolve exactly as in a top-level extension body — an extension
-    /// on the receiver outranks a same-named plain top-level function. Not
-    /// serialized.
+    /// Declared extension receiver of the local function whose body is about to lower, so its
+    /// bare calls resolve exactly as in a top-level extension body.
     pending_lambda_own_recv: ?[]const u8 = null,
-    /// The body about to lower belongs to a LOCAL `fun` with a BLOCK body:
-    /// its fall-through returns Unit, never the tail statement's value —
-    /// `fun f() { 42 }` yields Unit in Kotlin, while a lambda literal yields
-    /// its last expression. Same rule `lowerFunctionBodyWithImplicitOwner-
-    /// Enclosing` applies to top-level/member block bodies; without it a
-    /// restart-wrapped local composable returned its trailing
-    /// `endRestartGroup()?.updateScope(..)` null and Compose's
-    /// `block?.invoke(c, 1) ?: error("Invalid restart scope")` elvis fired.
-    /// Not serialized.
+    /// The pending body belongs to a LOCAL `fun` with a block body: fall-through returns Unit,
+    /// never the tail statement's value. A lambda literal yields its last expression instead.
     pending_lambda_fn_block_body: bool = false,
-    /// The pending lambda literal binds a `(...) -> Unit` parameter: its
-    /// tail expression is evaluated for effect and the lambda returns Unit.
-    /// Consumed on entry to the lambda body so it never leaks inward.
+    /// The pending lambda literal binds a `(...) -> Unit` parameter: its tail expression runs
+    /// for effect and the lambda returns Unit. Consumed on entry so it never leaks inward.
     pending_lambda_unit: bool = false,
-    /// Non-reified type-parameter names in scope at the lambda body about to
-    /// lower, carried into that body so an `x as T` cast inside the lambda is
-    /// still erased (`forEachScopeOf(v) { scope -> scope as Scope }` inside a
-    /// generic class). Not serialized.
+    /// Non-reified type-parameter names in scope, so an `x as T` inside the lambda stays erased.
     pending_lambda_type_params: ?[]const []const u8 = null,
-    /// The enclosing splice's REIFIED type-parameter substitutions, carried
-    /// into a lambda body lowered inside that splice. `filter { it is R }` in
-    /// a spliced `filterIsInstance<reified R>` reads `R` from here; without
-    /// it the body falls back to the runtime's bound class value, which
-    /// cannot carry nullability. Not serialized.
+    /// The enclosing splice's reified type-parameter substitutions, carried into a lambda body
+    /// lowered inside it; the runtime's bound class value cannot carry nullability.
     pending_lambda_reified_names: ?[]const ReifiedName = null,
-    /// Effective upper bounds parallel to the type-parameter names carried
-    /// into the pending lambda/local-function body. Not serialized.
+    /// Effective upper bounds parallel to the type-parameter names carried into the body.
     pending_lambda_type_param_bounds: ?[]const ModuleRegistry.TypeParamBound = null,
-    /// Full bound REFS (with type arguments) for the pending body, so a
-    /// receiver typed by a parameter substitutes inside nested lambdas too
-    /// (`data.any { it.startsWith("f") }` in a test method's expect-lambda).
-    /// Owned pairs; the lambda body takes ownership. Not serialized.
+    /// Full bound refs with type arguments for the pending body; the lambda body takes ownership.
     pending_lambda_type_param_bound_refs: ?[]PendingBoundRef = null,
-    /// Contextual function-type parameters of the enclosing builder, handed
-    /// to a lambda body so an implicit call `f(a..)` inside it still splits
-    /// its context arguments.
+    /// Contextual fn-type parameters of the enclosing builder, so a nested implicit call splits contexts.
     pending_lambda_ctx_fn_shapes: ?[]PendingCtxFnShape = null,
-    /// Receiver-lambda param names -> declared receiver heads of the
-    /// ENCLOSING builder, carried into a nested lambda body so a captured
-    /// receiver-fn param invoked bare there re-selects by its declared
-    /// head. Registry/arena-stable slices; the lambda body copies the
-    /// entries and frees the slice. Not serialized.
+    /// Receiver-lambda param names to the enclosing builder's declared receiver heads, so a
+    /// captured receiver-fn param invoked bare re-selects by its head. Slices are borrowed.
     pending_lambda_recv_heads: ?[]RecvHeadKV = null,
-    /// Engine step four: the caller's SOLVED fn-tp bindings for an inline
-    /// splice, registered as window bound refs at entry. Names are
-    /// registry-stable fn-tp slices; tys owned by the lowering allocator
-    /// (the consumer moves them into the builder's ref map).
+    /// The caller's solved fn-type-parameter bindings for an inline splice; tys owned by the
+    /// lowering allocator.
     pending_splice_solved: ?[]Module.TypeBinding = null,
-    /// Instantiated value-parameter types for the pending lambda literal,
-    /// derived from its resolved call-argument slot. The lambda body takes
-    /// ownership and records them as ordinary local declared types.
+    /// Instantiated value-parameter types for the pending lambda literal; the body takes ownership.
     pending_lambda_param_types: ?[]TypeRef = null,
-    /// Context parameters of the anonymous function whose body is lowered
-    /// next; the body lowering binds each from the context stack at entry.
+    /// Context parameters of the anonymous function lowered next, bound from the context stack.
     pending_lambda_ctx_params: ?[]const ast.ContextParam = null,
-    /// The LOCAL `fun` whose body (or a lambda nested in it) is about to
-    /// lower: its declared name and its mangled overload-cell binding. A bare
-    /// self-reference in that body must call through the mangled cell — the
-    /// plain-name slot is shared with any later same-named sibling declaration
-    /// (last bind wins), so a self re-invoke captured by name (the compose
-    /// restart lambda) would run the SIBLING. Not serialized.
+    /// The local `fun` about to lower: its name and mangled overload cell. A bare self-reference
+    /// calls through the cell, since the plain-name slot is shared with later same-named siblings.
     pending_lambda_self_fn: ?SelfLocalFn = null,
-    /// The next lambda body's declared shape is KNOWN to take no receiver
-    /// (a plain `(T) -> R` slot): its bare calls may consult the enclosing
-    /// receiver tier, exactly Kotlin's implicit-receiver chain. A lambda
-    /// whose receiver is merely UNTYPED must not (the ArrayDeque hazard).
+    /// The next lambda body's declared shape is KNOWN to take no receiver, so its bare calls
+    /// may consult the enclosing receiver tier. A merely untyped receiver must not.
     pending_lambda_no_receiver: bool = false,
-    /// Names of enclosing-scope locals with definite NON-callable evidence
-    /// (literal init / primitive declared type), carried into the lambda body
-    /// about to lower so a bare CALL there does not route through the captured
-    /// value (`var key = 0` beside the `key(...) {}` composable). Owned by the
-    /// receiving builder once consumed. Not serialized.
+    /// Enclosing locals with definite non-callable evidence, so a bare call is not the captured value.
     pending_lambda_nonfn_locals: ?std.StringHashMap(void) = null,
-    /// Names of the local `fun`'s vararg parameters for the body about to
-    /// lower: inside the body such a parameter's static type is the
-    /// MATERIALIZED array, never the element the annotation names, so the
-    /// declared-annotation registration must not record the element head.
-    /// Borrowed from the caller's AST for the lowering call's duration.
+    /// Vararg parameter names of the local `fun` about to lower: inside the body the static
+    /// type is the materialized array, not the annotated element. Borrowed from the AST.
     pending_lambda_vararg_params: ?[]const []const u8 = null,
-    /// Declared type heads of enclosing locals captured by the lambda body
-    /// about to lower. The runtime capture carries the value; this parallel
-    /// lowering-only carrier preserves the compile-time type Kotlin inferred
-    /// for explicit-receiver resolution inside the closure.
+    /// Declared type heads of enclosing locals the lambda captures, preserving the compile-time type.
     pending_lambda_local_decl_types: ?PendingLocalDeclTypes = null,
-    /// Lazy IR: byte section holding deferred functions' `blocks`, each encoded
-    /// self-contained, decoded on first execution. Borrows the image buffer;
-    /// empty unless this module was loaded from an image.
+    /// Lazy IR: byte section holding deferred functions' `blocks`, each self-contained and
+    /// decoded on first execution. Borrows the image buffer; empty unless image-loaded.
     deferred_func_section: []const u8 = &.{},
     /// Process-lifetime allocator a decoded `blocks` slice must persist in.
     deferred_func_arena: Allocator = undefined,
     /// Injected decoder (`image.decodeFuncBlocks`), null until installed.
     deferred_func_decode: ?*const fn (Allocator, []const u8, u32) ?[]Block = null,
-    /// Lazy IR func HEADERS: per-func self-contained sections + offsets
-    /// (`id -> offset+1`, 0 = absent), decoded on first `funcById`. `func_cache`
-    /// memoises the decoded `*Func`. All empty/eager unless loaded from an image;
-    /// then `funcs.items` is empty and lookups go through the lazy path.
+    /// Lazy IR func headers: per-func sections plus offsets (`id -> offset+1`, 0 = absent),
+    /// decoded on first `funcById` and memoised in `func_cache`. Empty unless image-loaded.
     func_header_section: []const u8 = &.{},
     func_header_offsets: []const u32 = &.{},
     func_header_decode: ?*const fn (Allocator, []const u8, u32) ?Func = null,
     func_cache: []?*Func = &.{},
     func_header_lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// First fqn segment of every lazy base func (distinct) — the lazy-friendly
-    /// `packageHeadDeclared` source. Borrowed from the image; empty when eager.
+    /// Distinct first FQN segment of every lazy base func. Borrowed from the image.
     func_fqn_heads: []const []const u8 = &.{},
-    /// Ids of the lazy base's bodyless funcs — the lazy-friendly replacement for
-    /// the link-phase scan over all funcs. Borrowed from the image; empty eager.
+    /// Ids of the lazy base's bodyless funcs. Borrowed from the image.
     bodyless_func_ids: []const u32 = &.{},
     classes: std.ArrayList(Class) = .empty,
     consts: std.ArrayList(Const) = .empty,
     /// Top-level (file-scope) function ids, in declaration order.
     top_level: std.ArrayList(FuncId) = .empty,
-    /// Top-level class declarations by simple name → `ClassId`. The
-    /// lowering pass populates this so `Foo(args)` Calls become
-    /// `NewInstance` instructions when `Foo` resolves to a class.
+    /// Top-level class declarations by simple name, so `Foo(args)` lowers to `NewInstance`.
     class_index: std.ArrayList(ClassIndexEntry) = .empty,
-    /// Simple name → first `ClassId`, an O(1) overlay on `class_index`'s linear
-    /// scan. Built once after the module is finalized (`buildClassIdMap`, at the
-    /// link step) and read lock-free at run time; null until then (`classId`
-    /// falls back to the scan, e.g. during lowering). First-entry-wins to match
-    /// the scan's duplicate-name behavior.
+    /// Simple name to first `ClassId`, an O(1) overlay on `class_index`'s scan built at the link
+    /// step; null until then. First-entry-wins matches the scan's duplicate-name behavior.
     class_id_map: ?std.StringHashMap(ClassId) = null,
-    /// FQN → `ClassId` overlay on `classIdByFqn`'s linear scan. A duplicated FQN
-    /// maps to `class_id_ambiguous` so the lookup returns null (the scan's
-    /// ambiguity guard). Built with `class_id_map`; null until then.
+    /// FQN to `ClassId` overlay. A duplicated FQN maps to `class_id_ambiguous` so the lookup
+    /// returns null. Built with `class_id_map`; null until then.
     class_fqn_map: ?std.StringHashMap(ClassId) = null,
-    /// Allocator for the lowering-phase lookup caches below, stored at
-    /// `init`. Null (e.g. a module assembled field-by-field from an image)
-    /// disables the caches; every cached lookup then takes its linear scan.
+    /// Allocator for the lowering-phase lookup caches below; null disables them, so lookups scan.
     lookup_cache_gpa: ?Allocator = null,
-    /// Lowering-phase package-head set: every dot-aligned FQN prefix of
-    /// every declared func/class, plus `func_fqn_heads`. Topped up lazily
-    /// by growth counter; `addClass`'s stub-claim (the one in-place FQN
-    /// rewrite) adds the claimed FQN's prefixes. Prefixes are only ever
-    /// added, so the set never goes stale-positive relative to the scan.
+    /// Lowering-phase package-head set: every dot-aligned FQN prefix of every declared func and
+    /// class. Prefixes are only ever added, so the set never goes stale-positive.
     pkg_head_cache: std.StringHashMapUnmanaged(void) = .empty,
     pkg_head_funcs_n: usize = 0,
     pkg_head_classes_n: usize = 0,
     pkg_head_heads_done: bool = false,
     pkg_head_cache_dead: bool = false,
-    /// Lowering-phase simple name → same-name `ClassId`s in `class_index`
-    /// order (the scan's first-wins/tier-tie order). Names in `class_index`
-    /// are immutable, so growth-counter top-up alone keeps this exact.
+    /// Lowering-phase simple name to same-name `ClassId`s in `class_index` order, which is stable.
     class_name_cache: std.StringHashMapUnmanaged(std.ArrayList(ClassId)) = .empty,
     class_name_cache_n: usize = 0,
-    /// Lowering-phase FQN → `ClassId` (or `class_id_ambiguous`). The
-    /// stub-claim FQN rewrite patches this in place; an unpatchable case
-    /// (a stub FQN that was already ambiguous) kills the cache for the
-    /// rest of the build rather than risk divergence from the scan.
+    /// Lowering-phase FQN to `ClassId` (or `class_id_ambiguous`). An unpatchable stub-claim
+    /// rewrite kills the cache for the rest of the build rather than diverge from the scan.
     class_fqn_cache: std.StringHashMapUnmanaged(ClassId) = .empty,
     class_fqn_cache_n: usize = 0,
     class_fqn_cache_dead: bool = false,
-    /// Lowering-phase simple name → what the per-name class scans would
-    /// find: the `ClassId` `uniqueClassIdBySimpleName` returns (or
-    /// `class_id_ambiguous`), plus whether any class under the name lives
-    /// outside the `kotlin` packages (`staticBuiltinIdentity`'s scan).
-    /// Each class contributes under both its `name` and its FQN's last
-    /// segment. Entries fold many classes, so the stub-claim FQN rewrite
-    /// cannot patch one contribution out; a claim that touches the cached
-    /// range resets the cache for a lazy rebuild.
+    /// Lowering-phase simple name to what the per-name class scans would find: the `ClassId`
+    /// `uniqueClassIdBySimpleName` returns (or `class_id_ambiguous`), plus whether any class
+    /// under it is outside `kotlin`. Entries fold many classes, so a stub claim resets it.
     unique_simple_cache: std.StringHashMapUnmanaged(SimpleNameInfo) = .empty,
     unique_simple_cache_n: usize = 0,
-    /// `internConst` dedup: const hash → first `ConstId` with that hash.
-    /// A hash collision falls back to the linear scan for that value.
+    /// `internConst` dedup: const hash to the first `ConstId` with it; a collision falls back to a scan.
     const_dedup: std.AutoHashMapUnmanaged(u64, ConstId) = .empty,
     const_dedup_n: usize = 0,
-    /// The classifier NESTING TREE, derived once from FQNs: for each class,
-    /// its lexical parent class (null for top-level) and, per parent, the
-    /// children keyed by their last FQN segment. One id-keyed structure
-    /// answers every scoped classifier lookup — no `$`/`.` string-mangled
-    /// probing at use sites.
+    /// The classifier nesting tree, derived once from FQNs: each class's lexical parent (null
+    /// for top-level) and, per parent, the children keyed by their last FQN segment.
     class_parent: ?std.AutoHashMap(ClassId, ClassId) = null,
-    /// The identity channel's lowering half: each lowered declaration's
-    /// AST name-span maps to its FuncId. Composed with typeck's
-    /// `Span(call) -> decl_span` record, this gives lowering an exact,
-    /// type-derived target per call site with no shared symbol table.
+    /// Each lowered declaration's AST name-span to its FuncId, composed with typeck's call records.
     func_by_decl_span: ?std.AutoHashMap(span.Span, FuncId) = null,
-    /// A per-anon-site image clone runtime-synthesized members lower into.
-    /// Decl-span reservations are disabled on it: synthesized getter/setter
-    /// thunks share their property ident's span, and the reservation channel
-    /// made the second thunk OVERWRITE the first at the adopted id.
+    /// A per-anon-site image clone that runtime-synthesized members lower into. Decl-span
+    /// reservations are off on it: synthesized thunks share their property ident's span.
     anon_side: bool = false,
-    /// The eager pipeline's per-call resolution: `Span(callee) ->
-    /// Span(decl)` converted from typeck's records by the driver
-    /// Lowering composes it with `func_by_decl_span`;
-    /// absent spans keep the lazy path.
+    /// The eager pipeline's per-call resolution, `Span(callee) -> Span(decl)`; absent spans go lazy.
     eager_calls: ?std.AutoHashMap(span.Span, span.Span) = null,
     eager_call_fids: ?std.AutoHashMap(span.Span, u32) = null,
-    /// Typeck's per-expression type heads (the E2.1 evidence seam).
+    /// Typeck's per-expression static type heads.
     eager_types: ?std.AutoHashMap(span.Span, EagerTypeHead) = null,
     eager_recv_heads: ?std.AutoHashMap(span.Span, []const u8) = null,
-    /// Extension-candidate index: receiver head -> the extension NAMES
-    /// declared on it, plus the generic-receiver names (`fun <T> T.also`)
-    /// that apply to every head. Rebuilt lazily when the declaration index
-    /// has grown. Answers the E4c membership question the hierarchy sets
-    /// cannot: could ANY extension named N serve receiver head H?
+    /// Extension-candidate index: receiver head to the extension names declared on it, plus the
+    /// generic-receiver names that apply to every head. Rebuilt lazily as declarations grow.
     ext_names_by_recv_head: ?std.StringHashMap(std.StringHashMap(ExtArity)) = null,
     generic_ext_names: ?std.StringHashMap(ExtArity) = null,
     ext_index_decl_count: usize = 0,
     eager_param_shapes: ?std.AutoHashMap(span.Span, EagerParamShape) = null,
     class_children: ?std.AutoHashMap(ClassId, std.StringHashMap(ClassId)) = null,
-    /// Top-level function declarations by simple name → `FuncId`.
-    /// Lowering routes Path-callees that match a registered name
-    /// to `Inst.Call { func }` instead of LoadGlobal+CallValue.
+    /// Top-level function declarations by simple name; a matching Path callee lowers to `Inst.Call`.
     func_index: std.ArrayList(FuncIndexEntry) = .empty,
-    /// Parallel index of `func_index` keyed by simple name for O(1)
-    /// `name → all matching FuncIds (in declaration order)` lookup.
-    /// Rebuilt from `func_index` via `rebuildFuncNameIndex`.
+    /// Simple-name index over `func_index` for O(1) name-to-FuncIds in declaration order.
     func_name_index: std.StringHashMap(std.ArrayList(FuncId)),
-    /// Package path for FQN qualification.
     package: ?[]const u8 = null,
-    /// Top-level function names declared `tailrec`. Populated by the
-    /// driver before bodies are lowered so a tailrec caller's lower
-    /// pass can emit `TailCallFunc` for a tail-position call into
-    /// another tailrec function whose body hasn't been lowered yet.
+    /// Top-level function names declared `tailrec`, populated before bodies lower so a caller
+    /// can emit `TailCallFunc` into a tailrec function whose body is not lowered yet.
     tailrec_fn_names: std.ArrayList([]const u8) = .empty,
-    /// Module-scoped runtime metadata: per-class/per-function side
-    /// tables that the IR build phase produces and the Vm consults
-    /// at dispatch time.
+    /// Per-class and per-function side tables the build produces and the Vm reads at dispatch.
     registry: ModuleRegistry,
-    /// Declared user-parameter count (excluding an implicit extension
-    /// `this`) per top-level `FuncId`, keyed by `FuncId.int()`.
-    /// Lowering-only; not serialized into packs.
+    /// Declared user-parameter count (excluding an implicit extension `this`) per top-level `FuncId`.
     decl_user_params: std.AutoHashMap(u32, u32),
-    /// Per top-level `FuncId` (keyed by `FuncId.int()`): the declared
-    /// user parameters' `(required, total, has_vararg)`.
-    /// Lowering-only; not serialized.
+    /// Declared user parameters' `(required, total, has_vararg)` per top-level `FuncId`.
     decl_user_arity: std.AutoHashMap(u32, DeclArity),
-    /// Per top-level `FuncId` (keyed by `FuncId.int()`): the declared
-    /// user parameters' full structural types — generic arguments and
-    /// function-type shapes included — recorded at phase-1 header
-    /// registration through the same lowering body params use. Lets the
-    /// symbol index prove signature identity for forward references
-    /// whose bodies (and thus lowered params) do not exist yet. Names
-    /// and arg slices are owned by the module allocator. Lowering-only;
-    /// not serialized.
+    /// Declared user parameters' full structural types per top-level `FuncId`, recorded at header
+    /// registration so forward references can be proved. Slices owned by the module allocator.
     decl_user_sig: std.AutoHashMap(u32, []TypeRef),
-    /// Per top-level `FuncId` (keyed by `FuncId.int()`): the function
-    /// declaration's source span, recorded at phase-1 header
-    /// registration so resolution diagnostics can point at the
-    /// conflicting declarations. Lowering-only; not serialized.
+    /// Source span of each top-level function declaration, for resolution diagnostics.
     decl_span: std.AutoHashMap(u32, Span),
-    /// Top-level `FuncId`s (keyed by `FuncId.int()`) whose declaration
-    /// carries a source body, recorded at phase-1 header registration.
-    /// Distinguishes a real function from a bodyless `expect` / header
-    /// stub while phase 2 has not placed the bodies yet (the in-memory
-    /// two-phase build a `klio test` module lowers user files against).
-    /// Lowering-only; not serialized.
+    /// Top-level `FuncId`s whose declaration carries a source body: separates a real function
+    /// from a bodyless `expect` or header stub before phase 2 places the bodies.
     decl_ast_body: std.AutoHashMap(u32, void),
-    /// Unified per-`FuncId` declaration record — the canonical-index
-    /// substrate for receiver-type membership queries and exact static
-    /// binds. Top-level functions fill at phase-1 header registration;
-    /// class members fill during class-body lowering (the piece the
-    /// split `decl_user_*` tables never covered). Lowering-only; not
-    /// serialized.
+    /// Unified per-`FuncId` declaration record for receiver-type membership queries and exact
+    /// static binds. Top-level funcs fill at header registration, members at class-body lowering.
     decl_sigs: std.AutoHashMap(u32, DeclSig),
-    /// Complete owner-scoped member overload sets. The key is
-    /// `(declaring-class FQN, source name)` and the value retains every
-    /// declaration in source order, including same-arity overloads. Member
-    /// headers populate this before any body lowers; image-loaded modules
-    /// rebuild it from their declaration records. This is the authoritative
-    /// candidate source for member resolution; `member_method_fids` remains
-    /// only as a compatibility index for older lowering helpers.
+    /// Complete owner-scoped member overload sets, keyed `(declaring-class FQN, source name)`,
+    /// retaining every declaration in source order. Image-loaded modules rebuild it from their
+    /// declaration records. The authoritative candidate source for member resolution.
     member_name_index: StrPairMap(std.ArrayList(FuncId)),
-    /// Link-time virtual dispatch table. Keys pack a runtime `ClassId` in the
-    /// high word and a declaration-rooted `MethodSlotId` in the low word.
-    /// Calls consult this table directly; method names never enter dispatch.
+    /// Link-time virtual dispatch table. Keys pack a runtime `ClassId` in the high word and a
+    /// declaration-rooted `MethodSlotId` in the low word; method names never enter dispatch.
     method_dispatch: std.AutoHashMap(u64, FuncId),
-    /// Lowering-time resolution diagnostics: ambiguous bare calls the
-    /// symbol index refused to pick among. Recorded during lowering and
-    /// surfaced by the build driver before the program runs. The name
-    /// and FQN slices borrow from the module's own funcs/AST and share
-    /// its lifetime.
+    /// Ambiguous bare calls the symbol index refused to pick among, surfaced by the build
+    /// driver before the program runs. Name and FQN slices borrow from the module's own data.
     resolve_diags: std.ArrayList(ResolveDiag) = .empty,
 
-    /// `(required, total, has_vararg)` for a top-level function's
-    /// declared user parameters. `has_vararg` is true for a `vararg`
-    /// parameter at ANY position — Kotlin allows a vararg before a
-    /// trailing function parameter, and such a candidate matches a call
-    /// just as inexactly as a trailing one.
+    /// `(required, total, has_vararg)` for a top-level function's declared user parameters.
+    /// `has_vararg` is true for a vararg at ANY position, which Kotlin allows.
     pub const DeclArity = struct {
         required: u32,
         total: u32,
@@ -544,115 +347,89 @@ pub const Module = struct {
 
     /// One declaration's resolved signature record (see `decl_sigs`).
     pub const DeclSig = struct {
-        /// Enclosing class for an instance method / member extension,
-        /// null for top-level declarations.
+        /// Enclosing class for an instance method or member extension, null for top-level.
         enclosing_class: ?ClassId = null,
         /// Declared extension receiver type (structural), else null.
         receiver_ty: ?TypeRef = null,
-        /// Declared user-parameter `(required, total, has_vararg)`.
         arity: DeclArity,
-        /// Declared user-parameter structural types (`loweredTypeRef`),
-        /// excluding any implicit receiver slot.
+        /// Declared user-parameter structural types, excluding any implicit receiver slot.
         sig: []const TypeRef = &.{},
         kind: FuncKind = .plain,
         visibility: ast.Visibility = .Public,
         is_inline: bool = false,
         is_suspend: bool = false,
-        /// The declaration carries a source body.
         has_body: bool = false,
-        /// Exact fully-qualified host ABI symbol for this declaration. A
-        /// bodyless declaration with this identity uses the ordinary FuncId
-        /// call ABI; link finalization attaches the host function once.
+        /// Exact fully-qualified host ABI symbol. A bodyless declaration with this identity uses
+        /// the ordinary FuncId call ABI; link finalization attaches the host function once.
         host_symbol: ?[]const u8 = null,
     };
 
     pub const MemberDispatch = enum {
         /// The declaration cannot be overridden at this call site.
         direct,
-        /// The declaration is resolved, but the runtime receiver selects an
-        /// override. This becomes a numeric method slot in the VM contract.
+        /// Resolved, but the runtime receiver selects an override: a numeric method slot in the VM.
         virtual,
         /// Static evidence did not identify one declaration.
         deferred,
     };
 
     pub const MemberResolution = struct {
-        /// Unique declaration identity when the candidate set proves one.
-        /// A deferred result may still carry this as expected-type metadata
-        /// for arguments while withholding a static dispatch commitment.
+        /// Unique declaration identity when the candidate set proves one. A deferred result may
+        /// carry it as argument expected-type metadata while withholding a dispatch commitment.
         target: ?FuncId = null,
         dispatch: MemberDispatch = .deferred,
-        /// At least one visible member accepts the supplied call shape.
-        /// This remains true for an ambiguity or incomplete static type proof,
-        /// where `target` must stay null but the member still shadows a
-        /// same-named package function.
+        /// At least one visible member accepts the supplied call shape. Stays true for an
+        /// ambiguity, where `target` is null but the member still shadows a package function.
         applicable: bool = false,
     };
 
     pub const MemberResolveCtx = struct {
-        /// Source file containing the call. Together with the declaration
-        /// span this identifies Kotlin `internal` visibility.
+        /// Source file containing the call; with the declaration span it decides `internal`.
         caller_file: ?FileId = null,
-        /// Innermost lexical class whose body contains the call. Visibility
-        /// walks its enclosing-class chain.
+        /// Innermost lexical class containing the call. Visibility walks its enclosing chain.
         lexical_owner: ?ClassId = null,
-        /// Restrict the query to private declarations. Used by bare own-member
-        /// calls, which can commit directly without considering virtual peers.
+        /// Restrict the query to private declarations, for bare own-member calls.
         private_only: bool = false,
         actual_type_param_bounds: []const ModuleRegistry.TypeParamBound = &.{},
         receiver_type: ?TypeRef = null,
     };
 
     pub const ExtensionResolveCtx = struct {
-        /// The caller's MEMBER resolution statically refuted every member
-        /// candidate: kotlinc's answer can only be an extension, so a sole
-        /// receiver-proven survivor commits even with unknown args.
+        /// The caller's member resolution refuted every member candidate, so kotlinc's answer can
+        /// only be an extension: a sole receiver-proven survivor commits even with unknown args.
         member_refuted: bool = false,
         caller_file: FileId,
         caller_package: []const u8,
-        /// Ordered implicit receiver heads that can supply a member
-        /// extension's dispatch owner, innermost first.
+        /// Implicit receiver heads that can supply a member extension's dispatch owner, innermost first.
         implicit_dispatch_owners: []const []const u8 = &.{},
-        /// Lexically enclosing class or object, retained separately from an
-        /// inner receiver-lambda head.
+        /// Lexically enclosing class or object, kept apart from an inner receiver-lambda head.
         lexical_owner: ?[]const u8 = null,
         /// Source-visible alias used for member-extension shadow checks.
         call_name: ?[]const u8 = null,
-        /// Bounds of type parameters owned by the enclosing declaration. They
-        /// make a receiver such as `Array<T>` fully static when `T` itself is
-        /// the caller's bounded type parameter.
+        /// Bounds of type parameters owned by the enclosing declaration, so a receiver such as
+        /// `Array<T>` is fully static when `T` is the caller's bounded type parameter.
         actual_type_param_bounds: []const ModuleRegistry.TypeParamBound = &.{},
     };
 
     pub const ExtensionResolution = struct {
         target: ?FuncId = null,
         dispatch_owner: ?ClassId = null,
-        /// At least one visible extension accepts the receiver and arguments.
-        /// A tie or incomplete proof keeps `target` null without making the
-        /// extension disappear from the candidate scope.
+        /// At least one visible extension accepts the receiver and arguments. A tie keeps `target`
+        /// null without removing the extension from the candidate scope.
         applicable: bool = false,
-        /// The same source argument list can bind a visible extension after
-        /// appending the Compose compiler ABI pair.
+        /// The same argument list binds a visible extension after the Compose compiler ABI pair.
         compiler_abi_applicable: bool = false,
-        /// A strict-key winner whose only weakness is an UNKNOWN argument
-        /// verdict. Its identity is not in doubt — RETURN-TYPE derivation
-        /// may use it (the `joinTo(StringBuilder(), ...)` chain); emission
-        /// must NOT, dispatch commitment still requires proof (the
-        /// trimIndent hazard is precisely about emission).
+        /// A strict-key winner whose only weakness is an unknown argument verdict. Return-type
+        /// derivation may use it; emission and dispatch commitment still require proof.
         sole_unknown: ?FuncId = null,
-        /// A TIED set whose candidates all declare the same parameter list
-        /// except each function-typed parameter's RETURN position — the
-        /// `flatMapIndexed` shape, overloaded on the lambda's return alone.
-        /// Only LAMBDA-PARAMETER typing may read this candidate: the tie is
-        /// real (return types and dispatch identity stay unresolved), but
-        /// every candidate hands the closure the same parameter types.
+        /// A tied set whose candidates declare identical parameter lists except each function-typed
+        /// parameter's RETURN position. Only lambda-parameter typing may read it, since every
+        /// candidate hands the closure the same parameter types.
         param_rep: ?FuncId = null,
     };
 
-    /// One ambiguous bare-call diagnostic: the call-site name and span
-    /// plus the first two identical-signature candidates' FQNs and
-    /// declaration spans (a span is null when the candidate carries no
-    /// phase-1 record).
+    /// One ambiguous bare-call diagnostic: the call-site name and span plus the first two
+    /// identical-signature candidates' FQNs and declaration spans (null with no phase-1 record).
     pub const ResolveDiag = struct {
         name: []const u8,
         fqn_a: []const u8,
@@ -665,25 +442,16 @@ pub const Module = struct {
         pub const Kind = enum {
             /// Two in-scope candidates nothing can tell apart.
             ambiguous,
-            /// Every candidate lives in a package the caller neither
-            /// declares, imports, nor sees by default. Kotlin does not
-            /// resolve such a reference at all.
+            /// Every candidate lives in a package the caller neither declares, imports, nor sees by
+            /// default. Kotlin does not resolve such a reference at all.
             unresolved,
-            /// A simple in-scope reference resolves to nothing: notably an
-            /// `it` written in a lambda that declares no parameters and is
-            /// not invoked with a single argument, where no enclosing
-            /// lambda provides an `it` either.
+            /// A simple in-scope reference resolves to nothing: notably an `it` in a lambda that
+            /// declares no parameters, is not invoked with one argument, and has no enclosing `it`.
             unresolved_local,
         };
 
-        /// Render the diagnostic with the call site (and declaration
-        /// sites) located as `path:line` through `map`. Two identical
-        /// FQNs are conflicting overloads — no qualification or import
-        /// can separate two declarations sharing one FQN, so the fix is
-        /// declaration-side. Distinct FQNs are a cross-package tie the
-        /// caller resolves by qualifying the call or importing one
-        /// candidate explicitly. An `unresolved` reference names the
-        /// out-of-scope candidates and how to bring one into scope.
+        /// Render the diagnostic with call and declaration sites located as `path:line`. Identical
+        /// FQNs are conflicting overloads, fixable only declaration-side; distinct ones are a tie.
         pub fn render(self: ResolveDiag, allocator: Allocator, map: *const span.SourceMap) Allocator.Error![]u8 {
             const call_loc = try locOf(allocator, map, self.span);
             defer allocator.free(call_loc);
@@ -767,13 +535,8 @@ pub const Module = struct {
     pub const staticTypeContainsFuncParam = m_static.staticTypeContainsFuncParam;
     pub const staticGenericArgCompatibility = m_static.staticGenericArgCompatibility;
 
-    /// The promotion proof, third derivation (the first two measured zero
-    /// for lack of argument authority — the typing channels now supply it):
-    /// a deferred member commits when every supplied argument is
-    /// AUTHORITATIVE and member-compatible, and every same-name extension
-    /// reachable from the receiver's chain is refuted by arity or by an
-    /// argument. Conservative everywhere: an unjudgeable candidate keeps
-    /// the deferral.
+    /// A deferred member commits when every supplied argument is authoritative and
+    /// member-compatible, and every reachable same-name extension is refuted.
     pub threadlocal var mpp_why: []const u8 = "-";
 
     pub const erasedHeadRefutes = m_static.erasedHeadRefutes;
@@ -799,12 +562,9 @@ pub const Module = struct {
             return false;
         }
         var member_fully_proven = true;
-        // The receiver's instantiation substitutes the owner's own type
-        // parameters positionally: `contains(element: E)` on an
-        // `Iterable<String>` receiver proves against String. Only the
-        // direct-instantiation case (receiver head IS the owner) is
-        // taken; projections keep the raw param and the conservative
-        // unknown below.
+        // The receiver's instantiation substitutes the owner's type parameters positionally, so
+        // `contains(element: E)` on an `Iterable<String>` receiver proves against String. Only
+        // the direct case (receiver head IS the owner) is taken; a projection keeps the raw param.
         const owner_tps: []const []const u8 = blk: {
             const ds = self.decl_sigs.get(member_fid.int()) orelse break :blk &.{};
             const oid = ds.enclosing_class orelse break :blk &.{};
@@ -835,12 +595,8 @@ pub const Module = struct {
                     break;
                 }
             }
-            // Unsubstitutable class-parameter ARGS erase to `*` for the
-            // proof: `Collection<E>` under a head-only receiver behaves as
-            // `Collection<*>` — the head adjudicates, the parameter proves
-            // and refutes nothing (the star-erasure convention). This is
-            // what lifts removeAll/addAll/putAll members to the
-            // scope-order tier.
+            // Unsubstitutable class-parameter args erase to `*` for the proof: the head adjudicates,
+            // the parameter neither proves nor refutes.
             var star_buf: [8]TypeRef = undefined;
             var param_args_erased = false;
             if (param_ty.args.len != 0 and param_ty.args.len <= star_buf.len) {
@@ -874,21 +630,10 @@ pub const Module = struct {
                     };
                 }
             }
-            // Two tiers. A member PROVEN applicable on every argument
-            // commits by Kotlin's scope order alone — members outrank
-            // extensions, no refutation needed. A member merely
-            // NON-refuted (the removeAll/addAll/putAll family, whose
-            // `Collection<E>` params stay unknown without a receiver
-            // instantiation) still commits, but only when every reachable
-            // extension is refuted below.
-            // A parameter that is STILL a bare type parameter after the
-            // receiver substitution accepts whatever the source passed: the
-            // program compiled, so the argument conforms to whatever the
-            // instantiation makes it. It is the same star-erasure convention
-            // applied one level up — the head adjudicates, the parameter
-            // neither proves nor refutes — except that an unprovable
-            // parameter must not cost the member its PROOF, or a
-            // `map.get(key)` loses to any same-named extension in scope.
+            // Two tiers. A member proven applicable on every argument commits by Kotlin's scope order
+            // alone, since members outrank extensions. A member merely non-refuted commits only when
+            // every reachable extension is refuted below. A parameter still a bare type parameter
+            // after substitution accepts whatever the source passed, and must not cost the proof.
             const param_still_tp = blk_tp: {
                 var ph2 = staticTypeHead(std.mem.trimEnd(u8, param_ty.name, "?"));
                 if (parseClassTypeParamIdentity(ph2)) |ident| ph2 = ident.param;

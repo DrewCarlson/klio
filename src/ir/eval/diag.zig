@@ -1,5 +1,4 @@
-//! Evaluator diagnostics: the wall-clock cap, the call/dispatch/frame
-//! censuses, the profiling dumps, and stack-trace and throwable rendering.
+//! Evaluator diagnostics: wall cap, profiling dumps, trace and throwable rendering.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -26,45 +25,20 @@ const EvalResult = ev_flow.EvalResult;
 const captureStack = ev_state.captureStack;
 const errResult = ev_flow.errResult;
 
-/// Append a captured stack trace to `out` as Kotlin-style `\n    at <fqn>
-/// (<file>:<line>)` lines, resolving each frame's position through the active
-/// source map. Frames with no recorded position (or an unknown file) render
-/// without the location suffix. Works uniformly for user, pack, and stdlib
-/// frames — every source file is registered in the same map.
-/// Render one captured frame as `<fqn> (<file>:<line>)`, or `<fqn> (native)`
-/// when its position does not resolve (a runtime-internal / host dispatch point
-/// — marked so the gap is intelligible rather than reading as a truncated line).
-/// Caller owns the returned slice.
-/// `KLIO_SPIN_TRACE=<seconds>` diagnostic: at block boundaries, when the
-/// interval has elapsed, print the live frame chain (innermost first, with
-/// resolved file:line) to stderr — an execution that never returns names its
-/// loop. No effect when the env var is unset.
+/// `KLIO_SPIN_TRACE=<seconds>`: interval for the live frame-chain dump; null = off.
 var spin_interval_s: ?i64 = null;
 
 var spin_interval_read = false;
 
-/// A wall-capped test must DIE, not cascade: without this, the deadline
-/// error unwound one coroutine while its siblings kept being resumed
-/// against half-torn state (each dying at its own next deadline check) —
-/// a resume storm whose half-run `finally` blocks mutated shared state
-/// and whose teardown interleavings crashed the process under the GC
-/// profile. Raising the drain-everything abandonment stops every thread
-/// and coroutine of the dying test at its next block or sleep slice; the
-/// test runner clears the flags (after a short grace) before the next
-/// test starts.
+/// Abandon the cohort: a wall-capped test must die rather than let its siblings
+/// resume against half-torn state. The runner clears the flags before the next.
 pub fn wallCapAbandon() void {
     runtime.requestAbandon();
     runtime.setRunBoundaryAbandon(true);
 }
 
-/// The wall-cap firing policy. FIRST fire: extend the deadline by an unwind
-/// budget and unwind with a CATCHABLE Kotlin exception, so the test's
-/// `catch`/`finally` (and the test infra's teardown — a compositionTest
-/// disposing its recomposer, a runTest cancelling its children) actually
-/// run; the hard `.Type` abort skipped them, and the dead test's globally
-/// registered snapshot observers and live compositions contaminated every
-/// later test in the class. SECOND fire (teardown itself hung past the
-/// budget): the original hard abort + cohort abandonment.
+/// FIRST fire: extend the deadline by an unwind budget and throw a CATCHABLE
+/// exception so teardown runs. SECOND fire: hard abort plus cohort abandonment.
 pub fn wallCapFire(allocator: Allocator) Allocator.Error!EvalResult {
     if (!parent.wall_cap_thrown.swap(true, .acq_rel)) {
         const dl = parent.test_wall_deadline_ms.load(.monotonic);
@@ -83,18 +57,13 @@ pub fn wallCapFire(allocator: Allocator) Allocator.Error!EvalResult {
     return errResult(.{ .Type = "test wall-clock deadline exceeded" });
 }
 
-/// Whether dispatch caches may be populated. A wall-capped or abandoned
-/// run produces walks that abort mid-probe; caching their outcomes (a
-/// spurious METHOD_MISS, a global-skip note, a wrong field-read route)
-/// poisoned every later execution of the same site — after one capped
-/// test, whole classes failed `unresolved global` on names that resolve
-/// fine in a fresh process (the cross-test contamination family).
-/// The runner's per-test invariant probe: a nonzero depth between tests
-/// is a leak in some unwind path.
+/// Per-test invariant probe: a nonzero depth between tests is an unwind leak.
 pub fn evalDepthNow() usize {
     return ev_state.evtls.eval_depth;
 }
 
+/// Whether dispatch caches may be populated: a capped or abandoned run aborts
+/// walks mid-probe, and caching those outcomes poisons every later execution.
 pub fn dispatchCacheStable() bool {
     if (runtime.shouldAbandon()) return false;
     const dl = parent.test_wall_deadline_ms.load(.monotonic);
@@ -105,20 +74,13 @@ pub fn nowMonotonicMs() i64 {
     return @intCast(@divTrunc(runtime.clockMonotonicNanos(), std.time.ns_per_ms));
 }
 
-/// Diagnostic: print the live frame chain (as the spin tracer does), for an
-/// error site that raises a traceless Vm error. Gated by KLIO_ERR_TRACE.
-/// KLIO_CALL_STATS: per-function invocation counters over the whole run.
-/// `callStatsDump` prints the top entries — the workload census that
-/// separates "the interpreter is slow per call" from "the program runs more
-/// calls than the reference would" (missed skipping, repeated recompose).
+/// `KLIO_CALL_STATS`: per-function invocation counters over the whole run.
 var call_stats_state: u8 = 0;
 
 var call_stats_mutex: runtime.SpinMutex = .{};
 
-/// Serve an outer-hop stored-slot field route (tag 3): hop the receiver's
-/// `outer` links, verify the destination's class identity (low 32 bits),
-/// then read the indexed slot with the same name/Null/Delegate guards the
-/// own-slot route applies. The returned value carries a retained ref.
+/// Outer-hop stored-slot field route (tag 3): hop `outer` links, check the
+/// destination class identity (low 32 bits), read the slot; returns a retained ref.
 pub fn serveOuterSlotRoute(recv: *const Value, name: []const u8, route: u64) ?Value {
     const hops: u64 = (route >> 2) & 63;
     const idx: usize = @intCast((route >> 8) & 0xFFFFFF);
@@ -152,10 +114,7 @@ fn callStatsBump(fqn: []const u8) void {
     callStatsBumpId(fqn, 0, null);
 }
 
-/// Census bump with the executing FuncId, so the anonymous-lambda mass
-/// (every lambda's fqn is the literal "<lambda>") decomposes into
-/// per-body counters under KLIO_CALL_STATS_LAMBDA — the id keys resolve
-/// back to bodies via `dump-ir --func`.
+/// Census bump keyed by FuncId, so `KLIO_CALL_STATS_LAMBDA` splits `<lambda>`.
 pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
     if (call_stats_state == 0)
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
@@ -164,8 +123,6 @@ pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
     var buf: [160]u8 = undefined;
     if (fid != 0 and std.mem.eql(u8, fqn, "<lambda>") and lambdaStatsOn()) {
         key = blk: {
-            // Name the body by its declaration site so the census reads
-            // without a dump-ir id correlation step.
             if (module) |m| {
                 if (@constCast(m).decl_span.get(fid)) |sp| {
                     if (span.active_map) |am| {
@@ -180,17 +137,13 @@ pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
             break :blk std.fmt.bufPrint(&buf, "<lambda>#{d}", .{fid}) catch fqn;
         };
     }
-    // KLIO_CALL_STATS_CALLER=<substr>: a matching fqn additionally bumps
-    // `<fqn>@<caller-fqn>`, attributing the frame to the interpreted frame
-    // live at activation. This names the dispatch context of census residue
-    // whose serve route is unknown.
+    // `KLIO_CALL_STATS_CALLER=<substr>`: a matching fqn also bumps
+    // `<fqn>@<caller-fqn>`, attributing the frame to the live interpreted caller.
     var cbuf: [256]u8 = undefined;
     var caller_key: ?[]const u8 = null;
     if (callerStatsFilter()) |substr| {
         if (std.mem.find(u8, key, substr) != null) {
             const cfqn: []const u8 = if (ev_state.evtls.frame_chain) |fr| fr.func.fqn else "<top>";
-            // The caller's current span IS the call site — it names which
-            // literal/site invoked this body without any id correlation.
             var site_buf: [64]u8 = undefined;
             var site: []const u8 = "";
             if (ev_state.evtls.frame_chain) |fr| {
@@ -214,8 +167,7 @@ pub fn callStatsBumpId(fqn: []const u8, fid: u32, module: ?*const Module) void {
     if (caller_key) |ck| callStatsBumpKeyLocked(ck);
 }
 
-/// Bump one census key with `call_stats_mutex` already held. The key may
-/// point at a stack buffer: the first insertion re-keys with an owned dupe.
+/// Bump one key with the mutex held; a stack-buffer key is duped on insertion.
 fn callStatsBumpKeyLocked(key: []const u8) void {
     const gop = call_stats.?.getOrPut(key) catch return;
     if (!gop.found_existing) {
@@ -247,9 +199,7 @@ fn lambdaStatsOn() bool {
     return S.state == 2;
 }
 
-/// KLIO_CALL_STATS census tap for slow-ladder GetField executions: keys are
-/// `<gf>Type.name`, so the dump separates the field-read workload from the
-/// call workload.
+/// `KLIO_CALL_STATS` tap for slow-ladder GetField; keys are `<gf>Type.name`.
 pub fn gfStatsBump(recv: *const Value, name: []const u8) void {
     if (call_stats_state == 0)
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
@@ -267,16 +217,13 @@ pub fn gfStatsBump(recv: *const Value, name: []const u8) void {
     gop.value_ptr.* += 1;
 }
 
-/// KLIO_CALL_STATS census tap for member calls that reached the slow name
-/// ladder: keys are `<ladder>Type.name`, so the dump names exactly which
-/// member dispatches are still unbound at runtime on a given workload.
+/// `KLIO_CALL_STATS` tap for the slow name ladder; keys `<ladder>Type.name@fn`.
 pub fn ladderStatsBump(recv: *const Value, name: []const u8, in_fn: []const u8) void {
     if (call_stats_state == 0)
         call_stats_state = if (runtime.envOnce("KLIO_CALL_STATS") != null) 2 else 1;
     if (call_stats_state != 2) return;
     var buf: [256]u8 = undefined;
-    // An interpreted instance reports `<instance>` through `typeFqn`, which
-    // names nothing — and the class is the whole point of a ladder split.
+    // `typeFqn` reports `<instance>` for an interpreted object, naming nothing.
     const recv_name: []const u8 = if (recv.* == .Instance) blk: {
         const g = recv.Instance.borrow();
         defer g.deinit();
@@ -285,9 +232,6 @@ pub fn ladderStatsBump(recv: *const Value, name: []const u8, in_fn: []const u8) 
         const nm = cg.get().name;
         break :blk if (nm.len != 0) nm else recv.typeFqn();
     } else recv.typeFqn();
-    // The enclosing function names the SITE: the ladder total is a few hot
-    // unbound sites times their execution counts, and per-name rows alone
-    // sent the analysis toward the wrong shape.
     const key = std.fmt.bufPrint(&buf, "<ladder>{s}.{s}@{s}", .{ recv_name, name, in_fn }) catch return;
     call_stats_mutex.lock();
     defer call_stats_mutex.unlock();
@@ -300,8 +244,7 @@ pub fn ladderStatsBump(recv: *const Value, name: []const u8, in_fn: []const u8) 
     gop.value_ptr.* += 1;
 }
 
-/// Host-route sub-tag names for the op profiler (see `runtime.prof.opRoute`).
-/// Order is the route index contract shared with the host dispatch stages.
+/// Host-route sub-tag names for the op profiler; order is the route-index contract.
 pub const op_route_names = [_][]const u8{
     "route:member-arg-prep", // 0
     "route:member-flat-prep", // 1
@@ -324,9 +267,7 @@ pub const op_route_names = [_][]const u8{
     "route:member-miss-tail", // 18
 };
 
-/// KLIO_OP_PROF report: map the runtime sampler's per-tag counts to opcode
-/// names and print the distribution. Lives here because only the IR layer
-/// can name `Inst` tags.
+/// `KLIO_OP_PROF` report: map the sampler's per-tag counts to opcode names.
 pub fn opProfDump() void {
     const counts = runtime.prof.opProfCounts() orelse return;
     const Entry = struct { name: []const u8, n: u64 };
@@ -365,8 +306,7 @@ pub fn opProfDump() void {
     }
 }
 
-/// Probe channel for the call census: host dispatch stages report the names
-/// that miss their caches, prefixed per stage in a second map.
+/// Probe channel: host dispatch stages report names that miss their caches.
 var probe_stats: ?std.StringHashMap(u64) = null;
 
 pub fn callStatsProbe(name: []const u8) void {
@@ -405,10 +345,7 @@ pub fn probeStatsDump() void {
     for (list.items[0..top]) |e| std.debug.print("[probe-stats] {d:>10} {s}\n", .{ e.n, e.fqn });
 }
 
-/// `KLIO_DISPATCH_STATS=1` — executed-instruction census over the call
-/// forms, so the static-dispatch campaign can be planned from counts rather
-/// than from the shape of the IR. Every counter is a plain relaxed add on a
-/// process-global array; the gate is read once.
+/// `KLIO_DISPATCH_STATS=1`: executed-instruction census over the call forms.
 pub const DispatchKind = enum(u8) {
     call_static,
     call_member_resolved,
@@ -421,8 +358,7 @@ pub const DispatchKind = enum(u8) {
     call_spread,
     call_super,
     ctx_call,
-    /// Where a name-based member dispatch ended up, so the campaign knows
-    /// whether static binding must target intrinsics or interpreted bodies.
+    /// Where a name-based member dispatch ended up.
     served_intrinsic,
     served_user_body,
     served_extension,
@@ -432,23 +368,17 @@ pub const DispatchKind = enum(u8) {
     member_range_iter,
     member_flat_prepare,
     member_ladder,
-    /// Slot-bound / lowering-resolved calls served as pushed activations on
-    /// the flat driver instead of through the recursive invoker.
+    /// Slot-bound / lowering-resolved calls served as pushed flat activations.
     virtual_flat_prepare,
     resolved_flat_prepare,
-    /// Exact static calls fused by the cached fast plan, split by whether
-    /// the widened receiver-carrying admission served them.
+    /// Exact static calls fused by the cached fast plan, split by admission.
     static_flat_fuse,
     static_flat_fuse_ext,
     /// By-name member calls replayed from their instruction-site memo.
     member_site_flat,
-    /// VM-plan P0 baseline: every interpreter frame constructed. P1's
-    /// contiguous stack and P2's call fusion drive this denominator down
-    /// per call; the compose margin is the external gauge.
+    /// Every interpreter frame constructed: the denominator for the rest.
     frame_push,
-    /// VM-plan P2 coverage: frames whose Func the flattened engine's
-    /// simple-inst subset can execute end to end. The ratio to
-    /// `frame_push` is the engine's reachable share BEFORE it is built.
+    /// Frames the flattened engine's simple-inst subset can execute end to end.
     frame_push_flattenable,
 };
 
@@ -466,7 +396,6 @@ pub inline fn dispatchBump(comptime k: DispatchKind) void {
     _ = dispatch_counts[@intFromEnum(k)].fetchAdd(1, .monotonic);
 }
 
-/// Public tap for the host's dispatch tails (see `DispatchKind`).
 pub fn dispatchNote(comptime k: DispatchKind) void {
     dispatchBump(k);
 }
@@ -538,11 +467,7 @@ pub inline fn frameCensusBump(fid: u32) void {
     frame_census[fid & (FRAME_CENSUS_SLOTS - 1)] +%= 1;
 }
 
-/// `KLIO_FUSE_CENSUS`: the ceiling measurement for a fused native-bank
-/// execution tier. Every activated body is classified once — could a walker
-/// with C-stack registers, routed field access and pre-resolved calls run
-/// it end to end? — and activations tally by verdict, with the blocking
-/// instruction named for the near-misses.
+/// `KLIO_FUSE_CENSUS`: classify every activated body once and tally by verdict.
 var fuse_census_on: bool = false;
 
 var fuse_ok_acts: u64 = 0;
@@ -653,8 +578,7 @@ pub fn frameCountDump(module: *const Module) void {
             return a.n > b.n;
         }
     }.lt);
-    // Package split for the AOT scoping question: how many activations are
-    // bodies an emitted compose set could own outright.
+    // Package split: how many activations belong to each library group.
     var in_compose: u64 = 0;
     var in_coroutines: u64 = 0;
     var in_accessor: u64 = 0;
@@ -682,8 +606,7 @@ pub fn frameCountDump(module: *const Module) void {
     for (list.items[0..top]) |e| std.debug.print("[frames] {d:>9} {s}\n", .{ e.n, e.name });
 }
 
-/// The first source span an emitted body carries, for naming an anonymous
-/// function in a profile.
+/// First source span of an emitted body, for naming an anonymous function.
 fn funcFirstSpan(f: *const ir.Func) ?ir.Span {
     for (f.blocks) |*b| {
         for (b.insts) |*inst| {
@@ -706,9 +629,7 @@ pub fn fnProfDump(module: *const Module) void {
         total += n;
         const f = module.funcById(@enumFromInt(fid));
         var nm: []const u8 = if (f) |ff| (if (ff.fqn.len != 0) ff.fqn else ff.name) else "<unknown>";
-        // A lambda's name says nothing; every one of them reads `<lambda>` and
-        // the whole population lands in one bucket. Name it by id and its
-        // source position, which is what makes a hot one findable.
+        // Every lambda reads `<lambda>`; name it by id and source position instead.
         if (f) |ff| {
             if (std.mem.eql(u8, nm, "<lambda>")) {
                 const buf = std.heap.page_allocator.alloc(u8, 160) catch return;
@@ -744,10 +665,7 @@ pub fn fnProfDump(module: *const Module) void {
     }
 }
 
-/// Cached KLIO_ERR_TRACE presence — the flag is read on every dispatch-miss
-/// diagnostic path, and `getenvSlice` takes a global mutex per call. The env
-/// is set at launch; a mid-run change is not observed (benign data race:
-/// both racers store the same verdict).
+/// Cached `KLIO_ERR_TRACE` presence; racers store the same verdict.
 var err_trace_state: u8 = 0;
 
 pub fn errTraceOn() bool {
@@ -762,11 +680,9 @@ pub fn dumpFrameChainForDiag() void {
     dumpFrameChainForDiagAlways();
 }
 
-/// Declaring location of a func for the resume diagnostics.
 pub const FuncLoc = struct { path: []const u8, line: u32 };
 
-/// Declaring location of a func for the resume diagnostics: the span of
-/// its first `Trace` instruction, resolved through the active source map.
+/// Declaring location: the span of the func's first `Trace`, via the source map.
 pub fn funcFirstLoc(func: *const ir.Func) FuncLoc {
     const fallback: FuncLoc = .{ .path = "?", .line = 0 };
     if (func.blocks.len == 0) return fallback;
@@ -786,14 +702,12 @@ pub fn funcFirstLoc(func: *const ir.Func) FuncLoc {
     return fallback;
 }
 
-/// Ungated frame-chain dump for name-filtered diagnostics that gate at
-/// their own call site (e.g. `KLIO_MISS_TRACE`).
-/// Install the runtime-layer frame-dump hook (idempotent; see
-/// `runtime.debug_frame_dump`).
+/// Install the runtime-layer frame-dump hook (idempotent).
 pub fn installDebugFrameDump() void {
     runtime.debug_frame_dump = &dumpFrameChainForDiagAlways;
 }
 
+/// Ungated frame-chain dump for diagnostics that gate at their own call site.
 pub fn dumpFrameChainForDiagAlways() void {
     std.debug.print("[errtrace] frame chain (innermost first):\n", .{});
     var cur = ev_state.evtls.frame_chain;
@@ -818,10 +732,7 @@ pub fn dumpFrameChainForDiagAlways() void {
     }
 }
 
-/// The innermost frame's declared params with the runtime shape each is
-/// bound to. Names an argument-misalignment (e.g. a generated `$composer`
-/// slot holding an `Int`) directly instead of leaving it to be inferred
-/// from a downstream receiver failure.
+/// The innermost frames' declared params with the runtime shape each is bound to.
 pub fn dumpCurrentFrameParamsForDiag() void {
     var cur = ev_state.evtls.frame_chain;
     var depth: usize = 0;
@@ -839,8 +750,7 @@ pub fn dumpCurrentFrameParamsForDiag() void {
                 i, p.name, @tagName(std.meta.activeTag(v.*)), diagValueClassName(v),
             });
         }
-        // Captures carry a closure's environment; a mis-captured callee
-        // slot (`this.LocalFn(...)` binding an Any) is only visible here.
+        // A mis-captured callee slot is only visible in the closure environment.
         for (fr.captures.items, 0..) |*cv, i| {
             std.debug.print("  [cap {d}] {s} {s}\n", .{
                 i, @tagName(std.meta.activeTag(cv.*)), diagValueClassName(cv),
@@ -849,10 +759,7 @@ pub fn dumpCurrentFrameParamsForDiag() void {
     }
 }
 
-/// The value's concrete runtime class name for diagnostics: an Instance
-/// answers its class, everything else its type FQN. `typeFqn` alone prints
-/// `<instance>` for interpreted objects, which hides exactly the fact a
-/// wrong-receiver diagnosis needs.
+/// Concrete runtime class for diagnostics; `typeFqn` alone prints `<instance>`.
 fn diagValueClassName(v: *const Value) []const u8 {
     if (v.* == .Instance) {
         const ig = v.Instance.borrow();
@@ -880,8 +787,7 @@ pub fn spinDumpMaybe() void {
     if (now - ev_state.evtls.spin_last_dump < iv) return;
     ev_state.evtls.spin_last_dump = now;
     std.debug.print("[spin] frame chain (innermost first):\n", .{});
-    // Innermost frames' scalar registers — live loop state (probe offsets,
-    // masks, bit groups) for a loop that never terminates.
+    // Innermost frames' scalar registers: live state of a loop that never ends.
     {
         var rf = ev_state.evtls.frame_chain;
         var fi: usize = 0;
@@ -927,6 +833,8 @@ pub fn spinDumpMaybe() void {
     }
 }
 
+/// One frame as `<fqn> (<file>:<line>)`, or `<fqn> (native)` when the position
+/// does not resolve. Caller owns the returned slice.
 fn frameToString(allocator: Allocator, fr: runtime.StackFrame) Allocator.Error![]u8 {
     if (fr.has_pos) {
         if (span.active_map) |m| {
@@ -954,9 +862,7 @@ fn formatStackTraceIndented(allocator: Allocator, trace: *const runtime.StackTra
     }
 }
 
-/// Build the `Throwable.stackTrace` value: an `Array` whose elements are the
-/// rendered frames (each a `String`, its `StackTraceElement.toString()` form).
-/// Returns null for a receiver that carries no captured trace.
+/// `Throwable.stackTrace`: an `Array` of rendered frames, null when none captured.
 pub fn stackTraceArray(allocator: Allocator, v: *const Value) Allocator.Error!?Value {
     const stk: ?runtime.StackRef = switch (v.*) {
         .Exception => |e| if (e.stack) |c| runtime.StackRef{ .cell = c } else null,
@@ -983,11 +889,8 @@ pub fn stackTraceArray(allocator: Allocator, v: *const Value) Allocator.Error!?V
     return runtime.ArrayData.fromBoxedList(try runtime.ValueList.initOwned(allocator, list));
 }
 
-/// Render a throwable in the JVM `printStackTrace` shape — the
-/// `type: message` header, captured frames, `Suppressed:` sections
-/// (indented one tab per nesting level), and the `Caused by:` chain — into
-/// `out`. A throwable already printed in this rendering appears as
-/// `[CIRCULAR REFERENCE: <header>]` and is not walked again.
+/// Render a throwable in the JVM `printStackTrace` shape: header, frames,
+/// `Suppressed:` sections, `Caused by:` chain. A repeat prints CIRCULAR REFERENCE.
 pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayList(u8), is_cause: bool, depth: u8) Allocator.Error!void {
     _ = depth;
     if (is_cause) try out.appendSlice(allocator, "\nCaused by: ");
@@ -996,8 +899,7 @@ pub fn formatThrowable(allocator: Allocator, v: *const Value, out: *std.ArrayLis
     try formatThrowableEnclosed(allocator, v, out, "", &deja, 0);
 }
 
-/// Stable identity for the dejaVu set; 0 (host-created throwables without
-/// one) opts out of cycle tracking and always prints in full.
+/// Identity for the dejaVu set; `0` opts out of cycle tracking and prints in full.
 fn throwableIdentity(v: *const Value) u64 {
     return switch (v.*) {
         .Exception => |e| e.identity,
@@ -1126,12 +1028,8 @@ fn formatThrowableEnclosed(
     }
 }
 
-/// Attach a freshly-captured stack trace to a throwable the first time it needs
-/// one (`fillInStackTrace`): called at construction (matching the JVM) and again
-/// at the throw seam as a fallback for host-created throwables. Attach-once, so
-/// the construction-site trace wins and a re-throw keeps it. Only
-/// `Throwable`-shaped values carry one — a builtin `Exception` value or a user
-/// `Throwable`-subclass instance.
+/// Attach a captured trace the first time a throwable needs one
+/// (`fillInStackTrace`): attach-once, so the construction site survives a re-throw.
 pub fn attachStackTrace(allocator: Allocator, v: *Value) Allocator.Error!void {
     switch (v.*) {
         .Exception => |e| {

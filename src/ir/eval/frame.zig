@@ -50,11 +50,8 @@ const releaseArgsIn = ev_state.releaseArgsIn;
 const releaseRegs = ev_state.releaseRegs;
 const stwAuditOn = ev_state.stwAuditOn;
 
-/// Per-call evaluation frame.
-/// Which register slots a frame has actually written. A no-fill frame keeps
-/// whatever its pooled buffer last held, so the collector — and any consumer
-/// that materializes the file — must know which slots are live. Four words
-/// cover every frame the def-before-use analysis admits.
+/// Which register slots a frame has actually written. A no-fill frame keeps whatever its pooled buffer
+/// last held, so the collector and anything that materializes the file must know which slots are live.
 pub const RegMask = struct {
     pub const WORDS = ir.FRAME_FILL_WORDS;
     pub const CAP: usize = WORDS * 64;
@@ -71,8 +68,7 @@ pub const RegMask = struct {
         return true;
     }
 
-    /// A slot past the tracked range belongs to an eagerly filled frame, so
-    /// it reads as written.
+    /// A slot past the tracked range belongs to an eagerly filled frame, so it reads as written.
     pub inline fn has(self: RegMask, i: usize) bool {
         if (i >= CAP) return true;
         return (self.w[i >> 6] >> @as(u6, @truncate(i))) & 1 != 0;
@@ -88,82 +84,45 @@ pub const RegMask = struct {
     }
 };
 
+/// Per-call evaluation frame.
 pub const Frame = struct {
     module: *const Module,
     func: *const Func,
     regs: std.ArrayList(Value),
-    /// Which register slots hold a real value. All-ones for an eagerly
-    /// Unit-filled file (any func without a `frameNoFill` proof, every
-    /// reclaim-backend frame, n_locals > 64); for a no-fill frame each
-    /// write sets its slot's bit. The collector's frame walk and the spin
-    /// dump mark/read only set slots, and `materializeRegs` fills the rest
-    /// with `Unit` before the file escapes the masked world (suspension
-    /// snapshot, loop JIT, C-native surface, resume rebuild).
+    /// Which register slots hold a real value: all-ones for an eagerly Unit-filled file, one bit per write
+    /// for a no-fill frame. The collector reads only set slots; `materializeRegs` fills the rest.
     wmask: RegMask,
     params: std.ArrayList(Value),
     captures: std.ArrayList(Value),
-    /// The enclosing-`this` chain this frame runs with, innermost last. Seeded
-    /// at frame entry from the frame's *lexical* receivers — a closure body's
-    /// creation-time snapshot plus whatever the dispatch just pushed for this
-    /// call (subject / displaced `this` / member-extension owner) — and
-    /// extended by this frame's own pushes for the duration of a sub-call.
-    /// Backed by `page_allocator` so any push site (`execInst` here or host
-    /// dispatch through `pushAccessEnclosing`) appends through one allocator.
-    /// Snapshotted into `FrameSnapshot.enclosing_this` on suspend and restored
-    /// verbatim on resume.
+    /// The enclosing-`this` chain this frame runs with, innermost last: the frame's lexical receivers plus
+    /// what dispatch pushed for this call. Snapshotted on suspend and restored verbatim on resume.
     enclosing_this: std.ArrayList(EnclosingEntry),
-    /// The `evtls.active_chain` pointer to restore when this frame exits, so a frame
-    /// running under a caller frame returns enclosing-`this` resolution to the
-    /// caller's chain rather than leaving a dangling pointer.
+    /// The `evtls.active_chain` to restore on exit, returning receiver resolution to the caller's chain.
     prev_chain: ?*std.ArrayList(EnclosingEntry),
-    /// The caller's `evtls.active_chain_base`, restored on exit alongside
-    /// `prev_chain`.
+    /// The caller's `evtls.active_chain_base`, restored on exit alongside `prev_chain`.
     prev_chain_base: usize,
-    /// The owning module handle when this frame runs in a per-method
-    /// *sub-module* (anonymous object / local class / nested
-    /// `private`/member class — each lowered into its own `Module`).
-    /// `null` for a frame in the main module. Captured into the
-    /// frame's `FrameSnapshot` so a suspended sub-module method resumes
-    /// by resolving its `FuncId` against the correct module rather than
-    /// the main one (which would index a different, wrong function).
+    /// The per-method sub-module this frame runs in (anonymous object, local or nested class), null in the
+    /// main module. Carried into the snapshot so a suspended method resolves `FuncId` against that module.
     module_arc: ?*const Module,
     allocator: Allocator,
-    /// A frame rebuilt by `resumeContinuation` *adopts* the values its
-    /// `SuspendState` snapshot retained: it owns one reference to each
-    /// param/capture (not just the regs), so its teardown must release them
-    /// to balance the retain the snapshot took on suspend. A freshly-called
-    /// frame leaves this false — its params/captures are borrows.
+    /// A frame rebuilt by `resumeContinuation` adopts the values its snapshot retained: it owns one reference
+    /// to each param and capture and releases them at teardown. A freshly-called frame borrows them.
     owns_params_caps: bool = false,
     /// Intrusive link onto the per-thread GC frame chain (see `evtls.frame_chain`).
     gc_link: ?*Frame = null,
-    /// The closure side-table id when this frame is executing a closure body
-    /// (`null` for a plain function / method body). A running closure body holds
-    /// only a *copy* of its capture values, not the `IrClosure` value, so without
-    /// this the collector would never mark the closure's slot — `reclaimDead`
-    /// would recycle its id and its capture-store cell would be swept out from
-    /// under a body that spans a collection (a long-running coroutine). The frame
-    /// re-roots the slot via `markClosureHook` for as long as it runs.
+    /// The closure side-table id when this frame runs a closure body. The body holds only a copy of its capture
+    /// values, so the frame re-roots the slot through `markClosureHook`; otherwise a collection sweeps the store.
     closure_id: ?u64 = null,
-    /// Out-of-band control-flow payload for the per-instruction executor (see
-    /// `Step`): `execInst` stashes any error/throw/return/suspend here and
-    /// returns the 1-byte `Step.raised`, instead of returning the ~80-byte
-    /// `EvalResult` by value on every instruction (its `.ok` is always the
-    /// ignored `.Unit`). Read by the dispatch loop only on `.raised`.
+    /// Out-of-band control-flow payload for `execInst`: it stashes an error, throw, return or suspend here and
+    /// returns the one-byte `Step.raised` instead of an `EvalResult`. Read by the dispatch loop only on `.raised`.
     step_err: ?EvalError = null,
-    /// Out-of-band payload for `Step.flat_call`: the resolved direct call the
-    /// flat driver should push. Set and consumed within one dispatch step.
+    /// Out-of-band payload for `Step.flat_call`, set and consumed within one dispatch step.
     flat_call: ?FlatCallReq = null,
     pending_finally: PendingFinallyState = .{},
-    /// The per-thread evaluator state, resolved once when the frame is built.
-    /// macOS resolves a thread-local address through a `_tlv_get_addr` call
-    /// that the compiler cannot hoist across any other call, so every access
-    /// site in a frame-carrying function would otherwise pay its own; the
-    /// frame already threads everywhere the state is needed.
+    /// The per-thread evaluator state, resolved once when the frame is built: macOS reaches a thread-local
+    /// through a call the compiler cannot hoist, so every access site would otherwise pay its own.
     tls: *EvalTls,
-    /// Source span of the statement this frame is currently executing, set by
-    /// the `Trace` instruction the lowerer emits per statement. Read when a
-    /// throw captures the call stack so each frame reports its in-progress
-    /// source position (file + line) rather than only its declaration site.
+    /// Source span of the statement in progress, set by `Trace`, so a captured stack reports each frame's line.
     cur_span: ?ir.Span = null,
 
     pub fn newWithCaptures(
@@ -195,9 +154,7 @@ pub const Frame = struct {
                 if (func.fqn.len != 0) func.fqn else func.name, params.items.len, func.params.len, caller,
             });
         }
-        // The coercion walks trigger only on specific declared param shapes;
-        // compute once per func which can ever apply (filled in place under
-        // the same benign-race convention as `fast_call`).
+        // The coercion walks trigger only on specific declared param shapes; compute once per func which can apply.
         const plan = coercePlanFor(module, func);
         if (plan & 2 != 0) coerceIntArgsToLong(func, params.items);
         if (plan & 4 != 0) coerceGenericIntPeersToLong(module, func, params.items);
@@ -224,9 +181,7 @@ pub const Frame = struct {
                 });
             }
         }
-        // The reclaim backend releases a register's previous occupant on
-        // every write and every slot at teardown, so its frames stay
-        // eagerly filled (exactly the leaf serve's rule).
+        // The reclaim backend releases a register's previous occupant on every write, so its frames stay filled.
         const no_fill = !runtime.reclaimEnabled() and func.frameNoFill();
         if (parent.frame_count_on) {
             frameCensusBump(func.id.int());
@@ -253,14 +208,8 @@ pub const Frame = struct {
         };
     }
 
-    /// Seed this frame's enclosing-`this` chain and make it the active chain
-    /// for the frame's lifetime. Kotlin receiver scope is lexical, so the
-    /// seed is NOT the caller's chain: it is `seed` (a closure body's
-    /// creation-time snapshot; empty for everything else) followed by the
-    /// caller's in-flight pushes — the entries the dispatch placed for this
-    /// very call (a receiver-lambda subject, a displaced `this`, a
-    /// member-extension owner). `access` entries are dispatch-transient and
-    /// never cross the frame boundary.
+    /// Seed this frame's enclosing-`this` chain and make it active for the frame's lifetime. Kotlin receiver
+    /// scope is lexical, so the seed is `seed` plus the pushes dispatch made for this call, not the caller's chain.
     pub fn activateChain(self: *Frame, seed: []const EnclosingEntry) Allocator.Error!void {
         if (chainTraceOn()) {
             std.debug.print("[chain] enter tid={d} tls={*} frame={*} caller={*} base={d} fn={s}\n", .{
@@ -277,12 +226,8 @@ pub const Frame = struct {
                 try self.enclosing_this.append(chainAllocator(), e);
             }
         }
-        // A method / extension body's own receiver is the innermost
-        // lexical receiver of everything written inside it — seed it onto
-        // the frame's chain so a closure created in the body snapshots it
-        // (and so dispatch-time visibility filters see it without a
-        // per-site push). It is part of the seeded base, never an
-        // in-flight push, so it does not leak into callees.
+        // A method or extension body's own receiver is the innermost lexical receiver of everything written
+        // inside it, so it joins the seeded base rather than the in-flight pushes and never leaks into callees.
         if (ownReceiverEntry(self.func, self.params.items)) |own| {
             const items = self.enclosing_this.items;
             const dup = items.len > 0 and sameReceiver(items[items.len - 1].v, own.v);
@@ -291,8 +236,7 @@ pub const Frame = struct {
         self.activateAs();
     }
 
-    /// Seed this frame's chain from a saved snapshot slice (resume path) and
-    /// make it active.
+    /// Seed this frame's chain from a saved snapshot slice (resume path) and make it active.
     pub fn activateChainFrom(self: *Frame, saved: []const EnclosingEntry) Allocator.Error!void {
         try self.enclosing_this.appendSlice(chainAllocator(), saved);
         self.activateAs();
@@ -321,10 +265,8 @@ pub const Frame = struct {
     }
 
     pub fn deinit(self: *Frame) void {
-        // Tripwire (`KLIO_GC_STW_AUDIT=1`): tearing a frame down while the
-        // world is stopped means the collector is walking this thread's
-        // chain right now — a rendezvous hole, and exactly the shape that
-        // makes a mark walk read freed frame buffers.
+        // `KLIO_GC_STW_AUDIT=1`: tearing a frame down while the world is stopped means the collector is walking
+        // this thread's chain right now.
         if (stwAuditOn() and runtime.gc.worldStopped()) {
             const me = runtime.gc.currentTid();
             if (me != runtime.gc.collector_tid.load(.acquire)) {
@@ -334,11 +276,8 @@ pub const Frame = struct {
                 }
             }
         }
-        // A register owns one reference to its value; release them all on
-        // teardown. The return/escaping value is retained out before this runs,
-        // and a suspended frame's registers are retained into its snapshot.
-        // `params`/`captures` are borrows — only their buffers are freed here.
-        // No-op under the arena fast path.
+        // A register owns one reference to its value and releases it at teardown; an escaping value is retained out
+        // first, and a suspension retains into the snapshot. `params`/`captures` are borrows, only buffers are freed.
         if (runtime.reclaimEnabled()) {
             for (self.regs.items) |v| v.release(self.allocator);
             if (self.owns_params_caps) {
@@ -347,12 +286,8 @@ pub const Frame = struct {
             }
             self.pending_finally.release(self.allocator);
         }
-        // Args before regs: `releaseRegs` runs the depth-0 pool drain, so
-        // the outermost frame's own carriers must already be pooled (or
-        // they leak past the drain).
-        // The pools belong to the thread tearing the frame down, not to the
-        // one that built it (see `acquireRegs`): read the running thread once
-        // and hand it to each pool.
+        // Args before regs: `releaseRegs` runs the depth-0 pool drain, so the outermost frame's own carriers must
+        // already be pooled. The pools belong to the thread tearing the frame down, not the one that built it.
         const ev: *EvalTls = &ev_state.evtls;
         releaseArgsIn(ev, self.allocator, &self.params);
         releaseArgsIn(ev, self.allocator, &self.captures);
@@ -366,16 +301,13 @@ pub const Frame = struct {
         return .Unit;
     }
 
-    /// Store `v` into register `r`, taking ownership of one reference to `v`.
-    /// The previous occupant is released. No refcount traffic under the arena.
+    /// Store `v` into register `r`, taking ownership of one reference; the previous occupant is released.
     pub fn write(self: *Frame, r: Reg, v: Value) Allocator.Error!void {
         const idx = r.int();
         if (idx >= self.regs.items.len) {
             try self.regs.appendNTimes(regsAlloc(self.allocator), .Unit, idx + 1 - self.regs.items.len);
         }
-        // For an eagerly-filled frame the mask is already all-ones and the
-        // (wrapped) bit is a no-op; a no-fill frame's indices are < 64 by
-        // the `frameNoFill` gate.
+        // An eagerly-filled frame's mask is already all-ones; a no-fill frame's indices are < 64 by `frameNoFill`.
         self.wmask.set(idx);
         if (runtime.reclaimEnabled()) {
             const old = self.regs.items[idx];
@@ -390,11 +322,8 @@ pub const Frame = struct {
         return &self.func.blocks[b.int()];
     }
 
-    /// Fill every not-yet-written register slot with `Unit` and saturate
-    /// the written mask. Called before the register file escapes the
-    /// masked world — a suspension snapshot, the loop JIT, the C-native
-    /// surface, a resume rebuild — so those consumers see exactly the file
-    /// an eagerly-filled frame would carry. No-op once saturated.
+    /// Fill every not-yet-written slot with `Unit` and saturate the mask before the file escapes the masked
+    /// world (suspension snapshot, loop JIT, C-native surface, resume rebuild). No-op once saturated.
     pub fn materializeRegs(self: *Frame) void {
         if (self.wmask.isAll()) return;
         for (self.regs.items, 0..) |*v, i| {

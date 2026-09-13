@@ -53,18 +53,14 @@ pub fn classIdIsOrExtendsDepth(
     return false;
 }
 
-/// Class-identity hierarchy check used where simple names are not enough
-/// to prove Kotlin visibility or dispatch ownership.
+/// Hierarchy check by class identity, where a simple name cannot prove Kotlin visibility or dispatch ownership.
 pub fn classIdIsOrExtends(self: *const Module, sub: ClassId, super: ClassId) bool {
     if (super.int() >= self.classes.items.len) return false;
     return self.classIdIsOrExtendsDepth(sub, super, 0);
 }
 
-/// Whether `cls` or any supertype declares a member named `name`,
-/// arity-blind. The declaration-completeness audit's member probe: it
-/// answers "can resolution see SOME declaration for this name on this
-/// receiver", which an empty-shape resolveMemberCall cannot (a member
-/// with required parameters refuses a zero-arg probe).
+/// Whether `cls` or a supertype declares SOME member named `name`, arity-blind. A zero-arg
+/// `resolveMemberCall` probe cannot answer this: a member with required parameters refuses it.
 pub fn classHierarchyDeclaresMember(self: *const Module, cls: ClassId, name: []const u8) bool {
     return self.classHierarchyDeclaresMemberDepth(cls, name, 0);
 }
@@ -77,13 +73,9 @@ pub fn classHierarchyDeclaresMemberDepth(self: *const Module, cls: ClassId, name
             if (std.mem.eql(u8, mf.name, name)) return true;
         }
     }
-    // The builtin headers' rows often carry NO method FuncIds — their
-    // member declarations live in decl_sigs and reach dispatch through
-    // the member-name index instead.
+    // Builtin headers often carry no method FuncIds; their declarations live in decl_sigs.
     if (self.memberDecls(c.fqn, name).len != 0) return true;
-    // PROPERTY members (`size`, `length`, `entries`) appear in neither
-    // list; the hierarchy shadow-name set is the registry's transitive
-    // member-name record and carries them.
+    // Property members (`size`, `entries`) are in neither list; the hierarchy shadow-name set carries them.
     if (self.registry.hierarchy_shadow_names.get(c.name)) |hs| {
         if (hs.names.contains(name)) return true;
     }
@@ -229,10 +221,7 @@ pub fn staticTypeContainsFuncParam(
     ty: TypeRef,
 ) bool {
     if (overrideQualifiedPath(ty) != null) return false;
-    // A use-site projection hides the parameter from the raw head:
-    // `Array<out T>` contains T even though its argument's head spells
-    // `out#T` — without the strip the whole parameter routed through
-    // receiver compatibility and the generic proof never ran.
+    // A use-site projection hides the parameter: `Array<out T>` contains T behind an `out#T` head.
     var head = staticTypeHead(ty.name);
     if (std.mem.startsWith(u8, head, "out#")) {
         head = head["out#".len..];
@@ -246,9 +235,8 @@ pub fn staticTypeContainsFuncParam(
     return false;
 }
 
-/// Prove one actual argument against a parameter containing declaration
-/// type variables. Classifier compatibility is checked structurally; a
-/// direct type variable accepts any value satisfying its upper bound.
+/// Prove one actual argument against a parameter containing declaration type variables.
+/// Classifier compatibility is structural; a type variable accepts anything its bound admits.
 pub fn staticGenericArgCompatibility(
     self: *const Module,
     fid: FuncId,
@@ -257,10 +245,7 @@ pub fn staticGenericArgCompatibility(
     depth: u8,
 ) StaticCompatibility {
     if (depth >= 32) return .unknown;
-    // A use-site variance projection is transparent to compatibility:
-    // `Array<String>` against `Array<out T>` adjudicates String-vs-T,
-    // not String-vs-`out#T` (whose head names nothing and left the
-    // Array overload of `minus` unknown at the argument step).
+    // A use-site variance projection is transparent: `Array<String>` against `Array<out T>` judges String against T.
     if (std.mem.startsWith(u8, param.name, "out#") or
         std.mem.startsWith(u8, param.name, "in#"))
     {
@@ -301,17 +286,12 @@ pub fn staticGenericArgCompatibility(
     const actual_head = staticTypeHead(actual_erased.name);
     const param_erased_head = staticTypeHead(param_erased.name);
     if (!std.mem.eql(u8, actual_head, param_erased_head)) {
-        // `Any` is the universal supertype: every classifier satisfies
-        // it, and the class table records no edges to it.
+        // `Any` is the universal supertype, and the class table records no edges to it.
         if (std.mem.eql(u8, applicability.simpleName(param_erased_head), "Any")) return .compatible;
         const actual_id = self.staticTypeClassId(actual_erased);
         var param_id = self.staticTypeClassId(param_erased);
-        // A param head written inside its declaring class resolves in
-        // that class's scope first: `get(key: Key<E>)` inside
-        // `CoroutineContext` means the NESTED `CoroutineContext.Key`,
-        // which a bare simple-name lookup misses (every companion is
-        // named `Key`) — and the missed resolution judged the actual's
-        // companion INCOMPATIBLE against the interface's own member.
+        // A param head written inside its declaring class resolves in that class's scope first:
+        // `get(key: Key<E>)` in `CoroutineContext` means the NESTED `CoroutineContext.Key`.
         if (param_id == null) {
             if (self.decl_sigs.get(fid.int())) |ds| {
                 if (ds.enclosing_class) |ec| {
@@ -342,22 +322,12 @@ pub fn staticGenericArgCompatibility(
         {
             return .incompatible;
         }
-        // A Kotlin Array is NOT an Iterable/Collection/Sequence. The
-        // runtime models arrays against those interfaces for member
-        // dispatch convenience, but overload REFUTATION follows
-        // kotlinc: `minus(elements: Iterable<T>)` never takes an Array
-        // argument, so the Array sibling resolves statically instead
-        // of deferring the whole overload set to a runtime value pick.
+        // A Kotlin Array is NOT an Iterable/Collection/Sequence for overload REFUTATION, whatever dispatch models.
         if (arrayVsCollectionParam(actual_head, param_erased_head)) {
             return .incompatible;
         }
     }
-    // A param head that resolves in its DECLARING class's scope can be
-    // proven by the class graph where the name-level classifier fails:
-    // `get(key: Key<E>)` inside CoroutineContext means the nested
-    // `CoroutineContext.Key`, and the actual's companion
-    // `ContinuationInterceptor.Key` extends it — same SIMPLE name, so
-    // the erased-head walk above never adjudicated them.
+    // The class graph can relate the actual to a param head resolved in its DECLARING class's scope.
     var scoped_related = false;
     if (self.staticTypeClassId(actual_erased)) |aid| {
         if (self.decl_sigs.get(fid.int())) |ds| {
@@ -389,11 +359,8 @@ pub fn staticGenericArgCompatibility(
     const param_args = overrideArgs(param);
     if (param_args.len == 0) return .compatible;
     const actual_args = overrideArgs(actual);
-    // A head-matching actual whose ARGS are absent (a derivation that
-    // kept only the head — `arrayOf("foo","g")` shapes as bare `Array`)
-    // still satisfies a parameter whose every argument is one of the
-    // callee's OWN inferable type parameters: kotlinc binds them by
-    // inference, and applicability is not instantiation proof.
+    // A head-matching actual whose ARGS are absent (an erased derivation) still satisfies a
+    // parameter whose arguments are all the callee's OWN type parameters: kotlinc infers them.
     if (actual_args.len == 0 and param_args.len != 0) {
         var all_own_tp = true;
         for (param_args) |pa| {
@@ -425,17 +392,8 @@ pub fn staticGenericArgCompatibility(
     return result;
 }
 
-/// Whether a STAR-ERASED parameter is satisfied by this argument on the
-/// head alone. The erasure convention says the arguments neither prove
-/// nor refute, so a `Collection<*>` slot is decided entirely by whether
-/// the argument's class is a `Collection` — which is exactly what
-/// Kotlin checks when it gives `set.addAll(collection)` to the member
-/// rather than the `Iterable` extension beside it.
-/// The mirror of `erasedHeadProves`: a star-erased slot the argument's
-/// head does NOT satisfy is a definite mismatch, so the member is not
-/// the target and the same-named extension beside it is. Restricted to
-/// heads the module KNOWS, so an unresolved or host-only name — whose
-/// hierarchy this module cannot see — never refutes.
+/// Whether a STAR-ERASED parameter is definitely NOT satisfied by this argument: under the
+/// erasure convention the head alone decides, and only heads this module knows may refute.
 pub fn erasedHeadRefutes(
     self: *const Module,
     erased: bool,
@@ -523,9 +481,7 @@ pub fn staticAliasHead(self: *const Module, ty: TypeRef) StaticAliasHead {
     return .{
         .name = current,
         .changed = changed,
-        // Alias metadata is currently keyed by simple name across the
-        // whole module universe, so it cannot prove which same-named
-        // package declaration a call-site type denotes.
+        // Alias metadata is keyed by simple name module-wide, so it cannot say which same-named package declaration a site denotes.
         .structure_lost = still_alias or changed,
     };
 }
@@ -576,8 +532,7 @@ pub fn staticBuiltinIdentity(
         return .no;
     }
     if (self.class_fqn_map != null) {
-        // Finalized module: lock-free read of the completed cache (see
-        // `uniqueClassIdBySimpleName`).
+        // Finalized module: lock-free read of the completed cache.
         if (self.unique_simple_cache_n == self.classes.items.len) {
             const info = self.unique_simple_cache.get(head) orelse return .yes;
             return if (info.non_kotlin) .ambiguous else .yes;
@@ -654,11 +609,8 @@ pub fn staticBoundProofComplete(
         self.staticTypeClassId(ty) != null;
 }
 
-/// Like `staticBoundProofComplete`, but for DISPROOF: a head-only bound
-/// record still names the one classifier the parameter is bounded by,
-/// and dropped bound ARGUMENTS only narrow a bound — they never add a
-/// supertype. Knowing the head is therefore enough to conclude that a
-/// failed subtype check against a concrete classifier is a real NO.
+/// `staticBoundProofComplete` for DISPROOF: dropped bound ARGUMENTS only narrow a bound and
+/// never add a supertype, so the head alone makes a failed subtype check a real NO.
 pub fn staticBoundProofHead(
     self: *const Module,
     bound: ModuleRegistry.TypeParamBound,
@@ -687,13 +639,8 @@ pub fn staticBoundProofHead(
         self.staticTypeClassId(ty) != null;
 }
 
-/// `staticTypeProofComplete` for the NEGATIVE direction only: consumers
-/// use it to turn a failed subtype check into `.incompatible`. A declared
-/// type parameter whose bound names its classifier (`T : Comparable<T>`,
-/// recorded head-only) is fully known for that purpose — kotlinc rules
-/// `Array<out Double>.minOrNull` out for an `Array<T>` receiver at the
-/// declaration, whatever T is later instantiated to. Gated by
-/// `KLIO_TP_DISPROOF` for single-binary A/B.
+/// `staticTypeProofComplete` for the NEGATIVE direction only, to turn a failed subtype check
+/// into `.incompatible`. A type parameter whose bound names its classifier qualifies.
 pub fn staticTypeDisproofComplete(
     self: *const Module,
     raw_ty: TypeRef,
@@ -738,9 +685,7 @@ pub fn staticReceiverCompatibility(
     const actual = actual_alias.name;
     const declared = declared_alias.name;
     if (actual.len == 0 or declared.len == 0) return .unknown;
-    // Exact generic inference needs one substitution environment shared
-    // by the receiver and every value argument. Until that environment is
-    // part of this proof, a declaration type parameter stays unresolved.
+    // A declaration type parameter stays unresolved: this proof carries no shared substitution environment.
     if (fid) |decl_id| {
         if (self.staticDeclTypeParam(decl_id, param)) return .unknown;
     }
@@ -774,11 +719,8 @@ pub fn staticReceiverCompatibility(
             if (actual_id != declared_id) return .incompatible;
         }
         if (staticTypeArgsEqual(receiver.args, param.args)) return .compatible;
-        // Unequal arguments are incompatible when at least one pair is
-        // provably disjoint in both subtype directions. This remains
-        // valid for invariant, covariant, and contravariant classifiers;
-        // one-way compatibility still needs declaration-site variance
-        // and therefore stays unknown.
+        // Unequal arguments refute only when a pair is provably disjoint in BOTH subtype directions,
+        // which holds under any variance; one-way compatibility needs declaration-site variance.
         if (receiver.args.len == param.args.len and receiver.args.len != 0) {
             for (receiver.args, param.args) |actual_arg, declared_arg| {
                 if (actual_arg.eql(declared_arg)) continue;
@@ -793,19 +735,12 @@ pub fn staticReceiverCompatibility(
                 }
             }
         }
-        // Variance and type-parameter substitution belong to the
-        // declared classifier. Other unequal generic arguments cannot
-        // prove compatibility without both.
+        // Other unequal generic arguments need variance and substitution, owned by the declared classifier.
         return .unknown;
     }
     if (param.args.len != 0) {
-        // Builtin hierarchy with matching arguments: a
-        // `MutableList<Int>` receiver satisfies a `List<Int>` bound
-        // through the table below, and equal args need no variance
-        // reasoning. Without this the non-star fallthrough returned
-        // `.unknown`, which refuted lexical local extensions on
-        // declared builtin receivers (`val l = mutableListOf<Int>()`
-        // then `fun List<Int>.f()` never bound).
+        // Builtin hierarchy with non-refuting arguments: a `MutableList<Int>` receiver satisfies a
+        // `List<Int>` bound through the table below, and equal args need no variance reasoning.
         if (self.staticBuiltinIdentity(receiver, actual) == .yes and
             staticBuiltinArgsNonRefuting(receiver.args, param.args))
         {
@@ -813,9 +748,7 @@ pub fn staticReceiverCompatibility(
                 if (std.mem.eql(u8, candidate, declared)) return .compatible;
             }
         }
-        // All-star arguments prove and refute nothing (the star-erasure
-        // convention): `List<String>` against `Collection<*>`
-        // adjudicates by HEAD alone below.
+        // All-star arguments prove and refute nothing (star erasure); the HEAD adjudicates below.
         var all_star = true;
         for (param.args) |pa| {
             if (!std.mem.eql(u8, pa.name, "*")) {
@@ -826,22 +759,14 @@ pub fn staticReceiverCompatibility(
         if (!all_star) return .unknown;
     }
     if (self.staticTypeClassId(receiver)) |actual_id| {
-        // An unqualified declared head means whatever the DECLARATION's
-        // own file scope says (a test file's private `Modifier` beside
-        // the shipped androidx one), so the decl-file resolution is the
-        // authoritative one; the module-unique lookup is the fallback
-        // for declarations with no recorded source.
+        // An unqualified declared head means whatever the DECLARATION's file scope says; the module-unique lookup is the fallback.
         const decl_scoped: ?ClassId = blk: {
             if (std.mem.findScalar(u8, param.name, '.') != null) break :blk null;
             const decl_id = fid orelse break :blk null;
             const decl_source = self.decl_span.get(decl_id.int()) orelse break :blk null;
             const decl_pkg = if (self.funcById(decl_id)) |df| df.package else "";
-            // Kotlin scope order: an exact import outranks the
-            // declaring package. The same-package FQN probe is what
-            // reaches a collision-mangled file-private classifier —
-            // its `class_index` entry carries the `$fN` mangle, so the
-            // simple-name candidates `classIdIndexed` ranks never
-            // contain it, but its FQN stays clean.
+            // Kotlin scope order: an exact import outranks the declaring package. The same-package FQN probe
+            // reaches a collision-mangled file-private classifier, whose `$fN` mangle keeps it out of the candidates.
             if (self.classIdExactImport(declared, decl_source.file)) |cid| break :blk cid;
             if (decl_pkg.len != 0 and declared.len < 200) {
                 var fqn_buf: [256]u8 = undefined;
@@ -867,10 +792,7 @@ pub fn staticReceiverCompatibility(
         }
     }
     if (actual_builtin == .ambiguous) return .unknown;
-    // The registered supertype chain is evidence the hardcoded builtin
-    // table lacks: `MutableCollection` IS a `Collection` through the
-    // shipped source hierarchy, and the blind refutation below held the
-    // whole removeAll/addAll member family.
+    // The registered supertype chain carries edges the builtin table lacks (`MutableCollection` IS a `Collection`).
     if (evidenceSubtypeCb(@ptrCast(@constCast(self)), actual, declared)) {
         return .compatible;
     }
@@ -881,10 +803,7 @@ pub fn staticReceiverCompatibility(
     return .incompatible;
 }
 
-/// Compare two concrete call-site types with the same identity-aware,
-/// nullability-aware proof used by member and extension resolution.
-/// Declaration-owned type parameters are supplied by the caller as
-/// unknown type heads and therefore remain conservative.
+/// Identity-aware, nullability-aware comparison of two concrete call-site types.
 pub fn staticTypeCompatibility(
     self: *const Module,
     actual: TypeRef,
@@ -951,8 +870,7 @@ pub fn scopedTypeAliasFqn(
         defer allocator.free(own);
         if (self.registry.type_alias_types.getKey(own)) |key| return key;
     } else if (self.registry.type_alias_types.getKey(name)) |key| {
-        // Default-package aliases register under their bare name — the
-        // dotted own-package probe above can never find them.
+        // Default-package aliases register under their bare name; the dotted own-package probe above cannot find them.
         return key;
     }
     if (file) |source_file| {
@@ -995,9 +913,8 @@ pub fn scopedTypeAliasFqn(
     return default_import;
 }
 
-/// Expand a source typealias using the imports and package of its exact
-/// reference site. The FQN-keyed alias registry keeps a same-simple-name
-/// alias from another package out of the proof.
+/// Expand a source typealias using the imports and package of its exact reference site. The
+/// FQN-keyed alias registry keeps a same-simple-name alias from another package out of the proof.
 pub fn resolveTypeAliasAt(
     self: *const Module,
     allocator: Allocator,
@@ -1091,12 +1008,7 @@ pub fn staticTypeIsSubtypeInner(
         const actual_args = overrideArgs(actual);
         const declared_args = overrideArgs(declared);
         if (declared_args.len == 0) return true;
-        // An argless actual on the SAME classifier is an erased
-        // derivation (`mutableListOf<Int>()` derives `MutableList`
-        // with the call-site argument dropped), not proof of a
-        // different instantiation — unknown arguments must not
-        // disprove, per this judgment's own convention for
-        // statically unresolvable evidence.
+        // An argless actual on the SAME classifier is an erased derivation, not a different instantiation.
         if (actual_args.len == 0) return true;
         if (actual_args.len != declared_args.len) return false;
         const class = if (declared_id) |id|
@@ -1146,14 +1058,8 @@ pub fn staticTypeIsSubtypeInner(
         return true;
     }
 
-    // The builtin collection hierarchy adjudicates before the module
-    // class walk: the stdlib pack's List/MutableList classes carry
-    // ids whose `classIdIsOrExtends` rows do not encode the builtin
-    // subinterface edges, so the walk below refuted
-    // `MutableList <: List<Int>` and dropped lexical local
-    // extensions on declared builtin receivers. Equal arguments need
-    // no variance reasoning; an argless actual is an erased
-    // derivation and must not disprove.
+    // The builtin collection hierarchy adjudicates before the module class walk: the stdlib pack's
+    // List/MutableList ids carry no `classIdIsOrExtends` edges for the builtin subinterfaces.
     if (self.staticBuiltinIdentity(actual, actual_head) == .yes and
         staticBuiltinArgsNonRefuting(overrideArgs(actual), overrideArgs(declared)))
     {
@@ -1212,8 +1118,7 @@ pub fn staticTypeIsSubtypeInner(
     return self.staticReceiverCompatibility(null, actual, declared) == .compatible;
 }
 
-/// Complete proof used to decide whether a statically typed receiver can
-/// bind a lexical local extension. Unknown evidence is not applicability.
+/// Complete subtype proof for binding a lexical local extension; unknown evidence is not applicability.
 pub fn staticTypeIsSubtype(
     self: *const Module,
     allocator: Allocator,
@@ -1225,12 +1130,8 @@ pub fn staticTypeIsSubtype(
     return self.staticTypeIsSubtypeInner(arena.allocator(), actual, declared, &.{}, 0);
 }
 
-/// Whether the builtin-hierarchy escapes may adjudicate by HEAD:
-/// every actual argument equals its declared counterpart, or is a
-/// bare unresolved type parameter (`MutableList<T>` — a factory
-/// return the deriver did not substitute; per the judgment's
-/// convention, statically unresolvable evidence must not disprove),
-/// or the actual is an erased argless derivation.
+/// Whether the builtin-hierarchy escapes may adjudicate by HEAD: every actual argument equals
+/// its declared counterpart, is a bare unresolved type parameter, or the actual is argless.
 pub fn staticBuiltinArgsNonRefuting(actual_args: []const TypeRef, declared_args: []const TypeRef) bool {
     if (actual_args.len == 0) return true;
     if (actual_args.len != declared_args.len) return false;
@@ -1412,10 +1313,8 @@ pub fn bindReceiverTypeParams(
     return true;
 }
 
-/// Applicability for a generic lexical extension receiver. The receiver
-/// pattern first binds the local declaration's type parameters, validates
-/// their upper bounds, then enters the ordinary subtype proof with the
-/// enclosing body's type-parameter bounds.
+/// Applicability for a generic lexical extension receiver: bind the local declaration's type
+/// parameters, validate their bounds, then enter the subtype proof with the body's bounds.
 pub fn staticGenericReceiverApplicable(
     self: *const Module,
     allocator: Allocator,
@@ -1427,12 +1326,8 @@ pub fn staticGenericReceiverApplicable(
     return self.staticGenericReceiverApplicableMode(allocator, actual, pattern, declared_params, actual_bounds, .prove);
 }
 
-/// Could-apply variant: a bound whose recorded form is INCOMPLETE (a
-/// head-only `Comparable` standing in for `Comparable<T>`) does not
-/// refute — kotlinc already accepted the declaration, and for a LOCAL
-/// extension nothing else can serve the call, so an unprovable bound
-/// must not make the sole candidate vanish. Prove callers keep
-/// declining on incomplete bounds through the wrapper above.
+/// Could-apply variant: an INCOMPLETE bound record (head-only `Comparable` standing in for
+/// `Comparable<T>`) does not refute, so the sole local candidate cannot vanish. `prove` still declines.
 pub fn staticGenericReceiverCouldApply(
     self: *const Module,
     allocator: Allocator,
@@ -1461,13 +1356,8 @@ pub fn staticGenericReceiverApplicableMode(
         const w = std.c.getenv("KLIO_GRA_TRACE") orelse break :blk false;
         break :blk std.mem.eql(u8, std.mem.span(w), staticTypeHead(actual.name));
     };
-    // The HEADS must relate before argument binding proves anything: a
-    // `Sequence<T>` receiver pattern never applies to an
-    // `Iterable<String>` actual — kotlinc drops the candidate outright —
-    // and binding `T := String` head-blind committed
-    // `kotlin.sequences.minus` for an Iterable-typed receiver. A pattern
-    // head that is itself one of the declaration's parameters keeps the
-    // binding walk as the authority.
+    // The HEADS must relate before argument binding proves anything: a `Sequence<T>` pattern never
+    // applies to an `Iterable<String>`. A pattern head that IS a declared parameter defers to binding.
     {
         const pat_head = applicability.simpleName(staticTypeHead(std.mem.trimEnd(u8, pattern.name, "?")));
         var pat_is_param = false;
@@ -1501,12 +1391,7 @@ pub fn staticGenericReceiverApplicableMode(
             }
         }
     }
-    // A bare actual HEAD whose class relates to the pattern carries no
-    // arguments to bind the pattern's parameters against. It cannot
-    // DISPROVE the candidate — the head relation already held above —
-    // so the lenient mode keeps it and the runtime receiver decides.
-    // Refusing here turned a derived-but-argless receiver record into a
-    // dropped local extension and a runtime member miss.
+    // A bare actual HEAD has no arguments to bind against; the head relation already held, so it cannot DISPROVE.
     if (mode == .could_apply and actual.args.len == 0 and
         overrideArgs(actual).len == 0 and pattern.args.len != 0)
     {
@@ -1536,10 +1421,8 @@ pub fn staticGenericReceiverApplicableMode(
         std.debug.print(" params={d}\n", .{declared_params.len});
     }
     for (declared_params) |param| {
-        // The pattern head's own parameter IS the receiver: a missing
-        // binding entry must not silently skip its bound check, or a
-        // `where`-bounded receiver (`T.observe() where T : Node`)
-        // accepts any receiver at all.
+        // The pattern head's own parameter IS the receiver: a missing binding entry must not skip
+        // its bound check, or `T.observe() where T : Node` accepts any receiver at all.
         const bound_actual = bindingType(bindings.items, param.param) orelse
             (if (std.mem.eql(u8, param.param, staticTypeHead(pattern.name)))
                 actual
@@ -1563,13 +1446,8 @@ pub fn staticGenericReceiverApplicableMode(
         {
             continue;
         }
-        // A dependent bound whose referenced parameter has NO receiver
-        // binding constrains nothing here: in `<S, T : S>` on an
-        // `Iterable<T>` receiver, `S` appears only in value-parameter
-        // and return positions, so inference chooses it at the call
-        // (`S := T` always satisfies `T : S`), and kotlinc keeps the
-        // candidate — `runningReduce` on an `Iterable<String>` receiver
-        // must not vanish. `S`'s own bounds get their own loop entry.
+        // A dependent bound whose referenced parameter has NO receiver binding constrains nothing here:
+        // in `<S, T : S>` inference picks `S := T` at the call. `S`'s own bounds get their own loop entry.
         const required_bound = if (dependent_bound)
             bindingType(bindings.items, staticTypeHead(param.bound)) orelse
                 continue
@@ -1587,8 +1465,7 @@ pub fn staticGenericReceiverApplicableMode(
     return self.staticTypeIsSubtypeInner(a, actual, substituted, actual_bounds, 0);
 }
 
-/// Diagnostic: the last route staticArgCompatibility answered through,
-/// for the rex-arg row. Set on every return path below.
+/// Diagnostic: the route `staticArgCompatibility` last answered through. Set on every return path.
 pub threadlocal var sac_route: []const u8 = "-";
 
 pub fn staticArgCompatibility(
@@ -1600,9 +1477,7 @@ pub fn staticArgCompatibility(
 ) StaticCompatibility {
     sac_route = "-";
     const declared = staticTypeHead(param.name);
-    // A `*` in the PARAM position is the deriver's own erasure product
-    // (an unbound class param star-projected by the receiver record);
-    // it proves nothing and must not refute.
+    // A `*` in the PARAM position is the deriver's own erasure product; it neither proves nor refutes.
     if (std.mem.eql(u8, declared, "*")) {
         sac_route = "star-neutral";
         return .unknown;
@@ -1624,9 +1499,7 @@ pub fn staticArgCompatibility(
         if (std.mem.eql(u8, applicability.simpleName(staticTypeHead(bound)), "Any")) return .compatible;
         return .unknown;
     }
-    // A class-owned type parameter needs the receiver's class
-    // substitution environment, which this per-argument probe does not
-    // yet carry.
+    // A class-owned type parameter needs the receiver's class substitution environment, which this probe lacks.
     if (self.staticDeclTypeParam(fid, param)) {
         if (parseClassTypeParamIdentity(declared)) |identity| {
             const owner = if (identity.owner.int() < self.classes.items.len)
@@ -1647,10 +1520,8 @@ pub fn staticArgCompatibility(
                 }
             }
             if (required != null and arg.ty != null) {
-                // A bare type-parameter ARGUMENT is never definite: the
-                // caller's own `T` offered to the owner's `T` slot
-                // (EnumEntriesList.indexOf(element: T) from a generic
-                // body) can bind anything its bound admits.
+                // A bare type-parameter ARGUMENT is never definite: the caller's
+                // own `T` can bind anything its bound admits.
                 {
                     var ah = staticTypeHead(std.mem.trimEnd(u8, arg.ty.?.name, "?"));
                     if (parseClassTypeParamIdentity(ah)) |ident2| ah = ident2.param;
@@ -1662,11 +1533,8 @@ pub fn staticArgCompatibility(
                         }
                     }
                     if (tp_bound) |ab| {
-                        // Judge the parameter THROUGH its bound: every
-                        // instantiation of T satisfies the bound, so
-                        // bound <: required proves the argument, and a
-                        // provably disjoint bound/required pair refutes
-                        // it. Anything else is unknown.
+                        // Judge the parameter THROUGH its bound: bound <:
+                        // required proves it, a disjoint pair refutes it.
                         var barg_buf: [8]TypeRef = undefined;
                         var bref = TypeRef{ .name = ab.bound, .nullable = false, .args = &.{} };
                         if (ab.args.len != 0 and ab.args.len <= barg_buf.len) {
@@ -1681,14 +1549,8 @@ pub fn staticArgCompatibility(
                             required.?,
                             actual_bounds,
                         ) catch false) return .compatible;
-                        // Refutation-by-bound needs a bare `T` that
-                        // provably names the CALLER's own parameter (an
-                        // authoritative shape). A call-return-derived
-                        // `T` names the CALLEE's parameter; a
-                        // same-named caller bound (`fun <T :
-                        // CharSequence>` shadowing the class's `T :
-                        // Number`) then refuted the overload kotlinc
-                        // picks. Advisory shapes never refute here.
+                        // Refutation by bound needs a shape naming the CALLER's
+                        // parameter; advisory shapes name the CALLEE's and never refute.
                         if (arg.ty_authoritative and
                             self.staticReceiverCompatibility(null, bref, required.?) == .incompatible and
                             self.staticReceiverCompatibility(null, required.?, bref) == .incompatible)
@@ -1744,20 +1606,15 @@ pub fn staticArgCompatibility(
                 if (std.mem.eql(u8, staticTypeHead(ty.name), declared)) {
                     return .compatible;
                 }
-                // An integer literal IS a Long in a Long slot (kotlinc
-                // literal typing): `onTimeout(1000) { }` binds the
-                // `timeMillis: Long` overload outright — leaving it
-                // unknown withheld the sole survivor and deferred a
-                // call kotlinc resolves statically.
+                // An integer literal IS a Long in a Long slot, per
+                // kotlinc literal typing.
                 if (std.mem.eql(u8, staticTypeHead(ty.name), "Int") and
                     std.mem.eql(u8, declared, "Long"))
                 {
                     return .compatible;
                 }
             }
-            // Integer literal coercion and floating/integral literal
-            // distinctions need value-aware evidence. A different
-            // additive type head cannot reject this candidate.
+            // Literal coercion and the integral/floating distinction need value-aware evidence.
             return .unknown;
         }
         return switch (kind) {
@@ -1777,10 +1634,8 @@ pub fn staticArgCompatibility(
             return self.staticGenericArgCompatibility(fid, ty, param, 0);
         }
         if (typeContainsBoundParam(ty, actual_bounds)) {
-            // An UNBOUNDED type variable of the caller (`value: T` with
-            // bound `Any`) is only an `Any`: it never binds a concrete
-            // class parameter (`mode: Mode`), exactly as kotlinc rejects
-            // it. A bounded one is judged through its bound below.
+            // An UNBOUNDED type variable of the caller (bound `Any`) is only an `Any` and never binds
+            // a concrete class parameter. A bounded one is judged through its bound below.
             if (ty.args.len == 0) {
                 const ah0 = staticTypeHead(std.mem.trimEnd(u8, ty.name, "?"));
                 for (actual_bounds) |ab| {
@@ -1802,13 +1657,7 @@ pub fn staticArgCompatibility(
                 param,
                 actual_bounds,
             ) catch false) return .compatible;
-            // Judging the arg's bare `T` THROUGH the caller's bound is
-            // only sound when the shape provably names the caller's own
-            // parameter (authoritative). A call-return-derived `T` is the
-            // CALLEE's parameter; a same-named caller bound (`fun <T :
-            // CharSequence>` shadowing the class's `T : Number`) then
-            // refuted the overload kotlinc picks. Advisory shapes never
-            // refute.
+            // Sound only for an authoritative shape: a call-return-derived `T` names the CALLEE's parameter.
             if (arg.ty_authoritative and
                 self.staticTypeDisproofComplete(ty, actual_bounds) and
                 self.staticTypeDisproofComplete(param, actual_bounds))
@@ -1822,15 +1671,8 @@ pub fn staticArgCompatibility(
         {
             return .incompatible;
         }
-        // A generic pair judges through the args-aware prover: the
-        // head-only tail proved `List<String>` against an instantiated
-        // `List<List<String>>` (`Box<List<String>>.put(xs: List<T>)`)
-        // and the wrong overload won. Heads still adjudicate first
-        // inside; absent-args grace and projections apply there. Routed
-        // only when the PARAM carries arguments: an instantiated actual
-        // against a plain-headed param (`MutableState<Int>` vs `Any?` on
-        // the memoized `remember`) is the ordinary erased-head question,
-        // and the prover's class-table walk has no edge to `Any`.
+        // A PARAM carrying arguments routes through the args-aware prover, where heads still adjudicate
+        // first. A plain-headed param is the ordinary erased-head question, with no class edge to `Any`.
         if (param.args.len != 0) {
             sac_route = "generic-tail";
             return self.staticGenericArgCompatibility(fid, ty, param, 0);
@@ -1853,18 +1695,10 @@ pub fn staticArgCompatibility(
                 }
             }
         }
-        // Callable arity proves the FunctionN surface, but not a SAM
-        // conversion or an unknown callable's parameter/return types.
-        // A non-callable BUILTIN parameter, though, is a definite
-        // refutation: no lambda converts to Unit or a primitive, so
-        // `tryResume(value: T := Unit)` drops for the onCancellation
-        // argument and the file-private Boolean extension binds. User
-        // classes stay unknown (a fun-interface SAM target).
+        // Callable arity proves the FunctionN surface, not a SAM conversion. A non-callable BUILTIN
+        // param still refutes outright; user classes stay unknown (a fun-interface SAM target).
         if (nonCallableBuiltinHead(head)) return .incompatible;
-        // A resolvable NON-fun-interface class param is a definite
-        // refutation too: a lambda converts only to a function type or
-        // a fun interface (`propertyEquals(property: KProperty1<..>)`
-        // drops for a lambda argument; its getter sibling binds).
+        // A resolvable NON-fun-interface class param refutes too: a lambda converts only to a function type or a fun interface.
         if (lambdaRefuteOn()) {
             if (self.staticTypeClassId(.{ .name = head, .nullable = false, .args = &.{} })) |pcid| {
                 if (pcid.int() < self.classes.items.len and
@@ -1876,14 +1710,7 @@ pub fn staticArgCompatibility(
         }
         return .unknown;
     }
-    // The reverse refutation: a definitely NON-callable argument (a
-    // String/scalar static type, no lambda and no callable surface)
-    // never satisfies a FUNCTION-TYPE parameter, whatever its
-    // spelling — the parser's `<function>` tag, a spelled
-    // `(A) -> B`, or the erased `FunctionN` names. `url(urlString)`
-    // must drop the member `url(block)` so the String extension
-    // binds; without this the head named no registered class and the
-    // probe answered `.unknown`, letting the member survive.
+    // The reverse refutation: a definitely NON-callable argument never satisfies a FUNCTION-TYPE parameter, in any spelling.
     if (!arg.is_lambda and arg.lambda_arity == null and !arg.func_typed) {
         if (headIsFunctionSpelling(param.name)) {
             if (arg.ty) |aty| {
@@ -1907,11 +1734,8 @@ pub fn lambdaRefuteOn() bool {
     return S.val;
 }
 
-/// Whether a param-type NAME denotes a function type in any spelling:
-/// the parser's `<function>` tag, a spelled-out `(A) -> B`, or the
-/// erased `FunctionN`/`SuspendFunctionN`/`KFunctionN` names (digit
-/// tail required so a user class named `FunctionTable` never claims
-/// the surface).
+/// Whether a param-type NAME denotes a function type in any spelling: the parser's `<function>`
+/// tag, a spelled `(A) -> B`, or `FunctionN`/`SuspendFunctionN`/`KFunctionN` (digit tail required).
 pub fn headIsFunctionSpelling(name: []const u8) bool {
     if (std.mem.eql(u8, name, "<function>")) return true;
     if (std.mem.find(u8, name, "->") != null) return true;
@@ -1931,10 +1755,6 @@ pub fn headIsFunctionSpelling(name: []const u8) bool {
     return false;
 }
 
-/// Whether the params a trailing-callable mapping would SKIP — those
-/// between the last positional arg and the final parameter — all carry
-/// defaults. Kotlin fills that gap from defaults only; mapping across
-/// an undefaulted middle fabricates an applicability kotlinc rejects.
 pub fn bargTraceEnv() ?[]const u8 {
     const S = struct {
         var cached: bool = false;
@@ -1959,6 +1779,8 @@ pub fn dropTraceEnv() ?[]const u8 {
     return S.val;
 }
 
+/// Whether the params a trailing-callable mapping would SKIP, those between the last positional
+/// arg and the final parameter, all carry defaults. Kotlin fills that gap from defaults only.
 pub fn trailingGapDefaulted(params: []const Param, n_args: usize) bool {
     if (n_args == 0 or n_args > params.len) return true;
     var i = n_args - 1;
@@ -1968,8 +1790,7 @@ pub fn trailingGapDefaulted(params: []const Param, n_args: usize) bool {
     return true;
 }
 
-/// Builtin classifier heads no function value can convert to: the
-/// definite-refutation set for a callable argument.
+/// Builtin classifier heads no function value can convert to: the definite-refutation set.
 pub fn nonCallableBuiltinHead(head: []const u8) bool {
     const set = [_][]const u8{
         "Unit",  "Int",    "Long",  "Short",  "Byte",  "Boolean",
@@ -2015,10 +1836,7 @@ pub fn staticMemberArgsCompatibility(
     }
     if (args.len > params.len) return .incompatible;
     var bindings: std.ArrayList(TypeBinding) = .empty;
-    // The receiver's type arguments exist to instantiate the PARAMETER
-    // types below. A zero-argument call has none to instantiate, so a
-    // receiver that cannot project (a bare `Set` head from a lambda body)
-    // must not turn `iterator()` unknown.
+    // The receiver's type arguments instantiate the PARAMETER types below; a zero-argument call has none to instantiate.
     if (args.len != 0) if (receiver) |actual_receiver| {
         if (self.decl_sigs.get(fid.int())) |sig| {
             if (sig.enclosing_class) |owner| {
@@ -2048,13 +1866,8 @@ pub fn staticMemberArgsCompatibility(
         }
     };
     var result: StaticCompatibility = .compatible;
-    // A trailing lambda maps to the LAST parameter across DEFAULTED
-    // middles, exactly as the extension ranker and arity mapping do.
-    // Kotlin fills the gap from defaults only: without the default
-    // check the single callable of `cont.tryResume(onCancellation)`
-    // mapped past the member's undefaulted `(value, idempotent)` and
-    // the token-returning member outranked the Boolean extension —
-    // a Symbol reached a branch and every `select` rendezvous hung.
+    // A trailing lambda maps to the LAST parameter across DEFAULTED middles, exactly as the
+    // extension ranker and arity mapping do; Kotlin fills the gap from defaults only.
     const trailing_lambda_arg = args.len != 0 and
         (args[args.len - 1].is_lambda or args[args.len - 1].lambda_arity != null or
             args[args.len - 1].func_typed) and
@@ -2109,9 +1922,8 @@ pub fn extensionKeyEquivalent(a: [9]i32, b: [9]i32) bool {
     return std.mem.eql(i32, a[0..8], b[0..8]);
 }
 
-/// True when two function-typed parameter refs agree on everything a
-/// closure body can observe: same arity head and same argument types in
-/// every position but the LAST (the function's return).
+/// True when two function-typed parameter refs agree on everything a closure body can observe:
+/// same arity head and same argument types in every position but the LAST (the return).
 pub fn functionParamArgsAgree(a: TypeRef, b: TypeRef) bool {
     if (!std.mem.eql(u8, staticTypeHead(a.name), staticTypeHead(b.name))) return false;
     if (a.args.len != b.args.len or a.args.len == 0) return false;
@@ -2121,10 +1933,8 @@ pub fn functionParamArgsAgree(a: TypeRef, b: TypeRef) bool {
     return true;
 }
 
-/// A representative for LAMBDA-PARAMETER typing out of a tied candidate
-/// set: non-null only when every candidate declares the same parameter
-/// list up to function-return positions, so whichever overload the tie
-/// eventually resolves to hands the closures the same parameter types.
+/// A representative for LAMBDA-PARAMETER typing out of a tied candidate set: non-null only when
+/// every candidate declares the same parameter list up to function-return positions.
 pub fn tiedLambdaParamRep(self: *const Module, fids: []const FuncId) ?FuncId {
     if (fids.len < 2) return null;
     const first = self.funcById(fids[0]) orelse return null;

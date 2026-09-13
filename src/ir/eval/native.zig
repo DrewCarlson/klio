@@ -66,14 +66,8 @@ const spinDumpMaybe = ev_diag.spinDumpMaybe;
 const wallCapFire = ev_diag.wallCapFire;
 const writeFastU = ev_exec.writeFastU;
 
-/// The C transpiler's native-function surface (plans/c-transpiler-plan.md (git history)
-/// stage 2). A transpiled program registers per-fid C functions before the
-/// run starts; the frame loop then executes a registered function's blocks
-/// through the emitted C instead of the bytecode stream. The C code never
-/// touches interpreter state: every op is a call back into one of the
-/// `nativeOp*` helpers below (exported behind a C ABI by klio_rt), which
-/// are the stream loop's own arm bodies over a `NativeCtx` that carries
-/// the frame-loop locals for one activation.
+/// Compiled body for one fid, run by the frame loop in place of the bytecode stream. The
+/// emitted C touches no interpreter state: every op calls a `nativeOp*` helper over a `NativeCtx`.
 pub const NativeFn = *const fn (ctx: ?*anyopaque, entry_block: u32) callconv(.c) void;
 
 var native_mutex: runtime.SpinMutex = .{};
@@ -84,16 +78,12 @@ var native_table: std.AutoHashMapUnmanaged(u32, NativeEntry) = .empty;
 
 pub var native_any: std.atomic.Value(bool) = .init(false);
 
-/// Set at the first lookup: the table is complete from then on and reads take
-/// no lock. A registration after this point would race, so registration is
-/// refused once frozen (the generated entry always registers first).
+/// Set at the first lookup; a later registration would race the lock-free reads and is refused.
 var native_frozen: std.atomic.Value(bool) = .init(false);
 
-/// The frozen table, indexed by fid. Empty until the first lookup.
 var native_slots: []const ?NativeEntry = &.{};
 
-/// Flatten the registered table into a fid-indexed array and publish it. Called
-/// once, at the first lookup; registration is closed from here on.
+/// Flatten the registered table into a fid-indexed array and close registration.
 fn freezeNativeTable() void {
     native_mutex.lock();
     defer native_mutex.unlock();
@@ -110,13 +100,8 @@ fn freezeNativeTable() void {
     native_frozen.store(true, .release);
 }
 
-/// Registration happens from the transpiled binary's `main` before the
-/// program runs; the table is read-only afterwards. `fqn` is the emitted
-/// function's fully qualified name: fids are only stable when the running
-/// binary lowers the same program to the same module shape the emitter
-/// walked, so the lookup refuses an entry whose name does not match —
-/// a mismatched table silently falls back to full interpretation rather
-/// than ever running the wrong body.
+/// Registration runs from the transpiled binary's `main`, before the program. `fqn` guards the
+/// fid: on a mismatch the lookup falls back to interpretation rather than a wrong body.
 pub fn registerNative(fid: u32, f: NativeFn, fqn: []const u8) void {
     native_mutex.lock();
     defer native_mutex.unlock();
@@ -128,11 +113,6 @@ pub fn registerNative(fid: u32, f: NativeFn, fqn: []const u8) void {
 
 pub fn nativeFor(fid: u32, fqn: []const u8) ?NativeFn {
     if (!native_any.load(.acquire)) return null;
-    // Registration happens once, from the generated `klio_transpiled_register`,
-    // before the program runs. The first lookup freezes the table into a
-    // fid-indexed array, so every later activation is one bounds check and one
-    // load: the hash probe under a process-global lock, paid per activation,
-    // cost a transpiled compose program ~40% of its run time.
     if (!native_frozen.load(.acquire)) freezeNativeTable();
     const slots = native_slots;
     if (fid >= slots.len) return null;
@@ -146,12 +126,8 @@ pub fn nativeFor(fid: u32, fqn: []const u8) ?NativeFn {
     return e.f;
 }
 
-/// Scalar-replay leaf body (`kl_<fid>`): the whole function computed over
-/// (int64 value, genre) pairs — genres 0 Int, 1 Long, 2 Bool, 3 Unit,
-/// 4 Char. Returns nonzero with the result in (ret, retg); zero = the
-/// body bailed (non-scalar input, div guard, depth or edge trigger) and
-/// the caller re-runs the call through the ordinary path — sound because
-/// only statically PURE bodies are ever registered here.
+/// Scalar-replay leaf body (`kl_<fid>`) over (int64 value, genre) pairs: genres 0 Int, 1 Long,
+/// 2 Bool, 3 Unit, 4 Char, 5 Double, 6 Float, 7 opaque, 8 instance handle. Zero = bailed.
 pub const NativeLeafFn = *const fn (
     ctx: ?*anyopaque,
     ev: *NativeEdgeView,
@@ -164,14 +140,8 @@ pub const NativeLeafFn = *const fn (
     auxg: [*]i32,
 ) callconv(.c) i32;
 
-/// A leaf's ctor-tail return (`*retg == leaf_ctor_tail_genre`): the body
-/// could not construct its result natively, so it hands back the site
-/// (`*ret` = block<<16 | inst index into the leaf FUNCTION's own IR) and
-/// the ctor's scalar arguments in `aux`/`auxg`. The gate constructs ONCE
-/// through the host with the inst's own names/static-heads — exact
-/// semantics including a throwing constructor, no re-run. A callee that
-/// may ctor-tail is only ever called in tail position (eligibility rule),
-/// so one shared aux buffer serves the whole native call chain.
+/// Ctor-tail return (`*retg == leaf_ctor_tail_genre`): `*ret` is block<<16 | inst index into
+/// the leaf's own IR and `aux`/`auxg` hold the ctor args, so the gate constructs ONCE, exactly.
 pub const leaf_ctor_tail_genre: i32 = 200;
 
 /// Zig mirror of the emitted C `klio_ctor_site` (see klio_rt.h).
@@ -182,8 +152,7 @@ pub const CtorSite = extern struct {
     memo: u64,
 };
 
-/// Threadlocal interp edge view for `tryLeafValues` (see the cache
-/// comment there); rebuilt only when the serving host changes.
+/// Threadlocal interp edge view, rebuilt only when the serving host changes.
 threadlocal var leaf_ev_cache: NativeEdgeView = undefined;
 
 threadlocal var leaf_ev_host: ?*anyopaque = null;
@@ -194,16 +163,12 @@ const NativeLeafEntry = struct { f: NativeLeafFn, fqn: []const u8 };
 
 var native_leaf_table: std.AutoHashMapUnmanaged(u32, NativeLeafEntry) = .empty;
 
-/// FQN-keyed leaves (a loaded leaf LIBRARY: bakes are not cross-process
-/// fid-stable, so a prebuilt library can only name bodies by fqn).
+/// FQN-keyed leaves: a prebuilt leaf library cannot use fids, which are not cross-process stable.
 var native_leaf_by_fqn: std.StringHashMapUnmanaged(NativeLeafFn) = .empty;
 
 var native_leaf_any: std.atomic.Value(bool) = .init(false);
 
-/// One character per declared param type, appended to a leaf's fqn so
-/// OVERLOADS (which share the fqn) can never serve each other's calls.
-/// Computed from the same Func data on both the emitting and the
-/// serving side, so the spellings agree by construction.
+/// One character per declared param type, appended to a leaf's fqn so OVERLOADS cannot alias.
 pub fn leafSigChar(ty: []const u8) u8 {
     const base = if (std.mem.findScalarLast(u8, ty, '.')) |d| ty[d + 1 ..] else ty;
     const eq = std.mem.eql;
@@ -218,13 +183,8 @@ pub fn leafSigChar(ty: []const u8) u8 {
     return 'o';
 }
 
-/// `fqn#<sig>` — the collision-proof registration key for `f`. A
-/// non-scalar param contributes its declared type HEAD, not just 'o':
-/// `Map.iterator`, `MutableMap.iterator`, and the identity
-/// `Iterator<T>.iterator() = this` all share
-/// `kotlin.collections.iterator` and an object receiver, and the
-/// single-char sig let the LAST registration win — the identity body
-/// served Map callers and returned the receiver map.
+/// `fqn#<sig>`, the collision-proof registration key: a non-scalar param contributes its declared
+/// type HEAD in braces, so same-fqn object-receiver overloads can never serve each other.
 pub fn leafKeyAlloc(gpa2: std.mem.Allocator, f: *const Func) ?[]u8 {
     var buf: std.ArrayList(u8) = .empty;
     buf.appendSlice(gpa2, f.fqn) catch return null;
@@ -276,7 +236,6 @@ test "leafKeyAlloc separates object-receiver overloads by type head" {
     try std.testing.expectEqualStrings("kotlin.collections.iterator#{Map}", a2);
 }
 
-/// Register a leaf by FQN alone (leaf-library loading).
 pub fn registerNativeLeafFqn(fqn: []const u8, f: NativeLeafFn) void {
     native_mutex.lock();
     defer native_mutex.unlock();
@@ -293,14 +252,6 @@ pub fn registerNativeLeaf(fid: u32, f: NativeLeafFn, fqn: []const u8) void {
     native_leaf_any.store(true, .release);
 }
 
-/// The scalar-replay leaf gate, shared by the transpiled program's
-/// native glue and the interpreter's call arm. Marshals scalar args,
-/// runs the registered `kl_` body, and unmarshals the result — a
-/// genre-200 ctor-tail constructs ONCE through the host with the site
-/// inst's own names/static-heads (exact, throw included). Returns null
-/// when the call is not leaf-served (no registration, non-scalar args,
-/// or the leaf bailed) — the caller falls through to the ordinary
-/// paths, which re-run the pure body exactly.
 var leaf_diag_serve = std.atomic.Value(u64).init(0);
 
 var leaf_diag_bail = std.atomic.Value(u64).init(0);
@@ -316,29 +267,19 @@ pub fn leafDiagDump() void {
 
 pub const LeafOutcome = union(enum) { val: Value, raise: EvalError };
 
-/// Value-level scalar-replay leaf gate shared by the framed call arm,
-/// the fused driver, and the transpiled program's native glue. Null =
-/// not leaf-served (no registration, non-scalar args, or a pure bail);
-/// the caller falls through to its ordinary path, which re-runs the
-/// pure body exactly. A genre-200 ctor-tail constructs ONCE through
-/// the host with the site inst's own names/static-heads — a throwing
-/// constructor comes back as `.raise`, exact, never re-run.
+/// Value-level scalar-replay leaf gate. Null = not leaf-served and the caller re-runs the pure
+/// body exactly; a genre-200 ctor-tail constructs ONCE through the host, never re-run.
 pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Module, cf: *const Func, args: []const Value, host: *H, nctx: ?*NativeCtx) Allocator.Error!?LeafOutcome {
     if (!native_leaf_any.load(.acquire)) return null;
     if (args.len > 8 or args.len != cf.params.len) return null;
 
-    // Per-Func route memo: the registry lookup (mutex + hash + fqn
-    // compare) priced every call by ~20% on a call-dense benchmark;
-    // the table is write-once, so one resolution is final.
+    // Per-Func route memo: the table is write-once, so one resolution is final.
     _ = leaf_diag_try.fetchAdd(1, .monotonic);
     const route = cf.leaf_route.load(.acquire);
     const klf: NativeLeafFn = switch (route) {
         0 => blk_r: {
-            // A symbol the link step settled onto a native binding (or a
-            // sibling redirect) never runs its lowered body — the leaf
-            // compiled that body, so serving it would bypass the host
-            // intrinsic (the clock stub __klio_time_systemMillis
-            // leaf-served 0). Checked once; the memo pins the verdict.
+            // A symbol the link step settled onto a native binding never runs its lowered body, so
+            // serving the leaf would bypass the host intrinsic. Checked once; the memo pins it.
             const runs_body = if (comptime @hasDecl(H, "funcRunsItsBody"))
                 host.funcRunsItsBody(cf.id)
             else
@@ -388,17 +329,13 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
                 argg[i] = 6;
             },
             .Instance => |inst| {
-                // Genre 8: a borrowed instance HANDLE (the raw cell — the
-                // caller's frame roots it and the GC never moves cells).
-                // Leaf field reads resolve through the view's field_route;
-                // any other op on genre 8 bails.
+                // Genre 8: a borrowed instance HANDLE, the raw cell, rooted by the caller's frame and
+                // never moved by the GC. Leaf field reads go through the view's field_route.
                 argv[i] = @bitCast(@as(u64, @intFromPtr(inst.cell)));
                 argg[i] = 8;
             },
             else => {
-                // Opaque cargo (genre 7): an unused receiver param rides
-                // through; every emitted op on genre > 6 bails, so a body
-                // that actually touches it re-runs interpreted.
+                // Genre 7: opaque cargo, and every emitted op on genre > 6 bails.
                 argv[i] = 0;
                 argg[i] = 7;
             },
@@ -412,12 +349,8 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         ev.type_route = &LeafTypeRoute(H).route;
         ev.statics_route = &LeafStaticsRoute(H).route;
     } else {
-        // Threadlocal cached interp edge view: every pointer in it is
-        // process- or thread-stable, so the per-call cost collapses to
-        // refreshing the two mode flags plus a host-identity check —
-        // the full 12-field build (four of them fn calls) priced every
-        // serve. The counter deliberately accumulates across calls;
-        // the guard only compares it against per-call thresholds.
+        // Threadlocal edge view: every pointer in it is process- or thread-stable, so a call refreshes
+        // only the mode flags. The counter accumulates across calls; the guard thresholds per call.
         if (leaf_ev_host != @as(?*anyopaque, @ptrCast(host))) {
             leaf_ev_cache = .{
                 .rare = &leafEdgeRareInterp,
@@ -447,9 +380,8 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
     const cctx: ?*anyopaque = if (nctx) |nc| @ptrCast(nc) else null;
     if (klf(cctx, evp, &argv, &argg, &rl, &rg, 0, &aux, &auxg) == 0) {
         _ = leaf_diag_bail.fetchAdd(1, .monotonic);
-        // Bail damper: a leaf that has NEVER served and keeps bailing is
-        // structural for this program's call shapes — stop attempting it.
-        // The served bit is sticky, so a genre-mixed fn stays enabled.
+        // Bail damper: a leaf that has NEVER served and keeps bailing is structural for this program's
+        // call shapes, so stop attempting it. The served bit is sticky, so a genre-mixed fn stays on.
         const probe = @constCast(cf).leaf_bail_probe.fetchAdd(1, .monotonic);
         if (probe & 0x8000_0000 == 0 and (probe & 0x7FFF_FFFF) >= 64) {
             @constCast(cf).leaf_route.store(1, .release);
@@ -508,9 +440,8 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
                 4 => .{ .Char = @intCast(aux[ai]) },
                 5 => .{ .Double = @bitCast(aux[ai]) },
                 6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(aux[ai]))))) },
-                // A genre-8 aux is a borrowed handle used as a ctor arg;
-                // the construction retains what it stores, so no retain
-                // here — the caller's frame roots it for the call.
+                // A genre-8 aux is a borrowed handle used as a ctor arg; the construction
+                // retains what it stores, and the caller's frame roots it for the call.
                 8 => .{ .Instance = .{ .cell = @ptrFromInt(@as(usize, @bitCast(aux[ai]))) } },
                 else => return null,
             };
@@ -536,8 +467,8 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         5 => .{ .Double = @bitCast(rl) },
         6 => .{ .Float = @bitCast(@as(u32, @truncate(@as(u64, @bitCast(rl))))) },
         8 => blk8: {
-            // A genre-8 handle coming BACK is a borrowed cell becoming an
-            // owned Value: retain before it escapes the call window.
+            // A genre-8 handle coming BACK is a borrowed cell becoming an owned
+            // Value: retain before it escapes the call window.
             const iv = Value{ .Instance = .{ .cell = @ptrFromInt(@as(usize, @bitCast(rl))) } };
             iv.retain();
             break :blk8 iv;
@@ -547,9 +478,6 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
     return .{ .val = v };
 }
 
-/// Frame-level wrapper over `tryLeafValues` for the framed call arm and
-/// the transpiled program's glue: args come straight from the frame's
-/// register file (they are Values already), the result writes the dst.
 pub fn tryLeafCall(comptime H: type, allocator: Allocator, frame: *Frame, c: anytype, host: *H, nctx: ?*NativeCtx) Allocator.Error!?Step {
     if (!native_leaf_any.load(.acquire)) return null;
     if (c.type_args.len != 0 or !argNamesAllNull(c.arg_names)) return null;
@@ -591,16 +519,8 @@ var native_expect_funcs: usize = 0;
 
 var native_expect_consts: usize = 0;
 
-/// The emitted operands (const ids, fids, register numbers) index the
-/// tables of the module the emitter walked. The fqn guard catches a
-/// shifted fid, but a frame can carry a module whose CONST pool differs
-/// while the function itself matches — a delegating anonymous-object
-/// module, or a run that rebuilt a different module shape — and a
-/// mismatched const id then reads garbage (or out of bounds). The
-/// emitted C registers the walked module's table sizes; a frame whose
-/// module carries LESS runs interpreted. Prefix bound, not equality:
-/// execution appends runtime-synthesized functions and constants to the
-/// program module, which leaves every emitted id valid.
+/// The emitted operands index the emitter's module tables, so a frame whose module carries
+/// FEWER funcs or consts runs interpreted. A prefix bound: execution only ever appends.
 pub fn setNativeModuleCheck(n_funcs: usize, n_consts: usize) void {
     native_expect_funcs = n_funcs;
     native_expect_consts = n_consts;
@@ -619,19 +539,14 @@ pub fn nativeModuleOk(module: *const Module) bool {
     return match;
 }
 
-/// What a native run left for the frame loop: the same exits the stream
-/// loop has. `term`/`goto` mirror `bc_term`/`bc_goto`, `brk` is the
-/// unwind break with `thrown`/`unwound` set, `ret` returns `ret_v`,
-/// `none` means the entry block was not compiled (fall back to the
-/// stream/walker for this block).
+/// The stream loop's own exits: `term`/`goto` mirror `bc_term`/`bc_goto`, `brk` is the unwind
+/// break with `thrown`/`unwound` set, `ret` returns `ret_v`, `none` means block not compiled.
 pub const NativeOutcome = enum(u8) { none, term, goto, brk, ret, oom };
 
 const NativeStep = enum { cont, brk, ret, oom };
 
-/// Recursive native call serving stops here and flat-parks instead; each
-/// recursive level stacks kf + glue + serve frames, so this must sit well
-/// under the C stack's capacity while staying above any realistic
-/// non-adversarial call chain.
+/// Recursive native serving stops here and flat-parks instead: each level stacks kf + glue +
+/// serve frames, so this sits well under the C stack while clearing any realistic call chain.
 pub const NATIVE_RECURSE_MAX_DEPTH: usize = 200;
 
 pub const NativeCtx = struct {
@@ -644,20 +559,14 @@ pub const NativeCtx = struct {
     thrown: *?Value,
     unwound: *?EvalError,
     ret_v: *EvalResult,
-    /// Host-typed glue (the frame loop instantiates these for its `H`):
-    /// run `execArmBinOp`/`execInst`/`execArmCall` + `afterStep` for the
-    /// inst at (block, idx).
+    /// Host-typed glue: run the inst at (block, idx) through its interpreter arm plus `afterStep`.
     arm_bin: *const fn (*NativeCtx, u32, u32) NativeStep,
     escape: *const fn (*NativeCtx, u32, u32) NativeStep,
     call: *const fn (*NativeCtx, u32, u32) NativeStep,
-    /// Resolve a `GetField` site to (class cell identity, stored slot) for
-    /// the receiver currently in its register, so the emitted C can read the
-    /// slot inline behind a class guard. Zero when the site is not a plain
-    /// stored read (custom accessor, non-instance receiver, unknown class).
+    /// Resolve a `GetField` site to (class cell identity, stored slot) so the emitted C can read the
+    /// slot inline behind a class guard. Zero when the site is not a plain stored read.
     field_route: *const fn (*NativeCtx, u32, u32, *u64, *i32) i32,
-    /// The same for a `SetField` site: a plain stored-slot verdict from the
-    /// interpreter's write memo, so the emitted C can store into the slot
-    /// behind a class guard (with the GC write barrier).
+    /// The same for a `SetField` site; the emitted C stores behind the GC write barrier.
     field_write_route: *const fn (*NativeCtx, u32, u32, *u64, *i32) i32,
     outcome: NativeOutcome = .none,
     out_block: u32 = 0,
@@ -682,12 +591,8 @@ pub fn NativeGlue(comptime H: type) type {
             const recv = frame.read(gf.receiver);
             if (recv != .Instance) return 0;
             const name = constStr(frame.module, gf.field) orelse return 0;
-            // The site memo's own verdict decides this, exactly as the
-            // frameless accessor serve reads it: only a PLAIN STORED slot
-            // (tag 1) may be read inline. A getter route, an outer-hop read
-            // or a delegated/lateinit property keeps the escape path, which
-            // is what forces a `by lazy` instead of handing back the
-            // delegate object.
+            // Only a PLAIN STORED slot (tag 1) may be read inline. A getter route, an outer-hop read or
+            // a delegated property keeps the escape path, which is what forces a `by lazy` to run.
             const claim = host.fieldSiteRoute(&recv, name) orelse return 0;
             if (claim.route & 3 != 1) return 0;
             const slot: usize = @intCast(claim.route >> 2);
@@ -696,16 +601,14 @@ pub fn NativeGlue(comptime H: type) type {
                 defer g.deinit();
                 const fields = g.get().fields.items;
                 if (slot >= fields.len) return 0;
-                // Re-verify by name, and decline the shapes the serve
-                // declines: a null slot may be an unset lateinit, and a
-                // Delegate must be read through its own protocol.
+                // Re-verify by name and decline what the serve declines: a null slot may
+                // be an unset lateinit, and a Delegate needs its own read protocol.
                 const fld = fields[slot];
                 if (!std.mem.eql(u8, fld.name, name) and
                     !H.sgetterNameMatches(name, fld.name)) return 0;
                 if (fld.value == .Null or fld.value == .Delegate) return 0;
-                // The identity the emitted C compares is the raw CELL
-                // pointer it reads out of `InstanceData.class`; `asPtr`
-                // would hand back the payload address instead.
+                // The identity the emitted C compares is the raw CELL pointer out of
+                // `InstanceData.class`; `asPtr` would hand back the payload address.
                 cls_out.* = @intFromPtr(g.get().class.cell);
             }
             slot_out.* = @intCast(slot);
@@ -738,28 +641,15 @@ pub fn NativeGlue(comptime H: type) type {
             const host: *H = @ptrCast(@alignCast(ctx.host));
             const frame = ctx.frame;
             const inst = &frame.func.blocks[block].insts[idx];
-            // Recursive serving stacks a full native+glue+serve slice per
-            // level, far heavier than an interpreter frame — past this
-            // depth the C stack would fault long before the eval-depth
-            // cap raises its catchable StackOverflow. Deep chains hand
-            // the call to the flat driver instead (the caller unwinds and
-            // resumes through the stream: slower, bounded).
+            // Recursive serving stacks a native + glue + serve slice per level, so past this depth the C
+            // stack faults before the eval-depth cap can raise StackOverflow. Deeper chains flat-park.
             const recurse_ok = ev_state.evtls.eval_depth < NATIVE_RECURSE_MAX_DEPTH;
-            // A monomorphic plain call whose callee LEAF-serves is
-            // answered in place — the same `leafExprServe` the
-            // interpreter's flat driver uses, without the full-frame
-            // recursive serve (which cost native calls 3x against the
-            // interpreter on fib). The gate mirrors execArmCall's fast
-            // path minus the shapes the leaf bank cannot take
-            // (extensions seed receivers; ambiguous fids re-resolve).
+            // A monomorphic plain call whose callee LEAF-serves is answered in place. The gate mirrors
+            // execArmCall's fast path minus what the leaf bank cannot take (extensions, ambiguous fids).
             if (recurse_ok) direct: {
                 const c = &inst.Call;
                 if (c.type_args.len != 0 or !argNamesAllNull(c.arg_names)) break :direct;
                 const cf = frame.module.funcById(c.func) orelse break :direct;
-                // Scalar-replay body (`kl_`): the whole call runs as direct
-                // C over (int64, genre) pairs when every argument is a
-                // scalar. A zero return is a pure bail — fall through to
-                // the ordinary paths, which re-run the call exactly.
                 if (tryLeafCall(H, ctx.allocator, frame, c, host, ctx) catch return .oom) |st| {
                     if (st == .cont) return .cont;
                     return glueAfter(ctx, st, inst, idx, block);
@@ -786,12 +676,8 @@ pub fn NativeGlue(comptime H: type) type {
                 }
             }
             const r = execArmCall(H, ctx.allocator, frame, &inst.Call, host, !recurse_ok) catch return .oom;
-            // A flat request whose callee LEAF-serves is answered in
-            // place: the flat driver would run the same
-            // `leafExprServe` after a full kf_ unwind + stream resume
-            // — the round trip cost native calls 3x against the
-            // interpreter on call-heavy code (fib). Identical serve,
-            // identical module choice, no unwind.
+            // A flat request whose callee LEAF-serves is answered in place: identical serve and module
+            // choice, without the kf_ unwind and stream resume the flat driver would pay for it.
             if (r == .flat_call) leaf: {
                 const req = frame.flat_call.?;
                 if (!leafReqServable(req)) break :leaf;
@@ -837,9 +723,7 @@ fn glueAfter(ctx: *NativeCtx, r: Step, inst: *const Inst, idx: u32, block: u32) 
     };
 }
 
-/// The activation's register file as raw bytes for the emitted C's
-/// inline scalar ops (the hot view). Stable for the whole activation:
-/// regs are sized once at frame construction and never reallocated.
+/// The activation's register file as raw bytes; regs are sized once, so the base is stable.
 pub fn nativeFrameRegs(ctx: *NativeCtx) [*]u8 {
     return @ptrCast(ctx.frame.regs.items.ptr);
 }
@@ -848,19 +732,13 @@ pub fn nativeOpTrace(ctx: *NativeCtx, file: u32, start: u32, end: u32) void {
     ctx.frame.cur_span = .{ .file = @enumFromInt(file), .start = start, .end = end };
 }
 
-/// The frame's `cur_span` storage as raw bytes, so the emitted C can
-/// inline the per-statement trace store (a plain 3×u32 + presence-tag
-/// write; no ownership). Stable for the activation — the frame is a
-/// field of the heap activation.
+/// The frame's `cur_span` as raw bytes for the emitted C's inline trace store; no ownership.
 pub fn nativeFrameSpanSlot(ctx: *NativeCtx) [*]u8 {
     return @ptrCast(&ctx.frame.cur_span);
 }
 
-/// The per-thread/global flag addresses the emitted C polls to inline
-/// the fused edge guard: the guard's slow work runs only when a trigger
-/// fires (`nativeOpEdgeRare`). Pointers are per-THREAD where the state
-/// is threadlocal, so the view is fetched at every activation entry —
-/// the same freshness rule as the register base.
+/// The flag addresses the emitted C polls to inline the fused edge guard, whose slow work runs
+/// only when a trigger fires. Per-THREAD pointers, so refetch at every activation entry.
 pub const NativeEdgeView = extern struct {
     counter: *u64,
     idle: *u64,
@@ -872,24 +750,17 @@ pub const NativeEdgeView = extern struct {
     always: u8,
     /// Rare-trigger handler for this view's context (see klio_rt.h).
     rare: *const fn (ctx: ?*anyopaque, reasons: u32) callconv(.c) i32,
-    /// Field-read route resolver for leaf genre-8 handles (see
-    /// klio_rt.h); null outside the leaf gates.
+    /// Field-read route resolver for leaf genre-8 handles; null outside the leaf gates.
     route_ctx: ?*anyopaque = null,
     field_route: ?*const fn (route_ctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8, cls48_out: *u64, slot_out: *i32) callconv(.c) i32 = null,
-    /// Instance-of verdict resolver for leaf genre-8 handles: 1 = the
-    /// receiver's class IS the named type, 2 = it is not, 0 = miss
-    /// (bail). The site binds the verdict to the receiver's class word.
+    /// Instance-of verdict for leaf genre-8 handles: 1 = the receiver's class IS the named type,
+    /// 2 = it is not, 0 = miss. The site binds the verdict to the receiver's class word.
     type_route: ?*const fn (route_ctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8) callconv(.c) i32 = null,
-    /// Static-member resolver for leaf genre-9 class handles (`owner`
-    /// is the emitted class-name literal): fills (value, genre) and
-    /// returns 1, or 0 to bail. Enum entries only — see
-    /// leafStaticMember.
+    /// Static-member resolver for genre-9 class handles: fills (value, genre); enum entries only.
     statics_route: ?*const fn (route_ctx: ?*anyopaque, owner: [*:0]const u8, name: [*:0]const u8, out_v: *i64, out_g: *i32) callconv(.c) i32 = null,
 };
 
-/// Per-host statics thunk for leaf bodies: a genre-9 class handle's
-/// member read resolves through the host's enum-entry table (the only
-/// borrow-safe static family) and marshals the entry like a leaf arg.
+/// Per-host statics thunk for leaf bodies: enum entries only, the one borrow-safe family.
 fn LeafStaticsRoute(comptime H: type) type {
     return struct {
         fn route(rctx: ?*anyopaque, owner: [*:0]const u8, name: [*:0]const u8, out_v: *i64, out_g: *i32) callconv(.c) i32 {
@@ -924,11 +795,7 @@ fn LeafStaticsRoute(comptime H: type) type {
     };
 }
 
-/// Per-host instance-of thunk for leaf bodies: rebuilds a borrowed
-/// Instance view over the raw cell and asks the host's own `is`
-/// predicate against a plain non-nullable classifier name (eligibility
-/// rejected everything else). 1 = yes, 2 = no; the site caches the
-/// verdict keyed to the receiver's class word.
+/// Per-host instance-of thunk for leaf genre-8 handles: 1 = yes, 2 = no, 0 = bail.
 fn LeafTypeRoute(comptime H: type) type {
     return struct {
         fn route(rctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8) callconv(.c) i32 {
@@ -942,10 +809,8 @@ fn LeafTypeRoute(comptime H: type) type {
     };
 }
 
-/// Per-host field-route thunk for leaf bodies: rebuilds a borrowed
-/// Instance view over the raw cell (no retain — the leaf's caller roots
-/// it) and asks the host's single-fill field-site claim. Only a PLAIN
-/// STORED slot resolves; everything else bails the leaf.
+/// Per-host field-route thunk: a borrowed Instance view over the raw cell (no retain, the
+/// leaf's caller roots it). Only a PLAIN STORED slot resolves; everything else bails.
 fn LeafFieldRoute(comptime H: type) type {
     return struct {
         fn route(rctx: ?*anyopaque, recv_cell: ?*anyopaque, name: [*:0]const u8, cls48_out: *u64, slot_out: *i32) callconv(.c) i32 {
@@ -961,10 +826,7 @@ fn LeafFieldRoute(comptime H: type) type {
             if (runtime.envOnce("KLIO_LEAF_ROUTE_TRACE") != null)
                 std.debug.print("[leaf-route] {s}: tag={d}\n", .{ std.mem.span(name), claim.route & 3 });
             if (claim.route & 3 == 2) {
-                // A GETTER route whose body is the canonical trivial
-                // accessor (`get() = _backing`) chases through to the
-                // backing field's stored slot — one level, exactly the
-                // accessorFastGet shape. Anything else bails the leaf.
+                // A GETTER route chases one level to the trivial accessor's backing slot.
                 if (comptime !@hasDecl(H, "hostModulePtr")) return 0;
                 const mod2 = host.hostModulePtr();
                 const gfid: u32 = @intCast(claim.route >> 2);
@@ -987,11 +849,8 @@ fn LeafFieldRoute(comptime H: type) type {
     };
 }
 
-/// Rare handler for the INTERPRETER's leaf gate: no NativeCtx exists,
-/// so a persistent condition (abandon request, pending GC, an expired
-/// test wall deadline) bails the leaf — the interpreted re-run reaches
-/// its own safe point and services it; the condition persisting is what
-/// makes the bail loop-free. A bare cadence tick continues natively.
+/// Rare handler for the INTERPRETER's leaf gate: with no NativeCtx, a persistent condition
+/// (abandon, pending GC, expired test deadline) bails the leaf, and persisting keeps it loop-free.
 fn leafEdgeRareInterp(ctx: ?*anyopaque, reasons: u32) callconv(.c) i32 {
     _ = ctx;
     if (reasons & 0x2 != 0 and runtime.shouldAbandon()) return 1;
@@ -1022,10 +881,8 @@ pub fn nativeEdgeView(ctx: *NativeCtx, out: *NativeEdgeView) void {
     };
 }
 
-/// Edge-guard slow path for the inlined edge: `reasons` says which
-/// trigger fired (bit 0 = counter cadence, bit 1 = abandon flags,
-/// bit 2 = gc pending, bit 3 = stress/always, bit 4 = idle cadence);
-/// the actions mirror `fusedEdgeGuard` exactly for those triggers.
+/// Edge-guard slow path: `reasons` bit 0 = counter cadence, 1 = abandon flags, 2 = gc pending,
+/// 3 = stress, 4 = idle cadence; the actions mirror `fusedEdgeGuard` for those triggers.
 pub fn nativeOpEdgeRare(ctx: *NativeCtx, reasons: u32) i32 {
     if (reasons & 0x2 != 0 and runtime.shouldAbandon()) {
         ctx.ret_v.* = errResult(.{ .Type = "daemon task abandoned at run boundary" });
@@ -1043,8 +900,7 @@ pub fn nativeOpEdgeRare(ctx: *NativeCtx, reasons: u32) i32 {
         }
     }
     if (reasons & 0x8 != 0) {
-        // Stress mode: run the full guard's gc arm (pending() carries the
-        // stress counters).
+        // Stress mode runs the full guard's gc arm (`pending()` carries the stress counters).
         if (runtime.gc.gc_enabled and runtime.gc.pending()) runtime.gc.safePoint();
         return 0;
     }
@@ -1116,10 +972,7 @@ pub fn nativeOpBin(ctx: *NativeCtx, block: u32, inst_idx: u32, kind: u32, dst: u
     }
 }
 
-/// A statically-bound `.Call` escape, served recursively so the emitted
-/// caller stays on the C stack (the callee's own emitted body engages
-/// inside the recursive activation). Same return contract as
-/// `nativeOpEscape`.
+/// A statically-bound `.Call` escape served recursively, keeping the emitted caller on the C stack.
 pub fn nativeOpCall(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
     if (runtime.envOnce("KLIO_NATIVE_TRACE") != null) {
         std.debug.print("[native-call] from={s} b{d} i{d}\n", .{ ctx.frame.func.fqn, block, inst_idx });
@@ -1142,10 +995,8 @@ pub fn nativeOpCall(ctx: *NativeCtx, block: u32, inst_idx: u32) i32 {
     }
 }
 
-/// Nonzero = the emitted function must return (outcome set on the ctx).
-/// Resolve a `GetField` site for the emitted C's inline read. Returns 1 with
-/// `cls_out`/`slot_out` filled when the site is a plain stored field on the
-/// receiver's current class; 0 leaves the site on the escape helper.
+/// Resolve a `GetField` site for the emitted C's inline read: 1 with `cls_out`/`slot_out` filled
+/// when the site is a plain stored field on the receiver's class, 0 leaves it on the escape.
 pub fn nativeOpFieldRoute(ctx: *NativeCtx, block: u32, inst_idx: u32, cls_out: *u64, slot_out: *i32) i32 {
     return ctx.field_route(ctx, block, inst_idx, cls_out, slot_out);
 }
@@ -1183,8 +1034,8 @@ pub fn nativeOpEdge(ctx: *NativeCtx) i32 {
     return 0;
 }
 
-/// Fused Branch: 1 = take the true edge, 0 = the false edge, 2 = return
-/// (non-Bool condition exits to the real terminator; edge-guard abort).
+/// Fused Branch: 1 = take the true edge, 0 = the false edge, 2 = return (a non-Bool condition
+/// exits to the real terminator; an edge-guard abort).
 pub fn nativeOpBr(ctx: *NativeCtx, block: u32, cond: u32) i32 {
     const cv = ctx.frame.regs.items.ptr[cond];
     if (cv != .Bool) {

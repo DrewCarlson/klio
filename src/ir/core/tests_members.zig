@@ -44,10 +44,7 @@ test "float nan does not collapse" {
     defer m.deinit(testing.allocator);
     _ = try m.internConst(testing.allocator, .{ .Double = std.math.nan(f64) });
     _ = try m.internConst(testing.allocator, .{ .Double = std.math.nan(f64) });
-    // Two interns of NaN compare equal under bit comparison when both
-    // share a bit pattern; the canonical quiet-NaN collapses to one
-    // entry. This guards that interning is total — it never traps on
-    // NaN.
+    // Interning is total: a NaN Double never traps, and a canonical quiet NaN collapses to one entry.
     try testing.expect(m.consts.items[0] == .Double);
 }
 
@@ -55,20 +52,15 @@ test "string consts are owned by the pool" {
     var m = Module.default(testing.allocator);
     defer m.deinit(testing.allocator);
 
-    // A caller-owned temporary that is freed right after interning. The
-    // pool must keep its own copy, so the stored slice cannot alias the
-    // freed buffer.
+    // The temporary is freed right after interning, so the pool must hold its own copy.
     const tmp = try testing.allocator.dupe(u8, "kotlin.math.abs");
     const id = try m.internConst(testing.allocator, .{ .String = tmp });
     testing.allocator.free(tmp);
 
     try testing.expect(m.consts.items[id.int()] == .String);
     try testing.expectEqualStrings("kotlin.math.abs", m.consts.items[id.int()].String);
-    // The stored copy is distinct memory from the freed temporary.
     try testing.expect(m.consts.items[id.int()].String.ptr != tmp.ptr);
 
-    // Interning an equal string dedups to the same id without leaking a
-    // second copy.
     const tmp2 = try testing.allocator.dupe(u8, "kotlin.math.abs");
     const id2 = try m.internConst(testing.allocator, .{ .String = tmp2 });
     testing.allocator.free(tmp2);
@@ -134,8 +126,7 @@ test "extension candidate index uses declaration metadata for bodyless headers" 
     try testing.expect(m.extCouldApply(a, "IntArray", "min", 0));
     try testing.expect(!m.extCouldApply(a, "String", "min", 0));
     try testing.expect(!m.extCouldApply(a, "IntArray", "max", 0));
-    // The extension declares no value parameters, so a one-argument call
-    // cannot select it and it cannot shadow a member of that name.
+    // An extension declaring no value parameters cannot be selected by a one-argument call, so it cannot shadow a member.
     try testing.expect(!m.extCouldApply(a, "IntArray", "min", 1));
 }
 
@@ -146,8 +137,7 @@ test "an unclaimed classifier header dispatches its bodied member virtually" {
     var m = Module.default(a);
     defer m.deinit(a);
 
-    // A reserved placeholder reads closed-and-final on every modifier
-    // whether the class is a final class or an unlowered interface.
+    // A reserved placeholder reads closed-and-final on every modifier.
     const owner = try m.reserveClass(a, "Sink", false);
     try testing.expect(m.classes.items[owner.int()].is_stub);
 
@@ -160,8 +150,7 @@ test "an unclaimed classifier header dispatches its bodied member virtually" {
         .has_body = true,
     });
 
-    // Reading the placeholder as a closed class binds the body by identity,
-    // and an implementing class's override never runs.
+    // Reading the placeholder as a closed class binds the body by identity, so an implementing class's override never runs.
     try testing.expectEqual(Module.MemberDispatch.virtual, m.dispatchForTarget(owner, accept).?);
 }
 
@@ -555,11 +544,8 @@ test "member resolution separates class and caller function bounds" {
         },
         .actual_type_param_bounds = &actual_bounds,
     });
-    // The caller's `T : CharSequence` proves nothing against the class's
-    // `T : Number` and refutes nothing either (one type can satisfy both
-    // bounds), so the single candidate commits only as DEFERRED — the
-    // runtime adjudicates. A `.virtual`/`.direct` result here means the
-    // two bound records were conflated into a false proof.
+    // The caller's `T : CharSequence` neither proves nor refutes the class's `T : Number`, since one type can
+    // satisfy both, so the single candidate commits only as DEFERRED and the runtime adjudicates.
     try testing.expect(resolved.target != null);
     try testing.expect(resolved.dispatch == .deferred);
 }
@@ -949,18 +935,13 @@ test "a redeclared interface slot reaches the body inherited beside it" {
     }
 
     try m.linkMethodSlots(a);
-    // The base family reaches the body, and the redeclaration's own slot must
-    // reach the SAME body rather than the bodyless header it inherits.
+    // A redeclaration's own slot must reach the same body as the base family, not the bodyless header it inherits.
     try testing.expectEqual(impl_del, m.methodSlotTarget(leaf, MethodSlotId.fromFunc(root_del)).?);
     try testing.expectEqual(impl_del, m.methodSlotTarget(leaf, MethodSlotId.fromFunc(redecl_del)).?);
-    // With no body anywhere in the family, the header stays as linked.
     try testing.expectEqual(redecl_del, m.methodSlotTarget(redecl, MethodSlotId.fromFunc(redecl_del)).?);
 
-    // Resolution over a redeclaration chain: equal-scoring redeclarations are
-    // one slot family, not an overload tie, and a zero-argument call has no
-    // parameter for an unprojectable bare receiver to turn unknown. Both
-    // wrong answers came back as `dispatch=deferred` with no target — the
-    // `Set.iterator()` shape.
+    // Equal-scoring redeclarations are one slot family, not an overload tie, and a zero-argument call has no
+    // parameter for an unprojectable bare receiver to turn unknown.
     const root_size = try pushTestFuncOpts(&m, a, "size", "sample.Root.size", "sample", 0, .{ .stub = true });
     const redecl_size = try pushTestFuncOpts(&m, a, "size", "sample.Redecl.size", "sample", 0, .{ .stub = true });
     for ([_]FuncId{ root_size, redecl_size }) |fid| m.funcs.items[fid.int()].kind = .instance_method;
@@ -984,9 +965,7 @@ test "a redeclared interface slot reaches the body inherited beside it" {
     try testing.expect(res.dispatch != .deferred);
     try testing.expectEqual(redecl_size, res.target.?);
 
-    // The GENERIC owner is where the bare receiver bites: `Set<E>` cannot be
-    // projected from a bare `Set` head, and that unknown must not defer a
-    // call with no parameters to instantiate.
+    // `Set<E>` cannot be projected from a bare `Set` head, and that unknown must not defer a parameterless call.
     const groot = try m.addClass(a, .{
         .id = ClassId.from(0),
         .name = "GRoot",
