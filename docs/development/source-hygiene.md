@@ -80,6 +80,32 @@ The parent's test block must call `refAllDecls` on each child by path.
 Referencing only the children the alias table happens to name left the ir
 module running 162 of its 258 tests.
 
+## Breaking a function down
+
+The instrument that matters is `scripts/token_multiset_check.py`, not the
+test suite. Extracting a helper moves tokens between functions; it does not
+remove them. So compare the multiset of string literals, character literals,
+numbers and identifiers before and after, and account for every loss.
+
+A run of `tryInlineCallWithTypeArgs` dropped the
+`if (eql(member.name.name, "invoke"))` guard while moving an arm into a
+helper, so that arm then ran for every member call. The commontest sweep
+passed. The ir module's 259 tests passed. All three itest suites passed.
+The token diff caught it, because `"invoke"` was present before and absent
+after.
+
+Losses that are legitimate and will show up in the report: a block label
+consumed by `break :label x` becoming `return x`; `var` where a local became
+a struct field; `continue` where a loop exit became a returned tag; `null`
+where `return null` became `return false`. A lost STRING literal is never
+routine. Either it was one of N identical copies collapsing into a shared
+helper, in which case prove the collapse is byte-identical at every call
+site, or it is a dropped condition.
+
+Where the code generates something, compare the generated artifact
+directly: the emitted C, the synthesized Kotlin, the JIT's gate-decision
+trace under `KLIO_JIT_DEBUG=1`. That is stronger than any test.
+
 ## Verification
 
 - `python3 scripts/comment_only_check.py <base-rev> [paths...]` proves a
