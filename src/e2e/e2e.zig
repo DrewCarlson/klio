@@ -16,7 +16,7 @@ fn applyRunDirective(io: std.Io, a: std.mem.Allocator, path: []const u8) void {
     var n: usize = 0;
     while (lines.next()) |line| : (n += 1) {
         if (n >= 12) break;
-        const at = std.mem.indexOf(u8, line, "Run with:") orelse continue;
+        const at = std.mem.find(u8, line, "Run with:") orelse continue;
         var it = std.mem.tokenizeAny(u8, line[at + "Run with:".len ..], " \t");
         while (it.next()) |arg| {
             if (std.mem.startsWith(u8, arg, "--language=")) {
@@ -34,7 +34,7 @@ const EXPECTED = "tests/corpus/expected";
 fn shardSkip(stem: []const u8) bool {
     const spec = std.c.getenv("KLIO_E2E_SHARD") orelse return false;
     const s = std.mem.span(spec);
-    const slash = std.mem.indexOfScalar(u8, s, '/') orelse return false;
+    const slash = std.mem.findScalar(u8, s, '/') orelse return false;
     const k = std.fmt.parseInt(u64, s[0..slash], 10) catch return false;
     const n = std.fmt.parseInt(u64, s[slash + 1 ..], 10) catch return false;
     if (n == 0) return false;
@@ -86,7 +86,7 @@ fn runCorpus(jit_on: bool) !void {
         const base = std.fs.path.basename(kt);
         const stem = base[0 .. base.len - ".kt".len];
         if (std.c.getenv("KLIO_E2E_FILTER")) |f| {
-            if (std.mem.indexOf(u8, stem, std.mem.span(f)) == null) continue;
+            if (std.mem.find(u8, stem, std.mem.span(f)) == null) continue;
         }
         if (shardSkip(stem)) continue;
         if (std.c.getenv("KLIO_E2E_TRACE") != null) std.debug.print("e2e RUN {s} (jit={})\n", .{ stem, jit_on });

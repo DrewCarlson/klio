@@ -271,7 +271,7 @@ fn flagValue(
 }
 
 fn parseInclude(val: []const u8) Include {
-    if (std.mem.lastIndexOfScalar(u8, val, ':')) |colon| {
+    if (std.mem.findScalarLast(u8, val, ':')) |colon| {
         return .{ .path = val[0..colon], .mount = val[colon + 1 ..] };
     }
     return .{ .path = val, .mount = "" };
@@ -342,7 +342,7 @@ fn bundle(gpa: Allocator, opts: *Options) u8 {
 
     var requested = RequestedFeatures.init(gpa);
     for (opts.feature_specs.items) |spec| {
-        const slash = std.mem.indexOfScalar(u8, spec, '/') orelse {
+        const slash = std.mem.findScalar(u8, spec, '/') orelse {
             io.printStderr(gpa, "error: --feature `{s}` must be `<pack>/<feature>`\n", .{spec});
             return 2;
         };
@@ -727,7 +727,7 @@ pub fn shimFileName(target: []const u8) []const u8 {
 /// `runApp` is the only windowing entrypoint in `klio.compose.ui`.
 fn programOpensWindow(texts: [][]const u8) bool {
     for (texts) |t| {
-        if (std.mem.indexOf(u8, t, "runApp") != null) return true;
+        if (std.mem.find(u8, t, "runApp") != null) return true;
     }
     return false;
 }
@@ -737,7 +737,7 @@ const ShimWindowSupport = enum { ok, stub, unknown };
 /// The shim's baked windowing-backend marker, emitted by `skia_shim.cpp`.
 fn skiaWindowSupport(shim: []const u8) ShimWindowSupport {
     const marker = "klio-win-backend:";
-    const idx = std.mem.indexOf(u8, shim, marker) orelse return .unknown;
+    const idx = std.mem.find(u8, shim, marker) orelse return .unknown;
     const start = idx + marker.len;
     var end = start;
     while (end < shim.len and isTagChar(shim[end])) : (end += 1) {}

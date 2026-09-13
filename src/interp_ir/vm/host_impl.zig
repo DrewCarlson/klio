@@ -23,7 +23,7 @@ threadlocal var startup_inits_active: bool = false;
 
 /// Properties whose startup turn came and deferred to on-access driving, so they keep
 /// the drive path. Holds run-stable `top_level_props` name slices for the window only.
-threadlocal var startup_deferred: std.ArrayListUnmanaged([]const u8) = .empty;
+threadlocal var startup_deferred: std.ArrayList([]const u8) = .empty;
 
 /// Set by `vmRunBody` around the in-order top-level init loop.
 pub fn setStartupInitsActive(active: bool) void {
@@ -74,12 +74,12 @@ fn typedDefaultValue(kind: build.TypedDefault) ?Value {
 
 /// Top-level property initializers executing on this thread, which breaks init cycles.
 /// Keys are program-image-owned slices, so an entry outlives a borrowed `name`.
-threadlocal var in_progress: std.ArrayListUnmanaged([]const u8) = .empty;
+threadlocal var in_progress: std.ArrayList([]const u8) = .empty;
 
 /// FileIds whose top-level `<clinit>` is running on this thread. Kotlin initializes
 /// top-level `val`s per FILE, lazily on first access: a prop whose file clinit already
 /// runs takes the declared-type default, one whose clinit has not started is driven.
-threadlocal var in_progress_files: std.ArrayListUnmanaged(u32) = .empty;
+threadlocal var in_progress_files: std.ArrayList(u32) = .empty;
 
 fn inProgressFileContains(file: u32) bool {
     for (in_progress_files.items) |f| {

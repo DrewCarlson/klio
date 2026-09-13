@@ -339,7 +339,7 @@ pub fn builtinBridgeDefault(self: *VmHost, receiver: *const Value, f: *const Fun
     // `ConcurrentSet<Key : Any>.contains(element: Key)`) takes every
     // argument; `Any` excludes only null.
     var head = std.mem.trimEnd(u8, pty.name, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (head.len == 0 or head[0] == '#' or ir.parseClassTypeParamIdentity(head) != null) return null;
     {
         const mg = self.module.borrow();

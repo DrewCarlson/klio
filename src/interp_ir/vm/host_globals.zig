@@ -272,7 +272,7 @@ pub fn ensureObjectSingleton(self: *VmHost, raw_name: []const u8) Allocator.Erro
                 return .{ .ok = inst };
             }
             // A companion's `outer` is its enclosing class, for its statics.
-            if (std.mem.indexOf(u8, name, "$Companion$")) |sep| {
+            if (std.mem.find(u8, name, "$Companion$")) |sep| {
                 const outer_name = name[0..sep];
                 const outer_def: ?ObjRef(ClassDef) = blk: {
                     const cg = self.classes.borrow();
@@ -396,7 +396,7 @@ pub fn ensureObjectSingletonById(self: *VmHost, class_id: ir.ClassId) Allocator.
                 clearObjectState(self, fqn);
                 return .{ .ok = inst };
             }
-            if (std.mem.indexOf(u8, simple, "$Companion$")) |sep| {
+            if (std.mem.find(u8, simple, "$Companion$")) |sep| {
                 const outer_name = simple[0..sep];
                 const outer_def: ?ObjRef(ClassDef) = blk: {
                     const cg = self.classes.borrow();
@@ -477,7 +477,7 @@ fn restashObjectCause(self: *VmHost, raw_name: []const u8, cause: Value) void {
 /// An enum's companion initializes last in the enum's own initialization, so
 /// a first access through it initializes the enum and its entries first.
 fn enumOwnerInitForCompanion(self: *VmHost, name: []const u8) Allocator.Error!?EvalError {
-    const sep = std.mem.indexOf(u8, name, "$Companion$") orelse return null;
+    const sep = std.mem.find(u8, name, "$Companion$") orelse return null;
     const owner_name = name[0..sep];
     const owner: ObjRef(ClassDef) = blk: {
         const cg = self.classes.borrow();
@@ -566,7 +566,7 @@ pub fn enumInitDone(cdef: ObjRef(ClassDef)) bool {
 }
 
 fn enumSimpleName(fqn: []const u8) []const u8 {
-    return if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
+    return if (std.mem.findScalarLast(u8, fqn, '.')) |dot| fqn[dot + 1 ..] else fqn;
 }
 
 fn buildEnumClass(self: *VmHost, cdef: ObjRef(ClassDef), enum_fqn: []const u8) Allocator.Error!?EvalError {
@@ -1318,7 +1318,7 @@ fn bareGlobalFnVisible(self: *VmHost, m: *const Module, fid: FuncId, name: []con
 /// returning the shadowed global for restore, as `callFuncTyped` does.
 pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name_in: []const u8) ?Value {
     // A generic spelling resolves by head, a nullable one by the class named.
-    const arg_head = if (std.mem.indexOfScalar(u8, arg_name_in, '<')) |lt| arg_name_in[0..lt] else arg_name_in;
+    const arg_head = if (std.mem.findScalar(u8, arg_name_in, '<')) |lt| arg_name_in[0..lt] else arg_name_in;
     const arg_name = std.mem.trimEnd(u8, arg_head, "?");
     const cls_value: ?Value = blk: {
         const cg = self.classes.borrow();
@@ -1344,7 +1344,7 @@ pub fn bindTypeParamGlobal(self: *VmHost, tp_name: []const u8, arg_name_in: []co
 /// Returns the key's previous value; null when the spelling has no arguments.
 pub fn bindTypeParamSpelling(self: *VmHost, allocator: Allocator, tp_name: []const u8, arg_name_in: []const u8) ?struct { key: []const u8, prev: ?Value } {
     // The class binding carries neither type arguments nor nullability.
-    if (std.mem.indexOfScalar(u8, arg_name_in, '<') == null and !std.mem.endsWith(u8, arg_name_in, "?")) return null;
+    if (std.mem.findScalar(u8, arg_name_in, '<') == null and !std.mem.endsWith(u8, arg_name_in, "?")) return null;
     const key = std.fmt.allocPrint(allocator, "{s}<>", .{tp_name}) catch return null;
     const prev = blk: {
         const g = self.globals.borrow();
@@ -1505,7 +1505,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         const m = mg.get();
         // An extension twin shares the receiverless FQN (`Func.fqn` carries no
         // receiver segment) and a value reference cannot supply a receiver.
-        const by_fqn: ?FuncId = if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| pick: {
+        const by_fqn: ?FuncId = if (std.mem.findScalarLast(u8, name, '.')) |dot| pick: {
             for (m.funcsBySimpleName(name[dot + 1 ..])) |fid| {
                 const f = m.funcById(fid) orelse continue;
                 if (!std.mem.eql(u8, f.fqn, name)) continue;
@@ -1583,7 +1583,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
                 if (trace.enabled(name)) {
                     trace.emit("map=global_fqn name={s} fqn={s}", .{ name, fqn });
                 }
-                const tail = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
+                const tail = if (std.mem.findScalarLast(u8, fqn, '.')) |i| fqn[i + 1 ..] else fqn;
                 if (looksConst(tail)) {
                     const r = dispatchIntrinsic(self, allocator, fqn, func, &.{}) catch return null;
                     if (r == .ok) return r.ok;
@@ -1607,7 +1607,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
         return .{ .Class = def };
     }
 
-    if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+    if (std.mem.findScalar(u8, name, '.')) |dot| {
         const ty = name[0..dot];
         const member = name[dot + 1 ..];
         if (stdlib.primitive_companion_const(ty, member)) |v| {
@@ -1617,7 +1617,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
 
     // Package-qualified class reference: the class table is keyed by simple
     // name, so retry the trailing segment once every other probe missed.
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| {
+    if (std.mem.findScalarLast(u8, name, '.')) |dot| {
         const tail = name[dot + 1 ..];
         if (!std.mem.eql(u8, tail, name) and tail.len != 0) {
             const cg = self.classes.borrow();
@@ -1630,7 +1630,7 @@ pub fn lookupGlobal(self: *VmHost, name_in_raw: []const u8) ?Value {
 
     // `typealias Alias = Target`: follow the chain with a cycle guard.
     {
-        var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+        var seen: std.ArrayList([]const u8) = .empty;
         defer seen.deinit(allocator);
         var cur = name;
         while (true) {

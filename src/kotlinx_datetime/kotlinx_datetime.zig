@@ -86,7 +86,7 @@ fn systemTimeZoneId(allocator: std.mem.Allocator) std.mem.Allocator.Error![]cons
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     if (std.Io.Dir.readLinkAbsolute(io, "/etc/localtime", &buf)) |n| {
         const target = buf[0..n];
-        if (std.mem.indexOf(u8, target, "zoneinfo/")) |i| {
+        if (std.mem.find(u8, target, "zoneinfo/")) |i| {
             const id = target[i + "zoneinfo/".len ..];
             if (id.len != 0) return try allocator.dupe(u8, id);
         }
@@ -231,7 +231,7 @@ fn tzOffsetForLocal(allocator: std.mem.Allocator, id: []const u8, local_epoch: i
 }
 
 fn readZoneInfo(allocator: std.mem.Allocator, id: []const u8) ![]u8 {
-    if (id.len == 0 or id[0] == '/' or std.mem.indexOf(u8, id, "..") != null) {
+    if (id.len == 0 or id[0] == '/' or std.mem.find(u8, id, "..") != null) {
         return error.BadZone;
     }
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -503,7 +503,7 @@ fn availableZoneIds(ctx: *CallCtx) std.mem.Allocator.Error!EvalResult {
             }
             // Data files rather than zones: no directory separator, and either a
             // lowercase start or a dot.
-            return std.mem.indexOfScalar(u8, name, '.') != null;
+            return std.mem.findScalar(u8, name, '.') != null;
         }
         fn walk(
             a: std.mem.Allocator,

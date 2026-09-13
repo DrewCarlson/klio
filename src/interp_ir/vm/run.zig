@@ -291,7 +291,7 @@ pub fn vmRunThreadBlock(self: *Vm, block: *const Value) Allocator.Error!runtime.
     return r;
 }
 
-var gc_vms: std.ArrayListUnmanaged(*const Vm) = .empty;
+var gc_vms: std.ArrayList(*const Vm) = .empty;
 var gc_vm_root_registered = std.atomic.Value(bool).init(false);
 var gc_vms_lock = std.atomic.Value(bool).init(false);
 

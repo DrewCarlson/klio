@@ -162,7 +162,7 @@ pub fn resolveExtReceiverFqn(allocator: Allocator, mod: *const Module, c: *const
     if (c.func.params.len == 0) return null;
     const nm = std.mem.trimEnd(u8, c.func.params[0].ty.name, "?");
     // An already-qualified receiver reference resolves directly.
-    if (std.mem.indexOfScalar(u8, nm, '.') != null) {
+    if (std.mem.findScalar(u8, nm, '.') != null) {
         if (mod.classIdByFqn(nm)) |cid| return mod.classFqnById(cid);
     }
     const simple = simpleName(nm);
@@ -1428,11 +1428,11 @@ pub fn classCompanionForward(self: *VmHost, allocator: Allocator, receiver: *con
         var start: usize = 0;
         while (true) {
             if (comp.get(cfqn[start..])) |c| break :blk c;
-            const dot = std.mem.indexOfScalarPos(u8, cfqn, start, '.') orelse break;
+            const dot = std.mem.findScalarPos(u8, cfqn, start, '.') orelse break;
             start = dot + 1;
             // Never the bare simple name here: that key is a top-level
             // class's; the class's own name is tried next.
-            if (std.mem.indexOfScalarPos(u8, cfqn, start, '.') == null) break;
+            if (std.mem.findScalarPos(u8, cfqn, start, '.') == null) break;
         }
         if (comp.get(cname)) |c| break :blk c;
         if (comp.get(simple)) |c| break :blk c;

@@ -144,13 +144,13 @@ fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
         if (p.len == 0) continue;
         if (p[0] == '!') {
             any_neg = true;
-            if (p.len > 1 and std.mem.indexOf(u8, name, p[1..]) != null) return false;
+            if (p.len > 1 and std.mem.find(u8, name, p[1..]) != null) return false;
             continue;
         }
         any_pos = true;
         if (p[0] == '=') {
             if (std.mem.eql(u8, name, p[1..])) pos_hit = true;
-        } else if (std.mem.indexOf(u8, name, p) != null) {
+        } else if (std.mem.find(u8, name, p) != null) {
             pos_hit = true;
         }
     }
@@ -431,10 +431,10 @@ fn wallCapForTest(name: []const u8) i64 {
     const spec = runtime.envOnce("KLIO_TEST_WALL_CAP_FOR") orelse return wallCapSeconds();
     var it = std.mem.splitScalar(u8, spec, ',');
     while (it.next()) |entry| {
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
         const key = std.mem.trim(u8, entry[0..eq], " ");
         if (key.len == 0) continue;
-        if (std.mem.indexOf(u8, name, key) == null) continue;
+        if (std.mem.find(u8, name, key) == null) continue;
         return std.fmt.parseInt(i64, std.mem.trim(u8, entry[eq + 1 ..], " "), 10) catch continue;
     }
     return wallCapSeconds();

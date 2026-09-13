@@ -35,7 +35,7 @@ const Source = struct {
     is_receiver: bool,
 };
 
-const Level = std.ArrayListUnmanaged(Source);
+const Level = std.ArrayList(Source);
 
 /// A contextual callee's declared context parameters, keyed by simple name.
 const CalleeSig = struct {
@@ -53,7 +53,7 @@ const Ctx = struct {
     self: *Checker,
     callees: std.StringHashMap(CalleeSig),
     class_map: *std.StringHashMap(*const Class),
-    levels: std.ArrayListUnmanaged(Level) = .empty,
+    levels: std.ArrayList(Level) = .empty,
 
     fn pushLevel(c: *Ctx, srcs: []const Source) Allocator.Error!void {
         var lvl: Level = .empty;
@@ -291,7 +291,7 @@ fn subtypeOf(self: *Checker, a: []const u8, b: []const u8) bool {
     if (std.mem.eql(u8, bt, "Any")) return true;
     var seen = std.StringHashMap(void).init(self.allocator);
     defer seen.deinit();
-    var stack: std.ArrayListUnmanaged([]const u8) = .empty;
+    var stack: std.ArrayList([]const u8) = .empty;
     defer stack.deinit(self.allocator);
     stack.append(self.allocator, at) catch return false;
     while (stack.pop()) |cur| {
@@ -318,7 +318,7 @@ fn walkDecl(ctx: *Ctx, d: *const Decl) Allocator.Error!void {
         .Property => |p| try walkProperty(ctx, p, null),
         .Class => |*c| try walkClass(ctx, c),
         .Object => |*o| {
-            var srcs: std.ArrayListUnmanaged(Source) = .empty;
+            var srcs: std.ArrayList(Source) = .empty;
             defer srcs.deinit(ctx.self.allocator);
             try srcs.append(ctx.self.allocator, .{ .ty = o.name.name, .is_receiver = true });
             try ctx.pushLevel(srcs.items);
@@ -331,7 +331,7 @@ fn walkDecl(ctx: *Ctx, d: *const Decl) Allocator.Error!void {
 
 fn walkClass(ctx: *Ctx, c: *const Class) Allocator.Error!void {
     // `this` is an outer level for every member body.
-    var srcs: std.ArrayListUnmanaged(Source) = .empty;
+    var srcs: std.ArrayList(Source) = .empty;
     defer srcs.deinit(ctx.self.allocator);
     try srcs.append(ctx.self.allocator, .{ .ty = c.name.name, .is_receiver = true });
     try ctx.pushLevel(srcs.items);
@@ -351,7 +351,7 @@ fn walkClass(ctx: *Ctx, c: *const Class) Allocator.Error!void {
 
 /// Its extension receiver and every context parameter share one level.
 fn ownLevelSources(self: *Checker, receiver: ?[]const u8, cps: []const ContextParam) Allocator.Error![]Source {
-    var srcs: std.ArrayListUnmanaged(Source) = .empty;
+    var srcs: std.ArrayList(Source) = .empty;
     if (receiver) |r| try srcs.append(self.allocator, .{ .ty = r, .is_receiver = true });
     for (cps) |*cp| try srcs.append(self.allocator, .{ .ty = cp.ty.name.name, .is_receiver = false });
     return srcs.toOwnedSlice(self.allocator);
@@ -468,7 +468,7 @@ fn walkCall(ctx: *Ctx, c: anytype, call_span: Span) Allocator.Error!void {
     if (callee_name) |nm| {
         if (std.mem.eql(u8, nm, "context") and c.args.len >= 2 and c.args[c.args.len - 1] == .Lambda) {
             for (c.args[0 .. c.args.len - 1]) |*a| try walkExpr(ctx, a);
-            var srcs: std.ArrayListUnmanaged(Source) = .empty;
+            var srcs: std.ArrayList(Source) = .empty;
             defer srcs.deinit(ctx.self.allocator);
             for (c.args[0 .. c.args.len - 1]) |*a| {
                 const ty = staticTypeName(a) orelse "";

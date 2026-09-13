@@ -559,7 +559,7 @@ fn searchRegistry(gpa: std.mem.Allocator, query: []const u8, registry_override: 
     for (entries) |e| {
         const lid = std.ascii.allocLowerString(gpa, e.library_id) catch continue;
         defer gpa.free(lid);
-        if (std.mem.indexOf(u8, lid, lq) == null) continue;
+        if (std.mem.find(u8, lid, lq) == null) continue;
         any = true;
         io.printStdout(gpa, "{s: <32}  {s: <12}  abi {d}  {s}\n", .{ e.library_id, e.version, e.abi_version, e.relative_path });
     }
@@ -907,19 +907,29 @@ pub const LibraryToml = struct {
     application: ApplicationToml = .{},
 };
 
+/// The tables of a `klio.toml`. `[[deps]]`, `[[source]]` and `[[test]]` open a
+/// fresh entry per header; every other section assigns in place, so a repeated
+/// key overwrites the earlier one.
+const TomlSection = enum { none, library, dep, bindings, source, test_source, features, feature_def, application };
+
+/// The parse in progress: the entries the repeated sections accumulate, and
+/// the scalar tables assigned straight into `cfg`.
+const TomlReader = struct {
+    a: std.mem.Allocator,
+    cfg: LibraryToml = .{},
+    deps: std.ArrayList(DepEntry) = .empty,
+    bindings: std.ArrayList(BindingPair) = .empty,
+    sources: std.ArrayList(SourceRoot) = .empty,
+    tests: std.ArrayList(TestRoot) = .empty,
+    feature_defs: std.ArrayList(FeatureTomlDef) = .empty,
+    section: TomlSection = .none,
+};
+
 /// Minimal TOML reader for the `klio.toml` shape the builder consumes. Values are
 /// bare scalars, double-quoted strings, or single-line arrays of those; `#`
 /// comments and blank lines are skipped. Parses into `a`, error text on failure.
 pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryToml) {
-    var cfg = LibraryToml{};
-    var deps: std.ArrayList(DepEntry) = .empty;
-    var bindings: std.ArrayList(BindingPair) = .empty;
-    var sources: std.ArrayList(SourceRoot) = .empty;
-    var tests: std.ArrayList(TestRoot) = .empty;
-    var feature_defs: std.ArrayList(FeatureTomlDef) = .empty;
-
-    const Section = enum { none, library, dep, bindings, source, test_source, features, feature_def, application };
-    var section: Section = .none;
+    var r = TomlReader{ .a = a };
 
     var line_it = std.mem.splitScalar(u8, text, '\n');
     while (line_it.next()) |raw_line| {
@@ -929,97 +939,127 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
         // Fold a multi-line array or inline table into one logical line, as the
         // runtime loader's manifest reader does: absorb lines until one has `]`.
         if (line[0] != '[' and
-            std.mem.indexOfScalar(u8, line, '=') != null and
-            std.mem.indexOfScalar(u8, line, '[') != null and
-            std.mem.indexOfScalar(u8, line, ']') == null)
+            std.mem.findScalar(u8, line, '=') != null and
+            std.mem.findScalar(u8, line, '[') != null and
+            std.mem.findScalar(u8, line, ']') == null)
         {
-            var buf: std.ArrayList(u8) = .empty;
-            buf.appendSlice(a, line) catch return .{ .err = fail(a, "out of memory", .{}) };
-            while (line_it.next()) |cont_raw| {
-                const cont = stripComment(std.mem.trim(u8, cont_raw, " \t\r"));
-                if (cont.len == 0) continue;
-                buf.append(a, ' ') catch return .{ .err = fail(a, "out of memory", .{}) };
-                buf.appendSlice(a, cont) catch return .{ .err = fail(a, "out of memory", .{}) };
-                if (std.mem.indexOfScalar(u8, cont, ']') != null) break;
-            }
-            line = buf.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
+            line = foldLogicalLine(a, &line_it, line) catch return .{ .err = fail(a, "out of memory", .{}) };
         }
 
         if (line[0] == '[') {
-            if (std.mem.startsWith(u8, line, "[[")) {
-                const name = std.mem.trim(u8, line[2 .. line.len - 2], " \t");
-                if (std.mem.eql(u8, name, "deps")) {
-                    section = .dep;
-                    deps.append(a, .{}) catch return .{ .err = fail(a, "out of memory", .{}) };
-                } else if (std.mem.eql(u8, name, "source")) {
-                    section = .source;
-                    sources.append(a, .{ .root = "" }) catch return .{ .err = fail(a, "out of memory", .{}) };
-                } else if (std.mem.eql(u8, name, "test")) {
-                    section = .test_source;
-                    tests.append(a, .{}) catch return .{ .err = fail(a, "out of memory", .{}) };
-                } else {
-                    section = .none;
-                }
-            } else {
-                const name = std.mem.trim(u8, line[1 .. line.len - 1], " \t");
-                if (std.mem.eql(u8, name, "library")) {
-                    section = .library;
-                } else if (std.mem.eql(u8, name, "application")) {
-                    section = .application;
-                } else if (std.mem.eql(u8, name, "bindings")) {
-                    section = .bindings;
-                } else if (std.mem.eql(u8, name, "features")) {
-                    section = .features;
-                } else if (std.mem.startsWith(u8, name, "features.")) {
-                    section = .feature_def;
-                    feature_defs.append(a, .{ .name = a.dupe(u8, name["features.".len..]) catch "" }) catch
-                        return .{ .err = fail(a, "out of memory", .{}) };
-                } else {
-                    section = .none;
-                }
-            }
+            enterSection(&r, line) catch return .{ .err = fail(a, "out of memory", .{}) };
             continue;
         }
 
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse
+        const eq = std.mem.findScalar(u8, line, '=') orelse
             return .{ .err = fail(a, "malformed line in klio.toml: `{s}`", .{line}) };
         const key = std.mem.trim(u8, line[0..eq], " \t");
         const val = std.mem.trim(u8, line[eq + 1 ..], " \t");
-
-        switch (section) {
-            .none => {},
-            .library => assignLibrary(a, &cfg.library, key, val),
-            .dep => assignDep(a, &deps.items[deps.items.len - 1], key, val),
-            .bindings => {
-                const pair = parseBindingPair(a, key, val) catch return .{ .err = fail(a, "out of memory", .{}) };
-                bindings.append(a, pair) catch return .{ .err = fail(a, "out of memory", .{}) };
-            },
-            .source => assignSource(a, &sources.items[sources.items.len - 1], key, val),
-            .test_source => assignTest(a, &tests.items[tests.items.len - 1], key, val),
-            .features => {
-                if (std.mem.eql(u8, key, "default")) {
-                    cfg.features.default = parseStrArray(a, val) catch return .{ .err = fail(a, "out of memory", .{}) };
-                } else if (std.mem.startsWith(u8, std.mem.trimStart(u8, val, " \t"), "{")) {
-                    // Inline-table feature def: `json = { sources = [...] }`.
-                    const def = parseInlineFeatureDef(a, key, val) catch
-                        return .{ .err = fail(a, "out of memory", .{}) };
-                    feature_defs.append(a, def) catch return .{ .err = fail(a, "out of memory", .{}) };
-                }
-            },
-            .feature_def => assignFeatureDef(a, &feature_defs.items[feature_defs.items.len - 1], key, val),
-            .application => assignApplication(a, &cfg.application, key, val),
-        }
+        assignKey(&r, key, val) catch return .{ .err = fail(a, "out of memory", .{}) };
     }
 
-    cfg.deps = deps.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
-    // Sort bindings by FQN so the `[bindings]` table is order-independent.
-    std.mem.sort(BindingPair, bindings.items, {}, lessBindingPair);
-    cfg.bindings = bindings.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
-    cfg.source = sources.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
-    cfg.tests = tests.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
-    std.mem.sort(FeatureTomlDef, feature_defs.items, {}, lessFeatureDef);
-    cfg.features.defs = feature_defs.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
+    const cfg = finishTables(&r) catch return .{ .err = fail(a, "out of memory", .{}) };
     return .{ .ok = cfg };
+}
+
+/// Absorb the continuation lines of a multi-line array or inline table into
+/// one logical line, as the runtime loader's manifest reader does.
+fn foldLogicalLine(a: std.mem.Allocator, line_it: *std.mem.SplitIterator(u8, .scalar), line: []const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    try buf.appendSlice(a, line);
+    while (line_it.next()) |cont_raw| {
+        const cont = stripComment(std.mem.trim(u8, cont_raw, " \t\r"));
+        if (cont.len == 0) continue;
+        try buf.append(a, ' ');
+        try buf.appendSlice(a, cont);
+        if (std.mem.findScalar(u8, cont, ']') != null) break;
+    }
+    return buf.toOwnedSlice(a);
+}
+
+/// A section header selects where the following keys land; an unknown one
+/// parks the reader on `.none` so its keys are dropped.
+fn enterSection(r: *TomlReader, line: []const u8) !void {
+    if (std.mem.startsWith(u8, line, "[[")) {
+        return enterArraySection(r, std.mem.trim(u8, line[2 .. line.len - 2], " \t"));
+    }
+    return enterTableSection(r, std.mem.trim(u8, line[1 .. line.len - 1], " \t"));
+}
+
+/// `[[name]]`: opens one more entry of a repeated table.
+fn enterArraySection(r: *TomlReader, name: []const u8) !void {
+    if (std.mem.eql(u8, name, "deps")) {
+        r.section = .dep;
+        try r.deps.append(r.a, .{});
+    } else if (std.mem.eql(u8, name, "source")) {
+        r.section = .source;
+        try r.sources.append(r.a, .{ .root = "" });
+    } else if (std.mem.eql(u8, name, "test")) {
+        r.section = .test_source;
+        try r.tests.append(r.a, .{});
+    } else {
+        r.section = .none;
+    }
+}
+
+/// `[name]`: selects a single table. `[features.<name>]` opens that feature.
+fn enterTableSection(r: *TomlReader, name: []const u8) !void {
+    if (std.mem.eql(u8, name, "library")) {
+        r.section = .library;
+    } else if (std.mem.eql(u8, name, "application")) {
+        r.section = .application;
+    } else if (std.mem.eql(u8, name, "bindings")) {
+        r.section = .bindings;
+    } else if (std.mem.eql(u8, name, "features")) {
+        r.section = .features;
+    } else if (std.mem.startsWith(u8, name, "features.")) {
+        r.section = .feature_def;
+        try r.feature_defs.append(r.a, .{ .name = r.a.dupe(u8, name["features.".len..]) catch "" });
+    } else {
+        r.section = .none;
+    }
+}
+
+/// One `key = value` pair, routed to the table the last header selected.
+fn assignKey(r: *TomlReader, key: []const u8, val: []const u8) !void {
+    const a = r.a;
+    switch (r.section) {
+        .none => {},
+        .library => assignLibrary(a, &r.cfg.library, key, val),
+        .dep => assignDep(a, &r.deps.items[r.deps.items.len - 1], key, val),
+        .bindings => try r.bindings.append(a, try parseBindingPair(a, key, val)),
+        .source => assignSource(a, &r.sources.items[r.sources.items.len - 1], key, val),
+        .test_source => assignTest(a, &r.tests.items[r.tests.items.len - 1], key, val),
+        .features => try assignFeaturesKey(r, key, val),
+        .feature_def => assignFeatureDef(a, &r.feature_defs.items[r.feature_defs.items.len - 1], key, val),
+        .application => assignApplication(a, &r.cfg.application, key, val),
+    }
+}
+
+/// `[features]`: the default set, plus the inline-table feature definitions
+/// (`json = { sources = [...] }`) that can stand in for a `[features.json]`.
+fn assignFeaturesKey(r: *TomlReader, key: []const u8, val: []const u8) !void {
+    const a = r.a;
+    if (std.mem.eql(u8, key, "default")) {
+        r.cfg.features.default = try parseStrArray(a, val);
+    } else if (std.mem.startsWith(u8, std.mem.trimStart(u8, val, " \t"), "{")) {
+        try r.feature_defs.append(a, try parseInlineFeatureDef(a, key, val));
+    }
+}
+
+/// Seal the accumulated tables into the parsed config. Bindings and feature
+/// definitions are sorted so their tables are order-independent.
+fn finishTables(r: *TomlReader) !LibraryToml {
+    const a = r.a;
+    var cfg = r.cfg;
+    cfg.deps = try r.deps.toOwnedSlice(a);
+    std.mem.sort(BindingPair, r.bindings.items, {}, lessBindingPair);
+    cfg.bindings = try r.bindings.toOwnedSlice(a);
+    cfg.source = try r.sources.toOwnedSlice(a);
+    cfg.tests = try r.tests.toOwnedSlice(a);
+    std.mem.sort(FeatureTomlDef, r.feature_defs.items, {}, lessFeatureDef);
+    cfg.features.defs = try r.feature_defs.toOwnedSlice(a);
+    return cfg;
 }
 
 fn lessBindingPair(_: void, a: BindingPair, b: BindingPair) bool {
@@ -1166,7 +1206,7 @@ fn parseInlineFeatureDef(a: std.mem.Allocator, name: []const u8, val: []const u8
 /// included so it feeds `parseStrArray`. Null when the field is absent.
 fn sliceInlineArray(table: []const u8, field: []const u8) ?[]const u8 {
     var search_from: usize = 0;
-    while (std.mem.indexOfPos(u8, table, search_from, field)) |at| {
+    while (std.mem.findPos(u8, table, search_from, field)) |at| {
         const after = at + field.len;
         // Whole-key match only: `{`, `,` or space before, `=` after.
         const before_ok = at == 0 or table[at - 1] == '{' or table[at - 1] == ',' or table[at - 1] == ' ';
@@ -1176,8 +1216,8 @@ fn sliceInlineArray(table: []const u8, field: []const u8) ?[]const u8 {
             search_from = after;
             continue;
         }
-        const open = std.mem.indexOfScalarPos(u8, table, i, '[') orelse return null;
-        const close = std.mem.indexOfScalarPos(u8, table, open, ']') orelse return null;
+        const open = std.mem.findScalarPos(u8, table, i, '[') orelse return null;
+        const close = std.mem.findScalarPos(u8, table, open, ']') orelse return null;
         return table[open .. close + 1];
     }
     return null;
@@ -1195,7 +1235,7 @@ fn parseBindingPair(a: std.mem.Allocator, key: []const u8, val: []const u8) !Bin
         while (it.next()) |raw| {
             const field = std.mem.trim(u8, raw, " \t");
             if (field.len == 0) continue;
-            const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, field, '=') orelse continue;
             const fk = std.mem.trim(u8, field[0..eq], " \t");
             const fv = std.mem.trim(u8, field[eq + 1 ..], " \t");
             if (std.mem.eql(u8, fk, "host_symbol")) {
@@ -1736,7 +1776,7 @@ test "buildAstBundle fails loudly on a parse error" {
     // A broken file is reported as a fatal error naming the file, never silently
     // dropped.
     try std.testing.expect(err != null);
-    try std.testing.expect(std.mem.indexOf(u8, err.?, "bad/Broken.kt") != null);
+    try std.testing.expect(std.mem.find(u8, err.?, "bad/Broken.kt") != null);
     std.testing.allocator.free(err.?);
 }
 

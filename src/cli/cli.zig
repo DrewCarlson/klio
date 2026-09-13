@@ -529,7 +529,7 @@ fn addFeatureSpec(
     feature_specs: *std.ArrayList([]const u8),
     project_features: *std.ArrayList([]const u8),
 ) void {
-    if (std.mem.indexOfScalar(u8, v, '/') != null) {
+    if (std.mem.findScalar(u8, v, '/') != null) {
         feature_specs.append(gpa, v) catch {};
     } else {
         project_features.append(gpa, v) catch {};
@@ -751,7 +751,7 @@ fn perfOptValue(a: []const u8, args: []const []const u8, i: *usize) ?[]const u8 
 fn parseRequestedFeatures(gpa: std.mem.Allocator, specs: []const []const u8) RequestedFeatures {
     var out = RequestedFeatures.init(gpa);
     for (specs) |spec| {
-        if (std.mem.indexOfScalar(u8, spec, '/')) |slash| {
+        if (std.mem.findScalar(u8, spec, '/')) |slash| {
             const pack = std.mem.trim(u8, spec[0..slash], " \t");
             const feat = std.mem.trim(u8, spec[slash + 1 ..], " \t");
             const gop = out.getOrPut(pack) catch continue;

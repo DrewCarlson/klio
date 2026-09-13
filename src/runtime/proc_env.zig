@@ -14,7 +14,7 @@ pub fn getVar(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
         if (eq == 0) continue;
         if (std.mem.eql(u8, entry[0..eq], name)) {
             return try allocator.dupe(u8, entry[eq + 1 ..]);
@@ -56,7 +56,7 @@ fn putAllNulBlock(allocator: std.mem.Allocator, map: *std.process.Environ.Map) v
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
         if (eq == 0) continue;
         map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
     }

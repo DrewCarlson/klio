@@ -692,7 +692,7 @@ pub fn propagateInheritedDefaults(a: Allocator, module: *Module, func_defaults: 
             if (self_idx) |si| try consult.append(a, si);
             for (consult.items) |ai| {
                 const cn = module.classes.items[ai].name;
-                const cn_simple = if (std.mem.lastIndexOfScalar(u8, cn, '.')) |dot| cn[dot + 1 ..] else cn;
+                const cn_simple = if (std.mem.findScalarLast(u8, cn, '.')) |dot| cn[dot + 1 ..] else cn;
                 const bslots = module.registry.abstract_member_defaults.get(.{ .a = cn, .b = mname }) orelse
                     module.registry.abstract_member_defaults.get(.{ .a = cn_simple, .b = mname }) orelse continue;
                 if (merged == null) {

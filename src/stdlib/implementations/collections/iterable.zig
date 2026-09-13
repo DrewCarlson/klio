@@ -178,7 +178,7 @@ pub fn coll_iter_filter_not_null(ctx: *CallCtx) Error!EvalResult {
 const SumKind = enum { int, long, uint, ulong, double };
 
 fn sumKindFromTyName(name: []const u8) ?SumKind {
-    const simple = if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| name[i + 1 ..] else name;
+    const simple = if (std.mem.findScalarLast(u8, name, '.')) |i| name[i + 1 ..] else name;
     if (std.mem.eql(u8, simple, "Int")) return .int;
     if (std.mem.eql(u8, simple, "Long")) return .long;
     if (std.mem.eql(u8, simple, "UInt")) return .uint;

@@ -163,7 +163,7 @@ test "run reports an unknown subcommand" {
     var err_w = std.Io.Writer.fixed(&err_buf);
     const code = try run(testing.allocator, io, .{ .unknown = "frobnicate" }, &err_w);
     try testing.expectEqual(USAGE, code);
-    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "unknown subcommand: frobnicate") != null);
+    try testing.expect(std.mem.find(u8, err_w.buffered(), "unknown subcommand: frobnicate") != null);
 }
 
 test "build reports a missing kotlin checkout" {
@@ -176,5 +176,5 @@ test "build reports a missing kotlin checkout" {
     const cmd = Cmd{ .build = .{ .kotlin = "this/dir/does/not/exist", .out = "ignored" } };
     const code = try run(testing.allocator, io, cmd, &err_w);
     try testing.expectEqual(USAGE, code);
-    try testing.expect(std.mem.indexOf(u8, err_w.buffered(), "kotlin checkout not found") != null);
+    try testing.expect(std.mem.find(u8, err_w.buffered(), "kotlin checkout not found") != null);
 }

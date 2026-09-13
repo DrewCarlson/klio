@@ -148,7 +148,7 @@ fn buildCuratedSources(a: std.mem.Allocator, result: *PackError) std.mem.Allocat
 /// the placeholder is absent.
 fn stampKotlinVersion(a: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!?[]const u8 {
     const needle = stdlib_sources.KOTLIN_VERSION_PLACEHOLDER;
-    const idx = std.mem.indexOf(u8, bytes, needle) orelse return null;
+    const idx = std.mem.find(u8, bytes, needle) orelse return null;
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a, bytes[0..idx]);
     try out.appendSlice(a, stdlib_sources.KOTLIN_VERSION_STAMPED);

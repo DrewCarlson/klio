@@ -399,7 +399,7 @@ pub const Module = struct {
     /// Lowering-phase simple name → same-name `ClassId`s in `class_index`
     /// order (the scan's first-wins/tier-tie order). Names in `class_index`
     /// are immutable, so growth-counter top-up alone keeps this exact.
-    class_name_cache: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(ClassId)) = .empty,
+    class_name_cache: std.StringHashMapUnmanaged(std.ArrayList(ClassId)) = .empty,
     class_name_cache_n: usize = 0,
     /// Lowering-phase FQN → `ClassId` (or `class_id_ambiguous`). The
     /// stub-claim FQN rewrite patches this in place; an unpatchable case

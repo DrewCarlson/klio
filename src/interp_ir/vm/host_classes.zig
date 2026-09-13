@@ -55,7 +55,7 @@ pub fn isDeclaredClassNameFrom(self: *VmHost, name: []const u8, pkg: []const u8)
 pub fn isConcreteCastTarget(self: *VmHost, name: []const u8) bool {
     const n = std.mem.trimEnd(u8, name, "?");
     if (n.len == 0) return false;
-    if (std.mem.lastIndexOfScalar(u8, n, '.')) |dot| {
+    if (std.mem.findScalarLast(u8, n, '.')) |dot| {
         if (dot + 1 < n.len and isBuiltinTypeName(n[dot + 1 ..])) return true;
     }
     {
@@ -106,7 +106,7 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     // `null is T?` holds for any nullable type; `null is T` does not.
     if (value.* == .Null) return ty.nullable;
     // A local class is spelled `$lc<fn>` in lowered types, registered bare.
-    if (std.mem.indexOf(u8, ty.name, "$lc")) |lci| {
+    if (std.mem.find(u8, ty.name, "$lc")) |lci| {
         return instanceOf(self, value, .{ .name = ty.name[0..lci], .nullable = ty.nullable, .args = ty.args });
     }
 
@@ -276,8 +276,8 @@ pub fn instanceOf(self: *VmHost, value: *const Value, ty: TypeRef) bool {
     // name in the module table. A user Instance keeps the full dotted name, so the
     // identity walk below can reject another package's class.
     if (value.* != .Instance) {
-        if (std.mem.indexOfScalar(u8, ty.name, '.')) |_| {
-            if (std.mem.lastIndexOfScalar(u8, ty.name, '.')) |i| {
+        if (std.mem.findScalar(u8, ty.name, '.')) |_| {
+            if (std.mem.findScalarLast(u8, ty.name, '.')) |i| {
                 const last = ty.name[i + 1 ..];
                 const alt: TypeRef = .{ .name = last, .nullable = ty.nullable, .args = ty.args };
                 return instanceOf(self, value, alt);
@@ -713,7 +713,7 @@ fn synthLocalClassDef(self: *VmHost, allocator: Allocator, class: *const ast.Cla
 /// Resolve a dotted runtime-only supertype by aligned FQN suffix, preferring the
 /// least-nested match. Program declarations resolve through the module first.
 fn classByQualifiedSuffix(classes: *const ClassTable, qualified: []const u8) ?ObjRef(ClassDef) {
-    if (std.mem.indexOfScalar(u8, qualified, '.') == null) return null;
+    if (std.mem.findScalar(u8, qualified, '.') == null) return null;
     var best: ?ObjRef(ClassDef) = null;
     var best_len: usize = std.math.maxInt(usize);
     var it = classes.valueIterator();
@@ -1383,7 +1383,7 @@ fn allAsciiDigit(s: []const u8) bool {
 }
 
 fn lastSegment(fqn: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| return fqn[i + 1 ..];
+    if (std.mem.findScalarLast(u8, fqn, '.')) |i| return fqn[i + 1 ..];
     return fqn;
 }
 

@@ -66,7 +66,7 @@ const Server = struct {
             ir.fillMore() catch break;
             const data = ir.buffered();
             if (head_end == null) {
-                if (std.mem.indexOf(u8, data, "\r\n\r\n")) |idx| {
+                if (std.mem.find(u8, data, "\r\n\r\n")) |idx| {
                     head_end = idx + 4;
                     content_len = parseContentLength(data[0..idx]);
                 }
@@ -101,7 +101,7 @@ const Server = struct {
 fn parseContentLength(head: []const u8) usize {
     var it = std.mem.splitSequence(u8, head, "\r\n");
     while (it.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " "), "content-length")) continue;
         const v = std.mem.trim(u8, line[colon + 1 ..], " ");
         return std.fmt.parseInt(usize, v, 10) catch 0;

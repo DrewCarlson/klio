@@ -178,9 +178,9 @@ pub const EvalTls = struct {
     resuming: ?*ResumeFrames = null,
 
     /// Free-list of frame register buffers (see `acquireRegs`).
-    regs_pool: std.ArrayListUnmanaged([]Value) = .empty,
+    regs_pool: std.ArrayList([]Value) = .empty,
     /// Free-list of frame ARG/CAPTURE carrier buffers (see `acquireArgsCap`).
-    args_pool: std.ArrayListUnmanaged([]Value) = .empty,
+    args_pool: std.ArrayList([]Value) = .empty,
     /// Size-classed free-lists of arg/capture carriers, one bucket per entry
     /// of `ARGS_CLASS_CAPS` (see `acquireArgsCap`).
     args_class_pool: [ARGS_CLASS_CAPS.len]ArgsBucket = @splat(.{}),

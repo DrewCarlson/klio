@@ -161,7 +161,7 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
                     if (languageDisablesFeature(d.value)) reason = reason orelse "LANGUAGE:-feature";
                     c.language = d.value;
                 } else if ((std.mem.eql(u8, d.name, "IGNORE_BACKEND") or std.mem.eql(u8, d.name, "IGNORE_BACKEND_K2")) and
-                    std.mem.indexOf(u8, d.value, "ANY") != null)
+                    std.mem.find(u8, d.value, "ANY") != null)
                 {
                     // Muted on every backend under the current frontend; the
                     // K1 and multi-module spellings stay selected.
@@ -201,7 +201,7 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
             reason = reason orelse "non-kt-section";
             continue;
         }
-        if (std.mem.indexOf(u8, s.text, "fun box()") != null) {
+        if (std.mem.find(u8, s.text, "fun box()") != null) {
             has_box = true;
             c.package = packageOf(s.text);
         }
@@ -215,12 +215,12 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
 
 /// Remove the `<!NAME!>text<!>` diagnostics markup, as kotlinc does.
 pub fn stripDiagnosticMarkup(a: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, text, "<!") == null) return text;
+    if (std.mem.find(u8, text, "<!") == null) return text;
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < text.len) {
         if (i + 2 <= text.len and text[i] == '<' and text[i + 1] == '!') {
-            if (std.mem.indexOfPos(u8, text, i + 2, "!>")) |close| {
+            if (std.mem.findPos(u8, text, i + 2, "!>")) |close| {
                 // `<!IDENT, IDENT2!>` opens a marked region.
                 var ident_like = true;
                 for (text[i + 2 .. close]) |ch| {
@@ -320,13 +320,13 @@ fn installKotlinTest(a: std.mem.Allocator, env: *std.process.Environ.Map, bin: [
 
 fn firstLine(s: []const u8) []const u8 {
     const t = std.mem.trim(u8, s, " \t\r\n");
-    const end = std.mem.indexOfScalar(u8, t, '\n') orelse t.len;
+    const end = std.mem.findScalar(u8, t, '\n') orelse t.len;
     return t[0..@min(end, 160)];
 }
 
 fn lastLine(s: []const u8) []const u8 {
     const t = std.mem.trim(u8, s, " \t\r\n");
-    const start = if (std.mem.lastIndexOfScalar(u8, t, '\n')) |i| i + 1 else 0;
+    const start = if (std.mem.findScalarLast(u8, t, '\n')) |i| i + 1 else 0;
     return t[start..@min(t.len, start + 160)];
 }
 
@@ -374,7 +374,7 @@ const Pool = struct {
                 continue;
             }
             const exited_ok = r.term == .exited and r.term.exited == 0;
-            if (exited_ok and std.mem.indexOf(u8, r.stdout, "BOX-OK") != null) {
+            if (exited_ok and std.mem.find(u8, r.stdout, "BOX-OK") != null) {
                 _ = passed.fetchAdd(1, .monotonic);
                 continue;
             }
@@ -427,7 +427,7 @@ pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
     std.Io.Dir.cwd().createDirPath(io, cases_dir) catch {};
     for (files.items) |path| {
         const rel = path[CORPUS.len + 1 ..];
-        if (filter) |f| if (std.mem.indexOf(u8, rel, f) == null) continue;
+        if (filter) |f| if (std.mem.find(u8, rel, f) == null) continue;
         const src = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch continue;
         const case = try a.create(Case);
         case.* = try parseCase(a, rel, src);

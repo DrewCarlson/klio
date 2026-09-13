@@ -389,7 +389,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
     // lexically enclosing `owner`'s getter is only the fallback.
     if (std.mem.startsWith(u8, name, "$sgetter$")) {
         const rest = name["$sgetter$".len..];
-        if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| {
+        if (std.mem.findScalar(u8, rest, '\u{1f}')) |sep| {
             const owner = rest[0..sep];
             const prop = rest[sep + 1 ..];
             const mptr: *const Module = self.module.asPtr();
@@ -1110,7 +1110,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
                 // it with the receiver converts the receiver (Type error).
                 // Type-qualified constant probes (`kotlin.Int.MAX_VALUE`) stay.
                 if (name.len > 0 and std.ascii.isUpper(name[0])) {
-                    const dot = std.mem.lastIndexOfScalar(u8, probe, '.') orelse 0;
+                    const dot = std.mem.findScalarLast(u8, probe, '.') orelse 0;
                     if (std.mem.eql(u8, probe[0..dot], "kotlin")) continue;
                 }
                 if (lookupIntrinsic(self, probe)) |func| {
@@ -1252,7 +1252,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
     // member probe skips it — companions ride the bare-name walk as
     // their own candidates at the owning class's depth.
     if (!member_probe and receiver.* == .Instance) {
-        const is_companion_recv = std.mem.indexOf(u8, className(receiver.Instance), "$Companion$") != null;
+        const is_companion_recv = std.mem.find(u8, className(receiver.Instance), "$Companion$") != null;
         var cur: ?[]const u8 = if (is_companion_recv) null else className(receiver.Instance);
         // The lexically-enclosing class for the *first* hop is taken from the
         // receiver's FQN, whose nesting is unambiguous. The `enclosing_class`
@@ -1518,7 +1518,7 @@ pub fn getFieldInner(self: *VmHost, allocator: Allocator, receiver: *const Value
             const prefix = "$sgetter$";
             if (std.mem.startsWith(u8, name, prefix)) {
                 const rest = name[prefix.len..];
-                if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| break :blk rest[sep + 1 ..];
+                if (std.mem.findScalar(u8, rest, '\u{1f}')) |sep| break :blk rest[sep + 1 ..];
             }
             break :blk name;
         };

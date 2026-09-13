@@ -106,7 +106,7 @@ pub fn substituteType(allocator: Allocator, ty: TypeRef, bindings: []const TypeB
         null;
     const binding_name = if (projection_prefix) |prefix| ty.name[prefix.len..] else ty.name;
     if (overrideQualifiedPath(ty) == null and
-        std.mem.indexOfScalar(u8, ty.name, '.') == null)
+        std.mem.findScalar(u8, ty.name, '.') == null)
     {
         if (bindingType(bindings, binding_name)) |replacement| {
             var out = replacement;
@@ -138,7 +138,7 @@ pub fn callTypeRefParam(
     ty: TypeRef,
 ) bool {
     if (overrideQualifiedPath(ty) != null or
-        std.mem.indexOfScalar(u8, ty.name, '.') != null) return false;
+        std.mem.findScalar(u8, ty.name, '.') != null) return false;
     return callTypeParam(params, ty.name);
 }
 
@@ -932,7 +932,7 @@ pub fn overrideTypeClassId(self: *const Module, fid: FuncId, name: []const u8) ?
     var scope = self.classes.items[owner.int()].fqn;
     while (true) {
         if (self.classIdDeclaredIn(scope, name)) |id| return id;
-        const dot = std.mem.lastIndexOfScalar(u8, scope, '.') orelse break;
+        const dot = std.mem.findScalarLast(u8, scope, '.') orelse break;
         scope = scope[0..dot];
     }
     return null;

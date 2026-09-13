@@ -99,8 +99,8 @@ pub fn classTypeParamBoundHeads(a: Allocator, type_params: []const ast.TypeParam
 
 pub fn simpleTypeHead(name: []const u8) []const u8 {
     var s = name;
-    if (std.mem.lastIndexOfScalar(u8, s, '.')) |i| s = s[i + 1 ..];
-    if (std.mem.indexOfScalar(u8, s, '<')) |i| s = s[0..i];
+    if (std.mem.findScalarLast(u8, s, '.')) |i| s = s[i + 1 ..];
+    if (std.mem.findScalar(u8, s, '<')) |i| s = s[0..i];
     if (s.len > 0 and s[s.len - 1] == '?') s = s[0 .. s.len - 1];
     return s;
 }
@@ -281,9 +281,9 @@ pub fn notePropScope(
         // A file-private collision rename (`prefix$f12`) happened after the
         // span-keyed override was recorded: the registered fqn must carry
         // the mangled simple name, or two files' consts share one key.
-        const last = if (std.mem.lastIndexOfScalar(u8, resolved, '.')) |d| resolved[d + 1 ..] else resolved;
+        const last = if (std.mem.findScalarLast(u8, resolved, '.')) |d| resolved[d + 1 ..] else resolved;
         if (std.mem.eql(u8, last, p.name.name)) break :blk resolved;
-        if (std.mem.lastIndexOfScalar(u8, resolved, '.')) |d| {
+        if (std.mem.findScalarLast(u8, resolved, '.')) |d| {
             break :blk try std.fmt.allocPrint(a, "{s}.{s}", .{ resolved[0..d], p.name.name });
         }
         break :blk p.name.name;
@@ -519,7 +519,7 @@ pub fn constLiteralOf(e: *const ast.Expr) ?ir.Const {
 /// `Duration.Companion`). Null when stripping changes nothing.
 pub fn ownerSimplePath(owner: []const u8) ?[]const u8 {
     var rest = owner;
-    while (std.mem.indexOfScalar(u8, rest, '.')) |dot| {
+    while (std.mem.findScalar(u8, rest, '.')) |dot| {
         const seg = rest[0..dot];
         if (seg.len == 0 or !std.ascii.isLower(seg[0])) break;
         rest = rest[dot + 1 ..];
@@ -735,7 +735,7 @@ pub fn propCtorHeadEvidence(prop: *const ast.Property, decls: []const ast.Decl, 
         const f = module.funcById(fid) orelse continue;
         if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
         var head = std.mem.trimEnd(u8, f.return_ty.name, "?");
-        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
         if (head.len == 0 or std.mem.eql(u8, head, "Unit") or (head.len <= 2 and std.ascii.isUpper(head[0]))) return null;
         if (agreed) |g| {
             if (!std.mem.eql(u8, g, head)) return null;

@@ -391,7 +391,7 @@ pub fn suspendLiveRegs(func: *const Func, block: BlockId, inst_idx: usize) Alloc
         }
     }
 
-    var ids: std.ArrayListUnmanaged(u32) = .empty;
+    var ids: std.ArrayList(u32) = .empty;
     errdefer ids.deinit(a);
     for (live, 0..) |is_live, r| {
         if (is_live) try ids.append(a, @intCast(r));

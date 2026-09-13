@@ -491,7 +491,7 @@ pub fn liftClassRecursive(
                     }
                     // The class's SOURCE simple name: a mangled nested
                     // class carries its outer as a `$` prefix.
-                    const own = if (std.mem.lastIndexOfScalar(u8, c.name.name, '$')) |d| c.name.name[d + 1 ..] else c.name.name;
+                    const own = if (std.mem.findScalarLast(u8, c.name.name, '$')) |d| c.name.name[d + 1 ..] else c.name.name;
                     try qual.appendSlice(a, own);
                     try ctx.companion_singletons.put(try qual.toOwnedSlice(a), comp_name);
                 }

@@ -142,7 +142,7 @@ pub fn callMemberStrictExt(self: *VmHost, allocator: Allocator, receiver: *const
                 const fqn = cg.get().fqn;
                 if (!std.mem.endsWith(u8, fqn, ".Companion")) break :blk false;
                 const owner = fqn[0 .. fqn.len - ".Companion".len];
-                const simple = if (std.mem.lastIndexOfScalar(u8, owner, '.')) |d| owner[d + 1 ..] else owner;
+                const simple = if (std.mem.findScalarLast(u8, owner, '.')) |d| owner[d + 1 ..] else owner;
                 break :blk std.mem.eql(u8, simple, name);
             },
             else => false,
@@ -790,7 +790,7 @@ pub fn memberApplicableForWalk(self: *VmHost, f: *const Func, args: []const Valu
     if (args.len > effective.len or effective.len == 0) return false;
     const last_ty = resolveAliasName(self, effective[effective.len - 1].ty.name);
     const last_is_fn = std.mem.startsWith(u8, last_ty, "Function") or
-        std.mem.indexOf(u8, last_ty, "->") != null or
+        std.mem.find(u8, last_ty, "->") != null or
         (last_ty.len > 0 and last_ty.len <= 2 and allUppercase(last_ty));
     if (!last_is_fn) return false;
     // Leading args fill the leading params; the middle params between the
@@ -945,7 +945,7 @@ pub fn scoreNamedMemberCandidate(
 pub fn lastParamIsFunctionShaped(self: *VmHost, p: *const ir.Param) bool {
     const last_ty = resolveAliasName(self, p.ty.name);
     return std.mem.startsWith(u8, last_ty, "Function") or
-        std.mem.indexOf(u8, last_ty, "->") != null or
+        std.mem.find(u8, last_ty, "->") != null or
         (last_ty.len > 0 and last_ty.len <= 2 and allUppercase(last_ty));
 }
 

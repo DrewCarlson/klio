@@ -90,9 +90,9 @@ fn setCode(c: SetCc) u32 {
 }
 
 pub const Emitter = struct {
-    buf: std.ArrayListUnmanaged(u8) = .empty,
-    labels: std.ArrayListUnmanaged(?usize) = .empty,
-    fixups: std.ArrayListUnmanaged(Fixup) = .empty,
+    buf: std.ArrayList(u8) = .empty,
+    labels: std.ArrayList(?usize) = .empty,
+    fixups: std.ArrayList(Fixup) = .empty,
     a: std.mem.Allocator,
 
     pub const Label = usize;

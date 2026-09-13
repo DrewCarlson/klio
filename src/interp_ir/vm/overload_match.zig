@@ -29,7 +29,7 @@ const PROOF_BONUS: i32 = 6;
 const SUSPEND_CONVERSION_PENALTY: i32 = 2;
 
 pub fn simpleName(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
 }
 
@@ -414,7 +414,7 @@ pub fn declaredElemProves(self: *VmHost, want: *const TypeRef, have_head: ?[]con
 fn declaredHeadMatch(self: *VmHost, want: *const TypeRef, have_head: ?[]const u8) Match {
     const have_full = simpleName(have_head orelse return .unknown);
     // A recorded FULL generic spelling (`List<Int>`) compares by head.
-    const have = if (std.mem.indexOfScalar(u8, have_full, '<')) |lt| have_full[0..lt] else have_full;
+    const have = if (std.mem.findScalar(u8, have_full, '<')) |lt| have_full[0..lt] else have_full;
     const want_head = bareHead(want.name);
     if (want_head.len == 0 or std.mem.eql(u8, want_head, "*")) return .proven;
     if (std.mem.eql(u8, want_head, "Any")) return .proven;

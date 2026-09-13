@@ -68,18 +68,18 @@ pub fn parseFactories(allocator: Allocator, src: []const u8) Allocator.Error![]S
     while (lines.next()) |raw_line| {
         const line = trim(raw_line);
         if (!std.mem.startsWith(u8, line, "val ")) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, line, '=') orelse continue;
         const rhs = trim(line[eq + 1 ..]);
         // Matches KtDiagnosticFactoryN( and KtDiagnosticFactoryForDeprecationN(.
         if (!std.mem.startsWith(u8, rhs, "KtDiagnosticFactory")) continue;
-        const open = std.mem.indexOfScalar(u8, rhs, '(') orelse continue;
+        const open = std.mem.findScalar(u8, rhs, '(') orelse continue;
         const args = rhs[open + 1 ..];
-        const quote_start = std.mem.indexOfScalar(u8, args, '"') orelse continue;
+        const quote_start = std.mem.findScalar(u8, args, '"') orelse continue;
         const after_quote = args[quote_start + 1 ..];
-        const quote_end = std.mem.indexOfScalar(u8, after_quote, '"') orelse continue;
+        const quote_end = std.mem.findScalar(u8, after_quote, '"') orelse continue;
         const name = after_quote[0..quote_end];
         const rest = after_quote[quote_end + 1 ..];
-        const comma = std.mem.indexOfScalar(u8, rest, ',') orelse continue;
+        const comma = std.mem.findScalar(u8, rest, ',') orelse continue;
         const sev_token = trimStart(rest[comma + 1 ..]);
         const severity: Severity = if (std.mem.startsWith(u8, sev_token, "ERROR"))
             .Error
@@ -129,7 +129,7 @@ pub fn parseMessages(allocator: Allocator, src: []const u8) Allocator.Error![]Me
         const line = trim(raw_line);
         if (!std.mem.startsWith(u8, line, "map.put(")) continue;
         const after_open = line["map.put(".len..];
-        const comma = std.mem.indexOfScalar(u8, after_open, ',') orelse continue;
+        const comma = std.mem.findScalar(u8, after_open, ',') orelse continue;
         const name = trim(after_open[0..comma]);
         const rest = trimStart(after_open[comma + 1 ..]);
         if (rest.len == 0 or rest[0] != '"') continue;
@@ -354,13 +354,13 @@ test "render emits factory consts and table" {
     const out = try render(testing.allocator, &factories);
     defer testing.allocator.free(out);
 
-    try testing.expect(std.mem.indexOf(u8, out, "pub const A_FACTORY = DiagnosticFactory{") != null);
-    try testing.expect(std.mem.indexOf(u8, out, ".default_severity = .Error,") != null);
-    try testing.expect(std.mem.indexOf(u8, out, ".default_severity = .Warning,") != null);
-    try testing.expect(std.mem.indexOf(u8, out, ".message_template = \"the {0} message\",") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "pub const FACTORIES = [_]*const DiagnosticFactory{") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "    &A_FACTORY,") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "    &B_FACTORY,") != null);
+    try testing.expect(std.mem.find(u8, out, "pub const A_FACTORY = DiagnosticFactory{") != null);
+    try testing.expect(std.mem.find(u8, out, ".default_severity = .Error,") != null);
+    try testing.expect(std.mem.find(u8, out, ".default_severity = .Warning,") != null);
+    try testing.expect(std.mem.find(u8, out, ".message_template = \"the {0} message\",") != null);
+    try testing.expect(std.mem.find(u8, out, "pub const FACTORIES = [_]*const DiagnosticFactory{") != null);
+    try testing.expect(std.mem.find(u8, out, "    &A_FACTORY,") != null);
+    try testing.expect(std.mem.find(u8, out, "    &B_FACTORY,") != null);
 }
 
 test "render escapes backslashes in message templates" {
@@ -369,7 +369,7 @@ test "render escapes backslashes in message templates" {
     };
     const out = try render(testing.allocator, &factories);
     defer testing.allocator.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, ".message_template = \"line\\\\nbreak\",") != null);
+    try testing.expect(std.mem.find(u8, out, ".message_template = \"line\\\\nbreak\",") != null);
 }
 
 test {

@@ -293,7 +293,7 @@ pub fn applicExtOwnerRankCb(ctx: *anyopaque, fid: FuncId) i32 {
     var chain = enclosingChainClassOrder(self, self.allocator) catch return 0;
     defer chain.deinit(self.allocator);
     for (chain.items, 0..) |co, pos| {
-        const matches = if (std.mem.indexOfScalar(u8, owner, '.') != null)
+        const matches = if (std.mem.findScalar(u8, owner, '.') != null)
             std.mem.eql(u8, co, owner)
         else
             std.mem.eql(u8, simpleName(co), owner);
@@ -466,7 +466,7 @@ pub fn instanceHasInvokeSurface(self: *VmHost, v: *const Value) bool {
         {
             const cg0 = g.get().class.borrow();
             defer cg0.deinit();
-            if (std.mem.indexOf(u8, cg0.get().fqn, "ComposableLambda") != null) return true;
+            if (std.mem.find(u8, cg0.get().fqn, "ComposableLambda") != null) return true;
         }
         var cls: ?ObjRef(runtime.ClassDef) = g.get().class.clone();
         while (cls) |c| {
@@ -620,8 +620,8 @@ pub fn receiverDefinitelyNotParam(self: *VmHost, param_ty: *const TypeRef, recei
             // callable receiver: `Function*`, suspend forms, and the
             // lowered `<function>` marker (`startCoroutineCancellable`
             // on `(suspend () -> Unit)`).
-            if (std.mem.indexOf(u8, pn, "Function") != null) return false;
-            if (std.mem.indexOf(u8, pn, "->") != null) return false;
+            if (std.mem.find(u8, pn, "Function") != null) return false;
+            if (std.mem.find(u8, pn, "->") != null) return false;
             if (std.mem.startsWith(u8, pn, "suspend")) return false;
             if (std.mem.eql(u8, pn, "<function>")) return false;
             if (receiver.isRuntimeType(pn)) return false;
@@ -746,7 +746,7 @@ pub fn isScalarKindName(n: []const u8) bool {
 /// Nested-lift names (`Outer$Name`) keep their shape: the stripped suffix
 /// must be `$f` followed by digits only.
 pub fn stripFileMangle(n: []const u8) []const u8 {
-    const i = std.mem.lastIndexOfScalar(u8, n, '$') orelse return n;
+    const i = std.mem.findScalarLast(u8, n, '$') orelse return n;
     if (i + 2 >= n.len or n[i + 1] != 'f') return n;
     for (n[i + 2 ..]) |c| {
         if (c < '0' or c > '9') return n;
@@ -806,7 +806,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
     // A QUALIFIED function-type head (`kotlin.Function1`) must reach the
     // Function arm below, not the qualified-name early-out: the callable
     // disproof is head-shaped and package-independent.
-    if (std.mem.indexOfScalar(u8, pn, '.') != null and
+    if (std.mem.findScalar(u8, pn, '.') != null and
         std.mem.startsWith(u8, simpleName(pn), "Function"))
     {
         pn = simpleName(pn);
@@ -814,7 +814,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
     // A qualified reference (`Owner.Pocket`) names a lifted nested/inner
     // class whose registered name the supertype walk cannot relate;
     // decline to adjudicate.
-    if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
+    if (std.mem.findScalar(u8, pn, '.') != null) return false;
     // A typealiased param type also adjudicates under its expansion. But the
     // alias table is keyed by SIMPLE NAME globally, so a file-private
     // `typealias` in one module shadows an unrelated real class of the same
@@ -825,7 +825,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
     // value that satisfies one of its readings.
     const orig = pn;
     pn = resolveAliasName(self, pn);
-    if (std.mem.indexOfScalar(u8, pn, '.') != null) return false;
+    if (std.mem.findScalar(u8, pn, '.') != null) return false;
 
     if (std.mem.eql(u8, pn, "Any") or std.mem.eql(u8, pn, "Unit")) return false;
     // A nullable parameter (`TypeInfo?`) accepts `null` — that is never a
@@ -968,7 +968,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
             // and the `Array<out Pair>` extension binds). The array-modeled
             // interfaces (`Iterable`/`Collection`/...) and array-named
             // params stay non-definite, same as the nominal arm below.
-            .Array => return std.mem.indexOf(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
+            .Array => return std.mem.find(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
             // An Instance falls through to the hierarchy walk below: a
             // user class that never reaches the container head in its
             // supertype closure is definite (a `RangesSpecifier` is not a
@@ -995,7 +995,7 @@ pub fn argDefinitelyNotParamTypeUncached(self: *VmHost, param_ty: *const TypeRef
         // EXCEPT the collection interfaces klio DOES model arrays against
         // (`Iterable`/`Collection`/`Sequence`, which back `Array.first()` and
         // friends) and any array-named param — those stay non-definite.
-        .Array => return std.mem.indexOf(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
+        .Array => return std.mem.find(u8, pn, "Array") == null and !isArrayRelatedIface(pn),
         // A SCALAR against a known user class: definite — except a VALUE
         // class whose underlying representation has the SAME kind, since
         // value-class instances circulate unboxed (a Long could be an `Sz`
@@ -1181,7 +1181,7 @@ pub fn classChainHasInvokeIn(mod: *const Module, v: *const Value) bool {
         const chain = reg.class_super_names.get(cn) orelse break;
         if (chain.len == 0) break;
         var sn = chain[0];
-        if (std.mem.lastIndexOfScalar(u8, sn, '.')) |i| sn = sn[i + 1 ..];
+        if (std.mem.findScalarLast(u8, sn, '.')) |i| sn = sn[i + 1 ..];
         cur = sn;
     }
     return false;

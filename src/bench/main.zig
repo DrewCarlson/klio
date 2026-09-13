@@ -144,7 +144,7 @@ pub fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) u8 {
         defer allocator.free(label);
 
         if (args.filter) |f| {
-            if (std.mem.indexOf(u8, label, f) == null) continue;
+            if (std.mem.find(u8, label, f) == null) continue;
         }
         if (!args.json_only) {
             printErr("[bench] {s}\n", .{label});

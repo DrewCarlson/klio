@@ -2269,7 +2269,7 @@ test "user-method memo answers per dispatch generation" {
 }
 
 fn classHasUserMethod(self: *VmHost, allocator: Allocator, start_in: []const u8, mname: []const u8) bool {
-    const start = if (std.mem.lastIndexOfScalar(u8, start_in, '.')) |d| start_in[d + 1 ..] else start_in;
+    const start = if (std.mem.findScalarLast(u8, start_in, '.')) |d| start_in[d + 1 ..] else start_in;
     {
         const mg = self.module.borrow();
         defer mg.deinit();
@@ -2301,7 +2301,7 @@ fn classHasUserMethodWalk(self: *VmHost, allocator: Allocator, start: []const u8
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const cur_raw = queue.items[head];
-        const cur = if (std.mem.lastIndexOfScalar(u8, cur_raw, '.')) |d| cur_raw[d + 1 ..] else cur_raw;
+        const cur = if (std.mem.findScalarLast(u8, cur_raw, '.')) |d| cur_raw[d + 1 ..] else cur_raw;
         if (seen.contains(cur)) continue;
         seen.put(cur, {}) catch {};
         {

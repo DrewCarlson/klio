@@ -14,7 +14,7 @@ const Value = runtime.Value;
 const TypeRef = ir.TypeRef;
 
 /// In-scope context values, innermost last; resolution never crosses a thread.
-threadlocal var stack: std.ArrayListUnmanaged(Value) = .empty;
+threadlocal var stack: std.ArrayList(Value) = .empty;
 
 /// Latched once the module declares a context parameter, so hot dispatch skips the push.
 threadlocal var active: bool = false;

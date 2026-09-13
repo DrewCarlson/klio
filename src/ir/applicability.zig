@@ -340,7 +340,7 @@ pub fn builtinSupersOf(concrete: []const u8) []const []const u8 {
 // -------------------------------------------------------------------------
 
 pub fn simpleName(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
 }
 
@@ -432,7 +432,7 @@ fn sameFid(a: ?FuncId, b: ?FuncId) bool {
 pub fn isFunctionTypeRef(ty: *const TypeRef) bool {
     const n = simpleName(ty.name);
     return std.mem.startsWith(u8, n, "Function") or
-        std.mem.indexOf(u8, ty.name, "->") != null;
+        std.mem.find(u8, ty.name, "->") != null;
 }
 
 fn paramHasDefault(sig: *const SigView, i: usize) bool {
@@ -501,7 +501,7 @@ fn unknownArgScore(nm: []const u8) i32 {
 /// the mangle is a lift-uniqueness artifact, not a different type head.
 fn evidenceHead(name: []const u8) []const u8 {
     const sn = std.mem.trimEnd(u8, simpleName(name), "?");
-    if (std.mem.lastIndexOfScalar(u8, sn, '$')) |i| {
+    if (std.mem.findScalarLast(u8, sn, '$')) |i| {
         if (i + 1 < sn.len) return sn[i + 1 ..];
     }
     return sn;
@@ -1429,7 +1429,7 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
             if (span_mod.active_map) |m| {
                 if (m.getChecked(cs.file)) |sf| {
                     const lc = sf.lineCol(cs.start);
-                    const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                    const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
                     break :blk std.fmt.bufPrint(&loc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
                 }
             }

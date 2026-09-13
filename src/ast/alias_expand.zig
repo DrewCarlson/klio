@@ -47,8 +47,8 @@ const Index = struct {
     a: Allocator,
     files: []const KotlinFile,
     file_pkgs: [][]const u8,
-    aliases: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(Alias)) = .empty,
-    classes: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(ClassInfo)) = .empty,
+    aliases: std.StringHashMapUnmanaged(std.ArrayList(Alias)) = .empty,
+    classes: std.StringHashMapUnmanaged(std.ArrayList(ClassInfo)) = .empty,
     /// Simple names the program declares as something other than an alias.
     blocked: std.StringHashMapUnmanaged(void) = .empty,
 
@@ -96,12 +96,12 @@ const Index = struct {
 };
 
 fn lastSegment(path: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| return path[dot + 1 ..];
+    if (std.mem.findScalarLast(u8, path, '.')) |dot| return path[dot + 1 ..];
     return path;
 }
 
 fn joinPath(a: Allocator, parts: []const []const u8) Allocator.Error![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     for (parts) |p| {
         if (p.len == 0) continue;
@@ -112,7 +112,7 @@ fn joinPath(a: Allocator, parts: []const []const u8) Allocator.Error![]const u8 
 }
 
 fn joinIdents(a: Allocator, idents: []const Ident) Allocator.Error![]const u8 {
-    var out: std.ArrayListUnmanaged(u8) = .empty;
+    var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
     for (idents, 0..) |id, i| {
         if (i != 0) try out.append(a, '.');
@@ -236,8 +236,8 @@ const Walker = struct {
     pkg: []const u8,
     imports: []const ast.ImportDecl,
     /// Dotted paths of the lexically enclosing classes, innermost last.
-    class_stack: std.ArrayListUnmanaged([]const u8) = .empty,
-    type_params: std.ArrayListUnmanaged([]const u8) = .empty,
+    class_stack: std.ArrayList([]const u8) = .empty,
+    type_params: std.ArrayList([]const u8) = .empty,
 
     fn deinit(w: *Walker) void {
         for (w.class_stack.items) |p| w.a.free(p);
@@ -348,7 +348,7 @@ const Walker = struct {
             if (pathEndsWith(al.fqn, path)) {
                 // `Owner.Alias` relative to the package: the owner class must be visible here.
                 const rel = al.fqn[al.fqn.len - path.len ..];
-                const head = rel[0 .. std.mem.indexOfScalar(u8, rel, '.') orelse rel.len];
+                const head = rel[0 .. std.mem.findScalar(u8, rel, '.') orelse rel.len];
                 if (al.pkg.len == 0 or al.fqn.len == path.len or w.packageVisible(al.pkg, head)) return al;
             }
             for (w.class_stack.items) |encl| {

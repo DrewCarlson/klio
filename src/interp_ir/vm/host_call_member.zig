@@ -614,7 +614,7 @@ pub fn numericOpMethod(name: []const u8) ?ir.BinOp {
 
 /// Simple-name tail of a possibly-qualified name (`a.b.C` -> `C`).
 pub fn simpleName(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
 }
 
@@ -623,7 +623,7 @@ pub fn simpleName(name: []const u8) []const u8 {
 pub fn staticReceiverBindingHead(name: []const u8) []const u8 {
     var head = std.mem.trim(u8, name, " ");
     head = std.mem.trimEnd(u8, head, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |i| head = head[0..i];
+    if (std.mem.findScalar(u8, head, '<')) |i| head = head[0..i];
     return std.mem.trim(u8, head, " ");
 }
 
@@ -634,7 +634,7 @@ pub fn staticReceiverBindingHead(name: []const u8) []const u8 {
 /// after the last `$` (then the last `.`) is the source simple name.
 pub fn classDisplayName(name: []const u8) []const u8 {
     var n = name;
-    if (std.mem.lastIndexOfScalar(u8, n, '$')) |i| n = n[i + 1 ..];
+    if (std.mem.findScalarLast(u8, n, '$')) |i| n = n[i + 1 ..];
     return simpleName(n);
 }
 

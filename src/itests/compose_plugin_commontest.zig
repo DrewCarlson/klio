@@ -165,12 +165,12 @@ fn testCount(a: std.mem.Allocator, io: std.Io, path: []const u8) usize {
 /// The test class a file contributes, or null when it declares none.
 fn testClassOf(a: std.mem.Allocator, io: std.Io, path: []const u8) ?[]const u8 {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return null;
-    if (std.mem.indexOf(u8, bytes, "@Test") == null) return null;
+    if (std.mem.find(u8, bytes, "@Test") == null) return null;
     const base = std.fs.path.basename(path);
     const stem = base[0 .. base.len - ".kt".len];
     var buf: [256]u8 = undefined;
     const needle = std.fmt.bufPrint(&buf, "class {s}", .{stem}) catch return null;
-    if (std.mem.indexOf(u8, bytes, needle) == null) return null;
+    if (std.mem.find(u8, bytes, needle) == null) return null;
     return a.dupe(u8, stem) catch null;
 }
 
@@ -191,7 +191,7 @@ fn streamedPassedCount(stderr: []const u8) usize {
     var it = std.mem.splitScalar(u8, stderr, '\n');
     while (it.next()) |line| {
         if (std.mem.startsWith(u8, line, "[test] ") and
-            std.mem.indexOf(u8, line, " PASSED ") != null) n += 1;
+            std.mem.find(u8, line, " PASSED ") != null) n += 1;
     }
     return n;
 }
@@ -225,7 +225,7 @@ const FailedNames = struct {
         var it = std.mem.splitScalar(u8, text, '\n');
         while (it.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
-            const at = std.mem.indexOf(u8, trimmed, marker) orelse continue;
+            const at = std.mem.find(u8, trimmed, marker) orelse continue;
             var name = std.mem.trim(u8, trimmed[0..at], " \t");
             if (std.mem.startsWith(u8, name, "[test]")) {
                 name = std.mem.trim(u8, name["[test]".len..], " \t");
@@ -264,8 +264,8 @@ fn streamedFailedCount(stderr: []const u8) usize {
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, stderr, '\n');
     while (it.next()) |line| {
-        if (std.mem.indexOf(u8, line, "[test] ") != null and
-            std.mem.indexOf(u8, line, " FAILED") != null) n += 1;
+        if (std.mem.find(u8, line, "[test] ") != null and
+            std.mem.find(u8, line, " FAILED") != null) n += 1;
     }
     return n;
 }
@@ -315,7 +315,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     var shard_k: usize = 0;
     var shard_n: usize = 1;
     if (runtime.envOnce("KLIO_COMMONTEST_SHARD")) |sv| {
-        if (std.mem.indexOfScalar(u8, sv, '/')) |sep| {
+        if (std.mem.findScalar(u8, sv, '/')) |sep| {
             const k = std.fmt.parseInt(usize, sv[0..sep], 10) catch 0;
             const n = std.fmt.parseInt(usize, sv[sep + 1 ..], 10) catch 1;
             if (n != 0 and k < n) {
@@ -352,7 +352,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
     // Longest-first: the wall is the slowest child, so the class that runs for
     // minutes starts with the first worker rather than where nothing overlaps it.
     for (classes.items, 0..) |cls, ci| {
-        if (std.mem.indexOf(u8, cls, "RecomposerTests") != null and ci != 0) {
+        if (std.mem.find(u8, cls, "RecomposerTests") != null and ci != 0) {
             const first = classes.items[0];
             classes.items[0] = classes.items[ci];
             classes.items[ci] = first;
@@ -393,8 +393,8 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
             var trimmed: std.ArrayList([]const u8) = .empty;
             for (sources.items) |src| {
                 const in_test_dirs =
-                    std.mem.indexOf(u8, src, "/commonTest/") != null or
-                    std.mem.indexOf(u8, src, "/nonEmulatorCommonTest/") != null;
+                    std.mem.find(u8, src, "/commonTest/") != null or
+                    std.mem.find(u8, src, "/nonEmulatorCommonTest/") != null;
                 const keep = !in_test_dirs or
                     std.mem.endsWith(u8, src, "/RecomposerTests.kt") or
                     std.mem.endsWith(u8, src, "/EffectsTests.kt") or
@@ -465,7 +465,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                 // the passes it had buffered. RecomposerTests carries
                 // `validatePotentialDeadlock`, slow rather than wedged, so its
                 // budget fits it.
-                const class_cap_ms: i64 = if (std.mem.indexOf(u8, names[i], "RecomposerTests") != null)
+                const class_cap_ms: i64 = if (std.mem.find(u8, names[i], "RecomposerTests") != null)
                     1_200_000
                 else
                     480_000;
@@ -490,7 +490,7 @@ test "compose runtime commonTest under the lowering plugin holds the ratchet bas
                     if (summary_count != 0) summary_failed else streamedFailedCount(r.stderr),
                     .monotonic,
                 );
-                if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
+                if (std.mem.find(u8, r.stdout, " passed,") == null) {
                     _ = phung.fetchAdd(1, .monotonic);
                     // Name the termination and the tail of the child's output.
                     const tail_from = if (r.stderr.len > 600) r.stderr.len - 600 else 0;

@@ -1046,7 +1046,7 @@ fn fusedInst(
             switch (r) {
                 .ok => |v| {
                     if (runtime.envOnce("KLIO_FUSED_CALL_TRACE")) |w| {
-                        if (std.mem.indexOf(u8, callee.name, w) != null) {
+                        if (std.mem.find(u8, callee.name, w) != null) {
                             std.debug.print("[fused-call] {s} in {s} -> {s}", .{ callee.name, func.name, @tagName(std.meta.activeTag(v)) });
                             switch (v) {
                                 .Long => |l| std.debug.print(" L{d}", .{l}),

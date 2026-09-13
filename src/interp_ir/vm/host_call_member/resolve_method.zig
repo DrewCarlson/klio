@@ -608,7 +608,7 @@ pub fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []co
         for (bounds) |b| {
             if (!std.mem.eql(u8, b.param, identity.param)) continue;
             var bn = simpleName(b.bound);
-            if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
+            if (std.mem.findScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
             bn = std.mem.trimEnd(u8, bn, "?");
             if (std.mem.eql(u8, bn, "Any")) continue;
             const arg = &args[i];
@@ -648,7 +648,7 @@ pub fn classTypeParamRefutes(self: *VmHost, mod: *const Module, class_name: []co
 /// lowering.
 pub fn typeHeadLast(s: []const u8) []const u8 {
     const t = std.mem.trimEnd(u8, s, "?");
-    if (std.mem.lastIndexOfScalar(u8, t, '.')) |d| return t[d + 1 ..];
+    if (std.mem.findScalarLast(u8, t, '.')) |d| return t[d + 1 ..];
     return t;
 }
 

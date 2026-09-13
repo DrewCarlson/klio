@@ -564,7 +564,7 @@ fn leafTraceWant(func: *const Func) bool {
     }
     if (leaf_trace_want.len == 0) return false;
     if (leaf_trace_want.len == 1 and leaf_trace_want[0] == '*') return true;
-    return std.mem.indexOf(u8, func.name, leaf_trace_want) != null;
+    return std.mem.find(u8, func.name, leaf_trace_want) != null;
 }
 
 /// The declared members of a builtin receiver that no user declaration can

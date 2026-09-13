@@ -1138,7 +1138,7 @@ pub noinline fn execArmCallMemberOrValue(comptime H: type, allocator: Allocator,
         orAudit("CallMemberOrValue", name_str, "member", 0, &recv);
         const r = try host.callMemberNamed(allocator, &recv, name_str, user_args, names);
         const member_missed = r == .err and r.err == .Unimplemented and
-            std.mem.indexOf(u8, r.err.Unimplemented, "Vm::") != null;
+            std.mem.find(u8, r.err.Unimplemented, "Vm::") != null;
         // The member exists by name but no overload serves this call
         // (arity/type). When the same-named local is an invocable
         // function value, it is the intended target — Kotlin resolves
@@ -1281,7 +1281,7 @@ pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator,
         // member. On the canonical member miss for the innermost receiver,
         // walk the outer implicit receivers before giving up.
         if (r == .err and r.err == .Unimplemented and
-            std.mem.indexOf(u8, r.err.Unimplemented, "Vm::call_member") != null)
+            std.mem.find(u8, r.err.Unimplemented, "Vm::call_member") != null)
         {
             const entries = try enclosingEntriesAlloc(allocator);
             defer allocator.free(entries);
@@ -1294,7 +1294,7 @@ pub noinline fn execArmCallValueOrMember(comptime H: type, allocator: Allocator,
                     ObjRef(InstanceData).ptrEq(e.v.Instance, recv.Instance)) continue;
                 const r2 = try host.callMemberNamed(allocator, &e.v, name_str, arg_values, names);
                 if (r2 == .err and r2.err == .Unimplemented and
-                    std.mem.indexOf(u8, r2.err.Unimplemented, "Vm::call_member") != null)
+                    std.mem.find(u8, r2.err.Unimplemented, "Vm::call_member") != null)
                 {
                     freeMissErr(allocator, r2.err);
                     continue;
@@ -3197,7 +3197,7 @@ fn frameThisParam(frame: *const Frame) ?usize {
 /// (a top-level / local function reached with an injected receiver).
 /// The head of a dotted class name (`a.b.C` -> `C`).
 fn simpleClassHead(name: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, name, '.')) |i| return name[i + 1 ..];
+    if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
 }
 
@@ -3757,7 +3757,7 @@ fn scopeGetterOwner(name: []const u8) ?[]const u8 {
     const prefix = "$sgetter$";
     if (std.mem.startsWith(u8, name, prefix)) {
         const rest = name[prefix.len..];
-        if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| {
+        if (std.mem.findScalar(u8, rest, '\u{1f}')) |sep| {
             return rest[0..sep];
         }
     }
@@ -3768,7 +3768,7 @@ fn stripScopeGetter(name: []const u8) []const u8 {
     const prefix = "$sgetter$";
     if (std.mem.startsWith(u8, name, prefix)) {
         const rest = name[prefix.len..];
-        if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| {
+        if (std.mem.findScalar(u8, rest, '\u{1f}')) |sep| {
             return rest[sep + 1 ..];
         }
     }

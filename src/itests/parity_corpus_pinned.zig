@@ -52,7 +52,7 @@ fn checkErr(stem: []const u8, needle: []const u8) !void {
             return error.ExpectedRejection;
         },
         .err => |m| {
-            if (std.mem.indexOf(u8, m, needle) == null) {
+            if (std.mem.find(u8, m, needle) == null) {
                 std.debug.print("parity corpus {s}: rejection `{s}` missing `{s}`\n", .{ stem, m, needle });
                 return error.WrongRejection;
             }
@@ -905,7 +905,7 @@ fn checkErrFiles(files: []const []const u8, needle: []const u8) !void {
             return error.ExpectedRejection;
         },
         .err => |m| {
-            if (std.mem.indexOf(u8, m, needle) == null) {
+            if (std.mem.find(u8, m, needle) == null) {
                 std.debug.print("multi-file: rejection `{s}` missing `{s}`\n", .{ m, needle });
                 return error.WrongRejection;
             }

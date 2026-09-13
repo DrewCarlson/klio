@@ -150,7 +150,7 @@ fn packVarargArgs(allocator: Allocator, func: *const Func, args: *std.ArrayList(
                 defer ig.deinit();
                 const cg = ig.get().class.borrow();
                 defer cg.deinit();
-                break :blk std.mem.indexOf(u8, cg.get().name, "Composer") != null;
+                break :blk std.mem.find(u8, cg.get().name, "Composer") != null;
             };
         if (!has_pair_tail) {
             tail_fixed -|= 2;
@@ -252,7 +252,7 @@ fn inferTypeArgFromArgs(self: *VmHost, allocator: Allocator, f: *const ir.Func, 
                 // A builtin binds its classifier, head only, so `typeOf<T>()` names the
                 // real type.
                 const fqn = v.typeFqn();
-                const head = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+                const head = if (std.mem.findScalarLast(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
                 {
                     const cg = self.classes.borrow();
                     defer cg.deinit();
@@ -292,7 +292,7 @@ pub fn reifiedFromFrame(self: *VmHost, allocator: Allocator, name: []const u8) ?
             .Null => continue,
             else => {
                 const fqn = v.typeFqn();
-                const head = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
+                const head = if (std.mem.findScalarLast(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
                 {
                     const cg = self.classes.borrow();
                     defer cg.deinit();
@@ -333,8 +333,8 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
     // `KTypeProjection`s.
     var head = base;
     var generic_args: ?[]const u8 = null;
-    if (std.mem.indexOfScalar(u8, base, '<')) |lt| {
-        if (std.mem.lastIndexOfScalar(u8, base, '>')) |gt| {
+    if (std.mem.findScalar(u8, base, '<')) |lt| {
+        if (std.mem.findScalarLast(u8, base, '>')) |gt| {
             if (gt > lt) {
                 head = base[0..lt];
                 generic_args = base[lt + 1 .. gt];
@@ -343,11 +343,11 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
     }
     // Lowering mangles a local class head as `$lc<fn>`; the runtime class is
     // registered under the simple declared name, which the KType needs.
-    if (std.mem.indexOf(u8, head, "$lc")) |lci| head = head[0..lci];
+    if (std.mem.find(u8, head, "$lc")) |lci| head = head[0..lci];
     // A bare type-variable head resolves through the bound type-param global, not a
     // class named `T`.
     const bound_head: []const u8 = blk: {
-        if (std.mem.indexOfScalar(u8, head, '.') != null) break :blk head;
+        if (std.mem.findScalar(u8, head, '.') != null) break :blk head;
         const fr = ir.eval.currentFrameFunc() orelse break :blk head;
         const names: []const []const u8 = nb: {
             const mg = self.module.borrow();
@@ -371,7 +371,7 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
                 const sg = sv.String.borrow();
                 defer sg.deinit();
                 const spelled = sg.get().bytes;
-                if (std.mem.eql(u8, spelled, head) or (std.mem.indexOfScalar(u8, spelled, '<') == null and !std.mem.endsWith(u8, spelled, "?"))) break :blk2 null;
+                if (std.mem.eql(u8, spelled, head) or (std.mem.findScalar(u8, spelled, '<') == null and !std.mem.endsWith(u8, spelled, "?"))) break :blk2 null;
                 break :blk2 try allocator.dupe(u8, spelled);
             };
             if (runtime.envOnce("KLIO_KTYPE_TRACE") != null) std.debug.print("[ktype] spelling {s} -> {?s}\n", .{ key, spelled_owned });
@@ -402,17 +402,17 @@ fn makeKTypeValue(self: *VmHost, allocator: Allocator, type_name: []const u8) Al
             if (cg.get().get(bound_head)) |c| break :blk Value{ .Class = c.clone() };
             // A LIFTED nested spelling (`Outer$Inner`) resolves through the
             // dotted form or the innermost simple name the table holds.
-            if (std.mem.indexOfScalar(u8, bound_head, '$')) |_| {
+            if (std.mem.findScalar(u8, bound_head, '$')) |_| {
                 const dotted = try allocator.dupe(u8, bound_head);
                 for (dotted) |*ch| {
                     if (ch.* == '$') ch.* = '.';
                 }
                 if (cg.get().get(dotted)) |c| break :blk Value{ .Class = c.clone() };
-                const last = bound_head[std.mem.lastIndexOfScalar(u8, bound_head, '$').? + 1 ..];
+                const last = bound_head[std.mem.findScalarLast(u8, bound_head, '$').? + 1 ..];
                 if (cg.get().get(last)) |c| break :blk Value{ .Class = c.clone() };
             }
         }
-        if (std.mem.indexOfScalar(u8, bound_head, '.')) |_| {
+        if (std.mem.findScalar(u8, bound_head, '.')) |_| {
             var segs = std.mem.splitScalar(u8, bound_head, '.');
             var cur: ?ObjRef(runtime.ClassDef) = null;
             var ok_walk = true;
@@ -918,7 +918,7 @@ fn applicExactHeadCb(ctx: *anyopaque, param_head: []const u8, arg_head: []const 
 fn applicSubtypeCb(ctx: *anyopaque, value: *const anyopaque, target: []const u8) ?i32 {
     const self: *VmHost = @ptrCast(@alignCast(ctx));
     const arg: *const Value = @ptrCast(@alignCast(value));
-    const strace = if (runtime.envOnce("KLIO_SUBTYPE_TRACE")) |w| (std.mem.indexOf(u8, target, w) != null) else false;
+    const strace = if (runtime.envOnce("KLIO_SUBTYPE_TRACE")) |w| (std.mem.find(u8, target, w) != null) else false;
     if (arg.* != .Instance) {
         if (strace) std.debug.print("[sub] target={s} arg-tag={s} -> null\n", .{ target, @tagName(std.meta.activeTag(arg.*)) });
         return null;
@@ -987,7 +987,7 @@ pub fn boundedParams(module: *const Module, cand: FuncId, f: *const Func) ?[]con
     var any = false;
     for (f.params) |*p| {
         var head = std.mem.trimEnd(u8, p.ty.name, "?");
-        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
         for (bounds) |b| {
             if (std.mem.eql(u8, b.param, head) and !std.mem.eql(u8, applicability.simpleName(b.bound), "Any")) any = true;
         }
@@ -998,11 +998,11 @@ pub fn boundedParams(module: *const Module, cand: FuncId, f: *const Func) ?[]con
     for (f.params, out) |*p, *o| {
         o.* = p.*;
         var head = std.mem.trimEnd(u8, p.ty.name, "?");
-        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
         for (bounds) |b| {
             if (!std.mem.eql(u8, b.param, head)) continue;
             var bn = std.mem.trim(u8, b.bound, " ");
-            if (std.mem.indexOfScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
+            if (std.mem.findScalar(u8, bn, '<')) |lt| bn = bn[0..lt];
             const bn_nullable = std.mem.endsWith(u8, bn, "?");
             bn = std.mem.trimEnd(u8, bn, "?");
             if (std.mem.eql(u8, applicability.simpleName(bn), "Any")) continue;
@@ -1097,7 +1097,7 @@ fn fnTypeArity(ty: *const TypeRef) ?usize {
             } else |_| {}
         }
     }
-    if (std.mem.indexOf(u8, ty.name, "->") != null and ty.args.len != 0) {
+    if (std.mem.find(u8, ty.name, "->") != null and ty.args.len != 0) {
         return ty.args.len - 1;
     }
     return null;
@@ -1221,7 +1221,7 @@ const valueIsBuiltin = root.valueIsBuiltin;
 pub fn fastCallPlan(self: *VmHost, module: *const Module, func: FuncId) u16 {
     const fp_trace = if (runtime.envOnce("KLIO_FASTPLAN_TRACE")) |w| blk: {
         const f0 = funcAt(module, func) orelse break :blk false;
-        break :blk std.mem.indexOf(u8, f0.name, w) != null;
+        break :blk std.mem.find(u8, f0.name, w) != null;
     } else false;
     const f = funcAt(module, func) orelse return 1;
     if (!f.hasBody()) {
@@ -1579,7 +1579,7 @@ pub fn callFunc(self: *VmHost, allocator: Allocator, module: *const Module, func
             const r = try host_call_member.callMember(self, allocator, &args_in[0], f.name, args_in[1..]);
             if (r == .err and r.err == .Unimplemented) {
                 const m = r.err.Unimplemented;
-                if (std.mem.indexOf(u8, m, "Vm::call_member") != null) {
+                if (std.mem.find(u8, m, "Vm::call_member") != null) {
                     if (runtime.freeScratch()) allocator.free(m);
                     if (f.is_expect) return missingActual(allocator, f);
                     return .{ .ok = .Unit };
@@ -1801,7 +1801,7 @@ fn namedPoints(self: *VmHost, module: *const Module, cand: FuncId, shapes: []con
 fn extRecvDisprovenByValue(self: *VmHost, ty: *const TypeRef, v: *const Value) bool {
     var head = applicability.simpleName(ty.name);
     head = std.mem.trimEnd(u8, head, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (head.len == 0 or std.mem.eql(u8, head, "Any")) return false;
     if (std.mem.startsWith(u8, head, "Function")) return false;
     if (v.* != .Instance) return false;
@@ -2028,7 +2028,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
     const func = func_in;
     if (funcAt(module, func)) |f| {
         if (runtime.envOnce("KLIO_CFN_TRACE")) |w| {
-            if (std.mem.indexOf(u8, f.name, w) != null) {
+            if (std.mem.find(u8, f.name, w) != null) {
                 std.debug.print("[cfn] {s}#{d} any_named={} nargs={d} params:", .{ f.fqn, func.int(), any_named, args.len });
                 for (f.params) |p| std.debug.print(" {s}", .{p.name});
                 std.debug.print(" names:", .{});
@@ -2137,7 +2137,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
                         defer ig.deinit();
                         const cg = ig.get().class.borrow();
                         defer cg.deinit();
-                        break :blk std.mem.indexOf(u8, cg.get().name, "Composer") != null;
+                        break :blk std.mem.find(u8, cg.get().name, "Composer") != null;
                     };
                     for (params[vararg_pos.? + 1 ..], vararg_pos.? + 1..) |*pp, j| {
                         if (slots[j] != null) continue;
@@ -2219,7 +2219,7 @@ pub fn callFuncNamed(self: *VmHost, allocator: Allocator, module: *const Module,
 pub fn callFuncTyped(self: *VmHost, allocator: Allocator, module: *const Module, func: FuncId, args: []const Value, arg_names: []const ?[]const u8, type_args: []const []const u8, exact: bool) Allocator.Error!EvalResult {
     if (runtime.envOnce("KLIO_CFN_TRACE")) |w0| {
         if (funcAt(module, func)) |f0| {
-            if (std.mem.indexOf(u8, f0.name, w0) != null) {
+            if (std.mem.find(u8, f0.name, w0) != null) {
                 std.debug.print("[cft] {s}#{d} nargs={d} names:", .{ f0.fqn, func.int(), args.len });
                 for (arg_names) |n| std.debug.print(" {s}", .{n orelse "<pos>"});
                 std.debug.print(" exact={}\n", .{exact});
@@ -2444,7 +2444,7 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                     if (cg.get().get(tn)) |c| break :blk Value{ .Class = c.clone() };
                     // An owner-qualified name resolves by FQN suffix: the table keys
                     // one simple-name winner.
-                    if (std.mem.indexOfScalar(u8, tn, '.') != null) {
+                    if (std.mem.findScalar(u8, tn, '.') != null) {
                         var it = cg.get().iterator();
                         while (it.next()) |e| {
                             const dg = e.value_ptr.borrow();
@@ -2454,7 +2454,7 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
                             dg.deinit();
                             if (hit) break :blk Value{ .Class = e.value_ptr.clone() };
                         }
-                        if (cg.get().get(tn[std.mem.lastIndexOfScalar(u8, tn, '.').? + 1 ..])) |c| break :blk Value{ .Class = c.clone() };
+                        if (cg.get().get(tn[std.mem.findScalarLast(u8, tn, '.').? + 1 ..])) |c| break :blk Value{ .Class = c.clone() };
                     }
                     break :blk host_globals.lookupGlobal(self, tn);
                 };
@@ -2586,7 +2586,7 @@ fn callFuncTypedInner(self: *VmHost, allocator: Allocator, module: *const Module
         const arg_full: []const u8 = if (idx < type_args.len) type_args[idx] else "";
         // A stamped spelling (`List<Int>`) binds its class by head; the full spelling
         // is for KType.
-        const arg_name = if (std.mem.indexOfScalar(u8, arg_full, '<')) |lt| arg_full[0..lt] else arg_full;
+        const arg_name = if (std.mem.findScalar(u8, arg_full, '<')) |lt| arg_full[0..lt] else arg_full;
         // Class table first: a type argument binds `.Class` even when its global is a
         // ctor intrinsic.
         const cls_value: ?Value = if (typeArgUnbound(arg_name, names)) blk: {

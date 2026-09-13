@@ -404,7 +404,7 @@ pub fn parseStringTemplate(p: *Parser) ?Expr {
 
 fn trimEndAny(s: []const u8, chars: []const u8) []const u8 {
     var end = s.len;
-    while (end > 0 and std.mem.indexOfScalar(u8, chars, s[end - 1]) != null) {
+    while (end > 0 and std.mem.findScalar(u8, chars, s[end - 1]) != null) {
         end -= 1;
     }
     return s[0..end];
@@ -433,7 +433,7 @@ fn filterOutChars(p: *Parser, s: []const u8, drop: []const u8) []const u8 {
     var buf = p.allocator.alloc(u8, s.len) catch @panic("OOM in primary");
     var n: usize = 0;
     for (s) |c| {
-        if (std.mem.indexOfScalar(u8, drop, c) == null) {
+        if (std.mem.findScalar(u8, drop, c) == null) {
             buf[n] = c;
             n += 1;
         }

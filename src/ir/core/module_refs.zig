@@ -254,7 +254,7 @@ pub fn topLevelPropHeadFor(self: *const Module, fqn: []const u8) ?[]const u8 {
         if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
         var h = staticTypeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"));
         if (h.len == 0) return null;
-        if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+        if (std.mem.findScalarLast(u8, h, '.')) |d| h = h[d + 1 ..];
         if (head) |prev| {
             if (!std.mem.eql(u8, prev, h)) return null;
         } else head = h;

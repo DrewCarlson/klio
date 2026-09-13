@@ -248,7 +248,7 @@ fn httpRequest(allocator: Allocator, in: RequestInputs) TransportError![][]const
 }
 
 fn flattenResponse(allocator: Allocator, raw: []const u8) TransportError![][]const u8 {
-    const sep = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadResponse;
+    const sep = std.mem.find(u8, raw, "\r\n\r\n") orelse return error.BadResponse;
     const head = raw[0..sep];
     const body = raw[sep + 4 ..];
 
@@ -260,7 +260,7 @@ fn flattenResponse(allocator: Allocator, raw: []const u8) TransportError![][]con
     var pairs: std.ArrayList(HeaderPair) = .empty;
     defer pairs.deinit(allocator);
     while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = std.mem.trim(u8, line[0..colon], " \t");
         const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
         if (std.ascii.eqlIgnoreCase(key, "content-type")) {
@@ -298,17 +298,17 @@ const ParsedUrl = struct {
 /// Split `scheme://host[:port][/path]`; the path defaults to `/` and the port to
 /// the scheme default.
 fn parseUrl(url: []const u8) TransportError!ParsedUrl {
-    const scheme_end = std.mem.indexOf(u8, url, "://") orelse return error.InvalidUrl;
+    const scheme_end = std.mem.find(u8, url, "://") orelse return error.InvalidUrl;
     const scheme = url[0..scheme_end];
     const rest = url[scheme_end + 3 ..];
-    const authority_end = std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len;
+    const authority_end = std.mem.findAny(u8, rest, "/?#") orelse rest.len;
     const authority = rest[0..authority_end];
     const path = if (authority_end < rest.len) rest[authority_end..] else "/";
     if (authority.len == 0) return error.InvalidUrl;
 
     var host = authority;
     var port: u16 = if (std.ascii.eqlIgnoreCase(scheme, "https")) 443 else 80;
-    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |ci| {
+    if (std.mem.findScalarLast(u8, authority, ':')) |ci| {
         host = authority[0..ci];
         port = std.fmt.parseInt(u16, authority[ci + 1 ..], 10) catch return error.InvalidUrl;
     }
@@ -597,7 +597,7 @@ fn read_request(allocator: Allocator, fd: i32) Allocator.Error!?ParsedRequest {
         }
         if (rc == 0) return null;
         try buf.appendSlice(allocator, chunk[0..@intCast(rc)]);
-        header_end = std.mem.indexOf(u8, buf.items, "\r\n\r\n");
+        header_end = std.mem.find(u8, buf.items, "\r\n\r\n");
     }
     const sep = header_end.?;
     const head = buf.items[0..sep];
@@ -615,7 +615,7 @@ fn read_request(allocator: Allocator, fd: i32) Allocator.Error!?ParsedRequest {
     while (lines.next()) |line| {
         const t = std.mem.trimEnd(u8, line, " \t\r");
         if (t.len == 0) break;
-        const colon = std.mem.indexOfScalar(u8, t, ':') orelse continue;
+        const colon = std.mem.findScalar(u8, t, ':') orelse continue;
         const key = std.mem.trim(u8, t[0..colon], " \t");
         const val = std.mem.trim(u8, t[colon + 1 ..], " \t");
         if (key.len == 0) continue;

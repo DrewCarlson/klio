@@ -3,12 +3,10 @@ const builtin = @import("builtin");
 const cli = @import("cli");
 const runtime = @import("runtime");
 
-/// Mobile app targets (iOS, Android). An app process cannot symbolize its own
-/// image at runtime — the iOS simulator SDK does not export the dyld
-/// image-header lookup std's stack-trace unwinder (`SelfInfo`) links against,
-/// and a packaged app has nowhere to print a trace regardless (crashes go to the
-/// OS crash reporter). Route panics to a minimal handler so `SelfInfo` is never
-/// linked; desktop keeps the full stack-trace panic.
+/// iOS and Android cannot symbolize their own image: the iOS simulator SDK
+/// omits the dyld image-header lookup `SelfInfo` links against, and a packaged
+/// app sends crashes to the OS reporter anyway. Panics route to a minimal
+/// handler there so `SelfInfo` is never linked. Desktop keeps the full panic.
 const is_mobile_target = runtime.trace.mobile;
 
 pub const panic = if (is_mobile_target)
@@ -16,44 +14,22 @@ pub const panic = if (is_mobile_target)
 else
     std.debug.FullPanic(std.debug.defaultPanic);
 
-/// macOS: ask every malloc zone to return its cached free pages to the OS.
-/// Called by the collector after a sweep so process RSS tracks the live set,
-/// not the cumulative allocation churn the libc free-lists would otherwise hold.
+/// macOS: return every malloc zone's cached free pages to the OS. Called after
+/// a sweep so RSS tracks the live set rather than cumulative churn.
 extern "c" fn malloc_zone_pressure_relief(zone: ?*anyopaque, goal: usize) usize;
 fn gcReleaseToOs() void {
     if (builtin.os.tag == .macos) _ = malloc_zone_pressure_relief(null, 0);
 }
 
-/// Backing-allocator selection for the process.
-///
-/// Default (`KLIO_RECLAIM` unset / `0`): the whole process runs on one
-/// process-lifetime arena, freed once at exit. Per-cell `ObjRef.deinit` is the
-/// arena fast path (`setReclaim(false)` in the run path), so reclamation is a
-/// no-op — the arena reclaims everything wholesale.
-///
-/// `KLIO_RECLAIM=free`: a real freeing allocator (`smp_allocator`) with the
-/// reference-counting reclamation path left OFF. Reclaims the host scratch and
-/// container temporaries the run path explicitly frees (the bulk of a server's
-/// per-request churn) without activating `ObjRef.deinit`'s value-graph teardown
-/// (not yet reconciled on the coroutine/ktor host path). Safe for long-running
-/// processes.
-///
-/// `KLIO_RECLAIM=smp`/`1`: a real freeing allocator (`smp_allocator`) with the
-/// reference-counting reclamation path left ON. Use to measure that a
-/// long-running process keeps memory bounded.
-///
-/// `KLIO_RECLAIM=debug`: a checking allocator (`DebugAllocator` with
-/// thread-safety + safety quarantine) with reclamation ON. Use to surface
-/// use-after-free / double-free / leaks at their source.
-/// Diagnostic backing allocator (KLIO_GC_GUARD): panic with a stack trace on an
-/// allocation whose size is absurd (the signature of a use-after-free reading a
-/// corrupted length out of a swept buffer), so the offending site is pinpointed
-/// instead of surfacing as a generic out-of-memory far away.
+/// `KLIO_GC_GUARD`: panic with a stack trace on an absurdly sized allocation,
+/// the signature of a use-after-free reading a corrupted length out of a swept
+/// buffer, so the offending site is pinpointed instead of surfacing as a
+/// distant out-of-memory.
 fn guardAllocator(inner: std.mem.Allocator) std.mem.Allocator {
     const G = struct {
         var backing: std.mem.Allocator = undefined;
-        // Only arm during program execution (alloc_perm flips false in vmRun);
-        // startup reads the multi-MB stdlib image while still permanent.
+        // Armed only during program execution: startup legitimately reads the
+        // multi-megabyte stdlib image.
         const LIMIT = 1 << 20; // 1 MB
         fn armed(len: usize) bool {
             return len > LIMIT and runtime.gc.program_started;
@@ -83,8 +59,8 @@ fn guardAllocator(inner: std.mem.Allocator) std.mem.Allocator {
     return .{ .ptr = undefined, .vtable = &G.vtable };
 }
 
-/// Resolve the performance profile from argv (`--opt`/`-O`) and `KLIO_OPT`
-/// before the backing allocator is chosen, defaulting to `fast` for the binary.
+/// Performance profile from argv (`--opt`/`-O`) and `KLIO_OPT`, resolved before
+/// the backing allocator is chosen. Defaults to `fast`.
 fn resolveProfile(args: std.process.Args) runtime.perf.Profile {
     const pa = std.heap.page_allocator;
     var it = args.iterateAllocator(pa) catch return runtime.perf.resolveBinaryProfile(&.{});
@@ -104,15 +80,13 @@ fn resolveProfile(args: std.process.Args) runtime.perf.Profile {
     return runtime.perf.resolveBinaryProfile(list.items);
 }
 
-/// Every command runs on a large stack reserve (virtual until touched):
-/// lowering a dependency base whose sources carry deeply-chained expressions
-/// recurses far past what a default main-thread stack holds, and the fault
-/// appears only on a cold bake — the warm-cache paths never re-lower.
+/// Every command runs on a large stack reserve, virtual until touched: lowering
+/// deeply-chained expressions recurses past a default main-thread stack, and
+/// only a cold bake reaches that path.
 ///
-/// The reserve comes from an in-thread stack switch, not a worker thread, so
-/// the command keeps running on the process main thread: a program that opens
-/// a Compose UI drives AppKit/Metal from there, and those reject a call made
-/// from any other thread.
+/// The reserve is an in-thread stack switch, not a worker thread, so the command
+/// stays on the process main thread. AppKit and Metal reject calls from any
+/// other thread, and a Compose UI program drives them from here.
 const CliCtx = struct {
     a: std.mem.Allocator,
     args: std.process.Args,
@@ -127,30 +101,27 @@ fn runCli(a: std.mem.Allocator, args: std.process.Args) u8 {
 }
 
 pub fn main(init: std.process.Init.Minimal) !u8 {
-    // The thread the program runs on reads its per-thread interpreter state
-    // from ordinary globals; every other thread keeps a threadlocal. Claimed
-    // here, before any interpreter thread exists.
+    // The program thread reads its per-thread interpreter state from ordinary
+    // globals, every other thread from a threadlocal. Claim before any
+    // interpreter thread exists.
     runtime.tls_fast.claimOwner();
     runtime.runstats.markStart();
-    // attachSegfaultHandler pulls the `SelfInfo` symbolizer (unavailable on
-    // mobile — see the panic override above); gate it out there at comptime.
+    // attachSegfaultHandler pulls the `SelfInfo` symbolizer, absent on mobile.
     if (comptime !is_mobile_target) {
         if (runtime.envOnce("KLIO_SEGV_TRACE")) |_| std.debug.attachSegfaultHandler();
     }
     if (runtime.envOnce("KLIO_PROF_ALL")) |_| runtime.prof.maybeStart();
     defer if (runtime.envOnce("KLIO_PROF_ALL")) |_| runtime.prof.maybeReport();
-    // In bundle mode argv belongs entirely to the embedded program, so the
-    // performance profile comes from the environment (KLIO_OPT) alone.
+    // In bundle mode argv belongs to the embedded program, so the profile comes
+    // from KLIO_OPT alone.
     runtime.perf.setProfile(if (cli.bundleModeActive())
         runtime.perf.resolveBinaryProfile(&.{})
     else
         resolveProfile(init.args));
 
-    // Mobile app process: no diagnostic allocator modes. The debug/guard/gpa
-    // branches below instantiate `std.heap.DebugAllocator`, whose leak reporting
-    // pulls the `SelfInfo` stack-trace symbolizer (unavailable on mobile — see
-    // the panic override above). Take the default process-lifetime arena
-    // directly and comptime-drop the whole diagnostic switch.
+    // Mobile has no diagnostic allocator modes: the branches below instantiate
+    // `DebugAllocator`, whose leak reporting pulls `SelfInfo`. Take the
+    // process-lifetime arena and comptime-drop the switch.
     if (comptime is_mobile_target) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
@@ -172,14 +143,14 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
             return runCli(std.heap.smp_allocator, init.args);
         },
         .gc => {
-            // Tracing GC (KGC): a freeing backing allocator + reachability-based
-            // reclamation. Reference counting is neutralized (deinit/retain/
-            // release no-op), so the collector alone frees, by reachability.
+            // Tracing collector: a freeing backing allocator plus
+            // reachability-based reclamation. Reference counting no-ops, so the
+            // collector alone frees.
             runtime.backing.configureGcFromEnv();
             if (runtime.envOnce("KLIO_GC_GUARD")) |v| {
-                // GUARD=dbg: route the GC's freeing backing through the checking
+                // GUARD=dbg: route the freeing backing through the checking
                 // allocator so a use-after-free of a swept cell is caught at the
-                // access with a stack trace, not as a far-away corruption.
+                // access.
                 if (std.mem.eql(u8, v, "dbg")) {
                     var dbg: std.heap.DebugAllocator(.{ .thread_safe = true, .safety = true }) = .init;
                     defer _ = dbg.deinit();
@@ -187,22 +158,18 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 }
                 return runCli(guardAllocator(std.heap.smp_allocator), init.args);
             }
-            // Backing allocator. The collector frees by reachability, but the
-            // backend decides whether reclaimed pages return to the OS. The
-            // default is the slab allocator (`runtime.slab`): same-size cells
-            // share a slab, and a slab returns to the OS the instant its last
-            // cell is freed — so RSS tracks the live set, not cumulative churn.
-            // The stock free-list allocators never return pages (RSS grew with
-            // total work even though the collector kept the live set flat).
-            // KLIO_GC_ALLOC selects an alternative for comparison:
-            //   slab   (default) — page-returning slab allocator
-            //   smp              — fastest; free-lists never return pages
-            //   gpa              — page-returning general-purpose allocator (slow)
-            //   calloc           — libc malloc + macOS pressure-relief trim
+            // The collector frees by reachability; the backend decides whether
+            // reclaimed pages return to the OS. Default `slab` shares a slab
+            // between same-size cells and unmaps it the instant its last cell is
+            // freed, so RSS tracks the live set. KLIO_GC_ALLOC picks another:
+            //   slab   (default) page-returning slab allocator
+            //   smp              fastest; free-lists never return pages
+            //   gpa              page-returning general-purpose allocator, slow
+            //   calloc           libc malloc plus macOS pressure-relief trim
             const alloc_mode = runtime.envOnce("KLIO_GC_ALLOC") orelse "slab";
-            // The slab backend returns the pages of stably-sparse regions to the OS
-            // after each sweep; the non-slab backends below either override this or
-            // do not touch the slab (the hook then no-ops over empty class lists).
+            // Returns stably-sparse regions to the OS after each sweep. The
+            // non-slab backends override this hook or leave it over empty class
+            // lists, where it no-ops.
             runtime.gc.release_to_os = runtime.slab.reclaimDormant;
             if (std.mem.eql(u8, alloc_mode, "smp")) {
                 return runCli(std.heap.smp_allocator, init.args);
@@ -221,9 +188,8 @@ pub fn main(init: std.process.Init.Minimal) !u8 {
                 const a = runtime.leaktrack.wrap(runtime.slab.allocator);
                 runtime.leaktrack.installSignalDump();
                 const rc = runCli(a, init.args);
-                // Force a final collection so GC-managed cells that were merely
-                // uncollected (not leaked) are freed before the report; what
-                // remains outstanding is the genuine raw host-temporary leak.
+                // Collect once more so merely-uncollected cells are freed before
+                // the report; what remains is a genuine host-temporary leak.
                 runtime.gc.collect();
                 if (runtime.envOnce("KLIO_LEAK_BY_FQN")) |_|
                     runtime.leaktrack.reportByFqn()

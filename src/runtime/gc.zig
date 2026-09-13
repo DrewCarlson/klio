@@ -34,7 +34,7 @@ pub var gc_hist: bool = false;
 /// the value graph is deep and cyclic.
 pub const Marker = struct {
     epoch: usize,
-    grey: std.ArrayListUnmanaged(*GcHeader) = .empty,
+    grey: std.ArrayList(*GcHeader) = .empty,
     arena: Allocator,
     /// Minor collections sweep only the nursery, so marking stops at each
     /// tenured cell; tenure or the remembered set covers its children.
@@ -115,7 +115,7 @@ fn rememberTraceOn() bool {
     return remember_trace_on;
 }
 
-var remembered: std.ArrayListUnmanaged(*GcHeader) = .empty;
+var remembered: std.ArrayList(*GcHeader) = .empty;
 var remembered_lock: SpinLock = .{};
 
 /// Record a reference store: a tenured cell joins the remembered set.
@@ -417,7 +417,7 @@ pub fn safePoint() void {
 // Each subsystem registers a callback that shades every live Value it owns.
 
 pub const RootFn = *const fn (*Marker) void;
-var roots: std.ArrayListUnmanaged(RootFn) = .empty;
+var roots: std.ArrayList(RootFn) = .empty;
 var roots_lock: SpinLock = .{};
 
 pub fn registerRoot(f: RootFn) void {

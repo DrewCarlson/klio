@@ -425,7 +425,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
                 const target = resolved.target orelse break :blk null;
                 const f = module.funcById(target) orelse break :blk null;
                 var h = std.mem.trimEnd(u8, f.return_ty.name, "?");
-                if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
                 if (h.len == 0 or std.mem.eql(u8, h, "Unit")) break :blk null;
                 // A return left as the owner's own type parameter names no
                 // class and types nothing.
@@ -971,7 +971,7 @@ pub fn buildObject(self: *VmHost, allocator: Allocator, expr: *const ast.Expr, c
         };
         const parent_def = classDefByName(self, resolved_name);
         if (parent_def == null) {
-            const simple = if (std.mem.lastIndexOfScalar(u8, resolved_name, '.')) |d| resolved_name[d + 1 ..] else resolved_name;
+            const simple = if (std.mem.findScalarLast(u8, resolved_name, '.')) |d| resolved_name[d + 1 ..] else resolved_name;
             if (isBuiltinThrowableName(simple)) throwable_args = vals;
         }
         if (parent_def) |pdef| {

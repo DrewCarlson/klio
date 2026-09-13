@@ -168,7 +168,7 @@ pub fn fieldSiteRoute(self: *VmHost, receiver: *const Value, name: []const u8) ?
     // virtual dispatch resolves it to.
     if (std.mem.startsWith(u8, name, "$sgetter$")) {
         const rest = name["$sgetter$".len..];
-        if (std.mem.indexOfScalar(u8, rest, '\u{1f}')) |sep| {
+        if (std.mem.findScalar(u8, rest, '\u{1f}')) |sep| {
             const owner = rest[0..sep];
             const prop = rest[sep + 1 ..];
             if (prop.len == 0) return null;

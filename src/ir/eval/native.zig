@@ -205,7 +205,7 @@ var native_leaf_any: std.atomic.Value(bool) = .init(false);
 /// Computed from the same Func data on both the emitting and the
 /// serving side, so the spellings agree by construction.
 pub fn leafSigChar(ty: []const u8) u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, ty, '.')) |d| ty[d + 1 ..] else ty;
+    const base = if (std.mem.findScalarLast(u8, ty, '.')) |d| ty[d + 1 ..] else ty;
     const eq = std.mem.eql;
     if (eq(u8, base, "Int")) return 'i';
     if (eq(u8, base, "Long")) return 'l';
@@ -236,7 +236,7 @@ pub fn leafKeyAlloc(gpa2: std.mem.Allocator, f: *const Func) ?[]u8 {
             continue;
         }
         const nm = p.ty.name;
-        const head = if (std.mem.lastIndexOfScalar(u8, nm, '.')) |d| nm[d + 1 ..] else nm;
+        const head = if (std.mem.findScalarLast(u8, nm, '.')) |d| nm[d + 1 ..] else nm;
         if (head.len == 0) {
             buf.append(gpa2, 'o') catch return null;
         } else {
@@ -469,9 +469,9 @@ pub fn tryLeafValues(comptime H: type, allocator: Allocator, module: *const Modu
         const memo = @atomicLoad(u64, &sd.memo, .acquire);
         const site_fid: u32 = if (memo != 0) @intCast(memo - 1) else fid_blk: {
             const want = std.mem.span(sd.fqn);
-            const hash_pos = std.mem.lastIndexOfScalar(u8, want, '#') orelse return null;
+            const hash_pos = std.mem.findScalarLast(u8, want, '#') orelse return null;
             const want_fqn = want[0..hash_pos];
-            const dot = std.mem.lastIndexOfScalar(u8, want_fqn, '.') orelse return null;
+            const dot = std.mem.findScalarLast(u8, want_fqn, '.') orelse return null;
             var found: ?u32 = null;
             for (module.funcsBySimpleName(want_fqn[dot + 1 ..])) |cand| {
                 const cf2 = module.funcById(cand) orelse continue;

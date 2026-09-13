@@ -122,7 +122,7 @@ pub fn emitPathLabeled(
 }
 
 fn pathSimpleName(fqn: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |i| return fqn[i + 1 ..];
+    if (std.mem.findScalarLast(u8, fqn, '.')) |i| return fqn[i + 1 ..];
     return fqn;
 }
 

@@ -1553,7 +1553,7 @@ test "ebf: constructor property field clause is a syntax error" {
     try testing.expect(out.parser.diagnostics.hasErrors());
     var found = false;
     for (out.parser.diagnostics.diags()) |d| {
-        if (std.mem.indexOf(u8, d.message, "constructor properties") != null) found = true;
+        if (std.mem.find(u8, d.message, "constructor properties") != null) found = true;
     }
     try testing.expect(found);
 }
@@ -1570,7 +1570,7 @@ test "ebf: local property field clause is a syntax error" {
     try testing.expect(out.parser.diagnostics.hasErrors());
     var found = false;
     for (out.parser.diagnostics.diags()) |d| {
-        if (std.mem.indexOf(u8, d.message, "local properties") != null) found = true;
+        if (std.mem.find(u8, d.message, "local properties") != null) found = true;
     }
     try testing.expect(found);
 }

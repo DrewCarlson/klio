@@ -89,7 +89,7 @@ pub fn packageOfFqn(fqn: []const u8, simple: []const u8) []const u8 {
     {
         return fqn[0 .. fqn.len - simple.len - 1];
     }
-    if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| return fqn[0..dot];
+    if (std.mem.findScalarLast(u8, fqn, '.')) |dot| return fqn[0..dot];
     return "";
 }
 

@@ -116,7 +116,7 @@ fn getEnvVar(allocator: Allocator, io: Io, name: []const u8) Allocator.Error!?[]
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
         if (std.mem.eql(u8, entry[0..eq], name)) {
             return try allocator.dupe(u8, entry[eq + 1 ..]);
         }
@@ -134,7 +134,7 @@ fn procEnvMap(allocator: Allocator, io: Io) Allocator.Error!std.process.Environ.
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| {
         if (entry.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
         map.put(entry[0..eq], entry[eq + 1 ..]) catch {};
     }
     return map;
@@ -283,8 +283,8 @@ fn locateKotlinc(allocator: Allocator, io: Io, kind: KotlincKind) Allocator.Erro
                     while (it.next(io) catch null) |entry| {
                         const s = entry.name;
                         if (std.mem.startsWith(u8, s, "kotlin-native-prebuilt-") and
-                            std.mem.indexOf(u8, s, TARGET_VERSION) != null and
-                            std.mem.indexOf(u8, s, "-RC") == null)
+                            std.mem.find(u8, s, TARGET_VERSION) != null and
+                            std.mem.find(u8, s, "-RC") == null)
                         {
                             const p = try std.fs.path.join(allocator, &.{ root, s, "bin", binary });
                             if (isFile(io, p)) {
@@ -940,7 +940,7 @@ pub const CaptureOutput = struct {
 
     fn writeStr(self: *CaptureOutput, s: []const u8) void {
         self.cur.appendSlice(self.allocator, s) catch return;
-        while (std.mem.indexOfScalar(u8, self.cur.items, '\n')) |idx| {
+        while (std.mem.findScalar(u8, self.cur.items, '\n')) |idx| {
             const line = self.allocator.dupe(u8, self.cur.items[0..idx]) catch return;
             self.lines.append(self.allocator, line) catch {
                 self.allocator.free(line);
@@ -1016,7 +1016,7 @@ fn collectImportPrefixes(allocator: Allocator, file: *const KotlinFile, set: *st
 /// `kotlin`/`kotlinx`-rooted dotted tokens; a hit inside a comment only over-opens.
 fn collectQualifiedPrefixes(allocator: Allocator, text: []const u8, set: *std.StringHashMap(void)) Allocator.Error!void {
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, text, i, "kotlin")) |at| {
+    while (std.mem.findPos(u8, text, i, "kotlin")) |at| {
         i = at + "kotlin".len;
         if (at > 0) {
             const c = text[at - 1];
@@ -1459,7 +1459,7 @@ fn traceBaseEnabled() bool {
         }
         var it = std.mem.splitScalar(u8, buf[0..len], 0);
         while (it.next()) |entry| {
-            const eq = std.mem.indexOfScalar(u8, entry, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, entry, '=') orelse continue;
             if (std.mem.eql(u8, entry[0..eq], "KLIO_TRACE_STDLIB_BASE")) {
                 const val = entry[eq + 1 ..];
                 enabled = val.len != 0 and !std.mem.eql(u8, val, "0");
@@ -2149,16 +2149,16 @@ fn parseManifestRoots(allocator: Allocator, toml: []const u8) Allocator.Error![]
         if (pending) |*buf| {
             try buf.append(allocator, ' ');
             try buf.appendSlice(allocator, line);
-            if (std.mem.indexOfScalar(u8, line, ']') != null) {
+            if (std.mem.findScalar(u8, line, ']') != null) {
                 try logical.append(allocator, try buf.toOwnedSlice(allocator));
                 pending = null;
             }
             continue;
         }
         if (line.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, line, '[') != null and
-            std.mem.indexOfScalar(u8, line, ']') == null and
-            std.mem.indexOfScalar(u8, line, '=') != null)
+        if (std.mem.findScalar(u8, line, '[') != null and
+            std.mem.findScalar(u8, line, ']') == null and
+            std.mem.findScalar(u8, line, '=') != null)
         {
             var buf: std.ArrayList(u8) = .empty;
             try buf.appendSlice(allocator, line);
@@ -2190,7 +2190,7 @@ fn parseManifestRoots(allocator: Allocator, toml: []const u8) Allocator.Error![]
             in_source_table = false;
             continue;
         }
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const eq = std.mem.findScalar(u8, line, '=') orelse continue;
         const key = std.mem.trim(u8, line[0..eq], " \t\r\n");
         const val = std.mem.trim(u8, line[eq + 1 ..], " \t\r\n");
         if (in_source_table) {
@@ -2486,7 +2486,7 @@ fn injectJvmInline(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
     var prev_had_jvminline = false;
     var idx: usize = 0;
     while (idx < src.len) {
-        const nl = std.mem.indexOfScalarPos(u8, src, idx, '\n');
+        const nl = std.mem.findScalarPos(u8, src, idx, '\n');
         const line_end = if (nl) |n| n + 1 else src.len;
         const line = src[idx..line_end];
         idx = line_end;
@@ -2816,7 +2816,7 @@ pub fn compileCorpus(allocator: Allocator, io: Io, label: []const u8, files: []c
     }
     for (files) |file| {
         const stem_full = std.fs.path.basename(file);
-        const stem = if (std.mem.lastIndexOfScalar(u8, stem_full, '.')) |dot| stem_full[0..dot] else stem_full;
+        const stem = if (std.mem.findScalarLast(u8, stem_full, '.')) |dot| stem_full[0..dot] else stem_full;
         const pkg_seg = try sanitizePkgSegment(allocator, stem);
         defer allocator.free(pkg_seg);
         const pkg = try std.fmt.allocPrint(allocator, "klio_parity.{s}.{s}", .{ label, pkg_seg });
@@ -2990,7 +2990,7 @@ test "plain_value_class_gets_annotation" {
 test "modifier_chain_handled" {
     const out = try injectJvmInline(std.testing.allocator, "public value class X(val a: Int)\n");
     defer std.testing.allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "@JvmInline\npublic value class X") != null);
+    try std.testing.expect(std.mem.find(u8, out, "@JvmInline\npublic value class X") != null);
 }
 
 test "existing_annotation_left_alone" {
