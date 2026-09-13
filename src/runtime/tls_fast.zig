@@ -1,41 +1,19 @@
-//! Owner-thread fast path for the interpreter's per-thread state.
-//!
-//! Darwin resolves every `threadlocal` access through a `_tlv_get_addr` CALL
-//! rather than a register-relative load. LLVM hoists the call out of a loop, so
-//! the cost lands wherever a call intervenes — which, in an interpreter, is
-//! every hot helper. Measured on a member-call loop it was the top leaf in the
-//! profile, and giving the four hottest per-thread structures ordinary global
-//! storage ran 11% faster.
-//!
-//! The interpreter's state is genuinely per-thread, so it cannot simply become
-//! global. Instead ONE thread — the one that claims ownership at startup, which
-//! is the thread every non-coroutine program runs on — reads its state from an
-//! ordinary global, and every other thread keeps its threadlocal. The owner
-//! never changes, so no state ever migrates between the two storages: a given
-//! thread deterministically reads the same object for the process's life, which
-//! is exactly the guarantee `threadlocal` gave.
-//!
-//! Reading the thread pointer is one instruction on both supported
-//! architectures. An architecture without one falls back to "never the owner",
-//! which is the threadlocal behavior unchanged.
+//! Owner-thread fast path for the interpreter's per-thread state. Darwin
+//! resolves every `threadlocal` access through a `_tlv_get_addr` call, and in
+//! an interpreter a call intervenes in every hot helper. The state is genuinely
+//! per-thread, so one thread, the one that claims ownership at startup and runs
+//! every non-coroutine program, reads its state from an ordinary global while
+//! every other thread keeps its threadlocal. The owner never changes, so a
+//! given thread deterministically reads the same object for the process's
+//! life.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// This thread's unique pointer, in one instruction — DARWIN ONLY, because the
-/// register holding it is per-platform and this reads it directly:
-/// `TPIDRRO_EL0` is the thread pointer Darwin's own aarch64 TLS lowering reads,
-/// and on x86_64 the same value sits at `%gs:0`.
-///
-/// Linux disagrees on BOTH: its x86_64 thread pointer is in `%fs` (`%gs` is the
-/// kernel's and reads zero in userspace, so this aborted), and its aarch64 one
-/// is `TPIDR_EL0`, not the read-only twin. Reading the wrong one is not a slow
-/// answer, it is a wrong or trapping one.
-///
-/// Scoping this to Darwin costs nothing, because the cost it exists to dodge is
-/// Darwin's alone: a `threadlocal` there resolves through a `_tlv_get_addr`
-/// CALL, while Linux lowers the same access to a register-relative load with no
-/// call to remove.
+/// This thread's unique pointer, in one instruction. Darwin only, because the
+/// register is per-platform and this reads it directly: `TPIDRRO_EL0` on
+/// aarch64, `%gs:0` on x86_64. Linux disagrees on both, so reading these there
+/// is wrong or trapping, and Darwin is where the cost this dodges lives.
 pub inline fn threadPtr() usize {
     if (comptime !supported()) return 0;
     return switch (builtin.cpu.arch) {
@@ -49,27 +27,22 @@ pub inline fn threadPtr() usize {
     };
 }
 
-/// Zero until a thread claims ownership. Written once, before any second
-/// interpreter thread exists.
+/// Written once, before any second interpreter thread exists.
 var owner: usize = 0;
 
-/// Claim the calling thread as the owner. Called once from the process entry
-/// point, on the thread the program runs on.
+/// Called once from the process entry point.
 pub fn claimOwner() void {
     if (comptime !supported()) return;
     @atomicStore(usize, &owner, threadPtr(), .release);
 }
 
-/// Where the thread-pointer register and its convention are both known here.
-/// Anywhere else every thread keeps its `threadlocal`, which is what this
-/// existed to avoid only on Darwin — so the fallback loses nothing.
+/// Anywhere else every thread keeps its `threadlocal`.
 pub inline fn supported() bool {
     return builtin.os.tag.isDarwin() and
         (builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .x86_64);
 }
 
-/// Whether the calling thread reads the global copy. False for every thread but
-/// the owner, and false everywhere before `claimOwner` runs.
+/// False everywhere before `claimOwner`.
 pub inline fn isOwner() bool {
     if (comptime !supported()) return false;
     const o = @atomicLoad(usize, &owner, .monotonic);

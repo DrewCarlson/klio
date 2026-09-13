@@ -1,108 +1,55 @@
 //! Reference-counted, interior-mutable cell behind `ObjRef`.
 //!
-//! `ObjRef(T)` is the handle to a shared, interior-mutable Kotlin heap
-//! object. The backing is a heap-allocated control block holding an
-//! atomic strong count (so handles are safe to share across threads)
-//! and a per-cell reader/writer lock that mediates every borrow.
+//! `ObjRef(T)` is the handle to a shared Kotlin heap object, backed by a heap
+//! control block with an atomic strong count and a per-cell reader/writer lock
+//! whose acquire/release ordering is the happens-before edge that makes
+//! cross-thread access sound, so a reference can escape to another thread with
+//! no separate publication step. Single-threaded execution never takes two
+//! conflicting borrows on one cell, since the interpreter and stdlib copy out
+//! of a borrow before running user code.
 //!
-//! Every `borrow` takes a shared (reader) lock; every `borrowMut` takes
-//! an exclusive (writer) lock. Any number of concurrent shared borrows
-//! proceed together; an exclusive borrow is exclusive against all
-//! readers and writers. The lock's acquire/release ordering is the
-//! happens-before edge that makes cross-thread access sound, so a
-//! reference can escape to another thread with no separate publication
-//! step.
-//!
-//! Single-threaded execution never takes an overlapping *conflicting*
-//! borrow on one cell (a `borrowMut` while a borrow on the same cell is
-//! live, or vice versa): the interpreter and stdlib copy out of a borrow
-//! before running any user code, so the reader/writer lock is always
-//! uncontended on the single-thread path — an uncontended `cmpxchg`,
-//! the same fast path a `RefCell` borrow flag would take.
-//!
-//! Synchronization choice: Zig 0.16's std has no blocking
-//! `Thread.Mutex`/`RwLock` (those moved behind the `Io` interface), so
-//! the reader/writer lock here is a small spin lock built on
-//! `std.atomic.Value` with a `spinLoopHint`/`Thread.yield` backoff. It
-//! provides the discipline the model needs: many concurrent shared
-//! readers, one exclusive writer, with acquire/release ordering.
-//!
-//! Allocator convention: an `ObjRef` owns a heap-allocated control
-//! block. The allocator used to create it is stored *inside* the
-//! control block, so `clone`, `deinit`, `borrow`, etc. need no
-//! allocator argument — only `init` does. `deinit` decrements the
-//! strong count and frees the block (running `T`'s `deinit` if it has
-//! one) when the count reaches zero.
+//! The allocator that created a control block is stored inside it, so only
+//! `init` takes one.
 
 const std = @import("std");
 const trace = @import("trace.zig");
 pub const gc = @import("gc.zig");
 
-/// Per-thread teardown mode for `ObjRef.deinit`.
+/// Teardown mode for `ObjRef.deinit`. `true`, the default, runs the atomic
+/// decrement, `T.deinit` and `allocator.destroy(cell)`; it must never be false
+/// on a thread running on a leak-checking `testing.allocator`. `false` is the
+/// arena fast path, where `deinit` returns without touching the refcount, the
+/// payload or the destroy, because the arena frees every cell on reset.
 ///
-/// `true` (the default) runs the full Arc/Drop path: the atomic refcount
-/// decrement, `T.deinit`, and `allocator.destroy(cell)`. This is the only
-/// mode the leak-checking unit tests and the real-thread objcell/objref
-/// stress tests ever run under, so they keep exercising the full
-/// refcount/free path that catches use-after-free and leaks.
-///
-/// `false` is the arena fast path: `ObjRef.deinit` returns immediately
-/// without touching the refcount, the payload `T.deinit`, or the destroy,
-/// because the backing arena frees every cell en masse on reset. It is
-/// opt-in by the arena-backed run configs (the `klio` binary's run path,
-/// the e2e/parity/differential harnesses) for the duration of one program
-/// and restored afterward. It must NEVER be set on a thread that runs on a
-/// leak-checking `testing.allocator`, or a UAF/leak would be masked.
-///
-/// Process-wide: the perf profile decides the mode once at startup and
-/// every spawned worker runs the same mode, so a shared atomic replaces
-/// the old threadlocal — `reclaimEnabled()` is read on nearly every
-/// register write and a macOS dyld TLV lookup was ~13% of a pure counting
-/// loop. Monotonic is enough: the value only changes at run boundaries
-/// when no interpreter thread is mid-flight.
+/// Process-wide rather than per-thread, since `reclaimEnabled()` is read on
+/// nearly every register write. Monotonic suffices: the value changes only at
+/// run boundaries, with no interpreter thread in flight.
 var reclaim_shared: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
 
-/// Set the `ObjRef.deinit` teardown mode. `true` = full
-/// refcount/destroy/`T.deinit` path; `false` = arena fast path (skip
-/// per-cell teardown, the arena reclaims). Defaults to `true`.
 pub fn setReclaim(on: bool) void {
     reclaim_shared.store(on, .monotonic);
 }
 
-/// Whether the current thread runs `ObjRef.deinit`'s full teardown path.
 pub fn reclaimEnabled() bool {
     return reclaim_shared.load(.monotonic);
 }
 
-/// Whether raw host-temporary buffers (scratch arrays, probe FQN strings, error
-/// messages — allocations that are NOT refcounted cells and never escape the
-/// host op) should be explicitly freed. True whenever the backing allocator
-/// actually frees: the reference-counting modes (`reclaim_tls`) AND the tracing
-/// GC (`gc.gc_enabled`), under which `reclaim_tls` is OFF (the collector frees
-/// cells by reachability) but raw scratch is invisible to the collector and
-/// would otherwise leak. False only under the pure process arena, where `free`
-/// is a no-op anyway. Keeps the value-graph ownership ops gated on
-/// `reclaimEnabled()` (must stay off under GC) distinct from scratch frees.
+/// Whether raw host temporaries, allocations that are not cells, must be freed
+/// explicitly. True whenever the backing allocator actually frees: the
+/// reference-counting modes, and the tracing GC, under which refcount teardown
+/// is off but raw scratch is invisible to the collector. Deliberately distinct
+/// from `reclaimEnabled()`, which must stay off under the GC.
 pub fn freeScratch() bool {
     return reclaim_shared.load(.monotonic) or gc.gc_enabled;
 }
 
-/// Whether the process was asked to run the freeing reference-counting path
-/// (a real allocator + reclaim-ON) instead of the arena fast path, via the
-/// `KLIO_RECLAIM` environment variable (`1`/`smp`/`debug` = on; unset/`0` =
-/// off). The run path consults this to decide whether to disable reclaim; the
-/// process entry point consults it to pick the backing allocator. Cached so
-/// repeated checks across the run are cheap and consistent.
+/// Whether `KLIO_RECLAIM` asked for the freeing reference-counting path rather
+/// than the arena; also selects the backing allocator at the entry point.
 var reclaim_req_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0 unknown, 1 off, 2 on
 
-/// libc `getenv` wrapper returning a borrowed slice. Returns null in a build
-/// without libc (module test binaries) — those never set the env anyway.
-///
-/// Memoized: the trace/diagnostic gates consult this on hot dispatch and
-/// suspend paths, and libc's `getenv` takes a process-wide lock per call —
-/// it profiled at a quarter of on-CPU time in the DeepRecursive commontests.
-/// The process env never changes mid-run (children get their env via
-/// spawn-time maps), so each name's first answer is authoritative.
+/// Null in a build without libc. Memoized, because the trace gates consult it
+/// on hot paths while `getenv` takes a process-wide lock per call, and the
+/// process env never changes mid-run.
 var env_cache_mutex: SpinMutex = .{};
 var env_cache: ?std.StringHashMap(?[]const u8) = null;
 
@@ -119,17 +66,9 @@ pub fn getenvSlice(name: [*:0]const u8) ?[]const u8 {
     return value;
 }
 
-/// A single environment variable read, answered from a per-call-site static
-/// after the first ask. `getenvSlice` still takes the shared cache's mutex and
-/// hashes the name on every call, which the dispatch and frame-entry gates pay
-/// once per interpreted call across every thread; a comptime-keyed name gets
-/// its own static, so the shared cache is consulted exactly once per site.
-/// Racing first asks compute the same answer.
-/// One variable's slot. A `struct` declared inside `envOnce` would NOT be
-/// per-name: a comptime pointer parameter does not re-instantiate the body,
-/// so every call site would share one static and answer with whichever
-/// variable was read first. Keying a TYPE on the name gives each variable its
-/// own statics, which is what the memoization needs to be correct.
+/// One variable's slot. A `struct` declared inside `envOnce` would not be
+/// per-name: a comptime pointer parameter does not re-instantiate the body, so
+/// every call site would share one static. Keying a type on the name does.
 fn EnvSlot(comptime name: [:0]const u8) type {
     return struct {
         const key: [:0]const u8 = name;
@@ -138,6 +77,8 @@ fn EnvSlot(comptime name: [:0]const u8) type {
     };
 }
 
+/// Answered from a per-name static after the first ask, since `getenvSlice`
+/// hashes the name under a mutex on every call.
 pub fn envOnce(comptime name: [:0]const u8) ?[]const u8 {
     const S = EnvSlot(name);
     if (S.state.load(.acquire) == 0) {
@@ -147,22 +88,18 @@ pub fn envOnce(comptime name: [:0]const u8) ?[]const u8 {
     return S.value;
 }
 
-/// `envOnce` as a plain presence test.
 pub fn envSetOnce(comptime name: [:0]const u8) bool {
     return envOnce(name) != null;
 }
 
 test "envOnce answers per variable, not per first read" {
-    // The shared-static bug this guards: two names must not alias.
     try std.testing.expect(envOnce("KLIO_ENVONCE_SELFTEST_A") == null);
     try std.testing.expect(envOnce("KLIO_ENVONCE_SELFTEST_B") == null);
     try std.testing.expect(EnvSlot("KLIO_ENVONCE_SELFTEST_A") != EnvSlot("KLIO_ENVONCE_SELFTEST_B"));
 }
 
-/// Diagnostic: when `KLIO_RC_DETECT` is set, `ObjRef.deinit` leaks freed cells
-/// and dumps a stack trace on a second decrement (a double-free). Off by
-/// default; only used to pinpoint reclamation double-frees during the host
-/// reconciliation.
+/// `KLIO_RC_DETECT`: leak freed cells and dump a stack trace on a second
+/// decrement, pinpointing a double-free.
 var detect_df_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
 fn detectDoubleFree() bool {
     switch (detect_df_state.load(.monotonic)) {
@@ -185,16 +122,11 @@ pub fn reclaimRequested() bool {
         else => {},
     }
     const on = blk: {
-        // Unset is the tracing GC (the collector reclaims by reachability;
-        // refcount teardown stays off — `main.zig` forces `setReclaim(false)`).
+        // Unset is the tracing GC, which reclaims by reachability.
         const v = envOnce("KLIO_RECLAIM") orelse break :blk false;
-        // `free` selects a freeing allocator (see `main.zig`) while leaving
-        // the refcount reclamation path OFF: it reclaims the host scratch and
-        // container temporaries the run path explicitly frees, without
-        // activating `ObjRef.deinit`'s value-graph teardown (not yet
-        // reconciled on the coroutine/ktor host path). `arena`/`0` and `gc`
-        // also leave refcount teardown off (arena never frees; gc's collector
-        // reclaims instead).
+        // `free` selects a freeing allocator while leaving refcount reclamation
+        // off, so it reclaims only the scratch the run path frees explicitly.
+        // `arena`, `0` and `gc` also leave it off.
         if (std.mem.eql(u8, v, "free") or std.mem.eql(u8, v, "arena") or std.mem.eql(u8, v, "gc")) break :blk false;
         break :blk v.len != 0 and !std.mem.eql(u8, v, "0");
     };
@@ -202,22 +134,17 @@ pub fn reclaimRequested() bool {
     return on;
 }
 
-/// Reader/writer spin lock. `state` encodes the lock as `RefCell` does
-/// its flag: `0` free, `n > 0` n active readers, `WRITER` (the sign bit)
-/// exclusive writer. Many readers proceed concurrently; a writer is
-/// exclusive against all readers and writers.
+/// Many readers proceed concurrently; a writer is exclusive against all.
 const SpinRwLock = struct {
-    /// `0` = free; positive = reader count; `WRITER` = exclusively
-    /// write-locked.
+    /// `0` free, positive the reader count, `WRITER` (the sign bit) exclusive.
     state: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
 
     const WRITER: i32 = std.math.minInt(i32);
 
     fn lockShared(self: *SpinRwLock) void {
-        // Readers enter with one wait-free `fetchAdd`: concurrent readers
-        // never fail each other, where a compare-exchange loop retries on
-        // every neighboring reader and storms exactly when a cell is hot.
-        // Only an active writer (negative state) forces the undo-and-spin.
+        // One wait-free `fetchAdd`, so concurrent readers never fail each other
+        // where a compare-exchange loop would storm. Only an active writer, a
+        // negative state, forces the undo-and-spin.
         const prev = self.state.fetchAdd(1, .acquire);
         if (prev >= 0) return;
         _ = self.state.fetchSub(1, .monotonic);
@@ -250,19 +177,14 @@ const SpinRwLock = struct {
     }
 
     fn unlockExclusive(self: *SpinRwLock) void {
-        // While the writer held the lock, entering readers may have bumped the
-        // state past `WRITER` before undoing (`lockShared`'s fetchAdd). A blind
-        // zero store would erase a bump whose undo is still pending and leave
-        // the state negative forever, so only the writer bit is cleared —
-        // `WRITER` is the sign bit, and the transient reader count rides in the
-        // low bits.
+        // Entering readers may have bumped the state past `WRITER` before
+        // undoing their `fetchAdd`, so a blind zero store would erase a bump
+        // whose undo is still pending. Clear only the writer bit: the transient
+        // reader count rides in the low bits.
         _ = self.state.fetchAnd(std.math.maxInt(i32), .release);
     }
 
-    /// Guarded-section waits are a handful of instructions, so the first
-    /// retries spin cheap CPU hints; only a wait that keeps losing pays the
-    /// `sched_yield` syscall (the old unconditional yield made every
-    /// contended borrow a syscall).
+    /// Guarded sections are short, so early retries spin on cheap hints.
     const Backoff = struct {
         n: u32 = 0,
         inline fn pause(self: *Backoff) void {
@@ -276,13 +198,9 @@ const SpinRwLock = struct {
     };
 };
 
-/// A zero-cost stand-in for `SpinRwLock` used by cells whose payload is
-/// immutable for its whole lifetime (it opts in with `pub const
-/// objref_immutable = true`). Such a cell is never write-locked — nothing
-/// ever takes an exclusive borrow — so the reader lock only ever guards
-/// against a writer that cannot exist. Sharing immutable data across threads
-/// needs no synchronization, so every operation is a no-op and the atomic
-/// read-lock traffic (a `cmpxchg`/`fetchSub` on every borrow) disappears.
+/// A stand-in for `SpinRwLock` for a payload immutable for its whole lifetime,
+/// opting in with `pub const objref_immutable = true`. Nothing ever takes an
+/// exclusive borrow of such a cell, so every operation here is a no-op.
 const NoopRwLock = struct {
     inline fn lockShared(_: *NoopRwLock) void {}
     inline fn unlockShared(_: *NoopRwLock) void {}
@@ -290,30 +208,20 @@ const NoopRwLock = struct {
     inline fn unlockExclusive(_: *NoopRwLock) void {}
 };
 
-/// The lock type a cell over `T` uses: the no-op lock when `T` declares
-/// itself immutable (`pub const objref_immutable = true`), else the real
-/// reader/writer spin lock.
+/// The no-op lock when `T` declares itself immutable, else the spin lock.
 fn LockFor(comptime T: type) type {
     return if (isContainer(T) and @hasDecl(T, "objref_immutable") and T.objref_immutable) NoopRwLock else SpinRwLock;
 }
 
-/// Exclusive spin lock. Zig 0.16's std has no blocking `Thread.Mutex`
-/// (synchronization moved behind the `Io` interface), so this is a small
-/// spin lock over `std.atomic.Value` with the same `spinLoopHint`/
-/// `Thread.yield` backoff as `SpinRwLock`. It is the one shared mutex
-/// definition imported by the interpreter, the stdlib concurrency
-/// intrinsics, and the shared output/closure handles; it provides the
-/// exclusive-access discipline a `Mutex` would, with acquire/release
-/// ordering.
+/// Exclusive spin lock, since Zig 0.16's std has no blocking `Thread.Mutex`.
+/// The one shared mutex definition the rest of the interpreter imports.
 pub const SpinMutex = struct {
     locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn lock(self: *SpinMutex) void {
         var b: SpinRwLock.Backoff = .{};
-        // Test-and-test-and-set: spin on a plain load while the lock is
-        // held so waiters share the cache line instead of ping-ponging it
-        // with bus-locked swaps; only attempt the swap on an observed
-        // release.
+        // Test-and-test-and-set: spin on a plain load while the lock is held,
+        // so waiters share the cache line instead of ping-ponging it.
         while (true) {
             if (!self.locked.load(.monotonic)) {
                 if (!self.locked.swap(true, .acquire)) return;
@@ -327,10 +235,8 @@ pub const SpinMutex = struct {
     }
 };
 
-/// True when `name=<non-empty,!=0>` appears in `/proc/self/environ`.
-/// Allocation-free: streams the procfs file through a stack buffer. Zig
-/// 0.16's std env API moved behind `Io`; this is the no-`Io` reader the
-/// diagnostic path can use safely.
+/// A value that is neither empty nor `0` counts as set. Allocation-free, so the
+/// diagnostic path needs no `Io`.
 fn procEnvironHas(comptime name: []const u8) bool {
     if (@import("builtin").os.tag != .linux) return false;
     const fd = std.os.linux.open("/proc/self/environ", .{ .ACCMODE = .RDONLY }, 0);
@@ -358,19 +264,13 @@ fn procEnvironHas(comptime name: []const u8) bool {
     return false;
 }
 
-/// `KLIO_RACE_JITTER`-gated interleaving widener. Inserted into the
-/// borrow lock-acquisition window so a genuine cross-thread borrow race
-/// reproduces reliably under test instead of only on a rare
-/// interleaving. Off (zero cost beyond the cached branch) unless the env
-/// var is set. Diagnostic-only; never enabled in the shipped suite.
+/// `KLIO_RACE_JITTER`: widen the borrow lock-acquisition window so a genuine
+/// cross-thread borrow race reproduces reliably under test.
 var race_jitter_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0); // 0 unknown, 1 off, 2 on
 
-/// The one-shot environment probe, kept OUT of `raceJitterEnabled`. Zig does not
-/// reclaim block-scoped stack allocations (ziglang/zig#23475), so
-/// `procEnvironHas`'s read buffer would sit in `raceJitterEnabled`'s prologue --
-/// a 16 KB frame reserved on EVERY call, just to read a cached atomic, on a
-/// predicate the objcell hot paths call constantly. `noinline` gives the cold
-/// path its own frame, which the return then reclaims.
+/// Kept out of `raceJitterEnabled`: Zig does not reclaim block-scoped stack
+/// allocations (ziglang/zig#23475), so `procEnvironHas`'s 16 KB read buffer
+/// would sit in the caller's prologue on every call.
 noinline fn raceJitterProbe() bool {
     const on = procEnvironHas("KLIO_RACE_JITTER");
     race_jitter_state.store(if (on) 2 else 1, .monotonic);
@@ -393,20 +293,13 @@ inline fn raceJitter() void {
     std.Thread.yield() catch {};
 }
 
-/// Heap-allocated control block for one `ObjRef`: an atomic strong
-/// count, the per-cell reader/writer `lock`, the data, and the owning
-/// allocator.
 pub fn ControlBlock(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        /// GC header first so the type-erased collector recovers `data` by a
-        /// fixed offset via `@fieldParentPtr("hdr", header)`.
-        ///
-        /// 16-byte aligned so a `Value` payload can TAG a cell pointer in its
-        /// low four bits and still hold one pointer. The slab allocator already
-        /// hands out 16-byte-aligned cells (`CELL_ALIGN`) and libc's malloc
-        /// guarantees it for these sizes, so this costs nothing.
+        /// First, so the type-erased collector recovers `data` at a fixed
+        /// offset through `@fieldParentPtr`. 16-byte aligned so a `Value`
+        /// payload can tag a cell pointer in its low four bits.
         hdr: gc.GcHeader align(16),
         refcount: std.atomic.Value(usize),
         lock: LockFor(T),
@@ -415,17 +308,14 @@ pub fn ControlBlock(comptime T: type) type {
     };
 }
 
-// ---------------------------------------------------------------------------
-// GC trace/finalize dispatch (duck-typed; `objcell` stays free of any
-// dependency on `value`/`class`/`env`). A cell's payload `T` declares how the
-// collector walks its out-edges and tears down its own buffers:
-//   - `pub fn gcMark(self, *gc.Marker)`   — a Value (shades its child cells)
-//   - `pub fn gcTrace(self: *const T, *gc.Marker)` — a struct holding Values
-//   - `pub fn gcFinalize(self: *T, Allocator)` — shallow teardown (own buffers)
-// std payloads (`ArrayList(Value)`/`ArrayList(MapPair)`/`[]Value`/`[]const u8`)
-// are handled structurally. Any other payload with Value out-edges that lacks
-// these decls traces as a leaf — caught by the GC-mode verify oracle.
-// ---------------------------------------------------------------------------
+// GC trace and finalize dispatch, duck-typed so `objcell` depends on neither
+// `value` nor `class` nor `env`. A payload `T` declares how the collector walks
+// its out-edges and tears down its own buffers:
+//   - `gcMark(self, *gc.Marker)`: a Value, shading its child cells
+//   - `gcTrace(self: *const T, *gc.Marker)`: a struct holding Values
+//   - `gcFinalize(self: *T, Allocator)`: shallow teardown of its own buffers
+// std payloads are handled structurally; anything else with Value out-edges and
+// none of these traces as a leaf, which the verify oracle catches.
 
 fn isContainer(comptime U: type) bool {
     return switch (@typeInfo(U)) {
@@ -446,12 +336,8 @@ fn isSlice(comptime U: type) bool {
     return @typeInfo(U) == .pointer and @typeInfo(U).pointer.size == .slice;
 }
 
-/// Bytes of heap backing a payload owns beyond its control block — the
-/// `ArrayList`/slice element storage and `[]const u8` bytes. The GC trigger
-/// must count these (they are freed by the cell's `gcFinalize`), or a cell
-/// with a large backing but a small control block (a `ByteArray`'s element
-/// vector, a long `String`) would not advance the collection threshold and the
-/// backing would accumulate uncollected.
+/// The collection trigger must count these, or a cell with a small control
+/// block over a large backing would not advance the threshold.
 fn externalBytes(comptime U: type, data: *const U) usize {
     if (comptime U == []const u8) return data.len;
     if (comptime hasDeclSafe(U, "gcExternalBytes")) return data.gcExternalBytes();
@@ -462,17 +348,13 @@ fn externalBytes(comptime U: type, data: *const U) usize {
     if (comptime isSlice(U)) return data.len * @sizeOf(@typeInfo(U).pointer.child);
     return 0;
 }
-/// An `ObjRef(X)` handle is a struct with a `.cell` field and a `clone` decl.
 fn isObjRef(comptime U: type) bool {
     return @typeInfo(U) == .@"struct" and @hasField(U, "cell") and @hasDecl(U, "clone");
 }
 
-/// Whether a payload of type `U` can hold references to other GC cells.
 /// Mirrors `gcTraceData`'s dispatch: if the tracer would walk nothing, a store
-/// into the payload cannot create a cell edge, so mutable access needs no
-/// write barrier — decided at compile time, the scalar/bytes fast paths pay
-/// nothing. A payload with a (possibly no-op) `gcTrace` can opt out with
-/// `pub const gc_pointer_free = true;`.
+/// cannot create a cell edge and mutable access needs no write barrier. A
+/// payload with a no-op `gcTrace` opts out with `gc_pointer_free = true`.
 fn mayHoldRefs(comptime U: type) bool {
     if (comptime hasDeclSafe(U, "gc_pointer_free")) return false;
     if (comptime hasDeclSafe(U, "gcTrace")) return true;
@@ -485,9 +367,8 @@ fn mayHoldRefs(comptime U: type) bool {
     return false;
 }
 
-/// Trace one out-edge value `e` of type `E` (a Value, a struct with gcTrace, an
-/// `ObjRef` handle, or an optional thereof). Shading an `ObjRef` cell is how the
-/// graph advances; the cell's own `gc_trace` reaches the next level.
+/// Shading a cell is how the graph advances; its own `gc_trace` does the next
+/// level.
 fn gcTraceElem(comptime E: type, e: *const E, m: *gc.Marker) void {
     if (comptime hasDeclSafe(E, "gcMark")) {
         e.gcMark(m);
@@ -498,7 +379,6 @@ fn gcTraceElem(comptime E: type, e: *const E, m: *gc.Marker) void {
     } else if (comptime @typeInfo(E) == .optional) {
         if (e.*) |inner| gcTraceElem(@TypeOf(inner), &inner, m);
     }
-    // else: a leaf element (e.g. u8 bytes) with no out-edges.
 }
 
 fn gcTraceData(comptime U: type, data: *const U, m: *gc.Marker) void {
@@ -518,7 +398,6 @@ fn gcTraceData(comptime U: type, data: *const U, m: *gc.Marker) void {
         var it = data.valueIterator();
         while (it.next()) |v| gcTraceElem(@TypeOf(v.*), v, m);
     }
-    // else: a leaf payload (scalar / Value-free struct) — nothing to trace.
 }
 
 fn gcFinalizeData(comptime U: type, data: *U, a: std.mem.Allocator) void {
@@ -533,28 +412,13 @@ fn gcFinalizeData(comptime U: type, data: *U, a: std.mem.Allocator) void {
     } else if (comptime isHashMapLike(U)) {
         data.deinit();
     }
-    // else: scalar / leaf payload — no owned buffer to free.
 }
 
-/// Error returned by `ObjRef.tryBorrowMut` when the cell is already
-/// borrowed.
 pub const BorrowMutError = error{AlreadyBorrowed};
 
-/// Handle to a shared, interior-mutable Kotlin heap object.
-///
-/// Clone increments the strong count; `deinit` decrements it and frees
-/// the backing control block when it reaches zero. The handle itself is
-/// a plain pointer-sized value; copying the struct without going through
-/// `clone` does NOT bump the count, so copy only when you also `deinit`
-/// exactly once per logical owner.
-/// A nullable `ObjRef(T)` that is the size of a pointer.
-///
-/// `?ObjRef(T)` is NOT: Zig's null-pointer optimization applies to a bare
-/// `?*T`, not to an optional of a single-pointer STRUCT, so the plain
-/// optional carries a separate tag word and costs 16 bytes. Every optional
-/// handle inlined into a `Value` payload therefore doubled that payload's
-/// contribution to the union's width. Storing the nullable cell pointer
-/// directly recovers the optimization.
+/// A nullable `ObjRef(T)` the size of a pointer. `?ObjRef(T)` is not: Zig's
+/// null-pointer optimization applies to a bare `?*T`, not to an optional of a
+/// single-pointer struct, which carries a tag word and costs 16 bytes.
 pub fn OptRef(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -566,8 +430,6 @@ pub fn OptRef(comptime T: type) type {
             return .{ .cell = if (r) |x| x.cell else null };
         }
 
-        /// The handle, or null. Borrowing/retaining rules are the caller's,
-        /// exactly as with the plain optional this replaces.
         pub inline fn get(self: Self) ?Ref {
             return if (self.cell) |c| Ref{ .cell = c } else null;
         }
@@ -578,6 +440,9 @@ pub fn OptRef(comptime T: type) type {
     };
 }
 
+/// Handle to a shared, interior-mutable Kotlin heap object. Copying the struct
+/// without `clone` does not bump the strong count, so copy only where you also
+/// `deinit` exactly once per logical owner.
 pub fn ObjRef(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -585,62 +450,40 @@ pub fn ObjRef(comptime T: type) type {
 
         cell: *Cell,
 
-        /// Whether this cell's payload is a `[]const u8` the cell owns and
-        /// must free on teardown. Only the string-bytes payload qualifies;
-        /// every other `ObjRef` payload is freed by its own `deinit` or is a
-        /// borrow.
+        /// The cell owns and frees a `[]const u8` payload; every other payload
+        /// is freed by its own `deinit`.
         const owns_bytes = (T == []const u8);
 
-        /// Allocate a new cell holding `v`. The allocator is retained
-        /// inside the control block and reused for `deinit`.
-        ///
-        /// For a `[]const u8` payload under the reclaim path, the bytes are
-        /// **duped** so the cell owns a private copy it can free on teardown:
-        /// `StringRef` byte ownership is otherwise ambiguous (some callers pass
-        /// interned/borrowed module-const bytes, others owned buffers), and a
-        /// uniform owned copy makes `release` able to free without corrupting a
-        /// borrowed original. Under the arena fast path (`!reclaim_tls`) the
-        /// slice is stored as-is — the arena reclaims everything wholesale, so
-        /// the dupe would be wasted. Owned-buffer callers that want to transfer
-        /// their buffer instead of paying a second allocation use `initOwned`.
+        /// Allocate a cell holding `v`; the allocator is kept inside it. A
+        /// `[]const u8` payload is duped under the reclaim path so the cell owns
+        /// a private copy it can free, since callers pass a mix of borrowed
+        /// module-const bytes and owned buffers. A caller transferring its own
+        /// buffer uses `initOwned`.
         pub fn init(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
             var data = v;
             if (comptime owns_bytes) {
-                // Dupe under reclaim OR GC: in both the cell owns its bytes and
-                // frees them on teardown (refcount `deinit` / GC `gcFinalize`).
-                // Under the pure arena path the slice is stored as-is.
                 if (reclaim_shared.load(.monotonic) or gc.gc_enabled) data = try allocator.dupe(u8, v);
             }
             return initOwned(allocator, data);
         }
 
-        /// Like `init`, but takes ownership of `v` verbatim with no dupe.
-        /// For a `[]const u8` payload this means the cell adopts the caller's
-        /// buffer (and will free it on teardown under the reclaim path); the
-        /// caller must not free it afterward. Identical to `init` for every
-        /// non-bytes payload.
-        /// The GC trace thunk for this cell type: recover the control block from
-        /// its `hdr` and walk the payload's out-edges.
         fn gcTraceThunk(h: *gc.GcHeader, m: *gc.Marker) void {
-            // Every cell is 16-byte aligned (see `hdr`), so recovering the block
-            // from its header re-establishes that alignment.
+            // Every cell is 16-byte aligned, so recovering the block from its
+            // header re-establishes that alignment.
             const cb: *Cell = @fieldParentPtr("hdr", @as(*align(16) gc.GcHeader, @alignCast(h)));
             gcTraceData(T, &cb.data, m);
         }
-        /// The GC finalize thunk: shallow-free the payload's own buffers, then
-        /// destroy the control block. Child cells are swept independently.
+        /// Shallow: child cells are swept independently.
         fn gcFinalizeThunk(h: *gc.GcHeader) void {
-            // Every cell is 16-byte aligned (see `hdr`), so recovering the block
-            // from its header re-establishes that alignment.
             const cb: *Cell = @fieldParentPtr("hdr", @as(*align(16) gc.GcHeader, @alignCast(h)));
             if (h.gc_remembered and getenvSlice("KLIO_GC_REMEMBER_TRACE") != null) {
                 std.debug.print("[gc-freed-remembered] SWEEP h={*} type={s}\n", .{ h, h.gc_type });
                 trace.dumpCurrent(.{});
             }
             if (gc.gc_poison) {
-                // Quarantine instead of free: keep the memory mapped, scribble
-                // the payload, and arm the trap so a later live reference is
-                // caught with this cell's type. Leaks by design (diagnostic).
+                // Quarantine instead of freeing: keep the memory mapped,
+                // scribble the payload and arm the trap, so a later live
+                // reference is caught with this cell's type. Leaks by design.
                 @memset(std.mem.asBytes(&cb.data), 0xDD);
                 h.gc_trace = gc.poisonTrap;
                 h.gc_mark = 0;
@@ -650,11 +493,10 @@ pub fn ObjRef(comptime T: type) type {
             cb.allocator.destroy(cb);
         }
 
-        /// Free the cell RIGHT NOW, regardless of refcount gating or memory
-        /// mode. For hand-managed process-global caches swapping their single
-        /// owner: the caller asserts no live handle dereferences the cell
-        /// afterwards, and the cell must not be on the sweep registry (mint
-        /// it under `alloc_perm`). Purges any remembered-set entry first.
+        /// Free the cell now, whatever the refcount gating or memory mode, for a
+        /// hand-managed process-global cache swapping its owner. The caller
+        /// asserts no live handle dereferences it afterwards, and the cell must
+        /// not be on the sweep registry, so mint it under `alloc_perm`.
         pub fn destroyImmediately(self: Self) void {
             if (gc.gc_enabled) gc.forgetCell(&self.cell.hdr);
             const allocator = self.cell.allocator;
@@ -666,6 +508,8 @@ pub fn ObjRef(comptime T: type) type {
             allocator.destroy(self.cell);
         }
 
+        /// `init` without the dupe: the cell adopts `v` verbatim, so it takes a
+        /// `[]const u8` caller's buffer and frees it under the reclaim path.
         pub fn initOwned(allocator: std.mem.Allocator, v: T) std.mem.Allocator.Error!Self {
             const cell = try allocator.create(Cell);
             cell.* = .{
@@ -679,35 +523,22 @@ pub fn ObjRef(comptime T: type) type {
             return .{ .cell = cell };
         }
 
-        /// Increment the strong count and return another handle to the
-        /// same cell. Gated exactly like `deinit`: under reclaim-off (the
-        /// arena and the tracing GC) neither side of the count runs — the
-        /// teardown paths that consult `strongCount` are themselves skipped
-        /// there, so the increment was pure shared-cacheline traffic on
-        /// every handle copy.
+        /// Gated exactly like `deinit`: under the arena and the tracing GC
+        /// neither side of the count runs.
         pub fn clone(self: Self) Self {
             if (reclaim_shared.load(.monotonic)) _ = self.cell.refcount.fetchAdd(1, .monotonic);
             return .{ .cell = self.cell };
         }
 
-        /// Drop one handle: decrement the strong count and, when it hits
-        /// zero, run `T.deinit` if present and free the control block.
-        ///
-        /// Under the arena fast path (`reclaimEnabled() == false`) this
-        /// returns immediately without the atomic decrement, the payload
-        /// `T.deinit`, or the destroy: the backing arena reclaims every
-        /// cell wholesale on reset, so the per-cell teardown is wasted
-        /// work. The default is the full path, so the leak-checking and
-        /// real-thread stress configs (which never disable reclaim) keep
-        /// the refcount/free discipline that catches UAF/leaks.
+        /// Decrement the strong count and, at zero, run `T.deinit` if present
+        /// and free the control block. Under the arena fast path this returns
+        /// immediately, since the arena reclaims every cell on reset.
         pub fn deinit(self: Self) void {
             if (!reclaim_shared.load(.monotonic)) return;
             const prev = self.cell.refcount.fetchSub(1, .release);
             if (detectDoubleFree()) {
-                // Diagnostic mode: never destroy the cell (leak it) so a second
-                // decrement is observable. A `prev` of 0 means we just dropped a
-                // cell whose count was already zero — a double-free; dump the
-                // offending stack.
+                // Never destroy here, so a second decrement stays observable:
+                // `prev == 0` means a double-free.
                 if (prev == 0 or prev > (1 << 40)) {
                     std.debug.print("\n[RC DOUBLE-FREE] cell={*} payload={s}\n", .{ self.cell, @typeName(T) });
                     trace.dumpCurrent(.{});
@@ -719,14 +550,13 @@ pub fn ObjRef(comptime T: type) type {
                     } else if (comptime hasDeinit(T)) {
                         deinitData(&self.cell.data, allocator);
                     }
-                    // leak the control block (do not destroy) to keep count==0 observable
+                    // Leak the control block, keeping count == 0 observable.
                 }
                 return;
             }
             if (prev == 1) {
-                // Acquire-load pairs with the release decrements of the
-                // other handles so all their writes happen-before this
-                // free (Arc's drop ordering).
+                // This acquire load pairs with the other handles' release
+                // decrements, so their writes happen-before this free.
                 _ = self.cell.refcount.load(.acquire);
                 if (self.cell.hdr.gc_remembered and getenvSlice("KLIO_GC_REMEMBER_TRACE") != null) {
                     std.debug.print("[gc-freed-remembered] RC h={*} type={s}\n", .{ &self.cell.hdr, @typeName(T) });
@@ -734,7 +564,6 @@ pub fn ObjRef(comptime T: type) type {
                 }
                 const allocator = self.cell.allocator;
                 if (comptime owns_bytes) {
-                    // The cell owns its string bytes (see `init`); free them.
                     allocator.free(self.cell.data);
                 } else if (comptime hasDeinit(T)) {
                     deinitData(&self.cell.data, allocator);
@@ -753,7 +582,6 @@ pub fn ObjRef(comptime T: type) type {
         fn deinitData(data: *T, allocator: std.mem.Allocator) void {
             const Fn = @TypeOf(T.deinit);
             const info = @typeInfo(Fn).@"fn";
-            // Support both `deinit(self)` and `deinit(self, allocator)`.
             if (info.params.len >= 2) {
                 data.deinit(allocator);
             } else {
@@ -761,21 +589,17 @@ pub fn ObjRef(comptime T: type) type {
             }
         }
 
-        /// Shared borrow, like `RefCell::borrow`: takes the reader lock.
         pub fn borrow(self: Self) ObjGuard(T) {
             return self.tryBorrow() orelse unreachable;
         }
 
-        /// Mutable borrow, like `RefCell::borrow_mut`: takes the writer
-        /// lock.
         pub fn borrowMut(self: Self) ObjGuardMut(T) {
             return self.tryBorrowMut() catch unreachable;
         }
 
-        /// Shared borrow: take the reader lock. Many concurrent shared
-        /// borrows proceed together; an exclusive borrow blocks until
-        /// they drain. Always succeeds (never returns null) — the
-        /// optional return is kept for source compatibility.
+        /// Concurrent shared borrows proceed together and an exclusive borrow
+        /// blocks until they drain. Never returns null; the optional is kept
+        /// for source compatibility.
         pub fn tryBorrow(self: Self) ?ObjGuard(T) {
             const cell = self.cell;
             raceJitter();
@@ -783,24 +607,19 @@ pub fn ObjRef(comptime T: type) type {
             return .{ .cell = cell };
         }
 
-        /// Mutable borrow: take the writer lock — exclusive against every
-        /// reader and writer. Blocks until any live borrows drain rather
-        /// than failing. Always succeeds (never returns the error) — the
-        /// error union is kept for source compatibility.
+        /// Exclusive against every reader and writer, blocking rather than
+        /// failing. Never returns the error.
         pub fn tryBorrowMut(self: Self) BorrowMutError!ObjGuardMut(T) {
             const cell = self.cell;
             raceJitter();
             cell.lock.lockExclusive();
             // Generational write barrier: a mutable borrow of a tenured cell
             // may store a nursery reference into it, so the cell joins the
-            // remembered set for the next minor mark. Covers every guarded
-            // mutation choke point at once; payloads that cannot hold cell
-            // references skip it at compile time.
+            // remembered set. This one point covers every guarded mutation.
             if (comptime mayHoldRefs(T)) gc.writeBarrier(&cell.hdr);
             return .{ .cell = cell };
         }
 
-        /// Whether two handles name the same backing cell.
         pub fn ptrEq(a: Self, b: Self) bool {
             return a.cell == b.cell;
         }
@@ -810,70 +629,54 @@ pub fn ObjRef(comptime T: type) type {
         }
 
         pub fn asPtr(self: Self) *T {
-            // Unguarded mutable access: same write-barrier obligation as a
-            // mutable borrow (several host paths store Values through this).
+            // Unguarded mutable access carries the same write-barrier
+            // obligation as a mutable borrow.
             if (comptime mayHoldRefs(T)) gc.writeBarrier(&self.cell.hdr);
             return &self.cell.data;
         }
 
-        /// Unguarded read-only access: no lock, no write barrier. Only for
-        /// payloads the caller can prove are not being mutated concurrently
-        /// (e.g. registry tables that are settled before worker threads run
-        /// and consulted read-only after, gated by their own published flag).
+        /// No lock, no write barrier. Only for a payload the caller can prove is
+        /// not mutated concurrently, such as a settled registry table.
         pub fn asPtrConst(self: Self) *const T {
             return &self.cell.data;
         }
 
-        /// Address-stable identity of the backing cell, usable as a key
-        /// in a visited set when walking a (possibly cyclic) value
-        /// graph. Two `ObjRef`s with this same value share the cell.
+        /// Address-stable, so it works as a visited-set key on a cyclic graph.
         pub fn identity(self: Self) usize {
             return @intFromPtr(&self.cell.data);
         }
     };
 }
 
-/// Shared-borrow guard. Holds the reader lock for its lifetime and
-/// releases it on `deinit`.
 pub fn ObjGuard(comptime T: type) type {
     return struct {
         const Self = @This();
         cell: *ControlBlock(T),
 
-        /// Borrowed view of the cell's data. Valid until `deinit`.
         pub fn get(self: Self) *const T {
             return &self.cell.data;
         }
 
-        /// Release the shared (reader) lock.
         pub fn deinit(self: Self) void {
             self.cell.lock.unlockShared();
         }
     };
 }
 
-/// Mutable-borrow guard. Holds the exclusive (writer) lock for its
-/// lifetime and releases it on `deinit`.
 pub fn ObjGuardMut(comptime T: type) type {
     return struct {
         const Self = @This();
         cell: *ControlBlock(T),
 
-        /// Mutable view of the cell's data. Valid until `deinit`.
         pub fn get(self: Self) *T {
             return &self.cell.data;
         }
 
-        /// Release the exclusive (writer) lock.
         pub fn deinit(self: Self) void {
             self.cell.lock.unlockExclusive();
         }
     };
 }
-
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -897,7 +700,6 @@ test "concurrent shared borrows coexist on one cell" {
     const obj = try ObjRef(i32).init(testing.allocator, 7);
     defer obj.deinit();
 
-    // Many readers proceed together (reader count climbs).
     const r1 = obj.borrow();
     const r2 = obj.borrow();
     const r3 = obj.borrow();
@@ -907,7 +709,6 @@ test "concurrent shared borrows coexist on one cell" {
     r2.deinit();
     r3.deinit();
 
-    // Once readers drain, an exclusive borrow proceeds.
     {
         const w = obj.borrowMut();
         defer w.deinit();
@@ -997,8 +798,6 @@ const PushWorker = struct {
                     @intCast(self.t * PUSHES_PER_THREAD + i),
                 ) catch unreachable;
             }
-            // Interleave shared reads to stress the lock under mixed
-            // shared/exclusive contention.
             const r = self.obj.borrow();
             _ = r.get().items.items.len;
             r.deinit();
@@ -1010,8 +809,8 @@ test "shared objref concurrent push is consistent" {
     const allocator = testing.allocator;
     var obj = try ObjRef(IntList).init(allocator, .{});
     defer obj.deinit();
-    // The per-cell lock mediates every cross-thread borrow; no publish
-    // step is needed before the handle escapes to other threads.
+    // The per-cell lock mediates every cross-thread borrow, so the handle needs
+    // no publication step before it escapes.
 
     var handles: [THREADS]std.Thread = undefined;
     var t: usize = 0;
@@ -1019,14 +818,11 @@ test "shared objref concurrent push is consistent" {
         const worker = PushWorker{ .obj = obj.clone(), .allocator = allocator, .t = t };
         handles[t] = try std.Thread.spawn(.{}, PushWorker.run, .{worker});
     }
-    // Each worker holds its own clone; release them here, the threads'
-    // copies keep the cell alive for the duration.
     t = 0;
     while (t < THREADS) : (t += 1) {
         handles[t].join();
     }
-    // The workers' clones are leaked-by-value into the closure; reclaim
-    // one decref per spawned worker.
+    // Reclaim one decrement per spawned worker's clone.
     t = 0;
     while (t < THREADS) : (t += 1) {
         obj.deinit();
@@ -1036,7 +832,6 @@ test "shared objref concurrent push is consistent" {
     defer g.deinit();
     try testing.expectEqual(THREADS * PUSHES_PER_THREAD, g.get().items.items.len);
 
-    // Every value in [0, THREADS*PUSHES) must appear exactly once.
     var seen = try allocator.alloc(bool, THREADS * PUSHES_PER_THREAD);
     defer allocator.free(seen);
     @memset(seen, false);

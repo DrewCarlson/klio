@@ -1,9 +1,6 @@
 //! Process backing setup: the collector's knobs and the allocator family a
-//! program runs on. Every entry point that runs a program comes through here —
-//! the `klio` binary, a bundle, and the C-ABI entries a transpiled binary calls
-//! — so a transpiled program gets the same collector and the same
-//! page-returning slab as `klio run`, instead of the never-free arena it used
-//! to fall back to (measured: same program, 144 MB peak vs 93 MB interpreted).
+//! program runs on. Every entry point that runs a program comes through here,
+//! so a transpiled binary gets the same collector and slab as `klio run`.
 
 const std = @import("std");
 const objcell = @import("objcell.zig");
@@ -16,13 +13,9 @@ fn envOn(comptime name: [:0]const u8) ?bool {
     return v.len != 0 and !std.mem.eql(u8, v, "0");
 }
 
-/// Turn on the tracing collector and apply its diagnostic knobs. Idempotent.
-/// The caller still chooses the backing allocator (`processAllocator`, or one
-/// of the diagnostic families the CLI exposes).
+/// Idempotent. The caller still chooses the backing allocator.
 pub fn configureGcFromEnv() void {
-    // Tracing GC (KGC): a freeing backing allocator + reachability-based
-    // reclamation. Reference counting is neutralized (deinit/retain/release
-    // no-op), so the collector alone frees, by reachability.
+    // Reference counting is neutralized, so the collector alone frees.
     gc.gc_enabled = true;
     if (envOn("KLIO_GC_STRESS")) |v| gc.gc_stress = v;
     if (envOn("KLIO_GC_DEBUG")) |v| gc.gc_debug = v;
@@ -41,14 +34,11 @@ pub fn configureGcFromEnv() void {
         gc.gc_stress_every = std.fmt.parseInt(usize, v, 10) catch 0;
     }
     objcell.setReclaim(false);
-    // The slab backend returns the pages of stably-sparse regions to the OS
-    // after each sweep; a caller selecting another backend overrides this.
+    // Another backend overrides this page-returning trim.
     gc.release_to_os = slab.reclaimDormant;
 }
 
-/// The backing allocator for the resolved performance profile, with the
-/// collector configured when the profile asks for it. The arena profile fills
-/// `arena_slot`; the caller owns its teardown.
+    // The arena profile fills `arena_slot`, whose teardown the caller owns.
 pub fn processAllocator(arena_slot: *?std.heap.ArenaAllocator) std.mem.Allocator {
     switch (perf.allocChoice()) {
         .gc => {

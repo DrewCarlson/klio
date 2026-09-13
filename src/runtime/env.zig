@@ -1,7 +1,5 @@
-//! Lexical environment: a scope of named bindings with a parent chain.
-//!
-//! `Env` is shared and interior-mutable in the runtime, so the parent
-//! link is `?ObjRef(Env)`.
+//! Lexical environment: a scope of named bindings with a parent chain. `Env` is
+//! shared and interior-mutable, so the parent link is `?ObjRef(Env)`.
 
 const std = @import("std");
 const objcell = @import("objcell.zig");
@@ -11,7 +9,6 @@ const ObjRef = objcell.ObjRef;
 const Value = value_mod.Value;
 const RuntimeError = value_mod.RuntimeError;
 
-/// A scope of name -> `Value` bindings plus an optional parent scope.
 pub const Env = struct {
     parent: ?ObjRef(Env) = null,
     vars: std.StringHashMap(Value),
@@ -29,16 +26,14 @@ pub const Env = struct {
         if (self.parent) |p| p.deinit();
     }
 
-    /// GC tracer: an env references its parent cell and owns one ref per bound
-    /// value.
+    /// An env references its parent cell and owns one ref per bound value.
     pub fn gcTrace(self: *const Env, m: *objcell.gc.Marker) void {
         if (self.parent) |p| m.shade(&p.cell.hdr);
         var it = self.vars.valueIterator();
         while (it.next()) |v| v.gcMark(m);
     }
 
-    /// GC finalizer (shallow): free only the binding map's spine. The bound
-    /// values and the parent are independent cells swept on their own.
+    /// Shallow: the bound values and the parent are swept on their own.
     pub fn gcFinalize(self: *Env, allocator: std.mem.Allocator) void {
         _ = allocator;
         self.vars.deinit();
@@ -48,7 +43,7 @@ pub const Env = struct {
         try self.vars.put(name, value);
     }
 
-    /// Remove a binding from this scope (does not touch parent scopes).
+    /// Does not touch parent scopes.
     pub fn removeLocal(self: *Env, name: []const u8) void {
         _ = self.vars.remove(name);
     }
@@ -61,18 +56,16 @@ pub const Env = struct {
         return g.get().lookup(name);
     }
 
-    /// Look up `name` in this scope only, skipping the parent chain.
+    /// This scope only.
     pub fn lookupLocal(self: *const Env, name: []const u8) ?Value {
         return self.vars.get(name);
     }
 
-    /// True when this env is a child scope (has a parent).
     pub fn hasParent(self: *const Env) bool {
         return self.parent != null;
     }
 
-    /// Resolve `name` ignoring any binding that lives in `stop_at`
-    /// (compared by backing-cell identity).
+    /// Ignores any binding in `stop_at`, compared by cell identity.
     pub fn lookupExcluding(self: *const Env, name: []const u8, stop_at: ObjRef(Env)) ?Value {
         if (self.vars.get(name)) |v| return v;
         const parent = self.parent orelse return null;
@@ -82,8 +75,7 @@ pub const Env = struct {
         return g.get().lookupExcluding(name, stop_at);
     }
 
-    /// Collect every value bound under `name` walking inside-out.
-    /// Caller owns the returned slice.
+    /// Walks inside-out. The caller owns the returned slice.
     pub fn lookupAll(self: *const Env, allocator: std.mem.Allocator, name: []const u8) ![]Value {
         var out: std.ArrayList(Value) = .empty;
         errdefer out.deinit(allocator);
@@ -100,11 +92,9 @@ pub const Env = struct {
         }
     }
 
-    /// A value paired with the scope depth (0 = innermost) it was bound at.
+    /// Depth 0 is the innermost scope.
     pub const DepthValue = struct { value: Value, depth: usize };
 
-    /// Look up `name` and return the scope depth (0 = innermost) where it
-    /// was found, along with the value.
     pub fn lookupWithDepth(self: *const Env, name: []const u8) ?DepthValue {
         if (self.vars.get(name)) |v| return .{ .value = v, .depth = 0 };
         const parent = self.parent orelse return null;
@@ -114,8 +104,7 @@ pub const Env = struct {
         return .{ .value = inner.value, .depth = inner.depth + 1 };
     }
 
-    /// Like `lookupAll` but pairs each value with its scope depth.
-    /// Caller owns the returned slice.
+    /// The caller owns the returned slice.
     pub fn lookupAllWithDepth(self: *const Env, allocator: std.mem.Allocator, name: []const u8) ![]DepthValue {
         var out: std.ArrayList(DepthValue) = .empty;
         errdefer out.deinit(allocator);
@@ -132,9 +121,8 @@ pub const Env = struct {
         }
     }
 
-    /// Assign to an existing binding, walking the parent chain. Returns
-    /// `null` on success or a `RuntimeError.Unbound` data value when the
-    /// name resolves nowhere (RuntimeError is data, not a Zig error).
+    /// Walks the parent chain. Answers a `RuntimeError.Unbound` data value, not
+    /// a Zig error, when the name resolves nowhere.
     pub fn assign(self: *Env, name: []const u8, value: Value) ?RuntimeError {
         if (self.vars.getPtr(name)) |slot| {
             slot.* = value;
@@ -149,9 +137,6 @@ pub const Env = struct {
     }
 };
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -218,7 +203,6 @@ test "removeLocal drops only the local binding" {
     try env.define("x", .{ .Int = 1 });
     env.removeLocal("x");
     try testing.expect(env.lookup("x") == null);
-    // Removing a missing name is harmless.
     env.removeLocal("y");
 }
 
@@ -231,12 +215,10 @@ test "lookupExcluding skips a stop-at scope" {
         try g.get().define("name", .{ .Int = 99 });
     }
 
-    // A child whose parent is the prelude: the prelude binding is excluded.
     var child = Env.withParent(testing.allocator, prelude.clone());
     defer child.deinit();
     try testing.expect(child.lookupExcluding("name", prelude) == null);
 
-    // A local binding shadows the excluded parent and is returned.
     try child.define("name", .{ .Int = 7 });
     try testing.expectEqual(@as(i32, 7), child.lookupExcluding("name", prelude).?.Int);
 }

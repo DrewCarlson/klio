@@ -1,9 +1,7 @@
-//! Diagnostic leak locator (KLIO_GC_ALLOC=leaktrack). Wraps a child allocator,
-//! keys every outstanding allocation by its capture stack, and at process exit
-//! dumps the sites holding the most un-freed bytes. Under the tracing GC the
-//! collector frees cells by reachability, so what remains outstanding at exit is
-//! the live set plus any raw host-temporary the port never frees — this names
-//! those sites directly, ranked by bytes. Scaffolding, not a production path.
+//! Diagnostic leak locator (`KLIO_GC_ALLOC=leaktrack`). Keys every outstanding
+//! allocation by its capture stack and dumps the sites holding the most
+//! un-freed bytes at exit. Under the tracing GC what remains is the live set
+//! plus any raw host temporary the port never frees.
 
 const std = @import("std");
 const trace = @import("trace.zig");
@@ -17,17 +15,12 @@ const Record = struct {
     len: usize,
     addrs: [FRAMES]usize,
     n: usize,
-    /// The intrinsic fqn active when this allocation was made (a `back`-owned
-    /// copy), or "" for allocations outside any intrinsic. Lets `reportByFqn`
-    /// attribute leaked raw scratch to the specific stdlib op that made it —
-    /// the stack alone collapses every intrinsic to the `func(&ctx)` call site.
+    /// The intrinsic fqn active at this allocation, or "" outside any: the
+    /// stack alone collapses every intrinsic to the `func(&ctx)` call site.
     fqn: []const u8 = "",
 };
 
-/// Set by `dispatchIntrinsic` around `func(&ctx)`: the fqn of the intrinsic
-/// currently executing on this thread (innermost wins; nested intrinsic calls
-/// save/restore it). Read by `note` to tag each allocation. No-op overhead when
-/// leaktrack is not the backing allocator (just a threadlocal pointer write).
+/// Innermost intrinsic wins; `note` reads it to tag each allocation.
 pub threadlocal var current_fqn: ?[]const u8 = null;
 
 const Site = struct {
@@ -37,9 +30,7 @@ const Site = struct {
     count: usize,
 };
 
-// Caching allocator for the tracking metadata: `page_allocator` mmaps/munmaps
-// per hashmap grow and per fqn dupe, which dominates runtime in allocation-heavy
-// programs. `smp_allocator` caches pages, so the tracker keeps up with a hot loop.
+// `page_allocator` mmaps per hashmap grow; `smp_allocator` caches pages.
 const back = std.heap.smp_allocator;
 
 var lock: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -54,9 +45,6 @@ var live: std.AutoHashMapUnmanaged(usize, Record) = .empty;
 var child_alloc: Allocator = undefined;
 var initialized: bool = false;
 
-/// `KLIO_LEAK_BY_FQN`: attribute leaks by intrinsic fqn only. Capturing a stack
-/// trace per allocation dominates runtime in allocation-heavy programs, so the
-/// by-fqn report (which never reads `addrs`) skips it entirely.
 pub var by_fqn_only: bool = false;
 
 fn capture(ret: usize) Record {
@@ -85,9 +73,8 @@ fn forget(ptr: [*]u8) void {
 
 fn alloc(_: *anyopaque, len: usize, a: Alignment, ra: usize) ?[*]u8 {
     const p = child_alloc.rawAlloc(len, a, ra) orelse return null;
-    // Only attribute allocations made during program execution; the static
-    // image (parser/stdlib build) is permanent baseline and would drown out the
-    // per-iteration host-temporary leaks this hunts.
+    // Only allocations made during program execution: the static image is
+    // baseline and would drown out the leaks this hunts.
     if (gc.program_started) note(p, len, @returnAddress());
     return p;
 }
@@ -111,7 +98,6 @@ fn free(_: *anyopaque, buf: []u8, a: Alignment, ra: usize) void {
 
 const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
 
-/// Wrap `child`; all subsequent allocations are tracked until `report`.
 pub fn wrap(child: Allocator) Allocator {
     child_alloc = child;
     initialized = true;
@@ -123,9 +109,6 @@ fn onSignal(_: std.c.SIG) callconv(.c) void {
     std.c._exit(0);
 }
 
-/// Install a SIGTERM/SIGINT handler that dumps the report and exits. Used to
-/// profile a long-running server (which never returns from `main`): the load
-/// harness `kill`s the process and the handler runs the report first.
 pub fn installSignalDump() void {
     var act: std.posix.Sigaction = .{
         .handler = .{ .handler = onSignal },
@@ -136,9 +119,8 @@ pub fn installSignalDump() void {
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 }
 
-/// Dump outstanding bytes grouped by the intrinsic fqn that allocated them
-/// (KLIO_LEAK_BY_FQN). After a final collect, GC-managed result cells are gone,
-/// so what remains under an fqn is the raw scratch that intrinsic leaks per call.
+/// After a final collect, what remains under an fqn is that intrinsic's leaked
+/// scratch.
 pub fn reportByFqn() void {
     if (!initialized) return;
     const Bucket = struct { fqn: []const u8, bytes: usize, count: usize };
@@ -179,7 +161,6 @@ fn sameSite(a: *const Record, b: *const Site) bool {
     return true;
 }
 
-/// Dump the top outstanding-byte sites to stderr, symbolized.
 pub fn report() void {
     if (!initialized) return;
     acquire();

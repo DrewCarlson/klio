@@ -1,10 +1,6 @@
-//! Side-channels the runtime exposes to native stdlib intrinsics:
-//! the `StdlibFn` pointer, the `CallCtx` it receives, and the
-//! `IntrinsicHost` it calls back through.
-//!
-//! `IntrinsicHost` is a `{ctx, vtable}` pair. Methods that carry a default
-//! body keep that default by letting the vtable slot be optional (`null`
-//! = use the default).
+//! Side-channels the runtime exposes to native stdlib intrinsics: the
+//! `StdlibFn` pointer, the `CallCtx` it receives, and the `IntrinsicHost` it
+//! calls back through, whose optional vtable slots select a default.
 
 const std = @import("std");
 const value_mod = @import("value.zig");
@@ -16,135 +12,86 @@ const EvalResult = value_mod.EvalResult;
 const BuilderStateRef = value_mod.BuilderStateRef;
 const Output = output_mod.Output;
 
-/// Outcome of driving a lazy `sequence{}`/`iterator{}` builder one step.
 pub const BuilderStepResult = union(enum) {
-    /// The block yielded a value (it suspended at a `yield`).
+    /// The block suspended at a `yield`, producing this value.
     value: Value,
-    /// The block ran to completion — no more elements.
     done,
     err: RuntimeError,
 };
 
-/// Function pointer signature for a native stdlib intrinsic.
-///
-/// `CallCtx.args` carries the call arguments. For member access the
-/// receiver is `args[0]`, with any further user arguments following.
-/// OOM surfaces as a Zig error; a `RuntimeError` surfaces as data via
-/// `EvalResult`.
+/// `CallCtx.args` carries the arguments, with a member access's receiver at
+/// `args[0]`. OOM surfaces as a Zig error, a `RuntimeError` as `EvalResult`.
 pub const StdlibFn = *const fn (ctx: *CallCtx) std.mem.Allocator.Error!EvalResult;
 
 pub const CallCtx = struct {
     args: []const Value,
     out: Output,
-    /// Single host handle the intrinsic uses to reach the rest of the
-    /// runtime — the lambda invoker and coroutine/thread machinery.
     host: IntrinsicHost,
-    /// Allocator for any heap the intrinsic produces.
     allocator: std.mem.Allocator,
 };
 
-/// Side-channel the runtime exposes to stdlib intrinsics. A `{ctx,
-/// vtable}` pair. Vtable slots that default are optional; `null` selects
-/// the default behavior implemented in the wrapper methods below.
+/// Optional slots fall back to the wrapper methods below.
 pub const IntrinsicHost = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Invoke a callable `Value` with the supplied args (required).
+        /// Required.
         invoke_callable: *const fn (ctx: *anyopaque, callable: *const Value, args: []const Value, out: Output) std.mem.Allocator.Error!EvalResult,
-        /// Invoke a callable binding `this` to `this_value` (required).
+        /// Required.
         invoke_callable_with_this: *const fn (ctx: *anyopaque, callable: *const Value, args: []const Value, this_value: *const Value, out: Output) std.mem.Allocator.Error!EvalResult,
-        /// Invoke a named method on a receiver. `null` slot => default
-        /// (returns `null`, i.e. fall back to structural rendering).
+        /// Null answers null, falling back to structural rendering.
         invoke_method: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
-        /// Construct an instance of a class value with NAMED arguments,
-        /// letting the constructor's defaults fill every unnamed parameter.
-        /// `null` slot => unavailable.
+        /// The constructor's defaults fill every unnamed parameter.
         construct_named: ?*const fn (ctx: *anyopaque, class: *const Value, names: []const []const u8, args: []const Value, out: Output) std.mem.Allocator.Error!?EvalResult = null,
-        /// Read a property/field off a receiver: resolves custom getters,
-        /// stored fields, and ctor-property params (unlike `invoke_method`,
-        /// which only dispatches functions). `null` slot => default (returns
-        /// `null`, i.e. unavailable).
+        /// Resolves custom getters and stored fields, where `invoke_method`
+        /// dispatches only functions.
         get_property: ?*const fn (ctx: *anyopaque, receiver: *const Value, name: []const u8, out: Output) std.mem.Allocator.Error!?EvalResult = null,
-        /// Resolve a top-level identifier. `null` => default (`null`).
         lookup_global: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
-        /// Allocate a fresh instance identity. `null` => default (`0`).
         alloc_instance_id: ?*const fn (ctx: *anyopaque) u64 = null,
-        /// Synthesise an opaque `Value::Instance`. `null` => default (Unit).
         new_synth_instance: ?*const fn (ctx: *anyopaque, class_fqn: []const u8, identity: u64, fields: []const InstanceData.Field) std.mem.Allocator.Error!Value = null,
-        /// Drive a root `runBlocking` block. `null` => default.
         run_blocking: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
-        /// Drive a `startCoroutine` root block. `null` => default.
         coroutine_run_root: ?*const fn (ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
-        /// Start `block` as a fresh root with no enclosing driver; returns
-        /// the block's value or `Value.CoroutineSuspended` when the root
-        /// parked (persisted for a later external resume).
+        /// Answers the block's value, or `Value.CoroutineSuspended` when the
+        /// root parked and was persisted for a later external resume.
         coroutine_start_root_or_suspended: ?*const fn (ctx: *anyopaque, scope: ?*const Value, block: *const Value, out: Output) std.mem.Allocator.Error!EvalResult = null,
-        /// Whether a cooperative driver pump is live on this thread.
         coroutine_has_driver: ?*const fn (ctx: *anyopaque) bool = null,
-        /// Spawn a child coroutine. `null` => default (run eagerly).
+        /// Null runs it eagerly.
         coroutine_launch: ?*const fn (ctx: *anyopaque, block: *const Value, scope: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
-        /// Schedule a `withTimeout` cancellation gate (`invokeOnTimeout`).
-        /// `null` => default (run eagerly, like a launch with no pump).
+        /// Null runs it eagerly, like a launch with no pump.
         coroutine_spawn_timeout: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_arm_slot: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
         coroutine_disarm_slot: ?*const fn (ctx: *anyopaque) void = null,
-        /// Whether the last root started by `startCoroutineUninterceptedOrReturn`
-        /// parked before it completed. `null` => false.
         coroutine_last_root_parked_once: ?*const fn (ctx: *anyopaque) bool = null,
-        /// Note that a suspension boundary was crossed. `null` => no-op.
         coroutine_note_suspension_hit: ?*const fn (ctx: *anyopaque) void = null,
-        /// Mark the pump owning `slot` as driven by an external dispatcher (a
-        /// `runTest` `TestCoroutineScheduler`): a channel delivery to one of its
-        /// waiters routed through that dispatcher, not the pump queue. `null` =>
-        /// no-op.
+        /// A channel delivery to one of that pump's waiters then routes through
+        /// the external dispatcher rather than the pump queue.
         mark_slot_owner_scheduler_backed: ?*const fn (ctx: *anyopaque, slot: i64) void = null,
-        /// Push / pop the active coroutine scope around an undispatched
-        /// block run inline in the caller's activation
-        /// (`startCoroutineUninterceptedOrReturn`). `null` => no-op.
         coroutine_push_scope: ?*const fn (ctx: *anyopaque, scope: *const Value) void = null,
         coroutine_pop_scope: ?*const fn (ctx: *anyopaque) void = null,
         coroutine_resume_slot_value: ?*const fn (ctx: *anyopaque, slot: i64, value: Value) void = null,
-        /// The active coroutine scope (the running coroutine / `Job`), or
-        /// `null` outside any cooperative driver. `null` slot => no scope.
         active_coro_scope: ?*const fn (ctx: *anyopaque) ?Value = null,
-        /// Resolve a top-level Kotlin function by name (the heavier
-        /// module-function lookup, distinct from `lookup_global`). `null`
-        /// slot => default (`null`).
+        /// The heavier module-function lookup, distinct from `lookup_global`.
         lookup_global_func: ?*const fn (ctx: *anyopaque, name: []const u8) ?Value = null,
         coroutine_drain_to_idle: ?*const fn (ctx: *anyopaque, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         coroutine_resume_external: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) void = null,
-        /// A Kotlin `Continuation.resumeWith`: the coroutine's own step, which
-        /// runs on the caller's stack. Distinct from `coroutine_resume_external`
-        /// (a klio-native suspension's resume, which the pump queue defers —
-        /// klio's native parks pass through no interceptor, so the queue is
-        /// their dispatch).
+        /// Run on the caller's stack, unlike `coroutine_resume_external`, which
+        /// the pump queue defers because a native park passes through no
+        /// interceptor.
         coroutine_resume_continuation: ?*const fn (ctx: *anyopaque, slot: i64, value: Value, out: Output) void = null,
-        /// Post a dispatcher runnable onto the shared worker pool
-        /// (`Dispatchers.Default` / `Dispatchers.IO`). `null` => default
-        /// (run the block inline on the calling thread).
+        /// Null runs the block inline on the calling thread.
         coroutine_dispatch_pooled: ?*const fn (ctx: *anyopaque, block: *const Value, io: bool, out: Output) std.mem.Allocator.Error!?RuntimeError = null,
         spawn_os_thread: ?*const fn (ctx: *anyopaque, block: *const Value, out: Output) std.mem.Allocator.Error!HostResultU64 = null,
         join_os_thread: ?*const fn (ctx: *anyopaque, id: u64) std.mem.Allocator.Error!?RuntimeError = null,
         os_thread_alive: ?*const fn (ctx: *anyopaque, id: u64) bool = null,
-        /// Drive a lazy `sequence{}`/`iterator{}` builder one element: start or
-        /// resume the coroutine block, return the next yielded value (or
-        /// `.done` at completion). `null` => default (`.done`, i.e. an empty
-        /// sequence — only the VM host implements real lazy driving).
+        /// Answers the next yielded value, or `.done`. Null answers `.done`;
+        /// only the VM host drives lazily for real.
         builder_step: ?*const fn (ctx: *anyopaque, state: BuilderStateRef, out: Output) std.mem.Allocator.Error!BuilderStepResult = null,
-        /// Declared return-type name of a callable's underlying function
-        /// (`"kotlin.Long"`), or `null` when unknown / not statically
-        /// typed. Numeric-kind-preserving folds (`sumOf`) read it to seed
-        /// an empty-receiver accumulator with the right kind. `null`
-        /// slot => default (`null`).
+        /// Null when not statically typed. A kind-preserving fold like `sumOf`
+        /// reads it to seed an empty-receiver accumulator.
         callable_return_ty: ?*const fn (ctx: *anyopaque, callable: *const Value) ?[]const u8 = null,
-        /// Return a stable `IntrinsicHost` that outlives the current activation.
-        /// A platform-driven frame loop (an OS vsync callback) re-enters the VM
-        /// after `main` has returned, so the transient per-call host it was
-        /// handed is gone; this hands back a resident copy that stays valid for
-        /// the process lifetime. `null` => default (returns `self` unchanged;
-        /// only the VM host builds a resident copy).
+        /// Outlives the current activation, for a frame loop that re-enters the
+        /// VM after `main` returned. Null answers `self` unchanged.
         persist: ?*const fn (ctx: *anyopaque) IntrinsicHost = null,
     };
 
@@ -152,8 +99,7 @@ pub const IntrinsicHost = struct {
         return self.vtable.invoke_callable(self.ctx, callable, args, out);
     }
 
-    /// A resident host bound to the same VM state, safe to store and re-enter
-    /// across activations (see `VTable.persist`).
+    /// Safe to store and re-enter across activations.
     pub fn persist(self: IntrinsicHost) IntrinsicHost {
         if (self.vtable.persist) |f| return f(self.ctx);
         return self;
@@ -334,14 +280,12 @@ pub const IntrinsicHost = struct {
     }
 };
 
-/// `Result<u64, RuntimeError>` for the OS-thread/dispatch entry points.
 pub const HostResultU64 = union(enum) {
     ok: u64,
     err: RuntimeError,
 };
 
-/// Bare-minimum host for unit tests of pure intrinsics. The callable
-/// entry points return `RuntimeError.Unimplemented` data.
+/// The callable entry points answer `RuntimeError.Unimplemented`.
 pub const NoopHost = struct {
     pub fn init(allocator: std.mem.Allocator) NoopHost {
         _ = allocator;
@@ -396,8 +340,8 @@ test "intrinsic host slot seams default to a no-op without a vtable slot" {
     var h = NoopHost.init(testing.allocator);
     defer h.deinit();
     const ih = h.host();
-    // The merged one-arm / one-resume coroutine surface: an unwired host
-    // tolerates each call as a no-op rather than dereferencing a null slot.
+    // An unwired host tolerates the call rather than dereferencing a null
+    // slot.
     ih.coroutineArmSlot(1);
     ih.coroutineResumeSlotValue(1, .Unit);
     ih.coroutineDisarmSlot();

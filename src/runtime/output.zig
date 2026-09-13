@@ -1,15 +1,11 @@
 //! Output sink for the interpreter and stdlib, plus the Kotlin-compatible
-//! number/char rendering re-exports the `Value` Display path leans on.
-//!
-//! `Output` is a small vtable struct (`ctx` + `*const VTable`) so the
-//! interpreter, the recording sink, the stdout sink, and the test capture
-//! sink all present the same `{write, writeln}` interface to intrinsics.
+//! number and char rendering the `Value` display path leans on. `Output` is a
+//! `{ctx, vtable}` pair, so every sink presents one interface to intrinsics.
 
 const std = @import("std");
 const float_fmt = @import("float_fmt.zig");
 
-/// Output sink interface. A `{ctx, vtable}` pair. `writeln` writes a
-/// string followed by a newline; `write` writes with no trailing newline.
+/// `writeln` appends a newline; `write` does not.
 pub const Output = struct {
     ctx: *anyopaque,
     vtable: *const VTable,
@@ -28,15 +24,12 @@ pub const Output = struct {
     }
 };
 
-/// One recorded output call. A `RecordingSink` logs the exact
-/// write/writeln sequence so it can later be replayed verbatim.
 pub const OutOp = union(enum) {
     write: []const u8,
     writeln: []const u8,
 };
 
-/// Sink that records the exact call sequence instead of formatting
-/// eagerly. Owns the recorded strings; `deinit` frees them.
+/// Owns the recorded strings; `deinit` frees them.
 pub const RecordingSink = struct {
     ops: std.ArrayList(OutOp) = .empty,
     allocator: std.mem.Allocator,
@@ -90,7 +83,6 @@ pub const RecordingSink = struct {
     }
 };
 
-/// Sink that writes to process stdout.
 pub const StdoutOutput = struct {
     fn vtWriteln(ctx: *anyopaque, s: []const u8) void {
         _ = ctx;
@@ -109,8 +101,7 @@ pub const StdoutOutput = struct {
     }
 };
 
-/// Test helper that captures every line written to it. `lines` and the
-/// pending partial own their bytes; `deinit` frees them.
+/// `lines` and the pending partial own their bytes; `deinit` frees them.
 pub const CaptureOutput = struct {
     lines: std.ArrayList([]const u8) = .empty,
     partial: std.ArrayList(u8) = .empty,
@@ -149,24 +140,20 @@ pub const CaptureOutput = struct {
     }
 };
 
-/// Kotlin-compatible `Float.toString`.
 pub fn kotlinFloatToString(allocator: std.mem.Allocator, d: f32) ![]u8 {
     return float_fmt.floatToString(allocator, d);
 }
 
-/// Kotlin-compatible `Double.toString`.
 pub fn kotlinDoubleToString(allocator: std.mem.Allocator, d: f64) ![]u8 {
     return float_fmt.doubleToString(allocator, d);
 }
 
-/// Render a single Kotlin `Char` (a UTF-16 code unit) as a string.
 pub fn charUnitToString(allocator: std.mem.Allocator, unit: u16) ![]u8 {
     return float_fmt.charUnitToString(allocator, unit);
 }
 
-/// Append a UTF-16 code unit to `out`, pairing a pending high surrogate
-/// (`prev`) with a following low surrogate into the astral scalar.
-/// Returns the new pending high surrogate, or `null`.
+/// Pairs a pending high surrogate (`prev`) with a following low surrogate, and
+/// answers the new pending high surrogate.
 pub fn pushCharUnit(allocator: std.mem.Allocator, out: *std.ArrayList(u8), prev: ?u16, unit: u16) !?u16 {
     if (prev) |hi| {
         if (unit >= 0xDC00 and unit <= 0xDFFF) {
@@ -174,8 +161,8 @@ pub fn pushCharUnit(allocator: std.mem.Allocator, out: *std.ArrayList(u8), prev:
             try appendScalar(allocator, out, c);
             return null;
         }
-        // Unpaired high surrogate: keep it as its WTF-8 form (a lone surrogate
-        // is a valid Kotlin Char that must round-trip), not U+FFFD.
+        // An unpaired high surrogate is a valid Kotlin Char that must
+        // round-trip, so keep its WTF-8 form rather than U+FFFD.
         try appendSurrogateUnit(allocator, out, hi);
     }
     if (unit >= 0xD800 and unit <= 0xDBFF) {
@@ -189,7 +176,6 @@ pub fn pushCharUnit(allocator: std.mem.Allocator, out: *std.ArrayList(u8), prev:
     return null;
 }
 
-/// Append a lone UTF-16 surrogate as its 3-byte WTF-8 form.
 fn appendSurrogateUnit(allocator: std.mem.Allocator, out: *std.ArrayList(u8), unit: u16) !void {
     try out.append(allocator, 0xE0 | @as(u8, @intCast(unit >> 12)));
     try out.append(allocator, 0x80 | @as(u8, @intCast((unit >> 6) & 0x3F)));
@@ -208,8 +194,6 @@ fn appendScalar(allocator: std.mem.Allocator, out: *std.ArrayList(u8), c: u32) !
     try out.appendSlice(allocator, buf[0..n]);
 }
 
-/// Fold a sequence of UTF-16 code units into a string, reconstructing
-/// surrogate pairs (and flushing any trailing unpaired high surrogate).
 pub fn charUnitsToString(allocator: std.mem.Allocator, units: []const u16) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -261,6 +245,5 @@ test "recording sink replays the exact call sequence" {
     try testing.expectEqual(@as(usize, 2), cap.lines.items.len);
     try testing.expectEqualStrings("abc", cap.lines.items[0]);
     try testing.expectEqualStrings("d", cap.lines.items[1]);
-    // Replay drains the recording.
     try testing.expectEqual(@as(usize, 0), rec.ops.items.len);
 }

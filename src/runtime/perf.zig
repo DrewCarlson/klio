@@ -1,35 +1,25 @@
-//! Runtime performance configuration: one resolved `Config` that gates the JIT
-//! tiers and the memory backend, instead of each subsystem probing its own env
-//! var. A single profile (`fast`/`safe`/`off`) is the primary control, exposed
-//! identically through the CLI (`--opt <profile>`) and the environment
-//! (`KLIO_OPT`). The low-level env vars stay as diagnostic overrides layered on
-//! top of the profile.
-//!
-//! The process entry point (`main.zig`) resolves the profile once for the
-//! `klio` binary, defaulting to `fast`. Contexts that never call `setProfile`
-//! (the in-process multi-program test harness) keep the conservative default —
-//! interpreter, bounded GC — so a hot loop never silently compiles per worker.
+//! Runtime performance configuration: one resolved `Config` gating the JIT
+//! tiers and the memory backend, from `--opt <profile>` or `KLIO_OPT`, with the
+//! low-level env vars as overrides. A context that never calls `setProfile`
+//! keeps the conservative default.
 
 const std = @import("std");
 const objcell = @import("objcell.zig");
 const getenvSlice = objcell.getenvSlice;
 const envOnce = objcell.envOnce;
 
-/// Bundled performance preset. `fast` turns on everything that speeds up a
-/// normal single-program run; `safe` keeps the interpreter; `off` also drops
-/// the bounded collector for the simplest never-free arena.
+/// `fast` speeds a normal run, `safe` keeps the interpreter, `off` also drops
+/// the bounded collector.
 pub const Profile = enum { fast, safe, off };
 
-/// Backing-allocator family for the run. Mirrors the historical `KLIO_RECLAIM`
-/// values; `gc` is the tracing collector with the page-returning slab backend.
+/// Mirrors the `KLIO_RECLAIM` values; `gc` is the tracing collector.
 pub const AllocChoice = enum { arena, smp, debug, gc };
 
 pub const Config = struct {
-    /// Loop-header JIT (`KLIO_JIT`).
+    /// `KLIO_JIT`.
     jit_loop: bool,
-    /// Whole-function JIT / native recursion (`KLIO_FUNC_JIT`); implies the loop tier.
+    /// `KLIO_FUNC_JIT`; implies the loop tier.
     jit_func: bool,
-    /// Backing allocator the entry point installs.
     reclaim: AllocChoice,
 };
 
@@ -41,7 +31,6 @@ fn forProfile(p: Profile) Config {
     };
 }
 
-/// Parse a profile name. Accepts a few friendly aliases.
 pub fn parseProfile(s: []const u8) ?Profile {
     const eq = std.mem.eql;
     if (eq(u8, s, "fast") or eq(u8, s, "full") or eq(u8, s, "on")) return .fast;
@@ -50,16 +39,13 @@ pub fn parseProfile(s: []const u8) ?Profile {
     return null;
 }
 
-/// Profile used when nothing set the config — conservative, so the in-process
-/// test harness and any embedder default to the interpreter.
+/// Conservative, so any embedder defaults to the interpreter.
 const default_profile: Profile = .safe;
 
 var profile_override: ?Profile = null;
 var cached: ?Config = null;
 
-/// Set the base profile (e.g. from the CLI `--opt` flag or `KLIO_OPT`). Passing
-/// `null` clears an explicit choice and falls back to the env/default. Resets the
-/// resolved cache so the next read re-applies the granular overrides.
+/// `null` falls back to the env or default and resets the resolved cache.
 pub fn setProfile(p: ?Profile) void {
     profile_override = p;
     cached = null;
@@ -78,9 +64,7 @@ fn envReclaim() ?AllocChoice {
     return .smp; // "free", "smp", "1", or any other non-zero value
 }
 
-/// The resolved configuration. Base profile precedence: explicit `setProfile`
-/// (CLI), then `KLIO_OPT`, then the conservative default. The granular env vars
-/// (`KLIO_JIT`, `KLIO_FUNC_JIT`, `KLIO_RECLAIM`) override individual fields.
+/// Precedence: an explicit `setProfile`, then `KLIO_OPT`, then the default.
 pub fn get() Config {
     if (cached) |c| return c;
     const base = profile_override orelse blk: {
@@ -98,15 +82,10 @@ pub fn get() Config {
     return c;
 }
 
-/// Backing-allocator family for the entry point. Honors the profile + override.
 pub fn allocChoice() AllocChoice {
     return get().reclaim;
 }
 
-/// Resolve the entry-point profile for the `klio` binary from its argv and the
-/// environment, defaulting to `fast`. Recognizes `--opt <v>`, `--opt=<v>`, and
-/// `-O <v>`/`-O<v>` anywhere in the arguments. An unknown value falls through to
-/// the env/`fast` default (the CLI surfaces the error separately).
 pub fn resolveBinaryProfile(args: []const []const u8) Profile {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -124,10 +103,8 @@ pub fn resolveBinaryProfile(args: []const []const u8) Profile {
     if (envOnce("KLIO_OPT")) |v| {
         if (parseProfile(v)) |p| return p;
     }
-    // Default by subcommand. `test` runs many small programs whose hot loops
-    // are dispatch-heavy (assertions, collection ops) rather than pure numeric
-    // kernels, so the loop JIT's per-block tracking costs more than it saves;
-    // default it to the plain interpreter (`safe`). A single `run` keeps `fast`.
+    // `test` runs many small programs whose hot loops are dispatch-heavy, so
+    // the loop JIT's tracking costs more than it saves.
     {
         var j: usize = 1; // args[0] is the executable path
         while (j < args.len) : (j += 1) {

@@ -1,6 +1,5 @@
-//! Declared Kotlin classes as the interpreter sees them at runtime:
-//! `ClassDef`, its parameter/method/property descriptors, the live
-//! `InstanceData`, and the method/property resolution walks.
+//! Declared Kotlin classes at runtime: `ClassDef` and its descriptors, the
+//! live `InstanceData`, and the method and property resolution walks.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -14,8 +13,7 @@ const ObjRef = objcell.ObjRef;
 const Env = env_mod.Env;
 const Value = value_mod.Value;
 
-/// One implicit receiver captured from a lexical scope. Storage order is
-/// outermost first, innermost last.
+/// Storage order is outermost first, innermost last.
 pub const ImplicitReceiver = struct {
     v: Value,
     kind: Kind = .receiver,
@@ -27,180 +25,107 @@ pub const ImplicitReceiver = struct {
     }
 };
 
-/// A declared Kotlin class as the interpreter sees it at runtime.
 pub const ClassDef = struct {
-    /// A class definition is built once and, after two-phase linking backpatches
-    /// `parent`/`interfaces`/`enum_entries` at single-threaded startup, is
-    /// immutable — the dispatch path already reads it lock-free. The one later
-    /// write, an enum's initialization installing its constructed entries, runs
-    /// under the enum's initialization claim, which serializes every reader
-    /// that could observe it. Nothing else takes an exclusive borrow of a class
-    /// cell (lazily-initialized bits like `companion` live in their own nested
-    /// cells with their own locks), so its reader lock is pure overhead; elide
-    /// it (see `objcell.LockFor`).
+    /// Immutable after two-phase linking backpatches `parent`, `interfaces` and
+    /// `enum_entries` at single-threaded startup. The one later write, an enum
+    /// installing its constructed entries, runs under the enum's initialization
+    /// claim, and nothing else takes an exclusive borrow, so the reader lock is
+    /// elided.
     pub const objref_immutable = true;
 
     name: []const u8,
     fqn: []const u8,
-    /// Runtime-retained annotation class names applied to this declaration.
     annotation_names: []const []const u8,
-    /// The same annotations with their resolved constructor ARGUMENTS, which
-    /// `annotation_names` alone cannot carry. Reflective consumers that read
-    /// an argument off a class annotation (`@SerialName("...")`) need these.
     annotation_records: []const AnnotationRecord = &.{},
-    /// Declared type-parameter names, in declaration order. A reflective
-    /// consumer handed one serializer per type argument matches them against
-    /// the rendered declared types of the properties to know which element a
-    /// given argument describes.
     type_params: []const []const u8 = &.{},
-    /// Parallel to `type_params`: the simple head of each parameter's
-    /// declared upper bound (`<T : Int>` / `where T : Int` gives `Int`),
-    /// empty when unbounded. Constructor ranking scores a parameter
-    /// declared as the type parameter against this bound.
+    /// Parallel to `type_params`: each declared upper bound's simple head.
     type_param_bounds: []const []const u8 = &.{},
     primary_params: []ClassParamDef,
-    /// Member functions keyed by simple name.
     methods: []MethodDef,
-    /// Body `val`/`var` properties (not primary-ctor properties).
+    /// Body properties, not primary-constructor ones.
     body_properties: []PropertyDef,
     init_blocks: []const forest.ForestField(ast.Block),
-    /// For each entry in `init_blocks`, the index of `body_properties` it
-    /// runs before — matching Kotlin's source-order init rule.
+    /// For each `init_blocks` entry, the `body_properties` index it runs
+    /// before: Kotlin's source-order initialization rule.
     init_block_property_positions: []usize,
     is_data: bool,
-    /// `true` for a `value class` / `@JvmInline value class`.
     is_value: bool,
     is_object: bool,
-    /// `true` for an `enum class`.
     is_enum: bool,
-    /// Whether the declaration has a primary constructor (see `ir.Class`).
     has_primary_ctor: bool = true,
-    /// `true` for an `annotation class`.
     is_annotation: bool = false,
-    /// `true` when the declaration carried the `sealed` modifier.
     is_sealed: bool,
-    /// Simple supertype names recorded from `class Foo : Bar(), Baz`.
     supertype_names: []const []const u8,
-    /// Parallel to `supertype_names`: the dotted source qualifier when a
-    /// supertype was written qualified (`Outer.Inner`), else null. Lets
-    /// parent resolution disambiguate a nested base from a same-simple-name
-    /// class in scope — including a subtype named like its base. Empty when
-    /// no supertype carried a qualifier (the common case).
+    /// Parallel to `supertype_names`: the dotted source qualifier when one was
+    /// written qualified. Parent resolution uses it to tell a nested base from a
+    /// same-simple-name class in scope.
     supertype_paths: []const ?[]const u8 = &.{},
-    /// Resolved parent class for method-resolution chain walking.
-    /// Backpatched once during two-phase class linking, then immutable for
-    /// the rest of the process; read lock-free on the dispatch path.
+    /// Backpatched once during linking, then immutable and read lock-free.
     parent: ?ObjRef(ClassDef),
-    /// Resolved interface supertypes (any number). Arena slice filled once
-    /// during linking; immutable and lock-free thereafter.
     interfaces: []const ObjRef(ClassDef),
-    /// `true` for a class declared with the `interface` keyword.
     is_interface: bool,
-    /// `true` for a `fun interface`.
     is_fun_interface: bool,
-    /// Constructor argument expressions for the parent class.
     parent_ctor_args: []const forest.ForestField(ast.Expr),
-    /// `true` when the declaration carried the `open` modifier.
     is_open: bool,
-    /// `true` for an `abstract class`.
     is_abstract: bool,
-    /// `true` for an `inner class`.
     is_inner: bool,
-    /// `true` for the synthetic `ClassDef` built from an `object { … }`.
     is_anonymous: bool,
-    /// Secondary constructors in source-declared order.
     secondary_ctors: []const forest.ForestField(ast.SecondaryCtor),
-    /// Enum entries in source order. The table is filled once during
-    /// linking with an instance shell per entry; the enum's first active use
-    /// constructs the entries in place (`host_globals.ensureEnumInit`).
+    /// Linking fills the table with one shell per entry; the enum's first use
+    /// constructs them in place.
     enum_entries: []const EnumEntry,
-    /// Enum class initialization: 0 = not started, 1 = in progress, 2 = the
-    /// entries are constructed and the companion has initialized.
+    /// 0 = not started, 1 = in progress, 2 = entries and companion ready.
     enum_init_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
-    /// Companion object instance, if any.
     companion: ObjRef(?ObjRef(InstanceData)),
-    /// For a companion-object class, the enclosing class.
     enclosing_class: ObjRef(?ObjRef(ClassDef)),
-    /// Nested classes by simple name. Immutable arena slice.
     nested_classes: []const NestedClass,
-    /// Captured env in which the class was declared.
     captured_env: ObjRef(Env),
-    /// Inheritance-delegation table. Immutable arena slice.
     supertype_delegates: []const SupertypeDelegate,
-    /// Synthesized forwarder methods for delegated interfaces. Immutable
-    /// arena slice.
     delegate_forwarders: []const MethodDef,
-    /// Lazily-constructed singleton for nested `is_object` classes.
     object_singleton: ObjRef(?ObjRef(InstanceData)),
-    /// `true` for a def synthesized at runtime from a LOCAL class declaration
-    /// (a `class`/`data class` inside a function body). Such a def is the
-    /// class — a constructor call on its `.Class` value must never be
-    /// redirected through the module class index, where an unrelated
-    /// same-simple-name class (a nested class of another owner) can shadow it.
+    /// Synthesized at runtime from a class declaration inside a function body.
+    /// Such a def is the class itself: a constructor call on its `.Class` value
+    /// must never be redirected through the module class index, where an
+    /// unrelated same-simple-name class can shadow it.
     is_local_runtime: bool = false,
-    /// For a runtime-local class, the scope captured by the declaration
-    /// that produced this def: the enclosing function's locals, the class
-    /// itself, and the classes nested in it, by name. One registration is
-    /// one scope, so an instance keeps the scope it was declared in even
-    /// after the same declaration runs again (a local class in a loop
-    /// body), and a method's `C()` or an `outer.D()` resolves to this
-    /// registration's family. Shared by every def of the family.
+    /// The scope a runtime-local declaration captured. One registration is one
+    /// scope, so an instance keeps the scope it was declared in.
     local_captures: []const InstanceData.Capture = &.{},
-    /// For a runtime-local class, the implicit receivers in scope where the
-    /// declaration ran (a receiver lambda's subject, an enclosing member's
-    /// dispatch receiver): its member bodies and constructor thunks resolve
-    /// bare names against them, as the declaration scope would.
+    /// The implicit receivers where a runtime-local declaration ran; its member
+    /// bodies resolve bare names against them.
     local_enclosing: []const ImplicitReceiver = &.{},
 
-    /// Single-fill memo for the ctor chain's first non-interface supertype
-    /// (`host_instances.firstNonInterfaceSuper`): the per-call string
-    /// resolution of every supertype name priced every instance
-    /// construction. 0 = uncomputed, 1 = none, 2 = filled with
-    /// `first_super_index` (into `supertype_names`) and `first_super_fqn`
-    /// (the resolved def's fqn, null for a builtin parent with no runtime
-    /// def). Benign-race: concurrent fillers compute identical values.
+    /// Memo for the constructor chain's first non-interface supertype.
+    /// 0 = uncomputed, 1 = none, 2 = filled with `first_super_index` and
+    /// `first_super_fqn`, null for a builtin parent.
     first_super_state: u8 = 0,
     first_super_index: u8 = 0,
     first_super_fqn: ?[]const u8 = null,
 
-    /// Single-fill memo: the ir-module `ClassId` this runtime class resolves
-    /// to, so the virtual-dispatch fast path skips the string-keyed
-    /// `classIdByFqn` probe it was paying per call. `resolve_mod` is claimed
-    /// by the first resolving module's pointer identity (CAS from 0);
-    /// `resolve_cid` (the id + 1, release-stored after the claim) is the
-    /// validity gate. A class consulted under a different module than the
-    /// one that claimed the memo just keeps the slow path.
+    /// Memo for the ir-module `ClassId` this class resolves to, so virtual
+    /// dispatch skips the string-keyed probe. `resolve_mod` is claimed by the
+    /// first resolving module's pointer identity, and `resolve_cid`, the id plus
+    /// 1, is the validity gate; another module keeps the slow path.
     resolve_mod: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     resolve_cid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
-    /// Single-fill memo for the `<class-companion-or-self>` value read:
-    /// whether this class resolves to a companion/object singleton and,
-    /// when it does, the singleton value itself (process-stable once
-    /// constructed — the shared singleton registry keeps it alive, so the
-    /// memo holds a borrowed copy). 0 = unresolved, 1 = the class value
-    /// itself (no companion, not an object), 2 = `companion_read_value`.
-    /// Benign-race: concurrent fillers store the same singleton.
+    /// Memo for the `<class-companion-or-self>` read: 0 = unresolved, 1 = the
+    /// class value itself, 2 = `companion_read_value`, a borrowed copy of a
+    /// process-stable singleton the shared registry keeps alive.
     companion_read_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     companion_read_value: Value = .Null,
 
-    /// One eager enum entry: its name and the `Value::Instance` for it.
     pub const EnumEntry = struct {
         name: []const u8,
         value: Value,
-        /// Annotations written on the entry declaration, with their arguments.
-        /// A reflective consumer reports these per element the way the class's
-        /// own `annotation_records` are reported for the declaration.
         annotation_records: []const AnnotationRecord = &.{},
     };
-    /// One nested class binding: simple name -> resolved `ClassDef`.
     pub const NestedClass = struct { name: []const u8, class: ObjRef(ClassDef) };
 
     pub const MAX_WALK = 128;
 
-    /// GC tracer for the class graph. Marks every cell a class reaches:
-    /// supertypes, nested/companion/enclosing/object-singleton, the captured
-    /// definition environment, and enum-entry singleton instances. (Method/
-    /// property/init bodies are AST-backed and hold no runtime Value cells.)
+    /// Method, property and init bodies are AST-backed and hold no Value
+    /// cells.
     pub fn gcTrace(self: *const ClassDef, m: *objcell.gc.Marker) void {
         if (self.parent) |p| m.shade(&p.cell.hdr);
         for (self.interfaces) |i| m.shade(&i.cell.hdr);
@@ -215,17 +140,13 @@ pub const ClassDef = struct {
         for (self.local_enclosing) |e| e.v.gcMark(m);
     }
 
-    /// Walk the class chain (self, then parent, then grandparent, …) and
-    /// return the first method matching `name`, paired with its declaring
-    /// class. Caller owns nothing extra; the returned handles are clones.
+    /// Walks self, then parent. The handles are clones the caller owns.
     pub fn findMethod(self: ObjRef(ClassDef), allocator: std.mem.Allocator, name: []const u8) ?MethodHit {
         var seen: std.ArrayList(*const ClassDef) = .empty;
         defer seen.deinit(allocator);
         return findMethodWalk(allocator, self, name, &seen);
     }
 
-    /// Like `findMethod`, but among overloads with this name, prefers one
-    /// whose first declared parameter type name matches `arg_type_name`.
     pub fn findMethodForArg(
         self: ObjRef(ClassDef),
         allocator: std.mem.Allocator,
@@ -242,20 +163,18 @@ pub const ClassDef = struct {
         return findMethod(self, allocator, name);
     }
 
-    /// Walk the class chain searching for a body property of `name`.
     pub fn findBodyProperty(self: ObjRef(ClassDef), allocator: std.mem.Allocator, name: []const u8) ?PropertyHit {
         var seen: std.ArrayList(*const ClassDef) = .empty;
         defer seen.deinit(allocator);
         return findBodyPropertyWalk(allocator, self, name, &seen);
     }
 
-    /// The list of declared interface supertypes (resolved). Caller owns
-    /// the returned slice.
+    /// The caller owns the slice.
     pub fn interfaceRefs(self: *const ClassDef, allocator: std.mem.Allocator) ![]ObjRef(ClassDef) {
         return allocator.dupe(ObjRef(ClassDef), self.interfaces);
     }
 
-    /// Collect companions reachable from this class. Caller owns the slice.
+    /// The caller owns the slice.
     pub fn allCompanions(self: ObjRef(ClassDef), allocator: std.mem.Allocator) ![]ObjRef(InstanceData) {
         var out: std.ArrayList(ObjRef(InstanceData)) = .empty;
         errdefer out.deinit(allocator);
@@ -265,7 +184,7 @@ pub const ClassDef = struct {
         return out.toOwnedSlice(allocator);
     }
 
-    /// True when this class or any of its named supertypes matches `name`.
+    /// Matches the class or any named supertype.
     pub fn isSubtypeOf(self: *const ClassDef, allocator: std.mem.Allocator, name: []const u8) bool {
         if (std.mem.eql(u8, self.name, name) or std.mem.eql(u8, self.fqn, name)) {
             return true;
@@ -301,65 +220,46 @@ pub const ClassDef = struct {
     }
 };
 
-/// A method paired with the class that declared it.
 pub const MethodHit = struct { method: MethodDef, class: ObjRef(ClassDef) };
-/// A property paired with the class that declared it.
 pub const PropertyHit = struct { property: PropertyDef, class: ObjRef(ClassDef) };
 
 pub const SupertypeDelegate = struct {
-    /// Simple name of the delegated interface (written before `by`).
     interface_name: []const u8,
-    /// Resolved interface class, if it resolves at registration time.
+    /// Null when it does not resolve at registration time.
     interface: ?ObjRef(ClassDef),
-    /// Delegate expression — evaluated in the primary-ctor parameter scope.
+    /// Evaluated in the primary constructor's parameter scope.
     expr: forest.ForestField(ast.Expr),
-    /// Field key on the instance where the resolved delegate value lives.
     field_key: []const u8,
 };
 
 pub const ClassParamDef = struct {
-    /// `true` for `var`, `false` for `val`, `null` if not a property.
+    /// `true` for `var`, `false` for `val`, null if not a property.
     property: ?bool,
     name: []const u8,
     default: ?forest.ForestField(ast.Expr),
-    /// Declared type's simple name (e.g. `"Long"`).
     declared_type: ?[]const u8,
-    /// The full declared-type shape, including generic args and nullability.
     declared_shape: ?TypeShape,
-    /// Per-anchor annotation records for a constructor property, after
-    /// use-site target assignment (`@all:` expansion / defaulting).
     anchors: PropertyAnchors = .{},
 };
 
-/// One resolved constructor argument of an annotation application.
-/// Runtime-retained so reflection-driven consumers (the serializer's
-/// `@SerialName`, validation libraries) can read annotation values.
+/// Retained at runtime so reflection can read annotation values.
 pub const AnnotationArg = union(enum) {
-    /// A string literal (`@SerialName("years")`).
     Str: []const u8,
     Int: i64,
     Bool: bool,
-    /// The trailing segment of a dotted path (`AnnotationTarget.PROPERTY`
-    /// records `"PROPERTY"`).
+    /// `AnnotationTarget.PROPERTY` records `"PROPERTY"`.
     EnumEntry: []const u8,
-    /// A class literal argument (`@Serializer(forClass = Foo::class)` records
-    /// `"Foo"`), which names a declaration rather than a value.
+    /// `@Serializer(forClass = Foo::class)` records `"Foo"`.
     ClassRef: []const u8,
-    /// Any argument shape the lowering does not resolve to a value.
     Other,
 };
 
-/// One annotation application recorded against a specific anchor.
 pub const AnnotationRecord = struct {
-    /// Resolved fully-qualified candidate names for the annotation class
-    /// (import-expanded, always ending with the source spelling).
+    /// Import-expanded, always ending with the source spelling.
     names: []const []const u8,
-    /// Resolved constructor arguments in source order.
     args: []const AnnotationArg = &.{},
-    /// Parallel to `args`: the argument name for named arguments.
     arg_names: []const ?[]const u8 = &.{},
 
-    /// Whether any resolved candidate matches `name` exactly.
     pub fn is(self: *const AnnotationRecord, name: []const u8) bool {
         for (self.names) |n| {
             if (std.mem.eql(u8, n, name)) return true;
@@ -367,8 +267,7 @@ pub const AnnotationRecord = struct {
         return false;
     }
 
-    /// The value of the string argument named `param`, or the first
-    /// positional string argument when no argument names were written.
+    /// Falls back to the first positional string when none are named.
     pub fn stringArg(self: *const AnnotationRecord, param: []const u8) ?[]const u8 {
         for (self.args, 0..) |arg, i| {
             if (arg != .Str) continue;
@@ -379,8 +278,7 @@ pub const AnnotationRecord = struct {
     }
 };
 
-/// The distinct anchors annotations of one property land on after
-/// use-site target assignment. Slices are arena-owned and immutable.
+/// After use-site target assignment. Arena-owned and immutable.
 pub const PropertyAnchors = struct {
     param: []const AnnotationRecord = &.{},
     property: []const AnnotationRecord = &.{},
@@ -390,7 +288,6 @@ pub const PropertyAnchors = struct {
     setparam: []const AnnotationRecord = &.{},
     delegate: []const AnnotationRecord = &.{},
 
-    /// The first record on the property anchor matching `name`.
     pub fn propertyRecord(self: *const PropertyAnchors, name: []const u8) ?*const AnnotationRecord {
         for (self.property) |*rec| {
             if (rec.is(name)) return rec;
@@ -399,15 +296,12 @@ pub const PropertyAnchors = struct {
     }
 };
 
-/// A structural view of a declared type retained for reflection.
 pub const TypeShape = struct {
     name: []const u8,
     nullable: bool,
     args: []TypeShape,
 
-    /// Build a `TypeShape` from a parsed AST type reference, recursing into
-    /// generic arguments and skipping star projections. Caller's allocator
-    /// owns the recursively-built `args` slices.
+    /// Skips star projections. The caller's allocator owns `args`.
     pub fn fromTypeRef(allocator: std.mem.Allocator, t: *const ast.TypeRef) std.mem.Allocator.Error!TypeShape {
         var args: std.ArrayList(TypeShape) = .empty;
         errdefer args.deinit(allocator);
@@ -425,90 +319,62 @@ pub const TypeShape = struct {
 
 pub const MethodDef = struct {
     name: []const u8,
-    /// The method's AST function — eager (`.ptr`, build/runtime/test) or lazy
-    /// (`.ref`, image-backed forest). Read via `decl.get()`.
+    /// Eager as `.ptr` or lazily image-backed as `.ref`.
     decl: forest.ForestField(ast.Function),
     is_operator: bool,
     is_open: bool,
     is_override: bool,
-    /// `true` when the source carried the `abstract` modifier.
     is_abstract: bool,
-    /// When non-null, calls dispatch through this SAM-converted lambda.
     sam_lambda: ?Value,
-    /// When non-null, a synthesized inheritance-delegation forwarder routing
-    /// calls to the delegate instance stored under this field key.
+    /// A delegation forwarder routes calls to the delegate instance under this
+    /// field key.
     delegate_field: ?[]const u8,
-    /// IR `FuncId` of the lowered method body, if lowered.
     ir_fn_id: ?u32,
-    /// Resolved fully-qualified candidate names for each source annotation
-    /// on this method, so a test runner can discover `@Test`/etc.
     annotation_names: []const []const u8 = &.{},
 };
 
 pub const PropertyDef = struct {
     name: []const u8,
     mutable: bool,
-    /// Initializer / accessor / delegate AST — eager (`.ptr`, build/bake) or lazy
-    /// (`.ref`, image-backed forest). A loaded image never reads these (the
-    /// lowered side-tables come from the built program), so the `.ref` form keeps
-    /// them out of the eager forest decode. Read via `.get()`.
+    /// A loaded image never reads these; the lowered side-tables come from the
+    /// built program.
     init: ?forest.ForestField(ast.Expr),
-    /// Custom getter body, if declared.
     getter: ?forest.ForestField(ast.Accessor),
-    /// Custom setter body, if declared.
     setter: ?forest.ForestField(ast.Accessor),
-    /// `val foo by expr` — the delegate expression.
     delegate: ?forest.ForestField(ast.Expr),
-    /// `true` when the property was declared `abstract`.
     is_abstract: bool,
-    /// `true` for a `lateinit var`.
     is_lateinit: bool,
-    /// Declared non-nullable primitive zero value for a property with no
-    /// initializer.
+    /// For a declared non-nullable primitive with no initializer.
     primitive_zero: ?Value,
-    /// Per-anchor annotation records after use-site target assignment.
     anchors: PropertyAnchors = .{},
-    /// Whether the property stores a backing field (kotlinc's rule:
-    /// initializer, defaulted accessor, or an accessor that reads `field`).
-    /// Serialization treats exactly the backing-field properties as
-    /// elements.
+    /// By kotlinc's rule: an initializer, a defaulted accessor, or one reading
+    /// `field`. Serialization treats exactly these as elements.
     has_backing: bool = true,
-    /// Declared type head, when the source annotates one. Null for an
-    /// inferred type — descriptor consumers fall back to the dynamic
-    /// element descriptor.
+    /// Null for an inferred type, where consumers use the dynamic descriptor.
     type_head: ?[]const u8 = null,
-    /// The property's type is a NON-NULLABLE scalar, so a read of its stored
-    /// field can never produce null. `type_head` cannot answer this: it keeps
-    /// only the head, so `Int?` and `Int` both read as "Int". The JIT needs the
-    /// distinction to compile a method deopt-free — without it a body property
-    /// only counted as non-null when it had NO initializer (`primitive_zero`),
-    /// which excluded `var n = 0`, i.e. the ordinary shape.
+    /// The type is a non-nullable scalar, so a read of the stored field can
+    /// never produce null. `type_head` keeps only the head, so `Int?` and `Int`
+    /// both read as "Int", and the JIT needs the distinction.
     scalar_nn: bool = false,
 };
 
-/// Interned instance-LAYOUT identity. Two instances carry the same shape id
-/// iff their field lists hold the same name POINTERS in the same order (field
-/// names are canonicalized program-lifetime strings, so pointer identity is
-/// name identity). A matching shape id therefore proves "field `name` is at
-/// index i" without reading any name — the field site memos and the JIT's
-/// per-entry name re-verify become one integer compare.
-///
-/// Ids are addresses of interned records in a program-lifetime arena; the
-/// table is bounded (`shape_cap`) so a pathological workload minting
-/// per-instance name buffers degrades to the UNSHAPED sentinel, never to
-/// unbounded growth. 0 = not computed yet, 1 = unshapeable.
+/// Interned instance-layout identity. Two instances share a shape id iff their
+/// field lists hold the same name pointers in the same order; field names are
+/// canonicalized program-lifetime strings, so a matching id proves "field
+/// `name` is at index i" without reading a name. Ids are addresses in a
+/// program-lifetime arena bounded by `shape_cap`, past which layouts degrade to
+/// the unshaped sentinel.
 pub const SHAPE_UNSET: usize = 0;
 pub const SHAPE_NONE: usize = 1;
 
 const ShapeRec = struct {
-    /// (ptr, len) per field name, in field order. Hashed on both; equality
-    /// on the POINTERS (identical ptr vector => identical layout).
+    /// Hashed on both, compared on the pointers: an identical pointer vector is
+    /// an identical layout.
     ptrs: [][*]const u8,
     lens: []u32,
 };
 
-/// Test-and-set spinlock (Zig 0.16 std has no blocking Thread.Mutex); held
-/// only for the intern-table probe on a shape MISS.
+/// Held only for the intern-table probe on a shape miss.
 const ShapeLock = struct {
     state: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     fn lock(self: *ShapeLock) void {
@@ -541,8 +407,7 @@ fn shapeMatches(rec: *const ShapeRec, fields: []const InstanceData.Field) bool {
     return true;
 }
 
-/// Intern the layout of `fields` and return its shape id (never SHAPE_UNSET;
-/// SHAPE_NONE when the table is at capacity).
+/// Never SHAPE_UNSET; SHAPE_NONE once the table is at capacity.
 fn internShape(fields: []const InstanceData.Field) usize {
     const h = shapeHash(fields);
     shape_lock.lock();
@@ -573,38 +438,25 @@ fn internShape(fields: []const InstanceData.Field) usize {
 
 pub const InstanceData = struct {
     class: ObjRef(ClassDef),
-    /// Field name -> value. Insertion ordered.
     fields: std.ArrayList(Field),
-    /// Interned layout identity (`SHAPE_UNSET` until computed; reset on any
-    /// field APPEND). Benign-race fill: every filler computes the same id
-    /// for the same layout. Read via `shapeOf`.
+    /// `SHAPE_UNSET` until computed, reset by any field append. Racing fillers
+    /// compute the same id.
     shape: std.atomic.Value(usize) = std.atomic.Value(usize).init(SHAPE_UNSET),
-    /// For an `inner class` instance, the captured enclosing-class instance.
     outer: ?Value,
-    /// Per-instance identity, assigned at construction from a monotonic
-    /// counter.
     identity: u64,
-    /// Opaque per-instance state owned by a native host binding.
     native_state: ?NativeState,
-    /// True when `fields` points into a baked image's arena rather than the
-    /// runtime allocator. Growing or freeing that buffer with the runtime
-    /// allocator crosses allocators; the first growth re-buffers and clears
-    /// this, and teardown skips the spine free (the arena owns it).
+    /// `fields` points into a baked image's arena, so growing or freeing it
+    /// with the runtime allocator would cross allocators. The first growth
+    /// re-buffers and clears this, and teardown skips the arena-owned spine.
     fields_foreign: bool = false,
-    /// For an anonymous-object instance, the values it captured from its
-    /// enclosing scope, used to seed the method-body env at dispatch. Held here
-    /// (per instance) rather than in a global registry so they are reclaimed
-    /// with the instance — the registry's anon method/class entries are
-    /// site-stable and shared across instances. Names are borrowed
-    /// (program-lifetime); the slice and the values are owned by the instance.
+    /// For an anonymous-object instance, the values it captured, seeding the
+    /// method-body env at dispatch. Held per instance, so they are reclaimed
+    /// with it; names are borrowed, the slice and values owned.
     anon_captures: []Capture = &.{},
-    /// Lexical implicit receivers visible where an anonymous-object expression
-    /// was created. Anonymous method frames are seeded from this snapshot so
-    /// nested receiver lambdas do not hide an outer dispatch receiver.
+    /// Lexical implicit receivers where the anonymous-object expression was
+    /// created, so nested receiver lambdas do not hide an outer receiver.
     anon_enclosing: []ImplicitReceiver = &.{},
-    /// For a user `Throwable` subclass instance, the call stack captured when it
-    /// was first thrown (`fillInStackTrace`). Null for every non-throwable
-    /// instance and until the throwable is thrown.
+    /// For a user `Throwable` subclass, the stack captured at the first throw.
     stack: ?value_mod.StackRef = null,
 
     pub const Field = struct { name: []const u8, value: Value };
@@ -613,29 +465,21 @@ pub const InstanceData = struct {
     pub fn get(self: *const InstanceData, name: []const u8) ?Value {
         for (self.fields.items) |f| {
             // Field names are canonicalized program-lifetime strings, so an
-            // identical pointer is an identical name — a cheap integer compare
-            // that skips the byte scan on the common hit. The `eql` keeps
-            // correctness for a name that bypassed canonicalization (a runtime
-            // string, a late side-module).
+            // identical pointer is an identical name; `eql` covers a name that
+            // bypassed canonicalization.
             if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) return f.value;
         }
         return null;
     }
 
-    /// `get` for a host-side probe with a NON-interned literal name: the
-    /// ptr fast path can never hit, so every call pays a byte-compare per
-    /// field. The caller passes a per-name cache slot; the first hit
-    /// stores the field's interned pointer and later calls ride the
-    /// integer compare. A class whose intern differs just re-fills.
-    /// The instance's class WITHOUT taking its reader lock. An instance's
-    /// class is written once at construction and never changes, so a
-    /// dispatch key or a site guard that needs only that pointer must not
-    /// pay two atomics for it — a recomposition takes ~380 such reads per
-    /// composable.
+    /// An instance's class is written once at construction, so a dispatch key
+    /// needing only that pointer pays no atomics.
     pub fn classIdentityUnlocked(inst: objcell.ObjRef(InstanceData)) usize {
         return inst.asPtrConst().class.identity();
     }
 
+    /// For a non-interned literal name, where the pointer fast path can never
+    /// hit. The caller passes a per-name cache slot the first hit fills.
     pub fn getCached(self: *const InstanceData, slot: *std.atomic.Value(?[*]const u8), name: []const u8) ?Value {
         if (slot.load(.monotonic)) |p| {
             for (self.fields.items) |f| {
@@ -661,12 +505,9 @@ pub const InstanceData = struct {
         return false;
     }
 
-    /// Store `v` into field `name` (creating it if absent), **adopting** one
-    /// owned reference to `v` (the caller hands off a fresh/owned ref; an alias
-    /// caller retains first). The value replaced on an existing field is
-    /// released — `InstanceData.deinit` releases every field value, so the
-    /// instance owns exactly one ref per field. No refcount traffic under the
-    /// arena fast path.
+    /// Adopts one owned reference to `v`; a caller passing an alias retains
+    /// first. A replaced value is released, so the instance owns exactly one
+    /// reference per field.
     pub fn define(self: *InstanceData, allocator: std.mem.Allocator, name: []const u8, v: Value) !void {
         for (self.fields.items) |*f| {
             if (f.name.ptr == name.ptr or std.mem.eql(u8, f.name, name)) {
@@ -677,19 +518,16 @@ pub const InstanceData = struct {
         }
         try self.ensureFieldsOwned(allocator, 1);
         try self.fields.append(allocator, .{ .name = name, .value = v });
-        // The layout changed: any memoized shape id no longer describes it.
+        // The layout changed, so the memoized shape id no longer describes it.
         self.shape.store(SHAPE_UNSET, .release);
     }
 
-    /// Any out-of-band field-list mutation (host-side appends, removes) must
-    /// drop the memoized layout id.
+    /// Any out-of-band field-list mutation must drop the memoized layout id.
     pub fn invalidateShape(self: *InstanceData) void {
         self.shape.store(SHAPE_UNSET, .release);
     }
 
-    /// The instance's interned layout identity, computing and memoizing it on
-    /// first use (and after any field append reset it). The caller must hold
-    /// a borrow on the instance (the field list must not grow mid-read).
+    /// The caller must hold a borrow: the field list must not grow mid-read.
     pub fn shapeOf(self: *const InstanceData) usize {
         const cached = self.shape.load(.acquire);
         if (cached != SHAPE_UNSET) return cached;
@@ -698,9 +536,7 @@ pub const InstanceData = struct {
         return id;
     }
 
-    /// Re-buffer an image-arena field list with the runtime allocator before
-    /// its first growth. The arena keeps the original buffer; the in-place
-    /// replace and read paths never needed this.
+    /// The arena keeps the original buffer.
     pub fn ensureFieldsOwned(self: *InstanceData, allocator: std.mem.Allocator, extra: usize) !void {
         if (!self.fields_foreign) return;
         var fresh: std.ArrayList(Field) = .empty;
@@ -710,12 +546,8 @@ pub const InstanceData = struct {
         self.fields_foreign = false;
     }
 
-    /// Reference-counting teardown: run when an instance's strong count
-    /// reaches zero. Releases the field values, the captured outer
-    /// instance, and the (cloned) class handle, then frees the field list.
-    /// The class is part of the immutable program graph and is held alive by
-    /// the module, so this only drops the instance's own clone of it;
-    /// `native_state` is owned by its host binding.
+    /// The module keeps the class alive, so this drops only the instance's own
+    /// clone; `native_state` belongs to its host binding.
     pub fn deinit(self: *InstanceData, allocator: std.mem.Allocator) void {
         for (self.fields.items) |f| f.value.release(allocator);
         if (self.outer) |o| o.release(allocator);
@@ -728,8 +560,7 @@ pub const InstanceData = struct {
         self.class.deinit();
     }
 
-    /// GC tracer: an instance references its class cell, owns one ref per field
-    /// value, and (for an inner class) its captured outer.
+    /// The class cell, one reference per field, and an inner class's outer.
     pub fn gcTrace(self: *const InstanceData, m: *objcell.gc.Marker) void {
         m.shade(&self.class.cell.hdr);
         for (self.fields.items) |f| f.value.gcMark(m);
@@ -737,28 +568,20 @@ pub const InstanceData = struct {
         for (self.anon_captures) |c| c.value.gcMark(m);
         for (self.anon_enclosing) |e| e.v.gcMark(m);
         if (self.stack) |s| m.shade(&s.cell.hdr);
-        // `native_state` is host-owned; value-bearing bindings install a
-        // NativeBox gc_trace (none today — kotlinx.io.Buffer is value-free).
+        // `native_state` is host-owned; a value-bearing binding installs its
+        // own tracer.
     }
 
-    /// GC finalizer (shallow): free only the field-list spine. Field values,
-    /// the outer, and the class cell are independent cells swept on their own
-    /// reachability, so they are NOT released here.
+    /// Shallow: the field values, the outer and the class are independent cells
+    /// swept on their own reachability.
     pub fn gcFinalize(self: *InstanceData, allocator: std.mem.Allocator) void {
         if (self.anon_captures.len != 0) allocator.free(self.anon_captures);
         if (self.anon_enclosing.len != 0) allocator.free(self.anon_enclosing);
         if (!self.fields_foreign) self.fields.deinit(allocator);
     }
 
-    /// Fetch the instance's native-state cell, creating it via `init` on
-    /// first access. `T` is the host binding's concrete payload type and
-    /// `kind` is its discriminator (convention: the binding's FQN). On a
-    /// repeat call the cached cell is cloned and returned; the boxed
-    /// payload can be reached through `nativeStatePtr`.
-    ///
-    /// Panics when the instance already carries native state under a
-    /// different `kind`, which indicates two host bindings are fighting
-    /// over the same instance.
+    /// Created through `init` on first access. `kind` is the binding's
+    /// discriminator; panics when the instance already carries another kind.
     pub fn ensureNativeState(
         self: *InstanceData,
         allocator: std.mem.Allocator,
@@ -789,9 +612,8 @@ pub const InstanceData = struct {
         return data;
     }
 
-    /// Downcast a native-state cell's boxed payload to `*T`. The caller
-    /// must request the same `T` the cell was created with; mismatches
-    /// are guarded by the cell's `kind` at the call site that produced it.
+    /// The caller must request the `T` the cell was created with; `kind` guards
+    /// mismatches at the site that produced it.
     pub fn nativeStatePtr(comptime T: type, data: ObjRef(NativeBox)) *T {
         const g = data.borrow();
         defer g.deinit();
@@ -806,18 +628,14 @@ fn hasDeinit(comptime U: type) bool {
     };
 }
 
-/// Native-side data attached to a `Value::Instance`. The `kind`
-/// discriminator is the FQN of the owning native binding (e.g.
-/// `"kotlinx.io.Buffer"`); the runtime guards downcasts against a kind
-/// mismatch. The payload is an opaque, refcounted, lock-protected handle.
+/// `kind` is the FQN of the owning binding, which guards downcasts.
 pub const NativeState = struct {
     kind: []const u8,
     data: ObjRef(NativeBox),
 };
 
-/// Opaque, lock-protected native payload. `ptr` is the host binding's
-/// boxed value; the binding alone knows its concrete type and how to
-/// free it via `destroy`, which runs when the last `ObjRef` clone drops.
+/// Only the binding knows `ptr`'s concrete type and how to free it, through
+/// `destroy`, run when the last clone drops.
 pub const NativeBox = struct {
     ptr: *anyopaque,
     destroy: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
@@ -952,28 +770,20 @@ fn findBodyPropertyWalk(
     return null;
 }
 
-/// Return a fresh clone of the resolved parent `ClassDef` handle, or null.
 fn parentClone(cls: *const ClassDef) ?ObjRef(ClassDef) {
     return if (cls.parent) |p| p.clone() else null;
 }
 
-/// Return a fresh clone of the enclosing `ClassDef` handle, or null.
 fn enclosingClone(cls: *const ClassDef) ?ObjRef(ClassDef) {
     const g = cls.enclosing_class.borrow();
     defer g.deinit();
     return if (g.get().*) |e| e.clone() else null;
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
-
 const testing = std.testing;
 
-/// A `ClassDef` wrapped in an `ObjRef` plus the inner cells it owns, so a
-/// test can tear everything down with `deinit`. The owned `methods` and
-/// `body_properties` slices are kept here for the same reason — `ClassDef`
-/// has no destructor; it is arena-owned.
+/// A `ClassDef` plus the inner cells it owns, so a test tears everything down
+/// with one `deinit`. `ClassDef` is arena-owned and has no destructor.
 const ClassFixture = struct {
     handle: ObjRef(ClassDef),
     env: ObjRef(Env),
@@ -1034,7 +844,6 @@ const ClassFixture = struct {
         return self.handle.asPtr();
     }
 
-    /// Link `parent` as this class's resolved superclass.
     fn setParent(self: *const ClassFixture, parent: ObjRef(ClassDef)) void {
         self.ptr().parent = parent.clone();
     }
@@ -1042,11 +851,7 @@ const ClassFixture = struct {
     fn deinit(self: *ClassFixture, allocator: std.mem.Allocator) void {
         _ = allocator;
         const cd = self.ptr();
-        // `parent`/`interfaces`/`enum_entries`/`nested_classes`/
-        // `supertype_delegates`/`delegate_forwarders` are now plain immutable
-        // slices/optionals (arena-owned in the runtime). Release only the
-        // resolved-handle clones the fixture installed; the empty slices own
-        // no backing buffer.
+        // The fixture's supertype slices are empty.
         if (cd.parent) |p| p.deinit();
         for (cd.interfaces) |iface| iface.deinit();
         {
@@ -1059,8 +864,6 @@ const ClassFixture = struct {
         cd.captured_env.deinit();
         cd.object_singleton.deinit();
         self.handle.deinit();
-        // The `Env` cell is shared with `captured_env`; its last `deinit`
-        // runs `Env.deinit` automatically.
         self.env.deinit();
     }
 };
@@ -1086,8 +889,7 @@ fn typeRef(name: []const u8, nullable: bool, args: []ast.TypeArg) ast.TypeRef {
     };
 }
 
-/// A `Function` AST node with a body, so `findMethod` treats a `MethodDef`
-/// built over it as concrete.
+/// With a body, so `findMethod` treats a `MethodDef` over it as concrete.
 fn fnWithBody(name: []const u8, params: []ast.Param, body: *ast.Block) ast.Function {
     return .{
         .name = ident(name),
@@ -1164,7 +966,6 @@ test "InstanceData get/set/define round-trip" {
     try inst.define(allocator, "x", .{ .Int = 7 });
     try testing.expectEqual(@as(i32, 7), inst.get("x").?.Int);
 
-    // define on an existing name overwrites without growing the list.
     try inst.define(allocator, "x", .{ .Int = 8 });
     try testing.expectEqual(@as(usize, 1), inst.fields.items.len);
     try testing.expectEqual(@as(i32, 8), inst.get("x").?.Int);
@@ -1178,7 +979,6 @@ test "instance release recursively frees a retained instance field" {
     var fx = try ClassFixture.build(allocator, "Foo", &.{}, &.{}, &.{});
     defer fx.deinit(allocator);
 
-    // Inner instance B (strong count 1, holding one clone of the class).
     const b = try objcell.ObjRef(InstanceData).init(allocator, .{
         .class = fx.handle.clone(),
         .fields = .empty,
@@ -1188,7 +988,6 @@ test "instance release recursively frees a retained instance field" {
     });
     const b_val = Value{ .Instance = b };
 
-    // Outer instance A storing B as a field. The store retains B (count 2).
     var a_data: InstanceData = .{
         .class = fx.handle.clone(),
         .fields = .empty,
@@ -1201,10 +1000,7 @@ test "instance release recursively frees a retained instance field" {
     const a = try objcell.ObjRef(InstanceData).init(allocator, a_data);
     const a_val = Value{ .Instance = a };
 
-    // Releasing A drops to zero → its deinit releases field B (2 → 1) and
-    // A's class clone. Releasing the local B handle drops it to zero → freed.
-    // `testing.allocator` asserts the whole graph is reclaimed with no leak
-    // and no double-free.
+    // `testing.allocator` asserts the whole graph is reclaimed.
     a_val.release(allocator);
     b_val.release(allocator);
 }
@@ -1259,8 +1055,6 @@ test "list release recursively frees retained instance elements" {
     const items = try ObjRef(std.ArrayList(Value)).init(allocator, arr);
     const list_val = try Value.newList(allocator, .{ .items = items, .mutable = true, .enum_entries = false, .backing = null });
 
-    // Releasing the list (its last owner) releases the element (2 → 1) and
-    // frees the backing array; releasing the local handle frees the instance.
     list_val.release(allocator);
     inst_val.release(allocator);
 }
@@ -1281,7 +1075,6 @@ test "findMethod walks the parent chain and prefers concrete bodies" {
     defer child_fx.deinit(allocator);
     child_fx.setParent(parent_fx.handle);
 
-    // Own method resolves to the declaring class.
     const own = ClassDef.findMethod(child_fx.handle, allocator, "speak").?;
     var own_hit = own;
     defer own_hit.class.deinit();
@@ -1292,7 +1085,6 @@ test "findMethod walks the parent chain and prefers concrete bodies" {
         try testing.expectEqualStrings("Derived", g.get().name);
     }
 
-    // Inherited method resolves through the parent link.
     const inherited = ClassDef.findMethod(child_fx.handle, allocator, "greet").?;
     var inh_hit = inherited;
     defer inh_hit.class.deinit();
@@ -1328,7 +1120,6 @@ test "findMethodForArg prefers the matching first-param overload" {
     defer h.class.deinit();
     try testing.expectEqualStrings("Bag", h.method.decl.get().params[0].ty.name.name);
 
-    // Unknown arg type falls back to the first matching name.
     const fallback = ClassDef.findMethodForArg(fx.handle, allocator, "plus", "Other").?;
     var fb = fallback;
     defer fb.class.deinit();
@@ -1372,8 +1163,7 @@ test "isSubtypeOf matches self, fqn, and named supertypes via captured env" {
     var derived_fx = try ClassFixture.build(allocator, "Derived", &.{"Base"}, &.{}, &.{});
     defer derived_fx.deinit(allocator);
 
-    // Bind `Base` in the derived class's captured env so the name walk
-    // can resolve it to a `Value::Class`.
+    // Bind `Base` in the derived class's captured env for the name walk.
     {
         const g = derived_fx.env.borrowMut();
         defer g.deinit();
@@ -1399,7 +1189,6 @@ test "allCompanions collects self and parent companions" {
     defer child_fx.deinit(allocator);
     child_fx.setParent(parent_fx.handle);
 
-    // Give each class a companion instance.
     const parent_comp = try ObjRef(InstanceData).init(allocator, .{
         .class = parent_fx.handle.clone(),
         .fields = .empty,
@@ -1407,8 +1196,6 @@ test "allCompanions collects self and parent companions" {
         .identity = 1,
         .native_state = null,
     });
-    // `InstanceData.deinit` releases the instance's class clone, so the
-    // ObjRef drop reclaims the whole instance.
     defer parent_comp.deinit();
     const child_comp = try ObjRef(InstanceData).init(allocator, .{
         .class = child_fx.handle.clone(),
@@ -1435,7 +1222,6 @@ test "allCompanions collects self and parent companions" {
         allocator.free(comps);
     }
     try testing.expectEqual(@as(usize, 2), comps.len);
-    // Self first, then parent.
     try testing.expect(ObjRef(InstanceData).ptrEq(comps[0], child_comp));
     try testing.expect(ObjRef(InstanceData).ptrEq(comps[1], parent_comp));
 }
@@ -1443,8 +1229,7 @@ test "allCompanions collects self and parent companions" {
 test "TypeShape from a generic, nullable type ref" {
     const allocator = testing.allocator;
 
-    // Build `Map<String, Item?>` with a star-projected arg to verify it is
-    // skipped: `Map<String, *>`-style mixing is collapsed.
+    // The star-projected argument must be skipped.
     const string_ty = typeRef("String", false, &.{});
     const item_ty = typeRef("Item", true, &.{});
     var args = [_]ast.TypeArg{
@@ -1491,17 +1276,15 @@ test "shape ids: intern by layout, reset on append, distinct layouts differ" {
 
     const sa = a.shapeOf();
     try testing.expect(sa != SHAPE_UNSET and sa != SHAPE_NONE);
-    // Same name POINTERS in the same order => same id, values irrelevant.
+    // Same name pointers in the same order is the same id.
     try testing.expectEqual(sa, b.shapeOf());
-    // Memoized.
     try testing.expectEqual(sa, a.shapeOf());
 
-    // Append changes the layout: id resets and re-interns differently.
+    // Append changes the layout: the id resets and re-interns differently.
     try b.fields.append(allocator, .{ .name = n2, .value = .Unit });
     b.shape.store(SHAPE_UNSET, .release);
     const sb2 = b.shapeOf();
     try testing.expect(sb2 != sa and sb2 != SHAPE_UNSET and sb2 != SHAPE_NONE);
-    // And the two-field layout interns stably too.
     try a.fields.append(allocator, .{ .name = n2, .value = .Unit });
     a.shape.store(SHAPE_UNSET, .release);
     try testing.expectEqual(sb2, a.shapeOf());
@@ -1536,7 +1319,6 @@ test "ensureNativeState creates once and returns the same payload" {
     defer first.deinit();
     try testing.expectEqual(@as(u32, 42), InstanceData.nativeStatePtr(Payload, first).n);
 
-    // Mutate through the boxed payload, then re-ensure: same cell, same data.
     InstanceData.nativeStatePtr(Payload, first).n = 99;
     const second = try inst.ensureNativeState(allocator, Payload, "kotlinx.io.Buffer", mk.make);
     defer second.deinit();
