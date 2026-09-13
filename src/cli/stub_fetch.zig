@@ -1,17 +1,11 @@
-//! Cross-target stub and shim resolution for `klio bundle --target`.
-//!
-//! A cross bundle needs the target's runtime stub (the `klio` binary for that
-//! OS/arch, same version as the bundler) and, for UI bundles, its Skia shim
-//! blob; same-target bundling uses the running executable and never comes
-//! here. Resolve order:
+//! Cross-target stub and shim resolution for `klio bundle --target`; same-target
+//! bundling uses the running executable and never comes here. Resolve order:
 //!
 //!   1. `--stub <path>`, handled by the caller.
 //!   2. `KLIO_STUB_DIR`: `<dir>/<target>/<name>`, for CI and air-gapped use.
 //!   3. `~/.klio/stubs/<version>/<target>/<name>`, the fetch cache.
-//!   4. HTTPS fetch from the GitHub release of the bundler's own version,
-//!      verified against the sha256 manifest baked in at release build time,
-//!      then cached under 3. A dev build has no manifest and refuses to fetch;
-//!      `--stub` and `KLIO_STUB_DIR` still work.
+//!   4. HTTPS fetch from the GitHub release of the bundler's own version, verified
+//!      against the baked sha256 manifest, then cached under 3.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,9 +15,8 @@ const runtime = @import("runtime");
 const pack = @import("pack");
 const io = @import("io.zig");
 
-/// Release-baked manifest: a flat JSON object of `"artifact-name":
-/// "hex-sha256"`. The committed placeholder is `{}` so dev builds refuse to
-/// fetch; the release workflow overwrites it for a tag build.
+/// Release-baked manifest, a flat JSON object of `"artifact-name": "hex-sha256"`. The
+/// committed placeholder is `{}`, so a dev build has no manifest and refuses to fetch.
 pub const baked_manifest_json: []const u8 = @embedFile("stubs-manifest.json");
 
 const RELEASE_URL_BASE = "https://github.com/klio-lang/klio/releases/download";
@@ -41,8 +34,7 @@ pub fn shimFileName(gpa: Allocator, target: []const u8, version: []const u8) ?[]
     return std.fmt.allocPrint(gpa, "klio-skia-{s}-{s}.zst", .{ version, target }) catch null;
 }
 
-/// In-tree names accepted alongside the release names, so a test or CI dir can
-/// hold `<target>/klio` copies without renaming.
+/// Accepted alongside the release name, so a CI dir can hold `<target>/klio` unrenamed.
 fn plainStubName(target: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, target, "windows")) "klio.exe" else "klio";
 }
@@ -53,7 +45,6 @@ fn plainShimName(target: []const u8) []const u8 {
     return "libklio_skia.so";
 }
 
-/// First of `names` that exists under `<dir>/<target>/`, as an owned path.
 fn findIn(gpa: Allocator, dir: []const u8, target: []const u8, names: []const []const u8) ?[]const u8 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -76,8 +67,6 @@ fn stubCacheDir(gpa: Allocator, version: []const u8) ?[]const u8 {
     return std.fs.path.join(gpa, &.{ home, ".klio", "stubs", version }) catch null;
 }
 
-/// Runtime stub binary for `target` as an owned path, or null when
-/// unavailable and the caller prints the offline hint.
 pub fn resolveStub(gpa: Allocator, target: []const u8, version: []const u8) ?[]const u8 {
     const release_name = stubFileName(gpa, target, version) orelse return null;
     const names = [_][]const u8{ plainStubName(target), release_name };
@@ -94,8 +83,7 @@ pub fn resolveStub(gpa: Allocator, target: []const u8, version: []const u8) ?[]c
     return null;
 }
 
-/// Skia shim bytes for `target`, decompressed when the artifact is the release
-/// `.zst`. Allocates into `arena`.
+/// Skia shim bytes for `target`, decompressed when the artifact is the release `.zst`.
 pub fn resolveShim(arena: Allocator, target: []const u8, version: []const u8) ?[]const u8 {
     const release_name = shimFileName(arena, target, version) orelse return null;
     const names = [_][]const u8{ plainShimName(target), release_name };
@@ -126,9 +114,7 @@ fn decompressZstFrame(arena: Allocator, bytes: []const u8) ?[]const u8 {
     return pack.zstd.decompress(arena, bytes, size) catch null;
 }
 
-/// Fetch `name` from the GitHub release for `version` into
-/// `<cache>/<target>/<name>`, verifying sha256 against the baked manifest. Null
-/// when no manifest is baked, the network fails, or verification fails.
+/// Fetches `name` into `<cache>/<target>/<name>`; null if the fetch or its sha256 fails.
 fn fetchIntoCache(
     gpa: Allocator,
     cache: []const u8,
@@ -172,14 +158,12 @@ fn fetchIntoCache(
     return dest;
 }
 
-/// Fetched-artifact integrity: sha256 must match the release manifest.
 fn verifySha256(bytes: []const u8, expect: [32]u8) bool {
     var got: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &got, .{});
     return std.mem.eql(u8, &got, &expect);
 }
 
-/// Look `name` up in the baked release manifest.
 fn manifestSha256(gpa: Allocator, name: []const u8) ?[32]u8 {
     return manifestSha256In(gpa, baked_manifest_json, name);
 }
@@ -230,8 +214,6 @@ test "sha256 verification accepts a match and refuses a mismatch" {
 
     const expect = manifestSha256In(gpa, json, "klio-0.1.0-linux-arm64").?;
     try std.testing.expect(verifySha256(payload, expect));
-    // A tampered artifact is refused.
     try std.testing.expect(!verifySha256("stub artifact bytez", expect));
-    // An artifact absent from the manifest never verifies.
     try std.testing.expect(manifestSha256In(gpa, json, "klio-0.1.0-macos-x64") == null);
 }

@@ -1,8 +1,6 @@
-//! Pack reader: validates the header and pack hash and decodes the section
-//! directory eagerly, section payloads on demand.
-//!
-//! The byte-level deserializer mirrors `write.zig`'s postcard encoder.
-//! `Zstd` and `ZstdDict` sections decompress through the system zstd library.
+//! Pack reader: validates header and pack hash, decodes the section directory
+//! eagerly and payloads on demand. The deserializer mirrors `write.zig`'s
+//! postcard encoder.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -16,9 +14,8 @@ const Compression = format.Compression;
 const SectionDirectory = format.SectionDirectory;
 const SectionEntry = format.SectionEntry;
 
-/// Result of reading a section: a slice borrowed from the reader's bytes when
-/// uncompressed, an owned buffer when decompressed. The caller frees an
-/// `owned` buffer with the reader's allocator.
+/// Borrowed from the reader's bytes when uncompressed, owned when
+/// decompressed; the caller frees an `owned` buffer with the reader's allocator.
 pub const SectionBytes = union(enum) {
     borrowed: []const u8,
     owned: []u8,
@@ -38,18 +35,15 @@ pub const SectionBytes = union(enum) {
     }
 };
 
-/// Parsed view over a pack's bytes, which the reader owns and keeps alive for
-/// its lifetime. Payload accessors borrow from those bytes for uncompressed
-/// sections and allocate for compressed ones.
+/// Parsed view over bytes the reader owns for its lifetime. Payload accessors
+/// borrow for uncompressed sections and allocate for compressed ones.
 pub const PackReader = struct {
     allocator: Allocator,
     bytes: []u8,
     dir: SectionDirectory,
     payload_start: usize,
 
-    /// Load the file at `path` into one owned allocation and delegate to
-    /// `fromBytes`. On a file-read failure `result` is set to `.Compression`
-    /// and null returned.
+    /// On a file-read failure `result` is `.Compression` and null is returned.
     pub fn fromPath(allocator: Allocator, path: []const u8, result: *PackError) Allocator.Error!?PackReader {
         var threaded: std.Io.Threaded = .init(allocator, .{});
         defer threaded.deinit();
@@ -64,10 +58,8 @@ pub const PackReader = struct {
         return fromBytes(allocator, bytes, result);
     }
 
-    /// Construct a reader over a complete pack byte stream, taking ownership
-    /// of `bytes` and freeing them in `deinit`. Verifies magic, format
-    /// version and pack hash, and rejects truncated streams; on error `bytes`
-    /// are freed and null returned with `result` set.
+    /// Takes ownership of `bytes`, freeing them in `deinit`. Verifies magic,
+    /// format version and pack hash; on error `bytes` are freed and null returned.
     pub fn fromBytes(allocator: Allocator, bytes: []u8, result: *PackError) Allocator.Error!?PackReader {
         const buf = bytes;
         if (buf.len < format.HASHED_REGION_OFFSET + 4) {
@@ -155,13 +147,12 @@ pub const PackReader = struct {
         self.* = undefined;
     }
 
-    /// Pack format version recorded in the header.
     pub fn formatVersion(self: *const PackReader) u32 {
         _ = self;
         return format.FORMAT_VERSION;
     }
 
-    /// Directory entries, borrowed, sorted by name.
+    /// Borrowed, sorted by name.
     pub fn sections(self: *const PackReader) []const SectionEntry {
         return self.dir.entries;
     }
@@ -174,9 +165,7 @@ pub const PackReader = struct {
         return self.dir.entries[index].name;
     }
 
-    /// Read a section by name; null when it is absent. An uncompressed
-    /// section borrows from the reader's bytes, a compressed one allocates
-    /// and is owned by the caller.
+    /// Null when absent. A compressed section allocates and is caller-owned.
     pub fn readSection(self: *const PackReader, name: []const u8, result: *PackError) Allocator.Error!?SectionBytes {
         const entry = self.findEntry(name) orelse return null;
         const start = self.payload_start + @as(usize, @intCast(entry.offset));
@@ -223,7 +212,6 @@ pub const PackReader = struct {
         }
     }
 
-    /// The pack hash as stored in the header.
     pub fn packHash(self: *const PackReader) [format.HASH_LEN]u8 {
         var hash: [format.HASH_LEN]u8 = undefined;
         @memcpy(&hash, self.bytes[format.HASH_OFFSET .. format.HASH_OFFSET + format.HASH_LEN]);
@@ -243,9 +231,8 @@ fn freeDir(allocator: Allocator, dir: SectionDirectory) void {
     d.deinit(allocator);
 }
 
-/// Decode a section payload into a `T`. The caller owns any heap data inside
-/// the result and frees it with the value's `deinit`; on failure `result` is
-/// set and null returned.
+/// The caller owns any heap data in the result and frees it with the value's
+/// `deinit`; on failure `result` is set and null returned.
 pub fn decode(
     comptime T: type,
     allocator: Allocator,
@@ -300,7 +287,7 @@ fn decodeValue(comptime T: type, allocator: Allocator, c: *Cursor) DecodeError!T
         .bool => return (try c.byte()) != 0,
         .int => return decodeInt(T, c),
         .float => {
-            // Mirrors the encoder: IEEE-754 bit pattern, little-endian.
+            // IEEE-754 bit pattern, little-endian.
             const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
             const s = try c.take(@sizeOf(T));
             return @bitCast(std.mem.littleToNative(Bits, std.mem.bytesToValue(Bits, s)));

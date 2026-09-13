@@ -1,13 +1,12 @@
 //! `klio` command-line entry point: argument parsing and subcommand dispatch.
-//! Parsing is hand-rolled to stay dependency-free. `src/main.zig` owns
-//! `pub fn main` and calls `cli.run(gpa)`, which returns the process exit code.
+//! `src/main.zig` owns `pub fn main` and calls `cli.run(gpa)` for the exit code.
 
 const std = @import("std");
 const parser = @import("parser");
 
 const ir = @import("ir");
-/// Re-exported so the native runtime shim reaches the coroutine driver: a
-/// compiled program drives coroutines on the same scheduler, not a second one.
+/// Re-exported so the native runtime shim reaches the coroutine driver: a compiled
+/// program drives coroutines on the same scheduler, not a second one.
 pub const interp_ir = @import("interp_ir");
 const runtime = @import("runtime");
 
@@ -94,30 +93,26 @@ const USAGE =
     \\
 ;
 
-/// Parse process args, dispatch to the subcommand, return the process exit code.
 pub fn run(gpa: std.mem.Allocator, args_in: std.process.Args) !u8 {
     const argv = try io.processArgs(gpa, args_in);
     defer io.freeArgs(gpa, argv);
     return runArgv(gpa, argv);
 }
 
-/// Run the CLI over a pre-built argv (argv[0] is the program name). `run` builds
-/// it from OS process args; the mobile C-ABI `klio_run` synthesizes one.
+/// `argv[0]` is the program name; the mobile C-ABI `klio_run` synthesizes one.
 pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
-    // Cap process RSS (default 6 GiB) so a runaway program aborts before OOMing
-    // the machine, and arm the opt-in wall-clock deadline. Both are call-once.
+    // Cap process RSS (default 6 GiB) so a runaway program aborts before OOMing the
+    // machine, and arm the opt-in wall-clock deadline. Both are call-once.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
     commands.loadLeafLibrary();
     defer commands.leafDiagDump();
 
-    // An appended bundle payload takes over the process: argv[1..] belongs to
-    // the embedded program and klio subcommands are unreachable.
+    // An appended bundle payload takes over: argv[1..] belongs to the embedded program.
     if (bundle_boot.bundleModeActive()) {
         return bundle_boot.run(gpa, argv);
     }
 
-    // argv[0] is the program name.
     const args = argv[1..];
     if (args.len == 0) {
         printErr(gpa, "{s}", .{USAGE});
@@ -153,8 +148,6 @@ pub fn runArgv(gpa: std.mem.Allocator, argv: []const []const u8) !u8 {
     } else if (std.mem.eql(u8, cmd, "transpile")) {
         var files: std.ArrayList([]const u8) = .empty;
         defer files.deinit(gpa);
-        // A program that needs a pack feature or language flag to run needs the
-        // same to transpile: the emitter lowers the same sources.
         var feature_specs: std.ArrayList([]const u8) = .empty;
         defer feature_specs.deinit(gpa);
         if (std.c.getenv("KLIO_LANGUAGE")) |env_specs| applyLanguageSpecs(std.mem.span(env_specs));
@@ -335,7 +328,6 @@ fn runRunCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
         } else if (perfOptValue(a, args, &i)) |v| {
-            // Applied at startup; validate here so a typo is rejected, not run.
             if (runtime.perf.parseProfile(v) == null) {
                 printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
                 return 2;
@@ -372,8 +364,6 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
     defer feature_specs.deinit(gpa);
     var only_files: std.ArrayList([]const u8) = .empty;
     defer only_files.deinit(gpa);
-    // Bare `--feature X` (no `/`) selects a project's own feature module; a
-    // `<pack>/<feat>` spec keeps its cross-pack meaning.
     var project_features: std.ArrayList([]const u8) = .empty;
     defer project_features.deinit(gpa);
     var all_features = false;
@@ -489,12 +479,10 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
     var requested = parseRequestedFeatures(gpa, feature_specs.items);
     defer deinitRequestedFeatures(&requested);
 
-    // No path: the project in the current directory.
     if (paths.items.len == 0) paths.append(gpa, ".") catch return 2;
 
-    // `--isolate` re-invokes `klio test` once per discovered test in its own
-    // sub-process under a per-test wall-clock timeout, pinpointing which test
-    // hangs or crashes. The child re-parses the same base args plus `--filter`.
+    // `--isolate` re-invokes `klio test` once per discovered test in its own sub-process
+    // under a per-test timeout; the child re-parses these base args plus `--filter`.
     if (isolate) {
         var base: std.ArrayList([]const u8) = .empty;
         defer base.deinit(gpa);
@@ -515,18 +503,15 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
         return commands.runTestsIsolated(gpa, self_exe, base.items, timeout_s);
     }
 
-    // Project mode: a single directory carrying `klio.toml` with `[[test]]` sets
-    // runs that project's composed test sources against its built and installed
-    // pack, with no hand-listed files. `planTest` returns null for a plain file
-    // or dir, so the normal path handles everything else. Default and `--all`
-    // test core plus every feature module; `--feature X` narrows to the named.
+    // Project mode: a directory carrying `klio.toml` with `[[test]]` sets runs that
+    // project's composed sources against its built and installed pack. `planTest`
+    // returns null for a plain file or dir, so the normal path handles those.
     if (paths.items.len == 1) {
         const sel: project.FeatureSel = if (!all_features and project_features.items.len != 0)
             .{ .selected = project_features.items }
         else
             .all;
         if (project.planTest(gpa, paths.items[0], sel)) |plan| {
-            // Activate the tested features' sources so their tests compile.
             activateFeatures(gpa, &requested, plan.pack_id, plan.active_features);
             if (buildAndInstallProjectPack(gpa, plan.project_dir, plan.pack_id)) |code| {
                 if (code != 0) return code;
@@ -537,8 +522,7 @@ fn runTestCmd(gpa: std.mem.Allocator, args: []const []const u8, self_exe: []cons
     return commands.runTestFiles(gpa, paths.items, &requested, only_files.items, filter, test_format, list_only);
 }
 
-/// Route a `--feature` value: `<pack>/<feat>` keeps its cross-pack meaning; a
-/// bare `<feat>` selects the current project's own feature module.
+/// `<pack>/<feat>` keeps its cross-pack meaning; a bare `<feat>` selects the project's own.
 fn addFeatureSpec(
     gpa: std.mem.Allocator,
     v: []const u8,
@@ -552,8 +536,7 @@ fn addFeatureSpec(
     }
 }
 
-/// Merge a project's active test features into the requested-feature set under
-/// its pack id, so the pack loader includes those feature modules' sources.
+/// Files the pack loader with these under `pack_id`, so its feature sources load.
 fn activateFeatures(
     gpa: std.mem.Allocator,
     requested: *RequestedFeatures,
@@ -568,8 +551,7 @@ fn activateFeatures(
     }
 }
 
-/// Build the project pack from `dir` and install it so its API resolves in
-/// the project's tests. Returns the failing exit code, or 0/null on success.
+/// Installs the built pack so its API resolves in the tests. Failing exit code, else 0 or null.
 fn buildAndInstallProjectPack(gpa: std.mem.Allocator, dir: []const u8, id: []const u8) ?u8 {
     if (id.len == 0) return null; // not a library project, nothing to install
     const b = pack_build.runPack(gpa, .{ .Build = .{ .dir = dir } });
@@ -600,7 +582,6 @@ fn runBakeCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
         } else if (perfOptValue(a, args, &i)) |v| {
-            // Applied at startup; validate here so a typo is rejected, not run.
             if (runtime.perf.parseProfile(v) == null) {
                 printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
                 return 2;
@@ -658,7 +639,6 @@ fn runCheckCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
         } else if (optionValue(a, "--language=")) |v| {
             applyLanguageSpecs(v);
         } else if (perfOptValue(a, args, &i)) |v| {
-            // Applied at startup; validate here so a typo is rejected, not run.
             if (runtime.perf.parseProfile(v) == null) {
                 printErr(gpa, "error: unknown --opt `{s}` (use fast|safe|off)\n", .{v});
                 return 2;
@@ -692,8 +672,7 @@ fn runPackCmd(gpa: std.mem.Allocator, args: []const []const u8) u8 {
     return pack_build.runPack(gpa, cmd);
 }
 
-/// Parse the minimal positional form of each pack subcommand; flag-heavy
-/// variants take their defaults.
+/// Only the minimal positional form; flag-heavy variants take their defaults.
 fn parsePackCmd(args: []const []const u8) ?PackCmd {
     const sub = args[0];
     const pos = args[1..];
@@ -742,8 +721,6 @@ fn parseFormat(s: []const u8) ?DiagFormat {
     return null;
 }
 
-/// Apply `+Feature[,+Other]` language specs, from `--language=` or
-/// `KLIO_LANGUAGE`, to the parser's process-wide toggles.
 fn applyLanguageSpecs(specs: []const u8) void {
     var it = std.mem.tokenizeAny(u8, specs, ", ");
     while (it.next()) |spec| _ = parser.setLanguageFeature(spec);
@@ -754,10 +731,9 @@ fn optionValue(arg: []const u8, prefix: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The performance profile flag (`--opt <p>`, `--opt=<p>`, `-O<p>`, `-O <p>`) is
-/// applied at process start, before the allocator is chosen, so subcommand
-/// parsers call this only to consume it. Null if `a` is not the flag, else its
-/// value (empty when missing), advancing `i` past a separate value argument.
+/// The profile flag (`--opt <p>`, `--opt=<p>`, `-O<p>`, `-O <p>`) is applied at process
+/// start, before the allocator is chosen, so parsers call this only to consume it. Null
+/// when `a` is not the flag, else its value, empty when missing, advancing `i` past it.
 fn perfOptValue(a: []const u8, args: []const []const u8, i: *usize) ?[]const u8 {
     if (std.mem.eql(u8, a, "--opt") or std.mem.eql(u8, a, "-O")) {
         if (i.* + 1 < args.len) {
@@ -771,8 +747,7 @@ fn perfOptValue(a: []const u8, args: []const []const u8, i: *usize) ?[]const u8 
     return null;
 }
 
-/// Parse `--feature <pack>/<feature>` specs into a per-pack feature map. A bare
-/// spec with no `/` names no pack, so it is reported and skipped.
+/// A spec with no `/` names no pack, so it is reported and skipped.
 fn parseRequestedFeatures(gpa: std.mem.Allocator, specs: []const []const u8) RequestedFeatures {
     var out = RequestedFeatures.init(gpa);
     for (specs) |spec| {

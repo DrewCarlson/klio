@@ -1,15 +1,8 @@
-//! Stdlib pack baked into the binary: the top-level build.zig runs
-//! `embed_gen` over the repo source checkout and wires the bytes in through
-//! the `stdlib_embedded` module.
-//!
-//! `stdlibPackBytes` resolves the pack in this order:
-//!   1. `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack`, a deliberate per-run
-//!      on-disk override.
+//! Stdlib pack resolution, in order:
+//!   1. `KLIO_STDLIB_PACK=/path/to/stdlib.klio-pack`, a per-run override.
 //!   2. The cwd source checkout (`kotlin/libraries/stdlib`, `kotlin-klio`),
-//!      built fresh by `build_stdlib_pack`, so in-repo stdlib `.kt` edits
-//!      take effect without rebuilding the binary.
-//!   3. The embedded bytes, always present in a build.zig-produced binary, so
-//!      `klio run` works from any directory with no setup.
+//!      built fresh, so in-repo `.kt` edits apply without rebuilding.
+//!   3. The bytes build.zig baked in, so `klio run` works from any directory.
 //! A null `env` skips the override and starts at the checkout.
 
 const std = @import("std");
@@ -22,18 +15,13 @@ const embedded = @import("stdlib_embedded");
 
 const PackError = pack.PackError;
 
-/// The pack bytes baked into the binary by build.zig, or `null` in builds
-/// that bypass build.zig (scripts/zigcheck.py wires the stub module).
+/// Baked in by build.zig; null where build.zig is bypassed.
 pub const EMBEDDED_PACK_BYTES: ?[]const u8 = embedded.pack_bytes;
 
-/// Environment variable naming a readable file whose contents override the
-/// built stdlib pack.
 pub const STDLIB_PACK_ENV: []const u8 = "KLIO_STDLIB_PACK";
 
-/// Stdlib pack bytes for the host to load, resolved in the order at the top
-/// of this file; a null `env` skips the override. The slice is owned by the
-/// caller and freed with `allocator`. When every source fails, `result`
-/// carries the checkout builder's error, which names the missing root.
+/// Resolved in the order at the top of this file. The slice is owned by the
+/// caller. When every source fails, `result` names the missing root.
 pub fn stdlibPackBytes(allocator: Allocator, env: ?*const EnvMap, result: *PackError) Allocator.Error!?[]u8 {
     if (env) |m| {
         if (m.get(STDLIB_PACK_ENV)) |path| {
@@ -51,9 +39,8 @@ pub fn stdlibPackBytes(allocator: Allocator, env: ?*const EnvMap, result: *PackE
     return null;
 }
 
-/// Implicit package list declared by the stdlib pack's manifest, so callers
-/// track whatever the pack declares. The slice and its strings are owned by
-/// the caller and freed with `allocator`; any failure yields an empty slice.
+/// Implicit packages the pack manifest declares. Slice and strings owned by
+/// the caller; any failure yields an empty slice.
 pub fn embeddedImplicitPackages(allocator: Allocator, env: ?*const EnvMap) Allocator.Error![][]const u8 {
     var err: PackError = undefined;
     const bytes = (try stdlibPackBytes(allocator, env, &err)) orelse return &.{};
@@ -76,14 +63,12 @@ pub fn embeddedImplicitPackages(allocator: Allocator, env: ?*const EnvMap) Alloc
     return out;
 }
 
-/// Free a slice returned by `embeddedImplicitPackages`.
 pub fn freeImplicitPackages(allocator: Allocator, packages: [][]const u8) void {
     for (packages) |p| allocator.free(p);
     allocator.free(packages);
 }
 
-/// Read `path` into an owned buffer. Null when the file cannot be read, so
-/// the caller falls back to the built pack.
+/// Null when unreadable, so the caller falls back to the built pack.
 fn readFile(allocator: Allocator, path: []const u8) Allocator.Error!?[]u8 {
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
@@ -116,7 +101,6 @@ test "embedded pack loads" {
 }
 
 test "baked-in pack bytes parse and carry every section" {
-    // Skipped under scripts/zigcheck.py (stub module, no baked bytes).
     const a = std.testing.allocator;
     const bytes = EMBEDDED_PACK_BYTES orelse return error.SkipZigTest;
     var err: PackError = undefined;
@@ -137,8 +121,7 @@ test "baked-in pack bytes parse and carry every section" {
 }
 
 test "embedded implicit packages match static list" {
-    // `stdlib.IMPLICITLY_IMPORTED_PACKAGES` is the boot-time source and the
-    // pack manifest the persistent form; the two must agree.
+    // The boot-time list and the pack manifest must agree.
     const a = std.testing.allocator;
 
     const from_pack = try embeddedImplicitPackages(a, null);

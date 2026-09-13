@@ -1,17 +1,14 @@
-//! Tiered native-compiler foundation: W^X executable memory plus a machine-code
-//! emitter selected per target, `X86Emitter` (System V) and the AArch64 backend
-//! in `arm64.zig`. Both expose the same method-level API and register-role
-//! contract, so the loop/function compiler in `ir/jit_loop.zig` stays
-//! arch-neutral, and any unsupported shape falls back to the interpreter.
-//! Design: `docs/design/JIT-DESIGN.md`.
+//! W^X executable memory plus a machine-code emitter selected per target,
+//! `X86Emitter` (System V) and the AArch64 backend in `arm64.zig`. Both expose
+//! the same method-level API and register-role contract, so `ir/jit_loop.zig`
+//! stays arch-neutral; any unsupported shape falls back to the interpreter.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
 pub const JitError = error{ Unsupported, OutOfMemory, MapFailed, ProtectFailed };
 
-/// SSE/NEON scratch register by encoding number; the loop compiler uses
-/// xmm0/xmm1 (v0/v1 on AArch64) as per-instruction float scratch.
+/// SSE/NEON scratch by encoding number; xmm0/xmm1 are per-instruction scratch.
 pub const Xmm = enum(u4) {
     xmm0 = 0,
     xmm1 = 1,
@@ -31,11 +28,9 @@ pub const Xmm = enum(u4) {
     xmm15 = 15,
 };
 
-/// Abstract branch condition consumed by `jcc`, lowered per backend. Signed
-/// forms follow an integer `cmp`; `a`/`ae`/`be` a float compare; `e`/`ne` either.
+/// Signed forms follow an integer `cmp`; `a`/`ae`/`be` a float compare; `e`/`ne` either.
 pub const Cond = enum { l, ge, e, ne, le, g, a, ae, b, be, p, np };
 
-/// Abstract boolean-materialization condition consumed by `setccReg`.
 pub const SetCc = enum { e, ne, l, ge, le, g, b, a, ae, p, np };
 
 /// Element access width + signedness for `[base + index*scale]`.
@@ -43,17 +38,15 @@ pub const ElemW = enum { b8s, b8u, b16s, b16u, b32s, b32u, b64 };
 
 pub const Label = usize;
 
-/// The active machine-code emitter, selected at compile time. The interpreter
-/// is the fallback on architectures without a backend (`finalize` rejects them).
+/// Selected at compile time; `finalize` rejects architectures without a backend.
 pub const Emitter = switch (builtin.cpu.arch) {
     .x86_64 => X86Emitter,
     .aarch64 => @import("arm64.zig").Emitter,
     else => X86Emitter,
 };
 
-// Darwin requires MAP_JIT pages toggled between writable and executable per
-// thread; other platforms use a plain RW->RX mprotect. Both need an explicit
-// instruction-cache sync on AArch64 before the freshly written code runs.
+// Darwin toggles MAP_JIT pages between writable and executable per thread;
+// elsewhere a plain RW->RX mprotect. AArch64 also needs an icache sync.
 extern "c" fn pthread_jit_write_protect_np(enabled: c_int) void;
 extern "c" fn sys_icache_invalidate(start: *anyopaque, len: usize) void;
 
@@ -63,8 +56,7 @@ extern "c" fn sys_icache_invalidate(start: *anyopaque, len: usize) void;
 pub const pages_supported = (builtin.cpu.arch == .x86_64 or builtin.cpu.arch == .aarch64) and
     builtin.os.tag != .windows;
 
-/// A finalized block of executable machine code owning its W^X pages, which
-/// `deinit` unmaps.
+/// Executable machine code owning its W^X pages, which `deinit` unmaps.
 pub const ExecBuf = struct {
     mem: []align(std.heap.page_size_min) u8,
     len: usize,
@@ -76,15 +68,13 @@ pub const ExecBuf = struct {
         self.* = undefined;
     }
 
-    /// Reinterpret the entry as `Fn`, a `*const fn (...) callconv(.c) T` the
-    /// caller must match to the emitted signature.
+    /// `Fn` is a `*const fn (...) callconv(.c) T` the caller must match.
     pub fn entry(self: *const ExecBuf, comptime Fn: type) Fn {
         return @ptrCast(@alignCast(self.mem.ptr));
     }
 };
 
-/// Copy `code` into fresh page-aligned memory and seal it read+execute, never
-/// writable and executable at once.
+/// Copy into fresh page-aligned memory and seal read+execute, never both at once.
 pub fn finalize(code: []const u8) JitError!ExecBuf {
     if (comptime !pages_supported) {
         return JitError.Unsupported;
@@ -95,8 +85,7 @@ pub fn finalize(code: []const u8) JitError!ExecBuf {
     }
 }
 
-/// Linux/Android: allocate writable, copy, seal as read+execute, then sync the
-/// instruction cache (a no-op-eliding builtin on x86, real maintenance on ARM).
+/// Linux/Android: allocate writable, copy, seal read+execute, sync the icache.
 fn finalizePosix(code: []const u8) JitError!ExecBuf {
     const linux = std.os.linux;
     const page = std.heap.pageSize();
@@ -118,8 +107,7 @@ fn finalizePosix(code: []const u8) JitError!ExecBuf {
     return .{ .mem = mem, .len = code.len };
 }
 
-/// Apple platforms: MAP_JIT pages are RWX but write-protected per thread.
-/// Drop the write lock, copy, re-arm it, then invalidate the icache.
+/// Apple: MAP_JIT pages are RWX but write-protected per thread.
 fn finalizeDarwin(code: []const u8) JitError!ExecBuf {
     const c = std.c;
     const page = std.heap.pageSize();
@@ -141,8 +129,7 @@ fn finalizeDarwin(code: []const u8) JitError!ExecBuf {
     return .{ .mem = mem, .len = code.len };
 }
 
-/// Make freshly written code visible to the instruction stream. Required on
-/// AArch64 (separate I/D caches); the x86 builtin compiles to nothing.
+/// Required on AArch64 (separate I/D caches); the x86 builtin compiles to nothing.
 fn syncICache(ptr: [*]u8, len: usize) void {
     if (comptime builtin.os.tag.isDarwin()) {
         sys_icache_invalidate(@ptrCast(ptr), len);
@@ -298,7 +285,6 @@ pub const X86Emitter = struct {
         try self.modrmRR(b, a);
     }
 
-    /// `neg <dst64>` (two's-complement negate).
     pub fn negReg(self: *X86Emitter, dst: Reg) JitError!void {
         try self.rexW(dst);
         try self.byte(0xF7);
@@ -335,8 +321,7 @@ pub const X86Emitter = struct {
         try self.memOperand(src, base, disp);
     }
 
-    /// `movzx <dst64>, byte [<base64> + disp32]`: zero-extend the byte at
-    /// `base+disp` into `dst`, used to read a `Value`'s 1-byte tag.
+    /// `movzx <dst64>, byte [<base64> + disp32]`, reading a `Value`'s 1-byte tag.
     pub fn loadMemB(self: *X86Emitter, dst: Reg, base: Reg, disp: i32) JitError!void {
         try self.rexWrr(dst, base);
         try self.byte(0x0F);
@@ -355,8 +340,7 @@ pub const X86Emitter = struct {
         try self.byte(v);
     }
 
-    /// ModRM+SIB+disp32 for `[base + disp32]` with ModRM.reg = `reg`. `rsp`/`r12`
-    /// bases require a SIB byte; mod=10 always emits a 32-bit displacement.
+    /// `rsp`/`r12` bases require a SIB byte; mod=10 always emits a 32-bit disp.
     fn memOperand(self: *X86Emitter, reg: Reg, base: Reg, disp: i32) JitError!void {
         const rm = low3(base);
         try self.byte(0x80 | (low3(reg) << 3) | rm); // mod=10
@@ -364,12 +348,10 @@ pub const X86Emitter = struct {
         try self.imm32(@bitCast(disp));
     }
 
-    /// `push <reg64>`.
     pub fn push(self: *X86Emitter, r: Reg) JitError!void {
         if (@intFromEnum(r) >= 8) try self.byte(0x41);
         try self.byte(0x50 | low3(r));
     }
-    /// `pop <reg64>`.
     pub fn pop(self: *X86Emitter, r: Reg) JitError!void {
         if (@intFromEnum(r) >= 8) try self.byte(0x41);
         try self.byte(0x58 | low3(r));
@@ -381,23 +363,20 @@ pub const X86Emitter = struct {
         try self.modrmRR(b, a);
     }
 
-    /// `movsxd <dst64>, <src32>`: sign-extend the low 32 bits of `src` into
-    /// `dst`, normalizing a 32-bit Kotlin `Int` result held in a 64-bit slot.
+    /// `movsxd <dst64>, <src32>`, normalizing a 32-bit Kotlin `Int` in a 64-bit slot.
     pub fn movsxd(self: *X86Emitter, dst: Reg, src: Reg) JitError!void {
         try self.rexWrr(dst, src);
         try self.byte(0x63); // MOVSXD r64, r/m32
         try self.modrmRR(dst, src);
     }
 
-    /// Low 3 bits of an SSE register's encoding. An IR `f64` register keeps its
-    /// bit pattern in its i64 slot and moves with `movsd`, so the hot path has no
-    /// integer<->xmm round-trip; xmm0-xmm2 are per-instruction scratch.
+    /// Low 3 bits of an SSE register. An IR `f64` keeps its bits in its i64 slot
+    /// and moves with `movsd`, so the hot path has no integer/xmm round-trip.
     fn xlow3(x: Xmm) u8 {
         return @as(u8, @intFromEnum(x)) & 0x7;
     }
-    /// Optional REX for an SSE op with xmm `reg` field and `rm` (xmm or gpr):
-    /// REX.R for an extended xmm reg, REX.B for an extended rm. Emitted only for
-    /// an extended register, since low registers need no REX.
+    /// REX.R for an extended xmm reg, REX.B for an extended rm; emitted only for
+    /// an extended register, since low ones need none.
     fn sseRex(self: *X86Emitter, reg_ext: bool, rm_ext: bool) JitError!void {
         if (reg_ext or rm_ext) {
             const r: u8 = if (reg_ext) 0x04 else 0;
@@ -406,8 +385,7 @@ pub const X86Emitter = struct {
         }
     }
 
-    /// scalar mem load/store: `prefix 0F op` with an xmm reg field and a memory
-    /// operand (`op` = 0x10 load, 0x11 store; prefix 0xF2 for sd, 0xF3 for ss).
+    /// `prefix 0F op` (0x10 load, 0x11 store; 0xF2 for sd, 0xF3 for ss).
     fn sseMem(self: *X86Emitter, prefix: u8, op: u8, reg: Xmm, base: Reg, disp: i32) JitError!void {
         try self.byte(prefix);
         try self.sseRex(@intFromEnum(reg) >= 8, @intFromEnum(base) >= 8);
@@ -415,11 +393,9 @@ pub const X86Emitter = struct {
         try self.byte(op);
         try self.memOperandX(reg, base, disp);
     }
-    /// `movsd <xdst>, [<base64> + disp32]`: load an f64 from a frame slot.
     pub fn movsdLoad(self: *X86Emitter, dst: Xmm, base: Reg, disp: i32) JitError!void {
         try self.sseMem(0xF2, 0x10, dst, base, disp);
     }
-    /// `movsd [<base64> + disp32], <xsrc>`: store an f64 to a frame slot.
     pub fn movsdStore(self: *X86Emitter, base: Reg, disp: i32, src: Xmm) JitError!void {
         try self.sseMem(0xF2, 0x11, src, base, disp);
     }
@@ -447,7 +423,6 @@ pub const X86Emitter = struct {
         try self.byte(op);
         try self.byte(0xC0 | (xlow3(dst) << 3) | xlow3(src)); // mod=11
     }
-    /// `addsd <xdst>, <xsrc>` (dst += src, IEEE double).
     pub fn addsd(self: *X86Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.sseRR(0xF2, 0x58, dst, src);
     }
@@ -460,7 +435,6 @@ pub const X86Emitter = struct {
     pub fn divsd(self: *X86Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.sseRR(0xF2, 0x5E, dst, src);
     }
-    /// Single-precision (f32) arithmetic.
     pub fn addss(self: *X86Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.sseRR(0xF3, 0x58, dst, src);
     }
@@ -473,23 +447,23 @@ pub const X86Emitter = struct {
     pub fn divss(self: *X86Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.sseRR(0xF3, 0x5E, dst, src);
     }
-    /// `ucomisd <a>, <b>`: unordered double compare, sets ZF/PF/CF (PF=1 on NaN).
+    /// Unordered double compare, setting ZF/PF/CF (PF=1 on NaN).
     pub fn ucomisd(self: *X86Emitter, a: Xmm, b: Xmm) JitError!void {
         try self.sseRR(0x66, 0x2E, a, b);
     }
-    /// `xorps <dst>, <src>`: bitwise xor of packed singles. `xorps x, x` zeroes x.
+    /// `xorps x, x` zeroes x.
     pub fn xorps(self: *X86Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.sseRR(0x00, 0x57, dst, src);
     }
-    /// `ucomiss <a>, <b>`: unordered single compare (no prefix).
+    /// Unordered single compare, no prefix.
     pub fn ucomiss(self: *X86Emitter, a: Xmm, b: Xmm) JitError!void {
         try self.sseRR(0x00, 0x2E, a, b);
     }
-    /// `cvtss2sd <xdst>, <xsrc>`: f32 -> f64 (exact).
+    /// f32 -> f64, exact.
     pub fn cvtss2sd(self: *X86Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.sseRR(0xF3, 0x5A, dst, src);
     }
-    /// `cvtsd2ss <xdst>, <xsrc>`: f64 -> f32 (round to nearest).
+    /// f64 -> f32, round to nearest.
     pub fn cvtsd2ss(self: *X86Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.sseRR(0xF2, 0x5A, dst, src);
     }
@@ -504,19 +478,17 @@ pub const X86Emitter = struct {
         try self.byte(op);
         try self.byte(0xC0 | (@as(u8, reg_num & 7) << 3) | (rm_num & 7));
     }
-    /// `cvtsi2sd <xdst>, <src64>`: signed i64 -> f64.
     pub fn cvtsi2sd(self: *X86Emitter, dst: Xmm, src: Reg) JitError!void {
         try self.cvtIntXmm(0xF2, 0x2A, @intFromEnum(dst), @intFromEnum(src));
     }
-    /// `cvttsd2si <dst64>, <xsrc>`: f64 -> signed i64 (truncating).
+    /// f64 -> signed i64, truncating.
     pub fn cvttsd2si(self: *X86Emitter, dst: Reg, src: Xmm) JitError!void {
         try self.cvtIntXmm(0xF2, 0x2C, @intFromEnum(dst), @intFromEnum(src));
     }
-    /// `cvtsi2ss <xdst>, <src64>`: signed i64 -> f32.
     pub fn cvtsi2ss(self: *X86Emitter, dst: Xmm, src: Reg) JitError!void {
         try self.cvtIntXmm(0xF3, 0x2A, @intFromEnum(dst), @intFromEnum(src));
     }
-    /// `cvttss2si <dst64>, <xsrc>`: f32 -> signed i64 (truncating).
+    /// f32 -> signed i64, truncating.
     pub fn cvttss2si(self: *X86Emitter, dst: Reg, src: Xmm) JitError!void {
         try self.cvtIntXmm(0xF3, 0x2C, @intFromEnum(dst), @intFromEnum(src));
     }
@@ -553,10 +525,9 @@ pub const X86Emitter = struct {
         try self.byte(0x31); // XOR r/m64, r64
         try self.modrmRR(src, dst);
     }
-    /// Shift `dst` by the count in CL. `ext` is the opcode extension (4 = shl,
-    /// 7 = sar, 5 = shr). `w64` selects the 64-bit operand (count masked to
-    /// 0x3f), otherwise the 32-bit form (count masked to 0x1f, high 32 of the
-    /// destination cleared), matching Kotlin's `Int` vs `Long` shift masking.
+    /// `ext` is the opcode extension (4 shl, 7 sar, 5 shr). `w64` selects the
+    /// 64-bit form (count masked to 0x3f) against the 32-bit one (0x1f, high 32
+    /// cleared), matching Kotlin's `Int` and `Long` shift masking.
     fn shiftCl(self: *X86Emitter, dst: Reg, ext: u8, w64: bool) JitError!void {
         if (w64) {
             try self.rexW(dst);
@@ -575,8 +546,7 @@ pub const X86Emitter = struct {
     pub fn shrCl(self: *X86Emitter, dst: Reg, w64: bool) JitError!void {
         try self.shiftCl(dst, 5, w64);
     }
-    /// Materialize a 0/1 boolean from the flags into `reg`: `setcc` writes the
-    /// low byte, `movzx` zero-extends it to 64 bits.
+    /// `setcc` writes the low byte, `movzx` zero-extends it to 64 bits.
     pub fn setccReg(self: *X86Emitter, cc: SetCc, reg: Reg) JitError!void {
         // setcc r/m8
         if (@intFromEnum(reg) >= 8) try self.byte(0x41) else if (low3(reg) >= 4) try self.byte(0x40); // REX for spl/bpl/sil/dil byte access
@@ -614,8 +584,7 @@ pub const X86Emitter = struct {
         try self.byte(0x00);
     }
 
-    /// `mov <dst64>, [<base> + <index>*scale]` with the given element width,
-    /// sign- or zero-extending into the 64-bit destination.
+    /// Sign- or zero-extends the element into the 64-bit destination.
     pub fn loadSib(self: *X86Emitter, dst: Reg, base: Reg, index: Reg, scale: u8, w: ElemW) JitError!void {
         switch (w) {
             .b8s => {
@@ -678,14 +647,12 @@ pub const X86Emitter = struct {
         try self.sibOperand(src, base, index, scale);
     }
 
-    /// `ret`.
     pub fn ret(self: *X86Emitter) JitError!void {
         try self.byte(0xC3);
     }
 
     /// `call <reg>`: indirect near call through a register holding the absolute
-    /// target address (load it with `movImm64` first). Used to invoke the host
-    /// trampoline from a JIT'd loop.
+    /// target (load it with `movImm64` first), used for the host trampoline.
     pub fn callReg(self: *X86Emitter, target: Reg) JitError!void {
         if (@intFromEnum(target) >= 8) try self.byte(0x41); // REX.B
         try self.byte(0xFF);
@@ -718,7 +685,6 @@ pub const X86Emitter = struct {
         return self.labels.items.len - 1;
     }
 
-    /// Bind `l` to the current position and patch every pending jump to it.
     pub fn bind(self: *X86Emitter, l: Label) JitError!void {
         const pos = self.buf.items.len;
         self.labels.items[l] = pos;
@@ -742,8 +708,7 @@ pub const X86Emitter = struct {
         try self.byte(jccOp(cc));
         try self.jumpRel(l, self.buf.items.len + 4);
     }
-    /// Emit the rel32 field: resolved now if the label is already bound
-    /// (backward jump), else a placeholder recorded for patching at `bind`.
+    /// Resolved now for a backward jump, else recorded for patching at `bind`.
     fn jumpRel(self: *X86Emitter, l: Label, end: usize) JitError!void {
         if (self.labels.items[l]) |tgt| {
             const rel: i32 = @intCast(@as(i64, @intCast(tgt)) - @as(i64, @intCast(end)));
@@ -787,7 +752,6 @@ test "movImm64 encodes the documented bytes" {
     var em = X86Emitter.init(std.testing.allocator);
     defer em.deinit();
     try em.movImm64(.rax, 42);
-    // 48 B8 2A 00 00 00 00 00 00 00
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0xB8, 0x2A, 0, 0, 0, 0, 0, 0, 0 }, em.code());
 }
 
@@ -1110,7 +1074,6 @@ test "cvtsi2sd / cvttsd2si round-trip int<->double" {
 }
 
 test {
-    // The AArch64 backend's tests compile on an x86 host, validating the
-    // encoders, and skip at the execution boundary.
+    // The AArch64 tests compile on an x86 host and skip at the execution boundary.
     _ = @import("arm64.zig");
 }

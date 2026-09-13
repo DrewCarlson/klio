@@ -1,8 +1,5 @@
-//! Subcommands of the `klio` CLI: lex, parse, run, check, test, transpile, repl.
-//! Each `run*` returns a process exit code and renders diagnostics through the
-//! `diagnostics.render` family. The pipeline is read .kt, lex, parse, resolve,
-//! typecheck, lower to IR, run under `interp_ir`, with the stdlib, kotlinx and
-//! ktor intrinsics registered.
+//! Subcommands of the `klio` CLI. Each `run*` returns a process exit code and
+//! renders diagnostics through `diagnostics.render`.
 
 const std = @import("std");
 
@@ -51,14 +48,12 @@ const bundle = @import("bundle.zig");
 const test_runner = @import("test_runner");
 const compose_ui = @import("compose_ui");
 
-/// Output format for `klio check`.
 pub const DiagFormat = enum {
     Plain,
     Json,
     Sarif,
 };
 
-/// Reads `path` into `map`, printing the failure to stderr and returning null.
 fn load(gpa: std.mem.Allocator, map: *SourceMap, path: []const u8) ?FileId {
     const src = io.readFile(gpa, path) catch |e| {
         io.printStderr(gpa, "error: cannot read {s}: {s}\n", .{ path, @errorName(e) });
@@ -68,8 +63,7 @@ fn load(gpa: std.mem.Allocator, map: *SourceMap, path: []const u8) ?FileId {
     return map.add(path, src) catch return null;
 }
 
-/// `klio check`: type-check `.kt` files and emit diagnostics. Exit 1 on
-/// any error, 2 on usage/IO failure.
+/// `klio check`: type-check files, emit diagnostics. Exit 1 on error, 2 on IO.
 pub fn runCheck(
     gpa: std.mem.Allocator,
     files: []const []const u8,
@@ -108,16 +102,14 @@ pub fn runCheck(
         user_asts.append(gpa, file_ast) catch return 2;
     }
 
-    // Imported pack declarations participate in resolution and inference, but
-    // only diagnostics anchored in a user file surface; pack shims are trusted.
+    // Only diagnostics anchored in a user file surface; pack shims are trusted.
     const loaded = loadInstalledPacks(gpa, user_asts.items, &map, features);
     var combined: std.ArrayList(KotlinFile) = .empty;
     defer combined.deinit(gpa);
     combined.appendSlice(gpa, loaded.asts) catch return 2;
     combined.appendSlice(gpa, user_asts.items) catch return 2;
 
-    // `gpa` is the process-lifetime arena, so the resolver and type checker
-    // allocate their whole workspace from it and free nothing.
+    // `gpa` is the process-lifetime arena: nothing here frees.
     var native_fqns: std.ArrayList([]const u8) = .empty;
     defer native_fqns.deinit(gpa);
     {
@@ -160,7 +152,6 @@ pub fn runCheck(
     return if (has_errors) 1 else 0;
 }
 
-/// `klio lex`: lex a source file and print tokens.
 pub fn runLex(gpa: std.mem.Allocator, path: []const u8) u8 {
     var map = SourceMap.init(gpa);
     defer map.deinit();
@@ -176,7 +167,6 @@ pub fn runLex(gpa: std.mem.Allocator, path: []const u8) u8 {
     return if (result.diagnostics.hasErrors()) 1 else 0;
 }
 
-/// `klio parse`: lex + parse a source file and print the AST.
 pub fn runParse(gpa: std.mem.Allocator, path: []const u8) u8 {
     var map = SourceMap.init(gpa);
     defer map.deinit();
@@ -194,8 +184,7 @@ pub fn runParse(gpa: std.mem.Allocator, path: []const u8) u8 {
     return if (p.diagnostics.hasErrors()) 1 else 0;
 }
 
-/// `klio run` over multiple files (single-module semantics): every
-/// file's top-level declarations are visible to every other file.
+/// `klio run` over several files as one module; declarations are mutually visible.
 pub fn runModuleFiles(
     gpa: std.mem.Allocator,
     paths: []const []const u8,
@@ -239,7 +228,6 @@ pub fn runModuleFiles(
     return runBuilt(gpa, all_asts.items, loaded.bindings, &map, "runtime error: no main function in module");
 }
 
-/// `klio run` over a single source file through `interp_ir`'s Vm.
 pub fn runFileIrVm(
     gpa: std.mem.Allocator,
     path: []const u8,
@@ -250,7 +238,6 @@ pub fn runFileIrVm(
     runtime.prof.opProfMaybeStart();
     runtime.prof.fnProfMaybeStart();
     ir.eval.frameCountInit();
-    // Clear receiver/coroutine thread-local state left by a prior run here.
     interp_ir.resetReceiverThreadLocals();
     interp_ir.resetRunGlobalCaches();
     if (tryImagePath(gpa, &.{path}, features)) |code| return code;
@@ -281,9 +268,7 @@ pub fn runFileIrVm(
     return runBuilt(gpa, all_asts.items, loaded.bindings, &map, "error: no main function found");
 }
 
-/// `klio dump-ir <file> [--func NAME] [--all]`: lower the file against the
-/// stdlib and any gated packs exactly as `run` does, then print its IR,
-/// including the Direct/Dynamic call tally. Nothing executes.
+/// `klio dump-ir <file>`: print the IR and the Direct/Dynamic call tally.
 pub fn runDumpIr(
     gpa: std.mem.Allocator,
     path: []const u8,
@@ -333,8 +318,7 @@ pub fn runDumpIr(
     return 0;
 }
 
-/// `klio transpile-dump <file>`: lower the file exactly as `run` does and print
-/// each function's decoded bytecode stream, the emitter's input. No execution.
+/// `klio transpile-dump <file>`: print each function's decoded bytecode stream.
 pub fn runTranspileDump(
     gpa: std.mem.Allocator,
     path: []const u8,
@@ -379,8 +363,7 @@ pub fn runTranspileDump(
     defer aw.deinit();
     const w = &aw.writer;
     for (m.funcs.items) |*f| {
-        // The user script's functions only (empty package); pack and stdlib
-        // bodies would drown the dump.
+        // User-script functions only; pack and stdlib bodies would drown the dump.
         if (f.blocks.len == 0) continue;
         if (f.package.len != 0) continue;
         const fs = ir.bc.funcStreams(f, false, m.consts.items) orelse continue;
@@ -397,10 +380,8 @@ pub fn runTranspileDump(
     return 0;
 }
 
-/// `klio transpile --native <file> [-o out.c]`: lower the file exactly as `run`
-/// does and emit the program as C that stands on its own, with no image and no
-/// interpreter. Falls back to `runTranspile`'s launcher emission when the
-/// program is outside the subset the backend covers.
+/// `klio transpile --native <file> [-o out.c]`: emit the program as standalone
+/// C. Falls back to `runTranspile` outside the subset the backend covers.
 pub fn runTranspileNative(
     gpa: std.mem.Allocator,
     paths: []const []const u8,
@@ -413,9 +394,7 @@ pub fn runTranspileNative(
         const stem = if (std.mem.endsWith(u8, base, ".kt")) base[0 .. base.len - 3] else base;
         break :blk std.fmt.allocPrint(gpa, "{s}.c", .{stem}) catch return 1;
     };
-    // Assemble the module the way `run` does: the stdlib and every pack come
-    // from the cached image rather than being re-lowered from source. Bodies
-    // arrive deferred and the emitter materializes the ones it reaches.
+    // Stdlib and packs come from the cached image; bodies arrive deferred.
     if (stdlib_image.tryPrepare(gpa, paths, features)) |prepared| {
         var built = prepared.built;
         return transpileNativeEmit(gpa, &built, path, c_out);
@@ -442,8 +421,7 @@ pub fn runTranspileNative(
     defer all_asts.deinit(gpa);
     all_asts.appendSlice(gpa, loaded.asts) catch return 1;
     all_asts.appendSlice(gpa, user_asts.items) catch return 1;
-    // Eager call binding over the program's own sources only: checking every
-    // pack source costs more than the emission and binds calls never reached.
+    // Program sources only: checking pack sources binds calls never reached.
     if (computeEagerCalls(gpa, user_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
     span.active_map = &map;
     var built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch {
@@ -454,7 +432,6 @@ pub fn runTranspileNative(
     return transpileNativeEmit(gpa, &built, path, c_out);
 }
 
-/// Emit one assembled module as a standalone C program.
 fn transpileNativeEmit(
     gpa: std.mem.Allocator,
     built: *interp_ir.build.BuiltModule,
@@ -475,14 +452,11 @@ fn transpileNativeEmit(
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
-    // Top-level properties and their initializer thunks, in interpreter order.
     var globals: std.ArrayList(cgen.Global) = .empty;
     defer globals.deinit(gpa);
     for (built.top_level_props.items) |tp| {
         globals.append(gpa, .{ .name = tp.name, .func = tp.func }) catch return 1;
     }
-    // Body properties and their initializer thunks: the IR carries neither, so
-    // both come from the built module's class table.
     var layouts: std.ArrayList(cgen.ClassLayout) = .empty;
     defer {
         for (layouts.items) |l| {
@@ -513,7 +487,6 @@ fn transpileNativeEmit(
                     .setter = built.instance_prop_setters.get(.{ .a = e.key_ptr.*, .b = bp.name }),
                 };
             }
-            // Enum entries in declaration order with their ctor-argument thunks.
             const ib_fids: []const ir.FuncId = built.init_blocks.get(e.key_ptr.*) orelse &.{};
             const ib_pos: []const usize = cg.get().init_block_property_positions;
             const is_data_cls = cg.get().is_data or cg.get().is_value;
@@ -548,7 +521,6 @@ fn transpileNativeEmit(
             }) catch return 1;
         }
     }
-    // Default-argument thunks by function: a call that omits a parameter runs one.
     var defaults: std.ArrayList(cgen.FuncDefaults) = .empty;
     defer defaults.deinit(gpa);
     {
@@ -576,23 +548,17 @@ fn transpileNativeEmit(
     return 0;
 }
 
-/// `klio transpile <file> [-o out.c]`: emit every user-script function's
-/// bytecode stream as C over the klio_rt per-op helpers, plus the per-fid
-/// registration hook and a `main` that drives the program through libklio_rt.
-/// Compiles with `zig cc out.c -I<include> -L<lib> -lklio_rt -lzstd`.
+/// `klio transpile <file> [-o out.c]`: emit each user-script function's bytecode
+/// as C. Build: `zig cc out.c -I<include> -L<lib> -lklio_rt -lzstd`.
 pub fn runTranspile(
     gpa: std.mem.Allocator,
     paths: []const []const u8,
     out_path: ?[]const u8,
     features: *RequestedFeatures,
 ) u8 {
-    // Every file joins the bake and lowering; the first names the outputs and
-    // stays the program entry.
     const path = paths[0];
-    // Emitted ids (fids, const ids, trace file ids) are meaningful against one
-    // exact module and a bake is not id-stable across processes, so the module
-    // is pinned: the dependency base bakes to a `.klio-image` beside the C file,
-    // the emitter assembles from it, and the emitted `main` runs against it.
+    // Emitted ids mean nothing outside one exact module and a bake is not
+    // id-stable across processes, so a `.klio-image` pins it for both sides.
     const c_out = out_path orelse blk: {
         const base = std.fs.path.basename(path);
         const stem = if (std.mem.endsWith(u8, base, ".kt")) base[0 .. base.len - 3] else base;
@@ -602,8 +568,7 @@ pub fn runTranspile(
         const stem = if (std.mem.endsWith(u8, c_out, ".c")) c_out[0 .. c_out.len - 2] else c_out;
         break :blk std.fmt.allocPrint(gpa, "{s}.klio-image", .{stem}) catch return 1;
     };
-    // Prefer the whole-program image: the binary then boots like a bundle
-    // (mmap, load, run) instead of re-lowering against a base at every start.
+    // A whole-program image boots like a bundle: mmap, load, run, no lowering.
     if (bundle.bakeProgramImageFile(gpa, paths, features, image_path) == 0) {
         if (bundle.loadProgramImage(gpa, image_path)) |asm_r| {
             var built = asm_r.built;
@@ -617,10 +582,8 @@ pub fn runTranspile(
             return transpileEmit(gpa, &built, path, c_out, image_path, .base);
         }
     }
-    // A program the image path cannot serve (an unbakeable base, or a base-name
-    // shadow `canExtendBase` rejects) falls back to whole-program lowering here
-    // and in the transpiled binary, whose `klio_rt_run_file` declines the image
-    // the same way. The fqn/fingerprint guards keep a drifted binary interpreted.
+    // A base the image path cannot serve falls back to whole-program lowering
+    // here and in the binary; fqn/fingerprint guards keep a drift interpreted.
     io.printStderr(gpa, "note: image path unavailable; emitting against the whole-program lowering\n", .{});
     var map = SourceMap.init(gpa);
     defer map.deinit();
@@ -657,9 +620,8 @@ pub fn runTranspile(
     return transpileEmit(gpa, &built, path, c_out, null, .none);
 }
 
-/// Which artifact the emitted `main` runs against: a whole-program image (no
-/// parse, no lowering), a dependency base the program is re-extended onto, or
-/// nothing, meaning whole-program lowering from source.
+/// Which artifact the emitted `main` runs against: a whole-program image, a
+/// dependency base it is re-extended onto, or lowering from source.
 const TranspileEntry = enum { program, base, none };
 
 fn transpileEmit(
@@ -673,9 +635,7 @@ fn transpileEmit(
     const mg = built.module.borrow();
     defer mg.deinit();
     const m = mg.get();
-    // KLIO_TRANSPILE_LEAVES=1 emits only the scalar-replay leaf bodies and a
-    // registration entry, as self-contained C for a shared library loaded via
-    // KLIO_LEAVES. Leaves are named by fqn and pure, so any bake can use them.
+    // KLIO_TRANSPILE_LEAVES=1 emits only leaf bodies plus a registration entry.
     if (runtime.envOnce("KLIO_TRANSPILE_LEAVES") != null) {
         return transpileEmitLeaves(gpa, m, path, out_path);
     }
@@ -683,10 +643,8 @@ fn transpileEmit(
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const w = &aw.writer;
-    // The hot-view layout frozen at emit time: the runtime's own fill printed as
-    // compile-time constants, so every inline fast path compiles to direct
-    // constant-offset loads. The runtime verifies the frozen copy against its
-    // own fill and disables the view wholesale on a mismatch.
+    // The hot-view layout frozen at emit time, so inline fast paths compile to
+    // constant-offset loads. A mismatch against the live fill disables the view.
     var kvf: ir.hot_layout.HotLayout = undefined;
     ir.hot_layout.fillLayout(&kvf);
     w.print(
@@ -923,11 +881,8 @@ fn transpileEmit(
     const Emitted = struct { fid: u32, fqn: []const u8 };
     var emitted: std.ArrayList(Emitted) = .empty;
     defer emitted.deinit(gpa);
-    // Scalar-replay (`kl_`) pass: per-function eligibility, a fixpoint closing
-    // the set over call targets (a body is pure only when every callee is),
-    // then prototypes (mutual and self recursion) and bodies.
-    // KLIO_TRANSPILE_PKGS=<comma-separated package prefixes> widens emission
-    // past the user script into library code; the default is user-only.
+    // Scalar-replay (`kl_`) pass: eligibility, then a fixpoint over call targets
+    // (a body is pure only when every callee is). KLIO_TRANSPILE_PKGS widens it.
     const pkg_sel: ?[]const u8 = runtime.envOnce("KLIO_TRANSPILE_PKGS");
     const emitFor = struct {
         fn ok(sel: ?[]const u8, f: *const ir.Func) bool {
@@ -941,8 +896,7 @@ fn transpileEmit(
         }
     }.ok;
 
-    // With a selector, the image's own functions (addressed by id through the
-    // lazy header table, not present in `funcs.items`) join the walk.
+    // The image's own functions are addressed by id, not present in `funcs.items`.
     var extra_funcs: std.ArrayList(*const ir.Func) = .empty;
     defer extra_funcs.deinit(gpa);
     if (pkg_sel != null) {
@@ -981,10 +935,8 @@ fn transpileEmit(
             leaf_targets.put(f.id.int(), tg) catch return 1;
         }
     }
-    // Fixpoint: every call target must itself be eligible, and a target that may
-    // return an object (its tail is a construction, or it tail-calls such a
-    // function) is callable only in tail position, so the ctor-tail genre
-    // forwards through the chain. Non-tail object calls prune the caller.
+    // Fixpoint: a call target must be eligible, and one that may return an object
+    // is callable only in tail position. Non-tail object calls prune the caller.
     var pruned = true;
     while (pruned) {
         pruned = false;
@@ -1053,17 +1005,13 @@ fn transpileEmit(
     }
     var leaf_emitted: std.ArrayList(Emitted) = .empty;
     defer leaf_emitted.deinit(gpa);
-    // The fids the emitter registers must match the fids the running binary
-    // resolves, which the pinned image guarantees. Only the `kl_` leaves emit by
-    // default: per-op helper bodies pay a host-ABI crossing per instruction and
-    // run slower than the runtime's own drivers, so everything else stays on
-    // libklio_rt's interpreter. KLIO_TRANSPILE_OPHELPERS=1 emits them anyway.
+    // Registered fids must match those the binary resolves, which the pinned
+    // image guarantees. Per-op helpers cost a host-ABI crossing per instruction.
     const emit_ophelpers = runtime.envOnce("KLIO_TRANSPILE_OPHELPERS") != null;
     for (m.funcs.items) |*f| {
         if (!emitFor(pkg_sel, f)) continue;
         if (f.blocks.len == 0 and !m.ensureFuncBody(@constCast(f))) continue;
-        // allow_fuse mirrors the frame loop's default (the loop JIT off):
-        // the running binary builds the same streams this emission used.
+        // allow_fuse mirrors the frame loop default: the binary rebuilds these streams.
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
         if (leaf_targets.contains(f.id.int())) {
             emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
@@ -1076,8 +1024,7 @@ fn transpileEmit(
     }
     for (extra_funcs.items) |f| {
         const fs = ir.bc.funcStreams(f, true, m.consts.items) orelse continue;
-        // Library leaves get the frameless scalar replay too: it is the only
-        // emitted form that skips the activation entirely.
+        // The replay is the only emitted form that skips the activation entirely.
         if (leaf_targets.contains(f.id.int())) {
             emitLeafFunc(w, m, f, fs, m.consts.items) catch return 1;
             leaf_emitted.append(gpa, .{ .fid = f.id.int(), .fqn = f.fqn }) catch return 1;
@@ -1146,7 +1093,6 @@ fn emitCString(w: anytype, s: []const u8) !void {
 }
 
 
-/// Whether `kind` is modeled by the scalar-replay (`kl_`) emitter.
 fn leafBinModeled(kind: ir.BinOp) bool {
     return switch (kind) {
         .Add, .Sub, .Mul, .Div, .Mod, .Less, .LessEq, .Greater, .GreaterEq, .Eq, .NotEq, .BoxedEq, .BoxedNotEq, .And, .Or, .Xor, .Shl, .Shr, .UShr => true,
@@ -1154,8 +1100,7 @@ fn leafBinModeled(kind: ir.BinOp) bool {
     };
 }
 
-/// Scalar consts the `kl_` emitter models: the fused-loop set plus the float
-/// genres, stored as raw bits in the int64 lane.
+/// Scalar consts the `kl_` emitter models; float genres ride the int64 lane as bits.
 fn leafConstScalar(consts: []const ir.Const, id: u32) ?struct { g: u8, v: i64 } {
     if (fuseConstScalar(consts, id)) |sc| return .{ .g = sc.g, .v = sc.v };
     if (id >= consts.len) return null;
@@ -1170,9 +1115,8 @@ fn leafTrace(f: *const ir.Func, comptime why: []const u8) void {
     if (std.c.getenv("KLIO_LEAF_TRACE") != null) std.debug.print("[leaf-miss] {s}: " ++ why ++ "\n", .{f.fqn});
 }
 
-/// Escape-op tag histogram over one transpile's eligibility fixpoint. Raw hits:
-/// a function rescanned by the fixpoint counts again, so this ranks tags rather
-/// than counting blocked bodies. Printed sorted under KLIO_LEAF_TRACE=1.
+/// Escape-op tag histogram over one eligibility fixpoint. Raw hits, so it ranks
+/// tags rather than counting blocked bodies. Printed under KLIO_LEAF_TRACE=1.
 var leaf_escape_histo = std.enums.EnumArray(std.meta.Tag(ir.Inst), u32).initFill(0);
 
 fn printLeafEscapeHisto() void {
@@ -1196,14 +1140,11 @@ fn printLeafEscapeHisto() void {
     }
 }
 
-/// KLIO_LEAVES=<path.so>: load a scalar-replay leaf library and register its
-/// bodies by fqn, since bakes are not cross-process fid-stable. A missing or
-/// malformed library leaves the interpreter alone. The dlopened handle is
-/// leaked on purpose: the leaves live as long as the process.
+/// KLIO_LEAVES=<path.so>: load a leaf library and register its bodies by fqn,
+/// since bakes are not fid-stable. The dlopened handle is leaked on purpose.
 pub fn loadLeafLibrary() void {
     const spec = runtime.envOnce("KLIO_LEAVES") orelse return;
-    // Colon-separated list; later libraries win on a key collision
-    // (registration overwrites), so order suite-specific after generic.
+    // Colon-separated; a later library overwrites an earlier key.
     var it = std.mem.splitScalar(u8, spec, ':');
     while (it.next()) |path| {
         if (path.len == 0) continue;
@@ -1216,8 +1157,7 @@ pub fn loadLeafLibrary() void {
             std.debug.print("warning: KLIO_LEAVES: {s} has no klio_leaves_entry\n", .{path});
             continue;
         };
-        // A library carrying frozen KVC layout constants must match this
-        // runtime's layout exactly; a mismatch refuses the library whole.
+        // Frozen KVC constants must match this runtime exactly, or the library is refused.
         const Frozen = *const fn () callconv(.c) *const ir.hot_layout.HotLayout;
         if (lib.lookup(Frozen, "klio_leaves_frozen")) |froz| {
             var live: ir.hot_layout.HotLayout = undefined;
@@ -1245,9 +1185,7 @@ fn leafRegShim(fqn: [*:0]const u8, f: ir.eval.NativeLeafFn) callconv(.c) void {
     ir.eval.registerNativeLeafFqn(std.mem.span(fqn), f);
 }
 
-/// Leaf field read over a genre-8 instance handle, shared by the full-program
-/// and leaves-mode preambles, which must stay byte-identical. Needs the KVC_*
-/// constants and the kv_tag/kv_int/kv_long/kv_char/kv_inst helpers in scope.
+/// Leaf field read over a genre-8 handle; both preambles must stay identical.
 const leaf_getfield_c =
     \\static inline int32_t kl_getfield(klio_edge_view *ev, int64_t rl, int32_t rgv, uint64_t *site, const char *name, int64_t *ol, int32_t *og) {
     \\  if (rgv == 9) {
@@ -1356,11 +1294,8 @@ fn leafEmitFor(sel: ?[]const u8, f: *const ir.Func) bool {
     return false;
 }
 
-/// Leaves-only emission (`KLIO_TRANSPILE_LEAVES=1`): the full program's
-/// eligibility fixpoint, then the leaf bodies, a helper preamble that must stay
-/// identical to the full-program one, and `klio_leaves_entry`, which registers
-/// every body by fqn through the function pointer the host hands in.
-/// Self-contained: `zig cc -shared -fPIC out.c -I<include> -o leaves.so`.
+/// Leaves-only emission (`KLIO_TRANSPILE_LEAVES=1`): the same eligibility
+/// fixpoint, a preamble identical to the full-program one, and registration by fqn.
 fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []const u8, out_path: []const u8) u8 {
     const pkg_sel: ?[]const u8 = runtime.envOnce("KLIO_TRANSPILE_PKGS");
     var extra_funcs: std.ArrayList(*const ir.Func) = .empty;
@@ -1503,9 +1438,7 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
         \\
         \\
     , .{path}) catch return 1;
-    // The KVC layout constants and slot helpers the leaf field read needs,
-    // frozen at emit time like the full-program preamble. The loader refuses
-    // the library when the runtime's layout disagrees (klio_leaves_frozen).
+    // KVC constants frozen at emit time; a layout disagreement refuses the library.
     var kvf: ir.hot_layout.HotLayout = undefined;
     ir.hot_layout.fillLayout(&kvf);
     inline for (@typeInfo(ir.hot_layout.HotLayout).@"struct".fields) |fld| {
@@ -1575,8 +1508,7 @@ fn transpileEmitLeaves(gpa: std.mem.Allocator, m: *const ir.Module, path: []cons
 const LeafTarget = struct { fid: u32, tail: bool };
 const LeafInfo = struct { targets: std.ArrayList(LeafTarget), ctor_tail: bool };
 
-/// Whether stream position `q`, just past an escape, is `ret dst`, so the
-/// escaped instruction's result flows straight out. Trace ops may intervene.
+/// Whether position `q`, just past an escape, is `ret dst`. Traces may intervene.
 fn streamTailRet(code: []const u32, q0: usize, dst: u32) bool {
     var q = q0;
     while (q < code.len and @as(ir.bc.Op, @enumFromInt(code[q])) == .trace) q += 4;
@@ -1593,8 +1525,7 @@ fn leafConstStrOf(consts: []const ir.Const, cid: ir.ConstId) ?[]const u8 {
     };
 }
 
-/// The scalar integer conversion a zero-arg virtual slot names, or null.
-/// Slot ids reuse the root declaration's FuncId, so the name is static.
+/// The scalar integer conversion a zero-arg virtual slot names; slot ids are static.
 const ScalarConv = enum { to_int, to_long, to_short, to_byte, to_char, inv };
 fn leafScalarConv(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarConv {
     const rf = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
@@ -1608,8 +1539,7 @@ fn leafScalarConv(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarConv {
     return null;
 }
 
-/// The scalar bitwise/shift infix a one-arg virtual slot names, or null
-/// (`x and y`, `shl`, ... lower as virtual calls on Int/Long receivers).
+/// The scalar bitwise/shift infix a one-arg virtual slot names (`and`, `shl`, ...).
 const ScalarBit = enum { band, bor, bxor, shl, shr, ushr };
 fn leafScalarBit(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarBit {
     const rf = m.funcById(ir.FuncId.from(slot.int())) orelse return null;
@@ -1623,9 +1553,8 @@ fn leafScalarBit(m: *const ir.Module, slot: ir.MethodSlotId) ?ScalarBit {
     return null;
 }
 
-/// Every class-method simple name in the module. A bare call bound to a
-/// top-level function can still be shadowed at runtime by a member of an
-/// implicit receiver; a name no class declares cannot be.
+/// Every class-method simple name. A bare call bound to a top-level function can
+/// be shadowed by an implicit receiver's member; a name no class declares cannot.
 fn buildMemberNameSet(gpa: std.mem.Allocator, m: *const ir.Module) std.StringHashMap(void) {
     var set = std.StringHashMap(void).init(gpa);
     for (m.classes.items) |*cls| {
@@ -1637,10 +1566,7 @@ fn buildMemberNameSet(gpa: std.mem.Allocator, m: *const ir.Module) std.StringHas
     return set;
 }
 
-/// Scalar-replay eligibility for one function: every stream op computable over
-/// (int64, genre) pairs, every call a plain positional exact-arity direct call.
-/// Returns the call-target fids (empty is fine), or null when ineligible; the
-/// caller closes the set over targets by fixpoint.
+/// Eligibility: every op computable over (int64, genre), every call exact-arity.
 fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *const std.StringHashMap(void), f: *const ir.Func, fs: *const ir.bc.FuncStreams, consts: []const ir.Const) ?LeafInfo {
     var targets: std.ArrayList(LeafTarget) = .empty;
     var ctor_tail = false;
@@ -1653,10 +1579,8 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
         leafTrace(f, "suspend");
         ok = false;
     }
-    // Inline functions are eligible: their standalone lowered bodies are real.
-    // The splice-dependent shapes are filtered at the op level instead: reified
-    // `is T` by the bare-type-var InstanceOf gate, `as T`/`::class`/`typeOf` as
-    // escape ops, and lambda-parameter calls as non-direct calls.
+    // Inline functions are eligible. Splice-dependent shapes are filtered at the
+    // op level: reified `is T`, `as T`/`::class`/`typeOf`, lambda-param calls.
     for (f.blocks, 0..) |*blk, bi| {
         if (!ok) break;
         if (blk.catches.len != 0 or blk.finally != null) {
@@ -1664,9 +1588,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
             ok = false;
             break;
         }
-        // A throw-terminated block never runs natively: the emitter replaces its
-        // body with `return 0` and the interpreter's exact re-run raises the
-        // real throwable, so a cold-path guard costs a body nothing.
+        // A throw-terminated block emits `return 0`; the re-run raises the real one.
         if (blk.terminator == .Throw) continue;
         const st = (if (bi < fs.streams.len) fs.streams[bi] else null) orelse {
             leafTrace(f, "no-stream");
@@ -1722,10 +1644,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                         },
                         .UnOp => {},
                         .Not => {},
-                        // A field read serves only when the receiver is a
-                        // genre-8 handle and the field is a plain stored slot;
-                        // anything else bails purely, so eligibility admits it.
-                        // The name must be a string const for the resolver.
+                        // Genre-8 receiver with a plain stored slot only.
                         .GetField => |*gf| {
                             if (leafConstStrOf(consts, gf.field) == null) {
                                 leafTrace(f, "field-name");
@@ -1733,15 +1652,10 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                             }
                         },
                         .CallMemberOrGlobal => |*cg| {
-                            // A bare constructor call bound to a class, in
-                            // tail position of a receiver-less top-level fn:
-                            // no member leg can shadow it, so the class leg is
-                            // the whole semantics. Same ctor-tail protocol as
-                            // NewInstance, constructed once at the gate.
+                            // Tail position of a receiver-less top-level fn, so
+                            // no member leg can shadow the class leg.
             if (cg.func != null and cg.class == null) {
-                                // A bare call bound to a top-level fn is a
-                                // safe direct target when no class declares a
-                                // member of this name, so nothing shadows it.
+                                // Safe when no class declares this name.
                                 const nm = leafConstStrOf(consts, cg.name);
                                 var names_null2 = true;
                                 for (cg.arg_names) |n2| {
@@ -1775,10 +1689,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                             }
                         },
                         .CallVirtual => |*cv| {
-                            // Receivers that are scalars by construction: the
-                            // slot id is the root declaration's FuncId, so the
-                            // name is known at emit time. Zero-arg conversions
-                            // and one-arg bitwise/shift infixes emit inline.
+                            // Scalar receivers: the slot id is the root FuncId.
                             const conv_ok = cv.n_args == 0 and leafScalarConv(m, cv.slot) != null;
                             const bit_ok = cv.n_args == 1 and leafScalarBit(m, cv.slot) != null;
                             if (!conv_ok and !bit_ok) {
@@ -1786,10 +1697,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 ok = false;
                             }
                         },
-                        // A plain classifier test serves via a per-site
-                        // verdict bound to the receiver's class word. The
-                        // runtime route covers only (class, name), so generic
-                        // args, nullable targets and bare type vars bail.
+                        // The route covers only (class, name).
                         .InstanceOf => |*iot| {
                             const head = std.mem.trimEnd(u8, iot.ty.name, "?");
                             if (iot.ty.args.len != 0 or iot.ty.nullable or head.len == 0 or
@@ -1800,10 +1708,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                             }
                         },
                         .NewInstance => |*ni| {
-                            // Ctor-tail only: the leaf hands the scalar ctor
-                            // args back through aux and the gate constructs
-                            // once through the host. Mid-body objects have
-                            // nowhere to live natively.
+                            // Ctor-tail only: the gate constructs via the host.
                             const inner = ni.class.int() < m.classes.items.len and
                                 m.classes.items[ni.class.int()].is_inner;
                             if (ni.n_args > 8 or inner or
@@ -1813,8 +1718,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 ok = false;
                             } else ctor_tail = true;
                         },
-                        // Same admission filter as InstanceOf: a positive
-                        // verdict passes the value through, anything else bails.
+                        // Same filter as InstanceOf; a positive verdict passes through.
                         .Cast => |*ct| {
                             const head = std.mem.trimEnd(u8, ct.ty.name, "?");
                             if (ct.ty.args.len != 0 or ct.ty.nullable or head.len == 0 or
@@ -1825,9 +1729,7 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
                                 ok = false;
                             }
                         },
-                        // A class-bound global read serves as a genre-9 name
-                        // handle. Only a field read consumes genre 9, resolving
-                        // enum entries through the statics route.
+                        // Genre-9 name handle; only a field read consumes it.
                         .LoadGlobal => |*lg| {
                             if (lg.class == null or lg.ctor_ref or
                                 leafConstStrOf(consts, lg.name) == null)
@@ -1876,12 +1778,9 @@ fn leafEligible(gpa: std.mem.Allocator, m: *const ir.Module, member_names: *cons
     return .{ .targets = targets, .ctor_tail = ctor_tail };
 }
 
-/// One scalar bin op of the replay: dynamic genre and width arithmetic
-/// matching `scalarBin`. Any combination outside the model bails (`return 0`).
+/// One scalar bin op of the replay, matching `scalarBin`; anything else bails.
 fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
-    // Genre 7 is an opaque value, a non-scalar the gate marshaled as dead cargo
-    // such as an unused receiver param. Any operation on it bails; the per-kind
-    // guards below assume genres 0-6.
+    // Genre 7 is opaque dead cargo and bails; the guards below assume 0-6.
     try w.print("  if (g{d} > 6 || g{d} > 6) return 0;\n", .{ lhs, rhs });
     switch (kind) {
         .Less, .LessEq, .Greater, .GreaterEq => {
@@ -1893,14 +1792,12 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
                 else => unreachable,
             };
             try w.print("  if (g{d} > 6 || g{d} > 6 || g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3) return 0;\n", .{ lhs, rhs, lhs, rhs, lhs, rhs });
-            // A float operand compares in IEEE floating point (NaN yields
-            // false), the other side converted by its genre.
+            // A float operand compares in IEEE (NaN false), the other by genre.
             try w.print("  if (g{d} >= 5 || g{d} >= 5) {{ double fa = kl_asd(l{d}, g{d}), fb = kl_asd(l{d}, g{d}); l{d} = (fa {s} fb); g{d} = 2; }}\n", .{ lhs, rhs, lhs, lhs, rhs, rhs, dst, sym, dst });
             try w.print("  else {{ l{d} = (l{d} {s} l{d}); g{d} = 2; }}\n", .{ dst, lhs, sym, rhs, dst });
         },
         .Eq, .NotEq => {
-            // Same genre, or both signed-numeric widths, compares by value
-            // (Kotlin promotes `1 == 1L`); any other mix bails.
+            // Same genre or both signed-numeric compares by value (`1 == 1L`).
             const neg: []const u8 = if (kind == .NotEq) "!" else "";
             try w.print("  if (!(g{d} == g{d} || (g{d} <= 1 && g{d} <= 1))) return 0;\n", .{ lhs, rhs, lhs, rhs });
             // Same-genre float equality is the IEEE operator, never a bit compare.
@@ -1909,9 +1806,7 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
             try w.print("  else {{ l{d} = {s}(l{d} == l{d}); g{d} = 2; }}\n", .{ dst, neg, lhs, rhs, dst });
         },
         .BoxedEq, .BoxedNotEq => {
-            // Boxed equality is tag-sensitive across widths and the framed path
-            // may have adopted an Int literal to Long at bind, so a genre
-            // mismatch cannot be decided locally and bails.
+            // Tag-sensitive across widths, and a literal may be adopted to Long.
             const neg: []const u8 = if (kind == .BoxedNotEq) "!" else "";
             try w.print("  if (g{d} != g{d} || g{d} >= 5) return 0;\n", .{ lhs, rhs, lhs });
             try w.print("  l{d} = {s}(l{d} == l{d}); g{d} = 2;\n", .{ dst, neg, lhs, rhs, dst });
@@ -1923,14 +1818,11 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
                 .Mul => "*",
                 else => unreachable,
             };
-            // Float promotion first: a Double operand computes double, a Float
-            // pair or Float/int mix computes float. Then the integer/Char rules.
+            // Float promotion first: any Double computes double, a Float mix float.
             try w.print("  if (g{d} == 5 || g{d} == 5) {{ if (g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3 || g{d} == 4 || g{d} == 4) return 0; double fa = kl_asd(l{d}, g{d}), fb = kl_asd(l{d}, g{d}); l{d} = kl_d2bits(fa {s} fb); g{d} = 5; }}\n", .{ lhs, rhs, lhs, rhs, lhs, rhs, lhs, rhs, lhs, lhs, rhs, rhs, dst, sym, dst });
             try w.print("  else if (g{d} == 6 || g{d} == 6) {{ if (g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3 || g{d} == 4 || g{d} == 4) return 0; float fa = kl_asf(l{d}, g{d}), fb = kl_asf(l{d}, g{d}); l{d} = kl_f2bits(fa {s} fb); g{d} = 6; }}\n", .{ lhs, rhs, lhs, rhs, lhs, rhs, lhs, rhs, lhs, lhs, rhs, rhs, dst, sym, dst });
             try w.print("  else {{\n", .{});
-            // Char rules: Char minus Char is Int, Char +/- Int stays Char, any
-            // other Char combination bails. Width by promotion, wrap via
-            // unsigned casts.
+            // Char minus Char is Int, Char +/- Int stays Char; else bails.
             try w.print("  {{ int cl = (g{d} == 4), cr = (g{d} == 4);\n", .{ lhs, rhs });
             try w.print("    if (g{d} > 4 || g{d} > 4 || g{d} == 2 || g{d} == 2 || g{d} == 3 || g{d} == 3) return 0;\n", .{ lhs, rhs, lhs, rhs, lhs, rhs });
             if (kind == .Sub) {
@@ -1945,8 +1837,7 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
         },
         .Div, .Mod => {
             const sym: []const u8 = if (kind == .Div) "/" else "%";
-            // Float division and remainder are IEEE (inf/NaN, no zero guard);
-            // fmod matches Kotlin's truncated `%`.
+            // Float div/rem are IEEE (inf/NaN); fmod matches Kotlin's truncated `%`.
             if (kind == .Div) {
                 try w.print("  if (g{d} == 5 || g{d} == 5) {{ if (!((g{d} <= 1 || g{d} == 5) && (g{d} <= 1 || g{d} == 5))) return 0; l{d} = kl_d2bits(kl_asd(l{d}, g{d}) / kl_asd(l{d}, g{d})); g{d} = 5; goto klx_dm_{d}_{d}; }}\n", .{ lhs, rhs, lhs, lhs, rhs, rhs, dst, lhs, lhs, rhs, rhs, dst, dst, lhs });
                 try w.print("  if (g{d} == 6 || g{d} == 6) {{ if (!((g{d} <= 1 || g{d} == 6) && (g{d} <= 1 || g{d} == 6))) return 0; l{d} = kl_f2bits(kl_asf(l{d}, g{d}) / kl_asf(l{d}, g{d})); g{d} = 6; goto klx_dm_{d}_{d}; }}\n", .{ lhs, rhs, lhs, rhs, lhs, rhs, dst, lhs, lhs, rhs, rhs, dst, dst, lhs });
@@ -1990,8 +1881,7 @@ fn emitLeafBin(w: anytype, kind: ir.BinOp, dst: u32, lhs: u32, rhs: u32) !void {
     }
 }
 
-/// One scalar unary op of the replay, matching `applyUnop` over the modeled
-/// genres; anything else bails.
+/// One scalar unary op of the replay, matching `applyUnop`; anything else bails.
 fn emitLeafUn(w: anytype, op: ir.UnOp, dst: u32, operand: u32) !void {
     switch (op) {
         .Plus => try w.print("  l{d} = l{d}; g{d} = g{d};\n", .{ dst, operand, dst, operand }),
@@ -2006,8 +1896,7 @@ fn emitLeafUn(w: anytype, op: ir.UnOp, dst: u32, operand: u32) !void {
             try w.print("  default: return 0;\n  }}\n", .{});
         },
         .Neg => {
-            // Negating NaN keeps the canonical quiet NaN (the interpreter
-            // pins Double.NaN's raw bits), not the IEEE sign flip.
+            // Negating NaN keeps the canonical quiet NaN, not the IEEE sign flip.
             try w.print("  switch (g{d}) {{\n", .{operand});
             try w.print("  case 0: l{d} = (int64_t)(int32_t)(0u - (uint32_t)l{d}); g{d} = 0; break;\n", .{ dst, operand, dst });
             try w.print("  case 1: l{d} = (int64_t)(0u - (uint64_t)l{d}); g{d} = 1; break;\n", .{ dst, operand, dst });
@@ -2156,8 +2045,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                     if (f.blocks[bi].insts[code[pc + 1]] == .CallMemberOrGlobal and
                         f.blocks[bi].insts[code[pc + 1]].CallMemberOrGlobal.class == null)
                     {
-                        // A bare call bound to a top-level fn that no member
-                        // can shadow emits as a direct `kl_` call.
+                        // No member can shadow it, so emit a direct `kl_` call.
                         const cg = &f.blocks[bi].insts[code[pc + 1]].CallMemberOrGlobal;
                         const cb = cg.args.int();
                         try w.print("  {{ int64_t cav[{d}]; int32_t cag[{d}];\n", .{ @max(cg.n_args, 1), @max(cg.n_args, 1) });
@@ -2177,10 +2065,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         else => null,
                     };
                     if (ctor_args) |ca| {
-                        // Ctor-tail, with `ret dst` guaranteed to follow: hand
-                        // the scalar args and the site descriptor to the gate,
-                        // which resolves the owner by fqn once and constructs
-                        // through the host.
+                        // Ctor-tail: the gate resolves the owner by fqn.
                         var ai: u32 = 0;
                         while (ai < ca.n) : (ai += 1) {
                             try w.print("  aux[{d}] = l{d}; auxg[{d}] = g{d};\n", .{ ai, ca.base + ai, ai, ca.base + ai });
@@ -2237,9 +2122,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         const rr = cv.receiver.int();
                         const aa = cv.args.int();
                         const dd = cv.dst.int();
-                        // Int/Long receivers only; Kotlin masks shift counts
-                        // to the receiver width and shifts arithmetically for
-                        // shr, logically for ushr.
+                        // Kotlin masks shift counts to the receiver width.
                         try w.print("  if (g{d} > 1 || g{d} > 1) return 0;\n", .{ rr, aa });
                         switch (bit) {
                             .band => try w.print("  l{d} = (g{d} == 0) ? (int64_t)(int32_t)((uint32_t)l{d} & (uint32_t)l{d}) : (int64_t)((uint64_t)l{d} & (uint64_t)l{d}); g{d} = g{d};\n", .{ dd, rr, rr, aa, rr, aa, dd, rr }),
@@ -2257,10 +2140,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                         const conv = leafScalarConv(m, cv.slot).?;
                         const rr = cv.receiver.int();
                         const dd = cv.dst.int();
-                        // Integer and char conversions only; floats bail at
-                        // runtime by genre. Kotlin narrowing is low-bits
-                        // truncation with sign extension, and toChar keeps the
-                        // low 16 bits unsigned.
+                        // Kotlin narrowing truncates low bits with sign extension.
                         try w.print("  if (g{d} > 4 || g{d} == 2 || g{d} == 3) return 0;\n", .{ rr, rr, rr });
                         switch (conv) {
                             .to_int => try w.print("  l{d} = (int64_t)(int32_t)l{d}; g{d} = 0;\n", .{ dd, rr, dd }),
@@ -2286,8 +2166,7 @@ fn emitLeafFunc(w: anytype, m: *const ir.Module, f: *const ir.Func, fs: *const i
                     pc += 2;
                 },
                 .jump => {
-                    // Only a back edge can loop, so only a back edge polls the
-                    // safe-point guard; forward jumps in a leaf are bounded.
+                    // Only a back edge can loop, so only a back edge polls the guard.
                     if (code[pc + 1] <= bi) {
                         try w.print("  if (kv_edge(ctx, ev)) return 0;\n  goto KLB{d};\n", .{code[pc + 1]});
                     } else {
@@ -2333,8 +2212,7 @@ fn emitNativeFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, c
         if (sopt == null) continue;
         try w.print("  case {d}u: goto B{d};\n", .{ bi, bi });
     }
-    // An uncompiled entry block: return with the outcome still `none`,
-    // so the interpreter runs that block itself.
+    // An uncompiled entry block returns outcome `none` so the interpreter runs it.
     try w.print("  default: return;\n  }}\n", .{});
     for (fs.streams, 0..) |sopt, bi| {
         const st = sopt orelse continue;
@@ -2343,8 +2221,7 @@ fn emitNativeFunc(w: anytype, f: *const ir.Func, fs: *const ir.bc.FuncStreams, c
     try w.print("}}\n\n", .{});
 }
 
-/// A taken edge lands on the target block's label when it was compiled, and
-/// otherwise hands the block back to the interpreter.
+/// A taken edge lands on the target's label when compiled, else the interpreter.
 fn emitEdgeTo(w: anytype, fs: *const ir.bc.FuncStreams, target: u32) !void {
     if (target < fs.streams.len and fs.streams[target] != null) {
         try w.print("goto B{d};", .{target});
@@ -2373,13 +2250,10 @@ const FUSE_MAX_REGS = 96;
 ///   BODY: straight-line {trace, const_int, move, wrap-arith, compare} .. jump L1
 ///   L1:   [trace*] cmp_br(Eq, ldst, I, B) ? DONE : L2
 ///   L2:   [trace*] bin(Add, I, I, STEP) .. jump H
-/// with B and STEP loop-invariant, the lowerer's step-progression shape; the Eq
-/// latch is the overflow-free last-element snap. The region re-emits as one
-/// typed C loop over int64 locals with a per-register width tag (Int arithmetic
-/// wraps at 32 bits, a Long operand promotes), entered from the header label
-/// only when every live-in register carries an Int/Long tag; anything else falls
-/// through to the per-op code. Interpreter entries at the BODY and latch labels
-/// keep the generic per-op path.
+/// with B and STEP loop-invariant; the Eq latch is the overflow-free last-element
+/// snap. The region re-emits as one typed C loop over int64 locals with a
+/// per-register width tag, entered from the header only when every live-in
+/// register carries an Int/Long tag.
 const CountedLoop = struct {
     header: u32,
     exit: u32,
@@ -2465,8 +2339,7 @@ fn fuseHeaderCmp(st: *const ir.bc.Stream) ?FuseCmp {
     return null;
 }
 
-/// Collect a straight-line block's fusible ops; the block must end in
-/// `jump expected_next`.
+/// Collect a straight-line block's fusible ops; it must end in `jump expected_next`.
 fn fuseConstScalar(consts: []const ir.Const, id: u32) ?struct { g: u8, v: i64 } {
     if (id >= consts.len) return null;
     return switch (consts[id]) {
@@ -2552,7 +2425,6 @@ fn fuseStraightBlock(cl: *CountedLoop, written: []bool, st: *const ir.bc.Stream,
     return false;
 }
 
-/// Recognize the counted-loop region headed at `header`, or null.
 fn fuseTrace(comptime fmt: []const u8, args: anytype) void {
     if (std.c.getenv("KLIO_FUSE_TRACE") != null) std.debug.print("[fuse] " ++ fmt ++ "\n", args);
 }
@@ -2600,9 +2472,7 @@ fn recognizeCountedLoop(fs: *const ir.bc.FuncStreams, header: u32, consts: []con
         return null;
     };
     if (@as(ir.BinOp, @enumFromInt(lc.kind)) != .Eq) { fuseTrace("B{d}: latch kind not Eq", .{header}); return null; }
-    // The Eq exit compares the induction register against the progression's last
-    // element; for a stepped or `downTo` loop the lowerer snaps it into a
-    // register distinct from the entry bound. Any loop-invariant one works.
+    // The Eq exit compares against the progression's last element, its own register.
     if (lc.lhs != cl.ind) {
         fuseTrace("B{d}: latch operands mismatch", .{header});
         return null;
@@ -2616,8 +2486,7 @@ fn recognizeCountedLoop(fs: *const ir.bc.FuncStreams, header: u32, consts: []con
     cl.ltrace = lc.trace;
     if (!fuseNoteWrite(&cl, &written, cl.ldst)) { fuseTrace("B{d}: note ldst", .{header}); return null; }
 
-    // The increment block's back edge returns to the BODY (the rotated
-    // loop's head), not to this entry-check block.
+    // The back edge returns to BODY, the rotated loop's head, not to this block.
     const l2 = lc.f;
     const l2stream = (if (l2 < fs.streams.len) fs.streams[l2] else null) orelse { fuseTrace("B{d}: l2 B{d} no stream", .{ header, l2 }); return null; };
     var back: u32 = 0;
@@ -2630,9 +2499,7 @@ fn recognizeCountedLoop(fs: *const ir.bc.FuncStreams, header: u32, consts: []con
     for (cl.latch_ops[0..cl.n_latch]) |op| {
         switch (op) {
             .bin => |b| {
-                // Ascending loops increment, `downTo` decrements; either
-                // replays generically. The validator pins only the shape:
-                // exactly one in-place +/- on the induction register.
+                // The validator pins one in-place +/- on the induction register.
                 if (b.dst != cl.ind or b.lhs != cl.ind or (b.kind != .Add and b.kind != .Sub)) {
                     fuseTrace("latch op shape: dst=r{d} lhs=r{d} kind={s}", .{ b.dst, b.lhs, @tagName(b.kind) });
                     return null;
@@ -2703,10 +2570,8 @@ fn emitFuseSpill(w: anytype, cl: *const CountedLoop) !void {
     }
 }
 
-/// Prologue tag propagation for one region op: updates the register width tags
-/// and, for an arithmetic op, freezes its promotion flag `f<idx>`. Two rounds
-/// before the loop reach the fixpoint; a third round that still changes a flag
-/// falls back to the generic path.
+/// Prologue tag propagation: updates register width tags and freezes an op's
+/// promotion flag `f<idx>`. Two rounds reach the fixpoint; a third falls back.
 fn emitTagPropOp(w: anytype, op: FusedOp, idx: usize, round: u32) !void {
     switch (op) {
         .trace => {},
@@ -2718,8 +2583,7 @@ fn emitTagPropOp(w: anytype, op: FusedOp, idx: usize, round: u32) !void {
             if (hot.is_bool) {
                 try w.print("      g{d} = 2;\n", .{b.dst});
             } else if (round == 0) {
-                // Char operands: Char minus Char is Int, Char +/- Int stays
-                // Char; either way the compute width is 32-bit (f = 0).
+                // Char operands compute at 32-bit width either way (f = 0).
                 try w.print("      if (g{d} == 4 || g{d} == 4) {{ f{d} = 0; g{d} = (g{d} == 4 && g{d} == 4) ? 0 : 4; }} else {{ f{d} = (g{d} | g{d}) & 1; g{d} = f{d}; }}\n", .{ b.lhs, b.rhs, idx, b.dst, b.lhs, b.rhs, idx, b.lhs, b.rhs, b.dst, idx });
             } else {
                 try w.print("      {{ int nf; int ng; if (g{d} == 4 || g{d} == 4) {{ nf = 0; ng = (g{d} == 4 && g{d} == 4) ? 0 : 4; }} else {{ nf = (g{d} | g{d}) & 1; ng = nf; }} if (nf != f{d}) fok = 0; f{d} = nf; g{d} = ng; }}\n", .{ b.lhs, b.rhs, b.lhs, b.rhs, b.lhs, b.rhs, idx, idx, b.dst });
@@ -2728,14 +2592,11 @@ fn emitTagPropOp(w: anytype, op: FusedOp, idx: usize, round: u32) !void {
     }
 }
 
-/// In-loop emission: width decisions read the frozen per-op flags, so the body
-/// carries no data-dependent tag writes and the C compiler can unswitch it into
-/// typed variants.
+/// In-loop emission: width decisions read the frozen flags, so the body carries
+/// no data-dependent tag writes and C can unswitch it into typed variants.
 fn emitFusedOp(w: anytype, op: FusedOp, idx: usize) !void {
     switch (op) {
-        // No op inside a fused region can throw (divmod is excluded), so
-        // per-iteration span updates are unobservable; the region's last trace
-        // is written once at each exit instead.
+        // Nothing in a fused region throws, so the last trace is written at exit.
         .trace => {},
         .const_int => |c| try w.print("        l{d} = (int32_t)0x{x}u;\n", .{ c.dst, c.v }),
         .const_scalar => |c| try w.print("        l{d} = (int64_t){d}ll;\n", .{ c.dst, c.v }),
@@ -2756,9 +2617,7 @@ fn emitFusedOp(w: anytype, op: FusedOp, idx: usize) !void {
     }
 }
 
-/// Emit the typed replay of a recognized counted loop at its header label, ahead
-/// of the generic per-op code, which stays the fallthrough for non-scalar entry
-/// tags and for interpreter entries at the inner labels.
+/// Emit the typed replay at the header label, ahead of the generic per-op code.
 fn emitFusedCountedLoop(w: anytype, cl: *const CountedLoop) !void {
     try w.print("  /* fused counted loop over blocks B{d}.. (typed int64 replay) */\n", .{cl.header});
     try w.print("  if (KV.usable) {{\n    int fok = 1;\n", .{});
@@ -2768,8 +2627,7 @@ fn emitFusedCountedLoop(w: anytype, cl: *const CountedLoop) !void {
     for (cl.reads[0..cl.n_reads]) |r| {
         try w.print("    {{ const uint8_t *s = kv_slot(regs, {d}u); uint64_t t = kv_tag(s); if (t == KVC_TAG_INT) {{ l{d} = kv_int(s); g{d} = 0; }} else if (t == KVC_TAG_LONG) {{ l{d} = kv_long(s); g{d} = 1; }} else if (t == KVC_TAG_CHAR) {{ l{d} = (int64_t)kv_char(s); g{d} = 4; }} else fok = 0; }}\n", .{ r, r, r, r, r, r, r });
     }
-    // Per-arith-op frozen width flags, settled by two propagation rounds plus a
-    // verify round; a tag pattern that has not converged clears fok.
+    // Frozen width flags from two propagation rounds plus a verify round.
     {
         var idx: usize = 0;
         for (cl.ops[0..cl.n_ops]) |op| {
@@ -2823,9 +2681,7 @@ fn emitFusedCountedLoop(w: anytype, cl: *const CountedLoop) !void {
             lidx3 += 1;
         }
     }
-    // Periodic edge guard: keep the interpreter's cadence of two increments per
-    // iteration by bumping the shared counter in bulk, spilling first so an
-    // abort or GC observes a consistent register file.
+    // Bump the counter in bulk to keep the cadence, spilling first for GC.
     try w.print("        kfl += 1;\n        if ((kfl & 0xFFu) == 0) {{\n", .{});
     try emitFuseSpill(w, cl);
     try w.print("        *EV.counter += 511u;\n        if (kv_edge(ctx, &EV)) return;\n        }}\n", .{});
@@ -2870,14 +2726,9 @@ fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block
                 pc += 6;
             },
             .escape => {
-                // A statically-bound call quickens to the call op: the native
-                // caller stays on the C stack and the callee's emitted body
-                // engages inside the recursive activation.
+                // A statically-bound call quickens; the caller stays on the C stack.
                 const inst_idx = code[pc + 1];
-                // A plain stored field read runs inline behind a class guard,
-                // caching the (class, slot) route the runtime resolves on its
-                // first execution; anything the guard misses falls through to
-                // the escape, which carries the full semantics.
+                // Inline behind a class guard caching the (class, slot) route.
                 if (f.blocks[block].insts[inst_idx] == .GetField) {
                     const gf = f.blocks[block].insts[inst_idx].GetField;
                     try w.print(
@@ -2970,15 +2821,12 @@ fn emitNativeBlock(w: anytype, f: *const ir.Func, st: *const ir.bc.Stream, block
             },
         }
     }
-    // A stream without fused terminators falls off its end: the real
-    // terminator runs in the interpreter, same as the stream loop.
+    // A stream without fused terminators falls off its end into the interpreter.
     if (!closed) try w.print("  klio_op_term(ctx, {d}u);\n  return;\n", .{block});
 }
 
-/// The C expression for an Int/Int fast-path BinOp matching `applyBinop` (wrap
-/// arithmetic via unsigned, C99 truncating div/mod), or null when the kind must
-/// stay on the helper. Div and Mod also need the `divmod_ok` runtime guard: a
-/// zero divisor and the INT_MIN/-1 overflow fall back to the interpreter arm.
+/// The C expression for an Int/Int fast-path BinOp matching `applyBinop`, or null
+/// when it stays on the helper. Div and Mod also need `divmod_ok`.
 fn hotIntExpr(kind: ir.BinOp) ?struct { expr: []const u8, is_bool: bool, divmod: bool } {
     return switch (kind) {
         .Add => .{ .expr = "(int32_t)((uint32_t)a + (uint32_t)b)", .is_bool = false, .divmod = false },
@@ -3002,8 +2850,7 @@ fn emitBinSite(w: anytype, block: u32, inst_idx: u32, kind_raw: u32, dst: u32, l
         try w.print("  if (klio_op_bin(ctx, {d}u, {d}u, {d}u, {d}u, {d}u, {d}u)) return;\n", .{ block, inst_idx, kind_raw, dst, lhs, rhs });
         return;
     };
-    // Mixed Int/Long promotes to Long as `applyBinop` does, except boxed
-    // equality, which is tag-sensitive across widths and inlines Long/Long only.
+    // Mixed Int/Long promotes to Long, except boxed equality (Long/Long only).
     const boxed_eq = kind == .BoxedEq or kind == .BoxedNotEq;
     try w.print("  {{ int kh = 0;\n", .{});
     try w.print("    uint8_t *bl = kv_slot(regs, {d}u), *br_ = kv_slot(regs, {d}u);\n", .{ lhs, rhs });
@@ -3059,10 +2906,7 @@ fn emitCmpBrSite(w: anytype, fs: *const ir.bc.FuncStreams, block: u32, inst_idx:
     const kind: ir.BinOp = @enumFromInt(kind_raw);
     const hot = hotIntExpr(kind);
     if (hot != null and hot.?.is_bool) {
-        // Inline compare, write dst (register state matches the unfused form),
-        // run the taken-edge guard, branch. Mixed Int/Long promotes as the
-        // interpreter's fast arm does, boxed equality stays Long/Long only;
-        // anything else falls to the helper switch below.
+        // Mixed Int/Long promotes; boxed equality stays Long/Long only.
         const boxed_eq = kind == .BoxedEq or kind == .BoxedNotEq;
         try w.print("  {{\n    uint8_t *bl = kv_slot(regs, {d}u), *br_ = kv_slot(regs, {d}u);\n", .{ lhs, rhs });
         try w.print("    if (KV.usable) {{\n      uint64_t tl = kv_tag(bl), tr = kv_tag(br_);\n", .{});
@@ -3101,13 +2945,11 @@ const TestRunCtx = struct {
     filter: ?[]const u8,
 };
 
-/// Big-stack worker entry: re-establish the thread-local coroutine time mode
-/// and reclaim flag (a fresh OS thread), then discover and run the tests.
+/// Big-stack worker entry: re-establish thread-local coroutine time and reclaim mode.
 fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
     interp_ir.setCoroutineTimeMode(ctx.time_mode);
     runtime.setReclaim(ctx.reclaim);
-    // KLIO_PROF profiles `klio test` as it does `klio run`: the sampler is
-    // per-thread and this thread executes the tests.
+    // The KLIO_PROF sampler is per-thread and this thread executes the tests.
     runtime.prof.maybeStart();
     defer runtime.prof.maybeReport();
     return test_runner.runTests(ctx.gpa, ctx.vm, ctx.user_asts, ctx.out, ctx.only_fids, ctx.filter) catch |err| {
@@ -3116,12 +2958,9 @@ fn testRunEntry(ctx: TestRunCtx) test_runner.Report {
     };
 }
 
-/// `--isolate`: runs each discovered `@Test` in its own sub-process with a
-/// per-test wall-clock timeout, so a test that hangs or crashes is pinpointed
-/// rather than taking down the suite. `base_args` is the `test` argument vector
-/// minus `--isolate`/`--jobs`; the driver re-invokes
-/// `klio test <base_args> --list` to enumerate, then one exact
-/// `--filter==<name>` per test with the parent enforcing the timeout.
+/// `--isolate`: run each `@Test` in its own sub-process under a wall-clock
+/// timeout, so a hang or crash is pinpointed. `base_args` is the `test` argv
+/// minus `--isolate`/`--jobs`; each test runs under one exact `--filter==<name>`.
 pub fn runTestsIsolated(
     gpa: std.mem.Allocator,
     self: []const u8,
@@ -3136,7 +2975,6 @@ pub fn runTestsIsolated(
     defer env.deinit();
     runtime.procEnvPutAllInto(gpa, &env);
 
-    // 1. Enumerate the test names (compile once; no execution).
     var list_argv: std.ArrayList([]const u8) = .empty;
     defer list_argv.deinit(gpa);
     list_argv.append(gpa, self) catch return 2;
@@ -3158,9 +2996,7 @@ pub fn runTestsIsolated(
         if (t.len != 0) names.append(gpa, t) catch return 2;
     }
     if (names.items.len == 0) {
-        // Print the summary line anyway: a file whose only `@Test` methods live
-        // on an abstract class contributes no cases but did run, and a harness
-        // reading the summary must not score it as a child that never reported.
+        // A file whose only `@Test` methods are on an abstract class still ran.
         io.printStdout(gpa, "no tests found\n\n0 tests, 0 passed, 0 failed, 0 skipped\n", .{});
         return 0;
     }
@@ -3194,8 +3030,7 @@ pub fn runTestsIsolated(
         };
         defer gpa.free(res.stdout);
         defer gpa.free(res.stderr);
-        // A clean exit-0 → the isolated test passed; exit-1 → it failed; any
-        // abnormal termination (signal/crash) → CRASH.
+        // exit 0 passed, exit 1 failed, abnormal termination is a crash.
         switch (res.term) {
             .exited => |c| if (c == 0) {
                 io.printStdout(gpa, "{s} PASSED\n", .{name});
@@ -3216,9 +3051,7 @@ pub fn runTestsIsolated(
     return if (failed + timed_out > 0) 1 else 0;
 }
 
-/// `klio test`: discover and run `kotlin.test` `@Test` functions in the given
-/// files and directories. Returns 1 if any test fails or the module fails to
-/// build, 0 otherwise.
+/// `klio test`: run `@Test` functions in the given files. 1 if any fails.
 pub fn runTestFiles(
     gpa: std.mem.Allocator,
     paths: []const []const u8,
@@ -3250,11 +3083,8 @@ pub fn runTestFiles(
         return 1;
     }
 
-    // Fast path: assemble against the baked stdlib image. Each selected FileId
-    // comes from the reparsed user AST itself, never from map length and argv
-    // position, which preparation can shift by inserting source-map entries.
-    // Falls back to the whole-module build when the cache misses or the program
-    // cannot extend the base (files declaring expect/actual, for one).
+    // Each selected FileId comes from the reparsed user AST, never from map
+    // length and argv position, which preparation can shift.
     {
         const prev_reclaim = runtime.reclaimEnabled();
         if (!runtime.reclaimRequested()) runtime.setReclaim(false);
@@ -3282,8 +3112,7 @@ pub fn runTestFiles(
     var map = SourceMap.init(gpa);
     defer map.deinit();
 
-    // `--only-file`: FileIds whose `@Test` methods should actually run (the
-    // rest are compiled as context only). Empty = run every file's tests.
+    // `--only-file` FileIds; the rest compile as context only. Empty runs all.
     var only_fids: std.ArrayList(u32) = .empty;
     defer only_fids.deinit(gpa);
 
@@ -3321,20 +3150,15 @@ pub fn runTestFiles(
     defer runtime.setReclaim(prev_reclaim);
 
     if (computeEagerCalls(gpa, all_asts.items, &.{})) |ec| ir.pending_eager_calls = ec;
-    // Reachable during lowering, not just during the run: lowering-time
-    // diagnostics resolve a span to a file and line through this map, and
-    // `runTestsOnBuilt` re-installs it for the run itself.
+    // Installed before lowering so lowering diagnostics resolve spans too.
     span.active_map = &map;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts.items) catch return 1;
     return runTestsOnBuilt(gpa, built, loaded.bindings, &map, user_asts.items, only_fids.items, filter, format, list_only);
 }
 
-/// Test-runner output format. `plain` is the human-facing per-test list +
-/// summary; `json` is a machine-readable object (counts + per-test status +
-/// failure reason) for CI ratchets.
+/// `plain` is the per-test list plus summary, `json` a machine-readable object.
 pub const TestFormat = enum { plain, json };
 
-/// Emit a JSON string literal with the minimal escapes JSON requires.
 fn writeJsonString(gpa: std.mem.Allocator, s: []const u8) void {
     io.printStdout(gpa, "\"", .{});
     for (s) |c| switch (c) {
@@ -3348,9 +3172,7 @@ fn writeJsonString(gpa: std.mem.Allocator, s: []const u8) void {
     io.printStdout(gpa, "\"", .{});
 }
 
-/// Tail shared by the whole-module and image test paths: surface lowering-time
-/// resolution diagnostics, materialize a Vm, install bindings, then discover and
-/// run the `@Test` functions in `user_asts`.
+/// Tail shared by the whole-module and image test paths.
 fn runTestsOnBuilt(
     gpa: std.mem.Allocator,
     built_in: interp_ir.build.BuiltModule,
@@ -3389,8 +3211,7 @@ fn runTestsOnBuilt(
     span.active_map = map;
     defer span.active_map = null;
 
-    // `--list`: discover the `@Test` names and print them, one per line, without
-    // running any (the `--isolate` driver spawns a sub-process per name).
+    // `--list` prints the discovered names, one per line, without running any.
     if (list_only) {
         const names = test_runner.listTests(gpa, &vm, user_asts, only_fids, filter) catch return 1;
         defer {
@@ -3402,9 +3223,7 @@ fn runTestsOnBuilt(
     }
 
     var stdout = io.StdoutSink{};
-    // Run on the large interpreter stack, in place on this thread: a test can
-    // recurse as deeply as `main`, and a test that opens a window needs the
-    // process main thread just as much as a program does.
+    // In place on this thread: a test recurses as deeply as `main` and may open a window.
     var report = runtime.runOnBigStackMainThread(TestRunCtx, test_runner.Report, testRunEntry, .{
         .gpa = gpa,
         .vm = &vm,
@@ -3480,8 +3299,7 @@ fn runTestsOnBuilt(
     return if (report.failed > 0) 1 else 0;
 }
 
-/// Collect `.kt` files from `path`: a single file as-is, or a directory walked
-/// recursively. Appended to `out` and sorted for deterministic test ordering.
+/// Collect `.kt` files from `path`, sorted for deterministic test ordering.
 fn collectKtFiles(
     gpa: std.mem.Allocator,
     path: []const u8,
@@ -3504,7 +3322,6 @@ fn collectKtDir(
     out: *std.ArrayList([]const u8),
 ) !void {
     var dir = std.Io.Dir.cwd().openDir(fio, path, .{ .iterate = true }) catch {
-        // Not a directory: a directly-named source file.
         if (std.mem.endsWith(u8, path, ".kt")) try out.append(gpa, try gpa.dupe(u8, path));
         return;
     };
@@ -3523,15 +3340,9 @@ fn collectKtDir(
     }
 }
 
-/// Shared tail of the two `run*` paths: build the module, materialize a
-/// Vm, register installed bindings, and run `main`. `map` locates
-/// lowering diagnostics (file:line) in the parsed sources.
 
-/// Run resolver and typeck over the program the way `klio check` does and
-/// convert the recorded overload picks into the span-pair map lowering composes
-/// with its own declaration identities. Any failure returns null and lowering
-/// proceeds on AST evidence alone (`KLIO_EAGER_AUDIT=1` logs the skip), so a
-/// program that defeats typeck still runs.
+/// Convert typeck's recorded overload picks into the span-pair map lowering
+/// composes with. Any failure returns null and AST evidence alone is used.
 pub fn computeEagerCalls(
     gpa: std.mem.Allocator,
     combined: []const KotlinFile,
@@ -3551,9 +3362,7 @@ pub fn computeEagerCalls(
         if (audit) std.debug.print("[EAGER] typeck failed; staying lazy\n", .{});
         return null;
     };
-    // Only a record whose decl_span is a function declaration's name span in the
-    // typechecked sources composes soundly: a builtin-header FnSig carries a
-    // synthetic span that can collide with real coordinates.
+    // A builtin-header FnSig carries a synthetic span that can collide.
     var declared = std.AutoHashMap(span_mod.Span, void).init(gpa);
     defer declared.deinit();
     for (combined) |*kf| {
@@ -3570,8 +3379,7 @@ pub fn computeEagerCalls(
         }
     }
     var out = std.AutoHashMap(span_mod.Span, span_mod.Span).init(gpa);
-    // Picks whose declaration lives in a prebuilt image: no source span
-    // exists for them anywhere, so they travel by FuncId instead.
+    // Picks declared in a prebuilt image have no source span; they go by FuncId.
     var out_fids = std.AutoHashMap(span_mod.Span, u32).init(gpa);
     var it = tc.resolved_calls.iterator();
     var n: usize = 0;
@@ -3609,26 +3417,19 @@ pub fn computeEagerCalls(
         if (ir.pending_eager_call_fids) |*old_m| old_m.deinit();
         ir.pending_eager_call_fids = out_fids;
     } else out_fids.deinit();
-    // The companion evidence channel, per-expression type heads. Only decisive
-    // heads enter (scalars, String, named classes, nullable wrappers of those);
-    // a Function/TypeParam/Unresolved answer would override AST evidence.
+    // Only decisive heads enter: Function/TypeParam/Unresolved would override.
     var tout = std.AutoHashMap(span_mod.Span, ir.EagerTypeHead).init(gpa);
     var tit = tc.types.iterator();
     var tn: usize = 0;
     while (tit.next()) |e| {
-        // A type recorded inside a generic body is true only for the
-        // instantiation typeck checked last, so handing it to lowering would
-        // change which overload wins.
+        // A type inside a generic body is true only for the last instantiation.
         if (tc.types_instantiation_dependent.contains(e.key_ptr.*)) continue;
         const head = eagerHeadOf(e.value_ptr, false) orelse continue;
         tout.put(e.key_ptr.*, head) catch continue;
         tn += 1;
     }
-    // The checker's class evidence folded into the same channel: a plain user
-    // class is `Type.Unresolved` in `tc.types`, so a receiver's class identity
-    // lives in `expr_class` instead. Heads lowering cannot resolve are dropped
-    // on read in `eagerTypeOf`, so an unresolvable name costs nothing rather
-    // than displacing a virtual bind.
+    // A plain user class is `Type.Unresolved` in `tc.types`, so identity lives in
+    // `expr_class`. Unresolvable heads are dropped on read in `eagerTypeOf`.
     var cn_added: usize = 0;
     {
         var cit = tc.expr_class.iterator();
@@ -3654,10 +3455,8 @@ pub fn computeEagerCalls(
 }
 
 fn eagerHeadOf(t: *const typeck.check.Type, nullable: bool) ?ir.EagerTypeHead {
-    // Primitive scalar heads stay out of the channel: applicability treats
-    // primitive evidence as exact, but a literal coerces to the parameter's
-    // primitive (an Int literal fills a `vararg Byte` slot) and the head cannot
-    // carry literalness.
+    // Primitive heads stay out: applicability treats them as exact, but a literal
+    // coerces (an Int literal fills a `vararg Byte`) and a head lacks literalness.
     return switch (t.*) {
         .String => .{ .name = "String", .nullable = nullable },
         .Nullable => |inner| eagerHeadOf(inner, true),
@@ -3673,17 +3472,14 @@ fn runBuilt(
     map: *const SourceMap,
     no_main_msg: []const u8,
 ) u8 {
-    // The process runs on one arena freed at exit, so per-cell `ObjRef.deinit`
-    // and the `vm.deinit()` value-graph walk are wasted work. Switch this thread
-    // to the reclaim fast path and restore the prior mode after, so the REPL's
-    // next program is unaffected.
+    // One arena freed at exit makes `ObjRef.deinit` and the `vm.deinit()` walk
+    // wasted work. The prior mode is restored so the REPL's next program is clean.
     const prev_reclaim = runtime.reclaimEnabled();
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
     if (computeEagerCalls(gpa, all_asts, &.{})) |ec| ir.pending_eager_calls = ec;
-    // Installed before lowering so lowering-time diagnostics can name a file
-    // and a line.
+    // Installed before lowering so diagnostics can name a file and a line.
     span.active_map = map;
     const built = interp_ir.build.buildModuleFiles(gpa, all_asts) catch |e| {
         io.printStderr(gpa, "error: lowering failed ({s})\n", .{@errorName(e)});
@@ -3692,10 +3488,8 @@ fn runBuilt(
     return runBuiltModule(gpa, built, bindings, map, no_main_msg);
 }
 
-/// Assemble the program against the baked stdlib image when possible. Returns
-/// the process exit code on the fast path, or null when the whole-program path
-/// must run instead: cache disabled or missing, parse errors, base-name
-/// collision, unbakeable base.
+/// Assemble against the baked stdlib image when possible. Null when the
+/// whole-program path must run: no cache, parse errors, unbakeable base.
 fn tryImagePath(
     gpa: std.mem.Allocator,
     paths: []const []const u8,
@@ -3709,8 +3503,7 @@ fn tryImagePath(
     return runBuiltModule(gpa, prepared.built, prepared.bindings, prepared.map, msg);
 }
 
-/// Tail shared by the whole-module and image paths: surface lowering-time
-/// resolution diagnostics, materialize a Vm, install bindings, run `main`.
+/// Tail shared by the whole-module and image paths: Vm, bindings, run `main`.
 
 
 fn runBuiltModule(
@@ -3723,8 +3516,7 @@ fn runBuiltModule(
     return runBuiltModuleArgs(gpa, built_in, bindings, map, no_main_msg, &.{});
 }
 
-/// `runBuiltModule` with the program argv `main(args: Array<String>)`
-/// receives (a bundle's argv[1..]; empty under `klio run`).
+/// `runBuiltModule` with the argv `main(args: Array<String>)` receives.
 pub fn runBuiltModuleArgs(
     gpa: std.mem.Allocator,
     built_in: interp_ir.build.BuiltModule,
@@ -3735,14 +3527,11 @@ pub fn runBuiltModuleArgs(
 ) u8 {
     const prev_reclaim = runtime.reclaimEnabled();
     if (!runtime.reclaimRequested()) runtime.setReclaim(false);
-    // A hosted UI run stays resident after `main` returns: the platform frame
-    // source re-enters the VM each vsync, so its reclaim mode, source map and VM
-    // state must outlive this scope. Every other run tears down here.
+    // A hosted UI run stays resident: the frame source re-enters the VM each vsync.
     defer if (!compose_ui.hostedActive()) runtime.setReclaim(prev_reclaim);
 
     var built = built_in;
-    // Lowering-time resolution diagnostics (ambiguous bare calls) fail
-    // the program before it runs.
+    // Lowering-time resolution diagnostics fail the program before it runs.
     {
         const mg = built.module.borrow();
         defer mg.deinit();
@@ -3769,8 +3558,7 @@ pub fn runBuiltModuleArgs(
     };
 
     var stdout = io.StdoutSink{};
-    // Reachable from inside the VM so a thrown exception's captured frames
-    // resolve to file paths and lines. Cleared after the run.
+    // Reachable from inside the VM so thrown frames resolve to file and line.
     span.active_map = map;
     defer if (!compose_ui.hostedActive()) {
         span.active_map = null;
@@ -3788,12 +3576,9 @@ pub fn runBuiltModuleArgs(
     ir.eval.dispatch_replay_hits = &interp_ir.VmHost.replayHits;
     ir.eval.ext_fb_counts = &interp_ir.VmHost.extFbCounts;
     ir.eval.dispatchStatsDump();
-    // The KLIO_OP_PROF per-opcode histogram belongs to `run` as well as `test`.
     ir.eval.opProfDump();
     if (runtime.envOnce("KLIO_DECL_AUDIT") != null) declAudit(gpa, &built);
-    // The dispatch census is reported for `run` as well as `test`: the stdlib's
-    // own tests are generic throughout, so an effect that needs a concrete
-    // element type measures as zero there and shows only in application code.
+    // Reported for `run` too: the stdlib's own tests are generic throughout.
     if (runtime.envOnce("KLIO_DISPATCH_STATS") != null) {
         ir.lower.expr.lowerSitesDump();
         ir.lower.expr.lowerNoRecvDump();
@@ -3815,15 +3600,10 @@ pub fn runBuiltModuleArgs(
 }
 
 
-/// `KLIO_DECL_AUDIT=1`: the symbol-table completeness audit. Reports every FQN
-/// the intrinsic registry can serve, paired with whether the module carries a
-/// declaration for it. A callable the runtime can dispatch but the resolver
-/// cannot see is a hole, and resolution falls back to a name probe there. Prints
-/// the tally and the first missing entries per package.
-///
-/// Program-scoped: the IR is lazy, so a declaration enters the module only when
-/// the audited program reaches its package. The count is a lower bound on what
-/// is declared, never an upper bound on what is missing.
+/// `KLIO_DECL_AUDIT=1`: every FQN the intrinsic registry can serve, paired with
+/// whether the module declares it. A callable the runtime dispatches but the
+/// resolver cannot see is a hole. Program-scoped: the IR is lazy, so the count
+/// is a lower bound on what is declared.
 fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) void {
     const mg = built.module.borrow();
     defer mg.deinit();
@@ -3846,8 +3626,7 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
     while (it.next()) |fqn| {
         total += 1;
         if (module.funcIdByFqn(fqn) != null) continue;
-        // A class (its constructor) and a top-level property are declared
-        // entities too; the registry serves both under an FQN key.
+        // A class constructor and a top-level property are declared entities too.
         if (module.classIdByFqn(fqn) != null) continue;
         {
             const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
@@ -3855,17 +3634,11 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
         }
         missing += 1;
         const pkg = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[0..d] else "";
-        // A receiver-qualified form (`kotlin.Float.plus`) is a member of a
-        // builtin type, which has no Kotlin source declaration by design. The
-        // holes that matter here are package-level callables, whose owner
-        // segment starts lowercase.
+        // A receiver-qualified builtin member has no source declaration.
         const owner_simple = if (std.mem.lastIndexOfScalar(u8, pkg, '.')) |d2| pkg[d2 + 1 ..] else pkg;
         if (owner_simple.len != 0 and std.ascii.isUpper(owner_simple[0])) {
-            // A member-shaped registry key is usually the dispatch key for an
-            // extension the module does declare (`kotlin.Char.titlecase` serves
-            // `kotlin.text.titlecase(Char)`), so it is aligned, not missing.
-            // Only a key with no extension of that simple name whose declared
-            // receiver head names the owner is a genuine member hole.
+            // A member-shaped key is usually the dispatch key for an extension
+            // the module declares (`kotlin.Char.titlecase`), so it is aligned.
             {
                 const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
                 const owner_cid: ?ir.ClassId = module.classIdByFqn(pkg) orelse
@@ -3882,16 +3655,12 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
                         ext_aligned = true;
                         break;
                     }
-                    // A one- or two-letter receiver is a type parameter: a
-                    // generic extension (`fun <T> T.also`) serves any
-                    // owner-qualified key of its name.
+                    // A one- or two-letter receiver is a type parameter.
                     if (rh.len != 0 and rh.len <= 2 and std.ascii.isUpper(rh[0])) {
                         ext_aligned = true;
                         break;
                     }
-                    // An extension on a supertype serves the subtype's key:
-                    // `Iterable.indexOfFirst` answers the
-                    // `MutableList.indexOfFirst` dispatch key.
+                    // `Iterable.indexOfFirst` answers `MutableList.indexOfFirst`.
                     if (owner_cid) |ocid| {
                         if (module.uniqueClassIdBySimpleName(rh)) |rcid| {
                             if (module.classIdIsOrExtends(ocid, rcid)) {
@@ -3902,16 +3671,12 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
                     }
                 }
                 if (ext_aligned) {
-                    // Declared as the extension the key dispatches for, so it
-                    // does not count as missing.
+                    // Declared as the extension the key dispatches for.
                     member_ext_aligned += 1;
                     missing -= 1;
                     continue;
                 }
-                // A member the owner class or a supertype declares: `List.isEmpty`
-                // lives on the Collection header. Arity-blind on purpose: an
-                // empty-shape resolution probe refuses members with required
-                // parameters (`MutableList.add`).
+                // Arity-blind: an empty-shape probe refuses required parameters.
                 if (owner_cid) |ocid| {
                     if (module.classHierarchyDeclaresMember(ocid, simple)) {
                         member_decl_aligned += 1;
@@ -3921,10 +3686,7 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
                 }
             }
             member_missing += 1;
-            // `KLIO_DECL_AUDIT=members` lists builtin-type member holes grouped
-            // by owner, each row carrying the owner's class-row state. A hole
-            // whose owner has no row, or an empty method list, is audit
-            // blindness rather than a resolution gap.
+            // An owner with no class row is audit blindness, not a gap.
             if (std.mem.eql(u8, runtime.envOnce("KLIO_DECL_AUDIT") orelse "", "members")) {
                 const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
                 const owner_cid2: ?ir.ClassId = module.classIdByFqn(pkg) orelse
@@ -3939,19 +3701,13 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
             }
             continue;
         }
-        // A registry key naming the same callable under a different package
-        // (`kotlin.naturalOrder` for `kotlin.comparisons.naturalOrder`) is an
-        // unaligned key, which the scope walk reconciles separately.
+        // The same callable under another package is unaligned, not missing.
         {
             const simple = if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |d| fqn[d + 1 ..] else fqn;
             var aligned_elsewhere = module.funcsBySimpleName(simple).len != 0;
-            // A class the module declares under another package
-            // (`kotlin.StringBuilder` for `kotlin.text.StringBuilder`) is the
-            // same shape of mismatch as a function's.
+            // A class declared under another package is the same mismatch.
             if (!aligned_elsewhere and module.uniqueClassIdBySimpleName(simple) != null) aligned_elsewhere = true;
-            // An extension property's getter carries the
-            // `__ext_get_<Head>_<name>` naming contract, so its declaration
-            // never appears under the registry's own key.
+            // An extension property getter is keyed `__ext_get_<Head>_<name>`.
             if (!aligned_elsewhere) {
                 var it2 = module.registry.ext_prop_type_heads.iterator();
                 while (it2.next()) |e2| {
@@ -3967,9 +3723,7 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
                 continue;
             }
         }
-        // A hole in a package with no loaded declaration at all is the audit's
-        // own program scoping, not a symbol-table gap: the IR is lazy. Only a
-        // hole in a loaded package is actionable.
+        // A package with no loaded declaration is the audit's own scoping.
         {
             var pkg_loaded = false;
             for (module.funcs.items) |*mf| {
@@ -3998,10 +3752,7 @@ fn declAudit(gpa: std.mem.Allocator, built: *const interp_ir.build.BuiltModule) 
     for (unaligned_samples.items) |fq| io.printStdout(gpa, "[decl-audit] unaligned: {s}\n", .{fq});
 }
 
-/// Run `main` on a large-stack worker thread so deep but finite recursion runs
-/// to completion instead of overflowing the ~8 MiB main stack; the eval-depth
-/// cap remains the backstop. The coroutine time mode is thread-local, so it is
-/// re-established on the worker.
+/// Large-stack worker so deep but finite recursion completes; the depth cap backstops.
 const MainRunCtx = struct {
     vm: *Vm,
     main: interp_ir.FuncId,
@@ -4018,11 +3769,8 @@ fn runMainBigStack(vm: *Vm, main: interp_ir.FuncId, out: interp_ir.Output) inter
         .time_mode = interp_ir.coroutineTimeMode(),
         .reclaim = runtime.reclaimEnabled(),
     };
-    // The interpreter runs on the process main thread on every platform, with a
-    // large stack via an in-thread stack switch and no worker-thread hop. A
-    // program that opens a Compose UI must drive platform windowing and the
-    // single-threaded GPU context from the main thread (AppKit/Metal on macOS,
-    // UIKit/Metal on iOS).
+    // The process main thread everywhere, with an in-thread stack switch: a
+    // Compose UI must drive windowing and the GPU context from the main thread.
     return runtime.runOnBigStackMainThread(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 

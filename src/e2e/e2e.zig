@@ -1,8 +1,6 @@
-//! End-to-end corpus test: runs every `examples/*.kt` through the in-process
-//! klio pipeline (`parity.runWithPacks`) and asserts stdout matches the
-//! checked-in expected output under `tests/corpus/expected/`, which holds the
-//! byte-exact kotlinc-compatible stdout for each program. Needs no external
-//! reference at test time.
+//! End-to-end corpus test: every `examples/*.kt` through the in-process klio
+//! pipeline, asserted against the byte-exact expected stdout under
+//! `tests/corpus/expected/`. Needs no external reference at test time.
 const std = @import("std");
 const parity = @import("parity");
 const jit = @import("ir").jit_loop;
@@ -10,9 +8,8 @@ const jit = @import("ir").jit_loop;
 const parser = @import("parser");
 const EXAMPLES = "examples";
 
-/// Apply the `--language=` specs an example declares in a `Run with:` header
-/// comment, as `scripts/corpus_check.py` does on the CLI route. They apply to
-/// the parser for this example only.
+/// Apply the `--language=` specs an example declares in its `Run with:` header
+/// comment. They apply to the parser for this example only.
 fn applyRunDirective(io: std.Io, a: std.mem.Allocator, path: []const u8) void {
     const src = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return;
     var lines = std.mem.splitScalar(u8, src, '\n');
@@ -33,8 +30,7 @@ fn applyRunDirective(io: std.Io, a: std.mem.Allocator, path: []const u8) void {
 
 const EXPECTED = "tests/corpus/expected";
 
-/// `KLIO_E2E_SHARD=K/N` runs only the programs whose name hashes into
-/// shard K of N, so the gate fans the corpus across parallel processes.
+/// `KLIO_E2E_SHARD=K/N` runs only the programs hashing into shard K of N.
 fn shardSkip(stem: []const u8) bool {
     const spec = std.c.getenv("KLIO_E2E_SHARD") orelse return false;
     const s = std.mem.span(spec);
@@ -47,9 +43,8 @@ fn shardSkip(stem: []const u8) bool {
     return (h.final() % n) != k;
 }
 
-/// Per-program SKIP notices are silent by default: a passing `zig build` run
-/// step that writes to stderr is rendered as a failed command by the build
-/// runner. `KLIO_ITEST_VERBOSE` surfaces them.
+/// SKIP notices are silent by default: stderr from a passing `zig build` run
+/// step is rendered as a failed command. `KLIO_ITEST_VERBOSE` surfaces them.
 fn verbose() bool {
     return std.c.getenv("KLIO_ITEST_VERBOSE") != null;
 }
@@ -58,9 +53,8 @@ fn runCorpus(jit_on: bool) !void {
     jit.setEnabledForTest(jit_on);
     defer jit.setEnabledForTest(false);
 
-    // The corpus spans ~8 distinct pack masks, each otherwise retaining its own
-    // full stdlib clone. Grouping by base key lets a cache of one base cover the
-    // run with one rebuild per mask, staying under the RSS watchdog.
+    // Grouping by base key lets one cached base cover the run with one rebuild
+    // per pack mask, staying under the RSS watchdog.
     parity.base_cache_max = if (std.c.getenv("KLIO_E2E_NO_EVICT") != null) 0 else 1;
 
     var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -85,8 +79,7 @@ fn runCorpus(jit_on: bool) !void {
 
     var failures: usize = 0;
     for (files) |kt| {
-        // Drop the previous program's JIT state: its module memory is about to be
-        // recycled, so a reused `*Func` address must not inherit stale native code.
+        // Module memory is recycled, so a reused `*Func` must not keep stale code.
         jit.resetForTest();
         _ = run_arena.reset(.retain_capacity);
         const a = run_arena.allocator();
@@ -139,9 +132,8 @@ test "e2e corpus matches expected output (jit off)" {
     try runCorpus(false);
 }
 
-// The whole-function JIT (native recursion) is opt-in via `KLIO_FUNC_JIT`, so
-// the corpus passes above never exercise it. Run a small main-thread-only set
-// here so the per-thread compiled-code retention cannot accumulate.
+// The whole-function JIT is opt-in via `KLIO_FUNC_JIT`, so the passes above
+// never exercise it. This small main-thread-only set bounds retention.
 test "function-JIT recursion matches the interpreter" {
     jit.setEnabledForTest(true);
     jit.setFuncEnabledForTest(true);

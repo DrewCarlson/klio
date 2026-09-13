@@ -1,10 +1,5 @@
-//! End-to-end bench driver: stable JSON on stdout, human summary on stderr.
-//!
-//! Usage:
-//!   klio-bench            # all corpora, fast budget
-//!   klio-bench --full     # extended workloads, ref runners
-//!   klio-bench --json     # JSON only, no stderr summary
-//!   klio-bench --diff <baseline.json>
+//! Bench driver: stable JSON on stdout, human summary on stderr.
+//!   klio-bench [--full] [--json] [--diff <baseline.json>]
 
 const std = @import("std");
 const bench = @import("bench.zig");
@@ -104,9 +99,8 @@ fn reportDiff(allocator: std.mem.Allocator, io: std.Io, base_path: []const u8, r
     return null;
 }
 
-/// Entry point; the returned value is the process exit code.
 pub fn run(allocator: std.mem.Allocator, raw_args: []const []const u8) u8 {
-    // Cap the bench process's RSS so a runaway corpus entry cannot OOM the host.
+    // Cap RSS so a runaway corpus entry cannot OOM the host.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
 
@@ -254,8 +248,7 @@ fn hostString(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
 }
 
 fn printErr(comptime fmt: []const u8, args: anytype) void {
-    // Silent under the test runner: arg-parsing tests exercise the usage and
-    // error paths, and stray stderr makes `zig build test` flag the command.
+    // Silent under the test runner: stray stderr makes `zig build test` flag it.
     if (@import("builtin").is_test) return;
     std.debug.print(fmt, args);
 }

@@ -1,11 +1,6 @@
-//! Ahead-of-time "missing implementation" check.
-//!
-//! An `expect` declaration (or a bodyless `external`) with no Kotlin `actual`
-//! and no host intrinsic still resolves at a call site: it runs nothing and
-//! returns `Unit` with no diagnostic. This check loads the program with every
-//! pack it imports and the embedded stdlib, walks all declarations, and reports
-//! each `expect` function or property that has neither a body-carrying
-//! counterpart nor a registered intrinsic backing its FQN.
+//! Ahead-of-time "missing implementation" check. An `expect` declaration, or a
+//! bodyless `external`, with no Kotlin `actual` and no host intrinsic still resolves
+//! at a call site: it runs nothing and returns `Unit` with no diagnostic.
 
 const std = @import("std");
 
@@ -32,18 +27,16 @@ const RequestedFeatures = pack_cache.RequestedFeatures;
 const loadInstalledPacks = pack_cache.loadInstalledPacks;
 const mergedHostBindings = pack_cache.mergedHostBindings;
 
-/// One unimplemented `expect` declaration awaiting an actual / intrinsic.
 const Missing = struct {
     /// `fun` or `val`/`var`.
     kind: []const u8,
-    /// Best-effort fully qualified display name (`pkg.Owner.name`).
+    /// Best-effort `pkg.Owner.name`.
     display: []const u8,
     file: []const u8,
     line: u32,
 };
 
-/// Strip generic args and package qualifier from a type/owner name:
-/// `kotlin.collections.List<T>` -> `List`.
+/// Strips generic args and package qualifier: `kotlin.collections.List<T>` -> `List`.
 fn simpleName(allocator: std.mem.Allocator, n: []const u8) []const u8 {
     const base = if (std.mem.indexOfScalar(u8, n, '<')) |lt| n[0..lt] else n;
     const tail = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[dot + 1 ..] else base;
@@ -51,8 +44,7 @@ fn simpleName(allocator: std.mem.Allocator, n: []const u8) []const u8 {
     return allocator.dupe(u8, trimmed) catch trimmed;
 }
 
-/// The owner used to key a declaration: an extension's receiver type if
-/// present, else the lexically enclosing class/object (`null` = top level).
+/// An extension's receiver type, else the enclosing class/object; null is top level.
 fn fnOwner(allocator: std.mem.Allocator, f: *const Function, enclosing: ?[]const u8) ?[]const u8 {
     if (f.receiver_type) |t| return simpleName(allocator, t.name.name);
     if (enclosing) |e| return allocator.dupe(u8, e) catch e;
@@ -65,8 +57,7 @@ fn propOwner(allocator: std.mem.Allocator, p: *const Property, enclosing: ?[]con
     return null;
 }
 
-/// `owner#name`, owner empty for a top-level entity: the key deciding whether
-/// a body-carrying counterpart exists for an `expect`.
+/// `owner#name`, owner empty at top level: the key deciding whether an `expect` has a body.
 fn implKey(allocator: std.mem.Allocator, owner: ?[]const u8, name: []const u8) []const u8 {
     return std.fmt.allocPrint(allocator, "{s}#{s}", .{ owner orelse "", name }) catch name;
 }
@@ -81,10 +72,8 @@ const ExpectDecl = struct {
 
 const Scan = struct {
     allocator: std.mem.Allocator,
-    /// Keys (`owner#name`) with a body somewhere: a Kotlin `actual` or a plain
-    /// definition the `expect` can bind to.
+    /// `owner#name` keys with a body: a Kotlin `actual`, or a plain definition.
     implemented: std.StringHashMap(void),
-    /// `expect`s discovered, paired with their owner + package context.
     expects: std.ArrayList(ExpectDecl),
 
     fn init(allocator: std.mem.Allocator) Scan {
@@ -114,8 +103,7 @@ const Scan = struct {
                     if (f.body != null or f.is_actual) {
                         self.implemented.put(implKey(self.allocator, owner, f.name.name), {}) catch {};
                     }
-                    // An `expect` never has a body. Abstract members and interface
-                    // methods are overridden, not implemented here, so skip them.
+                    // An `expect` never has a body, and an abstract member is overridden.
                     if (f.is_expect and !f.is_abstract and !in_abstract_owner) {
                         self.expects.append(self.allocator, .{
                             .kind = "fun",
@@ -144,8 +132,7 @@ const Scan = struct {
                     }
                 },
                 .Class => |*c| {
-                    // Members of an interface or abstract class dispatch through
-                    // overrides, so an absent body there is expected.
+                    // An interface or abstract class dispatches through overrides.
                     const abstract_owner = c.is_interface or c.is_abstract;
                     self.walk(c.members, pkg, c.name.name, abstract_owner);
                 },
@@ -158,10 +145,8 @@ const Scan = struct {
     }
 };
 
-/// Member names the interpreter resolves in hardcoded `callMember` arms rather
-/// than through the binding table, so an `expect` for one is already served and
-/// must not be reported. Mirrors the `("name", arity)` arms in
-/// `host_call_member.zig`, which are not otherwise enumerable.
+/// Names the interpreter resolves in hardcoded `callMember` arms, not the binding table,
+/// so an `expect` for one is served. Mirrors `host_call_member.zig`, not otherwise enumerable.
 const INTERP_BUILTIN_MEMBERS = [_][]const u8{
     // Reified enum reflection, resolved in `call_func_typed` (not a binding).
     "enumValues",
@@ -217,8 +202,7 @@ const CANDIDATE_PREFIXES = [_][]const u8{
     "kotlin.sequences",
 };
 
-/// Candidate intrinsic FQNs for an `expect`, generous so a binding under any
-/// plausible package or owner spelling counts. Owned by `allocator`.
+/// Candidate intrinsic FQNs, generous so any plausible spelling counts; owned by `allocator`.
 fn candidateFqns(
     allocator: std.mem.Allocator,
     pkg: []const u8,
@@ -239,14 +223,12 @@ fn candidateFqns(
             try out.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ p, name }));
         }
     }
-    // A bare `pkg.name` and `owner.name` fallback for unusual keyings.
     if (owner) |o| {
         try out.append(allocator, try std.fmt.allocPrint(allocator, "{s}.{s}", .{ o, name }));
     }
     return out.toOwnedSlice(allocator);
 }
 
-/// `(owner, name)` pair used to key member / extension intrinsics.
 const OwnerName = struct { owner: []const u8, name: []const u8 };
 
 const OwnerNameContext = struct {
@@ -264,7 +246,7 @@ const OwnerNameContext = struct {
 
 const OwnerNameSet = std.HashMap(OwnerName, void, OwnerNameContext, std.hash_map.default_max_load_percentage);
 
-/// Display name `pkg.owner.name`, dropping empty segments. Owned by `allocator`.
+/// `pkg.owner.name` with empty segments dropped; owned by `allocator`.
 fn displayName(
     allocator: std.mem.Allocator,
     pkg: []const u8,
@@ -293,8 +275,7 @@ pub fn runCheckUnimplemented(
     features: *const RequestedFeatures,
 ) u8 {
     if (files.len == 0) {
-        // Silent under the test runner: the usage test checks the exit code, and
-        // stray stderr makes `zig build test` flag the passing command as failed.
+        // Silent under the test runner: stray stderr makes a passing command read as failed.
         if (!@import("builtin").is_test) io.writeStderr("usage: klio check --unimplemented <file.kt> [...]\n");
         return 2;
     }
@@ -334,9 +315,8 @@ pub fn runCheckUnimplemented(
 
     var bindings = mergedHostBindings(gpa);
     defer bindings.deinit();
-    // Index every registered intrinsic by (owner, name) and by top-level name.
-    // Intrinsics are keyed `pkg.Owner.name` (member or extension) or `pkg.name`
-    // (top-level), so matching the real key set catches any package spelling.
+    // Intrinsics are keyed `pkg.Owner.name` (member or extension) or `pkg.name` (top
+    // level), so indexing the real key set catches any package spelling.
     var intrinsic_owner_name = OwnerNameSet.init(arena);
     defer intrinsic_owner_name.deinit();
     var intrinsic_top_name = std.StringHashMap(void).init(arena);
@@ -347,8 +327,7 @@ pub fn runCheckUnimplemented(
             const fqn = entry.key_ptr.*;
             const name = lastSegment(fqn) orelse continue;
             if (secondToLastSegment(fqn)) |prev| {
-                // A capitalised preceding segment is a type owner; a lowercase
-                // one is a package component (top-level fn).
+                // A capitalised preceding segment is a type owner, a lowercase one a package.
                 if (prev.len != 0 and std.ascii.isUpper(prev[0])) {
                     intrinsic_owner_name.put(.{ .owner = prev, .name = name }, {}) catch {};
                     continue;
@@ -363,9 +342,7 @@ pub fn runCheckUnimplemented(
     var seen = std.StringHashMap(void).init(arena);
     defer seen.deinit();
     for (scan.expects.items) |*e| {
-        // A Kotlin `actual` / body for this owner+name implements it.
         if (scan.implemented.contains(implKey(arena, e.owner, e.name))) continue;
-        // A registered host intrinsic under any candidate FQN implements it.
         const candidates = candidateFqns(arena, e.pkg, e.owner, e.name) catch return 2;
         var served = false;
         for (candidates) |fqn| {
@@ -375,18 +352,15 @@ pub fn runCheckUnimplemented(
             }
         }
         if (served) continue;
-        // Or one indexed by (owner, name). A top-level intrinsic of the same
-        // name also serves an extension: `kotlin.math.absoluteValue` backs the
-        // `Double.absoluteValue` property.
+        // A top-level intrinsic serves an extension too: `kotlin.math.absoluteValue`
+        // backs the `Double.absoluteValue` property.
         if (e.owner) |o| {
             if (intrinsic_owner_name.contains(.{ .owner = o, .name = e.name })) continue;
         }
         if (intrinsic_top_name.contains(e.name)) continue;
-        // Or a core interpreter builtin serves it directly.
         if (isInterpBuiltinMember(e.name)) continue;
 
         const display = displayName(arena, e.pkg, e.owner, e.name);
-        // Collapse overload sets / duplicate expects to one line.
         const gop = seen.getOrPut(display) catch return 2;
         if (gop.found_existing) continue;
 
@@ -406,7 +380,6 @@ pub fn runCheckUnimplemented(
         return 0;
     }
 
-    // Package prefix first (everything before the last `.`), then display name.
     std.mem.sort(Missing, missing.items, {}, missingPkgLessThan);
 
     io.printStdout(
@@ -431,7 +404,6 @@ fn scanFile(scan: *Scan, arena: std.mem.Allocator, f: *const KotlinFile) void {
     scan.walk(f.decls, pkg, null, false);
 }
 
-/// Join a file's package path segments with `.` (empty when no header).
 fn packageName(arena: std.mem.Allocator, f: *const KotlinFile) []const u8 {
     const header = f.package orelse return "";
     var parts: std.ArrayList([]const u8) = .empty;
@@ -440,14 +412,12 @@ fn packageName(arena: std.mem.Allocator, f: *const KotlinFile) []const u8 {
     return std.mem.join(arena, ".", parts.items) catch "";
 }
 
-/// Last `.`-delimited segment of an FQN.
 fn lastSegment(fqn: []const u8) ?[]const u8 {
     if (fqn.len == 0) return null;
     if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| return fqn[dot + 1 ..];
     return fqn;
 }
 
-/// Second-to-last `.`-delimited segment of an FQN.
 fn secondToLastSegment(fqn: []const u8) ?[]const u8 {
     const last_dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return null;
     const head = fqn[0..last_dot];
@@ -455,7 +425,6 @@ fn secondToLastSegment(fqn: []const u8) ?[]const u8 {
     return head;
 }
 
-/// Package prefix of a display name: everything before the final `.`, or `""`.
 fn displayPkg(display: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, display, '.')) |dot| return display[0..dot];
     return "";

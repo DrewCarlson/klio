@@ -1,15 +1,13 @@
-//! Reference runners: `kotlinc-native` and JVM `kotlinc`, both downloaded on
-//! demand via `parity`'s install machinery and never assumed on PATH. Compiled
-//! artifacts are cached under `target/bench-cache/` keyed by source-content
-//! hash, so repeated bench passes do not recompile.
+//! Reference runners: `kotlinc-native` and JVM `kotlinc`, downloaded on demand
+//! and never assumed on PATH. Artifacts cache under `target/bench-cache/` keyed
+//! by source-content hash.
 
 const std = @import("std");
 const parity = @import("parity");
 
 pub const KOTLIN_JVM_VERSION: []const u8 = "2.4.0";
 
-/// Error outcome of a reference-runner invocation, carried as data so the
-/// caller decides how to surface it. `deinit` frees the heap-text variants.
+/// Carried as data; `deinit` frees the heap-text variants.
 pub const RefError = union(enum) {
     Io: []const u8,
     Install: []const u8,
@@ -27,7 +25,7 @@ pub const RefError = union(enum) {
         }
     }
 
-    /// Render the error message. Caller owns the returned bytes.
+    /// Caller owns the returned bytes.
     pub fn message(self: RefError, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return switch (self) {
             .Io => |s| std.fmt.allocPrint(allocator, "io: {s}", .{s}),
@@ -75,8 +73,7 @@ fn isFile(io: std.Io, path: []const u8) bool {
     return st.kind == .file;
 }
 
-/// Look up one environment variable from the parent process. Reads
-/// `/proc/self/environ`; returns an owned copy of the value or `null`.
+/// Reads `/proc/self/environ`; returns an owned copy or null.
 fn getEnvVar(allocator: std.mem.Allocator, io: std.Io, name: []const u8) std.mem.Allocator.Error!?[]u8 {
     const data = std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/environ", allocator, .unlimited) catch
         return null;
@@ -92,8 +89,7 @@ fn getEnvVar(allocator: std.mem.Allocator, io: std.Io, name: []const u8) std.mem
     return null;
 }
 
-/// Build an `Environ.Map` from the parent process environment so spawned
-/// children inherit PATH/JAVA_HOME/etc. Caller deinits the map.
+/// Parent-process environment so children inherit PATH/JAVA_HOME. Caller deinits.
 fn procEnvMap(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!std.process.Environ.Map {
     var map = std.process.Environ.Map.init(allocator);
     errdefer map.deinit();
@@ -109,8 +105,7 @@ fn procEnvMap(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!
     return map;
 }
 
-/// Locate the requested `kotlinc` via the `parity` install machinery. Caller
-/// owns the returned path; `label` prefixes any install error.
+/// Caller owns the returned path; `label` prefixes any install error.
 fn findKotlinc(allocator: std.mem.Allocator, kind: parity.KotlincKind, label: []const u8) std.mem.Allocator.Error!RefResultPath {
     const r = try parity.findKotlincKind(allocator, kind);
     switch (r) {
@@ -137,7 +132,6 @@ fn termOk(term: std.process.Child.Term) bool {
     };
 }
 
-/// Time a single end-to-end run of `kotlinc-native` (compile + execute).
 /// Compilation is cached; only the execution time is measured.
 pub fn timeKotlincNative(allocator: std.mem.Allocator, io: std.Io, file: []const u8, iters: u32) std.mem.Allocator.Error!RefResult {
     const kpath = try findKotlinc(allocator, .Native, "kotlinc-native");
@@ -297,7 +291,6 @@ fn installKotlincJvm(
     std.Io.Dir.cwd().deleteTree(io, staging) catch {};
     std.Io.Dir.cwd().deleteFile(io, archive_path) catch {};
 
-    // Make scripts executable.
     for ([_][]const u8{ "kotlinc", "kotlin", "kotlinc-jvm" }) |name| {
         const p = std.fs.path.join(allocator, &.{ dest, "bin", name }) catch continue;
         defer allocator.free(p);

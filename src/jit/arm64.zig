@@ -11,11 +11,9 @@
 //!   rsi (arg1)                               -> x1
 //!   xmm0 / xmm1                              -> v0 / v1
 //! Internal scratch (never a role): x12 (div quotient), x16/x17 (addr/imm).
-//!
 //! C entry contract: the native unit takes the slots pointer in arg0 and
-//! returns its result code in the rax-role, which `ret` reconciles to x0, the
-//! AAPCS return register. `push`/`pop` pair the REGS save with the link
-//! register so a trampoline `blr` is transparent.
+//! returns its result in the rax-role, which `ret` reconciles to x0. `push`/
+//! `pop` pair the REGS save with LR so a trampoline `blr` is transparent.
 
 const std = @import("std");
 const root = @import("jit.zig");
@@ -27,7 +25,6 @@ const Cond = root.Cond;
 const SetCc = root.SetCc;
 const ElemW = root.ElemW;
 
-/// AArch64 register number for an x86-role register.
 fn gp(r: Reg) u32 {
     return switch (r) {
         .rax => 9,
@@ -36,8 +33,7 @@ fn gp(r: Reg) u32 {
         .rbx => 19,
         .rsi => 1,
         .rdi => 0,
-        // Not used as physical registers by the compiler; mapped to spare
-        // callee/caller regs so an accidental use is still a valid encoding.
+        // Never physical registers here; mapped to spares so a use still encodes.
         .rsp => 28,
         .rbp => 29,
         .r8 => 2,
@@ -60,8 +56,7 @@ const LR: u32 = 30;
 const TMP_DIV: u32 = 12;
 const TMP_ADDR: u32 = 16;
 
-/// AArch64 4-bit condition code for a compare result: signed forms follow
-/// `cmp`, `a`/`ae`/`be` only ever follow `fcmp`, and `e`/`ne` suit both.
+/// Signed forms follow `cmp`, `a`/`ae`/`be` only `fcmp`, `e`/`ne` either.
 fn condCode(c: Cond) u32 {
     return switch (c) {
         .e => 0b0000, // EQ
@@ -102,7 +97,7 @@ pub const Emitter = struct {
 
     pub const Label = usize;
 
-    /// A branch whose 19- or 26-bit offset is patched when its target binds.
+    /// A 19- or 26-bit offset patched when its target binds.
     const Fixup = struct { at: usize, wide: bool, target: Label };
 
     pub fn init(a: std.mem.Allocator) Emitter {
@@ -123,7 +118,6 @@ pub const Emitter = struct {
         self.buf.appendSlice(self.a, &le) catch return JitError.OutOfMemory;
     }
 
-    /// `movz`/`movk` sequence loading a full 64-bit immediate into `rd`.
     fn movImmRaw(self: *Emitter, rd: u32, v: u64) JitError!void {
         try self.inst(0xD2800000 | (@as(u32, @intCast(v & 0xFFFF)) << 5) | rd); // movz rd, #lo16
         var hw: u6 = 1;
@@ -209,8 +203,7 @@ pub const Emitter = struct {
     pub fn cqo(self: *Emitter) JitError!void {
         _ = self;
     }
-    /// Divide T0(rax/x9) by `src`, leaving the quotient in T0 and the remainder
-    /// in T2(rdx/x11), the post-idiv register contract the compiler reads.
+    /// Quotient in T0, remainder in T2: the post-idiv contract the compiler reads.
     pub fn idivReg(self: *Emitter, src: Reg) JitError!void {
         const dividend: u32 = gp(.rax);
         const divisor: u32 = gp(src);
@@ -223,7 +216,6 @@ pub const Emitter = struct {
         try self.inst(0xAA0003E0 | (TMP_DIV << 16) | dividend);
     }
 
-    /// Shift `dst` by the count in the rcx role (x10).
     fn shiftBy(self: *Emitter, dst: Reg, op2: u32, w64: bool) JitError!void {
         const base: u32 = if (w64) 0x9AC00000 else 0x1AC00000;
         const d = gp(dst);
@@ -239,8 +231,7 @@ pub const Emitter = struct {
         try self.shiftBy(dst, 0x2400, w64); // lsrv
     }
 
-    /// Effective-address load/store with a 12-bit scaled unsigned offset when
-    /// the displacement fits, else a materialized register offset.
+    /// 12-bit scaled unsigned offset when the displacement fits, else a register.
     fn memScaled(self: *Emitter, op_uoff: u32, op_roff: u32, t: u32, base: Reg, disp: i32, scale_log2: u5) JitError!void {
         const n = gp(base);
         const scale: i32 = @as(i32, 1) << scale_log2;
@@ -267,8 +258,7 @@ pub const Emitter = struct {
         try self.memScaled(0x39000000, 0x38206800, TMP_DIV, base, disp, 0); // strb w
     }
 
-    /// Saves `r` together with the link register so a trampoline `blr` in the
-    /// body is transparent: `pop` restores LR before `ret`.
+    /// Saves `r` with LR so a trampoline `blr` is transparent; `pop` restores LR.
     pub fn push(self: *Emitter, r: Reg) JitError!void {
         // stp r, lr, [sp, #-16]!   (pre-index, imm7 = -2)
         try self.inst(0xA9800000 | (0x7E << 15) | (LR << 10) | (SP << 5) | gp(r));
@@ -283,8 +273,7 @@ pub const Emitter = struct {
         try self.inst(0xAA0003E0 | (gp(.rax) << 16) | 0);
         try self.inst(0xD65F03C0); // ret
     }
-    /// `blr target`, then move the AAPCS return value (x0) into the rax-role so
-    /// the compiler's post-call `testReg(.rax, .rax)` sees the trampoline result.
+    /// `blr target`, then x0 into the rax-role for the post-call `testReg`.
     pub fn callReg(self: *Emitter, target: Reg) JitError!void {
         try self.inst(0xD63F0000 | (gp(target) << 5));
         try self.inst(0xAA0003E0 | (0 << 16) | gp(.rax)); // mov rax, x0
@@ -339,14 +328,14 @@ pub const Emitter = struct {
     pub fn divss(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.fpRRR(0x1E201800, dst, src);
     }
-    /// `fcmp dst, src`: sets NZCV (V=1 on unordered) for the cond mapping.
+    /// Sets NZCV (V=1 on unordered) for the cond mapping.
     pub fn ucomisd(self: *Emitter, a: Xmm, b: Xmm) JitError!void {
         try self.inst(0x1E602000 | (fp(b) << 16) | (fp(a) << 5));
     }
     pub fn ucomiss(self: *Emitter, a: Xmm, b: Xmm) JitError!void {
         try self.inst(0x1E202000 | (fp(b) << 16) | (fp(a) << 5));
     }
-    /// `eor Vd.8B, Vn.8B, Vm.8B`: zeroes the register when dst==src.
+    /// Zeroes the register when dst==src.
     pub fn xorps(self: *Emitter, dst: Xmm, src: Xmm) JitError!void {
         try self.inst(0x2E201C00 | (fp(src) << 16) | (fp(dst) << 5) | fp(dst));
     }
@@ -383,9 +372,8 @@ pub const Emitter = struct {
             .b64 => 3,
         };
     }
-    /// `[base + index, lsl #log2(scale)]` register-offset addressing. `scale`
-    /// from the compiler always equals the element size, matching AArch64's
-    /// scaled-register-offset requirement (shift amount = access-size log2).
+    /// `[base + index, lsl #log2(scale)]`. `scale` always equals the element
+    /// size, which AArch64 scaled-register-offset addressing requires.
     pub fn loadSib(self: *Emitter, dst: Reg, base: Reg, index: Reg, scale: u8, w: ElemW) JitError!void {
         _ = scale;
         const sh: u32 = elemLog2(w);
@@ -488,7 +476,6 @@ test "arm64: add/sub/mul/neg of args (rdi,rsi)" {
     if (!arch_ok) return error.SkipZigTest;
     var em = Emitter.init(testing.allocator);
     defer em.deinit();
-    // rax = ((a - b) * b); a=rdi, b=rsi
     try em.movReg(.rax, .rdi);
     try em.subReg(.rax, .rsi);
     try em.imulReg(.rax, .rsi);
@@ -523,7 +510,6 @@ test "arm64: counted loop (labels + jcc + jmp)" {
     if (!arch_ok) return error.SkipZigTest;
     var em = Emitter.init(testing.allocator);
     defer em.deinit();
-    // f(n=rdi) = sum(0..n-1)
     try em.movImm64(.rax, 0);
     try em.movImm64(.rcx, 0);
     const top = try em.newLabel();
@@ -587,7 +573,6 @@ test "arm64: shifts by cl (rcx), 32- and 64-bit" {
     if (!arch_ok) return error.SkipZigTest;
     var em = Emitter.init(testing.allocator);
     defer em.deinit();
-    // (a << b) 64-bit ; a=rdi, b=rcx<-rsi
     try em.movReg(.rax, .rdi);
     try em.movReg(.rcx, .rsi);
     try em.shlCl(.rax, true);
@@ -598,21 +583,18 @@ test "arm64: shifts by cl (rcx), 32- and 64-bit" {
 
     var em2 = Emitter.init(testing.allocator);
     defer em2.deinit();
-    // (a >> b) 32-bit arithmetic
     try em2.movReg(.rax, .rdi);
     try em2.movReg(.rcx, .rsi);
     try em2.sarCl(.rax, false);
     try em2.ret();
     const g = try run0(&em2, *const fn (i64, i64) callconv(.c) u64);
-    // 32-bit asr yields the 32-bit result zero-extended into the 64-bit reg,
-    // matching x86's 32-bit-op upper-clear; the caller sign-extends if needed.
+    // 32-bit asr zero-extends into the 64-bit reg, as x86's 32-bit ops do.
     try testing.expectEqual(@as(u64, 0xFFFF_FFFC), g(-16, 2));
     try testing.expectEqual(@as(u64, 5), g(20, 2));
 }
 
 test "arm64: signed divide and remainder (idiv contract)" {
     if (!arch_ok) return error.SkipZigTest;
-    // quotient: dividend T0(rax)<-rdi, divisor T1(rcx)<-rsi
     var em = Emitter.init(testing.allocator);
     defer em.deinit();
     try em.movReg(.rax, .rdi);
@@ -625,7 +607,6 @@ test "arm64: signed divide and remainder (idiv contract)" {
     try testing.expectEqual(@as(i64, -7), q(-47, 6));
     try testing.expectEqual(@as(i64, 0), q(5, 6));
 
-    // remainder is left in T2(rdx); read it back
     var em2 = Emitter.init(testing.allocator);
     defer em2.deinit();
     try em2.movReg(.rax, .rdi);
@@ -643,7 +624,6 @@ test "arm64: SIB byte + scaled-word array access" {
     if (!arch_ok) return error.SkipZigTest;
     var em = Emitter.init(testing.allocator);
     defer em.deinit();
-    // buf[i]=1 (byte), return buf[i]; buf=rdi, i=rsi
     try em.movImm64(.rax, 1);
     try em.storeSib(.rdi, .rsi, 1, .rax, .b8u);
     try em.loadSib(.rax, .rdi, .rsi, 1, .b8u);
@@ -668,7 +648,6 @@ test "arm64: double arithmetic over a slot file" {
     if (!arch_ok) return error.SkipZigTest;
     var em = Emitter.init(testing.allocator);
     defer em.deinit();
-    // fn(rdi=*[2]f64) -> f64 : s0*s1 + s0
     try em.push(.rbx);
     try em.movReg(.rbx, .rdi);
     try em.movsdLoad(.xmm0, .rbx, 0);

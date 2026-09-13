@@ -1,6 +1,5 @@
-//! Mines factory IDs, default severities, and message templates out of the
-//! upstream compiler's `FirErrors.kt` and `FirErrorsDefaultMessages.kt` and
-//! emits them as Zig constants in `src/diagnostics/generated/factories.zig`.
+//! Mines factory IDs, severities, and message templates from the upstream
+//! `FirErrors.kt` and `FirErrorsDefaultMessages.kt` into `src/diagnostics/generated/factories.zig`.
 
 const std = @import("std");
 
@@ -14,7 +13,6 @@ pub const Severity = enum {
     Error,
     Warning,
 
-    /// Enum-literal form of `diagnostics.Severity` for the generated table.
     pub fn asZig(self: Severity) []const u8 {
         return switch (self) {
             .Error => ".Error",
@@ -34,13 +32,11 @@ pub const Factory = struct {
     }
 };
 
-/// `name → severity` entry parsed from a `FirErrors.kt`-shaped file.
 pub const SeverityEntry = struct {
     name: []const u8,
     severity: Severity,
 };
 
-/// `name → template` entry parsed from the default-messages map.
 pub const MessageEntry = struct {
     name: []const u8,
     template: []const u8,
@@ -58,10 +54,8 @@ fn lessByFactoryName(_: void, a: Factory, b: Factory) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-/// Severity per factory, read from every
-/// `val NAME: KtDiagnosticFactoryN<…> = KtDiagnosticFactoryN("NAME", SEVERITY, …)`
-/// line, sorted by name with later duplicates winning. Caller frees the slice
-/// and its names with `freeSeverityEntries`.
+/// Severity per factory, from `val NAME: … = KtDiagnosticFactoryN("NAME", SEVERITY, …)`
+/// lines, name-sorted with later duplicates winning. Caller frees with `freeSeverityEntries`.
 pub fn parseFactories(allocator: Allocator, src: []const u8) Allocator.Error![]SeverityEntry {
     var map = std.StringHashMap(Severity).init(allocator);
     defer map.deinit();
@@ -80,7 +74,6 @@ pub fn parseFactories(allocator: Allocator, src: []const u8) Allocator.Error![]S
         if (!std.mem.startsWith(u8, rhs, "KtDiagnosticFactory")) continue;
         const open = std.mem.indexOfScalar(u8, rhs, '(') orelse continue;
         const args = rhs[open + 1 ..];
-        // First arg is "NAME", second is SEVERITY (ERROR/WARNING).
         const quote_start = std.mem.indexOfScalar(u8, args, '"') orelse continue;
         const after_quote = args[quote_start + 1 ..];
         const quote_end = std.mem.indexOfScalar(u8, after_quote, '"') orelse continue;
@@ -118,9 +111,8 @@ pub fn freeSeverityEntries(allocator: Allocator, entries: []SeverityEntry) void 
     allocator.free(entries);
 }
 
-/// Template per factory, read from every `map.put(NAME, "template", …)` line,
-/// sorted by name with later duplicates winning. Caller frees the slice and its
-/// strings with `freeMessageEntries`.
+/// Template per factory, from `map.put(NAME, "template", …)` lines, name-sorted
+/// with later duplicates winning. Caller frees with `freeMessageEntries`.
 pub fn parseMessages(allocator: Allocator, src: []const u8) Allocator.Error![]MessageEntry {
     var map = std.StringHashMap([]const u8).init(allocator);
     defer map.deinit();
@@ -142,7 +134,6 @@ pub fn parseMessages(allocator: Allocator, src: []const u8) Allocator.Error![]Me
         const rest = trimStart(after_open[comma + 1 ..]);
         if (rest.len == 0 or rest[0] != '"') continue;
         const body = rest[1..];
-        // Find the matching close quote, respecting `\"` escapes.
         var end: ?usize = null;
         var prev: u8 = 0;
         for (body, 0..) |c, idx| {
@@ -190,9 +181,8 @@ fn lookupMessage(messages: []const MessageEntry, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Sorted factory table from the two upstream files under `stdlib_root`; a
-/// missing or unreadable file reads as empty. Caller frees with
-/// `freeFactories`.
+/// Name-sorted factory table from the two upstream files under `stdlib_root`; a
+/// missing or unreadable file reads as empty. Caller frees with `freeFactories`.
 pub fn mine(allocator: Allocator, io: Io, stdlib_root: []const u8) Allocator.Error![]Factory {
     const fir_errors = try std.fs.path.join(allocator, &.{
         stdlib_root,
@@ -238,8 +228,8 @@ pub fn freeFactories(allocator: Allocator, factories: []Factory) void {
     allocator.free(factories);
 }
 
-/// Append `s` to `out` as a Zig string literal: backslash and quote are
-/// escaped, control bytes become `\n`, `\r`, `\t`, or `\xNN`.
+/// Appends `s` to `out` as a Zig string literal: backslash and quote escape,
+/// control bytes become `\n`, `\r`, `\t`, or `\xNN`.
 fn writeEscaped(out: *std.ArrayList(u8), allocator: Allocator, s: []const u8) Allocator.Error!void {
     try out.append(allocator, '"');
     for (s) |c| {
@@ -263,7 +253,7 @@ fn writeEscaped(out: *std.ArrayList(u8), allocator: Allocator, s: []const u8) Al
     try out.append(allocator, '"');
 }
 
-/// Render the generated Zig module. Caller owns the returned bytes.
+/// Renders the generated Zig module; caller owns the returned bytes.
 pub fn render(allocator: Allocator, factories: []const Factory) Allocator.Error![]u8 {
     var s: std.ArrayList(u8) = .empty;
     errdefer s.deinit(allocator);
@@ -379,7 +369,6 @@ test "render escapes backslashes in message templates" {
     };
     const out = try render(testing.allocator, &factories);
     defer testing.allocator.free(out);
-    // The message contains a literal backslash-n which must render as `\\n`.
     try testing.expect(std.mem.indexOf(u8, out, ".message_template = \"line\\\\nbreak\",") != null);
 }
 

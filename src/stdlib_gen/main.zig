@@ -1,7 +1,5 @@
-//! Stdlib codegen entry point, exposing `run` over parsed arguments rather than
-//! a real `main`. `build` mines the upstream stdlib sources and emits the
-//! encoded symbol index for `stdlib`; `coverage` prints implemented and total
-//! counts from the generated registry.
+//! Stdlib codegen entry point. `build` mines the upstream stdlib sources and
+//! emits the encoded symbol index for `stdlib`; `coverage` prints registry counts.
 
 const std = @import("std");
 
@@ -13,7 +11,6 @@ const emit = @import("emit.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-/// Process exit codes for this tool.
 pub const SUCCESS: u8 = 0;
 pub const FAILURE: u8 = 1;
 pub const STDLIB_MISSING: u8 = 2;
@@ -30,8 +27,7 @@ pub const Cmd = union(enum) {
     };
 };
 
-/// Run a parsed subcommand. `writer`/`err_writer` take stdout/stderr text;
-/// the result is the process exit code.
+/// Runs a parsed subcommand and returns the process exit code.
 pub fn run(
     allocator: Allocator,
     io: Io,
@@ -45,7 +41,7 @@ pub fn run(
     };
 }
 
-/// Workspace root: the generator runs from it, so paths stay relative to cwd.
+/// The generator runs from the workspace root, so paths stay relative to cwd.
 fn workspaceRoot(allocator: Allocator) Allocator.Error![]const u8 {
     return allocator.dupe(u8, ".");
 }

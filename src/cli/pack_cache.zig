@@ -1,7 +1,6 @@
-//! Pack cache and installed-pack loading. Walks the local pack cache, parses
-//! each pack the user imports so resolution and type inference see its real
-//! signatures, consumes the embedded stdlib's curated sources, and merges every
-//! pack's host bindings into the single table the loader installs.
+//! Pack cache and installed-pack loading: walk the cache, parse each pack the
+//! user imports, consume the embedded stdlib's curated sources, and merge every
+//! pack's host bindings into one table.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -41,96 +40,72 @@ const ktor_client = @import("ktor_client");
 const io = @import("io.zig");
 const qualified_refs = @import("qualified_refs.zig");
 
-/// `library_id` -> set of feature names a consumer requested. Seeds the
-/// loader's feature resolution; default features are added on top unless a
-/// request opts out.
+/// `library_id` -> requested features; defaults are added unless opted out.
 pub const RequestedFeatures = std.StringHashMap(std.StringHashMap(void));
 
-/// Result of loading installed packs: the parsed pack ASTs and the
-/// merged host-binding table their `host_symbol` keys resolve against.
+/// Parsed pack ASTs plus the table their `host_symbol` keys resolve against.
 pub const LoadedPacks = struct {
     asts: []const KotlinFile,
     bindings: HostBindings,
 };
 
-/// What the embedded-stdlib source load saw and did, for the stdlib-image fast
-/// path: the package universe behind the load gate, the packages it registered,
-/// and the host-binding FQNs it installed. Strings are owned by the loader's
-/// allocator.
+/// What the embedded-stdlib source load did. Strings owned by the loader.
 pub const EmbeddedReport = struct {
-    /// Package of every parsed curated source (deduplicated).
     pkgs: std.ArrayList([]const u8) = .empty,
     any_non_implicit: bool = false,
     /// The gate the load used (true = the full curated set loaded).
     gate_full: bool = false,
-    /// Packages registered via `stdlib.registerKnownPackage`.
     known_packages: std.ArrayList([]const u8) = .empty,
-    /// Host-binding FQNs registered into the installed overlay.
     binding_fqns: std.ArrayList([]const u8) = .empty,
 };
 
-/// One pack the loader selected, identified for cache keying: its cache
-/// path, the pack's stored content hash, and the resolved active feature
-/// names (sorted). Strings are dupes owned by the loader's allocator.
+/// One selected pack, identified for cache keying: cache path, stored content
+/// hash, resolved active feature names (sorted). Strings owned by the loader.
 pub const SelectedPack = struct {
     path: []const u8,
     hash: [pack.format.HASH_LEN]u8,
     features: []const []const u8,
 };
 
-/// Out-param describing one load for the stdlib-image fast path.
 pub const Selection = struct {
     packs: std.ArrayList(SelectedPack) = .empty,
-    /// The import-prefix universe at fixpoint end (user imports plus
-    /// imports discovered in loaded pack sources); the embedded-stdlib
-    /// load gate is a function of this set.
+    /// The import-prefix universe at fixpoint end; the load gate reads it.
     final_prefixes: std.ArrayList([]const u8) = .empty,
 };
 
-/// Knobs for `loadInstalledPacksOpts`.
 pub const LoadOptions = struct {
-    /// When false, the embedded stdlib sources are skipped entirely (the caller
-    /// supplies their lowered form from a baked image) and only cache packs load.
+    /// When false, only cache packs load; the caller supplies the lowered stdlib.
     include_stdlib: bool = true,
     embedded_report: ?*EmbeddedReport = null,
     selection: ?*Selection = null,
-    /// When false, wanted-but-undecodable installed packs are skipped without the
-    /// stderr warning, so a broken pack is reported once per run, not per load.
+    /// When false, an undecodable wanted pack is skipped without the warning.
     report_failures: bool = true,
-    /// When false, the caller keeps only the load's side products (bindings,
-    /// known packages, selection, import fixed point) and drops the ASTs. A pack
-    /// carrying the precomputed `imports` section then skips parsing its sources.
+    /// When false, the ASTs are dropped and a pack carrying the `imports`
+    /// section skips parsing its sources.
     asts_needed: bool = true,
 };
 
-/// A path-or-error pair: `ok` is an owned path, `err` an owned message. The
-/// caller frees whichever is set, with the producing function's allocator.
+/// `ok` is an owned path, `err` an owned message; the caller frees whichever is set.
 pub const PathResult = union(enum) {
     ok: []u8,
     err: []u8,
 };
 
-/// An owned error message, or none on success.
 pub const VoidResult = union(enum) {
     ok: void,
     err: []u8,
 };
 
-/// A manifest-or-error pair; `ok` carries an owned manifest the caller deinits.
 pub const ManifestResult = union(enum) {
     ok: schema.PackManifest,
     err: []u8,
 };
 
-// Environment access.
 
-/// Read one environment variable from the parent process, returning an owned
-/// copy or null. Used for `HOME` and `KLIO_PACK_DIAG`.
 fn getEnvVar(allocator: Allocator, name: []const u8) ?[]u8 {
     return runtime.procEnvGetVar(allocator, name) catch null;
 }
 
-/// True when `name` is present in the environment with any value.
 fn envVarPresent(allocator: Allocator, name: []const u8) bool {
     if (getEnvVar(allocator, name)) |v| {
         allocator.free(v);
@@ -139,22 +114,17 @@ fn envVarPresent(allocator: Allocator, name: []const u8) bool {
     return false;
 }
 
-/// Build an `Environ.Map` from the parent process environment so the
-/// stdlib-pack loader can consult `KLIO_STDLIB_PACK`. Caller deinits.
 fn procEnvMap(allocator: Allocator) std.process.Environ.Map {
     var map = std.process.Environ.Map.init(allocator);
     runtime.procEnvPutAllInto(allocator, &map);
     return map;
 }
 
-/// A throwaway threaded `Io` for filesystem work inside a single call.
 fn threadedIo(allocator: Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(allocator, .{});
 }
 
-// Import-prefix helpers.
 
-/// Join an identifier path into a dotted string (`a.b.c`). Caller owns it.
 fn joinIdentPath(allocator: Allocator, path: []const ast.Ident) Allocator.Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -165,11 +135,10 @@ fn joinIdentPath(allocator: Allocator, path: []const ast.Ident) Allocator.Error!
     return buf.toOwnedSlice(allocator);
 }
 
-/// The dotted prefixes a user's AST files imply for the load gate: every
-/// `import` line, plus the package prefix of every package-rooted qualified
-/// reference in the body, since `kotlin.coroutines.Foo` used inline needs no
-/// import in Kotlin and must open the same gated sources. Keys are owned by the
-/// returned map's allocator; deinit with `freeStringSet`.
+/// The dotted prefixes a user's files imply for the load gate: every `import`,
+/// plus the package prefix of every package-rooted qualified reference, since
+/// `kotlin.coroutines.Foo` used inline needs no import in Kotlin. Deinit with
+/// `freeStringSet`.
 fn collectUserImportPrefixes(
     allocator: Allocator,
     user_asts: []const KotlinFile,
@@ -186,10 +155,7 @@ fn collectUserImportPrefixes(
                 gop.value_ptr.* = {};
             }
         }
-        // A file in package P implicitly sees all of P, since same-package
-        // top-level declarations resolve by simple name. Folding the declared
-        // package into the gate set loads a pack whose `library_id` is that
-        // package even when the file imports nothing from it.
+        // A file in package P implicitly sees all of P, so P joins the gate set.
         if (f.package) |pkg| {
             if (pkg.path.len != 0) {
                 const joined = try joinIdentPath(allocator, pkg.path);
@@ -206,10 +172,7 @@ fn collectUserImportPrefixes(
     return out;
 }
 
-/// The package-rooted qualified-reference prefixes of `user_asts`, as owned
-/// dotted strings. The stdlib-image fast path uses this to decide whether to
-/// walk the pack cache, and to feed the load gate for a program that imports
-/// nothing but names a gated package in full. Deinit with `freeStringSet`.
+/// Qualified-reference prefixes of `user_asts`, owned; feeds the load gate.
 pub fn collectQualifiedRefPrefixes(
     allocator: Allocator,
     user_asts: []const KotlinFile,
@@ -217,8 +180,6 @@ pub fn collectQualifiedRefPrefixes(
     return qualified_refs.collect(allocator, user_asts);
 }
 
-/// Fold the package-rooted qualified-reference prefixes of `user_asts` into
-/// `out`, owning fresh keys.
 pub fn mergeQualifiedRefPrefixes(
     allocator: Allocator,
     out: *std.StringHashMap(void),
@@ -242,8 +203,6 @@ fn freeStringSet(set: *std.StringHashMap(void)) void {
     set.deinit();
 }
 
-/// The package path an AST file's `package` header declares, empty when
-/// absent. Caller owns the result.
 fn packagePathOf(allocator: Allocator, file: KotlinFile) Allocator.Error![]u8 {
     if (file.package) |p| {
         return joinIdentPath(allocator, p.path);
@@ -251,16 +210,10 @@ fn packagePathOf(allocator: Allocator, file: KotlinFile) Allocator.Error![]u8 {
     return allocator.dupe(u8, "");
 }
 
-// Embedded stdlib sources.
 
-/// Consume the embedded stdlib pack's `SOURCES` section, the curated upstream
-/// commonMain plus klio actuals. Only the Kotlin sources are parsed and their
-/// packages registered: `SYMBOLS` and `BINDINGS` are already statically linked
-/// into the interpreter, and the cache loop skips any on-disk `stdlib*` pack so
-/// they are not loaded twice.
-///
-/// Gated on the user's imports: the curated set loads only when a user import
-/// prefix-matches a package those sources declare.
+/// Consume the embedded stdlib pack's `SOURCES`. Only the Kotlin sources are
+/// parsed and registered: `SYMBOLS` and `BINDINGS` are statically linked in and
+/// the cache loop skips on-disk `stdlib*` packs. Gated on the user's imports.
 fn loadEmbeddedStdlibSources(
     allocator: Allocator,
     user_import_prefixes: *const std.StringHashMap(void),
@@ -273,9 +226,7 @@ fn loadEmbeddedStdlibSources(
     defer env.deinit();
     var err: PackError = undefined;
     const bytes = (stdlib_pack.stdlibPackBytes(allocator, &env, &err) catch return) orelse {
-        // Every pack source failed (override, cwd checkout, embedded bytes).
-        // Surface the builder's message instead of dying later on an
-        // unresolved stdlib global.
+        // Every pack source failed; surface the builder's message now.
         io.printStderr(allocator, "error: stdlib sources unavailable: {f}\n", .{err});
         io.printStderr(allocator, "set KLIO_STDLIB_PACK to a stdlib .klio-pack, or run from a klio checkout\n", .{});
         return;
@@ -290,9 +241,7 @@ fn loadEmbeddedStdlibSources(
 
     const diag = envVarPresent(allocator, "KLIO_PACK_DIAG");
 
-    // Parse each source once, recording its package header. The curated set is
-    // an interdependent unit: load every file iff some user import matches any
-    // package the set declares.
+    // The curated set is interdependent: all of it loads, or none.
     const Parsed = struct { pkg: []u8, file: KotlinFile };
     var parsed: std.ArrayList(Parsed) = .empty;
     defer {
@@ -301,8 +250,7 @@ fn loadEmbeddedStdlibSources(
     }
 
     for (bundle.files) |sf| {
-        // Sources that parse but whose interpreted declarations would shadow
-        // klio's host intrinsics; the intrinsics serve these APIs instead.
+        // Sources whose interpreted declarations would shadow klio's intrinsics.
         if (stdlib.isConsumptionDeferredSource(sf.rel_path)) continue;
         if (diag and (std.mem.indexOf(u8, sf.rel_path, "Maps.kt") != null or
             std.mem.indexOf(u8, sf.rel_path, "Sets.kt") != null))
@@ -343,9 +291,7 @@ fn loadEmbeddedStdlibSources(
         };
     }
 
-    // Files in implicitly-imported packages (kotlin.collections, kotlin.ranges)
-    // are visible without an import in every Kotlin file, so they always load.
-    // Other curated sources stay all-or-nothing behind a matching user import.
+    // Implicitly-imported packages are visible without an import, so always load.
     var any_non_implicit = false;
     for (parsed.items) |p| {
         if (p.pkg.len != 0 and !stdlib.isImplicitlyImportedPackage(p.pkg)) {
@@ -375,10 +321,7 @@ fn loadEmbeddedStdlibSources(
         }
     }
 
-    // Stdlib-internal closure: an always-loaded implicit file may itself import
-    // a gated curated package, and its resolution must not depend on whether the
-    // user program imported it too. Fixpoint: a file joins the load set when an
-    // already-included file's import lines cover its package.
+    // An implicit file may import a gated package; close over that by fixpoint.
     var include = try allocator.alloc(bool, parsed.items.len);
     defer allocator.free(include);
     for (parsed.items, 0..) |p, i| {
@@ -426,10 +369,7 @@ fn loadEmbeddedStdlibSources(
         try out_asts.append(allocator, p.file);
     }
 
-    // The curated sources' klio actuals call internal platform helpers whose
-    // Kotlin bodies are inert stubs. Registering their host bindings into the
-    // installed overlay shadows the stubs at dispatch. They come from the
-    // statically-linked stdlib defaults, not the embedded pack's sections.
+    // The curated klio actuals call internal helpers whose bodies are inert stubs.
     var merged = mergedHostBindings(allocator);
     defer merged.deinit();
     const platform_fqns = [_][]const u8{
@@ -449,9 +389,7 @@ fn loadEmbeddedStdlibSources(
     }
 }
 
-/// True when any prefix in `prefixes` matches `pkg` by the bidirectional
-/// dotted-prefix rule: `imp == pkg`, `imp` starts with `pkg.`, or `pkg`
-/// starts with `imp.`.
+/// Bidirectional dotted-prefix match: `imp == pkg`, or either starts with the other plus a dot.
 pub fn importPrefixMatches(
     allocator: Allocator,
     prefixes: *const std.StringHashMap(void),
@@ -467,7 +405,6 @@ pub fn importPrefixMatches(
     return false;
 }
 
-/// True when `s` starts with `prefix` followed by a dot.
 fn dottedPrefix(allocator: Allocator, s: []const u8, prefix: []const u8) bool {
     _ = allocator;
     if (s.len <= prefix.len) return false;
@@ -475,12 +412,10 @@ fn dottedPrefix(allocator: Allocator, s: []const u8, prefix: []const u8) bool {
     return s[prefix.len] == '.';
 }
 
-// Pack candidates and loading.
 
 const PackCandidate = struct {
     pack: PackReader,
     manifest: schema.PackManifest,
-    /// Cache path of the pack file, for selection identity.
     path: []u8,
 
     fn deinit(self: *PackCandidate, allocator: Allocator) void {
@@ -490,10 +425,7 @@ const PackCandidate = struct {
     }
 };
 
-/// An installed `.klio-pack` that could not be decoded (stale format version,
-/// corrupt, unreadable). Kept so the loader can name the pack it skipped when
-/// the program's imports want it, instead of failing later on an unresolved
-/// symbol with no hint.
+/// An installed `.klio-pack` that failed to decode, kept so the loader can name it.
 const FailedPack = struct {
     path: []u8,
     msg: []u8,
@@ -504,11 +436,9 @@ const FailedPack = struct {
     }
 };
 
-/// The library id an installed pack file was named for:
-/// `kotlinx.coroutines-1.11.0.klio-pack` -> `kotlinx.coroutines`. Installed
-/// packs are named `<library_id>-<version>.klio-pack` and the version part
-/// starts at the first `-` followed by a digit. Null when the name does not
-/// follow the convention.
+/// The library id an installed pack was named for. Installed packs are named
+/// `<library_id>-<version>.klio-pack`, the version starting at the first dash
+/// followed by a digit. Null when the name breaks the convention.
 fn packLibIdFromBasename(basename: []const u8) ?[]const u8 {
     const stem = if (std.mem.endsWith(u8, basename, ".klio-pack"))
         basename[0 .. basename.len - ".klio-pack".len]
@@ -524,11 +454,8 @@ fn packLibIdFromBasename(basename: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Read every `.klio-pack` in the cache directory (skipping the embedded
-/// stdlib) and decode its manifest, yielding the candidates the fixpoint loader
-/// picks from. The list and every candidate are owned by the caller. Files that
-/// exist but fail to decode are appended to `failures`, also caller-owned,
-/// rather than dropped silently.
+/// Decode every `.klio-pack` manifest in the cache, skipping the embedded
+/// stdlib. Caller-owned; a file that fails to decode joins `failures`.
 fn collectPackCandidates(allocator: Allocator, cache: []const u8, failures: *std.ArrayList(FailedPack)) Allocator.Error![]PackCandidate {
     var candidates: std.ArrayList(PackCandidate) = .empty;
     errdefer {
@@ -595,8 +522,7 @@ fn appendFailure(
     try failures.append(allocator, .{ .path = path_dup, .msg = msg });
 }
 
-/// Whether `rel_path` falls under any of `sources`, each a path prefix relative
-/// to the pack root (`shim/io/ktor/server`).
+/// Whether `rel_path` falls under any of `sources`, each a pack-root-relative prefix.
 fn sourceInFeature(rel_path: []const u8, sources: [][]const u8) bool {
     for (sources) |pat_raw| {
         const pat = std.mem.trimEnd(u8, pat_raw, "/");
@@ -608,9 +534,7 @@ fn sourceInFeature(rel_path: []const u8, sources: [][]const u8) bool {
     return false;
 }
 
-/// Compute a pack's active feature set: its default features (unless the
-/// request opted out) plus any explicitly requested features, expanded
-/// transitively over each feature's `requires`. Caller deinits the set.
+/// Defaults (unless opted out) plus requested features, expanded over `requires`.
 fn resolveActiveFeatures(
     allocator: Allocator,
     manifest: *const schema.PackManifest,
@@ -644,9 +568,7 @@ fn resolveActiveFeatures(
     return active;
 }
 
-/// True when `rel_path` should load given the pack's features and the
-/// active set: a file gated by some feature loads only if an active
-/// feature gates it; an ungated (core) file always loads.
+/// A file gated by a feature needs it active; an ungated core file always loads.
 fn sourceIsActive(
     rel_path: []const u8,
     manifest: *const schema.PackManifest,
@@ -662,9 +584,7 @@ fn sourceIsActive(
     return !gated;
 }
 
-/// For an inactive gated file, the `(feature_name, source_prefix)` of the first
-/// feature gating it, to hint which feature to enable; null when the file is
-/// core or already active. The slices borrow from `manifest`.
+/// The first feature gating an inactive file, to hint what to enable. Borrows `manifest`.
 const Gate = struct { feature: []const u8, prefix: []const u8 };
 
 fn inactiveGate(
@@ -686,8 +606,7 @@ fn inactiveGate(
     return null;
 }
 
-/// The Kotlin package declared in a source file, for the feature hint: the
-/// first `package a.b.c` statement, or null. Borrows from `bytes`.
+/// The first `package a.b.c` in a source file, for the feature hint. Borrows `bytes`.
 fn packageOfSource(bytes: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
@@ -702,9 +621,7 @@ fn packageOfSource(bytes: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Whether a user import targets a (possibly gated) package: it names that
-/// package (`import pkg.*`) or a member of it (`import pkg.Symbol`). A parent
-/// star-import does not target it.
+/// Whether an import names a package or a member of it. A parent star-import does not.
 fn importMatchesPackage(allocator: Allocator, import: []const u8, pkg: []const u8) bool {
     if (pkg.len == 0) return false;
     if (std.mem.eql(u8, import, pkg)) return true;
@@ -723,10 +640,8 @@ const FeatureHint = struct {
     }
 };
 
-/// Load one resolved pack candidate: register its packages, parse its
-/// sources (or fall back to the frozen AST bundle), and wire up its
-/// bindings. Imports discovered in the pack's files are appended to
-/// `new_imports` so the fixpoint loop can pull in transitive packs.
+/// Load one candidate: register its packages, parse its sources or frozen AST
+/// bundle, wire its bindings, and append discovered imports to `new_imports`.
 fn loadPackCandidate(
     allocator: Allocator,
     c: *const PackCandidate,
@@ -743,18 +658,14 @@ fn loadPackCandidate(
 ) Allocator.Error!void {
     const manifest = &c.manifest;
     const reader = &c.pack;
-    // Teach the resolver every package this pack ships or declares implicit, so
-    // user `import kotlinx.*` lines resolve. Manifests carry the implicit
-    // packages; each AST file's `package` header covers the rest.
+    // Every package this pack ships or declares implicit, so `import x.*` resolves.
     stdlib.registerKnownPackage(manifest.library_id);
     for (manifest.implicit_packages) |p| {
         stdlib.registerKnownPackage(p);
     }
     var loaded_from_sources = false;
     var err: PackError = undefined;
-    // A caller that drops the ASTs needs only the packages, imports and feature
-    // hints a parse would surface, served from the precomputed `imports`
-    // section when the pack carries one.
+    // Served from the precomputed `imports` section when the pack carries one.
     if (!asts_needed) {
         if (reader.readSection(section_names.IMPORTS, &err) catch null) |payload| {
             defer payload.deinit(allocator);
@@ -799,10 +710,9 @@ fn loadPackCandidate(
             return;
         }
     }
-    // Re-parse the pack's Kotlin sources through the shared SourceMap rather
-    // than decoding the frozen `ast` section: it assigns each pack file a fresh
-    // FileId so spans never collide, and is immune to AST-schema drift. The
-    // frozen `ast` bundle serves only when the `sources` section is absent.
+    // Re-parse through the shared SourceMap rather than decoding the frozen
+    // `ast` section: fresh FileIds never collide, and it survives schema drift.
+    // The frozen bundle serves only when `sources` is absent.
     if (reader.readSection(section_names.SOURCES, &err) catch null) |payload| {
         defer payload.deinit(allocator);
         if (schema.decode(schema.SourceBundle, allocator, payload.slice(), &err) catch null) |bundle_val| {
@@ -810,9 +720,8 @@ fn loadPackCandidate(
             defer bundle.deinit(allocator);
             for (bundle.files) |sf| {
                 if (stdlib.isConsumptionDeferredSource(sf.rel_path)) continue;
-                // Feature gating: a source under an inactive feature's roots
-                // is skipped, so the pack's core loads by default. Record a
-                // hint when a user import targets that gated package.
+                // A source under an inactive feature's roots is skipped; record
+                // a hint when a user import targets that gated package.
                 if (!sourceIsActive(sf.rel_path, manifest, active_features)) {
                     if (inactiveGate(sf.rel_path, manifest, active_features)) |gate| {
                         if (packageOfSource(sf.bytes)) |pkg| {
@@ -870,16 +779,13 @@ fn loadPackCandidate(
             defer payload.deinit(allocator);
             if (schema.decode(schema.AstBundle, allocator, payload.slice(), &err) catch null) |ast_bundle_val| {
                 const ast_bundle = ast_bundle_val;
-                // The carried KotlinFiles are pushed into out_asts and outlive
-                // the bundle; free only its spine and the rel_path strings.
+                // The KotlinFiles outlive the bundle; free only its spine.
                 defer {
                     for (ast_bundle.files) |*f| allocator.free(f.rel_path);
                     allocator.free(ast_bundle.files);
                 }
-                // The frozen bundle's spans carry pack-build-local FileIds,
-                // dense from 0, which collide with the run SourceMap's ids.
-                // Rebase every file onto a fresh id before lowering sees it,
-                // registering the real source text so diagnostics render.
+                // Frozen spans carry pack-build-local FileIds, dense from 0,
+                // which collide with the run map. Rebase before lowering.
                 const src_payload = reader.readSection(section_names.SOURCES, &err) catch null;
                 defer if (src_payload) |sp| sp.deinit(allocator);
                 var src_bundle: ?schema.SourceBundle = if (src_payload) |sp|
@@ -934,18 +840,15 @@ fn readPackBindings(
             defer bm.deinit(allocator);
             for (bm.bindings) |b| {
                 if (merged.resolve(b.host_symbol)) |f| {
-                    // HostBindings keys must outlive the table and `bm` is
-                    // freed here. Pack load is one-shot, so a leaked FQN dup
-                    // is bounded.
+                    // `bm` is freed here, so the FQN dup is leaked; load is one-shot.
                     const leaked = allocator.dupe(u8, b.fqn) catch continue;
                     try out_bindings.register(leaked, f);
                 }
             }
         }
     }
-    // Also bring in any merged binding whose FQN sits under the loaded
-    // pack's library_id but isn't explicitly listed in the pack
-    // manifest. Newer host entries take effect without a pack rebuild.
+    // A merged binding under the pack's library_id but absent from the manifest
+    // still applies, so a newer host entry needs no pack rebuild.
     const lib_prefix = std.fmt.allocPrint(allocator, "{s}.", .{lib_id}) catch return;
     defer allocator.free(lib_prefix);
     var entry_it = merged.table.iterator();
@@ -956,18 +859,16 @@ fn readPackBindings(
     }
 }
 
-/// Rewrite every span in a frozen-AST `KotlinFile` from its pack-build-local
-/// FileId to the id the run's shared `SourceMap` assigned it. Spans that do
-/// not carry `old` (placeholder spans) are left alone.
+/// Rebase every span in a frozen-AST file from its pack-build-local FileId to
+/// the run's. Spans that do not carry `old` are left alone.
 fn rebaseFileSpans(file: *KotlinFile, old: span.FileId, new: span.FileId) void {
     if (old == new) return;
     walkSpans(KotlinFile, file, old, new);
 }
 
-/// Recursive reflection walk over the AST mirroring the pack decoder's type
-/// coverage (structs, tagged unions, optionals, single pointers, slices): every
-/// reachable `span.Span` whose file id equals `old` is retargeted to `new`. The
-/// decoder freshly allocated the whole tree, so casting away const is sound.
+/// Recursive reflection walk mirroring the decoder's type coverage; every
+/// reachable `span.Span` with file id `old` is retargeted. The decoder freshly
+/// allocated the tree, so casting away const is sound.
 fn walkSpans(comptime T: type, value: *T, old: span.FileId, new: span.FileId) void {
     if (comptime T == span.Span) {
         if (value.file == old) value.file = new;
@@ -1003,16 +904,12 @@ fn walkSpans(comptime T: type, value: *T, old: span.FileId, new: span.FileId) vo
     }
 }
 
-// Installed-pack loader.
 
-/// Walk the local pack cache, parse each pack's sources, and build a
-/// `HostBindings` populated with the native bindings each pack declares. The
-/// caller prepends the returned ASTs to the user's list before lowering so pack
-/// declarations participate in IR build. Only packs whose imports appear in the
-/// user's source, or are pulled in transitively, are loaded.
-///
-/// `requested_features` maps a `library_id` to the feature names the consumer
-/// asked for; a pack's feature-gated source roots load only when active.
+/// Walk the pack cache, parse each pack's sources, and build the `HostBindings`
+/// the packs declare. The caller prepends the returned ASTs to the user's list
+/// before lowering. Only packs the user imports, directly or transitively, load.
+/// `requested_features` maps a `library_id` to the features a consumer asked
+/// for; feature-gated source roots load only when active.
 pub fn loadInstalledPacks(
     gpa: Allocator,
     user_asts: []const KotlinFile,
@@ -1022,8 +919,7 @@ pub fn loadInstalledPacks(
     return loadInstalledPacksOpts(gpa, user_asts, source_map, requested_features, .{});
 }
 
-/// `loadInstalledPacks` with the stdlib-image knobs: optionally skip the
-/// embedded stdlib sources and/or record what the load consumed.
+/// `loadInstalledPacks` with the stdlib-image knobs.
 pub fn loadInstalledPacksOpts(
     gpa: Allocator,
     user_asts: []const KotlinFile,
@@ -1052,9 +948,8 @@ fn loadInstalledPacksImpl(
     var user_import_prefixes = try collectUserImportPrefixes(gpa, user_asts);
     defer freeStringSet(&user_import_prefixes);
 
-    // The embedded stdlib's curated SOURCES are consumed after the pack-cache
-    // walk, so a loaded pack that itself imports one of those packages triggers
-    // the load; gating on the user program's imports alone would miss it.
+    // Consumed after the cache walk, so a loaded pack importing one of those
+    // packages triggers the load too.
     const cache_res = klioCacheDir(gpa);
     const cache = switch (cache_res) {
         .ok => |c| c,
@@ -1071,10 +966,8 @@ fn loadInstalledPacksImpl(
     var merged = mergedHostBindings(gpa);
     defer merged.deinit();
 
-    // Collect every candidate pack on disk once, then load by fixed point: each
-    // pass loads packs whose `library_id` matches a known import prefix, and the
-    // ASTs it loads contribute their own imports for the next pass, so a pack
-    // pulls in its transitive dependencies.
+    // Fixed point: each pass loads packs whose `library_id` matches a known
+    // import prefix, and the ASTs it loads contribute imports for the next pass.
     var failed_packs: std.ArrayList(FailedPack) = .empty;
     defer {
         for (failed_packs.items) |*f| f.deinit(gpa);
@@ -1086,8 +979,7 @@ fn loadInstalledPacksImpl(
         gpa.free(candidates);
     }
 
-    // known_prefixes owns its keys: dups of the user-import prefixes plus the
-    // imports discovered in loaded pack sources.
+    // known_prefixes owns its keys.
     var known_prefixes = std.StringHashMap(void).init(gpa);
     defer freeStringSet(&known_prefixes);
     {
@@ -1102,8 +994,7 @@ fn loadInstalledPacksImpl(
     var loaded_lib_ids = std.StringHashMap(void).init(gpa);
     defer freeStringSet(&loaded_lib_ids);
 
-    // Feature requests accumulate across passes: the CLI seed plus what
-    // each loaded pack asks of its own dependencies.
+    // Feature requests accumulate across passes: the CLI seed plus pack deps.
     var feature_reqs = try cloneRequestedFeatures(gpa, requested_features);
     defer deinitRequestedFeatures(&feature_reqs);
 
@@ -1113,11 +1004,9 @@ fn loadInstalledPacksImpl(
         feature_hints.deinit(gpa);
     }
 
-    // Feature fixed point over manifests before any pack loads. A directly
-    // imported pack would otherwise load in the first pass, before another
-    // pack's manifest dependency has recorded its feature request, making the
-    // chain depend on directory iteration order. The prepass walks manifests
-    // alone, so every feature request reachable through deps is known first.
+    // Feature fixed point over manifests before any pack loads: otherwise a
+    // directly imported pack loads before another pack's manifest has recorded
+    // its feature request, making the chain depend on directory order.
     {
         var pre_wanted = std.StringHashMap(void).init(gpa);
         defer freeStringSet(&pre_wanted);
@@ -1137,8 +1026,7 @@ fn loadInstalledPacksImpl(
             for (candidates) |*c| {
                 const lib_id = c.manifest.library_id;
                 if (!importPrefixMatches(gpa, &pre_prefixes, lib_id)) continue;
-                // Re-visit an already-seen manifest when its request set may
-                // have grown: the contribution loop below is idempotent.
+                // The contribution loop below is idempotent, so re-visiting is safe.
                 if (!pre_wanted.contains(lib_id)) {
                     const dup = try gpa.dupe(u8, lib_id);
                     const gop = try pre_wanted.getOrPut(dup);
@@ -1214,9 +1102,8 @@ fn loadInstalledPacksImpl(
                 });
             }
 
-            // An active feature can pull in dependency packs and ask features
-            // of them. A dep entry is `lib` or `lib/feat[,feat2]`, the suffix
-            // requesting features on that dependency.
+            // A dep entry is `lib` or `lib/feat[,feat2]`; the suffix requests
+            // features on that dependency.
             for (c.manifest.features) |f| {
                 if (active.contains(f.name)) {
                     for (f.deps) |dep| {
@@ -1266,10 +1153,8 @@ fn loadInstalledPacksImpl(
         }
     }
 
-    // An installed pack the program's imports want but that failed to decode is
-    // a broken environment, not a missing library: say so now, with the fix,
-    // instead of dying later on an unresolved symbol. A failed pack whose
-    // library another candidate already served stays quiet.
+    // A wanted pack that failed to decode is a broken environment, not a missing
+    // library. A failure another candidate already served stays quiet.
     for (failed_packs.items) |f| {
         if (!opts.report_failures) break;
         const base = std.fs.path.basename(f.path);
@@ -1294,9 +1179,8 @@ fn loadInstalledPacksImpl(
         try loadEmbeddedStdlibSources(gpa, &known_prefixes, source_map, &out_asts, &out_bindings, opts.embedded_report);
     }
 
-    // Tell the user how to enable any feature their imports need but that
-    // wasn't requested. Drop hints for packages something else already
-    // provided: only a genuinely unprovided import should prompt.
+    // Hint at features the imports need. Drop hints for packages something else
+    // already provided.
     var loaded_pkgs = std.StringHashMap(void).init(gpa);
     defer freeStringSet(&loaded_pkgs);
     for (out_asts.items) |f| {
@@ -1339,8 +1223,7 @@ fn loadInstalledPacksImpl(
     return .{ .asts = try out_asts.toOwnedSlice(gpa), .bindings = out_bindings };
 }
 
-/// Deep-copy a `RequestedFeatures` map (keys + nested sets owned by
-/// `allocator`). Caller frees with `deinitRequestedFeatures`.
+/// Deep-copy a `RequestedFeatures`. Free with `deinitRequestedFeatures`.
 fn cloneRequestedFeatures(allocator: Allocator, src: *const RequestedFeatures) Allocator.Error!RequestedFeatures {
     var out = RequestedFeatures.init(allocator);
     errdefer deinitRequestedFeatures(&out);
@@ -1369,8 +1252,7 @@ fn deinitRequestedFeatures(rf: *RequestedFeatures) void {
     rf.deinit();
 }
 
-/// Insert each comma-separated feature in `feats` into `lib`'s requested set,
-/// owning fresh copies of the strings.
+/// Insert each comma-separated feature in `feats` into `lib`'s set, owning copies.
 fn addFeatureReqs(
     allocator: Allocator,
     reqs: *RequestedFeatures,
@@ -1386,7 +1268,6 @@ fn addFeatureReqs(
     }
 }
 
-/// Insert each feature in `feats` into the requested set for `lib`.
 fn addFeatureSlice(
     allocator: Allocator,
     reqs: *RequestedFeatures,
@@ -1399,8 +1280,7 @@ fn addFeatureSlice(
     }
 }
 
-/// `addFeatureReqs` reporting whether any feature was newly added, the
-/// manifest prepass fixed point's termination signal.
+/// `addFeatureReqs` reporting a new addition, the prepass fixpoint's signal.
 fn addFeatureReqsChanged(
     allocator: Allocator,
     reqs: *RequestedFeatures,
@@ -1421,7 +1301,6 @@ fn addFeatureReqsChanged(
     return changed;
 }
 
-/// `addFeatureSlice` that reports whether any feature was newly added.
 fn addFeatureSliceChanged(
     allocator: Allocator,
     reqs: *RequestedFeatures,
@@ -1451,15 +1330,13 @@ fn featureSetFor(
     return reqs.getPtr(lib).?;
 }
 
-// Host-binding merge.
 
 fn mergedHostBindingsInit(gpa: Allocator) HostBindings {
     return mergedHostBindings(gpa);
 }
 
-/// Build a single `HostBindings` table that the loader passes to every
-/// pack: starts with `klio-stdlib`'s defaults and unions in the bindings
-/// each `klio-kotlinx-*` crate ships, plus ktor-client.
+/// One `HostBindings` for every pack: `klio-stdlib` defaults unioned with what
+/// each kotlinx library and ktor-client ships.
 pub fn mergedHostBindings(gpa: Allocator) HostBindings {
     var out = HostBindings.withStdlibDefaults(gpa) catch HostBindings.init(gpa);
     mergeInto(&out, kotlinx_atomicfu.hostBindings(gpa) catch null);
@@ -1469,11 +1346,9 @@ pub fn mergedHostBindings(gpa: Allocator) HostBindings {
     mergeInto(&out, kotlinx_serialization.hostBindings(gpa) catch null);
     mergeInto(&out, compose_runtime.hostBindings(gpa) catch null);
     mergeInto(&out, compose_ui.hostBindings(gpa) catch null);
-    // The composer-stack intrinsics live in interp_ir (they touch the VM's
-    // implicit-composer threadlocal), registered alongside the pure ones.
+    // The composer-stack intrinsics touch the VM's implicit-composer threadlocal.
     mergeInto(&out, interp_ir.compose.hostBindings(gpa) catch null);
-    // ktor-client is opt-in (the pack must be installed to take effect) but its
-    // host functions are always in the registry so the pack's bindings resolve.
+    // ktor-client is opt-in, but its host functions are always in the registry.
     mergeInto(&out, ktor_client.hostBindings(gpa) catch null);
     return out;
 }
@@ -1487,7 +1362,6 @@ fn mergeInto(dst: *HostBindings, src_opt: ?HostBindings) void {
     }
 }
 
-// Cache directory and manifest IO.
 
 fn klioCacheDir(allocator: Allocator) PathResult {
     const home = (runtime.procEnvKlioHome(allocator) catch null) orelse
@@ -1498,8 +1372,7 @@ fn klioCacheDir(allocator: Allocator) PathResult {
     return .{ .ok = path };
 }
 
-/// Read the manifest section of the pack at `path`. `ok` carries an owned
-/// `PackManifest` the caller deinits; `err` an owned message.
+/// Manifest of the pack at `path`; `ok` is owned and the caller deinits it.
 pub fn readPackManifest(allocator: Allocator, path: []const u8) ManifestResult {
     var threaded = threadedIo(allocator);
     defer threaded.deinit();
@@ -1526,9 +1399,8 @@ fn packErrMsg(allocator: Allocator, err: PackError) []u8 {
     return std.fmt.allocPrint(allocator, "{any}", .{err}) catch "";
 }
 
-/// Copy a `.klio-pack` into the local cache, named
-/// `<library_id>-<version>.klio-pack`. `ok` is the owned destination
-/// path. Rebuilds the sidecar index best-effort.
+/// Copy a `.klio-pack` into the cache as `<library_id>-<version>.klio-pack`.
+/// `ok` is the owned destination. Rebuilds the sidecar index best-effort.
 pub fn installPackIntoCache(allocator: Allocator, src: []const u8) PathResult {
     const manifest_res = readPackManifest(allocator, src);
     switch (manifest_res) {
@@ -1558,9 +1430,8 @@ pub fn installPackIntoCache(allocator: Allocator, src: []const u8) PathResult {
     const dest = std.fs.path.join(allocator, &.{ cache, name }) catch
         return .{ .err = allocator.dupe(u8, "out of memory") catch "" };
 
-    // Installing supersedes: drop any other installed version of the same
-    // library first, since two side by side would leave the pick to directory
-    // order.
+    // Installing supersedes: two versions side by side would leave the pick to
+    // directory order.
     removeOtherVersions(allocator, fio, cache, manifest.library_id, name);
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(fio, src, allocator, .unlimited) catch |e| {
@@ -1577,9 +1448,8 @@ pub fn installPackIntoCache(allocator: Allocator, src: []const u8) PathResult {
     return .{ .ok = dest };
 }
 
-/// Delete every installed `.klio-pack` whose library id matches `lib_id`,
-/// except `keep_name`. Best-effort: an undeletable stale version is left for
-/// the loader's failure reporting to surface.
+/// Delete every installed `.klio-pack` for `lib_id` except `keep_name`.
+/// Best-effort: an undeletable stale version surfaces via failure reporting.
 fn removeOtherVersions(allocator: Allocator, fio: std.Io, cache: []const u8, lib_id: []const u8, keep_name: []const u8) void {
     var dir = std.Io.Dir.cwd().openDir(fio, cache, .{ .iterate = true }) catch return;
     defer dir.close(fio);
@@ -1605,10 +1475,8 @@ fn removeOtherVersions(allocator: Allocator, fio: std.Io, cache: []const u8, lib
     }
 }
 
-// Cache index sidecar.
 
-/// One entry in the sidecar `index.json`. Field names are fixed so the
-/// serialized form stays stable across versions.
+/// One sidecar `index.json` entry; field names are fixed for format stability.
 const CacheIndexEntry = struct {
     library_id: []const u8,
     version: []const u8,
@@ -1619,8 +1487,7 @@ const CacheIndexEntry = struct {
 
 const CACHE_INDEX_NAME: []const u8 = "index.json";
 
-/// Walk every pack file in the cache, read each manifest, and write a sidecar
-/// `index.json` so later startups skip the per-pack header read. Best-effort.
+/// Rewrite the sidecar `index.json` so later startups skip per-pack header reads.
 fn rebuildCacheIndex(allocator: Allocator, cache: []const u8) void {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1670,9 +1537,7 @@ fn rebuildCacheIndex(allocator: Allocator, cache: []const u8) void {
     std.Io.Dir.cwd().writeFile(fio, .{ .sub_path = idx_path, .data = bytes }) catch return;
 }
 
-// List and remove.
 
-/// List every pack in the local cache, one line per pack.
 pub fn listCachePacks(allocator: Allocator) VoidResult {
     const cache_res = klioCacheDir(allocator);
     const cache = switch (cache_res) {
@@ -1746,8 +1611,7 @@ fn formatMin(allocator: Allocator, min: []const u8) []u8 {
     return std.fmt.allocPrint(allocator, " (>={s})", .{min}) catch "";
 }
 
-/// Remove the cached pack matching `library_id` (and optionally
-/// `version`). `ok` is the owned path that was removed.
+/// Remove the cached pack for `library_id` (and `version`). `ok` is owned.
 pub fn removeCachePack(allocator: Allocator, library_id: []const u8, version: ?[]const u8) PathResult {
     const cache_res = klioCacheDir(allocator);
     const cache = switch (cache_res) {
@@ -1793,10 +1657,8 @@ pub fn removeCachePack(allocator: Allocator, library_id: []const u8, version: ?[
     return .{ .err = std.fmt.allocPrint(allocator, "no pack matching {s} found in cache", .{library_id}) catch "" };
 }
 
-// Inspect and verify.
 
-/// Inspect a pack: print its format version, hash prefix, sections, and
-/// decoded manifest / symbol / binding counts.
+/// Print a pack's format version, hash prefix, sections and decoded counts.
 pub fn inspectPack(allocator: Allocator, path: []const u8) VoidResult {
     var threaded = threadedIo(allocator);
     defer threaded.deinit();
@@ -1899,8 +1761,7 @@ fn strSliceDebug(allocator: Allocator, slice: [][]const u8) []u8 {
     return buf.toOwnedSlice(allocator) catch "";
 }
 
-/// Verify a pack by reading every required section back through the
-/// loader and decoding it. `smoke` is accepted for compatibility.
+/// Read every required section back through the loader and decode it.
 pub fn verifyPack(allocator: Allocator, path: []const u8, smoke: ?[]const u8) VoidResult {
     var threaded = threadedIo(allocator);
     defer threaded.deinit();
@@ -1980,8 +1841,7 @@ test "resolveActiveFeatures expands defaults and requires" {
     try std.testing.expect(active.contains("core"));
     // "json" is not requested or default, so it is not active.
     try std.testing.expect(!active.contains("json"));
-    // Activating "json" pulls in nothing extra here, but "a"-required
-    // expansion is covered by a self-requiring feature.
+    // "a"-required expansion is covered by a self-requiring feature.
     _ = &feat_a;
 }
 
@@ -2023,15 +1883,12 @@ test "sourceIsActive and inactiveGate" {
     const a = std.testing.allocator;
     var active = std.StringHashMap(void).init(a);
     defer active.deinit();
-    // Core (ungated) file is always active.
     try std.testing.expect(sourceIsActive("shim/core/Core.kt", &manifest, &active));
-    // Gated file with no active feature is inactive.
     try std.testing.expect(!sourceIsActive("shim/server/Routing.kt", &manifest, &active));
     const gate = inactiveGate("shim/server/Routing.kt", &manifest, &active);
     try std.testing.expect(gate != null);
     try std.testing.expectEqualStrings("server", gate.?.feature);
     try std.testing.expectEqualStrings("shim/server", gate.?.prefix);
-    // Once active, the gated file becomes active and has no gate.
     try active.put("server", {});
     try std.testing.expect(sourceIsActive("shim/server/Routing.kt", &manifest, &active));
     try std.testing.expect(inactiveGate("shim/server/Routing.kt", &manifest, &active) == null);
@@ -2128,8 +1985,7 @@ test "packLibIdFromBasename strips the version suffix" {
         "io.ktor",
         packLibIdFromBasename("io.ktor-3.5.0.klio-pack").?,
     );
-    // A pre-release version keeps the id intact: the version part starts at
-    // the FIRST dash followed by a digit.
+    // A pre-release version keeps the id: the version starts at the first dash-digit.
     try std.testing.expectEqualStrings(
         "mylib",
         packLibIdFromBasename("mylib-1.0.0-beta.klio-pack").?,
@@ -2165,7 +2021,6 @@ test "rebaseFileSpans retargets every span in a parsed file" {
     const fresh = span.FileId.from(401);
     rebaseFileSpans(&file, old, fresh);
 
-    // Every reachable span now carries the fresh id.
     var count: usize = 0;
     countSpansWithFile(KotlinFile, &file, fresh, &count);
     var stale: usize = 0;

@@ -1,9 +1,6 @@
-//! Project resolution for `klio test` and `klio run`: read a directory's
-//! `klio.toml` and compose its active source sets for the file-list pipeline.
-//!
-//! A `[[test]]` set is composed for `klio test` when its `feature` is unset
-//! (core) or active (a default feature, or one named by `--feature`). The
-//! manifest's `[[source]]`/`source_roots` are the main sources for `klio run`.
+//! Project resolution from a directory's `klio.toml`. A `[[test]]` set composes for
+//! `klio test` when its `feature` is unset (core) or active, a default feature or one
+//! named by `--feature`; `[[source]]`/`source_roots` are the main sources for `klio run`.
 
 const std = @import("std");
 const pack_build = @import("pack_build.zig");
@@ -13,24 +10,18 @@ const span = @import("span");
 
 const Allocator = std.mem.Allocator;
 
-/// Which features' tests to compose for a `klio test` run.
 pub const FeatureSel = union(enum) {
-    /// Core + every feature module (the default, and `--all`).
     all,
-    /// Core + exactly these features (`--feature X` one or more times).
     selected: []const []const u8,
 };
 
 pub const TestPlan = struct {
-    /// Project directory holding `klio.toml`. Its pack is built and installed
-    /// so the library API resolves inside the tests.
+    /// Its pack is built and installed so the library API resolves inside the tests.
     project_dir: []const u8,
-    /// Manifest library id, naming the built `target/packs/<id>.klio-pack`.
     pack_id: []const u8,
-    /// Composed test source roots, project-dir-joined: core and active features.
+    /// Core plus active-feature test roots, project-dir-joined.
     roots: []const []const u8,
-    /// Features whose sources must be activated so their tests compile. The
-    /// caller adds these to the requested-feature set before the pack loads.
+    /// The caller adds these to the requested-feature set before the pack loads.
     active_features: []const []const u8,
 };
 
@@ -38,7 +29,6 @@ fn featureSelected(feature: []const u8, sel: FeatureSel, manifest: *const pack_b
     if (feature.len == 0) return true; // core is always active
     switch (sel) {
         .all => {
-            // Active iff it is a declared feature of this project.
             for (manifest.features.defs) |d| {
                 if (std.mem.eql(u8, d.name, feature)) return true;
             }
@@ -53,23 +43,19 @@ fn featureSelected(feature: []const u8, sel: FeatureSel, manifest: *const pack_b
     }
 }
 
-/// The resolved `[application]` surface of a project for `klio bundle`.
-/// All paths are project-dir-joined.
+/// The `[application]` surface for `klio bundle`, every path project-dir-joined.
 pub const Application = struct {
-    /// The file carrying `main` (manifest `main`, or discovered).
     main: []const u8,
-    /// Every project source file (sorted; includes `main`).
+    /// Sorted, and includes `main`.
     sources: []const []const u8,
     name: []const u8,
     icon: []const u8,
-    /// Raw `include = [...]` values (path[:mount]), dir-joined paths.
+    /// Each entry is `path[:mount]`.
     includes: []const []const u8,
 };
 
-/// Resolve the project at `dir` for `klio bundle <dir>`: read `klio.toml`, join
-/// the `[application]` paths, and discover `main` when the manifest omits it
-/// (exactly one source under the project's roots may declare a top-level
-/// `main`). Null without a readable manifest or a determinable main.
+/// Resolves the project at `dir`, discovering `main` when the manifest omits it:
+/// exactly one source under the roots may declare one. Null without a readable manifest.
 pub fn loadApplication(a: Allocator, dir: []const u8) ?Application {
     const toml_path = std.fs.path.join(a, &.{ dir, "klio.toml" }) catch return null;
     const text = pack_build.readFileOwned(a, toml_path) orelse return null;
@@ -79,8 +65,6 @@ pub fn loadApplication(a: Allocator, dir: []const u8) ?Application {
     };
     const app = manifest.application;
 
-    // Source roots: `[[source]]` roots, else the manifest's `source_roots`,
-    // else the project directory itself.
     var roots: std.ArrayList([]const u8) = .empty;
     for (manifest.source) |s| {
         if (s.root.len != 0) roots.append(a, std.fs.path.join(a, &.{ dir, s.root }) catch continue) catch {};
@@ -109,7 +93,7 @@ pub fn loadApplication(a: Allocator, dir: []const u8) ?Application {
     } else {
         for (sources.items) |s| {
             if (!declaresMain(a, s)) continue;
-            if (main_path != null) return null; // ambiguous: manifest must name it
+            if (main_path != null) return null;
             main_path = s;
         }
     }
@@ -117,7 +101,6 @@ pub fn loadApplication(a: Allocator, dir: []const u8) ?Application {
 
     var includes: std.ArrayList([]const u8) = .empty;
     for (app.include) |inc| {
-        // Join only the path half of `path[:mount]`.
         if (std.mem.lastIndexOfScalar(u8, inc, ':')) |colon| {
             const joined = std.fs.path.join(a, &.{ dir, inc[0..colon] }) catch continue;
             includes.append(a, std.fmt.allocPrint(a, "{s}:{s}", .{ joined, inc[colon + 1 ..] }) catch continue) catch {};
@@ -153,7 +136,6 @@ fn collectKt(a: Allocator, path: []const u8, out: *std.ArrayList([]const u8)) vo
     }
 }
 
-/// Whether the file parses and declares a top-level `fun main`.
 fn declaresMain(a: Allocator, path: []const u8) bool {
     const text = pack_build.readFileOwned(a, path) orelse return false;
     var map = span.SourceMap.init(a);
@@ -171,9 +153,8 @@ fn declaresMain(a: Allocator, path: []const u8) bool {
     return false;
 }
 
-/// Compose the active `[[test]]` roots of the project at `dir` under `sel`.
-/// Null when `dir` has no readable manifest or declares no tests, and the
-/// caller then treats `dir` as a bare source directory. Allocations are in `a`.
+/// Composes the active `[[test]]` roots of the project at `dir` under `sel`. Null when
+/// `dir` has no readable manifest or no tests, which the caller reads as a bare source dir.
 pub fn planTest(a: Allocator, dir: []const u8, sel: FeatureSel) ?TestPlan {
     const toml_path = std.fs.path.join(a, &.{ dir, "klio.toml" }) catch return null;
     const text = pack_build.readFileOwned(a, toml_path) orelse return null;
@@ -192,7 +173,6 @@ pub fn planTest(a: Allocator, dir: []const u8, sel: FeatureSel) ?TestPlan {
         roots.append(a, joined) catch continue;
         if (t.feature.len != 0) {
             const dup = a.dupe(u8, t.feature) catch continue;
-            // De-dup: a feature with several test roots activates once.
             var seen = false;
             for (active.items) |x| if (std.mem.eql(u8, x, dup)) {
                 seen = true;

@@ -1,5 +1,4 @@
-//! Stand-in for `embedded.zig` in builds that bypass build.zig (per-module
-//! verification via scripts/zigcheck.py): no baked pack bytes, so the stdlib
-//! pack comes from the `KLIO_STDLIB_PACK` override or the cwd checkout.
+//! Stand-in for `embedded.zig` where build.zig is bypassed: no baked bytes, so
+//! the pack comes from `KLIO_STDLIB_PACK` or the cwd checkout.
 
 pub const pack_bytes: ?[]const u8 = null;
