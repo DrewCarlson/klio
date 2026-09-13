@@ -600,7 +600,7 @@ pub fn lambdaSingletonSlot(used: []const LambdaUse, body: ir.FuncId) ?usize {
 /// has the member and no body satisfies it by delegation, which forwards to
 /// another object at run time.
 pub fn typeHasSlot(m: *const Module, cid: u32, root: *const Func) bool {
-    const dot = std.mem.lastIndexOfScalar(u8, root.fqn, '.') orelse return false;
+    const dot = std.mem.findScalarLast(u8, root.fqn, '.') orelse return false;
     const owner = root.fqn[0..dot];
     if (owner.len == 0) return false;
     var stack: [64]u32 = undefined;

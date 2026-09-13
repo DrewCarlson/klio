@@ -211,7 +211,7 @@ pub fn isBackingAccess(name: []const u8) bool {
 
 pub fn plainFieldName(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "$sgetter$") or std.mem.startsWith(u8, name, "$ssetter$")) {
-        if (std.mem.lastIndexOfScalar(u8, name, 0x1f)) |i| return name[i + 1 ..];
+        if (std.mem.findScalarLast(u8, name, 0x1f)) |i| return name[i + 1 ..];
     }
     if (std.mem.startsWith(u8, name, "__klio_field__")) return name["__klio_field__".len..];
     return name;

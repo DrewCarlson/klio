@@ -415,7 +415,7 @@ pub fn trampolinableFieldOf(module: *const Module, inst: *const Inst) ?TrampFiel
 /// plain stored field), or the name unchanged when it is already plain.
 pub fn memberFieldName(name: []const u8) []const u8 {
     if (std.mem.startsWith(u8, name, "$sgetter$") or std.mem.startsWith(u8, name, "$ssetter$")) {
-        if (std.mem.lastIndexOfScalar(u8, name, 0x1f)) |i| return name[i + 1 ..];
+        if (std.mem.findScalarLast(u8, name, 0x1f)) |i| return name[i + 1 ..];
     }
     return name;
 }

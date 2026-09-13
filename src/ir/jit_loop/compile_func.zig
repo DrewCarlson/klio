@@ -88,9 +88,9 @@ fn collectFunc(a: Allocator, func: *const Func) Allocator.Error!?[]BlockId {
     const reach = try a.alloc(bool, nb);
     defer a.free(reach);
     @memset(reach, false);
-    var order: std.ArrayListUnmanaged(BlockId) = .empty;
+    var order: std.ArrayList(BlockId) = .empty;
     errdefer order.deinit(a);
-    var succ: std.ArrayListUnmanaged(BlockId) = .empty;
+    var succ: std.ArrayList(BlockId) = .empty;
     defer succ.deinit(a);
     const entry = func.entry.int();
     if (entry >= nb) return null;
@@ -185,12 +185,12 @@ const FuncCtx = struct {
     obj_loads: []const ObjParamLoad = &.{},
     cap_loads: []const ObjParamLoad = &.{},
 
-    inline_sites: std.ArrayListUnmanaged(InlineSite) = .empty,
-    skip_insts: std.ArrayListUnmanaged(InstPos) = .empty,
-    direct_sites: std.ArrayListUnmanaged(DirectSite) = .empty,
-    escape_pos: std.ArrayListUnmanaged(EscapePos) = .empty,
-    field_pres: std.ArrayListUnmanaged(FieldPre) = .empty,
-    call_sites: std.ArrayListUnmanaged(CallSite) = .empty,
+    inline_sites: std.ArrayList(InlineSite) = .empty,
+    skip_insts: std.ArrayList(InstPos) = .empty,
+    direct_sites: std.ArrayList(DirectSite) = .empty,
+    escape_pos: std.ArrayList(EscapePos) = .empty,
+    field_pres: std.ArrayList(FieldPre) = .empty,
+    call_sites: std.ArrayList(CallSite) = .empty,
 
     has_div: bool = false,
     n_escapes: u32 = 0,

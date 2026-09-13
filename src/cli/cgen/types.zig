@@ -226,7 +226,7 @@ pub const ThrowTy = struct {
 /// The last segment of a dotted name. A catch clause and a class declaration
 /// can spell the same type either way.
 pub fn simpleName(n: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, n, '.')) |i| return n[i + 1 ..];
+    if (std.mem.findScalarLast(u8, n, '.')) |i| return n[i + 1 ..];
     return n;
 }
 

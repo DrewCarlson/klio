@@ -113,11 +113,11 @@ const LoopCtx = struct {
     total_regs: u32,
 
     array_info: []?ArrayInfo = &.{},
-    arrays: std.ArrayListUnmanaged(ArrayUnbox) = .empty,
-    inline_sites: std.ArrayListUnmanaged(InlineSite) = .empty,
-    recv_move_skips: std.ArrayListUnmanaged(BodyInstPos) = .empty,
+    arrays: std.ArrayList(ArrayUnbox) = .empty,
+    inline_sites: std.ArrayList(InlineSite) = .empty,
+    recv_move_skips: std.ArrayList(BodyInstPos) = .empty,
     cell_info: []?RegType = &.{},
-    cells: std.ArrayListUnmanaged(CellUnbox) = .empty,
+    cells: std.ArrayList(CellUnbox) = .empty,
     member_ret: []RegType = &.{},
     field_idx_of: []u32 = &.{},
     map_get_dst: []bool = &.{},
@@ -126,11 +126,11 @@ const LoopCtx = struct {
     sets: LoopSets = .{ .read = &.{}, .def = &.{} },
     nullable: []bool = &.{},
     null_flag_slot: []u32 = &.{},
-    nullables: std.ArrayListUnmanaged(NullableUnbox) = .empty,
-    call_sites: std.ArrayListUnmanaged(CallSite) = .empty,
-    skip_call_insts: std.ArrayListUnmanaged(BodyInstPos) = .empty,
-    field_bases: std.ArrayListUnmanaged(FieldBase) = .empty,
-    direct_sites: std.ArrayListUnmanaged(DirectSite) = .empty,
+    nullables: std.ArrayList(NullableUnbox) = .empty,
+    call_sites: std.ArrayList(CallSite) = .empty,
+    skip_call_insts: std.ArrayList(BodyInstPos) = .empty,
+    field_bases: std.ArrayList(FieldBase) = .empty,
+    direct_sites: std.ArrayList(DirectSite) = .empty,
 
     uc_slot: u32 = 0,
     tramp_slot: u32 = 0,
@@ -281,7 +281,7 @@ fn tryCompileWith(a: Allocator, module: *const Module, func: *const Func, header
     if (!try collectNullables(&ctx)) return null;
     if (rejectsUnknownScalarRegs(&ctx)) return null;
 
-    var direct_pre: std.ArrayListUnmanaged(DirectPre) = .empty;
+    var direct_pre: std.ArrayList(DirectPre) = .empty;
     defer direct_pre.deinit(a);
     ctx.skip_call_insts.appendSlice(a, ctx.recv_move_skips.items) catch return null;
     if (!try collectDirectCallPre(&ctx, &direct_pre)) return null;
@@ -712,7 +712,7 @@ fn discoverCells(ctx: *LoopCtx) Allocator.Error!bool {
     const array_info = ctx.array_info;
     const cell_info = ctx.cell_info;
     const cells = &ctx.cells;
-    var cell_ptrs: std.ArrayListUnmanaged(usize) = .empty;
+    var cell_ptrs: std.ArrayList(usize) = .empty;
     defer cell_ptrs.deinit(a);
     for (body) |bid| {
         for (func.blocks[bid.int()].insts) |*inst| {
@@ -1162,7 +1162,7 @@ fn rejectsUnknownScalarRegs(ctx: *const LoopCtx) bool {
 /// Found before registration because the Move precedes the call.
 /// A direct call jumps straight into the callee's code, so nothing re-seeds the
 /// array cache on the way back; those loops keep the trampoline.
-fn collectDirectCallPre(ctx: *LoopCtx, direct_pre: *std.ArrayListUnmanaged(DirectPre)) Allocator.Error!bool {
+fn collectDirectCallPre(ctx: *LoopCtx, direct_pre: *std.ArrayList(DirectPre)) Allocator.Error!bool {
     const a = ctx.a;
     const module = ctx.module;
     const func = ctx.func;

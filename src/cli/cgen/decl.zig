@@ -461,7 +461,7 @@ pub fn writeFloatLit(w: *std.Io.Writer, v: f64, is_f32: bool) !void {
     var buf: [64]u8 = undefined;
     const txt = std.fmt.bufPrint(&buf, "{e}", .{v}) catch return error.WriteFailed;
     try w.writeAll(txt);
-    if (std.mem.indexOfAny(u8, txt, ".eE") == null) try w.writeAll(".0");
+    if (std.mem.findAny(u8, txt, ".eE") == null) try w.writeAll(".0");
     if (is_f32) try w.writeByte('f');
 }
 
