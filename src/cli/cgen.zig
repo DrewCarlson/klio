@@ -2009,6 +2009,7 @@ fn bareCallTarget(
 ) ?*const ir.Func {
     var best: ?*const ir.Func = null;
     var best_score: u32 = 0;
+    var best_defaults: u32 = 0;
     var tied = false;
     for (m.funcs.items) |*cand| {
         if (!cand.hasBody() or cand.has_receiver_param) continue;
@@ -2019,8 +2020,10 @@ fn bareCallTarget(
         // How SPECIFIC the declaration is: a parameter naming a machine type
         // or a class is evidence, an erased type parameter is not. Kotlin
         // prefers the more specific declaration, which is what separates
-        // `atomic(Int)` from `atomic(T)`.
+        // `atomic(Int)` from `atomic(T)`, and prefers a declaration that needs
+        // no default over one that does.
         var score: u32 = 0;
+        var defaults_used: u32 = 0;
         for (cand.params, 0..) |p, i| {
             if (p.is_vararg) {
                 fits = false;
@@ -2029,6 +2032,7 @@ fn bareCallTarget(
             const reg = bnd.regs[i] orelse {
                 if (prog.defaultThunk(cand.id, @intCast(i)) == null) fits = false;
                 if (!fits) break;
+                defaults_used += 1;
                 continue;
             };
             if (tyOf(p.ty)) |want| {
@@ -2042,11 +2046,15 @@ fn bareCallTarget(
             }
         }
         if (!fits) continue;
-        if (best == null or score > best_score) {
+        const better = best == null or defaults_used < best_defaults or
+            (defaults_used == best_defaults and score > best_score);
+        const same = best != null and defaults_used == best_defaults and score == best_score;
+        if (better) {
             best = cand;
             best_score = score;
+            best_defaults = defaults_used;
             tied = false;
-        } else if (score == best_score) {
+        } else if (same) {
             tied = true;
         }
     }
@@ -2453,7 +2461,23 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         // answer it once, so it answers only when the
                         // declaration is unambiguous.
                         const picked = bareCallTarget(m, prog, cn2.String, types, cg2.args.int(), cg2.n_args, cg2.arg_names);
-                        if (picked == null) return noName(f, "bare call", cn2.String);
+                        if (picked == null) {
+                            // Which declarations the name could mean, and what
+                            // the arguments are: that is the backlog entry.
+                            if (traceOn()) {
+                                for (m.funcs.items) |*cnd| {
+                                    if (!std.mem.eql(u8, cnd.name, cn2.String)) continue;
+                                    std.debug.print("[cgen]   candidate {s} params={d}", .{ cnd.fqn, cnd.params.len });
+                                    for (cnd.params) |cp| std.debug.print(" [{s}:{s}]", .{ cp.name, cp.ty.name });
+                                    std.debug.print("\n", .{});
+                                }
+                                var kq: u32 = 0;
+                                while (kq < cg2.n_args) : (kq += 1) {
+                                    std.debug.print("[cgen]   argument {d} is {s}\n", .{ kq, @tagName(types[cg2.args.int() + kq]) });
+                                }
+                            }
+                            return noName(f, "bare call", cn2.String);
+                        }
                         if (ctorFits(m, cn2.String, types, cg2.args.int(), cg2.n_args, cg2.arg_names))
                             return noName(f, "bare call", cn2.String);
                         if (globalIndex(globals, cn2.String) != null) return noName(f, "bare call", cn2.String);
