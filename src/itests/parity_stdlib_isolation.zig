@@ -1,14 +1,7 @@
-//! Cross-program isolation gate for the once-per-process stdlib base.
-//!
-//! The in-process harness lowers the stdlib once and extends a clone per
-//! program, so the contamination risk is a later program observing state an
-//! earlier one defined or mutated — globals, object singletons, enum-entry
-//! patches, installed packs. Each test runs a probe program, then a
-//! polluting program that defines/mutates the SAME top-level names (and
-//! pulls in the kotlinx packs), then the probe again: every probe run must
-//! be byte-identical to the first, in both the embedded and pack modes. A
-//! base-name-colliding program is interleaved too, so the whole-program
-//! fallback path and the fast path alternate within one process.
+//! Cross-program isolation gate for the once-per-process stdlib base, which is
+//! lowered once and cloned per program. Each test runs a probe, a polluter
+//! that redefines the same top-level names and installs packs, then the probe
+//! again: every probe run must be byte-identical to the first.
 
 const std = @import("std");
 const parity = @import("parity");
@@ -34,9 +27,7 @@ fn runProgram(a: std.mem.Allocator, io: std.Io, path: []const u8, mode: parity.L
     }
 }
 
-/// The probe defines the same top-level names the polluter mutates, plus an
-/// enum whose ctor args are patched at startup (the runtime-mutable part of
-/// the cloned class table) and a lazily-initialized object.
+/// The enum is patched at startup: the mutable part of the cloned class table.
 const PROBE_SRC =
     \\var sharedCounter = 7
     \\object Registry {
@@ -62,8 +53,8 @@ const PROBE_EXPECTED =
     "paint 10 20 1\n" ++
     "after 8 6 1\n";
 
-/// Same names, different values and extra mutation; pulls in the
-/// coroutines pack so pack sources + host bindings install mid-sequence.
+/// Pulls in the coroutines pack, so pack sources and host bindings install
+/// mid-sequence.
 const POLLUTER_SRC =
     \\import kotlinx.coroutines.runBlocking
     \\var sharedCounter = 0
@@ -88,8 +79,7 @@ const POLLUTER_EXPECTED =
     "polluter-registry-init\n" ++
     "polluter 41 99 2 3\n";
 
-/// Redeclares a stdlib top-level name (`log`), which forces the
-/// whole-program fallback build in the same process.
+/// Redeclaring the stdlib name `log` forces the whole-program fallback build.
 const FALLBACK_SRC =
     \\fun log(s: String): String { println("local-log:" + s); return s }
     \\fun main() { println("fallback " + log("ok")) }
@@ -111,19 +101,15 @@ fn assertSequence(mode: parity.LoadMode, polluter_mode: parity.LoadMode) !void {
     const polluter = try writeProgram(a, io, "polluter", POLLUTER_SRC);
     const fallback = try writeProgram(a, io, "fallback", FALLBACK_SRC);
 
-    // Probe first: records the pristine-base output.
     const first = try runProgram(a, io, probe, mode);
     try std.testing.expectEqualStrings(PROBE_EXPECTED, first);
 
-    // Pollute: same top-level names, pack install, global/object/enum writes.
     const polluted = try runProgram(a, io, polluter, polluter_mode);
     try std.testing.expectEqualStrings(POLLUTER_EXPECTED, polluted);
 
-    // Probe again: must be byte-identical to the pristine run.
     const second = try runProgram(a, io, probe, mode);
     try std.testing.expectEqualStrings(first, second);
 
-    // Interleave the whole-program fallback path, then probe once more.
     const fb = try runProgram(a, io, fallback, mode);
     try std.testing.expectEqualStrings(FALLBACK_EXPECTED, fb);
     const third = try runProgram(a, io, probe, mode);

@@ -1,21 +1,13 @@
 //! End-to-end ktor server gate: a real `klio` child runs `embeddedServer`
-//! (through the installed packs, `klio run --feature io.ktor/server-
-//! serialization`) while this test acts as the HTTP client. The server
-//! blocks in the native `__kktor_serve` accept loop, so it is spawned as a
-//! background process, driven over real sockets, and killed at the end.
-//!
-//! Asserts the routing surface the server shim adds on top of the native
-//! loop: path parameters (`/users/{id}`), query parameters, request and
-//! response headers, status codes, content types, raw `receiveText`, and
-//! the typed JSON `receive<T>()` / `respond<T>()` content-negotiation path.
+//! while this test acts as the HTTP client. The server blocks in the native
+//! `__kktor_serve` accept loop, so it is spawned as a background process,
+//! driven over real sockets, and killed at the end.
 
 const std = @import("std");
 const census_support = @import("commontest_support.zig");
 const runtime = @import("runtime");
 const net = std.Io.net;
 
-/// The `klio` binary to spawn: `KLIO_ITEST_BIN` when set (the build run
-/// step points it at the harness-optimized install), else the Debug install.
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
 }
@@ -48,8 +40,7 @@ fn runKlio(
     return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-/// Build + install the dependency packs and the ktor pack into a scratch
-/// HOME, once per test-process.
+/// Installs the packs into a scratch HOME, once per test process.
 fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, home) catch {};
@@ -83,10 +74,6 @@ fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Envi
     }
 }
 
-// -------------------------------------------------------------------------
-// Minimal HTTP/1.1 client over std.Io.net (the test drives the klio server).
-// -------------------------------------------------------------------------
-
 /// An ephemeral free port: bind one, read the assigned port, release it.
 fn freePort(io: std.Io) !u16 {
     const addr = try net.IpAddress.parse("127.0.0.1", 0);
@@ -100,12 +87,10 @@ fn sleepMs(io: std.Io, ms: u64) void {
     std.Io.sleep(io, std.Io.Duration.fromMilliseconds(@intCast(ms)), .awake) catch {};
 }
 
-/// Poll-connect until the server accepts (or give up). A bare connect that
-/// closes without a request is handled by the serve loop as a dropped read.
+/// Poll-connect until the server accepts. The serve loop treats the bare
+/// connect that closes without a request as a dropped read.
 fn waitForServer(io: std.Io, port: u16, slowdown: i64) bool {
-    // 30s on the ReleaseSafe harness (a healthy server answers within a
-    // second or two); a Debug harness loads the ktor packs several times
-    // slower, so the budget scales with it.
+    // 30s on the ReleaseSafe harness, scaled up for a slower Debug one.
     const attempts: usize = @intCast(1200 * slowdown);
     var i: usize = 0;
     while (i < attempts) : (i += 1) {
@@ -120,8 +105,8 @@ fn waitForServer(io: std.Io, port: u16, slowdown: i64) bool {
     return false;
 }
 
-/// Send a raw HTTP/1.1 request and return the full response bytes (the
-/// server sends `Connection: close`, so read to EOF). Owned by `a`.
+/// The response bytes, owned by `a`. The server sends `Connection: close`,
+/// so this reads to EOF.
 fn httpRequest(a: std.mem.Allocator, io: std.Io, port: u16, req: []const u8) ![]u8 {
     const addr = try net.IpAddress.parse("127.0.0.1", port);
     var stream = try addr.connect(io, .{ .mode = .stream });
@@ -172,7 +157,6 @@ fn bodyOf(resp: []const u8) []const u8 {
     return resp[sep + 4 ..];
 }
 
-/// Case-insensitive header lookup over the response head.
 fn headerOf(resp: []const u8, name: []const u8) ?[]const u8 {
     const sep = std.mem.indexOf(u8, resp, "\r\n\r\n") orelse resp.len;
     var lines = std.mem.splitSequence(u8, resp[0..sep], "\r\n");
@@ -185,8 +169,6 @@ fn headerOf(resp: []const u8, name: []const u8) ?[]const u8 {
     }
     return null;
 }
-
-// -------------------------------------------------------------------------
 
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
@@ -246,16 +228,9 @@ const SERVER_SRC =
     \\}
 ;
 
-// `start(wait = false)` returns immediately (so the following `delay` +
-// `println` run) and the daemon serve loop is abandoned at the run boundary
-// (so the process exits instead of hanging in `joinAllThreads`).
-//
-// `embeddedServer` is called at top level, not inside `runBlocking`: Kotlin
-// resolves a bare call with an implicit `CoroutineScope` receiver to the
-// `CoroutineScope.embeddedServer` extension, which would parent the
-// application `SupervisorJob` to the enclosing `runBlocking` job and make
-// `runBlocking` wait on it forever. The top-level overload parents the
-// application to `GlobalScope`, which the run boundary abandons cleanly.
+// `embeddedServer` sits at top level, not inside `runBlocking`: under an
+// implicit `CoroutineScope` receiver it would resolve to the extension, which
+// parents the application job to `runBlocking` and makes it wait forever.
 const ASYNC_SRC =
     \\import io.ktor.server.engine.embeddedServer
     \\import io.ktor.server.engine.klio.Klio
@@ -303,8 +278,7 @@ test "server: routing, params, headers, status codes, and typed JSON" {
         std.debug.print("ktor_server: spawn klio failed: {s}\n", .{@errorName(e)});
         return error.SpawnFailed;
     };
-    // `kill` terminates the forever-serving child, waits, and reaps it in
-    // one call (a following `wait` would double-reap), so it stands alone.
+    // `kill` terminates, waits, and reaps, so no `wait` may follow it.
     defer child.kill(io);
 
     if (!waitForServer(io, port, census_support.harnessSlowdown(&env))) {
@@ -312,7 +286,6 @@ test "server: routing, params, headers, status codes, and typed JSON" {
         return error.ServerDidNotStart;
     }
 
-    // GET with a path parameter, query parameter, and request header.
     {
         const req = try buildRequest(a, "GET", "/users/42?q=hi", &.{.{ "X-Tag", "abc" }}, "");
         const resp = try httpRequest(a, io, port, req);
@@ -320,7 +293,6 @@ test "server: routing, params, headers, status codes, and typed JSON" {
         try std.testing.expectEqualStrings("id=42 q=hi tag=abc", bodyOf(resp));
     }
 
-    // POST raw text -> 201, custom response header echoed back.
     {
         const req = try buildRequest(a, "POST", "/items", &.{}, "widget");
         const resp = try httpRequest(a, io, port, req);
@@ -329,7 +301,6 @@ test "server: routing, params, headers, status codes, and typed JSON" {
         try std.testing.expectEqualStrings("created:widget", bodyOf(resp));
     }
 
-    // POST typed JSON through ContentNegotiation -> 201 application/json.
     {
         const req = try buildRequest(a, "POST", "/users", &.{.{ "Content-Type", "application/json" }}, "{\"id\":7,\"name\":\"Ada\"}");
         const resp = try httpRequest(a, io, port, req);
@@ -338,14 +309,12 @@ test "server: routing, params, headers, status codes, and typed JSON" {
         try std.testing.expectEqualStrings("{\"id\":7,\"name\":\"Ada!\"}", bodyOf(resp));
     }
 
-    // Unmatched route -> 404.
     {
         const req = try buildRequest(a, "GET", "/nope", &.{}, "");
         const resp = try httpRequest(a, io, port, req);
         try std.testing.expectEqual(@as(?u16, 404), statusOf(resp));
     }
 
-    // Nested `route { route { get } }` -> the accumulated prefix matches.
     {
         const req = try buildRequest(a, "GET", "/api/v1/ping", &.{}, "");
         const resp = try httpRequest(a, io, port, req);
@@ -353,7 +322,6 @@ test "server: routing, params, headers, status codes, and typed JSON" {
         try std.testing.expectEqualStrings("pong", bodyOf(resp));
     }
 
-    // Tailcard `{path...}` captures the rest of the path.
     {
         const req = try buildRequest(a, "GET", "/files/a/b/c.txt", &.{}, "");
         const resp = try httpRequest(a, io, port, req);
@@ -361,7 +329,7 @@ test "server: routing, params, headers, status codes, and typed JSON" {
         try std.testing.expectEqualStrings("f=a/b/c.txt", bodyOf(resp));
     }
 
-    // `*` matches any single segment; a longer path does not.
+    // `*` matches exactly one segment, so a longer path misses.
     {
         const ok = try httpRequest(a, io, port, try buildRequest(a, "GET", "/any/X/end", &.{}, ""));
         try std.testing.expectEqual(@as(?u16, 200), statusOf(ok));
@@ -389,10 +357,8 @@ test "server: start(wait = false) is non-blocking and the daemon serve abandons 
     const path = try std.fmt.allocPrint(a, "{s}/async_server.kt", .{TMP_DIR});
     try cwd.writeFile(io, .{ .sub_path = path, .data = prog });
 
-    // `start(wait = false)` must return so `delay` + the final `println` run,
-    // and the program must then exit on its own (the daemon serve loop notices
-    // the run-boundary abandon) rather than hang in `joinAllThreads`. A
-    // timeout converts a hang into a visible failure.
+    // The program must exit on its own once the daemon serve loop sees the
+    // run-boundary abandon; the timeout turns a hang into a failure.
     const r = std.process.run(a, io, .{
         .argv = &.{ klioBin(&env), "run", "--feature", "io.ktor/server", path },
         .environ_map = &env,

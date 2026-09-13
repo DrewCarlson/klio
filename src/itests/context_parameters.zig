@@ -1,15 +1,6 @@
-//! Context parameters (Kotlin 2.4): the acceptance matrix.
-//!
-//! Declarations and implicit resolution. Runtime rows run the full parity
-//! pipeline and assert stdout; diagnostic rows run lexer -> parser ->
-//! resolver -> typeck and assert the compiler-named diagnostic plus its
-//! message. The two carve-outs excluded from 2.4 (explicit context
-//! arguments, callable references to contextual declarations) are asserted
-//! to produce their rejection diagnostics.
-//!
-//! All 24 matrix rows are covered, including T14's fully-positional
-//! invocation of a multi-context contextual function-type value, which
-//! splits its leading context arguments onto the context stack (`CtxCall`).
+//! Context parameters (Kotlin 2.4): declaration forms and implicit resolution.
+//! Explicit context arguments and callable references to contextual
+//! declarations are outside 2.4, so they are pinned to their rejections.
 
 const std = @import("std");
 const parity = @import("parity");
@@ -64,8 +55,6 @@ fn frontendDiags(a: std.mem.Allocator, src: []const u8) ![]const Diagnostic {
     return out.items;
 }
 
-/// Assert `src` produces a diagnostic whose factory name is `factory_name`
-/// and whose message contains `msg_needle`.
 fn assertDiag(src: []const u8, factory_name: []const u8, msg_needle: []const u8) !void {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
@@ -83,7 +72,6 @@ fn assertDiag(src: []const u8, factory_name: []const u8, msg_needle: []const u8)
     return error.MissingExpectedDiagnostic;
 }
 
-/// Count how many diagnostics carry the given factory name.
 fn countDiag(src: []const u8, factory_name: []const u8) !usize {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
@@ -109,7 +97,6 @@ fn assertNoErrors(src: []const u8) !void {
     }
 }
 
-// T1 — happy path, named parameter + stdlib `context`.
 test "t01_named_parameter_stdlib_context" {
     const src =
         \\interface Logger { fun log(m: String) }
@@ -122,7 +109,6 @@ test "t01_named_parameter_stdlib_context" {
     try assertKlio("t01", src, "L: hi\n");
 }
 
-// T2 — `_` parameter + bridge via named forwarder.
 test "t02_anonymous_param_bridge" {
     const src =
         \\class Scope { fun greet() = println("hello") }
@@ -134,7 +120,7 @@ test "t02_anonymous_param_bridge" {
     try assertKlio("t02", src, "hello\n");
 }
 
-// T3 — contextual property (getter), receiver-as-context source.
+// `with` puts its receiver on the context stack, satisfying `u: Users`.
 test "t03_contextual_property_getter" {
     const src =
         \\class Users { fun byId(i: Int) = "User $i" }
@@ -145,7 +131,6 @@ test "t03_contextual_property_getter" {
     try assertKlio("t03", src, "User 1\n");
 }
 
-// T4 — contextual `var` with both accessors.
 test "t04_contextual_var_both_accessors" {
     const src =
         \\class Store { var cell = "" }
@@ -158,7 +143,6 @@ test "t04_contextual_var_both_accessors" {
     try assertKlio("t04", src, "x\n");
 }
 
-// T5 — nesting: inner context value shadows outer.
 test "t05_nested_inner_shadows_outer" {
     const src =
         \\context(s: String) fun show() = println(s)
@@ -169,7 +153,6 @@ test "t05_nested_inner_shadows_outer" {
     try assertKlio("t05", src, "inner\n");
 }
 
-// T6 — ambiguity at one level.
 test "t06_ambiguous_context_argument" {
     try assertDiag(
         \\context(s: String) fun show() = println(s)
@@ -178,7 +161,6 @@ test "t06_ambiguous_context_argument" {
     , "AMBIGUOUS_CONTEXT_ARGUMENT", "Multiple potential context arguments for 's' in scope.");
 }
 
-// T7 — missing context.
 test "t07_no_context_argument" {
     try assertDiag(
         \\context(s: String) fun show() = println(s)
@@ -187,15 +169,13 @@ test "t07_no_context_argument" {
     , "NO_CONTEXT_ARGUMENT", "No context argument for 's' found.");
 }
 
-// T8 — two same-type params on one declaration: named use OK, resolved use ambiguous.
 test "t08_two_same_type_params" {
-    // Without the resolved use, one value fills both `a` and `b`: prints `xx`.
+    // One context value satisfies both same-typed parameters.
     try assertKlio("t08",
         \\context(a: String, b: String) fun f() { println(a + b) }
         \\fun main() = context("x") { f() }
         \\
     , "xx\n");
-    // With a use that needs the type by resolution, it is ambiguous.
     try assertDiag(
         \\context(s: String) fun show() = println(s)
         \\context(a: String, b: String) fun f() { println(a + b); show() }
@@ -204,7 +184,7 @@ test "t08_two_same_type_params" {
     , "AMBIGUOUS_CONTEXT_ARGUMENT", "Multiple potential context arguments for 's' in scope.");
 }
 
-// T9 — extension receiver vs same-declaration context param are one level.
+// An extension receiver and a context parameter sit at one level, so neither wins.
 test "t09_receiver_and_context_same_level" {
     try assertDiag(
         \\class A
@@ -215,7 +195,6 @@ test "t09_receiver_and_context_same_level" {
     , "AMBIGUOUS_CONTEXT_ARGUMENT", "Multiple potential context arguments for 'ctx' in scope.");
 }
 
-// T10 — dispatch receiver satisfies a member's context (single source).
 test "t10_dispatch_receiver_satisfies_member_context" {
     const src =
         \\class A {
@@ -228,7 +207,6 @@ test "t10_dispatch_receiver_satisfies_member_context" {
     try assertKlio("t10", src, "m\n");
 }
 
-// T11 — receiver shadowed by context.
 test "t11_receiver_shadowed_by_context" {
     try assertDiag(
         \\class Cow { fun moo() {}
@@ -238,7 +216,6 @@ test "t11_receiver_shadowed_by_context" {
     , "RECEIVER_SHADOWED_BY_CONTEXT_PARAMETER", "moo");
 }
 
-// T12 — generic context parameter, explicit type argument.
 test "t12_generic_context_parameter" {
     const src =
         \\context(ctx: T) fun <T> implicit(): T = ctx
@@ -248,7 +225,6 @@ test "t12_generic_context_parameter" {
     try assertKlio("t12", src, "42\n");
 }
 
-// T13 — `contextOf` through a contextual-function-type lambda.
 test "t13_contextof_through_contextual_function_type" {
     const src =
         \\interface Logger { fun log(m: String) }
@@ -260,10 +236,7 @@ test "t13_contextof_through_contextual_function_type" {
     try assertKlio("t13", src, "go\n");
 }
 
-// T14 — invocation of a contextual function-type value both ways: the
-// fully-positional call `f("s", 1, true)` splits its leading context args
-// onto the context stack, and the implicit call `f(false)` resolves its
-// contexts from the enclosing scope.
+// A fully-positional call splits its leading arguments onto the context stack.
 test "t14_invocation_contextual_function_type" {
     const src =
         \\fun call(f: context(String, Int) (Boolean) -> Unit) {
@@ -276,7 +249,6 @@ test "t14_invocation_contextual_function_type" {
     try assertKlio("t14", src, "true s 1\nfalse t 2\n");
 }
 
-// T15 — overloads differing only in context: shadow warning + call ambiguity.
 test "t15_contextual_overload_shadowed_and_ambiguous" {
     const src =
         \\fun f() = println("plain")
@@ -288,7 +260,6 @@ test "t15_contextual_overload_shadowed_and_ambiguous" {
     try assertDiag(src, "OVERLOAD_RESOLUTION_AMBIGUITY", "f");
 }
 
-// T16 — smart cast on a context parameter.
 test "t16_smart_cast_context_parameter" {
     const src =
         \\context(s: String) fun bar() = println(s.length)
@@ -299,7 +270,6 @@ test "t16_smart_cast_context_parameter" {
     try assertKlio("t16", src, "4\n");
 }
 
-// T17 — constructor context list rejected.
 test "t17_constructor_context_rejected" {
     try assertDiag(
         \\class A
@@ -308,7 +278,6 @@ test "t17_constructor_context_rejected" {
     , "UNSUPPORTED", "Context parameters on constructors are unsupported.");
 }
 
-// T18 — contextual property with initializer rejected.
 test "t18_contextual_property_initializer_rejected" {
     try assertDiag(
         \\class A
@@ -317,7 +286,6 @@ test "t18_contextual_property_initializer_rejected" {
     , "CONTEXT_PARAMETERS_WITH_BACKING_FIELD", "no backing field");
 }
 
-// T19 — multiple lists / default value / vararg / bare type rejected.
 test "t19_structural_rejections" {
     try assertDiag(
         \\class A
@@ -339,7 +307,6 @@ test "t19_structural_rejections" {
     , "CONTEXT_PARAMETER_WITHOUT_NAME", "Context parameters must be named.");
 }
 
-// T20 — statement-level disambiguation (call vs local declaration).
 test "t20_statement_level_disambiguation" {
     const src =
         \\fun main() {
@@ -352,16 +319,14 @@ test "t20_statement_level_disambiguation" {
     try assertKlio("t20", src, "v\n7\n");
 }
 
-// T21 — override must match; name change allowed.
 test "t21_override_must_match_context" {
-    // A missing context list on the override overrides nothing.
     try assertDiag(
         \\class A
         \\open class Base { context(a: A) open fun foo() = println("base") }
         \\class D1 : Base() { override fun foo() = println("d1") }
         \\
     , "NOTHING_TO_OVERRIDE", "overrides nothing");
-    // A matching context list (name change allowed) overrides and runs.
+    // The context list must match, but its parameter names need not.
     try assertKlio("t21",
         \\class A
         \\open class Base { context(a: A) open fun foo() = println("base") }
@@ -371,7 +336,6 @@ test "t21_override_must_match_context" {
     , "d2\n");
 }
 
-// T22 — excluded: explicit context argument.
 test "t22_explicit_context_argument_rejected" {
     const src =
         \\class A
@@ -383,7 +347,6 @@ test "t22_explicit_context_argument_rejected" {
     try assertDiag(src, "NO_CONTEXT_ARGUMENT", "No context argument for 'a' found.");
 }
 
-// T23 — excluded: callable reference to a contextual declaration.
 test "t23_callable_reference_rejected" {
     try assertDiag(
         \\class A
@@ -393,7 +356,6 @@ test "t23_callable_reference_rejected" {
     , "CALLABLE_REFERENCE_TO_CONTEXTUAL_DECLARATION", "Callable reference to 'save' is unsupported because it has context parameters.");
 }
 
-// T24 — `NO_CONTEXT_ARGUMENT` reported per missing parameter.
 test "t24_no_context_argument_per_parameter" {
     const src =
         \\context(a: String, b: Int) fun f() {}

@@ -1,26 +1,14 @@
-//! Threaded stress gate for the pack-level concurrency primitives whose
-//! upstream contracts require thread safety: ktor's `ConcurrentMap` and
-//! `Attributes` (`computeIfAbsent` runs its block at most once per
-//! absent key under contention) and the `io.ktor.utils.io.locks`
-//! actuals (real mutual exclusion, used by `ByteChannel`'s flush
-//! buffer), hammered from real OS threads (`kotlin.concurrent.thread`
-//! — the genuinely parallel surface). The `ByteChannel` programs run
-//! the write/read sides through the cooperative pump: a continuation
-//! parked on one pump cannot yet be resumed from a foreign OS thread
-//! (see plans/open-campaigns.md), so cross-thread channel contention is
-//! exercised at the lock level, not the suspension level.
-//!
-//! Each program runs in a real `klio` child process against installed
-//! packs (`klio pack build` + `pack install` into a scratch HOME), with
-//! `KLIO_RACE_JITTER=1` set so the runtime widens borrow-acquisition
-//! windows and a lost update / double-computed block reproduces
-//! reliably instead of only on a rare interleaving.
+//! Threaded stress gate for pack primitives whose upstream contracts require
+//! thread safety: ktor's `ConcurrentMap` and `Attributes` (`computeIfAbsent`
+//! runs its block at most once per absent key) and the
+//! `io.ktor.utils.io.locks` actuals behind `ByteChannel`'s flush buffer. Load
+//! comes from real OS threads, so channel contention is exercised at the lock
+//! level; a continuation parked on one pump is not resumable from a foreign
+//! thread.
 
 const std = @import("std");
 const runtime = @import("runtime");
 
-/// The `klio` binary to spawn: `KLIO_ITEST_BIN` when set (the build run
-/// step points it at the harness-optimized install), else the Debug install.
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
 }
@@ -30,8 +18,7 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     errdefer map.deinit();
     runtime.procEnvPutAllInto(allocator, &map);
     try map.put("HOME", home);
-    // Widen the borrow-acquisition windows in the child so a genuine
-    // race reproduces reliably under this gate.
+    // Widens borrow-acquisition windows so a real race reproduces reliably.
     try map.put("KLIO_RACE_JITTER", "1");
     return map;
 }
@@ -56,8 +43,6 @@ fn runKlio(
     return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-/// Build + install the dependency packs and the ktor pack into a scratch
-/// HOME, once per test-process.
 fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, home) catch {};

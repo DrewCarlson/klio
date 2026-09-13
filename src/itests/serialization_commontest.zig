@@ -1,11 +1,5 @@
-//! kotlinx-serialization's own `commonTest` sources run through a child
-//! `klio test` against the installed `kotlinx.serialization` pack.
-//! See `commontest_support.zig`.
-//!
-//! The suite CONFIG (roots, packs, ratchet floors/ceilings) lives in the
-//! shared registry `commontest_support.suites` — one source of truth for
-//! this CI gate and the link-free `klio-census` driver. The ratchet
-//! history that used to live here is in git; tighten floors there only.
+//! kotlinx-serialization's own `commonTest` sources through a child `klio test`.
+//! Roots, packs, and ratchet bounds live in `commontest_support.suites`.
 
 const support = @import("commontest_support.zig");
 

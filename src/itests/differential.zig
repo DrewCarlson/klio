@@ -1,29 +1,14 @@
-//! Differential pack-vs-direct harness (§5.1 of the execution-architecture
-//! analysis). For every program in the corpus it runs the program through each
-//! `LoadMode` that APPLIES to it and asserts the stdout is byte-identical
-//! across modes. This converts pack-vs-direct resolution divergence (bug
-//! Class C) from a field bug into a default-target test failure.
-//!
-//! Applicable modes:
-//!   - A pure-stdlib program (no `kotlinx.*` import) is only meaningful under
-//!     `EmbeddedOnly` — the kotlinx packs would not load for it — so there is
-//!     nothing to compare and it is skipped here (the e2e corpus gate owns
-//!     single-mode example output).
-//!   - A program that uses a kotlinx pack runs `SourcePacks` (packs parsed from
-//!     source) AND `CompiledPacks` (packs round-tripped through a compiled
-//!     `.klio-pack` image), and the two outputs must match byte-for-byte.
-//!
-//! The corpus is every `examples/*.kt` plus the kotlinx-using
-//! `tests/fixtures/coroutine_smoke/*.kt` so at least one pack-using program is
-//! exercised across ≥2 modes.
+//! Differential pack-vs-direct harness over `examples/*.kt` and
+//! `tests/fixtures/coroutine_smoke/*.kt`: a kotlinx-using program runs under
+//! both `SourcePacks` and `CompiledPacks` and the outputs must be identical. A
+//! pure-stdlib program has only `EmbeddedOnly`, so it compares nothing and is
+//! skipped; the e2e corpus gate owns single-mode example output.
 
 const std = @import("std");
 const parity = @import("parity");
 const runtime = @import("runtime");
 
-/// Progress summaries are silent by default: a passing `zig build test` step
-/// must not write to stderr, or the build runner renders it as a failed
-/// command. Set `KLIO_ITEST_VERBOSE` to surface them when running directly.
+/// Stderr from a passing `zig build test` step renders as a failed command.
 fn verbose() bool {
     return runtime.envOnce("KLIO_ITEST_VERBOSE") != null;
 }
@@ -31,8 +16,6 @@ fn verbose() bool {
 const EXAMPLES = "examples";
 const SMOKE_DIR = "tests/fixtures/coroutine_smoke";
 
-/// True when `src` imports any `kotlinx.*` package, i.e. the program pulls in a
-/// kotlinx pack and is therefore meaningful under the pack-loading modes.
 fn usesKotlinxPack(src: []const u8) bool {
     var lines = std.mem.splitScalar(u8, src, '\n');
     while (lines.next()) |raw| {
@@ -46,7 +29,6 @@ fn usesKotlinxPack(src: []const u8) bool {
     return false;
 }
 
-/// The set of load modes that applies to a program with the given source.
 fn applicableModes(src: []const u8) []const parity.LoadMode {
     if (usesKotlinxPack(src)) {
         return &.{ .SourcePacks, .CompiledPacks };
@@ -67,22 +49,11 @@ fn runOne(gpa: std.mem.Allocator, io: std.Io, file: []const u8, mode: parity.Loa
     };
 }
 
-/// Run every program in `files` through every applicable mode and assert the
-/// stdout is byte-identical across modes. Returns the number of divergences.
-///
-/// Each program (and each mode within it) is run on a per-program arena that is
-/// reset between iterations so the per-run phase-scoped data — ASTs, IR, the
-/// rebuilt kotlinx/coroutines packs, the VM graph — is reclaimed instead of
-/// accumulating across the whole corpus in one process. Safe because the
-/// cross-program global state (inline-fn tables, receiver guard stacks) is
-/// backed by page_allocator, not this arena.
+/// Returns the number of cross-mode divergences. Runs share one arena, reset
+/// between programs; the cross-program globals live on the page allocator.
 fn checkCorpus(io: std.Io, files: []const []const u8) !usize {
-    // Bound the parity base cache: the corpus spans many pack masks and each
-    // base is a full stdlib+packs clone, so an unbounded cache (the default)
-    // accumulates one clone per mask on top of the fixed base-image working set.
-    // A small LRU bound frees evicted bases' arenas back to the OS; 2 is the
-    // divergence working set — the two load modes compared for the current
-    // program. (e2e sets the same bound; differential previously set none.)
+    // Each cached base is a full stdlib+packs clone, so cap the LRU at the
+    // working set: the two load modes compared for the current program.
     parity.base_cache_max = 2;
 
     var run_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -91,8 +62,6 @@ fn checkCorpus(io: std.Io, files: []const []const u8) !usize {
     var failures: usize = 0;
     var pack_programs: usize = 0;
     for (files) |file| {
-        // Free the per-program peak (a big compose program's rebuilt packs + VM)
-        // back to the OS instead of retaining it for the rest of the corpus.
         _ = run_arena.reset(.{ .retain_with_limit = 64 * 1024 * 1024 });
         const ra = run_arena.allocator();
         const src = std.Io.Dir.cwd().readFileAlloc(io, file, ra, .unlimited) catch |e| {
@@ -100,7 +69,6 @@ fn checkCorpus(io: std.Io, files: []const []const u8) !usize {
             continue;
         };
         const modes = applicableModes(src);
-        // One applicable mode compares nothing — skip the run entirely.
         if (modes.len < 2) continue;
         pack_programs += 1;
 
@@ -143,9 +111,6 @@ fn checkCorpus(io: std.Io, files: []const []const u8) !usize {
 }
 
 test "examples + coroutine smoke are byte-identical across load modes" {
-    // Stable arena for the corpus file list + io (lives for the whole test).
-    // The per-program pipeline allocations live in checkCorpus's own arena,
-    // which it resets between programs so they do not accumulate.
     var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer list_arena.deinit();
     const la = list_arena.allocator();
@@ -170,10 +135,7 @@ test "examples + coroutine smoke are byte-identical across load modes" {
         return error.SkipZigTest;
     }
 
-    // Group by dependency-base key so the 2-entry cache (one base per load
-    // mode of the CURRENT mask) stays hot across each group instead of
-    // thrashing per alphabetical mask switch — the coexistence + rebuild
-    // transient is what grazed the RSS watchdog cap.
+    // Grouping by base key keeps the two-entry cache hot within each group.
     parity.groupByBaseKey(la, io, corpus.items);
 
     const failures = try checkCorpus(io, corpus.items);
@@ -183,11 +145,8 @@ test "examples + coroutine smoke are byte-identical across load modes" {
     }
 }
 
-// Order-independence gate for the once-per-process stdlib base: the corpus
-// runs twice in one process — forward, then reversed — and every
-// (program, mode) outcome must be byte-identical between the passes. A
-// mutation leaking from one program's run into the shared base would make
-// an output depend on which programs ran before it.
+// A mutation leaking out of one run into the shared per-process base would
+// make an output depend on which programs ran before it.
 test "corpus outputs are independent of program order" {
     var list_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer list_arena.deinit();
@@ -207,11 +166,9 @@ test "corpus outputs are independent of program order" {
     try corpus.appendSlice(la, smoke);
     if (corpus.items.len == 0) return error.SkipZigTest;
 
-    // Base-state leakage is order-dependence in the shared per-process base;
-    // it shows up with any surrounding programs, so a deterministic sample
-    // spanning the sorted corpus proves the isolation without re-interpreting
-    // every example twice. Every pack-using program stays (the pack-mode
-    // bases carry the most shared state).
+    // Leakage shows up against any surrounding programs, so a deterministic
+    // sample suffices. Every pack-using program stays: those bases carry the
+    // most shared state.
     var sampled: std.ArrayList([]u8) = .empty;
     defer sampled.deinit(la);
     {
@@ -231,11 +188,8 @@ test "corpus outputs are independent of program order" {
     }
     corpus.clearRetainingCapacity();
     try corpus.appendSlice(la, sampled.items);
-    // Grouped by base key: the forward pass runs mask-grouped ascending and
-    // the reverse pass descending — still two distinct orders for every
-    // program (its predecessor set differs between passes), while the base
-    // cache stays hot within each group instead of thrash-rebuilding per
-    // alphabetical mask switch into the RSS cap.
+    // Grouping keeps the cache hot and still gives every program a different
+    // predecessor set in the two passes.
     parity.groupByBaseKey(la, io, corpus.items);
 
     const Key = struct { file: []const u8, mode: parity.LoadMode };
@@ -245,7 +199,7 @@ test "corpus outputs are independent of program order" {
     var run_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer run_arena.deinit();
 
-    // Forward pass: record every outcome (output or error text).
+    // Forward pass: record every outcome.
     for (corpus.items) |file| {
         if (verbose()) std.debug.print("differential order FWD {s}\n", .{file});
         _ = run_arena.reset(.{ .retain_with_limit = 64 * 1024 * 1024 });
@@ -266,7 +220,6 @@ test "corpus outputs are independent of program order" {
         }
     }
 
-    // Reverse pass: byte-compare against the forward pass.
     var failures: usize = 0;
     var idx: usize = recorded.items.len;
     while (idx > 0) {

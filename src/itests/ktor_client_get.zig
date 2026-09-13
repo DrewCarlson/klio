@@ -1,13 +1,7 @@
-//! End-to-end ktor-client gate: a real `klio` child process performs a GET
-//! against a localhost HTTP server owned by this test, through the real
-//! pack pipeline (`klio pack build` + `pack install` into a scratch HOME,
-//! then `klio run --feature io.ktor/client`). Asserts status + body, plus
-//! the typed `body<T>()` variant under `client-serialization`.
-//!
-//! This is the gate the ktor surface previously lacked: it exercises the
-//! installed-pack feature gating, the host `__kktor_request` transport, and
-//! the kotlinx-serialization typed-body path with zero network dependency
-//! (the server lives in this process).
+//! End-to-end ktor-client gate: a child `klio` process requests an HTTP server
+//! this test runs in-process, so nothing depends on the network. Covers
+//! feature gating, the host `__kktor_request` transport, and the
+//! kotlinx-serialization typed `body<T>()` path.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -15,20 +9,13 @@ const net = std.Io.net;
 
 const FIXED_BODY = "{\"name\":\"Ada\",\"age\":36,\"roles\":[\"ADMIN\",\"USER\"]}";
 
-// -------------------------------------------------------------------------
-// In-test HTTP server: accept loop on 127.0.0.1:<ephemeral>, fixed JSON
-// response per request, closes each connection (the engine sends
-// `Connection: close`). Built on the portable `std.Io.net` stream API.
-// -------------------------------------------------------------------------
-
 const Server = struct {
     io: std.Io,
     inner: net.Server,
     port: u16,
     thread: std.Thread,
     stop: std.atomic.Value(bool),
-    /// Requests served — the send-count oracle (one logical GET must
-    /// issue exactly one request).
+    /// Requests served: the oracle for one logical call sending one request.
     hits: std.atomic.Value(u32),
 
     fn start(self: *Server, io: std.Io) !void {
@@ -68,9 +55,8 @@ const Server = struct {
 
     fn handleConn(self: *Server, io: std.Io, stream: net.Stream) void {
         _ = self.hits.fetchAdd(1, .monotonic);
-        // Read the request until the head is complete plus, for a request
-        // carrying a Content-Length, the full body — a POST's payload is
-        // echoed back so the serialize-request path is asserted on the wire.
+        // A POST's payload is echoed back, so the serialize-request path is
+        // asserted on the wire.
         var buf: [8192]u8 = undefined;
         var reader = stream.reader(io, &buf);
         const ir = &reader.interface;
@@ -123,12 +109,6 @@ fn parseContentLength(head: []const u8) usize {
     return 0;
 }
 
-// -------------------------------------------------------------------------
-// Child-process plumbing.
-// -------------------------------------------------------------------------
-
-/// The `klio` binary to spawn: `KLIO_ITEST_BIN` when set (the build run
-/// step points it at the harness-optimized install), else the Debug install.
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
 }
@@ -161,9 +141,7 @@ fn runKlio(
     return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-/// Build + install the dependency packs and the ktor pack into a scratch
-/// HOME, once per test-process. The pack images go to target/packs/ (the
-/// CLI's default output), the installs into `<home>/.klio/packs`.
+/// Images land in `target/packs/`, installs in `<home>/.klio/packs`.
 fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, home) catch {};
@@ -233,7 +211,6 @@ fn runProgram(name: []const u8, src: []const u8, feature: []const u8, expected: 
         return error.KlioRunFailed;
     }
     try std.testing.expectEqualStrings(expected, r.stdout);
-    // One logical GET = exactly one request on the wire.
     try std.testing.expectEqual(@as(u32, 1), server.hits.load(.monotonic));
 }
 

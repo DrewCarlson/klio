@@ -1,30 +1,16 @@
-//! Bulk array copy/fill intrinsics and String <-> `ByteArray` (UTF-8)
-//! conversions, plus the kotlinx-io byte surface that rides on top of
-//! them. Upstream declares `copyInto` / `copyOf` / `copyOfRange` /
-//! `fill` and `encodeToByteArray` / `toByteArray` / `decodeToString`
-//! without a klio-runnable body; before the host actuals landed every
-//! one silently no-opped (a `ByteArray` copy left the destination zeroed).
-//! Also ranges, progressions, and primitive array specializations
-//! (IntArray init, step/downTo/until, char ranges, sliceArray,
-//! arrayOfNulls, withIndex, DoubleArray aggregates).
+//! Bulk array copy/fill, String/`ByteArray` UTF-8 conversion, ranges, and the
+//! kotlinx-io byte surface built on them.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_array_bulk_ops";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// One arena for the whole file: process-global lowering/VM state outlives any per-test arena.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -205,9 +191,8 @@ test "string_from_byte_array_decodes_utf8" {
 }
 
 test "kotlinx_io_read_byte_array" {
-    // readByteArray / readTo(ByteArray) bottom out on the extension
-    // `Source.readTo(ByteArray, ...)`; the member `Buffer.readTo(RawSink,
-    // byteCount)` must not shadow it (it's inapplicable by arity).
+    // `readTo(ByteArray)` must reach the extension, not the arity-mismatched
+    // member `Buffer.readTo(RawSink, byteCount)`.
     const src =
         \\import kotlinx.io.Buffer
         \\import kotlinx.io.readByteArray

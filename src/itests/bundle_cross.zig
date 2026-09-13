@@ -1,13 +1,6 @@
-//! Cross-target bundling gate: `klio bundle --target` resolves the
-//! target's stub through `KLIO_STUB_DIR` (never the network in tests),
-//! assembles the bundle by pure byte surgery, and the result boots —
-//! host-runnable here because the "linux-arm64" stub under the stub dir
-//! is really a copy of the host stub. Also covers the offline error when
-//! no stub resolves, `--stub` explicit paths, and the UI shim riding the
-//! same resolve order (a placeholder shim blob embeds and lands in the
-//! `skia-shim` section). Fetch-side sha256 refusal is unit-tested in
-//! `src/cli/stub_fetch.zig` (dev builds bake no manifest, so the network
-//! path never runs here).
+//! `klio bundle --target` resolves the target stub through `KLIO_STUB_DIR`,
+//! never the network. The "linux-arm64" stub planted there is a copy of the
+//! host stub, so the cross bundle it produces boots here.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -66,9 +59,6 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
 
-    // A stub dir carrying the "linux-arm64" stub (a copy of the host
-    // stub, so the produced bundle is host-runnable) and a placeholder
-    // shim blob for the UI resolve order.
     const stub_dir = TMP_ROOT ++ "/stubs";
     try cwd.createDirPath(io, stub_dir ++ "/" ++ FAKE_TARGET);
     {
@@ -83,7 +73,6 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
         });
     }
 
-    // Without a stub source, cross bundling reports the offline hint.
     {
         const r = try runChild(a, io, &env, &.{
             bin, "bundle", "examples/hello.kt", "-o", TMP_ROOT ++ "/nostub", "--target", FAKE_TARGET,
@@ -93,8 +82,6 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
         try std.testing.expect(std.mem.indexOf(u8, r.stderr, "--stub <path>") != null);
     }
 
-    // With KLIO_STUB_DIR, the cross bundle assembles and (being a host
-    // stub in disguise) boots byte-identically to `klio run`.
     try env.put("KLIO_STUB_DIR", stub_dir);
     const out = TMP_ROOT ++ "/hello_cross";
     {
@@ -112,7 +99,6 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
     try std.testing.expectEqual(expect.code, got.code);
     try std.testing.expectEqualStrings(expect.stdout, got.stdout);
 
-    // An unknown target is rejected up front.
     {
         const r = try runChild(a, io, &env, &.{
             bin, "bundle", "examples/hello.kt", "-o", TMP_ROOT ++ "/badtarget", "--target", "beos-ppc",
@@ -121,7 +107,6 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
         try std.testing.expect(std.mem.indexOf(u8, r.stderr, "unknown --target") != null);
     }
 
-    // --stub bypasses the resolve order entirely.
     {
         const r = try runChild(a, io, &env, &.{
             bin,      "bundle", "examples/hello.kt",
@@ -132,9 +117,8 @@ test "cross bundle resolves the stub from KLIO_STUB_DIR and boots" {
         try std.testing.expectEqual(@as(u32, 0), r.code);
     }
 
-    // A forced-UI cross bundle picks the shim blob up from the stub dir
-    // and embeds it (inspection shows the section; the blob is a
-    // placeholder, so it is not run).
+    // The embedded shim blob is a placeholder, so the UI bundle is inspected
+    // rather than run.
     {
         const ui_out = TMP_ROOT ++ "/ui_cross";
         const r = try runChild(a, io, &env, &.{

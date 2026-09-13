@@ -1,16 +1,9 @@
 //! The kotlinc box-test conformance corpus: every program under
 //! `kotlin/compiler/testData/codegen/box` declares `fun box(): String` that
-//! must return `"OK"`. Each selected test runs as its own child `klio run`
-//! (its `// FILE:` sections materialized as separate source files, plus a
-//! synthesized `main` that calls `box()` and asserts the answer), so a
-//! crash or hang isolates to one named test.
-//!
-//! Tests are selected by their header directives, never by name: a
-//! directive klio honors or can ignore is on the allow list, a directive
-//! that binds the test to a JVM/JS/multi-module framework feature excludes
-//! it, and an unknown directive excludes it under `unknown:<NAME>` so the
-//! exclusion census names what to teach the runner next. Shared by the
-//! `box_conformance` itest (the ratchet) and `klio-census box`.
+//! must return `"OK"`. Each selected test runs as its own child `klio run`,
+//! its `FILE:` sections materialized as separate sources under a synthesized
+//! `main`. Selection is by header directive, never by name, and an
+//! unrecognized directive excludes the test under `unknown:<NAME>`.
 const std = @import("std");
 const runtime = @import("runtime");
 
@@ -24,40 +17,14 @@ const HELPERS = [_][]const u8{
 };
 pub const SCRATCH_HOME = "/tmp/klio_itest_box_home";
 
-/// The ratchet: the measured pass count of the last recorded census is the
-/// floor (raise as fixes land, never lower) and its measured failure count
-/// the ceiling with no slack (lower as fixes land; raise only with a
-/// root-caused record). First census 2026-09-05 (build-2.4.10-RC corpus,
-/// ReleaseSafe harness): 5246 passed, 1105 failed, 20 did not complete of
-/// 6371 selected, 980 excluded by directive — `plans/kotlinc-box-conformance.md`.
-/// Kotlin 2.4 destructuring forms: 5409 / 942. Explicit primitive
-/// `rangeTo` + invoked lambda arguments: 5440 / 911. Enum entries with
-/// bodies as real subclasses: 5461 / 890. Language feature flags and the
-/// name-based short form: 5477 / 874. Corpus syntax gaps and contextual
-/// anonymous functions: 5506 / 845. Tailrec self-calls in tail position
-/// in every form: 5530 / 822. Bare accessors, enum secondary
-/// constructors, vararg enum entries: 5542 / 810. Parent secondary
-/// constructors from subclass headers, enum overrides virtual: 5553 / 799.
-/// Omitted varargs empty on every route, SAM context parameters: 5560 / 792.
-/// Annotation instances by value, captured locals in super calls, enum
-/// static scope and initialization: 5623 / 729.
-/// The `provideDelegate` convention at every delegated property: 5647 / 705.
-/// Callable references compare by target, receiver and adaptation: 5665 / 687.
-/// Delegated locals read through the delegate on every route: 5666 / 686.
-/// Floating-point comparisons follow the static type: 5695 / 657.
-/// Capturing lambdas keep identity, typealiases resolve as their class: 5696 / 656.
-/// Constructor references to local and inner classes, explicit `as Any`
-/// applicability: 5706 / 648. KType structural equality and reified binding
-/// from a local's declared type: 5716 / 638. Ranges: `in` desugars to
-/// `contains`, extensions serve non-element arguments, progression math in
-/// the element domain: 5751 / 609.
+/// Pass floor and failure ceiling. They tighten as fixes land, and loosen
+/// only with a root-caused record.
 pub const BASELINE: usize = 6040;
 pub const MAX_FAILED: usize = 316;
 
-/// Directives that bind a test to a framework feature klio has no
-/// counterpart for: a backend restriction, a second module, reflection,
-/// JDK classes, compiler flags, an older language version, or a helper the
-/// test framework synthesizes.
+/// Directives binding a test to a framework feature with no klio counterpart:
+/// a backend restriction, a second module, reflection, JDK classes, compiler
+/// flags, or an older language version.
 const EXCLUDE = [_][]const u8{
     "TARGET_BACKEND",       "MODULE",                             "WITH_REFLECT",
     "FULL_JDK",             "JVM_TARGET",                         "FREE_COMPILER_ARGS",
@@ -68,12 +35,9 @@ const EXCLUDE = [_][]const u8{
     "SAM_CONVERSIONS",      "JVM_DEFAULT_MODE",                   "STRING_CONCAT",
     "LAMBDAS",              "JVM_ABI_K1_K2_DIFF",                 "CHECK_TYPE_WITH_EXACT",
 };
-/// Directives klio honors (`WITH_STDLIB`, `WITH_COROUTINES`, `LANGUAGE`
-/// enabling a feature, the value-class placeholder) or can ignore: notes,
-/// per-backend mutes, IR/bytecode dump and listing checks that sit beside
-/// the `box()` answer, JS/wasm/native pipeline flags. A
-/// `DONT_TARGET_EXACT_BACKEND` naming the JVM excludes instead: klio
-/// follows the JVM, and such a test asserts another backend's behavior.
+/// Directives klio honors or can ignore: notes, per-backend mutes, checks
+/// that sit beside the `box()` answer, other backends' pipeline flags. A
+/// `DONT_TARGET_EXACT_BACKEND` naming the JVM excludes instead.
 const ALLOW = [_][]const u8{
     "WITH_STDLIB",                  "WITH_RUNTIME",                        "WITH_COROUTINES",
     "LANGUAGE",                     "WORKS_WHEN_VALUE_CLASS",              "ISSUE",
@@ -115,11 +79,9 @@ fn inList(list: []const []const u8, name: []const u8) bool {
 
 pub const Directive = struct { name: []const u8, value: []const u8 };
 
-/// `// NAME` or `// NAME: value` (an old `// !NAME` spelling too), with
-/// nothing else on the line. Uppercase words in ordinary comments
-/// (`// TODO: …`) match as well; the caller confines the header scan to the
-/// lines before the first code line and the allow list carries the note
-/// words.
+/// Matches `NAME`, `NAME: value` and `!NAME` in a comment with nothing else
+/// on the line. An uppercase word in an ordinary comment matches too, so the
+/// caller scans only the lines before the first code line.
 pub fn parseDirective(line: []const u8) ?Directive {
     const s = std.mem.trim(u8, line, " \t\r");
     if (!std.mem.startsWith(u8, s, "//")) return null;
@@ -146,14 +108,12 @@ pub const Section = struct { name: []const u8, text: []const u8 };
 pub const Case = struct {
     rel: []const u8,
     sections: []const Section = &.{},
-    /// Why the test is not run (the exclusion census key), or null.
+    /// The exclusion census key, or null when the test runs.
     reason: ?[]const u8 = null,
     with_coroutines: bool = false,
     value_class_placeholder: bool = false,
     /// `// LANGUAGE: +Feature …` specs, passed to the child as `--language=`.
     language: []const u8 = "",
-    /// The package of the file that declares `box()`, for the import in
-    /// the synthesized main.
     package: ?[]const u8 = null,
 };
 
@@ -175,8 +135,6 @@ fn languageDisablesFeature(value: []const u8) bool {
     return false;
 }
 
-/// Parse one corpus file: header directives, `// FILE:` sections, and the
-/// selection verdict.
 pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
     var c: Case = .{ .rel = rel };
     var sections: std.ArrayList(Section) = .empty;
@@ -205,15 +163,11 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
                 } else if ((std.mem.eql(u8, d.name, "IGNORE_BACKEND") or std.mem.eql(u8, d.name, "IGNORE_BACKEND_K2")) and
                     std.mem.indexOf(u8, d.value, "ANY") != null)
                 {
-                    // A mute on every backend under the current frontend.
-                    // `IGNORE_BACKEND_K1` mutes the retired K1 frontend only
-                    // and `_MULTI_MODULE` mutes a mode this runner never
-                    // uses; both stay selected.
+                    // Muted on every backend under the current frontend; the
+                    // K1 and multi-module spellings stay selected.
                     reason = reason orelse try std.fmt.allocPrint(a, "{s}:ANY", .{d.name});
                 } else if (std.mem.eql(u8, d.name, "DONT_TARGET_EXACT_BACKEND") and namesJvmBackend(d.value)) {
-                    // The test asserts a JS/Wasm/Native-only behavior (a
-                    // class-initialization order the JVM does not have);
-                    // klio follows the JVM.
+                    // Asserts a non-JVM backend's behavior.
                     reason = reason orelse "DONT_TARGET_EXACT_BACKEND:JVM";
                 } else if (std.mem.eql(u8, d.name, "WITH_COROUTINES")) {
                     c.with_coroutines = true;
@@ -259,9 +213,7 @@ pub fn parseCase(a: std.mem.Allocator, rel: []const u8, src: []const u8) !Case {
     return c;
 }
 
-/// The `box/diagnostics` tests carry diagnostics-test markup
-/// (`<!NON_TAIL_RECURSIVE_CALL!>call<!>`, `<!>`) that the framework strips
-/// before compiling; strip it the same way.
+/// Remove the `<!NAME!>text<!>` diagnostics markup, as kotlinc does.
 pub fn stripDiagnosticMarkup(a: std.mem.Allocator, text: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, text, "<!") == null) return text;
     var out: std.ArrayList(u8) = .empty;
@@ -326,9 +278,8 @@ fn envUsize(name: []const u8, default: usize) usize {
 }
 
 fn workerCount() usize {
-    // Box children are sub-second programs, so the runner takes its own
-    // width before the census-wide `KLIO_ITEST_JOBS` (sized for heavy
-    // library children).
+    // Box children are sub-second, so `KLIO_BOX_JOBS` outranks the census-wide
+    // width, which is sized for heavy library children.
     const own = envUsize("KLIO_BOX_JOBS", 0);
     if (own >= 1) return @min(own, 64);
     const n = envUsize("KLIO_ITEST_JOBS", 0);
@@ -353,9 +304,7 @@ fn runChild(a: std.mem.Allocator, env: *std.process.Environ.Map, argv: []const [
     return .{ .term = r.term, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-/// 1,483 corpus files `import kotlin.test.*`; the pack is built from the
-/// tree and installed into the scratch home once per census, the way the
-/// library censuses install theirs.
+/// Installed into the scratch home once per census.
 fn installKotlinTest(a: std.mem.Allocator, env: *std.process.Environ.Map, bin: []const u8, cap_ms: i64) !void {
     const b = try runChild(a, env, &.{ bin, "pack", "build", "kotlin-klio/klio-kotlin-test" }, cap_ms);
     if (b.term != .exited or b.term.exited != 0) {
@@ -441,11 +390,9 @@ const Pool = struct {
     }
 };
 
-/// Run the census: parse every corpus file, print the exclusion census and
-/// every failure by name, and return the counts. `KLIO_BOX_FILTER` keeps
-/// only the tests whose path contains the substring; `KLIO_ITEST_JOBS`
-/// sets the worker width; `KLIO_BOX_TIMEOUT_MS` the per-test wall
-/// (default 60 s, ×4 on a Debug harness).
+/// `KLIO_BOX_FILTER` keeps only paths containing the substring,
+/// `KLIO_ITEST_JOBS` sets the worker width, and `KLIO_BOX_TIMEOUT_MS` the
+/// per-test wall (default 60s, 4x that on a Debug harness).
 pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -518,7 +465,6 @@ pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
         try jobs.append(a, .{ .case = case, .argv = try argv.toOwnedSlice(a) });
     }
 
-    // Exclusion census, largest reason first.
     {
         const Entry = struct { k: []const u8, v: usize };
         var list: std.ArrayList(Entry) = .empty;
@@ -532,8 +478,7 @@ pub fn runCensus(a: std.mem.Allocator, label: []const u8) !Summary {
         for (list.items) |e| std.debug.print("[box-excluded] {s}: {d}\n", .{ e.k, e.v });
     }
 
-    // One serial warm-up run bakes the stdlib image into the scratch home
-    // before the pool fans out.
+    // A serial warm-up bakes the stdlib image before the pool fans out.
     if (jobs.items.len > 0) {
         _ = runChild(a, &env, jobs.items[0].argv, timeout_ms * 4) catch {};
     }
@@ -562,7 +507,6 @@ pub fn printSummary(label: []const u8, s: Summary, baseline: usize, max_failed: 
     );
 }
 
-/// Whether a backend list names the JVM (`JVM`, `JVM_IR`).
 fn namesJvmBackend(value: []const u8) bool {
     var it = std.mem.tokenizeAny(u8, value, ", ");
     while (it.next()) |tok| {

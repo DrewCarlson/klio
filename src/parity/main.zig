@@ -1,7 +1,5 @@
-//! `klio-parity <file.kt>` — compare our interpreter against JVM `kotlinc`.
-//! Exit code 0 on parity, 1 on mismatch, 2 on harness error.
-//!
-//! Exposes `pub fn run` (not a real `main`); the orchestrator wires the exe.
+//! `klio-parity <file.kt>`: compare the interpreter against JVM `kotlinc`. Exit
+//! 0 on parity, 1 on mismatch, 2 on harness error. Exposes `run`, not a `main`.
 
 const std = @import("std");
 const parity = @import("parity.zig");
@@ -10,11 +8,8 @@ const runtime = @import("runtime");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-/// Run the parity harness over `args` (the full argv, including argv[0]).
-/// Returns the process exit code (0 / 1 / 2).
 pub fn run(allocator: Allocator, io: Io, args: []const []const u8) Allocator.Error!u8 {
-    // Cap the harness process's RSS so a runaway program can't OOM the
-    // machine; arm the opt-in run deadline. Call-once.
+    // Cap the harness process's RSS and arm the opt-in deadline. Call-once.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
     const file = if (args.len > 1) args[1] else {
@@ -93,7 +88,7 @@ pub fn run(allocator: Allocator, io: Io, args: []const []const u8) Allocator.Err
     return if (any_mismatch) 1 else 0;
 }
 
-/// `klio-parity --sweep [corpus|examples|all]` — the fast inner loop.
+/// `klio-parity --sweep [corpus|examples|all]`.
 fn runSweepCmd(allocator: Allocator, io: Io, which: []const u8) Allocator.Error!u8 {
     switch (try parity.findKotlinc(allocator, io)) {
         .err => |e| {

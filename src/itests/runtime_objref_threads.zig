@@ -1,10 +1,6 @@
-//! Real-OS-thread stress + ordering tests for `ObjRef`. Exercises the actual
-//! `std`-backed reader/writer cell across
-//! genuine threads through the public `runtime` module API.
-//!
-//! `ObjRef` does its own ref-counted heap allocation/free, so these use the
-//! leak-checking testing allocator directly (no pipeline arena involved):
-//! every cell is freed when its last handle drops.
+//! `ObjRef` under real OS threads. It allocates and frees its own ref-counted
+//! cells, so these run on the leak-checking testing allocator: every cell must
+//! be freed when its last handle drops.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -16,9 +12,7 @@ const PUSHES_PER_THREAD: usize = 2_000;
 
 const IntList = struct {
     items: std.ArrayList(i32) = .empty,
-    // `pub` so the generic `ObjRef` in the runtime module can see this via
-    // `@hasDecl` and run it when the last handle drops (a non-`pub` decl is
-    // invisible across the module boundary).
+    // `pub` so `ObjRef` finds it with `@hasDecl` across the module boundary.
     pub fn deinit(self: *IntList, allocator: std.mem.Allocator) void {
         self.items.deinit(allocator);
     }
@@ -40,8 +34,6 @@ const PushWorker = struct {
                     @intCast(self.t * PUSHES_PER_THREAD + i),
                 ) catch unreachable;
             }
-            // Interleave shared reads to stress the lock under mixed
-            // shared/exclusive contention.
             const r = self.obj.borrow();
             _ = r.get().items.items.len;
             r.deinit();
@@ -51,10 +43,6 @@ const PushWorker = struct {
     }
 };
 
-// N threads hammer the same shared `ObjRef` with interleaved
-// `borrowMut().append(..)` and `borrow()` reads. The lock must serialize
-// every access: the final length equals the exact total of pushes and
-// every element is one we pushed (no corruption, no lost write).
 test "shared objref concurrent push is consistent" {
     const allocator = std.testing.allocator;
     const obj = try ObjRef(IntList).init(allocator, .{});
@@ -118,16 +106,13 @@ const HandoffReader = struct {
         defer g.deinit();
         std.debug.assert(g.get().items.items.len == 64);
         for (g.get().items.items, 0..) |v, i| {
-            // Never a partial write.
             std.debug.assert(v == @as(i32, @intCast(i)));
         }
     }
 };
 
-// Handoff ordering: the writing thread mutates the value, then hands the
-// handle to a reader thread. The reader (which only sees the handle after
-// the release store) must observe the fully-written value, never a
-// partial state.
+// The reader sees the handle only after the release store, so the value it
+// reads must be complete.
 test "handoff orders the write across threads" {
     const allocator = std.testing.allocator;
     const ROUNDS: usize = 200;
@@ -171,9 +156,6 @@ const CounterWorker = struct {
     }
 };
 
-// Many threads each clone the shared handle and do a read/modify under the
-// lock; an atomic side-counter cross-checks that exactly the expected number
-// of mutations were applied.
 test "shared objref read modify counter" {
     const allocator = std.testing.allocator;
     const obj = try ObjRef(i64).init(allocator, 0);

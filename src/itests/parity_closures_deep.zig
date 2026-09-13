@@ -4,22 +4,12 @@ const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_closures_deep";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// One file-scoped arena, reset per program: the pipeline's process-global
+// lowering/VM state points into it and must outlive each test.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
-/// Write `src` to a unique temp `.kt` file, run it through klio with the
-/// kotlinx packs loaded, and assert the captured stdout equals `expected`.
-/// An arena over the page allocator is used per test so the leak-checking
-/// test allocator never drives the pipeline.
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
 
@@ -41,8 +31,6 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     }
 }
 
-// 1. Closure of closure of var — innermost mutates, middle reads,
-//    outer reads after invocation.
 test "three_level_closure_capture" {
     const src =
         \\
@@ -60,8 +48,6 @@ test "three_level_closure_capture" {
     try assertKlio("three_level", src, "1,2,3,n=3\n");
 }
 
-// 2. Lambda referencing a captured var while loop reassigns it
-//    invokes lambda each iteration — lambda observes current value.
 test "lambda_observes_var_reassignment" {
     const src =
         \\
@@ -77,8 +63,6 @@ test "lambda_observes_var_reassignment" {
     try assertKlio("lambda_observes", src, "10,20,30,\n");
 }
 
-// 3. Closure capturing `this` of enclosing class accessed inside
-//    deeply nested lambdas.
 test "this_capture_in_deep_nesting" {
     const src =
         \\
@@ -97,7 +81,6 @@ test "this_capture_in_deep_nesting" {
     try assertKlio("this_deep", src, "Hi!\n");
 }
 
-// 4. Captured destructured variable.
 test "capture_destructured" {
     const src =
         \\
@@ -112,7 +95,6 @@ test "capture_destructured" {
     try assertKlio("capture_dest", src, "7,12\n");
 }
 
-// 5. Lambda returning lambda chain, currying-style.
 test "curried_lambda_chain" {
     const src =
         \\
@@ -125,8 +107,6 @@ test "curried_lambda_chain" {
     try assertKlio("curried", src, "6\n");
 }
 
-// 6. Mutual recursion via lambdas in val bindings using lateinit
-//    val and tied-knot through enclosing variable.
 test "lambda_tied_knot_recursion" {
     const src =
         \\
@@ -142,7 +122,6 @@ test "lambda_tied_knot_recursion" {
     try assertKlio("tied_knot", src, "true,false\n");
 }
 
-// 7. Lambda parameter shadowing enclosing local of same name.
 test "lambda_param_shadows_outer" {
     const src =
         \\
@@ -156,7 +135,6 @@ test "lambda_param_shadows_outer" {
     try assertKlio("shadow", src, "10,100\n");
 }
 
-// 8. Captured `it` in nested let-blocks doesn't bleed across.
 test "nested_let_it_scoping" {
     const src =
         \\
@@ -171,8 +149,6 @@ test "nested_let_it_scoping" {
     try assertKlio("let_it_scoping", src, "12\n");
 }
 
-// 9. Closure passed to a coroutine — captures stay alive across
-//    suspension points.
 test "closure_across_suspension" {
     const src =
         \\
@@ -188,8 +164,6 @@ test "closure_across_suspension" {
     try assertKlio("closure_suspend", src, "ok\n");
 }
 
-// 10. Lambda capturing a primitive Int via box; reassignment is
-//     observed across the boundary.
 test "primitive_box_observability" {
     const src =
         \\
@@ -204,11 +178,7 @@ test "primitive_box_observability" {
     try assertKlio("box_obs", src, "5\n");
 }
 
-// 11. Precise captured-`var` carrier: the SAME captured var, mutated by a
-//     lambda invoked three different ways (called directly, passed to a
-//     stdlib HOF, captured across launch/suspend), must round-trip
-//     identically on every path. Proves the carrier is uniform, not
-//     path-dependent.
+// The captured-`var` carrier is uniform, not path-dependent.
 test "captured_var_carrier_uniform_across_paths" {
     const src =
         \\import kotlinx.coroutines.*
@@ -232,11 +202,7 @@ test "captured_var_carrier_uniform_across_paths" {
     try assertKlio("carrier_uniform", src, "direct=3\nhof=10\nsus=100\n");
 }
 
-// 12. A captured `var` written across the inline-splice boundary: the
-//     inline HOF's own body `var` and the spliced user lambda both write
-//     captured state. Before the precise carrier, the inlined body's
-//     captured-`var` write lowered to the StoreGlobal fallback (only
-//     round-tripping on the HOF scoped env); now it lands on a shared cell.
+// Writes from the inline body and the spliced lambda land on one shared cell.
 test "captured_var_across_inline_splice" {
     const src =
         \\inline fun runAndCount(times: Int, block: (Int) -> Unit): Int {
@@ -275,8 +241,6 @@ test "boxed capture load dominates alternate branch after interpolation" {
     try assertKlio("boxed_capture_branch", src, "value=10 count=1\n");
 }
 
-// 13. Sibling closures over one captured var: one writes, one reads, while
-//     a stdlib HOF lambda writes the same var. All three observe one cell.
 test "captured_var_sibling_closures_and_hof" {
     const src =
         \\fun main() {
@@ -292,10 +256,6 @@ test "captured_var_sibling_closures_and_hof" {
     ;
     try assertKlio("carrier_siblings", src, "33\n");
 }
-
-// Advanced closure patterns: lambdas stored and invoked later, scope-fn
-// chaining with `this` reassignment, captures of class properties and
-// init-block locals, mutating fold accumulators, destructured let params.
 
 test "lambdas_stored_and_invoked_later" {
     const src =

@@ -1,8 +1,5 @@
-//! The compose ui modules' upstream conformance suites (ui-util,
-//! ui-geometry, ui-unit, ui-graphics, ui-text, ui commonTest) run through
-//! a child `klio test` against the installed compose ui packs. See
-//! `commontest_support.zig`; the suite CONFIG (roots, packs, support
-//! stand-ins, ratchet) lives in its shared registry.
+//! The compose ui modules' upstream suites through a child `klio test`.
+//! Config: `commontest_support.suites`.
 
 const support = @import("commontest_support.zig");
 

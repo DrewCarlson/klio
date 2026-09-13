@@ -1,58 +1,24 @@
 //! Run androidx.collection's own `commonTest` sources through `klio test`
 //! against the installed `androidx.collection` pack.
 //!
-//! The whole common test tree is discovered automatically. Files without
-//! `@Test` are shared fixtures (the value-class templates, ignore-target
-//! helpers) compiled into every test file's module. The androidx pack and its
-//! deps (`kotlinx.atomicfu`, `kotlin.test`) are built + installed first.
+//! The tree is discovered automatically; files without `@Test` are shared
+//! fixtures and compile into every test file's module.
 //!
-//! Several files contain a 1M-iteration `insertManyRemoveMany` stress test that
-//! the interpreter cannot yet finish inside the per-file timeout; such a file is
-//! killed before printing its summary, so the suite counts per-test `PASSED`
-//! lines (a strict lower bound that survives a mid-file hang) rather than the
-//! summary. The total must stay at or above a ratchet baseline; raise it as the
-//! static-dispatch work speeds the stress loops up, never lower it.
+//! A file carrying a 1M-iteration stress test can outlast the per-file timeout
+//! and never print its summary, so the suite counts per-test `PASSED` lines
+//! instead, a lower bound that survives a mid-file kill.
 
 const std = @import("std");
 const census_support = @import("commontest_support.zig");
 const runtime = @import("runtime");
 
-/// Minimum number of androidx commonTest cases that must pass. A ratchet: bump
-/// it up as fixes land (and as the stress loops get fast enough to complete),
-/// never down.
-///
-/// Raised 560 -> 1250 once the suite could actually run. The old figure was
-/// never enforced: the sparse checkout omitted `commonTest`, so `TEST_ROOT`
-/// was missing and the whole suite took the skip path. First real measurement:
-/// 1309 passed, 15 failed, 9 did not complete across 39 files. The floor sits
-/// below the measurement because a file killed mid-run keeps only the passes
-/// it had already printed, so the total moves with how many stress loops
-/// finish: 1275 passes at 10 did-not-complete, 1547 at 5. The floor stays at
-/// the low-water mark rather than the best run.
-// 1250 -> 1560. ValueClassListTest no longer hangs: a bare `forEachIndexed`
-// inside `buildString { … }` bound `CharSequence.forEachIndexed` and iterated
-// the builder its own body was appending to. The suite now reports 1841
-// passed, 0 failed, 0 did not complete — previously 1500/0 with 6 classes
-// timing out, which is how a real failure hid behind a green ceiling.
-const BASELINE: usize = 1841; // tightened 2026-09-01: 1841/0 across five consecutive full stacks
+/// Pass floor, at the low-water mark rather than the best run: a killed file
+/// keeps only the passes it already printed.
+const BASELINE: usize = 1841;
 
-/// Ceiling on failing cases, the mirror of `BASELINE`. 15 -> 4 -> 0 as two
-/// resolution roots closed: overloaded inline extensions no longer bind by
-/// call shape alone (that took fourteen failures, the whole of
-/// `IndexBasedArrayIteratorTest` and `ArraySetTest`), and a call carrying
-/// explicit type arguments no longer binds a same-named member that declares
-/// none (the last two, `ObjectIntTest`/`ObjectLongTest`'s `emptyObject*Map`,
-/// which recursed into their own @Test method until the eval depth blew).
-///
-/// Zero, deliberately: every case that runs, passes, so any new failure is a
-/// real regression. The count is biased DOWNWARD by the did-not-complete
-/// files — a file killed at the per-file timeout contributes no failures, and
-/// which of the 1M-iteration stress loops finish varies by run. If one of
-/// those starts completing and brings a genuine failure with it, that is
-/// worth knowing rather than absorbing into slack; the failing names are
-/// printed on every run, so a trip is diagnosable.
-///
-/// No did-not-complete ceiling, for the same throughput-bound reason.
+/// Failure ceiling, the mirror of `BASELINE`. Killed files contribute no
+/// failures, biasing the count down, so any trip is a real failure. There is
+/// no ceiling on killed files, which move with throughput.
 const MAX_FAILED: usize = 0;
 
 const TEST_ROOT = "kotlin-klio/klio-androidx-collection/upstream/collection/collection/src/commonTest/kotlin";
@@ -60,8 +26,7 @@ const INLINE_RECEIVER_FIXTURE = "tests/fixtures/androidx_collection_inline_recei
 const SCRATCH_HOME = "/tmp/klio_itest_androidx_home";
 
 const Pack = struct { dir: []const u8, artifact: []const u8 };
-/// Dependency order: atomicfu and kotlin.test before the androidx pack that
-/// depends on them.
+/// Dependency order: atomicfu and kotlin.test before androidx.
 const PACKS = [_]Pack{
     .{ .dir = "kotlin-klio/klio-kotlinx-atomicfu", .artifact = "target/packs/kotlinx.atomicfu.klio-pack" },
     .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
@@ -80,19 +45,14 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
     return map;
 }
 
-/// Concurrent child count. Each child is one `klio test` process; the pool
-/// keeps the cores busy while the slowest files run.
 fn workerCount() usize {
-    // KLIO_ITEST_JOBS overrides, like the shared registry runner — the
-    // full-stack script bounds every suite to its share of the box.
     if (std.c.getenv("KLIO_ITEST_JOBS")) |v| {
         if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |n| {
             if (n >= 1) return @min(n, 64);
         }
     }
     const cores = std.Thread.getCpuCount() catch 4;
-    // Half the cores, capped low: suites run beside sweeps and editors,
-    // and each child is itself a multi-threaded interpreter.
+    // Capped low: each child is itself a multi-threaded interpreter.
     return std.math.clamp(cores / 2, 1, 4);
 }
 
@@ -109,8 +69,7 @@ fn runKlio(
         .environ_map = env,
         .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(timeout_ms), .clock = .awake } },
     }) catch |e| {
-        // A hanging child (the 1M stress loop) is reported with whatever it
-        // printed before the kill, so the PASSED lines it already emitted count.
+        // A killed child keeps whatever it printed before the kill.
         if (e == error.Timeout) return .{ .term = .{ .exited = 124 }, .stdout = "", .stderr = "" };
         std.debug.print("androidx_commontest: spawn {s} failed: {s}\n", .{ argv[0], @errorName(e) });
         return error.SpawnFailed;
@@ -152,8 +111,7 @@ fn fileHasTest(a: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     return std.mem.indexOf(u8, bytes, "@Test") != null;
 }
 
-/// Count per-test `PASSED` lines. Robust to a file killed mid-run: the passes
-/// printed before the kill still count. A line is `<Class>.<method> PASSED`.
+/// Counts `<Class>.<method> PASSED` lines, so a killed file still counts.
 fn passedLineCount(stdout: []const u8) usize {
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, stdout, '\n');
@@ -163,9 +121,7 @@ fn passedLineCount(stdout: []const u8) usize {
     return n;
 }
 
-/// Small atomic spin lock. Zig 0.16's blocking `std.Io.Mutex` is parameterised
-/// on an `Io` handle, which the worker pool does not carry, so this guards the
-/// shared name list the same way the runtime guards its cell locks.
+/// Spin lock: `std.Io.Mutex` needs an `Io` handle the worker pool lacks.
 const SpinLock = struct {
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
@@ -180,9 +136,7 @@ const SpinLock = struct {
     }
 };
 
-/// Names of failing tests, collected across workers. A bare count is not
-/// actionable; the name distinguishes a real regression from one known
-/// unstable test flipping between runs.
+/// Failing test names, so a trip can be told from an unstable test flipping.
 const FailedNames = struct {
     mu: SpinLock = .{},
     a: std.mem.Allocator,
@@ -214,10 +168,6 @@ const FailedNames = struct {
     }
 };
 
-/// Count per-test `FAILED` lines, the mirror of `passedLineCount`. A floor on
-/// passes cannot see a regression *inside* the red mass: a change that turns
-/// one failure into a pass while breaking a different test leaves the pass
-/// count flat. Counting failures too gates both directions.
 fn failedLineCount(stdout: []const u8) usize {
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, stdout, '\n');
@@ -243,8 +193,7 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
 
     std.Io.Dir.cwd().createDirPath(io, SCRATCH_HOME) catch {};
     var env = try envWithHome(a, SCRATCH_HOME);
-    // A Debug harness interprets several times slower than the ReleaseSafe
-    // build these deadlines are tuned on; scale every child cap to match.
+    // The deadlines are tuned on ReleaseSafe; Debug runs several times slower.
     const slowdown = census_support.harnessSlowdown(&env);
     if (slowdown != 1) try census_support.scaleWallCaps(a, &env, slowdown);
     try installPacks(a, &env);
@@ -272,18 +221,14 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
         }
     }.lt);
 
-    // Fixtures (no `@Test`) are compiled into every test file's module.
     var support: std.ArrayList([]const u8) = .empty;
     var targets: std.ArrayList([]const u8) = .empty;
     for (all.items) |p| {
         if (fileHasTest(a, io, p)) try targets.append(a, p) else try support.append(a, p);
     }
 
-    // Build every child's argv up front, then drain the queue with a worker
-    // pool — each child is one isolated `klio test` process, so the only
-    // cross-thread state is the two counters. A file with the 1M stress loop
-    // is killed at the per-child cap; its earlier PASSED lines still count.
-    // Non-stress files finish in a few seconds.
+    // Argv is built up front and drained by a worker pool, so the only
+    // cross-thread state is the counters.
     var jobs: std.ArrayList([]const []const u8) = .empty;
     for (targets.items) |target| {
         var argv: std.ArrayList([]const u8) = .empty;
@@ -314,9 +259,7 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
                 const i = pnext.fetchAdd(1, .monotonic);
                 if (i >= queue.len) return;
                 _ = arena.reset(.retain_capacity);
-                // 180s per file: ScatterMapTest / OrderedScatterSetTest /
-                // SieveCacheTest are the compute-heavy tail (a healthy file
-                // returns long before), scaled for a Debug harness.
+                // 180s, above the compute-heavy tail and scaled for Debug.
                 const r = runKlio(arena.allocator(), penv, queue[i], 180_000 * census_support.harnessSlowdown(penv)) catch {
                     _ = phung.fetchAdd(1, .monotonic);
                     continue;
@@ -326,8 +269,6 @@ test "androidx.collection commonTest pass count holds at or above the ratchet ba
                 pnames.addFrom(r.stdout);
                 if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
                     _ = phung.fetchAdd(1, .monotonic);
-                    // Name the file that produced no summary (crashed or
-                    // cut off) so a red run is actionable from the log.
                     std.debug.print("[androidx-nosummary] <- {s}\n", .{queue[i][queue[i].len - 1]});
                 }
             }

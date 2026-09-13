@@ -1,20 +1,8 @@
-//! Strip the bodies of non-inline stdlib functions from the lifted AST.
-//!
-//! The baked stdlib image keeps the full post-lift AST forest (`lifted_decls`)
-//! alongside the lowered IR — ~67MB resident — even though a non-inline
-//! function's body never runs from the AST (its lowered IR does). Three things
-//! still read a base function's AST body: the lowerer splices `inline fun`
-//! bodies into user code (kept via `is_inline`), the runtime builds anonymous
-//! `object { … }` expressions from `Inst.BuildObject.ast` whose subtree lives in
-//! the body (kept when the body contains an `ObjectExpr`), and dispatch reads
-//! `body != null` as a concrete-vs-abstract sentinel (preserved by leaving an
-//! empty body, not `null`). Every other body is dead weight; replacing it with
-//! an empty block keeps the metadata (params, return type, the `body != null`
-//! sentinel) while dropping the statement tree.
-//!
-//! The `ObjectExpr` check is a compiler-exhaustive AST walk: Zig forces every
-//! `Expr`/`Stmt` union case to be handled, so a future node kind cannot silently
-//! slip an anonymous object past the keep test.
+//! Strip the bodies of non-inline stdlib functions from the lifted AST, which
+//! never run from the AST. Two readers keep theirs: `inline` bodies, spliced
+//! into user code by the lowerer, and bodies holding an `ObjectExpr` that an
+//! `Inst.BuildObject` points into. Dispatch reads `body != null` as a
+//! concrete-versus-abstract sentinel, so a stripped body is an empty block.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -26,22 +14,12 @@ const Block = ast.Block;
 const Stmt = ast.Stmt;
 const Expr = ast.Expr;
 
-/// Replace the bodies of non-inline, object-free functions across `decls`
-/// (recursing into class / object members) with an empty block. A non-inline,
-/// object-free *top-level* function additionally drops its signature (params,
-/// type params, receiver, return type, annotations): its AST declaration is
-/// never read again — resolution binds through the baked symbol index and the
-/// lowered IR func, calls dispatch by `FuncId`, and only class members are read
-/// back through `MethodDef.decl`. Inline functions (spliced) and class members
-/// keep their full signatures.
-///
-/// `keep_composable_sigs` (set when the `@Composable` lowering plugin is
-/// enabled) preserves the signature — params + annotations + return type — of a
-/// top-level `@Composable` function, or one taking a `@Composable`-typed lambda
-/// parameter: the plugin's oracle reads those from the baked base's lifted
-/// decls to thread downstream calls (`CompositionLocalProvider`, `ComposeNode`,
-/// `movableContentOf`). Their bodies are still dropped; only the signature must
-/// survive.
+/// Replace the bodies of non-inline, object-free functions across `decls` with
+/// an empty block, recursing into members. Such a top-level function also drops
+/// its signature: resolution binds through the baked symbol index and calls
+/// dispatch by `FuncId`, so only class members are read back through
+/// `MethodDef.decl`. `keep_composable_sigs` spares the signature of a
+/// `@Composable` function, which the plugin's oracle reads from the base.
 pub fn stripDeadBodies(decls: []Decl, keep_composable_sigs: bool) void {
     for (decls) |*d| pruneDecl(d, true, keep_composable_sigs);
 }
@@ -59,8 +37,7 @@ fn pruneDecl(d: *Decl, top_level: bool, keep_composable_sigs: bool) void {
     }
 }
 
-/// An annotation path ending in `Composable` (bare or dotted). Mirrors
-/// `compose_pass.isComposable` without a module dependency.
+/// An annotation path ending in `Composable`; mirrors `compose_pass`.
 fn annotationsHaveComposable(annotations: []const ast.Annotation) bool {
     for (annotations) |ann| {
         if (ann.path.len == 0) continue;
@@ -69,9 +46,7 @@ fn annotationsHaveComposable(annotations: []const ast.Annotation) bool {
     return false;
 }
 
-/// The compose plugin's oracle needs this function's signature: it is
-/// `@Composable`, or it declares a `@Composable`-typed lambda parameter (a
-/// sink downstream composable calls pass into).
+/// `@Composable`, or declaring a `@Composable`-typed lambda parameter.
 fn composeOracleNeedsSig(f: *const Function) bool {
     if (annotationsHaveComposable(f.annotations)) return true;
     for (f.params) |p| {
@@ -83,19 +58,12 @@ fn composeOracleNeedsSig(f: *const Function) bool {
 fn pruneFunction(f: *Function, top_level: bool, keep_composable_sigs: bool) void {
     const keep_sig = keep_composable_sigs and composeOracleNeedsSig(f);
     if (f.body) |*body| {
-        // Keep inline bodies (spliced into user code at lower time) and any body
-        // that materialises an anonymous object at runtime.
+        // Inline bodies splice at lower time; object-bearing ones run at runtime.
         if (f.is_inline or fnBodyHasObject(body)) return;
-        // Read the body's span into a local *before* overwriting `f.body`.
-        // `body` aliases `f.body`'s storage, and writing the new block in place
-        // would clobber the body fields mid-construction were the span read
-        // inline in the literal.
+        // Read the span first: `body` aliases the storage about to be written.
         const sp = fnBodySpan(body);
-        // Drop the statements; keep `body != null` so dispatch still treats the
-        // method as concrete.
+        // Keep `body != null` so dispatch still treats the method as concrete.
         f.body = .{ .Block = .{ .stmts = &.{}, .span = sp } };
-        // The compose oracle reads a composable's params + annotations from the
-        // baked base; keep the signature for those (body still dropped above).
         if (top_level and !keep_sig) {
             f.receiver_type = null;
             f.type_params = &.{};
@@ -114,13 +82,9 @@ fn fnBodySpan(b: *const FunctionBody) ast.Span {
     };
 }
 
-// --- Deferrable-body collection ----------------------------------------------
-
-/// Collect every `inline`, object-free function across `decls` (recursing into
-/// class / object members) into `out`. These are the bodies the baked image can
-/// hold in a lazily-decoded side section: a non-inline body is already stripped
-/// (it never runs from the AST), and an object-bearing body must stay eager (its
-/// `ObjectExpr` subtree is referenced by an `Inst.BuildObject`).
+/// Every `inline`, object-free function across `decls`: the bodies the image can
+/// defer to a lazily-decoded side section. An object-bearing body stays eager,
+/// since an `Inst.BuildObject` points into its `ObjectExpr` subtree.
 pub fn collectDeferrable(allocator: std.mem.Allocator, decls: []const Decl, out: *std.ArrayList(*Function)) std.mem.Allocator.Error!void {
     for (decls) |*d| try collectDeferrableDecl(allocator, d, out);
 }
@@ -138,7 +102,7 @@ fn collectDeferrableDecl(allocator: std.mem.Allocator, d: *const Decl, out: *std
     }
 }
 
-// --- ObjectExpr detection (compiler-exhaustive) ------------------------------
+// ObjectExpr detection, exhaustive over every `Expr` and `Stmt` case.
 
 pub fn fnBodyHasObject(b: *const FunctionBody) bool {
     return switch (b.*) {
@@ -253,8 +217,6 @@ fn exprHasObject(e: *const Expr) bool {
     };
 }
 
-// --- tests ------------------------------------------------------------------
-
 const testing = std.testing;
 
 fn tSpan(s: u32, e: u32) ast.Span {
@@ -298,12 +260,10 @@ test "non-inline body is stripped, span preserved" {
     var stmts = [_]Stmt{tIntStmt()};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(42, 99) } }, false);
     pruneFunction(&f, true, false);
-    // Body kept (concrete sentinel) but statements dropped.
     try testing.expect(f.body != null);
     try testing.expect(f.body.? == .Block);
     try testing.expectEqual(@as(usize, 0), f.body.?.Block.stmts.len);
-    // The empty block must carry the original body's span verbatim -- the
-    // in-place result-location aliasing bug used to clobber `end` here.
+    // The empty block carries the original body's span verbatim.
     try testing.expectEqual(@as(u32, 42), f.body.?.Block.span.start);
     try testing.expectEqual(@as(u32, 99), f.body.?.Block.span.end);
 }
@@ -337,7 +297,6 @@ test "object-bearing body is left intact" {
     var stmts = [_]Stmt{.{ .Expr = obj }};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, false);
     pruneFunction(&f, true, false);
-    // Must keep the statements: the runtime materialises the object from them.
     try testing.expectEqual(@as(usize, 1), f.body.?.Block.stmts.len);
 }
 
@@ -348,9 +307,7 @@ test "abstract body (null) stays null" {
 }
 
 test "a @Composable function keeps its signature when composable sigs are kept" {
-    // The compose plugin's oracle reads the base's composable signatures from
-    // the lifted decls; stripping params + annotations there (as the default
-    // prune does) makes a downstream call to the function un-threadable.
+    // The oracle reads composable signatures from the lifted decls.
     var stmts = [_]Stmt{tIntStmt()};
     var f = tFn(.{ .Block = .{ .stmts = &stmts, .span = tSpan(1, 2) } }, false);
     var composable_path = [_]ast.Ident{tIdent("Composable")};
@@ -368,7 +325,6 @@ test "a @Composable function keeps its signature when composable sigs are kept" 
     }};
     f.params = &params;
     pruneFunction(&f, true, true);
-    // Body statements dropped, but the signature survives for the oracle.
     try testing.expectEqual(@as(usize, 0), f.body.?.Block.stmts.len);
     try testing.expectEqual(@as(usize, 1), f.annotations.len);
     try testing.expectEqual(@as(usize, 1), f.params.len);

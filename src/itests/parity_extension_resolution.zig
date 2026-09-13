@@ -1,28 +1,17 @@
-//! Extension function resolution: top-level vs member, generic
-//! extension, extension on nullable, extension dispatched on
-//! interface.
+//! Extension resolution: top-level against member, generic extensions,
+//! extensions on nullable and interface receivers.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_extension_resolution";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// The pipeline's process-global state points into the run allocator, so one
+// file-scoped arena must outlive every test here.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
-/// Run `src` through the klio pipeline and assert stdout equals `expected`.
-/// An arena over the page allocator is used per test so the leak-checking
-/// testing allocator never backs the pipeline (it would abort on the
-/// intentional arena lifetime).
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
 
@@ -334,12 +323,8 @@ test "member_extension_unary_operator_on_primitive" {
 }
 
 test "bare_ext_inline_call_in_class_method_binds_enclosing_class_receiver" {
-    // Same-name inline extensions on two unrelated receivers, bare-
-    // called (with a non-local return forcing the splice) from each
-    // class's methods: the enclosing class is the implicit receiver, so
-    // A's method splices `A.label` and B's splices `B.label` (kotlinc:
-    // got:A / got:B) — never the first-declared candidate. Both
-    // declaration orders pin order-independence.
+    // An inline splice binds the enclosing class's extension, not the
+    // first-declared candidate. Both declaration orders appear.
     const a_first =
         \\var tag = ""
         \\class A {
@@ -371,14 +356,8 @@ test "bare_ext_inline_call_in_class_method_binds_enclosing_class_receiver" {
 }
 
 test "suspend_inline_ext_twins_bind_by_enclosing_class_receiver" {
-    // The suspend-inline variant: a `suspend inline` extension must
-    // splice (its continuation capture is only correct inlined), and
-    // the splice must still pick the enclosing class's extension, not
-    // the first-declared one (kotlinc: got:A / got:B). The completion
-    // is an anonymous object whose `override val context =
-    // EmptyCoroutineContext` initializer must bind the singleton —
-    // also pinning anon-object property inits that read a global
-    // object by bare name.
+    // A `suspend inline` extension must splice: its continuation capture is
+    // only correct inlined.
     const src =
         \\import kotlin.coroutines.*
         \\
@@ -407,11 +386,8 @@ test "suspend_inline_ext_twins_bind_by_enclosing_class_receiver" {
 }
 
 test "base_class_extension_accepts_subclass_method_receiver" {
-    // The receiver match walks the supertype chain: `B : A()` accepts
-    // `A.label` for B's methods (kotlinc: got:A) — including when an
-    // unrelated receiver's extension is declared first (kotlinc still
-    // got:A) — and B's own extension outranks the base one when both
-    // exist (kotlinc: got:B).
+    // The receiver match walks the supertype chain, and a subclass's own
+    // extension outranks the base one.
     const base_only =
         \\var tag = ""
         \\open class A
@@ -450,12 +426,9 @@ test "base_class_extension_accepts_subclass_method_receiver" {
     try assertKlio("ext_inline_super_recv_derived_wins", derived_wins, "got:B\n");
 }
 
-// Extension resolution inside an interface-extension body is STATIC:
-// `this` is declared as the interface, so a bare same-name extension
-// call binds the interface's extension even when the runtime value is a
-// delegating wrapper carrying its own extension. The direct call on the
-// wrapper still binds the wrapper's extension by its static type.
-// kotlinc-verified both directions (the DispatchedContinuation shape).
+// Extension resolution uses the static receiver type, so a bare call in an
+// interface-extension body binds the interface's extension even when the
+// runtime value is a wrapper carrying its own.
 test "ext_static_receiver_in_iface_ext_body" {
     const src =
         \\interface I5 { fun member(): String }
@@ -476,12 +449,8 @@ test "ext_static_receiver_in_iface_ext_body" {
     try assertKlio("ext_static_recv_iface_body", src, "on-wrapper\next:on-iface\n");
 }
 
-// A receiver-walk PROBE that is inapplicable by parameter type must fall
-// through to the outer receiver — kotlinc resolves `f("x")` to
-// `A.f(String)`; `B.f(Int)` is not a candidate and must not run (its
-// throw is the proof it ran). The ran-and-threw direction is pinned by
-// the sibling test below: an applicable candidate that throws owns its
-// control flow. kotlinc-verified both directions.
+// A candidate inapplicable by parameter type falls through to the outer
+// receiver; the throw in `B.f(Int)` is the proof it never ran.
 test "bare_call_inapplicable_inner_candidate_falls_through" {
     const src =
         \\class A { fun f(s: String) = "outer:" + s }
@@ -521,13 +490,8 @@ test "bare_call_applicable_inner_candidate_throw_propagates" {
 }
 
 test "fn_typed_receiver_ext_bare_call_binds_top_level" {
-    // Inside an extension on a *function type*, a bare call to a top-level
-    // function must bind that function statically: the receiver is a
-    // callable with no members, so nothing can shadow the top-level target.
-    // Deferring to the runtime member-first walk lets the SAM arm invoke the
-    // receiver itself with the call's arguments (the kotlinx.coroutines
-    // `runSafely` wedge: the coroutine body ran in place of the same-file
-    // helper and the completion was never resumed).
+    // A function-type receiver has no members to shadow the target, so a
+    // runtime member-first walk would misroute the call into the receiver.
     const src =
         \\fun relayParcel(tag: String, block: () -> Unit) {
         \\    println("top:" + tag)
@@ -548,12 +512,8 @@ test "fn_typed_receiver_ext_bare_call_binds_top_level" {
 }
 
 test "member_ext_prop_over_ctor_field_by_static_type" {
-    // A member-extension property (`private val I.parent`) wins over a
-    // same-named stored constructor-property field of the runtime object
-    // when the read is made through the interface static type: Kotlin
-    // resolves member-vs-extension by the STATIC receiver type, and `I`
-    // declares no member `parent`. A read through the concrete static type
-    // `Impl`, whose member exists, still reads the field.
+    // Member versus extension resolves on the static receiver type, so the
+    // same object reads its field through `Impl` and the extension through `I`.
     const src =
         \\interface I
         \\class Impl(val parent: String) : I
@@ -574,9 +534,6 @@ test "member_ext_prop_over_ctor_field_by_static_type" {
 }
 
 test "member_ext_prop_over_ctor_field_enclosing_member_receiver" {
-    // The receiver is an enclosing constructor-property whose declared
-    // (interface) type carries no member `tag`; the read resolves through
-    // the in-scope member-extension property, not the runtime `Boxed` field.
     const src =
         \\interface Named
         \\class Boxed(val tag: String) : Named

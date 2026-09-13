@@ -1,7 +1,5 @@
-//! Each test parses a small Kotlin function, lowers it, runs the
-//! smart-cast pass, and asserts on the per-place fact at a chosen
-//! block. Arena per test so the leak-checking allocator never runs the
-//! pipeline.
+//! Lowers a small Kotlin function, runs the smart-cast pass, and asserts the
+//! per-place facts at a chosen block.
 
 const std = @import("std");
 
@@ -22,9 +20,6 @@ const RegPlaceMap = cfa.lower.RegPlaceMap;
 const FileId = span.FileId;
 const Block = ast.Block;
 
-/// Parse the first function in `src` and lower its body, returning the
-/// full `Lowered` (cfg + side tables). Everything is allocated from
-/// `arena`.
 fn parseAndLower(arena: std.mem.Allocator, src: []const u8) !cfa.lower.Lowered {
     const file = FileId.from(0);
     var lx = try lexer.Lexer.init(arena, file, src);
@@ -54,8 +49,6 @@ fn parseAndLower(arena: std.mem.Allocator, src: []const u8) !cfa.lower.Lowered {
     return cfa.lower.lowerFunction(arena, &body, f.span);
 }
 
-/// Returns true if any per-node state, in any block, holds a fact for
-/// `place` that satisfies `pred`.
 fn anyNarrowingAnywhere(
     arena: std.mem.Allocator,
     cfg: *const Cfg,
@@ -141,7 +134,7 @@ test "join_drops_disagreeing_narrowings" {
     var fact_b = SmartCastFact.unknown();
     try fact_b.assumeIs(a, .Int, null);
     _ = try fact_a.join(a, &fact_b);
-    // String join Int should drop to Any — disagreement.
+    // Joining String with Int widens to Any.
     try std.testing.expect(fact_a.narrowed != null and fact_a.narrowed.? == .Any);
 }
 
@@ -166,8 +159,7 @@ test "killdataflow_invalidates_narrowing" {
     try cfa.dataflow.inferKillDataFlow(a, &lowered.cfg);
     var states = try smartcast.solve(a, &lowered.cfg, &lowered.reg_to_place);
     _ = &states;
-    // We assert that the loop head has a KillDataFlow for `y` —
-    // smart-cast then drops the narrowing when it sees it.
+    // The loop head carries a KillDataFlow for `y`, which drops the narrowing.
     var killed = false;
     for (lowered.cfg.blocks.items) |*b| {
         for (b.nodes.items) |*n| {
@@ -238,7 +230,6 @@ test "span_to_pos_indexes_every_eval" {
     while (it.next()) |entry| {
         const key = entry.key_ptr.*;
         const pos = entry.value_ptr.*;
-        // Every recorded position points at a real Eval node.
         const node = lowered.cfg.block(pos.block).nodes.items[pos.node_idx];
         switch (node) {
             .Eval => |e| {
