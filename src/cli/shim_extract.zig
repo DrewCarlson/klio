@@ -1,18 +1,9 @@
-//! First-launch extraction of the embedded Skia shim: a UI bundle carries the
-//! rendering backend as a zstd blob and `dlopen` needs a real file, so the blob
-//! is written once to a content-addressed per-user cache and the path handed to
-//! the loader.
-//!
-//! Layout: `<cache-base>/klio/shim/<blake3-16>/<libname>`, `<blake3-16>` being
-//! the hex prefix of the decompressed bytes' hash, so upgrades land in a new
-//! directory, bundles sharing a shim share one file, and a launch that finds
-//! the file skips the write. Writes go through a unique temp file and a rename,
-//! so concurrent first launches are safe and a torn temp file is invisible.
-//!
-//! `<cache-base>` is `$XDG_CACHE_HOME` (default `~/.cache`) on Linux,
-//! `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows; an unwritable
-//! cache falls back to the system temp dir, and if that fails too the caller
-//! reports one stderr line and the program stays headless.
+//! First-launch extraction of the embedded Skia shim. `dlopen` needs a real file,
+//! so the bundle's zstd blob lands once at `<cache-base>/klio/shim/<blake3-16>/<libname>`,
+//! `<blake3-16>` being the hex prefix of the decompressed bytes' hash: upgrades take a new
+//! directory and bundles sharing a shim share one file. A unique temp file plus a rename
+//! keeps concurrent first launches safe. `<cache-base>` is `$XDG_CACHE_HOME` on Linux,
+//! `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows, else the system temp dir.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,7 +15,6 @@ fn threadedIo(gpa: Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(gpa, .{});
 }
 
-/// The platform shim file name.
 pub fn libName() []const u8 {
     return switch (builtin.os.tag) {
         .macos => "libklio_skia.dylib",
@@ -55,8 +45,7 @@ fn cacheBase(gpa: Allocator) ?[]const u8 {
     }
 }
 
-/// Ensure `bytes` exists in the content-addressed cache; the returned path is
-/// `gpa`-allocated for the process lifetime. Null when nothing is writable.
+/// Path to `bytes` in the content-addressed cache, `gpa`-allocated; null when nothing is writable.
 pub fn ensureExtracted(gpa: Allocator, bytes: []const u8) ?[]const u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(bytes, &digest, .{});
@@ -68,7 +57,6 @@ pub fn ensureExtracted(gpa: Allocator, bytes: []const u8) ?[]const u8 {
         defer gpa.free(dir);
         if (extractInto(gpa, dir, bytes)) |p| return p;
     }
-    // Fallback: the system temp dir, same content-addressed layout.
     const tmp = std.fs.path.join(gpa, &.{ "/tmp", "klio-shim", &hex }) catch return null;
     defer gpa.free(tmp);
     return extractInto(gpa, tmp, bytes);
@@ -81,7 +69,7 @@ fn extractInto(gpa: Allocator, dir: []const u8, bytes: []const u8) ?[]const u8 {
     const cwd = std.Io.Dir.cwd();
 
     const dest = std.fs.path.join(gpa, &.{ dir, libName() }) catch return null;
-    // Content-addressed: an existing file is the right file.
+    // Content-addressed, so an existing file is the right file.
     if (cwd.statFile(fio, dest, .{}) catch null) |st| {
         if (st.size == bytes.len) return dest;
     }
@@ -139,7 +127,6 @@ test "extraction is content-addressed and idempotent" {
     defer gpa.free(on_disk);
     try std.testing.expectEqualStrings(payload, on_disk);
 
-    // Second extraction finds the file and skips the write: same path, mtime.
     const st_before = try std.Io.Dir.cwd().statFile(fio, first, .{});
     const second = extractInto(gpa, scratch, payload) orelse return error.TestUnexpectedResult;
     defer gpa.free(@constCast(second));

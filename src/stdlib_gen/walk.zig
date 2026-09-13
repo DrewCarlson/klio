@@ -59,9 +59,8 @@ pub const CollectResult = struct {
     }
 };
 
-/// Parse every `.kt` file under the curated roots of `stdlib_root`, which is
-/// `kotlin/libraries/stdlib`, absolute or relative to the cwd. Caller releases
-/// the result with `CollectResult.deinit`.
+/// Parses every `.kt` file under the curated roots of a `kotlin/libraries/stdlib`
+/// tree. Caller frees the result with `CollectResult.deinit`.
 pub fn collectDecls(allocator: Allocator, io: Io, stdlib_root: []const u8) Allocator.Error!CollectResult {
     var out: std.ArrayList(FileDecls) = .empty;
     errdefer {
@@ -111,7 +110,7 @@ pub fn collectDecls(allocator: Allocator, io: Io, stdlib_root: []const u8) Alloc
             .package = pf.package,
             .decls = pf.decls,
         });
-        // `out` took ownership of pf.package and pf.decls.
+        // `out` now owns pf.package and pf.decls.
         pf.package = "";
         pf.decls = &.{};
     }
@@ -119,7 +118,6 @@ pub fn collectDecls(allocator: Allocator, io: Io, stdlib_root: []const u8) Alloc
     return .{ .files = try out.toOwnedSlice(allocator), .stats = stats };
 }
 
-/// `path` minus a leading `prefix` and separator, as a slice into `path`.
 fn stripPrefix(path: []const u8, prefix: []const u8) []const u8 {
     if (path.len > prefix.len and std.mem.startsWith(u8, path, prefix)) {
         var rest = path[prefix.len..];

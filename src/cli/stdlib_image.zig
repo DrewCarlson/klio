@@ -1,23 +1,15 @@
 //! Stdlib image cache for the CLI: bake the lowered dependency base (embedded
 //! stdlib sources plus selected packs) to `~/.klio/cache/stdlib-<key>.klio-image`
-//! once, then load and extend it per run instead of re-parsing and re-lowering
-//! ~4500 declarations.
+//! once, then load and extend it per run.
 //!
 //! The key is a Blake3 over the image format version, the running executable's
 //! size and mtime, the content of every stdlib source the pack builder reads (or
 //! the `KLIO_STDLIB_PACK` override pack bytes), the stdlib load gate
 //! (implicit-only vs full curated set), and each selected pack's stored content
-//! hash and resolved feature set. A mismatch never serves stale lowered code; a
-//! stale or missing image rebakes transparently.
-//!
-//! Packs still load per run for their bindings, feature hints, and known-package
-//! registrations; only the embedded stdlib sources and all dependency lowering
-//! come from the image. Programs the `canExtendBase` gate refuses (redeclaring a
-//! base name, declaring expect/actual, sharing a base package) fall back to the
-//! whole-program build, byte-identically.
-//!
-//! `KLIO_STDLIB_IMAGE=0` or `KLIO_PACK_DIAG` disables the cache;
-//! `KLIO_TRACE_STDLIB_IMAGE=1` prints one hit/bake/fallback line per run.
+//! hash and resolved feature set. A mismatch rebakes rather than serving stale
+//! lowered code. Packs still load per run for their bindings and known-package
+//! registrations; only the stdlib sources and dependency lowering ride the image.
+//! `KLIO_STDLIB_IMAGE=0` or `KLIO_PACK_DIAG` disables the cache.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -51,21 +43,16 @@ const io = @import("io.zig");
 const pack_cache = @import("pack_cache.zig");
 const RequestedFeatures = pack_cache.RequestedFeatures;
 
-/// Keep this many images; older ones (by mtime) are pruned after a bake. The
-/// examples corpus alone spans ~10 distinct pack-set fingerprints, and a cap
-/// below that count makes parallel runs evict the images their siblings are
-/// about to load. Images run ~10-26MB, so this holds the cache under ~500MB.
+/// Keep this many images; older ones (by mtime) are pruned after a bake. Below
+/// ~10 the examples corpus makes parallel runs evict images siblings need.
 const KEEP_IMAGES = 24;
 
-/// A program assembled against the image (or freshly baked) base: the extended
-/// module, the map its spans resolve through, and the bindings to install, all
-/// on the caller's process-lifetime arena.
+/// A program assembled against the image base, on the caller's process arena.
 pub const Prepared = struct {
     built: BuiltModule,
     map: *const SourceMap,
     bindings: HostBindings,
-    /// The user files parsed onto `map`; their FileIds are the trailing
-    /// entries, after the base's. `klio test` discovers tests in these.
+    /// The user files parsed onto `map`; their FileIds trail the base's.
     user_asts: []const KotlinFile,
 };
 
@@ -114,8 +101,7 @@ fn cacheDir(gpa: Allocator) ?[]u8 {
     return dir;
 }
 
-/// Size + mtime of the running executable: any interpreter rebuild invalidates
-/// every baked image.
+/// Size + mtime of the running executable: any rebuild invalidates every image.
 fn exeStamp(gpa: Allocator) ?[2]u64 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -137,11 +123,9 @@ fn exeStamp(gpa: Allocator) ?[2]u64 {
     return .{ st.size, mtime_ns };
 }
 
-/// Content hash of every stdlib source the bake consumes, in
-/// `stdlibPackBytes`'s resolution order: the `KLIO_STDLIB_PACK` override pack
-/// when set, else the curated upstream files + klio actuals from the cwd
-/// checkout, else the pack bytes embedded in the binary. Null only when no
-/// source resolves, and then there is nothing to bake either.
+/// Content hash of every stdlib source the bake consumes, in `stdlibPackBytes`'s
+/// resolution order: the `KLIO_STDLIB_PACK` override pack, else the curated
+/// upstream files + klio actuals from the cwd checkout, else the embedded pack.
 fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -150,8 +134,8 @@ fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
 
     var hasher = std.crypto.hash.Blake3.init(.{});
 
-    // Constant salt for the @Composable lowering plugin: an image baked without
-    // its bake-time rewrite of base/pack composables must never be reused.
+    // Salt for the @Composable lowering plugin: an image baked without its
+    // bake-time rewrite of base/pack composables must never be reused.
     hasher.update("compose_plugin:1;");
 
     var override_hashed = false;
@@ -164,7 +148,6 @@ fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
             hasher.update(bytes);
             override_hashed = true;
         }
-        // An unreadable override falls through to the checkout.
     }
     if (!override_hashed and !hashCheckoutSources(gpa, fio, &hasher)) {
         return embeddedContentHash();
@@ -175,9 +158,8 @@ fn stdlibContentHash(gpa: Allocator) ?[32]u8 {
     return out;
 }
 
-/// Fold the cwd checkout's stdlib sources into `hasher`. False when any file is
-/// unreadable: the pack build fails the same way, so the run falls through to
-/// the embedded pack and its hash.
+/// Fold the cwd checkout's stdlib sources into `hasher`; false when one is
+/// unreadable, and the run falls through to the embedded pack.
 fn hashCheckoutSources(gpa: Allocator, fio: std.Io, hasher: *std.crypto.hash.Blake3) bool {
     const cwd = std.Io.Dir.cwd();
     const pb = stdlib.pack_builder;
@@ -208,8 +190,7 @@ fn hashCheckoutSources(gpa: Allocator, fio: std.Io, hasher: *std.crypto.hash.Bla
     return true;
 }
 
-/// Hash of the pack bytes embedded in the binary, or null in builds
-/// carrying none (zigcheck stub builds).
+/// Hash of the pack bytes embedded in the binary, null in builds carrying none.
 fn embeddedContentHash() ?[32]u8 {
     const bytes = stdlib_pack.EMBEDDED_PACK_BYTES orelse return null;
     var hasher = std.crypto.hash.Blake3.init(.{});
@@ -220,7 +201,6 @@ fn embeddedContentHash() ?[32]u8 {
     return out;
 }
 
-/// The image cache key for one dependency configuration.
 fn imageKey(
     stdlib_hash: [32]u8,
     exe: [2]u64,
@@ -238,8 +218,7 @@ fn imageKey(
     hasher.update(&word);
     hasher.update(&stdlib_hash);
     hasher.update(if (gate_full) "gate:full" else "gate:implicit");
-    // Order-independent fold: the XOR of each pack's own digest, because
-    // selection order is loader-internal.
+    // Order-independent XOR fold: selection order is loader-internal.
     var fold: [32]u8 = @splat(0);
     for (packs) |p| {
         var ph = std.crypto.hash.Blake3.init(.{});
@@ -264,8 +243,7 @@ fn keyHex(key: [32]u8) [32]u8 {
     return std.fmt.bytesToHex(key[0..16].*, .lower);
 }
 
-// Meta sidecar: the stdlib package universe, used to compute the load gate on
-// runs that skip the embedded source parse entirely.
+// Meta sidecar: the stdlib package universe, for the load gate without a parse.
 const MetaFile = struct {
     pkgs: []const []const u8,
     any_non_implicit: bool,
@@ -296,8 +274,7 @@ fn writeMeta(gpa: Allocator, cache: []const u8, path: []const u8, meta: MetaFile
     writeAtomic(gpa, cache, path, bytes.items);
 }
 
-/// Write via a unique temp file + rename: two racing processes can never expose
-/// a partial file, and the loser's rename wins last.
+/// Temp file + rename, so a racing reader never sees a partial file.
 fn writeAtomic(gpa: Allocator, cache: []const u8, dest: []const u8, bytes: []const u8) void {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -316,7 +293,6 @@ fn writeAtomic(gpa: Allocator, cache: []const u8, dest: []const u8, bytes: []con
     };
 }
 
-/// Delete all but the newest `KEEP_IMAGES` images (by mtime).
 fn pruneImages(gpa: Allocator, cache: []const u8) void {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -379,17 +355,12 @@ pub fn parseUserFiles(gpa: Allocator, map: *SourceMap, paths: []const []const u8
     return .{ .texts = out_texts, .asts = out_asts };
 }
 
-/// Stage the base sources' eager call resolutions on the pending channel so
-/// `buildStdlibBase`'s body lowering consumes them, the same ordering as the
-/// whole-program build where `computeEagerCalls` runs first. Base bodies lower
-/// during the base build, so a check running afterwards cannot influence them:
-/// a composable call the shape resolver cannot prove would lose its
-/// `($composer, $changed)` pair and bake an unthreaded call into the image.
+/// Stage the base's eager call resolutions before `buildStdlibBase` lowers the
+/// bodies; an unproven composable call bakes without its `($composer, $changed)`.
 fn stageBaseEagerCalls(gpa: Allocator, asts: []const KotlinFile) void {
     if (std.mem.eql(u8, runtime.envOnce("KLIO_STDLIB_CHECK") orelse "1", "0")) return;
     // The base's own sources are the whole universe for calls inside them, so a
-    // source extension pick is trustworthy here in a way it never is for a user
-    // program that also loads packs.
+    // source extension pick is trustworthy here, unlike in a user program.
     typeck_mod.check.expr_calls.complete_universe = true;
     defer typeck_mod.check.expr_calls.complete_universe = false;
     if (@import("commands.zig").computeEagerCalls(gpa, asts, &.{})) |ec| {
@@ -398,14 +369,12 @@ fn stageBaseEagerCalls(gpa: Allocator, asts: []const KotlinFile) void {
     }
 }
 
-/// Check the base's own sources and key the resulting resolutions to FuncIds so
-/// they ride the image. Runs only where those sources exist, while an image is
-/// being built, so a cached run pays nothing and still gets the answers.
+/// Check the base's sources, keying the resolutions to FuncIds so they ride the
+/// image. Runs only while an image is being built.
 fn checkBaseSources(gpa: Allocator, base: *interp_ir.build.StdlibBase, asts: []const KotlinFile) void {
     _ = asts;
     if (std.mem.eql(u8, runtime.envOnce("KLIO_STDLIB_CHECK") orelse "1", "0")) return;
-    // `stageBaseEagerCalls`'s resolutions were consumed into the built module as
-    // call span -> declaration span; key each to the FuncId lowering assigned.
+    // Resolutions arrive as call span -> declaration span; key each to its FuncId.
     {
         var out: std.ArrayList(interp_ir.build.StdlibBase.EagerCall) = .empty;
         var total: usize = 0;
@@ -427,8 +396,7 @@ fn checkBaseSources(gpa: Allocator, base: *interp_ir.build.StdlibBase, asts: []c
             std.debug.print("[stdlib-check] {d} base call resolutions, {d} keyed to a FuncId\n", .{ total, base.eager_calls.len });
         }
     }
-    // The checker's per-run channels belong to the user program; clear whatever
-    // the base pass staged so it does not leak into them.
+    // The checker's per-run channels belong to the user program; drop base staging.
     if (ir_mod.pending_eager_calls) |*m| {
         m.deinit();
         ir_mod.pending_eager_calls = null;
@@ -439,10 +407,7 @@ fn checkBaseSources(gpa: Allocator, base: *interp_ir.build.StdlibBase, asts: []c
     }
 }
 
-/// Republish the base's own eager call resolutions, baked when its sources were
-/// last available. Merged under the user program's, which is computed after this
-/// and wins on any shared span; base and user file ids are disjoint, so the
-/// ordering only states the intent.
+/// Republish the base's baked eager call resolutions under the user program's.
 fn publishBaseEagerCalls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibBase) void {
     if (sb.eager_calls.len == 0) return;
     var m = ir_mod.pending_eager_call_fids orelse std.AutoHashMap(span.Span, u32).init(gpa);
@@ -453,8 +418,6 @@ fn publishBaseEagerCalls(gpa: std.mem.Allocator, sb: *const interp_ir.build.Stdl
     }
 }
 
-/// The bare class head of a lowered type name: no nullability marker, no type
-/// arguments, no package qualification.
 fn headOf(name: []const u8) []const u8 {
     var h = std.mem.trimEnd(u8, name, "?");
     if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
@@ -462,18 +425,13 @@ fn headOf(name: []const u8) []const u8 {
     return h;
 }
 
-/// Publish the image's own declarations for the checker (`types.ExternDecls`):
-/// every class simple name, and the return class of every top-level function
-/// whose simple name resolves unambiguously.
+/// Publish the image's own declarations for the checker (`types.ExternDecls`).
 fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibBase) void {
     const mg = sb.built.module.borrow();
     defer mg.deinit();
     const m = mg.get();
-    // Simple names, the only spelling the checker's class table uses. Where two
-    // classes share one (compose declares `SlotTable` in both its gapbuffer and
-    // linkbuffer implementations) the name identifies nothing, and offering one's
-    // extensions for the other binds calls to a declaration the receiver never
-    // had, so such a name is dropped from every published map.
+    // Simple names are the only spelling the checker's class table uses, so a name
+    // two classes share identifies nothing and is dropped from every published map.
     var classes = std.StringHashMap(void).init(gpa);
     var ambiguous_names = std.StringHashMap(void).init(gpa);
     defer ambiguous_names.deinit();
@@ -485,10 +443,8 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
         var ait = ambiguous_names.keyIterator();
         while (ait.next()) |k| _ = classes.remove(k.*);
     }
-    // Return heads ride the image's baked index, since a cached load's funcs are
-    // lazy. The run that builds the base has no baked index yet and derives the
-    // heads from the funcs instead; both paths must publish the same thing, or
-    // the checker's answers depend on whether the cache was warm.
+    // Return heads ride the baked index, since a cached load's funcs are lazy; the
+    // run that builds the base derives them from the funcs. Both publish the same.
     var rets = std.StringHashMap([]const u8).init(gpa);
     if (sb.fn_returns.len != 0) {
         for (sb.fn_returns) |fr| {
@@ -513,11 +469,9 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
             } else gop.value_ptr.* = head;
         }
     }
-    // Extensions, keyed by the receiver's class head. Built from the name index
-    // and the declaration signatures, never from decoded function bodies: on a
-    // cached image the funcs are lazy and `m.funcs.items` is empty, while index
-    // and signatures are eager because lowering resolves names against them. The
-    // run that builds the base derives the same content from the decoded funcs.
+    // Extensions keyed by the receiver's class head, from the name index and the
+    // declaration signatures: on a cached image the funcs are lazy and
+    // `m.funcs.items` is empty, while the index and signatures are eager.
     var ext_rets = std.StringHashMap([]const u8).init(gpa);
     defer ext_rets.deinit();
     if (sb.ext_returns.len != 0) {
@@ -573,9 +527,7 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
                 .fid = fid.int(),
                 .param_heads = heads,
                 .param_nullable = nulls,
-                // From the baked index; the declaration signature carries no
-                // return type. Ranking evidence only, see the split at its
-                // consumer.
+                // From the baked index, as ranking evidence only.
                 .return_head = blk_r: {
                     const key = std.fmt.allocPrint(gpa, "{s}\x00{s}", .{ recv_head, fname }) catch break :blk_r "";
                     defer gpa.free(key);
@@ -620,8 +572,7 @@ fn publishExternDecls(gpa: std.mem.Allocator, sb: *const interp_ir.build.StdlibB
 }
 
 /// Assemble the program against a cached (or freshly baked) stdlib image. Null
-/// means take the whole-program path: the cache is off or unavailable, the user
-/// program fails to parse, it needs the fallback build, or the base is unbakeable.
+/// means take the whole-program path.
 pub fn tryPrepare(
     gpa: Allocator,
     paths: []const []const u8,
@@ -634,14 +585,11 @@ pub fn tryPrepare(
     const stdlib_hash = stdlibContentHash(gpa) orelse return null;
     const t_hash = runtime.clockMonotonicNanos();
 
-    // Scratch parse: the reuse gate and the key need the program's decls and
-    // imports before any base is chosen.
     var scratch_map = SourceMap.init(gpa);
     const user = parseUserFiles(gpa, &scratch_map, paths, null) orelse return null;
 
-    // A program with neither imports nor a package-rooted qualified reference can
-    // never match a pack's library id, so the cache walk (reading and verifying
-    // every pack file) is skipped for the loader's empty selection.
+    // Without imports or a package-rooted qualified reference nothing can match a
+    // pack's library id, so the cache walk over every pack file is skipped.
     var qref_prefixes = pack_cache.collectQualifiedRefPrefixes(gpa, user.asts) catch
         std.StringHashMap(void).init(gpa);
     defer {
@@ -655,10 +603,8 @@ pub fn tryPrepare(
         if (f.imports.len != 0) any_refs = true;
     }
     // Packs are parsed only for their bindings and selection identity; the image
-    // already holds their lowered form. The (large, e.g. ktor) pack ASTs parse
-    // into a scratch arena dropped before the program runs, leaving only the
-    // bindings table and selection in process-lifetime storage, so a server does
-    // not retain tens of MB of pack AST for its whole life.
+    // already holds their lowered form. Their ASTs land in a scratch arena dropped
+    // before the program runs, leaving only bindings and selection alive.
     var pack_arena = std.heap.ArenaAllocator.init(gpa);
     defer pack_arena.deinit();
     const paa = pack_arena.allocator();
@@ -692,7 +638,6 @@ pub fn tryPrepare(
     } else pack_cache.mergedHostBindings(gpa);
     const t_packs = runtime.clockMonotonicNanos();
 
-    // Load gate from the meta sidecar; missing meta means cold path.
     const meta_file = metaPath(gpa, cache, stdlib_hash) orelse return null;
     var gate_full: ?bool = null;
     if (readMeta(gpa, meta_file)) |meta| {
@@ -718,9 +663,7 @@ pub fn tryPrepare(
         if (loadImageFile(gpa, image_path)) |loaded| {
             const t_load = runtime.clockMonotonicNanos();
             const out = finishFromLoaded(gpa, loaded, user, paths, pack_bindings);
-            // A null `out` means the extend gate refused and the caller
-            // re-lowers the whole dependency surface from source; name that
-            // outcome so the trace never reads as a served hit.
+            // A null `out` means the extend gate refused; not a served hit.
             trace(gpa, "{s} {s} (key {d}ms, packs {d}ms, load {d}ms, extend {d}ms)", .{
                 if (out != null) @as([]const u8, "hit") else "hit-but-fallback",
                 hex,
@@ -759,10 +702,8 @@ fn writeTombstone(gpa: Allocator, cache: []const u8, hex: [32]u8) void {
 
 /// Read + decode an image file. Null on any mismatch (the caller rebakes).
 fn loadImageFile(gpa: Allocator, path: []const u8) ?image.Loaded {
-    // The decoded base borrows from these bytes for the process's life. A
-    // read-only mmap keeps the deferred body/IR sections and the slice-only
-    // stdlib source text file-backed, off RSS until something reads them; a heap
-    // read covers platforms without mmap.
+    // The decoded base borrows these bytes for the process's life, so the mmap is
+    // never unmapped; it also keeps the deferred sections file-backed, off RSS.
     const bytes = mmapImage(path) orelse blk: {
         var threaded = threadedIo(gpa);
         defer threaded.deinit();
@@ -773,9 +714,6 @@ fn loadImageFile(gpa: Allocator, path: []const u8) ?image.Loaded {
     return loaded;
 }
 
-/// Read-only `MAP_PRIVATE` mmap of the image, never unmapped: it lives as long
-/// as the base that borrows it. Null on any error, so the caller falls back to a
-/// heap read.
 fn mmapImage(path: []const u8) ?[]const u8 {
     if (path.len >= 4095) return null;
     var buf: [4096]u8 = undefined;
@@ -800,8 +738,6 @@ fn mmapImage(path: []const u8) ?[]const u8 {
     return mapped[0..len];
 }
 
-/// Shared tail of the hit and bake paths: replay the image's registry side
-/// effects, gate-check the user program, extend, and package the result.
 fn finishFromLoaded(
     gpa: Allocator,
     loaded: image.Loaded,
@@ -816,8 +752,7 @@ fn finishFromLoaded(
         return null;
     }
 
-    // Re-parse the user files onto a map extending the base's, so user FileIds
-    // continue after the base's and base spans stay resolvable.
+    // Re-parse onto a map extending the base's, so base spans stay resolvable.
     const map = gpa.create(SourceMap) catch return null;
     map.* = SourceMap.init(gpa);
     map.files.appendSlice(map.arena.allocator(), loaded.map.files.items) catch return null;
@@ -837,9 +772,7 @@ fn finishFromLoaded(
     return .{ .built = built, .map = map, .bindings = bindings, .user_asts = user2.asts };
 }
 
-/// Cold path: run the full dependency load on a fresh map, lower it into a
-/// `StdlibBase`, bake and publish the image plus its meta sidecar, then extend
-/// for this run.
+/// Cold path: load, lower, bake and publish the image and its meta sidecar.
 fn bakeAndPrepare(
     gpa: Allocator,
     cache: []const u8,
@@ -872,8 +805,7 @@ fn bakeAndPrepare(
             .pkgs = report.pkgs.items,
             .any_non_implicit = report.any_non_implicit,
         });
-        // The gate was unknown when this path was chosen; an image for the
-        // now-known key may already exist, the meta file having been pruned.
+        // The gate was unknown here, so an image for the now-known key may exist.
         if (loadImageFile(gpa, image_path)) |loaded| {
             trace(gpa, "hit {s}", .{hex});
             return finishFromLoaded(gpa, loaded, user, paths, deps.bindings);
@@ -890,9 +822,7 @@ fn bakeAndPrepare(
     };
     base.user_file_start = @intCast(dep_map.files.items.len);
 
-    // The only place the base's own sources exist: a cached run loads IR and
-    // never parses them, so a call site inside a stdlib body could otherwise
-    // never receive an eager pick. The results ride the image.
+    // The only run where the base's sources exist; the results ride the image.
     checkBaseSources(gpa, base, deps.asts);
 
     const tb_lower = runtime.clockMonotonicNanos();
@@ -914,8 +844,6 @@ fn bakeAndPrepare(
         (runtime.clockMonotonicNanos() - tb_lower) / 1_000_000,
     });
 
-    // Extend straight from the in-memory base instead of reloading the bytes
-    // just written.
     if (!interp_ir.build.canExtendBase(base, user.asts)) {
         trace(gpa, "fallback (base name collision)", .{});
         return null;
@@ -932,10 +860,8 @@ fn bakeAndPrepare(
     return .{ .built = built, .map = map, .bindings = deps.bindings, .user_asts = user2.asts };
 }
 
-/// One dependency load for `klio bundle`: the parsed dependency ASTs (embedded
-/// stdlib + installed packs), the map they parsed onto, and the run bindings.
-/// Lowering mutates the ASTs and baking strips dead AST bodies, so each lower
-/// needs its own load; the bundler calls this once per bake attempt.
+/// One dependency load for `klio bundle`. Lowering mutates the ASTs and baking
+/// strips dead bodies, so each bake attempt needs its own load.
 pub const BundleDeps = struct {
     asts: []const KotlinFile,
     map: *SourceMap,
@@ -958,18 +884,15 @@ pub fn bundleDepLoad(
     return .{ .asts = deps.asts, .map = dep_map, .bindings = deps.bindings };
 }
 
-/// The dependency base assembled for a bundle: the image bytes to embed and the
-/// in-memory base + map for bundle-time program verification.
+/// The image bytes to embed, plus the base and map for bundle-time verification.
 pub const BundleBase = struct {
     bytes: []const u8,
     base: *interp_ir.build.StdlibBase,
     map: *const SourceMap,
 };
 
-/// Assemble the dependency base image for `klio bundle` from a completed
-/// dependency load: reuse a cache-keyed image when one matches, else bake fresh
-/// and publish it into the cache like a normal run. `report`/`selection` are the
-/// load's out-params and key the cache. Null when the base cannot bake.
+/// Assemble the dependency base image for `klio bundle`, reusing a cache-keyed
+/// image when one matches. `report`/`selection` key the cache.
 pub fn bundleBaseImage(
     gpa: Allocator,
     deps: *const BundleDeps,
@@ -993,9 +916,7 @@ pub fn bundleBaseImage(
         return .{ .bytes = bytes, .base = loaded.base, .map = loaded.map };
     }
 
-    // Same bake-time staging and check as `bakeAndPrepare`: this is the other
-    // path that builds a base from source (`bake-image`, and any bundle), and
-    // the resolutions have to ride whichever image the run ends up with.
+    // Same bake-time staging and check as `bakeAndPrepare`, the other from-source path.
     stageBaseEagerCalls(gpa, deps.asts);
     const base = (interp_ir.build.buildStdlibBase(gpa, deps.asts) catch return null) orelse return null;
     base.user_file_start = @intCast(deps.map.files.items.len);
@@ -1014,8 +935,7 @@ pub fn bundleBaseImage(
 }
 
 /// `klio bake [files...]`: ensure the stdlib images the given programs need
-/// exist, baking on miss. With no files, both stdlib gate variants are baked (a
-/// program with no stdlib imports, and one importing the full curated set).
+/// exist. With no files, both stdlib gate variants are baked.
 pub fn runBake(gpa: Allocator, paths: []const []const u8, features: *const RequestedFeatures) u8 {
     if (disabled(gpa)) {
         io.writeStderr("error: the stdlib image cache is disabled (KLIO_STDLIB_IMAGE=0 or KLIO_PACK_DIAG set)\n");
@@ -1024,7 +944,6 @@ pub fn runBake(gpa: Allocator, paths: []const []const u8, features: *const Reque
     if (paths.len != 0) {
         return bakeForPrograms(gpa, paths, features);
     }
-    // Synthesize the two gate variants under the user's own cache dir.
     const cache = cacheDir(gpa) orelse {
         io.writeStderr("error: cannot resolve ~/.klio/cache\n");
         return 1;

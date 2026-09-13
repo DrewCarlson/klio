@@ -1,9 +1,7 @@
 //! Discovers and runs `kotlin.test` `@Test` functions through the real
-//! interpreter pipeline. Discovery reads the user's parsed sources, so it is
-//! scoped to the program under test and resolves `kotlin.test` annotations
-//! through each file's imports; execution drives the built module through the
-//! `Vm` embedder entry points (`prepare`/`callNoArg`/`construct`/`callMethod`).
-//! It uses only the public `interp_ir` API and adds nothing to the evaluator.
+//! interpreter pipeline. Discovery reads the user's parsed sources, so it
+//! resolves annotations through each file's imports; execution drives the built
+//! module through the public `Vm` embedder entry points only.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -19,10 +17,10 @@ const Value = runtime.Value;
 pub const Outcome = enum { passed, failed, skipped };
 
 pub const TestResult = struct {
-    /// Human-facing identity, e.g. `MathTest.addition` or `topLevelTest`.
+    /// `MathTest.addition` or `topLevelTest`.
     display: []const u8,
     outcome: Outcome,
-    /// Failure detail (exception type + message, or an interpreter error).
+    /// Exception type and message, or an interpreter error.
     detail: ?[]const u8 = null,
 };
 
@@ -66,8 +64,7 @@ fn joinPath(gpa: Allocator, path: []const ast.Ident) []const u8 {
     return buf.toOwnedSlice(gpa) catch "";
 }
 
-/// True if `imports` brings `kotlin.test.<simple>` into scope under its bare
-/// name, via `import kotlin.test.<simple>` or `import kotlin.test.*`.
+/// Whether `import kotlin.test.<simple>` or `import kotlin.test.*` is in scope.
 fn importsKotlinTest(imports: []const ast.ImportDecl, simple: []const u8) bool {
     for (imports) |imp| {
         if (imp.path.len == 0) continue;
@@ -75,7 +72,6 @@ fn importsKotlinTest(imports: []const ast.ImportDecl, simple: []const u8) bool {
             if (pathEquals(imp.path, &.{ "kotlin", "test" })) return true;
             continue;
         }
-        // `import kotlin.test.<simple>` (no alias rename of the leaf).
         if (imp.alias != null) continue;
         if (imp.path.len == 3 and
             std.mem.eql(u8, imp.path[0].name, "kotlin") and
@@ -93,8 +89,7 @@ fn pathEquals(path: []const ast.Ident, segs: []const []const u8) bool {
     return true;
 }
 
-/// True if any annotation in `annos` resolves to `kotlin.test.<simple>` given
-/// the declaring file's `imports`.
+/// Whether any annotation in `annos` resolves to `kotlin.test.<simple>`.
 fn hasKotlinTestAnno(
     annos: []const ast.Annotation,
     imports: []const ast.ImportDecl,
@@ -105,7 +100,7 @@ fn hasKotlinTestAnno(
         const leaf = an.path[an.path.len - 1].name;
         if (!std.mem.eql(u8, leaf, simple)) continue;
         if (an.path.len > 1) {
-            // Fully or partially qualified use site: accept `kotlin.test.X`.
+            // Qualified use site: accept `kotlin.test.X`.
             if (an.path.len == 3 and
                 std.mem.eql(u8, an.path[0].name, "kotlin") and
                 std.mem.eql(u8, an.path[1].name, "test")) return true;
@@ -126,11 +121,9 @@ fn qualify(gpa: Allocator, pkg: []const u8, name: []const u8) []const u8 {
     return std.fmt.allocPrint(gpa, "{s}.{s}", .{ pkg, name }) catch "";
 }
 
-/// One class declaration plus the imports of its declaring file (needed to
-/// resolve `kotlin.test` annotations on its members).
+/// A class declaration plus its file's imports, needed to resolve annotations.
 const ClassEntry = struct { cls: *const ast.Class, imports: []const ast.ImportDecl };
 
-/// True when `only_fids` is unrestricted (empty) or contains `fid`.
 fn fileSelected(only_fids: []const u32, fid: u32) bool {
     if (only_fids.len == 0) return true;
     for (only_fids) |x| if (x == fid) return true;
@@ -138,10 +131,8 @@ fn fileSelected(only_fids: []const u32, fid: u32) bool {
 }
 
 /// `filter == null` runs everything. Otherwise a test runs when its display
-/// name (a top-level `method`, or a class's `Class`) contains any of the
-/// comma-separated substrings. A `=` token matches the entire display name,
-/// which the isolated runner uses to avoid prefix collisions; a `!` token
-/// excludes matches regardless of the positive tokens, so
+/// name contains any comma-separated substring. A `=` token matches the whole
+/// display name; a `!` token excludes regardless of positive tokens, so
 /// `Recomposer,!validatePotentialDeadlock` runs a class minus one test.
 fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
     const pat = filter orelse return true;
@@ -163,8 +154,7 @@ fn filterMatches(filter: ?[]const u8, name: []const u8) bool {
             pos_hit = true;
         }
     }
-    // A purely negative pattern admits everything it does not exclude; a
-    // pattern with no usable tokens admits nothing.
+    // A purely negative pattern admits all it does not exclude; no tokens admits none.
     return pos_hit or (!any_pos and any_neg);
 }
 
@@ -195,10 +185,8 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
     var top: std.ArrayList(TopTest) = .empty;
     var classes: std.ArrayList(ClassTests) = .empty;
 
-    // Index every class by simple name so a concrete class can pull in the
-    // `@Test` methods it inherits from abstract base classes; the stdlib tests
-    // put bodies in abstract bases run through concrete subclasses. The index
-    // spans every file so cross-file bases resolve when discovery is narrowed.
+    // Index by simple name so a concrete class pulls in `@Test` methods it
+    // inherits from abstract bases, across every file.
     var index = std.StringHashMap(ClassEntry).init(gpa);
     defer index.deinit();
     for (user_asts) |*file| {
@@ -208,9 +196,7 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
     }
 
     for (user_asts) |*file| {
-        // `--only-file` compiles every file but discovers tests only in the
-        // selected ones, so cross-file helpers stay available without tests
-        // being double-counted across sibling files.
+        // `--only-file` compiles every file but discovers only in the selected ones.
         if (!fileSelected(only_fids, file.span.file.int())) continue;
         const pkg = filePackage(gpa, file);
         defer gpa.free(pkg);
@@ -228,8 +214,7 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
                     });
                 },
                 .Class => |*c| {
-                    // An abstract class is never instantiated directly; its
-                    // tests run through concrete subclasses (below).
+                    // Abstract classes run their tests through concrete subclasses.
                     if (c.is_abstract) continue;
                     const ct = try discoverClass(gpa, module, &index, file, c, pkg, filter);
                     if (ct) |found| try classes.append(gpa, found);
@@ -244,9 +229,8 @@ fn discover(gpa: Allocator, module: *const ir.Module, user_asts: []const ast.Kot
     };
 }
 
-/// Collect `@Test`/`@BeforeTest`/`@AfterTest` methods of `cls` and, transitively,
-/// of supertypes resolvable in `index`, de-duplicated by name so a most-derived
-/// override is not run twice. `display_class` is the class the tests run under.
+/// `@Test`/`@BeforeTest`/`@AfterTest` of `cls` and its supertypes in `index`,
+/// de-duplicated by name so a most-derived override runs once.
 fn collectClassMethods(
     gpa: Allocator,
     index: *const std.StringHashMap(ClassEntry),
@@ -261,10 +245,8 @@ fn collectClassMethods(
 ) Allocator.Error!void {
     if (visited.contains(cls.name.name)) return;
     try visited.put(cls.name.name, {});
-    // Collect from the concrete class decl itself, not an `index.get` by simple
-    // name, which would resolve to a same-named class in a different package and
-    // drop this one's tests. The index serves supertype recursion only, because
-    // Kotlin supertypes are referenced by simple name.
+    // Collect from the concrete class decl, not `index.get` by simple name,
+    // which would resolve a same-named class in another package.
     for (cls.members) |*m| {
         if (m.* != .Function) continue;
         const f = &m.Function;
@@ -311,9 +293,7 @@ fn discoverClass(
     var visited = std.StringHashMap(void).init(gpa);
     defer visited.deinit();
     try collectClassMethods(gpa, index, c, file.imports, c.name.name, &methods, &befores, &afters, &seen, &visited);
-    // Method-level `--filter`: if the class name itself does not match, keep
-    // only the methods whose `Class.method` display matches (a class whose
-    // name matches keeps all its methods). Dropped methods are freed here.
+    // A class whose name matches keeps all methods; otherwise filter per method.
     if (filter) |pat| {
         if (!filterMatches(pat, c.name.name) or filterHasNegation(pat)) {
             var kept: usize = 0;
@@ -369,15 +349,12 @@ const RunState = struct {
     gpa: Allocator,
     plan: *const Plan,
     results: std.ArrayList(TestResult),
-    /// The previous `record`'s monotonic reading; the delta is the
-    /// finished test's wall time in the progress stream.
+    /// The previous `record`'s reading; the delta is the finished test's time.
     last_record_ns: i128 = 0,
 };
 
-/// Pull a printable `type: message` (or just `type`) out of a thrown value.
 fn describeThrow(gpa: Allocator, v: Value) []const u8 {
-    // Under KLIO_ERR_TRACE render the full throwable (type, message, frames,
-    // causes): a teardown-masked failure is undiagnosable from type+message.
+    // KLIO_ERR_TRACE renders the full throwable; type and message can mask one.
     if (runtime.envOnce("KLIO_ERR_TRACE") != null) {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(gpa);
@@ -399,9 +376,7 @@ fn describeThrow(gpa: Allocator, v: Value) []const u8 {
 }
 
 fn record(st: *RunState, display: []const u8, outcome: Outcome, detail: ?[]const u8) Allocator.Error!void {
-    // Stream per-test progress to stderr as each test completes; the stdout
-    // report stays one post-run block for consumers to parse. The duration
-    // since the previous record is this test's wall time, setup included.
+    // Progress streams to stderr; stdout stays one post-run block to parse.
     const tag = switch (outcome) {
         .passed => "PASSED",
         .failed => "FAILED",
@@ -426,8 +401,7 @@ fn record(st: *RunState, display: []const u8, outcome: Outcome, detail: ?[]const
     };
 }
 
-/// Run one no-arg call and convert a non-`ok` outcome into a failure detail
-/// string (owned by `gpa`). Returns null on success.
+/// Non-`ok` becomes a failure detail owned by `gpa`. Null on success.
 fn failureDetail(st: *RunState, oc: interp_ir.CallOutcome) ?[]const u8 {
     return switch (oc) {
         .ok => null,
@@ -437,9 +411,7 @@ fn failureDetail(st: *RunState, oc: interp_ir.CallOutcome) ?[]const u8 {
 }
 
 /// Per-test wall cap in seconds, 300 when `KLIO_TEST_WALL_CAP` is unset, so a
-/// wedged test (deadlock, lost-wakeup park, spinning virtual-clock loop) fails
-/// with "test wall-clock deadline exceeded" instead of hanging the run
-/// silently. `KLIO_TEST_WALL_CAP=0` disables the cap for unbounded workloads.
+/// wedged test fails instead of hanging the run. `0` disables the cap.
 fn wallCapSeconds() i64 {
     const S = struct {
         var cached: ?i64 = null;
@@ -453,10 +425,8 @@ fn wallCapSeconds() i64 {
     return v;
 }
 
-/// Per-test budget overrides: `KLIO_TEST_WALL_CAP_FOR=name=secs,name=secs`. A
-/// test that completes but outruns the hang detector's window declares its own
-/// budget here. A declared budget is an upper bound that must only shrink:
-/// exceeding it still fails, so a regression is still caught.
+/// Per-test overrides: `KLIO_TEST_WALL_CAP_FOR=name=secs,...`. A declared
+/// budget is an upper bound that must only shrink; exceeding it still fails.
 fn wallCapForTest(name: []const u8) i64 {
     const spec = runtime.envOnce("KLIO_TEST_WALL_CAP_FOR") orelse return wallCapSeconds();
     var it = std.mem.splitScalar(u8, spec, ',');
@@ -488,19 +458,12 @@ fn clearWallDeadline() void {
     ir.eval.test_wall_deadline_ms.store(0, .monotonic);
 }
 
-/// Clear the drain-everything abandonment a wall-capped test raised, which
-/// kills its whole cohort (pool tasks, explicit threads, resumed coroutines)
-/// cooperatively instead of against half-torn state, so the next step starts
-/// clean.
+/// Clear a wall-capped test's drain-everything abandonment, cooperatively.
 fn drainWallCapAbandon() void {
     if (!runtime.runBoundaryAbandonActive()) return;
-    // Wait for quiescence, not a fixed grace window: cohort members observe the
-    // flags at block granularity and <=50 ms sleep slices, but a worker parked
-    // in a bounded native wait (a sync-resume spin, a gate slice) outlives a
-    // fixed window, and clearing the flags then strands it mid-task so a dead
-    // test's loops run into every later test in the class. Poll the in-eval
-    // census until only this thread remains, bounded at 10 s; on timeout clear
-    // anyway but say so, since a silent leak reads as a flake.
+    // Wait for quiescence, not a fixed window: a worker parked in a bounded
+    // native wait outlives one, and clearing the flags strands it mid-task.
+    // Poll the in-eval census until only this thread remains, bounded at 10 s.
     runtime.gc.enterBlockingSafe();
     var waited_ms: u64 = 0;
     while (ir.eval.threads_in_eval.load(.monotonic) != 0 and waited_ms < 10_000) {
@@ -560,7 +523,7 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
             switch (inst) {
                 .ok => |receiver| {
                     var detail: ?[]const u8 = null;
-                    // @BeforeTest -> @Test, stopping at the first failure.
+                    // @BeforeTest then @Test, stopping at the first failure.
                     for (ct.befores) |b| {
                         if (failureDetail(st, try vm.callMethod(&receiver, b))) |d| {
                             detail = d;
@@ -570,9 +533,7 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
                     if (detail == null) {
                         detail = failureDetail(st, try vm.callMethod(&receiver, m.name));
                     }
-                    // @AfterTest always runs, un-abandoned and on a fresh
-                    // deadline budget so a timed-out test still tears down;
-                    // its failure surfaces only if the test itself passed.
+                    // @AfterTest always runs on a fresh budget, un-abandoned.
                     drainWallCapAbandon();
                     armWallDeadline();
                     for (ct.afters) |a| {
@@ -592,8 +553,7 @@ fn runBody(st: *RunState, vm: *Vm) Allocator.Error!void {
     }
 }
 
-/// Discover the `@Test` display names without running them; the `--isolate`
-/// driver spawns one sub-process per name. Caller owns each string and the slice.
+/// Display names without running them. Caller owns each string and the slice.
 pub fn listTests(
     gpa: Allocator,
     vm: *Vm,
@@ -617,8 +577,7 @@ pub fn listTests(
     return names.toOwnedSlice(gpa);
 }
 
-/// Discover and run every `@Test` in `user_asts` against the prepared `vm`,
-/// writing test-program output to `out`. Caller owns the returned `Report`.
+/// Run every `@Test` in `user_asts` against `vm`. Caller owns the `Report`.
 pub fn runTests(
     gpa: Allocator,
     vm: *Vm,
@@ -634,12 +593,11 @@ pub fn runTests(
     };
     defer freePlan(gpa, &plan);
 
-    // Stamp the clock at run start so the first test's streamed duration is
-    // real rather than 0ms.
+    // Stamp the clock at run start so the first duration is real, not 0ms.
     var st = RunState{ .gpa = gpa, .plan = &plan, .results = .empty, .last_record_ns = runtime.clockMonotonicNanos() };
     const prep = try vm.runCalls(out, *RunState, &st, runBody);
     if (prep) |_| {
-        // Startup failed: surface one failing entry so the caller exits non-zero.
+        // Surface one failing entry so the caller exits non-zero.
         try record(&st, "<startup>", .failed, try gpa.dupe(u8, "module initialization failed"));
     }
 

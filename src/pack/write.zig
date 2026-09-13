@@ -1,11 +1,8 @@
-//! Pack writer: builds a `.klio-pack` byte stream deterministically.
-//!
-//! The byte-level serializer is the postcard wire format: little varints for
-//! multi-byte integers, length-prefixed sequences and byte strings,
-//! single-byte bool and `Option` tags, in-order struct fields. `Zstd` and
-//! `ZstdDict` sections compress through the system zstd library, a `ZstdDict`
-//! section against the pack's dictionary, which ships as a `zstd_dict`
-//! section so readers need no out-of-band state.
+//! Pack writer, deterministic. The byte-level serializer is the postcard wire
+//! format: little varints for multi-byte integers, length-prefixed sequences
+//! and byte strings, single-byte bool and `Option` tags, in-order struct
+//! fields. A `ZstdDict` section compresses against the pack's dictionary, which
+//! ships as a `zstd_dict` section so readers need no out-of-band state.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -19,8 +16,7 @@ const SectionDirectory = format.SectionDirectory;
 const SectionEntry = format.SectionEntry;
 const section_names = format.section_names;
 
-/// Default zstd compression level. Level 3 encodes fast and decompresses near
-/// memcpy speed, trading a little size for load time.
+/// Level 3 encodes fast and decompresses near memcpy speed.
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 const PendingSection = struct {
@@ -29,15 +25,13 @@ const PendingSection = struct {
     compression: Compression,
 };
 
-/// Builder for a pack file. Sections are added in any order and sorted at
-/// finish time, so the encoded directory is deterministic.
+/// Sections are added in any order and sorted at finish, so output is stable.
 pub const PackWriter = struct {
     allocator: Allocator,
     sections: std.ArrayList(PendingSection) = .empty,
     flags: u32 = 0,
-    /// Optional zstd dictionary. Sections added through `addZstdDict`
-    /// compress against it, and it ships as a `zstd_dict` section so readers
-    /// need no out-of-band state.
+    /// Sections added through `addZstdDict` compress against it, and it ships
+    /// as a `zstd_dict` section.
     zstd_dict: ?[]const u8 = null,
 
     pub fn init(allocator: Allocator) PackWriter {
@@ -49,15 +43,13 @@ pub const PackWriter = struct {
         self.* = undefined;
     }
 
-    /// Set the `flags` field in the pack header. Reserved for future use.
     pub fn setFlags(self: *PackWriter, flags: u32) *PackWriter {
         self.flags = flags;
         return self;
     }
 
-    /// Add a section. `name` must be unique within the pack; duplicates are
-    /// rejected at `finish`. `name` and `payload` are borrowed and must stay
-    /// alive until `finish` returns.
+    /// `name` must be unique; duplicates are rejected at `finish`. `name` and
+    /// `payload` are borrowed and must outlive `finish`.
     pub fn addSection(
         self: *PackWriter,
         name: []const u8,
@@ -72,36 +64,29 @@ pub const PackWriter = struct {
         return self;
     }
 
-    /// Add an uncompressed section.
     pub fn addRaw(self: *PackWriter, name: []const u8, payload: []const u8) Allocator.Error!*PackWriter {
         return self.addSection(name, payload, .None);
     }
 
-    /// Add a zstd-compressed section at `DEFAULT_ZSTD_LEVEL`.
     pub fn addZstd(self: *PackWriter, name: []const u8, payload: []const u8) Allocator.Error!*PackWriter {
         return self.addSection(name, payload, .Zstd);
     }
 
-    /// Add a section compressed against the writer's zstd dictionary. Without
-    /// a prior `setZstdDict`, `finish` errors.
+    /// Errors at `finish` without a prior `setZstdDict`.
     pub fn addZstdDict(self: *PackWriter, name: []const u8, payload: []const u8) Allocator.Error!*PackWriter {
         return self.addSection(name, payload, .ZstdDict);
     }
 
-    /// Attach a zstd dictionary. Later `addZstdDict` calls compress against
-    /// it, and it is emitted as a `zstd_dict` section.
     pub fn setZstdDict(self: *PackWriter, bytes: []const u8) *PackWriter {
         self.zstd_dict = bytes;
         return self;
     }
 
-    /// Encode the pack. Output is deterministic for a given set of input
-    /// sections, and the caller owns the returned buffer.
+/// Deterministic for a given set of sections; the caller owns the buffer.
     pub fn finish(self: *PackWriter, result: *PackError) Allocator.Error!?std.ArrayList(u8) {
         const a = self.allocator;
 
-        // Emit the dictionary as a `zstd_dict` section so readers resolve it
-        // on load; an explicitly added `zstd_dict` section wins.
+        // An explicitly added `zstd_dict` section wins over the attached one.
         if (self.zstd_dict) |dict| {
             var has_dict = false;
             for (self.sections.items) |s| {
@@ -129,8 +114,6 @@ pub const PackWriter = struct {
             }
         }
 
-        // First pass: directory entries plus the concatenated payload buffer,
-        // compressing each section as tagged.
         var payloads: std.ArrayList(u8) = .empty;
         defer payloads.deinit(a);
         var entries: std.ArrayList(SectionEntry) = .empty;
@@ -195,14 +178,13 @@ pub const PackWriter = struct {
         }
         const dir_len: u32 = @intCast(dir_buf.items.len);
 
-        // Second pass: assemble the final file. Layout matches format.zig.
+        // Layout matches format.zig.
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(a);
         try out.ensureTotalCapacity(a, format.HASHED_REGION_OFFSET + 4 + dir_buf.items.len + payloads.items.len);
         try out.appendSlice(a, format.MAGIC);
         try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u32, format.FORMAT_VERSION)));
         try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u32, self.flags)));
-        // Reserve hash slot; filled in below once the hashed region is known.
         const hash_slot = out.items.len;
         try out.appendNTimes(a, 0, format.HASH_LEN);
         try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToLittle(u32, dir_len)));
@@ -222,8 +204,7 @@ fn lessByName(_: void, a: PendingSection, b: PendingSection) bool {
     return std.mem.order(u8, a.name, b.name) == .lt;
 }
 
-/// Encode `value` into bytes ready for the pack writer. The caller owns the
-/// buffer; on failure `result` is set and null returned.
+/// Caller owns the buffer; on failure `result` is set and null returned.
 pub fn encode(
     comptime T: type,
     allocator: Allocator,
@@ -244,8 +225,7 @@ fn encodeValue(comptime T: type, allocator: Allocator, out: *std.ArrayList(u8), 
     switch (info) {
         .bool => try out.append(allocator, if (value) 1 else 0),
         .int => try encodeInt(T, allocator, out, value),
-        // Floats are written as their IEEE-754 bit pattern in little-endian
-        // byte order, so the encoded stream is identical across hosts.
+        // IEEE-754 bit pattern, little-endian, so the stream is host-independent.
         .float => {
             const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
             const raw: Bits = @bitCast(value);
@@ -338,11 +318,9 @@ test "float encodes as little-endian IEEE-754 bits" {
     const a = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
-    // 1.5f64 = 0x3FF8000000000000; little-endian byte order on the wire.
     try encodeValue(f64, a, &out, 1.5);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0xf8, 0x3f }, out.items);
     out.clearRetainingCapacity();
-    // -2.25f32 = 0xC0100000.
     try encodeValue(f32, a, &out, -2.25);
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0x10, 0xc0 }, out.items);
 }

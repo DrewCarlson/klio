@@ -1,16 +1,9 @@
-//! Harvest package-rooted fully-qualified reference prefixes from a parsed
-//! program.
-//!
-//! Kotlin needs no `import` to use a name by its fully-qualified path
-//! (`kotlin.coroutines.EmptyCoroutineContext`, `kotlinx.coroutines.launch(…)`),
-//! but the stdlib and pack load gate keys on `import` lines. This walk recovers
-//! the package prefixes a qualified-only use implies, so the gate sees them as
-//! if the program had imported them.
-//!
-//! A dotted chain contributes a prefix only when its head segment is a
-//! well-known package root (`kotlin`, `kotlinx`, `java`, `javax`); a member
-//! access on a local (`obj.a.b`) is rooted at the local's name and never widens
-//! the gate. A missed position only fails to widen, never a false positive.
+//! Harvests package-rooted fully-qualified reference prefixes from a parsed program.
+//! Kotlin needs no `import` to use a name by its fully-qualified path, but the stdlib
+//! and pack load gate keys on `import` lines, so this walk recovers the prefixes a
+//! qualified-only use implies. A chain contributes one only when its head segment is a
+//! known package root (`kotlin`, `kotlinx`, `java`, `javax`), so a member access on a
+//! local (`obj.a.b`) never widens the gate and a miss is never a false positive.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -23,8 +16,6 @@ const Block = ast.Block;
 const Stmt = ast.Stmt;
 const FunctionBody = ast.FunctionBody;
 
-/// Top-level package roots a dotted chain must start with to count as a
-/// fully-qualified reference (rather than member access on a value).
 const PACKAGE_ROOTS = [_][]const u8{ "kotlin", "kotlinx", "java", "javax" };
 
 fn isPackageRoot(name: []const u8) bool {
@@ -34,9 +25,8 @@ fn isPackageRoot(name: []const u8) bool {
     return false;
 }
 
-/// Collect every package-rooted qualified-reference prefix the files use, as a
-/// set of dotted strings. Keys are owned by `allocator`: free the keys and
-/// `deinit` the map (the loader's `freeStringSet` does both).
+/// Every package-rooted qualified-reference prefix the files use, as dotted strings.
+/// Keys are owned by `allocator`; the loader's `freeStringSet` frees keys and map.
 pub fn collect(
     allocator: Allocator,
     files: []const KotlinFile,
@@ -53,8 +43,7 @@ pub fn collect(
     return out;
 }
 
-/// If `e` is a package-rooted dotted chain, record every segment but the
-/// trailing symbol. Walks a `Member`/`Path` spine only; a non-name link aborts.
+/// Records all but the trailing segment of a package-rooted `Member`/`Path` spine.
 fn recordChainPrefix(
     allocator: Allocator,
     out: *std.StringHashMap(void),
@@ -63,8 +52,7 @@ fn recordChainPrefix(
     var segs: [16][]const u8 = undefined;
     var n: usize = 0;
     var cur: *const Expr = e;
-    // Unwind the chain right-to-left into `segs`, bounded by the buffer; a
-    // longer chain is not a package qualifier worth gating on.
+    // Unwind right-to-left into `segs`; a chain longer than the buffer is no qualifier.
     while (true) {
         switch (cur.*) {
             .Member => |m| {
@@ -90,7 +78,6 @@ fn recordChainPrefix(
     const head = segs[n - 1];
     if (!isPackageRoot(head)) return;
 
-    // Build the package prefix: head .. second-to-last (drop segs[0]).
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     var i: usize = n - 1;
@@ -109,7 +96,6 @@ fn walkExpr(
     out: *std.StringHashMap(void),
     e: *const Expr,
 ) Allocator.Error!void {
-    // A Member/Path spine may itself be a package qualifier.
     try recordChainPrefix(allocator, out, e);
 
     switch (e.*) {
@@ -275,8 +261,7 @@ const lexer = @import("lexer");
 const parser = @import("parser");
 const span = @import("span");
 
-/// Parse `src` and collect the prefixes. The parse allocations live on an
-/// arena passed by the caller; the returned set is owned by `out_alloc`.
+/// Parse allocations live on `arena`; the returned set is owned by `out_alloc`.
 fn collectFromSource(arena: Allocator, out_alloc: Allocator, src: []const u8) !std.StringHashMap(void) {
     var sm = span.SourceMap.init(arena);
     const fid = try sm.add("test.kt", src);

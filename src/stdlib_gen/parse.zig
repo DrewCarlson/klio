@@ -1,11 +1,7 @@
-//! Declaration-only Kotlin parser. Tokenizes source into a coarse stream that
-//! drops comment, string, and char-literal contents, then walks it for
-//! declaration headers: the file's single `package`, top-level decls, and decls
-//! one level inside a class/interface/object body, fqn-prefixed with the
-//! enclosing class name.
-//!
-//! Function bodies, property initializers, and anonymous-object bodies stay
-//! opaque brace groups; the walker never descends into them.
+//! Declaration-only Kotlin parser. Tokenizes source into a coarse stream that drops
+//! comment, string, and char-literal contents, then walks it for declaration headers:
+//! the file's single `package`, top-level decls, and decls one level inside a class,
+//! interface, or object body. Bodies and initializers stay opaque brace groups.
 
 const std = @import("std");
 
@@ -41,12 +37,10 @@ pub const Decl = struct {
     parent: ?[]const u8,
     /// Extension receiver as it appears in source, e.g. `List<T>`.
     receiver: ?[]const u8,
-    /// Modifier bitset (mirrors `stdlib.Modifiers`).
     modifiers: u32,
     /// Trimmed single-line signature text.
     signature: []const u8,
-    /// Parameter names in declaration order, empty for non-functions. The
-    /// interpreter reorders named-arg calls from them.
+    /// Declaration order, empty for non-functions; named-arg calls reorder from them.
     param_names: [][]const u8,
     line: u32,
     column: u32,
@@ -155,8 +149,7 @@ fn modifierBit(word: []const u8) ?u32 {
     return null;
 }
 
-/// Blank comment, string, and char-literal contents out of `src`, writing
-/// spaces so byte offsets and line numbers hold. Caller owns the returned bytes.
+/// Blanks comments, strings, and char literals to spaces so offsets and lines hold.
 fn scrub(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
     const bytes = src;
     var out: std.ArrayList(u8) = .empty;
@@ -271,14 +264,11 @@ const Tok = union(enum) {
     Op: u8,
     /// Multi-char operator: `->`, `::`, or `..`.
     OpStr: []const u8,
-    /// `@Annotation` or `@Annotation(...)`, collapsed into one token so it does
-    /// not disturb modifier scanning.
+    /// `@Annotation` or `@Annotation(...)`, one token so modifier scanning is undisturbed.
     Annotation,
     /// Matched `<...>` block, so a type parameter list skips as one token.
     Angle: []const u8,
-    /// Balanced `(...)` group; parameter lists are read out of it.
     Paren: []const u8,
-    /// Balanced `[...]` group.
     Bracket: []const u8,
     /// Number literal, produced but never inspected.
     Number: []const u8,
@@ -291,10 +281,8 @@ const PosTok = struct {
     col: u32,
 };
 
-/// Tokenize scrubbed source. Balanced `()`, `[]`, and heuristically `<>` groups
-/// collapse into one token holding their raw inner text; `{}` does not, so the
-/// decl walker can track class bodies. Token strings borrow `src` or arena
-/// scratch, both of which outlive the returned slice.
+/// Balanced `()`, `[]`, and heuristically `<>` groups collapse into one token holding
+/// their raw inner text; `{}` does not, so the walker can track class bodies.
 fn tokenize(arena: Allocator, src: []const u8) Allocator.Error![]PosTok {
     const bytes = src;
     var out: std.ArrayList(PosTok) = .empty;
@@ -383,8 +371,7 @@ fn tokenize(arena: Allocator, src: []const u8) Allocator.Error![]PosTok {
             continue;
         }
         if (b == '<') {
-            // A `<` opens a generic only when the group balances; otherwise it
-            // is the comparison operator.
+            // A `<` opens a generic only when the group balances, else it compares.
             if (try tryBalanceAngles(arena, bytes, i, line, col)) |r| {
                 i = r.end;
                 line = r.end_line;
@@ -419,9 +406,8 @@ fn tokenize(arena: Allocator, src: []const u8) Allocator.Error![]PosTok {
     return out.toOwnedSlice(arena);
 }
 
-/// Parameter names from the text between `(` and `)`: split on top-level commas
-/// (nested `()`/`[]`/`<>`/`{}` do not split) and take the last word before each
-/// `:`. Caller owns every returned string and the slice.
+/// Split on top-level commas (nested `()`/`[]`/`<>`/`{}` do not split), taking the last
+/// word before each `:`. Caller owns every returned string and the slice.
 fn extractParamNames(allocator: Allocator, content: []const u8) Allocator.Error![][]const u8 {
     var names: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -597,8 +583,7 @@ const SpanResult = struct {
     end_col: u32,
 };
 
-/// `balanced` without capturing the inner text, for spans where only the end
-/// position matters.
+/// `balanced` without capturing the inner text, for spans needing only the end.
 fn balancedSpan(
     bytes: []const u8,
     start: usize,
@@ -691,8 +676,7 @@ fn tryBalanceAngles(
     return null;
 }
 
-/// Parse `src` into a `ParsedFile`. Every string it owns comes from
-/// `allocator`; release with `ParsedFile.deinit`.
+/// Every string the result owns comes from `allocator`; release with `ParsedFile.deinit`.
 pub fn parseFile(allocator: Allocator, src: []const u8) Allocator.Error!ParsedFile {
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -803,14 +787,12 @@ const Parser = struct {
                 return;
             }
             if (!try self.parseOneDecl(parent)) {
-                // No decl here; advance one token to make progress.
                 self.pos += 1;
             }
         }
     }
 
-    /// Parse one declaration at the cursor. True leaves the cursor past the
-    /// decl; false restores it for the caller to bump and retry.
+    /// True leaves the cursor past the decl; false restores it for the caller to retry.
     fn parseOneDecl(self: *Parser, parent: ?[]const u8) Allocator.Error!bool {
         const start_pos = self.pos;
         var modifiers: u32 = 0;
@@ -978,8 +960,7 @@ const Parser = struct {
 
         self.skipSignatureTail();
         self.skipOptionalBody();
-        // Skip `get`/`set` accessor blocks. Matching only those two words keeps
-        // a modifier-led accessor from swallowing the next declaration.
+        // Matching only `get`/`set` keeps a modifier-led accessor from eating the next decl.
         while (true) {
             self.skipAnnotationsAndNewlines();
             const t = self.peek() orelse break;
@@ -1125,11 +1106,9 @@ const Parser = struct {
         name: ?[]const u8,
     };
 
-    /// Read `Recv[.Recv2][<T>][?].name`; a plain `name` yields a null receiver.
-    /// Both returned strings are owned by `self.allocator`.
+    /// Reads `Recv[.Recv2][<T>][?].name`; a plain `name` yields a null receiver.
     fn readOptionalReceiverAndName(self: *Parser) Allocator.Error!ReceiverAndName {
-        // Gather ident / `.` / Angle / `?` up to the terminator: the last ident
-        // is the name, the earlier pieces joined with `.` are the receiver.
+        // The last ident is the name, the earlier pieces joined with `.` the receiver.
         var pieces: std.ArrayList([]u8) = .empty;
         defer {
             for (pieces.items) |p| self.allocator.free(p);
@@ -1172,14 +1151,12 @@ const Parser = struct {
         if (pieces.items.len == 0) {
             return .{ .receiver = null, .name = null };
         }
-        // Drop a trailing dot so the name is the last piece.
         while (pieces.items.len > 0 and std.mem.eql(u8, pieces.items[pieces.items.len - 1], ".")) {
             const popped = pieces.pop().?;
             self.allocator.free(popped);
         }
         const name: ?[]u8 = if (pieces.items.len > 0) pieces.pop().? else null;
         errdefer if (name) |n| self.allocator.free(n);
-        // Drop trailing dot between receiver and name.
         if (pieces.items.len > 0 and std.mem.eql(u8, pieces.items[pieces.items.len - 1], ".")) {
             const popped = pieces.pop().?;
             self.allocator.free(popped);
@@ -1191,8 +1168,7 @@ const Parser = struct {
         return .{ .receiver = receiver, .name = name };
     }
 
-    /// Fully qualified name for `name` under `parent` and the file package.
-    /// Owned by `self.allocator`.
+    /// Fully qualified `name` under `parent` and the file package; owned by `self.allocator`.
     fn buildFqn(self: *Parser, parent: ?[]const u8, name: []const u8) Allocator.Error![]const u8 {
         if (parent) |p| {
             if (self.package.len == 0) {
@@ -1211,8 +1187,7 @@ const Parser = struct {
         return null;
     }
 
-    /// Skip to the `{` of a body, past an `= ...` expression body, or past the
-    /// terminating newline.
+    /// Skips to the `{` of a body, past an `= ...` expression body, or past the newline.
     fn skipSignatureTail(self: *Parser) void {
         var paren_depth: i32 = 0;
         var bracket_depth: i32 = 0;

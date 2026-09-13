@@ -1,6 +1,5 @@
 //! `klio-diagnostics-gen build`: mines kotlinc factory declarations and emits
-//! `src/diagnostics/generated/factories.zig`. Exposes `run` over parsed
-//! arguments rather than a real `main`.
+//! `src/diagnostics/generated/factories.zig`.
 
 const std = @import("std");
 
@@ -9,25 +8,21 @@ const gen = @import("diagnostics_gen.zig");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 
-/// Exit codes for the diagnostics-gen CLI.
 pub const SUCCESS: u8 = 0;
 pub const FAILURE: u8 = 1;
 pub const USAGE: u8 = 2;
 
 pub const Cmd = union(enum) {
     build: Build,
-    /// An unrecognized subcommand; carries its name for the error message.
     unknown: []const u8,
 
     pub const Build = struct {
-        /// Path to the upstream Kotlin checkout root.
         kotlin: ?[]const u8 = null,
-        /// Output path for the generated factories file.
         out: ?[]const u8 = null,
     };
 };
 
-/// Parse a raw argument vector (excluding the program name) into a `Cmd`.
+/// Parses a raw argument vector, program name excluded, into a `Cmd`.
 pub fn parseArgs(args: []const []const u8) Cmd {
     const cmd_name = if (args.len >= 1) args[0] else "build";
     const rest: []const []const u8 = if (args.len > 1) args[1..] else &.{};
@@ -55,8 +50,7 @@ pub fn parseArgs(args: []const []const u8) Cmd {
     return .{ .unknown = cmd_name };
 }
 
-/// Run a parsed subcommand. `err_writer` takes stderr text; the result is the
-/// process exit code.
+/// Runs a parsed subcommand and returns the process exit code.
 pub fn run(
     allocator: Allocator,
     io: Io,
@@ -109,7 +103,7 @@ fn build(allocator: Allocator, io: Io, args: Cmd.Build, err_writer: *std.Io.Writ
 
 const EmitError = error{WriteFailed} || Allocator.Error;
 
-/// Render `factories` into `out_file`, creating parent directories as needed.
+/// Renders `factories` into `out_file`, creating parent directories as needed.
 fn emit(allocator: Allocator, io: Io, factories: []const gen.Factory, out_file: []const u8) EmitError!void {
     const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(out_file)) |parent| {
@@ -120,12 +114,11 @@ fn emit(allocator: Allocator, io: Io, factories: []const gen.Factory, out_file: 
     cwd.writeFile(io, .{ .sub_path = out_file, .data = text }) catch return error.WriteFailed;
 }
 
-/// Kotlin checkout root, relative to the workspace root the generator runs in.
+/// Defaults are relative to the workspace root the generator runs in.
 fn defaultKotlinRoot(allocator: Allocator) Allocator.Error![]u8 {
     return allocator.dupe(u8, "kotlin");
 }
 
-/// Generated factories path, relative to that same workspace root.
 fn defaultOutFile(allocator: Allocator) Allocator.Error![]u8 {
     return allocator.dupe(u8, "src/diagnostics/generated/factories.zig");
 }

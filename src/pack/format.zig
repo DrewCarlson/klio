@@ -14,43 +14,35 @@
 //! +-------------------------+
 //! ```
 //!
-//! The directory lists every section; each entry records its offset from the
-//! start of the payload area, its on-disk length, its uncompressed length
-//! under `Compression.Zstd`, and a compression tag. Readers skip unknown
-//! sections without understanding their contents.
+//! The directory lists every section: offset from the payload area, on-disk
+//! length, uncompressed length under `Compression.Zstd`, and a compression tag.
+//! Readers skip unknown sections.
 
 const std = @import("std");
 
 /// Magic bytes at the start of every pack file.
 pub const MAGIC: *const [4]u8 = "KPK\x00";
 
-/// Pack format version, bumped when the on-disk layout or the
-/// `SectionDirectory` schema changes incompatibly. Postcard is sequential, so
-/// a pack written at an older version is rejected on read and must be rebuilt.
+/// Bumped when the on-disk layout or the `SectionDirectory` schema changes
+/// incompatibly. Postcard is sequential, so an older pack is rejected on read.
 pub const FORMAT_VERSION: u32 = 2;
 
-/// Length of the blake3 pack hash, in bytes.
 pub const HASH_LEN: usize = 32;
 
-/// Compression scheme applied to a section payload.
 pub const Compression = enum(u8) {
     None = 0,
     Zstd = 1,
-    /// zstd compressed against this pack's `zstd_dict` section. A section is
-    /// rejected when the pack carries no matching dictionary.
+    /// zstd against this pack's `zstd_dict`; rejected without a matching dict.
     ZstdDict = 2,
 };
 
-/// Directory entry for one section. Names are case-sensitive byte strings;
-/// well-known names are listed under `section_names`.
+/// Names are case-sensitive; well-known ones are under `section_names`.
 pub const SectionEntry = struct {
-    /// Section name such as `"manifest"`. Owned.
+    /// Owned.
     name: []const u8,
-    /// Offset of the payload from the start of the payload area.
     offset: u64,
-    /// On-disk payload length, compressed when `compression != None`.
+    /// Compressed length when `compression != None`.
     stored_len: u64,
-    /// Uncompressed length, equal to `stored_len` for `Compression.None`.
     uncompressed_len: u64,
     compression: Compression,
 
@@ -70,8 +62,7 @@ pub const SectionEntry = struct {
     }
 };
 
-/// Directory of section entries ordered by name, so the encoded directory is
-/// byte-deterministic for a given input set.
+/// Ordered by name, so the encoded directory is byte-deterministic.
 pub const SectionDirectory = struct {
     entries: []SectionEntry = &.{},
 
@@ -84,16 +75,12 @@ pub const SectionDirectory = struct {
     }
 };
 
-/// Well-known section names. Sections outside this list are legal and readers
-/// must tolerate them; tooling keys off these constants.
+/// Well-known names. Other sections are legal and readers must tolerate them.
 pub const section_names = struct {
     pub const MANIFEST: []const u8 = "manifest";
-    /// Raw `.kt` source bytes, parsed by the interpreter at install time.
     pub const SOURCES: []const u8 = "sources";
-    /// Precomputed per-source package and import paths
-    /// (`schema.ImportsBundle`), from the same parse that fills `ast`.
-    /// Optional; a loader needing only the import graph reads it instead of
-    /// parsing `sources`.
+    /// Per-source package and import paths (`schema.ImportsBundle`), from the
+    /// same parse that fills `ast`. Optional.
     pub const IMPORTS: []const u8 = "imports";
     pub const AST: []const u8 = "ast";
     pub const RESOLVED: []const u8 = "resolved";
@@ -102,18 +89,15 @@ pub const section_names = struct {
     pub const BINDINGS: []const u8 = "bindings";
     pub const TESTS: []const u8 = "tests";
     pub const DEBUG: []const u8 = "debug";
-    /// Raw zstd dictionary bytes that `Compression.ZstdDict` sections decode
-    /// against.
+    /// Raw dictionary bytes `Compression.ZstdDict` sections decode against.
     pub const ZSTD_DICT: []const u8 = "zstd_dict";
 };
 
-/// Byte offset of the `dir_len` u32 inside the file header.
 pub const DIR_LEN_OFFSET: usize = 4 + 4 + 4 + HASH_LEN;
 
 /// First hashed byte: everything from here to end-of-file feeds `pack_hash`.
 pub const HASHED_REGION_OFFSET: usize = DIR_LEN_OFFSET;
 
-/// Byte offset of the `pack_hash` field inside the header.
 pub const HASH_OFFSET: usize = 4 + 4 + 4;
 
 test "magic and header offsets are stable" {

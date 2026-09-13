@@ -1,13 +1,9 @@
-//! On-disk module format for the klio interpreter.
-//!
-//! A pack bundles a library's parsed AST, resolved symbols, type-check side
-//! tables, public symbol index, and optional native-binding manifest into one
-//! byte stream the interpreter loads without re-running the front end. The
-//! Kotlin standard library, kotlinx modules, and user libraries all use it.
-//!
-//! This module is the container: header layout, section directory,
-//! deterministic writer, validating reader, per-section zstd compression.
-//! Higher-level schemas live in `schema`.
+//! On-disk module format for the klio interpreter: one byte stream carrying a
+//! library's parsed AST, resolved symbols, type-check side tables, public
+//! symbol index and native-binding manifest, loaded without re-running the
+//! front end. This module is the container (header, section directory,
+//! deterministic writer, validating reader, per-section zstd); the schemas live
+//! in `schema`.
 
 const std = @import("std");
 
@@ -31,9 +27,8 @@ pub const PackWriter = write.PackWriter;
 
 pub const PackError = @import("errors.zig").PackError;
 
-/// Highest ABI version this build supports; the loader rejects a pack whose
-/// manifest declares a greater `abi_version`. Bump when the host-binding
-/// signature, the runtime value shape, or another binding contract changes.
+/// Highest ABI version this build supports; a pack declaring more is rejected.
+/// Bump when a host-binding signature or the runtime value shape changes.
 pub const SUPPORTED_ABI_VERSION: u32 = 1;
 
 test {
@@ -60,10 +55,8 @@ test "empty pack round trip" {
     defer reader.deinit();
     try std.testing.expectEqual(@as(usize, 0), reader.sections().len);
     try std.testing.expectEqual(@as(usize, 0), reader.sectionCount());
-    // The reader recomputes the hash, so reaching here means it matched.
     _ = reader.packHash();
 
-    // Re-encoding empty produces identical bytes.
     var w2 = PackWriter.init(a);
     defer w2.deinit();
     var again = (try w2.finish(&err)).?;
@@ -81,7 +74,7 @@ test "multi section round trip" {
 
     var w = PackWriter.init(a);
     defer w.deinit();
-    // Intentionally out-of-order: the writer must sort.
+    // Out of order on purpose: the writer must sort.
     _ = try w.addRaw(section_names.SYMBOLS, symbols);
     _ = try w.addRaw(section_names.MANIFEST, manifest);
     _ = try w.addRaw(section_names.BINDINGS, bindings);
@@ -141,7 +134,7 @@ test "tampered pack is rejected" {
     var bytes = (try w.finish(&err)).?;
     defer bytes.deinit(a);
 
-    // Flip a byte in the payload area; the header hash catches it on read.
+    // Flip a payload byte; the header hash catches it on read.
     const owned = try a.dupe(u8, bytes.items);
     owned[owned.len - 1] ^= 0x01;
     const reader = try PackReader.fromBytes(a, owned, &err);
@@ -166,7 +159,6 @@ test "zstd section round trip" {
     const a = std.testing.allocator;
     var err: PackError = undefined;
 
-    // Repetitive payload so compression shrinks the bytes.
     const payload = "klio pack zstd compressed section payload " ** 32;
 
     var w = PackWriter.init(a);
@@ -180,7 +172,6 @@ test "zstd section round trip" {
     var reader = (try PackReader.fromBytes(a, owned, &err)).?;
     defer reader.deinit();
 
-    // The stored section is smaller than the original payload.
     const entry = blk: {
         for (reader.sections()) |e| {
             if (std.mem.eql(u8, e.name, section_names.SYMBOLS)) break :blk e;
@@ -191,12 +182,10 @@ test "zstd section round trip" {
     try std.testing.expectEqual(@as(u64, payload.len), entry.uncompressed_len);
     try std.testing.expect(entry.stored_len < payload.len);
 
-    // The compressed section decodes back to the original bytes.
     const got = (try reader.readSection(section_names.SYMBOLS, &err)).?;
     defer got.deinit(a);
     try std.testing.expectEqualSlices(u8, payload, got.slice());
 
-    // The uncompressed neighbour still reads back fine.
     const got_manifest = (try reader.readSection(section_names.MANIFEST, &err)).?;
     defer got_manifest.deinit(a);
     try std.testing.expectEqualSlices(u8, "manifest-bytes", got_manifest.slice());
@@ -236,12 +225,10 @@ test "zstd dict round trip" {
     try std.testing.expect(saw_dict);
     try std.testing.expect(saw_symbols);
 
-    // The dict-compressed section decodes back to the original bytes.
     const got = (try reader.readSection(section_names.SYMBOLS, &err)).?;
     defer got.deinit(a);
     try std.testing.expectEqualSlices(u8, payload, got.slice());
 
-    // The dictionary section itself reads back as the raw dict bytes.
     const got_dict = (try reader.readSection(section_names.ZSTD_DICT, &err)).?;
     defer got_dict.deinit(a);
     try std.testing.expectEqualSlices(u8, dict, got_dict.slice());

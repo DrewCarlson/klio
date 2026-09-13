@@ -1,9 +1,6 @@
-//! Typed payloads carried in well-known pack sections. A section stores the
-//! encoded bytes of one of these values inside the `format.SectionDirectory`
-//! envelope.
-//!
-//! Representations are stable for a given `format.FORMAT_VERSION`; an
-//! incompatible schema change bumps that constant.
+//! Typed payloads carried in well-known pack sections, stored encoded inside
+//! the `format.SectionDirectory` envelope. Representations are stable for a
+//! given `format.FORMAT_VERSION`; an incompatible change bumps that constant.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -15,27 +12,20 @@ const Allocator = std.mem.Allocator;
 const errors = @import("errors.zig");
 pub const PackError = errors.PackError;
 
-/// Top-level pack metadata. Always present, always uncompressed.
+/// Always present, always uncompressed.
 pub const PackManifest = struct {
-    /// Library identifier (`stdlib`, `kotlinx.coroutines`), keying the pack
-    /// inside the host registry.
     library_id: []const u8,
-    /// Semantic version of the packaged library.
     library_version: []const u8,
-    /// ABI version for native bindings, bumped when the `StdlibFn` signature
-    /// changes. Readers reject packs with an ABI they do not understand.
+    /// Bumped when the `StdlibFn` signature changes; readers reject unknown ABIs.
     abi_version: u32,
-    /// Packages whose top-level entities are implicitly visible once loaded.
+    /// Top-level entities implicitly visible once loaded.
     implicit_packages: [][]const u8 = &.{},
-    /// Other packs this one depends on, by `library_id`, walked by the loader
-    /// in topological order.
+    /// Walked by the loader in topological order.
     dependencies: []PackDependency = &.{},
-    /// Features active when a consumer requests none. Empty means only
-    /// ungated ("core") source loads.
+    /// Active when a consumer requests none; empty loads only ungated sources.
     default_features: [][]const u8 = &.{},
-    /// Named features this pack provides. A source file whose `rel_path`
-    /// matches a feature's `sources` loads only while that feature is active;
-    /// a file matched by no feature is core and always loads.
+    /// A source whose `rel_path` matches a feature's `sources` loads only
+    /// while that feature is active; a file matched by none is core.
     features: []FeatureDef = &.{},
 
     pub fn eql(self: PackManifest, other: PackManifest) bool {
@@ -70,9 +60,8 @@ pub const PackManifest = struct {
 
 pub const PackDependency = struct {
     library_id: []const u8,
-    /// Minimum semantic version; empty accepts any version.
+    /// Empty accepts any version.
     min_version: []const u8,
-    /// Features of the dependency to activate.
     features: [][]const u8 = &.{},
     /// Whether the dependency's own `default_features` also activate.
     default_features: bool,
@@ -92,16 +81,12 @@ pub const PackDependency = struct {
     }
 };
 
-/// One named feature: the source paths it gates, the packs it pulls in, and
-/// the sibling features it enables.
 pub const FeatureDef = struct {
     name: []const u8 = "",
-    /// `rel_path` prefix patterns, matched like `[[source]]` includes, for the
-    /// files this feature gates.
+    /// `rel_path` prefix patterns, matched like `[[source]]` includes.
     sources: [][]const u8 = &.{},
-    /// `library_id`s pulled in only while this feature is active.
+    /// Pulled in only while this feature is active.
     deps: [][]const u8 = &.{},
-    /// Sibling features this one transitively activates.
     requires: [][]const u8 = &.{},
 
     pub fn eql(self: FeatureDef, other: FeatureDef) bool {
@@ -120,7 +105,7 @@ pub const FeatureDef = struct {
     }
 };
 
-/// Symbol index for the pack. One entry per public declaration.
+/// One entry per public declaration.
 pub const SymbolIndex = struct {
     entries: []SymbolRecord = &.{},
 
@@ -141,8 +126,7 @@ pub const SymbolIndex = struct {
     }
 };
 
-/// Kind of a declared symbol. Mirrors `stdlib.SymbolKind`, duplicated here so
-/// the schema does not depend on the stdlib module.
+/// Mirrors `stdlib.SymbolKind`, duplicated so the schema stays independent.
 pub const SymbolKind = enum(u8) {
     Function = 0,
     Property = 1,
@@ -152,8 +136,7 @@ pub const SymbolKind = enum(u8) {
     TypeAlias = 5,
 };
 
-/// Kotlin modifier bits attached to a symbol. Bit positions match
-/// `stdlib.Modifiers`, so the two round-trip without a translation table.
+/// Bit positions match `stdlib.Modifiers`, so the two round-trip untranslated.
 pub const ModifierBits = packed struct(u32) {
     PUBLIC: bool = false,
     INTERNAL: bool = false,
@@ -195,24 +178,19 @@ pub const ModifierBits = packed struct(u32) {
     }
 };
 
-/// One declared symbol, round-tripping `stdlib.SymbolEntry` without
-/// information loss.
+/// Round-trips `stdlib.SymbolEntry` without information loss.
 pub const SymbolRecord = struct {
-    /// Fully qualified name (`kotlin.collections.listOf`).
     fqn: []const u8,
-    /// Package path (`kotlin.collections`).
     package: []const u8,
-    /// Simple name (`listOf`).
     name: []const u8,
     kind: SymbolKind,
-    /// Extension receiver type as text, if any.
     receiver: ?[]const u8,
-    /// Raw textual signature (trimmed source line).
+    /// Trimmed source line.
     signature: []const u8,
-    /// Parameter names in declaration order; empty for non-functions.
+    /// Declaration order; empty for non-functions.
     param_names: [][]const u8 = &.{},
     modifiers: ModifierBits,
-    /// Upstream source location, for go-to-definition.
+    /// Upstream location, for go-to-definition.
     source: ?SourceLoc,
 
     pub fn eql(self: SymbolRecord, other: SymbolRecord) bool {
@@ -260,7 +238,7 @@ pub const SourceLoc = struct {
     }
 };
 
-/// Map of FQN -> native binding for the host to install at load time.
+/// FQN -> native binding, installed by the host at load time.
 pub const BindingManifest = struct {
     bindings: []Binding = &.{},
 
@@ -282,24 +260,19 @@ pub const BindingManifest = struct {
 };
 
 pub const Binding = struct {
-    /// Kotlin FQN this binding satisfies (`kotlin.io.println`).
     fqn: []const u8,
     kind: BindingKind,
-    /// Key the loader resolves to a host function pointer. Conventionally the
-    /// FQN, kept as a separate field so one host function can serve several
-    /// Kotlin names.
+    /// Resolved to a host function pointer. Separate from `fqn` so one host
+    /// function can serve several Kotlin names.
     host_symbol: []const u8,
-    /// True when the binding always wins over an interpreted body for this
-    /// FQN; false when it is a fast path and the interpreter may still fall
-    /// through to a Kotlin implementation shipped in the `ast` section.
+    /// True when the binding always wins; false when it is a fast path and the
+    /// interpreter may fall through to a Kotlin body in the `ast` section.
     overrides_interpreter: bool,
     purity: Purity,
     min_arity: u8,
     max_arity: u8,
-    /// True when this binding is the platform `actual` for an `expect`
-    /// declaration in the library's common sources. The interpreter treats an
-    /// `expect`-shaped declaration as non-instantiable until such a binding
-    /// is installed.
+    /// True when this is the platform `actual` for an `expect`. An
+    /// `expect`-shaped declaration is non-instantiable until one is installed.
     platform_actual: bool = false,
 
     pub fn eql(self: Binding, other: Binding) bool {
@@ -333,9 +306,8 @@ pub const Purity = enum(u8) {
     Suspend = 2,
 };
 
-/// Kotlin source files shipped inside the pack. The interpreter parses these
-/// at install time and registers the resulting declarations as if the user
-/// had written them.
+/// Kotlin sources shipped in the pack, parsed at install time and registered
+/// as if the user had written them.
 pub const SourceBundle = struct {
     files: []SourceFile = &.{},
 
@@ -357,11 +329,8 @@ pub const SourceBundle = struct {
 };
 
 pub const SourceFile = struct {
-    /// Path relative to the library root, such as
-    /// `common/src/main/kotlin/kotlinx/coroutines/Job.kt`. Keys diagnostic
-    /// spans and go-to-definition.
+    /// Relative to the library root; keys diagnostic spans and go-to-definition.
     rel_path: []const u8,
-    /// UTF-8 source bytes.
     bytes: []const u8,
 
     pub fn eql(self: SourceFile, other: SourceFile) bool {
@@ -376,9 +345,8 @@ pub const SourceFile = struct {
     }
 };
 
-/// Per-source package headers and import paths, precomputed at pack build
-/// from the parsed ASTs. A loader that needs only the import graph and
-/// package set skips lexing and parsing the carried sources entirely.
+/// Per-source package headers and import paths, precomputed at pack build. A
+/// loader needing only the import graph skips parsing the carried sources.
 pub const ImportsBundle = struct {
     files: []ImportsFile = &.{},
 
@@ -400,14 +368,12 @@ pub const ImportsBundle = struct {
 };
 
 pub const ImportsFile = struct {
-    /// Path relative to the library root; matches the `sources` entry so
-    /// feature gating applies identically to both sections.
+    /// Matches the `sources` entry, so feature gating applies to both.
     rel_path: []const u8,
-    /// Dotted package header; empty when the file declares none.
+    /// Empty when the file declares none.
     pkg: []const u8,
-    /// Dotted import paths in declaration order, aliases dropped and wildcard
-    /// stars omitted: the strings a source parse contributes to the loader's
-    /// import fixed point.
+    /// Declaration order, aliases dropped and wildcard stars omitted: what a
+    /// source parse contributes to the loader's import fixed point.
     imports: [][]const u8,
 
     pub fn eql(self: ImportsFile, other: ImportsFile) bool {
@@ -424,10 +390,8 @@ pub const ImportsFile = struct {
     }
 };
 
-/// Frozen front-end output. When present, the interpreter skips the
-/// install-time parse and feeds the carried `KotlinFile` straight to
-/// `register_pack_classes`; `sources` still carries the raw bytes for
-/// diagnostic spans and re-parse fallback.
+/// Frozen front-end output; when present the install-time parse is skipped.
+/// `sources` still carries raw bytes for spans and re-parse fallback.
 pub const AstBundle = struct {
     files: []AstFile = &.{},
 
@@ -450,12 +414,10 @@ pub const AstFile = struct {
     }
 };
 
-/// Frozen type-check output, keyed by source span so the loader rebuilds the
-/// interpreter's `expr_types` map without re-running the type checker. Only
-/// the per-expression `Type` map is carried.
+/// Frozen type-check output keyed by source span, so the loader rebuilds
+/// `expr_types` without re-running the checker.
 pub const TypeckBundle = struct {
-    /// `(Span, Type)` pairs: a sorted slice rather than a hash map, so
-    /// round-trips stay byte-identical.
+    /// A sorted slice, not a hash map, so round-trips stay byte-identical.
     entries: []TypeckEntry = &.{},
 
     pub const empty: TypeckBundle = .{ .entries = &.{} };
@@ -472,8 +434,6 @@ pub const TypeckEntry = struct {
     ty: types.Type,
 };
 
-/// Encode a value into bytes ready for the pack writer. The byte-level
-/// serializer lives in `write.zig`.
 pub fn encode(
     comptime T: type,
     allocator: Allocator,
@@ -484,8 +444,6 @@ pub fn encode(
     return write.encode(T, allocator, value, result);
 }
 
-/// Decode a section payload into a `T`. The byte-level deserializer lives in
-/// `read.zig`.
 pub fn decode(
     comptime T: type,
     allocator: Allocator,

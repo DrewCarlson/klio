@@ -1,6 +1,5 @@
-//! `embed_gen <out-path>` builds the stdlib `.klio-pack` byte stream from the
-//! repo source checkout and writes it to `<out-path>`. build.zig runs it with
-//! the repo root as cwd and embeds the output in the interpreter binary.
+//! `embed_gen <out-path>` builds the stdlib `.klio-pack` from the repo source
+//! checkout; build.zig runs it with the repo root as cwd and embeds the output.
 
 const std = @import("std");
 

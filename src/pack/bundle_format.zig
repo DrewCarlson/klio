@@ -19,16 +19,10 @@
 //! +--------------------------------------------------+
 //! ```
 //!
-//! Section payloads and the manifest use the pack module's postcard codec
-//! (`write.encode`, `read.decode`). Image sections (`base-image`,
-//! `program-image`) are stored uncompressed and SECTION_ALIGN-aligned so boot
-//! mmaps them straight out of the executable file; cold sections (resources,
-//! the Skia shim) compress with zstd.
-//!
-//! The trailer magic's last three bytes are the container revision (`KL1`): a
-//! layout change bumps it and an old stub fails the probe. The manifest's
-//! `klio_version` and `image_format_version` pin the producing binary, so a
-//! version-skewed payload is refused before anything decodes.
+//! Image sections are stored uncompressed and SECTION_ALIGN-aligned so boot
+//! mmaps them out of the executable; cold sections compress with zstd. The
+//! magic's last three bytes are the container revision: a layout change bumps
+//! it and an old stub fails the probe.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -39,20 +33,17 @@ const write = @import("write.zig");
 const zstd = @import("zstd.zig");
 const PackError = errors.PackError;
 
-/// Trailer magic. The final three bytes are the container revision.
 pub const MAGIC: *const [8]u8 = "KBND\x00KL1";
 
-/// Fixed trailer size in bytes: 8 magic + 4×8 offsets/lengths + 32 hash.
+/// 8 magic + 4x8 offsets/lengths + 32 hash.
 pub const TRAILER_LEN: usize = 72;
 
-/// Alignment, as an absolute file offset, of the payload area and of every
-/// mmap-target section. 16 KiB covers the largest page size in the support
-/// matrix (macOS arm64).
+/// Absolute-offset alignment of the payload area and every mmap-target
+/// section. 16 KiB covers the largest supported page size (macOS arm64).
 pub const SECTION_ALIGN: u64 = 16384;
 
 pub const HASH_LEN: usize = 32;
 
-/// Well-known section names.
 pub const section_names = struct {
     pub const MANIFEST: []const u8 = "manifest";
     pub const BASE_IMAGE: []const u8 = "base-image";
@@ -63,21 +54,16 @@ pub const section_names = struct {
     pub const ICON: []const u8 = "icon";
 };
 
-/// Compression applied to a stored section (or one resource entry).
 pub const Compression = enum(u8) {
     none = 0,
     zstd = 1,
 };
 
 pub const Trailer = struct {
-    /// Absolute file offset of the payload area, SECTION_ALIGN-aligned.
     payload_off: u64,
-    /// Length of the payload area: sections plus table, trailer excluded.
     payload_len: u64,
-    /// Absolute file offset of the encoded section table.
     table_off: u64,
     table_len: u64,
-    /// blake3 of the whole payload area.
     payload_hash: [HASH_LEN]u8,
 
     pub fn encode(self: *const Trailer) [TRAILER_LEN]u8 {
@@ -91,8 +77,7 @@ pub const Trailer = struct {
         return out;
     }
 
-    /// Parse a trailer candidate. Null when the magic is absent: the running
-    /// executable is a plain `klio`, not a bundle.
+    /// Null when the magic is absent: a plain `klio`, not a bundle.
     pub fn decode(bytes: *const [TRAILER_LEN]u8) ?Trailer {
         if (!std.mem.eql(u8, bytes[0..8], MAGIC)) return null;
         var hash: [HASH_LEN]u8 = undefined;
@@ -106,8 +91,7 @@ pub const Trailer = struct {
         };
     }
 
-    /// Check against the containing file's size: every region in bounds, the
-    /// table inside the payload area, alignment held.
+    /// Every region in bounds, table inside the payload area, alignment held.
     pub fn consistent(self: *const Trailer, file_len: u64) bool {
         if (self.payload_off % SECTION_ALIGN != 0) return false;
         const payload_end = std.math.add(u64, self.payload_off, self.payload_len) catch return false;
@@ -118,8 +102,6 @@ pub const Trailer = struct {
     }
 };
 
-/// Directory entry for one stored section. `offset` is an absolute file
-/// offset, so boot mmaps or slices without extra arithmetic.
 pub const Section = struct {
     name: []const u8,
     offset: u64,
@@ -132,8 +114,7 @@ pub const SectionTable = struct {
     entries: []Section = &.{},
 };
 
-/// One embedded resource (`--include`): a mount path and its zstd frame in
-/// the `resources` section, at `offset` from that section's stored start.
+/// `offset` is from the `resources` section's stored start.
 pub const ResourceEntry = struct {
     mount: []const u8,
     offset: u64,
@@ -142,16 +123,14 @@ pub const ResourceEntry = struct {
     compression: Compression,
 };
 
-/// One pack the bundle baked in, for introspection and diagnostics.
 pub const PackInfo = struct {
     id: []const u8,
     version: []const u8,
     features: []const []const u8,
 };
 
-/// A pack host binding replayed at boot: the Kotlin FQN and the host symbol
-/// it resolves to. Function pointers never serialize, so boot re-resolves
-/// `host_symbol` against the stub's registry, erroring hard when missing.
+/// Function pointers never serialize, so boot re-resolves `host_symbol`
+/// against the stub's registry and errors hard when it is missing.
 pub const BindingPair = struct {
     fqn: []const u8,
     host_symbol: []const u8,
@@ -162,34 +141,23 @@ pub const Flavor = enum(u8) {
     ui = 1,
 };
 
-/// The manifest section. Postcard is sequential, so fields only append; a
-/// breaking change bumps the trailer magic revision instead.
+/// Postcard is sequential: fields only append, breaking changes bump the magic.
 pub const BundleManifest = struct {
-    /// Version of the klio binary that produced the bundle; the stub refuses a
-    /// payload whose version differs from its own.
+    /// The stub refuses a payload whose version differs from its own.
     klio_version: []const u8,
-    /// `interp_ir.image.FORMAT_VERSION` of the embedded image sections.
     image_format_version: u32,
     flavor: Flavor,
-    /// App display name, the window-title default (`--name`).
     name: []const u8,
-    /// Main-function FQN when a `program-image` section boots directly; empty
-    /// when boot parses `program-src`.
     entry: []const u8,
-    /// True when a program-image bake was refused and the bundle fell back to
-    /// `program-src`, a startup-cost-only difference.
+    /// True when a program-image bake was refused; a startup-cost difference only.
     program_src_fallback: bool,
     packs: []const PackInfo,
-    /// Packages to replay through `stdlib.registerKnownPackage` at boot.
     known_packages: []const []const u8,
-    /// Platform-helper FQNs replayed against the host registry, duplicated
-    /// from the stdlib image's replay list for introspection.
     binding_fqns: []const []const u8,
     pack_bindings: []const BindingPair,
     resources: []const ResourceEntry,
 };
 
-/// One user source file carried in the `program-src` section.
 pub const ProgramFile = struct {
     path: []const u8,
     bytes: []const u8,
@@ -203,14 +171,11 @@ const PendingSection = struct {
     name: []const u8,
     payload: []const u8,
     compression: Compression,
-    /// Align the stored payload to SECTION_ALIGN as an absolute file offset,
-    /// so boot can mmap it. Implies `compression == .none`.
+    /// Absolute SECTION_ALIGN alignment so boot can mmap. Implies no compression.
     mmap_target: bool,
 };
 
-/// Assembles the payload area and trailer. Sections are emitted in insertion
-/// order, which the bundler fixes, so output is deterministic. Names and
-/// payloads are borrowed until `finish`.
+/// Emitted in insertion order. Names and payloads are borrowed until `finish`.
 pub const Writer = struct {
     gpa: Allocator,
     sections: std.ArrayList(PendingSection) = .empty,
@@ -240,9 +205,7 @@ pub const Writer = struct {
         });
     }
 
-    /// Encode everything after a stub of `stub_len` bytes: alignment padding,
-    /// the payload area (sections + table), and the trailer. Appending the
-    /// result to the stub yields the complete bundle; the caller owns it.
+/// Everything after a stub of `stub_len` bytes; appending it yields the bundle.
     pub fn finish(self: *Writer, stub_len: u64, result: *PackError) Allocator.Error!?[]u8 {
         const gpa = self.gpa;
         var out: std.ArrayList(u8) = .empty;
@@ -316,8 +279,6 @@ pub const Writer = struct {
     }
 };
 
-/// Verify the payload hash. `bytes` must span the whole file, since offsets
-/// are absolute.
 pub fn verifyPayload(bytes: []const u8, trailer: *const Trailer) bool {
     if (!trailer.consistent(bytes.len)) return false;
     const start: usize = @intCast(trailer.payload_off);
@@ -327,7 +288,7 @@ pub fn verifyPayload(bytes: []const u8, trailer: *const Trailer) bool {
     return std.mem.eql(u8, &hash, &trailer.payload_hash);
 }
 
-/// Decode the section table. Caller frees with `gpa`, or passes an arena.
+/// Caller frees with `gpa`, or passes an arena.
 pub fn decodeTable(gpa: Allocator, bytes: []const u8, trailer: *const Trailer) ?SectionTable {
     if (!trailer.consistent(bytes.len)) return null;
     const start: usize = @intCast(trailer.table_off);
@@ -343,14 +304,12 @@ pub fn findSection(table: *const SectionTable, name: []const u8) ?Section {
     return null;
 }
 
-/// Stored, possibly compressed, bytes of a section, borrowed from `bytes`.
 pub fn sectionStored(bytes: []const u8, s: Section) []const u8 {
     const start: usize = @intCast(s.offset);
     return bytes[start .. start + @as(usize, @intCast(s.stored_len))];
 }
 
-/// Materialize a section's payload: borrowed when uncompressed, owned when
-/// decompressed from zstd. Null on a corrupt frame.
+/// Borrowed when uncompressed, owned when decompressed. Null on a bad frame.
 pub fn sectionBytes(gpa: Allocator, bytes: []const u8, s: Section) Allocator.Error!?read.SectionBytes {
     const stored = sectionStored(bytes, s);
     switch (s.compression) {
@@ -365,7 +324,6 @@ pub fn sectionBytes(gpa: Allocator, bytes: []const u8, s: Section) Allocator.Err
     }
 }
 
-/// Decompress one resource entry from the `resources` section's stored bytes.
 /// Caller owns the result for compressed entries.
 pub fn resourceBytes(gpa: Allocator, resources_stored: []const u8, e: ResourceEntry) Allocator.Error!?read.SectionBytes {
     const start: usize = @intCast(e.offset);
@@ -400,10 +358,8 @@ test "trailer round-trips and rejects a non-bundle tail" {
     try std.testing.expectEqual(t.table_len, got.table_len);
     try std.testing.expectEqualSlices(u8, &t.payload_hash, &got.payload_hash);
 
-    // A plain-binary tail (no magic) probes negative.
     var plain: [TRAILER_LEN]u8 = @splat(0xAB);
     try std.testing.expect(Trailer.decode(&plain) == null);
-    // A pack file's magic is not a bundle trailer either.
     var packish: [TRAILER_LEN]u8 = @splat(0);
     @memcpy(packish[0..4], "KPK\x00");
     try std.testing.expect(Trailer.decode(&packish) == null);
@@ -431,7 +387,6 @@ test "bundle round-trips sections with alignment and hash" {
     const bundle = try buildTestBundle(gpa, stub);
     defer gpa.free(bundle);
 
-    // The stub prefix is untouched.
     try std.testing.expectEqualSlices(u8, stub, bundle[0..stub.len]);
 
     var tail: [TRAILER_LEN]u8 = undefined;
@@ -453,7 +408,6 @@ test "bundle round-trips sections with alignment and hash" {
     defer mb.deinit(gpa);
     try std.testing.expectEqualSlices(u8, "manifest-bytes", mb.slice());
 
-    // The image section is mmap-aligned and stored verbatim.
     const image = findSection(&table, section_names.BASE_IMAGE).?;
     try std.testing.expectEqual(@as(u64, 0), image.offset % SECTION_ALIGN);
     try std.testing.expectEqual(Compression.none, image.compression);
@@ -461,7 +415,6 @@ test "bundle round-trips sections with alignment and hash" {
     defer ib.deinit(gpa);
     try std.testing.expectEqualSlices(u8, "IMAGE" ** 100, ib.slice());
 
-    // The zstd section decompresses back.
     const shim = findSection(&table, section_names.SKIA_SHIM).?;
     try std.testing.expectEqual(Compression.zstd, shim.compression);
     try std.testing.expect(shim.stored_len < shim.uncompressed_len);

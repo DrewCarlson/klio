@@ -1,6 +1,5 @@
-//! Shared bench plumbing: corpus loader, per-stage pipeline runners, timing
-//! helpers, and the JSON result schema. Alloc-light on hot paths so it does
-//! not perturb the numbers it measures.
+//! Shared bench plumbing: corpus loader, per-stage pipeline runners, timing,
+//! and the JSON result schema. Alloc-light so it does not perturb its numbers.
 
 const std = @import("std");
 
@@ -32,8 +31,7 @@ pub const BenchRecord = schema.BenchRecord;
 pub const BenchReport = schema.BenchReport;
 pub const RegressionLevel = schema.RegressionLevel;
 
-/// Output sink that captures lines: `write` accumulates into a pending buffer
-/// and every embedded newline flushes one line, with the newline trimmed.
+/// Captures lines: every embedded newline flushes one line, newline trimmed.
 const CaptureOutput = struct {
     lines: std.ArrayList([]const u8) = .empty,
     cur: std.ArrayList(u8) = .empty,
@@ -53,7 +51,6 @@ const CaptureOutput = struct {
         const self: *CaptureOutput = @ptrCast(@alignCast(ctx));
         self.cur.appendSlice(self.allocator, s) catch return;
         while (std.mem.indexOfScalar(u8, self.cur.items, '\n')) |idx| {
-            // Drain through the newline; trim the trailing '\n' from the line.
             const line = self.allocator.dupe(u8, self.cur.items[0..idx]) catch return;
             self.lines.append(self.allocator, line) catch {};
             const rest = self.cur.items[idx + 1 ..];
@@ -73,19 +70,18 @@ const CaptureOutput = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    /// Join the captured lines with `\n`. Caller owns the returned bytes.
+    /// Caller owns the returned bytes.
     fn join(self: *const CaptureOutput, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         return std.mem.join(allocator, "\n", self.lines.items);
     }
 };
 
-/// Path to the bench corpus, resolved relative to the process working
-/// directory. Caller owns the result.
+/// Bench corpus path, relative to the process cwd. Caller owns the result.
 pub fn corpusRoot(allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
     return allocator.dupe(u8, "tests/fixtures/bench_corpus");
 }
 
-/// Every `.kt` file under `dir`, sorted. Caller owns the slice and each path.
+/// Every `.kt` under `dir`, sorted. Caller owns the slice and each path.
 pub fn collectKt(allocator: std.mem.Allocator, io: std.Io, dir: []const u8) std.mem.Allocator.Error![][]u8 {
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -123,13 +119,12 @@ fn collectKtInto(
     }
 }
 
-/// One loaded program ready to be re-run through the pipeline.
 pub const Program = struct {
     path: []const u8,
     source: []const u8,
     allocator: std.mem.Allocator,
 
-    /// Read a program from disk. `path` is duplicated into `allocator`.
+    /// `path` is duplicated into `allocator`.
     pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Program {
         const source = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited);
         const owned_path = try allocator.dupe(u8, path);
@@ -141,7 +136,7 @@ pub const Program = struct {
         self.allocator.free(self.source);
     }
 
-    /// Stable label for JSON output, e.g. `game/entity_tick`. Caller owns it.
+    /// Stable JSON label, `game/entity_tick`. Caller owns it.
     pub fn label(self: *const Program, allocator: std.mem.Allocator) std.mem.Allocator.Error![]u8 {
         const root = try corpusRoot(allocator);
         defer allocator.free(root);
@@ -150,10 +145,8 @@ pub const Program = struct {
             rel = rel[root.len..];
             while (rel.len > 0 and (rel[0] == '/' or rel[0] == '\\')) rel = rel[1..];
         }
-        // Strip the `.kt` extension.
         if (std.mem.endsWith(u8, rel, ".kt")) rel = rel[0 .. rel.len - 3];
         const owned = try allocator.dupe(u8, rel);
-        // Normalise path separators.
         for (owned) |*c| {
             if (c.* == '\\') c.* = '/';
         }
@@ -161,7 +154,6 @@ pub const Program = struct {
     }
 };
 
-/// Result of one lex pass, carried into the downstream stages.
 pub const Lexed = struct {
     id: FileId,
     source: []const u8,
@@ -188,8 +180,8 @@ pub fn typeckOnly(allocator: std.mem.Allocator, file: *const KotlinFile, res: *c
     return typeck.typecheck(allocator, file, res);
 }
 
-/// Outcome of `runFull`: captured stdout, owned by the caller, or a failure
-/// description (static, except the allocated `runtime: ...` form).
+/// Captured stdout owned by the caller, or a static failure description
+/// (except the allocated `runtime: ...` form).
 pub const RunOutcome = union(enum) {
     ok: []u8,
     err: []const u8,
@@ -244,8 +236,7 @@ pub const Timing = struct {
     p99_ns: u64,
 };
 
-/// Time `ctx.call()` over at least `min_total_ns` of wall clock, returning the
-/// median and p99 per-iteration samples and the iteration count.
+/// Time `ctx.call()` over at least `min_total_ns`; returns median, p99, iters.
 pub fn timeIters(
     allocator: std.mem.Allocator,
     ctx: anytype,
@@ -281,8 +272,8 @@ pub const StageTimings = struct {
     e2e: Timing,
 };
 
-/// Time each pipeline stage independently, each against a fresh input so one
-/// stage's cache effects do not help the next.
+/// Time each stage independently against a fresh input, so one stage's cache
+/// effects do not help the next.
 pub fn timePipelineStages(
     allocator: std.mem.Allocator,
     prog: *const Program,
@@ -369,7 +360,6 @@ pub fn timePipelineStages(
     };
 }
 
-/// Wall time of a single `ctx.call()`.
 pub fn quickRunNs(ctx: anytype) u64 {
     var t = std.time.Timer.start() catch unreachable;
     ctx.call();
@@ -384,8 +374,7 @@ test {
     _ = main;
 }
 
-// `Value` is pinned at 64 bytes or less; a bump means a variant grew or the
-// discriminant widened.
+// `Value` is pinned at 64 bytes or less; a bump means a variant grew.
 test "value_size_is_pinned" {
     const sz = @sizeOf(runtime.Value);
     try testing.expect(sz <= 64);
