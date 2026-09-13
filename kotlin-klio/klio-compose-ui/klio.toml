@@ -1,6 +1,6 @@
 # klio.compose.ui — a minimal Compose UI core on a headless software canvas.
 #
-# The first increment of the Compose-UI stack (plans/UI-RENDERING-PACKS.md §4):
+# The first increment of the Compose-UI stack:
 # LayoutNode + measure/layout/draw emitted through the compose runtime's node
 # path (ComposeNode -> Applier), a Modifier chain, and a DrawScope over a software
 # pixel buffer with a deterministic ASCII pixel-dump. The real androidx.compose.ui

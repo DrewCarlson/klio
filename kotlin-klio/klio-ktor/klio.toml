@@ -12,8 +12,8 @@ source_roots = ["shim"]
 auto_bindings = true
 
 # Real upstream ktor-http value types consumed verbatim from the
-# submodule (the start of the upstream-consumption migration; see
-# plans/KTOR-UPSTREAM.md). Gated under the `io` feature.
+# submodule (the start of the upstream-consumption migration).
+# Gated under the `io` feature.
 # Real upstream `io.ktor.utils.io` annotations (`InternalAPI`, `KtorDsl`,
 # `ExperimentalKtorApi`, …) consumed verbatim — pure declarations the rest
 # of ktor's commonMain imports. Gated under the `io` feature.

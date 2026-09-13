@@ -1,5 +1,4 @@
-/* Stage-1 proof: a plain C host drives the klio runtime end to end
- * through the C ABI (plans/c-transpiler-plan.md). */
+/* A plain C host drives the klio runtime end to end through the C ABI. */
 #include <stdio.h>
 #include <klio_rt.h>
 

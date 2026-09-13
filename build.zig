@@ -500,9 +500,9 @@ pub fn build(b: *std.Build) void {
 
     // The Compose-UI Skia backend: libklio_skia.so (the compose_ui module
     // dlopens it) is built by the system C++ toolchain because the prebuilt
-    // Skia archives use the GNU libstdc++ ABI (zig cc/libc++ cannot link them);
-    // see plans/UI-RENDERING-PACKS.md. Defaults ON when the vendored libs are
-    // present (`scripts/fetch-skia.sh`); a checkout without them stays green.
+    // Skia archives use the GNU libstdc++ ABI (zig cc/libc++ cannot link them).
+    // Defaults ON when the vendored libs are present
+    // (`scripts/fetch-skia.sh`); a checkout without them stays green.
     // On macOS the shim defaults to the Cocoa window + Metal backend (see
     // buildSkiaShim), so a plain `zig build` produces a UI-capable zig-out.
     const skia_libs_present = skiaLibsPresent(b, target);
@@ -721,8 +721,8 @@ pub fn build(b: *std.Build) void {
     if (android_ndk) |ndk| wireAndroidNdk(b, exe.root_module, ndk);
     b.installArtifact(exe);
 
-    // The C-ABI runtime library the C transpiler's output links against
-    // (plans/c-transpiler-plan.md stage 1): `zig build klio-rt` installs
+    // The C-ABI runtime library the C transpiler's output links against:
+    // `zig build klio-rt` installs
     // lib/libklio_rt.a + include/klio_rt.h. Ships inside every transpiled
     // binary, so it builds from the HARNESS module universe (a full module
     // graph without the CLI exe's extras) at the BUILD's optimize level:
@@ -747,7 +747,7 @@ pub fn build(b: *std.Build) void {
     });
     // Link-free census driver: runs any commontest suite from the shared
     // registry against the installed harness — one harness rebuild instead
-    // of a per-suite itest link (plans/verification-latency-campaign.md).
+    // of a per-suite itest link.
     const census_exe = b.addExecutable(.{
         .name = "klio-census",
         .root_module = b.createModule(.{
