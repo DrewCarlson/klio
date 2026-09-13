@@ -807,6 +807,10 @@ pub const BareResolution = union(enum) {
     /// A bare call that bound to the top-level declaration the lowering
     /// resolved, because no implicit receiver declares the name.
     call: ir.FuncId,
+    /// A bare call that names a CLASS: it constructs one. The lowering leaves
+    /// the name open when no function of it exists, because which of the two
+    /// a name means is a question about scope.
+    construct: u32,
 };
 
 /// The instance fields of a class, in the order the runtime lays them out:
@@ -2342,6 +2346,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (resolveBare(m, prog, types, cls, known, encl.items, null, bn.String, false)) |res| {
                         try bare.put(gpa, inst, res);
                         switch (res) {
+                            // A bare NAME never resolves to a construction;
+                            // only a bare call can.
+                            .construct => return no(f, "bare name"),
                             .field => |fl| {
                                 const fds = prog.of(cls[fl.recv].?).?;
                                 types[lt.dst.int()] = fds[fl.idx].ty;
@@ -2381,6 +2388,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     if (resolveBare(m, prog, types, cls, known, encl.items, pref, bn2.String, true)) |res| {
                         try bare.put(gpa, inst, res);
                         switch (res) {
+                            .construct => return no(f, "bare name"),
                             .field => |fl| {
                                 const fds = prog.of(cls[fl.recv].?).?;
                                 if (types[st.value.int()] != fds[fl.idx].ty) return no(f, "bare value type");
@@ -2461,6 +2469,47 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                         // answer it once, so it answers only when the
                         // declaration is unambiguous.
                         const picked = bareCallTarget(m, prog, cn2.String, types, cg2.args.int(), cg2.n_args, cg2.arg_names);
+                        // No function owns the name: a class of it is a
+                        // construction, which is what the lowering leaves open
+                        // when there is nothing else the name could mean.
+                        if (picked == null and globalIndex(globals, cn2.String) == null) {
+                            if (classQualifierNamed(m, cn2.String)) |bcid| {
+                                const bfields = prog.of(bcid) orelse return no(f, "class layout");
+                                const bdef = &m.classes.items[bcid];
+                                if (bdef.primary_params.len < cg2.n_args) return no(f, "ctor arity");
+                                const bb10 = bindCallArgs(m, bdef.primary_params, cg2.args.int(), cg2.n_args, cg2.arg_names) orelse
+                                    return no(f, "ctor argument binding");
+                                var bi10: u32 = 0;
+                                while (bi10 < bdef.primary_params.len) : (bi10 += 1) {
+                                    if (bb10.regs[bi10] != null) continue;
+                                    const bdf = ctorDefault(prog.layouts, bdef, bi10) orelse return no(f, "ctor arity");
+                                    const bdfn = m.funcById(bdf) orelse return no(f, "ctor default thunk");
+                                    if (funcRetTy2(m, bdfn) == null) return no(f, "ctor default thunk type");
+                                }
+                                for (bfields) |bfd| {
+                                    const bai = bfd.arg orelse continue;
+                                    const bar = bb10.regs[bai] orelse continue;
+                                    if (bar >= f.n_locals or !known[bar]) return no(f, "ctor arg");
+                                    const bwiden = isNumericTy(bfd.ty) and isNumericTy(types[bar]) and
+                                        !bfd.ty.isFloat() and !types[bar].isFloat() and
+                                        (if (const_at[bar]) |kv3| kv3 >= 0 else false);
+                                    if (types[bar] != bfd.ty and bfd.ty != .object and
+                                        !sameWidthKind(types[bar], bfd.ty) and !bwiden) return no(f, "ctor arg type");
+                                    if (bfd.ty == .object) {
+                                        if (bfd.cls) |bwc| {
+                                            const bgc = cls[bar] orelse return no(f, "ctor arg class");
+                                            if (bgc != bwc and !typeReaches(m, bgc, bwc)) return no(f, "ctor arg class");
+                                        }
+                                    }
+                                }
+                                if (cg2.dst.int() >= f.n_locals) return no(f, "ctor dst");
+                                try bare.put(gpa, inst, .{ .construct = bcid });
+                                types[cg2.dst.int()] = .object;
+                                cls[cg2.dst.int()] = bcid;
+                                known[cg2.dst.int()] = true;
+                                break;
+                            }
+                        }
                         if (picked == null) {
                             // Which declarations the name could mean, and what
                             // the arguments are: that is the backlog entry.
@@ -4641,6 +4690,59 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     var nb18: [32]u8 = undefined;
                     const cdst = regName(c, cg3.dst.int(), &nb18);
                     switch (c.bare.get(inst).?) {
+                        // A bare call that names a class constructs one.
+                        .construct => |bcid3| {
+                            const bdef3 = &m.classes.items[bcid3];
+                            const bb11 = bindCallArgs(m, bdef3.primary_params, cg3.args.int(), cg3.n_args, cg3.arg_names).?;
+                            var dq3: u32 = 0;
+                            while (dq3 < bb11.n) : (dq3 += 1) {
+                                if (bb11.regs[dq3] != null) continue;
+                                const dfn3 = m.funcById(ctorDefault(prog.layouts, bdef3, dq3).?).?;
+                                const dt3 = acceptedRet(accepted, dfn3) orelse funcRetTy2(m, dfn3).?;
+                                var ds3: std.Io.Writer.Allocating = .init(gpa);
+                                defer ds3.deinit();
+                                try writeSymbol(&ds3.writer, dfn3);
+                                try w.print("  {s} kbc{d}_{d} = {s}(klio_nat_null()", .{ dt3.cName(), cg3.dst.int(), dq3, ds3.written() });
+                                var dk3: u32 = 0;
+                                while (dk3 < bb11.n) : (dk3 += 1) {
+                                    try w.writeAll(", ");
+                                    const wt3 = ctorParamTy(bdef3, dk3);
+                                    if (dk3 >= dq3) {
+                                        if (wt3 == .object) try w.writeAll("klio_nat_null()") else try w.writeAll("0");
+                                        continue;
+                                    }
+                                    var bx7: [96]u8 = undefined;
+                                    if (bb11.regs[dk3]) |br7| {
+                                        var ab7: [32]u8 = undefined;
+                                        try w.print("{s}", .{convExpr(c.types[br7], wt3, regName(c, br7, &ab7), &bx7)});
+                                    } else {
+                                        var tb7: [48]u8 = undefined;
+                                        const tn7 = try std.fmt.bufPrint(&tb7, "kbc{d}_{d}", .{ cg3.dst.int(), dk3 });
+                                        try w.print("{s}", .{tn7});
+                                    }
+                                }
+                                try w.writeAll(");\n");
+                            }
+                            try w.print("  {s} = klio_nat_alloc_instance(KCLS_{d});\n", .{ cdst, bcid3 });
+                            try w.print("  kinit_{d}({s}", .{ bcid3, cdst });
+                            var pi7: u32 = 0;
+                            while (pi7 < bb11.n) : (pi7 += 1) {
+                                try w.writeAll(", ");
+                                const wt7 = ctorParamTy(bdef3, pi7);
+                                var ab8: [32]u8 = undefined;
+                                var bx8: [96]u8 = undefined;
+                                if (bb11.regs[pi7]) |ar8| {
+                                    try w.print("{s}", .{convExpr(c.types[ar8], wt7, regName(c, ar8, &ab8), &bx8)});
+                                    continue;
+                                }
+                                const dfn8 = m.funcById(ctorDefault(prog.layouts, bdef3, pi7).?).?;
+                                const hv8 = acceptedRet(accepted, dfn8) orelse funcRetTy2(m, dfn8).?;
+                                var tb8: [48]u8 = undefined;
+                                const tn8 = try std.fmt.bufPrint(&tb8, "kbc{d}_{d}", .{ cg3.dst.int(), pi7 });
+                                try w.print("{s}", .{convExpr(hv8, wt7, tn8, &bx8)});
+                            }
+                            try w.writeAll(");\n");
+                        },
                         .member => |mb2| {
                             var rb18: [32]u8 = undefined;
                             try w.print("  {s} = kvirt_{d}({s}", .{ cdst, mb2.slot, regName(c, mb2.recv, &rb18) });
@@ -4713,6 +4815,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     var nb8: [32]u8 = undefined;
                     const dst8 = regName(c, lt.dst.int(), &nb8);
                     switch (c.bare.get(inst).?) {
+                        .construct => unreachable,
                         .field => |fl| {
                             var rb8: [32]u8 = undefined;
                             var gb8: [128]u8 = undefined;
@@ -4739,6 +4842,7 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                 },
                 .StoreToThisOrGlobal => |st| {
                     switch (c.bare.get(inst).?) {
+                        .construct => unreachable,
                         .field => |fl| {
                             var rb10: [32]u8 = undefined;
                             var vb10: [32]u8 = undefined;
@@ -6638,6 +6742,42 @@ pub fn emit(
                 if (c.bare.get(inst)) |res| {
                     blkbare: switch (res) {
                         .field => {},
+                        .construct => |bcid2| {
+                            // Constructing runs the class's own initializers,
+                            // which the construction walk below queues.
+                            var have_bc = false;
+                            for (constructed.items) |uc2| {
+                                if (uc2 == bcid2) have_bc = true;
+                            }
+                            if (!have_bc) try constructed.append(gpa, bcid2);
+                            const bfd2 = prog.of(bcid2) orelse return false;
+                            for (bfd2) |fdx| {
+                                if (fdx.from_parent) continue;
+                                const ifx = fdx.init orelse continue;
+                                const ifnx = m.funcById(ifx) orelse return false;
+                                if (seen.contains(ifnx.id.int())) continue;
+                                try seen.put(ifnx.id.int(), {});
+                                try queue.append(gpa, .{ .f = ifnx, .synth = null });
+                            }
+                            const bdef2 = &m.classes.items[bcid2];
+                            var dpx: usize = 0;
+                            while (dpx < bdef2.primary_params.len) : (dpx += 1) {
+                                const dfx = ctorDefault(prog.layouts, bdef2, dpx) orelse continue;
+                                const dfnx = m.funcById(dfx) orelse return false;
+                                if (seen.contains(dfnx.id.int())) continue;
+                                try seen.put(dfnx.id.int(), {});
+                                const csynx = try gpa.alloc(ir.Param, 1 + bdef2.primary_params.len);
+                                try synth_owned.append(gpa, csynx);
+                                csynx[0] = .{
+                                    .name = "$ctor_default_recv",
+                                    .ty = .{ .name = "", .nullable = true, .args = &.{} },
+                                    .default = null,
+                                };
+                                @memcpy(csynx[1..], bdef2.primary_params);
+                                try queue.append(gpa, .{ .f = dfnx, .synth = csynx });
+                            }
+                            if (prog.parentOf(bcid2) != null) return false;
+                        },
                         .accessor => |ac| {
                             const afn3 = m.funcById(ac.func) orelse return false;
                             if (!seen.contains(afn3.id.int())) {
