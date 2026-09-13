@@ -1,17 +1,8 @@
-//! Host fast paths for the Compose snapshot validity walk.
-//!
-//! Every snapshot-state read and write resolves its record through the
-//! private top-level `readable(r, id, invalid)` / `valid(...)` walk in
-//! Snapshot.kt — a linked-list scan with a `SnapshotIdSet` bit-set
-//! probe per record. Interpreted, that is ~16 framed calls per map
-//! write; the data is host-readable (SnapshotId = Long in the engine
-//! actuals, the set is two Longs + a bound), so the host serves the
-//! whole walk.
-//!
-//! Exactness: any missing field, unexpected tag, or a set with a
-//! non-null `belowBound` overflow array bails to the interpreted body.
-//! The walk itself takes no references — the chain is rooted by the
-//! caller's live arguments — and only the returned record is retained.
+//! Host fast paths for Snapshot.kt's `readable(r, id, invalid)` / `valid(...)`
+//! chain scan, a `SnapshotIdSet` bit-set probe per record. Any missing field,
+//! unexpected tag, or non-null `belowBound` overflow array bails to the
+//! interpreted body. The walk takes no references, the chain being rooted by
+//! the caller's live arguments; only the returned record is retained.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -23,28 +14,18 @@ pub const Route = enum(u8) {
     readable = 2,
     valid = 3,
     current_snapshot = 4,
-    /// `T.readable(state: StateObject)` — the public wrapper: current
-    /// snapshot, observer notification (served only when there is none),
-    /// then the walk.
+    /// `T.readable(state: StateObject)`: current snapshot, notify, walk.
     readable_state = 5,
-    /// `current(r: T)` — current snapshot + walk, no observer semantics.
     current_record = 6,
-    /// `current(r: T, snapshot: Snapshot)` — walk against the given
-    /// snapshot, no observer semantics.
     current_with_snapshot = 7,
-    /// The `SnapshotState{Map,List,Set}.readable` getter: its whole body
-    /// is `(firstStateRecord as R).readable(this)`, so the serve is the
-    /// wrapper walk rooted at the receiver's stored `firstStateRecord`.
+    /// `SnapshotState{Map,List,Set}.readable`, whose body is
+    /// `(firstStateRecord as R).readable(this)`.
     state_readable_getter = 8,
-    /// The `Snapshot.Companion.current` getter: `currentSnapshot()`.
     current_getter = 9,
 };
 
-/// Classify a Func for host service, memoized by the caller into
-/// `Func.host_route`. The walk pair is matched by fqn + the 3-arg shape
-/// whose last parameter is a SnapshotIdSet (excludes the same-named
-/// record extensions); `currentSnapshot` by fqn + zero params; the
-/// wrapper family by fqn + arity + last-parameter head.
+/// Memoized by the caller into `Func.host_route`. The 3-arg SnapshotIdSet
+/// shape distinguishes the walk pair from the same-named record extensions.
 pub fn classify(fqn: []const u8, n_params: usize, last_param_ty: []const u8) Route {
     if (n_params == 0) {
         if (std.mem.eql(u8, fqn, "androidx.compose.runtime.snapshots.currentSnapshot")) return .current_snapshot;
@@ -97,12 +78,9 @@ var fn_next = std.atomic.Value(?[*]const u8).init(null);
 var fn_invalid = std.atomic.Value(?[*]const u8).init(null);
 var fn_readobs = std.atomic.Value(?[*]const u8).init(null);
 
-/// Class identity of `GlobalSnapshot`, the one snapshot class whose
-/// `snapshotId` / `invalid` / `readObserver` are known plain stored
-/// fields. Subclasses like `TransparentObserverMutableSnapshot` override
-/// these as computed delegating accessors while the base ctor's stored
-/// slots go stale, so a stored-field read is only sound behind this
-/// exact-class gate.
+/// `GlobalSnapshot` alone keeps `snapshotId`/`invalid`/`readObserver` as plain
+/// stored fields; subclasses override them as computed accessors while the base
+/// ctor's slots go stale, so a stored-field read needs this exact-class gate.
 var global_snap_hit = std.atomic.Value(usize).init(0);
 
 fn isGlobalSnapshotClass(v: *const Value) bool {
@@ -118,9 +96,7 @@ fn isGlobalSnapshotClass(v: *const Value) bool {
     return true;
 }
 
-/// KLIO_SNAPFAST_TRACE: per-reason bail counters for the wrapper-family
-/// serves, printed every 65536 bails so a dominant reason names itself
-/// without an exit hook.
+/// Per-reason bail counters, dumped periodically under KLIO_SNAPFAST_TRACE.
 const BailReason = enum(u8) { not_global_class, observer, idset_shape, walk_null, record_shape, cur_snapshot };
 var bail_counts: [6]std.atomic.Value(u64) = @splat(std.atomic.Value(u64).init(0));
 var bail_trace_state = std.atomic.Value(u8).init(0);
@@ -146,18 +122,10 @@ const SnapFields = struct { id: i64, set: IdSet, read_observer_null: bool };
 
 pub const WriteGate = struct { id: i64, set: IdSet };
 
-/// The write-cycle gate for the whole-op SnapshotStateMap serves: the
-/// current snapshot must be exactly the GlobalSnapshot with BOTH
-/// observers null — `withCurrent`'s contract skips read notification,
-/// and `notifyWrite` must be a provable no-op. A registered global
-/// read/write observer produces a GlobalSnapshot with the observer
-/// stored non-null, so the gate bails to the interpreted cycle there.
-/// GlobalSnapshot's `writeObserver` is never null — it is the ctor lambda
-/// draining the file-private `globalWriteObservers` list — so write-side
-/// observer soundness is the CALLER's obligation: prove that list empty
-/// (persistent_map_mut resolves it) before treating notifyWrite as a
-/// no-op. This gate proves only the exact-GlobalSnapshot class and the
-/// null READ observer.
+/// Proves only the exact-GlobalSnapshot class and a null read observer.
+/// GlobalSnapshot's `writeObserver` is never null, being the ctor lambda
+/// draining `globalWriteObservers`, so the caller owes the write-side proof:
+/// that list must be empty before `notifyWrite` counts as a no-op.
 pub fn globalWriteGate(thread_snapshot: *const Value, global_snapshot: *const Value) ?WriteGate {
     const wtrace = runtime.envOnce("KLIO_SSMPUT_TRACE") != null;
     const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse {
@@ -175,17 +143,14 @@ pub fn globalWriteGate(thread_snapshot: *const Value, global_snapshot: *const Va
     return .{ .id = f.id, .set = f.set };
 }
 
-/// The valid record with the highest snapshotId for a write cycle (the
-/// readable walk). Returns a BORROWED value or null.
+/// Returns a borrowed value, not a retained one.
 pub fn recordForWrite(first: *const Value, gate: WriteGate) ?Value {
     const c = readableWalk(first, gate.id, gate.set) orelse return null;
     if (c == .Null) return null;
     return c;
 }
 
-/// The stored `snapshotId` / `invalid` / `readObserver` of a
-/// GlobalSnapshot instance; null on any shape surprise or when the
-/// receiver is not exactly that class.
+/// Null on a shape surprise or a receiver that is not exactly GlobalSnapshot.
 fn globalSnapFields(snap: *const Value) ?SnapFields {
     if (!isGlobalSnapshotClass(snap)) return null;
     const g = snap.Instance.borrow();
@@ -199,8 +164,7 @@ fn globalSnapFields(snap: *const Value) ?SnapFields {
     return .{ .id = id, .set = s, .read_observer_null = obs == .Null };
 }
 
-/// Read the three scalar fields of a SnapshotIdSet; null when the shape
-/// is not the expected one or the overflow array is present.
+/// Null when the shape is unexpected or the overflow array is present.
 fn readIdSet(v: *const Value) ?IdSet {
     if (v.* != .Instance) return null;
     const g = v.Instance.borrow();
@@ -226,8 +190,8 @@ fn idSetGet(s: IdSet, id: i64) bool {
     if (offset >= 64 and offset < 128) {
         return (@as(i64, 1) << @as(u6, @intCast(offset - 64))) & s.upper != 0;
     }
-    // offset > 0 above the window: clear. Negative offsets would consult
-    // belowBound, which readIdSet already proved null (empty).
+    // Above the window: clear. A negative offset would consult belowBound,
+    // which `readIdSet` already proved null.
     return false;
 }
 
@@ -235,9 +199,8 @@ fn validId(current: i64, candidate: i64, s: IdSet) bool {
     return candidate != 0 and candidate <= current and !idSetGet(s, candidate);
 }
 
-/// `valid(currentSnapshot, candidateSnapshot, invalid)` /
-/// `valid(data, snapshot, invalid)` — discriminated by the first
-/// argument's tag exactly as overload resolution would.
+/// The two `valid` overloads, discriminated by the first argument's tag
+/// exactly as overload resolution would.
 pub fn serveValid(args: []const Value) ?Value {
     if (args.len != 3) return null;
     const s = readIdSet(&args[2]) orelse return null;
@@ -255,24 +218,17 @@ pub fn serveValid(args: []const Value) ?Value {
     return .{ .Bool = validId(snap, sid, s) };
 }
 
-/// `currentSnapshot() = threadSnapshot.get() ?: globalSnapshot`, over the
-/// interpreted objects the Kotlin bodies read: the SnapshotThreadLocal's
-/// `map` (engine AtomicReference wrapping an atomicfu `ref` cell) holds a
-/// ThreadMap `(size, keys: LongArray, values: Array<Any?>)`; the lookup is
-/// its binary search keyed on the SAME thread id the
-/// `__compose_currentThreadId` intrinsic reports. klio's `MainThreadId`
-/// actual is `-1` (no thread takes the field path); a `-1` id or any
-/// unexpected shape bails to the interpreted body. The returned snapshot
-/// is retained.
+/// `currentSnapshot() = threadSnapshot.get() ?: globalSnapshot`, binary-searched
+/// off the ThreadMap on the same thread id `__compose_currentThreadId` reports.
+/// klio's `MainThreadId` actual is -1, which bails. The result is retained.
 pub fn serveCurrentSnapshot(thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
     const result = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse return null;
     result.retain();
     return result;
 }
 
-/// `serveCurrentSnapshot` without the retain: for internal use by serves
-/// that only read fields off the result while the caller's globals keep
-/// it rooted.
+/// Unretained: callers only read fields off the result while their own
+/// globals keep it rooted.
 fn currentSnapshotRaw(thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
     const tid: i64 = @bitCast(@as(u64, std.Thread.getCurrentId()));
     if (tid == -1) return null;
@@ -333,9 +289,8 @@ fn currentSnapshotRaw(thread_snapshot: *const Value, global_snapshot: *const Val
     return if (found != .Null and found != .Unit) found else global_snapshot.*;
 }
 
-/// The record-chain walk shared by every readable/current serve: the
-/// valid record with the highest snapshotId, `.Null` when none, and
-/// null on a shape surprise (fall back to the interpreter).
+/// The valid record with the highest snapshotId, `.Null` when none, and Zig
+/// null on a shape surprise, which falls back to the interpreter.
 fn readableWalk(first: *const Value, id: i64, s: IdSet) ?Value {
     if (first.* != .Instance) return null;
     var current: Value = first.*;
@@ -362,8 +317,6 @@ fn readableWalk(first: *const Value, id: i64, s: IdSet) ?Value {
     return candidate;
 }
 
-/// `readable(r, id, invalid)` — the private record-chain walk. Returns
-/// the valid record with the highest snapshotId, or Null.
 pub fn serveReadable(args: []const Value) ?Value {
     if (args.len != 3) return null;
     const id = asI64(&args[1]) orelse return null;
@@ -373,11 +326,9 @@ pub fn serveReadable(args: []const Value) ?Value {
     return candidate;
 }
 
-/// `T.readable(state)` — the public wrapper: current snapshot, observer
-/// notification, walk. Served only when the current snapshot is exactly
-/// the GlobalSnapshot with a null readObserver (nothing to notify) and
-/// the walk finds a record; a null walk must run the interpreted sync
-/// retry, and any other snapshot class runs the interpreted body.
+/// Served only when the current snapshot is exactly GlobalSnapshot with a null
+/// readObserver and the walk finds a record: a null walk must run the
+/// interpreted sync retry.
 pub fn serveReadableState(args: []const Value, thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
     if (args.len != 2) return null;
     const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse {
@@ -404,7 +355,6 @@ pub fn serveReadableState(args: []const Value, thread_snapshot: *const Value, gl
     return candidate;
 }
 
-/// `current(r)` — current snapshot + walk, no observer semantics.
 pub fn serveCurrentRecord(args: []const Value, thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
     if (args.len != 1) return null;
     const snap = currentSnapshotRaw(thread_snapshot, global_snapshot) orelse return null;
@@ -417,10 +367,8 @@ pub fn serveCurrentRecord(args: []const Value, thread_snapshot: *const Value, gl
 
 var fn_first_record = std.atomic.Value(?[*]const u8).init(null);
 
-/// The `SnapshotState*.readable` getter: the wrapper walk rooted at the
-/// receiver's stored `firstStateRecord`. Same gates as
-/// `serveReadableState` (exact GlobalSnapshot, null observer, non-null
-/// walk); anything else runs the interpreted getter.
+/// The wrapper walk rooted at the receiver's stored `firstStateRecord`, under
+/// `serveReadableState`'s gates.
 pub fn serveStateReadableGetter(receiver: *const Value, thread_snapshot: *const Value, global_snapshot: *const Value) ?Value {
     if (receiver.* != .Instance) return null;
     const first: Value = blk: {
@@ -433,7 +381,6 @@ pub fn serveStateReadableGetter(receiver: *const Value, thread_snapshot: *const 
     return serveReadableState(wrapped[0..2], thread_snapshot, global_snapshot);
 }
 
-/// `current(r, snapshot)` — walk against the given snapshot's window.
 pub fn serveCurrentWithSnapshot(args: []const Value) ?Value {
     if (args.len != 2) return null;
     const f = globalSnapFields(&args[1]) orelse return null;

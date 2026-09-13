@@ -1,18 +1,10 @@
 //! Shared overload-resolution applicability engine.
 //!
-//! One `applicable()` function scores a single candidate signature against a
-//! list of actual arguments described by `ArgShape`. Each caller (lowering
-//! ladder, runtime global/member scorers, eager typeck) populates the
-//! `ArgShape` fields it can prove at its phase and leaves the rest null; the
-//! scorer folds arity / default / vararg / trailing-lambda binding and the
-//! per-argument point values in one place.
-//!
-//! The scoring constants and special cases are the canonical rules consumed by
-//! lowering, eager type checking, and runtime binding. The runtime deltas that
-//! depend on a live value (declared-generic-argument / function-shape
-//! refinement and instance subtype distance) are supplied through
-//! `ApplicabilityScope`; when a callback is null, the evidence is UNKNOWN and
-//! never disproves a candidate.
+//! `applicable()` scores one candidate signature against actual arguments
+//! described by `ArgShape`, folding arity, default, vararg and trailing-lambda
+//! binding with the per-argument points. A null `ArgShape` field is UNKNOWN
+//! evidence and never disproves a candidate; value-dependent deltas arrive
+//! through the `ApplicabilityScope` callbacks.
 
 const std = @import("std");
 
@@ -23,93 +15,57 @@ const TypeRef = ir.TypeRef;
 const Param = ir.Param;
 const FuncId = ir.FuncId;
 
-// -------------------------------------------------------------------------
-// Input shape.
-// -------------------------------------------------------------------------
-
 pub const LiteralKind = enum { numeric, string, boolean, char };
 
-/// Everything a caller can know about one actual argument at overload-pick
-/// time. A plain value struct: it borrows, never allocates. A field left null
-/// means "this caller could not prove anything here" and downgrades that
-/// argument from proven to unknown (never to disproven).
+/// One actual argument at overload-pick time. Borrows, never allocates; a null
+/// field downgrades that argument to unknown, never to disproven.
 pub const ArgShape = struct {
-    /// Declared / checked static type, when the caller has one (eager typeck,
-    /// and the synthesized member-receiver slot). Runtime value args leave it
-    /// null and score off `runtime_class`.
+    /// Declared static type; runtime value args leave it null for `runtime_class`.
     ty: ?TypeRef = null,
 
-    /// `ty` came from source syntax or declaration metadata rather than the
-    /// additive eager type-head channel. Static resolution may reject a
-    /// candidate only from authoritative evidence.
+    /// `ty` came from source or declaration metadata; static resolution rejects
+    /// a candidate only on authoritative evidence.
     ty_authoritative: bool = true,
 
-    /// The argument is written `expr as Any` / `as Any?`: its static type is
-    /// exactly `Any`, which no parameter of a concrete class type accepts
-    /// (`zs.contains(object {} as Any)` picks the `Iterable<T>.contains`
-    /// extension over the member `contains(element: Z)`).
+    /// The argument is written `expr as Any`: its static type is exactly `Any`,
+    /// which no parameter of a concrete class type accepts.
     cast_any: bool = false,
 
-    /// The argument is callable per `valueIsCallable`
-    /// (IrClosure/Function/Intrinsic/BoundMethod/PropertyRef) — drives the
-    /// trailing-lambda binding gate.
+    /// The argument is callable, which gates trailing-lambda binding.
     is_lambda: bool = false,
 
-    /// Declared arg arity when the callable is an IrClosure / Function / class
-    /// ctor ref (the legacy `arg_arity` switch: IrClosure -> n_params, Function
-    /// -> params.len, Class -> 0); null otherwise. Feeds the FunctionN score.
+    /// Declared parameter count of a callable argument; feeds the `FunctionN` score.
     lambda_arity: ?u8 = null,
 
-    /// The value's runtime typeFqn starts with "kotlin.Function"
-    /// (Function/IrClosure/Intrinsic/BoundMethod/BoundUserMethod). Part of the
-    /// per-arg callable gate for callables that carry no `lambda_arity`.
+    /// Runtime typeFqn starts with `kotlin.Function`: the callable gate for an
+    /// argument carrying no `lambda_arity`.
     func_typed: bool = false,
 
-    /// The argument is a LAMBDA LITERAL at the call site (AST-time shape),
-    /// so `lambda_arity` is the literal's declared header count — reliable
-    /// for exact-arity overload ranking. Runtime closure shapes leave this
-    /// false: their `n_params` includes lowering-added params (receiver,
-    /// continuation, composer pair), where only the `want`/`want+1` parity
-    /// is sound.
+    /// `lambda_arity` is a call-site literal's header count, so it ranks
+    /// exactly; a runtime closure's count includes lowering-added slots.
     lambda_is_literal: bool = false,
 
-    /// Declared lambda parameter types when the caller can see them. Unused by
-    /// the runtime path (the refine callback re-derives them from the value);
-    /// carried for the eager caller of a later step.
+    /// Declared lambda parameter types when the caller can see them.
     lambda_param_types: ?[]const TypeRef = null,
 
     /// Named-argument name for this slot (`x = ...`), else null (positional).
     named: ?[]const u8 = null,
 
-    /// The argument is a spread (`*arr`) feeding a vararg.
     is_spread: bool = false,
 
-    /// The argument value is `Null`. Only the runtime callers set it.
     is_null: bool = false,
 
-    /// Runtime class simple-name of the argument value (the class name for an
-    /// Instance, else `simpleName(typeFqn)`). Only the runtime callers set it;
-    /// it drives head-match, numeric widening, builtin-supertype and
-    /// instance-subtype scoring.
+    /// Runtime class simple-name; only the runtime callers set it.
     runtime_class: ?[]const u8 = null,
 
-    /// Literal-kind classification for an AST literal argument (lowering).
     literal_kind: ?LiteralKind = null,
 
-    /// Runtime `*const Value` pointer, opaque here, passed straight through to
-    /// the `ApplicabilityScope` refinement callbacks. Only the runtime callers
-    /// populate it.
+    /// Opaque runtime `*const Value`, passed to the scope callbacks.
     value: ?*const anyopaque = null,
 };
 
-// -------------------------------------------------------------------------
-// Output shape.
-// -------------------------------------------------------------------------
-
-/// Where each supplied arg landed, plus which params take defaults / vararg
-/// packing bounds. Only the scalar trailing-lambda / vararg fields are filled
-/// in this slice; the slice fields are materialized by the per-caller adapter
-/// steps (which thread a scratch buffer).
+/// Where each supplied arg landed, plus defaulted params and vararg bounds. The
+/// per-caller adapters own the scratch buffer the slice fields point into.
 pub const Binding = struct {
     arg_to_param: []const u16 = &.{},
     default_params: []const u16 = &.{},
@@ -119,192 +75,127 @@ pub const Binding = struct {
     trailing_lambda_param: ?u16 = null,
 };
 
-/// A ranked applicability verdict. `null` from `applicable()` == inapplicable
-/// (a definite mismatch: an arity no default / vararg fixes, or a per-arg
-/// disproven type). Never returned for mere lack of information.
+/// A ranked verdict; a null `applicable()` result means a definite mismatch.
 pub const Score = struct {
-    /// Sum of per-arg points, with the legacy conventions folded in: exact-head
-    /// 100, numeric widen 40/30, callable-arity 90, builtin-super 75-dist,
-    /// subtype 60-dist, Any 10, SAM 8, type-param 5, Unit 1, refinement +delta,
-    /// and the -1 under-application penalty when defaults are used.
+    /// Sum of per-arg points: exact head 100, numeric widen 40/30, callable
+    /// arity 90, builtin super 75-dist, subtype 60-dist, `Any` 10, SAM 8, type
+    /// parameter 5, `Unit` 1, plus -1 when defaults fill an under-application.
     points: i32,
 
-    /// Count of args scored from proven (`ty`/`runtime_class` present) vs
-    /// unknown evidence. Secondary tiebreak only; the global scanner keys on
-    /// `points`.
+    /// Proven versus unknown evidence counts; a secondary tiebreak only.
     proven_args: u16 = 0,
     unknown_args: u16 = 0,
 
-    /// The call supplied exactly one arg per fixed parameter, with neither
-    /// defaults nor vararg packing involved.
+    /// Exactly one arg per fixed parameter, with no defaults or vararg packing.
     exact_arity: bool = false,
 
-    /// The candidate is `@LowPriorityInOverloadResolution` / HIDDEN. Carried,
-    /// not pre-applied; each caller keeps its own convention.
+    /// Carried, not pre-applied: each caller keeps its own convention.
     low_priority: bool = false,
 
-    /// True when this candidate is a member rather than an extension/top-level.
     is_member: bool = false,
 
-    /// Extension-only lexicographic ranking tuple, populated only when a later
-    /// caller sets extension ranking. null here.
+    /// Extension-only lexicographic ranking tuple; null unless `rank_extensions`.
     ext_key: ?[9]i32 = null,
 
-    /// P2 binding side-channel the caller consumes.
     binding: Binding = .{},
 };
 
-/// Per-candidate signature view. `DeclSig` does not exist yet; this carries the
-/// slices the scorer reads directly off an `ir.Func`.
+/// Per-candidate signature view over the slices the scorer reads off an `ir.Func`.
 pub const SigView = struct {
-    /// Declared parameters (`ty`, `name`, `is_vararg`).
     params: []const Param,
     /// Default-thunk table for the candidate (`func_defaults`): `defaults[i] !=
     /// null` means param `i` has a default. Null means no defaults at all.
     defaults: ?[]const ?FuncId = null,
-    /// The candidate has an IR body (a bodyless expect / native stub is never
-    /// selectable).
+    /// A bodyless expect or native stub is never selectable.
     has_body: bool = true,
     /// `@LowPriorityInOverloadResolution` / error-level `@Deprecated`.
     low_priority: bool = false,
-    /// Member (implicit-receiver) candidate rather than extension/top-level.
     is_member: bool = false,
-    /// Extension / member-extension candidate.
     is_extension: bool = false,
-    /// The candidate's `FuncId`, used by the extension ranking for the
-    /// stable `neg_fid` tiebreak and to skip self in the `spec` count.
+    /// Candidate `FuncId`: the `neg_fid` tiebreak and the self-skip in `spec`.
     fid: ?FuncId = null,
-    /// Declaring package path — feeds the extension ranking's `is_user`
-    /// tier (`""` or an unknown package is user code).
+    /// Declaring package; `""` or an unknown package is the `is_user` tier.
     package: []const u8 = "",
 };
 
-/// Runtime-value refinement callbacks and phase flags, injected by the caller.
-/// The runtime callers pass `ctx = *VmHost` and wrap `refineByDeclaredArgs` /
-/// the instance-subtype BFS; lowering / eager leave them null.
+/// Refinement callbacks and phase flags injected by the caller. The runtime
+/// callers pass `ctx = *VmHost`; lowering and eager typeck leave them null.
 pub const ApplicabilityScope = struct {
     is_extension: bool = false,
     check_low_priority: bool = false,
 
-    /// Select the runtime NAMED-ARGUMENT scoring conventions
-    /// (`host_call_func.zig` `scoreNamedCandidate`): each arg's `named` binds to
-    /// its distinct same-named parameter, positional args fill the rest (a
-    /// vararg absorbing the arguments at its position), and every unfilled non-vararg parameter
-    /// must be defaultable. Unlike the positional/member scorers, a per-arg type
-    /// mismatch is NEUTRAL (scores 0) rather than disqualifying: named-parameter
-    /// presence is the hard discriminator, the type score only ranks survivors.
+    /// Named-argument scoring: each `named` arg binds its distinct same-named
+    /// parameter, positional args fill the rest, unfilled non-vararg parameters
+    /// must default, and a per-arg type mismatch is neutral, not disqualifying.
     named: bool = false,
 
-    /// A named call whose site supplies an implicit extension receiver (the
-    /// enclosing frame's `this`) that is not among the args: the candidate's
-    /// leading `this` parameter is receiver-filled rather than arg-bound.
+    /// The call site supplies an implicit extension receiver, filling `this`.
     recv_external: bool = false,
 
-    /// Optional caller-provided scratch for the named path's `Binding.arg_to_param`
-    /// (which parameter each supplied arg bound to). Left null when the caller
-    /// does not need the binding; when set, `applicable()` writes through it and
-    /// points `Binding.arg_to_param` at the filled prefix.
+    /// Caller-owned scratch the named path's `Binding.arg_to_param` points into.
     arg_to_param_buf: ?[]u16 = null,
 
-    /// Select the runtime *member* per-arg + candidate scoring conventions
-    /// (`host_call_member.zig`): no `$bound_ref$` callable head, a
-    /// `Function`-parse failure scores 20 (not 8), a callable against a
-    /// definitely-non-function concrete param disqualifies, the instance
-    /// subtype tier scores `75 - min(depth, 20)` (not `60 - min(depth, 50)`),
-    /// a short all-upper-or-digit head is a type parameter, the base score is
-    /// 0 (no under-application `-1`), and the receiver slot (`params[0].name ==
-    /// "this"`) is skipped before value scoring.
+    /// Member scoring conventions: an unparseable `Function` arity scores 20, a
+    /// callable against a concrete non-function param disqualifies, the subtype
+    /// tier is `75 - min(depth, 20)`, the base score is 0, and the `this`
+    /// receiver slot is skipped before value scoring.
     member: bool = false,
 
-    /// Extension ranking: fill `Score.ext_key` (mirrors `scoreExtCandidates`).
-    /// Implies member per-arg scoring; the receiver is `params[0]` and is
-    /// scored into the key, value args bind `params[1..]`.
+    /// Fill `Score.ext_key`; `params[0]` is the receiver, args bind `params[1..]`.
     rank_extensions: bool = false,
 
-    /// Extension receiver value shape (its `runtime_class`/`value` drive
-    /// `recv_score`/`recv_match`). Required when `rank_extensions`.
+    /// Extension receiver shape; required when `rank_extensions`.
     receiver: ?ArgShape = null,
 
-    /// All candidates in the extension overload set, for the `spec`
-    /// (supertype-specificity count) tier. Each entry's `params[0].ty` is the
-    /// declared receiver head; `fid` skips the candidate against itself.
+    /// The whole extension overload set, for the `spec` tier; `fid` skips self.
     all_candidates: ?[]const SigView = null,
 
     /// Opaque context (a `*VmHost`) threaded to the callbacks.
     ctx: ?*anyopaque = null,
 
-    /// `refineByDeclaredArgs`: declared-generic / function-shape delta for a
-    /// head-accepted (arg, param) pair. Returns the score delta, or null to
-    /// disqualify the candidate.
+    /// Declared-generic and function-shape delta; null disqualifies the candidate.
     refine: ?*const fn (*anyopaque, *const TypeRef, *const anyopaque) ?i32 = null,
 
-    /// Instance-subtype distance: the BFS depth from the value's runtime class
-    /// to `target` through the class supertype closure, or null when the value
-    /// is not an instance or `target` is not reached.
+    /// BFS depth from the value's class to `target`; null when unreached.
     subtype: ?*const fn (*anyopaque, *const anyopaque, []const u8) ?i32 = null,
 
-    /// Whether a parameter written qualified (`x: a.Box`) and the argument's
-    /// runtime class provably denote DIFFERENT registered classes that share a
-    /// simple name (a cross-package collision). When true the exact-name tier
-    /// is skipped so the sibling overload with the matching class identity
-    /// wins. Null callback (lowering / eager) never conflicts.
+    /// Whether a qualified parameter type and the argument's runtime class
+    /// denote different same-named classes; true skips the exact-name tier.
     identity_conflict: ?*const fn (*anyopaque, *const TypeRef, *const anyopaque) bool = null,
 
-    /// `isFunctionTypeRefResolved`: function-typed param test with typealias
-    /// indirection resolved, for the member trailing-lambda gate. Null falls
-    /// back to the static `isFunctionTypeRef`.
+    /// Function-typed param test with typealias indirection resolved.
     func_type: ?*const fn (*anyopaque, *const TypeRef) bool = null,
 
-    /// Whether a parameter type is a TYPE VARIABLE in scope for candidate
-    /// `fid` — one of its own type parameters, or its owning class's. The
-    /// complete `TypeRef` keeps a qualified nominal type from being
-    /// reinterpreted as a same-named type variable.
+    /// Whether a parameter type is a type variable in scope for `fid`. The
+    /// complete `TypeRef` keeps a qualified nominal from reading as one.
     type_var: ?*const fn (*anyopaque, FuncId, *const TypeRef) bool = null,
 
-    /// Precise runtime equivalence for alternate spellings of the same class
-    /// head, such as a source `Modifier.Node` parameter and its lifted
-    /// `Modifier$Node` runtime class. This callback must not use a
-    /// simple-name fallback: distinct same-named classes remain distinct.
+    /// Runtime equivalence of alternate spellings of one head (`Modifier.Node`
+    /// and `Modifier$Node`). No simple-name fallback: same names stay distinct.
     exact_head: ?*const fn (*anyopaque, []const u8, []const u8) bool = null,
 
-    /// Runtime member/global dispatch has erased the compile-time distinction
-    /// between a constant narrowed to Byte/Short and an Int value. Those paths
-    /// may retain the existing same-signedness width accommodation; factory
-    /// and constructor binding leave this false so an Int variable cannot bind
-    /// a Byte/Short parameter.
+    /// Runtime dispatch cannot tell a constant narrowed to `Byte`/`Short` from
+    /// an `Int`, so it allows same-signedness widths; factories leave it false.
     erased_integer_widths: bool = false,
 
-    /// `extReceiverSpecificity(receiver, ty_name)`: the extension `recv_match`
-    /// tier.
+    /// The extension `recv_match` tier: receiver specificity.
     ext_recv_match: ?*const fn (*anyopaque, *const anyopaque, []const u8) i32 = null,
 
-    /// `isSubtypeName(a, b)`: whether receiver head `a` is a proper subtype of
-    /// `b`, for the extension `spec` tier.
+    /// Whether head `a` is a proper subtype of `b`, for the extension `spec` tier.
     ext_is_subtype_name: ?*const fn (*anyopaque, []const u8, []const u8) bool = null,
 
     /// Owner rank for a member-extension nearer on the enclosing-`this` chain.
     ext_owner_rank: ?*const fn (*anyopaque, FuncId) i32 = null,
 
-    /// `stdlib.isKnownPackage(package)`: a shipped/pack namesake; the negation
-    /// (plus the empty package) is the extension `is_user` tier.
+    /// Whether `package` is a shipped pack; its negation is the `is_user` tier.
     ext_known_package: ?*const fn ([]const u8) bool = null,
 };
 
-// -------------------------------------------------------------------------
-// The merged builtin-assignability relation (design §3, the UNION table).
-// -------------------------------------------------------------------------
-
-/// Map a concrete runtime/value head to the ordered list of nominal supertypes
-/// it satisfies; the list position is the scoring distance. The union of the
-/// three previously-divergent tables (`builtinSupersFor`, `builtinSupers`,
-/// `builtinHeadAccepts`) — the `Collection`, `StringBuilder` and range rows
-/// missing from one or another are added back here.
+/// Nominal supertypes a builtin head satisfies; list position is the distance.
 pub fn builtinSupersOf(concrete: []const u8) []const []const u8 {
     const eq = std.mem.eql;
     const s = simpleName(concrete);
-    // The boxed numerics are `Number`s: a runtime `Int` satisfies a
-    // `Number?` parameter (`JsonPrimitive(value: Number?)` picked for an
-    // `Int` through a callable reference).
+    // The boxed numerics are `Number`s: a runtime `Int` satisfies `Number?`.
     if (eq(u8, s, "Int") or eq(u8, s, "Long") or eq(u8, s, "Short") or eq(u8, s, "Byte") or
         eq(u8, s, "Double") or eq(u8, s, "Float"))
         return &.{ "Number", "Comparable" };
@@ -335,26 +226,16 @@ pub fn builtinSupersOf(concrete: []const u8) []const []const u8 {
     return &.{};
 }
 
-// -------------------------------------------------------------------------
-// Small helpers (ported from the global scorer verbatim).
-// -------------------------------------------------------------------------
-
 pub fn simpleName(name: []const u8) []const u8 {
     if (std.mem.findScalarLast(u8, name, '.')) |i| return name[i + 1 ..];
     return name;
 }
 
-/// Synthetic suffix the `@Composable` lowering plugin appends to a defaulted
-/// parameter it moves into the body prologue (`p: T = D` becomes `p$arg: T =
-/// marker()`). A source-level named argument still names the ORIGINAL `p`, so
-/// binding a named call against the transformed signature must treat `p` and
-/// `p$arg` as the same parameter. `$` cannot begin a source identifier, so this
-/// never collides with a real parameter name.
+/// Suffix the `@Composable` lowering appends to a defaulted parameter, so named
+/// binding must treat `p` and `p$arg` as one parameter.
 pub const composable_arg_suffix = "$arg";
 
-/// Whether a caller's named-argument label `arg_name` designates the parameter
-/// declared as `param_name` — the identity match, or the compose-plugin's
-/// defaulted-parameter rename (`param_name == arg_name ++ "$arg"`).
+/// Identity, or the compose rename `param_name == arg_name ++ "$arg"`.
 pub fn paramNameMatchesArg(param_name: []const u8, arg_name: []const u8) bool {
     if (std.mem.eql(u8, param_name, arg_name)) return true;
     return arg_name.len != 0 and
@@ -363,10 +244,7 @@ pub fn paramNameMatchesArg(param_name: []const u8, arg_name: []const u8) bool {
         std.mem.endsWith(u8, param_name, composable_arg_suffix);
 }
 
-/// The compose lowering's generated call-site markers. They are appended by the
-/// AST pass rather than written in source, so a candidate that does not declare
-/// them is simply not a composable target — unlike a genuine source-level named
-/// argument, their absence from a signature must not disqualify the candidate.
+/// Compose's generated markers: their absence must not disqualify a candidate.
 pub fn isGeneratedComposeArg(name: []const u8) bool {
     return std.mem.eql(u8, name, "$composer") or std.mem.eql(u8, name, "$changed");
 }
@@ -378,8 +256,7 @@ fn allAsciiUpper(s: []const u8) bool {
     return true;
 }
 
-/// The member scorer's short-type-parameter test allows digits (`T1`, `A2`),
-/// unlike the global scorer's `allAsciiUpper`.
+/// The member scorer's short-type-parameter test, which allows digits (`T1`).
 fn allUpperOrDigit(s: []const u8) bool {
     for (s) |c| {
         if (!(std.ascii.isUpper(c) or std.ascii.isDigit(c))) return false;
@@ -387,9 +264,7 @@ fn allUpperOrDigit(s: []const u8) bool {
     return true;
 }
 
-/// Port of `host_call_member.zig` `isTopOrGenericType`: a maximally-unspecific
-/// receiver/param head (`Any`/`Unit`/`FunctionN`/short type parameter). Drives
-/// the extension `param_spec` tier.
+/// A maximally-unspecific head, which the extension `param_spec` tier counts against.
 fn isTopOrGenericType(ty_name: []const u8) bool {
     var pn = simpleName(ty_name);
     pn = std.mem.trimEnd(u8, pn, "?");
@@ -399,8 +274,7 @@ fn isTopOrGenericType(ty_name: []const u8) bool {
     return false;
 }
 
-/// A concrete builtin a callable argument can never satisfy. User class
-/// heads remain eligible for SAM conversion; scalars and containers do not.
+/// A concrete builtin a callable can never satisfy; user heads stay SAM-eligible.
 fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     const names = [_][]const u8{
         "String",          "CharSequence", "Boolean",     "Char",       "Byte",              "Short",
@@ -415,8 +289,6 @@ fn isDefinitelyNonFunctionTypeName(pn: []const u8) bool {
     return false;
 }
 
-/// Function-typed param test: the caller's typealias-resolving callback when
-/// present (member/extension), else the static name check.
 fn scopeIsFunctionType(scope: *const ApplicabilityScope, ty: *const TypeRef) bool {
     if (scope.func_type) |cb| return cb(scope.ctx.?, ty);
     return isFunctionTypeRef(ty);
@@ -428,7 +300,6 @@ fn sameFid(a: ?FuncId, b: ?FuncId) bool {
     return x.int() == y.int();
 }
 
-/// A `TypeRef` denoting a Kotlin function type (mirrors `interp_ir.isFunctionType`).
 pub fn isFunctionTypeRef(ty: *const TypeRef) bool {
     const n = simpleName(ty.name);
     return std.mem.startsWith(u8, n, "Function") or
@@ -436,34 +307,26 @@ pub fn isFunctionTypeRef(ty: *const TypeRef) bool {
 }
 
 fn paramHasDefault(sig: *const SigView, i: usize) bool {
-    // A null `defaults` slice is the lowering adapter (`sigViewForApplicability`):
-    // it cannot read the `ProgramImage`-side default-thunk table, so it carries
-    // the flag on the params instead. The runtime callers always set a non-null
-    // `defaults` and never reach this fallback.
+    // A null `defaults` slice is the lowering adapter, which cannot read the
+    // image-side thunk table and carries the flag on the params instead.
     const defs = sig.defaults orelse
         return i < sig.params.len and sig.params[i].has_default;
     return i < defs.len and defs[i] != null;
 }
 
-/// Declared-generic / function-shape refinement delta. Null callback (lowering
-/// / eager) contributes no delta and never disqualifies.
+/// Refinement delta; a null callback contributes 0 and never disqualifies.
 fn refineDelta(scope: *const ApplicabilityScope, param_ty: *const TypeRef, arg: *const ArgShape) ?i32 {
     const cb = scope.refine orelse return 0;
     const v = arg.value orelse return 0;
     return cb(scope.ctx.?, param_ty, v);
 }
 
-/// Instance-subtype BFS depth to `target`, or null (not an instance / not
-/// reached / no callback).
 fn subtypeDepth(scope: *const ApplicabilityScope, arg: *const ArgShape, target: []const u8) ?i32 {
     const cb = scope.subtype orelse return null;
     const v = arg.value orelse return null;
     return cb(scope.ctx.?, v, target);
 }
 
-/// Whether a qualified parameter type and the argument's runtime class provably
-/// denote different registered classes sharing a simple name. False whenever
-/// the callback is absent (lowering / eager) or the argument carries no value.
 fn scopeIdentityConflict(scope: *const ApplicabilityScope, param_ty: *const TypeRef, arg: *const ArgShape) bool {
     const cb = scope.identity_conflict orelse return false;
     const ctx = scope.ctx orelse return false;
@@ -478,8 +341,7 @@ fn scopeExactHeadMatch(scope: *const ApplicabilityScope, param_head: []const u8,
     return cb(ctx, param_head, arg_head);
 }
 
-/// Value-independent fallback for a caller that could not prove a runtime head
-/// (lowering / eager). Never disqualifies (returns a base, never null).
+/// Fallback score when no runtime head was proven; never disqualifies.
 fn unknownArgScore(nm: []const u8) i32 {
     if (std.mem.eql(u8, nm, "Any") or std.mem.eql(u8, nm, "Any?")) return 10;
     if (nm.len <= 2 and allAsciiUpper(nm)) return 5;
@@ -487,18 +349,7 @@ fn unknownArgScore(nm: []const u8) i32 {
     return 10;
 }
 
-/// Declared-type evidence for a (param, arg) pair whose runtime head is
-/// unknown: the caller proved the argument's declared static head (a local /
-/// parameter with a known declared type). STRICTLY ADDITIVE — a head match
-/// earns the head-match score, a type-parameter-typed argument head-matches a
-/// type-parameter-typed parameter (`a: T` inside `fun <T : Comparable<T>>`
-/// against `minOf(a: T, b: T)`), and anything else returns null so the caller
-/// falls back to the unknown base. Declared-type evidence can therefore only
-/// ever ADD points for a matching candidate; it never disqualifies one.
-/// The bare head for declared-type EVIDENCE comparison: the simple name,
-/// with a lift-mangled scope prefix (`Outer$Name`) stripped back to the
-/// source simple name — evidence compares what the declaration wrote, and
-/// the mangle is a lift-uniqueness artifact, not a different type head.
+/// Evidence head: the simple name, with a lift mangle (`Outer$Name`) stripped.
 fn evidenceHead(name: []const u8) []const u8 {
     const sn = std.mem.trimEnd(u8, simpleName(name), "?");
     if (std.mem.findScalarLast(u8, sn, '$')) |i| {
@@ -507,6 +358,8 @@ fn evidenceHead(name: []const u8) []const u8 {
     return sn;
 }
 
+/// Declared-type evidence for a (param, arg) pair: 100 for a head match or for
+/// two type-parameter heads, else null so the caller falls back to unknown.
 pub fn tyEvidenceScore(param_name: []const u8, arg_ty_name: []const u8, member: bool) ?i32 {
     const pn = evidenceHead(param_name);
     const an = evidenceHead(arg_ty_name);
@@ -518,8 +371,6 @@ pub fn tyEvidenceScore(param_name: []const u8, arg_ty_name: []const u8, member: 
     return null;
 }
 
-/// A builtin numeric head (the widths `paramLitKind`-style matching folds
-/// together for evidence purposes).
 fn isNumericHead(pn: []const u8) bool {
     const names = [_][]const u8{
         "Int",  "Long",  "Short",  "Byte",  "Double", "Float",
@@ -541,18 +392,13 @@ fn unsignedIntHead(n: []const u8) bool {
         std.mem.eql(u8, n, "UInt") or std.mem.eql(u8, n, "ULong");
 }
 
-/// Two integer heads of the same signedness (both signed or both unsigned),
-/// so a runtime value of one may serve a parameter of the other (klio stores
-/// all widths uniformly). Excludes cross-signedness (`Int`↛`UByte`) and floats.
+/// Two integer heads of one signedness; klio stores every width uniformly.
 fn sameSignednessInt(a: []const u8, b: []const u8) bool {
     return (signedIntHead(a) and signedIntHead(b)) or
         (unsignedIntHead(a) and unsignedIntHead(b));
 }
 
-/// Literal-kind evidence for a (param, literal arg) pair: a numeric literal
-/// matches any numeric parameter head, a string literal `String` /
-/// `CharSequence`, and so on. Null (no conclusion) otherwise — like the
-/// declared-type evidence, this only ever adds preference.
+/// Literal-kind evidence: a numeric literal matches any numeric head, and so on.
 fn literalEvidenceScore(param_name: []const u8, kind: LiteralKind) ?i32 {
     const pn = std.mem.trimEnd(u8, simpleName(param_name), "?");
     const hit = switch (kind) {
@@ -564,21 +410,14 @@ fn literalEvidenceScore(param_name: []const u8, kind: LiteralKind) ?i32 {
     return if (hit) 100 else null;
 }
 
-/// Lowering-time evidence bonus for ranking same-rung candidates in the
-/// bare-call ladder: the sum of per-arg evidence scores — a declared-type
-/// head match (100), a declared numeric head against a numeric parameter of
-/// another width (80, so an exact head still outranks it), or a literal-kind
-/// match (100). Zero whenever no argument carries evidence, so a call with
-/// no static facts ranks exactly as before — evidence only ever ADDS
-/// preference for a matching candidate, never demotes or disqualifies one.
+/// Evidence bonus for ranking same-rung candidates: 100 per declared head or
+/// literal-kind match, 80 for a numeric head of another width, 0 without evidence.
 pub fn tyEvidenceBonus(params: []const Param, args: []const ArgShape) i32 {
     return tyEvidenceBonusScoped(params, args, .{});
 }
 
-/// `tyEvidenceBonus` with the caller's scope: the hierarchy oracle lets a
-/// declared head that is a SUBTYPE of the parameter head count as evidence
-/// (weaker than an exact head match), so two same-arity overloads split on
-/// which parameter type the argument's declared class actually reaches.
+/// `tyEvidenceBonus` with the caller's scope: a declared head that is a subtype
+/// of the parameter head counts as weaker evidence.
 pub fn tyEvidenceBonusScoped(params: []const Param, args: []const ArgShape, scope: ApplicabilityScope) i32 {
     var total: i32 = 0;
     for (args, 0..) |*a, i| {
@@ -607,13 +446,7 @@ pub fn tyEvidenceBonusScoped(params: []const Param, args: []const ArgShape, scop
     return total;
 }
 
-// -------------------------------------------------------------------------
-// Per-argument scoring.
-// -------------------------------------------------------------------------
-
-/// Score one (param, arg) pair. Higher is better; null disqualifies the
-/// candidate. Value-dependent deltas are deferred to the scope callbacks.
-/// The declared VALUE parameter types of a lowered function type, or null when
+/// The declared value parameter types of a lowered function type, or null when
 /// `ty` is not one. Encoding: `[#suspend?] [receiver?] params… ret [#markers]`.
 fn fnTypeValueParamRefs(ty: *const TypeRef) ?[]const TypeRef {
     if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
@@ -642,28 +475,20 @@ fn builtinScalarHead(h: []const u8) bool {
     return false;
 }
 
+/// Score one (param, arg) pair; higher is better, null disqualifies.
 fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape, scope: *const ApplicabilityScope) ?i32 {
     const nm = param_ty.name;
     const member = scope.member;
     const shape_callable = arg.lambda_arity != null or arg.func_typed or arg.is_lambda;
 
-    // Runtime head of the argument. A caller that could not prove one
-    // (lowering / eager) scores from declared-type evidence when the shape
-    // carries it — additive-only, never disqualifying — else as unknown.
+    // Runtime head; without one, declared-type evidence, else the unknown base.
     const v_ty = arg.runtime_class orelse blk: {
-        // AST lowering has no runtime class for a lambda literal, but its
-        // callable shape is already authoritative. Keep it on the callable
-        // scoring path instead of returning the generic unknown score.
+        // A lambda literal has no runtime class; its callable shape is authoritative.
         if (shape_callable) break :blk "$callable$";
         if (arg.ty) |aty| {
             if (tyEvidenceScore(nm, aty.name, member)) |s| return s;
-            // Hierarchy evidence: a declared head that is a SUBTYPE of the
-            // parameter head proves the candidate the same way a matching
-            // head does (`calculateNodeKindSetFrom(this)` inside
-            // DelegatingNode's initializer carries head `DelegatingNode`,
-            // which reaches `Modifier.Node` but never `Modifier.Element` —
-            // without this the two same-arity overloads tie and the wrong
-            // one wins on declaration order).
+            // A declared head that is a subtype of the parameter head proves
+            // the candidate, splitting overloads an unknown score would tie.
             if (scope.ext_is_subtype_name) |cb| {
                 const ah = evidenceHead(aty.name);
                 const ph = evidenceHead(nm);
@@ -676,8 +501,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
     };
 
     if (scopeExactHeadMatch(scope, nm, v_ty)) {
-        // An exact or canonically-equivalent head match is rejected when the
-        // parameter and runtime value provably denote different classes.
+        // Refused when parameter and value denote different same-named classes.
         if (!scopeIdentityConflict(scope, param_ty, arg)) {
             const d = refineDelta(scope, param_ty, arg) orelse return null;
             return 100 + d;
@@ -690,25 +514,18 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
     if (std.mem.eql(u8, nm, "Long") and std.mem.eql(u8, v_ty, "Int")) return 40;
     if ((std.mem.eql(u8, nm, "Double") or std.mem.eql(u8, nm, "Float")) and std.mem.eql(u8, v_ty, "Int")) return 30;
     if (std.mem.eql(u8, nm, "Double") and std.mem.eql(u8, v_ty, "Long")) return 30;
-    // Same-signedness integer cross-width (e.g. Int -> Byte/Short) is
-    // applicable at a low score: klio stores every integer width uniformly, and
-    // the literal coercion kotlinc validated at compile time is lost by the
-    // time a plain runtime value reaches member dispatch — so `append(1)` must
-    // still bind `append(byte: Byte)`. Restricted to the same signedness so a
-    // signed `Int` does NOT match an unsigned `UByte` param (kotlinc forbids
-    // that without `1u`). Below the exact head match (100) and the widen rules
-    // above, so an exact numeric overload always wins.
+    // Cross-width integers of one signedness apply at a low score: the literal
+    // coercion kotlinc validated is gone by dispatch, so `append(1)` must still
+    // bind `append(byte: Byte)`. Kotlin forbids a signed `Int` against `UByte`.
     if (scope.erased_integer_widths and sameSignednessInt(nm, v_ty)) return 20;
 
-    // A callable argument against a function-typed parameter. The member
-    // scorer does not treat a `$bound_ref$` head as callable.
+    // The member scorer does not treat a `$bound_ref$` head as callable.
     const arg_arity: ?usize = if (arg.lambda_arity) |n| @as(usize, n) else null;
     const is_bound_ref = !member and std.mem.startsWith(u8, v_ty, "$bound_ref$");
     const is_callable = shape_callable or is_bound_ref;
     if (is_callable) {
-        // A literal that ANNOTATES its parameters states their types. Refute
-        // only on a DEFINITE mismatch — two different builtin scalars — so an
-        // unannotated literal, a type parameter or a class type is untouched.
+        // A literal annotating its parameters states their types. Refute only
+        // on a definite mismatch, two different builtin scalars.
         if (arg.lambda_param_types) |declared| {
             if (fnTypeValueParamRefs(param_ty)) |expected| {
                 const n = @min(declared.len, expected.len);
@@ -720,8 +537,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
                     if (std.mem.eql(u8, dh, eh)) continue;
                     if (builtinScalarHead(dh) and builtinScalarHead(eh)) return null;
                     // A builtin scalar against a head that is neither a scalar
-                    // nor a one-letter type parameter: androidx's
-                    // `element: TestValueClass` against a `Char`.
+                    // nor a type parameter.
                     if (builtinScalarHead(eh) and dh.len > 1 and !builtinScalarHead(dh) and
                         !std.mem.eql(u8, dh, "Any") and !std.mem.startsWith(u8, dh, "Function")) return null;
                 }
@@ -731,20 +547,9 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
             const expected = nm["Function".len..];
             if (std.fmt.parseInt(usize, expected, 10)) |want| {
                 if (arg_arity) |got| {
-                    // An AUTHORITATIVE arity — a lambda literal's header
-                    // count, or a runtime closure whose composer pair was
-                    // stripped (the count then IS the transformed
-                    // literal's own header) — ranks exactly: an exact
-                    // param-count match outranks the adapted shapes,
-                    // because same-name overloads often differ only in
-                    // their functional param's arity (`movableContentOf`
-                    // takes `() -> Unit` … `(P1..P4) -> Unit`) and scoring
-                    // `got == want + 1` level with `got == want` tied
-                    // every such call onto an arbitrary overload. A
-                    // headerless literal serving a 1-param type via
-                    // implicit `it` stays applicable just below. Other
-                    // runtime closure shapes keep the flat parity — their
-                    // param count may include lowering-added params.
+                    // A literal's arity is authoritative: an exact param count
+                    // outranks the adapted shapes, and a headerless literal
+                    // still serves a 1-param type via `it`.
                     if (arg.lambda_is_literal) {
                         if (got == want) {
                             const d = refineDelta(scope, param_ty, arg) orelse return null;
@@ -769,16 +574,14 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
                 if (member) return 20;
             }
         }
-        // A callable can never bind a concrete builtin scalar or container.
-        // Unknown user heads remain eligible because they may be fun
-        // interfaces and accept SAM conversion.
+        // A callable cannot bind a concrete builtin scalar or container; an
+        // unknown user head stays eligible as a possible fun interface.
         if (isDefinitelyNonFunctionTypeName(simpleName(nm))) return null;
         return 8;
     }
 
-    // Subtype: an instance argument whose class transitively extends /
-    // implements the parameter's nominal type (distance-weighted). The member
-    // scorer scores `75 - min(depth, 20)`; the global scorer `60 - min(depth, 50)`.
+    // Instance subtype, distance-weighted: `75 - min(depth, 20)` for the member
+    // scorer, `60 - min(depth, 50)` for the global one.
     if (subtypeDepth(scope, arg, nm)) |depth| {
         if (member) {
             const d: i32 = if (depth > 20) 20 else depth;
@@ -788,7 +591,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
         return 60 - d;
     }
 
-    // Builtin runtime types satisfy their nominal supertypes (§3 union table).
+    // Builtin runtime types satisfy their nominal supertypes.
     const builtin_supers = builtinSupersOf(v_ty);
     const nm_simple = std.mem.trimEnd(u8, simpleName(nm), "?");
     for (builtin_supers, 0..) |sup, pos| {
@@ -799,7 +602,7 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
         }
     }
 
-    // Generic single-letter type-parameter — accept any (member allows digits).
+    // A short type-parameter head accepts anything (member allows digits).
     const short_typaram = if (member) allUpperOrDigit(nm) else allAsciiUpper(nm);
     var qualified_nominal = false;
     for (param_ty.args) |arg_ty| {
@@ -809,13 +612,9 @@ fn scoreArg(sig: *const SigView, param_ty: *const TypeRef, arg: *const ArgShape,
         }
     }
     if (!qualified_nominal and nm.len <= 2 and short_typaram) return 5;
-    // Unit param type — accept anything but rank lowest.
+    // A `Unit` param accepts anything but ranks lowest.
     if (std.mem.eql(u8, nm, "Unit")) return 1;
-    // A param typed as one of the candidate's in-scope TYPE VARIABLES (its
-    // own type parameters, or its owning class's — `put(key: Key)` on
-    // `ConcurrentMap<Key, Value>`) accepts anything, exactly like the
-    // short-form `T` above — even when an unrelated class shares the
-    // variable's name.
+    // A param typed by an in-scope type variable accepts anything, like `T`.
     if (scope.type_var) |cb| {
         if (sig.fid) |fid| {
             if (cb(scope.ctx.?, fid, param_ty)) return 5;
@@ -840,36 +639,20 @@ fn scoreTraceOn() bool {
     return b;
 }
 
-/// Source position of the extension call currently being scored. DIAGNOSTIC
-/// ONLY — never read by scoring, and written only while `KLIO_EXTKEY_TRACE` is
-/// set. It lives here rather than on `ApplicabilityScope` because that struct
-/// is scored on the RUNTIME dispatch path, where widening it by a `?Span`
-/// costs real time for a field that is dead in every non-tracing run.
-///
-/// Without a span an `[extkey]` row cannot be tied to a source line, and
-/// several calls in one file can share a receiver/argument type shape, so the
-/// rows are unattributable. That gap is what stalled the
-/// `plusCollectionInference` diagnosis.
+/// Source position of the extension call being scored. Diagnostic only, written
+/// only under `KLIO_EXTKEY_TRACE`, and kept off the hot `ApplicabilityScope`.
 pub threadlocal var trace_call_span: ?ir.Span = null;
 
-/// Source-visible name of the extension call currently being scored, kept
-/// alongside `trace_call_span` and under the same gate. Selecting candidates
-/// by NAME is what makes the trace usable across rebuilds: a `FuncId` is
-/// assigned by lowering order and shifts whenever anything upstream changes,
-/// so a fid recorded in one session names a different function in the next.
+/// Source name of the call being scored; names stay stable across rebuilds.
 pub threadlocal var trace_call_name: ?[]const u8 = null;
 
-/// Whether any `[extkey]` tracing is requested at all. Callers use this to
-/// skip maintaining `trace_call_span` on the normal path.
+/// Whether any `[extkey]` tracing is on, so callers can skip keeping the span.
 pub fn extKeyTraceEnabled() bool {
     return std.c.getenv("KLIO_EXTKEY_TRACE") != null;
 }
 
-/// `KLIO_EXTKEY_TRACE=<name|fid>[,...]` gate; see the dump in
-/// `applicableExtension`. A numeric token selects a single candidate by
-/// `FuncId`; anything else selects every candidate considered for a call of
-/// that source name, which is what you want when comparing the overloads that
-/// compete at one site.
+/// `KLIO_EXTKEY_TRACE=<name|fid>[,...]` gate: a numeric token selects one
+/// candidate by `FuncId`, anything else every candidate of that call name.
 fn extKeyTraceWanted(fid: ?FuncId) bool {
     const want = std.mem.span(std.c.getenv("KLIO_EXTKEY_TRACE") != null orelse return false);
     var it = std.mem.tokenizeScalar(u8, want, ',');
@@ -888,17 +671,8 @@ fn argIsProven(arg: *const ArgShape) bool {
     return arg.runtime_class != null or arg.ty != null;
 }
 
-// -------------------------------------------------------------------------
-// Candidate scoring (mirror of `overloadScore`).
-// -------------------------------------------------------------------------
-
-/// Score one candidate against the actual args. Returns null on a definite
-/// mismatch. Reproduces `host_call_func.zig` `overloadScore`: the arity /
-/// default / trailing-lambda gates and the positional per-arg scoring, with the
-/// under-application `-1` folded into `points`.
-/// The element `TypeRef` a vararg parameter's declared (materialized array)
-/// type carries: `ByteArray` -> `Byte`, `Array<T>` -> `T`, etc. A non-array
-/// declared type is returned unchanged (already an element).
+/// The element type of a vararg parameter's materialized array type:
+/// `ByteArray` to `Byte`, `Array<T>` to `T`. A non-array type is unchanged.
 pub fn varargElementRef(param_ty: *const TypeRef) TypeRef {
     const n = param_ty.name;
     const eq = std.mem.eql;
@@ -908,6 +682,7 @@ pub fn varargElementRef(param_ty: *const TypeRef) TypeRef {
     return param_ty.*;
 }
 
+/// Score one candidate against the actual args; null means a definite mismatch.
 pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
     if (scope.named) return applicableNamed(sig, args, scope);
     if (scope.rank_extensions) return applicableExtension(sig, args, scope);
@@ -924,12 +699,9 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
 
     const last_vararg = params.len > 0 and params[params.len - 1].is_vararg;
 
-    // NON-FINAL vararg + trailing lambda: `remember(vararg keys, calculation)`
-    // called as `remember(k1 … kn) { … }`. The lambda binds the final
-    // function-typed parameter out of sequence, leading args fill the params
-    // before the vararg, the vararg absorbs the positional middle, and any
-    // params strictly between the vararg and the lambda must carry defaults
-    // (Kotlin fills them only by name).
+    // Non-final vararg plus trailing lambda: the lambda binds the final
+    // function-typed param out of sequence, the vararg absorbs the positional
+    // middle, and params between them must default (Kotlin fills those by name).
     const mid_vararg: ?usize = blk: {
         for (params, 0..) |p, pi| {
             if (p.is_vararg and pi + 1 < params.len) break :blk pi;
@@ -980,12 +752,8 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
         }
     }
 
-    // NON-FINAL vararg, purely positional: the leading args fill the prefix,
-    // the vararg absorbs every remaining positional, and every parameter
-    // after it must carry a default — Kotlin fills those only by name.
-    // `report("A", 1, 2, 3)` on `(title, vararg items, footer = "end")`
-    // binds items=[1,2,3]; without this arm the arity check below rejected
-    // the only candidate and the call fell to the value route.
+    // Non-final vararg, purely positional: the vararg absorbs every remaining
+    // positional, and every parameter after it must default.
     if (mid_vararg) |vpos| {
         if (args.len >= vpos and (args.len == 0 or !args[args.len - 1].is_lambda)) {
             var tail_ok = true;
@@ -1035,12 +803,8 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
     }
 
     // Trailing-lambda rule: the last arg binds out of sequence to the last
-    // function-typed parameter, provided the gap is all-defaulted. A shape
-    // this convention cannot bind — a non-defaulted gap, or a lambda the
-    // last parameter's type refuses — FALLS THROUGH to the plain positional
-    // fill below rather than rejecting the candidate: `render({..}, {..})`
-    // against `(leading, trailing, plain = null)` binds positionally with
-    // the tail defaulted, and only the out-of-sequence reading fails.
+    // function-typed parameter when the gap is all-defaulted. A shape this
+    // cannot bind falls through to the positional fill, it is not rejected.
     if (params.len > args.len and args.len > 0 and
         isFunctionTypeRef(&params[params.len - 1].ty) and
         args[args.len - 1].is_lambda)
@@ -1081,10 +845,7 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
         }
     }
 
-    // Under-applied: every unfilled parameter must carry a default or be a
-    // vararg, which Kotlin materializes as an empty array. This matters after
-    // an empty spread is flattened: `listOf(*emptyArray())` reaches the scorer
-    // with zero scalar arguments but still binds `vararg elements`.
+    // Under-applied: every unfilled parameter must default or be a vararg.
     if (params.len > args.len) {
         var all_defaulted = true;
         var i = args.len;
@@ -1100,29 +861,18 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
         }
     }
 
-    // A vararg application is less specific than an otherwise equal fixed
-    // overload. Carry the same one-point applicability penalty used for
-    // defaulted under-application so every lowering/runtime scanner observes
-    // the Kotlin fixed-over-vararg tiebreak.
+    // Kotlin prefers a fixed overload to an otherwise equal vararg one.
     var total: i32 = if (params.len == args.len and !last_vararg) 0 else -1;
     var proven: u16 = 0;
     var unknown: u16 = 0;
-    // A trailing vararg absorbs the args from its own position onward. Each
-    // absorbed arg is a single ELEMENT (scored against the element type), UNLESS
-    // it is a spread (`*arr`), which feeds the whole array (scored against the
-    // array/param type). This is why a non-spread `ByteArray` cannot satisfy a
-    // `vararg Byte` — it is not a `Byte` — so a same-named class constructor
-    // taking `(ByteArray, …)` wins instead of the factory silently absorbing it.
+    // A trailing vararg absorbs the args from its position onward, each against
+    // the element type unless it is a spread: a `ByteArray` cannot fill `vararg Byte`.
     const vp: ?usize = if (last_vararg) params.len - 1 else null;
     var idx: usize = 0;
     while (idx < params.len and idx < args.len) : (idx += 1) {
         if (vp != null and idx == vp.?) break;
         if (params[idx].is_vararg) {
-            // A MID-position vararg fed one packed array (the flattened
-            // spread `f(*arr, content, $composer, $changed)`): this is the
-            // exact shape `packVarargArgs` passes through at dispatch, so
-            // scoring the array against the ELEMENT type must not refute
-            // the candidate. Neutral score, counted unknown.
+            // A mid-position vararg fed one packed array: neutral, counted unknown.
             const cls = args[idx].runtime_class orelse "";
             if (std.mem.endsWith(u8, cls, "Array")) {
                 unknown += 1;
@@ -1158,22 +908,14 @@ pub fn applicable(sig: *const SigView, args: []const ArgShape, scope: Applicabil
     };
 }
 
-// -------------------------------------------------------------------------
-// Runtime MEMBER scorer (mirror of `pickMethodOverload`'s per-candidate body).
-// -------------------------------------------------------------------------
-
-/// Score one member candidate against the value args. `sig.params` includes
-/// the implicit `this` slot (skipped when `params[0].name == "this"`); value
-/// args score against the remaining `effective` params. The base score is 0
-/// (no under-application `-1`); the caller applies the `+5` exact-arity bonus
-/// and the `-1000` low-priority penalty from `Score.exact_arity`/`low_priority`.
+/// Score one member candidate; `sig.params` includes the implicit `this` slot,
+/// skipped by name. Base 0: the caller applies `+5` exact-arity, `-1000` low-priority.
 fn applicableMember(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
     const params = sig.params;
     const skip: usize = if (params.len > 0 and std.mem.eql(u8, params[0].name, "this")) 1 else 0;
     const effective = params[skip..];
 
-    // Trailing-lambda rule: `recv.f(a, …) { lambda }` binds the trailing
-    // lambda to the LAST function-typed param with the gap all-defaulted.
+    // A trailing lambda binds the last function-typed param over a defaulted gap.
     if (args.len < effective.len and args.len > 0 and effective.len > 0 and
         scopeIsFunctionType(&scope, &effective[effective.len - 1].ty) and
         args[args.len - 1].is_lambda)
@@ -1211,15 +953,11 @@ fn applicableMember(sig: *const SigView, args: []const ArgShape, scope: Applicab
                 .binding = .{ .trailing_lambda_param = @intCast(skip + last_param) },
             };
         }
-        // Gap not all-defaulted: fall through to the plain arity check (the
-        // legacy loop does not `continue` here).
+        // Gap not all-defaulted: fall through to the plain arity check.
     }
 
-    // Positional member varargs bind every argument from the vararg position
-    // onward as an element. A spread is scored against the declared array
-    // type, and zero elements materialize an empty array. Parameters after the
-    // vararg cannot be supplied positionally in this branch and therefore
-    // must be defaultable (a trailing lambda was handled above).
+    // A member vararg binds every argument from its position onward as an
+    // element, a spread against the array type; later params must be defaultable.
     var vararg_pos: ?usize = null;
     for (effective, 0..) |param, i| if (param.is_vararg) {
         vararg_pos = i;
@@ -1261,8 +999,7 @@ fn applicableMember(sig: *const SigView, args: []const ArgShape, scope: Applicab
         };
     }
 
-    // Over-supply with no vararg tail cannot bind (the multi-candidate member
-    // path does not pack a trailing vararg here).
+    // Over-supply with no vararg tail cannot bind.
     if (args.len > effective.len) return null;
     // Under-application: every unfilled param must carry a default.
     if (args.len < effective.len) {
@@ -1292,12 +1029,8 @@ fn applicableMember(sig: *const SigView, args: []const ArgShape, scope: Applicab
     };
 }
 
-// -------------------------------------------------------------------------
-// Runtime EXTENSION ranking (mirror of `scoreExtCandidates`'s per-candidate
-// `ExtKey` build). Always returns a Score with `ext_key` filled — an
-// inapplicable candidate is not dropped here, it ranks lowest via
-// `ext_key[0] == 0`, exactly as the legacy loop keeps every candidate.
-// -------------------------------------------------------------------------
+// Extension ranking always returns a Score: an inapplicable candidate is not
+// dropped, it ranks lowest through `ext_key[0] == 0`.
 
 fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
     const params = sig.params;
@@ -1315,12 +1048,7 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     var param_spec: i32 = 0;
     var proven: u16 = 0;
     var unknown: u16 = 0;
-    // Trailing-lambda rule (same as the member scorer): `recv.f(a, …) { … }`
-    // binds the trailing lambda to the LAST function-typed param, provided
-    // every skipped parameter in between carries a default. Without this, a
-    // lambda-only call scores the lambda against `params[1]` and marks the
-    // real block parameter unfilled, so every candidate looks inapplicable
-    // and the ranking decays to the noise tiers of the key.
+    // A trailing lambda binds the last function-typed param over a defaulted gap.
     var lambda_param: ?usize = null;
     if (args.len > 0 and params.len > want and
         scopeIsFunctionType(&scope, &params[params.len - 1].ty) and
@@ -1346,8 +1074,7 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
             if (argIsProven(a)) proven += 1 else unknown += 1;
         }
     }
-    // Every param past the supplied args must be defaulted or vararg (when
-    // the trailing lambda fills the last param, its gap was checked above).
+    // Every param past the supplied args must default or be a vararg.
     if (want < params.len and lambda_param == null) {
         var k: usize = want;
         while (k < params.len) : (k += 1) {
@@ -1366,15 +1093,13 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     }
     if (params.len == want and !has_vararg) score += 5;
 
-    // Receiver specificity (`extReceiverSpecificity`).
     const recv_match: i32 = blk: {
         const cb = scope.ext_recv_match orelse break :blk 0;
         const rv = if (recv) |r| r.value else null;
         break :blk cb(scope.ctx.?, rv orelse break :blk 0, if (params.len > 0) params[0].ty.name else "");
     };
 
-    // Subtype specificity: how many other candidates' receivers are supertypes
-    // of this one.
+    // Subtype specificity: how many other candidates' receivers are supertypes.
     var spec: i32 = 0;
     if (scope.all_candidates) |cands| {
         if (scope.ext_is_subtype_name) |cb| {
@@ -1400,30 +1125,19 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     else
         0;
 
-    // A user-program extension outranks a shipped namesake of equal
-    // applicability. The empty package is always user code.
+    // A user extension outranks a shipped namesake; an empty package is user code.
     const is_user: i32 = blk: {
         if (sig.package.len == 0) break :blk 1;
         const cb = scope.ext_known_package orelse break :blk 1;
         break :blk @intFromBool(!cb(sig.package));
     };
 
-    // Kotlin prefers the applicable overload that fills the FEWEST
-    // parameters from defaults (a bare `produce { }` binds the 3-param
-    // public overload, not its 5/6-param delegation targets); negated so
-    // the lexicographic compare ranks fewer-defaults higher, ahead of the
-    // identity component.
+    // Kotlin prefers the overload filling the fewest defaults; negated to rank first.
     const neg_defaults: i32 = -@as(i32, @intCast(params.len -| want));
     const key: [9]i32 = .{ applic, is_user, spec, recv_match, score, owner_rank, param_spec, neg_defaults, neg_fid };
-    // `KLIO_EXTKEY_TRACE=<fid>,<fid>` — dump the eight-element ranking key for
-    // the named candidates. Ranking is lexicographic, so the first component
-    // that differs is the one that decides; reading it beats guessing which
-    // term dominates.
+    // Ranking is lexicographic: the first differing component decides.
     if (extKeyTraceWanted(sig.fid)) {
-        // Name the call site. A file/line beats a file id and byte offset,
-        // and the running program's source map is a global, so resolve
-        // through it when it is installed and fall back to the raw span when
-        // it is not (unit tests, pre-run lowering).
+        // Resolve through the installed source map, else the raw file id and offset.
         var loc_buf: [256]u8 = undefined;
         const loc: []const u8 = if (trace_call_span) |cs| blk: {
             if (span_mod.active_map) |m| {
@@ -1463,18 +1177,8 @@ fn applicableExtension(sig: *const SigView, args: []const ArgShape, scope: Appli
     };
 }
 
-// -------------------------------------------------------------------------
-// Runtime NAMED-ARGUMENT scorer (mirror of `host_call_func.zig`
-// `scoreNamedCandidate`). A named/defaulted/reordered call binds each `named`
-// arg to its distinct same-named parameter, positional args fill the remaining
-// slots (a trailing callable binds out of sequence to the last function-typed
-// param, a vararg absorbs positional arguments at its position), and every unfilled
-// non-vararg parameter must be defaultable. A per-arg type mismatch scores 0
-// (neutral) instead of disqualifying the candidate; only a named arg that no
-// parameter accepts, a doubly-filled parameter, or an over-supplied
-// non-vararg call is a hard reject. When `scope.arg_to_param_buf` is set, the
-// parameter each supplied arg bound to is recorded through it.
-// -------------------------------------------------------------------------
+// Named-argument scoring. Only a named arg no parameter accepts, a doubly filled
+// parameter, or an over-supplied non-vararg call is a hard reject.
 
 fn applicTraceReject(site: []const u8) void {
     if (comptime !@import("builtin").link_libc) return;
@@ -1484,8 +1188,7 @@ fn applicTraceReject(site: []const u8) void {
 
 fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: ApplicabilityScope) ?Score {
     const params = sig.params;
-    // A bodyless declaration is only selectable when it backs a native
-    // intrinsic; the caller folds that into `sig.has_body`.
+    // A bodyless declaration is selectable only when it backs a native intrinsic.
     if (!sig.has_body) { applicTraceReject("named-1"); return null; }
     if (params.len > 64) { applicTraceReject("named-2"); return null; }
 
@@ -1495,8 +1198,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
     var unknown: u16 = 0;
     const bind = scope.arg_to_param_buf;
 
-    // An implicit extension receiver fills the leading `this` parameter; no
-    // positional arg lands on it.
+    // An implicit extension receiver fills the leading `this` parameter.
     const is_ext = params.len > 0 and std.mem.eql(u8, params[0].name, "this");
     if (is_ext and scope.recv_external) filled[0] = true;
 
@@ -1510,13 +1212,8 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
                 break;
             }
         }
-        // A named argument no parameter accepts is a hard reject. The
-        // generated `$composer`/`$changed` pair included: with the
-        // pre-resolution call-threading oracle retired, a pair only ever
-        // reaches a call whose RESOLVED target declares it (the lowering
-        // completion) or is being probed by the member-miss completion,
-        // where a candidate NOT declaring the pair is correctly not the
-        // completed call's target.
+        // A named argument no parameter accepts is a hard reject, the generated
+        // `$composer`/`$changed` pair included.
         const p = pos orelse {
             if (comptime @import("builtin").link_libc) {
                 if (std.c.getenv("KLIO_APPLIC_TRACE") != null) {
@@ -1536,11 +1233,8 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         }
     }
 
-    // A trailing positional callable binds to the last function-typed
-    // parameter, out of sequence. Compose lowering appends its named
-    // `$composer`/`$changed` pair after the source trailing lambda; for that
-    // generated shape, the last user parameter immediately before the pair is
-    // still the source trailing-lambda target.
+    // A trailing positional callable binds the last function-typed parameter out
+    // of sequence; compose appends its pair after the source lambda.
     var trailing_lambda: ?usize = null;
     var trailing_lambda_param: ?u16 = null;
     if (args.len > 0 and params.len > 0) {
@@ -1598,11 +1292,8 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         }
     }
 
-    // Vararg-aware positional walk. Kotlin permits parameters after a vararg;
-    // when those parameters were supplied by name, every remaining positional
-    // argument at the vararg position belongs to the vararg. For generated
-    // slot-exact calls, retain enough trailing positional arguments to fill
-    // the still-unbound, non-defaulted parameters after it.
+    // Vararg-aware positional walk: Kotlin permits parameters after a vararg, so
+    // reserve positionals for the still-unbound, non-defaulted params behind it.
     var vararg_pos: ?usize = null;
     for (params, 0..) |p, pi| {
         if (p.is_vararg) {
@@ -1676,8 +1367,7 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
     }
 
     return .{
-        // Kotlin prefers an otherwise equal fixed declaration for named calls
-        // just as it does for positional calls.
+        // Kotlin prefers an otherwise equal fixed declaration, as positionally.
         .points = total - @as(i32, @intFromBool(vararg_pos != null)),
         .proven_args = proven,
         .unknown_args = unknown,
@@ -1690,10 +1380,6 @@ fn applicableNamed(sig: *const SigView, args: []const ArgShape, scope: Applicabi
         },
     };
 }
-
-// -------------------------------------------------------------------------
-// Tests.
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -1710,26 +1396,18 @@ test {
 }
 
 test "paramNameMatchesArg: identity and the compose-default rename" {
-    // Identity.
     try testing.expect(paramNameMatchesArg("onReuse", "onReuse"));
-    // The compose plugin renames a defaulted parameter `p` to `p$arg`; a
-    // source-level named argument still names the original `p`.
     try testing.expect(paramNameMatchesArg("onReuse$arg", "onReuse"));
     try testing.expect(paramNameMatchesArg("content$arg", "content"));
-    // No spurious matches: a different base, a bare suffix, or a caller name
-    // that already carries the suffix must not cross-bind.
     try testing.expect(!paramNameMatchesArg("onReuse$arg", "onSet"));
     try testing.expect(!paramNameMatchesArg("onReuse", "onReuse$arg"));
     try testing.expect(!paramNameMatchesArg("$arg", ""));
     try testing.expect(!paramNameMatchesArg("onReuse", "onSet"));
-    // The synthetic composer/changed named pair keeps its exact match (they
-    // are never defaulted, so no `$arg` form of them exists).
+    // The composer/changed pair is never defaulted, so only identity matches.
     try testing.expect(paramNameMatchesArg("$composer", "$composer"));
 }
 
 test "applicableNamed: a named arg binds the compose-default-renamed parameter" {
-    // `f(onReuse = x, content = y)` against the transformed signature
-    // `f(onReuse$arg, content, ...)` must bind `onReuse` to `onReuse$arg`.
     const params = [_]Param{
         .{ .name = "onReuse$arg", .ty = tref("Function0"), .default = null },
         .{ .name = "content", .ty = tref("Function0"), .default = null },
@@ -1856,8 +1534,6 @@ test "applicable: fixed arity outranks an equally typed vararg" {
 }
 
 test "applicable: null defaults falls back to the param has_default flag" {
-    // The lowering adapter (`sigViewForApplicability`) leaves `defaults` null
-    // and carries the default on the param, so under-application still ranks.
     var p = [_]Param{
         .{ .name = "a", .ty = tref("Int"), .default = null },
         .{ .name = "b", .ty = tref("Int"), .default = null },
@@ -1866,10 +1542,8 @@ test "applicable: null defaults falls back to the param has_default flag" {
     const sig = SigView{ .params = &p, .defaults = null };
     const args = [_]ArgShape{.{ .runtime_class = "Int" }};
     const sc = applicable(&sig, &args, .{}).?;
-    // 100 (exact head) - 1 (under-application) == 99.
     try testing.expectEqual(@as(i32, 99), sc.points);
     try testing.expect(!sc.exact_arity);
-    // Without the flag the same under-application is inapplicable.
     p[1].has_default = false;
     try testing.expect(applicable(&sig, &args, .{}) == null);
 }
@@ -1883,11 +1557,9 @@ test "builtinSupersOf: union table adds Collection and StringBuilder rows" {
 test "declared-type evidence: head match scores 100, mismatch stays unknown (never disqualifies)" {
     const p = oneParam("Double");
     const sig = SigView{ .params = &p };
-    // Exact declared head.
     const hit = [_]ArgShape{.{ .ty = tref("Double") }};
     try testing.expectEqual(@as(i32, 100), applicable(&sig, &hit, .{}).?.points);
-    // Mismatching declared head falls back to the unknown base — the
-    // candidate stays applicable (additive-only rule).
+    // A mismatching declared head falls back to unknown, still applicable.
     const miss = [_]ArgShape{.{ .ty = tref("String") }};
     try testing.expectEqual(@as(i32, 10), applicable(&sig, &miss, .{}).?.points);
 }
@@ -1912,7 +1584,7 @@ test "tyEvidenceBonus: zero without evidence, promotes matching candidates only"
         .{ .name = "a", .ty = tref("UInt"), .default = null },
         .{ .name = "b", .ty = tref("UInt"), .default = null },
     };
-    // No evidence: every candidate scores zero (ranking unchanged).
+    // No evidence: every candidate scores zero.
     const blank = [_]ArgShape{ .{}, .{} };
     try testing.expectEqual(@as(i32, 0), tyEvidenceBonus(&generic, &blank));
     try testing.expectEqual(@as(i32, 0), tyEvidenceBonus(&numeric, &blank));
@@ -1936,7 +1608,6 @@ test "applicable: bodyless candidate is never selectable" {
     try testing.expect(applicable(&sig, &args, .{}) == null);
 }
 
-// --- member scorer ----------------------------------------------------------
 
 test "applicable member: receiver slot skipped, base 0 (no under-application -1), exact_arity" {
     const p = [_]Param{
@@ -2007,9 +1678,7 @@ fn mockSubtype(_: *anyopaque, _: *const anyopaque, _: []const u8) ?i32 {
 
 test "applicable member: a class-type-param-typed param accepts an unrelated instance through the type_var callback" {
     var dummy: u8 = 0;
-    // `put(key: Key)` where `Key` is the owning class's type parameter — the
-    // arg's runtime class is unrelated (`Token`), which without the callback
-    // is a nominal mismatch (null).
+    // `Key` is the owning class's type parameter: without the callback, a mismatch.
     const p = oneParam("Key");
     const sig = SigView{ .params = &p, .fid = FuncId.from(3), .is_member = true };
     const args = [_]ArgShape{.{ .runtime_class = "Token", .value = @ptrCast(&dummy) }};
@@ -2066,7 +1735,6 @@ test "applicable member vs global: instance subtype tier formula differs" {
     try testing.expectEqual(@as(i32, 72), applicable(&sig, &args, mscope).?.points); // 75 - min(3,20)
 }
 
-// --- extension ranking ------------------------------------------------------
 
 test "applicable extension: ext_key mirrors ExtKey tuple" {
     const p = [_]Param{
@@ -2114,9 +1782,7 @@ test "applicable extension: under-applied param that is neither default nor vara
 }
 
 test "applicable extension: trailing lambda binds to the last function-typed param over a defaulted gap" {
-    // The `produce {}` shape: f(ctx: Ctx = …, cap: Int = …, block: () -> T)
-    // called with only a trailing lambda must be fully applicable, while a
-    // sibling whose first param lacks a default must not be.
+    // A lambda-only call must apply over a defaulted gap; the sibling must not.
     const good = [_]Param{
         .{ .name = "this", .ty = tref("Scope"), .default = null },
         .{ .name = "ctx", .ty = tref("Ctx"), .default = null, .has_default = true },
@@ -2142,7 +1808,6 @@ test "applicable extension: trailing lambda binds to the last function-typed par
     try testing.expectEqual(@as(i32, 0), bad_sc.ext_key.?[0]);
 }
 
-// --- named-argument scorer ---------------------------------------------------
 
 test "applicable named: reordered named args bind by name and record the binding" {
     const p = [_]Param{
@@ -2150,7 +1815,7 @@ test "applicable named: reordered named args bind by name and record the binding
         .{ .name = "b", .ty = tref("Int"), .default = null },
     };
     const sig = SigView{ .params = &p };
-    // Call `f(b = 1, a = 2)` — supplied out of declared order.
+    // Call `f(b = 1, a = 2)`, supplied out of declared order.
     const args = [_]ArgShape{
         .{ .runtime_class = "Int", .named = "b" },
         .{ .runtime_class = "Int", .named = "a" },
@@ -2240,12 +1905,7 @@ test "applicable named: Compose pair preserves the source trailing lambda" {
 }
 
 test "applicable named: the generated Compose pair only binds a candidate that declares it" {
-    // With the pre-resolution call-threading oracle retired, a
-    // `$composer`/`$changed` pair only reaches calls whose resolved target
-    // (or the member-miss completion's probe) declares it. A candidate that
-    // does NOT declare the pair is therefore inapplicable to a
-    // pair-carrying call — the reverse of the absorber this test used to
-    // pin, whose leniency existed only for the oracle's stray appends.
+    // A candidate not declaring the pair is inapplicable to a pair-carrying call.
     const plain = [_]Param{
         .{ .name = "enabled", .ty = tref("Boolean"), .default = null },
     };
@@ -2262,8 +1922,7 @@ test "applicable named: the generated Compose pair only binds a candidate that d
     try testing.expect(applicable(&.{ .params = &plain }, &args, .{ .named = true }) == null);
     try testing.expect(applicable(&.{ .params = &composable }, &args, .{ .named = true }) != null);
 
-    // A source-level named argument that names no parameter remains a hard
-    // reject.
+    // A named argument naming no parameter remains a hard reject.
     const bogus = [_]ArgShape{
         .{ .runtime_class = "Boolean", .named = "enabled" },
         .{ .runtime_class = "Int", .named = "notAParameter" },
@@ -2321,9 +1980,7 @@ test "applicable named: a per-arg type mismatch is neutral (scores 0), not disqu
         .{ .name = "y", .ty = tref("String"), .default = null },
     };
     const sig = SigView{ .params = &p };
-    // `y = <Int>` type-mismatches the String param but is not rejected; it
-    // scores 0 and the candidate stays applicable (named presence is the
-    // discriminator).
+    // `y = <Int>` mismatches the `String` param: scores 0, not rejected.
     const args = [_]ArgShape{
         .{ .runtime_class = "Int", .named = "x" },
         .{ .runtime_class = "Int", .named = "y" },
@@ -2339,7 +1996,6 @@ test "applicable named: unfilled non-default parameter is a reject; a default pa
         .{ .name = "b", .ty = tref("Int"), .default = null },
     };
     const args = [_]ArgShape{.{ .runtime_class = "Int", .named = "a" }};
-    // No default for b -> reject.
     const sig_nd = SigView{ .params = &p };
     try testing.expect(applicable(&sig_nd, &args, .{ .named = true }) == null);
     // b defaulted -> applicable with the -1 default-padding penalty.
@@ -2350,8 +2006,7 @@ test "applicable named: unfilled non-default parameter is a reject; a default pa
 }
 
 test "applicable named: defaulted trailing param stays fillable for named Int args" {
-    // `Color(red = 0, green = 0, blue = 0)` against the Int factory
-    // `Color(red: Int, green: Int, blue: Int, alpha: Int = 0xFF)`.
+    // `Color(red, green, blue)` against a factory whose `alpha` defaults.
     const factory = [_]Param{
         .{ .name = "red", .ty = tref("Int"), .default = null },
         .{ .name = "green", .ty = tref("Int"), .default = null },
@@ -2368,11 +2023,7 @@ test "applicable named: defaulted trailing param stays fillable for named Int ar
 
 
 test "applicable: unbindable trailing-lambda reading falls through to the positional fill" {
-    // `render({..}, {..})` against `(leading: (Int) -> Unit,
-    // trailing: (Int, String) -> Unit, plain: ((Int) -> Int)? = null)`:
-    // the out-of-sequence trailing reading needs the gap param `trailing`
-    // defaulted (it is not), so the positional fill must still bind —
-    // leading and trailing positionally, `plain` from its default.
+    // The gap param is not defaulted, so the positional fill must bind both.
     const p = [_]Param{
         .{ .name = "leading", .ty = tref("Function1"), .default = null },
         .{ .name = "trailing", .ty = tref("Function2"), .default = null },

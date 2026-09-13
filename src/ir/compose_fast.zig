@@ -1,16 +1,9 @@
-//! Host fast paths for the Compose runtime's smallest hot helpers.
-//!
-//! A recomposition spends most of its calls in one-line library machinery:
-//! the composer's `IntStack` of group offsets, the composite-key rotation,
-//! and the changelist's stacks. Interpreted, each of those is a resolved
-//! call plus a frame to run three instructions. The data is host-readable
-//! (an `IntArray` and an `Int` on the receiver; a `Long` and two `Int`s for
-//! the key math), so the host answers them outright.
-//!
-//! Exactness: every serve reproduces the upstream body, and any shape it
-//! cannot prove — a missing field, a non-`Int` slot, a stack that must grow,
-//! an out-of-range index — bails to the interpreted body, which then raises
-//! or resizes exactly as Kotlin does.
+//! Host fast paths for the Compose runtime's smallest hot helpers: the
+//! composer's `IntStack`, the composite-key rotation, the changelist's stacks,
+//! and the gap-buffer slot table. Every serve reproduces the upstream body
+//! exactly; any shape it cannot prove (a missing field, a non-`Int` slot, a
+//! stack that must grow, an out-of-range index) bails to the interpreted body,
+//! which then raises or resizes as Kotlin does.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -19,9 +12,7 @@ const Value = runtime.Value;
 pub const Route = enum(u8) {
     unknown = 0,
     none = 1,
-    /// `CompositeKeyHashCode.compoundWith(segment: Int, shift: Int)`
     compound_with = 2,
-    /// `CompositeKeyHashCode.unCompoundWith(segment: Int, shift: Int)`
     uncompound_with = 3,
     int_stack_push = 4,
     int_stack_pop = 5,
@@ -34,68 +25,39 @@ pub const Route = enum(u8) {
     int_stack_is_not_empty = 12,
     int_stack_clear = 13,
     int_stack_size = 14,
-    /// `Operations.pushOp(op)` and its checked wrapper `push(op)`: record the
-    /// operation and advance the argument cursors.
     ops_push_op = 15,
-    /// `Operations.ensureAllArgumentsPushedFor(op)`: a debug-only assertion
-    /// that this build compiles out (`EnableDebugRuntimeChecks = false`), so
-    /// its whole body is dead.
     ops_ensure_args = 16,
-    /// `Operations.WriteScope.setInt(parameter, value)`
     ops_set_int = 17,
-    /// `Operations.WriteScope.setObject(parameter, value)`
     ops_set_object = 18,
-    /// `IntArray.slotAnchor(address)` — the gap-buffer group table's data
-    /// anchor plus the slot bits above it.
+    /// `IntArray.slotAnchor(address)`: data anchor plus the slot bits above it.
     slot_anchor = 19,
-    /// `SlotWriter.dataAnchorToDataIndex(anchor, gapLen, capacity)` — pure
-    /// arithmetic that reads none of the writer's state.
     data_anchor_to_index = 20,
-    /// The link-buffer changelist's `pushOp`/`push`: the gap-buffer body plus
-    /// `requiresApplication` raised from the operation's visibility, which is
-    /// a stored constructor property there.
     ops_push_op_link = 21,
-    /// `SlotReader.next()` — the hot had-a-slot branch only.
     sr_next = 22,
-    /// `SlotReader.groupKey` getter / `groupKey(index)` / `isGroupEnd` /
-    /// `nodeCount` getter / `nodeCount(index)`.
     sr_group_key_get = 23,
     sr_is_group_end_get = 24,
     sr_node_count_get = 25,
     sr_node_count_at = 26,
     sr_group_key_at = 27,
-    /// Top-level `IntArray.parentAnchor(address)` (file-private, lowered as a
-    /// package function).
+    /// File-private top-level `IntArray.parentAnchor`, lowered as a package fun.
     gap_parent_anchor = 28,
-    /// `SlotWriter.dataIndex(index)` — gap-adjusted anchor arithmetic.
     sw_data_index = 29,
-    /// `RecomposeScopeImpl.requiresRecompose` accessor pair — one bit of the
-    /// packed `flags` field.
+    /// One bit of the packed `flags` field.
     rsi_req_recompose_set = 30,
     rsi_req_recompose_get = 31,
-    /// `GapComposer.validateNodeNotExpected()` — a no-op unless it raises.
     gap_validate_node = 32,
-    /// `SlotReader.startGroup()` / `endGroup()` — group cursor bookkeeping.
     sr_start_group = 33,
     sr_end_group = 34,
-    /// `Operations.OpIterator.next/getInt/getObject` — the changelist drain
-    /// cursor (identical bodies in both composers).
+    /// The changelist drain cursor; both composers share the bodies.
     op_iter_next = 35,
     op_iter_get_int = 36,
     op_iter_get_object = 37,
-    /// `SlotReader.objectKey` (the IntArray member-extension) and
-    /// `groupObjectKey(index)` — the object key behind the data anchor.
     sr_object_key = 38,
     sr_group_object_key = 39,
-    /// `CompositionObserverHolder.current()` — the observer, refreshed from
-    /// the parent context's holder for a non-root holder.
     obs_holder_current = 40,
-    /// `SlotWriter`'s IntArray `slotIndex(address)` member-extension — the
-    /// slot-anchor sibling of `dataIndex`.
     sw_slot_index = 41,
-    /// The generic `Stack<T>` (an ArrayList-backed value class): the pure
-    /// read members. `push`/`pop` mutate through the MutableList intrinsic
-    /// and live on the host seam instead.
+    /// The pure read members of the ArrayList-backed `Stack<T>` value class;
+    /// `push`/`pop` mutate through the MutableList intrinsic on the host seam.
     stack_t_is_empty = 42,
     stack_t_is_not_empty = 43,
     stack_t_peek = 44,
@@ -181,8 +143,8 @@ fn asI32(v: *const Value) ?i32 {
     };
 }
 
-/// The composite key rotation. `CompositeKeyHashCode` is `Long` in the
-/// engine's actuals, and `rotateLeft`/`rotateRight` take the shift mod 64.
+/// `CompositeKeyHashCode` is `Long` in the engine's actuals, so
+/// `rotateLeft`/`rotateRight` take the shift mod 64.
 pub fn serveCompoundWith(args: []const Value) ?Value {
     const base = asI64(&args[0]) orelse return null;
     const segment = asI32(&args[1]) orelse return null;
@@ -324,9 +286,7 @@ fn readOpCounts(op: *const Value) ?OpCounts {
     return .{ .ints = asI32(&iv) orelse return null, .objects = asI32(&ov) orelse return null };
 }
 
-/// `Operations.pushOp`: bounds-check the three parallel stores the upstream
-/// body performs, then record the operation and advance the cursors. Any
-/// stack that must grow bails to the interpreted body, which resizes.
+/// Bounds-checks all three parallel stores before recording anything.
 pub fn servePushOp(allocator: std.mem.Allocator, args: []const Value) ?Value {
     if (runtime.envOnce("KLIO_CF_TRACE") != null) std.debug.print("[cf] pushOp enter a0={s} a1={s}\n", .{ @tagName(std.meta.activeTag(args[0])), @tagName(std.meta.activeTag(args[1])) });
     if (args[0] != .Instance) return null;
@@ -386,8 +346,7 @@ pub fn servePushOp(allocator: std.mem.Allocator, args: []const Value) ?Value {
         }
         op_codes = codes_v.Array;
     }
-    // The boxed store retains through `ArrayData.set` and its mutable borrow
-    // raises the generational write barrier.
+    // `ArrayData.set` retains the boxed store and raises the write barrier.
     op_codes.set(allocator, @intCast(op_size), args[1]);
     const g = args[0].Instance.borrowMut();
     defer g.deinit();
@@ -401,8 +360,7 @@ pub fn servePushOp(allocator: std.mem.Allocator, args: []const Value) ?Value {
 threadlocal var fn_stack: std.atomic.Value(?[*]const u8) = .init(null);
 threadlocal var fn_offset: std.atomic.Value(?[*]const u8) = .init(null);
 
-/// The `WriteScope` value class wraps the `Operations` it writes into. A
-/// boxed scope carries it in `stack`; an unboxed one IS the stack.
+/// A boxed `WriteScope` holds its `Operations` in `stack`; an unboxed one is it.
 fn scopeStack(recv: *const Value) ?Value {
     if (recv.* != .Instance) return null;
     const g = recv.Instance.borrow();
@@ -426,8 +384,7 @@ fn paramOffset(v: *const Value) ?i32 {
 
 const TopArgs = struct { arr: runtime.ArrayData, index: i32 };
 
-/// `intArgs[intArgsSize - peekOperation().ints + parameter]`, or the object
-/// equivalent. Declines whenever the stack is empty or the index escapes.
+/// Declines whenever the stack is empty or the index escapes its window.
 fn topSlot(stack: *const Value, parameter: i32, comptime objects: bool) ?TopArgs {
     const g = stack.Instance.borrow();
     defer g.deinit();
@@ -480,9 +437,8 @@ pub fn serveSetObject(allocator: std.mem.Allocator, args: []const Value) ?Value 
 
 threadlocal var fn_visible: std.atomic.Value(?[*]const u8) = .init(null);
 
-/// The link-buffer changelist additionally aggregates the operation's
-/// visibility into `requiresApplication`. That flag is a stored constructor
-/// property of `Operation`, so the host reads it directly.
+/// The link-buffer changelist also folds the operation's visibility into
+/// `requiresApplication`, a stored constructor property of `Operation`.
 pub fn servePushOpLink(allocator: std.mem.Allocator, args: []const Value) ?Value {
     if (args[1] != .Instance) return null;
     const visible = blk: {
@@ -503,7 +459,6 @@ pub fn servePushOpLink(allocator: std.mem.Allocator, args: []const Value) ?Value
     return pushed;
 }
 
-/// `groups[address * 5 + 4] + countOneBits(groups[address * 5 + 1] shr 28)`.
 /// Kotlin's `shr` is arithmetic and `countOneBits` counts the 32-bit pattern,
 /// so the shift is signed and the population count unsigned.
 pub fn serveSlotAnchor(args: []const Value) ?Value {
@@ -523,7 +478,6 @@ pub fn serveSlotAnchor(args: []const Value) ?Value {
     return .{ .Int = anchor +% bits };
 }
 
-/// `if (anchor < 0) (capacity - gapLen) + anchor + 1 else anchor`
 pub fn serveDataAnchorToDataIndex(args: []const Value) ?Value {
     const anchor = asI32(&args[1]) orelse return null;
     if (anchor >= 0) return .{ .Int = anchor };
@@ -532,8 +486,7 @@ pub fn serveDataAnchorToDataIndex(args: []const Value) ?Value {
     return .{ .Int = (capacity -% gap_len) +% anchor +% 1 };
 }
 
-/// The argument-completeness assertion compiles out in this build, so the
-/// call has no effect at all.
+/// The argument-completeness assertion compiles out here, so the call is inert.
 pub fn serveEnsureArgs(args: []const Value) ?Value {
     if (args[0] != .Instance) return null;
     return .{ .Unit = {} };
@@ -541,8 +494,7 @@ pub fn serveEnsureArgs(args: []const Value) ?Value {
 
 threadlocal var fn_backing: std.atomic.Value(?[*]const u8) = .init(null);
 
-/// The generic `Stack<T>` value class wraps an `ArrayList<T>`. A boxed
-/// receiver carries the list in `backing`; an unboxed one IS the list.
+/// A boxed `Stack<T>` holds its `ArrayList<T>` in `backing`; an unboxed one is it.
 pub fn stackTBacking(recv: *const Value) ?Value {
     if (recv.* == .List) return recv.*;
     if (recv.* != .Instance) return null;
@@ -570,8 +522,7 @@ pub fn serveStackTIsNotEmpty(args: []const Value) ?Value {
     return .{ .Bool = n != 0 };
 }
 
-/// `peek()` / `peek(index)`. An out-of-bounds index declines (read-only, no
-/// side effects) so the interpreted body raises the exact exception.
+/// An out-of-bounds index declines so the interpreted body raises for real.
 pub fn serveStackTPeek(args: []const Value, at: ?i64) ?Value {
     const b = stackTBacking(&args[0]) orelse return null;
     const g = b.List.items.borrow();
@@ -608,18 +559,15 @@ threadlocal var fn_root_flag: std.atomic.Value(?[*]const u8) = .init(null);
 threadlocal var fn_parent_ctx: std.atomic.Value(?[*]const u8) = .init(null);
 threadlocal var fn_obs_holder: std.atomic.Value(?[*]const u8) = .init(null);
 
-/// Identity in the sense Kotlin's `!=` means for observer objects (no custom
-/// equals): the same instance cell, or both null.
+/// What Kotlin's `!=` means for an observer with no custom equals.
 fn sameObserver(a: *const Value, b: *const Value) bool {
     if (a.* == .Null and b.* == .Null) return true;
     if (a.* == .Instance and b.* == .Instance) return a.Instance.cell == b.Instance.cell;
     return false;
 }
 
-/// `CompositionObserverHolder.current()`: the root holder answers its own
-/// observer; a non-root holder refreshes it from the parent context's
-/// holder. The parent's `observerHolder` must be a STORED override (the base
-/// class computes null) — a computed one declines by field absence.
+/// A non-root holder refreshes from the parent context's holder, whose
+/// `observerHolder` must be a stored override; a computed one declines.
 pub fn serveObserverHolderCurrent(allocator: std.mem.Allocator, args: []const Value) ?Value {
     if (args[0] != .Instance) return null;
     var own_obs: Value = undefined;
@@ -665,14 +613,10 @@ pub fn serveObserverHolderCurrent(allocator: std.mem.Allocator, args: []const Va
     return parent_obs;
 }
 
-// ---- Slot-table reader / writer / changelist-iterator serves ----------------
-//
-// All of these are field-and-index math over the gap-buffer group table
-// (five ints per group: key, info, parent anchor, size, data anchor) and the
-// changelist's parallel arrays. Reads and validations run first under a
-// shared borrow; writes run after, under a mutable borrow, and only once
-// every written field has been proven present — a serve must never leave an
-// instance half-mutated before declining.
+// Index math over the gap-buffer group table (five ints per group: key, info,
+// parent anchor, size, data anchor). Reads and validations run under a shared
+// borrow, writes after under a mutable one and only once every written field
+// is proven present: a serve must never half-mutate an instance and decline.
 
 threadlocal var fn_empty_count: std.atomic.Value(?[*]const u8) = .init(null);
 threadlocal var fn_cur_slot: std.atomic.Value(?[*]const u8) = .init(null);
@@ -728,8 +672,7 @@ fn objArrayField(inst: anytype, slot: *std.atomic.Value(?[*]const u8), name: []c
     return v.Array;
 }
 
-/// `slots[currentSlot++]` on the had-a-slot branch; the empty/end branch
-/// returns `Composer.Empty`, which only the interpreted body can name.
+/// The empty/end branch returns `Composer.Empty`, which only the interpreter names.
 pub fn serveSlotReaderNext(args: []const Value) ?Value {
     if (args[0] != .Instance) return null;
     var slot_v: Value = undefined;
@@ -821,11 +764,8 @@ pub fn serveGapParentAnchor(args: []const Value) ?Value {
     return .{ .Int = v };
 }
 
-/// `groups.dataIndex(groupIndexToAddress(index))` over the writer's gaps.
-/// Handles BOTH same-fqn overloads: the member fun (receiver = the writer,
-/// gap-adjusts the index) and the IntArray member-extension (receiver = the
-/// group table, index already an address, writer owner on the enclosing
-/// chain).
+/// Both same-fqn overloads: the member fun, whose receiver is the writer and
+/// whose index is gap-adjusted, and the member-extension on the group table.
 pub fn serveSlotWriterDataIndex(args: []const Value) ?Value {
     if (args[0] == .Array) return serveSlotWriterDataIndexExt(args);
     if (args[0] != .Instance) return null;
@@ -849,10 +789,8 @@ pub fn serveSlotWriterDataIndex(args: []const Value) ?Value {
     return .{ .Int = (cap_slots -% slots_gap_len) +% anchor +% 1 };
 }
 
-/// The member-extension owner for the same-class private IntArray helpers.
 /// Member-extension dispatch pushes the owner as the top enclosing receiver
-/// before the body runs, and the serve validates the shape by field
-/// presence — a wrong top declines.
+/// before the body runs; the serve validates it by field presence.
 fn extOwner() ?Value {
     const v = @import("eval.zig").enclosingThisLast() orelse return null;
     if (v != .Instance) return null;
@@ -879,8 +817,7 @@ fn serveSlotWriterDataIndexExt(args: []const Value) ?Value {
     return .{ .Int = (cap_slots -% slots_gap_len) +% anchor +% 1 };
 }
 
-/// `slotIndex(address)`: `dataAnchorToDataIndex(slotAnchor(address), ...)`
-/// against the owner's gaps; past-capacity addresses answer the slot end.
+/// Against the owner's gaps; a past-capacity address answers the slot end.
 pub fn serveSlotWriterSlotIndex(args: []const Value) ?Value {
     if (args[0] != .Array or args[0].Array.primKind() != .Int) return null;
     const address = asI32(&args[1]) orelse return null;
@@ -914,8 +851,7 @@ fn objectKeyFrom(groups: runtime.ArrayData, slots: runtime.ArrayData, index: i32
     return v;
 }
 
-/// The IntArray member-extension form: the receiver IS the reader's group
-/// table, `slots` comes from the owner on the chain.
+/// The member-extension form: `slots` comes from the owner on the chain.
 pub fn serveSlotReaderObjectKey(args: []const Value) ?Value {
     if (args[0] != .Array or args[0].Array.primKind() != .Int) return null;
     const index = asI32(&args[1]) orelse return null;
@@ -926,7 +862,6 @@ pub fn serveSlotReaderObjectKey(args: []const Value) ?Value {
     return objectKeyFrom(args[0].Array, slots, index);
 }
 
-/// `groupObjectKey(index) = groups.objectKey(index)` — the member fun.
 pub fn serveSlotReaderGroupObjectKey(args: []const Value) ?Value {
     if (args[0] != .Instance) return null;
     const index = asI32(&args[1]) orelse return null;
@@ -967,8 +902,7 @@ pub fn serveRsiRequiresRecomposeSet(args: []const Value) ?Value {
     return .{ .Unit = {} };
 }
 
-/// `runtimeCheck(!nodeExpected)` — a no-op unless it must raise, and the
-/// raising path belongs to the interpreted body.
+/// `runtimeCheck(!nodeExpected)`: the raising path belongs to the interpreter.
 pub fn serveValidateNodeNotExpected(args: []const Value) ?Value {
     if (args[0] != .Instance) return null;
     const g = args[0].Instance.borrow();
@@ -980,9 +914,8 @@ pub fn serveValidateNodeNotExpected(args: []const Value) ?Value {
     };
 }
 
-/// `startGroup()`: cursor bookkeeping plus one push onto the reader's
-/// IntStack. Declines when the stack must grow, the precondition would
-/// fail, or a source-information map is attached.
+/// Declines when the IntStack must grow, the precondition would fail, or a
+/// source-information map is attached.
 pub fn serveSlotReaderStartGroup(args: []const Value) ?Value {
     if (args[0] != .Instance) return null;
     var stack_v: Value = undefined;
@@ -1025,9 +958,8 @@ pub fn serveSlotReaderStartGroup(args: []const Value) ?Value {
         else
             groupField(groups, cur + 1, DATA_ANCHOR_OFF) orelse return null;
     }
-    // The IntStack push first: it is the only step that can decline (a full
-    // stack resizes on the interpreted path), and nothing is written before
-    // it succeeds.
+    // The push runs first: it is the only step that can decline, and nothing
+    // may be written before it succeeds.
     const s = readStack(&stack_v) orelse return null;
     if (s.tos < 0 or @as(usize, @intCast(s.tos)) >= s.len) return null;
     s.slots.set(std.heap.page_allocator, @intCast(s.tos), .{ .Int = push_v });
@@ -1043,7 +975,6 @@ pub fn serveSlotReaderStartGroup(args: []const Value) ?Value {
     return .{ .Unit = {} };
 }
 
-/// `endGroup()`: the inverse bookkeeping plus one IntStack pop.
 pub fn serveSlotReaderEndGroup(args: []const Value) ?Value {
     if (args[0] != .Instance) return null;
     var stack_v: Value = undefined;
@@ -1100,8 +1031,7 @@ pub fn serveSlotReaderEndGroup(args: []const Value) ?Value {
     return .{ .Unit = {} };
 }
 
-/// The drain cursor over the changelist's parallel arrays. The iterator is
-/// an inner class: its `Operations` lives in the instance's captured outer.
+/// The iterator is an inner class: its `Operations` is the captured outer.
 fn iterOuter(recv: *const Value) ?Value {
     if (recv.* != .Instance) return null;
     const g = recv.Instance.borrow();
