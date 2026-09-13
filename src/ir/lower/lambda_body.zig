@@ -220,6 +220,27 @@ pub fn lowerLambdaBodyCapturingKindWith(
     );
 }
 
+/// The state one lambda-body lowering threads through its phases.
+///
+/// The driver builds one of these and hands every phase a pointer to it. The
+/// builder is a driver local, so its teardown stays with the scope that owns it.
+const LambdaBodyCtx = struct {
+    module: *Module,
+    b: *FuncBuilder,
+    params: []const ast.Ident,
+    param_tys: []const ?ast.TypeRef,
+    body: *const ast.Block,
+    is_lambda: bool,
+    suppress_it: bool,
+};
+
+/// How the body terminates: a local `fun`'s block body and a lambda bound to a
+/// `-> Unit` parameter both return Unit rather than the tail expression's value.
+const BodyReturnShape = struct {
+    fn_block_body: bool,
+    unit_body: bool,
+};
+
 /// As `lowerLambdaBodyCapturingKindWith`, with the explicit-`it` suppression
 /// decision: `suppress_it` declares no implicit `it`, so an `it` inside resolves to
 /// an enclosing lambda's or is rejected.
@@ -249,6 +270,64 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     b.setBodySpan(body.span);
     b.it_suppressed = suppress_it;
     b.it_suppressed_span = it_span;
+    var ctx: LambdaBodyCtx = .{
+        .module = module,
+        .b = &b,
+        .params = params,
+        .param_tys = param_tys,
+        .body = body,
+        .is_lambda = is_lambda,
+        .suppress_it = suppress_it,
+    };
+    try adoptEnclosingReceiver(&ctx);
+    try inheritEnclosingLocals(&ctx);
+    const shape = consumeBodyReturnShape(&ctx);
+    try inheritTypeParamContext(&ctx);
+    bindEnclosingNameScope(&ctx, enclosing_owner, outer, is_named_local_fn, named_local_encl_recv);
+    // A captured `block: T.() -> R` must still dispatch a bare `block()` as
+    // `this.block()`, so carry the receiver-lambda-param names across the boundary.
+    var inherited = inherited_rlp;
+    defer inherited.deinit();
+    // The same carrier for local extension functions, whose captured bare call must
+    // still prepend the enclosing receiver.
+    var inherited_ext = inherited_lef;
+    defer inherited_ext.deinit();
+    // A captured parameter with an unbounded type-parameter type stays statically
+    // erased inside nested lambdas, so an explicit receiver call keeps its callable
+    // fallback instead of consulting members on the runtime value.
+    var inherited_erased = inherited_erp;
+    defer inherited_erased.deinit();
+    try inheritCapturedCallables(&ctx, &inherited, &inherited_ext, &inherited_erased, inherited_lfo);
+    markTailrecSelf(&ctx, tailrec_self);
+    var boxed = try computeBodyBoxedVars(&ctx, outer_boxed);
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(b.allocator);
+    try collectParamNames(&ctx, &names);
+    try boxParamsAssignedInNestedLambdas(&ctx, names.items, &boxed);
+    b.setBoxedVars(boxed);
+    try decl.bindParams(&b, names.items);
+    try bindAnonContextParams(&ctx);
+    try bindInferredParamTypes(&ctx, names.items);
+    try bindAnnotatedParamTypes(&ctx);
+    try bindLocalContextParams(&ctx);
+    try bindImplicitThisLabel(&ctx);
+    try markTypedParamKinds(&ctx, broad_coll_params, generic_typed_params);
+    try markReceiverLambdaParams(&ctx);
+    try lowerBodyAndTerminate(&ctx, shape);
+    return try finishBodyFunc(&ctx, names.items, shape.unit_body);
+}
+
+// -------------------------------------------------------------------------
+// Inheriting the construction site's context.
+// -------------------------------------------------------------------------
+
+/// Adopt the receiver context the construction site stashed on the module: the
+/// receiver in scope at that site, the implicit-receiver tower, and the
+/// receiver this body owns outright.
+fn adoptEnclosingReceiver(ctx: *LambdaBodyCtx) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
+    const body = ctx.body;
     // The receiver in scope at this body's construction site, the enclosing `this`
     // or this receiver lambda's own, stashed by `lowerLambda`. Carried so a bare
     // call can disambiguate a receiver-lambda argument's arity, `recv_ty` being null
@@ -275,6 +354,14 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         module.pending_lambda_own_recv = null;
         b.setRecvTy(rt);
     }
+}
+
+/// Inherit what the enclosing frame knows about its locals: the enclosing local
+/// `fun`'s identity, the definitely-non-callable names, and the declared types
+/// a member call in this body resolves against.
+fn inheritEnclosingLocals(ctx: *LambdaBodyCtx) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
     // The enclosing local `fun`'s identity, so a bare self-reference binds through
     // the mangled cell.
     if (module.pending_lambda_self_fn) |slf| {
@@ -317,6 +404,12 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             try receiver.clone(b.allocator),
         );
     }
+}
+
+/// Consume the pending flags deciding whether the body returns its tail
+/// expression or Unit.
+fn consumeBodyReturnShape(ctx: *LambdaBodyCtx) BodyReturnShape {
+    const module = ctx.module;
     // A local `fun`'s block body returns Unit on fall-through, while a lambda
     // literal keeps last-expression semantics. Consumed before any nested lambda
     // lowers, so it never leaks inward.
@@ -326,6 +419,14 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     // for effect. Consumed before any nested lambda lowers.
     const unit_body = module.pending_lambda_unit;
     module.pending_lambda_unit = false;
+    return .{ .fn_block_body = fn_block_body, .unit_body = unit_body };
+}
+
+/// Inherit the enclosing type-parameter environment: erased parameter names,
+/// reified substitutions, declared bounds and context-function shapes.
+fn inheritTypeParamContext(ctx: *LambdaBodyCtx) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
     // Enclosing non-reified type params, so an `x as T` cast in this body is erased.
     if (module.pending_lambda_type_params) |tps| {
         module.pending_lambda_type_params = null;
@@ -361,6 +462,19 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         defer moduleAllocator(module).free(shapes);
         for (shapes) |sh| try b.markContextFnParam(sh.name, sh.ctx_types, sh.n_regular);
     }
+}
+
+/// Bind the name scope the body resolves against: the lexically enclosing class
+/// and the enclosing frame's visible names.
+fn bindEnclosingNameScope(
+    ctx: *LambdaBodyCtx,
+    enclosing_owner: ?EnclosingOwner,
+    outer: StringSet,
+    is_named_local_fn: bool,
+    named_local_encl_recv: bool,
+) void {
+    const b = ctx.b;
+    const is_lambda = ctx.is_lambda;
     // Carry the lexically enclosing class and its member-name set so a member
     // reference inside the lambda resolves against the declaring class, ahead of a
     // same-named imported extension.
@@ -375,11 +489,20 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     } else {
         b.setOuterNamesWithoutLambda(outer);
     }
-    // A captured `block: T.() -> R` must still dispatch a bare `block()` as
-    // `this.block()`, so carry the receiver-lambda-param names across the boundary.
-    var inherited = inherited_rlp;
-    defer inherited.deinit();
-    try b.inheritReceiverLambdaParams(&inherited);
+}
+
+/// Carry the enclosing scope's callable classifications across the boundary, so
+/// a bare call of a captured callable keeps its declaration-site shape.
+fn inheritCapturedCallables(
+    ctx: *LambdaBodyCtx,
+    inherited: *const StringSet,
+    inherited_ext: *const std.StringHashMap(i8),
+    inherited_erased: *const StringSet,
+    inherited_lfo: ?*const LocalFnOverloadTable,
+) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
+    try b.inheritReceiverLambdaParams(inherited);
     // The declared receiver heads ride the module's pending slot, the name set above
     // carrying no types, so a captured receiver-typed callable re-selects its
     // receiver by the declared head.
@@ -390,28 +513,35 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             try b.setReceiverLambdaRecvHead(kv.name, kv.head);
         }
     }
-    // The same carrier for local extension functions, whose captured bare call must
-    // still prepend the enclosing receiver.
-    var inherited_ext = inherited_lef;
-    defer inherited_ext.deinit();
-    try b.inheritLocalExtFns(&inherited_ext);
-    // A captured parameter with an unbounded type-parameter type stays statically
-    // erased inside nested lambdas, so an explicit receiver call keeps its callable
-    // fallback instead of consulting members on the runtime value.
-    var inherited_erased = inherited_erp;
-    defer inherited_erased.deinit();
-    try b.inheritErasedRecvParams(&inherited_erased);
+    try b.inheritLocalExtFns(inherited_ext);
+    try b.inheritErasedRecvParams(inherited_erased);
     // And for local-fn overload sets: a call to a captured local fn declared more
     // than once must still select the applicable sibling by its mangled binding.
     if (inherited_lfo) |table| {
         try b.inheritLocalFnOverloads(table);
     }
+}
+
+/// Put a local tailrec function's body in tail position under its own name.
+fn markTailrecSelf(ctx: *LambdaBodyCtx, tailrec_self: ?[]const u8) void {
+    const b = ctx.b;
     if (tailrec_self) |name| {
     // A local tailrec function body is in tail position: its last statement or
     // `return` operand may jump.
         b.tail_pos = true;
         b.setTailrecSelf(name);
     }
+}
+
+// -------------------------------------------------------------------------
+// Parameters and the body's own bindings.
+// -------------------------------------------------------------------------
+
+/// The names this body boxes onto shared cells: the ones it mutates itself,
+/// plus the enclosing boxed names it references.
+fn computeBodyBoxedVars(ctx: *LambdaBodyCtx, outer_boxed: *const StringSet) Allocator.Error!StringSet {
+    const b = ctx.b;
+    const body = ctx.body;
     var boxed = try ast_scan.computeBoxedVars(b.allocator, body.stmts);
     if (outer_boxed.count() != 0) {
         var refs = StringSet.init(b.allocator);
@@ -426,24 +556,45 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             }
         }
     }
-    var names: std.ArrayList([]const u8) = .empty;
-    defer names.deinit(b.allocator);
+    return boxed;
+}
+
+/// The body's parameter names: the declared ones, plus the implicit `it` a
+/// zero-parameter lambda binds.
+fn collectParamNames(ctx: *LambdaBodyCtx, names: *std.ArrayList([]const u8)) Allocator.Error!void {
+    const b = ctx.b;
+    const params = ctx.params;
+    const suppress_it = ctx.suppress_it;
     for (params) |p| try names.append(b.allocator, p.name);
     if (params.len == 0 and !suppress_it) {
         try names.append(b.allocator, "it");
     }
+}
+
+/// Box the parameters a deeper nested lambda writes.
+fn boxParamsAssignedInNestedLambdas(
+    ctx: *LambdaBodyCtx,
+    names: []const []const u8,
+    boxed: *StringSet,
+) Allocator.Error!void {
+    const b = ctx.b;
+    const body = ctx.body;
     // A lambda parameter a deeper nested lambda writes is a captured-and-mutated
     // local, so box it onto a shared cell rather than the StoreGlobal fallback.
     {
         var assigned = ast_scan.StringSet.init(b.allocator);
         defer assigned.deinit();
         try ast_scan.namesAssignedInLambdasRebindsOnly(body.stmts, &assigned);
-        for (names.items) |pname| {
+        for (names) |pname| {
             if (assigned.contains(pname)) try boxed.put(pname, {});
         }
     }
-    b.setBoxedVars(boxed);
-    try decl.bindParams(&b, names.items);
+}
+
+/// Bind an anonymous context function's context names from the context stack.
+fn bindAnonContextParams(ctx: *LambdaBodyCtx) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
     // An anonymous context function binds its context names from the context stack,
     // which the caller's `CtxCall` fills.
     if (module.pending_lambda_ctx_params) |ctx_params| {
@@ -456,16 +607,24 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             try b.bind(cp.name.name, r);
         }
     }
+}
+
+/// Bind the parameter types the pass stamped on an unannotated lambda,
+/// clearing the inherited enclosing-local records the names shadow.
+fn bindInferredParamTypes(ctx: *LambdaBodyCtx, names: []const []const u8) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
+    const param_tys = ctx.param_tys;
     // Parameter names shadow inherited enclosing-local records; without this a
     // nested lambda's `it` types from the outer `it`'s record.
-    for (names.items) |nm| b.clearLocalDeclType(nm);
+    for (names) |nm| b.clearLocalDeclType(nm);
     if (module.pending_lambda_param_types) |expected_types| {
         module.pending_lambda_param_types = null;
         defer moduleAllocator(module).free(expected_types);
     // The producer clamps the type list to `min(ref types, value params)`, so bind
     // the leading names that have a type and free any surplus.
-        const bind_n = @min(expected_types.len, names.items.len);
-        for (expected_types[0..bind_n], names.items[0..bind_n], 0..) |expected, name, i| {
+        const bind_n = @min(expected_types.len, names.len);
+        for (expected_types[0..bind_n], names[0..bind_n], 0..) |expected, name, i| {
             var owned = expected;
             if (i < param_tys.len and param_tys[i] != null) {
                 owned.deinit(b.allocator);
@@ -487,6 +646,15 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             owned.deinit(b.allocator);
         }
     }
+}
+
+/// Bind the source-annotated parameter types, with a vararg parameter taking
+/// the materialized array head its annotation's element type implies.
+fn bindAnnotatedParamTypes(ctx: *LambdaBodyCtx) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
+    const params = ctx.params;
+    const param_tys = ctx.param_tys;
     const vararg_names = module.pending_lambda_vararg_params;
     module.pending_lambda_vararg_params = null;
     for (params, 0..) |p, i| {
@@ -512,12 +680,28 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
         try b.setLocalDeclTypeOwned(p.name, try decl.loweredTypeRef(b.allocator, &ty, true));
         if (ty.nullable) try b.setLocalDeclNullable(p.name);
     }
+}
+
+/// Emit the context-parameter loads a local contextual function's body opens
+/// with.
+fn bindLocalContextParams(ctx: *LambdaBodyCtx) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
     // A local contextual function's context parameters bind here, before the body
     // statements lower.
     if (module.pending_ctx) |pc| {
         module.pending_ctx = null;
-        try decl.emitContextParamLoads(&b, pc.params, pc.type_params);
+        try decl.emitContextParamLoads(b, pc.params, pc.type_params);
     }
+}
+
+/// Bind an argument lambda's implicit `this@label` to the receiver the invoke
+/// fills in.
+fn bindImplicitThisLabel(ctx: *LambdaBodyCtx) Allocator.Error!void {
+    const module = ctx.module;
+    const b = ctx.b;
+    const body = ctx.body;
+    const is_lambda = ctx.is_lambda;
     // An argument lambda's implicit label names its receiver, so bind the label to
     // the receiver the invoke fills in and let a nested scope capture this one
     // rather than the innermost `this`.
@@ -541,6 +725,16 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             }
         }
     }
+}
+
+/// Mark the parameters whose expected type gives them a static classification
+/// the runtime value alone would not.
+fn markTypedParamKinds(
+    ctx: *LambdaBodyCtx,
+    broad_coll_params: []const []const u8,
+    generic_typed_params: []const []const u8,
+) Allocator.Error!void {
+    const b = ctx.b;
     // A lambda parameter statically typed as a broad collection yields a `List` from
     // `+`/`-` even over a runtime `Set`, so the operator lowering coerces.
     for (broad_coll_params) |pname| {
@@ -552,6 +746,14 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     for (generic_typed_params) |pname| {
         try b.markGenericTypedParam(pname);
     }
+}
+
+/// Classify the parameters declared with an extension-function type, so a bare
+/// call binds its first argument as the receiver.
+fn markReceiverLambdaParams(ctx: *LambdaBodyCtx) Allocator.Error!void {
+    const b = ctx.b;
+    const params = ctx.params;
+    const param_tys = ctx.param_tys;
     // A local fn's params get the classification `decl.zig` gives a top-level fn's:
     // a param declared with an extension-function type is a receiver-lambda param,
     // so a bare call binds its first argument as the receiver.
@@ -581,7 +783,20 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             try b.markReceiverLambdaArity(pname.name, ar);
         }
     }
-    const result = try expr.lowerBlock(&b, body);
+}
+
+// -------------------------------------------------------------------------
+// Lowering the body and finishing the func.
+// -------------------------------------------------------------------------
+
+/// Lower the body statements and terminate on the value the return shape calls
+/// for.
+fn lowerBodyAndTerminate(ctx: *LambdaBodyCtx, shape: BodyReturnShape) Allocator.Error!void {
+    const b = ctx.b;
+    const body = ctx.body;
+    const fn_block_body = shape.fn_block_body;
+    const unit_body = shape.unit_body;
+    const result = try expr.lowerBlock(b, body);
     if (fn_block_body or unit_body) {
         // `fun f() { 42 }` returns Unit; an explicit `return` terminates earlier.
         const unit_dst = b.allocReg();
@@ -591,24 +806,17 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
     } else {
         b.terminate(.{ .Return = result });
     }
-    const captured = try b.allocator.dupe([]const u8, b.capturesTaken());
-    var func = try b.finish("<lambda>", "<lambda>", if (unit_body) build.typeUnit() else (literalReturnTy(body) orelse build.typeUnit()));
-    // Function count is bounded well below u32::MAX; the index is the new FuncId.
-    const id = module.nextFuncId();
-    func.id = id;
-    func.is_lambda = is_lambda;
-    if (module.pending_ref_key) |key| {
-        func.ref_key = key;
-        module.pending_ref_key = null;
-    }
-    // The receiver head may alias a span-keyed `lambda_arg_recv` entry the builder
-    // frees at teardown, and the Func outlives the builder, so it must own its copy.
-    func.lambda_receiver_ty = if (b.recvTy()) |head| try b.allocator.dupe(u8, head) else null;
+}
+
+/// The declared parameter slots the body func carries.
+fn placeDeclaredParams(ctx: *LambdaBodyCtx, names: []const []const u8) Allocator.Error![]Param {
+    const b = ctx.b;
+    const param_tys = ctx.param_tys;
     // Declared parameter annotations land on the body func so runtime overload
     // dispatch can match the value against a declared function-type parameter.
     // Unannotated slots keep the Unit placeholder, which dispatch reads as unknown.
-    const placed_params = try b.allocator.alloc(Param, names.items.len);
-    for (names.items, placed_params, 0..) |n, *dst, i| {
+    const placed_params = try b.allocator.alloc(Param, names.len);
+    for (names, placed_params, 0..) |n, *dst, i| {
         const ty: ir.TypeRef = blk: {
             if (i < param_tys.len) {
                 if (param_tys[i]) |*t| break :blk try decl.loweredTypeRef(b.allocator, t, false);
@@ -624,6 +832,34 @@ pub fn lowerLambdaBodyCapturingKindWithIt(
             .has_default = false,
         };
     }
+    return placed_params;
+}
+
+/// Finish the body func: snapshot the captures, register the func under a new
+/// id and hand back the id plus that capture list.
+fn finishBodyFunc(
+    ctx: *LambdaBodyCtx,
+    names: []const []const u8,
+    unit_body: bool,
+) Allocator.Error!LoweredLambda {
+    const module = ctx.module;
+    const b = ctx.b;
+    const body = ctx.body;
+    const is_lambda = ctx.is_lambda;
+    const captured = try b.allocator.dupe([]const u8, b.capturesTaken());
+    var func = try b.finish("<lambda>", "<lambda>", if (unit_body) build.typeUnit() else (literalReturnTy(body) orelse build.typeUnit()));
+    // Function count is bounded well below u32::MAX; the index is the new FuncId.
+    const id = module.nextFuncId();
+    func.id = id;
+    func.is_lambda = is_lambda;
+    if (module.pending_ref_key) |key| {
+        func.ref_key = key;
+        module.pending_ref_key = null;
+    }
+    // The receiver head may alias a span-keyed `lambda_arg_recv` entry the builder
+    // frees at teardown, and the Func outlives the builder, so it must own its copy.
+    func.lambda_receiver_ty = if (b.recvTy()) |head| try b.allocator.dupe(u8, head) else null;
+    const placed_params = try placeDeclaredParams(ctx, names);
     func.params = placed_params;
     // A local extension function lowers as a lambda body with a synthesized leading
     // `this` receiver param, ordinary receiver lambdas carrying theirs as a capture.

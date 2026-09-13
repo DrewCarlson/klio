@@ -680,22 +680,26 @@ pub fn spliceInlineLambda(
     return spliceInlineLambdaOn(b, lambda_name, lam, arg_exprs, null, null);
 }
 
-/// As `spliceInlineLambda`, with the receiver supplied by the call rather than
-/// inferred from the parameter's name-keyed mark, which an enclosing splice of a
-/// same-named parameter can suspend.
-pub fn spliceInlineLambdaOn(
+/// A caller record a lambda-splice parameter binding shadows, restored when the
+/// splice ends.
+const ShadowSave = struct { name: []const u8, ty: ?ir.TypeRef, init: ?*const ast.Expr };
+
+/// A caller binding hidden for the duration of a spliced lambda body.
+const HiddenBind = struct { name: []const u8, h: build.HiddenBinding };
+
+/// Where a spliced lambda literal takes its subject from: the caller's supplied
+/// receiver, the first positional argument when a receiver-formed literal is
+/// invoked through a param-form function type, or nothing at all.
+const LambdaSeat = struct { receiver: ?Reg, arg_supplies_recv: bool };
+
+fn lambdaSpliceSeat(
     b: *FuncBuilder,
     lambda_name: []const u8,
     lam: *const Expr,
     arg_exprs: []const Expr,
     explicit_receiver: ?Reg,
-    receiver_expr: ?*const Expr,
-) Allocator.Error!Reg {
-    if (lam.* != .Lambda) {
-        return lowerExpr(b, lam);
-    }
+) LambdaSeat {
     const params = lam.Lambda.params;
-    const body = lam.Lambda.body;
     // A receiver-formed literal invoked with one more positional argument than it
     // declares gets its receiver from that argument, Kotlin's function types
     // interconverting. The mark-route fallback is the lexically enclosing subject,
@@ -718,46 +722,45 @@ pub fn spliceInlineLambdaOn(
         b.resolve("this")
     else
         null;
+    return .{ .receiver = receiver, .arg_supplies_recv = arg_supplies_recv };
+}
+
+/// `KLIO_SPLICE_TRACE=<param>`: how a lambda argument seated its receiver.
+fn traceLambdaSpliceEntry(
+    b: *FuncBuilder,
+    lambda_name: []const u8,
+    lam: *const Expr,
+    arg_exprs: []const Expr,
+    explicit_receiver: ?Reg,
+    seat: LambdaSeat,
+) void {
+    const params = lam.Lambda.params;
+    const receiver = seat.receiver;
+    const arg_supplies_recv = seat.arg_supplies_recv;
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
         if (std.mem.eql(u8, w, lambda_name)) std.debug.print("[splice-lam] {s} owner={s} rlp={} explicit={} recv={} seat={} nargs={d} nparams={d} it={} lar={} span={}:{}\n", .{ lambda_name, b.ownerClass() orelse "?", b.isReceiverLambdaParam(lambda_name), explicit_receiver != null, receiver != null, arg_supplies_recv, arg_exprs.len, params.len, lam.Lambda.implicit_it, b.lambdaArgRecv(lam.Lambda.span) != null, lam.Lambda.span.file, lam.Lambda.span.start });
     }
+}
 
-    const arg_regs = try b.allocator.alloc(Reg, arg_exprs.len);
-    defer b.allocator.free(arg_regs);
-    for (arg_exprs, 0..) |*a, i| {
-        arg_regs[i] = try lowerExpr(b, a);
-    }
-    // A receiver-formed literal invoked through a param-form function type supplies
-    // its receiver as the first argument; without the seat it falls into `it`.
-    const recv_seat = arg_supplies_recv;
-    const arg_shift: usize = if (recv_seat) 1 else 0;
-    const eff_arg_regs = arg_regs[arg_shift..];
-    const eff_arg_exprs = arg_exprs[arg_shift..];
-    // The lambda being spliced was defined in the caller's scope, so its free names
-    // resolve there, not against the inline fn's parameter scope. The caller depth is
-    // on the frame that substitutes this lambda, not the innermost one: a lambda
-    // spliced from inside another belongs to the scope it was written in.
-    const defining_frame = b.definingInlineLambdaFrame(lambda_name, lam);
-    const splice_caller_depth = if (defining_frame) |di|
-        b.inlineLambdaFrameCallerDepth(di)
-    else
-        b.inlineLambdaCallerDepth();
-    const site_hint = if (defining_frame) |di|
-        b.inlineLambdaFrameHint(di)
-    else
-        b.inlineLambdaCallerHint();
-    // The enclosing inline fn's param names, collected before this splice pushes its
-    // own frame, are the marks to suspend while the caller's body lowers.
-    var enclosing_subst_keys: std.ArrayList([]const u8) = .empty;
-    defer enclosing_subst_keys.deinit(b.allocator);
+/// The enclosing inline fn's param names, collected before this splice pushes its
+/// own frame: exactly the marks to suspend while the caller's body lowers.
+fn collectEnclosingSubstKeys(b: *FuncBuilder, out: *std.ArrayList([]const u8)) Allocator.Error!void {
     if (b.innermostInlineLambdaSubst()) |subst0| {
         var kit0 = subst0.keyIterator();
-        while (kit0.next()) |k0| try enclosing_subst_keys.append(b.allocator, k0.*);
+        while (kit0.next()) |k0| try out.append(b.allocator, k0.*);
     }
-    const counted = inline_state.inlineExpandEnter();
-    const subject_prior_this = b.resolve("this");
-    try b.pushScope();
-    const lambda_own_base = b.scopeDepth() - 1;
+}
+
+/// The lambda's subject binds as its `this`, and as `this@<fn>` inside a receiver
+/// lambda passed to inline `f`, shadowing the fn splice's same-labeled binding.
+fn bindLambdaSubject(
+    b: *FuncBuilder,
+    lambda_name: []const u8,
+    receiver: ?Reg,
+    recv_seat: bool,
+    arg_regs: []const Reg,
+    lambda_own_base: usize,
+) Allocator.Error!void {
     if (receiver) |reg| try b.bind("this", reg) else if (recv_seat) try b.bind("this", arg_regs[0]);
     // Inside a receiver lambda passed to inline `f`, `this@f` names the lambda's own
     // receiver and shadows the fn splice's same-labeled binding, under which a
@@ -771,19 +774,20 @@ pub fn spliceInlineLambdaOn(
     if (inline_state.runtime.envOnce("KLIO_THIS_TRACE") != null) {
         std.debug.print("[lam-splice-bind] {s} recv={?d} own_base={d} depth={d}\n", .{ lambda_name, if (receiver) |r| r.int() else null, lambda_own_base, b.scopeDepth() });
     }
-    // The splice's parameter bindings inherit the argument expressions' static types,
-    // what kotlinc gives the lambda parameter. The splice runs in the caller's
-    // builder, so the binding shadows a same-named outer record and restores on exit.
-    const ShadowSave = struct { name: []const u8, ty: ?ir.TypeRef, init: ?*const ast.Expr };
-    var shadow_saves: std.ArrayList(ShadowSave) = .empty;
-    defer {
-        for (shadow_saves.items) |*sv| {
-            b.clearLocalDeclType(sv.name);
-            if (sv.ty) |t| b.setLocalDeclTypeOwned(sv.name, t) catch {};
-            if (sv.init) |e| b.setLocalInitExpr(sv.name, e) catch {};
-        }
-        shadow_saves.deinit(b.allocator);
-    }
+}
+
+/// The splice's parameter bindings inherit the argument expressions' static types,
+/// what kotlinc gives the lambda parameter. The splice runs in the caller's
+/// builder, so each binding shadows a same-named outer record, saved for the
+/// caller to restore on exit.
+fn bindSplicedLambdaParams(
+    b: *FuncBuilder,
+    lam: *const Expr,
+    eff_arg_regs: []const Reg,
+    eff_arg_exprs: []const Expr,
+    shadow_saves: *std.ArrayList(ShadowSave),
+) Allocator.Error!void {
+    const params = lam.Lambda.params;
     const bind_n: usize = if (params.len == 0)
         @min(@as(usize, 1), eff_arg_regs.len)
     else
@@ -842,18 +846,26 @@ pub fn spliceInlineLambdaOn(
             }
         }
     }
-    // Capture the owner splice's localize target before pushing the new frame, then
-    // duplicate it so restoring does not alias the frame's own snapshot. The target
-    // for an unlabeled `return` belongs to the frame the lambda was defined under.
-    const owner_ret: ?[]InlineReturn = if (defining_frame) |di|
-        try b.allocator.dupe(InlineReturn, b.inlineLambdaFrameOwnerReturn(di))
-    else if (b.inlineLambdaOwnerReturn()) |o|
-        try b.allocator.dupe(InlineReturn, o)
-    else
-        null;
-    // The lambda body is caller code, so the inline lambda parameters it can invoke
-    // come from the frame the lambda was defined under; the inline function's own
-    // frame is skipped, and a name it binds itself shadows.
+}
+
+/// The owner splice's localize target, captured before the new frame is pushed
+/// and duplicated so restoring does not alias the frame's own snapshot. The target
+/// for an unlabeled `return` belongs to the frame the lambda was defined under.
+fn ownerLambdaReturnSnapshot(b: *FuncBuilder, defining_frame: ?usize) Allocator.Error!?[]InlineReturn {
+    if (defining_frame) |di| return try b.allocator.dupe(InlineReturn, b.inlineLambdaFrameOwnerReturn(di));
+    if (b.inlineLambdaOwnerReturn()) |o| return try b.allocator.dupe(InlineReturn, o);
+    return null;
+}
+
+/// The lambda body is caller code, so the inline lambda parameters it can invoke
+/// come from the frame the lambda was defined under; the inline function's own
+/// frame is skipped, and a name it binds itself shadows.
+fn inheritedLambdaSubst(
+    b: *FuncBuilder,
+    lam: *const Expr,
+    defining_frame: ?usize,
+) Allocator.Error!std.StringHashMap(*const ast.Expr) {
+    const params = lam.Lambda.params;
     var inherited_subst = std.StringHashMap(*const ast.Expr).init(b.allocator);
     if (defining_frame) |di| {
         if (di > 0) {
@@ -877,22 +889,17 @@ pub fn spliceInlineLambdaOn(
             }
         }
     }
-    try b.pushInlineLambdaFrame(inherited_subst, b.scopeDepth());
-    const saved = try b.takeInlineReturn();
-    if (owner_ret) |o| {
-        try b.restoreInlineReturn(o);
-    }
-    const result = b.allocReg();
-    const unit0 = try b.emitConst(Const.Unit);
-    try b.push(.{ .Move = .{ .dst = result, .src = unit0 } });
-    const end = try b.allocBlock();
-    const label = b.currentInlineFn();
-    if (label) |lbl| {
-        try b.pushInlineLambdaRet(lbl, result, end);
-    }
-    // Resolve the lambda body's free names against the caller scopes plus the
-    // lambda's own, skipping the inline fn's parameter scopes in between.
-    const prev_splice = b.lambda_splice_resolve;
+    return inherited_subst;
+}
+
+/// Resolve the lambda body's free names against the caller scopes plus the
+/// lambda's own, skipping the inline fn's parameter scopes in between. Returns
+/// whether a hidden band was pushed for that skipped region.
+fn openSpliceResolveWindow(
+    b: *FuncBuilder,
+    splice_caller_depth: ?usize,
+    lambda_own_base: usize,
+) Allocator.Error!bool {
     var pushed_band = false;
     if (splice_caller_depth) |d| {
         b.lambda_splice_resolve = .{ .caller_depth = d, .own_base = lambda_own_base };
@@ -903,41 +910,59 @@ pub fn spliceInlineLambdaOn(
             pushed_band = true;
         }
     }
-    // The lambda body is caller code: its bare calls resolve under the hint active at
-    // the inline call site. The spliced body's receiver-lambda-param marks are scoped
-    // to the inline fn's own names, and a leaked mark emits CallValueWithThis with
-    // the scope subject as receiver, so suspend exactly those for the caller body.
-    var suspended_rlp: std.ArrayList([]const u8) = .empty;
-    defer suspended_rlp.deinit(b.allocator);
-    for (enclosing_subst_keys.items) |k| {
-    // Only a mark this splice added for the inline fn's own parameter is suspended;
-    // a caller's same-named receiver-lambda parameter keeps its own. The mark bit is
-    // name-keyed with no provenance, so keep it whenever an outer frame carries it.
+    return pushed_band;
+}
+
+/// The spliced body's receiver-lambda-param marks are scoped to the inline fn's
+/// own names, and a leaked mark emits CallValueWithThis with the scope subject as
+/// receiver, so suspend exactly those while the caller body lowers.
+fn suspendEnclosingRlpMarks(
+    b: *FuncBuilder,
+    keys: []const []const u8,
+    out: *std.ArrayList([]const u8),
+) Allocator.Error!void {
+    for (keys) |k| {
+        // Only a mark this splice added for the inline fn's own parameter is suspended;
+        // a caller's same-named receiver-lambda parameter keeps its own. The mark bit is
+        // name-keyed with no provenance, so keep it whenever an outer frame carries it.
         if (b.isReceiverLambdaParam(k) and b.isSpliceRlpMark(k) and
             !b.isSharedRlpMark(k))
         {
             b.unmarkReceiverLambdaParam(k);
-            try suspended_rlp.append(b.allocator, k);
+            try out.append(b.allocator, k);
         }
     }
-    // The inline fn's own parameter bindings are hidden for the caller body too, or
-    // they shadow a caller class's same-named member.
-    var hidden_binds: std.ArrayList(struct { name: []const u8, h: build.HiddenBinding }) = .empty;
-    defer hidden_binds.deinit(b.allocator);
-    for (enclosing_subst_keys.items) |k| {
+}
+
+/// The inline fn's own parameter bindings are hidden for the caller body too, or
+/// they shadow a caller class's same-named member.
+fn hideEnclosingParamBindings(
+    b: *FuncBuilder,
+    keys: []const []const u8,
+    out: *std.ArrayList(HiddenBind),
+) Allocator.Error!void {
+    for (keys) |k| {
         if (b.hideBinding(k)) |h| {
-            try hidden_binds.append(b.allocator, .{ .name = k, .h = h });
+            try out.append(b.allocator, .{ .name = k, .h = h });
         }
     }
-    const lam_prev_active = b.spliceHintActive();
-    const lam_prev_recv = b.spliceHintRecv();
-    // The spliced receiver lambda has no runtime closure, its subject being only the
-    // window's bound register, so bare member reads need the subject's static head
-    // to win the member-versus-global arbitration.
+}
+
+/// The spliced receiver lambda has no runtime closure, its subject being only the
+/// window's bound register, so bare member reads need the subject's static head to
+/// win the member-versus-global arbitration.
+fn splicedSubjectHead(
+    b: *FuncBuilder,
+    lambda_name: []const u8,
+    lam: *const Expr,
+    arg_exprs: []const Expr,
+    receiver_expr: ?*const Expr,
+    explicit_receiver: ?Reg,
+    receiver: ?Reg,
+    recv_seat: bool,
+    subject_reg: ?Reg,
+) Allocator.Error!?[]const u8 {
     var recv_head: ?[]const u8 = null;
-    // A seated subject, invoked with value-arity plus one positional args, is a
-    // subject exactly like a supplied receiver.
-    const subject_reg: ?Reg = receiver orelse if (recv_seat) arg_regs[0] else null;
     if (subject_reg != null) {
         recv_head = b.receiverLambdaRecvHead(lambda_name);
         if (recv_head == null) {
@@ -975,6 +1000,253 @@ pub fn spliceInlineLambdaOn(
             recv_head = b.spliceRecvTy();
         }
     }
+    return recv_head;
+}
+
+/// Body-declared `var`s a nested closure writes must box, the scan
+/// `tryInlineCallWithTypeArgs` runs for an inline fn body.
+fn markLambdaBodyBoxedVars(
+    b: *FuncBuilder,
+    body: *const ast.Block,
+    out: *std.ArrayList([]const u8),
+) Allocator.Error!void {
+    var body_boxed = try ast_scan.computeBoxedVars(b.allocator, body.stmts);
+    defer body_boxed.deinit();
+    var bit = body_boxed.keyIterator();
+    while (bit.next()) |k| {
+        if (!b.isBoxed(k.*)) {
+            try b.markBoxed(k.*);
+            try out.append(b.allocator, k.*);
+        }
+    }
+}
+
+/// The localize target and join point a spliced lambda body returns through: the
+/// caller's own inline-return stack is taken aside for the duration, the owner
+/// frame's target reinstated over it, and a labeled `return@<fn>` funnels to `end`.
+const SplicedLambdaReturn = struct {
+    saved: []InlineReturn,
+    result: Reg,
+    end: ir.BlockId,
+    label: ?[]const u8,
+};
+
+fn openSplicedLambdaReturn(
+    b: *FuncBuilder,
+    inherited_subst: std.StringHashMap(*const ast.Expr),
+    owner_ret: ?[]InlineReturn,
+) Allocator.Error!SplicedLambdaReturn {
+    try b.pushInlineLambdaFrame(inherited_subst, b.scopeDepth());
+    const saved = try b.takeInlineReturn();
+    if (owner_ret) |o| {
+        try b.restoreInlineReturn(o);
+    }
+    const result = b.allocReg();
+    const unit0 = try b.emitConst(Const.Unit);
+    try b.push(.{ .Move = .{ .dst = result, .src = unit0 } });
+    const end = try b.allocBlock();
+    const label = b.currentInlineFn();
+    if (label) |lbl| {
+        try b.pushInlineLambdaRet(lbl, result, end);
+    }
+    return .{ .saved = saved, .result = result, .end = end, .label = label };
+}
+
+/// In a receiver lambda the innermost implicit receiver is the lambda's subject,
+/// so bare calls hint its head, not the enclosing fn's receiver; without a subject
+/// the hint is the one active at the call site. Returns the parked `this` narrow.
+fn installSplicedLambdaHint(
+    b: *FuncBuilder,
+    subject_reg: ?Reg,
+    recv_head: ?[]const u8,
+    site_hint: ?FuncBuilder.CallerHint,
+) ?[]const u8 {
+    if (subject_reg != null) {
+        b.setSpliceHint(true, recv_head);
+        if (rfsEnabled()) {
+            b.setSpliceRecvTy(recv_head);
+            b.splice_recv_from_window = recv_head != null;
+        }
+    } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
+    return b.setThisNarrow(if (subject_reg != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
+}
+
+/// The caller-code region a spliced lambda body lowers in: the caller's member
+/// scope swapped back in, the subject joined to the runtime enclosing-receiver
+/// chain, the enclosing in-progress marks hidden so a same-fn call inside is not
+/// self-recursive, and the inline-fn-body flag suspended so the callee's loops
+/// cannot capture the lambda's `break`/`continue`.
+const SplicedBodyRegion = struct {
+    caller_scope: ?FuncBuilder.CallerScopeRestore,
+    encl_pushed: bool,
+    prev_tower_top: ?Reg,
+    prev_decl_base: usize,
+    prev_inline_fn_body: u32,
+};
+
+fn enterSplicedLambdaBody(b: *FuncBuilder, subject_reg: ?Reg) Allocator.Error!SplicedBodyRegion {
+    const caller_scope = try b.enterCallerMemberScope();
+    const encl_pushed = subject_reg != null and rfsEnabled();
+    const prev_tower_top = b.encl_tower_top;
+    if (encl_pushed) {
+        try b.push(.{ .EnclosingPush = .{ .src = subject_reg.? } });
+        b.encl_tower_depth += 1;
+        b.encl_tower_top = subject_reg.?;
+    }
+    const prev_decl_base = b.inline_stack_visible_base;
+    if (!std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_NRG") orelse "1", "0")) {
+        b.inline_stack_visible_base = b.inline_stack.items.len;
+    }
+    // A tail-position call hands its tail position to the lambda's last statement.
+    b.tail_pos = b.tail_call_ok;
+    const prev_inline_fn_body = b.lowering_inline_fn_body;
+    b.lowering_inline_fn_body = 0;
+    b.in_spliced_lambda_body += 1;
+    return .{
+        .caller_scope = caller_scope,
+        .encl_pushed = encl_pushed,
+        .prev_tower_top = prev_tower_top,
+        .prev_decl_base = prev_decl_base,
+        .prev_inline_fn_body = prev_inline_fn_body,
+    };
+}
+
+fn exitSplicedLambdaBody(b: *FuncBuilder, region: SplicedBodyRegion) void {
+    b.in_spliced_lambda_body -= 1;
+    b.lowering_inline_fn_body = region.prev_inline_fn_body;
+    b.inline_stack_visible_base = region.prev_decl_base;
+    if (region.encl_pushed) {
+        b.encl_tower_depth -= 1;
+        b.encl_tower_top = region.prev_tower_top;
+    }
+    if (region.caller_scope) |cs| b.exitCallerMemberScope(cs);
+}
+
+/// Hand every mark, binding and hint this splice parked back to the caller, in the
+/// reverse of the order they were taken.
+fn restoreSplicedLambdaContext(
+    b: *FuncBuilder,
+    lam_boxed_here: []const []const u8,
+    hidden_binds: []const HiddenBind,
+    suspended_rlp: []const []const u8,
+    lam_prev_narrow: ?[]const u8,
+    lam_prev_active: bool,
+    lam_prev_recv: ?[]const u8,
+    subject_reg: ?Reg,
+    lam_prev_splice_recv: ?[]const u8,
+    lam_prev_recv_from_window: bool,
+    pushed_band: bool,
+    prev_splice: ?build.SpliceWindow,
+) Allocator.Error!void {
+    for (lam_boxed_here) |n| b.unmarkBoxed(n);
+    for (hidden_binds) |hb| b.restoreHiddenBinding(hb.name, hb.h);
+    for (suspended_rlp) |k| try b.markReceiverLambdaParam(k);
+    _ = b.setThisNarrow(lam_prev_narrow);
+    b.setSpliceHint(lam_prev_active, lam_prev_recv);
+    if (subject_reg != null and rfsEnabled()) {
+        b.setSpliceRecvTy(lam_prev_splice_recv);
+        b.splice_recv_from_window = lam_prev_recv_from_window;
+    }
+    if (pushed_band) _ = b.splice_hidden_bands.pop();
+    b.lambda_splice_resolve = prev_splice;
+}
+
+/// As `spliceInlineLambda`, with the receiver supplied by the call rather than
+/// inferred from the parameter's name-keyed mark, which an enclosing splice of a
+/// same-named parameter can suspend.
+pub fn spliceInlineLambdaOn(
+    b: *FuncBuilder,
+    lambda_name: []const u8,
+    lam: *const Expr,
+    arg_exprs: []const Expr,
+    explicit_receiver: ?Reg,
+    receiver_expr: ?*const Expr,
+) Allocator.Error!Reg {
+    if (lam.* != .Lambda) {
+        return lowerExpr(b, lam);
+    }
+    const body = lam.Lambda.body;
+    const seat = lambdaSpliceSeat(b, lambda_name, lam, arg_exprs, explicit_receiver);
+    const receiver = seat.receiver;
+    traceLambdaSpliceEntry(b, lambda_name, lam, arg_exprs, explicit_receiver, seat);
+
+    const arg_regs = try b.allocator.alloc(Reg, arg_exprs.len);
+    defer b.allocator.free(arg_regs);
+    for (arg_exprs, 0..) |*a, i| {
+        arg_regs[i] = try lowerExpr(b, a);
+    }
+    // A receiver-formed literal invoked through a param-form function type supplies
+    // its receiver as the first argument; without the seat it falls into `it`.
+    const recv_seat = seat.arg_supplies_recv;
+    const arg_shift: usize = if (recv_seat) 1 else 0;
+    const eff_arg_regs = arg_regs[arg_shift..];
+    const eff_arg_exprs = arg_exprs[arg_shift..];
+    // The lambda being spliced was defined in the caller's scope, so its free names
+    // resolve there, not against the inline fn's parameter scope. The caller depth is
+    // on the frame that substitutes this lambda, not the innermost one: a lambda
+    // spliced from inside another belongs to the scope it was written in.
+    const defining_frame = b.definingInlineLambdaFrame(lambda_name, lam);
+    const splice_caller_depth = if (defining_frame) |di|
+        b.inlineLambdaFrameCallerDepth(di)
+    else
+        b.inlineLambdaCallerDepth();
+    const site_hint = if (defining_frame) |di|
+        b.inlineLambdaFrameHint(di)
+    else
+        b.inlineLambdaCallerHint();
+    // The enclosing inline fn's param names, collected before this splice pushes its
+    // own frame, are the marks to suspend while the caller's body lowers.
+    var enclosing_subst_keys: std.ArrayList([]const u8) = .empty;
+    defer enclosing_subst_keys.deinit(b.allocator);
+    try collectEnclosingSubstKeys(b, &enclosing_subst_keys);
+    const counted = inline_state.inlineExpandEnter();
+    const subject_prior_this = b.resolve("this");
+    try b.pushScope();
+    const lambda_own_base = b.scopeDepth() - 1;
+    try bindLambdaSubject(b, lambda_name, receiver, recv_seat, arg_regs, lambda_own_base);
+    // The splice's parameter bindings inherit the argument expressions' static types,
+    // what kotlinc gives the lambda parameter. The splice runs in the caller's
+    // builder, so the binding shadows a same-named outer record and restores on exit.
+    var shadow_saves: std.ArrayList(ShadowSave) = .empty;
+    defer {
+        for (shadow_saves.items) |*sv| {
+            b.clearLocalDeclType(sv.name);
+            if (sv.ty) |t| b.setLocalDeclTypeOwned(sv.name, t) catch {};
+            if (sv.init) |e| b.setLocalInitExpr(sv.name, e) catch {};
+        }
+        shadow_saves.deinit(b.allocator);
+    }
+    try bindSplicedLambdaParams(b, lam, eff_arg_regs, eff_arg_exprs, &shadow_saves);
+    const owner_ret = try ownerLambdaReturnSnapshot(b, defining_frame);
+    const inherited_subst = try inheritedLambdaSubst(b, lam, defining_frame);
+    const ret = try openSplicedLambdaReturn(b, inherited_subst, owner_ret);
+    const result = ret.result;
+    // Resolve the lambda body's free names against the caller scopes plus the
+    // lambda's own, skipping the inline fn's parameter scopes in between.
+    const prev_splice = b.lambda_splice_resolve;
+    const pushed_band = try openSpliceResolveWindow(b, splice_caller_depth, lambda_own_base);
+    var suspended_rlp: std.ArrayList([]const u8) = .empty;
+    defer suspended_rlp.deinit(b.allocator);
+    try suspendEnclosingRlpMarks(b, enclosing_subst_keys.items, &suspended_rlp);
+    var hidden_binds: std.ArrayList(HiddenBind) = .empty;
+    defer hidden_binds.deinit(b.allocator);
+    try hideEnclosingParamBindings(b, enclosing_subst_keys.items, &hidden_binds);
+    const lam_prev_active = b.spliceHintActive();
+    const lam_prev_recv = b.spliceHintRecv();
+    // A seated subject, invoked with value-arity plus one positional args, is a
+    // subject exactly like a supplied receiver.
+    const subject_reg: ?Reg = receiver orelse if (recv_seat) arg_regs[0] else null;
+    const recv_head = try splicedSubjectHead(
+        b,
+        lambda_name,
+        lam,
+        arg_exprs,
+        receiver_expr,
+        explicit_receiver,
+        receiver,
+        recv_seat,
+        subject_reg,
+    );
     const lam_prev_splice_recv = b.spliceRecvTy();
     const lam_prev_recv_from_window = b.splice_recv_from_window;
     const subject_bind_pushed = subject_reg != null;
@@ -988,87 +1260,37 @@ pub fn spliceInlineLambdaOn(
     defer if (subject_bind_pushed) {
         _ = b.subject_binds.pop();
     };
-    if (subject_reg != null) {
-        // In a receiver lambda the innermost implicit receiver is the lambda's
-        // subject, so bare calls hint its head, not the enclosing fn's receiver.
-        b.setSpliceHint(true, recv_head);
-        if (rfsEnabled()) {
-            b.setSpliceRecvTy(recv_head);
-            b.splice_recv_from_window = recv_head != null;
-        }
-    } else if (site_hint) |sh| b.setSpliceHint(sh.active, sh.recv);
-    const lam_prev_narrow = b.setThisNarrow(if (subject_reg != null) null else if (site_hint) |sh| sh.this_narrow else b.thisNarrow());
+    const lam_prev_narrow = installSplicedLambdaHint(b, subject_reg, recv_head, site_hint);
     // Body-declared `var`s a nested closure writes must box, the scan
     // `tryInlineCallWithTypeArgs` runs for an inline fn body.
     var lam_boxed_here: std.ArrayList([]const u8) = .empty;
     defer lam_boxed_here.deinit(b.allocator);
-    {
-        var body_boxed = try ast_scan.computeBoxedVars(b.allocator, body.stmts);
-        defer body_boxed.deinit();
-        var bit = body_boxed.keyIterator();
-        while (bit.next()) |k| {
-            if (!b.isBoxed(k.*)) {
-                try b.markBoxed(k.*);
-                try lam_boxed_here.append(b.allocator, k.*);
-            }
-        }
-    }
-    // The lambda body is caller code in the caller's member scope too: an active
-    // extension splice parked those sets, and the lambda content swaps them back.
-    const caller_scope = try b.enterCallerMemberScope();
-    // The spliced subject joins the runtime enclosing-receiver chain for the body's
-    // region, as the framed route's closure receiver would. Label returns funnel
-    // through `end`, whose first instruction pops; a non-local return is healed by
-    // frame teardown.
-    const encl_pushed = subject_reg != null and rfsEnabled();
-    const prev_tower_top = b.encl_tower_top;
-    if (encl_pushed) {
-        try b.push(.{ .EnclosingPush = .{ .src = subject_reg.? } });
-        b.encl_tower_depth += 1;
-        b.encl_tower_top = subject_reg.?;
-    }
-    // The literal's content is caller code, so enclosing in-progress marks must not
-    // make a same-fn call inside it self-recursive.
-    const prev_decl_base = b.inline_stack_visible_base;
-    if (!std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_NRG") orelse "1", "0")) {
-        b.inline_stack_visible_base = b.inline_stack.items.len;
-    }
-    // A tail-position call hands its tail position to the lambda's last statement.
-    b.tail_pos = b.tail_call_ok;
-    // The lambda body is lexically the caller's, so suspend the inline-fn-body flag
-    // and mark the spliced region, or `loopFor` lets the callee's loops capture the
-    // lambda's `break`/`continue`.
-    const prev_inline_fn_body = b.lowering_inline_fn_body;
-    b.lowering_inline_fn_body = 0;
-    b.in_spliced_lambda_body += 1;
+    try markLambdaBodyBoxedVars(b, &body, &lam_boxed_here);
+    const region = try enterSplicedLambdaBody(b, subject_reg);
     const v = try lowerBlock(b, &body);
-    b.in_spliced_lambda_body -= 1;
-    b.lowering_inline_fn_body = prev_inline_fn_body;
-    b.inline_stack_visible_base = prev_decl_base;
-    if (encl_pushed) {
-        b.encl_tower_depth -= 1;
-        b.encl_tower_top = prev_tower_top;
-    }
-    if (caller_scope) |cs| b.exitCallerMemberScope(cs);
-    for (lam_boxed_here.items) |n| b.unmarkBoxed(n);
-    for (hidden_binds.items) |hb| b.restoreHiddenBinding(hb.name, hb.h);
-    for (suspended_rlp.items) |k| try b.markReceiverLambdaParam(k);
-    _ = b.setThisNarrow(lam_prev_narrow);
-    b.setSpliceHint(lam_prev_active, lam_prev_recv);
-    if (subject_reg != null and rfsEnabled()) {
-        b.setSpliceRecvTy(lam_prev_splice_recv);
-        b.splice_recv_from_window = lam_prev_recv_from_window;
-    }
-    if (pushed_band) _ = b.splice_hidden_bands.pop();
-    b.lambda_splice_resolve = prev_splice;
+    exitSplicedLambdaBody(b, region);
+    try restoreSplicedLambdaContext(
+        b,
+        lam_boxed_here.items,
+        hidden_binds.items,
+        suspended_rlp.items,
+        lam_prev_narrow,
+        lam_prev_active,
+        lam_prev_recv,
+        subject_reg,
+        lam_prev_splice_recv,
+        lam_prev_recv_from_window,
+        pushed_band,
+        prev_splice,
+    );
     try b.push(.{ .Move = .{ .dst = result, .src = v } });
-    b.terminate(.{ .Goto = end });
-    b.switchTo(end);
-    if (encl_pushed) try b.push(.{ .EnclosingPop = .{} });
-    if (label != null) {
+    b.terminate(.{ .Goto = ret.end });
+    b.switchTo(ret.end);
+    if (region.encl_pushed) try b.push(.{ .EnclosingPop = .{} });
+    if (ret.label != null) {
         b.popInlineLambdaRet();
     }
-    try b.restoreInlineReturn(saved);
+    try b.restoreInlineReturn(ret.saved);
     b.popInlineLambdaFrame();
     try b.popScope();
     if (counted) {
@@ -1263,21 +1485,15 @@ pub fn argsBindAllReified(allocator: Allocator, name: []const u8, args: []const 
     return false;
 }
 
-/// Unify one declared value-parameter type against its actual argument expression,
-/// recording reified type-parameter solutions in `subst`. A function-typed parameter
-/// unifies each declared parameter type against the lambda literal's corresponding
-/// annotation; a generic-class parameter unifies against the argument's statically
-/// evident generic type, from explicit type args or a property's declared type.
-fn unifyParamAgainstArg(
-    allocator: Allocator,
+/// An argument naming an enclosing splice's parameter carries that parameter's
+/// declared type, already reified-substituted.
+fn unifySplicedParamArg(
     param_ty: *const TypeRef,
     arg: *const Expr,
     tp_names: *const std.StringHashMap(void),
     subst: *std.StringHashMap(TypeRef),
     bb: ?*const FuncBuilder,
-) Allocator.Error!void {
-    // An argument naming an enclosing splice's parameter carries that parameter's
-    // declared type, already reified-substituted.
+) Allocator.Error!bool {
     if (arg.* == .Path and arg.Path.segments.len == 1) {
         if (bb) |b| {
             // Inside a spliced lambda-argument body the free names are the caller's,
@@ -1300,7 +1516,7 @@ fn unifyParamAgainstArg(
                 } else {
                     try unifyTypeParam(param_ty, &aty, tp_names, subst);
                 }
-                return;
+                return true;
             };
             // A caller local with a declared type binds the parameter to that static
             // type, as kotlinc infers, never to the value's runtime class.
@@ -1315,12 +1531,23 @@ fn unifyParamAgainstArg(
                         var decl = try cloneAstTypeRef(b.module.registry.allocator, converted);
                         decl.nullable = decl.nullable or b.localDeclNullable(local_name);
                         try unifyTypeParam(param_ty, &decl, tp_names, subst);
-                        return;
+                        return true;
                     };
                 }
             }
         }
     }
+        return false;
+}
+
+/// A function-typed parameter unifies each declared parameter type against the
+/// lambda literal's corresponding annotation.
+fn unifyFunctionTypedParam(
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+) Allocator.Error!bool {
     if (param_ty.function) |ft| {
         if (arg.* == .Lambda) {
             const lam = &arg.Lambda;
@@ -1350,8 +1577,23 @@ fn unifyParamAgainstArg(
                 });
             }
         }
-        return;
+        return true;
     }
+        return false;
+}
+
+/// The parameter is a type parameter (`cause: T`), and its argument's own type
+/// solves it whenever statically evident, a constructor call being the shape that
+/// matters, then any argument whose static type lowering already knows. Positive
+/// proof only.
+fn unifyBareTypeParam(
+    allocator: Allocator,
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+    bb: ?*const FuncBuilder,
+) Allocator.Error!bool {
     // The parameter is a type parameter (`cause: T`), and its argument's own type
     // solves it whenever statically evident, a constructor call being the shape
     // that matters. Positive proof only.
@@ -1360,7 +1602,7 @@ fn unifyParamAgainstArg(
     {
         if (ctorArgTypeRef(allocator, arg, bb)) |aty| {
             try subst.put(param_ty.name.name, aty.*);
-            return;
+            return true;
         }
         if (std.c.getenv("KLIO_UNIFY_TRACE") != null) {
             const st = staticArgTypeRef(allocator, arg, bb);
@@ -1371,9 +1613,22 @@ fn unifyParamAgainstArg(
     // body reads a process-global `T`.
         if (staticArgTypeRef(allocator, arg, bb)) |aty| {
             try subst.put(param_ty.name.name, aty.*);
-            return;
+            return true;
         }
     }
+        return false;
+}
+
+/// A generic-class parameter against an argument the call derivation can type
+/// unifies the type arguments positionally.
+fn unifyGenericClassParam(
+    allocator: Allocator,
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+    bb: ?*const FuncBuilder,
+) Allocator.Error!bool {
     // A generic-class parameter against an argument the call derivation can type
     // unifies the type arguments positionally.
     if (param_ty.type_args.len != 0 and param_ty.function == null and
@@ -1392,6 +1647,21 @@ fn unifyParamAgainstArg(
             }
         }
     }
+        return false;
+}
+
+/// A companion serializer-factory argument against a `KSerializer<T>` parameter
+/// solves `T` from the receiver, the generated factory returning the declaration's
+/// own serializer. A prior arm may have bound the parameter from the factory's
+/// declared return type, which keeps only a simple head, so the written receiver
+/// path overrides an unqualified binding.
+fn unifySerializerFactoryParam(
+    allocator: Allocator,
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+) Allocator.Error!bool {
     // A companion serializer-factory argument against a `KSerializer<T>` parameter
     // solves `T` from the receiver, the generated factory returning the
     // declaration's own serializer. A prior arm may have bound the parameter from
@@ -1422,7 +1692,7 @@ fn unifyParamAgainstArg(
                             var merged = prior;
                             merged.qualified_path = qualified;
                             try subst.put(kser_tv.?, merged);
-                            return;
+                            return true;
                         }
                     }
                     try subst.put(param_ty.type_args[0].ty.name.name, .{
@@ -1435,11 +1705,21 @@ fn unifyParamAgainstArg(
                         .annotations = &.{},
                         .qualified_path = qualified,
                     });
-                    return;
+                    return true;
                 }
             }
         }
     }
+        return false;
+}
+
+/// A class-literal argument against a `KClass<T>` parameter solves `T = C`.
+fn unifyClassLiteralParam(
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+) Allocator.Error!bool {
     // A class-literal argument against a `KClass<T>` parameter solves `T = C`.
     if (param_ty.type_args.len == 1 and !param_ty.type_args[0].is_star and
         std.mem.eql(u8, std.mem.trimEnd(u8, param_ty.name.name, "?"), "KClass") and
@@ -1462,10 +1742,25 @@ fn unifyParamAgainstArg(
                     .annotations = &.{},
                     .qualified_path = null,
                 });
-                return;
+                return true;
             }
         }
     }
+        return false;
+}
+
+/// The parameter's own type arguments mention a type parameter, so the argument's
+/// generic type, its declaration's supertype list, a local object literal's
+/// supertype, the local's declared class, and finally its lowered record are
+/// tried in that order.
+fn unifyTypeArgumentsAgainstArg(
+    allocator: Allocator,
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+    bb: ?*const FuncBuilder,
+) Allocator.Error!bool {
     if (param_ty.type_args.len != 0) {
         var mentions_tp = false;
         for (param_ty.type_args) |*ta| {
@@ -1474,22 +1769,22 @@ fn unifyParamAgainstArg(
                 break;
             }
         }
-        if (!mentions_tp) return;
+        if (!mentions_tp) return true;
         if (try argGenericTypeRef(allocator, arg, 0)) |aty| {
             try unifyTypeParam(param_ty, aty, tp_names, subst);
-            return;
+            return true;
         }
         // The argument names a declaration, so the parameter's type argument comes
         // from that declaration's supertype list.
         if (argDeclSupertypeMatching(arg, param_ty.name.name, bb)) |sup| {
             try unifyTypeParam(param_ty, sup, tp_names, subst);
-            return;
+            return true;
         }
     // A local initialized by an object literal carries its supertype the same way,
     // the only place its type arguments are written.
         if (localObjectSupertypeMatching(arg, param_ty.name.name, bb)) |sup| {
             try unifyTypeParam(param_ty, sup, tp_names, subst);
-            return;
+            return true;
         }
     // A local whose declared type names a class solves through that class's supertype
     // list, binding `T` to the head, all a reified consumer can read.
@@ -1497,6 +1792,31 @@ fn unifyParamAgainstArg(
     // Last: the argument's statically recorded type, head-matched.
         try unifyLoweredTypeParam(param_ty, arg, tp_names, subst, bb);
     }
+        return false;
+}
+
+/// Unify one declared value-parameter type against its actual argument expression,
+/// recording reified type-parameter solutions in `subst`. A function-typed parameter
+/// unifies each declared parameter type against the lambda literal's corresponding
+/// annotation; a generic-class parameter unifies against the argument's statically
+/// evident generic type, from explicit type args or a property's declared type.
+fn unifyParamAgainstArg(
+    allocator: Allocator,
+    param_ty: *const TypeRef,
+    arg: *const Expr,
+    tp_names: *const std.StringHashMap(void),
+    subst: *std.StringHashMap(TypeRef),
+    bb: ?*const FuncBuilder,
+) Allocator.Error!void {
+    // An argument naming an enclosing splice's parameter carries that parameter's
+    // declared type, already reified-substituted.
+    if (try unifySplicedParamArg(param_ty, arg, tp_names, subst, bb)) return;
+    if (try unifyFunctionTypedParam(param_ty, arg, tp_names, subst)) return;
+    if (try unifyBareTypeParam(allocator, param_ty, arg, tp_names, subst, bb)) return;
+    if (try unifyGenericClassParam(allocator, param_ty, arg, tp_names, subst, bb)) return;
+    if (try unifySerializerFactoryParam(allocator, param_ty, arg, tp_names, subst)) return;
+    if (try unifyClassLiteralParam(param_ty, arg, tp_names, subst)) return;
+    if (try unifyTypeArgumentsAgainstArg(allocator, param_ty, arg, tp_names, subst, bb)) return;
 }
 
 /// The class an argument constructs, as a `TypeRef`: the one argument shape whose
@@ -2407,109 +2727,119 @@ fn astTypeMentionsFnTypeParam(ty: *const ast.TypeRef, f: *const ast.Function) bo
 
 pub var splice_route_tag: []const u8 = "?";
 
-pub fn tryInlineCallWithTypeArgs(
+/// The declaration a call splices. A bare call arrives with its `target` already
+/// resolved, so the splice expands the declaration the call binds. A member call
+/// resolves here by receiver and shape narrowing: the target must be a receiver
+/// extension.
+fn spliceTargetFor(
     b: *FuncBuilder,
     fname: []const u8,
     target: ?*const ast.Function,
     args: []const Expr,
-    arg_names: []const ?[]const u8,
+    this_arg: ?*const Expr,
+) Allocator.Error!?*const ast.Function {
+    if (target) |t| return t;
+    const last_is_lambda = args.len > 0 and switch (args[args.len - 1]) {
+        .Lambda, .AnonFun => true,
+        else => false,
+    };
+    const trailing_arity: ?usize = if (args.len == 0) null else switch (args[args.len - 1]) {
+        .Lambda => |l| if (l.implicit_it) 0 else l.params.len,
+        .AnonFun => |af| af.params.len,
+        else => null,
+    };
+    const call_shape = CallShape{
+        .want = args.len,
+        .last_is_lambda = last_is_lambda,
+        .trailing_lambda_arity = trailing_arity,
+        .call_file = if (this_arg) |ta| callSiteFileOf(ta) else null,
+        .arg0_class_literal = args.len != 0 and args[0] == .MemberRef and
+            std.mem.eql(u8, args[0].MemberRef.name.name, "class"),
+    };
+    var recv_ty = try inferReceiverType(b, this_arg);
+    // A bare call inside an extension body has the enclosing extension's
+    // declared receiver as its implicit receiver, without which the
+    // extensions-only decline below loses the reified type argument.
+    if (recv_ty == null and this_arg == null) recv_ty = b.recvTy();
+    const recv_chain: ?[]const []const u8 = if (recv_ty) |r|
+        try expr_lower.recvChainOf(b, r)
+    else
+        null;
+    return inline_state.inlineFnAstForRecvExt(
+        fname,
+        call_shape,
+        recv_chain,
+        this_arg != null,
+    );
+}
+
+/// A member extension narrowed by receiver and shape is visible only inside its
+/// declaring class hierarchy.
+fn memberExtVisibleAtCall(
+    b: *FuncBuilder,
+    fname: []const u8,
+    target: ?*const ast.Function,
+    f: *const ast.Function,
+) bool {
+    if (!(target == null and f.receiver_type != null)) return true;
+    const owner = inline_state.inlineMemberOwner(f) orelse return true;
+    const enc = b.ownerClass() orelse {
+        spliceBail(fname, "member-ext-owner-invisible (no enclosing class)");
+        return false;
+    };
+    if (!expr_lower.classIsOrExtendsHosted(b, enc, owner)) {
+        if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, fname)) std.debug.print("[splice-why] {s}: member-ext-owner-invisible enc={s} owner={s}\n", .{ fname, enc, owner });
+        }
+        return false;
+    }
+    return true;
+}
+
+/// `Result` is natively represented, and its inline members' source bodies read
+/// internal slots the native value never carries, so never splice them; the
+/// runtime serves them from intrinsics.
+fn resultReceiverIsNative(f: *const ast.Function) bool {
+    const rt = f.receiver_type orelse return false;
+    return std.mem.eql(u8, rt.name.name, "Result");
+}
+
+/// `kotlin.reflect.typeOf<T>()` is a reified intrinsic whose source body is a
+/// placeholder throw, served at runtime from the reified type argument.
+fn typeOfIsReifiedIntrinsic(fname: []const u8, f: *const ast.Function) bool {
+    if (!(std.mem.eql(u8, fname, "typeOf") and f.params.len == 0 and
+        f.type_params.len == 1 and f.type_params[0].is_reified)) return false;
+    const rt = f.return_type orelse return false;
+    return std.mem.endsWith(u8, rt.name.name, "KType");
+}
+
+/// `KLIO_SPLICE_TRACE=<fn>`: whether a named inline function reaches the splice
+/// path at all, and which parameter types the splice binds.
+fn traceSpliceEntry(
+    fname: []const u8,
+    f: *const ast.Function,
     this_arg: ?*const Expr,
     type_args: []const TypeRef,
-    expected: ?*const TypeRef,
-) Allocator.Error!?Reg {
-    // A bare call arrives with its `target` already resolved, so the splice expands
-    // the declaration the call binds. A member call resolves here by receiver and
-    // shape narrowing: the target must be a receiver extension.
-    var f: *const ast.Function = undefined;
-    if (target) |t| {
-        f = t;
-    } else {
-        const last_is_lambda = args.len > 0 and switch (args[args.len - 1]) {
-            .Lambda, .AnonFun => true,
-            else => false,
-        };
-        const trailing_arity: ?usize = if (args.len == 0) null else switch (args[args.len - 1]) {
-            .Lambda => |l| if (l.implicit_it) 0 else l.params.len,
-            .AnonFun => |af| af.params.len,
-            else => null,
-        };
-        const call_shape = CallShape{
-            .want = args.len,
-            .last_is_lambda = last_is_lambda,
-            .trailing_lambda_arity = trailing_arity,
-            .call_file = if (this_arg) |ta| callSiteFileOf(ta) else null,
-            .arg0_class_literal = args.len != 0 and args[0] == .MemberRef and
-                std.mem.eql(u8, args[0].MemberRef.name.name, "class"),
-        };
-        var recv_ty = try inferReceiverType(b, this_arg);
-        // A bare call inside an extension body has the enclosing extension's
-        // declared receiver as its implicit receiver, without which the
-        // extensions-only decline below loses the reified type argument.
-        if (recv_ty == null and this_arg == null) recv_ty = b.recvTy();
-        const recv_chain: ?[]const []const u8 = if (recv_ty) |r|
-            try expr_lower.recvChainOf(b, r)
-        else
-            null;
-        f = inline_state.inlineFnAstForRecvExt(
-            fname,
-            call_shape,
-            recv_chain,
-            this_arg != null,
-        ) orelse return null;
-    }
-    // A member extension narrowed by receiver and shape is visible only inside its
-    // declaring class hierarchy.
-    if (target == null and f.receiver_type != null) {
-        if (inline_state.inlineMemberOwner(f)) |owner| {
-            const enc = b.ownerClass() orelse {
-                spliceBail(fname, "member-ext-owner-invisible (no enclosing class)");
-                return null;
-            };
-            if (!expr_lower.classIsOrExtendsHosted(b, enc, owner)) {
-                if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
-                    if (std.mem.eql(u8, w, fname)) std.debug.print("[splice-why] {s}: member-ext-owner-invisible enc={s} owner={s}\n", .{ fname, enc, owner });
-                }
-                return null;
-            }
-        }
-    }
-    if (b.inlineDeclInProgress(f)) {
-        return null;
-    }
-    // `Result` is natively represented, and its inline members' source bodies read
-    // internal slots the native value never carries, so never splice them; the
-    // runtime serves them from intrinsics.
-    if (f.receiver_type) |rt| {
-        if (std.mem.eql(u8, rt.name.name, "Result")) return null;
-    }
-    // `kotlin.reflect.typeOf<T>()` is a reified intrinsic whose source body is a
-    // placeholder throw, served at runtime from the reified type argument.
-    if (std.mem.eql(u8, fname, "typeOf") and f.params.len == 0 and
-        f.type_params.len == 1 and f.type_params[0].is_reified)
-    {
-        if (f.return_type) |rt| {
-            if (std.mem.endsWith(u8, rt.name.name, "KType")) return null;
-        }
-    }
-    // `KLIO_SPLICE_TRACE=<fn>`: whether a named inline function reaches the splice
-    // path at all, and which parameter types the splice binds.
+) void {
     if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
         if (std.mem.eql(u8, w, fname)) {
             const site: ?u32 = if (this_arg) |r| helpers.exprSpan(r).start else null;
             std.debug.print("[splice] {s} entered, params={d} decl={}:{} site={?} nta={d} route={s}\n", .{ fname, f.params.len, f.name.span.file, f.name.span.start, site, type_args.len, splice_route_tag });
         }
     }
-    // Materialise the body if it is a deferred image marker before reading it.
-    inline_state.ensureInlineBody(f);
-    const body = if (f.body) |*body_ref| body_ref else {
-        spliceBail(fname, "no-body");
-        return null;
-    };
+}
 
-    var ordered = try b.allocator.alloc(?*const Expr, f.params.len);
-    defer b.allocator.free(ordered);
-    for (ordered) |*slot| slot.* = null;
-    var vararg_value: ?*const Expr = null;
+/// Seat every supplied argument in its declared parameter slot, materializing a
+/// vararg group into the array the inline body sees. False declines the splice.
+fn orderInlineArgs(
+    b: *FuncBuilder,
+    fname: []const u8,
+    f: *const ast.Function,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    ordered: []?*const Expr,
+    vararg_value: *?*const Expr,
+) Allocator.Error!bool {
     // A trailing lambda fills the last parameter even when earlier defaulted
     // parameters are omitted; mapping 1:1 from the front would leave the last,
     // function-typed one unfilled.
@@ -2545,11 +2875,11 @@ pub fn tryInlineCallWithTypeArgs(
         for (args[elem_start..positional_n], elem_start..) |*a, ai| {
             const nm: ?[]const u8 = if (ai < arg_names.len) arg_names[ai] else null;
             if (nm) |name| {
-                const idx = paramIndex(f, name) orelse return null;
-                if (idx == vi) return null;
+                const idx = paramIndex(f, name) orelse return false;
+                if (idx == vi) return false;
                 if (ordered[idx] != null) {
                     spliceBail(fname, "named-collision");
-                    return null;
+                    return false;
                 }
                 ordered[idx] = a;
                 elem_end = @min(elem_end, ai);
@@ -2557,7 +2887,7 @@ pub fn tryInlineCallWithTypeArgs(
         }
         const elems = args[elem_start..elem_end];
         if (elems.len != 0) ordered[vi] = &elems[0];
-        vararg_value = try inlineVarargArrayExpr(b, &f.params[vi], elems);
+        vararg_value.* = try inlineVarargArrayExpr(b, &f.params[vi], elems);
     } else {
         var next_pos: usize = 0;
         for (args[0..positional_n], 0..) |*a, i| {
@@ -2565,13 +2895,13 @@ pub fn tryInlineCallWithTypeArgs(
             if (nm) |name| {
                 const idx = paramIndex(f, name) orelse {
                     spliceBail(fname, "named-param-miss");
-                    return null;
+                    return false;
                 };
                 // A name for a slot a positional argument already took is Kotlin's
                 // "argument passed twice" error, and the sign of a wrong overload.
                 if (ordered[idx] != null) {
                     spliceBail(fname, "named-collision");
-                    return null;
+                    return false;
                 }
                 ordered[idx] = a;
             } else {
@@ -2580,15 +2910,24 @@ pub fn tryInlineCallWithTypeArgs(
                 }
                 if (next_pos >= ordered.len) {
                     spliceBail(fname, "positional-overflow");
-                    return null;
+                    return false;
                 }
                 ordered[next_pos] = a;
                 next_pos += 1;
             }
         }
     }
-    var slot_is_default = try b.allocator.alloc(bool, ordered.len);
-    defer b.allocator.free(slot_is_default);
+    return true;
+}
+
+/// Every slot a supplied argument did not take is filled from the declaration's
+/// own default, which is callee code. A slot with neither is not this overload.
+fn fillInlineDefaultSlots(
+    fname: []const u8,
+    f: *const ast.Function,
+    ordered: []?*const Expr,
+    slot_is_default: []bool,
+) bool {
     for (slot_is_default) |*x| x.* = false;
     for (ordered, 0..) |*slot, i| {
         if (slot.* == null) {
@@ -2599,44 +2938,55 @@ pub fn tryInlineCallWithTypeArgs(
                 slot_is_default[i] = true;
             } else {
                 spliceBail(fname, "unfilled-param");
-                return null;
+                return false;
             }
         }
     }
+    return true;
+}
 
-    // A reified parameter still unbound after explicit-argument, expected-type and
-    // callable-reference inference must not be one the body reads, or splicing
-    // leaves `T::class` dangling; decline and let member dispatch bind it.
-    // This is the caller-frame inference: arguments are the caller's expressions, so
-    // their typing belongs here, and the callee-frame pass may lose a derivation
-    // that needs the caller's scope.
-    var caller_probe: ?[]?TypeRef = null;
-    defer if (caller_probe) |cp| b.allocator.free(cp);
-    {
-        const probe = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
-        stripReifiedProjections(probe);
-        caller_probe = probe;
-        var unbound_reified = false;
-        for (f.type_params, 0..) |tp, i| {
-            if (!(tp.is_reified and probe[i] == null)) continue;
-            if (callableRefParamFor(f, ordered, tp.name.name) != null) continue;
-            unbound_reified = true;
-        }
-        if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
-            if (std.mem.eql(u8, w, fname)) {
-                for (f.type_params, 0..) |tp, i| {
-                    if (!tp.is_reified) continue;
-                    const bound: []const u8 = if (probe[i]) |t| t.name.name else "<unbound>";
-                    std.debug.print("[splice] {s} reified {s} probe={s}\n", .{ fname, tp.name.name, bound });
-                }
+/// A reified parameter still unbound after explicit-argument, expected-type and
+/// callable-reference inference must not be one the body reads, or splicing
+/// leaves `T::class` dangling; decline and let member dispatch bind it.
+fn declinesOnUnboundReified(
+    b: *FuncBuilder,
+    fname: []const u8,
+    f: *const ast.Function,
+    probe: []const ?TypeRef,
+    ordered: []const ?*const Expr,
+) Allocator.Error!bool {
+    var unbound_reified = false;
+    for (f.type_params, 0..) |tp, i| {
+        if (!(tp.is_reified and probe[i] == null)) continue;
+        if (callableRefParamFor(f, ordered, tp.name.name) != null) continue;
+        unbound_reified = true;
+    }
+    if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, fname)) {
+            for (f.type_params, 0..) |tp, i| {
+                if (!tp.is_reified) continue;
+                const bound: []const u8 = if (probe[i]) |t| t.name.name else "<unbound>";
+                std.debug.print("[splice] {s} reified {s} probe={s}\n", .{ fname, tp.name.name, bound });
             }
         }
-        if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) {
-            spliceBail(fname, "unbound-reified");
-            return null;
-        }
     }
+    if (unbound_reified and !(try reifiedParamsUnusedInBody(b.allocator, f))) {
+        spliceBail(fname, "unbound-reified");
+        return true;
+    }
+    return false;
+}
 
+/// A caller window bound ref a splice shadows with the call site's own solved
+/// binding, restored when the splice ends.
+const S4Restore = struct { name: []const u8, prev: ?ir.TypeRef };
+
+/// A caller local-decl type record an inline parameter binding shadows.
+const PTySave = struct { name: []const u8, ty: ?ir.TypeRef };
+
+/// Expansion-depth admission for one splice. A reified callee gets the wider
+/// budget, its body's type reads having no dynamic fallback.
+fn enterInlineExpansion(fname: []const u8, f: *const ast.Function) bool {
     const has_reified_tp = blk: {
         for (f.type_params) |tp| {
             if (tp.is_reified) break :blk true;
@@ -2645,40 +2995,49 @@ pub fn tryInlineCallWithTypeArgs(
     };
     if (!(if (has_reified_tp) inline_state.inlineExpandEnterReified() else inline_state.inlineExpandEnter())) {
         spliceBail(fname, "expand-depth");
-        return null;
+        return false;
     }
-    errdefer inline_state.inlineExpandLeave();
-    const member_splice = f.receiver_type == null and this_arg != null and
-        inline_state.inlineMemberOwner(f) != null;
-    const explicit_receiver = if ((f.receiver_type != null or member_splice) and
-        this_arg != null) recv_blk: {
-        // The receiver is a nested expression, so the caller's per-arg lambda typing
-        // stash, consumed by this splice's own arg loop, must not leak into it.
-        const sh_bm = b.pending_arg_broad_masks;
-        const sh_fg = b.pending_arg_fn_generic;
-        const sh_lp = b.pending_arg_lambda_param_types;
-        const sh_lu = b.pending_arg_lambda_unit;
-        b.pending_arg_broad_masks = null;
-        b.pending_arg_fn_generic = null;
-        b.pending_arg_lambda_param_types = null;
-        b.pending_arg_lambda_unit = null;
-        defer {
-            b.pending_arg_broad_masks = sh_bm;
-            b.pending_arg_fn_generic = sh_fg;
-            b.pending_arg_lambda_param_types = sh_lp;
-            if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
-            b.pending_arg_lambda_unit = sh_lu;
-        }
-        break :recv_blk try lowerExpr(b, this_arg.?);
-    } else null;
-    // The caller's lexical owner, for scope-true renames of the reified type
-    // arguments bound below; the callee frame pushed next has none.
-    const lexical_owner = b.ownerClass();
-    try b.pushInlineDecl(fname, f);
-    // The spliced extension's declared receiver is evidence for the body's own
-    // inline gates, on the dedicated splice channel rather than `recv_ty` so
-    // nested-lambda bare calls keep resolving through the runtime receiver walk.
-    const prev_splice_recv = b.spliceRecvTy();
+    return true;
+}
+
+/// An extension or member-inline splice through an explicit receiver lowers that
+/// receiver here. The receiver is a nested expression, so the caller's per-arg
+/// lambda typing stash, consumed by this splice's own arg loop, must not leak
+/// into it.
+fn lowerSpliceReceiver(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    this_arg: ?*const Expr,
+    member_splice: bool,
+) Allocator.Error!?Reg {
+    if (!((f.receiver_type != null or member_splice) and this_arg != null)) return null;
+    const sh_bm = b.pending_arg_broad_masks;
+    const sh_fg = b.pending_arg_fn_generic;
+    const sh_lp = b.pending_arg_lambda_param_types;
+    const sh_lu = b.pending_arg_lambda_unit;
+    b.pending_arg_broad_masks = null;
+    b.pending_arg_fn_generic = null;
+    b.pending_arg_lambda_param_types = null;
+    b.pending_arg_lambda_unit = null;
+    defer {
+        b.pending_arg_broad_masks = sh_bm;
+        b.pending_arg_fn_generic = sh_fg;
+        b.pending_arg_lambda_param_types = sh_lp;
+        if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
+        b.pending_arg_lambda_unit = sh_lu;
+    }
+    return try lowerExpr(b, this_arg.?);
+}
+
+/// The spliced extension's declared receiver is evidence for the body's own
+/// inline gates, on the dedicated splice channel rather than `recv_ty` so
+/// nested-lambda bare calls keep resolving through the runtime receiver walk.
+fn installSpliceRecvWindow(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    this_arg: ?*const Expr,
+    member_splice: bool,
+) Allocator.Error!void {
     if (f.receiver_type) |rt| {
     // A generic inline receiver names no classifier while the call site's static
     // receiver type does, so substitute it and let the body's bare calls see the
@@ -2715,11 +3074,17 @@ pub fn tryInlineCallWithTypeArgs(
             std.debug.print("[splice-ref] fn={s} bare-member-owner=NULL\n", .{f.name.name});
         }
     }
-    defer b.setSpliceRecvTy(prev_splice_recv);
-    // The actual receiver's full static type enters the window when the call site
-    // derives one, since iterating `this` inside the body types its elements from
-    // the receiver's arguments. A bare type-parameter head resolves through the
-    // caller's full bound ref.
+}
+
+/// The actual receiver's full static type enters the window when the call site
+/// derives one, since iterating `this` inside the body types its elements from
+/// the receiver's arguments. A bare type-parameter head resolves through the
+/// caller's full bound ref.
+fn spliceReceiverTypeRefOwned(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    this_arg: ?*const Expr,
+) Allocator.Error!?ir.TypeRef {
     var recv_ref_owned: ?ir.TypeRef = null;
     // An inline extension called bare on the implicit receiver has no receiver
     // expression to read a type from, but the window it splices into already holds
@@ -2761,24 +3126,15 @@ pub fn tryInlineCallWithTypeArgs(
             if (recv_ref_owned) |r| r.args.len else 0,
         });
     }
-    const prev_recv_ref = b.setSpliceRecvTyRef(recv_ref_owned);
-    defer if (b.setSpliceRecvTyRef(prev_recv_ref)) |owned| {
-        var t = owned;
-        t.deinit(b.allocator);
-    };
-    // The caller's solved bindings become window bound refs, so every consumer sees
-    // the call-site instantiation for each fn type parameter.
-    const S4Restore = struct { name: []const u8, prev: ?ir.TypeRef };
-    var s4_restores: std.ArrayList(S4Restore) = .empty;
-    defer s4_restores.deinit(b.allocator);
-    defer for (s4_restores.items) |*sr| {
-        if (sr.prev) |p| {
-            b.addTypeParamBoundRef(sr.name, p) catch {};
-        } else if (b.type_param_bound_refs.fetchRemove(sr.name)) |kv| {
-            var v = kv.value;
-            v.deinit(b.allocator);
-        }
-    };
+    return recv_ref_owned;
+}
+
+/// The caller's solved bindings become window bound refs, so every consumer sees
+/// the call-site instantiation for each fn type parameter.
+fn installSolvedTypeParamBounds(
+    b: *FuncBuilder,
+    s4_restores: *std.ArrayList(S4Restore),
+) void {
     if (b.module.pending_splice_solved) |solved| {
         b.module.pending_splice_solved = null;
         defer b.allocator.free(solved);
@@ -2795,33 +3151,19 @@ pub fn tryInlineCallWithTypeArgs(
             b.addTypeParamBoundRef(sb.name, sb.ty) catch {};
         }
     }
-    // Bare-call hygiene for the spliced body: its bare calls resolve against the
-    // inline fn's own receiver, never the caller's class. The pre-splice hint is
-    // recorded on the inline-lambda frame so a spliced caller lambda restores it.
-    const prev_hint_active = b.spliceHintActive();
-    const prev_hint_recv = b.spliceHintRecv();
-    b.setSpliceHint(true, if (f.receiver_type) |rt| rt.name.name else if (member_splice) inline_state.inlineMemberOwner(f) else null);
-    defer b.setSpliceHint(prev_hint_active, prev_hint_recv);
-    const prev_hint_recv_ref = b.setSpliceHintRecvRef(f.receiver_type);
-    defer _ = b.setSpliceHintRecvRef(prev_hint_recv_ref);
-    // The spliced body has its own receiver context, so the caller's smart-cast
-    // narrow of `this` must not leak into it.
-    const prev_this_narrow = b.setThisNarrow(null);
-    defer _ = b.setThisNarrow(prev_this_narrow);
-    // Scope depth before the inline fn binds its parameters: a lambda argument
-    // spliced from this call resolves its free names in these caller scopes.
-    var caller_scope_depth = b.scopeDepth();
-    try b.pushScope();
-    // The inline body lowers into the caller's builder, so its own `var` decls and
-    // any inline parameter a nested closure writes must be boxed into a shared
-    // `Value.Cell` here, exactly as a captured `var` is at a lambda boundary.
-    // Otherwise the write takes the `StoreGlobal`-for-capture fallback, which only
-    // round-trips on the stdlib-HOF scoped env. Newly boxed names are unboxed after
-    // the splice so the mark never leaks onto a same-named caller local.
-    var boxed_here: std.ArrayList([]const u8) = .empty;
-    defer boxed_here.deinit(b.allocator);
-    var splice_boxed = ast_scan.StringSet.init(b.allocator);
-    defer splice_boxed.deinit();
+}
+
+/// The inline body lowers into the caller's builder, so its own `var` decls and
+/// any inline parameter a nested closure writes must be boxed into a shared
+/// `Value.Cell` there, exactly as a captured `var` is at a lambda boundary.
+/// Otherwise the write takes the `StoreGlobal`-for-capture fallback, which only
+/// round-trips on the stdlib-HOF scoped env.
+fn computeSpliceBoxedNames(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    body: *const ast.FunctionBody,
+    splice_boxed: *ast_scan.StringSet,
+) Allocator.Error!void {
     if (body.* == .Block) {
         // Body-declared `var`s captured-and-written by a nested closure.
         var body_boxed = try ast_scan.computeBoxedVars(b.allocator, body.Block.stmts);
@@ -2837,280 +3179,352 @@ pub fn tryInlineCallWithTypeArgs(
             if (assigned.contains(p.name.name)) try splice_boxed.put(p.name.name, {});
         }
     }
-    var lambda_map = std.StringHashMap(*const ast.Expr).init(b.allocator);
-    const arg_regs = try b.allocator.alloc(Reg, f.params.len);
-    defer b.allocator.free(arg_regs);
-    // The caller's emitter computed instantiated expected param types per argument
-    // slot, which this loop bypasses, so consume them here.
-    const arg_lambda_param_types = b.pending_arg_lambda_param_types;
-    b.pending_arg_lambda_param_types = null;
-    const PTySave = struct { name: []const u8, ty: ?ir.TypeRef };
-    var param_ty_saves: std.ArrayList(PTySave) = .empty;
-    defer param_ty_saves.deinit(b.allocator);
-    defer for (param_ty_saves.items) |*sv| {
-        b.clearLocalDeclType(sv.name);
-        if (sv.ty) |t| b.setLocalDeclTypeOwned(sv.name, t) catch {};
-    };
-    var any_forwarded_lambda = false;
-    var any_literal_lambda = false;
-    // Params already bound by earlier iterations must not capture a later
-    // caller-supplied argument using the same name: Kotlin evaluates supplied
-    // arguments in the caller's scope, and only a default-filled slot is callee code.
-    var bound_param_names: std.ArrayList([]const u8) = .empty;
-    defer bound_param_names.deinit(b.allocator);
-    for (f.params, 0..) |*p, i| {
-        const a = if (p.is_vararg) vararg_value.? else ordered[i].?;
-        const forwarded_lambda = forwardedInlineLambda(b, a);
-    // A numeric literal argument re-types to its declared primitive parameter, per
-    // kotlinc literal typing. The regular call path coerces in `lowerArgRunFull`,
-    // but the splice binds the lowered arg directly.
-        const coerced: ?Reg = if (p.ty.function == null and !p.ty.nullable)
-            try helpers.coerceNumericLiteralArg(b, a, p.ty.name.name)
+}
+
+/// The state one inline parameter binding reads and writes: the call's ordered
+/// arguments and default marks on the way in, and the bound registers, splice
+/// substitution map and shadow records on the way out.
+const InlineArgBind = struct {
+    b: *FuncBuilder,
+    fname: []const u8,
+    f: *const ast.Function,
+    args: []const Expr,
+    ordered: []const ?*const Expr,
+    slot_is_default: []const bool,
+    vararg_value: ?*const Expr,
+    arg_lambda_param_types: ?[]const ?[]const ir.TypeRef,
+    explicit_receiver: ?Reg,
+    splice_boxed: *const ast_scan.StringSet,
+    arg_regs: []Reg,
+    lambda_map: *std.StringHashMap(*const ast.Expr),
+    param_ty_saves: *std.ArrayList(PTySave),
+    bound_param_names: *std.ArrayList([]const u8),
+    boxed_here: *std.ArrayList([]const u8),
+    any_forwarded_lambda: bool = false,
+    any_literal_lambda: bool = false,
+};
+
+/// A lambda or callable-reference argument bound to a declared function-typed
+/// param takes its arity from the declaration, and the caller's per-slot
+/// instantiated param types, which this binding otherwise bypasses.
+fn prepareInlineLambdaArg(ctx: *InlineArgBind, p: *const ast.Param, a: *const Expr) void {
+    const b = ctx.b;
+    const args = ctx.args;
+    const arg_lambda_param_types = ctx.arg_lambda_param_types;
+// A callable-reference argument needs the declared arity too: the MemberRef
+// lowering binds the target fid only when it knows the expected function
+// shape, and a name-carrying reference cannot reach a file-scoped extension.
+if (a.* == .MemberRef and p.ty.function != null) {
+    b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
+}
+// A lambda argument bound to a declared function-typed param takes its arity
+// from the declaration; a zero-`->` lambda for a `() -> R` param must not
+// keep the parser's implicit `it`.
+if ((a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null) {
+    b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
+    if (arg_lambda_param_types) |slots| {
+        // `ordered[i]` points into the caller's arg slice; recover the
+        // argument index the per-slot types are keyed by. The synthetic
+        // vararg expression lies outside the slice.
+        const base = @intFromPtr(args.ptr);
+        const off = @intFromPtr(a) -% base;
+        const idx = off / @sizeOf(Expr);
+        if (@intFromPtr(a) >= base and idx < args.len and
+            idx < slots.len)
+        {
+            b.pending_ref_lambda_param_types = slots[idx];
+        }
+    }
+}
+}
+
+/// A lambda argument every call position of the body expands is consumed by the
+/// splice, so materializing it builds a dead closure per call. The substitution
+/// map serves the call positions and the use scan proved no value position
+/// exists. The literal's own body referencing the param's name still needs the
+/// binding as the shadow the window hides.
+fn spliceConsumesLambdaArg(
+    fname: []const u8,
+    f: *const ast.Function,
+    p: *const ast.Param,
+    a: *const Expr,
+    is_default: bool,
+) bool {
+    return a.* == .Lambda and !is_default and
+        p.ty.function != null and paramOnlyCalled(f, p.name.name) and
+        !pocStmts(false, a.Lambda.body.stmts, p.name.name) and
+        !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_ARG_SKIP") orelse "1", "0") and
+        blk_only: {
+            const only = inline_state.runtime.envOnce("KLIO_ARG_SKIP_ONLY") orelse break :blk_only true;
+            var it = std.mem.splitScalar(u8, only, ',');
+            while (it.next()) |w| {
+                if (std.mem.eql(u8, w, fname)) break :blk_only true;
+            }
+            break :blk_only false;
+        };
+}
+
+/// Lower one argument into the caller's builder. A default-filled slot is callee
+/// code: Kotlin evaluates a default in the declaration's scope, where the
+/// extension receiver and earlier params are visible, while a caller-supplied
+/// argument keeps the call site's scope and must not see the params already
+/// bound by earlier iterations.
+fn lowerInlineArgValue(
+    ctx: *InlineArgBind,
+    p: *const ast.Param,
+    a: *const Expr,
+    i: usize,
+    coerced: ?Reg,
+) Allocator.Error!Reg {
+    _ = p;
+    const b = ctx.b;
+    const f = ctx.f;
+    const slot_is_default = ctx.slot_is_default;
+    const explicit_receiver = ctx.explicit_receiver;
+    return if (slot_is_default[i] and explicit_receiver != null) blk: {
+        // The default is callee code, so the receiver is its innermost implicit
+        // receiver typed by the declaration, even when the call site could not
+        // type the receiver expression.
+        const prior_this = b.resolveIgnoringFloor("this");
+        try b.pushScope();
+        try b.bind("this", explicit_receiver.?);
+        const prev_default_recv = b.spliceRecvTy();
+        const recv_head: ?[]const u8 = if (f.receiver_type) |rt|
+            expr_lower.typeHead(std.mem.trimEnd(u8, rt.name.name, "?"))
         else
             null;
-        // A callable-reference argument needs the declared arity too: the MemberRef
-        // lowering binds the target fid only when it knows the expected function
-        // shape, and a name-carrying reference cannot reach a file-scoped extension.
-        if (a.* == .MemberRef and p.ty.function != null) {
-            b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
-        }
-        // A lambda argument bound to a declared function-typed param takes its arity
-        // from the declaration; a zero-`->` lambda for a `() -> R` param must not
-        // keep the parser's implicit `it`.
-        if ((a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null) {
-            b.pending_lambda_arity = @intCast(p.ty.function.?.params.len);
-            if (arg_lambda_param_types) |slots| {
-                // `ordered[i]` points into the caller's arg slice; recover the
-                // argument index the per-slot types are keyed by. The synthetic
-                // vararg expression lies outside the slice.
-                const base = @intFromPtr(args.ptr);
-                const off = @intFromPtr(a) -% base;
-                const idx = off / @sizeOf(Expr);
-                if (@intFromPtr(a) >= base and idx < args.len and
-                    idx < slots.len)
-                {
-                    b.pending_ref_lambda_param_types = slots[idx];
-                }
+        if (recv_head) |h| b.setSpliceRecvTy(h);
+        try b.subject_binds.append(b.allocator, .{
+            .reg = explicit_receiver.?,
+            .head = recv_head,
+            .prior_this = prior_this,
+        });
+        const rr = coerced orelse try lowerExpr(b, a);
+        _ = b.subject_binds.pop();
+        b.setSpliceRecvTy(prev_default_recv);
+        try b.popScope();
+        break :blk rr;
+    } else if (slot_is_default[i]) coerced orelse try lowerExpr(b, a) else blk: {
+        var hidden_params: std.ArrayList(struct { name: []const u8, h: build.HiddenBinding }) = .empty;
+        defer hidden_params.deinit(b.allocator);
+        for (ctx.bound_param_names.items) |nm| {
+            if (b.hideBinding(nm)) |h| {
+                hidden_params.append(b.allocator, .{ .name = nm, .h = h }) catch break;
             }
         }
-        // A default-filled slot is callee code: Kotlin evaluates a default in the
-        // declaration's scope, where the extension receiver and earlier params are
-        // visible, while caller-supplied arguments keep the call site's scope. The
-        // splice bypasses `lowerArgRun`, so the sibling-solved expected type applies
-        // here too.
-        const sib_push = if (b.sib_expected_site) |site|
-            site == @as(*const anyopaque, @ptrCast(a))
-        else
-            false;
-        const sib_prev = if (sib_push) b.pushExpected(b.sib_expected_ty) else null;
-        // A literal lambda that materializes, the body forwarding the param as a
-        // value rather than only calling it, must lower under the param's declared
-        // function type exactly as `lowerArgRun` would, the expected type being where
-        // `lowerLambda` reads the receiver head. Otherwise a receiver-formed literal
-        // lowers as a plain block whose `this` comes from the enclosing splice's
-        // subject, and every later invocation runs against that stale receiver.
-        const lam_ty_push = (a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null;
-        const lam_ty_prev = if (lam_ty_push) b.pushExpected(p.ty) else null;
-        // Span-keyed receiver record for the literal: a later call-position splice
-        // must know it is receiver-formed, so the supplied argument seats as `this`.
-        if (lam_ty_push and a.* == .Lambda) {
-            if (p.ty.function.?.receiver) |*rty| {
-                const lowered_recv = try expr_lower.loweredOwnedLocalTypeRef(b, rty);
-                try b.recordLambdaArgRecvOwned(a.Lambda.span, lowered_recv);
-                b.recordLambdaArgArity(a.Lambda.span, @intCast(p.ty.function.?.params.len));
-            }
+        const rr = coerced orelse try lowerExpr(b, a);
+        var hi = hidden_params.items.len;
+        while (hi > 0) {
+            hi -= 1;
+            b.restoreHiddenBinding(hidden_params.items[hi].name, hidden_params.items[hi].h);
         }
-        if (lam_ty_push and inline_state.runtime.envOnce("KLIO_ARG_SKIP_TRACE") != null) {
-            std.debug.print("[arg-mat] fn={s} param={s} recv_ty={s}\n", .{ fname, p.name.name, if (p.ty.function.?.receiver) |r| r.name.name else "-" });
-        }
-        // by the splice's call-position expansion, so materializing it builds a dead
-        // closure per call. The substitution map serves the call positions and the
-        // use scan proved no value position exists. The literal's own body
-        // referencing the param's name needs the binding as the shadow the window
-        // hides.
-        const splice_consumed_lambda = a.* == .Lambda and !slot_is_default[i] and
-            p.ty.function != null and paramOnlyCalled(f, p.name.name) and
-            !pocStmts(false, a.Lambda.body.stmts, p.name.name) and
-            !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_ARG_SKIP") orelse "1", "0") and
-            blk_only: {
-                const only = inline_state.runtime.envOnce("KLIO_ARG_SKIP_ONLY") orelse break :blk_only true;
-                var it = std.mem.splitScalar(u8, only, ',');
-                while (it.next()) |w| {
-                    if (std.mem.eql(u8, w, fname)) break :blk_only true;
+        break :blk rr;
+    };
+}
+
+/// A parameter declared by one of the callee's own type parameters types nothing
+/// inside the body, so the argument's static type is the instantiation. Recorded
+/// under the local-decl channel, which `spliceParamTy` falls through to for tp
+/// heads, shadow-saving any same-named caller record. A bare tp head is refused;
+/// loose tp args ride, the head still binding.
+fn recordInlineParamDeclType(
+    ctx: *InlineArgBind,
+    p: *const ast.Param,
+    a: *const Expr,
+) Allocator.Error!void {
+    const b = ctx.b;
+    const f = ctx.f;
+    if (!(p.ty.function == null and !p.is_vararg)) return;
+    tp_arg: {
+        const dh = p.ty.name.name;
+        const tp_declared = (dh.len > 0 and dh.len <= 2 and
+            std.ascii.isUpper(dh[0])) or
+            blk_tp: {
+                for (f.type_params) |*tp| {
+                    if (std.mem.eql(u8, tp.name.name, dh)) break :blk_tp true;
                 }
-                break :blk_only false;
+                break :blk_tp false;
             };
-        if (splice_consumed_lambda) {
-            if (inline_state.runtime.envOnce("KLIO_ARG_SKIP_TRACE") != null) {
-                std.debug.print("[arg-skip] fn={s} param={s}\n", .{ fname, p.name.name });
-            }
-            if (lam_ty_push) b.restoreExpected(lam_ty_prev);
-            if (sib_push) b.restoreExpected(sib_prev);
-            b.pending_lambda_arity = -1;
-            b.pending_ref_lambda_param_types = null;
-            arg_regs[i] = try b.emitConst(Const.Unit);
-            try bound_param_names.append(b.allocator, p.name.name);
-            try lambda_map.put(p.name.name, a);
-            any_literal_lambda = true;
-            continue;
-        }
-        const r = if (slot_is_default[i] and explicit_receiver != null) blk: {
-            // The default is callee code, so the receiver is its innermost implicit
-            // receiver typed by the declaration, even when the call site could not
-            // type the receiver expression.
-            const prior_this = b.resolveIgnoringFloor("this");
-            try b.pushScope();
-            try b.bind("this", explicit_receiver.?);
-            const prev_default_recv = b.spliceRecvTy();
-            const recv_head: ?[]const u8 = if (f.receiver_type) |rt|
-                expr_lower.typeHead(std.mem.trimEnd(u8, rt.name.name, "?"))
-            else
-                null;
-            if (recv_head) |h| b.setSpliceRecvTy(h);
-            try b.subject_binds.append(b.allocator, .{
-                .reg = explicit_receiver.?,
-                .head = recv_head,
-                .prior_this = prior_this,
-            });
-            const rr = coerced orelse try lowerExpr(b, a);
-            _ = b.subject_binds.pop();
-            b.setSpliceRecvTy(prev_default_recv);
-            try b.popScope();
-            break :blk rr;
-        } else if (slot_is_default[i]) coerced orelse try lowerExpr(b, a) else blk: {
-            var hidden_params: std.ArrayList(struct { name: []const u8, h: build.HiddenBinding }) = .empty;
-            defer hidden_params.deinit(b.allocator);
-            for (bound_param_names.items) |nm| {
-                if (b.hideBinding(nm)) |h| {
-                    hidden_params.append(b.allocator, .{ .name = nm, .h = h }) catch break;
-                }
-            }
-            const rr = coerced orelse try lowerExpr(b, a);
-            var hi = hidden_params.items.len;
-            while (hi > 0) {
-                hi -= 1;
-                b.restoreHiddenBinding(hidden_params.items[hi].name, hidden_params.items[hi].h);
-            }
-            break :blk rr;
-        };
-        if (lam_ty_push) b.restoreExpected(lam_ty_prev);
-        if (sib_push) b.restoreExpected(sib_prev);
-        b.pending_lambda_arity = -1;
-        b.pending_ref_lambda_param_types = null;
-        arg_regs[i] = r;
-        // A fn-typed literal that materialized because the body forwards it is a
-        // dead-construction candidate: when every forward lands in a nested
-        // call-position splice, nothing reads the closure register.
-        if (a.* == .Lambda and p.ty.function != null and !slot_is_default[i]) {
-            b.noteForwardedLambda(r, a.Lambda.span);
-        }
-        // A lambda argument is spliced inline, so it is never a closure value to
-        // box, even if a deeper nested lambda mentions the param name.
-        const box_param = splice_boxed.contains(p.name.name) and a.* != .Lambda;
-        if (box_param and !b.isBoxed(p.name.name)) {
-            // Box the parameter into a shared cell. The scope-local `bind` suffices
-            // for `boxedCellReg`, so the mark and binding live only inside the
-            // spliced scope and leak no `mutable_homes` entry onto a caller local.
-            const home = b.allocReg();
-            try b.push(.{ .MakeCell = .{ .dst = home, .src = r } });
-            try b.markBoxed(p.name.name);
-            try b.bind(p.name.name, home);
-            try boxed_here.append(b.allocator, p.name.name);
-        } else {
-            try b.bind(p.name.name, r);
-        }
-        try bound_param_names.append(b.allocator, p.name.name);
-        // A parameter declared by one of the callee's own type parameters types
-        // nothing inside the body, so the argument's static type is the
-        // instantiation. Recorded under the local-decl channel, which `spliceParamTy`
-        // falls through to for tp heads, shadow-saving any same-named caller record.
-        // A bare tp head is refused; loose tp args ride, the head still binding.
-        if (p.ty.function == null and !p.is_vararg) tp_arg: {
-            const dh = p.ty.name.name;
-            const tp_declared = (dh.len > 0 and dh.len <= 2 and
-                std.ascii.isUpper(dh[0])) or
-                blk_tp: {
-                    for (f.type_params) |*tp| {
-                        if (std.mem.eql(u8, tp.name.name, dh)) break :blk_tp true;
-                    }
-                    break :blk_tp false;
-                };
-            if (!tp_declared) {
-                // A concrete declared head is the parameter's static type inside the
-                // spliced body just as in the framed activation, letting the
-                // explicit-receiver derivations see through the binding.
-                if (dh.len == 0) break :tp_arg;
-                // A concrete head can still carry the fn's type params in its
-                // arguments, and the declared spelling verbatim would feed a raw `T`
-                // to the reified derivations, so those keep the derived channel.
-                if (astTypeMentionsFnTypeParam(&p.ty, f)) break :tp_arg;
-                try param_ty_saves.append(b.allocator, .{
-                    .name = p.name.name,
-                    .ty = if (b.localDeclTypeRef(p.name.name)) |t| try t.clone(b.allocator) else null,
-                });
-                b.clearLocalDeclType(p.name.name);
-                try b.setLocalDeclTypeOwned(p.name.name, try expr_lower.loweredOwnedLocalTypeRef(b, &p.ty));
-                break :tp_arg;
-            }
-            var derived_owned: ?ir.TypeRef = null;
-            defer if (derived_owned) |*t| t.deinit(b.allocator);
-            const derived: ?ir.TypeRef = expr_lower.argDeclTypeRefLazy(b, a) orelse dblk: {
-                derived_owned = try expr_lower.staticExprTypeRef(b, a);
-                break :dblk derived_owned;
-            };
-            // Clone before clearing: `derived` may borrow the very record the clear
-            // frees, a same-named caller local's.
-            var derived_clone: ?ir.TypeRef = null;
-            if (derived) |dv| {
-                var h = std.mem.trimEnd(u8, dv.name, "?");
-                if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
-                const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
-                    b.isTypeParam(h) or ir.parseClassTypeParamIdentity(h) != null;
-                if (!bare) derived_clone = try dv.clone(b.allocator);
-            }
-            // Always shadow the caller's same-named record for a tp-declared param:
-            // with nothing derivable the body must see no record at all.
-            try param_ty_saves.append(b.allocator, .{
+        if (!tp_declared) {
+            // A concrete declared head is the parameter's static type inside the
+            // spliced body just as in the framed activation, letting the
+            // explicit-receiver derivations see through the binding.
+            if (dh.len == 0) break :tp_arg;
+            // A concrete head can still carry the fn's type params in its
+            // arguments, and the declared spelling verbatim would feed a raw `T`
+            // to the reified derivations, so those keep the derived channel.
+            if (astTypeMentionsFnTypeParam(&p.ty, f)) break :tp_arg;
+            try ctx.param_ty_saves.append(b.allocator, .{
                 .name = p.name.name,
                 .ty = if (b.localDeclTypeRef(p.name.name)) |t| try t.clone(b.allocator) else null,
             });
             b.clearLocalDeclType(p.name.name);
-            if (derived_clone) |dc| {
-                try b.setLocalDeclTypeOwned(p.name.name, dc);
-            } else if (b.typeParamBound(dh) != null) {
-                // Nothing derivable from the argument, but the callee declared this
-                // parameter by one of its own bounded type parameters, and the
-                // receiver walk resolves a type parameter through its bound.
-                try b.setLocalDeclTypeOwned(p.name.name, .{
-                    .name = try b.allocator.dupe(u8, dh),
-                    .nullable = p.ty.nullable,
-                    .args = &.{},
-                });
-            }
+            try b.setLocalDeclTypeOwned(p.name.name, try expr_lower.loweredOwnedLocalTypeRef(b, &p.ty));
+            break :tp_arg;
         }
-        // `noinline` parameters opt out of inline-lambda splicing: their argument
-        // value still flows through the binding above, but a call to the parameter
-        // inside the inlined body lowers as a normal CallValue, so the lambda can be
-        // passed on or stored. `crossinline` keeps the inline-lambda path, but a
-        // bare `return` in the lambda body is illegal there, since the inlined
-        // body's return targets the enclosing inline fn's caller. No parser-level
-        // diagnostic is emitted; the runtime semantics match.
-        if (!p.is_noinline) {
-            if (forwarded_lambda) |lam| {
-                try lambda_map.put(p.name.name, lam);
-                any_forwarded_lambda = true;
-            } else if (a.* == .Lambda) {
-                try lambda_map.put(p.name.name, a);
-                any_literal_lambda = true;
-            }
+        var derived_owned: ?ir.TypeRef = null;
+        defer if (derived_owned) |*t| t.deinit(b.allocator);
+        const derived: ?ir.TypeRef = expr_lower.argDeclTypeRefLazy(b, a) orelse dblk: {
+            derived_owned = try expr_lower.staticExprTypeRef(b, a);
+            break :dblk derived_owned;
+        };
+        // Clone before clearing: `derived` may borrow the very record the clear
+        // frees, a same-named caller local's.
+        var derived_clone: ?ir.TypeRef = null;
+        if (derived) |dv| {
+            var h = std.mem.trimEnd(u8, dv.name, "?");
+            if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
+            const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
+                b.isTypeParam(h) or ir.parseClassTypeParamIdentity(h) != null;
+            if (!bare) derived_clone = try dv.clone(b.allocator);
+        }
+        // Always shadow the caller's same-named record for a tp-declared param:
+        // with nothing derivable the body must see no record at all.
+        try ctx.param_ty_saves.append(b.allocator, .{
+            .name = p.name.name,
+            .ty = if (b.localDeclTypeRef(p.name.name)) |t| try t.clone(b.allocator) else null,
+        });
+        b.clearLocalDeclType(p.name.name);
+        if (derived_clone) |dc| {
+            try b.setLocalDeclTypeOwned(p.name.name, dc);
+        } else if (b.typeParamBound(dh) != null) {
+            // Nothing derivable from the argument, but the callee declared this
+            // parameter by one of its own bounded type parameters, and the
+            // receiver walk resolves a type parameter through its bound.
+            try b.setLocalDeclTypeOwned(p.name.name, .{
+                .name = try b.allocator.dupe(u8, dh),
+                .nullable = p.ty.nullable,
+                .args = &.{},
+            });
         }
     }
-    // Mark params whose declared type is one of this inline fn's own generic type
-    // parameters, so a comparison operator on such an operand lowers to `compareTo`,
-    // the total order for Double and Float. The names added are removed once the
-    // body lowers, so the mark never leaks onto a same-named caller local.
-    var marked_generic: std.ArrayList([]const u8) = .empty;
-    defer marked_generic.deinit(b.allocator);
+}
+
+/// Bind one inline parameter: lower its argument in the right scope, seat the
+/// register, box it where a nested closure writes it, record its static type and
+/// enter it in the splice substitution map unless it is `noinline`.
+fn bindInlineArg(ctx: *InlineArgBind, p: *const ast.Param, i: usize) Allocator.Error!void {
+    const b = ctx.b;
+    const f = ctx.f;
+    const fname = ctx.fname;
+    const ordered = ctx.ordered;
+    const slot_is_default = ctx.slot_is_default;
+    const vararg_value = ctx.vararg_value;
+    const arg_regs = ctx.arg_regs;
+    const a = if (p.is_vararg) vararg_value.? else ordered[i].?;
+    const forwarded_lambda = forwardedInlineLambda(b, a);
+// A numeric literal argument re-types to its declared primitive parameter, per
+// kotlinc literal typing. The regular call path coerces in `lowerArgRunFull`,
+// but the splice binds the lowered arg directly.
+    const coerced: ?Reg = if (p.ty.function == null and !p.ty.nullable)
+        try helpers.coerceNumericLiteralArg(b, a, p.ty.name.name)
+    else
+        null;
+    prepareInlineLambdaArg(ctx, p, a);
+    // A default-filled slot is callee code: Kotlin evaluates a default in the
+    // declaration's scope, where the extension receiver and earlier params are
+    // visible, while caller-supplied arguments keep the call site's scope. The
+    // splice bypasses `lowerArgRun`, so the sibling-solved expected type applies
+    // here too.
+    const sib_push = if (b.sib_expected_site) |site|
+        site == @as(*const anyopaque, @ptrCast(a))
+    else
+        false;
+    const sib_prev = if (sib_push) b.pushExpected(b.sib_expected_ty) else null;
+    // A literal lambda that materializes, the body forwarding the param as a
+    // value rather than only calling it, must lower under the param's declared
+    // function type exactly as `lowerArgRun` would, the expected type being where
+    // `lowerLambda` reads the receiver head. Otherwise a receiver-formed literal
+    // lowers as a plain block whose `this` comes from the enclosing splice's
+    // subject, and every later invocation runs against that stale receiver.
+    const lam_ty_push = (a.* == .Lambda or a.* == .AnonFun) and p.ty.function != null;
+    const lam_ty_prev = if (lam_ty_push) b.pushExpected(p.ty) else null;
+    // Span-keyed receiver record for the literal: a later call-position splice
+    // must know it is receiver-formed, so the supplied argument seats as `this`.
+    if (lam_ty_push and a.* == .Lambda) {
+        if (p.ty.function.?.receiver) |*rty| {
+            const lowered_recv = try expr_lower.loweredOwnedLocalTypeRef(b, rty);
+            try b.recordLambdaArgRecvOwned(a.Lambda.span, lowered_recv);
+            b.recordLambdaArgArity(a.Lambda.span, @intCast(p.ty.function.?.params.len));
+        }
+    }
+    if (lam_ty_push and inline_state.runtime.envOnce("KLIO_ARG_SKIP_TRACE") != null) {
+        std.debug.print("[arg-mat] fn={s} param={s} recv_ty={s}\n", .{ fname, p.name.name, if (p.ty.function.?.receiver) |r| r.name.name else "-" });
+    }
+    const splice_consumed_lambda = spliceConsumesLambdaArg(fname, f, p, a, slot_is_default[i]);
+    if (splice_consumed_lambda) {
+        if (inline_state.runtime.envOnce("KLIO_ARG_SKIP_TRACE") != null) {
+            std.debug.print("[arg-skip] fn={s} param={s}\n", .{ fname, p.name.name });
+        }
+        if (lam_ty_push) b.restoreExpected(lam_ty_prev);
+        if (sib_push) b.restoreExpected(sib_prev);
+        b.pending_lambda_arity = -1;
+        b.pending_ref_lambda_param_types = null;
+        arg_regs[i] = try b.emitConst(Const.Unit);
+        try ctx.bound_param_names.append(b.allocator, p.name.name);
+        try ctx.lambda_map.put(p.name.name, a);
+        ctx.any_literal_lambda = true;
+        return;
+    }
+    const r = try lowerInlineArgValue(ctx, p, a, i, coerced);
+    if (lam_ty_push) b.restoreExpected(lam_ty_prev);
+    if (sib_push) b.restoreExpected(sib_prev);
+    b.pending_lambda_arity = -1;
+    b.pending_ref_lambda_param_types = null;
+    arg_regs[i] = r;
+    // A fn-typed literal that materialized because the body forwards it is a
+    // dead-construction candidate: when every forward lands in a nested
+    // call-position splice, nothing reads the closure register.
+    if (a.* == .Lambda and p.ty.function != null and !slot_is_default[i]) {
+        b.noteForwardedLambda(r, a.Lambda.span);
+    }
+    // A lambda argument is spliced inline, so it is never a closure value to
+    // box, even if a deeper nested lambda mentions the param name.
+    const box_param = ctx.splice_boxed.contains(p.name.name) and a.* != .Lambda;
+    if (box_param and !b.isBoxed(p.name.name)) {
+        // Box the parameter into a shared cell. The scope-local `bind` suffices
+        // for `boxedCellReg`, so the mark and binding live only inside the
+        // spliced scope and leak no `mutable_homes` entry onto a caller local.
+        const home = b.allocReg();
+        try b.push(.{ .MakeCell = .{ .dst = home, .src = r } });
+        try b.markBoxed(p.name.name);
+        try b.bind(p.name.name, home);
+        try ctx.boxed_here.append(b.allocator, p.name.name);
+    } else {
+        try b.bind(p.name.name, r);
+    }
+    try ctx.bound_param_names.append(b.allocator, p.name.name);
+    try recordInlineParamDeclType(ctx, p, a);
+    // `noinline` parameters opt out of inline-lambda splicing: their argument
+    // value still flows through the binding above, but a call to the parameter
+    // inside the inlined body lowers as a normal CallValue, so the lambda can be
+    // passed on or stored. `crossinline` keeps the inline-lambda path, but a
+    // bare `return` in the lambda body is illegal there, since the inlined
+    // body's return targets the enclosing inline fn's caller. No parser-level
+    // diagnostic is emitted; the runtime semantics match.
+    if (!p.is_noinline) {
+        if (forwarded_lambda) |lam| {
+            try ctx.lambda_map.put(p.name.name, lam);
+            ctx.any_forwarded_lambda = true;
+        } else if (a.* == .Lambda) {
+            try ctx.lambda_map.put(p.name.name, a);
+            ctx.any_literal_lambda = true;
+        }
+    }
+}
+
+/// A caller splice-param type record this splice shadows.
+const SpRestore = struct { name: []const u8, prev: ?ast.TypeRef };
+
+/// Mark params whose declared type is one of this inline fn's own generic type
+/// parameters, so a comparison operator on such an operand lowers to `compareTo`,
+/// the total order for Double and Float. The names added are removed once the
+/// body lowers, so the mark never leaks onto a same-named caller local.
+fn markInlineGenericTypedParams(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    marked_generic: *std.ArrayList([]const u8),
+) Allocator.Error!void {
     if (f.type_params.len != 0) {
         var tp_names = std.StringHashMap(void).init(b.allocator);
         defer tp_names.deinit();
@@ -3128,12 +3542,17 @@ pub fn tryInlineCallWithTypeArgs(
             }
         }
     }
-    // Mark params whose declared type is a receiver-typed function so a bare
-    // `block(...)` dispatches `this.block()`. Same record-and-remove discipline.
-    var marked_rlp: std.ArrayList([]const u8) = .empty;
-    defer marked_rlp.deinit(b.allocator);
-    var shared_rlp_here: std.ArrayList([]const u8) = .empty;
-    defer shared_rlp_here.deinit(b.allocator);
+}
+
+/// Mark params whose declared type is a receiver-typed function so a bare
+/// `block(...)` dispatches `this.block()`. Same record-and-remove discipline as
+/// the generic marks.
+fn markInlineReceiverLambdaParams(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    marked_rlp: *std.ArrayList([]const u8),
+    shared_rlp_here: *std.ArrayList([]const u8),
+) Allocator.Error!void {
     for (f.params) |*p| {
         const has_recv = if (p.ty.function) |ft| ft.receiver != null else false;
         if (has_recv and b.isReceiverLambdaParam(p.name.name)) {
@@ -3157,106 +3576,51 @@ pub fn tryInlineCallWithTypeArgs(
             try marked_rlp.append(b.allocator, p.name.name);
         }
     }
-    // A forwarded inline lambda is caller-of-caller code: its free names, bare-call
-    // hints and receiver context belong to the frame it was forwarded from, so when
-    // every substituted lambda is forwarded, inherit that frame's provenance.
-    var frame_hint_active = prev_hint_active;
-    var frame_hint_recv = prev_hint_recv;
-    var frame_this_narrow = prev_this_narrow;
-    if (any_forwarded_lambda and !any_literal_lambda) {
-        if (b.inlineLambdaCallerDepth()) |d| caller_scope_depth = d;
-        if (b.inlineLambdaCallerHint()) |h| {
-            frame_hint_active = h.active;
-            frame_hint_recv = h.recv;
-            frame_this_narrow = h.this_narrow;
+}
+
+/// The member body's bare sibling calls must lower as member-shadowable dispatch
+/// on the bound `this`, so activate the owner class and its hierarchy's
+/// member-name set over the caller's parked ones.
+fn installMemberSpliceScope(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    member_scope_prev_owner: *?[]const u8,
+    member_scope_prev_members: *?build.StringSet,
+) void {
+    const owner = inline_state.inlineMemberOwner(f).?;
+    member_scope_prev_owner.* = b.owner_class;
+    b.owner_class = owner;
+    var merged = build.StringSet.init(b.allocator);
+    var ok = true;
+    {
+        var it = b.enclosing_members.keyIterator();
+        while (it.next()) |k| merged.put(k.*, {}) catch {
+            ok = false;
+            break;
+        };
+    }
+    if (ok) {
+        if (b.module.registry.hierarchy_methods.get(owner)) |methods| {
+            var mit = methods.keyIterator();
+            while (mit.next()) |k| merged.put(k.*, {}) catch {};
         }
+        var prev = merged;
+        std.mem.swap(build.StringSet, &prev, &b.enclosing_members);
+        member_scope_prev_members.* = prev;
+    } else {
+        merged.deinit();
     }
-    try b.pushInlineLambdaFrameHinted(lambda_map, caller_scope_depth, frame_hint_active, frame_hint_recv, frame_this_narrow);
-    // An inline extension splice's body resolves names against the inline function's
-    // own parameter and receiver scopes, not the caller lambda's free names, but a
-    // nesting `lambda_splice_resolve` window skips the very scopes this splice binds
-    // into. Suspend it after lowering the receiver expression, itself a caller free
-    // name, and restore it after the body.
-    // A member-inline fn spliced through an explicit receiver binds that receiver as
-    // the body's `this` exactly like a receiver extension.
-    const ext_splice = (f.receiver_type != null or member_splice) and this_arg != null;
-    // The member body's bare sibling calls must lower as member-shadowable dispatch
-    // on the bound `this`, so activate the owner class and its hierarchy's
-    // member-name set. A spliced body resolves in its declaration scope, so park the
-    // caller's member sets and lexical owner; member splices park too, their owner
-    // swap installing the owner scope on top, and the call-site lambda swaps the
-    // parked caller scope back in for its own nested-class ctors.
-    // `KLIO_SPLICE_HYG=0` disables.
-    var hyg_snap: build.FuncBuilder.MemberScopeSnapshot = undefined;
-    const hyg_active = (ext_splice or member_splice) and
-        !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_SPLICE_HYG") orelse "1", "0");
-    if (hyg_active) b.beginSpliceDeclScope(&hyg_snap);
-    defer if (hyg_active) b.endSpliceDeclScope(&hyg_snap);
-    var member_scope_prev_owner: ?[]const u8 = null;
-    var member_scope_prev_members: ?build.StringSet = null;
-    // The body's lexical scope is the owner class, not the call site, so bare names
-    // in a spliced member body never bind a caller local. The floor covers the whole
-    // splice; the caller-lambda window overrides it while an arg lambda lowers.
-    var prev_body_floor: ?usize = null;
-    var body_floor_set = false;
-    // A spliced body resolves bare names in the callee's scope, the caller's locals
-    // sitting below the floor for member and extension splices alike. The splice's
-    // own parameters bind above the floor.
-    if (hyg_active) {
-        prev_body_floor = b.splice_body_floor;
-        b.splice_body_floor = caller_scope_depth;
-        body_floor_set = true;
-    }
-    defer if (body_floor_set) {
-        b.splice_body_floor = prev_body_floor;
-    };
-    if (member_splice) {
-        const owner = inline_state.inlineMemberOwner(f).?;
-        member_scope_prev_owner = b.owner_class;
-        b.owner_class = owner;
-        var merged = build.StringSet.init(b.allocator);
-        var ok = true;
-        {
-            var it = b.enclosing_members.keyIterator();
-            while (it.next()) |k| merged.put(k.*, {}) catch {
-                ok = false;
-                break;
-            };
-        }
-        if (ok) {
-            if (b.module.registry.hierarchy_methods.get(owner)) |methods| {
-                var mit = methods.keyIterator();
-                while (mit.next()) |k| merged.put(k.*, {}) catch {};
-            }
-            var prev = merged;
-            std.mem.swap(build.StringSet, &prev, &b.enclosing_members);
-            member_scope_prev_members = prev;
-        } else {
-            merged.deinit();
-        }
-    }
-    defer if (member_splice) {
-        b.owner_class = member_scope_prev_owner;
-        if (member_scope_prev_members) |pm| {
-            b.enclosing_members.deinit();
-            b.enclosing_members = pm;
-        }
-    };
-    var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
-    if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
-        if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} recv={} ext={} member={} this_arg={}\n", .{ fname, explicit_receiver != null, f.receiver_type != null, member_splice, this_arg != null });
-    }
-    // An extension splice's bound receiver is an implicit receiver inner to any
-    // spliced lambda subject already on the tower, so push it too. Only while a
-    // tower region is active: outside one, emissions pin the bound register.
-    const encl_ext_pushed = explicit_receiver != null and rfsEnabled() and b.encl_tower_depth > 0;
-    const prev_ext_tower_top = b.encl_tower_top;
-    if (encl_ext_pushed) {
-        try b.push(.{ .EnclosingPush = .{ .src = explicit_receiver.? } });
-        b.encl_tower_depth += 1;
-        b.encl_tower_top = explicit_receiver.?;
-    }
-    const ext_subject_pushed = explicit_receiver != null;
+}
+
+/// The bound receiver shadows `this` for the body, so join the subject-bind stack
+/// and let a nested member-inline splice find its owner's receiver. `this@<fn>`
+/// inside the spliced body, anon-object members included, must reach the splice
+/// receiver, which a real call binds at function entry.
+fn bindSpliceReceiverSubject(
+    b: *FuncBuilder,
+    fname: []const u8,
+    explicit_receiver: ?Reg,
+) Allocator.Error!void {
     if (explicit_receiver) |receiver| {
         // The bound receiver shadows `this` for the body, so join the subject-bind
         // stack and let a nested member-inline splice find its owner's receiver.
@@ -3276,14 +3640,19 @@ pub fn tryInlineCallWithTypeArgs(
         const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{fname});
         try b.bind(label, receiver);
     }
-    defer if (ext_subject_pushed) {
-        _ = b.subject_binds.pop();
-    };
-    // A bare member-inline call inside spliced-subject regions dispatches on the
-    // innermost receiver whose class reaches the owner; when no subject can receive
-    // the member the body's `this` is the owning receiver further out.
-    if (this_arg == null and inline_state.inlineMemberOwner(f) != null and
-        b.subject_binds.items.len != 0) owner_this: {
+}
+
+/// A bare member-inline call inside spliced-subject regions dispatches on the
+/// innermost receiver whose class reaches the owner; when no subject can receive
+/// the member the body's `this` is the owning receiver further out.
+fn bindOwnerImplicitThis(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    this_arg: ?*const Expr,
+) Allocator.Error!void {
+    if (!(this_arg == null and inline_state.inlineMemberOwner(f) != null and
+        b.subject_binds.items.len != 0)) return;
+    owner_this: {
         const owner = inline_state.inlineMemberOwner(f).?;
         const owner_base = if (std.mem.find(u8, owner, "$f")) |oi| owner[0..oi] else owner;
         var si = b.subject_binds.items.len;
@@ -3307,30 +3676,126 @@ pub fn tryInlineCallWithTypeArgs(
         const outer = b.subject_binds.items[0].prior_this orelse break :owner_this;
         try b.bind("this", outer);
     }
-    if (ext_splice) {
-        prev_splice_window = b.lambda_splice_resolve;
-        b.lambda_splice_resolve = null;
+}
+
+/// Record each parameter's declared type with this splice's reified substitutions
+/// applied, so a nested reified inline call passing them along solves its own type
+/// parameters lexically.
+fn bindSpliceParamTypes(
+    b: *FuncBuilder,
+    fname: []const u8,
+    f: *const ast.Function,
+    splice_ty_restores: *std.ArrayList(SpRestore),
+) Allocator.Error!void {
+    for (f.params) |*p| {
+        const sub = try substReifiedInTypeRef(b, &p.ty);
+        const sprev = try b.bindSpliceParamTy(p.name.name, sub);
+        try splice_ty_restores.append(b.allocator, .{ .name = p.name.name, .prev = sprev });
+        if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+            if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} bound {s}: {s}\n", .{ fname, p.name.name, sub.name.name });
+        }
     }
-    // Bind each reified type parameter to the resolved class value at the call site,
-    // in two places: locally, so the body's `T::class` read lowers as a bare `T`
-    // Path plus MemberRef `.class`; and as a global named "T", which
-    // `Inst::InstanceOf { ty: TypeRef "T" }` checks against, mirroring how
-    // `call_func_typed` binds runtime type-args. Without the global, `x is T` tests
-    // a non-existent class and falls through to `true`.
-    //
-    // The global is not saved or restored, the same shape non-inline type-arg
-    // binding uses: a nested splice overwrites it, and the restore happens
-    // implicitly when the enclosing call returns.
-    // Explicit `<…>` type arguments win; an unspecified reified parameter is
-    // inferred by unifying the declared return against the call's expected type. The
-    // callee frame is pushed by now, so argument-derived bindings rename nested
-    // classes through the caller's lexical owner.
-    const prev_splice_owner = splice_lexical_owner;
-    splice_lexical_owner = lexical_owner;
-    defer splice_lexical_owner = prev_splice_owner;
+}
+
+/// The callee's non-reified type-parameter bounds ride along with its param types,
+/// without which the head names nothing and every member call on such a parameter
+/// stays dynamic. Marked incomplete: the record supports the receiver-owner lookup,
+/// never a negative proof.
+fn bindSpliceTypeParamBounds(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    splice_bound_restores: *std.ArrayList(build.FuncBuilder.SpliceBoundRestore),
+) Allocator.Error!void {
+    for (f.type_params) |*tp| {
+        if (tp.is_reified) continue;
+        const bound_ty: ?*const ast.TypeRef = blk: {
+            if (tp.upper_bound) |*ub| break :blk ub;
+            for (f.where_bounds) |*wb| {
+                if (std.mem.eql(u8, wb.name.name, tp.name.name)) break :blk &wb.bound;
+            }
+            break :blk null;
+        };
+        const ub = bound_ty orelse continue;
+        if (ub.function != null or ub.qualified_path != null or ub.name.name.len == 0) continue;
+        const r = try b.bindSpliceTypeParamBound(tp.name.name, .{
+            .param = tp.name.name,
+            .bound = ub.name.name,
+            .complete = false,
+            .head_only = !ub.nullable,
+        });
+        try splice_bound_restores.append(b.allocator, r);
+    }
+}
+
+/// Mark body-declared `var`s a nested closure writes as boxed, so their decl emits
+/// `MakeCell`. Params were boxed at bind time; newly-boxed names are recorded so
+/// the mark is removed after the splice.
+fn markSpliceBodyBoxedVars(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    splice_boxed: *const ast_scan.StringSet,
+    boxed_here: *std.ArrayList([]const u8),
+) Allocator.Error!void {
+    var sit = splice_boxed.keyIterator();
+    while (sit.next()) |k| {
+        if (paramIndex(f, k.*) != null) continue; // params handled at bind time
+        if (!b.isBoxed(k.*)) {
+            try b.markBoxed(k.*);
+            try boxed_here.append(b.allocator, k.*);
+        }
+    }
+}
+
+/// A caller reified-type binding this splice shadows.
+const ReifiedRestore = struct { name: []const u8, prev: ?Reg };
+
+/// A caller reified type-name substitution this splice shadows.
+const NameRestore = struct { name: []const u8, prev: ?[]const u8 };
+
+/// A forwarded inline lambda is caller-of-caller code: its free names, bare-call
+/// hints and receiver context belong to the frame it was forwarded from, so when
+/// every substituted lambda is forwarded, inherit that frame's provenance.
+fn pushSpliceLambdaFrame(
+    b: *FuncBuilder,
+    lambda_map: std.StringHashMap(*const ast.Expr),
+    caller_scope_depth: *usize,
+    prev_hint_active: bool,
+    prev_hint_recv: ?[]const u8,
+    prev_this_narrow: ?[]const u8,
+    any_forwarded_lambda: bool,
+    any_literal_lambda: bool,
+) Allocator.Error!void {
+    var frame_hint_active = prev_hint_active;
+    var frame_hint_recv = prev_hint_recv;
+    var frame_this_narrow = prev_this_narrow;
+    if (any_forwarded_lambda and !any_literal_lambda) {
+        if (b.inlineLambdaCallerDepth()) |d| caller_scope_depth.* = d;
+        if (b.inlineLambdaCallerHint()) |h| {
+            frame_hint_active = h.active;
+            frame_hint_recv = h.recv;
+            frame_this_narrow = h.this_narrow;
+        }
+    }
+    try b.pushInlineLambdaFrameHinted(lambda_map, caller_scope_depth.*, frame_hint_active, frame_hint_recv, frame_this_narrow);
+}
+
+/// Explicit `<…>` type arguments win; an unspecified reified parameter is
+/// inferred by unifying the declared return against the call's expected type,
+/// falling back to the caller-frame probe. The callee frame is pushed by now, so
+/// argument-derived bindings rename nested classes through the caller's lexical
+/// owner.
+fn effectiveReifiedTypeArgs(
+    b: *FuncBuilder,
+    fname: []const u8,
+    f: *const ast.Function,
+    type_args: []const TypeRef,
+    expected: ?*const TypeRef,
+    ordered: []?*const Expr,
+    this_arg: ?*const Expr,
+    caller_probe: ?[]?TypeRef,
+) Allocator.Error![]?TypeRef {
     const effective_type_args = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
     stripReifiedProjections(effective_type_args);
-    defer b.allocator.free(effective_type_args);
     if (caller_probe) |cp| {
         for (effective_type_args, 0..) |*eff, i| {
             if (eff.* == null and i < cp.len) eff.* = cp[i];
@@ -3345,15 +3810,29 @@ pub fn tryInlineCallWithTypeArgs(
             }
         }
     }
-    const ReifiedRestore = struct { name: []const u8, prev: ?Reg };
-    var reified_restores: std.ArrayList(ReifiedRestore) = .empty;
-    defer reified_restores.deinit(b.allocator);
-    // Name substitutions for the splice's reified params, consumed by `emitCall` and
-    // `emitExtBareCall` to stamp static type args onto nested calls in the body.
-    const NameRestore = struct { name: []const u8, prev: ?[]const u8 };
-    var reified_name_restores: std.ArrayList(NameRestore) = .empty;
-    defer reified_name_restores.deinit(b.allocator);
-    defer for (reified_name_restores.items) |nr| b.restoreReifiedTypeName(nr.name, nr.prev);
+    return effective_type_args;
+}
+
+/// Bind each reified type parameter to the resolved class value at the call site,
+/// in two places: locally, so the body's `T::class` read lowers as a bare `T` Path
+/// plus MemberRef `.class`; and as a global named "T", which
+/// `Inst::InstanceOf { ty: TypeRef "T" }` checks against, mirroring how
+/// `call_func_typed` binds runtime type-args. Without the global, `x is T` tests a
+/// non-existent class and falls through to `true`. The global is not saved or
+/// restored, the same shape non-inline type-arg binding uses: a nested splice
+/// overwrites it, and the restore happens implicitly when the enclosing call
+/// returns.
+fn bindReifiedTypeArgs(
+    b: *FuncBuilder,
+    fname: []const u8,
+    f: *const ast.Function,
+    effective_type_args: []const ?TypeRef,
+    ordered: []?*const Expr,
+    arg_regs: []const Reg,
+    lexical_owner: ?[]const u8,
+    reified_restores: *std.ArrayList(ReifiedRestore),
+    reified_name_restores: *std.ArrayList(NameRestore),
+) Allocator.Error!void {
     for (f.type_params, 0..) |tp, tp_idx| {
         if (!tp.is_reified) continue;
         const arg = if (tp_idx < effective_type_args.len) effective_type_args[tp_idx] else null;
@@ -3428,86 +3907,29 @@ pub fn tryInlineCallWithTypeArgs(
         const prev = try b.bindReifiedType(tp.name.name, cls_reg);
         try reified_restores.append(b.allocator, .{ .name = tp.name.name, .prev = prev });
     }
-    // Record each parameter's declared type with this splice's reified substitutions
-    // applied, so a nested reified inline call passing them along solves its own
-    // type parameters lexically.
-    const SpRestore = struct { name: []const u8, prev: ?ast.TypeRef };
-    var splice_ty_restores: std.ArrayList(SpRestore) = .empty;
-    defer splice_ty_restores.deinit(b.allocator);
-    defer for (splice_ty_restores.items) |sr| b.restoreSpliceParamTy(sr.name, sr.prev);
-    for (f.params) |*p| {
-        const sub = try substReifiedInTypeRef(b, &p.ty);
-        const sprev = try b.bindSpliceParamTy(p.name.name, sub);
-        try splice_ty_restores.append(b.allocator, .{ .name = p.name.name, .prev = sprev });
-        if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
-            if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} bound {s}: {s}\n", .{ fname, p.name.name, sub.name.name });
-        }
+}
+
+/// A body mentioning `return@<this fn>` may put that return inside a closure that
+/// crosses a real frame, unwinding as a `LabeledReturn` toward a frame this splice
+/// never creates, so a runtime absorption region is armed over the spliced body.
+fn bodyNeedsLabeledReturnAbsorb(f: *const ast.Function, body: *const ast.FunctionBody) bool {
+    switch (body.*) {
+        .Block => |bb| {
+            for (bb.stmts) |*st| if (ast_scan.containsLabeledReturnStmt(st, f.name.name)) return true;
+        },
+        .Expr => |*ex| if (ast_scan.containsLabeledReturn(ex, f.name.name)) return true,
     }
-    // The callee's non-reified type-parameter bounds ride along with its param
-    // types, without which the head names nothing and every member call on such a
-    // parameter stays dynamic. Marked incomplete: the record supports the
-    // receiver-owner lookup, never a negative proof.
-    var splice_bound_restores: std.ArrayList(build.FuncBuilder.SpliceBoundRestore) = .empty;
-    defer splice_bound_restores.deinit(b.allocator);
-    defer for (splice_bound_restores.items) |sb| b.restoreSpliceTypeParamBound(sb);
-    for (f.type_params) |*tp| {
-        if (tp.is_reified) continue;
-        const bound_ty: ?*const ast.TypeRef = blk: {
-            if (tp.upper_bound) |*ub| break :blk ub;
-            for (f.where_bounds) |*wb| {
-                if (std.mem.eql(u8, wb.name.name, tp.name.name)) break :blk &wb.bound;
-            }
-            break :blk null;
-        };
-        const ub = bound_ty orelse continue;
-        if (ub.function != null or ub.qualified_path != null or ub.name.name.len == 0) continue;
-        const r = try b.bindSpliceTypeParamBound(tp.name.name, .{
-            .param = tp.name.name,
-            .bound = ub.name.name,
-            .complete = false,
-            .head_only = !ub.nullable,
-        });
-        try splice_bound_restores.append(b.allocator, r);
-    }
-    // Mark body-declared `var`s a nested closure writes as boxed, so their decl emits
-    // `MakeCell`. Params were boxed at bind time above; newly-boxed names are
-    // recorded so the mark is removed after the splice.
-    {
-        var sit = splice_boxed.keyIterator();
-        while (sit.next()) |k| {
-            if (paramIndex(f, k.*) != null) continue; // params handled at bind time
-            if (!b.isBoxed(k.*)) {
-                try b.markBoxed(k.*);
-                try boxed_here.append(b.allocator, k.*);
-            }
-        }
-    }
-    const result = b.allocReg();
-    const unit0 = try b.emitConst(Const.Unit);
-    try b.push(.{ .Move = .{ .dst = result, .src = unit0 } });
-    const join = try b.allocBlock();
-    try b.pushInlineReturn(result, join, f.name.name);
-    // A body mentioning `return@<this fn>` may put that return inside a closure that
-    // crosses a real frame, unwinding as a `LabeledReturn` toward a frame this splice
-    // never creates, so arm a runtime absorption region over the spliced body.
-    const needs_lr_absorb = blk: {
-        switch (body.*) {
-            .Block => |bb| {
-                for (bb.stmts) |*st| if (ast_scan.containsLabeledReturnStmt(st, f.name.name)) break :blk true;
-            },
-            .Expr => |*ex| if (ast_scan.containsLabeledReturn(ex, f.name.name)) break :blk true,
-        }
-        break :blk false;
-    };
-    if (needs_lr_absorb and inline_state.runtime.envOnce("KLIO_NO_LR_ABSORB") == null) {
-        const region = try b.allocBlock();
-        b.terminate(.{ .Goto = region });
-        b.switchTo(region);
-        b.setLrAbsorb(region, f.name.name, join, result);
-    }
-    // Lowering the callee's own body: its loops are lexical for its own
-    // `break`/`continue`, so suspend any enclosing spliced-lambda context, which a
-    // lambda the body splices re-enters through `spliceInlineLambdaOn`.
+    return false;
+}
+
+/// Lowering the callee's own body: its loops are lexical for its own
+/// `break`/`continue`, so suspend any enclosing spliced-lambda context, which a
+/// lambda the body splices re-enters through `spliceInlineLambdaOn`.
+fn lowerSplicedBody(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    body: *const ast.FunctionBody,
+) Allocator.Error!Reg {
     const prev_in_spliced = b.in_spliced_lambda_body;
     b.in_spliced_lambda_body = 0;
     b.lowering_inline_fn_body += 1;
@@ -3524,6 +3946,324 @@ pub fn tryInlineCallWithTypeArgs(
     };
     b.lowering_inline_fn_body -= 1;
     b.in_spliced_lambda_body = prev_in_spliced;
+    return body_val;
+}
+
+/// Remove the marks, boxing flags and reified bindings this splice added, so a
+/// same-named caller local keeps its own; the reified bindings unwind in reverse
+/// order so nested same-named params restore correctly.
+fn restoreSpliceMarks(
+    b: *FuncBuilder,
+    marked_rlp: []const []const u8,
+    shared_rlp_here: []const []const u8,
+    boxed_here: []const []const u8,
+    reified_restores: []const ReifiedRestore,
+) void {
+    for (marked_rlp) |n| {
+        b.unmarkReceiverLambdaParam(n);
+        b.clearSpliceRlpMark(n);
+    }
+    for (shared_rlp_here) |n| b.clearSharedRlpMark(n);
+    // Remove the boxing marks added for this splice so a same-named caller local
+    // keeps its own boxed status.
+    for (boxed_here) |n| b.unmarkBoxed(n);
+    // Restore enclosing reified-type bindings shadowed by this splice, in reverse
+    // order so nested same-named params unwind correctly.
+    {
+        var ri: usize = reified_restores.len;
+        while (ri > 0) {
+            ri -= 1;
+            const rr = reified_restores[ri];
+            b.restoreReifiedType(rr.name, rr.prev);
+        }
+    }
+}
+
+pub fn tryInlineCallWithTypeArgs(
+    b: *FuncBuilder,
+    fname: []const u8,
+    target: ?*const ast.Function,
+    args: []const Expr,
+    arg_names: []const ?[]const u8,
+    this_arg: ?*const Expr,
+    type_args: []const TypeRef,
+    expected: ?*const TypeRef,
+) Allocator.Error!?Reg {
+    const f = (try spliceTargetFor(b, fname, target, args, this_arg)) orelse return null;
+    if (!memberExtVisibleAtCall(b, fname, target, f)) return null;
+    if (b.inlineDeclInProgress(f)) return null;
+    if (resultReceiverIsNative(f)) return null;
+    if (typeOfIsReifiedIntrinsic(fname, f)) return null;
+    traceSpliceEntry(fname, f, this_arg, type_args);
+    // Materialise the body if it is a deferred image marker before reading it.
+    inline_state.ensureInlineBody(f);
+    const body = if (f.body) |*body_ref| body_ref else {
+        spliceBail(fname, "no-body");
+        return null;
+    };
+
+    const ordered = try b.allocator.alloc(?*const Expr, f.params.len);
+    defer b.allocator.free(ordered);
+    for (ordered) |*slot| slot.* = null;
+    var vararg_value: ?*const Expr = null;
+    if (!try orderInlineArgs(b, fname, f, args, arg_names, ordered, &vararg_value)) return null;
+    const slot_is_default = try b.allocator.alloc(bool, ordered.len);
+    defer b.allocator.free(slot_is_default);
+    if (!fillInlineDefaultSlots(fname, f, ordered, slot_is_default)) return null;
+
+    // This is the caller-frame inference: arguments are the caller's expressions, so
+    // their typing belongs here, and the callee-frame pass may lose a derivation
+    // that needs the caller's scope.
+    var caller_probe: ?[]?TypeRef = null;
+    defer if (caller_probe) |cp| b.allocator.free(cp);
+    {
+        const probe = try inferReifiedTypeArgsRecv(b.allocator, f, type_args, expected, ordered, b, this_arg);
+        stripReifiedProjections(probe);
+        caller_probe = probe;
+        if (try declinesOnUnboundReified(b, fname, f, probe, ordered)) return null;
+    }
+
+    if (!enterInlineExpansion(fname, f)) return null;
+    errdefer inline_state.inlineExpandLeave();
+    const member_splice = f.receiver_type == null and this_arg != null and
+        inline_state.inlineMemberOwner(f) != null;
+    const explicit_receiver = try lowerSpliceReceiver(b, f, this_arg, member_splice);
+    // The caller's lexical owner, for scope-true renames of the reified type
+    // arguments bound below; the callee frame pushed next has none.
+    const lexical_owner = b.ownerClass();
+    try b.pushInlineDecl(fname, f);
+    const prev_splice_recv = b.spliceRecvTy();
+    try installSpliceRecvWindow(b, f, this_arg, member_splice);
+    defer b.setSpliceRecvTy(prev_splice_recv);
+    const recv_ref_owned = try spliceReceiverTypeRefOwned(b, f, this_arg);
+    const prev_recv_ref = b.setSpliceRecvTyRef(recv_ref_owned);
+    defer if (b.setSpliceRecvTyRef(prev_recv_ref)) |owned| {
+        var t = owned;
+        t.deinit(b.allocator);
+    };
+    var s4_restores: std.ArrayList(S4Restore) = .empty;
+    defer s4_restores.deinit(b.allocator);
+    defer for (s4_restores.items) |*sr| {
+        if (sr.prev) |p| {
+            b.addTypeParamBoundRef(sr.name, p) catch {};
+        } else if (b.type_param_bound_refs.fetchRemove(sr.name)) |kv| {
+            var v = kv.value;
+            v.deinit(b.allocator);
+        }
+    };
+    installSolvedTypeParamBounds(b, &s4_restores);
+    // Bare-call hygiene for the spliced body: its bare calls resolve against the
+    // inline fn's own receiver, never the caller's class. The pre-splice hint is
+    // recorded on the inline-lambda frame so a spliced caller lambda restores it.
+    const prev_hint_active = b.spliceHintActive();
+    const prev_hint_recv = b.spliceHintRecv();
+    b.setSpliceHint(true, if (f.receiver_type) |rt| rt.name.name else if (member_splice) inline_state.inlineMemberOwner(f) else null);
+    defer b.setSpliceHint(prev_hint_active, prev_hint_recv);
+    const prev_hint_recv_ref = b.setSpliceHintRecvRef(f.receiver_type);
+    defer _ = b.setSpliceHintRecvRef(prev_hint_recv_ref);
+    // The spliced body has its own receiver context, so the caller's smart-cast
+    // narrow of `this` must not leak into it.
+    const prev_this_narrow = b.setThisNarrow(null);
+    defer _ = b.setThisNarrow(prev_this_narrow);
+    // Scope depth before the inline fn binds its parameters: a lambda argument
+    // spliced from this call resolves its free names in these caller scopes.
+    var caller_scope_depth = b.scopeDepth();
+    try b.pushScope();
+    // The inline body lowers into the caller's builder, so its own `var` decls and
+    // any inline parameter a nested closure writes must be boxed into a shared
+    // `Value.Cell` here, exactly as a captured `var` is at a lambda boundary.
+    // Otherwise the write takes the `StoreGlobal`-for-capture fallback, which only
+    // round-trips on the stdlib-HOF scoped env. Newly boxed names are unboxed after
+    // the splice so the mark never leaks onto a same-named caller local.
+    var boxed_here: std.ArrayList([]const u8) = .empty;
+    defer boxed_here.deinit(b.allocator);
+    var splice_boxed = ast_scan.StringSet.init(b.allocator);
+    defer splice_boxed.deinit();
+    try computeSpliceBoxedNames(b, f, body, &splice_boxed);
+    var lambda_map = std.StringHashMap(*const ast.Expr).init(b.allocator);
+    const arg_regs = try b.allocator.alloc(Reg, f.params.len);
+    defer b.allocator.free(arg_regs);
+    // The caller's emitter computed instantiated expected param types per argument
+    // slot, which this loop bypasses, so consume them here.
+    const arg_lambda_param_types = b.pending_arg_lambda_param_types;
+    b.pending_arg_lambda_param_types = null;
+    var param_ty_saves: std.ArrayList(PTySave) = .empty;
+    defer param_ty_saves.deinit(b.allocator);
+    defer for (param_ty_saves.items) |*sv| {
+        b.clearLocalDeclType(sv.name);
+        if (sv.ty) |t| b.setLocalDeclTypeOwned(sv.name, t) catch {};
+    };
+    // Params already bound by earlier iterations must not capture a later
+    // caller-supplied argument using the same name: Kotlin evaluates supplied
+    // arguments in the caller's scope, and only a default-filled slot is callee code.
+    var bound_param_names: std.ArrayList([]const u8) = .empty;
+    defer bound_param_names.deinit(b.allocator);
+    var arg_bind = InlineArgBind{
+        .b = b,
+        .fname = fname,
+        .f = f,
+        .args = args,
+        .ordered = ordered,
+        .slot_is_default = slot_is_default,
+        .vararg_value = vararg_value,
+        .arg_lambda_param_types = arg_lambda_param_types,
+        .explicit_receiver = explicit_receiver,
+        .splice_boxed = &splice_boxed,
+        .arg_regs = arg_regs,
+        .lambda_map = &lambda_map,
+        .param_ty_saves = &param_ty_saves,
+        .bound_param_names = &bound_param_names,
+        .boxed_here = &boxed_here,
+    };
+    for (f.params, 0..) |*p, i| try bindInlineArg(&arg_bind, p, i);
+    const any_forwarded_lambda = arg_bind.any_forwarded_lambda;
+    const any_literal_lambda = arg_bind.any_literal_lambda;
+    var marked_generic: std.ArrayList([]const u8) = .empty;
+    defer marked_generic.deinit(b.allocator);
+    try markInlineGenericTypedParams(b, f, &marked_generic);
+    // Mark params whose declared type is a receiver-typed function so a bare
+    // `block(...)` dispatches `this.block()`. Same record-and-remove discipline.
+    var marked_rlp: std.ArrayList([]const u8) = .empty;
+    defer marked_rlp.deinit(b.allocator);
+    var shared_rlp_here: std.ArrayList([]const u8) = .empty;
+    defer shared_rlp_here.deinit(b.allocator);
+    try markInlineReceiverLambdaParams(b, f, &marked_rlp, &shared_rlp_here);
+    // A forwarded inline lambda is caller-of-caller code: its free names, bare-call
+    // hints and receiver context belong to the frame it was forwarded from, so when
+    // every substituted lambda is forwarded, inherit that frame's provenance.
+    try pushSpliceLambdaFrame(b, lambda_map, &caller_scope_depth, prev_hint_active, prev_hint_recv, prev_this_narrow, any_forwarded_lambda, any_literal_lambda);
+    // An inline extension splice's body resolves names against the inline function's
+    // own parameter and receiver scopes, not the caller lambda's free names, but a
+    // nesting `lambda_splice_resolve` window skips the very scopes this splice binds
+    // into. Suspend it after lowering the receiver expression, itself a caller free
+    // name, and restore it after the body.
+    // A member-inline fn spliced through an explicit receiver binds that receiver as
+    // the body's `this` exactly like a receiver extension.
+    const ext_splice = (f.receiver_type != null or member_splice) and this_arg != null;
+    // The member body's bare sibling calls must lower as member-shadowable dispatch
+    // on the bound `this`, so activate the owner class and its hierarchy's
+    // member-name set. A spliced body resolves in its declaration scope, so park the
+    // caller's member sets and lexical owner; member splices park too, their owner
+    // swap installing the owner scope on top, and the call-site lambda swaps the
+    // parked caller scope back in for its own nested-class ctors.
+    // `KLIO_SPLICE_HYG=0` disables.
+    var hyg_snap: build.FuncBuilder.MemberScopeSnapshot = undefined;
+    const hyg_active = (ext_splice or member_splice) and
+        !std.mem.eql(u8, inline_state.runtime.envOnce("KLIO_SPLICE_HYG") orelse "1", "0");
+    if (hyg_active) b.beginSpliceDeclScope(&hyg_snap);
+    defer if (hyg_active) b.endSpliceDeclScope(&hyg_snap);
+    var member_scope_prev_owner: ?[]const u8 = null;
+    var member_scope_prev_members: ?build.StringSet = null;
+    // The body's lexical scope is the owner class, not the call site, so bare names
+    // in a spliced member body never bind a caller local. The floor covers the whole
+    // splice; the caller-lambda window overrides it while an arg lambda lowers.
+    var prev_body_floor: ?usize = null;
+    var body_floor_set = false;
+    // A spliced body resolves bare names in the callee's scope, the caller's locals
+    // sitting below the floor for member and extension splices alike. The splice's
+    // own parameters bind above the floor.
+    if (hyg_active) {
+        prev_body_floor = b.splice_body_floor;
+        b.splice_body_floor = caller_scope_depth;
+        body_floor_set = true;
+    }
+    defer if (body_floor_set) {
+        b.splice_body_floor = prev_body_floor;
+    };
+    if (member_splice) installMemberSpliceScope(b, f, &member_scope_prev_owner, &member_scope_prev_members);
+    defer if (member_splice) {
+        b.owner_class = member_scope_prev_owner;
+        if (member_scope_prev_members) |pm| {
+            b.enclosing_members.deinit();
+            b.enclosing_members = pm;
+        }
+    };
+    var prev_splice_window: @TypeOf(b.lambda_splice_resolve) = null;
+    if (inline_state.runtime.envOnce("KLIO_SPLICE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, fname)) std.debug.print("[splice] {s} recv={} ext={} member={} this_arg={}\n", .{ fname, explicit_receiver != null, f.receiver_type != null, member_splice, this_arg != null });
+    }
+    // An extension splice's bound receiver is an implicit receiver inner to any
+    // spliced lambda subject already on the tower, so push it too. Only while a
+    // tower region is active: outside one, emissions pin the bound register.
+    const encl_ext_pushed = explicit_receiver != null and rfsEnabled() and b.encl_tower_depth > 0;
+    const prev_ext_tower_top = b.encl_tower_top;
+    if (encl_ext_pushed) {
+        try b.push(.{ .EnclosingPush = .{ .src = explicit_receiver.? } });
+        b.encl_tower_depth += 1;
+        b.encl_tower_top = explicit_receiver.?;
+    }
+    const ext_subject_pushed = explicit_receiver != null;
+    try bindSpliceReceiverSubject(b, fname, explicit_receiver);
+    defer if (ext_subject_pushed) {
+        _ = b.subject_binds.pop();
+    };
+    try bindOwnerImplicitThis(b, f, this_arg);
+    if (ext_splice) {
+        prev_splice_window = b.lambda_splice_resolve;
+        b.lambda_splice_resolve = null;
+    }
+    // Bind each reified type parameter to the resolved class value at the call site,
+    // in two places: locally, so the body's `T::class` read lowers as a bare `T`
+    // Path plus MemberRef `.class`; and as a global named "T", which
+    // `Inst::InstanceOf { ty: TypeRef "T" }` checks against, mirroring how
+    // `call_func_typed` binds runtime type-args. Without the global, `x is T` tests
+    // a non-existent class and falls through to `true`.
+    //
+    // The global is not saved or restored, the same shape non-inline type-arg
+    // binding uses: a nested splice overwrites it, and the restore happens
+    // implicitly when the enclosing call returns.
+    // Explicit `<…>` type arguments win; an unspecified reified parameter is
+    // inferred by unifying the declared return against the call's expected type. The
+    // callee frame is pushed by now, so argument-derived bindings rename nested
+    // classes through the caller's lexical owner.
+    const prev_splice_owner = splice_lexical_owner;
+    splice_lexical_owner = lexical_owner;
+    defer splice_lexical_owner = prev_splice_owner;
+    const effective_type_args = try effectiveReifiedTypeArgs(b, fname, f, type_args, expected, ordered, this_arg, caller_probe);
+    defer b.allocator.free(effective_type_args);
+    var reified_restores: std.ArrayList(ReifiedRestore) = .empty;
+    defer reified_restores.deinit(b.allocator);
+    // Name substitutions for the splice's reified params, consumed by `emitCall` and
+    // `emitExtBareCall` to stamp static type args onto nested calls in the body.
+    var reified_name_restores: std.ArrayList(NameRestore) = .empty;
+    defer reified_name_restores.deinit(b.allocator);
+    defer for (reified_name_restores.items) |nr| b.restoreReifiedTypeName(nr.name, nr.prev);
+    try bindReifiedTypeArgs(b, fname, f, effective_type_args, ordered, arg_regs, lexical_owner, &reified_restores, &reified_name_restores);
+    // Record each parameter's declared type with this splice's reified substitutions
+    // applied, so a nested reified inline call passing them along solves its own
+    // type parameters lexically.
+    var splice_ty_restores: std.ArrayList(SpRestore) = .empty;
+    defer splice_ty_restores.deinit(b.allocator);
+    defer for (splice_ty_restores.items) |sr| b.restoreSpliceParamTy(sr.name, sr.prev);
+    try bindSpliceParamTypes(b, fname, f, &splice_ty_restores);
+    // The callee's non-reified type-parameter bounds ride along with its param
+    // types, without which the head names nothing and every member call on such a
+    // parameter stays dynamic. Marked incomplete: the record supports the
+    // receiver-owner lookup, never a negative proof.
+    var splice_bound_restores: std.ArrayList(build.FuncBuilder.SpliceBoundRestore) = .empty;
+    defer splice_bound_restores.deinit(b.allocator);
+    defer for (splice_bound_restores.items) |sb| b.restoreSpliceTypeParamBound(sb);
+    try bindSpliceTypeParamBounds(b, f, &splice_bound_restores);
+    try markSpliceBodyBoxedVars(b, f, &splice_boxed, &boxed_here);
+    const result = b.allocReg();
+    const unit0 = try b.emitConst(Const.Unit);
+    try b.push(.{ .Move = .{ .dst = result, .src = unit0 } });
+    const join = try b.allocBlock();
+    try b.pushInlineReturn(result, join, f.name.name);
+    // A body mentioning `return@<this fn>` may put that return inside a closure that
+    // crosses a real frame, unwinding as a `LabeledReturn` toward a frame this splice
+    // never creates, so arm a runtime absorption region over the spliced body.
+    const needs_lr_absorb = bodyNeedsLabeledReturnAbsorb(f, body);
+    if (needs_lr_absorb and inline_state.runtime.envOnce("KLIO_NO_LR_ABSORB") == null) {
+        const region = try b.allocBlock();
+        b.terminate(.{ .Goto = region });
+        b.switchTo(region);
+        b.setLrAbsorb(region, f.name.name, join, result);
+    }
+    // Lowering the callee's own body: its loops are lexical for its own
+    // `break`/`continue`, so suspend any enclosing spliced-lambda context, which a
+    // lambda the body splices re-enters through `spliceInlineLambdaOn`.
+    const body_val = try lowerSplicedBody(b, f, body);
     try b.push(.{ .Move = .{ .dst = result, .src = body_val } });
     if (ext_splice) b.lambda_splice_resolve = prev_splice_window;
     b.terminate(.{ .Goto = join });
@@ -3533,24 +4273,7 @@ pub fn tryInlineCallWithTypeArgs(
         b.encl_tower_depth -= 1;
         b.encl_tower_top = prev_ext_tower_top;
     }
-    for (marked_rlp.items) |n| {
-        b.unmarkReceiverLambdaParam(n);
-        b.clearSpliceRlpMark(n);
-    }
-    for (shared_rlp_here.items) |n| b.clearSharedRlpMark(n);
-    // Remove the boxing marks added for this splice so a same-named caller local
-    // keeps its own boxed status.
-    for (boxed_here.items) |n| b.unmarkBoxed(n);
-    // Restore enclosing reified-type bindings shadowed by this splice, in reverse
-    // order so nested same-named params unwind correctly.
-    {
-        var ri: usize = reified_restores.items.len;
-        while (ri > 0) {
-            ri -= 1;
-            const rr = reified_restores.items[ri];
-            b.restoreReifiedType(rr.name, rr.prev);
-        }
-    }
+    restoreSpliceMarks(b, marked_rlp.items, shared_rlp_here.items, boxed_here.items, reified_restores.items);
     b.popInlineReturn();
     b.popInlineLambdaFrame();
     try b.popScope();

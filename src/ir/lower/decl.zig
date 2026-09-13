@@ -423,6 +423,18 @@ fn memberOwnerIdForFunction(
     return module.uniqueClassIdBySimpleName(owner_name);
 }
 
+/// The state each member-header reservation phase reads: the class whose
+/// members are being reserved and the identity its stubs are filed under.
+const HeaderReserve = struct {
+    /// The registry allocator, owning every reserved header's storage.
+    a: Allocator,
+    module: *Module,
+    c: *const ast.Class,
+    class_fqn: []const u8,
+    class_pkg: []const u8,
+    owner_id: ?ClassId,
+};
+
 /// Reserve every member-function signature before any class body lowers, so the
 /// declaration-span identity stays stable when the body replaces the stub and the
 /// owner-scoped index retains the full overload set.
@@ -434,6 +446,35 @@ pub fn reserveMemberHeaders(
 ) Allocator.Error!void {
     const a = module.registry.allocator;
     const owner_id = module.classIdByFqn(class_fqn) orelse module.classId(c.name.name);
+    try backfillOwnerTypeParams(module, a, c, owner_id);
+    var ctx: HeaderReserve = .{
+        .a = a,
+        .module = module,
+        .c = c,
+        .class_fqn = class_fqn,
+        .class_pkg = class_pkg,
+        .owner_id = owner_id,
+    };
+    for (c.members) |*member| {
+        if (member.* != .Function) continue;
+        const f = &member.Function;
+        if (module.funcByDeclSpan(f.name.span)) |id| {
+            try module.registerMemberDecl(a, class_fqn, f.name.name, id);
+            continue;
+        }
+        try reserveMemberHeader(&ctx, f);
+    }
+}
+
+/// A shell registered before the source class was seen carries no type
+/// parameters; fill them in from the declaration so member types resolve against
+/// the owner's own names.
+fn backfillOwnerTypeParams(
+    module: *Module,
+    a: Allocator,
+    c: *const ast.Class,
+    owner_id: ?ClassId,
+) Allocator.Error!void {
     if (owner_id) |owner| {
         if (owner.int() < module.classes.items.len and
             module.classes.items[owner.int()].type_params.len == 0 and
@@ -449,158 +490,206 @@ pub fn reserveMemberHeaders(
             module.classes.items[owner.int()].type_param_variance = variances;
         }
     }
-    for (c.members) |*member| {
-        if (member.* != .Function) continue;
-        const f = &member.Function;
-        if (module.funcByDeclSpan(f.name.span)) |id| {
-            try module.registerMemberDecl(a, class_fqn, f.name.name, id);
-            continue;
-        }
-        const decl_key = try memberDeclKey(a, c.name.name, f);
+}
 
-        const id = module.nextFuncId();
-        const params = try a.alloc(Param, f.params.len + 1);
-        params[0] = .{
-            .name = "this",
-            .ty = if (f.receiver_type) |*rt|
-                try loweredMemberTypeRef(module, a, owner_id, f, rt, false)
-            else blk: {
-                const owner_args = try a.alloc(TypeRef, c.type_params.len);
-                for (c.type_params, owner_args) |*param, *arg| {
-                    arg.* = .{
-                        .name = if (owner_id) |owner|
-                            try ir.classTypeParamIdentity(a, owner, param.name.name)
-                        else
-                            param.name.name,
-                        .nullable = false,
-                        .args = &.{},
-                    };
-                }
-                break :blk .{
-                    .name = class_fqn,
+/// Reserve one member's header: a bodyless func slot plus every declaration
+/// table member resolution consults before the body lowers.
+fn reserveMemberHeader(ctx: *HeaderReserve, f: *const ast.Function) Allocator.Error!void {
+    const decl_key = try memberDeclKey(ctx.a, ctx.c.name.name, f);
+
+    const id = ctx.module.nextFuncId();
+    const params = try reservedHeaderParams(ctx, f);
+    try appendReservedHeaderFunc(ctx, f, id, params);
+    try indexReservedHeader(ctx, f, id);
+    try registerFuncTypeParams(ctx.module, f, id);
+    try recordReservedHeaderDecl(ctx, f, id, decl_key);
+    try recordReservedHeaderFid(ctx, f, id);
+}
+
+/// The header's parameter list: the synthesized receiver slot, then each source
+/// parameter carrying its full structural type.
+fn reservedHeaderParams(ctx: *HeaderReserve, f: *const ast.Function) Allocator.Error![]Param {
+    const a = ctx.a;
+    const module = ctx.module;
+    const c = ctx.c;
+    const owner_id = ctx.owner_id;
+    const params = try a.alloc(Param, f.params.len + 1);
+    params[0] = .{
+        .name = "this",
+        .ty = if (f.receiver_type) |*rt|
+            try loweredMemberTypeRef(module, a, owner_id, f, rt, false)
+        else blk: {
+            const owner_args = try a.alloc(TypeRef, c.type_params.len);
+            for (c.type_params, owner_args) |*param, *arg| {
+                arg.* = .{
+                    .name = if (owner_id) |owner|
+                        try ir.classTypeParamIdentity(a, owner, param.name.name)
+                    else
+                        param.name.name,
                     .nullable = false,
-                    .args = owner_args,
+                    .args = &.{},
                 };
-            },
-            .default = null,
-            .is_property = false,
-            .is_vararg = false,
-            .has_default = false,
-        };
-        for (f.params, 0..) |*p, i| {
-            params[i + 1] = .{
-                .name = p.name.name,
-                .ty = renameParamHead(
-                    try loweredMemberTypeRef(
-                        module,
-                        a,
-                        owner_id,
-                        f,
-                        &p.ty,
-                        false,
-                    ),
-                    &p.ty,
-                ),
-                .default = null,
-                .composable_arity = @import("compose_pass").composableFunctionArity(&p.ty),
-                .composable_recv_slots = @import("compose_pass").composableFunctionRecvSlots(&p.ty),
-                .is_property = false,
-                .is_vararg = p.is_vararg,
-                .has_default = p.default != null,
-            };
-        }
-        const fqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ class_fqn, f.name.name });
-        const return_ty = if (f.return_type) |*rt|
-            renameParamHead(try loweredMemberTypeRef(module, a, owner_id, f, rt, false), rt)
-        else
-            build.typeUnit();
-        try module.appendFunc(.{
-            .id = id,
-            .name = f.name.name,
-            .fqn = fqn,
-            .package = class_pkg,
-            .params = params,
-            .return_ty = return_ty,
-            .return_ty_declared = f.return_type != null,
-            .n_locals = 0,
-            .blocks = &.{},
-            .entry = ir.BlockId.from(0),
-            .is_suspend = f.is_suspend,
-            .kind = if (f.receiver_type != null) .member_extension else .instance_method,
-            .is_tailrec = f.is_tailrec,
-            .has_receiver_param = true,
-            .is_inline = f.is_inline,
-            .low_priority = isLowPriorityOverload(f),
-            .deprecated_error = annotationsAreDeprecatedError(f.annotations),
-            .is_expect = f.is_expect,
-            .is_override = f.is_override,
-            .is_open = f.is_open,
-            .is_final = f.is_final,
-        });
-        if (f.receiver_type != null) {
-            try module.func_index.append(a, .{ .name = f.name.name, .id = id });
-            try funcNameIndexPush(module, f.name.name, id);
-        }
-        try module.recordFuncDeclSpan(a, f.name.span, id);
-        if (f.receiver_type != null) {
-            try module.registry.member_ext_owner_class.put(id, class_fqn);
-            if (f.visibility == .Private) {
-                try module.registry.private_fn_files.put(id, f.name.span.file);
             }
-        }
-        try registerFuncTypeParams(module, f, id);
-
-        var has_vararg = false;
-        var required: u32 = 0;
-        for (f.params) |*p| {
-            if (p.is_vararg) has_vararg = true;
-            if (p.default == null and !p.is_vararg) required += 1;
-        }
-        const arity: Module.DeclArity = .{
-            .required = required,
-            .total = @intCast(f.params.len),
-            .has_vararg = has_vararg,
-        };
-        const sig = try a.alloc(TypeRef, f.params.len);
-        for (f.params, 0..) |*p, i| {
-            sig[i] = try loweredMemberTypeRef(
-                module,
-                a,
-                owner_id,
-                f,
+            break :blk .{
+                .name = ctx.class_fqn,
+                .nullable = false,
+                .args = owner_args,
+            };
+        },
+        .default = null,
+        .is_property = false,
+        .is_vararg = false,
+        .has_default = false,
+    };
+    for (f.params, 0..) |*p, i| {
+        params[i + 1] = .{
+            .name = p.name.name,
+            .ty = renameParamHead(
+                try loweredMemberTypeRef(
+                    module,
+                    a,
+                    owner_id,
+                    f,
+                    &p.ty,
+                    false,
+                ),
                 &p.ty,
-                true,
-            );
-        }
-        try module.decl_user_params.put(id.int(), @intCast(f.params.len));
-        try module.decl_user_arity.put(id.int(), arity);
-        try module.decl_user_sig.put(id.int(), sig);
-        try module.decl_sigs.put(id.int(), .{
-            .enclosing_class = owner_id,
-            .receiver_ty = if (f.receiver_type) |*rt|
-                try loweredMemberTypeRef(module, a, owner_id, f, rt, true)
-            else
-                null,
-            .arity = arity,
-            .sig = sig,
-            .kind = if (f.receiver_type != null) .member_extension else .instance_method,
-            .visibility = f.visibility,
-            .is_inline = f.is_inline,
-            .is_suspend = f.is_suspend,
-            .has_body = f.body != null,
-        });
-        try module.decl_span.put(id.int(), f.span);
-        if (f.body != null) try module.decl_ast_body.put(id.int(), {});
-        try module.registry.member_method_fids.put(decl_key, id);
-        try module.registerMemberDecl(a, class_fqn, f.name.name, id);
+            ),
+            .default = null,
+            .composable_arity = @import("compose_pass").composableFunctionArity(&p.ty),
+            .composable_recv_slots = @import("compose_pass").composableFunctionRecvSlots(&p.ty),
+            .is_property = false,
+            .is_vararg = p.is_vararg,
+            .has_default = p.default != null,
+        };
+    }
+    return params;
+}
 
-        const key = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ c.name.name, f.name.name, f.params.len });
-        const gop = try module.registry.member_method_fids.getOrPut(key);
-        if (gop.found_existing) {
-            a.free(key);
-        } else {
-            gop.value_ptr.* = id;
+/// Append the bodyless func the reserved id names, carrying the declaration's
+/// modifiers so overload resolution ranks it before any body lowers.
+fn appendReservedHeaderFunc(
+    ctx: *HeaderReserve,
+    f: *const ast.Function,
+    id: FuncId,
+    params: []Param,
+) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    const fqn = try std.fmt.allocPrint(a, "{s}.{s}", .{ ctx.class_fqn, f.name.name });
+    const return_ty = if (f.return_type) |*rt|
+        renameParamHead(try loweredMemberTypeRef(module, a, ctx.owner_id, f, rt, false), rt)
+    else
+        build.typeUnit();
+    try module.appendFunc(.{
+        .id = id,
+        .name = f.name.name,
+        .fqn = fqn,
+        .package = ctx.class_pkg,
+        .params = params,
+        .return_ty = return_ty,
+        .return_ty_declared = f.return_type != null,
+        .n_locals = 0,
+        .blocks = &.{},
+        .entry = ir.BlockId.from(0),
+        .is_suspend = f.is_suspend,
+        .kind = if (f.receiver_type != null) .member_extension else .instance_method,
+        .is_tailrec = f.is_tailrec,
+        .has_receiver_param = true,
+        .is_inline = f.is_inline,
+        .low_priority = isLowPriorityOverload(f),
+        .deprecated_error = annotationsAreDeprecatedError(f.annotations),
+        .is_expect = f.is_expect,
+        .is_override = f.is_override,
+        .is_open = f.is_open,
+        .is_final = f.is_final,
+    });
+}
+
+/// File the reserved header in the name indexes: a member extension also answers
+/// to its bare name, and every header answers to its declaration span.
+fn indexReservedHeader(ctx: *HeaderReserve, f: *const ast.Function, id: FuncId) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    if (f.receiver_type != null) {
+        try module.func_index.append(a, .{ .name = f.name.name, .id = id });
+        try funcNameIndexPush(module, f.name.name, id);
+    }
+    try module.recordFuncDeclSpan(a, f.name.span, id);
+    if (f.receiver_type != null) {
+        try module.registry.member_ext_owner_class.put(id, ctx.class_fqn);
+        if (f.visibility == .Private) {
+            try module.registry.private_fn_files.put(id, f.name.span.file);
         }
+    }
+}
+
+/// Record the reserved header's declaration shape: arity, signature and the
+/// owner-scoped overload index rows applicability reads.
+fn recordReservedHeaderDecl(
+    ctx: *HeaderReserve,
+    f: *const ast.Function,
+    id: FuncId,
+    decl_key: []const u8,
+) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    const owner_id = ctx.owner_id;
+    var has_vararg = false;
+    var required: u32 = 0;
+    for (f.params) |*p| {
+        if (p.is_vararg) has_vararg = true;
+        if (p.default == null and !p.is_vararg) required += 1;
+    }
+    const arity: Module.DeclArity = .{
+        .required = required,
+        .total = @intCast(f.params.len),
+        .has_vararg = has_vararg,
+    };
+    const sig = try a.alloc(TypeRef, f.params.len);
+    for (f.params, 0..) |*p, i| {
+        sig[i] = try loweredMemberTypeRef(
+            module,
+            a,
+            owner_id,
+            f,
+            &p.ty,
+            true,
+        );
+    }
+    try module.decl_user_params.put(id.int(), @intCast(f.params.len));
+    try module.decl_user_arity.put(id.int(), arity);
+    try module.decl_user_sig.put(id.int(), sig);
+    try module.decl_sigs.put(id.int(), .{
+        .enclosing_class = owner_id,
+        .receiver_ty = if (f.receiver_type) |*rt|
+            try loweredMemberTypeRef(module, a, owner_id, f, rt, true)
+        else
+            null,
+        .arity = arity,
+        .sig = sig,
+        .kind = if (f.receiver_type != null) .member_extension else .instance_method,
+        .visibility = f.visibility,
+        .is_inline = f.is_inline,
+        .is_suspend = f.is_suspend,
+        .has_body = f.body != null,
+    });
+    try module.decl_span.put(id.int(), f.span);
+    if (f.body != null) try module.decl_ast_body.put(id.int(), {});
+    try module.registry.member_method_fids.put(decl_key, id);
+    try module.registerMemberDecl(a, ctx.class_fqn, f.name.name, id);
+}
+
+/// Key the reserved header by (class, name, declared arity) so a body lowered
+/// later in the same class reaches its signature.
+fn recordReservedHeaderFid(ctx: *HeaderReserve, f: *const ast.Function, id: FuncId) Allocator.Error!void {
+    const a = ctx.a;
+    const key = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ ctx.c.name.name, f.name.name, f.params.len });
+    const gop = try ctx.module.registry.member_method_fids.getOrPut(key);
+    if (gop.found_existing) {
+        a.free(key);
+    } else {
+        gop.value_ptr.* = id;
     }
 }
 
@@ -941,6 +1030,21 @@ pub fn populateClassSupertypes(
     slot.supertype_refs = try supertype_refs.toOwnedSlice(a);
 }
 
+/// The state every class-member lowering phase reads: the class being lowered,
+/// its registered shell, and the tables its member bodies resolve against.
+const ClassLower = struct {
+    /// The registry allocator, owning everything the lowered class keeps.
+    a: Allocator,
+    module: *Module,
+    c: *const ast.Class,
+    class_id: ClassId,
+    extra_members: *const StringSet,
+    own_member_names: *StringSet,
+    own_member_arity: *std.StringHashMap(u64),
+    /// The class's method list, sealed onto the shell once every member lowers.
+    methods: *std.ArrayList(FuncId),
+};
+
 pub fn lowerClassWithExtras(
     module: *Module,
     c: *const ast.Class,
@@ -949,13 +1053,66 @@ pub fn lowerClassWithExtras(
 ) Allocator.Error!ClassId {
     const a = module.registry.allocator;
 
+    const class_id = try registerClassShell(module, a, c);
+
+    // Collect this class's own member names so method-body lowering can tell
+    // `someMember()` from `topLevelFn()`. The lexically enclosing class's members
+    // stay separate: they belong to an enclosing `this@Outer`, reached only through
+    // the implicit-receiver candidate walk. Routing them through the candidate
+    // resolver matches kotlinc, which searches the inner's own `this` then its
+    // `outer` links, while a subject brings only itself.
+    var own_member_names = StringSet.init(a);
+    defer own_member_names.deinit();
+    try collectOwnMemberNames(a, c, file_classes, &own_member_names);
+    // Per-member arity masks, so a method body's bare call prefers a member only
+    // when one is arity-applicable.
+    var own_member_arity = std.StringHashMap(u64).init(a);
+    defer own_member_arity.deinit();
+    try collectOwnMemberArities(a, c, file_classes, &own_member_arity);
+
+    var methods: std.ArrayList(FuncId) = .empty;
+    errdefer methods.deinit(a);
+
+    var ctx: ClassLower = .{
+        .a = a,
+        .module = module,
+        .c = c,
+        .class_id = class_id,
+        .extra_members = extra_members,
+        .own_member_names = &own_member_names,
+        .own_member_arity = &own_member_arity,
+        .methods = &methods,
+    };
+
+    for (c.members) |*m| {
+        if (m.* == .Function) {
+            const f = &m.Function;
+            // Skip bodyless methods: they would lower to a func returning Unit, and
+            // IR-native member dispatch must fall through to the real override.
+            if (f.body == null) {
+                try retainBodylessMember(&ctx, f);
+                continue;
+            }
+            try lowerConcreteMember(&ctx, f);
+        }
+    }
+    try lowerDataClassComponents(&ctx);
+    // Patch the registered class with its now-known method list.
+    if (class_id.int() < module.classes.items.len) {
+        const slot = &module.classes.items[class_id.int()];
+        slot.methods = try methods.toOwnedSlice(a);
+    }
+    return class_id;
+}
+
+/// Register the class shell first so the class name resolves inside its own
+/// method bodies.
+fn registerClassShell(module: *Module, a: Allocator, c: *const ast.Class) Allocator.Error!ClassId {
     const class_type_params = try a.alloc([]const u8, c.type_params.len);
     for (c.type_params, class_type_params) |*param, *out| out.* = param.name.name;
     const class_type_param_variance = try a.alloc(ast.Variance, c.type_params.len);
     for (c.type_params, class_type_param_variance) |*param, *out| out.* = param.variance;
 
-    // Register the class shell first so the class name resolves inside its own
-    // method bodies.
     const class_fqn = lower_class_fqn orelse c.name.name;
     const class_id = try module.addClass(a, .{
         .id = ClassId.from(0),
@@ -992,225 +1149,249 @@ pub fn lowerClassWithExtras(
         class_fqn,
         lower_class_pkg orelse ir.packageOfFqn(class_fqn, c.name.name),
     );
-    // Collect this class's own member names so method-body lowering can tell
-    // `someMember()` from `topLevelFn()`. The lexically enclosing class's members
-    // stay separate: they belong to an enclosing `this@Outer`, reached only through
-    // the implicit-receiver candidate walk. Routing them through the candidate
-    // resolver matches kotlinc, which searches the inner's own `this` then its
-    // `outer` links, while a subject brings only itself.
-    var own_member_names = StringSet.init(a);
-    defer own_member_names.deinit();
-    // Walk this class and every supertype reachable through the file's class
-    // registry so inherited member names also route as `this.<name>`.
+    return class_id;
+}
+
+/// Walk this class and every supertype reachable through the file's class
+/// registry so inherited member names also route as `this.<name>`.
+fn collectOwnMemberNames(
+    a: Allocator,
+    c: *const ast.Class,
+    file_classes: *const FileClasses,
+    own_member_names: *StringSet,
+) Allocator.Error!void {
     var seen_for_collect = StringSet.init(a);
     defer seen_for_collect.deinit();
-    try collectMembers(c, file_classes, &own_member_names, &seen_for_collect);
-    try addVisibleMemberNames(c, &own_member_names);
-    // Per-member arity masks, so a method body's bare call prefers a member only
-    // when one is arity-applicable.
-    var own_member_arity = std.StringHashMap(u64).init(a);
-    defer own_member_arity.deinit();
+    try collectMembers(c, file_classes, own_member_names, &seen_for_collect);
+    try addVisibleMemberNames(c, own_member_names);
+}
+
+/// The same supertype walk, recording each member's arity mask.
+fn collectOwnMemberArities(
+    a: Allocator,
+    c: *const ast.Class,
+    file_classes: *const FileClasses,
+    own_member_arity: *std.StringHashMap(u64),
+) Allocator.Error!void {
     var seen_for_arity = StringSet.init(a);
     defer seen_for_arity.deinit();
-    try collectMemberArities(c, file_classes, &own_member_arity, &seen_for_arity);
+    try collectMemberArities(c, file_classes, own_member_arity, &seen_for_arity);
+}
 
-    var methods: std.ArrayList(FuncId) = .empty;
-    errdefer methods.deinit(a);
-    for (c.members) |*m| {
-        if (m.* == .Function) {
-            const f = &m.Function;
-            // Skip bodyless methods: they would lower to a func returning Unit, and
-            // IR-native member dispatch must fall through to the real override.
-            if (f.body == null) {
-                // The abstract slot is skipped, but a concrete `override` inherits
-                // its default-arg values, so lower the thunks and stash them by
-                // (class, method) for the build pass to fold onto the override.
-                try recordAbstractMemberDefaults(module, c, f);
-                // Record the declared arity so overload picks ranking members above
-                // extensions see the bodyless slot; defaulted params widen the mask
-                // down to the min arity.
-                {
-                    var defaults_n: usize = 0;
-                    for (f.params) |*fp| {
-                        if (fp.default != null) defaults_n += 1;
-                    }
-                    const hi: u6 = @intCast(@min(f.params.len, 63));
-                    const lo: u6 = @intCast(@min(f.params.len - defaults_n, 63));
-                    var mask: u64 = 0;
-                    var ar: u6 = lo;
-                    while (true) : (ar += 1) {
-                        mask |= @as(u64, 1) << ar;
-                        if (ar == hi) break;
-                    }
-                    const gop2 = try module.registry.abstract_member_arity.getOrPut(.{ .a = c.name.name, .b = f.name.name });
-                    if (gop2.found_existing) gop2.value_ptr.* |= mask else gop2.value_ptr.* = mask;
-                }
-                // An abstract member-extension declaration records its
-                // extension-receiver type head, which a SAM conversion of the fun
-                // interface binds as the lambda's implicit `this`.
-                if (f.receiver_type) |*rt| {
-                    try module.registry.iface_member_ext_recv.put(.{ .a = c.name.name, .b = f.name.name }, rt.name.name);
-                }
-                // Likewise its `context(...)` parameter types, which the SAM
-                // dispatch resolves from the call site's context scope.
-                if (f.context_params.len != 0) {
-                    var joined: std.ArrayList(u8) = .empty;
-                    for (f.context_params, 0..) |*cp, ci| {
-                        if (ci != 0) try joined.append(a, '|');
-                        try joined.appendSlice(a, cp.ty.name.name);
-                    }
-                    try module.registry.iface_member_ctx_types.put(.{ .a = c.name.name, .b = f.name.name }, try joined.toOwnedSlice(a));
-                }
-                // A bodyless expect-class member is the declaration of a host-backed
-                // API, retained as a header row whose decl sig names its member fqn
-                // as the host symbol. The link step joins the intrinsic where one
-                // exists, and member resolution binds the call statically.
-                if (c.is_expect and f.receiver_type == null) {
-                    if (runtime.envOnce("KLIO_EXPECT_HDR_TRACE") != null)
-                        std.debug.print("[expect-hdr] {s}.{s} class_fqn={s}\n", .{ c.name.name, f.name.name, lower_class_fqn orelse "-" });
-                    if (try retainExpectMemberHeader(module, c, f, class_id)) |hid| {
-                        try methods.append(a, hid);
-                    }
-                }
-                continue;
-            }
-            // Use the method's own FuncId, not `funcs.len() - 1`: lowering a method
-            // also pushes its default-arg thunk funcs.
-            const placed = try lowerMethodWithMemberContext(
-                module,
-                f,
-                c.name.name,
-                &own_member_names,
-                extra_members,
-                &own_member_arity,
-            );
-            try methods.append(a, placed.id);
-            // Record this method by (class, name, declared arity) so a sibling body
-            // lowered later reaches its signature, owner-scoped so an unrelated
-            // class's namesake is never mistaken for it.
-            {
-                const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ c.name.name, f.name.name, f.params.len });
-                const gop = try module.registry.member_method_fids.getOrPut(ukey);
-                if (gop.found_existing) {
-                    a.free(ukey);
-                } else {
-                    gop.value_ptr.* = placed.id;
-                }
-            }
-            // Unified declaration record: the member half of the canonical index,
-            // the split `decl_user_*` tables covering only top-level declarations.
-            if (!module.decl_sigs.contains(placed.id.int())) {
-                var has_vararg = false;
-                var required: u32 = 0;
-                for (f.params) |*p| {
-                    if (p.is_vararg) has_vararg = true;
-                    if (p.default == null and !p.is_vararg) required += 1;
-                }
-                const msig = try a.alloc(ir.TypeRef, f.params.len);
-                for (f.params, 0..) |*p, i| {
-                    msig[i] = try loweredTypeRef(a, &p.ty, true);
-                }
-                try module.decl_sigs.put(placed.id.int(), .{
-                    .enclosing_class = class_id,
-                    .receiver_ty = if (f.receiver_type) |*rt| try loweredTypeRef(a, rt, true) else null,
-                    .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
-                    .sig = msig,
-                    .kind = if (f.receiver_type != null) .member_extension else .instance_method,
-                    .visibility = f.visibility,
-                    .is_inline = f.is_inline,
-                    .is_suspend = f.is_suspend,
-                    .has_body = true,
-                });
-            }
+/// A bodyless member declares a slot without filling it. Record what dispatch
+/// and SAM conversion still need from the declaration, and retain a header row
+/// where the declaration names a host-backed API.
+fn retainBodylessMember(ctx: *ClassLower, f: *const ast.Function) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    const c = ctx.c;
+    // The abstract slot is skipped, but a concrete `override` inherits
+    // its default-arg values, so lower the thunks and stash them by
+    // (class, method) for the build pass to fold onto the override.
+    try recordAbstractMemberDefaults(module, c, f);
+    try recordAbstractMemberArity(ctx, f);
+    // An abstract member-extension declaration records its
+    // extension-receiver type head, which a SAM conversion of the fun
+    // interface binds as the lambda's implicit `this`.
+    if (f.receiver_type) |*rt| {
+        try module.registry.iface_member_ext_recv.put(.{ .a = c.name.name, .b = f.name.name }, rt.name.name);
+    }
+    // Likewise its `context(...)` parameter types, which the SAM
+    // dispatch resolves from the call site's context scope.
+    if (f.context_params.len != 0) {
+        var joined: std.ArrayList(u8) = .empty;
+        for (f.context_params, 0..) |*cp, ci| {
+            if (ci != 0) try joined.append(a, '|');
+            try joined.appendSlice(a, cp.ty.name.name);
+        }
+        try module.registry.iface_member_ctx_types.put(.{ .a = c.name.name, .b = f.name.name }, try joined.toOwnedSlice(a));
+    }
+    // A bodyless expect-class member is the declaration of a host-backed
+    // API, retained as a header row whose decl sig names its member fqn
+    // as the host symbol. The link step joins the intrinsic where one
+    // exists, and member resolution binds the call statically.
+    if (c.is_expect and f.receiver_type == null) {
+        if (runtime.envOnce("KLIO_EXPECT_HDR_TRACE") != null)
+            std.debug.print("[expect-hdr] {s}.{s} class_fqn={s}\n", .{ c.name.name, f.name.name, lower_class_fqn orelse "-" });
+        if (try retainExpectMemberHeader(module, c, f, ctx.class_id)) |hid| {
+            try ctx.methods.append(a, hid);
         }
     }
-    // A data class's `componentN` accessors are members of the class, and member
-    // resolution walks declarations, so without declaring them the call falls
-    // through to extension lookup. Declaring them also gives each accessor its
-    // property's declared return type.
-    if (c.is_data) {
-        for (c.primary_params, 0..) |*p, idx| {
-            if (p.property == null) continue;
-            const cname = try std.fmt.allocPrint(a, "component{d}", .{idx + 1});
-            if (declaresNullaryMember(c, cname)) {
-                a.free(cname);
-                continue;
-            }
-            const recv = try a.create(ast.Expr);
-            recv.* = .{ .This = .{ .qualifier = null, .span = p.span } };
-            const syn = try a.create(ast.Function);
-            syn.* = .{
-                .name = .{ .name = cname, .span = p.name.span },
-                .receiver_type = null,
-                .type_params = &.{},
-                .where_bounds = &.{},
-                .params = &.{},
-                .return_type = p.ty,
-                .body = .{ .Expr = .{ .Member = .{
-                    .receiver = recv,
-                    .name = p.name,
-                    .safe = false,
-                    .span = p.span,
-                } } },
-                .is_open = false,
-                .is_override = false,
-                .is_abstract = false,
-                .is_operator = true,
-                .is_inline = false,
-                .is_infix = false,
-                .is_tailrec = false,
-                .is_suspend = false,
-                .is_expect = false,
-                .is_actual = false,
-                // Kotlin gives the accessor the property's own visibility.
+}
+
+/// Record the declared arity so overload picks ranking members above
+/// extensions see the bodyless slot; defaulted params widen the mask
+/// down to the min arity.
+fn recordAbstractMemberArity(ctx: *ClassLower, f: *const ast.Function) Allocator.Error!void {
+    var defaults_n: usize = 0;
+    for (f.params) |*fp| {
+        if (fp.default != null) defaults_n += 1;
+    }
+    const hi: u6 = @intCast(@min(f.params.len, 63));
+    const lo: u6 = @intCast(@min(f.params.len - defaults_n, 63));
+    var mask: u64 = 0;
+    var ar: u6 = lo;
+    while (true) : (ar += 1) {
+        mask |= @as(u64, 1) << ar;
+        if (ar == hi) break;
+    }
+    const gop2 = try ctx.module.registry.abstract_member_arity.getOrPut(.{ .a = ctx.c.name.name, .b = f.name.name });
+    if (gop2.found_existing) gop2.value_ptr.* |= mask else gop2.value_ptr.* = mask;
+}
+
+/// Lower a member that has a body, then index it by the routes member
+/// resolution reads.
+fn lowerConcreteMember(ctx: *ClassLower, f: *const ast.Function) Allocator.Error!void {
+    // Use the method's own FuncId, not `funcs.len() - 1`: lowering a method
+    // also pushes its default-arg thunk funcs.
+    const placed = try lowerMethodWithMemberContext(
+        ctx.module,
+        f,
+        ctx.c.name.name,
+        ctx.own_member_names,
+        ctx.extra_members,
+        ctx.own_member_arity,
+    );
+    try ctx.methods.append(ctx.a, placed.id);
+    try recordMemberMethodFid(ctx, f.name.name, f.params.len, placed.id);
+    try recordMemberDeclSig(ctx, f, placed.id);
+}
+
+/// Record this method by (class, name, declared arity) so a sibling body
+/// lowered later reaches its signature, owner-scoped so an unrelated
+/// class's namesake is never mistaken for it.
+fn recordMemberMethodFid(
+    ctx: *ClassLower,
+    name: []const u8,
+    arity: usize,
+    id: FuncId,
+) Allocator.Error!void {
+    const a = ctx.a;
+    const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x00{d}", .{ ctx.c.name.name, name, arity });
+    const gop = try ctx.module.registry.member_method_fids.getOrPut(ukey);
+    if (gop.found_existing) {
+        a.free(ukey);
+    } else {
+        gop.value_ptr.* = id;
+    }
+}
+
+/// Unified declaration record: the member half of the canonical index,
+/// the split `decl_user_*` tables covering only top-level declarations.
+fn recordMemberDeclSig(ctx: *ClassLower, f: *const ast.Function, id: FuncId) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    if (module.decl_sigs.contains(id.int())) return;
+    var has_vararg = false;
+    var required: u32 = 0;
+    for (f.params) |*p| {
+        if (p.is_vararg) has_vararg = true;
+        if (p.default == null and !p.is_vararg) required += 1;
+    }
+    const msig = try a.alloc(ir.TypeRef, f.params.len);
+    for (f.params, 0..) |*p, i| {
+        msig[i] = try loweredTypeRef(a, &p.ty, true);
+    }
+    try module.decl_sigs.put(id.int(), .{
+        .enclosing_class = ctx.class_id,
+        .receiver_ty = if (f.receiver_type) |*rt| try loweredTypeRef(a, rt, true) else null,
+        .arity = .{ .required = required, .total = @intCast(f.params.len), .has_vararg = has_vararg },
+        .sig = msig,
+        .kind = if (f.receiver_type != null) .member_extension else .instance_method,
+        .visibility = f.visibility,
+        .is_inline = f.is_inline,
+        .is_suspend = f.is_suspend,
+        .has_body = true,
+    });
+}
+
+/// A data class's `componentN` accessors are members of the class, and member
+/// resolution walks declarations, so without declaring them the call falls
+/// through to extension lookup. Declaring them also gives each accessor its
+/// property's declared return type.
+fn lowerDataClassComponents(ctx: *ClassLower) Allocator.Error!void {
+    const a = ctx.a;
+    const module = ctx.module;
+    const c = ctx.c;
+    if (!c.is_data) return;
+    for (c.primary_params, 0..) |*p, idx| {
+        if (p.property == null) continue;
+        const cname = try std.fmt.allocPrint(a, "component{d}", .{idx + 1});
+        if (declaresNullaryMember(c, cname)) {
+            a.free(cname);
+            continue;
+        }
+        const syn = try synthesizeComponentAccessor(a, p, cname);
+        const placed = try lowerMethodWithMemberContext(
+            module,
+            syn,
+            c.name.name,
+            ctx.own_member_names,
+            ctx.extra_members,
+            ctx.own_member_arity,
+        );
+        try ctx.methods.append(a, placed.id);
+        // Member resolution reads the owner-scoped overload index, not the
+        // class's method list, so the accessor has to land there too.
+        if (ctx.class_id.int() < module.classes.items.len) {
+            try module.registerMemberDecl(a, module.classes.items[ctx.class_id.int()].fqn, cname, placed.id);
+        }
+        try recordMemberMethodFid(ctx, cname, 0, placed.id);
+        if (!module.decl_sigs.contains(placed.id.int())) {
+            try module.decl_sigs.put(placed.id.int(), .{
+                .enclosing_class = ctx.class_id,
+                .receiver_ty = null,
+                .arity = .{ .required = 0, .total = 0, .has_vararg = false },
+                .sig = &.{},
+                .kind = .instance_method,
                 .visibility = p.visibility,
-                .annotations = &.{},
-                .span = p.span,
-            };
-            const placed = try lowerMethodWithMemberContext(
-                module,
-                syn,
-                c.name.name,
-                &own_member_names,
-                extra_members,
-                &own_member_arity,
-            );
-            try methods.append(a, placed.id);
-            // Member resolution reads the owner-scoped overload index, not the
-            // class's method list, so the accessor has to land there too.
-            if (class_id.int() < module.classes.items.len) {
-                try module.registerMemberDecl(a, module.classes.items[class_id.int()].fqn, cname, placed.id);
-            }
-            {
-                const ukey = try std.fmt.allocPrint(a, "{s}\x00{s}\x000", .{ c.name.name, cname });
-                const gop = try module.registry.member_method_fids.getOrPut(ukey);
-                if (gop.found_existing) {
-                    a.free(ukey);
-                } else {
-                    gop.value_ptr.* = placed.id;
-                }
-            }
-            if (!module.decl_sigs.contains(placed.id.int())) {
-                try module.decl_sigs.put(placed.id.int(), .{
-                    .enclosing_class = class_id,
-                    .receiver_ty = null,
-                    .arity = .{ .required = 0, .total = 0, .has_vararg = false },
-                    .sig = &.{},
-                    .kind = .instance_method,
-                    .visibility = p.visibility,
-                    .is_inline = false,
-                    .is_suspend = false,
-                    .has_body = true,
-                });
-            }
+                .is_inline = false,
+                .is_suspend = false,
+                .has_body = true,
+            });
         }
     }
-    // Patch the registered class with its now-known method list.
-    if (class_id.int() < module.classes.items.len) {
-        const slot = &module.classes.items[class_id.int()];
-        slot.methods = try methods.toOwnedSlice(a);
-    }
-    return class_id;
+}
+
+/// Build the `componentN` accessor declaration: a nullary operator returning
+/// `this.<property>`.
+fn synthesizeComponentAccessor(
+    a: Allocator,
+    p: *const ast.ClassParam,
+    cname: []const u8,
+) Allocator.Error!*ast.Function {
+    const recv = try a.create(ast.Expr);
+    recv.* = .{ .This = .{ .qualifier = null, .span = p.span } };
+    const syn = try a.create(ast.Function);
+    syn.* = .{
+        .name = .{ .name = cname, .span = p.name.span },
+        .receiver_type = null,
+        .type_params = &.{},
+        .where_bounds = &.{},
+        .params = &.{},
+        .return_type = p.ty,
+        .body = .{ .Expr = .{ .Member = .{
+            .receiver = recv,
+            .name = p.name,
+            .safe = false,
+            .span = p.span,
+        } } },
+        .is_open = false,
+        .is_override = false,
+        .is_abstract = false,
+        .is_operator = true,
+        .is_inline = false,
+        .is_infix = false,
+        .is_tailrec = false,
+        .is_suspend = false,
+        .is_expect = false,
+        .is_actual = false,
+        // Kotlin gives the accessor the property's own visibility.
+        .visibility = p.visibility,
+        .annotations = &.{},
+        .span = p.span,
+    };
+    return syn;
 }
 
 /// Lower one AST function into an IR Func: the body lowers into the entry block,
@@ -1927,151 +2108,207 @@ fn addScopedTypeParamBounds(
     f: *const ast.Function,
 ) Allocator.Error!void {
     if (owner_class) |owner| {
-        const owner_id = blk: {
-            if (module.funcByDeclSpan(f.name.span)) |reserved| {
-                if (module.decl_sigs.get(reserved.int())) |sig| {
-                    if (sig.enclosing_class) |exact| break :blk exact;
-                }
-            }
-            if (std.mem.findScalar(u8, owner, '.') != null) {
-                break :blk module.classIdByFqn(owner);
-            }
-            break :blk module.classIdIndexed(owner, b.self_package, f.span.file) orelse
-                module.uniqueClassIdBySimpleName(owner);
-        };
-        const exact_owner = if (owner_id) |id|
-            (if (id.int() < module.classes.items.len)
-                module.classes.items[id.int()].fqn
-            else
-                owner)
+        try addOwnerClassTypeParamBounds(b, module, owner, f);
+    }
+    try addOwnTypeParamBounds(b, f);
+}
+
+/// Install the enclosing class's type-parameter bounds, keyed both by the
+/// owner's identity and by the bare parameter name a body still spells.
+fn addOwnerClassTypeParamBounds(
+    b: *FuncBuilder,
+    module: *Module,
+    owner: []const u8,
+    f: *const ast.Function,
+) Allocator.Error!void {
+    const owner_id = scopedOwnerClassId(b, module, owner, f);
+    const exact_owner = if (owner_id) |id|
+        (if (id.int() < module.classes.items.len)
+            module.classes.items[id.int()].fqn
         else
-            owner;
-        if (module.registry.class_type_param_bounds.get(exact_owner) orelse
-            module.registry.class_type_param_bounds.get(owner)) |bounds|
-        {
-            for (bounds) |bound| {
-                if (owner_id) |id| {
-                    const identity = try ir.classTypeParamIdentity(
-                        b.allocator,
-                        id,
-                        bound.param,
-                    );
-                    var owned_bound: []const u8 = bound.bound;
-                    if (id.int() < module.classes.items.len and
-                        std.mem.findScalar(u8, bound.bound, '.') == null)
-                    {
-                        for (module.classes.items[id.int()].type_params) |param| {
-                            if (!std.mem.eql(u8, param, bound.bound)) continue;
-                            owned_bound = try b.ownTypeParamText(
-                                try ir.classTypeParamIdentity(
-                                    b.allocator,
-                                    id,
-                                    param,
-                                ),
-                            );
-                            break;
-                        }
-                    }
-                    try b.addOwnedTypeParamBoundEvidence(
-                        identity,
-                        owned_bound,
-                        bound.complete,
-                    );
+            owner)
+    else
+        owner;
+    if (module.registry.class_type_param_bounds.get(exact_owner) orelse
+        module.registry.class_type_param_bounds.get(owner)) |bounds|
+    {
+        for (bounds) |bound| {
+            if (owner_id) |id| {
+                try addOwnerBoundIdentityEvidence(b, module, id, bound);
+            }
+            var shadowed = false;
+            for (f.type_params) |*param| {
+                if (std.mem.eql(u8, param.name.name, bound.param)) {
+                    shadowed = true;
+                    break;
                 }
-                var shadowed = false;
-                for (f.type_params) |*param| {
-                    if (std.mem.eql(u8, param.name.name, bound.param)) {
-                        shadowed = true;
-                        break;
-                    }
-                }
-                if (!shadowed) {
-                    try b.addTypeParamBoundHeadArgs(
-                        bound.param,
-                        bound.bound,
-                        bound.complete,
-                        bound.head_only,
-                        bound.args,
-                    );
-                    // A bound whose record kept concrete type arguments also
-                    // registers the full ref, so a receiver typed by this parameter
-                    // can substitute a generic callee's lambda params.
-                    if (bound.args.len != 0) {
-                        const arg_refs = try b.allocator.alloc(ir.TypeRef, bound.args.len);
-                        var filled: usize = 0;
-                        errdefer {
-                            for (arg_refs[0..filled]) |*t| t.deinit(b.allocator);
-                            b.allocator.free(arg_refs);
-                        }
-                        for (bound.args, arg_refs) |src, *dst| {
-                            dst.* = .{
-                                .name = try b.allocator.dupe(u8, src),
-                                .nullable = false,
-                                .args = &.{},
-                            };
-                            filled += 1;
-                        }
-                        try b.addTypeParamBoundRef(bound.param, .{
-                            .name = try b.allocator.dupe(u8, bound.bound),
-                            .nullable = false,
-                            .args = arg_refs,
-                        });
-                    }
-                }
+            }
+            if (!shadowed) {
+                try addUnshadowedOwnerBound(b, bound);
             }
         }
     }
+}
+
+/// The class id the bounds are keyed under: the reserved header's exact owner
+/// where one exists, else the name resolved in this file's scope.
+fn scopedOwnerClassId(
+    b: *FuncBuilder,
+    module: *Module,
+    owner: []const u8,
+    f: *const ast.Function,
+) ?ClassId {
+    if (module.funcByDeclSpan(f.name.span)) |reserved| {
+        if (module.decl_sigs.get(reserved.int())) |sig| {
+            if (sig.enclosing_class) |exact| return exact;
+        }
+    }
+    if (std.mem.findScalar(u8, owner, '.') != null) {
+        return module.classIdByFqn(owner);
+    }
+    return module.classIdIndexed(owner, b.self_package, f.span.file) orelse
+        module.uniqueClassIdBySimpleName(owner);
+}
+
+/// Record the bound under the owner-qualified parameter identity, rewriting a
+/// bound that names another of the owner's own parameters to that identity too.
+fn addOwnerBoundIdentityEvidence(
+    b: *FuncBuilder,
+    module: *Module,
+    id: ClassId,
+    bound: ir.ModuleRegistry.TypeParamBound,
+) Allocator.Error!void {
+    const identity = try ir.classTypeParamIdentity(
+        b.allocator,
+        id,
+        bound.param,
+    );
+    var owned_bound: []const u8 = bound.bound;
+    if (id.int() < module.classes.items.len and
+        std.mem.findScalar(u8, bound.bound, '.') == null)
+    {
+        for (module.classes.items[id.int()].type_params) |param| {
+            if (!std.mem.eql(u8, param, bound.bound)) continue;
+            owned_bound = try b.ownTypeParamText(
+                try ir.classTypeParamIdentity(
+                    b.allocator,
+                    id,
+                    param,
+                ),
+            );
+            break;
+        }
+    }
+    try b.addOwnedTypeParamBoundEvidence(
+        identity,
+        owned_bound,
+        bound.complete,
+    );
+}
+
+/// Record the bound under its bare parameter name, which a body reaches only
+/// while no function type parameter shadows it.
+fn addUnshadowedOwnerBound(
+    b: *FuncBuilder,
+    bound: ir.ModuleRegistry.TypeParamBound,
+) Allocator.Error!void {
+    try b.addTypeParamBoundHeadArgs(
+        bound.param,
+        bound.bound,
+        bound.complete,
+        bound.head_only,
+        bound.args,
+    );
+    // A bound whose record kept concrete type arguments also
+    // registers the full ref, so a receiver typed by this parameter
+    // can substitute a generic callee's lambda params.
+    if (bound.args.len != 0) {
+        const arg_refs = try b.allocator.alloc(ir.TypeRef, bound.args.len);
+        var filled: usize = 0;
+        errdefer {
+            for (arg_refs[0..filled]) |*t| t.deinit(b.allocator);
+            b.allocator.free(arg_refs);
+        }
+        for (bound.args, arg_refs) |src, *dst| {
+            dst.* = .{
+                .name = try b.allocator.dupe(u8, src),
+                .nullable = false,
+                .args = &.{},
+            };
+            filled += 1;
+        }
+        try b.addTypeParamBoundRef(bound.param, .{
+            .name = try b.allocator.dupe(u8, bound.bound),
+            .nullable = false,
+            .args = arg_refs,
+        });
+    }
+}
+
+/// Install the function's own type-parameter bounds. A reified parameter is
+/// resolved by the splice, so it carries no erased bound.
+fn addOwnTypeParamBounds(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!void {
     for (f.type_params) |*param| {
         if (param.is_reified) continue;
-        var bound: []const u8 = "kotlin.Any";
-        var complete = true;
-        var head_only = true;
-        var count: usize = 0;
-        var bound_ast: ?*const ast.TypeRef = null;
-        if (param.upper_bound) |*upper| {
-            bound = upper.name.name;
-            complete = boundTypeRecordComplete(upper);
-            head_only = boundTypeRecordHeadOnly(upper);
-            bound_ast = upper;
+        try addOwnTypeParamBound(b, f, param);
+    }
+}
+
+/// Record one type parameter's bound: its upper bound merged with every `where`
+/// clause naming it, defaulting to `kotlin.Any` when it has none.
+fn addOwnTypeParamBound(
+    b: *FuncBuilder,
+    f: *const ast.Function,
+    param: *const ast.TypeParam,
+) Allocator.Error!void {
+    var bound: []const u8 = "kotlin.Any";
+    var complete = true;
+    var head_only = true;
+    var count: usize = 0;
+    var bound_ast: ?*const ast.TypeRef = null;
+    if (param.upper_bound) |*upper| {
+        bound = upper.name.name;
+        complete = boundTypeRecordComplete(upper);
+        head_only = boundTypeRecordHeadOnly(upper);
+        bound_ast = upper;
+        count += 1;
+    }
+    for (f.where_bounds) |*where_bound| {
+        if (std.mem.eql(u8, where_bound.name.name, param.name.name)) {
+            if (count == 0) {
+                bound = where_bound.bound.name.name;
+                complete = boundTypeRecordComplete(&where_bound.bound);
+                head_only = boundTypeRecordHeadOnly(&where_bound.bound);
+                bound_ast = &where_bound.bound;
+            }
             count += 1;
         }
-        for (f.where_bounds) |*where_bound| {
-            if (std.mem.eql(u8, where_bound.name.name, param.name.name)) {
-                if (count == 0) {
-                    bound = where_bound.bound.name.name;
-                    complete = boundTypeRecordComplete(&where_bound.bound);
-                    head_only = boundTypeRecordHeadOnly(&where_bound.bound);
-                    bound_ast = &where_bound.bound;
-                }
-                count += 1;
-            }
-        }
-        if (count > 1) {
-            complete = false;
-            head_only = false;
-        }
-        try b.addTypeParamBoundHeadArgs(
-            param.name.name,
-            bound,
-            complete,
-            head_only,
-            if (count == 1) if (bound_ast) |upper|
-                try concreteBoundArgs(b.allocator, f.type_params, upper)
-            else
-                &.{} else &.{},
-        );
-        // The string record drops the bound's type arguments, so keep the full
-        // lowered form when there are any and let a receiver typed by this parameter
-        // instantiate a call's return type through it.
-        if (count == 1) if (bound_ast) |upper| {
-            if (upper.type_args.len != 0) {
-                try b.addTypeParamBoundRef(
-                    param.name.name,
-                    try loweredTypeRef(b.allocator, upper, true),
-                );
-            }
-        };
     }
+    if (count > 1) {
+        complete = false;
+        head_only = false;
+    }
+    try b.addTypeParamBoundHeadArgs(
+        param.name.name,
+        bound,
+        complete,
+        head_only,
+        if (count == 1) if (bound_ast) |upper|
+            try concreteBoundArgs(b.allocator, f.type_params, upper)
+        else
+            &.{} else &.{},
+    );
+    // The string record drops the bound's type arguments, so keep the full
+    // lowered form when there are any and let a receiver typed by this parameter
+    // instantiate a call's return type through it.
+    if (count == 1) if (bound_ast) |upper| {
+        if (upper.type_args.len != 0) {
+            try b.addTypeParamBoundRef(
+                param.name.name,
+                try loweredTypeRef(b.allocator, upper, true),
+            );
+        }
+    };
 }
 
 pub fn lowerFunctionBodyWithImplicitOwner(
@@ -2091,6 +2328,20 @@ pub fn lowerFunctionBodyWithImplicitOwner(
         null,
     );
 }
+
+/// The state every function-body lowering phase reads: the builder being filled,
+/// the declaration it lowers, and the parameter names in bind order.
+const BodyLower = struct {
+    /// The registry allocator, owning everything the lowered `Func` keeps.
+    a: Allocator,
+    module: *Module,
+    f: *const ast.Function,
+    b: *FuncBuilder,
+    implicit_params: []const []const u8,
+    owner_class: ?[]const u8,
+    /// The implicit params followed by the source parameter names, in bind order.
+    names: []const []const u8,
+};
 
 /// Lower a method body, threading the lexically enclosing class's member names as
 /// the builder's `enclosing_members`, distinct from `own_members`: an enclosing
@@ -2117,29 +2368,81 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     defer build.popCurrentOwnerClass(prev_owner);
     var b = try FuncBuilder.init(a, module);
     defer b.deinit();
-    // A compose-ABI'd fn's ordered value params, pair excluded, for the call-site
-    // `$changed` forwarded-param bit emission.
+    markComposeValueParams(&b, f);
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(a);
+    try names.appendSlice(a, implicit_params);
+    for (f.params) |*p| try names.append(a, p.name.name);
+
+    var ctx: BodyLower = .{
+        .a = a,
+        .module = module,
+        .f = f,
+        .b = &b,
+        .implicit_params = implicit_params,
+        .owner_class = owner_class,
+        .names = names.items,
+    };
+
+    // Scope setup: everything the body lowering below reads out of the builder.
+    try installBoxedVars(&ctx);
+    try bindParams(&b, names.items);
+    try bindExtensionReceiverLabel(&ctx);
+    try seedMemberThisDeclType(&ctx);
+    markPlainThisParam(&ctx);
+    try recordParamDeclTypes(&ctx);
+    try bindLabeledReceiverAliases(&ctx);
+    try emitContextParamLoads(&b, f.context_params, f.type_params);
+    markContextDeclGate(&ctx);
+    try markFunctionTypedParams(&ctx);
+    try installTypeParamScope(&ctx);
+    try markAnyTypedParams(&ctx);
+    try installOwnerAndReceiverType(&ctx);
+    try installMemberNameTables(&ctx, own_members, enclosing_members, own_member_arity);
+    installTailrecSelf(&ctx);
+    b.setInline(f.is_inline);
+    // The declared return type is the expected type for an expression body and for a
+    // `return …` inside a block body, so a reified inline call can infer.
+    b.setDeclaredReturn(f.return_type);
+
+    // The boxed-var set was computed and set before `bindParams` above so the
+    // params bind as cells.
+    var derived_return: ?TypeRef = null;
+    const result = try lowerBodyIntoBuilder(&ctx, &derived_return);
+    b.terminate(.{ .Return = result });
+
+    var func = try finishLoweredFunc(&ctx, derived_return);
+    func.params = try buildLoweredParams(&ctx);
+    try applyReceiverParamType(&ctx, &func);
+    try applyFuncDeclFlags(&ctx, &func);
+    return func;
+}
+
+/// A compose-ABI'd fn's ordered value params, pair excluded, for the call-site
+/// `$changed` forwarded-param bit emission.
+fn markComposeValueParams(b: *FuncBuilder, f: *const ast.Function) void {
     if (f.params.len >= 2 and
         std.mem.eql(u8, f.params[f.params.len - 2].name.name, "$composer") and
         std.mem.eql(u8, f.params[f.params.len - 1].name.name, "$changed"))
     {
         b.compose_value_params = f.params[0 .. f.params.len - 2];
     }
+}
 
-    var names: std.ArrayList([]const u8) = .empty;
-    defer names.deinit(a);
-    try names.appendSlice(a, implicit_params);
-    for (f.params) |*p| try names.append(a, p.name.name);
-    // Compute the boxed-var set before binding params so a parameter a nested
-    // closure writes binds as a shared cell. The body-`var` half comes from
-    // `computeBoxedVars`; this adds any parameter a nested lambda mutates.
-    if (f.body) |body| {
+/// Compute the boxed-var set before binding params so a parameter a nested
+/// closure writes binds as a shared cell. The body-`var` half comes from
+/// `computeBoxedVars`; this adds any parameter a nested lambda mutates.
+fn installBoxedVars(ctx: *BodyLower) Allocator.Error!void {
+    const a = ctx.a;
+    const b = ctx.b;
+    if (ctx.f.body) |body| {
         if (body == .Block) {
             var boxed = try mod.computeBoxedVars(a, body.Block.stmts);
             var assigned = mod.ast_scan.StringSet.init(a);
             defer assigned.deinit();
             try mod.ast_scan.namesAssignedInLambdasRebindsOnly(body.Block.stmts, &assigned);
-            for (names.items) |pname| {
+            for (ctx.names) |pname| {
                 if (assigned.contains(pname)) try boxed.put(pname, {});
             }
             for (build.anonBoxedCaptureNames()) |n| try boxed.put(n, {});
@@ -2150,24 +2453,34 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             b.setBoxedVars(boxed);
         }
     }
-    try bindParams(&b, names.items);
-    // An extension function's own receiver is addressable as `this@<name>` from
-    // anywhere in its body, including inside a spliced receiver-lambda region where
-    // the innermost `this` is the splice subject. Bind the labeled slot at entry so
-    // the labeled-this lowering resolves it directly.
-    if (f.receiver_type != null and names.items.len != 0 and
-        std.mem.eql(u8, names.items[0], "this"))
+}
+
+/// An extension function's own receiver is addressable as `this@<name>` from
+/// anywhere in its body, including inside a spliced receiver-lambda region where
+/// the innermost `this` is the splice subject. Bind the labeled slot at entry so
+/// the labeled-this lowering resolves it directly.
+fn bindExtensionReceiverLabel(ctx: *BodyLower) Allocator.Error!void {
+    const b = ctx.b;
+    const f = ctx.f;
+    if (f.receiver_type != null and ctx.names.len != 0 and
+        std.mem.eql(u8, ctx.names[0], "this"))
     {
         if (b.resolve("this")) |own_this| {
             const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{f.name.name});
             try b.bind(label, own_this);
         }
     }
-    // A normal member's synthesized `this` is not in the source parameter list, so
-    // seed it from the reserved declaration header and let explicit `this.member(…)`
-    // see the same qualified generic owner type.
-    if (implicit_params.len != 0 and
-        std.mem.eql(u8, implicit_params[0], "this") and
+}
+
+/// A normal member's synthesized `this` is not in the source parameter list, so
+/// seed it from the reserved declaration header and let explicit `this.member(…)`
+/// see the same qualified generic owner type.
+fn seedMemberThisDeclType(ctx: *BodyLower) Allocator.Error!void {
+    const b = ctx.b;
+    const f = ctx.f;
+    const module = ctx.module;
+    if (ctx.implicit_params.len != 0 and
+        std.mem.eql(u8, ctx.implicit_params[0], "this") and
         f.receiver_type == null)
     {
         if (module.funcByDeclSpan(f.name.span)) |reserved| {
@@ -2183,17 +2496,24 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             }
         }
     }
-    // A user parameter literally named `this` on a receiver-less function is an
-    // ordinary value binding, so bare calls must not member-dispatch through it.
-    if (implicit_params.len == 0 and owner_class == null) {
-        for (f.params) |*p| {
-            if (std.mem.eql(u8, p.name.name, "this")) b.this_is_plain_param = true;
+}
+
+/// A user parameter literally named `this` on a receiver-less function is an
+/// ordinary value binding, so bare calls must not member-dispatch through it.
+fn markPlainThisParam(ctx: *BodyLower) void {
+    if (ctx.implicit_params.len == 0 and ctx.owner_class == null) {
+        for (ctx.f.params) |*p| {
+            if (std.mem.eql(u8, p.name.name, "this")) ctx.b.this_is_plain_param = true;
         }
     }
-    // Record each declared parameter's static type head so a cast-rebound call can
-    // disambiguate overloads by an argument naming a parameter. A vararg parameter's
-    // static type inside the body is the materialized array, never the element type.
-    for (f.params) |*p| {
+}
+
+/// Record each declared parameter's static type head so a cast-rebound call can
+/// disambiguate overloads by an argument naming a parameter. A vararg parameter's
+/// static type inside the body is the materialized array, never the element type.
+fn recordParamDeclTypes(ctx: *BodyLower) Allocator.Error!void {
+    const b = ctx.b;
+    for (ctx.f.params) |*p| {
         if (p.is_vararg) {
             try b.setLocalDeclTypeOwned(p.name.name, try varargArrayTypeRef(b.allocator, &p.ty));
         } else {
@@ -2208,10 +2528,16 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             try b.setLocalCallReturn(p.name.name, ft.ret.name.name, ft.ret.nullable);
         }
     }
-    // Labeled-receiver alias: `this@<fn>` names this function's receiver, so a
-    // qualified `this@fn` in a nested lambda captures it rather than the lambda's
-    // own `this`.
-    if (names.items.len != 0 and std.mem.eql(u8, names.items[0], "this")) {
+}
+
+/// Labeled-receiver alias: `this@<fn>` names this function's receiver, so a
+/// qualified `this@fn` in a nested lambda captures it rather than the lambda's
+/// own `this`.
+fn bindLabeledReceiverAliases(ctx: *BodyLower) Allocator.Error!void {
+    const a = ctx.a;
+    const b = ctx.b;
+    const f = ctx.f;
+    if (ctx.names.len != 0 and std.mem.eql(u8, ctx.names[0], "this")) {
         if (b.resolve("this")) |this_reg| {
             const label = try std.fmt.allocPrint(a, "this@{s}", .{f.name.name});
             try b.bind(label, this_reg);
@@ -2226,7 +2552,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             // `this` param is the owner instance; a member extension binds its
             // extension receiver as `this`, so `this@C` is a different receiver.
             if (f.receiver_type == null) {
-                if (owner_class) |oc| {
+                if (ctx.owner_class) |oc| {
                     if (!std.mem.eql(u8, oc, f.name.name)) {
                         const clabel = try std.fmt.allocPrint(a, "this@{s}", .{oc});
                         try b.bind(clabel, this_reg);
@@ -2235,20 +2561,28 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             }
         }
     }
-    try emitContextParamLoads(&b, f.context_params, f.type_params);
-    // A user contextual declaration makes receivers context sources; the stdlib
-    // intrinsics resolve without the runtime receiver stack, so they must not flip
-    // the module-wide gate.
+}
+
+/// A user contextual declaration makes receivers context sources; the stdlib
+/// intrinsics resolve without the runtime receiver stack, so they must not flip
+/// the module-wide gate.
+fn markContextDeclGate(ctx: *BodyLower) void {
+    const b = ctx.b;
+    const f = ctx.f;
     if (f.context_params.len != 0 and
         !std.mem.eql(u8, f.name.name, "context") and
         !std.mem.eql(u8, f.name.name, "contextOf"))
     {
         b.module.has_context_decls = true;
     }
-    // A param whose declared type is a receiver-typed function carries that fact so
-    // a bare call `block(...)` lowers to a member call with the enclosing `this` as
-    // receiver. Implicit params never come in this shape.
-    for (f.params) |*p| {
+}
+
+/// A param whose declared type is a receiver-typed function carries that fact so
+/// a bare call `block(...)` lowers to a member call with the enclosing `this` as
+/// receiver. Implicit params never come in this shape.
+fn markFunctionTypedParams(ctx: *BodyLower) Allocator.Error!void {
+    const b = ctx.b;
+    for (ctx.f.params) |*p| {
         if (p.ty.function == null) {
             // An aliased receiver-fn type carries no syntactic function type; the
             // alias registry keeps the receiver-ness the `Function{N}` tag drops.
@@ -2285,71 +2619,96 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             }
         }
     }
-    // A param whose declared type is one of the function's own generic type
-    // parameters: comparison operators on such an operand follow Kotlin's
-    // `compareTo` total order, not the IEEE primitive.
-    {
-        var tp_names = StringSet.init(a);
-        defer tp_names.deinit();
-        for (f.type_params) |*tp| try tp_names.put(tp.name.name, {});
-        // A type parameter with no upper bound has the members of `Any?`, none
-        // worth dispatching.
-        var tp_unbounded = StringSet.init(a);
-        defer tp_unbounded.deinit();
-        for (f.type_params) |*tp| {
-            if (tp.upper_bound != null) continue;
-            var bounded = false;
-            for (f.where_bounds) |*wb| {
-                if (std.mem.eql(u8, wb.name.name, tp.name.name)) {
-                    bounded = true;
-                    break;
-                }
+}
+
+/// A param whose declared type is one of the function's own generic type
+/// parameters: comparison operators on such an operand follow Kotlin's
+/// `compareTo` total order, not the IEEE primitive.
+fn installTypeParamScope(ctx: *BodyLower) Allocator.Error!void {
+    const a = ctx.a;
+    const b = ctx.b;
+    const f = ctx.f;
+    var tp_names = StringSet.init(a);
+    defer tp_names.deinit();
+    for (f.type_params) |*tp| try tp_names.put(tp.name.name, {});
+    // A type parameter with no upper bound has the members of `Any?`, none
+    // worth dispatching.
+    var tp_unbounded = StringSet.init(a);
+    defer tp_unbounded.deinit();
+    for (f.type_params) |*tp| {
+        if (tp.upper_bound != null) continue;
+        var bounded = false;
+        for (f.where_bounds) |*wb| {
+            if (std.mem.eql(u8, wb.name.name, tp.name.name)) {
+                bounded = true;
+                break;
             }
-            if (!bounded) try tp_unbounded.put(tp.name.name, {});
         }
-        b.setSelfDeclSpan(f.name.span);
-        b.setHasOwnTypeParams(f.type_params.len != 0);
-        // Non-reified type parameters in scope: this function's own, a reified one
-        // being resolved by the reified splice, plus the enclosing class's, never
-        // reified in Kotlin. A cast to such a name is erased. The outer class
-        // installs first so a same-named function parameter keeps the nearer bound.
-        try addScopedTypeParamBounds(&b, module, owner_class, f);
-        for (f.params) |*p| {
-            if (p.ty.function == null and !p.ty.nullable and tp_names.contains(p.ty.name.name)) {
-                try b.markGenericTypedParam(p.name.name);
-            }
-            if (p.ty.function == null and tp_unbounded.contains(p.ty.name.name)) {
-                try b.markErasedRecvParam(p.name.name);
-            }
-            // A concrete non-function param type does not shadow a same-named
-            // top-level function for a call.
-            if (p.ty.function == null and !tp_names.contains(p.ty.name.name)) {
-                try b.markNonFnParam(p.name.name);
-            }
-            // A param statically typed as a broad collection returns a `List` from
-            // `p + x` even over a runtime `Set`, so the operator lowering coerces it.
-            if (p.ty.function == null and helpers.isBroadCollectionTypeName(p.ty.name.name)) {
-                try b.markBroadCollectionLocal(p.name.name);
-            }
+        if (!bounded) try tp_unbounded.put(tp.name.name, {});
+    }
+    b.setSelfDeclSpan(f.name.span);
+    b.setHasOwnTypeParams(f.type_params.len != 0);
+    // Non-reified type parameters in scope: this function's own, a reified one
+    // being resolved by the reified splice, plus the enclosing class's, never
+    // reified in Kotlin. A cast to such a name is erased. The outer class
+    // installs first so a same-named function parameter keeps the nearer bound.
+    try addScopedTypeParamBounds(b, ctx.module, ctx.owner_class, f);
+    for (f.params) |*p| {
+        if (p.ty.function == null and !p.ty.nullable and tp_names.contains(p.ty.name.name)) {
+            try b.markGenericTypedParam(p.name.name);
+        }
+        if (p.ty.function == null and tp_unbounded.contains(p.ty.name.name)) {
+            try b.markErasedRecvParam(p.name.name);
+        }
+        // A concrete non-function param type does not shadow a same-named
+        // top-level function for a call.
+        if (p.ty.function == null and !tp_names.contains(p.ty.name.name)) {
+            try b.markNonFnParam(p.name.name);
+        }
+        // A param statically typed as a broad collection returns a `List` from
+        // `p + x` even over a runtime `Set`, so the operator lowering coerces it.
+        if (p.ty.function == null and helpers.isBroadCollectionTypeName(p.ty.name.name)) {
+            try b.markBroadCollectionLocal(p.name.name);
         }
     }
-    // A param declared `Any` or `Any?` holds a boxed value, so `==` on it uses
-    // total-order equality, matching `Double.equals`.
-    for (f.params) |*p| {
+}
+
+/// A param declared `Any` or `Any?` holds a boxed value, so `==` on it uses
+/// total-order equality, matching `Double.equals`.
+fn markAnyTypedParams(ctx: *BodyLower) Allocator.Error!void {
+    const b = ctx.b;
+    for (ctx.f.params) |*p| {
         if (p.ty.function == null and std.mem.eql(u8, p.ty.name.name, "Any")) {
             try b.markAnyTyped(p.name.name);
         }
     }
-    if (owner_class) |owner| {
+}
+
+/// Install the owner class, then record the enclosing extension's declared
+/// receiver type so a bare call to a same-named extension inside the body
+/// resolves to the matching overload.
+fn installOwnerAndReceiverType(ctx: *BodyLower) Allocator.Error!void {
+    const b = ctx.b;
+    if (ctx.owner_class) |owner| {
         b.setOwnerClass(owner);
     }
-    // Record the enclosing extension's declared receiver type so a bare call to a
-    // same-named extension inside the body resolves to the matching overload.
-    if (f.receiver_type) |*receiver| {
+    if (ctx.f.receiver_type) |*receiver| {
         b.setRecvTypeRefOwned(try loweredTypeRef(b.allocator, receiver, true));
     } else {
         b.setRecvTy(null);
     }
+}
+
+/// Copy the caller's member-name tables into the builder: the owner's own
+/// members, the lexically enclosing class's, and the own-member arities.
+fn installMemberNameTables(
+    ctx: *BodyLower,
+    own_members: ?*const StringSet,
+    enclosing_members: ?*const StringSet,
+    own_member_arity: ?*const std.StringHashMap(u64),
+) Allocator.Error!void {
+    const a = ctx.a;
+    const b = ctx.b;
     if (own_members) |set| {
         b.setOwnMembers(try cloneStringSet(a, set));
     }
@@ -2362,19 +2721,27 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
         while (it.next()) |e| try copy.put(e.key_ptr.*, e.value_ptr.*);
         b.setOwnMemberArity(copy);
     }
+}
+
+/// Name the declaration as its own tail-call target so a self call in tail
+/// position lowers to a jump.
+fn installTailrecSelf(ctx: *BodyLower) void {
+    const b = ctx.b;
+    const f = ctx.f;
     if (f.is_tailrec) {
         b.setTailrecSelf(f.name.name);
-        b.setTailrecSelfHasThis(names.items.len != 0 and std.mem.eql(u8, names.items[0], "this"));
+        b.setTailrecSelfHasThis(ctx.names.len != 0 and std.mem.eql(u8, ctx.names[0], "this"));
         b.setTailrecParams(f.params);
     }
-    b.setInline(f.is_inline);
-    // The declared return type is the expected type for an expression body and for a
-    // `return …` inside a block body, so a reified inline call can infer.
-    b.setDeclaredReturn(f.return_type);
-    // The boxed-var set was computed and set before `bindParams` above so the
-    // params bind as cells.
+}
+
+/// Lower the declaration's body into the builder, yielding the result register an
+/// expression body produces and, through `derived_return`, the return type an
+/// unannotated expression body infers.
+fn lowerBodyIntoBuilder(ctx: *BodyLower, derived_return: *?TypeRef) Allocator.Error!?ir.Reg {
+    const b = ctx.b;
+    const f = ctx.f;
     var result: ?ir.Reg = null;
-    var derived_return: ?TypeRef = null;
     if (f.body) |body| {
         switch (body) {
             .Block => |*blk| {
@@ -2383,7 +2750,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
                 // body's last statement is in tail position; a value-returning body
                 // reaches its value only through `return`.
                 b.tail_pos = f.return_type == null or std.mem.eql(u8, f.return_type.?.name.name, "Unit");
-                _ = try mod.lowerBlock(&b, blk);
+                _ = try mod.lowerBlock(b, blk);
             },
             .Expr => |*e| {
                 b.tail_pos = true;
@@ -2394,31 +2761,42 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
                 // An expression body with no annotation carries its inferred return
                 // where the static derivation proves one, so callers' locals type
                 // through it, which member refutation needs.
-                if (f.return_type == null and derived_return == null) {
-                    derived_return = try mod.staticExprTypeRef(&b, e);
+                if (f.return_type == null and derived_return.* == null) {
+                    derived_return.* = try mod.staticExprTypeRef(b, e);
                 }
-                result = try mod.lowerExpr(&b, e);
+                result = try mod.lowerExpr(b, e);
                 b.restoreExpected(prev);
             },
         }
     }
-    b.terminate(.{ .Return = result });
+    return result;
+}
+
+/// Seal the builder into a `Func`, carrying the declared return type so the
+/// evaluator can normalize a bare integer-literal result to a `Long` return slot;
+/// inferred returns stay `Unit`, the coercion only triggering on an explicit `Long`.
+fn finishLoweredFunc(ctx: *BodyLower, derived_return: ?TypeRef) Allocator.Error!Func {
+    const a = ctx.a;
+    const f = ctx.f;
     const fqn = f.name.name;
-    // Carry the declared return type so the evaluator can normalize a bare
-    // integer-literal result to a `Long` return slot; inferred returns stay `Unit`,
-    // the coercion only triggering on an explicit `Long`.
     const return_ty: TypeRef = if (f.return_type) |*rt|
         renameParamHead(try loweredTypeRef(a, rt, false), rt)
     else if (derived_return) |dr|
         dr
     else
         build.typeUnit();
-    var func = try b.finish(f.name.name, fqn, return_ty);
+    var func = try ctx.b.finish(f.name.name, fqn, return_ty);
     func.return_ty_declared = f.return_type != null;
+    return func;
+}
 
+/// Build the lowered parameter list: the implicit receivers as `Unit`
+/// placeholders, then every source parameter.
+fn buildLoweredParams(ctx: *BodyLower) Allocator.Error![]Param {
+    const a = ctx.a;
     var params: std.ArrayList(Param) = .empty;
     errdefer params.deinit(a);
-    for (implicit_params) |n| {
+    for (ctx.implicit_params) |n| {
         try params.append(a, .{
             .name = n,
             .ty = build.typeUnit(),
@@ -2428,7 +2806,7 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             .has_default = false,
         });
     }
-    for (f.params) |*p| {
+    for (ctx.f.params) |*p| {
         // The full structural type rides on the param so the symbol index can prove
         // or refute signature identity between overloads; runtime overload matching
         // keeps reading only the head name and nullability.
@@ -2437,16 +2815,22 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             .ty = renameParamHead(try loweredTypeRef(a, &p.ty, false), &p.ty),
             .default = null,
             .composable_arity = @import("compose_pass").composableFunctionArity(&p.ty),
-                .composable_recv_slots = @import("compose_pass").composableFunctionRecvSlots(&p.ty),
+            .composable_recv_slots = @import("compose_pass").composableFunctionRecvSlots(&p.ty),
             .is_property = false,
             .is_vararg = p.is_vararg,
             .has_default = p.default != null,
         });
     }
-    func.params = try params.toOwnedSlice(a);
-    // An extension fn's synthetic receiver param carries the declared receiver type,
-    // not the `Unit` placeholder, so runtime overload resolution picks the right
-    // receiver overload instead of falling back to declaration order.
+    return try params.toOwnedSlice(a);
+}
+
+/// An extension fn's synthetic receiver param carries the declared receiver type,
+/// not the `Unit` placeholder, so runtime overload resolution picks the right
+/// receiver overload instead of falling back to declaration order.
+fn applyReceiverParamType(ctx: *BodyLower, func: *Func) Allocator.Error!void {
+    const a = ctx.a;
+    const f = ctx.f;
+    const module = ctx.module;
     if (f.receiver_type) |*rt| {
         if (func.params.len != 0 and std.mem.eql(u8, func.params[0].name, "this")) {
             // The full structural type, head name and generic arguments, so the
@@ -2454,10 +2838,10 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             // on a list of Ints instead of proving on the bare head.
             func.params[0].ty = try loweredTypeRef(a, rt, false);
         }
-    } else if (owner_class != null and func.params.len != 0 and
+    } else if (ctx.owner_class != null and func.params.len != 0 and
         std.mem.eql(u8, func.params[0].name, "this"))
     {
-        const owner = owner_class.?;
+        const owner = ctx.owner_class.?;
         const owner_id = blk: {
             if (module.funcByDeclSpan(f.name.span)) |reserved| {
                 if (module.decl_sigs.get(reserved.int())) |sig| {
@@ -2467,11 +2851,16 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
             if (std.mem.findScalar(u8, owner, '.') != null) {
                 break :blk module.classIdByFqn(owner);
             }
-            break :blk module.classIdIndexed(owner, b.self_package, f.span.file) orelse
+            break :blk module.classIdIndexed(owner, ctx.b.self_package, f.span.file) orelse
                 module.uniqueClassIdBySimpleName(owner);
         };
         func.params[0].ty = try memberOwnerTypeRef(module, a, owner_id, owner);
     }
+}
+
+/// Carry the declaration's modifiers and annotation set onto the lowered func.
+fn applyFuncDeclFlags(ctx: *BodyLower, func: *Func) Allocator.Error!void {
+    const f = ctx.f;
     func.is_suspend = f.is_suspend;
     func.low_priority = isLowPriorityOverload(f);
     func.deprecated_error = annotationsAreDeprecatedError(f.annotations);
@@ -2481,10 +2870,9 @@ pub fn lowerFunctionBodyWithImplicitOwnerEnclosing(
     func.is_final = f.is_final;
     // A leading `this` injected via `implicit_params` is a synthesized dispatch or
     // extension receiver, distinct from a user param that spells its name `this`.
-    func.has_receiver_param = implicit_params.len != 0 and
-        std.mem.eql(u8, implicit_params[0], "this");
-    func.annotation_names = try resolveAnnotationNames(module, f.annotations);
-    return func;
+    func.has_receiver_param = ctx.implicit_params.len != 0 and
+        std.mem.eql(u8, ctx.implicit_params[0], "this");
+    func.annotation_names = try resolveAnnotationNames(ctx.module, f.annotations);
 }
 
 /// A function is excluded from overload resolution while any ordinary candidate
