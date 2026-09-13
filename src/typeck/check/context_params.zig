@@ -1,9 +1,7 @@
-//! Context parameters (Kotlin 2.4): declaration-position rules and the
-//! static context-argument resolution that surfaces `NO_CONTEXT_ARGUMENT`,
-//! `AMBIGUOUS_CONTEXT_ARGUMENT`, and the excluded-form diagnostics
-//! (explicit context arguments, callable references to contextual
-//! declarations). Runtime resolution is driven separately by the lowered
-//! `CtxLoad`/`CtxScope` ops; this pass is the compile-time contract.
+//! Context parameters (Kotlin 2.4): declaration-position rules plus the
+//! static context-argument resolution behind the missing, ambiguous and
+//! excluded-form diagnostics. This pass is the compile-time contract; runtime
+//! resolution runs off the lowered `CtxLoad`/`CtxScope` ops.
 //!
 //! Free functions over `*Checker`, driven from `phases.run`.
 
@@ -47,9 +45,9 @@ const CalleeSig = struct {
     /// parameter typed by one (`context(ctx: T) fun <T> ...`) resolves
     /// against the call-site type argument.
     type_params: []const []const u8,
-    /// True when a non-contextual overload with the same value signature
-    /// exists: context resolution then yields OVERLOAD_RESOLUTION_AMBIGUITY
-    /// rather than NO_CONTEXT_ARGUMENT when unresolved.
+    /// A non-contextual overload with the same value signature exists, so an
+    /// unresolved context reports an overload ambiguity rather than a missing
+    /// context argument.
     has_plain_sibling: bool = false,
 };
 
@@ -71,7 +69,7 @@ const Ctx = struct {
     }
 };
 
-/// Entry point: driven from `phases.run` after the body checks.
+/// Driven from `phases.run` after the body checks.
 pub fn checkContextParameters(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
     var class_map = std.StringHashMap(*const Class).init(self.allocator);
     defer class_map.deinit();
@@ -87,7 +85,7 @@ pub fn checkContextParameters(self: *Checker, file: *const KotlinFile) Allocator
     defer plain_names.deinit();
     try collectPlainNames(&plain_names, file.decls);
     try collectCallees(&ctx, file.decls);
-    // Mark contextual callees that have a plain sibling overload.
+    // Mark contextual callees with a plain sibling overload.
     var cit = ctx.callees.iterator();
     while (cit.next()) |e| {
         if (plain_names.contains(e.key_ptr.*)) e.value_ptr.has_plain_sibling = true;
@@ -96,18 +94,18 @@ pub fn checkContextParameters(self: *Checker, file: *const KotlinFile) Allocator
     // Declaration-position rules.
     for (file.decls) |*d| try checkDeclPositions(self, d);
 
-    // Override signature rules: an override's context parameters must match
-    // the overridden member's types in order.
+    // An override's context parameters must match the overridden member's
+    // types in order.
     for (file.decls) |*d| try checkOverrides(self, &class_map, d);
 
-    // Call-site resolution + excluded forms. The file scope is the outermost
-    // level (no implicit sources).
+    // Call-site resolution and excluded forms. The file scope is the
+    // outermost level and carries no implicit sources.
     try ctx.pushLevel(&.{});
     defer ctx.popLevel();
     for (file.decls) |*d| try walkDecl(&ctx, d);
 }
 
-/// Names of functions declared WITHOUT a context clause.
+/// Names of functions declared with no context clause.
 fn collectPlainNames(out: *std.StringHashMap(void), decls: []const Decl) Allocator.Error!void {
     for (decls) |*d| {
         switch (d.*) {
@@ -140,8 +138,8 @@ fn collectCallees(ctx: *Ctx, decls: []const Decl) Allocator.Error!void {
 }
 
 fn putCallee(ctx: *Ctx, name: []const u8, cps: []const ContextParam, tps: []const ast.TypeParam) Allocator.Error!void {
-    // The stdlib `context`/`contextOf` intrinsics carry a context parameter
-    // but resolve through dedicated lowering, never this static walk.
+    // The `context`/`contextOf` intrinsics carry a context parameter but
+    // resolve through dedicated lowering, never this walk.
     if (std.mem.eql(u8, name, "context") or std.mem.eql(u8, name, "contextOf")) return;
     if (ctx.callees.contains(name)) return;
     const names = try ctx.self.allocator.alloc([]const u8, cps.len);
@@ -154,10 +152,6 @@ fn putCallee(ctx: *Ctx, name: []const u8, cps: []const ContextParam, tps: []cons
     for (tps, 0..) |*tp, i| tp_names[i] = tp.name.name;
     try ctx.callees.put(name, .{ .names = names, .types = types, .type_params = tp_names });
 }
-
-// -------------------------------------------------------------------------
-// Declaration positions
-// -------------------------------------------------------------------------
 
 fn emit(self: *Checker, factory: *const diagnostics.DiagnosticFactory, msg: []const u8, sp: Span) Allocator.Error!void {
     var d = Diagnostic.err(msg, sp);
@@ -182,7 +176,7 @@ fn checkDeclPositions(self: *Checker, d: *const Decl) Allocator.Error!void {
 
 fn checkContextualProperty(self: *Checker, p: *const Property) Allocator.Error!void {
     const sp = if (p.context_params.len != 0) p.context_params[0].span else p.name.span;
-    // A contextual property has no backing field: an initializer or
+    // A contextual property has no backing field, so an initializer or
     // `lateinit` is invalid.
     if (p.init) |_| {
         try emit(self, &g.CONTEXT_PARAMETERS_WITH_BACKING_FIELD, "Property with context parameters cannot be initialized because it has no backing field.", sp);
@@ -193,10 +187,6 @@ fn checkContextualProperty(self: *Checker, p: *const Property) Allocator.Error!v
         try emit(self, &g.UNSUPPORTED, "Context parameters on delegated properties are unsupported.", sp);
     }
 }
-
-// -------------------------------------------------------------------------
-// Override signatures
-// -------------------------------------------------------------------------
 
 fn collectClasses(map: *std.StringHashMap(*const Class), decls: []const Decl) Allocator.Error!void {
     for (decls) |*d| {
@@ -273,13 +263,9 @@ fn namesDiffer(a: []const ContextParam, b: []const ContextParam) bool {
     return false;
 }
 
-// -------------------------------------------------------------------------
-// Static type of a context-value expression
-// -------------------------------------------------------------------------
-
-/// A best-effort static type head for an implicit context value. `null`
-/// when unknown — an unknown source is treated as compatible so the walk
-/// never emits a spurious `NO_CONTEXT_ARGUMENT`.
+/// The static type head of an implicit context value, or null when unknown.
+/// An unknown source is treated as compatible, so the walk never reports a
+/// spurious missing context argument.
 fn staticTypeName(e: *const Expr) ?[]const u8 {
     return switch (e.*) {
         .StringTemplate => "String",
@@ -294,7 +280,7 @@ fn staticTypeName(e: *const Expr) ?[]const u8 {
         .As => |a| a.ty.name.name,
         .ObjectExpr => |o| if (o.supertypes.len != 0) o.supertypes[0].name.name else "Any",
         .Call => |c| blk: {
-            // A constructor call `Foo(...)` reports `Foo`. Recognised by a
+            // A constructor call `Foo(...)` reports `Foo`, recognised by a
             // capitalised single-segment callee.
             if (c.callee.* == .Path and c.callee.Path.segments.len == 1) {
                 const nm = c.callee.Path.segments[0].name;
@@ -305,10 +291,6 @@ fn staticTypeName(e: *const Expr) ?[]const u8 {
         else => null,
     };
 }
-
-// -------------------------------------------------------------------------
-// Subtyping
-// -------------------------------------------------------------------------
 
 fn subtypeOf(self: *Checker, a: []const u8, b: []const u8) bool {
     const at = std.mem.trimEnd(u8, a, "?");
@@ -332,19 +314,14 @@ fn subtypeOf(self: *Checker, a: []const u8, b: []const u8) bool {
     return false;
 }
 
-/// Does source type `src` satisfy a request for `want`? An unknown source
-/// (`null` or the empty sentinel) is treated as satisfying anything, so an
-/// implicit value whose static type the walk cannot recover never produces
-/// a spurious `NO_CONTEXT_ARGUMENT`.
+/// Whether source type `src` satisfies a request for `want`. An unknown
+/// source, null or the empty sentinel, satisfies anything, so a value whose
+/// static type the walk cannot recover never reports a missing context.
 fn sourceMatches(self: *Checker, src: ?[]const u8, want: []const u8) bool {
     const s = src orelse return true;
     if (s.len == 0) return true;
     return subtypeOf(self, s, want);
 }
-
-// -------------------------------------------------------------------------
-// Resolution walk
-// -------------------------------------------------------------------------
 
 fn walkDecl(ctx: *Ctx, d: *const Decl) Allocator.Error!void {
     switch (d.*) {
@@ -383,8 +360,8 @@ fn walkClass(ctx: *Ctx, c: *const Class) Allocator.Error!void {
     }
 }
 
-/// A function body's own level holds its extension receiver and all its
-/// context parameters (one level).
+/// A function body's own level holds its extension receiver and every one of
+/// its context parameters.
 fn ownLevelSources(self: *Checker, receiver: ?[]const u8, cps: []const ContextParam) Allocator.Error![]Source {
     var srcs: std.ArrayListUnmanaged(Source) = .empty;
     if (receiver) |r| try srcs.append(self.allocator, .{ .ty = r, .is_receiver = true });
@@ -462,8 +439,8 @@ fn walkExpr(ctx: *Ctx, e: *const Expr) Allocator.Error!void {
         .Postfix => |*p| try walkExpr(ctx, p.expr),
         .If => |*i| {
             try walkExpr(ctx, i.cond);
-            // Smart cast: inside `if (x is T) …` the narrowed value is a
-            // T-typed context source for the then-branch (KEEP §7.6).
+            // Inside `if (x is T) …` the narrowed value is a T-typed context
+            // source for the then-branch.
             if (i.cond.* == .IsCheck and !i.cond.IsCheck.negated) {
                 var srcs = [_]Source{.{ .ty = i.cond.IsCheck.ty.name.name, .is_receiver = false }};
                 try ctx.pushLevel(&srcs);
@@ -500,8 +477,8 @@ fn walkCall(ctx: *Ctx, c: anytype, call_span: Span) Allocator.Error!void {
     else
         null;
 
-    // `context(v..., block)`: the trailing lambda gets a new level holding
-    // the static types of the leading context values.
+    // For `context(v..., block)` the trailing lambda gets a level holding the
+    // static types of the leading context values.
     if (callee_name) |nm| {
         if (std.mem.eql(u8, nm, "context") and c.args.len >= 2 and c.args[c.args.len - 1] == .Lambda) {
             for (c.args[0 .. c.args.len - 1]) |*a| try walkExpr(ctx, a);
@@ -516,7 +493,7 @@ fn walkCall(ctx: *Ctx, c: anytype, call_span: Span) Allocator.Error!void {
             try walkBlock(ctx, &c.args[c.args.len - 1].Lambda.body);
             return;
         }
-        // `with(recv) { block }`: the block gets a receiver level.
+        // `with(recv) { block }` gives the block a receiver level.
         if (std.mem.eql(u8, nm, "with") and c.args.len == 2 and c.args[1] == .Lambda) {
             try walkExpr(ctx, &c.args[0]);
             const ty = staticTypeName(&c.args[0]) orelse "";
@@ -528,13 +505,13 @@ fn walkCall(ctx: *Ctx, c: anytype, call_span: Span) Allocator.Error!void {
         }
     }
 
-    // Recurse into argument expressions and the callee.
+    // Recurse into the callee and the argument expressions.
     try walkExpr(ctx, c.callee);
     for (c.args) |*a| try walkExpr(ctx, a);
 
-    // A call to a contextual callee: resolve each context parameter and,
-    // if a named argument targets a context parameter, reject the explicit
-    // form (out of scope in 2.4 without the opt-in flag).
+    // At a call to a contextual callee, resolve each context parameter; a
+    // named argument targeting one is the explicit form, which 2.4 excludes
+    // without the opt-in flag.
     if (callee_name) |nm| {
         if (ctx.callees.get(nm)) |sig| {
             try resolveContextArgs(ctx, sig, nm, c.type_args, call_span);
@@ -557,9 +534,9 @@ fn walkCall(ctx: *Ctx, c: anytype, call_span: Span) Allocator.Error!void {
     }
 }
 
-/// KEEP §7.10(a): an unqualified member call binds an implicit receiver at
-/// level `Lr`, but a context value at a strictly more nested level is
-/// type-compatible with that receiver — the call is `RECEIVER_SHADOWED`.
+/// An unqualified member call binds an implicit receiver at one level, but a
+/// context value at a strictly more nested level is type-compatible with that
+/// receiver, so the receiver is shadowed (context-parameters KEEP, §7.10(a)).
 fn checkReceiverShadowed(ctx: *Ctx, nm: []const u8, call_span: Span) Allocator.Error!void {
     var recv_level: ?usize = null;
     var recv_ty: []const u8 = "";
@@ -588,7 +565,7 @@ fn checkReceiverShadowed(ctx: *Ctx, nm: []const u8, call_span: Span) Allocator.E
     }
 }
 
-/// Whether any level currently holds a non-receiver context value.
+/// Whether any level holds a non-receiver context value.
 fn hasContextValueInScope(ctx: *Ctx) bool {
     for (ctx.levels.items) |lvl| {
         for (lvl.items) |src| if (!src.is_receiver) return true;
@@ -619,9 +596,9 @@ fn classHasMemberRec(ctx: *Ctx, class_name: []const u8, member: []const u8, seen
 }
 
 fn resolveContextArgs(ctx: *Ctx, sig: CalleeSig, callee_name: []const u8, type_args: []const ast.TypeRef, call_span: Span) Allocator.Error!void {
-    // A contextual overload shadowed by a plain sibling never reports a
-    // missing context: if every context resolves, the call is ambiguous with
-    // the plain overload; otherwise the plain overload simply applies.
+    // A contextual overload with a plain sibling never reports a missing
+    // context: if every context resolves the call is ambiguous with the plain
+    // overload, and otherwise the plain overload simply applies.
     if (sig.has_plain_sibling) {
         var all_resolved = true;
         for (sig.types, 0..) |raw, pi| {
@@ -665,8 +642,8 @@ fn resolveContextArgs(ctx: *Ctx, sig: CalleeSig, callee_name: []const u8, type_a
     }
 }
 
-/// True when at least one in-scope level has a compatible source for `want`
-/// (the winning level's first non-zero count).
+/// True when some in-scope level has a compatible source for `want`, taking
+/// the innermost level with a non-zero count.
 fn contextResolves(ctx: *Ctx, want: []const u8) bool {
     var i = ctx.levels.items.len;
     while (i > 0) {
@@ -679,8 +656,7 @@ fn contextResolves(ctx: *Ctx, want: []const u8) bool {
 }
 
 /// Resolve a context-parameter type against the call's explicit type
-/// arguments: a type naming one of the callee's own type parameters is
-/// substituted with the corresponding type argument.
+/// arguments, substituting the callee's own type-parameter names.
 fn substituteTypeParam(sig: CalleeSig, raw: []const u8, type_args: []const ast.TypeRef) []const u8 {
     for (sig.type_params, 0..) |tp, i| {
         if (std.mem.eql(u8, tp, raw) and i < type_args.len) return type_args[i].name.name;

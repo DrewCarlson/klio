@@ -1,10 +1,8 @@
-//! Declaration-checking phase. Free functions over `*Checker`.
-//!
-//! Top-level declaration
-//! intake, class-info collection, and the per-declaration body / shape
-//! checks (override rules, data/enum/value class shapes, supertype
-//! validity, lateinit, operator signatures, circular bounds, diamond
-//! inheritance, abstract-member implementation).
+//! Declaration-checking phase. Free functions over `*Checker`: top-level
+//! declaration intake, class-info collection, and the per-declaration body
+//! and shape checks (override rules, class-kind shapes, supertype validity,
+//! lateinit, operator signatures, bounds, diamond inheritance, abstract-member
+//! implementation).
 
 const std = @import("std");
 
@@ -74,8 +72,6 @@ const isPrimitiveTypeName = helpers.isPrimitiveTypeName;
 const stmtSpan = helpers.stmtSpan;
 const typeDisplay = helpers.typeDisplay;
 
-// ---- diagnostic helpers ------------------------------------------------
-
 fn emitError(self: *Checker, msg: []const u8, sp: Span, code: []const u8) Allocator.Error!void {
     var d = Diagnostic.err(msg, sp);
     _ = d.withCode(code);
@@ -88,8 +84,7 @@ fn emitWarning(self: *Checker, msg: []const u8, sp: Span, code: []const u8) Allo
     try self.diagnostics.emit(self.allocator, d);
 }
 
-// ---- env helpers (owned by narrowing.zig) ------------------------------
-
+// Scope and CFG helpers re-exported from the sibling phase files.
 const pushFrame = narrowing.pushFrame;
 const popFrame = narrowing.popFrame;
 const currentFrame = narrowing.currentFrame;
@@ -99,8 +94,6 @@ const synthesizeClassInitBody = narrowing.synthesizeClassInitBody;
 const cfgViaUnassignedAtExit = narrowing.cfgViaUnassignedAtExit;
 const checkInlineParamEscape = phases.checkInlineParamEscape;
 const checkAnonymousObjectEscape = phases.checkAnonymousObjectEscape;
-
-// ---- top-level declaration intake -------------------------------------
 
 pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
     switch (decl.*) {
@@ -145,8 +138,8 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                 });
             } else {
                 // An explicit backing field narrows same-file reads to the
-                // field type; the public (property) type rides along for
-                // reads outside the declaring file.
+                // field type; the public property type rides along for reads
+                // outside the declaring file.
                 var bound_ty = ty;
                 var bound_cn = cn;
                 var ebf: ?root.EbfBinding = null;
@@ -162,9 +155,8 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                             .file = p.name.span.file,
                         };
                     } else if (ef.init != null and p.ty != null) {
-                        // Field type inferred from the initializer: the
-                        // narrowed head is resolved when the initializer is
-                        // checked; until then reads stay tolerant.
+                        // The narrowed head is resolved when the initializer
+                        // is checked; until then reads stay tolerant.
                         bound_ty = Type.Unresolved;
                         bound_cn = null;
                         ebf = .{
@@ -199,7 +191,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
             try root.putClassChecked(self, c.name.name, info, c.name.span.file);
         },
         .Object => |*o| {
-            // Treat object singleton like a class with no ctor.
+            // An object singleton is a class with no constructor.
             var info = ClassInfo.init(self.allocator);
             info.is_object = true;
             info.decl_file = o.name.span.file;
@@ -208,7 +200,7 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
                 try info.supertypes.append(self.allocator, s.name.name);
             }
             try root.putClassChecked(self, o.name.name, info, o.name.span.file);
-            // Bind the singleton name itself so `Foo.bar` reads pass.
+            // Bind the singleton name so `Foo.bar` reads resolve.
             try self.frames.items[0].bindings.put(o.name.name, .{
                 .ty = Type.Unresolved,
                 .mutable = false,
@@ -229,11 +221,11 @@ pub fn declareTopLevel(self: *Checker, decl: *const Decl) Allocator.Error!void {
     }
 }
 
-/// Materializes the per-type-parameter upper-bound list for a
-/// declaration. The inline `<T : Foo>` bound contributes one entry;
-/// every `where T : ...` clause that names the parameter appends
-/// another. Bounds that lower to `Type.Unresolved` are dropped because
-/// they would render the subtype check vacuously true.
+/// The per-type-parameter upper-bound list for a declaration: the inline
+/// `<T : Foo>` bound contributes one entry and each `where T : ...` clause
+/// naming the parameter appends another. A bound lowering to
+/// `Type.Unresolved` is dropped, since it would make the subtype check
+/// vacuously true.
 pub fn collectTypeParamBounds(
     self: *Checker,
     type_params: []const TypeParam,
@@ -266,12 +258,11 @@ pub fn collectTypeParamBounds(
     };
 }
 
-/// Register a top-level function signature under `name`. An
-/// `expect`/`actual` pair (or the same declaration visible from two
-/// curated source roots) is one logical function, not an overload set:
-/// when the function is `expect`/`actual` and an identical parameter
-/// signature is already registered, skip the duplicate so overload
-/// resolution does not see a spurious `(T), (T)` ambiguity.
+/// Register a top-level function signature under `name`. An `expect`/`actual`
+/// pair, or one declaration reached through two source roots, is one logical
+/// function rather than an overload set, so an identical parameter signature
+/// already registered for such a declaration is skipped; otherwise overload
+/// resolution would see a spurious `(T), (T)` ambiguity.
 pub fn pushFnSig(self: *Checker, name: []const u8, sig: FnSig, expect_or_actual: bool) Allocator.Error!void {
     const gop = try self.fns.getOrPut(name);
     if (!gop.found_existing) gop.value_ptr.* = .empty;
@@ -351,7 +342,7 @@ pub fn classInfo(self: *Checker, c: *const Class) Allocator.Error!ClassInfo {
     info.decl_visibility = c.visibility;
     info.decl_file = c.name.span.file;
     info.primary_ctor_visibility = c.primary_ctor_visibility;
-    // Primary ctor params that are properties become members.
+    // A primary-constructor parameter declared `val`/`var` is also a member.
     for (c.primary_params) |*p| {
         const ty = try convertTypeRefLossy(self.allocator, &p.ty);
         if (p.property) |mutable| {
@@ -419,11 +410,9 @@ pub fn classInfo(self: *Checker, c: *const Class) Allocator.Error!ClassInfo {
     return info;
 }
 
-/// GADT supertype walk: given a `subclass` and a `target` class name,
-/// find the type-arg list `subclass` declares for `target` in its
-/// supertype chain. Returns the args when a match is found anywhere
-/// along the transitive supertype chain; `null` when the chain has no
-/// link to `target`. The result owns its heap data.
+/// The type-argument list `subclass` declares for `target` anywhere in its
+/// transitive supertype chain, or null when the chain never reaches `target`.
+/// Drives GADT refinement. The result owns its heap data.
 pub fn walkSupertypeArgs(self: *Checker, subclass: []const u8, target: []const u8) Allocator.Error!?[]Type {
     const info = root.classNamed(self, subclass) orelse return null;
     if (std.mem.eql(u8, subclass, target)) {
@@ -490,8 +479,8 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                 if (f.return_type) |*rt| {
                     if (classNameFromTyperef(rt)) |cn| try info.member_class.put(f.name.name, cn);
                 }
-                // Interface members and abstract members are implicitly
-                // `open` in Kotlin.
+                // Kotlin makes interface and abstract members implicitly
+                // `open`.
                 const implicit_open = info.is_interface or info.is_abstract or f.is_abstract;
                 try info.member_flags.put(f.name.name, .{
                     .is_open = f.is_open or implicit_open,
@@ -521,8 +510,8 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
                     if (classNameFromTyperef(pt)) |cn| try info.member_class.put(p.name.name, cn);
                 }
                 if (p.explicit_field) |ef| {
-                    // The public (property) type stays in `members`; reads
-                    // inside the declaring scope get the field type.
+                    // `members` keeps the public property type; reads inside
+                    // the declaring scope get the field type.
                     const fty = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else Type.Unresolved;
                     const fcn = if (ef.ty) |*ft| classNameFromTyperef(ft) else null;
                     const disp = if (p.ty) |*pt| try helpers.typeRefDisplay(self.allocator, pt) else p.name.name;
@@ -553,8 +542,6 @@ pub fn collectMembers(self: *Checker, members: []const Decl, info: *ClassInfo) A
     }
 }
 
-// ---- decl bodies ------------------------------------------------------
-
 pub fn checkDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
     switch (decl.*) {
         .Function => |*f| try checkFunction(self, f),
@@ -574,7 +561,7 @@ pub fn checkTopLevelProperty(self: *Checker, p: *const Property) Allocator.Error
         if (annot) |*a| {
             try checkAssignable(self, &init_ty, a, init.span());
         } else {
-            // Infer from initializer.
+            // Unannotated: the initializer's type stands.
             if (self.frames.items[0].bindings.getPtr(p.name.name)) |b| {
                 if (b.ty == .Unresolved) {
                     b.ty = try init_ty.clone(self.allocator);
@@ -591,7 +578,7 @@ pub fn checkTopLevelProperty(self: *Checker, p: *const Property) Allocator.Error
             if (want) |*a| {
                 try checkAssignable(self, &fty, a, finit.span());
             } else {
-                // The narrowed binding's type is inferred from the field
+                // The narrowed binding takes its type from the field
                 // initializer (`field = mutableListOf(1)`).
                 if (self.frames.items[0].bindings.getPtr(p.name.name)) |b| {
                     if (b.ty == .Unresolved) {
@@ -600,8 +587,8 @@ pub fn checkTopLevelProperty(self: *Checker, p: *const Property) Allocator.Error
                 }
             }
         }
-        // A top-level field with no initializer has no construction path
-        // that could assign it.
+        // A top-level field has no construction path that could assign it,
+        // so it must be initialized here.
         if (ef.init == null) {
             var d = Diagnostic.err("Field must be initialized.", ef.span);
             _ = d.withCode(codes.TYPE_VAR_NOT_DEFINITELY_ASSIGNED);
@@ -619,10 +606,9 @@ pub fn checkTopLevelProperty(self: *Checker, p: *const Property) Allocator.Error
     try checkAccessorReturnTypes(self, p);
 }
 
-/// Spec ch.9: validate the signature of an `operator fun` declaration
-/// against its name. Each well-known operator name has a fixed shape
-/// (arity / return type). T0088 is a warning so existing programs keep
-/// running while authors fix shapes.
+/// Validate an `operator fun` declaration against its name: each convention
+/// name has a fixed arity and return shape (Kotlin spec ch. 9). Reported as a
+/// warning, so a program with a mis-shaped operator still runs.
 pub fn checkOperatorSignature(self: *Checker, f: *const Function) Allocator.Error!void {
     if (!f.is_operator) return;
     const name = f.name.name;
@@ -652,13 +638,13 @@ pub fn checkOperatorSignature(self: *Checker, f: *const Function) Allocator.Erro
     } else if (std.mem.eql(u8, name, "set")) {
         if (n < 2) try emitOpSig(self, f, "`set` operator requires at least 2 arguments (last is the value)");
     } else if (eqAny(name, &.{ "invoke", "componentN" })) {
-        // no checks
+        // Any shape is legal.
     } else if (eqAny(name, &.{ "provideDelegate", "getValue" })) {
         expected = "2 args";
     } else if (std.mem.eql(u8, name, "setValue")) {
         expected = "3 args";
     } else {
-        // componentN: digits after "component"
+        // `componentN` is the prefix followed by digits.
         if (std.mem.startsWith(u8, name, "component")) {
             const rest = name["component".len..];
             if (rest.len != 0 and allAsciiDigit(rest) and n != 0) {
@@ -723,8 +709,8 @@ fn allAsciiDigit(s: []const u8) bool {
     return true;
 }
 
-/// Head name of a type reference — i.e. the top-level classifier name,
-/// ignoring generic args.
+/// The top-level classifier name of a type reference, ignoring generic
+/// arguments.
 pub fn headName(t: *const TypeRef) []const u8 {
     return t.name.name;
 }
@@ -771,7 +757,8 @@ pub fn checkCircularBounds(
             try g.value_ptr.append(self.allocator, head);
         }
     }
-    // Tarjan-lite: DFS, mark gray/black, any back-edge to gray is a cycle.
+    // Depth-first search marking gray then black; a back-edge to gray is a
+    // cycle.
     var color = std.StringHashMap(u8).init(self.allocator);
     defer color.deinit();
     for (type_params) |*tp| {
@@ -807,8 +794,8 @@ pub fn findCycleDfs(
     return null;
 }
 
-/// Validates that each user-supplied explicit type argument satisfies
-/// the declared upper bounds of the corresponding type parameter.
+/// Check each explicit type argument against the declared upper bounds of its
+/// type parameter.
 pub fn checkTypeArgBounds(self: *Checker, sig: *const FnSig, type_args: []const TypeRef) Allocator.Error!void {
     if (type_args.len != sig.type_param_count or sig.type_param_bounds.len == 0) return;
     const supplied = try self.allocator.alloc(Type, type_args.len);
@@ -861,7 +848,7 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
     try pushFrame(self);
     for (f.params) |*p| {
         const declared = try convertTypeRefLossy(self.allocator, &p.ty);
-        // A `vararg x: T` binds the PACKED ARRAY in the body, not an element.
+        // `vararg x: T` binds the packed array in the body, not an element.
         const ty = if (p.is_vararg)
             try helpers.varargParamType(self.allocator, &declared)
         else
@@ -902,8 +889,8 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
     for (f.type_params) |*tp| try all_tps.put(tp.name.name, {});
     try self.type_params_in_scope.append(self.allocator, all_tps);
 
-    // Explicit-backing-field narrowing is off inside non-private inline
-    // functions: the inlined body may execute outside the declaring scope.
+    // Explicit-backing-field narrowing is off inside a non-private inline
+    // function: the spliced body may run outside the declaring scope.
     const suppress_field_narrow = f.is_inline and f.visibility != .Private;
     if (suppress_field_narrow) self.field_narrow_off += 1;
     if (f.body) |*body| {
@@ -933,7 +920,7 @@ pub fn checkFunction(self: *Checker, f: *const Function) Allocator.Error!void {
 }
 
 fn checkFunctionBody(self: *Checker, f: *const Function, body: *const FunctionBody, declared_return: *const Type) Allocator.Error!void {
-    // Build a CFG for the body alongside type checking.
+    // The CFG is built alongside type checking.
     var body_block: Block = switch (body.*) {
         .Block => |b| b,
         .Expr => |e| Block{
@@ -952,8 +939,8 @@ fn checkFunctionBody(self: *Checker, f: *const Function, body: *const FunctionBo
     low.* = lowered;
     try self.lowerings.put(f.span, low);
     try self.cfg_fn_stack.append(self.allocator, f.span);
-    // See `generic_body_depth`: types recorded inside a generic body are
-    // only true for one instantiation, so they must not reach lowering.
+    // Types recorded inside a generic body hold for one instantiation only,
+    // so they must not reach lowering. See `generic_body_depth`.
     const generic_body = f.type_params.len != 0;
     if (generic_body) self.generic_body_depth += 1;
     defer if (generic_body) {
@@ -964,13 +951,13 @@ fn checkFunctionBody(self: *Checker, f: *const Function, body: *const FunctionBo
         .Block => |*b| {
             var body_ty = try checkBlock(self, b, declared_return);
             defer body_ty.deinit(self.allocator);
-            // Block-body functions with a declared non-`Unit` / non-`Nothing`
-            // return require every path to terminate. Defer to the CFG.
+            // A block body with a declared return other than `Unit` or
+            // `Nothing` requires every path to terminate; the CFG decides.
             const normal_exit_reachable = blk: {
                 const scratch = narrowing.queryScratch(self);
-                // Reachability only consults divergent (`Nothing`-typed)
-                // spans in this function's CFG, so feed it the function's
-                // bucket rather than a snapshot of the whole types map.
+                // Reachability consults only the divergent spans in this
+                // function's CFG, so feed it the function's bucket rather than
+                // the whole types map.
                 var type_map = cfa.analyses.reachable.TypeMap.init(scratch);
                 if (self.nothing_by_fn.getPtr(f.span)) |bucket| {
                     var it = bucket.keyIterator();
@@ -1010,19 +997,19 @@ fn checkFunctionBody(self: *Checker, f: *const Function, body: *const FunctionBo
     }
 }
 
-// Sequential class validation passes share balanced scope-stack
-// push/pop discipline, so they stay in one function.
+// The class validation passes run in sequence and share one balanced
+// scope-stack push/pop discipline, so they stay in one function.
 pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     try self.class_stack.append(self.allocator, c.name.name);
-    // Track class type parameters in the same scope as function type
-    // params. Class type params are never `reified`, so we push an empty
-    // set into `reified_type_params` to keep depth in lock-step.
+    // Class type parameters share the scope stack with function ones. They
+    // are never `reified`, so an empty set goes onto `reified_type_params` to
+    // keep the two stacks at equal depth.
     var class_tps = std.StringHashMap(void).init(self.allocator);
     for (c.type_params) |*tp| try class_tps.put(tp.name.name, {});
     try self.type_params_in_scope.append(self.allocator, class_tps);
     try self.reified_type_params.append(self.allocator, std.StringHashMap(void).init(self.allocator));
     try checkCircularBounds(self, c.type_params, c.where_bounds);
-    // Spec §5.1: data, enum, and annotation classes are always closed.
+    // Data, enum and annotation classes are always closed.
     if (c.is_data or c.is_enum) {
         const kind = if (c.is_data) "data" else "enum";
         const mods = [_]struct { set: bool, name: []const u8 }{
@@ -1037,7 +1024,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
-    // Spec §4.1.1: secondary constructor delegation must not form a cycle.
+    // Secondary-constructor delegation must not form a cycle.
     if (c.secondary_ctors.len != 0) {
         const n = c.secondary_ctors.len;
         var edges = try self.allocator.alloc(std.ArrayList(usize), n);
@@ -1085,7 +1072,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
-    // Spec §4.1.2: `data class` shape.
+    // `data class` shape.
     if (c.is_data) {
         var n_props: usize = 0;
         for (c.primary_params) |*p| {
@@ -1102,7 +1089,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
-    // Spec §4.1.2: `data class` cannot explicify `copy` or `componentN`.
+    // A `data class` cannot declare its own `copy` or `componentN`.
     if (c.is_data) {
         var n_props: usize = 0;
         for (c.primary_params) |*p| {
@@ -1128,8 +1115,8 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
-    // Spec §3.9: `kotlin.Enum<T>` declares `equals`, `hashCode`, `compareTo`
-    // as `final`. `toString` remains overridable.
+    // `kotlin.Enum<T>` declares `equals`, `hashCode` and `compareTo` final;
+    // `toString` stays overridable.
     if (c.is_enum) {
         for (c.members) |*m| {
             if (m.* == .Function) {
@@ -1142,13 +1129,13 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
-    // Spec §3.12: subtypes of `kotlin.Throwable` cannot have type params.
+    // A subtype of `kotlin.Throwable` cannot declare type parameters.
     if (c.type_params.len != 0 and try isThrowableSubtype(self, c)) {
         const msg = try std.fmt.allocPrint(self.allocator, "Subclasses of `kotlin.Throwable` cannot declare type parameters; `{s}` does", .{c.name.name});
         try emitError(self, msg, c.name.span, codes.TYPE_THROWABLE_TYPE_PARAMS);
     }
-    // Spec §5.4: `private` is mutually exclusive with `open` / `abstract` /
-    // `override` on a member declaration.
+    // On a member declaration `private` excludes `open`, `abstract` and
+    // `override`.
     for (c.members) |*m| {
         switch (m.*) {
             .Function => |*f| {
@@ -1164,9 +1151,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             else => {},
         }
     }
-    // Spec §5.1: supertype validity.
+    // Supertype validity.
     try checkSupertypeValidity(self, c.name.name, c.supertypes);
-    // Soft override diagnostics.
+    // Override diagnostics reported as warnings.
     var inherited = try collectInheritedMemberFlags(self, c);
     defer inherited.deinit();
     {
@@ -1174,8 +1161,8 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         defer sigs_tmp.deinit();
         try injectFunctionTypeSupertypes(self, c, &inherited, &sigs_tmp);
     }
-    // A supertype whose declaration is not visible to this type-check unit
-    // may legitimately declare the overridden member.
+    // A supertype the type-check unit cannot see may legitimately declare
+    // the overridden member.
     var has_opaque_supertype = false;
     for (c.supertypes) |*s| {
         if (s.function == null and !self.classes.contains(s.name.name)) {
@@ -1215,7 +1202,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             else => continue,
         }
         if (inherited.get(mname)) |parent_flags| {
-            // Member exists in a parent.
+            // A parent supplies the member.
             if (mflags.is_override) {
                 if (!parent_flags.is_open and !parent_flags.is_abstract and !has_opaque_supertype) {
                     const msg = try std.fmt.allocPrint(self.allocator, "`{s}` overrides nothing — parent member is not `open`", .{mname});
@@ -1234,7 +1221,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
-    // Spec §5.4 override-rule diagnostics.
+    // Override-rule diagnostics.
     var inherited_sigs = try collectInheritedMemberSigs(self, c);
     defer deinitMemberSigMap(self, &inherited_sigs);
     try injectFunctionTypeSupertypes(self, c, &inherited, &inherited_sigs);
@@ -1252,7 +1239,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
                         try std.fmt.allocPrint(self.allocator, "override `{s}` is not `suspend` but the overridden function is", .{f.name.name});
                     try emitError(self, msg, f.name.span, codes.TYPE_OVERRIDE_SUSPEND_MISMATCH);
                 }
-                // Only check when both ends have explicit return types.
+                // Checkable only when both ends annotate a return type.
                 if (f.return_type) |*rt| {
                     var derived_ret = try convertTypeRefLossy(self.allocator, rt);
                     defer derived_ret.deinit(self.allocator);
@@ -1274,12 +1261,13 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
                 const base = got.Property;
                 var derived_ty = if (p.ty) |*pt| try convertTypeRefLossy(self.allocator, pt) else Type.Unresolved;
                 defer derived_ty.deinit(self.allocator);
-                // T0066: mutability cannot strengthen.
+                // Mutability cannot strengthen.
                 if (base.mutable and !p.mutable) {
                     const msg = try std.fmt.allocPrint(self.allocator, "property `{s}` overrides `var` base with `val`: mutability cannot strengthen", .{p.name.name});
                     try emitError(self, msg, p.name.span, codes.TYPE_OVERRIDE_PROPERTY_MUTABILITY);
                 }
-                // T0067: type subtype, except both `var` requires equivalent types.
+                // The override's type must be a subtype, or equivalent when
+                // both ends are `var`.
                 const type_ok = if (base.mutable and p.mutable)
                     (derived_ty.eql(base.ty) or derived_ty == .Unresolved or base.ty == .Unresolved)
                 else
@@ -1300,7 +1288,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             else => {},
         }
     }
-    // Abstract-member check for concrete classes.
+    // A concrete class must implement every abstract member.
     if (!c.is_abstract and !c.is_interface) {
         var required: std.ArrayList([]const u8) = .empty;
         defer required.deinit(self.allocator);
@@ -1350,7 +1338,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         while (pit.next()) |entry| {
             const member = entry.key_ptr.*;
             const supplying = entry.value_ptr.items;
-            // Filter out suppliers shadowed by a subtype supplier.
+            // Drop suppliers shadowed by a subtype supplier.
             var leaves: std.ArrayList(Provider) = .empty;
             defer leaves.deinit(self.allocator);
             for (supplying) |sp| {
@@ -1382,7 +1370,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         }
     }
 
-    // `lateinit` compile-time rules.
+    // `lateinit` rules.
     for (c.members) |*m| {
         if (m.* == .Property) try checkLateinit(self, m.Property);
     }
@@ -1396,7 +1384,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     }
 
     try pushFrame(self);
-    // Bind primary-ctor params.
+    // Bind primary-constructor parameters.
     for (c.primary_params) |*p| {
         const ty = try convertTypeRefLossy(self.allocator, &p.ty);
         const cn = classNameFromTyperef(&p.ty);
@@ -1430,7 +1418,7 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
                 a.deinit(self.allocator);
             }
         }
-        // An explicit field's initializer checks against the FIELD type.
+        // An explicit field's initializer checks against the field type.
         if (p.explicit_field) |ef| {
             if (ef.init) |*finit| {
                 var want: ?Type = if (ef.ty) |*ft| try convertTypeRefLossy(self.allocator, ft) else null;
@@ -1445,8 +1433,8 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         const ef_has_init = if (p.explicit_field) |ef| ef.init != null else false;
         const has_init = p.init != null or ef_has_init or p.delegate != null or p.is_lateinit or p.is_abstract or p.getter != null or c.is_interface or c.is_abstract;
         if (!has_init) {
-            // For an explicit field the declaring scope (the class body,
-            // including init blocks) sees — and assigns — the field type.
+            // Inside the declaring scope, the class body and its init blocks,
+            // an explicit field is seen and assigned at the field type.
             const narrow_tr: ?*const ast.TypeRef = if (p.explicit_field) |ef|
                 (if (ef.ty) |*ft| ft else null)
             else
@@ -1491,7 +1479,8 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
-    // Build the synthetic class-init CFG.
+    // The synthetic class-init CFG covers property initializers and init
+    // blocks.
     const init_cfg_span = c.name.span;
     var init_body = try synthesizeClassInitBody(self, c);
     var init_lowered = try cfa.lower.lowerFunction(self.allocator, &init_body, init_cfg_span);
@@ -1506,9 +1495,10 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         bty.deinit(self.allocator);
     }
     _ = self.cfg_fn_stack.pop();
-    // VIA: every uninitialized property must be definitely assigned.
+    // Every uninitialized property must be definitely assigned by the end of
+    // class initialization.
     if (c.secondary_ctors.len != 0) {
-        // Secondary-ctor flow runs its own path; skip to avoid false positives.
+        // Secondary-constructor flow runs its own path.
     } else if (c.is_expect) {
         // An `expect class` declares members without bodies or initializers.
     } else {
@@ -1556,9 +1546,8 @@ fn joinNames(allocator: Allocator, names: []const []const u8) Allocator.Error![]
     return aw.toOwnedSlice();
 }
 
-/// Spec §5.4: an explicit override visibility must not be stronger than
-/// the overridden declaration's visibility. Strength order:
-/// public < internal < protected < private.
+/// An explicit override visibility must not be stronger than the overridden
+/// declaration's. Strength order: public < internal < protected < private.
 pub fn checkOverrideVisibility(self: *Checker, name: []const u8, sp: Span, derived: Visibility, base: Visibility) Allocator.Error!void {
     if (visStrength(derived) > visStrength(base)) {
         const msg = try std.fmt.allocPrint(
@@ -1603,7 +1592,7 @@ pub fn checkPrivateOpenOrOverride(self: *Checker, name: []const u8, sp: Span, is
     }
 }
 
-/// Spec §5.1: check each declared supertype is legal to inherit from.
+/// Check that each declared supertype is legal to inherit from.
 pub fn checkSupertypeValidity(self: *Checker, derived_name: []const u8, supertypes: []const TypeRef) Allocator.Error!void {
     const derived_local = if (root.classNamed(self, derived_name)) |i| i.is_local_or_anonymous else false;
     for (supertypes) |*s| {
@@ -1644,8 +1633,8 @@ const BUILTIN_THROWABLES_CLASS = [_][]const u8{
     "NumberFormatException",      "NoWhenBranchMatchedException",    "UninitializedPropertyAccessException",
 };
 
-/// Predicate used at `throw e` sites: is `ty` known to descend from
-/// `kotlin.Throwable`?
+/// Whether `ty` is known to descend from `kotlin.Throwable`, asked at every
+/// `throw` site.
 pub fn typeIsThrowableSubtype(self: *Checker, ty: *const Type) bool {
     return switch (ty.*) {
         .Nothing, .Unresolved, .TypeParam => true,
@@ -1727,9 +1716,8 @@ pub fn injectFunctionTypeSupertypes(
     }
 }
 
-/// Collects the detailed inherited member signatures used by the
-/// override-rule diagnostics. The first occurrence wins. The returned
-/// map's `MemberSig` values own heap data.
+/// The inherited member signatures the override-rule diagnostics read, first
+/// occurrence winning. The returned map's `MemberSig` values own heap data.
 pub fn collectInheritedMemberSigs(self: *Checker, c: *const Class) Allocator.Error!std.StringHashMap(MemberSig) {
     var out = std.StringHashMap(MemberSig).init(self.allocator);
     var frontier: std.ArrayList([]const u8) = .empty;
@@ -1774,7 +1762,7 @@ pub fn collectInheritedMemberFlags(self: *Checker, c: *const Class) Allocator.Er
         var it = parent.member_flags.iterator();
         while (it.next()) |entry| {
             var effective = entry.value_ptr.*;
-            // An override member without explicit `final` is itself overridable.
+            // An override that is not explicitly `final` stays overridable.
             if (effective.is_override) effective.is_open = true;
             if (!out.contains(entry.key_ptr.*)) try out.put(entry.key_ptr.*, effective);
         }
@@ -1801,9 +1789,9 @@ pub fn handleAccessors(self: *Checker, p: *const Property) Allocator.Error!void 
     }
 }
 
-/// For `val/var x by EXPR`, when EXPR resolves to a constructor call on
-/// a user class, require that class's `getValue` (and `setValue` for
-/// `var`) carry the `operator` modifier. Emitted as a warning (T0012).
+/// For `val/var x by EXPR` whose expression constructs a user class, warn
+/// unless that class's `getValue`, and `setValue` for a `var`, carry the
+/// `operator` modifier.
 pub fn checkDelegateOperator(self: *Checker, p: *const Property, delegate: *const Expr) Allocator.Error!void {
     const class_name: ?[]const u8 = switch (delegate.*) {
         .Call => |call| switch (call.callee.*) {
@@ -1828,8 +1816,8 @@ pub fn checkDelegateOperator(self: *Checker, p: *const Property, delegate: *cons
     }
 }
 
-/// Compile-time rules for `lateinit`. Kotlin restricts `lateinit` to:
-/// non-null, non-primitive, `var` properties with no initializer.
+/// Kotlin restricts `lateinit` to non-null, non-primitive `var` properties
+/// with no initializer.
 pub fn checkLateinit(self: *Checker, p: *const Property) Allocator.Error!void {
     if (!p.is_lateinit) return;
     if (!p.mutable) {
@@ -1864,11 +1852,10 @@ fn emitEbf(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// Static rules for a property declared with an explicit backing field
-/// (`val p: Tp` + `field: Tf = init`). The shipped surface admits only
-/// final, non-private, non-extension `val` member/top-level properties
-/// with no accessor bodies, no property initializer, and no delegate; the
-/// field type must be a subtype of the property type.
+/// Static rules for `val p: Tp` with `field: Tf = init`. The supported
+/// surface is a final, non-private, non-extension `val` member or top-level
+/// property with no accessor bodies, property initializer or delegate, whose
+/// field type is a subtype of the property type.
 pub fn checkExplicitBackingField(self: *Checker, p: *const Property, in_interface: bool) Allocator.Error!void {
     const ef = p.explicit_field orelse return;
     const g = diagnostics.generated;
@@ -1916,7 +1903,8 @@ pub fn checkExplicitBackingField(self: *Checker, p: *const Property, in_interfac
                 try emitEbf(self, &g.INCONSISTENT_BACKING_FIELD_TYPE, "The type of the backing field must be a subtype of the property's type.", pt.span);
             }
         } else if (ef.init == null) {
-            // Bare `field` takes the property's own type — always redundant.
+            // A bare `field` takes the property's own type, so the clause
+            // says nothing.
             var d = Diagnostic.warning("Explicit backing field declaration is unnecessary if it has the same type as the property.", ef.span);
             _ = d.withCode(codes.WARN_REDUNDANT_EXPLICIT_BACKING_FIELD);
             _ = d.withFactory(&diagnostics.generated.REDUNDANT_EXPLICIT_BACKING_FIELD);
@@ -1925,12 +1913,11 @@ pub fn checkExplicitBackingField(self: *Checker, p: *const Property, in_interfac
     }
 }
 
-/// Is the field type a subtype of the property type? Works on the source
-/// type references (the lossy `Type` conversion collapses class types).
-/// Exact equality is handled by the caller (it is the redundancy warning,
-/// not an error). Unknown shapes stay permissive — only relations the
-/// checker positively knows to be wrong (disjoint scalars, unrelated
-/// user classes) report an inconsistency.
+/// Whether the field type is a subtype of the property type, decided on the
+/// source type references because the lossy `Type` conversion collapses class
+/// types. Exact equality is the caller's redundancy warning, not an error.
+/// Unknown shapes stay permissive: only a relation positively known wrong
+/// (disjoint scalars, unrelated user classes) reports an inconsistency.
 fn fieldTypeRefConforms(self: *Checker, ft: *const TypeRef, pt: *const TypeRef) Allocator.Error!bool {
     if (ft.function != null or pt.function != null) return true;
     if (ft.nullable and !pt.nullable) return false;
@@ -1957,8 +1944,8 @@ fn fieldTypeRefConforms(self: *Checker, ft: *const TypeRef, pt: *const TypeRef) 
     }
     if (std.mem.eql(u8, pname, "Comparable")) return true;
     if (fb != null) {
-        // A scalar field under a class-typed property: wrong for a user
-        // class, permissive for stdlib interfaces the checker cannot see.
+        // A scalar field under a class-typed property is wrong for a user
+        // class, permissive for a stdlib interface the checker cannot see.
         return !self.classes.contains(pname) and !isBuiltinCollectionHead(pname);
     }
     const fname = ft.name.name;
@@ -1967,15 +1954,14 @@ fn fieldTypeRefConforms(self: *Checker, ft: *const TypeRef, pt: *const TypeRef) 
         return typeArgsCompatible(ft.type_args, pt.type_args);
     }
     if (try isSubtypeOf(self, fname, pname)) return true;
-    // Both heads known (user classes / builtin collection interfaces) with
-    // no subtype path: a real inconsistency. Anything else is out of the
-    // checker's sight and stays permissive.
+    // Two known heads with no subtype path between them is a real
+    // inconsistency; anything else is out of sight and stays permissive.
     const fname_known = self.classes.contains(fname) or isBuiltinCollectionHead(fname);
     const pname_known = self.classes.contains(pname) or isBuiltinCollectionHead(pname);
     return !(fname_known and pname_known);
 }
 
-/// Is `name` a generic type parameter of the enclosing declaration(s)?
+/// Whether `name` is a type parameter of some enclosing declaration.
 fn typeParamInScope(self: *const Checker, name: []const u8) bool {
     for (self.type_params_in_scope.items) |s| {
         if (s.contains(name)) return true;
@@ -1996,10 +1982,9 @@ fn isBuiltinCollectionHead(name: []const u8) bool {
     return false;
 }
 
-/// Covariant-leaning type-argument compatibility for the builtin
-/// collection chain (`List<out E>` and friends): exact matches and
-/// star projections pass; two distinct scalar heads conflict; anything
-/// else stays permissive.
+/// Type-argument compatibility for the covariant builtin collection chain
+/// (`List<out E>` and friends): exact matches and star projections pass, two
+/// distinct scalar heads conflict, anything else stays permissive.
 fn typeArgsCompatible(sub_args: []const ast.TypeArg, sup_args: []const ast.TypeArg) bool {
     if (sub_args.len != sup_args.len) return true;
     for (sub_args, sup_args) |*l, *r| {
@@ -2008,8 +1993,8 @@ fn typeArgsCompatible(sub_args: []const ast.TypeArg, sup_args: []const ast.TypeA
         const lb = builtinByName(l.ty.name.name);
         const rb = builtinByName(r.ty.name.name);
         if (lb != null and rb != null) {
-            // Covariant reading: a narrower numeric under Number is fine,
-            // but two distinct scalars conflict.
+            // Reading covariantly, a narrower numeric under `Number` is
+            // fine, but two distinct scalars conflict.
             if (rb.? == .Any) continue;
             return false;
         }
@@ -2017,8 +2002,8 @@ fn typeArgsCompatible(sub_args: []const ast.TypeArg, sup_args: []const ast.TypeA
     return true;
 }
 
-/// Transitive walk of the builtin kotlin.collections interface hierarchy:
-/// is `sup` reachable from `sub`?
+/// Whether `sup` is reachable from `sub` in the builtin kotlin.collections
+/// interface hierarchy.
 fn builtinChainContains(sub: []const u8, sup: []const u8) bool {
     const supersOf = struct {
         fn f(name: []const u8) []const []const u8 {
@@ -2066,8 +2051,8 @@ fn builtinChainContains(sub: []const u8, sup: []const u8) bool {
     return false;
 }
 
-/// Enforce that an accessor's explicit return-type annotation matches
-/// the property's declared type.
+/// An accessor's explicit return-type annotation must match the property's
+/// declared type.
 pub fn checkAccessorReturnTypes(self: *Checker, p: *const Property) Allocator.Error!void {
     const prop_ty_ref = if (p.ty) |*pt| pt else return;
     var prop_ty = try convertTypeRefLossy(self.allocator, prop_ty_ref);
@@ -2097,7 +2082,7 @@ pub fn typesMatchForAccessor(a: *const Type, b: *const Type) bool {
     return a.eql(b.*);
 }
 
-/// True when `sub` is a transitive supertype-walk descendant of `sup`.
+/// True when `sub` reaches `sup` through its supertype chain.
 pub fn isSubtypeOf(self: *Checker, sub: []const u8, sup: []const u8) Allocator.Error!bool {
     if (std.mem.eql(u8, sub, sup)) return false;
     var frontier: std.ArrayList([]const u8) = .empty;
@@ -2122,8 +2107,8 @@ pub fn isSubtypeOf(self: *Checker, sub: []const u8, sup: []const u8) Allocator.E
 
 const Provider = struct { name: []const u8, concrete: bool };
 
-/// For diamond detection: for every member name supplied by some
-/// supertype, list `(supertype, has_default_body)` pairs.
+/// For diamond detection: every member name a supertype supplies, with the
+/// `(supertype, has_default_body)` pairs that supply it.
 pub fn collectDefaultProviders(self: *Checker, c: *const Class) Allocator.Error!std.StringHashMap(std.ArrayList(Provider)) {
     var out = std.StringHashMap(std.ArrayList(Provider)).init(self.allocator);
     var frontier: std.ArrayList([]const u8) = .empty;
@@ -2257,8 +2242,6 @@ pub fn checkObject(self: *Checker, o: *const ObjectDecl) Allocator.Error!void {
     popFrame(self);
     _ = self.class_stack.pop();
 }
-
-// ---- small utilities --------------------------------------------------
 
 fn sliceContains(slice: []const []const u8, needle: []const u8) bool {
     for (slice) |s| {

@@ -65,32 +65,26 @@ pub const context_params = @import("check/context_params.zig");
 
 pub const helpers = @import("check/helpers.zig");
 
-/// Output of the type-checking pass. Every container the checker fills —
-/// the `types`/`cfgs` side tables, the diagnostics, and all the scratch the
-/// `Checker` holds — is allocated from the single driver-owned arena passed
-/// to `typecheck`/`typecheckModule`. The driver frees that arena once the
-/// last reader of this output is done, so the result exposes no teardown.
+/// Output of the type-checking pass. Every container here comes from the one
+/// driver-owned arena passed to `typecheck`/`typecheckModule`, which the
+/// driver frees once the last reader is done, so the result has no teardown.
 pub const TypeCheck = struct {
-    /// Type assigned to each expression by its span. Statements have no
-    /// entry. Spans not in this map were either skipped or assigned
-    /// `Type.Unresolved`.
+    /// Type assigned to each expression by span. Statements have no entry;
+    /// a missing span was skipped or typed `Type.Unresolved`.
     types: std.AutoHashMap(Span, Type),
     /// Spans whose recorded type is only valid for one generic
     /// instantiation; see `Checker.generic_body_depth`. Consumers that feed
     /// lowering must skip these.
     types_instantiation_dependent: std.AutoHashMap(Span, void),
     diagnostics: DiagnosticSink,
-    /// CFGs built during type checking, keyed by the source span of the
-    /// owning function. Populated for every function body the checker
-    /// visits. Consumers (notably the dataflow analyses in `cfa`)
-    /// read this to ground reachability / VIA / smart-cast queries.
+    /// CFGs keyed by the owning function's source span, one per function
+    /// body the checker visits. The `cfa` dataflow analyses read these to
+    /// ground reachability, VIA and smart-cast queries.
     cfgs: std.AutoHashMap(Span, Cfg),
-    /// The signature the overload checker CHOSE for each overloaded call,
-    /// keyed by call span: the declaring function's name-span (the identity
-    /// channel — lowering composes it with its own decl-span -> FuncId map)
-    /// plus the compact render ("arity=N;p0=Int;...;ret=T"). The eager half
-    /// of the one-engine-two-modes design: recorded once, consumable by
-    /// lowering-side audits and typeck-informed evidence.
+    /// The signature overload resolution chose for each call, keyed by call
+    /// span: the declaring function's name-span, which lowering composes with
+    /// its own decl-span to FuncId map, plus a comparison-stable render
+    /// ("arity=N;p0=Int;...;ret=T").
     resolved_calls: std.AutoHashMap(Span, ResolvedCall),
     lambda_recv_heads: std.AutoHashMap(Span, []const u8),
     lambda_param_shapes: std.AutoHashMap(Span, ParamShape),
@@ -98,29 +92,26 @@ pub const TypeCheck = struct {
     /// user class is `Type.Unresolved` here, so this is where a receiver's
     /// class identity actually lives.
     expr_class: std.AutoHashMap(Span, []const u8),
-    /// Class identity used ONLY to pick the next receiver while checking.
-    /// Kept apart from `expr_class` because that map is exported as TYPE
-    /// evidence for lowering, and a head good enough to rank candidates is
-    /// not automatically a head lowering can bind against — publishing
-    /// extension return heads into `expr_class` broke 31 corpus programs.
+    /// Class identity used only to pick the next receiver while checking.
+    /// Separate from `expr_class`, which lowering reads as type evidence: a
+    /// head good enough to rank candidates is not necessarily one lowering
+    /// can bind against.
     rank_class: std.AutoHashMap(Span, []const u8),
 
-    /// Look up the type assigned to an expression by span.
     pub fn typeOf(self: *const TypeCheck, sp: Span) ?*const Type {
         return self.types.getPtr(sp);
     }
 
-    /// The resolution the checker recorded for the call at `sp`.
     pub fn resolvedCallOf(self: *const TypeCheck, sp: Span) ?ResolvedCall {
         return self.resolved_calls.get(sp);
     }
 };
 
-/// One recorded overload decision: the chosen declaration's identity and
-/// its comparison-stable render.
 /// A function-typed parameter's declared shape.
 pub const ParamShape = struct { has_receiver: bool, arity: u16 };
 
+/// One recorded overload decision: the chosen declaration's identity and its
+/// comparison-stable render.
 pub const ResolvedCall = struct {
     decl_span: ?Span,
     render: []const u8,
@@ -158,12 +149,10 @@ pub fn typecheck(
     };
 }
 
-/// Walk every top-level `inline fun` in `file` and record any
-/// `contract { callsInPlace(p, InvocationKind.EXACTLY_ONCE) }`
-/// declarations as a map of fn-simple-name -> exactly-once param
-/// names. Consumed by `cfa`'s lowering to extend its trailing-lambda
-/// inline scheme to user contracts so a `val` assigned inside the
-/// lambda is observed as definitely assigned at the call site.
+/// Map each top-level `inline fun` to the parameters its
+/// `contract { callsInPlace(p, InvocationKind.EXACTLY_ONCE) }` names. `cfa`
+/// lowering extends its trailing-lambda inline scheme with these, so a `val`
+/// assigned inside such a lambda is definitely assigned at the call site.
 fn scanUserInlineContracts(
     allocator: Allocator,
     file: *const KotlinFile,
@@ -233,10 +222,9 @@ fn calleeNameIs(callee: *const Expr, name: []const u8) bool {
     };
 }
 
-/// Multi-file entry point. Synthesizes a merged `KotlinFile` whose decls
-/// and imports are the concatenation of every input file's; per-decl
-/// `Span.file` is preserved so cross-file visibility checks (T0032)
-/// continue to work.
+/// Multi-file entry point. Merges the inputs into one `KotlinFile` whose
+/// decls and imports concatenate every file's, preserving per-decl
+/// `Span.file` so cross-file visibility checks still work.
 pub fn typecheckModule(
     allocator: Allocator,
     files: []const KotlinFile,
@@ -263,9 +251,8 @@ pub fn typecheckModule(
             try tc.classes.put(k.*, info);
         }
         tc.extern_fn_return_class = ed.fn_return_class;
-        // Extensions the IMAGE carries. Without these an image run found
-        // zero candidates for every member call, so no overload ranking ran
-        // at all — the checker was ranking against an empty stdlib.
+        // Extensions the image carries; without them a member call on an
+        // image type finds no candidates and no ranking runs at all.
         if (ed.has_extensions) {
             var eit = ed.extensions.iterator();
             while (eit.next()) |entry| {
@@ -341,10 +328,9 @@ pub fn typecheckModule(
     };
 }
 
-/// Return the checker's per-query scratch pages to the OS once the checker
-/// is done. The arena's backing is the page allocator, not the driver's
-/// phase arena, so this teardown is required even under the
-/// driver-owned-arena model.
+/// Return the checker's per-query scratch pages to the OS. The arena is
+/// backed by the page allocator, not the driver's phase arena, so this
+/// teardown is required even though everything else rides that arena.
 fn destroyQueryScratch(allocator: Allocator, scratch: *std.heap.ArenaAllocator) void {
     scratch.deinit();
     allocator.destroy(scratch);
@@ -499,10 +485,8 @@ pub const codes = struct {
     pub const WARN_REDUNDANT_EXPLICIT_BACKING_FIELD = "W0008";
 };
 
-/// A scope frame mapping local names to their declared/inferred types
-/// and mutability. Frames stack lexically. The smart-cast / bound-alias
-/// data that used to live here has moved to the CFG; the frame now only
-/// holds the binding map.
+/// A lexically stacked scope frame mapping local names to their declared or
+/// inferred types and mutability. Smart-cast facts live in the CFG, not here.
 pub const Frame = struct {
     bindings: std.StringHashMap(Binding),
 
@@ -525,15 +509,13 @@ pub const Binding = struct {
     /// exhaustiveness, member-access lookup, and smart-cast widening of
     /// `val` properties.
     class_name: ?[]const u8,
-    /// Original declared-type name when the binding was annotated with a
-    /// bare identifier (e.g. `t: T` for a type parameter). Lets
-    /// runtime-availability checks recover the spelling that
+    /// Declared-type name when the annotation was a bare identifier (`t: T`),
+    /// recovering for runtime-availability checks the spelling that
     /// `convertTypeRefLossy` collapsed to `Type.Unresolved`.
     decl_type_name: ?[]const u8,
-    /// Set for a top-level property with an explicit backing field: `ty`
-    /// above is the (narrowed) field type; this carries the public view.
-    /// Reads outside the declaring file — or where narrowing is switched
-    /// off — see the public type instead.
+    /// Set for a top-level property with an explicit backing field: `ty` is
+    /// the narrowed field type, this is the public view. Reads outside the
+    /// declaring file, or where narrowing is off, see the public type.
     ebf: ?EbfBinding = null,
 };
 
@@ -544,7 +526,7 @@ pub const EbfBinding = struct {
     public_class: ?[]const u8,
     /// Rendered public type for diagnostics (`List<Int>`).
     public_display: []const u8,
-    /// File the property is declared in — narrowing is file-scoped.
+    /// File the property is declared in; narrowing is file-scoped.
     file: FileId,
 };
 
@@ -558,9 +540,9 @@ pub const EbfMember = struct {
     public_display: []const u8,
 };
 
-/// Recorded at a property-read site that resolved OUTSIDE the declaring
-/// scope of an explicit-backing-field property: member calls on that read
-/// must resolve against the public type.
+/// Recorded at a property-read site outside the declaring scope of an
+/// explicit-backing-field property: member calls on that read must resolve
+/// against the public type.
 pub const EbfOutside = struct {
     /// Head class/interface name of the public type (`List`, user class).
     head: ?[]const u8,
@@ -568,12 +550,11 @@ pub const EbfOutside = struct {
     display: []const u8,
 };
 
-/// One extension declaration on a given receiver type.
 /// A `Type` for a declaration head recovered from an image. Primitive and
-/// builtin heads become their exact type; anything else becomes a `Generic`
-/// with no arguments, which is what the ranking compares by name. A short
-/// all-caps head is a type PARAMETER spelling and stays one, so a generic
-/// declaration never ranks as if it named a class.
+/// builtin heads become their exact type; anything else becomes an
+/// argument-less `Generic`, which ranking compares by name. A short all-caps
+/// head spells a type parameter and stays one, so a generic declaration never
+/// ranks as if it named a class.
 fn externHeadType(allocator: Allocator, head: []const u8, nullable: bool) Allocator.Error!Type {
     const base: Type = if (std.mem.eql(u8, head, "Unit"))
         .Unit
@@ -619,6 +600,7 @@ fn externHeadType(allocator: Allocator, head: []const u8, nullable: bool) Alloca
     return Type{ .Nullable = inner };
 }
 
+/// One extension declaration on a given receiver type.
 pub const ExtensionSig = struct {
     name: []const u8,
     sig: FnSig,
@@ -648,10 +630,10 @@ pub const FnSig = struct {
     /// True for each parameter declared `vararg`.
     is_vararg: []bool,
     return_ty: Type,
-    /// True when the source declared the function with the `infix` modifier.
+    /// Declared with the `infix` modifier.
     is_infix: bool,
-    /// Number of declaration-site type parameters. Used to filter the OCS
-    /// against an explicit call-site `<...>` list.
+    /// Number of declaration-site type parameters; filters candidates against
+    /// an explicit call-site `<...>` list.
     type_param_count: usize,
     /// Names of the declaration-site type parameters in order, matching
     /// `type_param_count`.
@@ -659,13 +641,12 @@ pub const FnSig = struct {
     /// Per-type-parameter upper bounds. Each inner slice is the bound list
     /// for the corresponding type parameter, in declaration order.
     type_param_bounds: [][]Type,
-    /// User-class simple name this function's declared RETURN type names,
-    /// `null` for a primitive / function / unresolved return. A plain user
-    /// class is `Type.Unresolved` in this checker (only generic
-    /// INSTANTIATIONS are `Type.Generic`), so the class identity has to
-    /// travel beside the type — the same reason `param_class_names` exists.
+    /// Simple name of the user class the declared return type names, null for
+    /// a primitive, function or unresolved return. A plain user class types as
+    /// `Type.Unresolved` here (only generic instantiations are
+    /// `Type.Generic`), so class identity travels beside the type.
     return_class: ?[]const u8 = null,
-    /// FuncId of an IMAGE-published declaration. Source declarations carry
+    /// FuncId of an image-published declaration. Source declarations carry
     /// identity in `decl_span`; an image one has no span at all.
     extern_fid: ?u32 = null,
     /// User-class simple name for each parameter whose declared type names
@@ -673,7 +654,7 @@ pub const FnSig = struct {
     param_class_names: []?[]const u8,
     /// Declaration-name span. `null` for synthetic / constructor sigs.
     decl_span: ?Span,
-    /// True when declared with the `suspend` modifier.
+    /// Declared with the `suspend` modifier.
     is_suspend: bool,
     /// Declared with an extension receiver (`fun T.f()`): a bare call to
     /// it inside a receiver scope competes with candidates typeck's flat
@@ -683,14 +664,13 @@ pub const FnSig = struct {
     /// same index is marked `crossinline`.
     is_crossinline_param: []bool,
     /// Declared context-parameter type names, in order. Two overloads whose
-    /// context type-sets differ are NOT conflicting (they are shadowed
-    /// contextual overloads instead).
+    /// context type-sets differ are shadowed contextual overloads, not
+    /// conflicting ones.
     context_types: []const []const u8 = &.{},
 };
 
-/// Detailed per-member signature used by override-rule diagnostics
-/// (T0065 / T0066 / T0067 / T0068). Stored separately from `MemberFlags`
-/// so existing name-keyed override walks keep their semantics.
+/// Per-member signature used by the override-rule diagnostics, kept apart
+/// from `MemberFlags` so name-keyed override walks keep their semantics.
 pub const MemberSig = union(enum) {
     Function: struct {
         param_types: []Type,
@@ -709,11 +689,11 @@ pub const MemberFlags = struct {
     is_open: bool = false,
     is_override: bool = false,
     is_abstract: bool = false,
-    /// True when a `fun` member carried the `operator` modifier.
+    /// The member carried the `operator` modifier.
     is_operator: bool = false,
-    /// True when a `fun` member carried the `infix` modifier.
+    /// The member carried the `infix` modifier.
     is_infix: bool = false,
-    /// True when a `fun` member declares an actual body (default impl).
+    /// The member declares a body, a default implementation.
     has_default_body: bool = false,
 };
 
@@ -723,7 +703,6 @@ pub const TypedSupertype = struct {
     args: []Type,
 };
 
-/// Description of a user-declared class.
 /// Register a class under its simple name, recording a collision instead of
 /// overwriting. See `ambiguous_class_names`.
 pub fn putClassChecked(self: anytype, name: []const u8, info: ClassInfo, decl_file: ?FileId) !void {
@@ -746,9 +725,10 @@ pub fn classNamed(self: anytype, name: []const u8) ?ClassInfo {
     return self.classes.get(name);
 }
 
+/// Description of a user-declared class.
 pub const ClassInfo = struct {
-    /// Has any secondary constructor — we then relax primary-ctor arity
-    /// checks to avoid false positives.
+    /// Any secondary constructor exists, which relaxes primary-constructor
+    /// arity checks.
     has_secondary_ctors: bool = false,
     /// Member name -> type. Covers primary-param properties, body
     /// properties, and methods (as `Type.Function`).
@@ -759,15 +739,15 @@ pub const ClassInfo = struct {
     member_methods: std.StringHashMap(std.ArrayList(FnSig)),
     /// Member name -> mutable? (only for properties).
     member_mutable: std.StringHashMap(bool),
-    /// Constructor parameter list (primary). Used to type-check `Box(...)`.
+    /// Primary constructor's parameter list.
     ctor: ?FnSig = null,
     /// Names of declared abstract members on this class.
     abstract_members: std.ArrayList([]const u8) = .empty,
     /// Names of declared concrete members on this class.
     concrete_members: std.ArrayList([]const u8) = .empty,
-    /// Per-member modifier flags. Drives T0009/T0010/T0011.
+    /// Per-member modifier flags, driving the override diagnostics.
     member_flags: std.StringHashMap(MemberFlags),
-    /// Per-member detailed signature used by T0065 / T0066 / T0067 / T0068.
+    /// Per-member detailed signature for the override-rule diagnostics.
     member_sigs: std.StringHashMap(MemberSig),
     /// Member name -> user-class name when the member's declared type
     /// names a user class.
@@ -775,7 +755,7 @@ pub const ClassInfo = struct {
     /// Member name -> explicit-backing-field record. Present only for
     /// properties declared with a `field` clause.
     member_ebf: std.StringHashMap(EbfMember),
-    /// Names of supertypes (raw — interfaces or classes).
+    /// Supertype names, interfaces and classes alike.
     supertypes: std.ArrayList([]const u8) = .empty,
     /// Typed supertypes paired with type-arg lists, in declaration order.
     typed_supertypes: std.ArrayList(TypedSupertype) = .empty,
@@ -787,7 +767,6 @@ pub const ClassInfo = struct {
     is_open: bool = false,
     /// `object` singleton.
     is_object: bool = false,
-    /// `enum class` flag.
     is_enum: bool = false,
     /// Declared inside a function body (local class) or via `object { … }`.
     is_local_or_anonymous: bool = false,
@@ -826,16 +805,11 @@ pub const InferenceSession = struct {
     cs: types.constraints.ConstraintSystem,
     /// True when a nested call is currently using the session.
     depth: u32,
-    /// Every inference variable created in this session, with the unique
-    /// `T@start-end` name the recorded expression types carry.
-    ///
-    /// A nested call substitutes its signature with its OWN fresh vars and
-    /// returns before the root solves, so the type recorded for
-    /// `listOf("a")` inside a larger expression is `List<TypeParam(T@…)>` —
-    /// a container whose argument is an unsolved placeholder. The root has
-    /// the solution for those same vars (they live in one constraint
-    /// system); this list is what lets it go back and replace them, so the
-    /// recorded types describe real types rather than in-flight ones.
+    /// Every inference variable created in this session, under the unique
+    /// `T@start-end` name the recorded expression types carry. A nested call
+    /// returns before the root solves, leaving placeholders in the recorded
+    /// types; root and nested share one constraint system, so this list is
+    /// what lets the root go back and substitute the solved types.
     all_vars: std.ArrayList(SessionVar),
 };
 
@@ -845,7 +819,7 @@ pub const SessionVar = struct { unique: []const u8, v: types.constraints.Inferen
 pub const TypeAliasInfo = struct {
     /// Declared type-parameter names in source order.
     type_params: [][]const u8,
-    /// Right-hand-side `TypeRef` — the alias target.
+    /// The alias target.
     target: TypeRef,
     /// Span of the alias's name for cycle-diagnostic labeling.
     name_span: Span,
@@ -867,13 +841,12 @@ pub const Checker = struct {
     types: std.AutoHashMap(Span, Type),
     /// Chosen-overload record per call span (see TypeCheck.resolved_calls).
     resolved_calls: std.AutoHashMap(Span, ResolvedCall),
-    /// Receiver-lambda bodies keyed by their BLOCK span -> the receiver
-    /// class head typeck bound `this` to. The eager channel that lets
-    /// lowering answer member-vs-global precisely inside lambda bodies.
+    /// Receiver-lambda body span to the receiver class head `this` was bound
+    /// to, which is how lowering answers member-versus-global inside a body.
     lambda_recv_heads: std.AutoHashMap(Span, []const u8),
-    /// Function-typed lambda PARAMS keyed by the param ident's span: the
-    /// declared shape (receiver-ness + arity) for params the AST leaves
-    /// unannotated (`{ f -> f(x) }` against an expected function type).
+    /// Declared shape, receiver-ness and arity, of function-typed lambda
+    /// parameters the AST leaves unannotated (`{ f -> f(x) }` against an
+    /// expected function type), keyed by the parameter ident's span.
     lambda_param_shapes: std.AutoHashMap(Span, ParamShape),
     /// Spans whose recorded type is `Nothing`, maintained alongside `types`.
     /// The reachability queries only need to know where control diverges,
@@ -891,9 +864,8 @@ pub const Checker = struct {
     /// Cached reachability solve for the W0002 per-statement query: valid
     /// while the queried function and `nothing_epoch` both match.
     reach_cache: ReachCache,
-    /// User-class name attached to an expression by span — populated for
-    /// path / `this` / constructor-call sites whose static type is a
-    /// user-declared class.
+    /// User-class name attached to an expression by span, populated for path,
+    /// `this` and constructor-call sites whose static type is a user class.
     expr_class: std.AutoHashMap(Span, []const u8),
     /// Ranking-only receiver classes; see the field of the same name on
     /// the result struct.
@@ -914,11 +886,11 @@ pub const Checker = struct {
     /// User-declared extension functions keyed by the receiver type's simple
     /// name.
     extensions: std.StringHashMap(std.ArrayList(ExtensionSig)),
-    /// Every name declared as an EXTENSION function, on any receiver. A bare
+    /// Every name declared as an extension function on any receiver. A bare
     /// call inside an extension body has that receiver in scope, so a
-    /// same-named extension on it out-ranks a top-level declaration —
-    /// evidence the flat name registry cannot see. Names in this set stay out
-    /// of the eager call channel.
+    /// same-named extension out-ranks a top-level declaration, evidence the
+    /// flat name registry cannot see; these names stay out of the eager
+    /// call channel.
     extension_fn_names: std.StringHashMap(void),
     /// Extension properties keyed by simple receiver-type name.
     extension_properties: std.StringHashMap(std.ArrayList(ExtensionPropSig)),
@@ -926,15 +898,13 @@ pub const Checker = struct {
     classes: std.StringHashMap(ClassInfo),
     /// Return classes for functions known only from a prebuilt image.
     extern_fn_return_class: ?std.StringHashMap([]const u8) = null,
-    /// Simple names declared by MORE THAN ONE class. `classes` is keyed by
-    /// simple name, so two same-named classes in different packages would
-    /// otherwise silently overwrite each other and every lookup would answer
-    /// with whichever registered last. A wrong answer is worse than none —
-    /// it feeds the eager evidence channel and can disprove valid candidates
-    /// downstream — so an ambiguous name answers nothing until typeck
-    /// resolves classes per package.
+    /// Simple names declared by more than one class. `classes` is keyed by
+    /// simple name, so same-named classes in different packages would
+    /// otherwise overwrite each other and every lookup would answer with
+    /// whichever registered last. That answer feeds the eager evidence
+    /// channel, so an ambiguous name answers nothing instead.
     ambiguous_class_names: std.StringHashMap(void),
-    /// Name of the enclosing class while we type-check a class body.
+    /// Enclosing class name while a class body is checked.
     class_stack: std.ArrayList([]const u8),
     /// Enclosing function's declared/inferred return type for `return`.
     fn_return_stack: std.ArrayList(Type),
@@ -980,21 +950,15 @@ pub const Checker = struct {
     lowerings: std.AutoHashMap(Span, *Lowered),
     /// Stack of currently-active function spans.
     cfg_fn_stack: std.ArrayList(Span),
-    /// Nesting depth of function bodies that declare TYPE PARAMETERS.
+    /// Nesting depth of function bodies that declare type parameters.
     ///
-    /// A generic body is resolved once, against its type parameters — never
-    /// against one call site's instantiation. `plusElement` is
-    /// `return plus(element)` where `element: T`, and Kotlin matches
-    /// `plus(element: T)` exactly; substitute `T = List<String>` and
-    /// `plus(elements: Iterable<T>)` also becomes applicable and
-    /// CONCATENATES. So a type recorded inside such a body is only true for
-    /// the instantiation that happened to be checked last, and handing it to
-    /// lowering changes which overload wins.
-    ///
-    /// Types recorded at depth > 0 are therefore excluded from the eager
-    /// evidence channel (`types_instantiation_dependent`). Lowering compiles
-    /// the body once, so per-instantiation evidence would need lowering to
-    /// ask with an instantiation in hand — a larger design than this.
+    /// Kotlin resolves a generic body once against its type parameters, never
+    /// against a call site's instantiation: `plusElement` is `plus(element)`
+    /// with `element: T`, matching `plus(element: T)`, but substituting
+    /// `T = List<String>` would also admit `plus(elements: Iterable<T>)` and
+    /// concatenate. A type recorded inside such a body is true only for the
+    /// instantiation checked last, so depth > 0 excludes it from the eager
+    /// evidence channel via `types_instantiation_dependent`.
     generic_body_depth: usize,
     /// Spans whose recorded type depends on a generic instantiation.
     types_instantiation_dependent: std.AutoHashMap(Span, void),
@@ -1003,33 +967,31 @@ pub const Checker = struct {
     /// Set while typing a call whose callee is annotated `@BuilderInference`.
     builder_inference_active: bool,
     /// Number of lambda bodies currently being checked. Inside a lambda a
-    /// bare call may target a member of a receiver the checker cannot see
-    /// (user DSL builders), so resolution against same-named top-level
-    /// functions stays tolerant when no candidate's arity admits the call.
+    /// bare call may target a member of a receiver the checker cannot see, so
+    /// resolution against same-named top-level functions stays tolerant when
+    /// no candidate's arity admits the call.
     lambda_depth: usize,
     /// Property-read sites of explicit-backing-field properties resolved
     /// outside their declaring scope, keyed by the read expression's span.
     /// Member calls on such a receiver must resolve against the public
     /// (property) type.
     ebf_outside: std.AutoHashMap(Span, EbfOutside),
-    /// Depth of enclosing non-private `inline` functions. Explicit-
-    /// backing-field narrowing is switched off inside them: the inlined
-    /// body may land outside the declaring scope.
+    /// Depth of enclosing non-private `inline` functions. Explicit-backing-
+    /// field narrowing is off inside them: the spliced body may land outside
+    /// the declaring scope.
     field_narrow_off: usize,
-    /// Retained arena for per-query CFG-analysis scratch (smart-cast / VIA /
-    /// reachability solves). Reset at the start of each query via
-    /// `narrowing.queryScratch`; torn down by the typecheck entry points once
-    /// the checker is done. Backed by the page allocator so its pages are
-    /// genuinely returned between queries even when the driver hands the
-    /// checker a phase arena.
+    /// Retained arena for per-query CFG-analysis scratch: smart-cast, VIA and
+    /// reachability solves. Reset at the start of each query by
+    /// `narrowing.queryScratch`, torn down by the typecheck entry points.
+    /// Backed by the page allocator so pages are genuinely returned between
+    /// queries even when the driver hands the checker a phase arena.
     query_scratch: *std.heap.ArenaAllocator,
 
     pub const new = phases.new;
     pub const run = phases.run;
 
-    // Phase driver hooks. Sibling files supply the bodies; the root binds
-    // them as methods so every per-aspect file calls them uniformly through
-    // `self.<name>(...)`.
+    // Phase driver hooks. Sibling files supply the bodies; binding them here
+    // lets every per-aspect file call them as `self.<name>(...)`.
     pub const declareTopLevel = decl.declareTopLevel;
     pub const checkDecl = decl.checkDecl;
     pub const checkExpr = expr.checkExpr;

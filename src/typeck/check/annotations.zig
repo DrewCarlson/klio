@@ -33,7 +33,7 @@ const DiagnosticSink = diagnostics.DiagnosticSink;
 const Checker = root.Checker;
 const codes = root.codes;
 
-/// Severity of an opt-in requirement; parallels `DeprecationLevel`.
+/// Severity of an opt-in requirement, mirroring `DeprecationLevel`.
 pub const OptInLevel = enum {
     Warning,
     Error,
@@ -100,8 +100,8 @@ pub fn extractOptInLevel(e: *const Expr) ?OptInLevel {
     return null;
 }
 
-/// Build the per-declaration map of opt-in markers applied at the
-/// declaration site. Only markers known in `markers` count.
+/// Per-declaration map of the opt-in markers applied at each declaration
+/// site. Only markers present in `markers` count.
 pub fn collectRequiredOptIns(
     allocator: Allocator,
     decls: []const Decl,
@@ -167,8 +167,8 @@ pub fn markerNamesIn(
     return out.toOwnedSlice(allocator);
 }
 
-/// Read marker classes named in `@OptIn(M1::class, M2::class)` on the
-/// given annotation set. Returns the set of marker simple names.
+/// The marker simple names an `@OptIn(M1::class, M2::class)` in this
+/// annotation set opts into.
 pub fn optInMarkersIn(allocator: Allocator, anns: []const Annotation) Allocator.Error![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (anns) |*a| {
@@ -216,8 +216,7 @@ pub fn walkDeclForOptIn(
     switch (d.*) {
         .Function => |*f| {
             const added = try pushScope(allocator, scope, f.annotations);
-            // A function annotated with the marker itself also "opts
-            // in" to the marker for its own body.
+            // A function annotated with the marker opts its own body in.
             const self_markers = try markerNamesIn(allocator, f.annotations, markers);
             defer allocator.free(self_markers);
             for (self_markers) |m| {
@@ -341,7 +340,6 @@ pub fn walkBlockForOptIn(
     }
 }
 
-// Single recursive walk over every Expr variant.
 pub fn walkExprForOptIn(
     allocator: Allocator,
     e: *const Expr,
@@ -524,9 +522,9 @@ pub fn emitOptInAt(
     return emitted;
 }
 
-/// A `@Suppress("code", ...)` annotation on a declaration silences each
-/// named diagnostic emitted anywhere inside that declaration's span. Scope
-/// is lexical: an inner `@Suppress` adds to the enclosing one.
+/// A `@Suppress("code", ...)` on a declaration silences each named diagnostic
+/// emitted anywhere inside that declaration's span. Scope is lexical: an inner
+/// `@Suppress` adds to the enclosing one.
 pub fn applySuppressAnnotations(
     allocator: Allocator,
     file: *const KotlinFile,
@@ -579,10 +577,9 @@ pub fn collectSuppressRegions(
     file: *const KotlinFile,
     out: *std.ArrayList(SuppressRegion),
 ) Allocator.Error!void {
-    // `@file:Suppress(...)` on the KotlinFile covers the whole file.
-    // The parser currently lifts `@file:` annotations onto the
-    // top-level declaration that follows, so file-level suppression is
-    // handled via the decls below.
+    // The parser lifts a `@file:Suppress(...)` onto the top-level declaration
+    // that follows it, so file-level suppression falls out of the per-decl
+    // walk below.
     for (file.decls) |*d| {
         try collectSuppressDecl(allocator, d, out);
     }
@@ -654,7 +651,6 @@ pub fn pushSuppress(
     }
 }
 
-/// Deprecation levels.
 pub const DeprecationLevel = enum {
     Warning,
     Error,
@@ -676,9 +672,9 @@ pub fn parseDeprecation(anns: []const Annotation) ?DeprecationInfo {
             .level = .Warning,
             .message = null,
         };
-        // Positional first arg is `message: String` unless an explicit
-        // `message = ...` named arg is also given. ReplaceWith / level
-        // can appear in any position by name.
+        // The first positional argument is `message: String` unless an
+        // explicit `message = ...` is also given; `replaceWith` and `level`
+        // may appear in any position by name.
         var positional_idx: usize = 0;
         for (a.args, 0..) |*arg, i| {
             const name: ?[]const u8 = if (i < a.arg_names.len) a.arg_names[i] else null;
@@ -719,10 +715,9 @@ pub fn parseDeprecation(anns: []const Annotation) ?DeprecationInfo {
     return null;
 }
 
-/// A string-template expression made entirely of literal text yields its
-/// text; any interpolation makes it non-constant and returns null. The
-/// lexer coalesces contiguous text into a single `Text` part, so a plain
-/// literal is one part and an empty literal is zero parts.
+/// The text of a string template made entirely of literal parts, or null when
+/// any part is interpolated. The lexer coalesces contiguous text into one
+/// `Text` part, so a plain literal is one part and an empty literal is none.
 pub fn extractStringLiteral(e: *const Expr) ?[]const u8 {
     if (e.* == .StringTemplate) {
         const parts = e.StringTemplate.parts;
@@ -771,8 +766,8 @@ pub fn collectDeprecationInfo(
                 }
             },
             .Object => |*o| {
-                // Object name acts as a value reference; recurse into
-                // members for top-level-like decls.
+                // An object name is a value reference, and its members read
+                // like top-level declarations.
                 for (o.members) |*m| {
                     try collectDeprecationInfo(m[0..1], out);
                 }
@@ -898,7 +893,6 @@ pub fn walkStmtForDeprecation(
     }
 }
 
-// Single recursive walk over every Expr variant.
 pub fn walkExprForDeprecation(
     allocator: Allocator,
     e: *const Expr,
@@ -912,9 +906,9 @@ pub fn walkExprForDeprecation(
             }
         },
         .Call => |c| {
-            // Recurse into the callee unless it's a bare-name reference
-            // to a deprecated symbol — we emit once for the call as a
-            // whole using the call's span.
+            // Recurse into the callee unless it is a bare-name reference to a
+            // deprecated symbol, which reports once for the whole call under
+            // the call's span.
             var emitted_at_call = false;
             if (c.callee.* == .Path and c.callee.Path.segments.len == 1 and
                 info.contains(c.callee.Path.segments[0].name))
@@ -1065,7 +1059,6 @@ pub fn emitDeprecationAt(
     }
 }
 
-/// Annotation target kinds.
 pub const AnnotationTarget = enum {
     Class,
     AnnotationClass,
@@ -1131,8 +1124,8 @@ pub const AnnotationTarget = enum {
 pub const AnnotationMeta = struct {
     /// `@Repeatable` set on the annotation class.
     repeatable: bool = false,
-    /// `@Target(...)` set on the annotation class. `null` means no
-    /// explicit `@Target` — application sites are not restricted.
+    /// `@Target(...)` on the annotation class; null means no explicit
+    /// `@Target`, which leaves application sites unrestricted.
     targets: ?[]AnnotationTarget = null,
 };
 
@@ -1239,8 +1232,8 @@ pub const AnnotationWalker = struct {
         defer counts.deinit();
         for (anns) |*ann| {
             const leaf = if (ann.path.len > 0) ann.path[ann.path.len - 1].name else continue;
-            // @Target check — only when we know the annotation class and
-            // it carries a @Target list.
+            // Only checkable when the annotation class is known and carries
+            // a `@Target` list.
             if (self.meta.get(leaf)) |m| {
                 if (m.targets) |targets| {
                     if (!containsTarget(targets, site)) {
@@ -1256,9 +1249,8 @@ pub const AnnotationWalker = struct {
                     }
                 }
             }
-            // Duplicate detection — only when the annotation class is
-            // known to be non-repeatable (it lives in `self.meta` and its
-            // `repeatable` flag is `false`).
+            // Only a known annotation class whose `repeatable` flag is false
+            // can duplicate.
             if (counts.get(leaf)) |prev_span| {
                 if (self.meta.get(leaf)) |m| {
                     if (!m.repeatable) {

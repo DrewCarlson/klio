@@ -46,11 +46,9 @@ const stmtSpan = helpers.stmtSpan;
 const substituteTypeParams = helpers.substituteTypeParams;
 const typeHasCompoundAssign = helpers.typeHasCompoundAssign;
 
-/// A `*const Type` for the `Boolean` expectation passed to condition
-/// subexpressions.
+/// The `Boolean` expectation passed to condition subexpressions.
 const boolean_ty: Type = .Boolean;
 
-/// Emit a diagnostic carrying a freshly-allocated message and legacy code.
 fn emitErr(self: *Checker, msg: []const u8, sp: Span, code: []const u8) Allocator.Error!void {
     var d = Diagnostic.err(msg, sp);
     _ = d.withCode(code);
@@ -64,7 +62,7 @@ fn emitWarn(self: *Checker, msg: []const u8, sp: Span, code: []const u8) Allocat
 }
 
 /// Record the inferred type at `sp`, freeing any prior entry so repeated
-/// checks of the same span don't leak. The map owns the stored value.
+/// checks of one span do not leak. The map owns the stored value.
 fn recordType(self: *Checker, sp: Span, ty: *const Type) Allocator.Error!void {
     if (self.generic_body_depth != 0) {
         try self.types_instantiation_dependent.put(sp, {});
@@ -76,9 +74,9 @@ fn recordType(self: *Checker, sp: Span, ty: *const Type) Allocator.Error!void {
     if (owned == .Nothing) {
         const ng = try self.nothing_spans.getOrPut(sp);
         if (!ng.found_existing) self.nothing_epoch += 1;
-        // Record the span under the active function context as well; a
-        // span can be re-typed under a different context than the one
-        // that first saw it, so membership is per (function, span).
+        // Also record under the active function context: a span can be
+        // re-typed under a different context than first saw it, so membership
+        // is per (function, span).
         if (self.cfg_fn_stack.items.len != 0) {
             const fn_span = self.cfg_fn_stack.items[self.cfg_fn_stack.items.len - 1];
             const bucket = try self.nothing_by_fn.getOrPut(fn_span);
@@ -93,19 +91,15 @@ fn recordType(self: *Checker, sp: Span, ty: *const Type) Allocator.Error!void {
     }
 }
 
-// ---- statements & blocks --------------------------------------------
-
 pub fn checkBlock(self: *Checker, block: *const Block, expected: ?*const Type) Allocator.Error!Type {
     try narrowing.pushFrame(self);
     var last: Type = .Unit;
     var warned = false;
     for (block.stmts, 0..) |*s, i| {
         const is_last = i + 1 == block.stmts.len;
-        // W0002 unreachable code fires when the CFG's reachability
-        // analysis classifies the block containing this statement as
-        // dead. The typed reachability variant picks up Nothing-returning
-        // expressions in earlier statements (return / throw / error("...")
-        // / TODO()).
+        // Unreachable code is reported when the CFG's reachability analysis
+        // classifies this statement's block as dead. The typed variant picks
+        // up `Nothing`-returning expressions in earlier statements.
         const cfg_dead = (try narrowing.cfgIsUnreachableAt(self, stmtSpan(s))) orelse false;
         if (cfg_dead and !warned) {
             var d = Diagnostic.warning("Unreachable code", stmtSpan(s));
@@ -161,9 +155,9 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
     const a = self.allocator;
     switch (decl.*) {
         .Property => |p| {
-            // `@all:` is a property meta-target; local properties have no
-            // constructor parameter, backing field, or accessors to
-            // expand over.
+            // `@all:` is a property meta-target, and a local property has no
+            // constructor parameter, backing field or accessors to expand
+            // over.
             for (p.annotations) |*ann| {
                 if (ann.use_site != null and ann.use_site.? == .All) {
                     var d = Diagnostic.err(
@@ -218,15 +212,14 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
             });
 
             // Tie `val b = a` to its source for bound smart-cast
-            // propagation. Only immutable locals participate (mutable
-            // bindings can be reassigned, breaking the alias).
+            // propagation. Only immutable locals participate: a mutable
+            // binding can be reassigned, breaking the alias.
             if (!p.mutable) {
                 if (p.init) |*init| {
                     if (singlePathName(init)) |src| {
-                        // Require the source to be an immutable binding in some
-                        // scope; otherwise the alias may not hold. Bound
-                        // smart-cast aliasing lives in the CFG lowering's
-                        // `aliases` map, consulted by cfgNarrowedAt.
+                        // The source must itself be an immutable binding for the
+                        // alias to hold. Bound smart-cast aliasing lives in the
+                        // CFG lowering's `aliases` map, read by `cfgNarrowedAt`.
                         const src_is_stable = if (narrowing.lookup(self, src)) |b| !b.mutable else false;
                         _ = src_is_stable;
                     }
@@ -275,18 +268,17 @@ pub fn checkLocalDecl(self: *Checker, decl: *const Decl) Allocator.Error!void {
 
 pub fn checkAssign(self: *Checker, target: *const Expr, op: AssignOp, value: *const Expr, sp: Span) Allocator.Error!void {
     const a = self.allocator;
-    // For a compound assignment, both the `*Assign` form and the `*`
-    // binary form may resolve. When both apply on the LHS receiver class,
-    // the call is ambiguous.
+    // A compound assignment can resolve to both the `*Assign` form and the
+    // binary form; when both apply on the LHS receiver class it is ambiguous.
     if (op != .Assign) {
         try visibility.checkCompoundAssignAmbiguity(self, target, op, sp);
     }
-    // Reassignment-of-val check for the simple identifier case.
+    // Reassignment of a `val` through a simple identifier.
     if (target.* == .Path and target.Path.segments.len == 1) {
         const name = target.Path.segments[0].name;
         const target_span = target.Path.span;
-        // Per-accessor visibility on `var x; private set`. Reject the write
-        // when use site is outside the setter's declared scope.
+        // Per-accessor visibility (`var x; private set`): reject a write from
+        // outside the setter's declared scope.
         if (self.setter_visibility.get(name)) |sv| {
             if (sv.visibility == .Private and target_span.file != sv.file) {
                 const msg = try std.fmt.allocPrint(
@@ -304,16 +296,15 @@ pub fn checkAssign(self: *Checker, target: *const Expr, op: AssignOp, value: *co
                 var w = want;
                 w.deinit(a);
             }
-            // `val x: T` followed by `x = …` later in scope: CFG VIA reports
-            // `x` as Unassigned at the assignment span, marking this as the
-            // binding's first (and only legal) write. CFG fact `None` (no
-            // DeclLocal upstream) means the binding is already in scope as a
-            // parameter or top-level — never a first write.
+            // For `val x: T` assigned later in scope, VIA reports `x` as
+            // unassigned at the assignment span, marking this the binding's
+            // first and only legal write. No fact at all means the binding is
+            // already in scope as a parameter or top-level, never a first
+            // write.
             const is_first_write = ((try narrowing.cfgViaUnassignedAt(self, name, target_span)) orelse false);
-            // A compound assignment to a `val` is permitted when the LHS type
-            // carries a matching `*Assign` operator (the operator-function
-            // path mutates in place, never rebinds the name). Plain `=`
-            // reassignment still errors.
+            // A compound assignment to a `val` is legal when the LHS type
+            // carries a matching `*Assign` operator, which mutates in place
+            // and never rebinds the name. Plain `=` still errors.
             const compound_with_assign = op != .Assign and typeHasCompoundAssign(&want, op);
             if (!mutable and !is_first_write and !compound_with_assign) {
                 const msg = try std.fmt.allocPrint(a, "Val cannot be reassigned: `{s}`", .{name});
@@ -321,15 +312,14 @@ pub fn checkAssign(self: *Checker, target: *const Expr, op: AssignOp, value: *co
             }
             var got = try self.checkExpr(value, &want);
             defer got.deinit(a);
-            // A compound assignment that resolves to a `*Assign` operator
-            // checks the value against the operator's parameter
-            // (`list += 100` feeds `plusAssign(element)`), not against the
-            // receiver type itself.
+            // A compound assignment resolving to a `*Assign` operator checks
+            // the value against the operator's parameter (`list += 100` feeds
+            // `plusAssign(element)`), not against the receiver type.
             if (!compound_with_assign) {
                 try expr_calls.checkAssignable(self, &got, &want, value.span());
             }
-            // killDataFlow lives in the CFG: Node::KillDataFlow at every loop
-            // head invalidates narrowings on reassigned places.
+            // A KillDataFlow node at every loop head invalidates narrowings
+            // on reassigned places.
             return;
         }
     }
@@ -339,16 +329,13 @@ pub fn checkAssign(self: *Checker, target: *const Expr, op: AssignOp, value: *co
     v.deinit(a);
 }
 
-// ---- expression typing ----------------------------------------------
-
 pub fn checkExpr(self: *Checker, expr: *const Expr, expected: ?*const Type) Allocator.Error!Type {
-    // Reuse a call's already-recorded type instead of recomputing it. A call's
-    // type at a span is fixed (narrowing is span-determined) and every check of
-    // a given call carries the same expected type (a call is a receiver OR an
-    // argument, never both), so this is sound — and it turns the O(2^depth)
-    // re-typing of every receiver in a deep `a.f().g().h()...` chain into O(depth).
-    // Limited to `expected == null` (the receiver position) to leave
-    // expected-driven inference untouched.
+    // Reuse a call's recorded type instead of recomputing it. A call's type at
+    // a span is fixed (narrowing is span-determined) and every check of one
+    // call carries the same expected type, since a call is a receiver or an
+    // argument but never both, so this turns the re-typing of every receiver
+    // in a deep `a.f().g().h()` chain from 2^depth into depth. Restricted to
+    // the receiver position so expected-driven inference is untouched.
     if (expected == null and expr.* == .Call) {
         if (self.types.getPtr(expr.span())) |cached| {
             return try cached.clone(self.allocator);
@@ -363,10 +350,10 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
     const a = self.allocator;
     switch (expr.*) {
         .IntLit => |lit| {
-            // Suffix-typed literals pin their type unconditionally: `1L` is
-            // Long, `1u` is UInt, `1uL` is ULong. An unsuffixed integer
-            // literal coerces to any narrow integer / Long / unsigned
-            // variant when an expected type drives the call site.
+            // A suffixed literal pins its type unconditionally: `1L` is Long,
+            // `1u` is UInt, `1uL` is ULong. An unsuffixed integer literal
+            // coerces to any narrow integer, Long or unsigned variant an
+            // expected type asks for.
             switch (lit.kind) {
                 .Long => return .Long,
                 .UInt => return .UInt,
@@ -412,8 +399,8 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             if (p.segments.len == 1) {
                 const name = p.segments[0].name;
                 try visibility.enforceDslScopeForMember(self, name, sp);
-                // One dataflow solve serves the class/type narrowings and
-                // the GADT substitution at this read.
+                // One dataflow solve serves both the narrowings and the GADT
+                // substitution at this read.
                 var facts = try narrowing.cfgSmartFactsAt(self, name, sp, true);
                 defer {
                     var git = facts.gadt.valueIterator();
@@ -434,9 +421,9 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                         const anns: []const ast.Annotation = self.prop_annotations.get(name) orelse &.{};
                         try visibility.checkPublishedApiUse(self, name, vf.visibility, anns, sp);
                     }
-                    // Explicit-backing-field property read outside its
-                    // declaring file (or where narrowing is off): serve the
-                    // public type and record the site so member calls check
+                    // An explicit-backing-field property read outside its
+                    // declaring file, or where narrowing is off, serves the
+                    // public type; the site is recorded so member calls check
                     // against it.
                     if (b.ebf) |ebf| {
                         if (sp.file.int() != ebf.file.int() or self.field_narrow_off > 0) {
@@ -452,12 +439,11 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                             return ebf.public_ty.clone(a);
                         }
                     }
-                    // Definite-assignment check: the CFG's VIA analysis is
-                    // authoritative. It returns None when the place isn't
-                    // tracked (parameter, top-level property), Some(true)
-                    // when declared without an initializer and no subsequent
-                    // Assign reaches this read, Some(false) when assigned
-                    // along every path. T0020 fires only on Some(true).
+                    // The CFG's VIA analysis decides definite assignment: no
+                    // answer for an untracked place (parameter, top-level
+                    // property), true when the place was declared without an
+                    // initializer and no Assign reaches this read, false when
+                    // assigned along every path. Only true is diagnosed.
                     if (((try narrowing.cfgViaUnassignedAt(self, name, sp)) orelse false)) {
                         const msg = try std.fmt.allocPrint(a, "Variable '{s}' must be initialized", .{name});
                         try emitErr(self, msg, sp, codes.TYPE_VAR_NOT_DEFINITELY_ASSIGNED);
@@ -465,11 +451,10 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                     if (cn) |c| {
                         try self.expr_class.put(sp, c);
                     }
-                    // GADT static refinement: when this read lies inside a
-                    // branch whose smart-cast narrows a generic receiver,
-                    // fold the implied type-parameter substitution into the
-                    // declared type. Outside any branch the substitution is
-                    // empty and `ty` is returned unchanged.
+                    // GADT refinement: inside a branch whose smart-cast
+                    // narrows a generic receiver, fold the implied
+                    // type-parameter substitution into the declared type.
+                    // Elsewhere the substitution is empty.
                     if (facts.gadt.count() == 0) {
                         return ty;
                     }
@@ -478,8 +463,8 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                     return substituteTypeParams(a, &owned, &facts.gadt);
                 }
                 if (self.fns.get(name)) |sigs| {
-                    // Function reference (not a call) — pick the first declared
-                    // overload to materialize a function type.
+                    // A function reference rather than a call: the first
+                    // declared overload materializes the function type.
                     if (sigs.items.len > 0) {
                         const sig = &sigs.items[0];
                         const params = try a.alloc(Type, sig.params.len);
@@ -497,8 +482,8 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                     try self.expr_class.put(sp, name);
                     return .Unresolved;
                 }
-                // Resolved by name resolver but not in our tables (e.g.
-                // stdlib). Silently stay tolerant.
+                // Resolved by the name resolver but absent from these tables,
+                // as stdlib names are. Stay tolerant.
                 return .Unresolved;
             }
             return .Unresolved;
@@ -519,8 +504,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                 }
             }
             // `this@Outer.b` is rejected when a closer DSL receiver sharing a
-            // marker with `Outer` is also in scope and itself exposes a
-            // member named `b`.
+            // marker with `Outer` is in scope and also exposes `b`.
             if (m.receiver.* == .This) {
                 if (m.receiver.This.qualifier) |q| {
                     try visibility.enforceDslScopeForQualifiedThis(self, q.name, m.name.name, m.name.span);
@@ -539,9 +523,8 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                     try self.expr_class.put(sp, name);
                 }
             }
-            // `super.f(...)` with no `<Qualifier>` must resolve to a member
-            // from exactly one direct supertype. Two or more contributing
-            // supertypes require the caller to disambiguate via
+            // Unqualified `super.f(...)` must resolve to a member of exactly
+            // one direct supertype; two or more contributors require
             // `super<Type>.f(...)`.
             if (c.callee.* == .Member and c.callee.Member.receiver.* == .Super) {
                 const sup = c.callee.Member.receiver.Super;
@@ -552,9 +535,9 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                     try visibility.checkAmbiguousSuper(self, mname.name, sup.span);
                 }
             }
-            // Implicit lambda label — bind the call's callee simple name as a
-            // label visible inside any lambda argument so
-            // `xs.forEach { return@forEach }` checks.
+            // Bind the callee's simple name as an implicit label visible
+            // inside any lambda argument, so `xs.forEach { return@forEach }`
+            // checks.
             const implicit_label: ?[]const u8 = switch (c.callee.*) {
                 .Path => |pp| if (pp.segments.len > 0) pp.segments[pp.segments.len - 1].name else null,
                 .Member => |mm| mm.name.name,
@@ -630,9 +613,9 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             switch (pf.op) {
                 .Inc, .Dec => return t,
                 .NotNull => {
-                    // `expr!!` narrowing is handled by the CFG: the lowering
-                    // emits AssumeNull(eq_null=false) followed by Assert, and
-                    // the smart-cast analysis picks up the non-null fact.
+                    // `expr!!` narrowing comes from the CFG: lowering emits
+                    // AssumeNull(eq_null=false) then Assert, and the smart-cast
+                    // analysis picks up the non-null fact.
                     switch (t) {
                         .Nullable => |inner| {
                             const out = try inner.clone(a);
@@ -649,10 +632,9 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             var ct = try self.checkExpr(i.cond, &boolean_ty);
             ct.deinit(a);
             try narrowing.pushFrame(self);
-            // All branch narrowings and definite-assignment joins flow
-            // through the CFG: each arm contributes an Assume on the right
-            // branch and the smart-cast / VIA analyses join at the if's join
-            // block.
+            // Branch narrowings and definite-assignment joins flow through
+            // the CFG: each arm contributes an Assume on its branch, and the
+            // analyses join at the if's join block.
             var then_ty = try self.checkExpr(i.then_branch, expected);
             defer then_ty.deinit(a);
             narrowing.popFrame(self);
@@ -672,8 +654,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
         .While => |w| {
             var ct = try self.checkExpr(w.cond, &boolean_ty);
             ct.deinit(a);
-            // Body smart-cast facts propagate to the surrounding scope
-            // through the CFG.
+            // Body smart-cast facts reach the surrounding scope via the CFG.
             var bt = try self.checkExpr(w.body, null);
             bt.deinit(a);
             return .Unit;
@@ -690,10 +671,9 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
         .For => |f| {
             var it = try self.checkExpr(f.iter, null);
             it.deinit(a);
-            // `for (x in c)` dispatches `iterator()` on `c`, then
-            // `hasNext()` / `next()` on the iterator. We only know the
-            // iterable's class here; the inner iterator class isn't tracked,
-            // so the check is best-effort on `iterator`.
+            // `for (x in c)` dispatches `iterator()` on `c`, then `hasNext()`
+            // and `next()` on the iterator. Only the iterable's class is known
+            // here, so the check covers `iterator` alone.
             const cls = self.expr_class.get(f.iter.span());
             try expr_calls.checkUserOperatorKeyword(self, cls, "iterator", f.span);
             try narrowing.pushFrame(self);
@@ -772,10 +752,9 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                 );
                 try emitErr(self, msg, th.span, codes.TYPE_THROW_NON_THROWABLE);
             }
-            // The throw operand must be a value of a runtime-available type.
-            // When the operand is a bare local whose declared type names a
-            // non-reified type parameter, the static type is erased at
-            // runtime and the throw is unsafe.
+            // The throw operand must have a runtime-available type. A bare
+            // local whose declared type names a non-reified type parameter is
+            // erased at runtime, making the throw unsafe.
             if (th.value.* == .Path and th.value.Path.segments.len == 1) {
                 const name = th.value.Path.segments[0].name;
                 const decl_ty_name: ?[]const u8 = blk: {
@@ -806,10 +785,10 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
         .Try => |tr| {
             var acc = try checkBlock(self, &tr.body, expected);
             for (tr.catches) |*c| {
-                // Exception types in `catch` must be runtime-available. A
-                // non-reified type parameter is erased at runtime, and a
-                // generic exception type with non-star arguments has erased
-                // arguments — neither can be matched by the dispatch.
+                // A `catch` type must be runtime-available. A non-reified type
+                // parameter is erased, and a generic exception type with
+                // non-star arguments has erased arguments; dispatch can match
+                // neither.
                 {
                     const tname = c.ty.name.name;
                     const is_type_param = typeParamInScope(self, tname);
@@ -854,10 +833,9 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                 acc.deinit(a);
                 acc = merged;
             }
-            // finally is evaluated after body+catch along the normal
-            // continuation. If finally diverges (return / throw inside), the
-            // try expression itself diverges — the body's normal-exit path is
-            // suppressed.
+            // `finally` runs after body and catch on the normal continuation,
+            // so if it diverges the whole try expression diverges and the
+            // body's normal exit is suppressed.
             if (tr.finally) |fb| {
                 var fty = try checkBlock(self, &fb, null);
                 defer fty.deinit(a);
@@ -883,9 +861,8 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
         },
         .Super, .PropertyRef => return .Unresolved,
         .MemberRef => |mr| {
-            // Class-literal LHS validation: only non-nullable
-            // runtime-available types may appear on the LHS of `::class`.
-            // Type parameters are permitted only when `reified`.
+            // Only a non-nullable, runtime-available type may appear left of
+            // `::class`; a type parameter only when `reified`.
             if (std.mem.eql(u8, mr.name.name, "class")) {
                 if (mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1) {
                     const tname = mr.receiver.Path.segments[0].name;
@@ -900,8 +877,8 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                             );
                             try emitErr(self, msg, mr.receiver.span(), codes.TYPE_NON_REIFIED_CLASS_LITERAL);
                         }
-                        // Skip the receiver pass — Path[T] would otherwise
-                        // emit a misleading UNRESOLVED_REFERENCE.
+                        // Skip the receiver pass, which would type `T` as a
+                        // path and report a misleading unresolved reference.
                         return .Unresolved;
                     }
                 }
@@ -928,7 +905,7 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                 st.deinit(a);
                 subj_class = self.expr_class.get(s.span());
             }
-            // `when (val v = subject)` — register `v` as an immutable local
+            // `when (val v = subject)` registers `v` as an immutable local
             // for the branch bodies.
             var pushed_binding = false;
             if (w.subject_binding) |b| {
@@ -969,10 +946,9 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                 for (b.patterns) |*p| {
                     if (p.kind == .Else) has_else = true;
                 }
-                // `when` arm narrowings come from the CFG: each arm's body is
-                // preceded by AssumeIs / AssumeNull emitted by
-                // `lowerWhenPattern`, so smart-cast queries inside the arm see
-                // the refined types without an extra frame push.
+                // Arm narrowings come from the CFG: `lowerWhenPattern` emits
+                // AssumeIs / AssumeNull before each body, so smart-cast queries
+                // inside the arm see refined types with no extra frame push.
                 var t = try self.checkExpr(&b.body, expected);
                 if (acc) |*prev| {
                     const merged = try lub(a, prev, &t);
@@ -995,11 +971,9 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
         .IsCheck => |ic| {
             var lhs_ty = try self.checkExpr(ic.expr, null);
             defer lhs_ty.deinit(a);
-            // `null is T?` is always `true`; `null is T` (non-nullable) is
-            // always `false`. Surface the observation as a warning. The
-            // literal `null` case fires the strongest narrowing; we also
-            // handle the symmetric null-typed value (Nothing? or a
-            // `val n: T? = null` after smart-cast).
+            // `null is T?` is always true and `null is T` always false, so
+            // warn. Besides the literal, a null-typed value counts: `Nothing?`
+            // or a `val n: T? = null` after smart-cast.
             const lhs_is_null = (ic.expr.* == .NullLit) or
                 (lhs_ty == .Nullable and lhs_ty.Nullable.* == .Nothing);
             if (lhs_is_null) {
@@ -1062,11 +1036,10 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
                 );
                 try emitWarn(self, msg, as_e.ty.span, codes.TYPE_UNCHECKED_CAST);
             }
-            // A cast to a non-reified type parameter T cannot be checked at
-            // runtime. For `as?` the safe-cast can never observe a failure
-            // (always succeeds when the value is non-null), so we surface the
-            // dedicated T0083; for unsafe `as` the cast is also unchecked —
-            // fold it under T0028.
+            // A cast to a non-reified type parameter cannot be checked at
+            // runtime. `as?` can never observe a failure, since it succeeds for
+            // any non-null value, so it gets its own diagnostic; unsafe `as` is
+            // reported as an unchecked cast.
             {
                 const target_name = as_e.ty.name.name;
                 const is_type_param = typeParamInScope(self, target_name);
@@ -1093,8 +1066,8 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             if (classNameFromTyperef(&as_e.ty)) |cn| {
                 try self.expr_class.put(as_e.span, cn);
             }
-            // `expr as T` narrowing is handled by the CFG via the AssumeIs
-            // node the lowering emits for the cast.
+            // `expr as T` narrowing comes from the AssumeIs node lowering
+            // emits for the cast.
             if (as_e.safe) {
                 return target.asNullable(a);
             }
@@ -1176,18 +1149,17 @@ pub fn computeExprTy(self: *Checker, expr: *const Expr, expected: ?*const Type) 
             } };
         },
         .Spread => |sp_e| {
-            // A bare `*expr` outside a call-arg position is invalid; the
-            // call-arg site handles legal use. Recurse so any sub-expression
+            // A bare `*expr` outside an argument position is invalid; legal
+            // use is handled at the call site. Recurse so sub-expression
             // diagnostics still surface.
             var t = try self.checkExpr(sp_e.expr, null);
             t.deinit(a);
             return .Unresolved;
         },
         .ObjectExpr => |oe| {
-            // Anonymous object inheriting from a sealed type is rejected —
-            // sealed inheritors require a fully-qualified name. Same code path
-            // also catches inherit-from-object / inherit-from-final-class for
-            // anonymous objects.
+            // A sealed type's inheritors need a fully-qualified name, so an
+            // anonymous object cannot be one. The same path catches inheriting
+            // from an object or a final class.
             for (oe.supertypes) |*s| {
                 const pname = s.name.name;
                 const parent = root.classNamed(self, pname) orelse continue;
@@ -1289,9 +1261,8 @@ pub fn checkMemberAccess(
         );
         try emitErr(self, msg, recv_span, codes.TYPE_NULL_SAFETY);
     }
-    // A receiver whose static type is `Nothing` (or `Nothing?`) is never
-    // applicable for member callables. Skip the class-chain walk entirely so
-    // only extensions can resolve here.
+    // A receiver typed `Nothing` or `Nothing?` admits no member callable, so
+    // skip the class-chain walk and let only extensions resolve.
     const recv_is_nothing = (recv_ty.* == .Nothing) or
         (recv_ty.* == .Nullable and recv_ty.Nullable.* == .Nothing);
     var result: Type = .Unresolved;
@@ -1306,10 +1277,9 @@ pub fn checkMemberAccess(
                 if (found[1]) |cn| {
                     try self.expr_class.put(member_span, cn);
                 }
-                // Explicit backing field: inside the declaring class's
-                // scope the read narrows to the field type; outside, the
-                // public type stands and the site is recorded so member
-                // calls resolve against it.
+                // Inside the declaring class's scope an explicit-backing-field
+                // read narrows to the field type; outside, the public type
+                // stands and the site is recorded so member calls use it.
                 if (try lookupMemberEbf(self, class, name)) |hit| {
                     const inside = self.field_narrow_off == 0 and classStackContains(self, hit.decl_class);
                     if (inside) {
@@ -1349,8 +1319,8 @@ pub fn checkMemberAccess(
 }
 
 /// Walk `class`'s supertype chain for an explicit-backing-field record on
-/// member `name`. Returns the record plus the class that declares it (the
-/// anchor of the narrowing scope).
+/// member `name`, returning it with the declaring class, which anchors the
+/// narrowing scope.
 pub fn lookupMemberEbf(
     self: *const Checker,
     class: []const u8,
@@ -1377,8 +1347,8 @@ pub fn lookupMemberEbf(
     return null;
 }
 
-/// True when the class named `name` encloses the code currently being
-/// checked (the class body, its methods, init blocks, and companions).
+/// True when `name`'s class encloses the code being checked: its body,
+/// methods, init blocks and companions.
 pub fn classStackContains(self: *const Checker, name: []const u8) bool {
     for (self.class_stack.items) |c| {
         if (std.mem.eql(u8, c, name)) return true;
@@ -1451,9 +1421,9 @@ pub fn lookupExtensionProperty(
     return null;
 }
 
-/// Walk a receiver class's supertype chain plus `Any` looking for a
-/// matching extension by name + arity. Returns the chosen signature and the
-/// declared return user-class name if known.
+/// Walk a receiver class's supertype chain, then `Any`, for an extension
+/// matching by name and arity. Returns the signature and the declared return
+/// user-class name when known.
 pub fn lookupExtension(
     self: *const Checker,
     recv_class: []const u8,
@@ -1506,10 +1476,9 @@ fn extensionArityFits(sig: *const root.FnSig, n_args: usize) bool {
     return n_args >= min and n_args <= sig.params.len;
 }
 
-/// Every extension named `name` reachable from `recv_class` (its class,
-/// supertype chain, then `Any`) whose arity admits `n_args`, in
-/// most-specific-receiver-first order. The caller runs full overload
-/// selection over the returned signatures.
+/// Every extension named `name` reachable from `recv_class`, through its
+/// supertype chain and then `Any`, whose arity admits `n_args`, most-specific
+/// receiver first. The caller runs full overload selection over the result.
 pub fn lookupExtensionCandidates(
     self: *const Checker,
     recv_class: []const u8,
@@ -1540,8 +1509,8 @@ pub fn lookupExtensionCandidates(
         }
     }
     try keys.append(a, "Any");
-    // Member methods declared on the receiver's class chain come first:
-    // Kotlin gives members precedence over extensions.
+    // Kotlin gives members precedence over extensions, so the receiver
+    // chain's member methods come first.
     for (keys.items) |key| {
         const info = root.classNamed(self, key) orelse continue;
         const sigs = info.member_methods.get(name) orelse continue;
@@ -1564,8 +1533,8 @@ pub const ExtensionCandidate = struct { sig: root.FnSig, return_class: ?[]const 
 
 test {
     std.testing.refAllDecls(@This());
-    // Force semantic analysis of the public entry points (and everything
-    // they call) so cross-file signature drift is caught here.
+    // Force semantic analysis of the public entry points and everything they
+    // call, so cross-file signature drift is caught here.
     _ = &checkBlock;
     _ = &checkStmt;
     _ = &checkLocalDecl;

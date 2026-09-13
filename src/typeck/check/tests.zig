@@ -42,11 +42,9 @@ const KotlinFile = ast.KotlinFile;
 const testing = std.testing;
 const test_file = FileId.from(0);
 
-// ---------------------------------------------------------------------------
-// AST builder: a `Builder` owns an arena, hands out heap pointers, and tracks
-// a monotonic span offset so every node gets a distinct span (the checker keys
-// its side tables by span, so collisions would alias unrelated expressions).
-// ---------------------------------------------------------------------------
+// A `Builder` owns an arena, hands out heap pointers, and tracks a monotonic
+// span offset so every node gets a distinct span: the checker keys its side
+// tables by span, so a collision would alias unrelated expressions.
 
 const Builder = struct {
     arena: std.heap.ArenaAllocator,
@@ -70,10 +68,10 @@ const Builder = struct {
         return Span.init(test_file, start, start + 1);
     }
 
-    /// Current span offset; pair with `spanFrom` to build an enclosing
-    /// span over everything constructed in between (the parser gives a
-    /// declaration a span covering its whole body; lexical-region checks
-    /// like `@Suppress` rely on that containment).
+    /// Current span offset; pair with `spanFrom` to build an enclosing span
+    /// over everything constructed in between. The parser gives a declaration
+    /// a span covering its whole body, and lexical-region checks like
+    /// `@Suppress` rely on that containment.
     fn snap(self: *const Builder) u32 {
         return self.off;
     }
@@ -588,10 +586,8 @@ const Builder = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Result harness: holds the resolution + typecheck output plus an owning
-// allocator so they can be torn down together.
-// ---------------------------------------------------------------------------
+// Holds the resolution and typecheck output plus an owning allocator, so they
+// tear down together.
 
 const Checked = struct {
     arena: *std.heap.ArenaAllocator,
@@ -644,9 +640,8 @@ const Checked = struct {
     }
 };
 
-/// Resolve, then typecheck, the given file. Everything the resolver and
-/// checker allocate lands on a private arena so the whole run is torn down
-/// with a single `deinit`.
+/// Resolve, then typecheck, the given file. Everything the resolver and the
+/// checker allocate lands on a private arena, torn down by one `deinit`.
 fn checkFile(gpa: std.mem.Allocator, f: *const KotlinFile) Checked {
     const arena = gpa.create(std.heap.ArenaAllocator) catch unreachable;
     arena.* = std.heap.ArenaAllocator.init(gpa);
@@ -655,10 +650,6 @@ fn checkFile(gpa: std.mem.Allocator, f: *const KotlinFile) Checked {
     const tc = typecheck(a, f, &res) catch unreachable;
     return .{ .arena = arena, .res = res, .tc = tc };
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test "literal_types" {
     // fun main() { val x: Int = 1; val y: String = "hi" }
@@ -1276,9 +1267,9 @@ test "lambda_param_types_from_expected" {
 
 test "implicit it remains resolvable while a generic lambda shape is unknown" {
     // fun main() { val predicates = listOf({ it }) }
-    // The generic collection call loses its outer expected element type
-    // during its first inference pass. That must not make `it` an unresolved
-    // name inside the lambda body.
+    // The generic collection call loses its outer expected element type on
+    // the first inference pass, which must not leave `it` unresolved inside
+    // the lambda body.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var predicate = b.lambda(&.{"it"}, &.{b.exprStmt(b.path("it"))});
@@ -2114,8 +2105,8 @@ test "unreachable_after_throw" {
 test "unreachable_after_nothing_typed_call" {
     // fun boom(): Nothing { throw RuntimeException("x") }
     // fun main() { boom(); println("dead") }
-    // The reachability query consumes the maintained per-function set of
-    // Nothing-typed spans: code after a call typed `Nothing` is dead.
+    // Reachability reads the per-function set of `Nothing`-typed spans, so
+    // code after a call typed `Nothing` is dead.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const boom = b.funBlock("boom", &.{}, b.ty("Nothing"), &.{
@@ -2135,9 +2126,9 @@ test "unreachable_memo_does_not_leak_across_functions" {
     // fun boom(): Nothing { throw RuntimeException("x") }
     // fun dead() { boom(); println("dead") }
     // fun alive() { println("ok"); println("still ok") }
-    // The memoized per-function reachability solve must not let `dead`'s
-    // divergence mark statements in `alive` unreachable, and `alive`'s
-    // clean solve must not mask the warning in `dead`.
+    // The memoized per-function solve must not let `dead`'s divergence mark
+    // statements in `alive` unreachable, nor let `alive`'s clean solve mask
+    // the warning in `dead`.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const boom = b.funBlock("boom", &.{}, b.ty("Nothing"), &.{
@@ -2158,8 +2149,8 @@ test "unreachable_memo_does_not_leak_across_functions" {
 }
 
 test "unreachable_warns_in_each_diverging_function" {
-    // Two functions that each diverge mid-body: the per-function memo must
-    // recompute when the Nothing-span set grows, warning in both.
+    // Two functions each diverging mid-body: the per-function memo must
+    // recompute as the `Nothing`-span set grows, warning in both.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f1 = b.funBlock("f1", &.{}, null, &.{
@@ -2468,8 +2459,8 @@ test "suppress_silences_deprecation_warning" {
     const caller_start = b2.snap();
     var caller2 = b2.funExpr("caller", &.{}, b2.ty("Int"), b2.call(b2.path("foo"), &.{}));
     caller2.annotations = b2.slice(Annotation, &.{b2.annotation("Suppress", &.{b2.str("W0006")})});
-    // The function's source span encloses its body so the `@Suppress`
-    // region covers the deprecated call inside it.
+    // The function's span encloses its body, so the `@Suppress` region covers
+    // the deprecated call inside it.
     caller2.span = b2.spanFrom(caller_start);
     const f2 = b2.file(&.{ .{ .Function = foo2 }, .{ .Function = caller2 } });
     var c2 = checkFile(testing.allocator, &f2);
@@ -2549,12 +2540,10 @@ test "suspend_call_inside_anon_fun_marked_suspend" {
     try testing.expect(c.hasCode(codes.TYPE_SUSPEND_CALL_FROM_NON_SUSPEND));
 }
 
-// ---------------------------------------------------------------------------
 // Module-level (multi-file) checks: conflicting overloads are per package.
-// ---------------------------------------------------------------------------
 
-/// Re-home every span a test function carries onto `fid` so the checker's
-/// per-file package map (and cross-file visibility checks) see the decl in
+/// Re-home every span a test function carries onto `fid`, so the per-file
+/// package map and the cross-file visibility checks see the declaration in
 /// the right file.
 fn rehomeFn(f: *Function, fid: FileId) void {
     f.span.file = fid;
@@ -2584,8 +2573,8 @@ fn checkModule(gpa: std.mem.Allocator, files: []const KotlinFile) Checked {
 test "module: cross-package same-signature functions are not conflicting overloads" {
     // liba.kt: package liba; fun f(x: Int): Int = x
     // libb.kt: package libb; fun f(x: Int): Int = x
-    // kotlinc compiles this module clean — the conflicting-overloads
-    // domain is one package, so no T0094.
+    // Kotlin scopes conflicting overloads to one package, so this module is
+    // clean.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var fa = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -2600,8 +2589,8 @@ test "module: cross-package same-signature functions are not conflicting overloa
 }
 
 test "module: same-package same-signature functions across files still conflict" {
-    // a.kt + b.kt both `package liba` declaring `fun f(x: Int): Int` —
-    // one package, identical signatures: kotlinc rejects, T0094 fires.
+    // a.kt and b.kt both `package liba` declaring `fun f(x: Int): Int`: one
+    // package, identical signatures, so Kotlin rejects the pair.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var fa = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -2614,10 +2603,6 @@ test "module: same-package same-signature functions across files still conflict"
     defer c.deinit();
     try testing.expect(c.countCode(codes.TYPE_CONFLICTING_OVERLOADS) >= 1);
 }
-
-// ---------------------------------------------------------------------------
-// Explicit backing fields
-// ---------------------------------------------------------------------------
 
 fn ebfOf(b: *Builder, t: ?TypeRef, init_e: ?Expr) *ast.ExplicitField {
     return b.dup(ast.ExplicitField, .{ .ty = t, .init = init_e, .span = b.ts() });
@@ -2731,7 +2716,7 @@ test "ebf_delegate_flagged" {
 
 test "ebf_no_narrowing_outside_class" {
     // class Cart { val items: List<String>  field: MutableList<String> = mutableListOf() }
-    // fun main() { Cart().items.add("b") }  — `add` unresolved on List<String>.
+    // fun main() { Cart().items.add("b") }  with `add` unresolved on List<String>.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var cart = b.class("Cart");
@@ -2772,9 +2757,8 @@ test "ebf_read_outside_class_public_type_ok" {
     try testing.expect(!c.hasFactory("UNRESOLVED_REFERENCE"));
 }
 
-// ---------------------------------------------------------------------------
-// Annotation use-site targeting: `@all:` expansion and LV 2.4 defaulting.
-// ---------------------------------------------------------------------------
+// Annotation use-site targeting: `@all:` expansion and the defaulting rules
+// Kotlin 2.4 applies when no use-site target is written.
 
 /// `@Target(AnnotationTarget.<entries>) annotation class <name>`
 fn targetAnnotationClass(b: *Builder, name: []const u8, entries: []const []const u8) ast.Class {
@@ -2811,7 +2795,7 @@ test "annotation_all_target_expands_without_diagnostics" {
 }
 
 test "annotation_all_target_nothing_applicable_rejected" {
-    // A5: @Target(FUNCTION) annotation class FunOnly
+    // @Target(FUNCTION) annotation class FunOnly
     // class U(@all:FunOnly val e: String)
     var b = Builder.init(testing.allocator);
     defer b.deinit();
@@ -2827,7 +2811,7 @@ test "annotation_all_target_nothing_applicable_rejected" {
 }
 
 test "annotation_all_target_on_plain_ctor_param_rejected" {
-    // A11: class U(@all:Wide x: String) — no val/var.
+    // class U(@all:Wide x: String), with no val/var.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const wide = targetAnnotationClass(&b, "Wide", &.{ "VALUE_PARAMETER", "PROPERTY" });
@@ -2843,7 +2827,7 @@ test "annotation_all_target_on_plain_ctor_param_rejected" {
 }
 
 test "annotation_all_target_on_local_property_rejected" {
-    // A7: fun f() { @all:Wide val x = 1 }
+    // fun f() { @all:Wide val x = 1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const wide = targetAnnotationClass(&b, "Wide", &.{ "VALUE_PARAMETER", "PROPERTY" });
@@ -2857,7 +2841,7 @@ test "annotation_all_target_on_local_property_rejected" {
 }
 
 test "annotation_all_plus_field_repeats_on_backing_field" {
-    // A10: class U(@all:FieldOnly @field:FieldOnly val e: String)
+    // class U(@all:FieldOnly @field:FieldOnly val e: String)
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const field_only = targetAnnotationClass(&b, "FieldOnly", &.{"FIELD"});
@@ -2875,8 +2859,8 @@ test "annotation_all_plus_field_repeats_on_backing_field" {
 }
 
 test "annotation_defaulting_param_field_accepted_on_ctor_property" {
-    // B2/B11: @Target(VALUE_PARAMETER, FIELD) annotation class PF
-    // class C(@PF val x: Int) — param + field, no diagnostic.
+    // @Target(VALUE_PARAMETER, FIELD) annotation class PF
+    // class C(@PF val x: Int) expands to param and field, with no diagnostic.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const pf = targetAnnotationClass(&b, "PF", &.{ "VALUE_PARAMETER", "FIELD" });
@@ -2891,8 +2875,8 @@ test "annotation_defaulting_param_field_accepted_on_ctor_property" {
 }
 
 test "annotation_defaulting_getter_only_rejected_on_member_property" {
-    // B8: @Target(PROPERTY_GETTER) annotation class G
-    // class C { @G val x = 1 } — never defaults to `get`.
+    // @Target(PROPERTY_GETTER) annotation class G
+    // class C { @G val x = 1 } never defaults to `get`.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const g = targetAnnotationClass(&b, "G", &.{"PROPERTY_GETTER"});
@@ -2907,7 +2891,7 @@ test "annotation_defaulting_getter_only_rejected_on_member_property" {
 }
 
 test "annotation_defaulting_field_only_needs_backing_field" {
-    // B7: class C { @F val x: Int get() = 1 } — F targets FIELD only.
+    // class C { @F val x: Int get() = 1 }, where F targets FIELD only.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fcls = targetAnnotationClass(&b, "F", &.{"FIELD"});
@@ -2931,7 +2915,7 @@ test "annotation_defaulting_field_only_needs_backing_field" {
 }
 
 test "annotation_explicit_use_site_disables_defaulting" {
-    // B12: class C(@param:PPF val x: Int) — no diagnostic.
+    // class C(@param:PPF val x: Int), with no diagnostic.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const ppf = targetAnnotationClass(&b, "PPF", &.{ "VALUE_PARAMETER", "PROPERTY", "FIELD" });
