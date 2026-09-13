@@ -1,6 +1,5 @@
-//! Annotation-related checks: `@Suppress` regions, deprecation, opt-in,
-//! `@Target` / `@Repeatable` enforcement, DSL markers. Free functions over
-//! `*Checker` plus standalone collectors.
+//! `@Suppress` regions, deprecation, opt-in, `@Target`/`@Repeatable`, DSL
+//! markers. Free functions over `*Checker`, plus standalone collectors.
 
 const std = @import("std");
 
@@ -33,7 +32,7 @@ const DiagnosticSink = diagnostics.DiagnosticSink;
 const Checker = root.Checker;
 const codes = root.codes;
 
-/// Severity of an opt-in requirement, mirroring `DeprecationLevel`.
+/// Mirrors `DeprecationLevel`.
 pub const OptInLevel = enum {
     Warning,
     Error,
@@ -100,8 +99,7 @@ pub fn extractOptInLevel(e: *const Expr) ?OptInLevel {
     return null;
 }
 
-/// Per-declaration map of the opt-in markers applied at each declaration
-/// site. Only markers present in `markers` count.
+/// Only markers present in `markers` count.
 pub fn collectRequiredOptIns(
     allocator: Allocator,
     decls: []const Decl,
@@ -167,8 +165,7 @@ pub fn markerNamesIn(
     return out.toOwnedSlice(allocator);
 }
 
-/// The marker simple names an `@OptIn(M1::class, M2::class)` in this
-/// annotation set opts into.
+/// The simple names an `@OptIn(M::class, …)` here opts into.
 pub fn optInMarkersIn(allocator: Allocator, anns: []const Annotation) Allocator.Error![][]const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     for (anns) |*a| {
@@ -522,9 +519,8 @@ pub fn emitOptInAt(
     return emitted;
 }
 
-/// A `@Suppress("code", ...)` on a declaration silences each named diagnostic
-/// emitted anywhere inside that declaration's span. Scope is lexical: an inner
-/// `@Suppress` adds to the enclosing one.
+/// Silences each named diagnostic anywhere inside the declaration's span.
+/// Scope is lexical: an inner `@Suppress` adds to the enclosing one.
 pub fn applySuppressAnnotations(
     allocator: Allocator,
     file: *const KotlinFile,
@@ -577,9 +573,8 @@ pub fn collectSuppressRegions(
     file: *const KotlinFile,
     out: *std.ArrayList(SuppressRegion),
 ) Allocator.Error!void {
-    // The parser lifts a `@file:Suppress(...)` onto the top-level declaration
-    // that follows it, so file-level suppression falls out of the per-decl
-    // walk below.
+    // The parser lifts `@file:` onto the declaration that follows, so
+    // file-level suppression falls out of the per-decl walk.
     for (file.decls) |*d| {
         try collectSuppressDecl(allocator, d, out);
     }
@@ -672,9 +667,8 @@ pub fn parseDeprecation(anns: []const Annotation) ?DeprecationInfo {
             .level = .Warning,
             .message = null,
         };
-        // The first positional argument is `message: String` unless an
-        // explicit `message = ...` is also given; `replaceWith` and `level`
-        // may appear in any position by name.
+        // The first positional is `message` unless named explicitly;
+        // `replaceWith` and `level` may appear anywhere by name.
         var positional_idx: usize = 0;
         for (a.args, 0..) |*arg, i| {
             const name: ?[]const u8 = if (i < a.arg_names.len) a.arg_names[i] else null;
@@ -715,9 +709,8 @@ pub fn parseDeprecation(anns: []const Annotation) ?DeprecationInfo {
     return null;
 }
 
-/// The text of a string template made entirely of literal parts, or null when
-/// any part is interpolated. The lexer coalesces contiguous text into one
-/// `Text` part, so a plain literal is one part and an empty literal is none.
+/// Null when any part is interpolated. The lexer coalesces contiguous text,
+/// so a plain literal is one part and an empty literal is none.
 pub fn extractStringLiteral(e: *const Expr) ?[]const u8 {
     if (e.* == .StringTemplate) {
         const parts = e.StringTemplate.parts;
@@ -766,8 +759,7 @@ pub fn collectDeprecationInfo(
                 }
             },
             .Object => |*o| {
-                // An object name is a value reference, and its members read
-                // like top-level declarations.
+                // The name is a value reference; members read as top-level.
                 for (o.members) |*m| {
                     try collectDeprecationInfo(m[0..1], out);
                 }
@@ -906,9 +898,7 @@ pub fn walkExprForDeprecation(
             }
         },
         .Call => |c| {
-            // Recurse into the callee unless it is a bare-name reference to a
-            // deprecated symbol, which reports once for the whole call under
-            // the call's span.
+            // A deprecated bare-name callee reports once, under the call span.
             var emitted_at_call = false;
             if (c.callee.* == .Path and c.callee.Path.segments.len == 1 and
                 info.contains(c.callee.Path.segments[0].name))
@@ -1124,8 +1114,7 @@ pub const AnnotationTarget = enum {
 pub const AnnotationMeta = struct {
     /// `@Repeatable` set on the annotation class.
     repeatable: bool = false,
-    /// `@Target(...)` on the annotation class; null means no explicit
-    /// `@Target`, which leaves application sites unrestricted.
+    /// Null means no explicit `@Target`, so sites are unrestricted.
     targets: ?[]AnnotationTarget = null,
 };
 
@@ -1232,8 +1221,7 @@ pub const AnnotationWalker = struct {
         defer counts.deinit();
         for (anns) |*ann| {
             const leaf = if (ann.path.len > 0) ann.path[ann.path.len - 1].name else continue;
-            // Only checkable when the annotation class is known and carries
-            // a `@Target` list.
+            // Only checkable for a known class with a `@Target` list.
             if (self.meta.get(leaf)) |m| {
                 if (m.targets) |targets| {
                     if (!containsTarget(targets, site)) {
@@ -1249,8 +1237,7 @@ pub const AnnotationWalker = struct {
                     }
                 }
             }
-            // Only a known annotation class whose `repeatable` flag is false
-            // can duplicate.
+            // Only a known, non-repeatable class can duplicate.
             if (counts.get(leaf)) |prev_span| {
                 if (self.meta.get(leaf)) |m| {
                     if (!m.repeatable) {

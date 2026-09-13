@@ -1,9 +1,6 @@
-//! End-to-end type-checker tests.
-//!
-//! The typeck module's dependency graph excludes the lexer and parser, so
-//! these tests build the `KotlinFile` AST directly with small helpers rather
-//! than parsing source text. Each helper mirrors a syntactic form, with the
-//! corresponding source program reproduced in a comment.
+//! End-to-end type-checker tests. The typeck dependency graph excludes the
+//! lexer and parser, so these build the `KotlinFile` AST directly with helpers
+//! that each mirror one syntactic form.
 
 const std = @import("std");
 
@@ -42,9 +39,8 @@ const KotlinFile = ast.KotlinFile;
 const testing = std.testing;
 const test_file = FileId.from(0);
 
-// A `Builder` owns an arena, hands out heap pointers, and tracks a monotonic
-// span offset so every node gets a distinct span: the checker keys its side
-// tables by span, so a collision would alias unrelated expressions.
+// Every node gets a distinct span: the checker keys its side tables by span,
+// so a collision would alias unrelated expressions.
 
 const Builder = struct {
     arena: std.heap.ArenaAllocator,
@@ -68,10 +64,8 @@ const Builder = struct {
         return Span.init(test_file, start, start + 1);
     }
 
-    /// Current span offset; pair with `spanFrom` to build an enclosing span
-    /// over everything constructed in between. The parser gives a declaration
-    /// a span covering its whole body, and lexical-region checks like
-    /// `@Suppress` rely on that containment.
+    /// Pair with `spanFrom` to span everything built in between, matching the
+    /// whole-body declaration spans `@Suppress` regions rely on.
     fn snap(self: *const Builder) u32 {
         return self.off;
     }
@@ -98,7 +92,6 @@ const Builder = struct {
         return out;
     }
 
-    // --- types ---
 
     fn ty(self: *Builder, name: []const u8) TypeRef {
         return self.tyN(name, false);
@@ -178,7 +171,6 @@ const Builder = struct {
         };
     }
 
-    // --- expressions ---
 
     fn intLit(self: *Builder, value: i64) Expr {
         return .{ .IntLit = .{ .value = value, .kind = .Int, .span = self.ts() } };
@@ -370,7 +362,6 @@ const Builder = struct {
         return .{ .patterns = pats, .body = body, .span = self.ts() };
     }
 
-    // --- statements ---
 
     fn exprStmt(self: *Builder, e: Expr) Stmt {
         _ = self;
@@ -425,7 +416,6 @@ const Builder = struct {
         };
     }
 
-    // --- declarations ---
 
     fn param(self: *Builder, name: []const u8, t: TypeRef) Param {
         return .{
@@ -586,9 +576,6 @@ const Builder = struct {
     }
 };
 
-// Holds the resolution and typecheck output plus an owning allocator, so they
-// tear down together.
-
 const Checked = struct {
     arena: *std.heap.ArenaAllocator,
     res: resolver.Resolution,
@@ -640,8 +627,7 @@ const Checked = struct {
     }
 };
 
-/// Resolve, then typecheck, the given file. Everything the resolver and the
-/// checker allocate lands on a private arena, torn down by one `deinit`.
+/// Everything the resolver and checker allocate lands on one private arena.
 fn checkFile(gpa: std.mem.Allocator, f: *const KotlinFile) Checked {
     const arena = gpa.create(std.heap.ArenaAllocator) catch unreachable;
     arena.* = std.heap.ArenaAllocator.init(gpa);
@@ -652,7 +638,6 @@ fn checkFile(gpa: std.mem.Allocator, f: *const KotlinFile) Checked {
 }
 
 test "literal_types" {
-    // fun main() { val x: Int = 1; val y: String = "hi" }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -666,7 +651,6 @@ test "literal_types" {
 }
 
 test "literal_int_fits_long" {
-    // fun main() { val x: Long = 1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -679,7 +663,6 @@ test "literal_int_fits_long" {
 }
 
 test "type_mismatch_literal" {
-    // fun main() { val x: Int = "hi" }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -692,7 +675,6 @@ test "type_mismatch_literal" {
 }
 
 test "val_reassign_flagged" {
-    // fun main() { val x = 1; x = 2 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -706,7 +688,6 @@ test "val_reassign_flagged" {
 }
 
 test "var_reassign_ok" {
-    // fun main() { var x = 1; x = 2 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -720,7 +701,6 @@ test "var_reassign_ok" {
 }
 
 test "null_deref_flagged" {
-    // fun main() { val s: String? = null; println(s.length) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -734,7 +714,6 @@ test "null_deref_flagged" {
 }
 
 test "safe_call_on_nullable_ok" {
-    // fun main() { val s: String? = null; println(s?.length) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -748,7 +727,6 @@ test "safe_call_on_nullable_ok" {
 }
 
 test "smart_cast_after_unsafe_as" {
-    // fun main() { val a: Any = "hi"; val s = a as String; println(a.length) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -763,7 +741,6 @@ test "smart_cast_after_unsafe_as" {
 }
 
 test "smart_cast_safe_as_does_not_narrow_subject" {
-    // fun main() { val a: Any = "hi"; val s = a as? String; val x: Any = a }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -778,7 +755,6 @@ test "smart_cast_safe_as_does_not_narrow_subject" {
 }
 
 test "smart_cast_after_while_true_with_return" {
-    // fun f(a: String?): Int { while (true) { if (a == null) return -1; break }; return a.length }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const loop_body = b.block(&.{
@@ -800,7 +776,6 @@ test "smart_cast_after_while_true_with_return" {
 }
 
 test "smart_cast_after_do_while" {
-    // fun f(a: String?): Int { do { if (a == null) return -1 } while (false); return a.length }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const do_body = b.block(&.{
@@ -821,7 +796,6 @@ test "smart_cast_after_do_while" {
 }
 
 test "builder_call_typechecks" {
-    // fun main() { val xs = buildList<Int> {} }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -832,7 +806,6 @@ test "builder_call_typechecks" {
     defer c.deinit();
     try testing.expect(!c.hasErrors());
 
-    // fun main() { val m = buildMap<String, Int> {} }
     var b2 = Builder.init(testing.allocator);
     defer b2.deinit();
     const main2 = b2.funBlock("main", &.{}, null, &.{
@@ -845,7 +818,6 @@ test "builder_call_typechecks" {
 }
 
 test "bare_type_argument_inference_is_check" {
-    // fun f(x: Any) { if (x is List) {}; if (x is Map) {} }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f0 = b.funBlock("f", &.{b.param("x", b.ty("Any"))}, null, &.{
@@ -859,7 +831,6 @@ test "bare_type_argument_inference_is_check" {
 }
 
 test "bare_type_argument_inference_user_generic" {
-    // class Box<T>(val v: T); fun f(x: Any) { if (x is Box) {}; val y = x as Box }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -876,7 +847,6 @@ test "bare_type_argument_inference_user_generic" {
 }
 
 test "lambda_zero_arity_against_unit_callable" {
-    // fun foreach(action: () -> Unit) {}; fun main() { foreach { 1 + 2 } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const foreach = b.funBlock("foreach", &.{b.param("action", b.tyFun(&.{}, b.ty("Unit")))}, null, &.{});
@@ -891,7 +861,6 @@ test "lambda_zero_arity_against_unit_callable" {
 }
 
 test "lambda_one_arity_with_it_against_one_arity_callable" {
-    // fun action(a: (Int) -> Int): Int { return a(1) }; fun main() { action { it + 1 } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const action = b.funBlock("action", &.{b.param("a", b.tyFun(&.{b.ty("Int")}, b.ty("Int")))}, b.ty("Int"), &.{
@@ -908,7 +877,6 @@ test "lambda_one_arity_with_it_against_one_arity_callable" {
 }
 
 test "smart_cast_bound_alias_narrows_source" {
-    // fun f(a: Any): Int { val b = a; if (b is String) { return a.length }; return -1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f0 = b.funBlock("f", &.{b.param("a", b.ty("Any"))}, b.ty("Int"), &.{
@@ -927,7 +895,6 @@ test "smart_cast_bound_alias_narrows_source" {
 }
 
 test "smart_cast_bound_alias_narrows_copy" {
-    // fun f(a: Any): Int { val b = a; if (a is String) { return b.length }; return -1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f0 = b.funBlock("f", &.{b.param("a", b.ty("Any"))}, b.ty("Int"), &.{
@@ -946,7 +913,6 @@ test "smart_cast_bound_alias_narrows_copy" {
 }
 
 test "smart_cast_bound_alias_chain" {
-    // fun f(a: Any): Int { val b = a; val c = b; if (a is String) { return c.length }; return -1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f0 = b.funBlock("f", &.{b.param("a", b.ty("Any"))}, b.ty("Int"), &.{
@@ -966,7 +932,6 @@ test "smart_cast_bound_alias_chain" {
 }
 
 test "smart_cast_after_not_is_return" {
-    // fun f(x: Any): Int { if (x !is String) return -1; return x.length }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f0 = b.funBlock("f", &.{b.param("x", b.ty("Any"))}, b.ty("Int"), &.{
@@ -980,7 +945,6 @@ test "smart_cast_after_not_is_return" {
 }
 
 test "smart_cast_not_is_else_branch" {
-    // fun f(x: Any): Int = if (x !is String) -1 else x.length
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const body = b.ifExpr(
@@ -996,7 +960,6 @@ test "smart_cast_not_is_else_branch" {
 }
 
 test "smart_cast_when_subject_is_branch" {
-    // fun f(x: Any): Int = when (x) { is String -> x.length; else -> 0 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const w = b.whenExpr(b.path("x"), null, &.{
@@ -1011,7 +974,6 @@ test "smart_cast_when_subject_is_branch" {
 }
 
 test "smart_cast_when_with_subject_binding" {
-    // fun f(): Int = when (val v: Any = "hi") { is String -> v.length; else -> 0 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const binding: WhenBinding = .{
@@ -1032,7 +994,6 @@ test "smart_cast_when_with_subject_binding" {
 }
 
 test "smart_cast_cross_variable_ref_eq" {
-    // fun main() { val a: Any? = "hi"; val b: String = "bye"; if (a === b) { val x: String = a; } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -1051,7 +1012,6 @@ test "smart_cast_cross_variable_ref_eq" {
 }
 
 test "smart_cast_cross_variable_ref_neq_in_else" {
-    // fun main() { val a: Any? = "x"; val b: String = "y"; if (a !== b) {} else { val s: String = a } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -1070,7 +1030,6 @@ test "smart_cast_cross_variable_ref_neq_in_else" {
 }
 
 test "smart_cast_after_elvis_return" {
-    // fun greet(name: String?) { val n = name ?: return; println(name.length) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const greet = b.funBlock("greet", &.{b.param("name", b.tyNull("String"))}, null, &.{
@@ -1084,7 +1043,6 @@ test "smart_cast_after_elvis_return" {
 }
 
 test "smart_cast_after_elvis_throw" {
-    // fun greet(name: String?) { name ?: throw RuntimeException("x"); println(name.length) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const greet = b.funBlock("greet", &.{b.param("name", b.tyNull("String"))}, null, &.{
@@ -1098,7 +1056,6 @@ test "smart_cast_after_elvis_throw" {
 }
 
 test "smart_cast_after_if_null_return" {
-    // fun greet(name: String?) { if (name == null) return; println(name.length) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const greet = b.funBlock("greet", &.{b.param("name", b.tyNull("String"))}, null, &.{
@@ -1112,7 +1069,6 @@ test "smart_cast_after_if_null_return" {
 }
 
 test "smart_cast_after_if_nonnull_else_return" {
-    // fun greet(name: String?) { if (name != null) {} else return; println(name.length) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const greet = b.funBlock("greet", &.{b.param("name", b.tyNull("String"))}, null, &.{
@@ -1126,7 +1082,6 @@ test "smart_cast_after_if_nonnull_else_return" {
 }
 
 test "smart_cast_after_null_check" {
-    // fun main() { val s: String? = null; if (s != null) { println(s.length) } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -1144,8 +1099,6 @@ test "smart_cast_after_null_check" {
 }
 
 test "arity_mismatch_flagged" {
-    // fun f(a: Int) = a
-    // fun main() { f(1, 2) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f0 = b.funExpr("f", &.{b.param("a", b.ty("Int"))}, null, b.path("a"));
@@ -1159,8 +1112,6 @@ test "arity_mismatch_flagged" {
 }
 
 test "wrong_arg_type_flagged" {
-    // fun f(s: String) {}
-    // fun main() { f(1) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f0 = b.funBlock("f", &.{b.param("s", b.ty("String"))}, null, &.{});
@@ -1174,7 +1125,6 @@ test "wrong_arg_type_flagged" {
 }
 
 test "if_lub_string_int_is_any" {
-    // fun main() { val x: Any = if (true) "hi" else 1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -1187,7 +1137,6 @@ test "if_lub_string_int_is_any" {
 }
 
 test "is_check_narrows_in_branch" {
-    // fun main() { val a: Any = "hi"; if (a is String) { println(a.length) } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -1205,7 +1154,6 @@ test "is_check_narrows_in_branch" {
 }
 
 test "binary_string_concat" {
-    // fun main() { val x: String = "a" + 1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -1218,8 +1166,6 @@ test "binary_string_concat" {
 }
 
 test "user_class_call_type_checks" {
-    // class Box(val x: Int)
-    // fun main() { val b = Box(3); println(b.x) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1235,8 +1181,6 @@ test "user_class_call_type_checks" {
 }
 
 test "user_class_wrong_ctor_arg_type" {
-    // class Box(val x: Int)
-    // fun main() { val b = Box("hi") }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1251,7 +1195,6 @@ test "user_class_wrong_ctor_arg_type" {
 }
 
 test "lambda_param_types_from_expected" {
-    // fun main() { val f: (Int) -> Int = { x -> x + 1 }; println(f(2)) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const lam = b.lambda(&.{"x"}, &.{b.exprStmt(b.binary(.Add, b.path("x"), b.intLit(1)))});
@@ -1266,10 +1209,8 @@ test "lambda_param_types_from_expected" {
 }
 
 test "implicit it remains resolvable while a generic lambda shape is unknown" {
-    // fun main() { val predicates = listOf({ it }) }
-    // The generic collection call loses its outer expected element type on
-    // the first inference pass, which must not leave `it` unresolved inside
-    // the lambda body.
+    // The generic call loses its expected element type on the first inference
+    // pass, which must not leave `it` unresolved in the lambda body.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var predicate = b.lambda(&.{"it"}, &.{b.exprStmt(b.path("it"))});
@@ -1288,8 +1229,6 @@ test "implicit it remains resolvable while a generic lambda shape is unknown" {
 }
 
 test "abstract_member_not_implemented" {
-    // abstract class Shape { abstract fun area(): Int }
-    // class Square : Shape()
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var shape = b.class("Shape");
@@ -1307,8 +1246,6 @@ test "abstract_member_not_implemented" {
 }
 
 test "delegate_with_operator_modifier_ok" {
-    // class D { operator fun getValue(...): Int = 1; operator fun setValue(...) {} }
-    // var x: Int by D()
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var d = b.class("D");
@@ -1326,8 +1263,6 @@ test "delegate_with_operator_modifier_ok" {
 }
 
 test "delegate_missing_operator_on_get_value_flagged" {
-    // class D { fun getValue(...): Int = 1 }
-    // val x: Int by D()
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var d = b.class("D");
@@ -1342,8 +1277,6 @@ test "delegate_missing_operator_on_get_value_flagged" {
 }
 
 test "delegate_missing_operator_on_set_value_flagged" {
-    // class D { operator fun getValue(...): Int = 1; fun setValue(...) {} }
-    // var x: Int by D()
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var d = b.class("D");
@@ -1360,10 +1293,6 @@ test "delegate_missing_operator_on_set_value_flagged" {
 }
 
 test "diamond_conflict_flagged" {
-    // interface A { fun hi(): String = "A" }
-    // interface B { fun hi(): String = "B" }
-    // class C : A, B
-    // fun main() { println(C().hi()) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var ia = b.class("A");
@@ -1385,10 +1314,6 @@ test "diamond_conflict_flagged" {
 }
 
 test "diamond_conflict_resolved_by_override" {
-    // interface A { fun hi(): String = "A" }
-    // interface B { fun hi(): String = "B" }
-    // class C : A, B { override fun hi(): String = "C" }
-    // fun main() { println(C().hi()) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var ia = b.class("A");
@@ -1413,10 +1338,6 @@ test "diamond_conflict_resolved_by_override" {
 }
 
 test "diamond_no_false_positive_for_linear_chain" {
-    // open class Shape { open fun area(): Int = 0 }
-    // open class Rectangle : Shape() { override fun area(): Int = 1 }
-    // class Square : Rectangle()
-    // fun main() { println(Square().area()) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var shape = b.class("Shape");
@@ -1444,8 +1365,6 @@ test "diamond_no_false_positive_for_linear_chain" {
 }
 
 test "lateinit_var_string_ok" {
-    // class Box { lateinit var s: String }
-    // fun main() { println(Box()) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1465,7 +1384,6 @@ test "lateinit_var_string_ok" {
 }
 
 test "lateinit_val_flagged" {
-    // class Box { lateinit val s: String }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1482,7 +1400,6 @@ test "lateinit_val_flagged" {
 }
 
 test "lateinit_primitive_flagged" {
-    // class Box { lateinit var n: Int }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1499,7 +1416,6 @@ test "lateinit_primitive_flagged" {
 }
 
 test "lateinit_initializer_flagged" {
-    // class Box { lateinit var s: String = "x" }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1516,7 +1432,6 @@ test "lateinit_initializer_flagged" {
 }
 
 test "lateinit_nullable_flagged" {
-    // class Box { lateinit var s: String? }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1533,8 +1448,6 @@ test "lateinit_nullable_flagged" {
 }
 
 test "accessor_return_type_match_ok" {
-    // class Box { val x: Int get(): Int = 1 }
-    // fun main() { println(Box().x) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1559,8 +1472,6 @@ test "accessor_return_type_match_ok" {
 }
 
 test "accessor_return_type_mismatch_flagged" {
-    // class Box { val x: Int get(): String = "hi" }
-    // fun main() { println(Box().x) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1585,8 +1496,6 @@ test "accessor_return_type_mismatch_flagged" {
 }
 
 test "member_access_resolves_through_class_table" {
-    // class Box(val n: Int)
-    // fun main() { val b = Box(3); val y: Int = b.n }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var box = b.class("Box");
@@ -1602,9 +1511,6 @@ test "member_access_resolves_through_class_table" {
 }
 
 test "member_access_chains_propagate_class" {
-    // class Inner(val value: Int)
-    // class Outer(val inner: Inner)
-    // fun main() { val o = Outer(Inner(7)); val n: Int = o.inner.value }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var inner = b.class("Inner");
@@ -1622,10 +1528,6 @@ test "member_access_chains_propagate_class" {
 }
 
 test "extension_function_resolves_through_receiver_chain" {
-    // open class Animal(val name: String)
-    // class Dog(n: String) : Animal(n)
-    // fun Animal.greet(): String = "hi " + this.name
-    // fun main() { val d = Dog("Rex"); val g: String = d.greet(); println(g) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var animal = b.class("Animal");
@@ -1649,11 +1551,6 @@ test "extension_function_resolves_through_receiver_chain" {
 }
 
 test "receiver extension keeps shadowable global out of eager calls" {
-    // class Scope
-    // fun launch(block: () -> Unit) {}
-    // fun Scope.launch(block: () -> Unit) {}
-    // fun withScope(block: Scope.() -> Unit) {}
-    // fun main() { withScope { launch {} } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
 
@@ -1683,7 +1580,6 @@ test "receiver extension keeps shadowable global out of eager calls" {
 }
 
 test "stdlib_chain_infers_lambda_params_and_fold_result" {
-    // fun main() { val r: Int = listOf(1,2,3).map { it*2 }.filter { it>0 }.fold(0) { acc, x -> acc + x }; println(r) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const list_of = b.call(b.path("listOf"), &.{ b.intLit(1), b.intLit(2), b.intLit(3) });
@@ -1704,9 +1600,6 @@ test "stdlib_chain_infers_lambda_params_and_fold_result" {
 }
 
 test "overload_picks_by_first_fit_arg_types" {
-    // fun f(x: Int): Int = x
-    // fun f(x: String): String = x
-    // fun main() { val a: Int = f(1); val b: String = f("hi") }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fi = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -1722,9 +1615,6 @@ test "overload_picks_by_first_fit_arg_types" {
 }
 
 test "overload_picks_int_over_short_per_widen" {
-    // fun f(x: Int): Int = x
-    // fun f(x: Short): Short = x
-    // fun main() { val a: Int = f(2) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fi = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -1739,9 +1629,6 @@ test "overload_picks_int_over_short_per_widen" {
 }
 
 test "named_arg_picks_matching_overload" {
-    // fun f(x: Int): Int = x
-    // fun f(name: String): String = name
-    // fun main() { val s: String = f(name = "hi") }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fi = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -1756,9 +1643,6 @@ test "named_arg_picks_matching_overload" {
 }
 
 test "named_arg_unknown_param_reports_t0089" {
-    // fun f(x: Int): Int = x
-    // fun f(y: Int): Int = y
-    // fun main() { val _r = f(z = 1) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fx = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -1773,9 +1657,6 @@ test "named_arg_unknown_param_reports_t0089" {
 }
 
 test "type_arg_count_filters_overloads" {
-    // fun <T> f(x: T): T = x
-    // fun <T, U> f(x: T, y: U): T = x
-    // fun main() { val r: Int = f<Int>(1) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var f1 = b.funExpr("f", &.{b.param("x", b.ty("T"))}, b.ty("T"), b.path("x"));
@@ -1792,11 +1673,6 @@ test "type_arg_count_filters_overloads" {
 }
 
 test "msc_picks_more_specific_subtype" {
-    // open class Animal
-    // class Dog : Animal()
-    // fun f(a: Animal): Int = 1
-    // fun f(d: Dog): String = "dog"
-    // fun main() { val r: String = f(Dog()) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var animal = b.class("Animal");
@@ -1816,9 +1692,6 @@ test "msc_picks_more_specific_subtype" {
 }
 
 test "msc_non_parameterized_beats_parameterized" {
-    // fun f(x: Int): Int = x
-    // fun <T> f(x: T): Int = 0
-    // fun main() { val _r: Int = f(1) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fi = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -1834,8 +1707,6 @@ test "msc_non_parameterized_beats_parameterized" {
 }
 
 test "conflicting_overloads_reports_t0094" {
-    // fun f(x: Int): Int = x
-    // fun f(y: Int): Int = y
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fx = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -1847,8 +1718,6 @@ test "conflicting_overloads_reports_t0094" {
 }
 
 test "distinct_overloads_no_conflict" {
-    // fun f(x: Int): Int = x
-    // fun f(x: String): String = x
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fi = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -1860,9 +1729,6 @@ test "distinct_overloads_no_conflict" {
 }
 
 test "super_ambiguous_reports_t0093" {
-    // interface A { fun f(): Int }
-    // interface B { fun f(): Int }
-    // class C : A, B { override fun f(): Int = super.f() + 1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var ia = b.class("A");
@@ -1889,9 +1755,6 @@ test "super_ambiguous_reports_t0093" {
 }
 
 test "super_qualified_unambiguous_ok" {
-    // interface A { fun f(): Int { return 1 } }
-    // interface B { fun f(): Int { return 2 } }
-    // class C : A, B { override fun f(): Int = super<A>.f() + super<B>.f() }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var ia = b.class("A");
@@ -1915,9 +1778,6 @@ test "super_qualified_unambiguous_ok" {
 }
 
 test "nothing_receiver_uses_extension_only" {
-    // fun Any?.describe(): String = "x"
-    // fun bottom(): Nothing = throw RuntimeException("x")
-    // fun main() { val s: String = bottom().describe(); println(s) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var describe = b.funExpr("describe", &.{}, b.ty("String"), b.str("x"));
@@ -1934,12 +1794,6 @@ test "nothing_receiver_uses_extension_only" {
 }
 
 test "msc_ambiguous_reports_t0091" {
-    // interface I
-    // interface J
-    // class Both : I, J
-    // fun f(x: I): Int = 1
-    // fun f(x: J): Int = 2
-    // fun main() { val _r: Int = f(Both()) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var ii = b.class("I");
@@ -1961,9 +1815,6 @@ test "msc_ambiguous_reports_t0091" {
 }
 
 test "expect_actual_pair_is_not_ambiguous" {
-    // expect fun mk(x: Int): Int
-    // actual fun mk(x: Int): Int = x
-    // fun main() { val _r: Int = mk(1) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var mk_e = b.func("mk", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), null);
@@ -1980,9 +1831,6 @@ test "expect_actual_pair_is_not_ambiguous" {
 }
 
 test "msc_no_vararg_beats_vararg" {
-    // fun f(x: Int): Int = x
-    // fun f(vararg xs: Int): Int = 0
-    // fun main() { val _r: Int = f(1) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fi = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -1997,9 +1845,6 @@ test "msc_no_vararg_beats_vararg" {
 }
 
 test "none_applicable_reports_t0090" {
-    // fun f(x: Int): Int = x
-    // fun f(x: Int, y: Int): Int = x + y
-    // fun main() { val _r = f(1, 2, 3) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f1 = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -2014,8 +1859,6 @@ test "none_applicable_reports_t0090" {
 }
 
 test "type_arg_count_mismatch_reports_t0092" {
-    // fun f(x: Int): Int = x
-    // fun main() { val _r = f<Int>(1) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f0 = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -2029,9 +1872,6 @@ test "type_arg_count_mismatch_reports_t0092" {
 }
 
 test "overload_picks_int_over_long_per_widen" {
-    // fun f(x: Int): Int = x
-    // fun f(x: Long): Long = x
-    // fun main() { val a: Int = f(2) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fi = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -2046,10 +1886,6 @@ test "overload_picks_int_over_long_per_widen" {
 }
 
 test "smart_cast_narrows_val_member_chain" {
-    // open class Shape
-    // class Circle(val radius: Int) : Shape()
-    // class Wrapper(val shape: Shape)
-    // fun area(w: Wrapper): Int { if (w.shape is Circle) { return w.shape.radius }; return 0 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var shape = b.class("Shape");
@@ -2075,7 +1911,6 @@ test "smart_cast_narrows_val_member_chain" {
 }
 
 test "unreachable_after_return" {
-    // fun main() { return; println("dead") }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -2089,7 +1924,6 @@ test "unreachable_after_return" {
 }
 
 test "unreachable_after_throw" {
-    // fun main() { throw RuntimeException("x"); println("dead") }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -2103,10 +1937,7 @@ test "unreachable_after_throw" {
 }
 
 test "unreachable_after_nothing_typed_call" {
-    // fun boom(): Nothing { throw RuntimeException("x") }
-    // fun main() { boom(); println("dead") }
-    // Reachability reads the per-function set of `Nothing`-typed spans, so
-    // code after a call typed `Nothing` is dead.
+    // Code after a call typed `Nothing` is dead.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const boom = b.funBlock("boom", &.{}, b.ty("Nothing"), &.{
@@ -2123,12 +1954,8 @@ test "unreachable_after_nothing_typed_call" {
 }
 
 test "unreachable_memo_does_not_leak_across_functions" {
-    // fun boom(): Nothing { throw RuntimeException("x") }
-    // fun dead() { boom(); println("dead") }
-    // fun alive() { println("ok"); println("still ok") }
-    // The memoized per-function solve must not let `dead`'s divergence mark
-    // statements in `alive` unreachable, nor let `alive`'s clean solve mask
-    // the warning in `dead`.
+    // The per-function memo must not leak `dead`'s divergence into `alive`,
+    // nor let `alive`'s clean solve mask the warning in `dead`.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const boom = b.funBlock("boom", &.{}, b.ty("Nothing"), &.{
@@ -2149,8 +1976,7 @@ test "unreachable_memo_does_not_leak_across_functions" {
 }
 
 test "unreachable_warns_in_each_diverging_function" {
-    // Two functions each diverging mid-body: the per-function memo must
-    // recompute as the `Nothing`-span set grows, warning in both.
+    // The memo must recompute as the `Nothing`-span set grows.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f1 = b.funBlock("f1", &.{}, null, &.{
@@ -2168,7 +1994,6 @@ test "unreachable_warns_in_each_diverging_function" {
 }
 
 test "senseless_comparison_nonnull_eq_null" {
-    // fun main() { val x: Int = 5; if (x == null) { println("nope") } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -2186,7 +2011,6 @@ test "senseless_comparison_nonnull_eq_null" {
 }
 
 test "useless_cast_same_type" {
-    // fun main() { val x: Int = 5; val y = x as Int; println(y) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -2201,7 +2025,6 @@ test "useless_cast_same_type" {
 }
 
 test "useless_elvis_nonnull_lhs" {
-    // fun main() { val x: Int = 5; val y = x ?: 0; println(y) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -2216,7 +2039,6 @@ test "useless_elvis_nonnull_lhs" {
 }
 
 test "finally_return_makes_continuation_unreachable" {
-    // fun main() { try { println("try") } finally { return }; println("dead") }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const try_expr: Expr = .{ .Try = .{
@@ -2236,8 +2058,6 @@ test "finally_return_makes_continuation_unreachable" {
 }
 
 test "var_reassign_kills_narrowing" {
-    // fun src(): String? = null
-    // fun main() { var x: String? = "ok"; if (x != null) { while (true) { x = src(); println(x.length) } } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const src = b.funExpr("src", &.{}, b.tyNull("String"), b.nullLit());
@@ -2260,8 +2080,6 @@ test "var_reassign_kills_narrowing" {
 }
 
 test "class_val_property_uninit_in_init_block" {
-    // class Foo(b: Boolean) { val x: Int; init { if (b) { x = 1 } } }
-    // fun main() { println(Foo(true).x) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var foo = b.class("Foo");
@@ -2287,8 +2105,6 @@ test "class_val_property_uninit_in_init_block" {
 }
 
 test "class_val_property_initialized_in_all_init_branches" {
-    // class Foo(b: Boolean) { val x: Int; init { if (b) { x = 1 } else { x = 2 } } }
-    // fun main() { println(Foo(true).x) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var foo = b.class("Foo");
@@ -2314,7 +2130,6 @@ test "class_val_property_initialized_in_all_init_branches" {
 }
 
 test "notnull_narrows_subject" {
-    // fun main() { val s: String? = "hi"; s!!; val n: Int = s.length; println(n) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -2330,7 +2145,6 @@ test "notnull_narrows_subject" {
 }
 
 test "as_cast_narrows_subject" {
-    // fun main() { val a: Any = "hi"; val s = a as String; val n: Int = a.length; println(s); println(n) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -2347,7 +2161,6 @@ test "as_cast_narrows_subject" {
 }
 
 test "contract_run_initializes_val" {
-    // fun main() { val x: Int; run { x = 4 }; println(x) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const run_lam = b.lambda(&.{}, &.{b.assign(b.path("x"), b.intLit(4))});
@@ -2363,7 +2176,6 @@ test "contract_run_initializes_val" {
 }
 
 test "contract_check_introduces_smartcast" {
-    // fun main() { val x: Any = 42; check(x is Int); val y: Int = x + 1; println(y) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const main = b.funBlock("main", &.{}, null, &.{
@@ -2379,8 +2191,6 @@ test "contract_check_introduces_smartcast" {
 }
 
 test "contract_require_nonnull" {
-    // fun f(s: String?): Int { require(s != null); return s.length }
-    // fun main() { println(f("hi")) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const f0 = b.funBlock("f", &.{b.param("s", b.tyNull("String"))}, b.ty("Int"), &.{
@@ -2397,8 +2207,6 @@ test "contract_require_nonnull" {
 }
 
 test "infer_call_return_propagates_arg_type" {
-    // fun <T> id(x: T): T = x
-    // fun main() { val n: Int = id(5); val s: String = id("hi"); println(n); println(s) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var id = b.funExpr("id", &.{b.param("x", b.ty("T"))}, b.ty("T"), b.path("x"));
@@ -2416,10 +2224,6 @@ test "infer_call_return_propagates_arg_type" {
 }
 
 test "opt_in_marker_propagates" {
-    // @RequiresOptIn annotation class Experimental
-    // @Experimental fun risky(): Int = 1
-    // fun unsafe(): Int = risky()
-    // @OptIn(Experimental::class) fun safe(): Int = risky()
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var experimental = b.class("Experimental");
@@ -2438,8 +2242,6 @@ test "opt_in_marker_propagates" {
 }
 
 test "suppress_silences_deprecation_warning" {
-    // @Deprecated("gone") fun foo(): Int = 1
-    // fun caller(): Int = foo()
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var foo = b.funExpr("foo", &.{}, b.ty("Int"), b.intLit(1));
@@ -2450,8 +2252,6 @@ test "suppress_silences_deprecation_warning" {
     defer c.deinit();
     try testing.expect(c.hasCode(codes.WARN_DEPRECATED));
 
-    // @Deprecated("gone") fun foo(): Int = 1
-    // @Suppress("W0006") fun caller(): Int = foo()
     var b2 = Builder.init(testing.allocator);
     defer b2.deinit();
     var foo2 = b2.funExpr("foo", &.{}, b2.ty("Int"), b2.intLit(1));
@@ -2459,8 +2259,7 @@ test "suppress_silences_deprecation_warning" {
     const caller_start = b2.snap();
     var caller2 = b2.funExpr("caller", &.{}, b2.ty("Int"), b2.call(b2.path("foo"), &.{}));
     caller2.annotations = b2.slice(Annotation, &.{b2.annotation("Suppress", &.{b2.str("W0006")})});
-    // The function's span encloses its body, so the `@Suppress` region covers
-    // the deprecated call inside it.
+    // The function's span encloses its body, so the region covers the call.
     caller2.span = b2.spanFrom(caller_start);
     const f2 = b2.file(&.{ .{ .Function = foo2 }, .{ .Function = caller2 } });
     var c2 = checkFile(testing.allocator, &f2);
@@ -2469,9 +2268,6 @@ test "suppress_silences_deprecation_warning" {
 }
 
 test "member_access_inherits_from_supertype" {
-    // open class Base(val tag: String)
-    // class Sub(t: String) : Base(t)
-    // fun main() { val s = Sub("hi"); val t: String = s.tag }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var base = b.class("Base");
@@ -2492,9 +2288,6 @@ test "member_access_inherits_from_supertype" {
 }
 
 test "suspend_call_from_suspend_ok" {
-    // suspend fun a() {}
-    // suspend fun b() { a() }
-    // fun main() {}
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var fa = b.funBlock("a", &.{}, null, &.{});
@@ -2509,8 +2302,6 @@ test "suspend_call_from_suspend_ok" {
 }
 
 test "suspend_call_from_non_suspend_flagged" {
-    // suspend fun a() {}
-    // fun main() { a() }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var fa = b.funBlock("a", &.{}, null, &.{});
@@ -2523,8 +2314,6 @@ test "suspend_call_from_non_suspend_flagged" {
 }
 
 test "suspend_call_inside_anon_fun_marked_suspend" {
-    // suspend fun a() {}
-    // fun outer() { val f = fun() { a() }; f() }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var fa = b.funBlock("a", &.{}, null, &.{});
@@ -2540,11 +2329,8 @@ test "suspend_call_inside_anon_fun_marked_suspend" {
     try testing.expect(c.hasCode(codes.TYPE_SUSPEND_CALL_FROM_NON_SUSPEND));
 }
 
-// Module-level (multi-file) checks: conflicting overloads are per package.
-
 /// Re-home every span a test function carries onto `fid`, so the per-file
-/// package map and the cross-file visibility checks see the declaration in
-/// the right file.
+/// package map and cross-file visibility checks place the declaration right.
 fn rehomeFn(f: *Function, fid: FileId) void {
     f.span.file = fid;
     f.name.span.file = fid;
@@ -2571,8 +2357,6 @@ fn checkModule(gpa: std.mem.Allocator, files: []const KotlinFile) Checked {
 }
 
 test "module: cross-package same-signature functions are not conflicting overloads" {
-    // liba.kt: package liba; fun f(x: Int): Int = x
-    // libb.kt: package libb; fun f(x: Int): Int = x
     // Kotlin scopes conflicting overloads to one package, so this module is
     // clean.
     var b = Builder.init(testing.allocator);
@@ -2589,8 +2373,7 @@ test "module: cross-package same-signature functions are not conflicting overloa
 }
 
 test "module: same-package same-signature functions across files still conflict" {
-    // a.kt and b.kt both `package liba` declaring `fun f(x: Int): Int`: one
-    // package, identical signatures, so Kotlin rejects the pair.
+    // One package, identical signatures, so Kotlin rejects the pair.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var fa = b.funExpr("f", &.{b.param("x", b.ty("Int"))}, b.ty("Int"), b.path("x"));
@@ -2609,7 +2392,6 @@ fn ebfOf(b: *Builder, t: ?TypeRef, init_e: ?Expr) *ast.ExplicitField {
 }
 
 test "ebf_var_property_flagged" {
-    // class C { var n: Number  field: Int = 1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var c0 = b.class("C");
@@ -2623,7 +2405,6 @@ test "ebf_var_property_flagged" {
 }
 
 test "ebf_inconsistent_type_flagged" {
-    // class C { val n: Int  field: String = "x" }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var c0 = b.class("C");
@@ -2637,7 +2418,6 @@ test "ebf_inconsistent_type_flagged" {
 }
 
 test "ebf_redundant_same_type_warns" {
-    // class C { val n: Int  field: Int = 1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var c0 = b.class("C");
@@ -2652,7 +2432,6 @@ test "ebf_redundant_same_type_warns" {
 }
 
 test "ebf_mutable_collection_subtype_ok" {
-    // class C { val ns: List<Int>  field: MutableList<Int> = mutableListOf(1) }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var c0 = b.class("C");
@@ -2671,7 +2450,6 @@ test "ebf_mutable_collection_subtype_ok" {
 }
 
 test "ebf_field_must_be_initialized" {
-    // class C { val ns: List<Int>  field: MutableList<Int> }  (no init path)
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var c0 = b.class("C");
@@ -2685,7 +2463,6 @@ test "ebf_field_must_be_initialized" {
 }
 
 test "ebf_private_property_flagged" {
-    // class C { private val n: Number  field: Int = 1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var c0 = b.class("C");
@@ -2700,7 +2477,6 @@ test "ebf_private_property_flagged" {
 }
 
 test "ebf_delegate_flagged" {
-    // class C { val n: Number  field: Int = 1  by lazy { 2 } }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var c0 = b.class("C");
@@ -2715,8 +2491,7 @@ test "ebf_delegate_flagged" {
 }
 
 test "ebf_no_narrowing_outside_class" {
-    // class Cart { val items: List<String>  field: MutableList<String> = mutableListOf() }
-    // fun main() { Cart().items.add("b") }  with `add` unresolved on List<String>.
+    // Outside the class the read has the public `List`, which lacks `add`.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var cart = b.class("Cart");
@@ -2737,7 +2512,7 @@ test "ebf_no_narrowing_outside_class" {
 }
 
 test "ebf_read_outside_class_public_type_ok" {
-    // Same shape, but a read-only member call resolves fine outside.
+    // A read-only member call resolves fine outside.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     var cart = b.class("Cart");
@@ -2756,9 +2531,6 @@ test "ebf_read_outside_class_public_type_ok" {
     defer c.deinit();
     try testing.expect(!c.hasFactory("UNRESOLVED_REFERENCE"));
 }
-
-// Annotation use-site targeting: `@all:` expansion and the defaulting rules
-// Kotlin 2.4 applies when no use-site target is written.
 
 /// `@Target(AnnotationTarget.<entries>) annotation class <name>`
 fn targetAnnotationClass(b: *Builder, name: []const u8, entries: []const []const u8) ast.Class {
@@ -2779,8 +2551,6 @@ fn annotationWithSite(b: *Builder, use_site: ?ast.AnnotationUseSite, name: []con
 }
 
 test "annotation_all_target_expands_without_diagnostics" {
-    // @Target(VALUE_PARAMETER, PROPERTY, FIELD, PROPERTY_GETTER) annotation class Wide
-    // class U(@all:Wide val e: String)
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const wide = targetAnnotationClass(&b, "Wide", &.{ "VALUE_PARAMETER", "PROPERTY", "FIELD", "PROPERTY_GETTER" });
@@ -2795,8 +2565,6 @@ test "annotation_all_target_expands_without_diagnostics" {
 }
 
 test "annotation_all_target_nothing_applicable_rejected" {
-    // @Target(FUNCTION) annotation class FunOnly
-    // class U(@all:FunOnly val e: String)
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fun_only = targetAnnotationClass(&b, "FunOnly", &.{"FUNCTION"});
@@ -2811,7 +2579,6 @@ test "annotation_all_target_nothing_applicable_rejected" {
 }
 
 test "annotation_all_target_on_plain_ctor_param_rejected" {
-    // class U(@all:Wide x: String), with no val/var.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const wide = targetAnnotationClass(&b, "Wide", &.{ "VALUE_PARAMETER", "PROPERTY" });
@@ -2827,7 +2594,6 @@ test "annotation_all_target_on_plain_ctor_param_rejected" {
 }
 
 test "annotation_all_target_on_local_property_rejected" {
-    // fun f() { @all:Wide val x = 1 }
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const wide = targetAnnotationClass(&b, "Wide", &.{ "VALUE_PARAMETER", "PROPERTY" });
@@ -2841,7 +2607,6 @@ test "annotation_all_target_on_local_property_rejected" {
 }
 
 test "annotation_all_plus_field_repeats_on_backing_field" {
-    // class U(@all:FieldOnly @field:FieldOnly val e: String)
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const field_only = targetAnnotationClass(&b, "FieldOnly", &.{"FIELD"});
@@ -2859,8 +2624,6 @@ test "annotation_all_plus_field_repeats_on_backing_field" {
 }
 
 test "annotation_defaulting_param_field_accepted_on_ctor_property" {
-    // @Target(VALUE_PARAMETER, FIELD) annotation class PF
-    // class C(@PF val x: Int) expands to param and field, with no diagnostic.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const pf = targetAnnotationClass(&b, "PF", &.{ "VALUE_PARAMETER", "FIELD" });
@@ -2875,8 +2638,6 @@ test "annotation_defaulting_param_field_accepted_on_ctor_property" {
 }
 
 test "annotation_defaulting_getter_only_rejected_on_member_property" {
-    // @Target(PROPERTY_GETTER) annotation class G
-    // class C { @G val x = 1 } never defaults to `get`.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const g = targetAnnotationClass(&b, "G", &.{"PROPERTY_GETTER"});
@@ -2891,7 +2652,6 @@ test "annotation_defaulting_getter_only_rejected_on_member_property" {
 }
 
 test "annotation_defaulting_field_only_needs_backing_field" {
-    // class C { @F val x: Int get() = 1 }, where F targets FIELD only.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const fcls = targetAnnotationClass(&b, "F", &.{"FIELD"});
@@ -2915,7 +2675,6 @@ test "annotation_defaulting_field_only_needs_backing_field" {
 }
 
 test "annotation_explicit_use_site_disables_defaulting" {
-    // class C(@param:PPF val x: Int), with no diagnostic.
     var b = Builder.init(testing.allocator);
     defer b.deinit();
     const ppf = targetAnnotationClass(&b, "PPF", &.{ "VALUE_PARAMETER", "PROPERTY", "FIELD" });
