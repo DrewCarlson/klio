@@ -2455,6 +2455,65 @@ fn enrichCallableRefArgShapes(
 /// `ownerTypeArgFromReceiver` is the type the receiver gives one of the owner
 /// class's type parameters, only for the direct-instantiation case where the
 /// receiver's head is the declaring class so the arguments line up positionally.
+/// Rewrite the owner's type parameters appearing in `ty`'s arguments to the
+/// receiver's instantiation, in place. `Iterable<T>.iterator()` records its return
+/// as `Iterator<Iterable's T>`, and only the receiver says what that is; left alone
+/// it reaches `next()` as the owner's erased parameter rather than the element.
+/// The head is not touched, being the bare-head rung's business.
+fn substituteOwnerArgs(
+    b: *FuncBuilder,
+    member_fid: FuncId,
+    recv_ty: ir.TypeRef,
+    ty: *ir.TypeRef,
+) Allocator.Error!void {
+    for (ty.args) |*a| {
+        if (ownerArgSubstitution(b, member_fid, recv_ty, a.name)) |sub| {
+            var replacement = try sub.clone(b.allocator);
+            replacement.nullable = replacement.nullable or a.nullable;
+            a.deinit(b.allocator);
+            a.* = replacement;
+            continue;
+        }
+        try substituteOwnerArgs(b, member_fid, recv_ty, a);
+    }
+}
+
+/// What the receiver instantiates one owner type parameter to, named either bare
+/// or as a class-type-param identity. Unlike `ownerTypeParamSubstitution` this
+/// accepts a type parameter of the caller's own scope: in argument position a
+/// bare `T` is the answer, not a head that fails to name a class.
+fn ownerArgSubstitution(
+    b: *FuncBuilder,
+    member_fid: FuncId,
+    recv_ty: ir.TypeRef,
+    arg_name: []const u8,
+) ?ir.TypeRef {
+    if (recv_ty.args.len == 0) return null;
+    const ds = b.module.decl_sigs.get(member_fid.int()) orelse return null;
+    const oid = ds.enclosing_class orelse return null;
+    if (oid.int() >= b.module.classes.items.len) return null;
+    const ocls = &b.module.classes.items[oid.int()];
+    if (ocls.type_params.len != recv_ty.args.len) return null;
+    const recv_head = typeHead(std.mem.trimEnd(u8, recv_ty.name, "?"));
+    if (!std.mem.eql(u8, ocls.name, recv_head)) return null;
+    var h = std.mem.trimEnd(u8, arg_name, "?");
+    if (ir.parseClassTypeParamIdentity(h)) |id| {
+        if (id.owner.int() != oid.int()) return null;
+        h = id.param;
+    } else {
+        if (std.mem.startsWith(u8, h, "out#")) h = h["out#".len..];
+        if (std.mem.startsWith(u8, h, "in#")) h = h["in#".len..];
+        if (!bareTypeParamHead(h)) return null;
+    }
+    for (ocls.type_params, 0..) |tp, i| {
+        if (!std.mem.eql(u8, tp, h)) continue;
+        const arg = recv_ty.args[i];
+        if (arg.name.len == 0 or std.mem.eql(u8, arg.name, "*")) return null;
+        return arg;
+    }
+    return null;
+}
+
 fn ownerTypeParamSubstitution(
     b: *FuncBuilder,
     member_fid: FuncId,
@@ -2585,6 +2644,7 @@ fn ownMemberDeclaredReturn(
         if (staticTypeClassId(b, f.return_ty) == null) return .refuse;
         var out = try f.return_ty.clone(b.allocator);
         if (safe_call) out.nullable = true;
+        try substituteOwnerArgs(b, fid, recv_ty, &out);
         return .{ .answer = out };
     }
     return .none;

@@ -156,6 +156,10 @@ test "type_param_operand_compares_by_equals" {
         \\fun <T> indexedEqual(a: Array<out T>): Boolean = a[0] == a[1]
         \\fun <T> listEqual(l: List<T>): Boolean = l[0] == l[1]
         \\fun <T> nextEqual(i: Iterator<T>): Boolean = i.next() == i.next()
+        \\fun <T> inferredIterEqual(l: Iterable<T>): Boolean {
+        \\    val i = l.iterator()
+        \\    return i.next() == i.next()
+        \\}
         \\fun main() {
         \\    val nan = arrayOf(Double.NaN, Double.NaN)
         \\    val zeros = arrayOf(0.0, -0.0)
@@ -163,10 +167,12 @@ test "type_param_operand_compares_by_equals" {
         \\    println(indexedEqual(zeros))
         \\    println(listEqual(listOf(Float.NaN, Float.NaN)))
         \\    println(nextEqual(listOf(Double.NaN, Double.NaN).iterator()))
+        \\    println(inferredIterEqual(listOf(Double.NaN, Double.NaN)))
+        \\    println(inferredIterEqual(listOf(0.0, -0.0)))
         \\    println(Double.NaN == Double.NaN)
         \\    println(0.0 == -0.0)
         \\}
         \\
     ;
-    try assertKlio("type_param_eq", src, "true\nfalse\ntrue\ntrue\nfalse\ntrue\n");
+    try assertKlio("type_param_eq", src, "true\nfalse\ntrue\ntrue\ntrue\nfalse\nfalse\ntrue\n");
 }

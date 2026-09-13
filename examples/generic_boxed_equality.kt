@@ -17,6 +17,13 @@ fun <T> firstTwoEqual(l: List<T>): Boolean = l[0] == l[1]
 
 fun <T> nextTwoEqual(i: Iterator<T>): Boolean = i.next() == i.next()
 
+// The iterator's own type is inferred here, so `Iterable<T>.iterator()` has to
+// carry `T` into `Iterator<T>` for `next()` to come back as `T`.
+fun <T> firstTwoEqualByIterator(l: Iterable<T>): Boolean {
+    val i = l.iterator()
+    return i.next() == i.next()
+}
+
 fun main() {
     val nan = arrayOf(Double.NaN, Double.NaN, Double.NaN)
     val zeros = arrayOf(0.0, -0.0)
@@ -26,6 +33,8 @@ fun main() {
     println(firstTwoEqual(listOf(Double.NaN, Double.NaN)))
     println(firstTwoEqual(listOf(0.0, -0.0)))
     println(nextTwoEqual(listOf(Double.NaN, Double.NaN).iterator()))
+    println(firstTwoEqualByIterator(listOf(Double.NaN, Double.NaN)))
+    println(firstTwoEqualByIterator(listOf(0.0, -0.0)))
 
     // A statically typed `Double` keeps the IEEE comparison.
     val x = Double.NaN
