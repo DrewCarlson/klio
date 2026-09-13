@@ -364,7 +364,23 @@ const ev_tests = @import("eval/tests.zig");
 
 test {
     testing.refAllDecls(@This());
-    inline for (.{ ev_state, ev_diag, ev_chain, ev_flow, ev_snapshot, ev_frame, ev_enter, ev_leaf, ev_activation, ev_loop, ev_exec, ev_native, ev_inst, ev_values, ev_host, ev_tests, ev_fused }) |m| testing.refAllDecls(m);
+    testing.refAllDecls(@import("eval/activation.zig"));
+    testing.refAllDecls(@import("eval/chain.zig"));
+    testing.refAllDecls(@import("eval/diag.zig"));
+    testing.refAllDecls(@import("eval/enter.zig"));
+    testing.refAllDecls(@import("eval/exec.zig"));
+    testing.refAllDecls(@import("eval/flow.zig"));
+    testing.refAllDecls(@import("eval/frame.zig"));
+    testing.refAllDecls(@import("eval/fused.zig"));
+    testing.refAllDecls(@import("eval/host.zig"));
+    testing.refAllDecls(@import("eval/inst.zig"));
+    testing.refAllDecls(@import("eval/leaf.zig"));
+    testing.refAllDecls(@import("eval/loop.zig"));
+    testing.refAllDecls(@import("eval/native.zig"));
+    testing.refAllDecls(@import("eval/snapshot.zig"));
+    testing.refAllDecls(@import("eval/state.zig"));
+    testing.refAllDecls(@import("eval/tests.zig"));
+    testing.refAllDecls(@import("eval/values.zig"));
 }
 
 const ev_fused = @import("eval/fused.zig");

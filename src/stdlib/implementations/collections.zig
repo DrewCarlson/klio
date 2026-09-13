@@ -352,6 +352,16 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
-    _ = @import("collections/tests.zig");
-    inline for (.{ common_mod, iterable_mod, builders_mod, list_mod, views_mod, sequence_mod, list_transforms_mod, set_mod, map_mod, tuple_mod, array_mod }) |m| testing.refAllDecls(m);
+    testing.refAllDecls(@import("collections/array.zig"));
+    testing.refAllDecls(@import("collections/builders.zig"));
+    testing.refAllDecls(@import("collections/common.zig"));
+    testing.refAllDecls(@import("collections/iterable.zig"));
+    testing.refAllDecls(@import("collections/list.zig"));
+    testing.refAllDecls(@import("collections/list_transforms.zig"));
+    testing.refAllDecls(@import("collections/map.zig"));
+    testing.refAllDecls(@import("collections/sequence.zig"));
+    testing.refAllDecls(@import("collections/set.zig"));
+    testing.refAllDecls(@import("collections/tests.zig"));
+    testing.refAllDecls(@import("collections/tuple.zig"));
+    testing.refAllDecls(@import("collections/views.zig"));
 }

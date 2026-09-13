@@ -189,8 +189,15 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
+    testing.refAllDecls(@import("build/base.zig"));
+    testing.refAllDecls(@import("build/classes.zig"));
+    testing.refAllDecls(@import("build/clone.zig"));
+    testing.refAllDecls(@import("build/lift.zig"));
+    testing.refAllDecls(@import("build/module.zig"));
+    testing.refAllDecls(@import("build/overrides.zig"));
+    testing.refAllDecls(@import("build/scan.zig"));
+    testing.refAllDecls(@import("build/types.zig"));
     _ = lift;
-    inline for (.{ build_types, build_scan, build_module, build_overrides, build_classes, build_base, build_clone }) |m| testing.refAllDecls(m);
 }
 
 test "symbol-index default-import list matches the stdlib's canonical one" {

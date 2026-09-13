@@ -125,7 +125,6 @@ pub const memberRoot = mod_analysis.memberRoot;
 pub const settleTypes = mod_analysis.settleTypes;
 pub const noReg = mod_analysis.noReg;
 pub const bareTy = mod_analysis.bareTy;
-pub const array_init_args = mod_analysis.array_init_args;
 pub const arrayInitFnType = mod_analysis.arrayInitFnType;
 pub const expectedFnType = mod_analysis.expectedFnType;
 pub const lambdaParams = mod_analysis.lambdaParams;
@@ -227,3 +226,15 @@ pub var layout_quiet = true;
 /// deriving one compiles property initializers, which can refuse again. Without
 /// this, the explanation recurses into itself.
 pub var layout_diag_busy = false;
+
+test {
+    std.testing.refAllDecls(@This());
+    std.testing.refAllDecls(@import("cgen/analysis.zig"));
+    std.testing.refAllDecls(@import("cgen/body.zig"));
+    std.testing.refAllDecls(@import("cgen/decl.zig"));
+    std.testing.refAllDecls(@import("cgen/eligible.zig"));
+    std.testing.refAllDecls(@import("cgen/emit.zig"));
+    std.testing.refAllDecls(@import("cgen/layout.zig"));
+    std.testing.refAllDecls(@import("cgen/model.zig"));
+    std.testing.refAllDecls(@import("cgen/types.zig"));
+}

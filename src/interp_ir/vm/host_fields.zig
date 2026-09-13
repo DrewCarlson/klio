@@ -357,7 +357,16 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
-    inline for (.{ common, enum_static, bound_ref, read_paths, get_field_inner, class_access, ext_props, instance_field, field_cache, set_field }) |m| testing.refAllDecls(m);
+    testing.refAllDecls(@import("host_fields/bound_ref.zig"));
+    testing.refAllDecls(@import("host_fields/class_access.zig"));
+    testing.refAllDecls(@import("host_fields/common.zig"));
+    testing.refAllDecls(@import("host_fields/enum_static.zig"));
+    testing.refAllDecls(@import("host_fields/ext_props.zig"));
+    testing.refAllDecls(@import("host_fields/field_cache.zig"));
+    testing.refAllDecls(@import("host_fields/get_field_inner.zig"));
+    testing.refAllDecls(@import("host_fields/instance_field.zig"));
+    testing.refAllDecls(@import("host_fields/read_paths.zig"));
+    testing.refAllDecls(@import("host_fields/set_field.zig"));
 }
 
 test "utf16Len counts code units, falling back to bytes" {

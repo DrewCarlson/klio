@@ -145,5 +145,14 @@ test "loop JIT preserves exact member-extension operands" {
 
 test {
     std.testing.refAllDecls(@This());
-    inline for (.{ common, shapes, inline_analysis, type_infer, loop_shape, compiler, compile_loop, run_mod, code_cache, compile_func }) |m| std.testing.refAllDecls(m);
+    std.testing.refAllDecls(@import("jit_loop/cache.zig"));
+    std.testing.refAllDecls(@import("jit_loop/common.zig"));
+    std.testing.refAllDecls(@import("jit_loop/compile_func.zig"));
+    std.testing.refAllDecls(@import("jit_loop/compile_loop.zig"));
+    std.testing.refAllDecls(@import("jit_loop/compiler.zig"));
+    std.testing.refAllDecls(@import("jit_loop/inline_analysis.zig"));
+    std.testing.refAllDecls(@import("jit_loop/loop_shape.zig"));
+    std.testing.refAllDecls(@import("jit_loop/run.zig"));
+    std.testing.refAllDecls(@import("jit_loop/shapes.zig"));
+    std.testing.refAllDecls(@import("jit_loop/types.zig"));
 }

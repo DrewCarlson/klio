@@ -227,7 +227,14 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
-    inline for (.{ common, ctor_select, ctor_defaults, super_chain, new_instance, ctor_path, materialize, build_object }) |m| testing.refAllDecls(m);
+    testing.refAllDecls(@import("host_instances/build_object.zig"));
+    testing.refAllDecls(@import("host_instances/common.zig"));
+    testing.refAllDecls(@import("host_instances/ctor_defaults.zig"));
+    testing.refAllDecls(@import("host_instances/ctor_path.zig"));
+    testing.refAllDecls(@import("host_instances/ctor_select.zig"));
+    testing.refAllDecls(@import("host_instances/materialize.zig"));
+    testing.refAllDecls(@import("host_instances/new_instance.zig"));
+    testing.refAllDecls(@import("host_instances/super_chain.zig"));
 }
 
 test "isIntrinsicClass / isBuiltinThrowableName classification" {

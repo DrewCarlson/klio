@@ -1294,5 +1294,28 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
-    inline for (.{ receiver_mod, binary_mod, paths_mod, member_mod, control_mod, lambda_mod, compose_mod, call_mod, emit_mod, call_general_mod, inline_target_mod, local_call_mod, arg_shape_mod, static_type_mod, type_probe_mod, bare_call_mod, probe_mod, audit_mod, refs_mod, expected_mod, member_call_mod, block_mod, tests_shapes_mod, tests_dispatch_mod }) |m| testing.refAllDecls(m);
+    testing.refAllDecls(@import("expr/arg_shape.zig"));
+    testing.refAllDecls(@import("expr/audit.zig"));
+    testing.refAllDecls(@import("expr/bare_call.zig"));
+    testing.refAllDecls(@import("expr/binary.zig"));
+    testing.refAllDecls(@import("expr/block.zig"));
+    testing.refAllDecls(@import("expr/call.zig"));
+    testing.refAllDecls(@import("expr/call_general.zig"));
+    testing.refAllDecls(@import("expr/compose.zig"));
+    testing.refAllDecls(@import("expr/control.zig"));
+    testing.refAllDecls(@import("expr/emit.zig"));
+    testing.refAllDecls(@import("expr/expected.zig"));
+    testing.refAllDecls(@import("expr/inline_target.zig"));
+    testing.refAllDecls(@import("expr/lambda.zig"));
+    testing.refAllDecls(@import("expr/local_call.zig"));
+    testing.refAllDecls(@import("expr/member.zig"));
+    testing.refAllDecls(@import("expr/member_call.zig"));
+    testing.refAllDecls(@import("expr/paths.zig"));
+    testing.refAllDecls(@import("expr/probe.zig"));
+    testing.refAllDecls(@import("expr/receiver.zig"));
+    testing.refAllDecls(@import("expr/refs.zig"));
+    testing.refAllDecls(@import("expr/static_type.zig"));
+    testing.refAllDecls(@import("expr/tests_dispatch.zig"));
+    testing.refAllDecls(@import("expr/tests_shapes.zig"));
+    testing.refAllDecls(@import("expr/type_probe.zig"));
 }
