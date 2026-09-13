@@ -1,24 +1,15 @@
-//! Static type checker.
+//! Static type checker: `parse -> resolve -> typecheck -> interp`, aborting
+//! before the interpreter on failure. Produces a `TypeCheck` result carrying a
+//! `Span -> Type` side table for every expression typed, plus a diagnostic
+//! sink.
 //!
-//! Runs after the resolver and before the interpreter. Produces a
-//! `TypeCheck` result carrying a `Span -> Type` side table for every
-//! expression we typed, plus a diagnostic sink.
-//!
-//! Design choices:
-//!
-//! * Tolerant. The resolver is permissive — many stdlib names like
-//!   `listOf` resolve to "unresolved" at this stage because we have no
-//!   global symbol table for the stdlib. The type checker treats every
-//!   uncertain shape as `Type.Unresolved` and silently propagates it.
-//!   Hard diagnostics are reserved for cases where the program is
-//!   unambiguously wrong.
-//!
-//! * Flow-insensitive with narrow smart-cast support. We thread a
-//!   `Frame` of name -> narrowed type through conditional branches so
-//!   `if (x != null) x.length` typechecks even when `x: String?`.
-//!
-//! * Pass placement. `parse -> resolve -> typecheck -> interp`. A
-//!   typecheck failure aborts before interp.
+//! The pass is tolerant. The resolver is permissive and a stdlib name such as
+//! `listOf` resolves to nothing at this stage, so every uncertain shape
+//! becomes `Type.Unresolved` and propagates silently; a hard diagnostic is
+//! reserved for a program that is unambiguously wrong. Flow sensitivity comes
+//! from the CFG: smart-cast, definite-assignment and reachability facts are
+//! queried per program point, so `if (x != null) x.length` typechecks for
+//! `x: String?`.
 
 const std = @import("std");
 

@@ -1,6 +1,5 @@
-//! Top-level phase driver: checker construction and the `run` pass
-//! sequence, plus the per-phase declaration walks. Free functions over
-//! `*Checker`.
+//! Checker construction, the `run` pass sequence, and the per-phase
+//! declaration walks. Free functions over `*Checker`.
 
 const std = @import("std");
 
@@ -109,14 +108,14 @@ pub fn new(allocator: Allocator, resolution: *const Resolution) Allocator.Error!
 }
 
 pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
-    // First pass: seed signatures of top-level functions, classes and
-    // top-level property types so forward references in bodies typecheck.
+    // Seed signatures of top-level functions, classes and property types so
+    // forward references in bodies typecheck.
     for (file.decls) |*d| {
         try self.declareTopLevel(d);
     }
-    // Collect dsl-marker annotation classes and the user classes that
-    // carry them so per-body DSL-scope diagnostics can consult them as
-    // the lambda-receiver stack is pushed.
+    // Collect dsl-marker annotation classes and the user classes carrying
+    // them, so DSL-scope diagnostics can consult them as the lambda-receiver
+    // stack is pushed.
     {
         var all_classes: std.ArrayList(*const Class) = .empty;
         defer all_classes.deinit(self.allocator);
@@ -146,15 +145,15 @@ pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
             }
         }
     }
-    // Second pass: typecheck bodies.
+    // Typecheck bodies.
     for (file.decls) |*d| {
         try self.checkDecl(d);
     }
-    // Generics-related diagnostics (reified/inline, vararg, declaration-site variance).
+    // Reified/inline, vararg and declaration-site variance diagnostics.
     for (file.decls) |*d| {
         try checkGenericsDecl(self, d);
     }
-    // T0027: definitely-non-nullable (`T & Any`) used outside a type parameter.
+    // Definitely-non-nullable (`T & Any`) used outside a type parameter.
     {
         var tp_scope: std.ArrayList(std.StringHashMap(void)) = .empty;
         defer {
@@ -166,10 +165,10 @@ pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
             try checkDefinitelyNonNullDecl(self, d, &tp_scope);
         }
     }
-    // `const val`, `value class`, `annotation class` shape checks.
-    // Pre-seed the annotation- and enum-class name sets so the
-    // annotation-class parameter-type check (T0037) can recognise other
-    // annotation types and enums.
+    // `const val`, `value class` and `annotation class` shape checks. The
+    // annotation- and enum-class name sets are seeded first so the
+    // annotation-parameter-type check recognises other annotation types and
+    // enums.
     {
         var anns: std.ArrayList(*const Class) = .empty;
         defer anns.deinit(self.allocator);
@@ -187,41 +186,41 @@ pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
     for (file.decls) |*d| {
         try checkPhaseFDecl(self, d, .TopLevel);
     }
-    // typealias scope + cycle checks.
+    // Typealias scope and cycle checks.
     for (file.decls) |*d| {
         try checkPhaseGDecl(self, d, true);
     }
     try checkTypealiasCycles(self);
-    // extension property shape checks.
+    // Extension-property shape checks.
     for (file.decls) |*d| {
         try checkPhaseHDecl(self, d);
     }
-    // data object, backing-field, spread, @PublishedApi.
+    // Data object, backing field, spread and `@PublishedApi` checks.
     for (file.decls) |*d| {
         try checkPhaseJDecl(self, d, false);
     }
-    // annotation-class self-reference cycle detection.
+    // Annotation-class self-reference cycles.
     try checkAnnotationCycles(self, file);
-    // @Target / @Repeatable enforcement.
+    // `@Target` and `@Repeatable` enforcement.
     try checkAnnotationApplications(self, file);
-    // emit deprecation warning/error at every reference to a declaration
-    // marked `@Deprecated`.
+    // Deprecation diagnostics at every reference to a `@Deprecated`
+    // declaration.
     try checkDeprecatedReferences(self, file);
-    // opt-in propagation for declarations marked with an annotation that
+    // Opt-in propagation for declarations marked with an annotation that
     // itself carries `@RequiresOptIn`.
     try checkOptInReferences(self, file);
     // `tailrec` tail-call analysis.
     for (file.decls) |*d| {
         try checkPhaseKDecl(self, d);
     }
-    // declaration-site conflicting-overload detection. The body is
-    // owned by the visibility-checking sibling file; drive it when present.
+    // Declaration-site conflicting overloads; the body lives in the
+    // visibility sibling, so drive it only when present.
     if (@hasDecl(@import("visibility.zig"), "checkConflictingOverloads")) {
         try @import("visibility.zig").checkConflictingOverloads(self);
     }
-    // top-level property initializer cycles.
+    // Top-level property initializer cycles.
     try checkPropertyInitializerCycles(self, file);
-    // non-property primary-ctor param read from method body.
+    // Non-property primary-constructor parameters read from a method body.
     for (file.decls) |*d| {
         try checkCtorParamScopeDecl(self, d);
     }
@@ -232,10 +231,10 @@ pub fn run(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
 pub fn checkCtorParamScopeDecl(self: *Checker, d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Class => |*c| {
-            // Names visible as members of this class — own members and
-            // transitively inherited supertype members / properties — are
-            // shadowed by their member binding rather than the ctor param.
-            // Skip those names when computing the non-property set.
+            // A name visible as a member of this class, whether declared
+            // here or inherited, binds to that member rather than to the
+            // constructor parameter, so it is left out of the non-property
+            // set.
             var member_names = try collectMemberNameSet(self, c);
             defer member_names.deinit();
             var non_prop = std.StringHashMap(Span).init(self.allocator);
@@ -257,10 +256,10 @@ pub fn checkCtorParamScopeDecl(self: *Checker, d: *const Decl) Allocator.Error!v
                             }
                         },
                         .Property => |p| {
-                            // Property initializers run during instance init —
-                            // non-property ctor params are visible there.
-                            // Accessor bodies are invoked post-construction and
-                            // must not see them.
+                            // Property initializers run during instance
+                            // initialization, where non-property constructor
+                            // parameters are visible; accessor bodies run
+                            // after construction and must not see them.
                             if (p.getter) |getter| {
                                 var local = std.StringHashMap(void).init(self.allocator);
                                 defer local.deinit();
@@ -290,9 +289,9 @@ pub fn checkCtorParamScopeDecl(self: *Checker, d: *const Decl) Allocator.Error!v
     }
 }
 
-/// Names that resolve as class members at any point in the class's
-/// inheritance chain — own properties / functions / property-form ctor
-/// params, plus transitively inherited equivalents via `self.classes`.
+/// Names resolving as class members anywhere in the inheritance chain: own
+/// properties, functions and property-form constructor parameters, plus the
+/// transitively inherited equivalents reached through `self.classes`.
 pub fn collectMemberNameSet(self: *const Checker, c: *const Class) Allocator.Error!std.StringHashMap(void) {
     var out = std.StringHashMap(void).init(self.allocator);
     for (c.primary_params) |*p| {
@@ -496,9 +495,9 @@ fn checkCtorParamInTry(
     }
 }
 
-/// Detect cycles among top-level property initializer reads. A property
-/// whose initializer reads another property — directly or transitively
-/// back to itself — forms a cycle whose evaluation order is unspecified.
+/// Detect cycles among top-level property initializer reads. A property whose
+/// initializer reads back to itself, directly or transitively, forms a cycle
+/// whose evaluation order is unspecified.
 pub fn checkPropertyInitializerCycles(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
     const a = self.allocator;
     var props: std.ArrayList(*const Property) = .empty;
@@ -625,9 +624,9 @@ pub fn checkPhaseFDecl(self: *Checker, d: *const Decl, scope: PhaseFScope) Alloc
         .Property => |p| {
             if (p.is_const) try checkConstVal(self, p, scope);
             if (p.is_inline) try checkInlineProperty(self, p);
-            // A property without a backing field cannot declare an
-            // initializer. Skip extension properties (T0040 already covers
-            // that case) and abstract properties.
+            // A property with no backing field cannot declare an
+            // initializer. Extension and abstract properties are covered
+            // elsewhere.
             if (p.init != null and !p.is_abstract and p.receiver_type == null and !propertyHasBackingField(p)) {
                 const msg = try std.fmt.allocPrint(
                     self.allocator,
@@ -683,8 +682,8 @@ pub fn checkPhaseHDecl(self: *Checker, d: *const Decl) Allocator.Error!void {
             const need_setter = p.mutable;
             const getter_absent = p.getter == null;
             const setter_absent = need_setter and p.setter == null;
-            // An `expect` extension property is a declaration with no body;
-            // its accessors come from the `actual`.
+            // An `expect` extension property has no body; its accessors come
+            // from the `actual`.
             if ((getter_absent or setter_absent) and p.init == null and p.delegate == null and !p.is_expect) {
                 const what: []const u8 = if (getter_absent and setter_absent)
                     "explicit getter and setter"
@@ -748,7 +747,7 @@ pub fn checkPhaseJDecl(self: *Checker, d: *const Decl, in_accessor: bool) Alloca
             for (c.members) |*m| try checkPhaseJDecl(self, m, false);
         },
         .Property => |p| {
-            // Extension properties never have a backing field — any `field`
+            // Extension properties have no backing field, so any `field`
             // reference inside their accessors is invalid.
             const has_backing_field = p.receiver_type == null;
             if (p.getter) |g| {
@@ -843,7 +842,7 @@ pub fn walkExprForPhaseJ(
             try checkFieldReference(self, p.segments[0].span, in_accessor, has_backing_field, prop_name);
         }
     }
-    // Recurse through children that may contain `field` references.
+    // Recurse through children that may reference `field`.
     switch (e.*) {
         .Block => |*b| try walkBlockForPhaseJ(self, b, in_accessor, has_backing_field, prop_name),
         .If => |i| {
@@ -1012,8 +1011,8 @@ pub fn walkExprForPhaseG(self: *Checker, e: *const Expr) Allocator.Error!void {
     }
 }
 
-/// Detect direct / transitive `typealias` cycles. Emits T0038 once per
-/// alias on a cycle.
+/// Detect direct and transitive `typealias` cycles, reporting once per alias
+/// on a cycle.
 pub fn checkTypealiasCycles(self: *Checker) Allocator.Error!void {
     var names: std.ArrayList([]const u8) = .empty;
     defer names.deinit(self.allocator);
@@ -1055,14 +1054,10 @@ pub fn aliasReachesSelf(
     return false;
 }
 
-/// A property has a backing field iff:
-///
-/// * no custom accessors (default get/set);
-/// * any custom accessor body references `field`;
-/// * mutable property with exactly one of get/set custom (the other
-///   defaults and needs storage).
-///
-/// Extension properties never have a backing field.
+/// A property has a backing field when it has no custom accessors, when any
+/// custom accessor body references `field`, or when it is mutable with exactly
+/// one custom accessor (the defaulted one needs storage). An extension
+/// property never has one.
 pub fn propertyHasBackingField(p: *const Property) bool {
     if (p.receiver_type != null) return false;
     const getter = p.getter;
@@ -1079,10 +1074,10 @@ pub fn propertyHasBackingField(p: *const Property) bool {
     return helpers.accessorUsesField(getter.?) or helpers.accessorUsesField(setter.?);
 }
 
-/// A non-private function that returns an anonymous object with multiple
-/// declared supertypes (and no explicit return type annotation) leaks an
-/// unnameable type out of its scope. Single-supertype anonymous objects
-/// are implicitly downcast to their supertype, so they are allowed.
+/// A non-private function returning an unannotated anonymous object with
+/// several declared supertypes leaks an unnameable type out of its scope. A
+/// single-supertype anonymous object is implicitly downcast to that
+/// supertype, so it is allowed.
 pub fn checkAnonymousObjectEscape(self: *Checker, f: *const Function) Allocator.Error!void {
     if (f.visibility == .Private) return;
     if (f.return_type != null) return;
@@ -1113,8 +1108,8 @@ pub fn checkAnonymousObjectEscape(self: *Checker, f: *const Function) Allocator.
 
 pub fn checkInlineParamEscape(self: *Checker, f: *const Function) Allocator.Error!void {
     if (!f.is_inline) return;
-    // Only function-typed parameters are inlined (or crossinline /
-    // noinline). Plain values (`x: Int`) on an inline fun are not affected.
+    // Only function-typed parameters are inlined, crossinline or noinline;
+    // a plain value parameter on an inline fun is unaffected.
     var inline_params: std.ArrayList([]const u8) = .empty;
     defer inline_params.deinit(self.allocator);
     var crossinline_params: std.ArrayList([]const u8) = .empty;
@@ -1189,8 +1184,8 @@ pub fn walkExprForInlineEscape(
         .Call => |c| {
             try walkExprForInlineEscape(self, c.callee, inline_params, crossinline_params, true);
             for (c.args) |*a| {
-                // An argument position is an escape for a bare inline param
-                // reference (we cannot prove the callee is inline).
+                // An argument position is an escape for a bare inline
+                // parameter reference: the callee may not be inline.
                 try flagInlineEscape(self, a, inline_params, crossinline_params, "passed as an argument");
                 try walkExprForInlineEscape(self, a, inline_params, crossinline_params, false);
             }
@@ -1225,9 +1220,8 @@ pub fn flagInlineEscape(
     const p = e.Path;
     if (p.segments.len != 1) return;
     const n = p.segments[0].name;
-    // crossinline: store / return are forbidden; argument-passing is
-    // allowed when the action is exactly "passed as an argument" — but we
-    // still flag store/return.
+    // A crossinline parameter may be passed as an argument but not stored
+    // or returned.
     if (sliceContainsStr(crossinline_params, n) and !std.mem.eql(u8, action, "passed as an argument")) {
         const msg = try std.fmt.allocPrint(
             self.allocator,
@@ -1239,9 +1233,9 @@ pub fn flagInlineEscape(
         try self.diagnostics.emit(self.allocator, d);
         return;
     }
-    // inline (non-crossinline, non-noinline): any non-callee use is an
-    // escape. Already flagged at the bare-Path case for non-call contexts;
-    // only flag here when the bare reference is in an argument list.
+    // For a plain inline parameter any non-callee use is an escape. Non-call
+    // contexts are flagged at the bare-Path case, so only an argument-list
+    // reference is reported here.
     if (sliceContainsStr(inline_params, n) and std.mem.eql(u8, action, "passed as an argument")) {
         const msg = try std.fmt.allocPrint(
             self.allocator,
@@ -1255,9 +1249,8 @@ pub fn flagInlineEscape(
 }
 
 pub fn checkInlineProperty(self: *Checker, p: *const Property) Allocator.Error!void {
-    // An inline property has no backing field. That means no initializer,
-    // no `lateinit`, no `by` delegate, and any custom accessor must avoid
-    // the `field` identifier.
+    // An inline property has no backing field: no initializer, no `lateinit`,
+    // no `by` delegate, and no `field` inside a custom accessor.
     var bad = false;
     if (p.init != null or p.is_lateinit or p.delegate != null) bad = true;
     // An inline property must declare at least one accessor.
@@ -1340,10 +1333,10 @@ pub fn checkConstVal(self: *Checker, p: *const Property, scope: PhaseFScope) All
     }
 }
 
-/// Structural check: is this expression composed solely of literals,
-/// references to other `const val` declarations, arithmetic / comparison /
-/// string-concat operators over const-capable types, and string templates
-/// whose interpolated parts are also const?
+/// Whether the expression is built solely from literals, references to other
+/// `const val` declarations, arithmetic, comparison and string-concat
+/// operators over const-capable types, and string templates whose
+/// interpolated parts are themselves const.
 pub fn isConstInitializer(self: *const Checker, e: *const Expr) bool {
     switch (e.*) {
         .IntLit, .FloatLit, .BoolLit, .CharLit => return true,
@@ -1363,23 +1356,21 @@ pub fn isConstInitializer(self: *const Checker, e: *const Expr) bool {
             if (p.segments.len == 1) {
                 return isConstRef(self, p.segments[0].name);
             }
-            // Permit qualified references when the leaf is a const val on a
-            // known class (best-effort: trailing segment).
+            // A qualified reference counts when its trailing segment names a
+            // const val on a known class.
             return isConstRef(self, p.segments[p.segments.len - 1].name);
         },
         .Member => |m| {
             if (m.safe) return false;
-            // Access expressions to enum entries are constant expressions.
-            // Recognize `EnumClass.ENTRY`.
+            // `EnumClass.ENTRY` is a constant expression.
             if (m.receiver.* == .Path) {
                 const segs = m.receiver.Path.segments;
                 if (segs.len == 1) {
                     if (root.classNamed(self, segs[0].name)) |info| {
                         if (info.is_enum) return true;
                     }
-                    // Builtin primitive companion constants (`Long.MAX_VALUE`,
-                    // `Int.MIN_VALUE`, `Double.POSITIVE_INFINITY`,
-                    // `*.SIZE_BITS`, …) are compile-time constants.
+                    // Builtin primitive companion constants such as
+                    // `Long.MAX_VALUE` and `Double.POSITIVE_INFINITY`.
                     if (isPrimitiveCompanionHead(segs[0].name)) return true;
                 }
             }
@@ -1395,9 +1386,9 @@ pub fn isConstInitializer(self: *const Checker, e: *const Expr) bool {
             };
             return op_ok and isConstInitializer(self, b.lhs) and isConstInitializer(self, b.rhs);
         },
-        // Integer bitwise/shift infix functions are compile-time constant in
-        // Kotlin (`const val M = 1 shl 30`, `Long.MAX_VALUE / MS`): they
-        // parse as an infix call `a shl b` or a member call `a.shl(b)`.
+        // Kotlin treats the integer bitwise and shift infix functions as
+        // compile-time constant (`const val M = 1 shl 30`); they parse as an
+        // infix call `a shl b` or a member call `a.shl(b)`.
         .Call => |c| {
             switch (c.callee.*) {
                 .Path => |segs| {
@@ -1426,10 +1417,10 @@ pub fn isConstInitializer(self: *const Checker, e: *const Expr) bool {
     }
 }
 
-/// An annotation type's primary-ctor parameter default values must be
-/// compile-time constant. Extends `isConstInitializer` with the forms
-/// specific to annotation arguments: `T::class` literals, `arrayOf(...)`
-/// of constants, and bare enum-entry references.
+/// An annotation type's primary-constructor parameter defaults must be
+/// compile-time constant. Extends `isConstInitializer` with the annotation
+/// argument forms: `T::class` literals, `arrayOf(...)` of constants, and bare
+/// enum-entry references.
 pub fn isAnnotationParamDefaultConst(self: *const Checker, e: *const Expr) bool {
     if (isConstInitializer(self, e)) return true;
     switch (e.*) {
@@ -1518,9 +1509,9 @@ pub fn checkValueClass(self: *Checker, c: *const Class) Allocator.Error!void {
     for (c.members) |*m| {
         switch (m.*) {
             .Property => |p| {
-                // Body properties with a backing field are forbidden: an
-                // initializer or `lateinit` implies a backing field. A body
-                // property with only a `get()` accessor is allowed.
+                // An initializer or `lateinit` implies a backing field,
+                // which a value class body property may not have; a
+                // `get()`-only property is allowed.
                 const has_backing_field = p.init != null or p.is_lateinit or p.delegate != null;
                 if (has_backing_field) {
                     try emitValueClassShape(self, sp, "`value class {s}` cannot declare body properties with backing fields", c.name.name);
@@ -1562,8 +1553,8 @@ fn checkAnnotationClassShape(self: *Checker, c: *const Class) Allocator.Error!vo
     if (c.secondary_ctors.len != 0) try emitAnnotationClassShape(self, sp, "`annotation class {s}` cannot have secondary constructors", c.name.name);
     if (c.init_blocks.len != 0) try emitAnnotationClassShape(self, sp, "`annotation class {s}` cannot have `init` blocks", c.name.name);
     if (c.members.len != 0) {
-        // A bare companion object inside an annotation class is permitted by
-        // kotlinc; everything else is rejected.
+        // Kotlin permits a bare companion object inside an annotation class
+        // and nothing else.
         for (c.members) |*m| {
             const allowed = m.* == .Class and m.Class.is_companion;
             if (!allowed) {
@@ -1606,10 +1597,9 @@ pub fn checkAnnotationClass(self: *Checker, c: *const Class) Allocator.Error!voi
             _ = d.withCode(codes.TYPE_ANNOTATION_PARAM_TYPE);
             try self.diagnostics.emit(self.allocator, d);
         } else if (std.mem.eql(u8, p.ty.name.name, "Array")) {
-            // Array element type is restricted to the same allowed-type set
-            // (primitives / String / KClass / annotation / enum). Look into
-            // the first type-argument; reject anything not recognised. `out
-            // T` projections are unwrapped via `TypeArg.ty`.
+            // The element type is restricted to the same set as any other
+            // annotation parameter, read off the first type argument. An
+            // `out T` projection is unwrapped through `TypeArg.ty`.
             if (p.ty.type_args.len > 0) {
                 const arg = p.ty.type_args[0];
                 const inner = arg.ty.name.name;
@@ -1631,11 +1621,10 @@ pub fn checkAnnotationClass(self: *Checker, c: *const Class) Allocator.Error!voi
     }
 }
 
-/// A declaration marked with an annotation that itself carries
-/// `@RequiresOptIn(message, level)` requires every reference site to opt
-/// in via `@OptIn(MarkerClass::class)` on an enclosing declaration.
-/// Reference sites without an active opt-in get a warning (default) or
-/// error (level = Level.ERROR).
+/// A declaration marked with an annotation carrying
+/// `@RequiresOptIn(message, level)` requires every reference site to opt in
+/// through `@OptIn(MarkerClass::class)` on an enclosing declaration. A site
+/// with no active opt-in gets a warning, or an error at `Level.ERROR`.
 pub fn checkOptInReferences(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
     const a = self.allocator;
     var markers = std.StringHashMap(OptInMarker).init(a);
@@ -1668,22 +1657,20 @@ pub fn checkOptInReferences(self: *Checker, file: *const KotlinFile) Allocator.E
     }
 }
 
-/// Emit a warning / error / hidden diagnostic at every bare-name reference
-/// to a top-level declaration carrying
-/// `@Deprecated(message, replaceWith, level)`. Only top-level functions /
-/// properties / classes / typealiases are tracked; member accesses are not
-/// flagged.
+/// Diagnose every bare-name reference to a top-level declaration carrying
+/// `@Deprecated(message, replaceWith, level)`, at the severity its level
+/// names. Only top-level functions, properties, classes and typealiases are
+/// tracked; member accesses are not flagged.
 pub fn checkDeprecatedReferences(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
     const a = self.allocator;
     var info = std.StringHashMap(DeprecationInfo).init(a);
     defer info.deinit();
     try collectDeprecationInfo(a, file.decls, &info);
     if (info.count() == 0) return;
-    // The tracker is keyed by bare name, with no overload resolution: if a
-    // non-deprecated declaration shares the name (`append` has one
-    // deprecated overload among many live ones), a use site cannot be
-    // attributed to the deprecated one, so the name is dropped rather than
-    // flagging every call.
+    // The tracker is keyed by bare name with no overload resolution, so when
+    // a live declaration shares the name (one deprecated `append` among many
+    // live ones) no use site can be attributed to the deprecated declaration
+    // and the name is dropped instead.
     var clean = std.StringHashMap(void).init(a);
     defer clean.deinit();
     try collectNonDeprecatedNames(a, file.decls, &clean);
@@ -1738,9 +1725,8 @@ pub fn checkAnnotationApplications(self: *Checker, file: *const KotlinFile) Allo
     try annotationWalkFile(self, &meta, file);
 }
 
-/// An annotation type cannot reference itself, either directly or
-/// indirectly (through another annotation type, or through `Array<T>`
-/// whose element is an annotation type).
+/// An annotation type cannot reference itself, directly or through another
+/// annotation type or an `Array<T>` of one.
 pub fn checkAnnotationCycles(self: *Checker, file: *const KotlinFile) Allocator.Error!void {
     const a = self.allocator;
     var classes: std.ArrayList(*const Class) = .empty;
@@ -1928,8 +1914,6 @@ pub fn walkExprForDnn(self: *Checker, e: *const Expr, tp_scope: *std.ArrayList(s
     }
 }
 
-// ---- Generics + inline diagnostics --------------------------------------
-
 pub fn checkGenericsDecl(self: *Checker, d: *const Decl) Allocator.Error!void {
     switch (d.*) {
         .Function => |*f| try checkGenericsFunction(self, f),
@@ -1939,7 +1923,7 @@ pub fn checkGenericsDecl(self: *Checker, d: *const Decl) Allocator.Error!void {
 }
 
 pub fn checkGenericsFunction(self: *Checker, f: *const Function) Allocator.Error!void {
-    // T0023 — reified outside inline
+    // A reified type parameter requires an `inline` function.
     for (f.type_params) |*tp| {
         if (tp.is_reified and !f.is_inline) {
             const msg = try std.fmt.allocPrint(
@@ -1952,7 +1936,7 @@ pub fn checkGenericsFunction(self: *Checker, f: *const Function) Allocator.Error
             try self.diagnostics.emit(self.allocator, d);
         }
     }
-    // T0026 — crossinline/noinline outside inline
+    // `crossinline` and `noinline` require an `inline` function.
     for (f.params) |*p| {
         if ((p.is_crossinline or p.is_noinline) and !f.is_inline) {
             const which: []const u8 = if (p.is_crossinline) "crossinline" else "noinline";
@@ -1966,7 +1950,7 @@ pub fn checkGenericsFunction(self: *Checker, f: *const Function) Allocator.Error
             try self.diagnostics.emit(self.allocator, d);
         }
     }
-    // T0025 — vararg misuse
+    // At most one `vararg`, and what may follow it.
     var vararg_idxs: std.ArrayList(usize) = .empty;
     defer vararg_idxs.deinit(self.allocator);
     for (f.params, 0..) |*p, i| {
@@ -1984,7 +1968,7 @@ pub fn checkGenericsFunction(self: *Checker, f: *const Function) Allocator.Error
     }
     if (vararg_idxs.items.len > 0) {
         const i = vararg_idxs.items[0];
-        // Following params are allowed only if they have defaults.
+        // A parameter after the vararg must have a default.
         var j = i + 1;
         while (j < f.params.len) : (j += 1) {
             const p = &f.params[j];
@@ -2000,7 +1984,7 @@ pub fn checkGenericsFunction(self: *Checker, f: *const Function) Allocator.Error
             }
         }
     }
-    // Recurse into nested functions/classes inside the body.
+    // Recurse into nested functions and classes in the body.
     if (f.body) |body| {
         switch (body) {
             .Block => |b| try walkBlockForGenerics(self, &b),
@@ -2010,15 +1994,15 @@ pub fn checkGenericsFunction(self: *Checker, f: *const Function) Allocator.Error
 }
 
 pub fn checkGenericsClass(self: *Checker, c: *const Class) Allocator.Error!void {
-    // T0024 — declaration-site variance positions on member functions.
+    // Declaration-site variance positions on member functions.
     for (c.type_params) |*tp| {
         if (tp.variance == .Invariant) continue;
         for (c.members) |*m| {
             if (m.* == .Function) {
                 const f = &m.Function;
-                // A `private` member is only accessible via `this`, so its
-                // parameter / return positions are not observable through the
-                // public API. Variance rules don't apply.
+                // A `private` member is reachable only through `this`, so its
+                // parameter and return positions are not observable through
+                // the public API and variance does not constrain them.
                 if (f.visibility == .Private) continue;
                 try checkMemberVariancePositions(self, tp.name.name, tp.variance, f);
             }
@@ -2041,8 +2025,7 @@ pub fn checkMemberVariancePositions(
     for (f.type_params) |*tp| {
         if (std.mem.eql(u8, tp.name.name, param)) return;
     }
-    // For `out T`: T must not appear in input positions.
-    // For `in T`: T must not appear in output positions.
+    // `out T` bars T from input positions; `in T` bars it from output ones.
     switch (variance) {
         .Out => {
             for (f.params) |*p| {
@@ -2115,13 +2098,9 @@ pub fn walkExprForGenerics(self: *Checker, e: *const Expr) Allocator.Error!void 
     }
 }
 
-// ============================================================================
-// Annotation collectors / walkers.
-//
-// These mirror the standalone collectors that the multi-phase driver consumes
-// from the annotation-check module. They are private to the driver and
-// operate over read-only views of the AST.
-// ============================================================================
+// Annotation collectors and walkers, private to this driver and operating
+// over read-only views of the AST. They mirror the standalone collectors the
+// annotation-check module exposes.
 
 const OptInLevel = enum { Warning, Error };
 
@@ -2282,8 +2261,6 @@ fn extractAnnotationTargets(allocator: Allocator, e: *const Expr, out: *std.Arra
     }
 }
 
-// === @Target / @Repeatable walk ===========================================
-
 /// Whether a property declaration is a class member or top-level; drives
 /// the target description in `WRONG_ANNOTATION_TARGET` messages.
 const PropContainer = enum { TopLevel, Member };
@@ -2349,10 +2326,9 @@ fn annotationWalkClass(self: *Checker, meta: *const std.StringHashMap(Annotation
     for (c.members) |*m| try annotationWalkDecl(self, meta, m, .Member);
 }
 
-/// Backing-field presence as target assignment sees it: an explicit
-/// `field` clause always supplies one; a delegated / abstract / expect
-/// property never has one; otherwise the accessor-shape rule
-/// (`propertyHasBackingField`) decides.
+/// Backing-field presence as target assignment sees it: an explicit `field`
+/// clause always supplies one, a delegated, abstract or expect property never
+/// has one, and otherwise `propertyHasBackingField` decides.
 fn annotationShapeHasBackingField(p: *const Property) bool {
     if (p.delegate != null or p.is_abstract or p.is_expect) return false;
     if (p.explicit_field != null) return true;
@@ -2373,9 +2349,9 @@ fn annotationCheckSet(
     try annotationCheckSetMsg(self, meta, anns, site, all_msg);
 }
 
-/// The plain (non-property-declaration) annotation-set check: `@Target`
-/// applicability against the declaration site kind, `@all:` rejection
-/// with the site-specific message, and per-site repetition.
+/// The annotation-set check for every declaration but a property: `@Target`
+/// applicability against the site kind, `@all:` rejection with the
+/// site-specific message, and per-site repetition.
 fn annotationCheckSetMsg(
     self: *Checker,
     meta: *const std.StringHashMap(AnnotationMeta),
@@ -2392,8 +2368,8 @@ fn annotationCheckSetMsg(
             try emitInapplicableAllTarget(self, all_msg, ann.span);
             continue;
         }
-        // @Target check — only when we know the annotation class and it
-        // carries a @Target list.
+        // Only checkable when the annotation class is known and carries a
+        // `@Target` list.
         if (meta.get(leaf)) |m| {
             if (m.targets) |targets| {
                 if (!targetsContain(targets, site)) {
@@ -2414,8 +2390,7 @@ fn annotationCheckSetMsg(
                 }
             }
         }
-        // @Repeatable duplicate detection — only when the annotation class is
-        // known to be non-repeatable.
+        // Only a known, non-repeatable annotation class can duplicate.
         if (counts.get(leaf)) |prev_span| {
             if (meta.get(leaf)) |m| {
                 if (!m.repeatable) {
@@ -2457,8 +2432,8 @@ pub fn emitInapplicableAllTarget(self: *Checker, what: []const u8, sp: Span) All
 
 const at = ast.annotation_targets;
 
-/// Convert a declared `@Target` list into the use-site target set U(A).
-/// `null` targets (no `@Target` on the class) admit everything but `file`.
+/// Convert a declared `@Target` list into its use-site target set. Null
+/// targets, meaning no `@Target` on the class, admit everything but `file`.
 fn useSiteSetFor(targets: ?[]const AnnotationTarget) at.UseSiteSet {
     const list = targets orelse return at.UseSiteSet.no_target;
     var u = at.UseSiteSet{};
@@ -2483,8 +2458,8 @@ fn useSiteSetFor(targets: ?[]const AnnotationTarget) at.UseSiteSet {
     return u;
 }
 
-/// kotlinc's lowercase target description, used in the applicable-targets
-/// tail of `WRONG_ANNOTATION_TARGET` messages.
+/// Lowercase target description for the applicable-targets tail of a
+/// wrong-target message.
 fn targetDescription(t: AnnotationTarget) []const u8 {
     return switch (t) {
         .Class => "class",
@@ -2515,8 +2490,8 @@ fn joinTargetDescriptions(a: Allocator, targets: []const AnnotationTarget) Alloc
     return buf.toOwnedSlice(a);
 }
 
-/// kotlinc's description of the property declaration itself, used as the
-/// `{0}` of `WRONG_ANNOTATION_TARGET`.
+/// Description of the property declaration itself, the `{0}` of a
+/// wrong-target message.
 fn propertyTargetDescription(shape: at.PropertyShape, container: PropContainer) []const u8 {
     const member = shape.is_ctor_property or container == .Member;
     if (shape.is_delegated) {
@@ -2544,10 +2519,10 @@ fn useSiteSpelling(us: ast.AnnotationUseSite) []const u8 {
     };
 }
 
-/// Target assignment for the annotation entries of one property
-/// declaration (member, top-level, or primary-constructor `val`/`var`):
-/// `@all:` expansion, the LV 2.4 defaulting rule for target-less entries,
-/// explicit use-site applicability, and per-anchor repetition.
+/// Target assignment for the annotation entries of one property declaration,
+/// member, top-level or primary-constructor: `@all:` expansion, Kotlin 2.4's
+/// defaulting rule for target-less entries, explicit use-site applicability,
+/// and per-anchor repetition.
 fn checkPropertyAnnotationSet(
     self: *Checker,
     meta: *const std.StringHashMap(AnnotationMeta),
@@ -2632,8 +2607,8 @@ fn checkPropertyAnnotationSet(
             if (placement.isEmpty()) {
                 // Nothing to default to: the entry stays on the property
                 // declaration, where plain target checking rejects an
-                // annotation that cannot target a property. Only known
-                // classes with an explicit @Target can fail here.
+                // annotation that cannot target a property. Only a known
+                // class with an explicit `@Target` can fail here.
                 if (known_targets) |targets| {
                     const list = try joinTargetDescriptions(a, targets);
                     const msg = try std.fmt.allocPrint(
@@ -2650,9 +2625,9 @@ fn checkPropertyAnnotationSet(
             }
         }
 
-        // Per-anchor repetition: a non-repeatable annotation may reach a
-        // given anchor only once, whatever mix of `@all:` / explicit /
-        // defaulted entries put it there.
+        // A non-repeatable annotation may reach a given anchor only once,
+        // whatever mix of `@all:`, explicit and defaulted entries put it
+        // there.
         var repeated: ?Span = null;
         inline for (anchor_fields, 0..) |fname, i| {
             if (@field(placement, fname)) {
@@ -2676,8 +2651,6 @@ fn checkPropertyAnnotationSet(
         }
     }
 }
-
-// === opt-in collectors ====================================================
 
 fn parseRequiresOptIn(allocator: Allocator, anns: []const Annotation) Allocator.Error!?OptInMarker {
     for (anns) |*a| {
@@ -3057,8 +3030,6 @@ fn emitOptInAt(
     return emitted;
 }
 
-// === deprecation collectors ===============================================
-
 fn parseDeprecation(allocator: Allocator, anns: []const Annotation) Allocator.Error!?DeprecationInfo {
     for (anns) |*a| {
         const leaf = if (a.path.len > 0) a.path[a.path.len - 1].name else "";
@@ -3113,9 +3084,8 @@ fn extractDeprecationLevel(e: *const Expr) ?DeprecationLevel {
     return null;
 }
 
-/// Concatenate the Text parts of a pure-text string-literal template into
-/// an owned string. Returns null when any non-Text (interpolated) part is
-/// present.
+/// Concatenate the Text parts of a pure-text string template into an owned
+/// string, or null when any interpolated part is present.
 fn extractStringLiteral(allocator: Allocator, e: *const Expr) Allocator.Error!?[]const u8 {
     if (e.* == .StringTemplate) {
         const parts = e.StringTemplate.parts;
@@ -3275,8 +3245,8 @@ fn walkExprForDeprecation(
             }
         },
         .Call => |c| {
-            // Recurse into the callee unless it's a bare-name reference to a
-            // deprecated symbol — we emit once for the call as a whole using
+            // Recurse into the callee unless it is a bare-name reference to a
+            // deprecated symbol, which reports once for the whole call under
             // the call's span.
             var emitted_at_call = false;
             if (c.callee.* == .Path) {
@@ -3402,12 +3372,8 @@ fn emitDeprecationAt(
     }
 }
 
-// ============================================================================
-// Small local helpers.
-// ============================================================================
-
-/// `EnumClass.ENTRY` head names that resolve to a builtin primitive
-/// companion (constants like `Long.MAX_VALUE`, `Int.MIN_VALUE`, …).
+/// `EnumClass.ENTRY` head names resolving to a builtin primitive companion,
+/// as in `Long.MAX_VALUE` or `Int.MIN_VALUE`.
 fn isPrimitiveCompanionHead(name: []const u8) bool {
     const names = [_][]const u8{
         "Int",    "Long",  "Short",  "Byte",
@@ -3468,9 +3434,7 @@ fn cloneStringSet(allocator: Allocator, src: *const std.StringHashMap(void)) All
     return out;
 }
 
-// ============================================================================
-// Tarjan's strongly-connected-components over an adjacency list.
-// ============================================================================
+// Tarjan's strongly-connected components over an adjacency list.
 
 const TarjanScc = struct {
     allocator: Allocator,

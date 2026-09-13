@@ -1,5 +1,4 @@
-//! Visibility / access checks (T0031, T0032, T0068, …). Free functions
-//! over `*Checker`.
+//! Visibility and access checks. Free functions over `*Checker`.
 
 const std = @import("std");
 
@@ -34,8 +33,8 @@ const OverloadPair = struct {
     name: []const u8,
 };
 
-/// Walk a class's supertype chain in `classes` looking for `sup`. Returns
-/// false when `sub == sup` (an identity is not a strict subtype here).
+/// Walk a class's supertype chain for `sup`. False when `sub == sup`: an
+/// identity is not a strict subtype here.
 fn isSubtypeOf(self: *const Checker, sub: []const u8, sup: []const u8) bool {
     if (std.mem.eql(u8, sub, sup)) {
         return false;
@@ -66,7 +65,6 @@ fn isSubtypeOf(self: *const Checker, sub: []const u8, sup: []const u8) bool {
     return false;
 }
 
-/// Look up the most recent binding for `name` across the frame stack.
 fn lookup(self: *const Checker, name: []const u8) ?*const root.Binding {
     var i: usize = self.frames.items.len;
     while (i > 0) {
@@ -85,18 +83,16 @@ fn sliceContains(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Check a member / reference access at `e` against the declaring scope's
-/// visibility. No-op placeholder retained so the phase driver keeps a
-/// uniform entry point; the per-site checks below are invoked directly by
-/// the expression / declaration phases.
+/// Phase-driver entry point for access checks. The per-site checks below are
+/// invoked directly by the expression and declaration phases.
 pub fn checkVisibility(self: *Checker, e: *const Expr) Allocator.Error!void {
     _ = self;
     _ = e;
 }
 
-/// Look up the effective visibility a class declares for a member.
-/// Walks the supertype chain so inherited members are seen with the
-/// declaring class's annotation. Returns `(visibility, declaring_class)`.
+/// The effective visibility a class declares for a member, with the class
+/// that declares it. Walks the supertype chain so an inherited member is seen
+/// with its declaring class's annotation.
 pub fn lookupMemberVisibility(
     self: *const Checker,
     class: []const u8,
@@ -130,10 +126,9 @@ pub fn lookupMemberVisibility(
     return null;
 }
 
-/// `protected` access through a receiver is allowed only when (a) the
-/// current enclosing class is the declaring class or a subclass, AND
-/// (b) the receiver's static class is the current enclosing class or
-/// a subclass of it. Matches kotlinc's qualified-access rule.
+/// Kotlin allows `protected` access through a receiver only when the
+/// enclosing class is the declaring class or a subclass of it, and the
+/// receiver's static class is the enclosing class or a subclass of that.
 pub fn protectedAccessAllowed(
     self: *const Checker,
     declaring_class: []const u8,
@@ -155,9 +150,9 @@ pub fn protectedAccessAllowed(
         isSubtypeOf(self, rc, declaring_class);
 }
 
-/// Emit T0031 when access at `member_span` to `name` on `declaring_class`
-/// is forbidden by visibility. `recv_class` is the receiver's static
-/// user-class when known, used for the `protected` qualified-access rule.
+/// Diagnose access at `member_span` to `name` on `declaring_class` when
+/// visibility forbids it. `recv_class` is the receiver's static user class
+/// when known, which the `protected` qualified-access rule needs.
 pub fn checkMemberVisibility(
     self: *Checker,
     declaring_class: []const u8,
@@ -194,19 +189,17 @@ pub fn checkMemberVisibility(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// Constructor / class-as-reference visibility. `private` top-level
-/// class is reachable only from inside its file; `protected` at the
-/// top level is illegal in Kotlin and we conservatively treat it the
-/// same as `private`.
+/// Constructor and class-as-reference visibility. A `private` top-level class
+/// is reachable only from its own file; top-level `protected` is illegal in
+/// Kotlin and is treated the same as `private`.
 pub fn checkClassUseVisibility(
     self: *Checker,
     name: []const u8,
     info: *const ClassInfo,
     use_span: Span,
 ) Allocator.Error!void {
-    // A per-primary-ctor visibility (`class Foo private constructor(...)`)
-    // gates constructor invocations independently of the class visibility
-    // itself.
+    // `class Foo private constructor(...)` gates constructor invocations
+    // independently of the class's own visibility.
     const same_file = info.decl_file == null or info.decl_file.? == use_span.file;
     if (info.primary_ctor_visibility) |pcv| {
         if (pcv == .Private and !same_file) {
@@ -245,8 +238,8 @@ pub fn checkClassUseVisibility(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// When inside the body of a `public inline` function, references to an
-/// `internal` top-level declaration require `@PublishedApi`.
+/// Inside a `public inline` body, a reference to an `internal` top-level
+/// declaration requires `@PublishedApi`.
 pub fn checkPublishedApiUse(
     self: *Checker,
     name: []const u8,
@@ -275,9 +268,8 @@ pub fn checkPublishedApiUse(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// Emit T0031/T0032 when a bare-name reference resolves to a `private`
-/// top-level fn / property declared in another file. `decl_file` is the
-/// file of the declaration; `use_span` carries the access site's file.
+/// Diagnose a bare-name reference resolving to a `private` top-level function
+/// or property declared in another file.
 pub fn checkTopLevelVisibility(
     self: *Checker,
     name: []const u8,
@@ -289,8 +281,8 @@ pub fn checkTopLevelVisibility(
         .Public, .Internal => return,
         else => {},
     }
-    // Top-level `protected` is illegal in Kotlin; until we surface a
-    // dedicated diagnostic, treat it as `private` and gate by file.
+    // Top-level `protected` is illegal in Kotlin and is gated by file the
+    // same way `private` is.
     if (use_span.file == decl_file) {
         return;
     }
@@ -304,11 +296,10 @@ pub fn checkTopLevelVisibility(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// Walk a class's supertype chain looking for a member by simple name.
-/// Returns the declared `Type` plus the user-class name when the
-/// declared type names a user class (drives `expr_class` propagation
-/// through chains like `foo.bar.baz`). The returned `Type` is cloned and
-/// owned by `allocator`.
+/// Walk a class's supertype chain for a member by simple name, returning its
+/// declared `Type` with the user-class name when the type names one, which
+/// carries `expr_class` through a `foo.bar.baz` chain. The `Type` is cloned
+/// onto `allocator`.
 pub fn lookupMemberThroughChain(
     self: *const Checker,
     allocator: Allocator,
@@ -341,10 +332,8 @@ pub fn lookupMemberThroughChain(
     return null;
 }
 
-/// Probe whether a member named `name` is reachable through `class`'s
-/// supertype chain, without cloning the member type. Mirrors the
-/// `lookup_member_through_chain(..).is_some()` uses in the DSL / super
-/// checks below.
+/// Whether a member named `name` is reachable through `class`'s supertype
+/// chain, without cloning the member type.
 fn memberReachable(self: *const Checker, class: []const u8, name: []const u8) Allocator.Error!bool {
     var seen = std.StringHashMap(void).init(self.allocator);
     defer seen.deinit();
@@ -371,10 +360,9 @@ fn memberReachable(self: *const Checker, class: []const u8, name: []const u8) Al
     return false;
 }
 
-/// A bare member reference inside nested DSL lambdas must resolve against
-/// the innermost implicit receiver whenever any closer receiver shares a
-/// dsl marker with the receiver that actually owns the member. Emits
-/// T0113 at `member_span` otherwise.
+/// A bare member reference inside nested DSL lambdas must resolve against the
+/// innermost implicit receiver whenever a closer receiver shares a dsl marker
+/// with the one that owns the member.
 pub fn enforceDslScopeForMember(self: *Checker, name: []const u8, member_span: Span) Allocator.Error!void {
     const stack = self.dsl_receiver_stack.items;
     if (stack.len < 2) {
@@ -463,7 +451,7 @@ pub fn enforceDslScopeForQualifiedThis(
     try self.diagnostics.emit(self.allocator, d);
 }
 
-/// True when `markers` contains any key that also appears in `against`.
+/// True when the two marker sets share a key.
 fn markersIntersect(markers: *const std.StringHashMap(void), against: *const std.StringHashMap(void)) bool {
     var it = markers.keyIterator();
     while (it.next()) |k| {
@@ -472,10 +460,9 @@ fn markersIntersect(markers: *const std.StringHashMap(void), against: *const std
     return false;
 }
 
-/// `a name b` (`is_infix == true`) must resolve to a function declared
-/// with the `infix` modifier. Walks top-level fns, the lhs's class
-/// members, and extension functions visible on the lhs's class chain;
-/// emits T0029 when no candidate has the modifier set.
+/// An `a name b` call must resolve to a function declared `infix`. Walks
+/// top-level functions, the lhs class's members, and the extensions visible on
+/// its class chain, reporting when no candidate carries the modifier.
 pub fn checkInfixModifier(self: *Checker, callee: *const Expr, args: []const Expr, call_span: Span) Allocator.Error!void {
     const segments = switch (callee.*) {
         .Path => |p| p.segments,
@@ -583,12 +570,10 @@ pub fn checkInfixModifier(self: *Checker, callee: *const Expr, args: []const Exp
     }
 }
 
-/// Walk every (f, g) declared in the same scope at the same c-level
-/// partition. The phantom call site is fully-specified (every parameter
-/// supplied, no defaults used), so we only consider pairs of equal arity.
-/// If neither dominates the other on the pairwise MSC test and the case-3
-/// tiebreakers also fail to pick a winner, the pair is a compile-time
-/// conflict.
+/// Compare every pair of same-scope declarations against a fully-specified
+/// phantom call site, where no default is used, so only equal arities can
+/// clash. A pair conflicts when neither dominates the other on the pairwise
+/// most-specific test and the tiebreakers below also pick no winner.
 pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
     var pairs: std.ArrayList(OverloadPair) = .empty;
     defer pairs.deinit(self.allocator);
@@ -608,8 +593,8 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
                 if (a.params.len != b.params.len) {
                     continue;
                 }
-                // Two packages may each declare the same signature —
-                // kotlinc's conflicting-overloads domain is one package.
+                // The conflicting-overloads domain is one package, so two
+                // packages may each declare the same signature.
                 if (!sameDeclPackage(self, a.decl_span, b.decl_span)) {
                     continue;
                 }
@@ -619,8 +604,7 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
                 if (!(a_ge_b and b_ge_a)) {
                     continue;
                 }
-                // Case 3 tiebreakers: non-parameterized, fewer defaults,
-                // no-vararg.
+                // Tiebreakers: non-parameterized, fewer defaults, no vararg.
                 if ((a.type_param_count == 0) != (b.type_param_count == 0)) {
                     continue;
                 }
@@ -634,10 +618,11 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
                 if (a_va != b_va) {
                     continue;
                 }
-                // Context parameters are part of the signature: two overloads
-                // whose context type-sets differ do NOT conflict. When one is
-                // applicable whenever the other is (one has a subset of the
-                // other's contexts), the more-constrained one is shadowed.
+                // Context parameters are part of the signature, so two
+                // overloads with different context type-sets do not conflict.
+                // When one's contexts are a subset of the other's it is
+                // applicable wherever the other is, shadowing the more
+                // constrained one.
                 if (!contextTypesEqual(a.context_types, b.context_types)) {
                     const more: ?Span = if (contextSubset(b.context_types, a.context_types))
                         a.decl_span
@@ -672,9 +657,8 @@ pub fn checkConflictingOverloads(self: *Checker) Allocator.Error!void {
     }
 }
 
-/// Whether two declaration sites live in the same package, judged by
-/// their files' package headers (the multi-file entry point records one
-/// package per FileId; a missing entry is the root package).
+/// Whether two declaration sites live in the same package, judged by their
+/// files' package headers. A file with no recorded entry is the root package.
 fn sameDeclPackage(self: *Checker, a: ?Span, b: ?Span) bool {
     const sa = a orelse return true;
     const sb = b orelse return true;
@@ -683,15 +667,14 @@ fn sameDeclPackage(self: *Checker, a: ?Span, b: ?Span) bool {
     return std.mem.eql(u8, pa, pb);
 }
 
-/// Do two context type-lists denote the same multiset of types?
+/// Whether two context type-lists denote the same multiset of types.
 fn contextTypesEqual(a: []const []const u8, b: []const []const u8) bool {
     if (a.len != b.len) return false;
     return contextSubset(a, b) and contextSubset(b, a);
 }
 
-/// Is every type in `sub` also present in `sup` (multiset-ish membership)?
-/// Used to detect when one contextual overload is applicable whenever
-/// another is.
+/// Whether every type in `sub` also appears in `sup`, which is how one
+/// contextual overload is found applicable wherever another is.
 fn contextSubset(sub: []const []const u8, sup: []const []const u8) bool {
     outer: for (sub) |s| {
         for (sup) |t| {
@@ -717,10 +700,9 @@ fn anyTrue(flags: []const bool) bool {
     return false;
 }
 
-/// A compound assignment `A op= B` is ambiguous when the LHS receiver's
-/// class declares *both* the `op` binary operator (`plus` / `minus` /
-/// `times` / `div` / `rem`) and the matching `opAssign` form
-/// (`plusAssign` / …). Emits T0079.
+/// A compound assignment `A op= B` is ambiguous when the LHS receiver's class
+/// declares both the binary operator (`plus`, `minus`, `times`, `div`, `rem`)
+/// and the matching `opAssign` form.
 pub fn checkCompoundAssignAmbiguity(
     self: *Checker,
     target: *const Expr,
@@ -761,7 +743,7 @@ pub fn checkCompoundAssignAmbiguity(
 }
 
 /// `super<Q>.f(...)` requires `Q` to be an immediate supertype of the
-/// enclosing class. Emits T0073 otherwise.
+/// enclosing class.
 pub fn checkSuperQualifier(self: *Checker, qualifier: *const TypeRef, super_span: Span) Allocator.Error!void {
     if (self.class_stack.items.len == 0) {
         return;
@@ -788,9 +770,9 @@ pub fn checkSuperQualifier(self: *Checker, qualifier: *const TypeRef, super_span
     }
 }
 
-/// Basic super-form: walk the enclosing class's direct supertypes and emit
-/// T0093 when two or more contribute a member named `name`. The diagnostic
-/// encourages disambiguation via `super<TypeName>.name(...)`.
+/// Unqualified `super.name`: report when two or more of the enclosing class's
+/// direct supertypes contribute a member named `name`, which the caller must
+/// disambiguate with `super<TypeName>.name(...)`.
 pub fn checkAmbiguousSuper(self: *Checker, name: []const u8, super_span: Span) Allocator.Error!void {
     if (self.class_stack.items.len == 0) {
         return;
