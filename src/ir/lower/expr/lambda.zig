@@ -1894,7 +1894,7 @@ const CallableRefArgShapes = struct {
     shapes: []applicability.ArgShape,
     owned_types: []TypeRef = &.{},
 
-    fn deinit(self: *@This(), allocator: Allocator) void {
+    pub fn deinit(self: *@This(), allocator: Allocator) void {
         for (self.owned_types) |*ty| ty.deinit(allocator);
         if (self.owned_types.len != 0) allocator.free(self.owned_types);
         allocator.free(self.shapes);

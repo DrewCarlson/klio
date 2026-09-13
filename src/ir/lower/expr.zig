@@ -217,26 +217,15 @@ pub const orEmitAudit = audit_mod.orEmitAudit;
 pub const setResolveStrictForTest = audit_mod.setResolveStrictForTest;
 pub const resetResolveStrictForTest = audit_mod.resetResolveStrictForTest;
 const refAudit = audit_mod.refAudit;
-pub const lm_sites = audit_mod.lm_sites;
-pub const lm_eager_norecv = audit_mod.lm_eager_norecv;
 pub const LmReason = audit_mod.LmReason;
-pub const lm_norecv = audit_mod.lm_norecv;
-pub const lm_norecv_eager = audit_mod.lm_norecv_eager;
 pub const NoRecvPath = audit_mod.NoRecvPath;
-pub const lm_norecv_path = audit_mod.lm_norecv_path;
 pub const NoRecvInit = audit_mod.NoRecvInit;
-pub const lm_norecv_init = audit_mod.lm_norecv_init;
 pub const NoRecvCall = audit_mod.NoRecvCall;
-pub const lm_norecv_call = audit_mod.lm_norecv_call;
 pub const DeclineKind = audit_mod.DeclineKind;
-pub const lm_decline = audit_mod.lm_decline;
 pub const PromoBlock = audit_mod.PromoBlock;
-pub const lm_promo = audit_mod.lm_promo;
-pub const lm_localinit = audit_mod.lm_localinit;
 pub const lowerLocalInitDump = audit_mod.lowerLocalInitDump;
 pub const lowerPromoDump = audit_mod.lowerPromoDump;
 pub const NoClassKind = audit_mod.NoClassKind;
-pub const lm_noclass = audit_mod.lm_noclass;
 pub const lowerNoClassDump = audit_mod.lowerNoClassDump;
 pub const lowerDeclineDump = audit_mod.lowerDeclineDump;
 pub const lowerNoRecvDump = audit_mod.lowerNoRecvDump;
@@ -263,7 +252,6 @@ pub const applyExpectedLiteralKinds = expected_mod.applyExpectedLiteralKinds;
 pub const applyExpectedLiteralKindsToArgs = expected_mod.applyExpectedLiteralKindsToArgs;
 
 const member_call_mod = @import("expr/member_call.zig");
-pub const ext_route_tag = member_call_mod.ext_route_tag;
 
 const block_mod = @import("expr/block.zig");
 pub const lowerBlock = block_mod.lowerBlock;
@@ -1306,6 +1294,5 @@ const testing = std.testing;
 
 test {
     testing.refAllDecls(@This());
-    _ = tests_shapes_mod;
-    _ = tests_dispatch_mod;
+    inline for (.{ receiver_mod, binary_mod, paths_mod, member_mod, control_mod, lambda_mod, compose_mod, call_mod, emit_mod, call_general_mod, inline_target_mod, local_call_mod, arg_shape_mod, static_type_mod, type_probe_mod, bare_call_mod, probe_mod, audit_mod, refs_mod, expected_mod, member_call_mod, block_mod, tests_shapes_mod, tests_dispatch_mod }) |m| testing.refAllDecls(m);
 }

@@ -213,7 +213,7 @@ pub const SelectedCallArgs = struct {
     owned_names: ?[]?[]const u8 = null,
     owned_composer_path: ?[]ast.Ident = null,
 
-    fn deinit(self: *SelectedCallArgs, allocator: Allocator) void {
+    pub fn deinit(self: *SelectedCallArgs, allocator: Allocator) void {
         if (self.owned_args) |items| allocator.free(items);
         if (self.owned_names) |items| allocator.free(items);
         if (self.owned_composer_path) |items| allocator.free(items);
