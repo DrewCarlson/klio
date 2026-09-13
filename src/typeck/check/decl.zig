@@ -979,6 +979,53 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     try self.type_params_in_scope.append(self.allocator, class_tps);
     try self.reified_type_params.append(self.allocator, std.StringHashMap(void).init(self.allocator));
     try checkCircularBounds(self, c.type_params, c.where_bounds);
+    try checkDataOrEnumFinality(self, c);
+    try checkSecondaryCtorDelegationCycles(self, c);
+    try checkDataClassPrimaryProperties(self, c);
+    try checkDataClassGeneratedMembers(self, c);
+    try checkEnumFinalMemberOverrides(self, c);
+    try checkThrowableTypeParams(self, c);
+    try checkMemberPrivateModifiers(self, c);
+    // Supertype validity.
+    try checkSupertypeValidity(self, c.name.name, c.supertypes);
+    var inherited = try inheritedMemberFlags(self, c);
+    defer inherited.deinit();
+    try checkOverridePresence(self, c, &inherited);
+    try checkOverrideSignatures(self, c, &inherited);
+    try checkAbstractMembersImplemented(self, c);
+    try checkDiamondInheritance(self, c);
+    try checkPropertyDeclarationRules(self, c);
+
+    try pushFrame(self);
+    try bindPrimaryConstructorParams(self, c);
+    // Body properties bind in declaration order.
+    var uninitialized_properties: std.ArrayList(UninitProperty) = .empty;
+    defer uninitialized_properties.deinit(self.allocator);
+    try checkBodyProperties(self, c, &uninitialized_properties);
+    try checkSupertypeDelegation(self, c);
+    // Covers property initializers and init blocks.
+    const init_cfg_span = try lowerClassInitFlow(self, c);
+    try checkPropertiesDefinitelyAssigned(self, c, &uninitialized_properties, init_cfg_span);
+    for (c.secondary_ctors) |*sc| try checkSecondaryCtor(self, sc);
+    for (c.members) |*m| {
+        if (m.* == .Function) try checkFunction(self, &m.Function);
+    }
+    for (c.enum_entries) |*entry| try checkEnumEntry(self, entry);
+    popFrame(self);
+    _ = self.class_stack.pop();
+    {
+        var s = self.type_params_in_scope.pop().?;
+        s.deinit();
+    }
+    {
+        var s = self.reified_type_params.pop().?;
+        s.deinit();
+    }
+}
+
+const UninitProperty = struct { name: []const u8, sp: Span, explicit_field: bool };
+
+fn checkDataOrEnumFinality(self: *Checker, c: *const Class) Allocator.Error!void {
     // Data, enum and annotation classes are always closed.
     if (c.is_data or c.is_enum) {
         const kind = if (c.is_data) "data" else "enum";
@@ -994,6 +1041,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
+}
+
+fn checkSecondaryCtorDelegationCycles(self: *Checker, c: *const Class) Allocator.Error!void {
     // Secondary-constructor delegation must not form a cycle.
     if (c.secondary_ctors.len != 0) {
         const n = c.secondary_ctors.len;
@@ -1042,6 +1092,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
+}
+
+fn checkDataClassPrimaryProperties(self: *Checker, c: *const Class) Allocator.Error!void {
     // `data class` shape.
     if (c.is_data) {
         var n_props: usize = 0;
@@ -1059,6 +1112,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
+}
+
+fn checkDataClassGeneratedMembers(self: *Checker, c: *const Class) Allocator.Error!void {
     // A `data class` cannot declare its own `copy` or `componentN`.
     if (c.is_data) {
         var n_props: usize = 0;
@@ -1085,6 +1141,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
+}
+
+fn checkEnumFinalMemberOverrides(self: *Checker, c: *const Class) Allocator.Error!void {
     // `kotlin.Enum<T>` declares `equals`, `hashCode` and `compareTo` final;
     // `toString` stays overridable.
     if (c.is_enum) {
@@ -1099,11 +1158,17 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
+}
+
+fn checkThrowableTypeParams(self: *Checker, c: *const Class) Allocator.Error!void {
     // A subtype of `kotlin.Throwable` cannot declare type parameters.
     if (c.type_params.len != 0 and try isThrowableSubtype(self, c)) {
         const msg = try std.fmt.allocPrint(self.allocator, "Subclasses of `kotlin.Throwable` cannot declare type parameters; `{s}` does", .{c.name.name});
         try emitError(self, msg, c.name.span, codes.TYPE_THROWABLE_TYPE_PARAMS);
     }
+}
+
+fn checkMemberPrivateModifiers(self: *Checker, c: *const Class) Allocator.Error!void {
     // On a member declaration `private` excludes `open`, `abstract` and
     // `override`.
     for (c.members) |*m| {
@@ -1121,16 +1186,20 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             else => {},
         }
     }
-    // Supertype validity.
-    try checkSupertypeValidity(self, c.name.name, c.supertypes);
-    // Reported as warnings.
+}
+
+/// Inherited member flags, with `invoke` injected for function-type supertypes.
+fn inheritedMemberFlags(self: *Checker, c: *const Class) Allocator.Error!std.StringHashMap(MemberFlags) {
     var inherited = try collectInheritedMemberFlags(self, c);
-    defer inherited.deinit();
-    {
-        var sigs_tmp = std.StringHashMap(MemberSig).init(self.allocator);
-        defer sigs_tmp.deinit();
-        try injectFunctionTypeSupertypes(self, c, &inherited, &sigs_tmp);
-    }
+    errdefer inherited.deinit();
+    var sigs_tmp = std.StringHashMap(MemberSig).init(self.allocator);
+    defer sigs_tmp.deinit();
+    try injectFunctionTypeSupertypes(self, c, &inherited, &sigs_tmp);
+    return inherited;
+}
+
+/// `override` is present exactly where a supertype member requires it.
+fn checkOverridePresence(self: *Checker, c: *const Class, inherited: *const std.StringHashMap(MemberFlags)) Allocator.Error!void {
     // An unseen supertype may legitimately declare the overridden member.
     var has_opaque_supertype = false;
     for (c.supertypes) |*s| {
@@ -1189,10 +1258,14 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
+}
+
+/// An override's signature, type and visibility conform to the overridden member.
+fn checkOverrideSignatures(self: *Checker, c: *const Class, inherited: *std.StringHashMap(MemberFlags)) Allocator.Error!void {
     // Override-rule diagnostics.
     var inherited_sigs = try collectInheritedMemberSigs(self, c);
     defer deinitMemberSigMap(self, &inherited_sigs);
-    try injectFunctionTypeSupertypes(self, c, &inherited, &inherited_sigs);
+    try injectFunctionTypeSupertypes(self, c, inherited, &inherited_sigs);
     for (c.members) |*m| {
         switch (m.*) {
             .Function => |*f| {
@@ -1255,6 +1328,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             else => {},
         }
     }
+}
+
+fn checkAbstractMembersImplemented(self: *Checker, c: *const Class) Allocator.Error!void {
     // A concrete class must implement every abstract member.
     if (!c.is_abstract and !c.is_interface) {
         var required: std.ArrayList([]const u8) = .empty;
@@ -1287,7 +1363,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
+}
 
+fn checkDiamondInheritance(self: *Checker, c: *const Class) Allocator.Error!void {
     // Diamond inheritance.
     if (!c.is_interface) {
         var providers = try collectDefaultProviders(self, c);
@@ -1336,7 +1414,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             try emitError(self, msg, c.name.span, codes.TYPE_DIAMOND_CONFLICT);
         }
     }
+}
 
+fn checkPropertyDeclarationRules(self: *Checker, c: *const Class) Allocator.Error!void {
     // `lateinit` rules.
     for (c.members) |*m| {
         if (m.* == .Property) try checkLateinit(self, m.Property);
@@ -1349,8 +1429,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
     for (c.members) |*m| {
         if (m.* == .Property) try checkAccessorReturnTypes(self, m.Property);
     }
+}
 
-    try pushFrame(self);
+fn bindPrimaryConstructorParams(self: *Checker, c: *const Class) Allocator.Error!void {
     for (c.primary_params) |*p| {
         const ty = try convertTypeRefLossy(self.allocator, &p.ty);
         const cn = classNameFromTyperef(&p.ty);
@@ -1369,9 +1450,10 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             try checkAssignable(self, &dty, &want, default.span());
         }
     }
-    // Body properties bind in declaration order.
-    var uninitialized_properties: std.ArrayList(struct { name: []const u8, sp: Span, explicit_field: bool }) = .empty;
-    defer uninitialized_properties.deinit(self.allocator);
+}
+
+/// Body property initializers and accessors; collects the ones left unassigned.
+fn checkBodyProperties(self: *Checker, c: *const Class, uninitialized_properties: *std.ArrayList(UninitProperty)) Allocator.Error!void {
     for (c.members) |*m| {
         if (m.* != .Property) continue;
         const p = m.Property;
@@ -1422,6 +1504,9 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         }
         try handleAccessors(self, p);
     }
+}
+
+fn checkSupertypeDelegation(self: *Checker, c: *const Class) Allocator.Error!void {
     // Inheritance-delegation diagnostics.
     for (c.supertypes, 0..) |*s, i| {
         if (i >= c.supertype_delegates.len) continue;
@@ -1445,7 +1530,10 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
             }
         }
     }
-    // Covers property initializers and init blocks.
+}
+
+/// Lowers the synthesized initializer body and checks the `init` blocks against it.
+fn lowerClassInitFlow(self: *Checker, c: *const Class) Allocator.Error!Span {
     const init_cfg_span = c.name.span;
     var init_body = try synthesizeClassInitBody(self, c);
     var init_lowered = try cfa.lower.lowerFunction(self.allocator, &init_body, init_cfg_span);
@@ -1460,6 +1548,10 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
         bty.deinit(self.allocator);
     }
     _ = self.cfg_fn_stack.pop();
+    return init_cfg_span;
+}
+
+fn checkPropertiesDefinitelyAssigned(self: *Checker, c: *const Class, uninitialized_properties: *const std.ArrayList(UninitProperty), init_cfg_span: Span) Allocator.Error!void {
     // Each must be definitely assigned by the end of initialization.
     if (c.secondary_ctors.len != 0) {
         // Secondary-constructor flow runs its own path.
@@ -1480,21 +1572,6 @@ pub fn checkClass(self: *Checker, c: *const Class) Allocator.Error!void {
                 }
             }
         }
-    }
-    for (c.secondary_ctors) |*sc| try checkSecondaryCtor(self, sc);
-    for (c.members) |*m| {
-        if (m.* == .Function) try checkFunction(self, &m.Function);
-    }
-    for (c.enum_entries) |*entry| try checkEnumEntry(self, entry);
-    popFrame(self);
-    _ = self.class_stack.pop();
-    {
-        var s = self.type_params_in_scope.pop().?;
-        s.deinit();
-    }
-    {
-        var s = self.reified_type_params.pop().?;
-        s.deinit();
     }
 }
 
