@@ -179,35 +179,31 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     if (!f.hasBody() or f.blocks.len == 0) return no(f, "no body");
     if (f.n_locals == 0) return no(f, "no locals");
 
-    // The declared return type is a starting point: an unannotated declaration carries a
-    // placeholder, so the returned register decides, and the declaration settles the Unit case.
-    const ret = funcRetTy2(m, f) orelse Ty.unit;
-    for (params) |p| {
-        // A parameter naming nothing the module declares is an erased reference, not a refusal.
-        _ = p;
-    }
+    // Every allocation below is handed to the returned `Compiled`, or freed here.
+    // Refusal returns null rather than an error, so `errdefer` would not fire.
+    var committed = false;
 
     const types = try gpa.alloc(Ty, f.n_locals);
-    errdefer gpa.free(types);
+    defer if (!committed) gpa.free(types);
     @memset(types, .unit);
     const cls = try gpa.alloc(?u32, f.n_locals);
-    errdefer gpa.free(cls);
+    defer if (!committed) gpa.free(cls);
     @memset(cls, null);
     const elem = try gpa.alloc(Ty, f.n_locals);
-    errdefer gpa.free(elem);
+    defer if (!committed) gpa.free(elem);
     @memset(elem, .unit);
     const elem_cls = try gpa.alloc(?u32, f.n_locals);
-    errdefer gpa.free(elem_cls);
+    defer if (!committed) gpa.free(elem_cls);
     @memset(elem_cls, null);
     // The integer constant a register was JUST given; any other instruction clears the table.
     const const_at = try gpa.alloc(?i64, f.n_locals);
     defer gpa.free(const_at);
     @memset(const_at, null);
     const lam = try gpa.alloc(?LambdaInfo, f.n_locals);
-    errdefer gpa.free(lam);
+    defer if (!committed) gpa.free(lam);
     @memset(lam, null);
     const slot = try gpa.alloc(i32, f.n_locals);
-    errdefer gpa.free(slot);
+    defer if (!committed) gpa.free(slot);
     @memset(slot, -1);
     const known = try gpa.alloc(bool, f.n_locals);
     defer gpa.free(known);
@@ -216,7 +212,7 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
     // Where each bare name inside an inlined receiver body resolved. Owned by
     // the Compiled this returns; freed on refusal.
     var bare: std.AutoHashMapUnmanaged(*const ir.Inst, BareResolution) = .empty;
-    errdefer bare.deinit(gpa);
+    defer if (!committed) bare.deinit(gpa);
     // The implicit receivers in scope, innermost last: `with(x)` and `apply` splice inline.
     var encl: std.ArrayList(u32) = .empty;
     defer encl.deinit(gpa);
@@ -242,8 +238,9 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
         .encl = &encl,
     };
     if ((try walkBody(&w, order)) == .refuse) return null;
-    const shape = (try returnShape(&w, order, ret)) orelse return null;
+    const shape = (try returnShape(&w, order)) orelse return null;
     const n_slots = assignSlots(types, slot);
+    committed = true;
     return .{ .f = f, .caps = caps, .params = params, .types = types, .cls = cls, .elem = elem, .elem_cls = elem_cls, .lam = lam, .slot = slot, .n_slots = n_slots, .ret = shape.ty, .ret_cls = shape.cls, .ret_elem = shape.elem, .suspends = suspends, .bare = bare };
 }
 
@@ -2376,14 +2373,14 @@ fn callResolved(w: *Walk, inst: *const ir.Inst) Error!Step {
 }
 
 /// The result the returned registers agree on. Disagreeing returns mean no single C type.
-fn returnShape(w: *Walk, order: []const u32, declared: Ty) Error!?ReturnShape {
+fn returnShape(w: *Walk, order: []const u32) Error!?ReturnShape {
     const gpa = w.gpa;
     const f = w.f;
     const types = w.types;
     const cls = w.cls;
     const elem = w.elem;
     const known = w.known;
-    var ret = declared;
+    var ret: Ty = .unit;
     var saw_ret = false;
     var ret_cls: ?u32 = null;
     var ret_elem: Ty = .unit;

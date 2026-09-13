@@ -1070,20 +1070,12 @@ fn writeBinOp(ctx: *const Body, inst: *const ir.Inst) !void {
     if (dt == .object) {
         // Concatenation: either operand may be any value, rendered as Kotlin would render it.
         var db: [32]u8 = undefined;
-        var lb: [32]u8 = undefined;
-        var rb: [32]u8 = undefined;
-        var l1: [96]u8 = undefined;
-        var r1: [96]u8 = undefined;
         var lex: std.Io.Writer.Allocating = .init(gpa);
         defer lex.deinit();
         var rex2: std.Io.Writer.Allocating = .init(gpa);
         defer rex2.deinit();
         try renderExpr(gpa, m, prog, c, b.lhs.int(), &lex);
         try renderExpr(gpa, m, prog, c, b.rhs.int(), &rex2);
-        _ = &lb;
-        _ = &rb;
-        _ = &l1;
-        _ = &r1;
         try w.print("  {s} = klio_nat_concat({s}, {s});\n", .{
             regName(c, b.dst.int(), &db), lex.written(), rex2.written(),
         });
@@ -1162,8 +1154,8 @@ fn writeUnOp(ctx: *const Body, inst: *const ir.Inst) !void {
     switch (u.op) {
         // Negating the most negative value overflows, which Kotlin wraps and C leaves undefined.
         .Neg => if (wrapTy(t)) |ut3| {
-            try w.print("  r{d} = ({s})(0{s} - ({s})r{d});\n", .{
-                u.dst.int(), t.cName(), if (t == .i64) "u" else "u", ut3, u.operand.int(),
+            try w.print("  r{d} = ({s})(0u - ({s})r{d});\n", .{
+                u.dst.int(), t.cName(), ut3, u.operand.int(),
             });
         } else {
             try w.print("  r{d} = ({s})(-r{d});\n", .{ u.dst.int(), t.cName(), u.operand.int() });
@@ -1359,6 +1351,7 @@ fn writeArrayMemberCall(ctx: *const Body, inst: *const ir.Inst, recv: []const u8
             regName(c, cm.dst.int(), &nb), unboxExpr(c.types[cm.dst.int()], g7, &ob7),
         });
     } else {
+        std.debug.assert(std.mem.eql(u8, an2, "set") and cm.n_args == 2);
         var vb7: [32]u8 = undefined;
         var bb7: [96]u8 = undefined;
         try w.print("  klio_nat_array_set({s}, {s}, {s});\n", .{
@@ -1793,10 +1786,8 @@ fn writeCall(ctx: *const Body, inst: *const ir.Inst) !void {
     }
     if (isPrintln(callee)) {
         const a0 = call.args.int();
-        const at = c.types[a0];
-        // EVERYTHING prints through the runtime's renderer: how Kotlin renders a value is the
-        // interpreter's own code, and printf's buffered stream interleaves wrongly with it.
-        _ = at;
+        // Everything prints through the runtime's renderer: how Kotlin renders a value is
+        // the interpreter's own code, and printf's buffered stream interleaves wrongly.
         var rex: std.Io.Writer.Allocating = .init(gpa);
         defer rex.deinit();
         try renderExpr(gpa, m, prog, c, a0, &rex);
