@@ -546,7 +546,7 @@ pub const suites = [_]Config{
             .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
             .{ .dir = "kotlin-klio/klio-ktor", .artifact = "target/packs/io.ktor.klio-pack" },
         },
-        .baseline = 450,
+        .baseline = 464,
         .max_failed = 0,
         .max_incomplete = 2,
     },

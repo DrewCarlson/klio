@@ -5,7 +5,7 @@
 # prefix-matches its id, so the umbrella lets a server-only program
 # (which never imports `io.ktor.client.*`) still load the pack.
 id = "io.ktor"
-version = "3.5.1"
+version = "3.5.2"
 abi = 1
 implicit_packages = []
 source_roots = ["shim"]
@@ -71,6 +71,14 @@ root = "upstream/ktor-io/posix/src"
 include = [
     "io/ktor/utils/io/ByteChannel.posix.kt",
     "io/ktor/utils/io/charsets/CharsetNative.kt",
+]
+
+# `Source.readText` became an `expect` in 3.5.2; its non-JVM `actual` is the
+# body that used to sit in commonMain.
+[[source]]
+root = "upstream/ktor-io/nonJvm/src"
+include = [
+    "io/ktor/utils/io/core/Strings.nonJvm.kt",
 ]
 
 # Upstream `io.ktor.util` string helpers (escapeHTML / quote /
@@ -251,6 +259,8 @@ include = [
     "io/ktor/websocket/FrameCommon.kt",
     "io/ktor/websocket/FrameType.kt",
     "io/ktor/websocket/CloseReason.kt",
+    # The RFC 6455 control-frame size limits CloseReason and FrameNative check.
+    "io/ktor/websocket/ControlFrames.kt",
 ]
 [[source]]
 root = "upstream/ktor-shared/ktor-websockets/posix/src"
@@ -481,6 +491,7 @@ default = []
 sources = [
     "upstream/ktor-io/common/src/",
     "upstream/ktor-io/posix/src/",
+    "upstream/ktor-io/nonJvm/src/",
     "shim/core/io/ktor/utils/io/",
 ]
 

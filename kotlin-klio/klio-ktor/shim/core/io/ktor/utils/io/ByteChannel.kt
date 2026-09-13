@@ -2,7 +2,7 @@
  * Copyright 2014-2025 JetBrains s.r.o and contributors. Use of this source code is governed by the Apache 2.0 license.
  */
 
-// Curated copy of upstream ktor-io ByteChannel.kt (3.5.1). One change:
+// Curated copy of upstream ktor-io ByteChannel.kt (3.5.2). One change:
 // `awaitContent` rethrows the close cause when it returns short. Upstream
 // has a window where a cancel(cause) landing between the entry rethrow
 // and the sleep condition makes awaitContent return false with the cause
