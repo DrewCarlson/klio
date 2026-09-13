@@ -1,8 +1,6 @@
-//! Primary-expression parsing: literals, paths, parenthesized
-//! expressions, lambdas, string templates, `this`/`super`, callable and
-//! member references, object/anonymous-function expressions.
-//!
-//! Free functions over `*Parser`.
+//! Primary-expression parsing: literals, paths, parenthesized expressions,
+//! lambdas, string templates, `this`/`super`, callable and member references,
+//! object and anonymous-function expressions. Free functions over `*Parser`.
 
 const std = @import("std");
 
@@ -83,12 +81,10 @@ pub fn parsePrimary(p: *Parser) ?Expr {
             const tok = support.bump(p);
             return Expr{ .CharLit = .{ .value = c, .span = tok.span } };
         },
-        // Collection-literal `[a, b, ...]`. Kotlin permits this
-        // only as an annotation argument
-        // (`@Foo(imports = ["a", "b"])`); klio accepts it as a
-        // `listOf(...)` expression — annotation arguments are
-        // runtime-inert, so the representation only needs to
-        // parse and carry the elements.
+        // Collection literal `[a, b, ...]`. Kotlin permits it only as an
+        // annotation argument (`@Foo(imports = ["a", "b"])`); klio accepts it
+        // as a `listOf(...)` expression, annotation arguments being
+        // runtime-inert, so carrying the elements is enough.
         .LBracket => {
             const lb = support.bump(p);
             support.skipNl(p);
@@ -128,11 +124,10 @@ pub fn parsePrimary(p: *Parser) ?Expr {
         .StringQuote => return parseStringTemplate(p),
         .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => {
             // Annotated expression: `@Composable { ... }`,
-            // `@Suppress("UNCHECKED_CAST") (x as T)`,
-            // `@OptIn(Api::class) Flags.enabled`. The annotation prefixes
-            // an expression; it is a runtime no-op, but a function literal
-            // keeps its set so the compose pass can recognise an
-            // `@Composable { … }` bound to an untyped val.
+            // `@Suppress("UNCHECKED_CAST") (x as T)`. The annotation prefixes an
+            // expression and is a runtime no-op, but a function literal keeps
+            // its set so the compose pass recognises an `@Composable { ... }`
+            // bound to an untyped val.
             const annos = file.parseAnnotations(p);
             support.skipNl(p);
             // A `{` after the annotations is a function literal; other
@@ -148,9 +143,9 @@ pub fn parsePrimary(p: *Parser) ?Expr {
             if (control.tryParseLabelBinding(p)) |label_expr| {
                 return label_expr;
             }
-            // `context(x: A) fun (p: P): R { … }` — an anonymous function with
-            // context parameters, which its body reads from the context stack
-            // like a declared context function. A `context(...)` not followed
+            // `context(x: A) fun (p: P): R { ... }`, an anonymous function with
+            // context parameters, whose body reads them from the context stack
+            // as a declared context function does. A `context(...)` not followed
             // by `fun` is a call to a function named `context`.
             if (support.peekKeywordIdent(p, "context") and anonContextFunAhead(p)) {
                 const clause = file.parseContextClause(p);
@@ -181,11 +176,10 @@ pub fn parsePrimary(p: *Parser) ?Expr {
             return inner;
         },
         .LBrace => {
-            // A brace in expression position is always a function
-            // literal in Kotlin (there is no block-expression);
-            // `{ it + 1 }` assigned to a function-typed val is a
-            // lambda, not a block. `parseLambdaLiteral` handles
-            // the no-`->` (implicit `it` / zero-arg) form.
+            // A brace in expression position is always a function literal in
+            // Kotlin, which has no block expression: `{ it + 1 }` assigned to a
+            // function-typed val is a lambda. `parseLambdaLiteral` handles the
+            // no-`->` form with its implicit `it` or zero arguments.
             return control.parseLambdaLiteral(p);
         },
         .Keyword => |kw| switch (kw) {
@@ -215,10 +209,10 @@ pub fn parsePrimary(p: *Parser) ?Expr {
                 } };
             },
             .Object => {
-                // Anonymous object expression: `object { … }` or
-                // `object : Super(args), Iface { … }`. A named `object Foo`
-                // is a declaration, not an expression; the statement-level
-                // parser handles that form before reaching here.
+                // Anonymous object expression `object { ... }` or
+                // `object : Super(args), Iface { ... }`. A named `object Foo` is
+                // a declaration, handled by the statement-level parser before
+                // reaching here.
                 const kw_tok = support.bump(p);
                 const st = class.parseOptionalSupertypesFull(p);
                 const body = class.parseClassBody(p);
@@ -312,9 +306,9 @@ pub fn parseIntLiteral(p: *Parser, base: NumBase, suffix: IntSuffix) Expr {
         },
     }
     const cleaned = filterOut(p, digits, '_');
-    // An unsigned-suffixed literal (`u`/`uL`) ranges up to `u64::MAX`; parse the
-    // magnitude as `u64` and store its bit pattern in the `i64` value field
-    // (`kind` marks it unsigned so downstream reinterprets the bits). A signed
+    // An unsigned-suffixed literal (`u`/`uL`) ranges up to `u64` max: parse the
+    // magnitude as `u64` and store its bit pattern in the `i64` value field,
+    // `kind` marking it unsigned so downstream reinterprets the bits. A signed
     // literal stays bounded by `i64`.
     const value: i64 = blk: {
         if (suffix == .UInt or suffix == .ULong) {
@@ -382,17 +376,17 @@ pub fn parseStringTemplate(p: *Parser) ?Expr {
             },
             .StringText => |s| {
                 _ = support.bump(p);
-                // Own the text in the AST allocator: the lexer's StringText is an
-                // owned token buffer that callers free after parsing, so borrowing
-                // it would dangle once tokens are released (before lowering).
+                // Own the text in the AST allocator: the lexer's StringText is
+                // an owned token buffer freed after parsing, so a borrow would
+                // dangle once the tokens are released, before lowering.
                 const owned = p.allocator.dupe(u8, s) catch @panic("OOM in primary");
                 parts.append(p.allocator, StringPart{ .Text = owned }) catch @panic("OOM in primary");
             },
             .ShortInterp => |name| {
                 const tok = support.bump(p);
-                // Own the name in the AST allocator for the same reason as
-                // StringText below: the token's buffer is freed with the
-                // token stream, which can happen before resolution.
+                // Own the name in the AST allocator: the token's buffer is
+                // freed with the token stream, which can happen before
+                // resolution.
                 const owned_name = p.allocator.dupe(u8, name) catch @panic("OOM in primary");
                 parts.append(p.allocator, StringPart{ .ShortInterp = Ident{
                     .name = owned_name,
@@ -424,8 +418,6 @@ pub fn parseStringTemplate(p: *Parser) ?Expr {
     }
 }
 
-// ---------- small text helpers ----------
-
 /// Trim every trailing character that appears in `chars`.
 fn trimEndAny(s: []const u8, chars: []const u8) []const u8 {
     var end = s.len;
@@ -435,7 +427,7 @@ fn trimEndAny(s: []const u8, chars: []const u8) []const u8 {
     return s[0..end];
 }
 
-/// Strip a single leading `prefix` if present; matches at most once here.
+/// Strip one leading `prefix` when present.
 fn trimStartPrefix(s: []const u8, prefix: []const u8) []const u8 {
     if (std.mem.startsWith(u8, s, prefix)) {
         return s[prefix.len..];
@@ -469,9 +461,9 @@ fn filterOutChars(p: *Parser, s: []const u8, drop: []const u8) []const u8 {
     return buf[0..n];
 }
 
-/// Parse `s` as a signed 64-bit integer in `radix`, returning `null` on
-/// overflow or invalid digits. The digit text is unsigned but stored as
-/// `i64`: values up to `u64::MAX` that overflow `i64` are rejected.
+/// Parse `s` as a signed 64-bit integer in `radix`; `null` on overflow or an
+/// invalid digit. The digit text is unsigned but stored as `i64`, so a value
+/// above `i64` max is rejected.
 fn parseI64Radix(s: []const u8, radix: u8) ?i64 {
     return std.fmt.parseInt(i64, s, radix) catch null;
 }

@@ -1,25 +1,23 @@
-//! Typealias expansion over a parsed program. A `typealias` is transparent
-//! in Kotlin: wherever the alias name appears, the program means the
-//! aliased type with the alias's type parameters substituted. This pass
-//! rewrites every such reference in place, before lowering, so later phases
-//! only ever see the target:
+//! Typealias expansion over a parsed program. A `typealias` is transparent in
+//! Kotlin: wherever the alias name appears, the program means the aliased type
+//! with the alias's type parameters substituted. This pass rewrites every such
+//! reference in place, before lowering, so later phases only see the target:
 //!
 //! - type positions (declarations, `is`/`as`, type arguments, supertypes of
 //!   classes and object literals, function types, catch clauses, ...);
 //! - constructor calls `Alias(args)` / `Alias<T>(args)` / `recv.Alias(args)`
-//!   for an alias of a class, inner class, nested class or builtin such as
+//!   for an alias of a class, inner class, nested class or a builtin such as
 //!   `Array<T>`;
 //! - value positions (`Alias.member` for an alias of an object or companion);
 //! - callable references `::Alias`, `Recv::Alias`.
 //!
 //! Name resolution follows Kotlin scoping: aliases declared in an enclosing
-//! class body, then explicit imports, the file's own package (a private
-//! alias only in its own file), then star imports. The target of an alias is
+//! class body, then explicit imports, then the file's own package (a private
+//! alias only within its own file), then star imports. An alias's target is
 //! resolved in the scope of its declaration, so the rewritten reference keeps
-//! the target's own spans (its declaring file's imports govern the name).
-//! An alias name that the program also declares as a classifier, function or
-//! value anywhere is left alone: such a reference is decided by the lowering's
-//! full scope model, not here.
+//! the target's own spans and the declaring file's imports govern the name. An
+//! alias name the program also declares as a classifier, function or value is
+//! left alone: such a reference is decided by lowering's full scope model.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -139,9 +137,8 @@ fn packageOf(a: Allocator, f: *const KotlinFile) Allocator.Error![]const u8 {
     return joinIdents(a, pkg.path);
 }
 
-/// Expand every typealias reference in `files` in place.
-/// A package of the shipped stdlib or a library pack rather than the
-/// program being built.
+/// A package of the shipped stdlib or a library pack rather than of the program
+/// being built.
 fn shippedPackage(pkg: []const u8) bool {
     for ([_][]const u8{ "kotlin", "kotlinx", "androidx", "io.ktor", "org.jetbrains" }) |root| {
         if (std.mem.eql(u8, pkg, root)) return true;
@@ -150,6 +147,7 @@ fn shippedPackage(pkg: []const u8) bool {
     return false;
 }
 
+/// Expand every typealias reference in `files` in place.
 pub fn expandFiles(a: Allocator, files: []const KotlinFile) Allocator.Error!void {
     var any = false;
     for (files) |*f| {
@@ -180,9 +178,9 @@ pub fn expandFiles(a: Allocator, files: []const KotlinFile) Allocator.Error!void
     defer w.deinit();
     for (files, 0..) |*f, i| {
         // The program's own files are rewritten; a shipped library keeps its
-        // source spelling (its aliases are still collected, so a program
-        // that uses them expands them), because a library's private
-        // extension on an aliased scalar resolves by the alias head today.
+        // source spelling, its aliases still collected so a program that uses
+        // them expands them, because a library's private extension on an
+        // aliased scalar resolves by the alias head.
         if (shippedPackage(idx.file_pkgs[i])) continue;
         w.file = i;
         w.pkg = idx.file_pkgs[i];
@@ -937,9 +935,7 @@ const Walker = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
 // Tests
-// ---------------------------------------------------------------------------
 
 const testing = std.testing;
 

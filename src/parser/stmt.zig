@@ -1,7 +1,6 @@
-//! Statement and block parsing: local declarations, assignments,
-//! destructuring declarations, and statement-separator handling.
-//!
-//! Free functions over `*Parser`.
+//! Statement and block parsing: local declarations, assignments, destructuring
+//! declarations, and statement-separator handling. Free functions over
+//! `*Parser`.
 
 const std = @import("std");
 
@@ -69,14 +68,13 @@ pub fn skipStmtSeparators(p: *Parser) void {
     }
 }
 
-// Single match-dispatch over statement-leading tokens; splitting would fragment it.
 pub fn parseStmt(p: *Parser) ?Stmt {
     const save = p.pos;
-    // A label before a local DECLARATION (`a@ val x = 1`, `b@ fun f() = 2`)
-    // is a no-op at runtime; consume the `ident@` so the declaration parses.
-    // A label before an EXPRESSION or loop (`loop@ for(...)`) keeps its
-    // meaning and is handled by the expression path, so only strip the
-    // label here when a declaration keyword follows it.
+    // A label before a local DECLARATION (`a@ val x = 1`, `b@ fun f() = 2`) is
+    // a runtime no-op, so the `ident@` is consumed and the declaration parses.
+    // A label before an expression or loop (`loop@ for(...)`) keeps its meaning
+    // and belongs to the expression path, so strip it here only when a
+    // declaration keyword follows.
     if (std.meta.activeTag(support.peekKind(p).*) == .Ident and
         p.pos + 2 < p.tokens.len and
         (std.meta.activeTag(p.tokens[p.pos + 1].kind) == .AtNoWs or
@@ -95,9 +93,9 @@ pub fn parseStmt(p: *Parser) ?Stmt {
     const flags = file.skipModifiersWithFlagsLevel(p, true);
     switch (support.peekKind(p).*) {
         .LParen => {
-            // `(val a, val b) = expr` — the name-based destructuring form,
-            // which carries no leading keyword. Anything else that opens
-            // with `(` is an expression statement.
+            // `(val a, val b) = expr`, the name-based destructuring form, which
+            // carries no leading keyword. Anything else opening with `(` is an
+            // expression statement.
             const next: ?TokenKind = if (p.pos + 1 < p.tokens.len) p.tokens[p.pos + 1].kind else null;
             if (next != null and std.meta.activeTag(next.?) == .Keyword and (next.?.Keyword == .Val or next.?.Keyword == .Var)) {
                 return parseNameBasedDestructuringStmt(p);
@@ -105,22 +103,21 @@ pub fn parseStmt(p: *Parser) ?Stmt {
             return parseFallthroughStmt(p, save);
         },
         .LBracket => {
-            // `[val a, val b] = expr` / `[a, b] = expr` — the positional
-            // full form at statement level opens with `[` and carries no
-            // leading `val`/`var`. A statement-leading `[` is only ever a
-            // positional destructuring in Kotlin (there is no array literal
-            // expression), so route it there. But a soft-keyword identifier
-            // (`data`, `value`, ...) is wrongly eaten as a modifier above,
-            // leaving its `[` index access at the switch: if modifiers were
-            // consumed, this `[` is a postfix index, not a destructuring, so
-            // rewind and parse the statement as an expression.
+            // `[val a, val b] = expr` / `[a, b] = expr`, the positional full
+            // form, which opens with `[` and carries no leading `val`/`var`. A
+            // statement-leading `[` is only ever a positional destructuring,
+            // Kotlin having no array-literal expression. A soft-keyword
+            // identifier (`data`, `value`) is eaten as a modifier above,
+            // though, leaving its `[` index access at the switch: when
+            // modifiers were consumed this `[` is a postfix index, so rewind
+            // and parse the statement as an expression.
             if (p.pos != before_mods) return parseFallthroughStmt(p, save);
             return parseBracketDestructuringStmt(p);
         },
         .Keyword => |kw| switch (kw) {
             .Val, .Var => {
-                // `val (a, b) = expr` — destructuring declaration. Falls through
-                // to plain property parsing on a single name.
+                // `val (a, b) = expr`, a destructuring declaration; a single
+                // name falls through to plain property parsing.
                 const next: ?TokenKind = if (p.pos + 1 < p.tokens.len) p.tokens[p.pos + 1].kind else null;
                 if (next != null and (std.meta.activeTag(next.?) == .LParen or std.meta.activeTag(next.?) == .LBracket)) {
                     return parseDestructuringDecl(p);
@@ -157,14 +154,14 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                     ) orelse return null;
                     return Stmt{ .Decl = Decl{ .Class = c } };
                 }
-                // Anonymous-function expression statement: `fun(...) ...`
-                // or `fun <T>(...) ...`. No name follows the `fun` keyword.
-                // For `fun <...> Ident(...)`, this is a local generic
-                // function declaration — fall through to `parseFun`.
+                // Anonymous-function expression statement `fun(...) ...` or
+                // `fun <T>(...) ...`, with no name after `fun`. A
+                // `fun <...> Ident(...)` is a local generic function
+                // declaration and falls through to `parseFun`.
                 const after_generics: ?TokenKind = blk: {
                     if (next != null and std.meta.activeTag(next.?) == .Lt) {
-                        // Skip a balanced generic param list to peek at what
-                        // follows: `(` → anonymous; `Ident` → local fn.
+                        // Skip a balanced generic param list to see what
+                        // follows: `(` is anonymous, `Ident` a local fn.
                         var depth: i32 = 1;
                         var i = p.pos + 2;
                         while (i < p.tokens.len) {
@@ -231,9 +228,9 @@ pub fn parseStmt(p: *Parser) ?Stmt {
                 return Stmt{ .Decl = Decl{ .Class = c } };
             },
             .Object => {
-                // `object Name { … }` — local singleton. `object { … }` /
-                // `object : Super { … }` is an anonymous-object *expression*
-                // and falls through to expression parsing.
+                // `object Name { ... }`, a local singleton. `object { ... }` and
+                // `object : Super { ... }` are anonymous-object EXPRESSIONS and
+                // fall through to expression parsing.
                 const next: ?TokenKind = if (p.pos + 1 < p.tokens.len) p.tokens[p.pos + 1].kind else null;
                 if (next != null and std.meta.activeTag(next.?) == .Ident) {
                     const o = class.parseObject(
@@ -262,14 +259,13 @@ pub fn parseStmt(p: *Parser) ?Stmt {
     }
 }
 
-/// No declaration matched — roll back so unrelated modifiers
-/// (annotations on expressions, etc.) don't get swallowed.
+/// No declaration matched: roll back so unrelated modifiers, such as
+/// annotations on expressions, are not swallowed.
 fn parseFallthroughStmt(p: *Parser, save: usize) ?Stmt {
     p.pos = save;
-    // A statement may carry leading annotations (`@Suppress(...)`
-    // before a `return`/expression statement). They are runtime
-    // no-ops here; consume and discard so the expression parser
-    // sees the statement itself.
+    // A statement may carry leading annotations (`@Suppress(...)` before a
+    // `return` or expression statement). They are runtime no-ops, so consume
+    // and discard them and let the expression parser see the statement.
     _ = file.parseAnnotations(p);
     support.skipNl(p);
     return parseExprOrAssignStmt(p);

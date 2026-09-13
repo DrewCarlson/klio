@@ -1,14 +1,13 @@
 //! Compiler diagnostics.
 //!
-//! Models a Kotlin-compatible diagnostic: each emission can carry a
-//! `DiagnosticFactory` (a stable ID + default severity + message
-//! template mined from kotlinc's `FirErrors.kt`), zero or more secondary
-//! labels, notes, and zero or more `FixIt`s. Severities align with
-//! kotlinc's `CompilerMessageSeverity`.
+//! Models a Kotlin-compatible diagnostic: an emission can carry a
+//! `DiagnosticFactory` (stable id, default severity and message template taken
+//! from kotlinc's `FirErrors.kt`), secondary labels, notes and `FixIt`s.
+//! Severities align with kotlinc's `CompilerMessageSeverity`.
 //!
-//! Diagnostics render via the `render` module — plain text matching
-//! `kotlinc`'s `MessageRenderer.PLAIN`, NDJSON for tooling, and SARIF
-//! 2.1.0 for static-analysis aggregators.
+//! Rendering lives in the `render` module: plain text matching kotlinc's
+//! `MessageRenderer.PLAIN`, NDJSON for tooling, and SARIF 2.1.0 for
+//! static-analysis aggregators.
 
 const std = @import("std");
 const span = @import("span");
@@ -34,10 +33,9 @@ pub const Severity = enum {
     }
 };
 
-/// A stable diagnostic identifier paired with its default severity and
-/// message template. Names mirror the upstream Kotlin compiler so existing
-/// IDE infrastructure (IntelliJ inspections, quick-fix dispatchers, etc.)
-/// recognizes them without translation.
+/// A stable diagnostic identifier with its default severity and message
+/// template. Names mirror the upstream Kotlin compiler, so IDE infrastructure
+/// (IntelliJ inspections, quick-fix dispatchers) recognizes them untranslated.
 pub const DiagnosticFactory = struct {
     name: []const u8,
     default_severity: Severity,
@@ -70,12 +68,11 @@ pub const FixIt = struct {
 
 pub const Diagnostic = struct {
     severity: Severity,
-    /// Factory (canonical Kotlin-style ID) when one applies. Falls back to
-    /// `legacy_code` for diagnostics we haven't mapped to a kotlinc factory yet.
+    /// Canonical Kotlin-style factory when one applies; emit sites without one
+    /// fall back to `legacy_code`.
     factory: ?*const DiagnosticFactory,
-    /// Older, kt-exp-internal code (e.g. `E0001`, `R0005`). Kept so the
-    /// renderer can emit *something* even before every emit site is
-    /// migrated to factories.
+    /// Older klio-internal code (`E0001`, `R0005`), kept so the renderer emits
+    /// an identifier for an emit site that has no factory.
     legacy_code: ?[]const u8,
     message: []const u8,
     primary: Label,
@@ -172,8 +169,8 @@ pub const Diagnostic = struct {
         return self;
     }
 
-    /// The identifier we render in tool output. Factory name takes priority;
-    /// falls back to the legacy code.
+    /// The identifier rendered in tool output: the factory name when present,
+    /// else the legacy code.
     pub fn code(self: *const Diagnostic) ?[]const u8 {
         if (self.factory) |f| return f.name;
         return self.legacy_code;
@@ -207,7 +204,7 @@ pub const DiagnosticSink = struct {
         return self.diagnostics.items;
     }
 
-    /// Convenience: render with the default plain-text renderer.
+    /// Render with the default plain-text renderer.
     pub fn render(
         self: *const DiagnosticSink,
         allocator: std.mem.Allocator,
@@ -263,7 +260,7 @@ test "builders mutate and code priority" {
     _ = d.withCode("E0001");
     try std.testing.expectEqualStrings("E0001", d.code().?);
     _ = d.withFactory(&generated.ABSTRACT_DELEGATED_PROPERTY);
-    // factory takes priority over legacy code
+    // The factory takes priority over the legacy code.
     try std.testing.expectEqualStrings("ABSTRACT_DELEGATED_PROPERTY", d.code().?);
     _ = try d.withLabel(a, sp, "here");
     _ = try d.withNote(a, "a note");

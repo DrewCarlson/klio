@@ -1,13 +1,11 @@
 //! `finally`-divergence pruning.
 //!
-//! When a `finally` block always diverges (`return`, `throw`, infinite
-//! loop), the `try` it wraps cannot reach its normal continuation —
-//! every path out of the `try` is replaced by the `finally`'s
-//! divergent terminator. The CFG records this by placing a copy of
-//! the finally body on each exit path; the analysis here detects the
-//! divergent-finally case and prunes the normal-exit edge from the
-//! finally copy to the join, leaving only the divergent terminators
-//! in place.
+//! When a `finally` block always diverges (`return`, `throw`, an infinite
+//! loop), the `try` it wraps cannot reach its normal continuation: every path
+//! out of the `try` ends in the `finally`'s divergent terminator. The CFG
+//! records this by placing a copy of the finally body on each exit path, and
+//! this analysis detects the divergent case and prunes the normal-exit edge
+//! from that copy to the join, leaving only the divergent terminators.
 
 const std = @import("std");
 const ir = @import("../ir.zig");

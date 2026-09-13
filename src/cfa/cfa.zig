@@ -1,9 +1,8 @@
 //! Control-flow graph IR for analyses on Kotlin functions.
 //!
-//! This module hosts the IR (`ir`), low-level construction primitives
-//! (`builder`), and a snapshot-printable form (`print`). The AST →
-//! CFG lowering (`lower`) and the dataflow framework (`dataflow`)
-//! build on top of this without touching the types here.
+//! Hosts the IR (`ir`), the construction primitives (`builder`) and a
+//! snapshot-printable form (`print`). The AST to CFG lowering (`lower`) and the
+//! dataflow framework (`dataflow`) build on these without touching them.
 
 pub const analyses = @import("analyses/mod.zig");
 pub const builder = @import("builder.zig");

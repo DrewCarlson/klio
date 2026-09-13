@@ -1,7 +1,6 @@
-//! Textual CFG printer for snapshot tests. Produces a stable, dense
-//! representation suitable for golden-file diffs. The format carries
-//! the same information as the dataflow box diagram in line-oriented
-//! text.
+//! Textual CFG printer for snapshot tests. The output is dense and stable, so
+//! golden-file diffs stay readable, and line-oriented text carries the same
+//! information as the block diagram.
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -247,9 +246,9 @@ fn formatGenericArg(w: Out, a: GenericArg) Allocator.Error!void {
     try w.writeAll(" }");
 }
 
-/// Render a string wrapped in double quotes with the standard escapes.
-/// The names that reach this path are type-parameter and class
-/// identifiers, but the escaping is faithful for any content.
+/// Render a string in double quotes with the standard escapes. Only
+/// type-parameter and class identifiers reach this path, but the escaping is
+/// faithful for any content.
 fn formatStrDebug(w: Out, s: []const u8) Allocator.Error!void {
     try w.writeAll("\"");
     for (s) |c| {

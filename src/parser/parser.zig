@@ -1,8 +1,7 @@
 //! Kotlin parser.
 //!
-//! Hand-written recursive descent over a `Token` stream produced by the
-//! `lexer` module. The expression grammar is a Pratt parser with
-//! precedence levels:
+//! Hand-written recursive descent over the `lexer` module's `Token` stream. The
+//! expression grammar is a Pratt parser with these precedence levels:
 //!
 //!   disjunction      ||
 //!   conjunction      &&
@@ -17,15 +16,14 @@
 //!   postfix          ++ -- . ?. !! () []
 //!   primary
 //!
-//! Assignment is parsed at the statement level (Kotlin assignments are not
-//! expressions). Newlines act as soft separators: inside parens/braces/
-//! brackets they are skipped freely; at statement positions they terminate
+//! Assignment is parsed at the statement level, Kotlin assignments not being
+//! expressions. Newlines are soft separators: inside parens, braces and
+//! brackets they are skipped freely, and at statement positions they terminate
 //! a statement.
 //!
-//! The recursive-descent methods live in sibling files as free functions
-//! over `*Parser` (e.g. `expr.parseExpr(p)`, `file.parseFile(p)`). This
-//! root file owns the `Parser` struct, the modifier-flag helpers, the
-//! top-level entry point, and the module-level tests.
+//! The recursive-descent methods live in sibling files as free functions over
+//! `*Parser` (`expr.parseExpr(p)`, `file.parseFile(p)`). This root file owns the
+//! `Parser` struct, the modifier-flag helpers, the entry point and the tests.
 
 const std = @import("std");
 
@@ -57,9 +55,9 @@ const TokenKind = lexer.TokenKind;
 /// `-XXLanguage:+Feature` does. Set once per process from `klio run
 /// --language=+Feature` (or `KLIO_LANGUAGE`), read by the parser.
 pub const LanguageFeatures = struct {
-    /// Kotlin 2.4 name-based destructuring (`NameBasedDestructuring`): the
-    /// full form `(val a, val b = prop)` and the positional `[a, b]`, which
-    /// klio parses unconditionally.
+    /// Kotlin 2.4 `NameBasedDestructuring`: the full form
+    /// `(val a, val b = prop)` and the positional `[a, b]`, which klio parses
+    /// unconditionally.
     name_based_destructuring: bool = false,
     /// `EnableNameBasedDestructuringShortForm`: the parenthesized short
     /// form `(a, b = prop)` binds by property name; off, `(a, b)` stays
@@ -68,9 +66,8 @@ pub const LanguageFeatures = struct {
 };
 pub var language: LanguageFeatures = .{};
 
-/// Apply one `+Feature` / `-Feature` spec. Unknown features are accepted
-/// and ignored (klio implements the current language by default); the
-/// return says whether the name was a known toggle.
+/// Apply one `+Feature` / `-Feature` spec. An unknown feature is accepted and
+/// ignored; the return says whether the name was a known toggle.
 pub fn setLanguageFeature(spec: []const u8) bool {
     const s = std.mem.trim(u8, spec, " \t");
     if (s.len < 2) return false;
@@ -96,39 +93,33 @@ pub const Parser = struct {
     tokens: []const Token,
     pos: usize,
     diagnostics: DiagnosticSink,
-    /// When `true`, postfix expression parsing will not attach a trailing
-    /// `{ … }` lambda. Set while reading the delegate expression in a
-    /// supertype-list entry of the form `: I by expr`, so the class body's
-    /// opening brace isn't swallowed as `expr { … }`.
+    /// When `true`, postfix parsing does not attach a trailing `{ ... }` lambda.
+    /// Set while reading the delegate of a `: I by expr` supertype entry, so the
+    /// class body's opening brace is not swallowed as `expr { ... }`.
     suppress_trailing_lambda: bool,
-    /// When `true`, `parseSimpleType` does NOT fold trailing `.Ident`
-    /// segments into a qualified type path. Set while parsing an
-    /// extension / anonymous-function *receiver* type, where the
-    /// trailing `.name` is the function name (the receiver-fold loop
-    /// separates the qualifier itself). Keeps qualified type refs
-    /// working everywhere else.
+    /// When `true`, `parseSimpleType` does NOT fold trailing `.Ident` segments
+    /// into a qualified type path. Set while parsing an extension or
+    /// anonymous-function receiver type, where the trailing `.name` is the
+    /// function name and the receiver-fold loop separates the qualifier itself.
     suppress_qualified_path: bool,
-    /// When `true`, the cursor is inside a property accessor body, where
-    /// `field` is the backing-field expression. Local-property parsing
-    /// then never mistakes a `field = value` assignment statement for an
-    /// explicit-backing-field clause.
+    /// When `true`, the cursor is inside a property accessor body, where `field`
+    /// is the backing-field expression. Local-property parsing then never reads
+    /// a `field = value` assignment as an explicit-backing-field clause.
     in_accessor_body: bool,
-    /// Per-token flag: `true` when the token sits inside an unclosed
-    /// `(` or `[` (not `{`). Kotlin treats newlines as soft inside
-    /// round/square brackets — an expression may break before or after
-    /// a binary/infix operator there — but significant inside `{ … }`
-    /// blocks. Precomputed so it is O(1) regardless of how the cursor
-    /// advances. Allocated from `allocator`.
+    /// Per-token flag: `true` when the token sits inside an unclosed `(` or `[`,
+    /// not `{`. Kotlin treats newlines as soft inside round and square brackets,
+    /// where an expression may break around a binary or infix operator, but as
+    /// significant inside `{ ... }` blocks. Precomputed for O(1) lookup however
+    /// the cursor moves; allocated from `allocator`.
     nl_soft: []bool,
 
     /// Build a parser over a freshly lexed token stream.
     ///
-    /// A newline is *soft* (an expression may wrap across it) only when
-    /// the innermost still-open bracket is `(` or `[`. Inside a `{ … }` —
-    /// a block, lambda, or `when` body — newlines stay significant
-    /// (statement / when-entry separators) even when that `{}` is itself
-    /// nested inside `(…)`, e.g. `f(when { a -> x \n b -> y })`. Tracked
-    /// with a bracket stack so the *innermost* context wins.
+    /// A newline is soft, so an expression may wrap across it, only when the
+    /// innermost still-open bracket is `(` or `[`. Inside a `{ ... }` block,
+    /// lambda or `when` body, newlines stay significant even when that `{}` is
+    /// nested inside `(...)`, as in `f(when { a -> x \n b -> y })`. A bracket
+    /// stack tracks this so the innermost context wins.
     pub fn new(
         allocator: std.mem.Allocator,
         file_id: FileId,
@@ -181,15 +172,14 @@ pub const Parser = struct {
         return p;
     }
 
-    /// Parse the whole compilation unit. The diagnostics produced are left
-    /// on `self.diagnostics`.
+    /// Parse the whole compilation unit; diagnostics are left on
+    /// `self.diagnostics`.
     pub fn parseFile(self: *Parser) KotlinFile {
         return file.parseFile(self);
     }
 };
 
-/// Modifier flags map one-to-one to Kotlin declaration modifiers and are
-/// constructed/destructured field-by-field across several parse modules.
+/// Class-declaration modifiers, one field per Kotlin modifier.
 pub const ClassModifiers = struct {
     is_data: bool = false,
     is_companion: bool = false,
@@ -205,8 +195,8 @@ pub const ClassModifiers = struct {
     is_actual: bool = false,
 };
 
-/// Modifier flags map one-to-one to Kotlin declaration modifiers and are
-/// constructed/destructured field-by-field across several parse modules.
+/// Declaration modifiers, one field per Kotlin modifier, filled in and read
+/// field-by-field across the parse modules.
 pub const ModifierFlags = struct {
     is_data: bool = false,
     is_companion: bool = false,
@@ -228,31 +218,29 @@ pub const ModifierFlags = struct {
     is_suspend: bool = false,
     is_expect: bool = false,
     is_actual: bool = false,
-    /// Span of the `suspend` modifier when one was consumed. Used to point
-    /// the user at the modifier when emitting the rejection diagnostic on
-    /// constructors / accessors / anonymous functions / delegation
-    /// operators.
+    /// Span of the `suspend` modifier when one was consumed, so a rejection on
+    /// constructors, accessors, anonymous functions or delegation operators can
+    /// point at it.
     suspend_span: ?span.Span = null,
-    /// Span of the `inline` modifier when one was consumed. Used to emit a
-    /// deprecation warning when the source wrote `inline class`, since
-    /// `inline class` is an alias for `value class`.
+    /// Span of the `inline` modifier when one was consumed, so `inline class`
+    /// can be reported as a deprecated alias for `value class`.
     inline_span: ?span.Span = null,
     /// Parsed `context(name: Type, ...)` modifier clause. Attached to the
     /// following function/property declaration; rejected on classes,
     /// objects, type aliases, and constructors.
     context_params: []ast.ContextParam = &.{},
-    /// Span of the `context(...)` clause when one was consumed. Used both
-    /// for rejection diagnostics on invalid positions and to detect a
-    /// second clause (`MULTIPLE_CONTEXT_LISTS`).
+    /// Span of the `context(...)` clause when one was consumed, used both for
+    /// rejections in invalid positions and to detect a second clause
+    /// (`MULTIPLE_CONTEXT_LISTS`).
     context_span: ?span.Span = null,
     visibility: Visibility = Visibility.default,
     annotations: std.ArrayList(Annotation) = .empty,
 };
 
-/// Identifiers that are reserved soft modifiers / contextual keywords and
-/// must never be tentatively consumed as infix function names. Without this
-/// guard, declarations like `val x = foo\nprivate fun ...` could be misread
-/// because the previous statement has no newline separator.
+/// Identifiers that are reserved soft modifiers or contextual keywords and must
+/// never be tentatively consumed as an infix function name. Without the guard,
+/// `val x = foo` followed by `private fun ...` on the next line misreads, the
+/// previous statement having no newline separator.
 pub fn isValidInfixName(name: []const u8) bool {
     const reserved = [_][]const u8{
         "private",  "public",      "protected", "internal", "open",
@@ -276,16 +264,12 @@ pub fn isTrailingLambdaCallable(e: *const Expr) bool {
     };
 }
 
-// -------------------------------------------------------------------------
 // Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
-/// True while the sibling parse modules are still stubs. Full-pipeline
-/// tests (which drive the whole recursive-descent grammar) are skipped
-/// until the fill agents complete the siblings; flip this to `false` once
-/// they do and the tests below run for real.
+/// When true, the full-pipeline tests below are skipped through
+/// `skipIfStubbed`.
 const siblings_stubbed = false;
 
 const ParseOut = struct {
@@ -1142,17 +1126,17 @@ test "labeled_lambda_via_run" {
 }
 
 test "generic_call_with_labeled_trailing_lambda" {
-    // `f<Unit> sc@{ … }` is a generic call whose trailing lambda carries a
-    // label, not the comparison `f < Unit > sc`. Without the labeled-lambda
-    // case in `trySkipGenericCallArgs` the `<`/`>` parse as operators and
-    // `suspendCancellableCoroutine<Unit> sc@{ … }` mis-lowers.
+    // `f<Unit> sc@{ ... }` is a generic call whose trailing lambda carries a
+    // label, not the comparison `f < Unit > sc`. Without the labeled-lambda case
+    // in `trySkipGenericCallArgs` the `<`/`>` parse as operators and
+    // `suspendCancellableCoroutine<Unit> sc@{ ... }` mis-lowers.
     try skipIfStubbed();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const out = try parse(arena.allocator(), "fun main() { val r = f<Unit> sc@{ it } }\n");
     try testing.expect(!out.parser.diagnostics.hasErrors());
     const stmts = bodyStmts(out.file.decls[0].Function);
-    // `val r = <Call>` — the initializer is a Call, not a comparison Binary.
+    // `val r = <Call>`: the initializer is a Call, not a comparison Binary.
     const init = stmts[0].Decl.Property.init.?;
     try testing.expect(init == .Call);
     try testing.expect(init.Call.type_args.len == 1);
@@ -1466,9 +1450,7 @@ test {
     _ = control;
 }
 
-// -------------------------------------------------------------------------
 // Explicit backing fields
-// -------------------------------------------------------------------------
 
 test "ebf: member property field clause with initializer" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1671,7 +1653,7 @@ test "ebf: backing-field assignment in accessor body is not a clause" {
     try testing.expect(p.setter != null);
 }
 
-// -------- context parameters --------
+// Context parameters
 
 test "ctx: named context clause on a top-level function" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

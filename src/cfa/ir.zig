@@ -1,10 +1,8 @@
-//! CFG IR shared across analyses. Every interesting program point is
-//! either an `Eval` of a sub-expression into a virtual register, an
-//! `Assume` that refines a register on a particular control-flow
-//! edge, or an assignment to a `Place`. Blocks end in a `Terminator`
-//! that names the successor blocks. Edges between blocks carry an
-//! `EdgeKind` so analyses can distinguish exception edges, finally
-//! entry/exit, and normal control flow.
+//! CFG IR shared across analyses. Every interesting program point is an `Eval`
+//! of a sub-expression into a virtual register, an `Assume` refining a register
+//! on one control-flow edge, or an assignment to a `Place`. Blocks end in a
+//! `Terminator` naming their successors, and each edge carries an `EdgeKind` so
+//! analyses can tell exception edges and finally entry/exit from normal flow.
 
 const std = @import("std");
 const span = @import("span");
@@ -26,9 +24,8 @@ pub const BlockId = enum(u32) {
     }
 };
 
-/// Virtual register holding the result of an `Eval` node. SSA-free;
-/// registers are produced once and consumed at any later point in
-/// the same CFG.
+/// Virtual register holding the result of an `Eval` node. Not SSA: a register
+/// is produced once and consumed at any later point in the same CFG.
 pub const Reg = enum(u32) {
     _,
     pub fn from(v: u32) Reg {
@@ -52,8 +49,7 @@ pub const LoopId = enum(u32) {
 };
 
 /// Stable identifier for a user-visible label (`outer@`, `lambda@foo`).
-/// Distinct from `LoopId` so labeled non-loop blocks can be addressed
-/// without inventing fake loops.
+/// Distinct from `LoopId` so a labeled non-loop block needs no fake loop.
 pub const LabelId = enum(u32) {
     _,
     pub fn from(v: u32) LabelId {
@@ -78,9 +74,9 @@ pub const Symbol = struct {
     }
 };
 
-/// Identifier for a structural field projection used by smart-cast
-/// dot paths (`p.x.y`). Carries the unresolved name; the smart-cast
-/// analysis matches by name within an enclosing `val`-stable chain.
+/// Structural field projection used by smart-cast dot paths (`p.x.y`). Carries
+/// the unresolved name, which smart-cast matches within an enclosing
+/// `val`-stable chain.
 pub const FieldId = struct {
     name: []const u8,
 
@@ -93,11 +89,10 @@ pub const FieldId = struct {
     }
 };
 
-/// Assignable / narrowable location. Smart casts attach to `Place`,
-/// not `Reg` — registers are short-lived expression slots while
-/// places persist across the CFG.
+/// Assignable, narrowable location. Smart casts attach to `Place` rather than
+/// `Reg`: registers are short-lived expression slots, places persist across the
+/// CFG.
 pub const Place = union(enum) {
-    /// Named local or parameter.
     Local: Symbol,
     /// Dotted access onto another place: `receiver.field`.
     Field: struct {
@@ -145,8 +140,7 @@ pub const Place = union(enum) {
         }
     }
 
-    /// Total order over `Place` values, ordered by their structural
-    /// rendering. Returns `std.math.Order`.
+    /// Total order over `Place` values by their structural rendering.
     pub fn order(self: Place, other: Place) std.math.Order {
         return orderStructural(self, other);
     }
@@ -175,22 +169,18 @@ fn orderStructural(a: Place, b: Place) std.math.Order {
     };
 }
 
-/// Per-node `Eval` payload. Holds the AST span so analyses can map
-/// results back to source for diagnostics; the static type is
-/// preserved so reachability can spot `Nothing`-typed evaluations
-/// without re-running typeck.
+/// Per-node `Eval` payload. The AST span maps results back to source for
+/// diagnostics, and the static type lets reachability spot a `Nothing`-typed
+/// evaluation without re-running typeck.
 pub const ExprRef = struct {
     span: Span,
     ty: Type,
 };
 
-/// A single CFG node within a block. Order inside a block matters:
-/// nodes execute top-to-bottom. Control transfer happens only at
-/// the block's `Terminator`.
+/// A single CFG node within a block. Nodes execute top to bottom; control
+/// transfers only at the block's `Terminator`.
 pub const Node = union(enum) {
-    /// Compute an expression into a fresh register.
     Eval: struct { reg: Reg, expr: ExprRef },
-    /// Write a register into a place.
     Assign: struct { lhs: Place, rhs: Reg, span: Span },
     /// Declare a fresh local; VIA seeds this place as `Unassigned`.
     DeclLocal: struct {
@@ -201,12 +191,11 @@ pub const Node = union(enum) {
     /// Assume `reg` is true (false). Emitted on `Branch::True` /
     /// `Branch::False` arms after lowering `if`/`when`/`&&`/`||`.
     Assume: struct { reg: Reg, polarity: bool },
-    /// Assume the runtime type of `reg` is (is not) `ty`. Emitted on
-    /// the arms of `is` / `!is` checks; smart-cast lattice consumes
-    /// both polarities. `class_name` carries the source type-ref's
-    /// simple name so the typechecker can recover a user-class
-    /// narrowing — `ty` itself is `Type.Unresolved` for any name
-    /// not in `builtin_by_name`.
+    /// Assume the runtime type of `reg` is (is not) `ty`, emitted on the arms of
+    /// an `is` / `!is` check; the smart-cast lattice consumes both polarities.
+    /// `class_name` carries the source type-ref's simple name so the typechecker
+    /// can recover a user-class narrowing, `ty` being `Type.Unresolved` for any
+    /// name outside `builtin_by_name`.
     AssumeIs: struct {
         reg: Reg,
         ty: Type,
@@ -214,57 +203,48 @@ pub const Node = union(enum) {
         polarity: bool,
         span: Span,
     },
-    /// Assume `reg == null` (or `reg != null`). Distinct from
-    /// `AssumeIs Nothing?` because nullability is its own axis on
-    /// the smart-cast lattice.
+    /// Assume `reg == null` (or `!= null`). Distinct from `AssumeIs Nothing?`
+    /// because nullability is its own axis on the smart-cast lattice.
     AssumeNull: struct { reg: Reg, eq_null: bool, span: Span },
-    /// Assume that two registers refer to the same runtime value.
-    /// Produced by `a === b` (and the structural-equality form when
-    /// at least one side is non-nullable) and consumed by smart-
-    /// cast: both registers' places narrow to the intersection of
-    /// their facts on the truthy branch.
+    /// Assume two registers refer to the same runtime value. Produced by
+    /// `a === b`, and by structural equality when at least one side is
+    /// non-nullable; on the truthy branch both places narrow to the intersection
+    /// of their facts.
     AssumeRefEq: struct {
         reg_a: Reg,
         reg_b: Reg,
         polarity: bool,
         span: Span,
     },
-    /// Assert `reg` is true; if it is not, control diverges (the
-    /// containing block ends in `Terminator.Unreachable` along the
-    /// false edge). Used for `!!`, `as`, and contract `require`.
+    /// Assert `reg` is true; otherwise control diverges, the containing block
+    /// ending in `Terminator.Unreachable` along the false edge. Used for `!!`,
+    /// `as`, and contract `require`.
     Assert: struct { reg: Reg, span: Span },
-    /// Invalidate every smart-cast bound on `place` because a loop
-    /// back-edge may have reassigned it. Inserted by the `killDataFlow`
-    /// pass after the dataflow framework reaches fixpoint.
+    /// Invalidate every smart cast bound on `place`, since a loop back-edge may
+    /// have reassigned it. Inserted by `killDataFlow` after the fixpoint.
     KillDataFlow: struct { place: Place },
-    /// Loop back-jump marker. Holds the loop's id so the dataflow
-    /// solver can identify backedges without re-deriving the loop
-    /// nest from the CFG.
+    /// Loop back-jump marker carrying the loop's id, so the dataflow solver
+    /// identifies backedges without re-deriving the loop nest.
     Backedge: struct { loop_id: LoopId },
-    /// Source-visible label position; consumed by `break@l` and
-    /// `continue@l` lowering and by diagnostics that want to point
-    /// at the labeled site.
+    /// Source-visible label position, consumed by `break@l` / `continue@l`
+    /// lowering and by diagnostics pointing at the labeled site.
     LabelMark: struct { label: LabelId },
-    /// Marker the lowering inserts whenever it knows a point is
-    /// statically dead (e.g. after `Nothing`-returning calls). The
-    /// reachability analysis treats this as an authoritative bottom.
+    /// Marker inserted wherever lowering knows a point is statically dead, such
+    /// as after a `Nothing`-returning call. Reachability treats it as bottom.
     Unreachable,
 };
 
-/// One arm of a `Switch` terminator.
 pub const SwitchArm = struct {
     pattern: Pattern,
     target: BlockId,
 };
 
-/// Pattern shapes the lowering produces for `when` arms. Conditions
-/// inside an arm (`is T`, `in r`, equality) are emitted as `AssumeIs`
-/// / `AssumeNull` / `Assume` nodes in the arm's body, not in the
-/// pattern itself; this keeps the switch table cheap to walk.
+/// Pattern shapes lowering produces for `when` arms. Conditions inside an arm
+/// (`is T`, `in r`, equality) become `AssumeIs` / `AssumeNull` / `Assume` nodes
+/// in the arm's body rather than part of the pattern, which keeps the switch
+/// table cheap to walk.
 pub const Pattern = union(enum) {
-    /// Match by structural equality with a register.
     Equal: Reg,
-    /// Match by `is`-check against a type.
     Is: struct { ty: Type, polarity: bool },
     /// Always-match arm (used for the desugared `else`).
     Wildcard,
@@ -272,52 +252,45 @@ pub const Pattern = union(enum) {
 
 /// How control leaves a block. Every block has exactly one.
 pub const Terminator = union(enum) {
-    /// Fall through to one successor.
     Goto: BlockId,
-    /// Two-way branch on a boolean register.
     Branch: struct {
         cond: Reg,
         then_blk: BlockId,
         else_blk: BlockId,
     },
-    /// N-way switch driven by a register and a list of patterns.
-    /// Used for `when (subject)` lowerings; arms are exclusive,
-    /// `default` is taken if none match.
+    /// N-way switch on a register and a list of exclusive patterns, used for
+    /// `when (subject)`; `default` is taken when none match.
     Switch: struct {
         reg: Reg,
         arms: []SwitchArm,
         default: BlockId,
     },
-    /// Throw a value; control transfers to the nearest matching
-    /// catch handler (resolved by exception edges on this block).
+    /// Throw a value; control transfers to the nearest matching handler, found
+    /// through this block's exception edges.
     Throw: Reg,
     /// Return from the enclosing function. `null` for `Unit`.
     Return: ?Reg,
-    /// Block is statically unreachable past this point. Equivalent
-    /// to a divergent terminator; the reachability analysis prunes
-    /// successors.
+    /// Statically unreachable past this point, equivalent to a divergent
+    /// terminator; reachability prunes the successors.
     Unreachable,
 };
 
-/// Kind of edge between two blocks. Analyses route differently
-/// depending on the kind — exception edges skip normal joins, and
-/// finally edges feed both the normal-exit and exception-path
-/// summaries.
+/// Kind of edge between two blocks. Analyses route by kind: exception edges
+/// skip normal joins, and finally edges feed both the normal-exit and the
+/// exception-path summaries.
 pub const EdgeKind = union(enum) {
     Normal,
-    /// Edge from a `Branch` terminator's true arm.
     True,
-    /// Edge from a `Branch` terminator's false arm.
     False,
-    /// Edge that may be taken when the source block throws a value
-    /// whose runtime type is a subtype of `ty`. Lowered for every
-    /// statement inside a `try` whose handler matches.
+    /// Edge taken when the source block throws a value whose runtime type is a
+    /// subtype of `ty`. Lowered for every statement in a `try` with a matching
+    /// handler.
     Exception: struct { ty: ?Type },
-    /// Edge into the `finally` block from the normal exit of a `try`
-    /// body or its handler.
+    /// Edge into the `finally` block from the normal exit of a `try` body or of
+    /// one of its handlers.
     FinallyEntry,
-    /// Edge out of the `finally` block back to the original
-    /// continuation (normal exit or rethrow).
+    /// Edge out of the `finally` block back to the original continuation,
+    /// normal exit or rethrow.
     FinallyExit,
 
     pub fn eql(self: EdgeKind, other: EdgeKind) bool {
@@ -336,14 +309,13 @@ pub const EdgeKind = union(enum) {
     }
 };
 
-/// Reference to a neighbouring block plus the kind of edge.
 pub const Edge = struct {
     block: BlockId,
     kind: EdgeKind,
 };
 
-/// One block in a CFG. `preds` / `succs` carry the kind of each
-/// edge so analyses can pick the appropriate transfer function.
+/// One block in a CFG. `preds` and `succs` carry each edge's kind, so an
+/// analysis can pick the matching transfer function.
 pub const BasicBlock = struct {
     id: BlockId,
     nodes: std.ArrayList(Node) = .empty,
@@ -352,11 +324,9 @@ pub const BasicBlock = struct {
     succs: std.ArrayList(Edge) = .empty,
 };
 
-/// The CFG of one function / property accessor / init block.
-///
-/// `entry` is always present; `exits` lists every block whose
-/// terminator is `Return` or whose continuation falls off the end
-/// of the body (for `Unit`-typed bodies).
+/// The CFG of one function, property accessor or init block. `entry` is always
+/// present; `exits` lists every block whose terminator is `Return` and every
+/// block that falls off the end of a `Unit`-typed body.
 pub const Cfg = struct {
     blocks: std.ArrayList(BasicBlock) = .empty,
     entry: BlockId,

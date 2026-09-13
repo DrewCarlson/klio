@@ -15,7 +15,7 @@ pub const FileId = enum(u32) {
 /// Sentinel `FileId.int()` the stdlib-image baker stamps on a deferred
 /// `inline`-function body marker: the empty block's `span.start` then holds the
 /// body's byte offset in the image's deferred-body section. Far above any real
-/// SourceMap id, so it can never collide with a genuine file.
+/// SourceMap id, so it cannot collide with a genuine file.
 pub const DEFERRED_BODY_FILE: u32 = 0xDEFE_4DED;
 
 /// A half-open byte range within a single source file.
@@ -33,7 +33,6 @@ pub const Span = struct {
         return self.end - self.start;
     }
 
-    /// The source text covered by this span.
     pub fn text(self: Span, source: []const u8) []const u8 {
         return source[self.start..self.end];
     }
@@ -81,12 +80,11 @@ pub const SourceFile = struct {
         };
     }
 
-    /// 1-based line and column for a byte offset. Files added with a
-    /// precomputed `line_starts` index resolve by binary search; files added
-    /// borrowed (no index — the common case for the process-lifetime stdlib
-    /// image, whose source is rarely pointed at by a diagnostic) resolve by a
-    /// one-shot linear scan, trading a rare O(offset) walk for not building a
-    /// per-line table at load.
+    /// 1-based line and column for a byte offset. A file added with a
+    /// precomputed `line_starts` index resolves by binary search; a borrowed
+    /// file has no index, as the process-lifetime stdlib image rarely needs one,
+    /// and resolves by a one-shot linear scan, trading a rare O(offset) walk for
+    /// building no per-line table at load.
     pub fn lineCol(self: SourceFile, offset: u32) LineCol {
         if (self.line_starts.len == 0) {
             var line: u32 = 1;
@@ -137,11 +135,11 @@ pub const SourceMap = struct {
         return id;
     }
 
-    /// Register a file whose `path`/`source` already have process-lifetime
-    /// backing (the mmap'd stdlib image), borrowing both slices instead of
-    /// copying them and skipping the eager per-line index. Saves the
-    /// whole-stdlib source dupe (~6 MB) and its line tables (~1 MB) at startup;
-    /// `lineCol` falls back to a linear scan for these files.
+    /// Register a file whose `path` and `source` already have process-lifetime
+    /// backing (the mmap'd stdlib image), borrowing both slices rather than
+    /// copying and skipping the eager per-line index. This saves the whole-stdlib
+    /// source dupe (~6 MB) and its line tables (~1 MB) at startup; `lineCol`
+    /// falls back to a linear scan for these files.
     pub fn addBorrowed(self: *SourceMap, path: []const u8, source: []const u8) !FileId {
         const a = self.arena.allocator();
         const id = FileId.from(@intCast(self.files.items.len));
@@ -158,8 +156,8 @@ pub const SourceMap = struct {
         return &self.files.items[id.int()];
     }
 
-    /// `get` guarded against an out-of-range id (a stale/zeroed span captured
-    /// before a frame ran). Returns null instead of indexing past the end.
+    /// `get` guarded against an out-of-range id, such as a stale or zeroed span
+    /// captured before a frame ran; returns null instead of indexing past the end.
     pub fn getChecked(self: *const SourceMap, id: FileId) ?*const SourceFile {
         if (id.int() >= self.files.items.len) return null;
         return &self.files.items[id.int()];
@@ -167,9 +165,9 @@ pub const SourceMap = struct {
 };
 
 /// The SourceMap for the program currently running, installed by the CLI before
-/// `main` runs so the interpreter can resolve a captured stack-trace span to a
-/// file path + line from deep inside the VM (uncaught render, `printStackTrace`)
-/// where the map is not otherwise threaded. Null outside a run.
+/// `main` so the interpreter can resolve a captured stack-trace span to a file
+/// and line from deep inside the VM (uncaught render, `printStackTrace`), where
+/// the map is not otherwise threaded. Null outside a run.
 pub var active_map: ?*const SourceMap = null;
 
 test "span join extends range" {

@@ -1,12 +1,11 @@
 //! Variable initialisation analysis.
 //!
-//! Forward pass over the CFG with a `Map<Place, Flat<AssignState>>`
-//! lattice. `DeclLocal` seeds `Unassigned`; `Assign` sets `Assigned`.
-//! A read of a place whose state is not `Assigned` (i.e. `Unassigned`
-//! or `Top` — "may be unassigned along some path") is a definite-
-//! assignment violation. A future integration step reroutes T0020
-//! onto this analysis; for now we expose the per-place facts and a
-//! helper that reports violations as a list of spans.
+//! Forward pass over the CFG with a `Map<Place, Flat<AssignState>>` lattice.
+//! `DeclLocal` seeds `Unassigned` and `Assign` sets `Assigned`. Reading a place
+//! whose state is not `Assigned`, so `Unassigned` or the `Top` that means "may
+//! be unassigned along some path", is a definite-assignment violation. The
+//! module exposes the per-place facts plus a helper that reports violations as
+//! a list of spans.
 
 const std = @import("std");
 const span = @import("span");
@@ -63,22 +62,21 @@ pub const UnassignedRead = struct {
     span: Span,
 };
 
-/// Per-block in-state at fixpoint.
 pub const ViaBlockStates = std.ArrayList(ViaLattice);
 
 pub fn solveVia(allocator: Allocator, cfg: *const Cfg) Allocator.Error!ViaBlockStates {
-    // Function parameters land as "assigned" before we enter the
-    // function body; the lowering doesn't currently emit `DeclLocal`
-    // for them, which means absent ⇒ "no fact" ⇒ not flagged.
+    // Function parameters count as assigned on entry to the body. Lowering
+    // emits no `DeclLocal` for them, so absent means no fact and nothing is
+    // flagged.
     const entry = ViaLattice.init();
     var transfer = ViaTransfer{};
     return dataflow.solveForward(ViaLattice, ViaTransfer, allocator, cfg, entry, &transfer);
 }
 
-/// Returns the in-state at every node in `block` by re-running the
-/// transfer from the block's start. Useful for a downstream
-/// "check at this AST span" query without a full per-node array.
-/// Consumes `entry`; the caller owns every returned lattice.
+/// The in-state at every node of `block`, produced by re-running the transfer
+/// from the block's start, for a "check at this AST span" query that needs no
+/// full per-node array. Consumes `entry`; the caller owns every returned
+/// lattice.
 pub fn statesWithinBlock(
     allocator: Allocator,
     cfg: *const Cfg,
@@ -103,13 +101,11 @@ pub fn statesWithinBlock(
     return out.toOwnedSlice(allocator);
 }
 
-/// Read of a place is "live" when the place is named on the right of
-/// an `Eval` whose AST shape would touch it. The IR does not record
-/// reads directly — those live in `ExprRef.span`. This helper
-/// therefore returns the per-block fact stream so the typechecker
-/// can query "is this place assigned at this span?" by
-/// indexing the state map with the place at the eval's preceding
-/// program point. Caller owns the returned value.
+/// A place is read when it is named on the right of an `Eval` whose AST shape
+/// touches it. The IR records no reads directly, those living in
+/// `ExprRef.span`, so this returns the per-block fact stream: the typechecker
+/// answers "is this place assigned at this span?" by indexing the state map with
+/// the place at the eval's preceding program point. Caller owns the result.
 pub fn placeStateAtBlockEntry(
     allocator: Allocator,
     states: *const ViaBlockStates,
@@ -131,8 +127,7 @@ pub const MaybeUnassignedEntry = struct {
     }
 };
 
-/// Ordered `Place -> []BlockId` collection, iterated in sorted-key
-/// order.
+/// Ordered `Place -> []BlockId` collection, iterated in sorted-key order.
 pub const MaybeUnassigned = struct {
     entries: std.ArrayList(MaybeUnassignedEntry) = .empty,
 
@@ -149,10 +144,9 @@ pub const MaybeUnassigned = struct {
     }
 };
 
-/// Convenience aggregator: collect places that join to `Top`
-/// (i.e. "assigned on some paths, not all") at any block entry.
-/// These are candidates for a "variable might be uninitialised"
-/// diagnostic. Caller owns the returned collection.
+/// Collect the places that join to `Top`, assigned on some paths and not
+/// others, at any block entry. These are the candidates for a "variable might be
+/// uninitialised" diagnostic. Caller owns the returned collection.
 pub fn maybeUnassignedPlaces(allocator: Allocator, states: *const ViaBlockStates) Allocator.Error!MaybeUnassigned {
     var out = MaybeUnassigned{};
     errdefer out.deinit(allocator);

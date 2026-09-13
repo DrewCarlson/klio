@@ -1,5 +1,5 @@
-//! NDJSON renderer — one diagnostic per line, suitable for streaming into
-//! external tooling that wants to consume our diagnostics directly.
+//! NDJSON renderer: one diagnostic per line, for streaming into external
+//! tooling that consumes diagnostics directly.
 
 const std = @import("std");
 const span = @import("span");

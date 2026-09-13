@@ -1,16 +1,14 @@
 //! Reachability analysis.
 //!
-//! A block is reachable iff there is a path from the CFG's entry to
-//! it through edges that the dataflow regards as live. An edge is
-//! dead when its source block ends in a divergent terminator
-//! (`Throw`, `Return`, `Unreachable`) or when an `Unreachable`
-//! node is encountered before the terminator (typical for code
-//! after a `Nothing`-typed call).
+//! A block is reachable iff a path runs from the CFG's entry to it over edges
+//! the dataflow regards as live. An edge is dead when its source block ends in a
+//! divergent terminator (`Throw`, `Return`, `Unreachable`) or when an
+//! `Unreachable` node appears before the terminator, as it does after a
+//! `Nothing`-typed call.
 //!
-//! The `WithTypes` variant consults a span-keyed type map so an
-//! `Eval` of a `Nothing`-returning call (`error("…")`, `TODO()`)
-//! prunes its block's successors the same way an explicit
-//! `Throw` would. The typechecker passes its `types` map in.
+//! The `WithTypes` variant consults a span-keyed type map supplied by the
+//! typechecker, so an `Eval` of a `Nothing`-returning call (`error("...")`,
+//! `TODO()`) prunes its block's successors exactly as an explicit `Throw` does.
 
 const std = @import("std");
 const ir = @import("../ir.zig");
@@ -33,8 +31,8 @@ const SpanKeyContext = struct {
     }
 };
 
-/// Span-keyed type map. The typechecker collects its span→Type results
-/// into this shape.
+/// Span-keyed type map, the shape the typechecker collects its span-to-`Type`
+/// results into.
 pub const TypeMap = std.HashMap(SpanKey, Type, SpanKeyContext, std.hash_map.default_max_load_percentage);
 
 pub const Reachability = struct {
@@ -67,10 +65,9 @@ pub fn analyse(allocator: Allocator, cfg: *const Cfg) Allocator.Error!Reachabili
     return analyseWithTypes(allocator, cfg, null);
 }
 
-/// Same as `analyse` but consults `type_map` (typechecker-supplied
-/// span→Type results) so an `Eval` of a `Nothing`-typed expression
-/// is treated like an in-block `Unreachable` marker: control does
-/// not propagate past it.
+/// Like `analyse`, but consults the typechecker's span-to-`Type` results so an
+/// `Eval` of a `Nothing`-typed expression acts as an in-block `Unreachable`
+/// marker: control does not propagate past it.
 pub fn analyseWithTypes(
     allocator: Allocator,
     cfg: *const Cfg,
@@ -114,10 +111,10 @@ pub fn analyseWithTypes(
         if (block_diverges) continue;
         switch (block.term) {
             .Return, .Unreachable => {},
-            // A throw's recorded successors are exactly the exceptional
-            // edges the lowering routed to enclosing catch / finally
-            // blocks; control genuinely flows there. Without a handler
-            // the successor list is empty.
+            // A throw's recorded successors are exactly the exceptional edges
+            // lowering routed to enclosing catch and finally blocks, where
+            // control genuinely flows. With no handler the successor list is
+            // empty.
             else => {
                 for (block.succs.items) |e| {
                     try stack.append(allocator, e.block);

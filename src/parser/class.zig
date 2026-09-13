@@ -1,7 +1,6 @@
-//! Class / interface / object / enum declaration parsing, including
-//! supertype lists, primary-constructor params, and class bodies.
-//!
-//! Free functions over `*Parser`.
+//! Class, interface, object and enum declaration parsing, including supertype
+//! lists, primary-constructor parameters and class bodies. Free functions over
+//! `*Parser`.
 
 const std = @import("std");
 
@@ -179,10 +178,10 @@ pub fn parseClass(
 }
 
 /// Skip newlines only when the first non-newline token continues the class
-/// header (`<`, `(`, `:`, `{`, a ctor annotation `@`, `where`, or a
-/// visibility/`constructor` keyword). A bodyless class (`class A`) must not
-/// swallow the newline that separates it from the next declaration, so a
-/// `class A` / `class B` pair on consecutive lines parses as two statements.
+/// header (`<`, `(`, `:`, `{`, a ctor annotation `@`, `where`, or a visibility
+/// or `constructor` keyword). A bodyless `class A` must not swallow the newline
+/// separating it from the next declaration, so `class A` and `class B` on
+/// consecutive lines parse as two declarations.
 fn skipNlIfHeaderContinues(p: *Parser) void {
     if (std.meta.activeTag(support.peekKind(p).*) != .Newline) return;
     var i = p.pos;
@@ -211,14 +210,12 @@ fn skipNlIfHeaderContinues(p: *Parser) void {
 }
 
 /// Consume an optional primary-constructor annotation run:
-/// `class Foo @Inject @Deprecated(...) internal constructor(...)`.
-/// Kotlin requires the `constructor` keyword when the primary
-/// constructor is annotated/modified, so only consume a leading
-/// `@…` run when it is actually followed by `[visibility]
-/// constructor` — otherwise the `@` belongs to the *next*
-/// top-level declaration (e.g. `annotation class A` then
-/// `@A fun f()`) and must be left untouched. klio treats
-/// primary-ctor annotations as runtime no-ops.
+/// `class Foo @Inject @Deprecated(...) internal constructor(...)`. Kotlin
+/// requires the `constructor` keyword once the primary constructor is annotated
+/// or modified, so a leading `@...` run is consumed only when followed by
+/// `[visibility] constructor`; otherwise the `@` belongs to the NEXT top-level
+/// declaration (`annotation class A` then `@A fun f()`) and is left untouched.
+/// Primary-constructor annotations are runtime no-ops.
 fn skipPrimaryCtorAnnotations(p: *Parser) void {
     if (!support.peekKind(p).isAt()) {
         return;
@@ -230,9 +227,9 @@ fn skipPrimaryCtorAnnotations(p: *Parser) void {
         }
         support.skipNl(p);
     }
-    // Skip an optional run of constructor modifiers (visibility plus the
-    // `actual`/`expect` soft keywords, in any order — e.g. `@JvmOverloads
-    // public actual constructor`), then require `constructor`.
+    // Skip an optional run of constructor modifiers, visibility plus the
+    // `actual` / `expect` soft keywords in any order (`@JvmOverloads public
+    // actual constructor`), then require `constructor`.
     var probe = p.pos;
     while (probe < p.tokens.len) {
         while (probe < p.tokens.len and
@@ -259,11 +256,10 @@ fn skipPrimaryCtorAnnotations(p: *Parser) void {
 }
 
 /// Consume an optional explicit primary constructor header:
-/// `class Foo [visibility] [actual|expect]* constructor(...)`.
-/// Scan a run of soft-keyword constructor modifiers (in any
-/// order) that must terminate in `constructor`; commit only
-/// then. `actual`/`expect` are runtime-inert here (klio's
-/// expect/actual is name-keyed), visibility is recorded.
+/// `class Foo [visibility] [actual|expect]* constructor(...)`. A run of
+/// soft-keyword modifiers in any order must terminate in `constructor` before
+/// anything is committed. `actual` / `expect` are inert here, expect/actual
+/// being name-keyed; visibility is recorded.
 fn parsePrimaryCtorHeader(p: *Parser) ?Visibility {
     const saved = p.pos;
     var vis: ?Visibility = null;
@@ -282,7 +278,7 @@ fn parsePrimaryCtorHeader(p: *Parser) ?Visibility {
         } else if (std.mem.eql(u8, t, "internal")) {
             vis = .Internal;
         } else if (std.mem.eql(u8, t, "actual") or std.mem.eql(u8, t, "expect")) {
-            // runtime-inert
+            // Inert at runtime.
         } else {
             break;
         }
@@ -298,17 +294,17 @@ fn parsePrimaryCtorHeader(p: *Parser) ?Visibility {
         return vis;
     }
     if (consumed_modifier) {
-        // The run was not a constructor header — restore.
+        // The run was not a constructor header, so restore the cursor.
         p.pos = saved;
     }
     return null;
 }
 
-/// Parse an enum class body: optional entry list (comma-separated, with
-/// optional `(...)` ctor args and optional `{...}` per-entry body),
-/// optional `;` then regular class-body members.
+/// Parse an enum class body: an optional comma-separated entry list, each entry
+/// with optional `(...)` constructor arguments and an optional `{...}` body,
+/// then an optional `;` and the regular class-body members.
 pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
-    // Helper: enum-class body content (after the optional `;`) shares the
+    // After the optional `;`, enum-class body content shares the
     // member-parsing shape of a regular class body, minus secondary
     // constructors.
     var member_list: std.ArrayList(Decl) = .empty;
@@ -327,7 +323,6 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
         };
     }
     _ = support.bump(p);
-    // Parse entries until `;`, `}`, or EOF.
     while (true) {
         support.skipNl(p);
         switch (support.peekKind(p).*) {
@@ -348,8 +343,8 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
                     break;
                 }
                 // An enum entry may pass named constructor arguments
-                // (`ENTRY(1, "x", viaBroadcast = true)`, `A(b = 1, a = 0)`);
-                // the label names the parameter the argument binds.
+                // (`ENTRY(1, "x", viaBroadcast = true)`); the label names the
+                // parameter the argument binds.
                 const label = expr.tryConsumeNamedArgName(p);
                 const a = expr.parseValueArgument(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
@@ -375,11 +370,11 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
         const entry_args = args.toOwnedSlice(p.allocator) catch @panic("OOM");
         const entry_arg_names: []const ?[]const u8 = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM");
         if (body) |cb| {
-            // `B(args) { … }` declares an anonymous subclass of the enum whose
+            // `B(args) { ... }` declares an anonymous subclass of the enum whose
             // instance is the entry: the body's properties, `init` blocks,
-            // functions, and nested classes become members of a synthesized
-            // nested class `$B : Enum(args)`, instantiated for the entry at
-            // VM start. The entry name itself stays the entry value.
+            // functions and nested classes become members of a synthesized
+            // nested class `$B : Enum(args)`, instantiated for the entry at VM
+            // start. The entry name itself stays the entry value.
             const synth = std.fmt.allocPrint(p.allocator, "${s}", .{name.name}) catch @panic("OOM");
             const sups = p.allocator.alloc(TypeRef, 1) catch @panic("OOM");
             sups[0] = .{
@@ -449,7 +444,6 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
     support.skipNl(p);
     if (std.meta.activeTag(support.peekKind(p).*) == .Semicolon) {
         _ = support.bump(p);
-        // Continue with regular class-body members until `}`.
         while (true) {
             support.skipNl(p);
             switch (support.peekKind(p).*) {
@@ -467,8 +461,8 @@ pub fn parseEnumClassBody(p: *Parser, enum_name: Ident) EnumClassBody {
                 }
                 continue;
             }
-            // A secondary constructor in the enum body: `constructor(n: Int) :
-            // this(n, "x")`, called for the entries whose arguments fit it.
+            // A secondary constructor in the enum body (`constructor(n: Int) :
+            // this(n, "x")`), called for the entries whose arguments fit it.
             const mod_save = p.pos;
             const flags = file.skipModifiersWithFlags(p);
             if (std.meta.activeTag(support.peekKind(p).*) == .Ident and
@@ -502,12 +496,12 @@ pub fn parseCompanionObjectAsClass(
     visibility: Visibility,
     annotations: []Annotation,
 ) ?Class {
-    // The `object` keyword is OPTIONAL: `companion { ... }` is the
-    // shorthand for `companion object { ... }`. Consume it only when
-    // present; otherwise start at the (optional) name or the body `{`.
+    // The `object` keyword is OPTIONAL: `companion { ... }` is shorthand for
+    // `companion object { ... }`. Consume it only when present, otherwise start
+    // at the optional name or the body `{`.
     const kw_span = support.currentSpan(p);
     if (std.meta.activeTag(support.peekKind(p).*) == .Keyword and support.peekKind(p).*.Keyword == .Object) _ = support.bump(p);
-    // Optional companion name. If absent, name as "Companion".
+    // Optional companion name, defaulting to "Companion".
     const name = if (std.meta.activeTag(support.peekKind(p).*) == .Ident)
         (support.parseIdent(p, "companion name") orelse return null)
     else
@@ -606,7 +600,6 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
         support.skipNl(p);
         const t = types.parseType(p) orelse break;
         type_list.append(p.allocator, t) catch @panic("OOM");
-        // Optional constructor call `Bar(args)` after the type name.
         if (std.meta.activeTag(support.peekKind(p).*) == .LParen) {
             _ = support.bump(p);
             var args: std.ArrayList(Expr) = .empty;
@@ -616,9 +609,9 @@ pub fn parseOptionalSupertypesFull(p: *Parser) SupertypeList {
                 if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
                     break;
                 }
-                // A supertype constructor argument is a value argument like
-                // any call's: `Base(ints = *ints, s = s)` spreads into the
-                // vararg slot under its name.
+                // A supertype constructor argument is an ordinary value
+                // argument: `Base(ints = *ints, s = s)` spreads into the vararg
+                // slot under its name.
                 const this_name = expr.tryConsumeNamedArgName(p);
                 const a = expr.parseValueArgument(p) orelse break;
                 args.append(p.allocator, a) catch @panic("OOM");
@@ -698,16 +691,15 @@ pub fn parseClassBody(p: *Parser) ClassBody {
             _ = support.bump(p);
             support.skipNl(p);
             if (stmt.parseBlock(p)) |b| {
-                // Record the init block's position as the number of
-                // members already seen — runs before the next member
-                // (and after earlier ones).
+                // The init block's position is the number of members already
+                // seen: it runs before the next member and after earlier ones.
                 init_block_positions.append(p.allocator, member_list.items.len) catch @panic("OOM");
                 init_block_list.append(p.allocator, b) catch @panic("OOM");
             }
             continue;
         }
-        // Skip any modifiers in front of the next member. After that we
-        // can detect a `constructor` keyword to branch to secondary-ctor
+        // Skip any modifiers in front of the next member, after which a
+        // `constructor` keyword can be detected to branch to secondary-ctor
         // parsing.
         const mod_save = p.pos;
         const flags = file.skipModifiersWithFlags(p);
@@ -727,8 +719,8 @@ pub fn parseClassBody(p: *Parser) ClassBody {
             }
             continue;
         }
-        // Roll back the modifier consumption so `parseTopDecl` can do
-        // it itself (it depends on flags for the member it sees).
+        // Roll back the modifier consumption so `parseTopDecl` can redo it; it
+        // depends on the flags for the member it sees.
         p.pos = mod_save;
         if (file.parseTopDecl(p)) |d| {
             member_list.append(p.allocator, d) catch @panic("OOM");
@@ -760,7 +752,6 @@ pub fn parseSecondaryCtor(
     if (std.meta.activeTag(support.peekKind(p).*) == .Colon) {
         _ = support.bump(p);
         support.skipNl(p);
-        // Either `this` or `super` keyword, followed by `(args)`.
         const is_this: ?bool = switch (support.peekKind(p).*) {
             .Keyword => |k| switch (k) {
                 .This => true,
@@ -780,7 +771,7 @@ pub fn parseSecondaryCtor(
                 if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
                     break;
                 }
-                // A named delegation argument (`this(groups = …, slots = …)`)
+                // A named delegation argument (`this(groups = ..., slots = ...)`)
                 // binds the target constructor's parameter of that name; the
                 // names ride beside the positional expressions.
                 const an = expr.tryConsumeNamedArgName(p);
@@ -827,7 +818,6 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
     while (true) {
         support.skipNl(p);
         const annotations = file.parseAnnotations(p);
-        // Visibility modifiers in front of a param.
         var visibility: Visibility = .Public;
         while (std.meta.activeTag(support.peekKind(p).*) == .Ident) {
             const t = support.text(p, support.currentSpan(p));
@@ -865,7 +855,6 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
             .RParen, .Eof => break,
             else => {},
         }
-        // Optional `vararg` modifier on a primary-ctor parameter.
         var is_vararg = false;
         if (std.meta.activeTag(support.peekKind(p).*) == .Ident and
             std.mem.eql(u8, support.text(p, support.currentSpan(p)), "vararg"))
@@ -904,9 +893,9 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
             .annotations = &.{},
             .qualified_path = null,
         };
-        // An explicit-backing-field clause is never legal on a constructor
-        // property: reject `val xs: List<Int> field: MutableList<Int> = …`
-        // at the `field` token and consume the clause to recover.
+        // An explicit backing-field clause is never legal on a constructor
+        // property: reject `val xs: List<Int> field: MutableList<Int> = ...` at
+        // the `field` token and consume the clause to recover.
         if (std.meta.activeTag(support.peekKind(p).*) == .Ident and
             std.mem.eql(u8, support.text(p, support.currentSpan(p)), "field"))
         {
@@ -955,8 +944,6 @@ pub fn parseClassParamList(p: *Parser) []ClassParam {
     }
     return params.toOwnedSlice(p.allocator) catch @panic("OOM");
 }
-
-// ---------- helpers ----------
 
 fn eqlOpt(a: ?[]const u8, b: []const u8) bool {
     return if (a) |s| std.mem.eql(u8, s, b) else false;

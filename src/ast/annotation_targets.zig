@@ -1,17 +1,16 @@
-//! Annotation use-site targeting (Kotlin 2.4 semantics).
+//! Annotation use-site targeting (Kotlin 2.4 semantics), shared by the type
+//! checker for diagnostics and by lowering for per-anchor runtime annotation
+//! records.
 //!
-//! Shared by the type checker (diagnostics) and lowering (per-anchor
-//! runtime annotation records). Three pieces:
-//!
-//! - `useSiteSet` derives an annotation class's allowed use-site target
-//!   set U(A) from its `@Target` entry names.
-//! - `expandAll` implements the `@all:` property meta-target: a copy of
-//!   the annotation lands on every applicable anchor, skipping silently
-//!   any anchor outside U(A).
-//! - `defaultPlacement` implements the LV 2.4 defaulting rule for a
-//!   target-less annotation on a property: `param` when applicable, plus
-//!   the first of `property`/`field`; otherwise the first applicable of
-//!   `property`, `field`, delegate storage.
+//! - `useSiteSet` derives an annotation class's allowed use-site target set
+//!   U(A) from its `@Target` entry names.
+//! - `expandAll` implements the `@all:` property meta-target: a copy of the
+//!   annotation lands on every applicable anchor, skipping any anchor outside
+//!   U(A) silently.
+//! - `defaultPlacement` implements the defaulting rule for a target-less
+//!   annotation on a property: `param` when applicable plus the first of
+//!   `property`/`field`, else the first applicable of `property`, `field`,
+//!   delegate storage.
 
 const std = @import("std");
 
@@ -31,8 +30,7 @@ pub const UseSiteSet = struct {
     set: bool = false,
     file: bool = false,
 
-    /// No `@Target` on the annotation class: every use-site target except
-    /// `file` is admitted.
+    /// No `@Target` on the class: every use-site target but `file` is admitted.
     pub const no_target: UseSiteSet = .{
         .param = true,
         .receiver = true,
@@ -73,8 +71,7 @@ pub fn useSiteSet(target_names: ?[]const []const u8) UseSiteSet {
     return u;
 }
 
-/// The shape of the property declaration an annotation entry anchors to,
-/// as target assignment needs it.
+/// Shape of the property declaration an annotation entry anchors to.
 pub const PropertyShape = struct {
     /// A `val`/`var` declared in a primary constructor.
     is_ctor_property: bool = false,
@@ -108,11 +105,11 @@ pub const Placement = struct {
     }
 };
 
-/// `@all:A` expansion on a member/top-level property (KEEP-0402): a copy
-/// on the constructor parameter (constructor properties), the property,
-/// the backing field (when one exists), the getter, and the setter
-/// parameter (`var` only) — each iff its use-site target is in U(A).
-/// An empty result means no anchor is applicable (an error at the site).
+/// `@all:A` expansion on a member or top-level property: a copy on the
+/// constructor parameter (for a constructor property), the property, the
+/// backing field when one exists, the getter, and the setter parameter for a
+/// `var`, each only when its use-site target is in U(A). An empty result means
+/// no anchor applies, which is an error at the site.
 pub fn expandAll(u: UseSiteSet, shape: PropertyShape) Placement {
     var p = Placement{};
     if (shape.is_ctor_property and u.param) p.param = true;
@@ -123,11 +120,10 @@ pub fn expandAll(u: UseSiteSet, shape: PropertyShape) Placement {
     return p;
 }
 
-/// LV 2.4 defaulting for `@A` written with no use-site target on a
-/// property declaration. An empty result means none of the defaulting
-/// anchors is applicable: the annotation stays on the property
-/// declaration and plain target checking decides (an annotation that
-/// cannot target a property at all is an error).
+/// Defaulting for `@A` written with no use-site target on a property. An empty
+/// result means no defaulting anchor applies: the annotation stays on the
+/// property declaration and plain target checking decides, an annotation that
+/// cannot target a property at all being an error.
 pub fn defaultPlacement(u: UseSiteSet, shape: PropertyShape) Placement {
     var p = Placement{};
     if (shape.is_ctor_property and u.param) {
@@ -154,9 +150,7 @@ pub fn defaultPlacement(u: UseSiteSet, shape: PropertyShape) Placement {
     return p;
 }
 
-// -------------------------------------------------------------------------
 // Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -185,24 +179,24 @@ test "useSiteSet maps @Target entries per the KEEP table" {
 
 test "expandAll places on every applicable anchor" {
     const wide = set(&.{ "VALUE_PARAMETER", "PROPERTY", "FIELD", "PROPERTY_GETTER" });
-    // A1: ctor val — param, property, field, get; no setparam.
+    // A1: ctor val, so param, property, field, get; no setparam.
     {
         const p = expandAll(wide, .{ .is_ctor_property = true, .has_backing_field = true });
         try testing.expect(p.param and p.property and p.field and p.get);
         try testing.expect(!p.setparam and !p.set and !p.delegate);
     }
-    // A2: ctor var — also setparam (VALUE_PARAMETER covers it).
+    // A2: ctor var, so also setparam (VALUE_PARAMETER covers it).
     {
         const p = expandAll(wide, .{ .is_ctor_property = true, .is_var = true, .has_backing_field = true });
         try testing.expect(p.param and p.property and p.field and p.get and p.setparam);
     }
-    // A3/A12: member/top-level val — property, field, get; no param.
+    // A3/A12: member or top-level val, so property, field, get; no param.
     {
         const p = expandAll(wide, .{ .has_backing_field = true });
         try testing.expect(!p.param and p.property and p.field and p.get);
     }
-    // A4: getter-only annotation on a property with no backing field —
-    // get only, field skipped silently.
+    // A4: getter-only annotation on a property with no backing field, so get
+    // only, the field skipped silently.
     {
         const p = expandAll(set(&.{"PROPERTY_GETTER"}), .{});
         try testing.expect(p.get and !p.field and !p.property);
@@ -212,7 +206,7 @@ test "expandAll places on every applicable anchor" {
         const p = expandAll(set(&.{"FUNCTION"}), .{ .is_ctor_property = true, .has_backing_field = true });
         try testing.expect(p.isEmpty());
     }
-    // A9: param-only annotation — param only, rest skipped silently.
+    // A9: param-only annotation, so param only, the rest skipped silently.
     {
         const p = expandAll(set(&.{"VALUE_PARAMETER"}), .{ .is_ctor_property = true, .has_backing_field = true });
         try testing.expect(p.param and !p.property and !p.field and !p.get and !p.setparam);

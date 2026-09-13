@@ -68,7 +68,13 @@ def main():
         print(__doc__)
         return 2
     base = sys.argv[1]
-    paths = sys.argv[2:]
+    paths = []
+    for arg in sys.argv[2:]:
+        if os.path.isdir(arg):
+            for dp, _, fns in os.walk(arg):
+                paths += [os.path.join(dp, f) for f in fns if f.endswith('.zig')]
+        else:
+            paths.append(arg)
     if not paths:
         r = subprocess.run(['git', 'diff', '--name-only', base], capture_output=True, text=True)
         paths = [p for p in r.stdout.split('\n') if p.endswith('.zig')]
