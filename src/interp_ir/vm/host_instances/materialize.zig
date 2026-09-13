@@ -50,7 +50,6 @@ const build_object = @import("build_object.zig");
 const anonKey = build_object.anonKey;
 
 const common = @import("common.zig");
-const enum_entry_preset = common.enum_entry_preset;
 const typeErr = common.typeErr;
 
 const ctor_defaults = @import("ctor_defaults.zig");
@@ -466,12 +465,12 @@ pub fn materializeInstance(self: *VmHost, allocator: Allocator, class_def: ObjRe
     }
 
     var entry_slot: ?*Value = null;
-    if (enum_entry_preset) |preset| {
+    if (common.enum_entry_preset) |preset| {
         if (std.mem.eql(u8, preset.class_fqn, class_fqn)) {
             try fields.append(allocator, .{ .name = "name", .value = preset.name });
             try fields.append(allocator, .{ .name = "ordinal", .value = preset.ordinal });
             entry_slot = preset.slot;
-            enum_entry_preset = null;
+            common.enum_entry_preset = null;
         }
     }
     if (builtin_base) |bb| {

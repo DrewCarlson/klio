@@ -48,8 +48,6 @@ const NameValue = root.NameValue;
 
 const common = @import("common.zig");
 const boundHead = common.boundHead;
-const ctor_bounds = common.ctor_bounds;
-const ctor_static_heads = common.ctor_static_heads;
 const installCtorBounds = common.installCtorBounds;
 const typeErr = common.typeErr;
 
@@ -249,7 +247,7 @@ pub fn builtinTypeKind(head: []const u8) u8 {
 pub fn scoreCtorHeads(self: *VmHost, heads: []const []const u8, args: []const Value) ?i32 {
     var score: i32 = 0;
     var i: usize = 0;
-    const static_heads = ctor_static_heads;
+    const static_heads = common.ctor_static_heads;
     while (i < args.len and i < heads.len) : (i += 1) {
         const declared = boundHead(heads[i]);
         const got = valueTypeHead(args[i]);
@@ -451,7 +449,7 @@ pub fn expandParentSecondaryThisArgs(
         const def = classDefByName(self, sideTableKey(class_fqn, class_name)) orelse return .{ .ok = {} };
         defer def.deinit();
         const prev_bounds = installCtorBounds(def);
-        defer ctor_bounds = prev_bounds;
+        defer common.ctor_bounds = prev_bounds;
         const primary_count = classDefPrimaryParamCount(def);
         const entries = secondaryCtors(self, class_fqn, class_name);
         // Named header arguments (`A(y = 2, x = 4)`) bind to a secondary

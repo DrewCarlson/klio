@@ -1074,4 +1074,5 @@ test "discarded member probes release their owned miss message" {
 
 test {
     testing.refAllDecls(@This());
+    inline for (.{ receiver_probe, member_presence, applicability_probe, flat_call, static_tail, binding_probe, reflect_anon, resolve_method, slot_ops, virtual_tail, caches, stdlib_tail, member_ext_visibility, ext_fallback, named_call, member_ref_super }) |m| testing.refAllDecls(m);
 }

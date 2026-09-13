@@ -51,8 +51,6 @@ const common = @import("common.zig");
 const ctorGuardContains = common.ctorGuardContains;
 const ctorGuardPop = common.ctorGuardPop;
 const ctorGuardPush = common.ctorGuardPush;
-const ctor_bounds = common.ctor_bounds;
-const ctor_static_heads = common.ctor_static_heads;
 const installCtorBounds = common.installCtorBounds;
 const typeErr = common.typeErr;
 
@@ -293,7 +291,7 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
     defer self.ka.restore(ctor_keepalive);
     self.ka.pushSlice(args);
     const prev_bounds = installCtorBounds(class_def);
-    defer ctor_bounds = prev_bounds;
+    defer common.ctor_bounds = prev_bounds;
     const class_name = classDefName(class_def);
     const entries = secondaryCtors(self, classDefFqn(class_def), class_name);
     // A defaulted secondary is a candidate only when the primary cannot
@@ -306,7 +304,7 @@ pub fn dispatchSecondaryCtor(self: *VmHost, allocator: Allocator, class: ClassId
         chooseSecondaryCtorDefaulted(self, entries, args);
     // Everything below constructs further values; the site's static heads
     // describe THIS call's arguments only.
-    ctor_static_heads = null;
+    common.ctor_static_heads = null;
     if (chosen == null) {
         for (entries) |e| {
             // A hidden binary-compat constructor must not swallow an
