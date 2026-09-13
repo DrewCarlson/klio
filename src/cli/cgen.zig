@@ -1941,6 +1941,22 @@ fn companionReceiver(m: *const Module, prog: Program, types: []const Ty, cls: []
     return companionObjectNamed(m, prog, m.classes.items[sc].fqn);
 }
 
+/// The top-level function a bare name in value position denotes: `::twice`
+/// lowers to a read of the name, and the value it answers is the function
+/// itself. Only when exactly one declaration owns the name — an overload set
+/// has no single answer.
+fn topLevelFuncNamed(m: *const Module, name: []const u8) ?*const ir.Func {
+    var found: ?*const ir.Func = null;
+    for (m.funcs.items) |*fn_| {
+        if (!fn_.hasBody()) continue;
+        if (fn_.has_receiver_param) continue;
+        if (!std.mem.eql(u8, fn_.name, name) and !std.mem.eql(u8, fn_.fqn, name)) continue;
+        if (found != null) return null;
+        found = fn_;
+    }
+    return found;
+}
+
 fn classQualifierNamed(m: *const Module, name: []const u8) ?u32 {
     for (m.classes.items, 0..) |*c, i| {
         if (std.mem.eql(u8, c.name, name) or std.mem.eql(u8, c.fqn, name)) return @intCast(i);
@@ -3188,6 +3204,22 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                             cls[lg.dst.int()] = qc;
                             known[lg.dst.int()] = true;
                             continue;
+                        }
+                    }
+                    if (globalIndex(globals, gn.String) == null) {
+                        // A function's NAME in value position is the function
+                        // itself: a callable with no captures, which is the
+                        // same shape a lambda that captures nothing takes.
+                        if (topLevelFuncNamed(m, gn.String)) |rf| {
+                            if (rf.params.len <= FUNC_MAX_ARITY) {
+                                if (lg.dst.int() >= f.n_locals) return no(f, "callable dst");
+                                types[lg.dst.int()] = .object;
+                                cls[lg.dst.int()] = funcCls(@intCast(rf.params.len));
+                                elem[lg.dst.int()] = funcRetTy2(m, rf) orelse .object;
+                                lam[lg.dst.int()] = .{ .body = rf.id, .captures = &.{} };
+                                known[lg.dst.int()] = true;
+                                continue;
+                            }
                         }
                     }
                     const gi = globalIndex(globals, gn.String) orelse return noName(f, "global not declared", gn.String);
@@ -5292,6 +5324,13 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     // A class name used as a qualifier resolves at emit time
                     // and leaves nothing behind to load.
                     if (staticClassOf(c.types, c.cls, lg.dst.int()) != null) continue;
+                    if (c.lam[lg.dst.int()]) |li10| {
+                        var nb23: [32]u8 = undefined;
+                        try w.print("  {s} = KL[{d}];\n", .{
+                            regName(c, lg.dst.int(), &nb23), lambdaSingletonSlot(lambdas, li10.body).?,
+                        });
+                        continue;
+                    }
                     if (c.cls[lg.dst.int()]) |rc| {
                         if (!isBuiltinCls(rc) and singletonSlot(singletons, rc, null) != null) {
                             var nb2: [32]u8 = undefined;
@@ -6029,6 +6068,17 @@ pub fn emit(
         try accepted.append(gpa, c);
         for (f.blocks) |*blk| {
             for (blk.insts) |*inst| {
+                // A function's NAME in value position: the body it refers to
+                // is reachable through the reference alone.
+                if (inst.* == .LoadGlobal) {
+                    if (c.lam[inst.LoadGlobal.dst.int()]) |li11| {
+                        const rfn = m.funcById(li11.body) orelse return false;
+                        if (!seen.contains(rfn.id.int())) {
+                            try seen.put(rfn.id.int(), {});
+                            try queue.append(gpa, .{ .f = rfn, .synth = null });
+                        }
+                    }
+                }
                 // The one instance an `object` declaration has, named either
                 // by its own name or through the class whose companion it is.
                 const singleton_cid: ?u32 = switch (inst.*) {
@@ -6729,6 +6779,24 @@ pub fn emit(
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
+                if (inst.* == .LoadGlobal) {
+                    const lr9 = inst.LoadGlobal.dst.int();
+                    if (c.lam[lr9]) |li9| {
+                        var have_r = false;
+                        for (used_lambdas.items) |u| {
+                            if (u.body == li9.body) have_r = true;
+                        }
+                        if (!have_r) {
+                            try used_lambdas.append(gpa, .{
+                                .body = li9.body,
+                                .n_caps = 0,
+                                .arity = funcClsArity(c.cls[lr9].?).?,
+                                .ret = c.elem[lr9],
+                            });
+                        }
+                    }
+                    continue;
+                }
                 if (inst.* != .AstLambda) continue;
                 const al2 = inst.AstLambda;
                 if (c.types[al2.dst.int()] != .object) continue;
