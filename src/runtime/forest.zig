@@ -1,38 +1,26 @@
-//! Lazy stdlib-AST-forest resolver.
-//!
-//! The baked image holds each top-level `lifted_decls[i]` as a self-contained
-//! section (a fresh node registry; the deferred-`FunctionBody` pattern
-//! generalised to a whole decl). Instead of materialising the whole forest at
-//! load, `built`/`module` store `ForestRef`s — `(decl, ord)` — into the forest,
-//! and resolve them here on first runtime touch: the owning decl is decoded
-//! once (memoised), and `ord` indexes its decode-order node registry.
-//!
-//! The decode function is injected by the image loader (`setSection`) so this
-//! low runtime module needs no dependency on the codec, mirroring the
-//! deferred-body decoder hook in `ir/lower/inline_state.zig`.
+//! Lazy stdlib-AST-forest resolver. The baked image holds each top-level
+//! `lifted_decls[i]` as a self-contained section with its own node registry, so
+//! `built`/`module` store `ForestRef`s and resolve them here on first touch:
+//! the owning decl decodes once, memoised, and `ord` indexes its decode-order
+//! registry. The decode hook is injected by the image loader.
 
 const std = @import("std");
 const ast = @import("ast");
 const SpinMutex = @import("objcell.zig").SpinMutex;
 
-/// A reference to a watched AST node in the lazy forest: `decl` selects the
-/// top-level decl section, `ord` is the node's index in that decl's
-/// decode-order registry (stable: decode replays the bake traversal exactly).
+/// `ord` indexes the decl's decode-order registry, stable because decode
+/// replays the bake traversal.
 pub const ForestRef = struct { decl: u32, ord: u32 };
 
-/// A pointer to a forest AST node that is either eager (`ptr`, set by the build
-/// / runtime-class / fallback paths into live AST) or lazy (`ref`, set by the
-/// image load — resolved on first `get()`). Lets one field serve both the
-/// image-backed base and the freshly-built base.
+/// Either eager (`ptr`, the build path) or lazy (`ref`, the image load).
 pub fn ForestField(comptime T: type) type {
     return union(enum) {
         ptr: *const T,
         ref: ForestRef,
 
         const Self = @This();
-        /// Marker + element type read by the image codec to encode/decode this
-        /// union as a forest reference (or an inline fallback) rather than via
-        /// the generic union path.
+        /// Read by the image codec to encode this union as a forest reference
+        /// rather than through the generic union path.
         pub const is_forest_field = true;
         pub const Child = T;
 
@@ -42,8 +30,7 @@ pub fn ForestField(comptime T: type) type {
         pub fn fromRef(r: ForestRef) Self {
             return .{ .ref = r };
         }
-        /// Resolve to the node pointer, decoding+memoising the owning decl on
-        /// first lazy access.
+        /// Decodes and memoises the owning decl on first lazy access.
         pub fn get(self: Self) *const T {
             return switch (self) {
                 .ptr => |p| p,
@@ -53,13 +40,10 @@ pub fn ForestField(comptime T: type) type {
     };
 }
 
-/// A decoded decl plus its node-ordinal table (`nodes[ord]` = node address).
 pub const DeclReg = struct { decl: *const ast.Decl, nodes: []const usize };
 
 const DecodeFn = *const fn (std.mem.Allocator, []const u8, u32) ?DeclReg;
 
-/// One loaded image's forest: its per-decl section, offsets, the process-
-/// lifetime arena decoded decls live in, the decode hook, and the memo.
 const Section = struct {
     bytes: []const u8,
     offsets: []const u32,
@@ -68,12 +52,9 @@ const Section = struct {
     memo: []?DeclReg,
 };
 
-/// A ref's `decl` index carries its owning image's slot in the top byte
-/// (`(slot << SLOT_SHIFT) | local`), so bases loaded from several images
-/// coexist in one process — the parity harness loads both stdlib gate
-/// variants; the CLI loads one. Slot 0's refs are numerically identical to
-/// the single-image encoding, and refs are rebased from image-local form at
-/// image load, never at bake.
+/// A ref's `decl` index carries its owning image's slot in the top byte, so
+/// bases from several images coexist. Slot 0 matches the single-image encoding,
+/// and refs are rebased at image load, never at bake.
 pub const SLOT_SHIFT: u5 = 24;
 const LOCAL_MASK: u32 = (@as(u32, 1) << SLOT_SHIFT) - 1;
 const MAX_SECTIONS = 64;
@@ -82,10 +63,8 @@ var sections: [MAX_SECTIONS]?Section = @splat(null);
 var next_slot: u32 = 0;
 var mutex: SpinMutex = .{};
 
-/// Claim the next image slot. The loader reserves before decoding its root so
-/// refs can be rebased as they decode, and fills the slot once the section
-/// tables are known. Null when the registry is full — the load then fails and
-/// the caller falls back to the source build.
+/// The loader reserves before decoding its root, so refs rebase as they decode.
+/// Null when the registry is full, which fails the load back to a source build.
 pub fn reserveSlot() ?u32 {
     mutex.lock();
     defer mutex.unlock();
@@ -95,13 +74,11 @@ pub fn reserveSlot() ?u32 {
     return s;
 }
 
-/// The `decl`-index base for refs owned by `slot`.
 pub fn slotBase(slot: u32) u32 {
     return slot << SLOT_SHIFT;
 }
 
-/// Install a reserved slot's forest section, offset table, arena, and decode
-/// function. Allocates the memo table (one entry per decl).
+/// Allocates the memo table, one entry per decl.
 pub fn fillSlot(slot: u32, sec: []const u8, offs: []const u32, a: std.mem.Allocator, decode: DecodeFn) void {
     std.debug.assert(offs.len <= LOCAL_MASK);
     const m: []?DeclReg = a.alloc(?DeclReg, offs.len) catch &.{};
@@ -111,15 +88,12 @@ pub fn fillSlot(slot: u32, sec: []const u8, offs: []const u32, a: std.mem.Alloca
     sections[slot] = .{ .bytes = sec, .offsets = offs, .arena = a, .decode = decode, .memo = m };
 }
 
-/// Reserve + fill in one step for callers that need no rebase window (tests,
-/// single-image tools). Returns the slot's decl-index base.
 pub fn setSection(sec: []const u8, offs: []const u32, a: std.mem.Allocator, decode: DecodeFn) u32 {
     const slot = reserveSlot() orelse return 0;
     fillSlot(slot, sec, offs, a, decode);
     return slotBase(slot);
 }
 
-/// Whether any forest section is installed (some lazy path is active).
 pub fn active() bool {
     return next_slot != 0;
 }
@@ -139,8 +113,6 @@ fn ensureDecl(idx: u32) ?DeclReg {
     return dr;
 }
 
-/// Resolve a forest ref to the raw node address, decoding+memoising the owning
-/// decl on first touch. Null on a malformed image / out-of-range ref.
 pub fn resolveNode(ref: ForestRef) ?usize {
     const dr = ensureDecl(ref.decl) orelse return null;
     if (ref.ord >= dr.nodes.len) return null;

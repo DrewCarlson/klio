@@ -1,24 +1,15 @@
 //! Page-returning slab allocator for the tracing GC backend.
 //!
-//! The collector frees by reachability, but the backing allocator decides
-//! whether reclaimed pages return to the OS. `smp_allocator`/libc free-lists
-//! never do, so a long-running server's RSS grew with cumulative churn even
-//! though the live cell set stayed flat. This allocator fixes that: same-size
-//! cells are grouped into a `SLAB`-aligned slab, and the instant a slab's last
-//! live cell is freed the whole slab is `munmap`ped — so process RSS tracks the
-//! live set, not the high-water of allocation.
+//! libc and `smp_allocator` free-lists never return reclaimed pages to the OS,
+//! so RSS grows with cumulative churn while the live set stays flat. Here
+//! same-size cells share a `SLAB`-aligned slab, whose header a cell pointer
+//! masked to the `SLAB` boundary finds, and the slab is `munmap`ped the instant
+//! its last live cell frees. An allocation over `MAX_SMALL`, or needing more
+//! than `CELL_ALIGN`, goes straight to `mmap` and is recognised on free by the
+//! same test the allocation used.
 //!
-//! Layout: each small allocation rounds up to one of a fixed set of 16-byte
-//! aligned size classes and is served from a slab of that class. A cell's slab
-//! header is found by masking the pointer to the slab boundary (slabs are
-//! `SLAB`-aligned). Allocations larger than `MAX_SMALL`, or needing alignment
-//! beyond `CELL_ALIGN`, go straight to `mmap` (page-granular, already returns to
-//! the OS on free) and are recognised on free by the same size/alignment test
-//! the allocation used, so no per-pointer bookkeeping is needed.
-//!
-//! Thread-safety: one spinlock per size class guards that class's partial-slab
-//! list; the mmap-backed large path is lock-free. Locks are never held across a
-//! GC safe point.
+//! One spinlock per size class guards that class's partial-slab list; the large
+//! path is lock-free. A lock is never held across a GC safe point.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,12 +18,11 @@ const gc = @import("gc.zig");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
-const SLAB: usize = 256 * 1024; // slab span; also the cell→slab mask granularity
+const SLAB: usize = 256 * 1024; // slab span, and the cell-to-slab mask granularity
 const CELL_ALIGN: usize = 16; // every slab cell is 16-byte aligned
-const MAX_SMALL: usize = 8 * 1024; // larger allocations bypass slabs → direct mmap
+const MAX_SMALL: usize = 8 * 1024; // above this, allocations go direct to mmap
 
-/// 16-byte-aligned size classes. Spaced finely below 256 (where interpreter
-/// `ControlBlock`s and host scratch cluster), geometrically above.
+/// Spaced finely below 256, where the `ControlBlock`s and host scratch cluster.
 const class_sizes = [_]usize{
     16,   32,   48,   64,   80,   96,   112,  128,
     160,  192,  224,  256,  320,  384,  448,  512,
@@ -41,12 +31,11 @@ const class_sizes = [_]usize{
 };
 
 fn classIndex(size: usize) usize {
-    // class_sizes is sorted ascending; find the smallest class >= size.
     var i: usize = 0;
     while (i < class_sizes.len) : (i += 1) {
         if (class_sizes[i] >= size) return i;
     }
-    unreachable; // caller guarantees size <= MAX_SMALL == class_sizes[last]
+    unreachable; // the caller guarantees size <= MAX_SMALL
 }
 
 const FreeCell = struct { next: ?*FreeCell };
@@ -54,49 +43,34 @@ const FreeCell = struct { next: ?*FreeCell };
 const SlabHeader = struct {
     class_idx: u32,
     total: u32, // cells in this slab
-    free_count: u32, // free cells currently on `free_head` (excludes dormant)
+    free_count: u32, // cells on `free_head`, dormant ones excluded
     cell_size: u32,
     free_head: ?*FreeCell,
-    next: ?*SlabHeader, // partial-list links (owned by the class lock)
+    next: ?*SlabHeader, // partial-list links, owned by the class lock
     prev: ?*SlabHeader,
-    /// Pages `madvise`d/decommitted away (their cells pulled off the free list so
-    /// the discarded link storage is never read). Bit p = page p.
+    /// Bit p marks page p decommitted, its cells pulled off the free list so
+    /// the discarded link storage is never read.
     dormant_pages: u64,
-    /// Cells removed from the free list because they live in a dormant page. Not
-    /// re-handed-out until revived; counted toward the `live == 0` unmap test.
+    /// Not handed out again until revived; counts toward the unmap test.
     dormant_cells: u32,
-    /// Consecutive reclaim passes this slab has been mostly free. A few passes of
-    /// hysteresis keep transiently-empty slabs (between two allocations) out of
-    /// reclaim, so only stably-idle stragglers pay the decommit/revive churn.
+    /// Consecutive reclaim passes mostly free, so a slab empty only between
+    /// two allocations stays out of reclaim.
     idle_passes: u8,
 };
 
-/// Upper bounds for the per-slab reclaim scan, independent of the runtime page
-/// size: a slab holds at most `SLAB / CELL_ALIGN` cells and, at the smallest
-/// conceivable page, `SLAB / 4096` pages.
 const MAX_PAGES = SLAB / 4096;
 const MAX_CELL_WORDS = (SLAB / CELL_ALIGN + 63) / 64;
-/// Reclaim a slab only after it has been mostly free this many consecutive
-/// passes (hysteresis against decommit/revive thrash on actively-cycled slabs).
+/// Keeps an actively cycled slab out of decommit and revive thrash.
 const RECLAIM_IDLE_PASSES = 2;
 
 const ClassState = struct {
     lock: SpinLock = .{},
-    /// Slabs of this class that have at least one free cell. A slab with zero
-    /// free cells is unlinked (found again on free via the pointer mask); a slab
-    /// with every cell free is unlinked and either parked in `spare` or unmapped.
+    /// A full slab is unlinked and found again on free through the mask.
     partial: ?*SlabHeader = null,
-    /// Fully-free slabs kept mapped and threaded (an intrusive stack via
-    /// `next`), reused by the next allocation of this class instead of mapping
-    /// fresh ones. Unmapping a slab the instant its last cell frees thrashes
-    /// any workload that holds a single live cell of a class across a call —
-    /// the interpreted receiver chain is exactly that, so a method-call loop
-    /// paid an mmap, a 16K-cell threading pass, and an munmap PER CALL. A
-    /// single parked slab still thrashed GC-heavy churn (a sweep frees whole
-    /// bursts of slabs per class, the next allocation burst remaps them), so
-    /// every fully-free slab parks, and instead of the reclaim pass dropping
-    /// them unconditionally they age there (`idle_passes`) and return to the
-    /// OS only after sitting unused for `RECLAIM_IDLE_PASSES` passes.
+    /// Fully free slabs kept mapped and threaded for reuse. Unmapping one the
+    /// instant its last cell frees thrashes a workload holding a live cell
+    /// across a call, and a sweep frees whole bursts per class, so they park
+    /// here and age out after `RECLAIM_IDLE_PASSES`.
     spare: ?*SlabHeader = null,
     spare_count: u32 = 0,
 };
@@ -117,26 +91,18 @@ var class_states: [class_sizes.len]ClassState = blk: {
     break :blk s;
 };
 
-/// Diagnostic (KLIO_SLAB_STAT): bytes currently mapped from the OS (slab regions
-/// + direct-mmap large allocations). Tracks the process's real backing-store
-/// footprint independent of the GC's cell accounting, so a growing value with a
-/// flat GC live set pinpoints non-cell (host-temporary) leaks.
+/// `KLIO_SLAB_STAT`: bytes currently mapped from the OS. Independent of the
+/// GC's cell accounting, so growth against a flat live set is a non-cell leak.
 pub var mapped_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
-// --- Diagnostic mmap-site tracer (KLIO_SLAB_TRACE) ---------------------------
-// Below the GC allocator wrapper and the perm/nursery + main/worker split, so
-// it sees every slab/large mmap regardless of thread or generation — catching
-// leaks that bypass `leaktrack` (worker raw-slab allocations) or the GC sweep
-// (permanent-generation cells). Records the capture stack of each live mmap and
-// dumps the top sites by mapped bytes on SIGTERM/SIGINT.
+// `KLIO_SLAB_TRACE` mmap-site tracer, below the GC allocator wrapper and the
+// perm/nursery and main/worker splits, so it sees every mmap whatever the
+// thread or generation.
 pub var trace_enabled: bool = false;
-/// KLIO_SLAB_TRACE_ALL: trace build-phase mmaps too (see `mapRaw`).
+/// `KLIO_SLAB_TRACE_ALL`: trace build-phase mmaps too; see `mapRaw`.
 pub var trace_all: bool = false;
-/// Like `trace_enabled` but for small slab cells (KLIO_CELL_TRACE). Tracks every
-/// live small allocation at `allocSmall`/`freeSmall` — the guaranteed-paired
-/// free path for slab cells, unlike the higher-level leak locator whose
-/// alloc/free can straddle the GC sweep. Surfaces leaked raw host-temporaries
-/// (non-cell allocations the collector never frees) by their allocation stack.
+/// `KLIO_CELL_TRACE`: the same for small slab cells, whose alloc and free are
+/// guaranteed-paired unlike the higher-level leak locator.
 pub var cell_trace_enabled: bool = false;
 const TRACE_FRAMES = 14;
 const MapRec = struct { size: usize, addrs: [TRACE_FRAMES]usize, n: usize };
@@ -165,10 +131,8 @@ fn traceForget(ptr: usize) void {
     _ = trace_map.remove(ptr);
 }
 
-// Per-size-class cell trace maps, each guarded by that class's existing slab
-// lock (already held in allocSmall/freeSmall). Using the class lock instead of
-// a global one means the tracer adds no new cross-thread contention, so it does
-// not starve the stop-the-world sweep the way a single global lock did.
+// Per-size-class cell trace maps, guarded by the slab lock `allocSmall` and
+// `freeSmall` already hold, so the tracer cannot starve the sweep.
 const ClassTrace = struct { map: std.AutoHashMapUnmanaged(usize, MapRec) = .empty };
 var class_trace: [class_sizes.len]ClassTrace = blk: {
     var t: [class_sizes.len]ClassTrace = undefined;
@@ -197,7 +161,6 @@ fn mergeSite(sites: *std.ArrayListUnmanaged(TraceSite), r: *const MapRec) void {
     sites.append(std.heap.page_allocator, s) catch {};
 }
 
-/// Dump the top live-allocation sites by bytes (KLIO_SLAB_TRACE / KLIO_CELL_TRACE).
 pub fn traceReport() void {
     if (!trace_enabled and !cell_trace_enabled) return;
     var sites: std.ArrayListUnmanaged(TraceSite) = .empty;
@@ -230,7 +193,6 @@ fn onTraceSignal(_: std.c.SIG) callconv(.c) void {
     std.c._exit(0);
 }
 
-/// Install a SIGTERM/SIGINT handler that dumps the mmap-site report and exits.
 pub fn installTraceSignalDump() void {
     var act: std.posix.Sigaction = .{
         .handler = .{ .handler = onTraceSignal },
@@ -241,11 +203,8 @@ pub fn installTraceSignalDump() void {
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 }
 
-// --- Diagnostic page-allocator wrapper (KLIO_SLAB_TRACE) ---------------------
-// `page_allocator` allocations bypass the slab (so the mmap-site tracer above
-// never sees them) and the GC (so they leak silently if a free is gated wrong).
-// Routing a subsystem's `page_allocator` through this wrapper records each live
-// allocation under the same site report, exposing per-iteration page leaks.
+// `page_allocator` allocations bypass the slab, so the tracer never sees them,
+// and the GC, so they leak silently when a free is gated wrong.
 fn pAlloc(_: *anyopaque, len: usize, a: Alignment, ra: usize) ?[*]u8 {
     const p = std.heap.page_allocator.vtable.alloc(std.heap.page_allocator.ptr, len, a, ra) orelse return null;
     if (gc.program_started) traceNote(@intFromPtr(p), len);
@@ -266,21 +225,17 @@ fn pFree(_: *anyopaque, buf: []u8, a: Alignment, ra: usize) void {
 }
 const traced_page_vtable: Allocator.VTable = .{ .alloc = pAlloc, .resize = pResize, .remap = pRemap, .free = pFree };
 
-/// `page_allocator`, but every allocation is recorded in the mmap-site tracer
-/// when `KLIO_SLAB_TRACE` is on; otherwise the raw page allocator.
 pub fn tracedPage() Allocator {
     if (!trace_enabled) return std.heap.page_allocator;
     return .{ .ptr = undefined, .vtable = &traced_page_vtable };
 }
 
-/// Whether an `(len, alignment)` request is served from a slab (vs direct mmap).
-/// Both alloc and free apply this identical test, so free needs no per-pointer
-/// table to tell the two apart.
+/// Alloc and free apply the identical test, so free needs no per-pointer table
+/// to tell a slab cell from a direct mmap.
 inline fn isSmall(len: usize, alignment: Alignment) bool {
     return len <= MAX_SMALL and alignment.toByteUnits() <= CELL_ALIGN;
 }
 
-// --- direct mmap path (large or over-aligned) --------------------------------
 
 fn mapRaw(size: usize) ?[]align(std.heap.page_size_min) u8 {
     const m = std.posix.mmap(
@@ -292,10 +247,7 @@ fn mapRaw(size: usize) ?[]align(std.heap.page_size_min) u8 {
         0,
     ) catch return null;
     _ = mapped_bytes.fetchAdd(size, .monotonic);
-    // Only track post-startup mmaps so the permanent stdlib-image baseline does
-    // not crowd out the per-iteration host leaks this hunts; KLIO_SLAB_TRACE_ALL
-    // drops the gate for the multi-program harnesses, whose build-phase mmaps
-    // ARE the hunt.
+    // Track only post-startup mmaps; `KLIO_SLAB_TRACE_ALL` drops the gate.
     if (trace_enabled and (gc.program_started or trace_all)) traceNote(@intFromPtr(m.ptr), size);
     return m;
 }
@@ -317,11 +269,7 @@ fn allocLarge(len: usize) ?[*]u8 {
     return m.ptr;
 }
 
-// --- slab path ---------------------------------------------------------------
-
-/// `mmap` a `SLAB`-sized, `SLAB`-aligned region by over-mapping and trimming the
-/// unaligned head/tail. Slabs map infrequently, so the two extra `munmap`s are
-/// negligible against the per-cell fast path.
+/// Over-maps and trims the unaligned head and tail.
 fn mapSlabRegion() ?*SlabHeader {
     const over = mapRaw(SLAB + SLAB) orelse return null;
     const base = @intFromPtr(over.ptr);
@@ -333,7 +281,6 @@ fn mapSlabRegion() ?*SlabHeader {
     return @ptrFromInt(aligned);
 }
 
-/// Carve a fresh slab for `class_idx`, threading every cell onto its free list.
 fn newSlab(class_idx: usize) ?*SlabHeader {
     const s = mapSlabRegion() orelse return null;
     const cell_size = class_sizes[class_idx];
@@ -352,7 +299,7 @@ fn newSlab(class_idx: usize) ?*SlabHeader {
         .dormant_cells = 0,
         .idle_passes = 0,
     };
-    // Thread cells onto the free list (descending so the head is cell 0).
+    // Thread cells on descending, so the head ends up as cell 0.
     var i: usize = total;
     while (i > 0) {
         i -= 1;
@@ -367,8 +314,7 @@ inline fn slabOf(ptr: [*]u8) *SlabHeader {
     return @ptrFromInt(@intFromPtr(ptr) & ~(SLAB - 1));
 }
 
-/// The class's next allocation frontier: the parked spare (already mapped and
-/// threaded) before a freshly mapped slab. Caller holds the class lock.
+/// The parked spare before a freshly mapped slab. Caller holds the lock.
 fn takeFrontier(cs: *ClassState, ci: usize) ?*SlabHeader {
     const s = if (cs.spare) |sp| blk: {
         cs.spare = sp.next;
@@ -383,19 +329,16 @@ fn takeFrontier(cs: *ClassState, ci: usize) ?*SlabHeader {
     return s;
 }
 
-/// One cell off the class's partial list. Caller holds the class lock.
 fn allocLockedOne(cs: *ClassState, ci: usize) ?[*]u8 {
     var slab = cs.partial orelse takeFrontier(cs, ci) orelse return null;
-    // The head may have had its free cells decommitted into dormant pages by a
-    // reclaim pass. Re-commit one (reusing that slab) before mapping fresh memory
-    // — this is what keeps the reclaim from growing the address space unboundedly.
+    // A reclaim pass may have decommitted the head's free cells into dormant
+    // pages. Re-commit one before mapping fresh memory: this bounds the address
+    // space.
     while (slab.free_head == null) {
         if (slab.dormant_pages != 0) {
             _ = reviveOnePage(slab, class_sizes[ci], std.heap.pageSize());
             continue;
         }
-        // Truly exhausted (no free cells, nothing dormant): drop and take the next
-        // partial slab, reusing the parked spare (or mapping fresh) when none remain.
         cs.partial = slab.next;
         if (slab.next) |n| n.prev = null;
         slab.next = null;
@@ -405,8 +348,6 @@ fn allocLockedOne(cs: *ClassState, ci: usize) ?[*]u8 {
     slab.free_head = cell.next;
     slab.free_count -= 1;
     if (slab.free_count == 0 and slab.dormant_pages == 0) {
-        // No free cells and nothing dormant to revive: drop from the partial list
-        // (re-linked on the next free of one of its live cells).
         cs.partial = slab.next;
         if (slab.next) |n| n.prev = null;
         slab.next = null;
@@ -414,39 +355,30 @@ fn allocLockedOne(cs: *ClassState, ci: usize) ?[*]u8 {
     return @ptrCast(cell);
 }
 
-/// One cell back onto its slab's free list. Caller holds the class lock.
 fn freeLockedOne(ptr: [*]u8, slab: *SlabHeader, cs: *ClassState) void {
-    // Off the partial list only when *truly* full — no free cell and no dormant
-    // page. A reclaim pass can leave `free_count == 0` while the slab stays linked
-    // (its capacity dormant, revived on demand); re-linking on `free_count` alone
-    // would re-insert an already-linked slab and cycle the list.
+    // A slab is off the partial list only when truly full: no free cell and no
+    // dormant page. A reclaim pass can leave `free_count == 0` on a linked slab,
+    // so re-linking on `free_count` alone would cycle the list.
     const was_full = slab.free_count == 0 and slab.dormant_pages == 0;
     const cell: *FreeCell = @ptrCast(@alignCast(ptr));
     cell.next = slab.free_head;
     slab.free_head = cell;
     slab.free_count += 1;
     if (was_full) {
-        // Re-enter the partial list now that it has a free cell.
         slab.prev = null;
         slab.next = cs.partial;
         if (cs.partial) |p| p.prev = slab;
         cs.partial = slab;
     }
     if (slab.free_count + slab.dormant_cells == slab.total) {
-        // No live cells remain (the rest are free or dormant): unlink it.
         if (slab.prev) |p| p.next = slab.next else cs.partial = slab.next;
         if (slab.next) |n| n.prev = slab.prev;
         slab.prev = null;
         slab.next = null;
-        // Park it on the class's spare stack, so the next allocation burst
-        // reuses mapped, already-threaded slabs. A GC sweep frees whole
-        // bursts of slabs per class at once; any free-time cap here made the
-        // sweep unmap the burst and the next mutator burst remap+rethread it
-        // (`newSlab` was 2.3% of the concurrent map profile). Unbounded
-        // parking never raises the peak — these spans were mapped as garbage
-        // moments ago — and the reclaim pass ages idle spares back to the
-        // OS, so only a live churn cycle keeps them. Dormant-paged slabs
-        // still unmap outright (`munmap` reclaims their pages too).
+        // Park it on the class's spare stack so the next burst reuses mapped,
+        // already-threaded slabs. Parking never raises the peak, since these
+        // spans were garbage moments ago, and the reclaim pass ages idle spares
+        // back to the OS. A dormant-paged slab unmaps outright.
         if (slab.dormant_pages == 0) {
             slab.idle_passes = 0;
             slab.next = cs.spare;
@@ -458,17 +390,12 @@ fn freeLockedOne(ptr: [*]u8, slab: *SlabHeader, cs: *ClassState) void {
     }
 }
 
-// --- per-thread magazines -----------------------------------------------------
-// Every alloc/free taking the class spinlock serializes the interpreter's
-// worker threads on a handful of hot size classes — a concurrent-stress
-// workload spent a third of its samples spinning here. Each thread instead
-// keeps a small per-class cache of free cells: pops and pushes touch only
-// thread-local state, and the class lock is taken once per BATCH (refill on
-// empty, flush of half on full) instead of once per cell. Magazine cells are
-// off their slab's free list, so the GC-time reclaim pass sees them as live
-// and never decommits their pages out from under a cache.
+// Per-thread magazines: taking the class spinlock on every alloc and free
+// serializes the workers on a handful of hot size classes, so each thread
+// caches free cells per class and takes the lock once per batch. Magazine cells
+// are off their slab's free list, so the reclaim pass sees them as live.
 
-/// Per-class magazine capacity: ~4KB of cached cells, at least 4, at most 64.
+/// About 4KB of cached cells, at least 4, at most 64.
 const mag_caps: [class_sizes.len]u16 = blk: {
     var c: [class_sizes.len]u16 = undefined;
     for (class_sizes, 0..) |sz, i| c[i] = @intCast(@min(64, @max(4, 4096 / sz)));
@@ -479,8 +406,7 @@ const Magazine = struct { head: ?*FreeCell = null, count: u16 = 0 };
 
 threadlocal var magazines: [class_sizes.len]Magazine = @splat(.{});
 
-/// Return every cached cell to the slabs. Called at worker-thread exit so a
-/// dead thread strands nothing; also keeps `KLIO_SLAB_STAT` runs exact.
+/// Called at worker-thread exit so a dead thread strands nothing.
 pub fn flushMagazines() void {
     for (&magazines, 0..) |*mag, ci| {
         if (mag.head == null) continue;
@@ -498,15 +424,12 @@ pub fn flushMagazines() void {
 fn allocSmall(len: usize) ?[*]u8 {
     const ci = classIndex(len);
     const cs = &class_states[ci];
-    // The cell tracer records per-address stacks; magazine round-trips would be
-    // invisible to it, so diagnostic runs take the exact locked path.
+    // A magazine round-trip would be invisible to the per-address cell tracer.
     if (cell_trace_enabled) {
         cs.lock.lock();
         defer cs.lock.unlock();
         const cell = allocLockedOne(cs, ci) orelse return null;
-        // Sample 1-in-256 by address (deterministic, so free's remove agrees) to
-        // keep the per-allocation stack capture from starving the collector on a
-        // heavily-churning workload. Reported bytes are ~1/256 of the true total.
+        // Sample 1 address in 256, deterministically so free's remove agrees.
         if (gc.program_started and (@intFromPtr(cell) & 0xff) == 0) cellTraceNote(ci, @intFromPtr(cell), len);
         return cell;
     }
@@ -516,8 +439,6 @@ fn allocSmall(len: usize) ?[*]u8 {
         mag.count -= 1;
         return @ptrCast(cell);
     }
-    // Empty: take one for the caller and refill half a magazine in the same
-    // critical section.
     cs.lock.lock();
     defer cs.lock.unlock();
     const first = allocLockedOne(cs, ci) orelse return null;
@@ -551,7 +472,6 @@ fn freeSmall(ptr: [*]u8) void {
         mag.count += 1;
         return;
     }
-    // Full: return this cell and drain half the magazine under one lock.
     cs.lock.lock();
     defer cs.lock.unlock();
     freeLockedOne(ptr, slab, cs);
@@ -564,21 +484,16 @@ fn freeSmall(ptr: [*]u8) void {
     }
 }
 
-// --- page reclamation --------------------------------------------------------
-// A slab is `munmap`ped only when its last live cell frees, so a region holding
-// even one long-lived straggler keeps its whole span resident even after the rest
-// churns free. This pass — run during the stop-the-world GC — hands the physical
-// pages of such stably-sparse regions back to the OS: a page no live cell overlaps
-// is decommitted, and the free cells whose intrusive link storage lived in it are
-// pulled off the free list so the discarded links are never read. Those cells go
-// "dormant" — re-committed and re-threaded on demand by `allocSmall` rather than
-// mapping a fresh slab, so the address space stays bounded.
+// Page reclamation. A slab is `munmap`ped only when its last live cell frees,
+// so one long-lived straggler keeps a whole span resident. This pass, run
+// stop-the-world, decommits any page no live cell overlaps and pulls the free
+// cells whose link storage lived there off the free list. Those cells go
+// dormant, re-committed on demand by `allocSmall`.
 
-/// Return the resident pages of `[addr, addr+len)` to the OS while keeping the
-/// range mapped (zero-fill on the next touch). Overlaying a fresh anonymous
-/// `MAP_FIXED` mapping is the portable way to actually drop RSS — on macOS
-/// `madvise(MADV_FREE*/DONTNEED)` leaves the pages counted resident until
-/// reclaimed under pressure, so it does not move RSS at all.
+/// Returns the resident pages to the OS while keeping the range mapped,
+/// zero-filled on the next touch. Overlaying a fresh anonymous `MAP_FIXED`
+/// mapping is the portable way to actually drop RSS: on macOS `madvise` leaves
+/// the pages resident until reclaimed under pressure.
 inline fn decommit(addr: usize, len: usize) void {
     const p: [*]align(std.heap.page_size_min) u8 = @ptrFromInt(addr);
     _ = std.posix.mmap(
@@ -591,10 +506,8 @@ inline fn decommit(addr: usize, len: usize) void {
     ) catch {};
 }
 
-/// Re-commit one dormant page's cells onto the free list. The decommitted page
-/// stayed mapped (zero-filled), so re-threading its cells — which faults the page
-/// back in as it is touched — makes them allocatable again. Reusing dormant
-/// capacity rather than mapping a fresh slab is what bounds the address space.
+/// The decommitted page stayed mapped, zero-filled, so re-threading its cells
+/// faults it back in. Reusing dormant capacity bounds the address space.
 fn reviveOnePage(s: *SlabHeader, cell_size: usize, pg: usize) u32 {
     if (s.dormant_pages == 0) return 0;
     const p: usize = @ctz(s.dormant_pages);
@@ -616,12 +529,8 @@ fn reviveOnePage(s: *SlabHeader, cell_size: usize, pg: usize) u32 {
     return revived;
 }
 
-/// Decommit the all-free pages of one stably-sparse slab. STW-only: the class
-/// lock is held and no other thread mutates the slab.
+/// Stop-the-world only: the class lock is held and nothing else mutates it.
 fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
-    // Hysteresis: only act on slabs that have been mostly free for several
-    // consecutive passes, so a slab that is merely between two allocations is not
-    // churned into dormant pages and immediately revived.
     const live = s.total - s.free_count - s.dormant_cells;
     if (live * 2 > s.total) {
         s.idle_passes = 0;
@@ -635,7 +544,6 @@ fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
     const data_start = std.mem.alignForward(usize, slab_base + @sizeOf(SlabHeader), CELL_ALIGN);
     const n_pages = SLAB / pg;
 
-    // Bitset of cells currently on the free list.
     var free_bits = [_]u64{0} ** MAX_CELL_WORDS;
     {
         var fc = s.free_head;
@@ -646,8 +554,7 @@ fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
         }
     }
 
-    // A page is reclaimable iff no *live* cell overlaps it. Page 0 holds the
-    // header; already-dormant pages are left as they are.
+    // A page is reclaimable iff no live cell overlaps it; page 0 is header.
     var reclaimable = [_]bool{false} ** MAX_PAGES;
     {
         var p: usize = 1;
@@ -678,9 +585,8 @@ fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
     }
     if (!any) return;
 
-    // Rebuild the free list, dropping every cell whose link storage (its start)
-    // sits in a page about to be discarded — reading its `next` afterward would
-    // fault in a zeroed page and corrupt the chain.
+    // Drop every cell whose link storage sits in a page about to be discarded:
+    // reading its `next` would fault in a zeroed page.
     var new_head: ?*FreeCell = null;
     var kept: u32 = 0;
     var dropped: u32 = 0;
@@ -703,7 +609,6 @@ fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
     s.free_count = kept;
     s.dormant_cells += dropped;
 
-    // Decommit the reclaimable pages in contiguous runs (one mapping op per run).
     var p: usize = 1;
     while (p < n_pages) {
         if (!reclaimable[p]) {
@@ -718,21 +623,15 @@ fn reclaimSlab(s: *SlabHeader, cell_size: usize, pg: usize) void {
     }
 }
 
-/// Return the resident pages of sparsely-populated slabs to the OS. Wired as the
-/// GC's `release_to_os` hook for the slab backend; runs stop-the-world after a
-/// sweep, so the partial lists are stable and no cell is concurrently touched.
+/// The GC's `release_to_os` hook, run stop-the-world after a sweep.
 pub fn reclaimDormant() void {
     const pg = std.heap.pageSize();
-    if (SLAB / pg > MAX_PAGES) return; // defensive: oversized runtime page
+    if (SLAB / pg > MAX_PAGES) return; // runtime page larger than the scan bound
     for (&class_states, 0..) |*cs, ci| {
         cs.lock.lock();
         defer cs.lock.unlock();
-        // Parked spares hold no live cells, but dropping them all here made
-        // every GC cycle of a churn-heavy workload remap+rethread its whole
-        // burst (`newSlab` was 2.4% of the concurrent map profile). They age
-        // instead: a spare untouched for `RECLAIM_IDLE_PASSES` consecutive
-        // passes hands its span back, so a burst-cycled spare survives while
-        // a long-idle one never becomes a permanent per-class 256K tax.
+        // Dropping every parked spare here would make each collection of a
+        // churn-heavy workload remap its whole burst, so they age out instead.
         var keep: ?*SlabHeader = null;
         var keep_count: u32 = 0;
         var sp = cs.spare;
@@ -750,10 +649,7 @@ pub fn reclaimDormant() void {
         }
         cs.spare = keep;
         cs.spare_count = keep_count;
-        // Skip the partial head: it is the active allocation frontier, so
-        // decommitting it would just be undone by the next allocation. Reclaimed
-        // slabs stay linked — their dormant capacity is revived on demand by
-        // `allocSmall` — so the partial list stays a stable spine across passes.
+        // Skip the partial head: it is the active allocation frontier.
         const head = cs.partial orelse continue;
         var slab = head.next;
         while (slab) |s| {
@@ -763,7 +659,6 @@ pub fn reclaimDormant() void {
     }
 }
 
-// --- Allocator vtable --------------------------------------------------------
 
 fn alloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
     if (len == 0) return null;
@@ -774,10 +669,7 @@ fn alloc(_: *anyopaque, len: usize, alignment: Alignment, _: usize) ?[*]u8 {
 fn resize(_: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize, _: usize) bool {
     if (new_len == 0) return false;
     if (isSmall(buf.len, alignment)) {
-        // In place iff the new size still maps to this cell's class — i.e. the
-        // cell is already big enough AND a smaller request would not be a
-        // different class' job (free keys on the original len, so the class must
-        // not change).
+        // `free` keys on the requested length, so the class must not change.
         if (!isSmall(new_len, alignment)) return false;
         return classIndex(new_len) == classIndex(buf.len);
     }
@@ -786,8 +678,8 @@ fn resize(_: *anyopaque, buf: []u8, alignment: Alignment, new_len: usize, _: usi
 }
 
 fn remap(_: *anyopaque, _: []u8, _: Alignment, _: usize, _: usize) ?[*]u8 {
-    // Force the caller to alloc-copy-free; keeps the slab/mmap classification of
-    // a pointer fixed for its whole life (free must agree with alloc).
+    // Force alloc-copy-free, keeping a pointer's slab-or-mmap classification
+    // fixed for life, so free agrees with alloc.
     return null;
 }
 
@@ -807,24 +699,19 @@ const vtable: Allocator.VTable = .{
     .free = free,
 };
 
-/// The process-wide slab allocator handle. Stateless (all state is in the
-/// module globals), so a single shared instance serves every thread.
+/// Stateless, so one shared instance serves every thread.
 pub const allocator: Allocator = .{ .ptr = undefined, .vtable = &vtable };
-
-// --- tests -------------------------------------------------------------------
 
 test "slab alloc/free round-trips across classes and frees slabs" {
     const a = allocator;
-    // Exercise several size classes; free everything; the slabs must unmap.
     var bufs: [200][]u8 = undefined;
     for (&bufs, 0..) |*b, i| {
-        const sz = 16 + (i % 64) * 7; // 16..457, spans many classes
+        const sz = 16 + (i % 64) * 7; // 16..457, spanning many classes
         b.* = try a.alloc(u8, sz);
         @memset(b.*, @intCast(i & 0xff));
     }
     for (bufs) |b| try std.testing.expectEqual(@as(usize, 0), b.len & 0); // touch
     for (bufs) |b| a.free(b);
-    // A large allocation goes through mmap and frees cleanly.
     const big = try a.alloc(u8, 100 * 1024);
     @memset(big, 7);
     a.free(big);
@@ -837,7 +724,6 @@ test "slab reuses a freed cell (same address) within a class" {
     a.free(p1);
     const p2 = try a.alloc(u8, 64);
     defer a.free(p2);
-    // Same class, freed then re-allocated: the slab's free list returns it.
     try std.testing.expectEqual(addr1, @intFromPtr(p2.ptr));
 }
 
@@ -847,9 +733,6 @@ test "slab magazine caches a freed cell and flush returns it" {
     const p1 = try a.alloc(u8, 64);
     const addr = @intFromPtr(p1.ptr);
     a.free(p1);
-    // The freed cell sits in this thread's magazine; flushing pushes it (and
-    // the refill batch) back onto the slab free list, so it is among the next
-    // allocations rather than stranded in the cache.
     flushMagazines();
     var bufs: [40][]u8 = undefined;
     var seen = false;
@@ -868,13 +751,8 @@ test "slab spare stack parks freed slabs and ages them out across reclaim passes
     flushMagazines();
     const ci = classIndex(2048);
     const cs = &class_states[ci];
-    // Fill several slabs' worth of one class, then free everything. The
-    // design parks EVERY fully-free slab (no free-time cap: a GC sweep
-    // frees whole bursts and a cap forced the next burst to remap them;
-    // the aging below is the only unmapper), so a multi-slab burst must
-    // park more than one slab, bounded by the number of slabs the burst
-    // could have created.
-    const N = 400; // ~128 cells per 256K slab at 2 KiB → several slabs
+    // Every fully-free slab parks, so a multi-slab burst parks more than one.
+    const N = 400; // about 128 cells per 256K slab at 2 KiB, so several slabs
     var bufs: [N][]u8 = undefined;
     for (&bufs) |*b| b.* = try a.alloc(u8, 2048);
     for (bufs) |b| a.free(b);
@@ -887,19 +765,16 @@ test "slab spare stack parks freed slabs and ages them out across reclaim passes
         try T.expect(parked >= 2);
         try T.expect(parked <= N);
     }
-    // One pass ages the spares but keeps every one (hysteresis window):
-    // the count must not shrink yet.
+    // One pass is inside the hysteresis window, so the count must not shrink.
     reclaimDormant();
     {
         cs.lock.lock();
         defer cs.lock.unlock();
         try T.expectEqual(parked, cs.spare_count);
     }
-    // An allocation between passes reuses a parked spare (its age resets).
     const p = try a.alloc(u8, 2048);
     a.free(p);
     flushMagazines();
-    // Enough consecutive idle passes return every parked span to the OS.
     var pass: usize = 0;
     while (pass < RECLAIM_IDLE_PASSES + 1) : (pass += 1) reclaimDormant();
     {
@@ -913,27 +788,22 @@ test "slab spare stack parks freed slabs and ages them out across reclaim passes
 test "slab reclaim decommits sparse slabs, preserves stragglers, revives dormant" {
     const a = allocator;
     const T = std.testing;
-    const N = 300; // 2 KiB cells (~128/slab) → spans several slabs
+    const N = 300; // 2 KiB cells, about 128 per slab, so several slabs
     var bufs: [N][]u8 = undefined;
     for (&bufs, 0..) |*b, i| {
         b.* = try a.alloc(u8, 2048);
         @memset(b.*, @intCast(i & 0xff));
     }
-    // Free everything except a few scattered stragglers, so the slabs they do not
-    // pin go mostly free and become reclaim candidates.
     const kept = [_]usize{ 7, 140, 293 };
     for (bufs, 0..) |b, i| {
         const keep = i == kept[0] or i == kept[1] or i == kept[2];
         if (!keep) a.free(b);
     }
-    // Clear the idle-pass hysteresis so the sparse non-head slabs decommit.
+    // Clear the hysteresis so the sparse non-head slabs decommit.
     var pass: usize = 0;
     while (pass < RECLAIM_IDLE_PASSES + 2) : (pass += 1) reclaimDormant();
-    // A straggler shares its slab with decommitted pages, but its own page is
-    // never discarded — its bytes must be intact.
+    // A straggler's own page is never discarded.
     for (kept) |k| for (bufs[k]) |byte| try T.expectEqual(@as(u8, @intCast(k & 0xff)), byte);
-    // Allocating again must revive dormant capacity (or map fresh) and hand back
-    // sound, writable cells.
     var more: [N][]u8 = undefined;
     for (&more, 0..) |*b, i| {
         b.* = try a.alloc(u8, 2048);

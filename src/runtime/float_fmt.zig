@@ -1,26 +1,19 @@
-//! Kotlin/JVM-faithful `Double` / `Float` -> `String` formatting.
-//!
-//! Digit generation is a port of the Schubfach algorithm (Raffaello
-//! Giulietti, "The Schubfach way to render doubles", 2020), the same
-//! algorithm `java.lang.Double.toString` / `Float.toString` use. It
-//! reproduces Java's exact shortest-decimal choices -- including the
-//! deep-subnormal boundaries (`Double.MIN_VALUE` -> `4.9E-324`,
-//! `Float.MIN_VALUE` -> `1.4E-45`) where shortest-length-only formatting
-//! would render a different (also round-tripping) string. The layout step
-//! (scientific-vs-plain threshold, `E` notation, trailing `.0`) follows
-//! Kotlin's `Double.toString` contract.
+//! Kotlin/JVM-faithful `Double` and `Float` to `String` formatting. Digit
+//! generation ports Schubfach (Giulietti 2020), the algorithm
+//! `java.lang.Double.toString` uses, so it reproduces Java's exact
+//! shortest-decimal choices, including the deep-subnormal boundaries where
+//! shortest-length-only formatting renders a different, also round-tripping,
+//! string.
 
 const std = @import("std");
 
-/// Smallest `k` in `POW10`; entry `i` is `10^(POW10_MIN_K + i)` rounded
-/// up to a 128-bit `(hi, lo)` significand.
+/// Smallest `k` in `POW10`; entry `i` is `10^(POW10_MIN_K + i)` rounded up.
 const POW10_MIN_K: i32 = -292;
 
-/// A 128-bit power-of-ten significand: `.{ hi, lo }` 64-bit words,
-/// `[0]` high and `[1]` low.
+/// `[0]` high word, `[1]` low.
 const Pow10 = [2]u64;
 
-/// `ceil(2^-r . 10^k)` for `k` in `[-292, 324]`, as `(hi, lo)` 64-bit words.
+/// `ceil(2^-r . 10^k)` for `k` in `[-292, 324]`, as `(hi, lo)` words.
 const POW10 = [_]Pow10{
     .{ 0xFF77B1FCBEBCDC4F, 0x25E8E89C13BB0F7B },
     .{ 0x9FAACF3DF73609B1, 0x77B191618C54E9AD },
@@ -641,20 +634,17 @@ const POW10 = [_]Pow10{
     .{ 0x9E19DB92B4E31BA9, 0x6C07A2C26A8346D2 },
 };
 
-/// floor(log2(10^x)) for |x| <= 1233.
 fn floorLog2Pow10(x: i32) i32 {
     return (x * 1741647) >> 19;
 }
 
 fn pow10F64(k: i32) Pow10 {
-    // `k - POW10_MIN_K` is a valid non-negative table index for callers.
     const idx: usize = @intCast(k - POW10_MIN_K);
     return POW10[idx];
 }
 
-/// `roundToOdd(g, cp)` -- the high 64 bits of `cp . g` (128-bit `g`),
-/// with the low bits folded into bit 0 so the result is odd iff the exact
-/// product had any set bits below the top word past the first.
+/// The high 64 bits of `cp . g`, with the low bits folded into bit 0, so the
+/// result is odd iff the exact product had set bits below the top word.
 fn roundToOdd128(g: Pow10, cp: u64) u64 {
     const x: u128 = @as(u128, cp) * @as(u128, g[1]);
     const y: u128 = @as(u128, cp) * @as(u128, g[0]) + (x >> 64);
@@ -668,13 +658,10 @@ fn multipleOfPow2(value: u64, e2: i32) bool {
     return value & ((@as(u64, 1) << sh) - 1) == 0;
 }
 
-/// `(digits, exponent)` such that the magnitude equals `digits . 10^exponent`.
 const DigitsExp = struct { digits: u64, exponent: i32 };
 
-/// Schubfach digit generation for a finite, non-zero `f64` bit pattern.
-/// Returns `(digits, exponent)` such that the value's magnitude equals
-/// `digits . 10^exponent` and `digits` is the shortest significand Java
-/// would print (possibly with one trailing zero, stripped by the layout).
+/// `digits` is the shortest significand Java would print, possibly with one
+/// trailing zero that the layout strips.
 fn schubfachF64(bits: u64) DigitsExp {
     const HIDDEN_BIT: u64 = 1 << 52;
     const FRACTION_MASK: u64 = (1 << 52) - 1;
@@ -745,10 +732,7 @@ fn schubfachF64(bits: u64) DigitsExp {
     return .{ .digits = s + @intFromBool(round_up), .exponent = k + dk };
 }
 
-/// Schubfach digit generation for a finite, non-zero `f32` bit pattern.
-/// Same algorithm as `schubfachF64` with single-precision parameters;
-/// the 128-bit `POW10` table is shared (f32's `-k` range `[-31, 45]` is a
-/// subset of the table's `[-292, 324]`).
+/// The `POW10` table is shared; f32's `-k` range is a subset of it.
 fn schubfachF32(bits: u32) DigitsExp {
     const HIDDEN_BIT: u32 = 1 << 23;
     const FRACTION_MASK: u32 = (1 << 23) - 1;
@@ -819,24 +803,16 @@ fn schubfachF32(bits: u32) DigitsExp {
     return .{ .digits = s + @intFromBool(round_up), .exponent = k + dk };
 }
 
-/// A `Double`/`Float` rendered in Kotlin `toString` form never exceeds this
-/// many bytes: optional sign + 17 significant digits + `.` + `E` + sign +
-/// 3 exponent digits, with comfortable slack. Keeping the layout in a fixed
-/// stack buffer means rendering never allocates and never fails, so the
-/// callers (println, string templates, `Double.toString`) cannot fall back
-/// to a non-Kotlin shape on an allocator hiccup.
+/// A fixed stack buffer means rendering never allocates and never fails, so no
+/// caller falls back to a non-Kotlin shape on an allocator hiccup.
 pub const MAX_LEN: usize = 32;
 
-/// Render `(neg, digits, exponent)` (value = `+/-digits.10^exponent`) into
-/// Kotlin's `Double`/`Float` `toString` form, writing into `buf` and
-/// returning the populated prefix: plain decimal when the scientific
-/// exponent is in `[-3, 6]`, else `d.ddddE+/-x` notation, always with a
-/// fractional part (`.0` for integers, single-digit mantissas).
+/// Plain decimal when the scientific exponent is in `[-3, 6]`, else
+/// `d.ddddE+/-x`, always with a fractional part.
 fn layoutKotlin(buf: *[MAX_LEN]u8, neg: bool, digits_in: u64, exponent_in: i32) []u8 {
     var digits = digits_in;
     var exponent = exponent_in;
-    // Strip trailing zeros -- Schubfach may return e.g. `10.10^k`, which is
-    // one significant digit (`1.10^(k+1)`), and the layout counts digits.
+    // Schubfach may return `10.10^k`, which is one significant digit.
     while (digits >= 10 and digits % 10 == 0) {
         digits /= 10;
         exponent += 1;
@@ -871,7 +847,7 @@ fn layoutKotlin(buf: *[MAX_LEN]u8, neg: bool, digits_in: u64, exponent_in: i32) 
             push.slice(buf, &len, digit_str[1..]);
         }
         push.byte(buf, &len, 'E');
-        // Kotlin prints a bare exponent: `E20`, `E-324` (no `+`, no pad).
+        // Kotlin prints a bare exponent: `E20`, `E-324`, no `+` and no pad.
         var exp_buf: [12]u8 = undefined;
         const exp_str = std.fmt.bufPrint(&exp_buf, "{d}", .{sci_exp}) catch unreachable;
         push.slice(buf, &len, exp_str);
@@ -898,8 +874,7 @@ fn layoutKotlin(buf: *[MAX_LEN]u8, neg: bool, digits_in: u64, exponent_in: i32) 
     return buf[0..len];
 }
 
-/// `kotlin.Double.toString` digit/layout engine, rendering into the
-/// caller's fixed `buf` and returning the populated prefix. Never allocates.
+/// Never allocates.
 pub fn formatDouble(buf: *[MAX_LEN]u8, d: f64) []const u8 {
     if (std.math.isNan(d)) {
         return "NaN";
@@ -915,8 +890,6 @@ pub fn formatDouble(buf: *[MAX_LEN]u8, d: f64) []const u8 {
     return layoutKotlin(buf, neg, de.digits, de.exponent);
 }
 
-/// `kotlin.Float.toString` digit/layout engine, rendering into the caller's
-/// fixed `buf` and returning the populated prefix. Never allocates.
 pub fn formatFloat(buf: *[MAX_LEN]u8, f: f32) []const u8 {
     if (std.math.isNan(f)) {
         return "NaN";
@@ -932,39 +905,31 @@ pub fn formatFloat(buf: *[MAX_LEN]u8, f: f32) []const u8 {
     return layoutKotlin(buf, neg, de.digits, de.exponent);
 }
 
-/// `kotlin.Double.toString` digit/layout engine. Caller owns the returned
-/// slice (allocated with `allocator`).
+/// The caller owns the returned slice.
 pub fn doubleToString(allocator: std.mem.Allocator, d: f64) ![]u8 {
     var buf: [MAX_LEN]u8 = undefined;
     return allocator.dupe(u8, formatDouble(&buf, d));
 }
 
-/// `kotlin.Float.toString` digit/layout engine. Caller owns the returned
-/// slice (allocated with `allocator`).
 pub fn floatToString(allocator: std.mem.Allocator, f: f32) ![]u8 {
     var buf: [MAX_LEN]u8 = undefined;
     return allocator.dupe(u8, formatFloat(&buf, f));
 }
 
-/// Kotlin-compatible `Float.toString`. Caller owns the returned slice.
 pub fn kotlinFloatToString(allocator: std.mem.Allocator, d: f32) ![]u8 {
     return floatToString(allocator, d);
 }
 
-/// Kotlin-compatible `Double.toString`. Caller owns the returned slice.
 pub fn kotlinDoubleToString(allocator: std.mem.Allocator, d: f64) ![]u8 {
     return doubleToString(allocator, d);
 }
 
-/// Render a single Kotlin `Char` (a UTF-16 code unit) as a `String`. A
-/// BMP scalar renders as itself; a lone surrogate renders as the Unicode
-/// replacement character, since a UTF-8 string cannot hold one. Caller
-/// owns the returned slice.
+/// A lone surrogate renders as the replacement character, since a UTF-8 string
+/// cannot hold one.
 pub fn charUnitToString(allocator: std.mem.Allocator, unit: u16) ![]u8 {
     // A lone UTF-16 surrogate cannot be a valid UTF-8 scalar, so encode it as
-    // WTF-8 (the 3-byte `ED A0-BF 8x` form) so it round-trips through the byte
-    // buffer; an adjacent high+low pair is coalesced into the astral scalar by
-    // `coalesceSurrogates`. `Utf16View` decodes these back to the code unit.
+    // WTF-8 (`ED A0-BF 8x`) to round-trip through the byte buffer;
+    // `coalesceSurrogates` folds an adjacent pair into the astral scalar.
     if (unit >= 0xD800 and unit <= 0xDFFF) {
         var sbuf: [3]u8 = undefined;
         sbuf[0] = 0xE0 | @as(u8, @intCast(unit >> 12));
@@ -977,24 +942,17 @@ pub fn charUnitToString(allocator: std.mem.Allocator, unit: u16) ![]u8 {
     return allocator.dupe(u8, buf[0..n]);
 }
 
-/// True for the first byte of a 3-byte WTF-8 surrogate sequence at `bytes[i]`
-/// (`ED` followed by `A0-BF`), i.e. an encoded lone UTF-16 surrogate.
+/// `ED` followed by `A0-BF`: an encoded lone UTF-16 surrogate.
 pub fn isWtf8SurrogateAt(bytes: []const u8, i: usize) bool {
     return i + 3 <= bytes.len and bytes[i] == 0xED and bytes[i + 1] >= 0xA0 and bytes[i + 1] <= 0xBF;
 }
 
-/// Decode the WTF-8 surrogate 3-byte sequence at `bytes[i]` to its UTF-16 code
-/// unit (caller has checked `isWtf8SurrogateAt`).
 pub fn wtf8SurrogateUnit(bytes: []const u8, i: usize) u16 {
     return (@as(u16, bytes[i] & 0x0F) << 12) | (@as(u16, bytes[i + 1] & 0x3F) << 6) | (bytes[i + 2] & 0x3F);
 }
 
-/// Coalesce adjacent WTF-8 high+low surrogate sequences (each `ED A0-BF 8x`)
-/// into the single 4-byte astral scalar they encode, leaving all other bytes
-/// untouched. Used when a String/StringBuilder is built from individual `Char`
-/// units so a high/low pair becomes valid UTF-8 (matching a string literal),
-/// while a genuinely lone surrogate keeps its 3-byte WTF-8 form. Returns a
-/// freshly-allocated slice owned by `allocator`.
+/// Used when a String is built from individual `Char` units, so a high+low pair
+/// becomes valid UTF-8 while a genuinely lone surrogate keeps its 3-byte form.
 pub fn coalesceSurrogates(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, bytes, 0xED) == null) return allocator.dupe(u8, bytes);
     var out = try std.ArrayList(u8).initCapacity(allocator, bytes.len);
@@ -1020,7 +978,6 @@ pub fn coalesceSurrogates(allocator: std.mem.Allocator, bytes: []const u8) ![]u8
     return out.toOwnedSlice(allocator);
 }
 
-/// Snake_case aliases matching the names referenced across the codebase.
 pub const char_unit_to_string = charUnitToString;
 pub const kotlin_double_to_string = kotlinDoubleToString;
 pub const kotlin_float_to_string = kotlinFloatToString;
@@ -1131,15 +1088,12 @@ test "char unit to string" {
     defer a.free(bmp);
     try std.testing.expectEqualStrings("\u{00E9}", bmp);
 
-    // A lone surrogate is encoded as its 3-byte WTF-8 form (ED A0 80 for
-    // U+D800), not collapsed to U+FFFD, so it round-trips through the buffer.
     const lone_surrogate = try charUnitToString(a, 0xD800);
     defer a.free(lone_surrogate);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0xED, 0xA0, 0x80 }, lone_surrogate);
     try std.testing.expect(isWtf8SurrogateAt(lone_surrogate, 0));
     try std.testing.expectEqual(@as(u16, 0xD800), wtf8SurrogateUnit(lone_surrogate, 0));
 
-    // A high+low pair coalesces into the astral scalar (U+10000 = F0 90 80 80).
     const pair = try charUnitToString(a, 0xD800);
     defer a.free(pair);
     const low = try charUnitToString(a, 0xDC00);

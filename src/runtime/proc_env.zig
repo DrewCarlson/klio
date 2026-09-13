@@ -1,16 +1,12 @@
-//! Portable process-environment access.
-//!
-//! Zig 0.16 has no single global env accessor that works the same on every
-//! target, so this module reads the running process environment per platform:
-//! `/proc/self/environ` on Linux, the C `environ` array on other POSIX hosts,
-//! and the PEB environment block on Windows. All of these expose the same
-//! `KEY=VALUE` view; the value is returned as an `allocator`-owned copy.
+//! Portable process-environment access, since Zig 0.16 has no global accessor
+//! that works the same everywhere: `/proc/self/environ` on Linux, the C
+//! `environ` array on other POSIX hosts, the PEB block on Windows. The value is
+//! an `allocator`-owned copy.
 
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// Read an environment variable's value, returning an `allocator`-owned copy
-/// or `null` when the variable is unset (or the environment is unreadable).
+/// Null when the variable is unset or the environment is unreadable.
 pub fn getVar(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error!?[]u8 {
     if (builtin.os.tag == .windows) return getVarWindows(allocator, name);
     const data = readEnvironBlock(allocator) orelse return null;
@@ -27,11 +23,9 @@ pub fn getVar(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.
     return null;
 }
 
-/// The base directory that holds klio's `.klio` data tree (packs, cache,
-/// registry, stubs). `KLIO_HOME` overrides `HOME`, so a project can point its
-/// dev/test data at a repo-local gitignored folder instead of the shared
-/// `~/.klio`, keeping parallel workstreams from clobbering each other's packs.
-/// Caller frees.
+/// The base directory holding klio's `.klio` data tree. `KLIO_HOME` overrides
+/// `HOME`, so a project can point its data at a repo-local folder. Caller
+/// frees.
 pub fn klioHome(allocator: std.mem.Allocator) std.mem.Allocator.Error!?[]u8 {
     if (try getVar(allocator, "KLIO_HOME")) |v| {
         if (v.len != 0) return v;
@@ -40,7 +34,6 @@ pub fn klioHome(allocator: std.mem.Allocator) std.mem.Allocator.Error!?[]u8 {
     return getVar(allocator, "HOME");
 }
 
-/// Whether the named environment variable is present.
 pub fn isSet(allocator: std.mem.Allocator, name: []const u8) bool {
     const v = getVar(allocator, name) catch return false;
     if (v) |owned| {
@@ -50,8 +43,6 @@ pub fn isSet(allocator: std.mem.Allocator, name: []const u8) bool {
     return false;
 }
 
-/// Populate `map` with every `KEY=VALUE` pair from the process environment.
-/// Failures to read the environment leave `map` unchanged.
 pub fn putAllInto(allocator: std.mem.Allocator, map: *std.process.Environ.Map) void {
     switch (builtin.os.tag) {
         .windows => putAllWindows(map),
@@ -59,7 +50,6 @@ pub fn putAllInto(allocator: std.mem.Allocator, map: *std.process.Environ.Map) v
     }
 }
 
-/// Linux/POSIX: read the NUL-delimited `KEY=VALUE` block and split it.
 fn putAllNulBlock(allocator: std.mem.Allocator, map: *std.process.Environ.Map) void {
     const data = readEnvironBlock(allocator) orelse return;
     defer allocator.free(data);
@@ -72,9 +62,7 @@ fn putAllNulBlock(allocator: std.mem.Allocator, map: *std.process.Environ.Map) v
     }
 }
 
-/// Read the whole `KEY=VALUE` environment block into an owned buffer.
-/// Linux uses `/proc/self/environ`; other POSIX hosts reconstruct it from
-/// the libc `environ` array.
+/// Other POSIX hosts reconstruct it from the libc `environ` array.
 fn readEnvironBlock(allocator: std.mem.Allocator) ?[]u8 {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
@@ -116,7 +104,6 @@ fn readEnvironBlock(allocator: std.mem.Allocator) ?[]u8 {
     return contents.toOwnedSlice(allocator) catch null;
 }
 
-/// Windows: walk the PEB env block, WTF-8 decoding each key and value.
 fn putAllWindows(map: *std.process.Environ.Map) void {
     const windows = std.os.windows;
     const a = map.allocator;
@@ -151,9 +138,8 @@ fn wtf16Alloc(allocator: std.mem.Allocator, w: []const u16) ?[]u8 {
     return out;
 }
 
-/// Windows: the PEB holds the environment as a doubly-NUL-terminated block of
-/// UTF-16 `KEY=VALUE` entries. Keys compare case-insensitively (Windows env
-/// semantics). The value is WTF-8 decoded into an `allocator`-owned copy.
+/// A doubly-NUL-terminated block of UTF-16 `KEY=VALUE` entries, with
+/// case-insensitive keys.
 fn getVarWindows(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocator.Error!?[]u8 {
     const windows = std.os.windows;
     const peb = windows.peb();
@@ -162,8 +148,7 @@ fn getVarWindows(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocat
     var i: usize = 0;
     while (ptr[i] != 0) {
         const key_start = i;
-        // Some special vars start with '='; don't treat a leading '=' as the
-        // key/value separator.
+        // Some special vars start with '=', which is then not the separator.
         if (ptr[i] == '=') i += 1;
         while (ptr[i] != 0 and ptr[i] != '=') : (i += 1) {}
         const key_w = ptr[key_start..i];
@@ -184,8 +169,6 @@ fn getVarWindows(allocator: std.mem.Allocator, name: []const u8) std.mem.Allocat
     return null;
 }
 
-/// Case-insensitive (ASCII) comparison between a UTF-16 env key and an ASCII
-/// name. Env var names used here are ASCII, so a byte-wise fold suffices.
 fn keyMatchesWtf16(key_w: []const u16, name: []const u8) bool {
     if (key_w.len != name.len) return false;
     for (key_w, name) |kc, nc| {

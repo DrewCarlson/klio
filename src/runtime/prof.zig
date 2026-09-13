@@ -1,12 +1,7 @@
-//! Statistical PC sampler. Enabled with `KLIO_PROF=1`. Installs a SIGPROF
-//! handler driven by an ITIMER_PROF timer (CPU-time, so it samples only while
-//! the program actually runs), records the interrupted instruction pointer into
-//! a fixed buffer (signal-safe: one atomic increment + one store, no alloc),
-//! and at exit symbolizes the collected PCs into a by-function histogram.
-//!
-//! This is the ground-truth profiling tool for the interpreter. `clockMonotonicNanos`
-//! is useless for profiling (it spins up a threaded Io per call); a sampler that
-//! attributes wall-by-function is the right instrument.
+//! Statistical PC sampler (`KLIO_PROF=1`). A SIGPROF handler on an ITIMER_PROF
+//! timer, so it samples only while the program runs, records the interrupted
+//! instruction pointer into a fixed buffer (signal-safe: one atomic increment
+//! and one store) and symbolizes the PCs into a histogram at exit.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -16,21 +11,13 @@ const cpu_context = std.debug.cpu_context;
 
 const MAX_SAMPLES = 1 << 22; // 4M slots; overflow simply stops recording.
 
-/// The three sample tables are `mmap`ed by `maybeStart`, never declared as
-/// static arrays. At 4M slots each they are 32 MB apiece, and a Debug build
-/// fills an `undefined` global with a poison pattern — so as statics they could
-/// not live in `.bss` and became 96 MB of real bytes in EVERY binary, for a
-/// sampler that is off unless `KLIO_PROF` is set (they were the bulk of a
-/// 525 MB `klio`). Null until started; the handler bails on null.
+/// `mmap`ed by `maybeStart`, never static arrays: at 32 MB apiece a Debug
+/// build's `undefined` poison pattern would keep them out of `.bss`.
 var samples: ?[*]usize = null;
-/// Caller PC (one frame up via the frame pointer, Debug builds keep it),
-/// 0 when unavailable — lets the report attribute a hot leaf to its
-/// callers (`KLIO_PROF_CALLERS=<leaf-substring>`).
+/// Caller PC one frame up, 0 when unavailable, for `KLIO_PROF_CALLERS`.
 var callers: ?[*]usize = null;
 var callers2: ?[*]usize = null;
 
-/// Reserve the sample tables. Anonymous `mmap`, so the pages are committed by
-/// the kernel only as the sampler actually touches them.
 fn allocTables() bool {
     const bytes = MAX_SAMPLES * @sizeOf(usize);
     const m = std.posix.mmap(
@@ -67,9 +54,7 @@ fn handler(sig: posix.SIG, info: *const posix.siginfo_t, ctx: ?*anyopaque) callc
     }
 }
 
-/// One frame up: read the saved return address through the frame pointer
-/// (Debug builds keep it). Signal-safe (guarded loads); returns 0 when
-/// the frame pointer looks bogus.
+/// Signal-safe; returns 0 when the frame pointer looks bogus.
 fn callerPcsFromContext(ctx: ?*anyopaque) [2]usize {
     if (builtin.cpu.arch != .x86_64) return .{ 0, 0 };
     const cc = cpu_context.fromPosixSignalContext(ctx) orelse return .{ 0, 0 };
@@ -77,10 +62,8 @@ fn callerPcsFromContext(ctx: ?*anyopaque) [2]usize {
     var bp: usize = @intCast(cc.gprs.get(.rbp));
     var out: [2]usize = .{ 0, 0 };
     for (0..2) |lvl| {
-        // The frame pointer must sit on this stack, above SP and within a
-        // sane window — anything else is a leaf without FP or a foreign
-        // register value, and dereferencing it in a signal handler kills
-        // the process.
+        // The frame pointer must sit on this stack, above SP and within a sane
+        // window; dereferencing anything else in a signal handler kills us.
         if (bp <= sp or bp - sp > (1 << 23) or bp % @alignOf(usize) != 0) break;
         const ret_ptr: *const usize = @ptrFromInt(bp + @sizeOf(usize));
         out[lvl] = ret_ptr.*;
@@ -89,12 +72,9 @@ fn callerPcsFromContext(ctx: ?*anyopaque) [2]usize {
         if (next <= bp) break;
         bp = next;
     }
-    // FP-less leaf (compiler-rt memset, libc): the frame pointer still holds
-    // the CALLER's frame, so the leaf's return address is on the stack between
-    // SP and BP. Scan that window for the first own-text address and report it
-    // as the caller — heuristic (a spilled stale return address can match),
-    // but it turns an unattributable <no-fp> bucket into the right caller for
-    // the overwhelmingly common case.
+    // FP-less leaf: the frame pointer still holds the caller's frame, so the
+    // leaf's return address is on the stack between SP and BP. Scanning that
+    // window for the first own-text address is a heuristic.
     if (out[0] == 0) {
         const anchor = @intFromPtr(&handler);
         const lo = anchor -| (1 << 29);
@@ -113,8 +93,7 @@ fn callerPcsFromContext(ctx: ?*anyopaque) [2]usize {
     return out;
 }
 
-/// Start sampling if `KLIO_PROF` is set. Interval defaults to 1ms (1000 Hz);
-/// override microseconds with `KLIO_PROF=<usec>`.
+/// Interval defaults to 1ms; `KLIO_PROF=<usec>` overrides.
 pub fn maybeStart() void {
     if (builtin.os.tag != .linux) return;
     const env = if (builtin.link_libc) (std.c.getenv("KLIO_PROF") orelse return) else return;
@@ -132,8 +111,7 @@ pub fn maybeStart() void {
         .flags = posix.SA.SIGINFO | posix.SA.RESTART,
     };
     posix.sigaction(.PROF, &act, null);
-    // NOTE: the kernel reads `setitimer`'s second field as MICROseconds even
-    // though std types it as `nsec`. Put the microsecond count there directly.
+    // The kernel reads `setitimer`'s second field as MICROseconds.
     const its = linux.itimerspec{
         .it_interval = .{ .sec = @divFloor(usec, 1_000_000), .nsec = @mod(usec, 1_000_000) },
         .it_value = .{ .sec = @divFloor(usec, 1_000_000), .nsec = @mod(usec, 1_000_000) },
@@ -143,25 +121,16 @@ pub fn maybeStart() void {
 
 const NameCount = struct { name: []const u8, count: u32 };
 
-// ---------------------------------------------------------------------------
-// Opcode sampler (`KLIO_OP_PROF`): instead of machine PCs (which the linker's
-// identical-code folding merges into unattributable blobs), sample the
-// interpreter's own "currently executing opcode" tag. The eval loop stores
-// each instruction's enum tag into `current_op` (a threadlocal, gated on
-// `op_prof_active`); the SIGPROF handler increments a per-tag counter. The
-// innermost frame's store wins, so the histogram reads as self-time by
-// opcode — including time spent inside the host machinery an opcode
-// dispatches into. Works on macOS and Linux (libc setitimer).
-// ---------------------------------------------------------------------------
+// Opcode sampler (`KLIO_OP_PROF`): machine PCs merge under identical-code
+// folding, so this samples the interpreter's executing opcode tag instead. The
+// innermost frame's store wins, so it reads as self-time by opcode.
 
 pub var op_prof_active: bool = false;
 pub threadlocal var current_op: u16 = OP_OUTSIDE;
-/// Tag meaning "not inside execInst" (startup, host-only threads, GC).
+/// Tag meaning "not inside execInst".
 pub const OP_OUTSIDE: u16 = 0x1FF;
-/// Host-route sub-tags: stages inside a dispatch arm set these so the
-/// histogram splits an opcode's time by route. The eval loop overwrites the
-/// tag at the next instruction, so a route tag covers exactly the host work
-/// until either the callee's first instruction or the next stage marker.
+/// Host-route sub-tags split an opcode's time by route. The eval loop
+/// overwrites the tag at the next instruction.
 pub const OP_ROUTE_BASE: u16 = 0x100;
 pub inline fn opRoute(route: u16) void {
     if (op_prof_active) current_op = OP_ROUTE_BASE + route;
@@ -206,14 +175,9 @@ pub fn opProfMaybeStart() void {
     _ = setitimer(ITIMER_PROF_C, &itv, null);
 }
 
-// ---------------------------------------------------------------------------
-// Kotlin-function sampler (`KLIO_FN_PROF`): the PC sampler attributes time to
-// INTERPRETER functions; this one attributes it to the interpreted program's
-// own functions. `runFrameExec` stamps the executing func id into a
-// threadlocal (gated on `fn_prof_active`) and restores the caller's on exit,
-// so the histogram reads as self-time per Kotlin function — the census that
-// says which library bodies are worth serving natively.
-// ---------------------------------------------------------------------------
+// Kotlin-function sampler (`KLIO_FN_PROF`): `runFrameExec` stamps the executing
+// func id into a threadlocal and restores the caller's on exit, so this reads as
+// self-time per interpreted function rather than per interpreter function.
 
 pub var fn_prof_active: bool = false;
 pub threadlocal var current_fn: u32 = FN_OUTSIDE;
@@ -254,22 +218,19 @@ pub fn fnProfMaybeStart() void {
     _ = setitimer(ITIMER_PROF_C, &itv, null);
 }
 
-/// The raw per-id sample counts (index = func id, folded into the table).
-/// The caller maps ids to names — the runtime layer cannot see the IR.
+/// Index is the func id; the caller maps ids to names, this layer not being
+/// able to see the IR.
 pub fn fnProfCounts() ?*const [FN_SLOTS]std.atomic.Value(u32) {
     if (!fn_prof_active) return null;
     return &fn_hist;
 }
 
-/// The raw per-tag sample counts (index = instruction enum tag;
-/// `OP_OUTSIDE` = time outside the eval loop). The caller maps indexes to
-/// opcode names — the runtime layer cannot see the IR enum.
+/// Index is the instruction enum tag; `OP_OUTSIDE` is time outside the loop.
 pub fn opProfCounts() ?*const [OP_SLOTS]std.atomic.Value(u64) {
     if (!op_prof_active) return null;
     return &op_hist;
 }
 
-/// Stop sampling and print the by-function histogram to stderr.
 pub fn maybeReport() void {
     if (builtin.os.tag != .linux) return;
     if (!active) return;
@@ -291,7 +252,7 @@ pub fn maybeReport() void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Fold identical PCs first so symbolization runs once per unique address.
+    // Fold identical PCs first, so symbolization runs once per address.
     var addr_counts = std.AutoHashMap(usize, u32).init(gpa);
     defer addr_counts.deinit();
     const sm = (samples orelse return)[0..total];
@@ -327,7 +288,6 @@ pub fn maybeReport() void {
         accumulate(&by_name, arena, nm, c);
     }
 
-    // Sort by count descending.
     var list = std.ArrayList(NameCount).empty;
     defer list.deinit(gpa);
     var nit = by_name.iterator();
@@ -370,9 +330,8 @@ pub fn maybeReport() void {
         shown += 1;
     }
 
-    // Caller attribution for one hot leaf: KLIO_PROF_CALLERS=<substring>
-    // folds the CALLER PCs of every sample whose leaf symbol contains the
-    // substring, naming who drives it.
+    // `KLIO_PROF_CALLERS=<substring>` folds the caller PCs of every matching
+    // sample.
     const want_env = if (builtin.link_libc) std.c.getenv("KLIO_PROF_CALLERS") else null;
     if (want_env) |we| {
         const want = std.mem.span(we);
@@ -397,8 +356,6 @@ pub fn maybeReport() void {
             };
             if (!is_leaf) continue;
             matched += 1;
-            // Attribute one entry per level so a thin wrapper's own caller
-            // shows up alongside it.
             const e = caller_counts.getOrPut(caller) catch continue;
             if (e.found_existing) e.value_ptr.* += 1 else e.value_ptr.* = 1;
             if (caller2 != 0) {
@@ -440,9 +397,7 @@ pub fn maybeReport() void {
             std.debug.print("  {d:>8}  {s}\n", .{ nc.count, nc.name });
             cshown += 1;
         }
-        // With KLIO_PROF_RAW, also dump the caller PCs themselves so an
-        // opaque anon instantiation can be pinned to file:line offline
-        // (addr2line -e <binary> <pc - load_base>).
+            // `KLIO_PROF_RAW` also dumps the caller PCs for offline addr2line.
         if (builtin.link_libc and std.c.getenv("KLIO_PROF_RAW") != null) {
             const AddrCount = struct {
                 addr: usize,
@@ -467,9 +422,7 @@ pub fn maybeReport() void {
     }
 }
 
-/// The process's /proc/self/maps regions, held so an address the debug-info
-/// symbolizer cannot resolve is at least attributed to its mapped module
-/// (`<unknown:libc.so.6>`) instead of one opaque bucket.
+/// So an unresolvable address is at least attributed to its module.
 const MapRanges = struct {
     starts: []usize = &.{},
     ends: []usize = &.{},
@@ -478,8 +431,7 @@ const MapRanges = struct {
     fn read(arena: std.mem.Allocator) MapRanges {
         var out: MapRanges = .{};
         if (@import("builtin").os.tag != .linux) return out;
-        // Raw procfs read: Zig 0.16's std fs API moved behind `Io` (same
-        // no-`Io` pattern as objcell's `procEnvironHas`).
+        // Raw procfs read: Zig 0.16's std fs API moved behind `Io`.
         const fd_raw = std.os.linux.open("/proc/self/maps", .{ .ACCMODE = .RDONLY }, 0);
         if (@as(isize, @bitCast(fd_raw)) < 0) return out;
         const fd: i32 = @intCast(fd_raw);
@@ -537,8 +489,7 @@ fn accumulate(map: *std.StringHashMap(u32), arena: std.mem.Allocator, name: []co
     if (e.found_existing) {
         e.value_ptr.* += c;
     } else {
-        // Key may point into per-call arena memory that getSymbols recycles;
-        // dupe into the persistent report arena.
+        // The key may point into arena memory `getSymbols` recycles.
         e.key_ptr.* = arena.dupe(u8, name) catch name;
         e.value_ptr.* = c;
     }

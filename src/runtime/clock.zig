@@ -1,14 +1,7 @@
-//! Portable clock and sleep helpers.
-//!
-//! Zig 0.16 routes wall-clock, monotonic time, and sleeping through the
-//! `Io` interface; these helpers instead go straight to the libc syscalls
-//! when libc is linked. The original per-call `std.Io.Threaded` ceremony
-//! (allocator setup, a syscall-helper thread hop, teardown) profiled as
-//! the TOP consumer of a whole commontest run: every idle pool worker,
-//! monitor waiter, and pump poll sleeps at a ~1 ms cadence, and paying a
-//! runtime construction per tick multiplied into whole cores of overhead
-//! (and its allocation churn drove GC collections while idle). The `Io`
-//! path remains as the no-libc fallback.
+//! Portable clock and sleep helpers. Zig 0.16 routes wall-clock, monotonic time
+//! and sleeping through `Io`; these go straight to the libc syscalls when libc
+//! is linked, because every idle worker and pump poll sleeps at a ~1 ms cadence
+//! and a per-call `std.Io.Threaded` construction costs whole cores.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -32,7 +25,6 @@ fn cSleepNs(ns: u64) bool {
     return true;
 }
 
-/// Wall-clock time in milliseconds since the Unix epoch.
 pub fn wallMillis() i64 {
     if (cNowNs(.REALTIME)) |ns| return @intCast(@divFloor(ns, std.time.ns_per_ms));
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
@@ -41,7 +33,6 @@ pub fn wallMillis() i64 {
     return std.Io.Clock.real.now(io).toMilliseconds();
 }
 
-/// Wall-clock seconds and the nanosecond remainder since the Unix epoch.
 pub const WallTime = struct { secs: i64, nanos: u32 };
 
 pub fn wallTime() WallTime {
@@ -56,8 +47,7 @@ pub fn wallTime() WallTime {
     return .{ .secs = @intCast(secs), .nanos = nanos };
 }
 
-/// Monotonic clock reading in nanoseconds (since some unspecified epoch).
-/// Only differences between readings are meaningful. Returns 0 on failure.
+/// Only differences are meaningful. 0 on failure.
 pub fn monotonicNanos() u64 {
     const ns: i128 = cNowNs(.MONOTONIC) orelse blk: {
         var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
@@ -69,23 +59,17 @@ pub fn monotonicNanos() u64 {
     return @intCast(@min(ns, @as(i128, std.math.maxInt(u64))));
 }
 
-/// Sleep for `ms` milliseconds. A non-positive value returns immediately.
-/// On an abandonable thread (a dispatcher pool worker running a daemon
-/// task) the sleep is sliced so a run-boundary abandon request wakes the
-/// task promptly instead of waiting out the full duration.
+/// On an abandonable thread the sleep is sliced, so a run-boundary abandon
+/// request wakes the task promptly.
 pub fn sleepMillis(ms: i64) void {
     if (ms <= 0) return;
     // A sleeping thread makes no progress and holds its live Values in its
-    // registered per-thread roots, so it counts as parked for a concurrent
-    // collection's stop-the-world rendezvous rather than blocking it.
+    // registered per-thread roots, so it counts as parked for a collection's
+    // rendezvous rather than blocking it.
     gc.enterBlockingSafe();
     defer gc.exitBlockingSafe();
-    // Every sleep is sliced so an abandon request — the pool's daemon
-    // shutdown for its workers, or the run boundary's drain-everything
-    // stop for explicit threads — wakes the sleeper promptly instead of
-    // waiting out the full duration. Non-abandonable threads use coarse
-    // slices: the overhead is one wakeup per 50 ms, and a leaked sleeper
-    // no longer holds the run's final join open.
+    // A non-abandonable thread uses coarse slices, so a leaked sleeper no
+    // longer holds the run's final join open.
     const slice_ms: i64 = if (threads_mod.isThreadAbandonable()) 2 else 50;
     if (comptime builtin.link_libc) {
         var remaining = ms;
@@ -109,13 +93,9 @@ pub fn sleepMillis(ms: i64) void {
     }
 }
 
-/// Cross-thread event gate: an epoch counter with a libc condvar, so a
-/// waiter parks until the epoch moves (or a timeout) instead of polling.
-/// `ring` bumps the epoch under the gate mutex and broadcasts; `waitFrom`
-/// parks only while the epoch still equals the `seen` snapshot the caller
-/// took BEFORE its final emptiness check, which closes the post-then-wait
-/// race. Without libc the wait degrades to a bounded micro-sleep. Waits
-/// are bracketed GC blocking-safe, exactly like sleeps.
+/// Cross-thread event gate: an epoch counter with a libc condvar. `waitFrom`
+/// parks only while the epoch still equals the `seen` snapshot the caller took
+/// before its final emptiness check, which closes the post-then-wait race.
 pub const EventGate = struct {
     mutex: std.c.pthread_mutex_t = .{},
     cond: std.c.pthread_cond_t = .{},
@@ -155,10 +135,7 @@ pub const EventGate = struct {
     }
 };
 
-/// Block the calling thread for `us` microseconds — the fine-grained
-/// variant of `sleepMillis` for sub-millisecond wait cadences (the pump's
-/// adaptive wall-timer backoff). Same GC blocking-safe bracket; no
-/// abandonment slicing (the callers' own loops re-check between slices).
+/// No abandonment slicing: the callers' own loops re-check between slices.
 pub fn sleepMicros(us: i64) void {
     if (us <= 0) return;
     gc.enterBlockingSafe();

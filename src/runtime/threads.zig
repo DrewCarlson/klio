@@ -1,32 +1,23 @@
-//! Cross-thread runtime registries shared by every interpreter layer:
-//! per-OS-thread display-name overrides (dispatcher worker threads
-//! report upstream-shaped names through `Thread.currentThread().name`)
-//! and run-boundary cleanup hooks (a layer that keeps process-global
-//! state keyed into a run's value graph registers a sweep here so the
-//! run boundary empties it before the run arena is reset).
+//! Cross-thread registries: per-OS-thread display names, the daemon-task
+//! abandonment flags, and run-boundary cleanup hooks a layer registers so the
+//! boundary empties its state before the run arena resets.
 
 const std = @import("std");
 const objcell = @import("objcell.zig");
 
 const SpinMutex = objcell.SpinMutex;
 
-/// Allocator backing the process-global registries; the spines live for
-/// the whole process, entries are bounded by live threads / hooks.
+/// The spines live for the whole process.
 fn registryAllocator() std.mem.Allocator {
     return std.heap.page_allocator;
 }
 
-// -------------------------------------------------------------------------
-// Thread display names.
-// -------------------------------------------------------------------------
 
 var names_mutex: SpinMutex = .{};
 var names: ?std.AutoHashMap(u64, []const u8) = null;
 
-/// Register a display name for the OS thread `id`. The name bytes are
-/// copied into the registry. A worker registers on entry and clears on
-/// exit (`clearThreadName`) so a recycled OS thread id never reports a
-/// stale name.
+/// The bytes are copied. A worker registers on entry and clears on exit, so a
+/// recycled OS thread id never reports a stale name.
 pub fn setThreadName(id: u64, name: []const u8) void {
     const a = registryAllocator();
     const copy = a.dupe(u8, name) catch return;
@@ -41,7 +32,6 @@ pub fn setThreadName(id: u64, name: []const u8) void {
     gop.value_ptr.* = copy;
 }
 
-/// Drop the display name registered for `id`, if any.
 pub fn clearThreadName(id: u64) void {
     names_mutex.lock();
     defer names_mutex.unlock();
@@ -50,8 +40,7 @@ pub fn clearThreadName(id: u64) void {
     }
 }
 
-/// The display name registered for `id`, copied into `allocator`-owned
-/// bytes, or `null` when the thread has no override.
+/// Copied into `allocator`-owned bytes.
 pub fn threadName(allocator: std.mem.Allocator, id: u64) ?[]const u8 {
     names_mutex.lock();
     defer names_mutex.unlock();
@@ -63,98 +52,71 @@ pub fn threadName(allocator: std.mem.Allocator, id: u64) ?[]const u8 {
     return null;
 }
 
-// -------------------------------------------------------------------------
-// Daemon-task abandonment.
-//
-// Dispatcher pool tasks are daemons (upstream `GlobalScope` semantics):
-// the run boundary does not wait for them. A task still in flight when
-// the pool shuts down is asked to stop through this flag; the evaluator
-// and the host sleep primitives poll it on abandonable threads and abort
-// the task cooperatively, so the pool can join its workers without
-// waiting out (or hanging on) a daemon body.
-// -------------------------------------------------------------------------
+// Daemon-task abandonment. Dispatcher pool tasks are daemons, so the run
+// boundary does not wait for them: an in-flight task is asked to stop through
+// this flag, which the evaluator and the sleep primitives poll.
 
-/// Process-global "abandon in-flight daemon tasks now" request, set for
-/// the duration of the pool's run-boundary shutdown.
+/// Set for the duration of the pool's run-boundary shutdown.
 var abandon_requested = std.atomic.Value(bool).init(false);
 
-/// `true` on threads whose current work may be abandoned (dispatcher
-/// pool workers running a task). Never set on the main thread or on
-/// explicit `kotlin.concurrent.thread` workers, which are always joined.
+/// Never set on the main thread or on explicit `kotlin.concurrent.thread`
+/// workers, which are always joined.
 threadlocal var thread_abandonable: bool = false;
 
-/// Mark the calling thread's current work abandonable (dispatcher pool
-/// task execution) or not.
 pub fn setThreadAbandonable(on: bool) void {
     thread_abandonable = on;
 }
 
-/// Whether the calling thread's current work is abandonable.
 pub fn isThreadAbandonable() bool {
     return thread_abandonable;
 }
 
-/// Optional hook the coroutine layer installs to be told the calling thread
-/// is about to block in a real wall sleep (`Thread.sleep`). A dispatched pool
-/// task doing wall work is not advancing the cooperative virtual clock, so the
-/// hook settles its virtual-clock "unsettled" count, letting a top-level
-/// driver advance virtual time without waiting out the wall sleep. `null`
-/// until installed; a no-op for every non-coroutine build.
+/// Hook the coroutine layer installs to hear that this thread is about to block
+/// in a real wall sleep. A pool task doing wall work does not advance the
+/// cooperative virtual clock, so the hook settles its unsettled count.
 var wall_block_hook: ?*const fn () void = null;
 
 pub fn setWallBlockHook(hook: *const fn () void) void {
     wall_block_hook = hook;
 }
 
-/// Notify the installed hook (if any) that this thread is entering a wall
-/// sleep. Cheap when no hook is installed.
 pub fn notifyWallBlock() void {
     if (wall_block_hook) |h| h();
 }
 
-/// Ask every abandonable thread to abort its current task.
 pub fn requestAbandon() void {
     abandon_requested.store(true, .release);
 }
 
-/// Withdraw the abandon request (the pool finished its shutdown).
 pub fn clearAbandon() void {
     abandon_requested.store(false, .release);
 }
 
-/// Run-boundary hard stop: the run's result is already computed and the
-/// boundary is draining workers, so EVERY thread still executing user
-/// code — including explicit `kotlin.concurrent.thread` workers, which
-/// are otherwise never abandonable — must stop cooperatively. A test
-/// that leaks a spinning or sleeping thread previously hung the whole
-/// run at the final join (the per-test wall cap is cleared by then, and
-/// the pool's own abandonment only starts after the explicit joins).
+/// Run-boundary hard stop: every thread still executing user code, including
+/// explicit `kotlin.concurrent.thread` workers that are otherwise never
+/// abandonable, must stop, or a leaked spinning thread hangs the final join.
 var run_boundary_abandon = std.atomic.Value(bool).init(false);
 
 pub fn setRunBoundaryAbandon(on: bool) void {
     run_boundary_abandon.store(on, .release);
 }
 
-/// Whether the drain-everything stop is currently raised. The test runner
-/// consults this after a test returns to know a wall-cap abort fired and a
-/// grace drain + flag clear is needed before the next test starts.
+/// The test runner consults this after a test to know a wall-cap abort fired
+/// and a grace drain is needed.
 pub fn runBoundaryAbandonActive() bool {
     return run_boundary_abandon.load(.acquire);
 }
 
-/// Whether the calling thread should abort its current task: abandonment
-/// is requested and the thread is either abandonable (a pool worker) or
-/// the run boundary is draining every worker. The threadlocal gate keeps
-/// the check cheap for non-pool threads outside the boundary.
+/// True when abandonment is requested and the thread is either abandonable or
+/// the boundary is draining. The threadlocal gate keeps the check cheap.
 pub fn shouldAbandon() bool {
     if (!thread_abandonable and !run_boundary_abandon.load(.acquire)) return false;
     return abandon_requested.load(.acquire);
 }
 
-/// Raw flag addresses for the transpiled hot path's inlined edge guard:
-/// the emitted C polls these bytes and calls the slow edge op only when
-/// a trigger fires. `thread_abandonable` is threadlocal — the pointer is
-/// only valid on the fetching thread, refreshed per activation entry.
+/// Raw flag addresses for the transpiled hot path's inlined edge guard.
+/// `thread_abandonable` is threadlocal, so the pointer is valid only on the
+/// fetching thread and is refreshed per activation entry.
 pub fn abandonablePtr() *const bool {
     return &thread_abandonable;
 }
@@ -165,17 +127,13 @@ pub fn abandonRequestedPtr() *const bool {
     return &abandon_requested.raw;
 }
 
-// -------------------------------------------------------------------------
-// Run-boundary sweep hooks.
-// -------------------------------------------------------------------------
 
 const Hook = *const fn () void;
 
 var hooks_mutex: SpinMutex = .{};
 var hooks: ?std.ArrayList(Hook) = null;
 
-/// Register a cleanup hook to run at every run boundary (after all
-/// worker threads have joined, before the run arena can be reset).
+/// Runs after all workers have joined and before the run arena resets.
 /// Registering the same function twice is a no-op.
 pub fn registerRunBoundaryHook(hook: Hook) void {
     hooks_mutex.lock();
@@ -187,8 +145,7 @@ pub fn registerRunBoundaryHook(hook: Hook) void {
     hooks.?.append(registryAllocator(), hook) catch {};
 }
 
-/// Invoke every registered run-boundary hook. Called exactly once per
-/// run from the top-level driver thread after every worker has joined.
+/// Called once per run, after every worker has joined.
 pub fn runBoundarySweep() void {
     const snapshot = blk: {
         hooks_mutex.lock();
@@ -200,9 +157,6 @@ pub fn runBoundarySweep() void {
     for (snapshot) |h| h();
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 

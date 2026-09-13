@@ -1,9 +1,7 @@
-//! Shared runtime types for the interpreter and the stdlib.
-//!
-//! `Value`, `RuntimeError`, the `Output` sink, and `Env` live here so that
-//! the stdlib can express native intrinsics in terms of the same
-//! types the interpreter evaluates against, without either depending on
-//! the other.
+//! Shared runtime types for the interpreter and the stdlib: `Value`,
+//! `RuntimeError`, the `Output` sink and `Env` live here so the stdlib can
+//! express native intrinsics against the types the interpreter evaluates,
+//! without either depending on the other.
 
 const std = @import("std");
 
@@ -20,7 +18,6 @@ const safety_mod = @import("safety.zig");
 const threads_mod = @import("threads.zig");
 const alloc_track_mod = @import("alloc_track.zig");
 
-// objcell
 pub const ObjRef = objcell.ObjRef;
 pub const OptRef = objcell.OptRef;
 pub const ObjGuard = objcell.ObjGuard;
@@ -36,27 +33,23 @@ pub const getenvSlice = objcell.getenvSlice;
 pub const envOnce = objcell.envOnce;
 pub const envSetOnce = objcell.envSetOnce;
 
-/// Consolidated runtime performance configuration (`--opt` / `KLIO_OPT`): the
-/// JIT tiers and the memory backend, resolved once from a single profile.
+/// `--opt` / `KLIO_OPT`: the JIT tiers and the memory backend, resolved once.
 pub const perf = @import("perf.zig");
 pub const AllocChoice = perf.AllocChoice;
 pub const allocChoice = perf.allocChoice;
-// Tracing GC (KGC) — see gc.zig / docs/design/GC.md.
 pub const gc = objcell.gc;
-// Page-returning slab allocator for the GC backend (keeps RSS tracking the
-// live set; smp/libc free-lists never return reclaimed pages to the OS).
 pub const slab = @import("slab.zig");
 pub const leaktrack = @import("leaktrack.zig");
 pub const trace = @import("trace.zig");
 pub const forest = @import("forest.zig");
 pub const prof = @import("prof.zig");
 
-/// Debug-only frame-chain dump hook, installed by the evaluator at startup
-/// so a stdlib intrinsic (which cannot import the ir layer) can name its
-/// calling frames in a diagnostic. Null until the evaluator installs it.
+/// Debug-only frame-chain dump hook the evaluator installs at startup, so a
+/// stdlib intrinsic, which cannot import the ir layer, can name its calling
+/// frames in a diagnostic.
 pub var debug_frame_dump: ?*const fn () void = null;
-// Host-op temporary keepalive (a GC root for accumulators/snapshots held across
-// a re-entrant user callable). No-ops unless the GC is active.
+// Host-op temporary keepalive: a GC root for accumulators held across a
+// re-entrant user callable. No-ops unless the GC is active.
 pub const keepaliveMark = value_mod.keepaliveMark;
 pub const keepaliveHandle = value_mod.keepaliveHandle;
 pub const KeepaliveHandle = value_mod.KeepaliveHandle;
@@ -67,7 +60,6 @@ pub const keepalivePushCell = value_mod.keepalivePushCell;
 pub const keepaliveRestore = value_mod.keepaliveRestore;
 pub const gcUninstallKeepaliveRoot = value_mod.gcUninstallKeepaliveRoot;
 
-// alloc_track (opt-in allocation accounting; KLIO_ALLOC_TRACK)
 pub const allocTrackWrap = alloc_track_mod.wrap;
 pub const allocTrackSnapshot = alloc_track_mod.snapshot;
 pub const allocTrackReportPhase = alloc_track_mod.reportPhase;
@@ -77,7 +69,6 @@ pub const AllocTrackSnap = alloc_track_mod.Snap;
 pub const pageAllocator = alloc_track_mod.pageAllocator;
 pub const allocTrackReportPageStderr = alloc_track_mod.reportPageStderr;
 
-// value
 pub const Value = value_mod.Value;
 pub const ReceiverAbi = value_mod.ReceiverAbi;
 pub const classifierReceiverAbi = value_mod.classifierReceiverAbi;
@@ -162,7 +153,6 @@ pub const SetData = value_mod.SetData;
 pub const SetRef = value_mod.SetRef;
 pub const setRefOf = value_mod.setRefOf;
 
-// class
 pub const ClassDef = class_mod.ClassDef;
 pub const ImplicitReceiver = class_mod.ImplicitReceiver;
 pub const SupertypeDelegate = class_mod.SupertypeDelegate;
@@ -181,7 +171,6 @@ pub const NativeBox = class_mod.NativeBox;
 pub const MethodHit = class_mod.MethodHit;
 pub const PropertyHit = class_mod.PropertyHit;
 
-// host
 pub const StdlibFn = host_mod.StdlibFn;
 pub const CallCtx = host_mod.CallCtx;
 pub const IntrinsicHost = host_mod.IntrinsicHost;
@@ -189,7 +178,6 @@ pub const NoopHost = host_mod.NoopHost;
 pub const HostResultU64 = host_mod.HostResultU64;
 pub const BuilderStepResult = host_mod.BuilderStepResult;
 
-// output
 pub const Output = output_mod.Output;
 pub const OutOp = output_mod.OutOp;
 pub const RecordingSink = output_mod.RecordingSink;
@@ -204,16 +192,13 @@ pub const wtf8SurrogateUnit = float_fmt_mod.wtf8SurrogateUnit;
 pub const pushCharUnit = output_mod.pushCharUnit;
 pub const charUnitsToString = output_mod.charUnitsToString;
 
-// env
 pub const Env = env_mod.Env;
 
-// proc_env (portable process-environment access)
 pub const procEnvGetVar = proc_env_mod.getVar;
 pub const procEnvKlioHome = proc_env_mod.klioHome;
 pub const procEnvIsSet = proc_env_mod.isSet;
 pub const procEnvPutAllInto = proc_env_mod.putAllInto;
 
-// clock (portable wall-clock / monotonic time / sleep)
 pub const clockWallMillis = clock_mod.wallMillis;
 pub const clockWallTime = clock_mod.wallTime;
 pub const ClockWallTime = clock_mod.WallTime;
@@ -222,11 +207,9 @@ pub const clockSleepMillis = clock_mod.sleepMillis;
 pub const clockSleepMicros = clock_mod.sleepMicros;
 pub const EventGate = clock_mod.EventGate;
 
-// float_fmt
 pub const floatToString = float_fmt_mod.floatToString;
 pub const doubleToString = float_fmt_mod.doubleToString;
 
-// threads (cross-thread name overrides + run-boundary sweep hooks)
 pub const setThreadName = threads_mod.setThreadName;
 pub const clearThreadName = threads_mod.clearThreadName;
 pub const threadName = threads_mod.threadName;
@@ -245,7 +228,6 @@ pub const abandonablePtr = threads_mod.abandonablePtr;
 pub const runBoundaryAbandonPtr = threads_mod.runBoundaryAbandonPtr;
 pub const abandonRequestedPtr = threads_mod.abandonRequestedPtr;
 
-// safety (host-protection backstops)
 pub const startMemoryWatchdog = safety_mod.startMemoryWatchdog;
 pub const startRunDeadline = safety_mod.startRunDeadline;
 pub const runCapped = safety_mod.runCapped;
@@ -275,9 +257,6 @@ test {
     _ = alloc_track_mod;
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 

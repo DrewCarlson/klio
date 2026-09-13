@@ -1,13 +1,6 @@
-//! Opt-in allocation tracker: wrap any backing allocator to count bytes,
-//! allocations, frees, and a power-of-two size histogram, with named phase
-//! snapshots so a caller can attribute a region of work (e.g. the stdlib
-//! image decode) to a byte delta.
-//!
-//! Gated by `KLIO_ALLOC_TRACK`: when unset, `wrap` returns the child
-//! allocator untouched (zero overhead, zero behavior change). When set,
-//! `wrap` installs a global tracking layer and `reportStderr` / `snapshot`
-//! expose the running totals. The whole-process report prints at exit when
-//! `main` calls `reportStderr`.
+//! Opt-in allocation tracker (`KLIO_ALLOC_TRACK`): wraps a backing allocator to
+//! count bytes, allocations, frees and a size histogram, with named phase
+//! snapshots. When the variable is unset `wrap` returns the child untouched.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -48,8 +41,7 @@ fn enabledByEnv() bool {
     return s.len != 0 and !std.mem.eql(u8, s, "0");
 }
 
-/// Returns a tracking allocator wrapping `child` when `KLIO_ALLOC_TRACK` is
-/// set, otherwise `child` itself.
+/// The child itself when `KLIO_ALLOC_TRACK` is unset.
 pub fn wrap(child: std.mem.Allocator) std.mem.Allocator {
     if (!enabledByEnv()) return child;
     state = .{ .child = child };
@@ -123,7 +115,6 @@ fn freeFn(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: u
     state.mutex.unlock();
 }
 
-/// Print a labeled snapshot delta since `since` to stderr.
 pub fn reportPhase(label: []const u8, since: Snap) void {
     if (!active) return;
     const now = snapshot();
@@ -135,7 +126,6 @@ pub fn reportPhase(label: []const u8, since: Snap) void {
     );
 }
 
-/// Print the full process report (totals + histogram) to stderr.
 pub fn reportStderr() void {
     if (!active) return;
     state.mutex.lock();
@@ -157,11 +147,8 @@ fn mb(bytes: u64) f64 {
     return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
 }
 
-// -------------------------------------------------------------------------
-// Page-allocator probe: a passthrough over `std.heap.page_allocator` that
-// (when KLIO_PAGE_TRACE is set) dumps a stack trace for allocations in a
-// target size window, to attribute large direct page mmaps to their source.
-// -------------------------------------------------------------------------
+// Page-allocator probe: under `KLIO_PAGE_TRACE` it dumps a stack trace for
+// allocations in a target size window, attributing large mmaps to their source.
 
 var page_trace_on: bool = false;
 var page_trace_inited: bool = false;
@@ -185,7 +172,6 @@ const page_vtable: std.mem.Allocator.VTable = .{
     .free = pageFreeFn,
 };
 
-/// `std.heap.page_allocator` plus optional large-allocation stack tracing.
 pub fn pageAllocator() std.mem.Allocator {
     if (!pageTraceEnabled()) return std.heap.page_allocator;
     return .{ .ptr = undefined, .vtable = &page_vtable };
@@ -210,7 +196,7 @@ fn pageAllocFn(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr
     return p;
 }
 
-/// Print the page-allocator size histogram (only meaningful with tracing on).
+/// Only meaningful with tracing on.
 pub fn reportPageStderr() void {
     if (!pageTraceEnabled()) return;
     page_mutex.lock();

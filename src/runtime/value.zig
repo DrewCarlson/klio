@@ -1,11 +1,7 @@
-//! The runtime `Value` model: the tagged union every interpreter and
-//! stdlib path evaluates against, its helper enums/structs, and the
-//! `RuntimeError` data type.
-//!
-//! Reference handles: `ObjRef(T)` is the refcounted, interior-mutable,
-//! lock-mediated cell; `*Value` is an owning pointer to a single boxed
-//! value. Shared-immutable AST nodes map to `*const ast.X` pointers,
-//! owned by the parse/lower arena.
+//! The runtime `Value` model: the tagged union every interpreter and stdlib
+//! path evaluates against, its helper types, and `RuntimeError`. `ObjRef(T)` is
+//! the refcounted, lock-mediated cell; `*Value` an owning pointer to one boxed
+//! value; `*const ast.X` a borrow from the parse/lower arena.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -24,23 +20,17 @@ const Env = env_mod.Env;
 
 const StdlibFn = @import("host.zig").StdlibFn;
 
-/// Scratch arena for the supertype walks below. The walk is bounded (64 steps
-/// over two `[]const u8` lists), so a fixed buffer covers it; keeping the
-/// buffer in thread-local storage instead of on the stack means the safety
-/// fill of an `undefined` stack array does not run on every call, which is
-/// what made object equality pay a 16 KiB `memset` per comparison.
+/// Scratch arena for the supertype walks below; the walk is bounded. Held
+/// thread-local rather than on the stack, so the safety fill of an `undefined`
+/// stack array does not run on every call.
 threadlocal var subtype_scratch: [16 * 1024]u8 align(16) = undefined;
 threadlocal var subtype_scratch_busy: bool = false;
 
-/// Direct-mapped per-class memo for `instanceImplementsMapEntry`. A class's
-/// `Map.Entry`-ness is fixed by its supertype graph, so one walk per class is
-/// enough no matter how many comparisons ask.
+/// A class's `Map.Entry`-ness is fixed by its supertype graph.
 const MapEntryMemoSlot = struct { key: usize = 0, val: bool = false };
 threadlocal var map_entry_memo: [512]MapEntryMemoSlot = @splat(.{});
 
-/// A borrowed allocator for one supertype walk. A nested walk (the buffer is
-/// already lent out) falls back to the page allocator rather than aliasing the
-/// lender's frontier.
+/// A nested walk finds the buffer lent out and uses the page allocator.
 const SubtypeScratch = struct {
     fba: std.heap.FixedBufferAllocator = undefined,
     owned: bool = false,
@@ -65,22 +55,16 @@ const SubtypeScratch = struct {
     }
 };
 
-/// Backing of a `String`: the owned UTF-8 `bytes` plus metadata computed once at
-/// creation — `u16_len` (Kotlin `String.length`, in UTF-16 code units) and
-/// `ascii` (no byte ≥ 0x80). Because a Kotlin string is immutable, these never
-/// change, so caching them turns `length`/indexing/`substring` from per-call
-/// O(n) UTF-16 walks into O(1) reads (and ASCII indexing into a direct byte
-/// load), at the cost of one scan when the string is built.
+/// Backing of a `String`. `u16_len` is Kotlin's `String.length` in UTF-16 code
+/// units and `ascii` means no byte is >= 0x80; a Kotlin string is immutable, so
+/// both are computed once at construction.
 pub const StringData = struct {
     bytes: []const u8,
     u16_len: u32,
     ascii: bool,
-    /// Cursor cache for UTF-16 index conversions on a non-ASCII string: a
     /// UTF-16 index and the byte offset of the same boundary, packed into one
-    /// atomic word so a reader on another thread never sees a torn pair. A
-    /// sequential walk (`s[i]`, `substring(i, j)`, `append(s, from, to)` with
-    /// advancing positions) resumes from it instead of re-walking from byte 0,
-    /// which kept a JSON lexer over a long non-ASCII source linear.
+    /// atomic word so a reader on another thread never sees a torn pair. A walk
+    /// with advancing positions resumes from it, keeping indexing linear.
     cursor: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub const Cursor = struct { u16_pos: usize, byte_pos: usize };
@@ -96,15 +80,10 @@ pub const StringData = struct {
         @constCast(&self.cursor).store(w, .monotonic);
     }
 
-    /// A Kotlin `String` is immutable: `bytes`/`u16_len`/`ascii` are set once at
-    /// construction and only ever read until teardown frees the bytes. Nothing
-    /// takes an exclusive borrow of a string cell, so its `ObjRef` reader lock
-    /// guards against a writer that never exists — this marker elides it (see
-    /// `objcell.LockFor`), removing the per-borrow atomic on every string read.
+    /// Nothing ever takes an exclusive borrow of an immutable string, so this
+    /// marker elides the reader lock; see `objcell.LockFor`.
     pub const objref_immutable = true;
 
-    /// The cell owns its bytes (see `ObjRef.init`/`initOwned` for `[]const u8`),
-    /// so teardown frees them — same contract the bare `[]const u8` payload had.
     pub fn gcFinalize(self: *StringData, a: std.mem.Allocator) void {
         a.free(self.bytes);
     }
@@ -116,10 +95,8 @@ pub const StringData = struct {
     }
 };
 
-/// `Arc<String>` — a shared, refcounted, immutable string (UTF-8 + cached meta).
 pub const StringRef = ObjRef(StringData);
 
-/// UTF-16 length + ASCII flag for `bytes` (computed once per string).
 pub fn strMeta(bytes: []const u8) struct { u16_len: u32, ascii: bool } {
     for (bytes) |b| {
         if (b >= 0x80) break;
@@ -136,28 +113,21 @@ pub fn strMeta(bytes: []const u8) struct { u16_len: u32, ascii: bool } {
     return .{ .u16_len = n, .ascii = false };
 }
 
-/// `StringRef` constructor mirroring `ObjRef([]const u8).init`: under the GC /
-/// reclaim backends the cell owns a private copy of `bytes` (duped); under the
-/// pure-arena fast path the slice is adopted as-is (the arena reclaims it).
+/// Under the GC and reclaim backends the cell owns a private copy of `bytes`;
+/// under the pure arena the slice is adopted as-is.
 pub fn strInit(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!StringRef {
     const owned = if (objcell.reclaimEnabled() or objcell.gc.gc_enabled) try allocator.dupe(u8, bytes) else bytes;
     const m = strMeta(owned);
     return StringRef.initOwned(allocator, .{ .bytes = owned, .u16_len = m.u16_len, .ascii = m.ascii });
 }
 
-/// `StringRef` constructor mirroring `ObjRef([]const u8).initOwned`: adopt `bytes`
-/// verbatim (caller transfers ownership; freed on teardown under reclaim/GC).
 pub fn strInitOwned(allocator: std.mem.Allocator, bytes: []const u8) std.mem.Allocator.Error!StringRef {
     const m = strMeta(bytes);
     return StringRef.initOwned(allocator, .{ .bytes = bytes, .u16_len = m.u16_len, .ascii = m.ascii });
 }
-/// One captured call-stack entry: the function's display label plus the
-/// source position the frame was executing. `file_id`/`offset` are the raw
-/// `Span` components (kept as plain integers so this module need not depend on
-/// `span`); they resolve to a path + line through the `SourceMap` at render
-/// time, which works uniformly for user, pack, and stdlib frames. `has_pos` is
-/// false when the frame had no recorded position yet (e.g. before its first
-/// statement ran). `fqn` borrows program-lifetime module memory — never freed.
+/// One captured call-stack entry. `file_id` and `offset` are raw `Span`
+/// components, kept as integers so this module need not import `span`. `fqn`
+/// borrows program-lifetime module memory.
 pub const StackFrame = struct {
     fqn: []const u8,
     file_id: u32,
@@ -165,13 +135,11 @@ pub const StackFrame = struct {
     has_pos: bool,
 };
 
-/// A captured throwable stack trace: the frames innermost-first. Owns only the
-/// `frames` slice; each frame's `fqn` borrows the module.
+/// Innermost frame first. Each `fqn` borrows the module.
 pub const StackTraceData = struct {
     frames: []StackFrame,
 
-    /// A captured stack trace is set once at throw time and only read
-    /// thereafter, so its cell is never write-locked; elide the reader lock.
+    /// Set once at throw time and only read after, so never write-locked.
     pub const objref_immutable = true;
 
     pub fn gcFinalize(self: *StackTraceData, a: std.mem.Allocator) void {
@@ -182,28 +150,19 @@ pub const StackTraceData = struct {
     }
 };
 
-/// Shared, refcounted captured stack trace attached to a thrown value.
 pub const StackRef = ObjRef(StackTraceData);
 
-/// `ObjRef<Vec<Value>>` — shared, growable element storage.
 pub const ValueList = ObjRef(std.ArrayList(Value));
-/// `Arc<Vec<Value>>` — shared, frozen element storage.
 pub const ValueSlice = ObjRef([]Value);
-/// A closure's identity and its captured values in ONE cell, so the `Value`
-/// payload is a single pointer rather than (id, capture cell) — which is what
-/// holds `Value` to 16 bytes rather than 24. Every construction site already
-/// minted a fresh capture cell alongside the closure, so folding the id into it
-/// costs no extra allocation, and closure identity becomes cell identity.
-///
-/// `id` is immutable after construction and reads through `asPtr()` with no
-/// lock; `captures` is rebindable (a closure's `this` can be re-bound), so it
-/// keeps the cell's borrow.
+/// A closure's identity and captured values in one cell, so the `Value` payload
+/// is one pointer and closure identity is cell identity. `id` is immutable and
+/// reads through `asPtr()` without a lock; `captures` is rebindable, since a
+/// closure's `this` can be re-bound, so it keeps the cell's borrow.
 pub const IrClosureData = struct {
     id: u64,
     captures: []Value,
 
-    /// The collector reaches a plain struct payload ONLY through this hook —
-    /// without it the captures would read as a leaf and be swept while live.
+    /// Without this hook the captures read as a leaf and are swept while live.
     pub fn gcTrace(self: *const IrClosureData, m: *objcell.gc.Marker) void {
         for (self.captures) |*c| c.gcMark(m);
     }
@@ -212,49 +171,36 @@ pub const IrClosureData = struct {
         a.free(self.captures);
     }
 };
-/// Shared handle to a closure's identity and captures.
 pub const IrClosureRef = ObjRef(IrClosureData);
-/// One key/value pair inside a `Map`.
 pub const MapPair = struct {
     key: Value,
     value: Value,
-    /// GC tracer: a map entry owns one ref to its key and value.
+    /// A map entry owns one reference to its key and one to its value.
     pub fn gcTrace(self: *const MapPair, m: *objcell.gc.Marker) void {
         self.key.gcMark(m);
         self.value.gcMark(m);
     }
 };
-/// Backing store for a `Map`/`MutableMap`: the insertion-ordered entry list
-/// (Kotlin `LinkedHashMap` semantics) plus an optional hash index over the keys.
-///
-/// The list alone gives O(n) `get`/`put`/`containsKey` — quadratic for any
-/// map-heavy loop. The index is a chained hash over entry positions: `head`
-/// maps a key hash to the first entry index (+1; 0 = empty) and `chain[i]` links
-/// to the next entry sharing `pairs[i]`'s hash bucket (+1; 0 = end). It holds no
-/// `Value`s (the pairs own the keys/values), so it needs no refcount or GC
-/// tracing — only freeing. Small maps skip the index entirely (linear scan is
-/// cheaper than a hash table below `index_threshold`). A non-hashable key
-/// (Instance / collection / etc.) disables the index and falls back to linear
-/// scan, preserving exact `equals` semantics.
+/// Backing store for `Map`/`MutableMap`: the insertion-ordered entry list
+/// Kotlin's `LinkedHashMap` semantics require, plus an optional hash index. The
+/// index is a chained hash over entry positions: `head` maps a key hash to the
+/// first entry index + 1 (0 means empty) and `chain[i]` links to the next entry
+/// in `pairs[i]`'s bucket, biased the same way. It holds no `Value`s. Maps
+/// below `index_threshold` skip it, and a non-hashable key disables it.
 pub const MapStore = struct {
     pairs: std.ArrayList(MapPair) = .empty,
     head: std.AutoHashMapUnmanaged(u64, u32) = .empty,
     chain: std.ArrayListUnmanaged(u32) = .empty,
-    /// Entry count the index currently reflects. A mismatch with `pairs.len`
-    /// means entries were appended without incremental maintenance (a non-hot
-    /// path), so `find` rebuilds — keeping the index correct everywhere while the
-    /// hot put path stays O(1) via `noteAppended`.
+    /// A mismatch with `pairs.len` means entries were appended without
+    /// maintenance, so `find` rebuilds.
     indexed_len: usize = 0,
     built: bool = false,
     indexable: bool = true,
-    /// Structural-modification counter for fail-fast iteration over a mutable
-    /// map's `keys`/`values`/`entries` views. Shared (ObjRef handle) with every
-    /// such view; the map's structural mutations bump it on a size change and a
-    /// view iterator captures it. Null for a read-only map.
+    /// Structural-modification counter for fail-fast iteration, shared with
+    /// every `keys`, `values` and `entries` view. Null for a read-only map.
     mod_count: objcell.OptRef(u64) = .{},
 
-    /// Below this entry count, a linear scan beats a hash table (and avoids the
-    /// table's allocation), so the index is not built.
+    /// Below this count a linear scan beats a hash table, so no index is built.
     pub const index_threshold: usize = 16;
 
     pub fn deinit(self: *MapStore, a: std.mem.Allocator) void {
@@ -264,21 +210,18 @@ pub const MapStore = struct {
         if (self.mod_count.get()) |mc| mc.deinit();
     }
 
-    /// GC teardown (no allocator-bound buffers escape the cell): free the same
-    /// backing the refcount `deinit` frees.
     pub fn gcFinalize(self: *MapStore, a: std.mem.Allocator) void {
         self.deinit(a);
     }
 
-    /// Out-edges: only the entry list owns `Value`s; the index is index-only.
     pub fn gcTrace(self: *const MapStore, m: *objcell.gc.Marker) void {
         for (self.pairs.items) |*kv| kv.gcTrace(m);
         if (self.mod_count.get()) |mc| m.shade(&mc.cell.hdr);
     }
 
-    /// Hash for a key, consistent with `Value.structuralEqBoxed` (equal keys
-    /// hash equal; types are kept distinct so `5` (Int) and `5L` (Long) differ).
-    /// `null` for a key that is not simple-hashable (caller disables the index).
+    /// Consistent with `Value.structuralEqBoxed`: equal keys hash equal, and
+    /// the type tag is mixed in so `5` and `5L` differ. Null for a key that is
+    /// not simple-hashable, which makes the caller disable the index.
     fn keyHash(k: *const Value) ?u64 {
         var h = std.hash.Wyhash.init(0);
         switch (k.*) {
@@ -351,8 +294,6 @@ pub const MapStore = struct {
         return null;
     }
 
-    /// (Re)build the hash index from the entry list. Disables indexing if any
-    /// key is not simple-hashable.
     fn build(self: *MapStore, a: std.mem.Allocator) std.mem.Allocator.Error!void {
         self.head.clearRetainingCapacity();
         self.chain.clearRetainingCapacity();
@@ -377,8 +318,6 @@ pub const MapStore = struct {
         self.indexed_len = self.pairs.items.len;
     }
 
-    /// Find the entry index for `key`, or null. O(1) amortized for large maps
-    /// with hashable keys; linear for small maps or non-hashable keys.
     pub fn find(self: *MapStore, a: std.mem.Allocator, key: *const Value) std.mem.Allocator.Error!?usize {
         if (!self.indexable or self.pairs.items.len < index_threshold) return self.linearFind(key);
         if (!self.built or self.indexed_len != self.pairs.items.len) {
@@ -395,14 +334,10 @@ pub const MapStore = struct {
         return null;
     }
 
-    /// Record that `pairs[i]` was just appended (a new key). Maintains the index
-    /// incrementally when it is live so a put-heavy loop stays O(1); otherwise a
-    /// no-op (the index builds lazily on the next `find`).
+    /// Maintains a live index incrementally; otherwise the index builds lazily
+    /// on the next `find`.
     pub fn noteAppended(self: *MapStore, a: std.mem.Allocator, i: usize) std.mem.Allocator.Error!void {
         if (!self.built or !self.indexable) return;
-        // Only maintain incrementally when `i` is exactly the next uncovered
-        // entry; a gap means other entries were appended without maintenance, so
-        // drop to a lazy rebuild rather than silently miss them.
         if (self.indexed_len != i) {
             self.invalidate();
             return;
@@ -422,8 +357,6 @@ pub const MapStore = struct {
         self.indexed_len = self.pairs.items.len;
     }
 
-    /// Invalidate the index after a structural change that shifts entry indices
-    /// (removal / clear); it rebuilds lazily on the next `find`.
     pub fn invalidate(self: *MapStore) void {
         self.built = false;
         self.indexed_len = 0;
@@ -432,11 +365,7 @@ pub const MapStore = struct {
     }
 };
 
-/// The whole state of a `Value.RangeIter`: the advancing cursor and
-/// yielded-last flag PLUS the fixed end/step/kind. The fixed fields ride
-/// in the same shared cell because every `hasNext`/`next` already takes
-/// one snapshot borrow of it — folding them here costs nothing per step
-/// and shrinks the `Value` payload to the one handle.
+/// One shared cell, so `hasNext` and `next` take a single snapshot borrow.
 pub const RangeIterState = struct {
     cur: i64,
     end: i64,
@@ -445,24 +374,16 @@ pub const RangeIterState = struct {
     done: bool = false,
 };
 
-/// `ObjRef<MapStore>` — shared, growable map entry storage with a hash index.
 pub const MapEntries = ObjRef(MapStore);
 
-/// The boxed payload of `Value.Map` (see the union field). One control block
-/// per map VALUE; copies of the `Value` share it by pointer, and the box's
-/// refcount teardown releases what the map owns.
 pub const MapData = struct {
     entries: MapEntries,
     mutable: bool,
-    /// Declared key/value type heads from explicit call-site type
-    /// arguments on the creating stdlib function; see `List`.
+    /// Declared key and value type heads; see `ListData.declared_elem`.
     declared_key: ?[]const u8 = null,
     declared_value: ?[]const u8 = null,
 
-    /// Refcount teardown (the box's last handle): release each entry's key
-    /// and value when this box was the entries' last owner, then the
-    /// entries handle itself. Mirrors what `Value.release` did in-line
-    /// before the payload was boxed.
+    /// Releases the entries' keys and values when this was their last owner.
     pub fn deinit(self: *MapData, allocator: std.mem.Allocator) void {
         if (self.entries.strongCount() == 1) {
             const g = self.entries.borrow();
@@ -475,38 +396,31 @@ pub const MapData = struct {
         self.entries.deinit();
     }
 
-    /// GC out-edge: the entries cell (its own trace reaches the pairs).
     pub fn gcTrace(self: *const MapData, m: *objcell.gc.Marker) void {
         m.shade(&self.entries.cell.hdr);
     }
 };
 
-/// The control-block handle behind a boxed `Value.Map` payload.
 pub const MapRef = ObjRef(MapData);
 
-/// Recover the owning control block from a boxed map payload pointer.
 pub inline fn mapRefOf(m: *MapData) MapRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", m)) };
 }
 
-/// The boxed payload of `Value.Range` (see `MapData` for the scheme).
 /// Immutable after construction.
 pub const RangeData = struct {
     start: i64,
     end: i64,
     step: i64,
     kind: RangeKind,
-    /// True when built as a progression (`step`, `downTo`, `reversed`)
-    /// rather than a `..` / `until` range. A step-1 progression is NOT
-    /// an `IntRange`: it renders as `1..10 step 1`, hashes with the
-    /// progression formula, and fails `is IntRange`.
+    /// Built as a progression (`step`, `downTo`, `reversed`). Even at step 1 a
+    /// progression is not an `IntRange`: it renders as `1..10 step 1`, hashes by
+    /// the progression formula, and fails `is IntRange`.
     progression: bool = false,
 };
 
-/// The control-block handle behind a boxed `Value.Range` payload.
 pub const RangeRef = ObjRef(RangeData);
 
-/// The boxed payload of `Value.BoundMethod` (see `MapData` for the scheme).
 pub const BoundMethodData = struct {
     fqn: []const u8,
     func: StdlibFn,
@@ -522,37 +436,31 @@ pub const BoundMethodData = struct {
     }
 };
 
-/// The boxed payload of `Value.MapEntry` (see `MapData` for the scheme).
 pub const MapEntryData = struct {
     key: ValueBox,
     value: ValueBox,
-    /// When set, the live map's entries: `setValue` writes through and
-    /// reads resolve the live pair by key.
+    /// When set, the live map's entries: `setValue` writes through.
     backing: objcell.OptRef(MapStore) = .{},
-    /// The backing counter observed when this entry was handed out
-    /// (creation or iterator `next()`). A later structural change to
-    /// the map makes every member access throw
-    /// ConcurrentModificationException. Meaningful only with `backing`.
+    /// The backing counter when this entry was handed out; a later structural
+    /// change makes every member access throw ConcurrentModificationException.
     exp_mod: u64 = 0,
 
     pub fn deinit(self: *MapEntryData, allocator: std.mem.Allocator) void {
         _ = allocator;
         self.key.deinit();
         self.value.deinit();
-        // `backing` is a non-owning write-through reference; not released.
+        // `backing` is a non-owning write-through reference.
     }
 
     pub fn gcTrace(self: *const MapEntryData, m: *objcell.gc.Marker) void {
-        // Shade the value-box CELLS (whose own tracers mark the inner
-        // values) — dereferencing the interior here would leave the box
-        // cells unmarked and swept while the entry lives.
+        // Shade the box cells, whose own tracers reach the inner values:
+        // marking through the interior would leave the boxes unmarked.
         m.shade(&self.key.cell.hdr);
         m.shade(&self.value.cell.hdr);
         if (self.backing.get()) |b| m.shade(&b.cell.hdr);
     }
 };
 
-/// The boxed payload of `Value.Result` (see `MapData` for the scheme).
 pub const ResultData = struct {
     ok: bool,
     payload: ValueBox,
@@ -567,15 +475,12 @@ pub const ResultData = struct {
     }
 };
 
-/// The control-block handle behind a boxed `Value.Result` payload.
 pub const ResultRef = ObjRef(ResultData);
 
-/// Recover the owning control block from a boxed payload pointer.
 pub inline fn resultRefOf(r: *ResultData) ResultRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", r)) };
 }
 
-/// The boxed payload of `Value.Comparator` (see `MapData` for the scheme).
 pub const ComparatorData = struct {
     steps: ObjRef([]ComparatorStep),
     descending: bool,
@@ -590,15 +495,12 @@ pub const ComparatorData = struct {
     }
 };
 
-/// The control-block handle behind a boxed `Value.Comparator` payload.
 pub const ComparatorRef = ObjRef(ComparatorData);
 
-/// Recover the owning control block from a boxed payload pointer.
 pub inline fn comparatorRefOf(c: *ComparatorData) ComparatorRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", c)) };
 }
 
-/// The boxed payload of `Value.Pair` (see `MapData` for the scheme).
 pub const PairData = struct {
     first: ValueBox,
     second: ValueBox,
@@ -615,15 +517,12 @@ pub const PairData = struct {
     }
 };
 
-/// The control-block handle behind a boxed `Value.Pair` payload.
 pub const PairRef = ObjRef(PairData);
 
-/// Recover the owning control block from a boxed payload pointer.
 pub inline fn pairRefOf(p: *PairData) PairRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", p)) };
 }
 
-/// The boxed payload of `Value.Triple` (see `MapData` for the scheme).
 pub const TripleData = struct {
     first: ValueBox,
     second: ValueBox,
@@ -643,8 +542,7 @@ pub const TripleData = struct {
     }
 };
 
-/// The interned payload of `Value.Intrinsic`: program-lifetime, never
-/// freed, invisible to the refcount and the collector.
+/// Program-lifetime, never freed, invisible to the refcount and collector.
 pub const IntrinsicData = struct {
     fqn: []const u8,
     func: StdlibFn,
@@ -653,54 +551,36 @@ pub const IntrinsicData = struct {
 var intrinsic_intern_mutex: objcell.SpinMutex = .{};
 var intrinsic_intern: ?std.StringHashMap(*const IntrinsicData) = null;
 
-/// The control-block handle behind a boxed `Value.MatchGroup` payload
-/// (the payload struct is `MatchGroupData`, shared with `MatchData`'s
-/// group descriptors).
 pub const MatchGroupRef = ObjRef(MatchGroupData);
 
-/// Recover the owning control block from a boxed payload pointer.
 pub inline fn matchGroupRefOf(g: *MatchGroupData) MatchGroupRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", g)) };
 }
 
-/// The control-block handle behind a boxed `Value.Triple` payload.
 pub const TripleRef = ObjRef(TripleData);
 
-/// Recover the owning control block from a boxed payload pointer.
 pub inline fn tripleRefOf(t: *TripleData) TripleRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", t)) };
 }
 
-/// The control-block handle behind a boxed `Value.MapEntry` payload.
 pub const MapEntryRef = ObjRef(MapEntryData);
 
-/// Recover the owning control block from a boxed payload pointer.
 pub inline fn mapEntryRefOf(e: *MapEntryData) MapEntryRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", e)) };
 }
 
-/// The control-block handle behind a boxed `Value.BoundMethod` payload.
 pub const BoundMethodRef = ObjRef(BoundMethodData);
 
-/// Recover the owning control block from a boxed payload pointer.
 pub inline fn boundMethodRefOf(b: *BoundMethodData) BoundMethodRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", b)) };
 }
 
-/// Recover the owning control block from a boxed range payload pointer.
 pub inline fn rangeRefOf(r: *RangeData) RangeRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", r)) };
 }
 
-/// The boxed payload of `Value.Exception` (see `MapData` for the scheme).
-/// Copies of the `Value` share one record, so `fillInStackTrace`,
-/// `addSuppressed`, and cause writes are visible through every copy — the
-/// JVM's reference semantics.
-/// A `Value` in the shape compiled code passes it: two opaque words. A tagged
-/// union has no guaranteed layout, so the conversion is a byte copy rather than
-/// a bitcast; compiled code treats the result as opaque and only ever hands it
-/// back. It lives here rather than in the native runtime shim because the
-/// coroutine driver resumes NATIVE continuations through the same form.
+/// A `Value` as compiled code passes it: two opaque words. A tagged union has
+/// no guaranteed layout, so the conversion is a byte copy, not a bitcast.
 pub const CValue = extern struct { lo: u64, hi: u64 };
 
 pub inline fn toC(v: Value) CValue {
@@ -717,41 +597,32 @@ pub inline fn fromC(v: CValue) Value {
     return out;
 }
 
-/// A compiled continuation: the emitted resume function and the heap frame it
-/// resumes into. Calling it with the value the suspension produced runs the
-/// body from its suspension point; the answer is either the result or
-/// `CoroutineSuspended` when it suspended again.
+/// The emitted resume function and the heap frame it resumes into. Answers the
+/// result, or `CoroutineSuspended`.
 pub const NativeResume = struct {
     call: *const fn (?*anyopaque, CValue) callconv(.c) CValue,
     frame: ?*anyopaque,
 };
 
+/// Copies of the `Value` share one record, so `fillInStackTrace`,
+/// `addSuppressed` and cause writes are visible through every copy, matching
+/// JVM reference semantics.
 pub const ExceptionData = struct {
     fqn: StringRef,
     message: objcell.OptRef(StringData) = .{},
-    /// Stored as a bare nullable cell pointer (`?*ValueBox.Cell`, 8 bytes —
-    /// `?ObjRef` is not null-optimized) and reconstructed as `ValueBox` at
-    /// each use. Mirrors `ListData.backing`.
+    /// A bare cell pointer, since `?ObjRef` is not null-optimized.
     cause: ?*ValueBox.Cell,
-    /// The call stack captured when this throwable was first thrown
-    /// (`fillInStackTrace`). Null until thrown. Borrows program-lifetime
-    /// frame labels; the frame slice is owned by the `StackRef` cell.
-    /// Stored as `?*StackRef.Cell`; reconstructed as `StackRef` at use.
+    /// Captured at the first throw. Borrows program-lifetime frame labels; the
+    /// slice belongs to the `StackRef`.
     stack: ?*StackRef.Cell = null,
-    /// Reference identity for `===` / `assertSame`. Assigned fresh at the
-    /// throwable construction site (`host.allocInstanceId()`); 0 for
-    /// exceptions built outside that path, which then compare structurally.
+    /// Reference identity for `===`. 0 for exceptions built outside the
+    /// constructor, which then compare structurally.
     identity: u64 = 0,
-    /// Suppressed throwables (`addSuppressed`/`suppressedExceptions`). A
-    /// shared list allocated at the constructor site so every value-copy
-    /// of the exception observes the same suppressed set; null for
-    /// exceptions built outside that path. Stored as `?*ValueList.Cell`;
-    /// reconstructed as `ValueList` at use.
+    /// Shared so every copy of the exception value sees the same set.
     suppressed: ?*ValueList.Cell = null,
-    /// This throwable's position in a compiled program's throwable hierarchy:
-    /// the preorder number of its type. A handler carries the interval its own
-    /// type spans, so `catch` is two comparisons rather than a name walk. Zero
-    /// when nothing assigned one, which is every value the interpreter makes.
+    /// Preorder number of this throwable's type in a compiled program's
+    /// hierarchy: a handler carries the interval its own type spans, so `catch`
+    /// is two comparisons. Zero for every value the interpreter makes.
     type_id: u32 = 0,
 
     pub fn deinit(self: *ExceptionData, allocator: std.mem.Allocator) void {
@@ -772,37 +643,23 @@ pub const ExceptionData = struct {
     }
 };
 
-/// The control-block handle behind a boxed `Value.Exception` payload.
 pub const ExceptionRef = ObjRef(ExceptionData);
 
-/// Recover the owning control block from a boxed exception payload pointer.
 pub inline fn exceptionRefOf(e: *ExceptionData) ExceptionRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", e)) };
 }
 
-/// The boxed payload of `Value.List` (see `MapData` for the scheme).
 pub const ListData = struct {
     items: ValueList,
     mutable: bool,
-    /// Set for `EnumName.entries` / `.values()` lists. Only ever queried as
-    /// a boolean ("is this the enum-entries list"), so a flag suffices — no
-    /// StringRef allocation.
     enum_entries: bool = false,
-    /// Set for a live view: a `MutableMap.values` view, a `subList` window,
-    /// or a primitive-array `.asList()` (see `CollBacking`).
+    /// Set for a live view; see `CollBacking`.
     backing: ?*CollBackingCell,
-    /// Declared element-type head from an explicit call-site type
-    /// argument on the creating stdlib function (`listOf<String>()`).
-    /// Head name only; borrows the module's interned consts, which
-    /// outlive every value. Dispatch reads it to type an empty list;
-    /// `null` everywhere the creation site carried no annotation.
+    /// Declared element-type head from a call-site type argument, borrowing the
+    /// module's interned consts. Dispatch reads it to type an empty list.
     declared_elem: ?[]const u8 = null,
-    /// Structural-modification counter for fail-fast iteration. Allocated
-    /// when a mutable list is created; shared (by ObjRef handle) across
-    /// every value-copy of the list and the iterators it spawns. A
-    /// structural mutation (add/remove/clear/…) bumps it; an iterator
-    /// captures it and throws `ConcurrentModificationException` when it
-    /// changes underneath. Null for read-only lists / views.
+    /// Structural-modification counter for fail-fast iteration, shared across
+    /// every copy of the list value and the iterators it spawns.
     mod_count: objcell.OptRef(u64) = .{},
 
     pub fn deinit(self: *ListData, allocator: std.mem.Allocator) void {
@@ -818,24 +675,18 @@ pub const ListData = struct {
     }
 };
 
-/// The control-block handle behind a boxed `Value.List` payload.
 pub const ListRef = ObjRef(ListData);
 
-/// Recover the owning control block from a boxed list payload pointer.
 pub inline fn listRefOf(l: *ListData) ListRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", l)) };
 }
 
-/// The boxed payload of `Value.Set` (see `MapData` for the scheme).
 pub const SetData = struct {
     items: ValueList,
     mutable: bool,
-    /// Set when this is a live `MutableMap.keys`/`.entries` view.
     backing: ?*CollBackingCell,
-    /// Declared element-type head from an explicit call-site type
-    /// argument on the creating stdlib function; see `List`.
+    /// See `ListData.declared_elem`.
     declared_elem: ?[]const u8 = null,
-    /// Structural-modification counter for fail-fast iteration; see `List`.
     mod_count: objcell.OptRef(u64) = .{},
 
     pub fn deinit(self: *SetData, allocator: std.mem.Allocator) void {
@@ -851,58 +702,40 @@ pub const SetData = struct {
     }
 };
 
-/// The control-block handle behind a boxed `Value.Set` payload.
 pub const SetRef = ObjRef(SetData);
 
-/// Recover the owning control block from a boxed set payload pointer.
 pub inline fn setRefOf(s: *SetData) SetRef {
     return .{ .cell = @alignCast(@fieldParentPtr("data", s)) };
 }
-/// A refcounted box holding a single `Value`, shared by handle. Used for
-/// the component slots of `Pair`/`Triple`/`MapEntry`/
-/// `Result`/`Exception.cause`/`BoundMethod.receiver`/`Sequence` generators so a
-/// copy of the enclosing value shares the box by refcount and releasing the
-/// last copy recursively frees the boxed `Value` (via `ObjRef(Value).deinit` →
-/// `Value.deinit`). Same backing type as a capture `Cell`.
+/// A refcounted box holding one `Value`, so a copy of the enclosing value
+/// shares the box and the last release frees the `Value`.
 pub const ValueBox = ObjRef(Value);
 
-/// Which face of a `MutableMap` a live view exposes.
 pub const MapViewKind = enum { Keys, Values, Entries };
 
-/// Back-reference carried by a live collection view so its reads and mutations
-/// resolve through the originating source.
-///   - `map`: a `MutableMap.keys`/`.values`/`.entries` view edits the map.
-///   - `sublist`: a `List.subList(from, to)` window into `parent`; reads and
-///     structural ops splice through the parent list's items.
-///   - `array`: a primitive-array `.asList()` over packed scalar storage; reads
-///     reflect later array element writes (a reference `Array<T>.asList()`
-///     instead shares the boxed buffer outright and carries no backing).
+/// Back-reference carried by a live collection view so reads and mutations
+/// resolve through the source: a `MutableMap` view edits the map, a `subList`
+/// splices through the parent's items, and a primitive-array `.asList()`
+/// reflects later element writes. A reference `Array<T>.asList()` shares the
+/// boxed buffer outright and carries no backing.
 pub const CollBacking = union(enum) {
     map: struct { entries: MapEntries, kind: MapViewKind },
     sublist: struct {
-        /// The immediate parent's element storage: the parent VIEW's cache
-        /// for a `sub.subList(...)` chain, or the root list itself.
+        /// The parent view's cache in a `subList` chain, or the root list.
         parent: ValueList,
-        /// The immediate parent's own sublist backing when the parent is
-        /// itself a view — write-through and refresh recurse through it to
-        /// the root, updating each ancestor's window (Java's
-        /// `SubList(parent)` chain). Non-owning, like `List.backing`.
+        /// The parent's own backing when it is itself a view: write-through
+        /// and refresh recurse to the root. Non-owning.
         parent_backing: ?*CollBackingRef.Cell = null,
-        /// Window start/length, PARENT-relative.
+        /// Window start and length, parent-relative.
         from: usize,
         len: usize,
-        /// Shared structural counter value this view last observed. A
-        /// mismatch on access means the backing changed structurally not
-        /// through this view (or a descendant) —
-        /// ConcurrentModificationException.
+        /// A mismatch is a ConcurrentModificationException.
         exp_mod: u64 = 0,
     },
     array: struct { buf: objcell.ObjRef(PrimBuf), view_kind: PrimitiveArrayKind },
 
-    /// GC out-edge: keep the source cell reachable while a live view references
-    /// it. The handle is a non-owning write-through reference (no `deinit`), so
-    /// refcount teardown of this cell never releases the borrowed source; only
-    /// the GC keeps it marked.
+    /// Keeps the source cell reachable while a live view references it; the
+    /// handle is non-owning, so refcount teardown never releases the source.
     pub fn gcTrace(self: *const CollBacking, m: *objcell.gc.Marker) void {
         switch (self.*) {
             .map => |x| m.shade(&x.entries.cell.hdr),
@@ -915,17 +748,13 @@ pub const CollBacking = union(enum) {
     }
 };
 
-/// A heap-managed `CollBacking`: the view owns this cell (retained/released and
-/// GC-swept with the view) but not the source it points at.
+/// The view owns this cell but not the source it points at.
 pub const CollBackingRef = objcell.ObjRef(CollBacking);
-/// The control block behind a `CollBackingRef`. `List`/`Set` store `?*Cell`
-/// (a single pointer, so `?` is null-optimized to 8 bytes — keeping `Value`
-/// pinned at 64) and reconstruct the `CollBackingRef` at each use.
+/// `List` and `Set` store `?*Cell` rather than a `CollBackingRef`: one pointer,
+/// null-optimized to 8 bytes, which keeps `Value` at 64.
 pub const CollBackingCell = CollBackingRef.Cell;
 
-/// Distinguishes integer ranges (`IntRange`) from long/char ranges.
-/// One endpoint of a range in its element type: a Char kind writes the
-/// character, a ULong kind the unsigned value, the rest the signed value.
+/// A Char kind writes the character, a ULong kind the unsigned value.
 pub fn writeRangeEndpoint(writer: anytype, kind: RangeKind, v: i64) !void {
     switch (kind) {
         .Char => {
@@ -951,11 +780,9 @@ pub const RangeKind = enum {
 
     pub const default: RangeKind = .Int;
 
-    /// Whether `cur` has not yet passed `end` in the step's direction — the
-    /// "keep iterating" test. `ULong` values span the full u64 range stored as
-    /// i64, so they compare unsigned; every other kind fits a signed i64 (UInt
-    /// is 0..2^32-1). Used by every progression cursor and the emptiness check
-    /// so `MaxUL..MinUL` reads as empty rather than a wrapped, huge range.
+    /// Whether `cur` has not yet passed `end` in the step's direction. `ULong`
+    /// spans the full u64 range stored in an i64, so it compares unsigned. The
+    /// emptiness check uses it too, so `MaxUL..MinUL` reads as empty.
     pub fn inBounds(self: RangeKind, cur: i64, end: i64, step: i64) bool {
         if (self == .ULong) {
             const uc: u64 = @bitCast(cur);
@@ -965,8 +792,7 @@ pub const RangeKind = enum {
         return if (step > 0) cur <= end else cur >= end;
     }
 
-    /// `a until to` / `a ..< to` is empty exactly when `to` is the kind's
-    /// MIN_VALUE (Char/UInt/ULong: 0).
+    /// Empty exactly when `to` is the kind's MIN_VALUE.
     pub fn untilEmpty(self: RangeKind, to: i64) bool {
         return switch (self) {
             .Int => to <= std.math.minInt(i32),
@@ -975,9 +801,7 @@ pub const RangeKind = enum {
         };
     }
 
-    /// Stored `(start, end)` bounds of the kind's EMPTY range: signed kinds use
-    /// `1..0`, unsigned kinds `MAX..0` (matching `IntRange.EMPTY` /
-    /// `UIntRange.EMPTY`).
+    /// The kind's empty range: `1..0` signed, `MAX..0` unsigned.
     pub fn emptyBounds(self: RangeKind) [2]i64 {
         return switch (self) {
             .Int, .Long, .Char => .{ 1, 0 },
@@ -987,7 +811,7 @@ pub const RangeKind = enum {
     }
 };
 
-/// Numeric promotion rank — wider types win in mixed arithmetic.
+/// Wider types win in mixed arithmetic.
 pub const NumericRank = enum(u8) {
     Byte = 0,
     Short = 1,
@@ -1001,7 +825,6 @@ pub const NumericRank = enum(u8) {
     Double = 9,
 };
 
-/// Identifies the typed Kotlin primitive-array variants.
 pub const PrimitiveArrayKind = enum {
     Int,
     Long,
@@ -1050,7 +873,6 @@ pub const PrimitiveArrayKind = enum {
         };
     }
 
-    /// Byte width of one packed element of this kind.
     pub fn elemSize(self: PrimitiveArrayKind) usize {
         return switch (self) {
             .Byte, .UByte, .Boolean => 1,
@@ -1060,8 +882,7 @@ pub const PrimitiveArrayKind = enum {
         };
     }
 
-    /// The signed array kind backing an unsigned array (`UByteArray.storage`
-    /// is a `ByteArray` over the same bytes), or null for a non-unsigned kind.
+    /// `UByteArray.storage` is a `ByteArray` over the same bytes.
     pub fn signedCounterpart(self: PrimitiveArrayKind) ?PrimitiveArrayKind {
         return switch (self) {
             .UByte => .Byte,
@@ -1073,11 +894,8 @@ pub const PrimitiveArrayKind = enum {
     }
 };
 
-/// Packed scalar storage for a Kotlin primitive array (`IntArray`,
-/// `BooleanArray`, `ByteArray`, …). Replaces the 64-byte-per-element boxed
-/// `ArrayList(Value)` with a flat byte buffer (1–8 bytes/element): ~8–64× less
-/// memory, cache-resident, no per-element retain/release, and the GC traces
-/// nothing (scalars have no out-edges). Elements box/unbox at the boundary.
+/// Packed scalar storage for a Kotlin primitive array: a flat byte buffer of 1
+/// to 8 bytes per element, with no per-element retain, release or tracing.
 pub const PrimBuf = struct {
     kind: PrimitiveArrayKind,
     bytes: std.ArrayListUnmanaged(u8) = .empty,
@@ -1099,15 +917,12 @@ pub const PrimBuf = struct {
         @memcpy(p[0..@sizeOf(T)], std.mem.asBytes(&v));
     }
 
-    /// Box element `i` into the `Value` the boxed array would have held.
     pub fn get(self: *const PrimBuf, i: usize) Value {
         return self.getAs(i, self.kind);
     }
 
-    /// As `get`, but boxes according to `view_kind` rather than the storage
-    /// kind. The two differ only for an unsigned-array view over signed
-    /// backing (`IntArray.asUIntArray()`), where the byte layout is identical
-    /// and only the boxed tag changes (`Int` -> `UInt`).
+    /// `view_kind` differs from the storage kind only for an unsigned view over
+    /// signed backing, where only the boxed tag changes.
     pub fn getAs(self: *const PrimBuf, i: usize, view_kind: PrimitiveArrayKind) Value {
         const p: [*]const u8 = self.bytes.items.ptr + i * view_kind.elemSize();
         return switch (view_kind) {
@@ -1126,14 +941,11 @@ pub const PrimBuf = struct {
         };
     }
 
-    /// Unbox `v` into element `i`. `i` must be in bounds. Numeric values are
-    /// read through the widening accessors so a coerced argument still stores
-    /// correctly; the destination kind defines the stored width.
+    /// `i` must be in bounds. The destination kind defines the stored width.
     pub fn set(self: *PrimBuf, i: usize, v: Value) void {
         self.setAs(i, v, self.kind);
     }
 
-    /// As `set`, but unboxes according to `view_kind` (see `getAs`).
     pub fn setAs(self: *PrimBuf, i: usize, v: Value, view_kind: PrimitiveArrayKind) void {
         const p: [*]u8 = self.bytes.items.ptr + i * view_kind.elemSize();
         switch (view_kind) {
@@ -1158,9 +970,8 @@ pub const PrimBuf = struct {
         self.set(self.len() - 1, v);
     }
 
-    /// GC: scalars have no out-edges, so tracing is a no-op (the decl makes the
-    /// generic tracer treat this as a leaf rather than guessing), and mutable
-    /// access needs no write barrier.
+    /// Scalars have no out-edges, so the payload is a leaf and mutable access
+    /// needs no write barrier.
     pub const gc_pointer_free = true;
     pub fn gcTrace(self: *const PrimBuf, m: *objcell.gc.Marker) void {
         _ = self;
@@ -1169,7 +980,7 @@ pub const PrimBuf = struct {
     pub fn gcFinalize(self: *PrimBuf, a: std.mem.Allocator) void {
         self.bytes.deinit(a);
     }
-    /// Bytes owned beyond the control block (for the GC collection threshold).
+    /// Bytes owned beyond the control block, for the collection threshold.
     pub fn gcExternalBytes(self: *const PrimBuf) usize {
         return self.bytes.capacity;
     }
@@ -1178,25 +989,17 @@ pub const PrimBuf = struct {
     }
 };
 
-/// Storage for `kotlin.Array<T>` and the primitive-array siblings. `boxed`
-/// holds reference types and `Array<T>`; `packed` holds primitive scalars. A
-/// union (not two fields) so every access site is compiler-flagged when the
-/// representation changes — primitive arrays must never be silently read as an
-/// empty boxed list.
+/// A union rather than two fields, so every access site is compiler-flagged
+/// when the representation changes.
 pub const ArrayStore = union(enum) {
     boxed: ValueList,
     scalars: ObjRef(PrimBuf),
 };
 
-/// `kotlin.Array<T>` and the primitive-array siblings. `prim` is the element
-/// kind (`null` for a reference `Array<T>`) and matches `storage`: `.boxed`
-/// when `prim == null`, `.scalars` when `prim != null`.
 pub const ArrayData = struct {
-    /// The storage cell with its element kind TAGGED into the low four bits.
-    /// Every control block is 16-byte aligned, so the pair fits in ONE pointer
-    /// — which is what holds `Value` to 16 bytes rather than 24.
-    ///
-    /// Tag `0` is a reference `Array<T>`, whose cell is an
+    /// The storage cell with its element kind tagged into the low four bits.
+    /// Every control block is 16-byte aligned, so the pair fits in one pointer
+    /// and `Value` stays 16 bytes. Tag 0 is a reference `Array<T>` over an
     /// `ObjRef(std.ArrayList(Value))`; tag `k + 1` is an `ObjRef(PrimBuf)` of
     /// kind `k`. Every reader goes through `cellPtr`, so the collector and the
     /// refcount only ever see the untagged pointer.
@@ -1212,21 +1015,17 @@ pub const ArrayData = struct {
         return .{ .tagged = @intFromPtr(pb.cell) | (@as(usize, @intFromEnum(kind)) + 1) };
     }
 
-    /// The cell pointer with the kind tag masked off.
     pub inline fn cellPtr(self: ArrayData) *anyopaque {
         return @ptrFromInt(self.tagged & ~TAG_MASK);
     }
 
-    /// The packed element kind, or null for a reference `Array<T>`. A pure bit
-    /// extraction — no cell borrow — so the hot `is this an IntArray?` tests
-    /// cost what the old field read did.
+    /// Null for a reference `Array<T>`.
     pub inline fn primKind(self: ArrayData) ?PrimitiveArrayKind {
         const t = self.tagged & TAG_MASK;
         if (t == 0) return null;
         return @enumFromInt(t - 1);
     }
 
-    /// Rebuild the typed storage view from the packed cell pointer.
     pub fn storage(self: ArrayData) ArrayStore {
         if (self.primKind() == null) return .{ .boxed = .{ .cell = @ptrCast(@alignCast(self.cellPtr())) } };
         return .{ .scalars = .{ .cell = @ptrCast(@alignCast(self.cellPtr())) } };
@@ -1247,9 +1046,8 @@ pub const ArrayData = struct {
         }
     }
 
-    /// Box element `i` (0-based, must be in bounds). Boxed elements are returned
-    /// as stored (caller retains if it keeps a copy); packed elements are fresh
-    /// scalars with no out-edges.
+    /// A boxed element is returned as stored, so the caller retains it to keep
+    /// a copy.
     pub fn get(self: ArrayData, i: usize) Value {
         switch (self.storage()) {
             .boxed => |vl| {
@@ -1265,9 +1063,8 @@ pub const ArrayData = struct {
         }
     }
 
-    /// Write element `i` (must be in bounds). For a boxed array the previous
-    /// element is released and the new one retained under a reclaiming backend;
-    /// packed elements are plain scalars.
+    /// Under a reclaiming backend a boxed array releases the previous element
+    /// and retains the new one.
     pub fn set(self: ArrayData, allocator: std.mem.Allocator, i: usize, v: Value) void {
         switch (self.storage()) {
             .boxed => |vl| {
@@ -1288,17 +1085,11 @@ pub const ArrayData = struct {
         }
     }
 
-    /// A freshly allocated boxed copy of every element (caller owns the slice;
-    /// elements are NOT retained — matches the prior `a.dupe(Value, items)` of
-    /// boxed arrays). For packed arrays the scalars are boxed into the copy; the
-    /// array stays packed.
+    /// The caller owns the slice and the elements are not retained.
     pub fn snapshot(self: ArrayData, allocator: std.mem.Allocator) std.mem.Allocator.Error![]Value {
         return self.snapshotRange(allocator, 0, self.len());
     }
 
-    /// `snapshot` of the half-open element range `[start, end)` only. A range
-    /// copy (`copyInto` of a slice out of a large backing array) pays for the
-    /// elements it moves rather than for the whole source.
     pub fn snapshotRange(self: ArrayData, allocator: std.mem.Allocator, start: usize, end: usize) std.mem.Allocator.Error![]Value {
         switch (self.storage()) {
             .boxed => |vl| {
@@ -1324,9 +1115,7 @@ pub const ArrayData = struct {
         }
     }
 
-    /// The boxed `ValueList` ObjRef when this is a reference array, else `null`.
-    /// For sites that genuinely need to alias the backing list (iterators); a
-    /// packed array has no such list (use `snapshot`).
+    /// Null for a packed array; use `snapshot` there.
     pub fn boxedList(self: ArrayData) ?ValueList {
         return switch (self.storage()) {
             .boxed => |vl| vl,
@@ -1334,7 +1123,6 @@ pub const ArrayData = struct {
         };
     }
 
-    /// Drop one reference to the backing storage (boxed list or packed buffer).
     pub fn deinitStorage(self: ArrayData) void {
         switch (self.storage()) {
             .boxed => |vl| vl.deinit(),
@@ -1342,7 +1130,7 @@ pub const ArrayData = struct {
         }
     }
 
-    /// Identity (backing-cell address) for reference equality and `===`.
+    /// Backing-cell address, for reference equality and `===`.
     pub fn identity(self: ArrayData) usize {
         return switch (self.storage()) {
             .boxed => |vl| vl.identity(),
@@ -1350,8 +1138,6 @@ pub const ArrayData = struct {
         };
     }
 
-    /// Build a primitive (packed) array Value from boxed `items` (unboxed into
-    /// the scalar buffer; the caller still owns/relinquishes `items`).
     pub fn initPacked(a: std.mem.Allocator, kind: PrimitiveArrayKind, items: []const Value) std.mem.Allocator.Error!Value {
         var pb = PrimBuf{ .kind = kind };
         try pb.bytes.appendNTimes(a, 0, items.len * kind.elemSize());
@@ -1359,14 +1145,11 @@ pub const ArrayData = struct {
         return .{ .Array = ArrayData.scalars(try ObjRef(PrimBuf).initOwned(a, pb), kind) };
     }
 
-    /// Build a reference `Array<T>` Value from a boxed `ValueList`.
     pub fn fromBoxedList(vl: ValueList) Value {
         return .{ .Array = ArrayData.boxed(vl) };
     }
 
-    /// Overwrite every element from `src` (length must equal `len()`). Mirrors a
-    /// snapshot→reorder→write-back (no net refcount change for a permutation):
-    /// boxed elements are replaced as-is, packed scalars are unboxed.
+    /// `src.len` must equal `len()`; a permutation is refcount-neutral.
     pub fn writeBack(self: ArrayData, a: std.mem.Allocator, src: []const Value) std.mem.Allocator.Error!void {
         switch (self.storage()) {
             .boxed => |vl| {
@@ -1384,18 +1167,13 @@ pub const ArrayData = struct {
     }
 };
 
-/// Built-in property delegates (`lazy`, `Delegates.observable`,
-/// `Delegates.notNull`).
 pub const DelegateKind = union(enum) {
-    /// `lazy { producer }`.
     Lazy: struct { producer: Value, cached: ?Value },
-    /// `Delegates.observable(initial) { property, old, new -> … }`.
     Observable: struct { value: Value, on_change: Value },
-    /// `Delegates.notNull<T>()`.
     NotNull: struct { value: ?Value, name: []const u8 },
 
-    /// GC out-edges: a delegate held across a collection must keep its producer
-    /// / change lambda and stored/cached value reachable (they live only here).
+    /// These live only here, so a delegate held across a collection must keep
+    /// them reachable.
     pub fn gcTrace(self: *const DelegateKind, m: *objcell.gc.Marker) void {
         switch (self.*) {
             .Lazy => |l| {
@@ -1411,95 +1189,67 @@ pub const DelegateKind = union(enum) {
     }
 };
 
-/// State-machine representation of a `suspend fun` body.
 pub const SuspendBody = struct {
     states: []SuspendState,
 };
 
-/// One "basic block" in a suspend state machine.
 pub const SuspendState = struct {
-    /// Optional local to bind the resumed value to before the stmts run.
     resume_target: ?[]const u8,
-    /// Statements to execute in order.
     stmts: []ast.Stmt,
-    /// What to do after the last stmt finishes.
     transition: SuspendTransition,
 };
 
 pub const SuspendTransition = union(enum) {
-    /// Move to the named state.
     Goto: usize,
-    /// Function returns.
     Return,
-    /// Branch on a boolean register: jump to `then_state` if true.
     Branch: struct { then_state: usize, else_state: usize },
 };
 
-/// Result of a previously-suspended `suspendCoroutine` call.
 pub const PausedResume = union(enum) {
     Resumed: Value,
     Failed: Value,
 };
 
-/// Where a finished suspend frame hands its result.
 pub const SuspendCallerCont = union(enum) {
     Frame: ObjRef(SuspendFrame),
     HostSlot: ObjRef(?HostSlotResult),
 };
 
-/// `Result<Value, Value>` payload delivered to a `runBlocking` host slot.
 pub const HostSlotResult = union(enum) {
     ok: Value,
     err: Value,
 };
 
-/// A live `suspend fun` invocation.
 pub const SuspendFrame = struct {
     decl: *const ast.Function,
     body: ObjRef(SuspendBody),
     env: ObjRef(Env),
-    /// Locals introduced by val/var statements in earlier states.
     locals: std.ArrayList(Local),
-    /// Index into `body.states` for the next state to run.
     state: usize,
-    /// The caller's continuation chain, when this frame is active.
     caller: ?SuspendCallerCont,
-    /// Result of a paused async `suspendCoroutine`, read on re-entry.
     paused_resume: ?PausedResume,
 
     pub const Local = struct { name: []const u8, value: Value };
 };
 
-/// The lazy coroutine state of a `sequence { yield(...) }` / `iterator { ... }`
-/// builder. The builder block runs as a restricted-suspension coroutine: each
-/// `yield(x)` suspends it, capturing the block's continuation as an
-/// `ir.eval.SuspendState` box held here through `cont` (an `*anyopaque` because
-/// `runtime` cannot import `ir`). The host drives one step per consumer pull
-/// (`builderStep`): the first pull starts the block, a later pull resumes the
-/// continuation. `scope` is the `SequenceScope` Instance the block runs against;
-/// the host reads the yielded value off its fields after each suspension.
+/// The lazy coroutine state of a `sequence {}` or `iterator {}` builder. Each
+/// `yield(x)` suspends the block, parking the continuation in `cont`, opaque
+/// because `runtime` cannot import `ir`. `builderStep` drives one step per pull
+/// and reads the yielded value off `scope`'s fields.
 pub const BuilderState = struct {
-    /// The `suspend SequenceScope<T>.() -> Unit` block (an `IrClosure` Value).
     block: ValueBox,
-    /// The `SequenceScope` Instance the block runs against; carries the pending
-    /// yielded value / yieldAll iterator between steps.
+    /// Carries the pending yielded value or `yieldAll` iterator between steps.
     scope: ValueBox,
-    /// Host-owned `*ir.eval.SuspendState` — the parked continuation between
-    /// pulls. `null` before the first pull, after completion, and while a pull
-    /// is in flight.
+    /// Host-owned `*ir.eval.SuspendState`, null before the first pull, after
+    /// completion, and while a pull is in flight.
     cont: ?*anyopaque = null,
-    /// The block has been started (the first pull ran `evalClosureRaw`).
     started: bool = false,
-    /// The block ran to completion (no more elements).
     done: bool = false,
-    /// The block threw. The throw itself propagated out of the pull that
-    /// observed it; every later pull throws IllegalStateException, matching
+    /// Every later pull throws IllegalStateException, matching
     /// `SequenceBuilderIterator`'s failed state.
     failed: bool = false,
 
-    /// GC out-edges: the builder block, the scope Instance, and every Value
-    /// the parked continuation's frames keep live (through the suspend-mark
-    /// hook). All are reachable only through a held `Sequence`/`Iterator`.
+    /// All are reachable only through a held `Sequence` or `Iterator`.
     pub fn gcTrace(self: *const BuilderState, m: *objcell.gc.Marker) void {
         m.shade(&self.block.cell.hdr);
         m.shade(&self.scope.cell.hdr);
@@ -1508,16 +1258,12 @@ pub const BuilderState = struct {
         }
     }
 
-    /// Finalize an abandoned builder: a `Sequence` swept without being driven
-    /// to completion still owns its parked continuation box (frames with
-    /// retained values + raw slice buffers). Release and free it through the
-    /// host hook so the run allocator reclaims it.
+    /// A `Sequence` swept before completion still owns its parked continuation
+    /// box, freed here through the host hook.
     pub fn gcFinalize(self: *BuilderState, a: std.mem.Allocator) void {
         self.freeCont(a);
     }
 
-    /// Refcount teardown: same as `gcFinalize` (the continuation box must be
-    /// freed when the last handle to an undriven builder drops).
     pub fn deinit(self: *BuilderState, a: std.mem.Allocator) void {
         self.freeCont(a);
     }
@@ -1532,33 +1278,23 @@ pub const BuilderState = struct {
 
 pub const BuilderStateRef = ObjRef(BuilderState);
 
-/// Lazy iterator over a `Sequence` (the `Sequence.iterator()` / `iterator{}`
-/// result). Pulls one output element at a time from the underlying source +
-/// op pipeline, so an infinite source never materialises. Holds the `Sequence`
-/// value, a one-element lookahead, the done flag, and the per-op streaming
-/// counters (mirrors the materialiser's `PumpState`).
+/// Pulls one element at a time through the source and op pipeline, so an
+/// infinite source never materialises.
 pub const SeqIterState = struct {
-    /// The `Value.Sequence` being iterated.
     seq: Value,
-    /// One-element lookahead produced by `hasNext()` and consumed by `next()`.
+    /// Produced by `hasNext()`, consumed by `next()`.
     buffered: ?Value = null,
-    /// The pipeline is exhausted.
     done: bool = false,
-    /// For an `Items` source: the cursor into the eager element slice.
     src_pos: usize = 0,
-    /// For a `Generate` source: the next seed to emit (the seed initially,
-    /// then each step's result), or null before the first pull / once done.
+    /// The next seed to emit, null before the first pull and once done.
     gen_cur: ?Value = null,
     gen_started: bool = false,
-    /// For an `IteratorFn` source: the Iterator the factory produced for
-    /// THIS iteration (invoked lazily on first pull).
+    /// This iteration's Iterator, made on the first pull.
     iter_obj: ?Value = null,
-    /// For a `Merged` source: the two child iterators, created together on
-    /// the first pull.
+    /// Created together on the first pull.
     iter_left: ?Value = null,
     iter_right: ?Value = null,
-    /// Per-op streaming counters, indexed by op position. Allocated lazily to
-    /// `ops.len`. `Take`/`Drop` counts and `takeWhile`/`dropWhile`/index state.
+    /// Indexed by op position, allocated lazily.
     taken: []usize = &.{},
     dropped: []usize = &.{},
     take_while_live: []bool = &.{},
@@ -1606,38 +1342,30 @@ pub const SeqIterState = struct {
 
 pub const SeqIterStateRef = ObjRef(SeqIterState);
 
-/// The advancing state of a `Value.Iterator`, held behind one shared handle so
-/// it survives the by-value copies a `Value` undergoes.
+/// Behind one shared handle, so it survives the by-value copies a `Value`
+/// undergoes.
 pub const IterCursor = struct {
-    /// Index of the next element to yield.
     pos: usize = 0,
-    /// Index of the element the LAST `next()`/`previous()` returned (the
-    /// ListIterator set/remove target), or -1 when none — before the first
-    /// move, and after `add`/`remove`.
+    /// The `ListIterator` set and remove target. -1 before the first move and
+    /// after an `add` or `remove`.
     last_ret: i64 = -1,
-    /// The source's `mod_count` as captured when the iterator was created.
-    /// Meaningful only when the iterator carries a `mod_count` handle.
+    /// Meaningful only when the iterator carries a `mod_count`.
     exp_mod: u64 = 0,
-    /// The elements (shared with the mutable source, or a snapshot). The
-    /// fixed iterator fields ride in the cursor cell every step already
-    /// borrows, so `Value.Iterator` is the one handle.
+    /// Shared with a mutable source or snapshotted. They ride in the cursor
+    /// cell every step already borrows.
     items: ValueList,
     prim: ?PrimitiveArrayKind = null,
-    /// The source collection's `mod_count`, shared with it. `next`/`hasNext`
-    /// throw `ConcurrentModificationException` when it no longer matches
-    /// `exp_mod`; the iterator's own `add`/`remove` resync it. Null when
-    /// the source had no `mod_count`.
+    /// Shared with the source: `next` and `hasNext` throw
+    /// `ConcurrentModificationException` once it stops matching `exp_mod`, and
+    /// the iterator's own `add` and `remove` resync it.
     mod_count: objcell.OptRef(u64) = .{},
-    /// True only when the iterator shares a *mutable* collection's backing,
-    /// so `MutableIterator.remove`/`MutableListIterator.set`/`.add` mutate
-    /// the source. A snapshot iterator over a read-only collection (or an
-    /// array/string) is false: those mutating ops throw
-    /// `UnsupportedOperationException`, matching Kotlin.
+    /// True only when the iterator shares a mutable collection's backing, so
+    /// `MutableIterator.remove` and the `MutableListIterator` writes reach the
+    /// source. Kotlin throws `UnsupportedOperationException` otherwise.
     mutable: bool = false,
 
     pub fn deinit(self: *IterCursor, allocator: std.mem.Allocator) void {
-        // Mirrors `Value.releaseValueList`: the last handle releases the
-        // contained elements before dropping the list itself.
+        // The last handle releases the contained elements before the list.
         if (self.items.strongCount() == 1) {
             const g = self.items.borrow();
             for (g.get().items) |e| e.release(allocator);
@@ -1656,17 +1384,12 @@ pub const IterCursor = struct {
 pub const SequenceData = struct {
     source: SequenceSource,
     ops: []SeqOp,
-    /// `generateSequence { … }` (nullary form) consumes once: the second
-    /// iteration throws IllegalStateException, matching the source's
-    /// `.constrainOnce()`.
+    /// The nullary `generateSequence {}` consumes once, as `.constrainOnce()`
+    /// does: a second iteration throws IllegalStateException.
     one_shot: bool = false,
     consumed: bool = false,
 
-    /// GC out-edges: the lazy source (eager items, or the seed/step generator
-    /// closures) and every pipeline op's lambda. Without this a `Sequence` held
-    /// across a collection sweeps its generator/op closures and source elements
-    /// (they are reachable only through here), so reads after the collection hit
-    /// freed cells.
+    /// The source and each op's lambda are reachable only through here.
     pub fn gcTrace(self: *const SequenceData, m: *objcell.gc.Marker) void {
         switch (self.source) {
             .Items => |items| m.shade(&items.cell.hdr),
@@ -1702,25 +1425,18 @@ pub const SequenceData = struct {
 };
 
 pub const SequenceSource = union(enum) {
-    /// Eager-known elements (`asSequence` / `sequenceOf`).
     Items: ValueSlice,
-    /// `generateSequence(seed) { it -> next }`. `seed` is null for the
-    /// nullary form. `seed_is_fn` marks the `generateSequence(seedFn,
-    /// next)` form: the boxed seed is a producer invoked at each
-    /// iteration start.
+    /// `seed` is null for the nullary form. `seed_is_fn` marks
+    /// `generateSequence(seedFn, next)`, where the seed is a producer invoked
+    /// at each iteration start.
     Generate: struct { seed: ?ValueBox, next: ValueBox, seed_is_fn: bool = false },
-    /// `sequence { yield(...) }` / `iterator { ... }` — a lazy coroutine
-    /// builder driven one element at a time.
     Builder: BuilderStateRef,
-    /// `Sequence { () -> Iterator<T> }` — the SAM factory. Each iteration
-    /// invokes the factory for a fresh Iterator and pulls it element by
-    /// element (lazy, re-iterable).
+    /// Each iteration invokes the factory for a fresh Iterator, so the sequence
+    /// stays lazy and re-iterable.
     IteratorFn: ValueBox,
-    /// `seq.zip(other)` — the merging source. Each pull advances BOTH child
-    /// iterators one element (left first, then right), so shared-state
-    /// generators observe the strict alternating interleave of
-    /// `MergingSequence`. `transform` (when non-null) maps each (a, b)
-    /// instead of building a Pair.
+    /// Each pull advances both children, left before right, so shared-state
+    /// generators observe `MergingSequence`'s interleave. A non-null `transform`
+    /// maps each `(a, b)` instead of building a Pair.
     Merged: MergedSource,
 };
 
@@ -1730,11 +1446,8 @@ pub const SeqOp = union(enum) {
     Map: Value,
     Filter: Value,
     FilterNot: Value,
-    /// `onEach { }` — run the lambda for its side effect, pass through.
     OnEach: Value,
-    /// `mapIndexed { index, value -> }`.
     MapIndexed: Value,
-    /// `filterIndexed { index, value -> }`.
     FilterIndexed: Value,
     Take: i64,
     Drop: i64,
@@ -1743,32 +1456,27 @@ pub const SeqOp = union(enum) {
     FlatMap: Value,
     Distinct,
     DistinctBy: Value,
-    /// Sort in natural order; `descending` flips the comparison.
+    /// Natural order; the payload flips the comparison.
     Sorted: bool,
-    /// Sort by a key-selector lambda; the bool flips the comparison.
+    /// Key-selector order; `descending` flips the comparison.
     SortedBy: struct { selector: Value, descending: bool },
-    /// Sort with a user-supplied `Value::Comparator`.
     SortedWith: Value,
 };
 
-/// Compiled regex + the original pattern source. The compiled engine is
-/// not in the Zig std; `engine` is an opaque host-provided handle.
+/// Compiled regex and its pattern. The engine is not in the Zig standard
+/// library, so `engine` is an opaque host handle.
 pub const RegexData = struct {
-    /// A compiled regex is immutable once PUBLISHED: `regex_ctor` attaches
-    /// `options` through `asPtr` after `compileRegexFlags` mints the cell but
-    /// before the value escapes the constructor, so no reader can observe a
-    /// mutation and the cell is never write-locked; elide the reader lock.
-    /// Any new mutation site must stay inside that pre-escape window.
+    /// Immutable once published: `regex_ctor` attaches `options` through
+    /// `asPtr` after the cell is minted but before the value escapes the
+    /// constructor, so the reader lock is elided. Any new mutation site must
+    /// stay inside that pre-escape window.
     pub const objref_immutable = true;
 
     pattern: StringRef,
-    /// Opaque compiled-regex handle owned by the host regex binding.
     engine: ?*anyopaque,
-    /// The RegexOption values the regex was constructed with (the
-    /// caller's enum singletons, for identity-equal `options` reads).
+    /// The caller's enum singletons, so `options` reads are identity-equal.
     options: ?ValueList = null,
 
-    /// GC out-edge: a live regex keeps its pattern bytes reachable.
     pub fn gcTrace(self: *const RegexData, m: *objcell.gc.Marker) void {
         m.shade(&self.pattern.cell.hdr);
         if (self.options) |ol| m.shade(&ol.cell.hdr);
@@ -1790,19 +1498,15 @@ pub const MatchGroupData = struct {
     }
 };
 
-/// A single regex match outcome — full match plus capture groups, with
-/// enough state to resume scanning via `MatchResult.next()`.
+/// Carries enough state to resume scanning from `MatchResult.next()`.
 pub const MatchData = struct {
     input: StringRef,
-    /// Index 0 is the whole match; later indices are capture groups.
-    /// `null` means a group did not participate.
+    /// Index 0 is the whole match. Null for a non-participating group.
     groups: []?MatchGroupData,
-    /// Byte offset in `input` immediately after the matched span.
+    /// Byte offset in `input` just after the matched span.
     end_byte: usize,
     regex: ObjRef(RegexData),
 
-    /// GC out-edges: the matched input, the originating regex, and each capture
-    /// group's text — all reachable only through a held `MatchResult`.
     pub fn gcTrace(self: *const MatchData, m: *objcell.gc.Marker) void {
         m.shade(&self.input.cell.hdr);
         m.shade(&self.regex.cell.hdr);
@@ -1810,39 +1514,28 @@ pub const MatchData = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Host-op temporary keepalive (a GC root). A pure-host re-entry — a stdlib op
-// iterating a host-built slice and calling a user callable via `invoke*` /
-// `callValueRec` — holds its accumulator/snapshot in a native `ArrayList`/slice
-// with NO calling frame register pinning it. The nested eval the callable runs
-// reaches a safe point, so those host-local Values must be a root for that
-// window. Each such op marks the stack depth on entry, pushes its in-progress
-// contents before each re-entrant call, and restores to the entry mark at exit.
-// Lives here (not in `ir/eval`) because the stdlib layer cannot import `ir`; it
-// reaches the API through `runtime`.
-// ---------------------------------------------------------------------------
+// Host-op temporary keepalive, a GC root. A stdlib op that iterates a
+// host-built slice and calls a user callable holds its accumulator in native
+// storage with no frame register pinning it, and the nested eval reaches a safe
+// point, so those Values must be rooted for that window. It lives here because
+// the stdlib layer cannot import `ir`.
 
-/// `many`/`pairs` keep a whole slice rooted in O(1) (no per-element copy);
-/// `cell` pins a raw object cell (e.g. a transient scope `Env` the host swapped
-/// into place) whose own `gc_trace` then reaches its contents.
+/// `many` and `pairs` root a whole slice in O(1); `cell` pins a raw object cell
+/// whose own `gc_trace` reaches its contents.
 const KeepEntry = union(enum) {
     one: Value,
     many: []const Value,
     pairs: []const MapPair,
     cell: *objcell.gc.GcHeader,
 };
-/// The keepalive stack, its GC root node and the once-flag as ONE threadlocal.
-/// Darwin resolves every threadlocal access through a `_tlv_get_addr` CALL, so
-/// three variables meant three calls on a path the interpreter runs per host
-/// re-entry; as one struct, the pointer is fetched once and the fields are
-/// offsets from it.
+/// One threadlocal, not three: Darwin resolves each access through a
+/// `_tlv_get_addr` call, so this costs one fetch per host re-entry.
 const KeepaliveTls = struct {
     stack: std.ArrayListUnmanaged(KeepEntry) = .empty,
     troot: objcell.gc.ThreadRoot = undefined,
     troot_inited: bool = false,
 };
-/// Owner thread reads the global copy, every other thread its own — see
-/// `tls_fast`.
+/// The owner thread reads the global copy, every other its own.
 var keepalive_owner: KeepaliveTls = .{};
 threadlocal var keepalive_other: KeepaliveTls = .{};
 inline fn keepaliveTls() *KeepaliveTls {
@@ -1859,7 +1552,6 @@ fn gcMarkKeepaliveCtx(ctx: *anyopaque, m: *objcell.gc.Marker) void {
     };
 }
 
-/// Unlink this thread's keepalive root node at its exit seam.
 pub fn gcUninstallKeepaliveRoot() void {
     const k = keepaliveTls();
     if (!k.troot_inited) return;
@@ -1867,10 +1559,8 @@ pub fn gcUninstallKeepaliveRoot() void {
     k.troot_inited = false;
 }
 
-/// A handle to this thread's keepalive state, resolved ONCE. Darwin resolves a
-/// threadlocal through a `_tlv_get_addr` CALL, and a body that pins across a
-/// host re-entry marks, pushes and restores — three fetches per activation on
-/// the interpreter's hottest path. Take a handle and pay one.
+/// Resolved once: a body that pins across a host re-entry would otherwise
+/// resolve the threadlocal three times.
 pub const KeepaliveHandle = struct {
     k: *KeepaliveTls,
 
@@ -1898,21 +1588,16 @@ pub const KeepaliveHandle = struct {
     }
 };
 
-/// This thread's keepalive handle.
 pub fn keepaliveHandle() KeepaliveHandle {
     return .{ .k = keepaliveTls() };
 }
 
-/// Snapshot the keepalive depth; pass to `keepaliveRestore` to pop everything
-/// pushed since. Valid (and cheap) even when the GC is off.
+/// Pass the result to `keepaliveRestore`. Valid with the GC off.
 pub inline fn keepaliveMark() usize {
     return keepaliveTls().stack.items.len;
 }
 
-/// Register the keepalive root provider once. Lazy: the first push on any thread
-/// installs it (idempotent across threads). The threadlocal stack it reads is
-/// the collecting thread's — sufficient single-threaded; per-thread records
-/// extend it across worker threads.
+/// Registered on the first push. The root reads that thread's own stack.
 inline fn ensureKeepaliveRoot(k: *KeepaliveTls) void {
     if (k.troot_inited) return;
     k.troot_inited = true;
@@ -1920,7 +1605,7 @@ inline fn ensureKeepaliveRoot(k: *KeepaliveTls) void {
     objcell.gc.registerThreadRoot(&k.troot);
 }
 
-/// Pin a single Value across a re-entrant host call. No-op unless GC is on.
+/// No-op unless GC is on.
 pub fn keepalivePush(v: Value) void {
     if (!objcell.gc.gc_enabled) return;
     const k = keepaliveTls();
@@ -1929,9 +1614,7 @@ pub fn keepalivePush(v: Value) void {
         @panic("KGC: host_keepalive push failed");
 }
 
-/// Pin a whole slice of Values (an accumulator's live contents, a snapshot)
-/// across a re-entrant host call. The slice must stay valid until the matching
-/// restore. No-op unless GC is on.
+/// The slice must stay valid until the matching restore.
 pub fn keepalivePushSlice(vs: []const Value) void {
     if (!objcell.gc.gc_enabled) return;
     const k = keepaliveTls();
@@ -1940,8 +1623,6 @@ pub fn keepalivePushSlice(vs: []const Value) void {
         @panic("KGC: host_keepalive push failed");
 }
 
-/// Pin a slice of `MapPair`s (a map/grouping accumulator's live contents)
-/// across a re-entrant host call. No-op unless GC is on.
 pub fn keepalivePushPairs(ps: []const MapPair) void {
     if (!objcell.gc.gc_enabled) return;
     const k = keepaliveTls();
@@ -1950,10 +1631,8 @@ pub fn keepalivePushPairs(ps: []const MapPair) void {
         @panic("KGC: host_keepalive push failed");
 }
 
-/// Pin a raw object cell across a re-entrant host call — for a transient cell
-/// the host holds in a stack local that no frame register or Vm-graph root
-/// reaches (a scope `Env` swapped into the host's active globals). The cell's
-/// own `gc_trace` reaches its contents. No-op unless GC is on.
+/// For a transient cell in a stack local that no frame register or Vm-graph
+/// root reaches. The cell's own `gc_trace` reaches its contents.
 pub fn keepalivePushCell(h: *objcell.gc.GcHeader) void {
     if (!objcell.gc.gc_enabled) return;
     const k = keepaliveTls();
@@ -1962,27 +1641,20 @@ pub fn keepalivePushCell(h: *objcell.gc.GcHeader) void {
         @panic("KGC: host_keepalive push failed");
 }
 
-/// Pop the keepalive stack back to a depth from `keepaliveMark`.
 pub inline fn keepaliveRestore(mark: usize) void {
     if (!objcell.gc.gc_enabled) return;
     keepaliveTls().stack.items.len = mark;
 }
 
-/// The runtime value: a tagged union over every Kotlin value the
-/// interpreter manipulates.
-/// Receiver ABI required by a Kotlin classifier at the IR/runtime call
-/// boundary. `instance` classifiers use numeric virtual slots. `specialized`
-/// classifiers use the host member ABI, either because they have a dedicated
-/// `Value` tag or because they are host-synthesized `Value.Instance` values.
+/// An `instance` classifier uses numeric virtual slots; a `specialized` one
+/// uses the host member ABI.
 pub const ReceiverAbi = enum {
     instance,
     specialized,
 };
 
-/// Canonical manifest of classifiers whose receivers have a specialized host
-/// representation. Interface entries are included whenever at least one
-/// specialized value implements them, so a call through that static interface
-/// never assumes `Value.Instance`.
+/// An interface is listed whenever at least one specialized value implements
+/// it, so a call through that static interface never assumes `Value.Instance`.
 pub fn classifierReceiverAbi(fqn: []const u8) ReceiverAbi {
     if (std.mem.eql(u8, fqn, "kotlin.Function")) return .specialized;
     if (std.mem.startsWith(u8, fqn, "kotlin.Function") and
@@ -2127,9 +1799,9 @@ fn allAsciiDigits(s: []const u8) bool {
     return true;
 }
 
+/// The runtime value: a tagged union over every Kotlin value.
 pub const Value = union(enum) {
     Unit,
-    /// The `COROUTINE_SUSPENDED` singleton.
     CoroutineSuspended,
     Int: i32,
     Long: i64,
@@ -2140,139 +1812,71 @@ pub const Value = union(enum) {
     UShort: u16,
     UByte: u8,
     Double: f64,
-    /// Kotlin `Float`, stored as `f32`.
     Float: f32,
     Bool: bool,
     String: StringRef,
-    /// Kotlin `Char` is a single UTF-16 code unit (may be a lone surrogate).
+    /// A single UTF-16 code unit, possibly a lone surrogate.
     Char: u16,
     Null,
-    /// Inclusive integer progression with a signed step. Boxed like `Map`
-    /// (see `RangeData`); construct with `Value.newRange`. Immutable after
-    /// construction, so copies sharing the record is invisible.
+    /// Immutable after construction; construct with `Value.newRange`.
     Range: *RangeData,
-    /// A stdlib function value. The payload is an INTERNED program-
-    /// lifetime record (`Value.internIntrinsic`): the fqn is a static
-    /// string and the pair never dies, so copies carry one pointer and
-    /// neither the refcount nor the collector ever touches it.
+    /// Interned for the life of the program, so neither the refcount nor the
+    /// collector touches it.
     Intrinsic: *const IntrinsicData,
-    /// IR-side closure handle: one cell holding the closure id and its
-    /// captured values (see `IrClosureData`).
     IrClosure: IrClosureRef,
-    /// A method intrinsic bound to a specific receiver. Boxed like `Map`
-    /// (see `BoundMethodData`); construct with `Value.newBoundMethod`.
     BoundMethod: *BoundMethodData,
-    /// A thrown value, modeled as a Kotlin Throwable. Boxed like `Map` (see
-    /// `ExceptionData`); construct with `Value.newException`.
     Exception: *ExceptionData,
-    /// `kotlin.collections.List` / `MutableList`. Boxed like `Map` (see
-    /// `ListData`); construct with `Value.newList`.
     List: *ListData,
-    /// `kotlin.Array<T>` and primitive-array siblings.
     Array: ArrayData,
-    /// `kotlin.collections.Set` / `MutableSet`. Boxed like `Map` (see
-    /// `SetData`); construct with `Value.newSet`.
     Set: *SetData,
-    /// `kotlin.collections.Map` / `MutableMap`. Boxed: the pointer targets
-    /// the `data` field of an `ObjRef(MapData)` control block (recovered
-    /// with `mapRefOf`), so a `Value` copy moves 8 bytes and shares the
-    /// payload. Construct with `Value.newMap`.
+    /// The pointer targets the `data` field of an `ObjRef(MapData)` control
+    /// block, recovered with `mapRefOf`, so a `Value` copy moves 8 bytes and
+    /// shares the payload. Every other boxed payload follows this scheme.
     Map: *MapData,
-    /// `kotlin.Pair`. Boxed like `Map` (see `PairData`); construct with
-    /// `Value.newPair`.
     Pair: *PairData,
-    /// `kotlin.Triple`.
-    /// `kotlin.Triple`. Boxed like `Map` (see `TripleData`); construct
-    /// with `Value.newTriple`.
     Triple: *TripleData,
-    /// `kotlin.collections.Map.Entry`.
-    /// `kotlin.collections.Map.Entry`. Boxed like `Map` (see
-    /// `MapEntryData`); construct with `Value.newMapEntry`. Copies share
-    /// the record — the JVM's reference semantics for an entry.
+    /// Copies share the record, the JVM's reference semantics for an entry.
     MapEntry: *MapEntryData,
-    /// `kotlin.Result<T>`.
-    /// `kotlin.Result<T>`. Boxed like `Map` (see `ResultData`); construct
-    /// with `Value.newResult`.
     Result: *ResultData,
-    /// `kotlin.Comparator<T>`. Boxed like `Map` (see `ComparatorData`);
-    /// construct with `Value.newComparator`.
     Comparator: *ComparatorData,
-    /// A user-declared class.
     Class: ObjRef(ClassDef),
-    /// A live instance of a user-declared class.
     Instance: ObjRef(InstanceData),
-    /// `kotlin.sequences.Sequence<T>`.
     Sequence: ObjRef(SequenceData),
-    /// `kotlin.collections.Iterator<T>` and primitive specializations.
-    /// Snapshot/live iterator over materialised elements. The whole state
-    /// (elements, cursor, prim kind, mod-count handle, mutability) lives
-    /// in the ONE `IterCursor` cell every step already borrows; construct
-    /// with `Value.newIterator`.
+    /// The whole state lives in the one `IterCursor` cell every step borrows.
     Iterator: ObjRef(IterCursor),
-    /// Lazy O(1)-memory iterator over a `Range`/progression. The whole
-    /// state — cursor, yielded-last flag, and the fixed end/step/kind —
-    /// lives in ONE shared cell (`RangeIterState`) so it survives the
-    /// iterator value being copied between reads and costs a single lock
-    /// per step. `done` exists because the cursor saturates at the
-    /// integer boundary (`MaxL +| 1 == MaxL`), so a `cur <= end` test
-    /// alone would loop forever on a range ending at
-    /// `Long.MAX_VALUE`/`MIN_VALUE`.
+    /// `done` is needed because the cursor saturates at the integer boundary
+    /// (`MaxL +| 1 == MaxL`), so `cur <= end` alone would loop forever on a
+    /// range ending at `Long.MAX_VALUE`.
     RangeIter: ObjRef(RangeIterState),
-    /// Lazy iterator over a `Sequence` (the `Sequence.iterator()` / lazy
-    /// `iterator { }` result), pulling one element at a time.
     SeqIter: SeqIterStateRef,
-    /// A built-in property delegate.
     Delegate: ObjRef(DelegateKind),
-    /// `::foo` — a lightweight property/function reference.
     PropertyRef: struct {
         name: StringRef,
     },
-    /// `kotlin.text.Regex`.
     Regex: ObjRef(RegexData),
-    /// `kotlin.text.MatchResult`.
     Match: ObjRef(MatchData),
-    /// `kotlin.text.MatchGroup`. Boxed like `Map` (see `MatchGroupData`);
-    /// construct with `Value.newMatchGroup`.
     MatchGroup: *MatchGroupData,
-    /// `kotlin.text.StringBuilder` — mutable string buffer.
     StringBuilder: ObjRef(std.ArrayList(u8)),
-    /// Boxed local `var` captured by a closure (`Ref.ObjectRef`).
     Cell: ObjRef(Value),
 
-    /// Wrap a value in a fresh capture cell.
     pub fn newCell(allocator: std.mem.Allocator, v: Value) !Value {
         return .{ .Cell = try ObjRef(Value).init(allocator, v) };
     }
 
-    /// Heap-box a `Value` so it can fill a `*Value` payload slot
-    /// (`Box::new(v)` -> `*Value`).
     pub fn box(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error!*Value {
         const p = try allocator.create(Value);
         p.* = v;
         return p;
     }
 
-    /// Box a `Value` into a refcounted `ValueBox` (the owning component slot of
-    /// `Pair`/`Triple`/`MapEntry`/`Result`/etc.). The box owns `v`; copies of
-    /// the enclosing value clone the box, and the last release frees `v`.
+    /// The box owns `v`; the last release frees it.
     pub fn boxRef(allocator: std.mem.Allocator, v: Value) std.mem.Allocator.Error!ValueBox {
         return ValueBox.init(allocator, v);
     }
 
-    /// Reference-counting increment: bump the strong count of
-    /// every refcounted handle this value holds, returning another owning
-    /// copy of the same value graph. Primitives and the immutable program
-    /// graph (`Class`) are no-ops. Owning-`*Value` variants
-    /// (`Pair`/`Triple`/`MapEntry`/`Result`/`BoundMethod`/`Exception.cause`)
-    /// are not yet refcounted — they share their boxes on copy and are
-    /// retained/released as no-ops here until they are converted to `ObjRef`.
-    /// Single source of truth for the value graph's out-edges: invokes
-    /// `visitor.visit(objref)` for every refcounted `ObjRef` handle this value
-    /// *directly* holds (one level — the handle's own cell, not its transitive
-    /// elements; a container backing cell's own children are reached through the
-    /// cell's GC `trace_fn`). `retain` (incref), `release` (decref), and the GC
-    /// mark phase all drive this same walk, so they cannot diverge. `backing`
-    /// write-through views are non-owning and intentionally not visited.
+    /// Single source of truth for the value graph's out-edges, one level only.
+    /// Retain, release and the mark phase all drive this walk, so they cannot
+    /// diverge. `backing` write-through views are non-owning and not visited.
     pub fn forEachChildCell(self: Value, visitor: anytype) void {
         switch (self) {
             .String => |s| visitor.visit(s),
@@ -2291,8 +1895,7 @@ pub const Value = union(enum) {
                 .boxed => |vl| visitor.visit(vl),
                 .scalars => |pb| visitor.visit(pb),
             },
-            // Boxed payload: the BOX cell is the one owned edge (its own
-            // trace/teardown reaches the entries).
+            // The box cell is the one owned edge.
             .Map => |x| visitor.visit(mapRefOf(x)),
             .Range => |x| visitor.visit(rangeRefOf(x)),
             .Iterator => |x| visitor.visit(x),
@@ -2316,9 +1919,8 @@ pub const Value = union(enum) {
         }
     };
 
-    /// A non-owning leaf value: no cell to retain/release. Listed conservatively
-    /// (only the unambiguous primitives) so a heap variant accidentally omitted
-    /// still takes the full path — never the reverse, which would leak.
+    /// Listed conservatively, so a heap variant omitted here still takes the
+    /// full path rather than leaking.
     pub inline fn isPrimitive(self: Value) bool {
         return switch (self) {
             .Unit, .CoroutineSuspended, .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Bool, .Char, .Null => true,
@@ -2326,28 +1928,22 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Allocate the boxed `Map` payload (one control block, refcount 1) and
-    /// return the `Value` holding it. The only way to construct a `.Map`.
+    /// The only way to construct a `.Map`.
     pub fn newMap(allocator: std.mem.Allocator, data: MapData) std.mem.Allocator.Error!Value {
         const ref = try MapRef.initOwned(allocator, data);
         return .{ .Map = &ref.cell.data };
     }
 
-    /// Allocate the boxed `Range` payload; the only way to construct a
-    /// `.Range`.
     pub fn newRange(allocator: std.mem.Allocator, data: RangeData) std.mem.Allocator.Error!Value {
         const ref = try RangeRef.initOwned(allocator, data);
         return .{ .Range = &ref.cell.data };
     }
 
-    /// Allocate the iterator's single state cell; the only way to
-    /// construct an `.Iterator`.
     pub fn newIterator(allocator: std.mem.Allocator, data: IterCursor) std.mem.Allocator.Error!Value {
         return .{ .Iterator = try ObjRef(IterCursor).init(allocator, data) };
     }
 
-    /// Intern the (fqn, func) pair; the only way to construct an
-    /// `.Intrinsic`. Immortal: allocation failure here is fatal.
+    /// The interned entry is immortal; allocation failure here is fatal.
     pub fn internIntrinsic(fqn: []const u8, func: StdlibFn) Value {
         intrinsic_intern_mutex.lock();
         defer intrinsic_intern_mutex.unlock();
@@ -2355,11 +1951,8 @@ pub const Value = union(enum) {
         if (intrinsic_intern == null) intrinsic_intern = std.StringHashMap(*const IntrinsicData).init(a);
         const gop = intrinsic_intern.?.getOrPut(fqn) catch @panic("intrinsic intern");
         if (!gop.found_existing) {
-            // Own the key bytes: the caller's slice is typically a module's
-            // constant, which an in-process multi-program driver frees at
-            // that program's teardown — a borrowed key then dangles and the
-            // next program's probe compares against freed memory. The dup is
-            // immortal, matching the entry's own lifetime.
+            // Own the key bytes: the caller's slice is typically a module
+            // constant a multi-program driver frees at that program's teardown.
             const owned = a.dupe(u8, fqn) catch @panic("intrinsic intern");
             gop.key_ptr.* = owned;
             const d = a.create(IntrinsicData) catch @panic("intrinsic intern");
@@ -2369,79 +1962,59 @@ pub const Value = union(enum) {
         return .{ .Intrinsic = gop.value_ptr.* };
     }
 
-    /// Allocate the boxed `MatchGroup` payload; the only way to construct
-    /// a `.MatchGroup`.
     pub fn newMatchGroup(allocator: std.mem.Allocator, data: MatchGroupData) std.mem.Allocator.Error!Value {
         const ref = try MatchGroupRef.initOwned(allocator, data);
         return .{ .MatchGroup = &ref.cell.data };
     }
 
-    /// Allocate the boxed `Result` payload; the only way to construct a
-    /// `.Result`.
     pub fn newResult(allocator: std.mem.Allocator, data: ResultData) std.mem.Allocator.Error!Value {
         const ref = try ResultRef.initOwned(allocator, data);
         return .{ .Result = &ref.cell.data };
     }
 
-    /// Allocate the boxed `Comparator` payload; the only way to construct
-    /// a `.Comparator`.
     pub fn newComparator(allocator: std.mem.Allocator, data: ComparatorData) std.mem.Allocator.Error!Value {
         const ref = try ComparatorRef.initOwned(allocator, data);
         return .{ .Comparator = &ref.cell.data };
     }
 
-    /// Allocate the boxed `Pair` payload; the only way to construct a
-    /// `.Pair`.
     pub fn newPair(allocator: std.mem.Allocator, data: PairData) std.mem.Allocator.Error!Value {
         const ref = try PairRef.initOwned(allocator, data);
         return .{ .Pair = &ref.cell.data };
     }
 
-    /// Allocate the boxed `Triple` payload; the only way to construct a
-    /// `.Triple`.
     pub fn newTriple(allocator: std.mem.Allocator, data: TripleData) std.mem.Allocator.Error!Value {
         const ref = try TripleRef.initOwned(allocator, data);
         return .{ .Triple = &ref.cell.data };
     }
 
-    /// Allocate the boxed `MapEntry` payload; the only way to construct a
-    /// `.MapEntry`.
     pub fn newMapEntry(allocator: std.mem.Allocator, data: MapEntryData) std.mem.Allocator.Error!Value {
         const ref = try MapEntryRef.initOwned(allocator, data);
         return .{ .MapEntry = &ref.cell.data };
     }
 
-    /// Allocate the boxed `BoundMethod` payload; the only way to construct
-    /// a `.BoundMethod`.
     pub fn newBoundMethod(allocator: std.mem.Allocator, data: BoundMethodData) std.mem.Allocator.Error!Value {
         const ref = try BoundMethodRef.initOwned(allocator, data);
         return .{ .BoundMethod = &ref.cell.data };
     }
 
-    /// Allocate the boxed `Set` payload; the only way to construct a `.Set`.
     pub fn newSet(allocator: std.mem.Allocator, data: SetData) std.mem.Allocator.Error!Value {
         const ref = try SetRef.initOwned(allocator, data);
         return .{ .Set = &ref.cell.data };
     }
 
-    /// Allocate the boxed `List` payload; the only way to construct a `.List`.
     pub fn newList(allocator: std.mem.Allocator, data: ListData) std.mem.Allocator.Error!Value {
         const ref = try ListRef.initOwned(allocator, data);
         return .{ .List = &ref.cell.data };
     }
 
-    /// Allocate the boxed `Exception` payload; the only way to construct a
-    /// `.Exception`.
     pub fn newException(allocator: std.mem.Allocator, data: ExceptionData) std.mem.Allocator.Error!Value {
         const ref = try ExceptionRef.initOwned(allocator, data);
         return .{ .Exception = &ref.cell.data };
     }
 
+    /// Dual of `release`.
     pub fn retain(self: Value) void {
-        // Gated to match `release` (whose `ObjRef.deinit` is a no-op under the
-        // arena fast path): under reclaim-off retains and releases are both
-        // skipped, so the arena reclaims everything and production pays no
-        // refcount traffic. Under reclaim-on both run and stay balanced.
+        // Gated to match `release`: under reclaim-off both are skipped.
         if (!objcell.reclaimEnabled()) return;
         if (self.isPrimitive()) return;
         self.forEachChildCell(RetainVisitor{});
@@ -2454,42 +2027,29 @@ pub const Value = union(enum) {
         }
     };
 
-    /// GC tracer for a `Value`: shade each cell this value directly references
-    /// (one level; the shaded cell's own `gc_trace` reaches the next level).
-    /// Covers the same owning edges as `retain`, PLUS the non-owning
-    /// view->source `backing` edges that retain/release intentionally skip: a
-    /// live `MutableMap.keys`/`.values`/`.entries` view or a `Map.Entry` write-
-    /// through must keep the source map's entries cell reachable, or the
-    /// collector frees the map out from under a live view. It cannot leak the
-    /// map: once the view is gone, nothing marks the backing.
+    /// Shade each cell this value directly references. Covers the same owning
+    /// edges as `retain` plus the non-owning view-to-source `backing` edges
+    /// retain and release skip: a live view must keep the source entries cell
+    /// reachable. It cannot leak, since once the view is gone nothing marks it.
     pub fn gcMark(self: Value, m: *objcell.gc.Marker) void {
         self.forEachChildCell(MarkVisitor{ .m = m });
         switch (self) {
-            // Most declared classes are minted in the permanent generation,
-            // but synthetic class literals and local class declarations can
-            // be created after program start. A live KClass value must keep
-            // either kind reachable. A bound inner-class constructor also
-            // owns the outer instance it will pass to construction.
+            // Most declared classes are minted permanent, but a synthetic or
+            // local one can be created after the program starts, and a live
+            // KClass must keep either kind reachable.
             .Class => |c| m.shade(&c.cell.hdr),
-            // `List`/`Set` view `backing` is shaded by `forEachChildCell` above
-            // (the `CollBacking` cell's own `gcTrace` reaches the source).
-            // Keep the side-table's canonical capture store + receiver chain for
-            // this closure alive (the dup'd `captures` ValueSlice is already
-            // shaded by `forEachChildCell` above). A closure no live value marks
-            // never reaches here, so its slot's captures go white and are swept.
+            // Keep the side-table's capture store and receiver chain alive. A
+            // closure no live value marks never reaches here.
             .IrClosure => |c| if (objcell.gc.markClosureHook) |f| f(c.asPtr().id, m),
             else => {},
         }
     }
 
-    /// Kotlin's `hashCode()` for the value shapes whose hash is a pure
-    /// function of the value itself: scalars per kotlinc's boxed hash
-    /// (Long folds halves, Bool is 1231/1237, unsigned types hash their
-    /// signed storage, NaN canonicalizes) and String as the UTF-16
-    /// 31-polynomial. Null when the shape's hash could involve dispatch
-    /// (instances) — the one definition every host fast path and the
-    /// stdlib hashing intrinsics must share, or trie/bucket placement
-    /// diverges between served and interpreted operations.
+    /// Kotlin's `hashCode()` where it is a pure function of the value: scalars
+    /// as kotlinc boxes them (Long folds its halves, Bool is 1231/1237, unsigned
+    /// types hash their signed storage, NaN canonicalizes) and String as the
+    /// UTF-16 31-polynomial. Null where hashing could dispatch. Every host fast
+    /// path and hashing intrinsic shares it, or bucket placement diverges.
     pub fn kotlinScalarHash(v: *const Value) ?i32 {
         const longHash = struct {
             fn f(x: i64) i32 {
@@ -2548,17 +2108,10 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Reference-counting decrement: drop one owning handle to
-    /// this value graph. When a handle's strong count reaches zero its
-    /// payload `deinit` recursively releases what it owns. The dual of
-    /// `retain`; primitives, `Class`, and the not-yet-refcounted
-    /// owning-`*Value` variants are no-ops.
+    /// At strong count zero the payload `deinit` releases what it owns.
     pub fn release(self: Value, allocator: std.mem.Allocator) void {
-        // Gated identically to `retain`: under reclaim-off (the arena and the
-        // tracing GC) both are skipped — the arena frees en masse and the GC
-        // reclaims by reachability, so refcount teardown is not just wasted but
-        // actively O(n) here (releasing a collection whose `strongCount` reads 1
-        // walks every element). Only the reference-counting modes run it.
+        // Gated identically to `retain`: the arena frees en masse and the GC
+        // reclaims by reachability, while refcount teardown here is O(n).
         if (!objcell.reclaimEnabled()) return;
         if (self.isPrimitive()) return;
         switch (self) {
@@ -2571,7 +2124,7 @@ pub const Value = union(enum) {
             .StringBuilder => |s| s.deinit(),
             .Cell => |c| c.deinit(),
             // The closure cell owns its captures: release each element, then
-            // drop the cell (whose finalize frees the slice itself).
+            // drop the cell, whose finalize frees the slice.
             .IrClosure => |c| {
                 if (c.cell.refcount.load(.monotonic) == 1) {
                     const g = c.borrow();
@@ -2595,8 +2148,7 @@ pub const Value = union(enum) {
                 .boxed => |vl| releaseValueList(vl, allocator),
                 .scalars => |pb| pb.deinit(),
             },
-            // Boxed payload: drop the box handle; its last-owner teardown
-            // (`MapData.deinit`) releases the entries and their pairs.
+            // `MapData.deinit` releases the entries when it was the last owner.
             .Map => |x| mapRefOf(x).deinit(),
             .Range => |x| rangeRefOf(x).deinit(),
             .Iterator => |x| x.deinit(),
@@ -2614,10 +2166,8 @@ pub const Value = union(enum) {
         }
     }
 
-    /// Drop one owning handle to a `ValueList` and, when it was the last,
-    /// release each contained element first. Safe without locking the count:
-    /// `strongCount() == 1` means this is the only handle, so no other thread
-    /// can hold one to clone from concurrently.
+    /// Releases each element first when this was the last handle.
+    /// `strongCount() == 1` means no other thread holds one, so no lock.
     fn releaseValueList(items: ValueList, allocator: std.mem.Allocator) void {
         if (items.strongCount() == 1) {
             const g = items.borrow();
@@ -2627,7 +2177,6 @@ pub const Value = union(enum) {
         items.deinit();
     }
 
-    /// `releaseValueList` for an `ObjRef([]Value)` capture slice.
     fn releaseSliceElems(slice: ValueSlice, allocator: std.mem.Allocator) void {
         if (slice.strongCount() == 1) {
             const g = slice.borrow();
@@ -2637,8 +2186,6 @@ pub const Value = union(enum) {
         slice.deinit();
     }
 
-    /// `ObjRef(Value)` (capture `Cell`) payload teardown: a boxed value is
-    /// released when its cell's strong count reaches zero.
     pub fn deinit(self: *Value, allocator: std.mem.Allocator) void {
         self.release(allocator);
     }
@@ -2668,7 +2215,7 @@ pub const Value = union(enum) {
         return self.isIntegral() or self.isFloating();
     }
 
-    /// Widen any integral variant to `i64`. Floating returns null.
+    /// Floating returns null.
     pub fn asI64(self: Value) ?i64 {
         return switch (self) {
             .Int => |v| @as(i64, v),
@@ -2683,7 +2230,7 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Widen any integral variant to `u64`. Negative signed values wrap.
+    /// Negative signed values wrap.
     pub fn asU64(self: Value) ?u64 {
         return switch (self) {
             .Int => |v| @bitCast(@as(i64, v)),
@@ -2698,7 +2245,6 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Widen any numeric variant to `f64`.
     pub fn asF64(self: Value) ?f64 {
         return switch (self) {
             .Int => |v| @floatFromInt(v),
@@ -2715,7 +2261,6 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Widen any numeric variant to `f32`.
     pub fn asF32(self: Value) ?f32 {
         return switch (self) {
             .Int => |v| @floatFromInt(v),
@@ -2732,7 +2277,7 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Construct an `Int`, wrapping to 32-bit width.
+    /// Wraps to 32-bit width.
     pub fn newInt(v: i64) Value {
         return .{ .Int = @truncate(v) };
     }
@@ -2749,7 +2294,6 @@ pub const Value = union(enum) {
         return .{ .Byte = @truncate(v) };
     }
 
-    /// Promotion rank used to determine a mixed-numeric result type.
     pub fn numericRank(self: Value) ?NumericRank {
         return switch (self) {
             .Byte => .Byte,
@@ -2766,7 +2310,6 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Convert this numeric value to the variant matching `rank`.
     pub fn promoteTo(self: Value, rank: NumericRank) ?Value {
         return switch (rank) {
             .Byte => if (self.asI64()) |v| Value{ .Byte = @truncate(v) } else null,
@@ -2782,8 +2325,7 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Truncate an `i64` arithmetic result back to the storage range of the
-    /// requested integer rank. Long is returned as-is.
+    /// Long is returned as-is.
     pub fn wrapInteger(rank: NumericRank, v: i64) Value {
         return switch (rank) {
             .Byte => .{ .Byte = @truncate(v) },
@@ -2798,7 +2340,6 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Wrap a `u64` arithmetic result into the unsigned variant for `rank`.
     pub fn wrapUnsigned(rank: NumericRank, v: u64) Value {
         return switch (rank) {
             .UByte => .{ .UByte = @truncate(v) },
@@ -2809,8 +2350,7 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Fully-qualified Kotlin type name, used as the key prefix for member
-    /// lookups in the stdlib registry.
+    /// The key prefix for member lookups in the stdlib registry.
     pub fn typeFqn(self: Value) []const u8 {
         return switch (self) {
             .Cell => "kotlin.Any",
@@ -2890,13 +2430,10 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Render a `Double` the way Kotlin's `Double.toString` does. Caller
-    /// owns the returned string.
     pub fn renderDouble(allocator: std.mem.Allocator, d: f64) ![]u8 {
         return float_fmt.kotlinDoubleToString(allocator, d);
     }
 
-    /// Live exception fqn — for catch-clause matching by type name.
     pub fn exceptionFqn(self: Value) ?[]const u8 {
         return switch (self) {
             .Exception => |e| {
@@ -2908,18 +2445,14 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Whether a builtin `Throwable` whose fully-qualified name is `fqn` is an
-    /// instance of the type named `name` (simple or fully-qualified) per the
-    /// `kotlin.*` exception hierarchy. The single source of truth shared by
-    /// `isRuntimeType` (the `is`/`as` and `KClass.isInstance` paths) and the
-    /// VM's `instanceOf`.
+    /// `name` may be simple or fully-qualified. Shared by `isRuntimeType` and
+    /// the VM's `instanceOf`.
     pub fn builtinThrowableIsA(fqn: []const u8, name: []const u8) bool {
         const tail = lastSegment(fqn);
         if (std.mem.eql(u8, tail, name)) return true;
         if (matchesAny(name, &.{ "Throwable", "Any" })) return true;
         if (std.mem.eql(u8, fqn, name)) return true;
-        // `Error`-side throwables (AssertionError, OutOfMemoryError, ...) are
-        // not `Exception`s; `Exception`-side are not `Error`s.
+        // `Error`-side throwables are not `Exception`s, and the reverse.
         if (std.mem.eql(u8, name, "Exception")) return !throwableIsErrorSide(tail);
         if (std.mem.eql(u8, name, "Error")) return throwableIsErrorSide(tail);
         const runtime_exc = [_][]const u8{
@@ -2937,14 +2470,12 @@ pub const Value = union(enum) {
             matchesAny(tail, &.{ "ArrayIndexOutOfBoundsException", "StringIndexOutOfBoundsException" })) return true;
         // CancellationException : IllegalStateException : RuntimeException.
         if (std.mem.eql(u8, name, "IllegalStateException") and std.mem.eql(u8, tail, "CancellationException")) return true;
-        // `NumberFormatException : IllegalArgumentException` — a
-        // `catch (e: IllegalArgumentException)` around `toInt()`/`toDouble()`
-        // (kotlinx's `parseString`) must take the host-thrown failure.
+        // `NumberFormatException : IllegalArgumentException`, so a `catch (e:
+        // IllegalArgumentException)` around `toInt()` takes the host failure.
         if (std.mem.eql(u8, name, "IllegalArgumentException") and std.mem.eql(u8, tail, "NumberFormatException")) return true;
         return false;
     }
 
-    /// Runtime `is` check against a simple type name.
     pub fn isRuntimeType(self: Value, name: []const u8) bool {
         return switch (self) {
             .Cell => |c| blk: {
@@ -2968,8 +2499,8 @@ pub const Value = union(enum) {
             .Char => matchesAny(name, &.{ "Char", "Any", "Comparable" }),
             .Unit => matchesAny(name, &.{ "Unit", "Any" }),
             .Null => false,
-            // A `..` range (step 1) is an XRange and a ClosedRange; a `downTo`
-            // or `step`ped progression (step != 1) is only an XProgression.
+            // A step-1 `..` range is an XRange and a ClosedRange; a stepped
+            // progression is only an XProgression.
             .Range => |r| switch (r.kind) {
                 .Int => matchesAny(name, &.{ "IntProgression", "Iterable", "Any" }) or
                     (r.step == 1 and !r.progression and matchesAny(name, &.{ "IntRange", "ClosedRange" })),
@@ -3011,7 +2542,6 @@ pub const Value = union(enum) {
                     defer g.deinit();
                     break :sblk .{ .mutable = g.get().mutable, .prim = g.get().prim };
                 };
-                // Mutable-backed iterators satisfy the mutable interfaces.
                 if (snap.mutable and matchesAny(name, &.{ "MutableIterator", "MutableListIterator" })) break :blk true;
                 if (snap.prim) |p| {
                     break :blk simpleNameMatchesIterator(name, p.simpleName());
@@ -3048,9 +2578,7 @@ pub const Value = union(enum) {
                 const inst = g.get();
                 const cg = inst.class.borrow();
                 defer cg.deinit();
-                // The subtype walk needs an allocator for its frontier; use the
-                // shared scratch buffer to avoid threading one through the
-                // predicate.
+                // The shared scratch buffer avoids threading an allocator in.
                 var scratch: SubtypeScratch = .{};
                 const a = scratch.acquire();
                 defer scratch.release();
@@ -3087,25 +2615,19 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Whether a range/progression value covers no elements (Kotlin
-    /// `isEmpty()`): a positive step needs `start <= end`, a negative one
-    /// `start >= end`.
+    /// Kotlin `isEmpty()`: a positive step needs `start <= end`.
     fn rangeIsEmptyVal(r: anytype) bool {
         return !r.kind.inBounds(r.start, r.end, r.step);
     }
 
-    /// Whether a user `Instance` implements `kotlin.collections.Map.Entry`,
-    /// so it participates in the `Map.Entry` equality contract (compare by
-    /// key and value regardless of concrete type).
+    /// Whether it takes part in the `Map.Entry` equality contract.
     fn instanceImplementsMapEntry(inst: ObjRef(InstanceData)) bool {
         const cls = blk: {
             const g = inst.borrow();
             defer g.deinit();
             break :blk g.get().class;
         };
-        // The answer is a property of the class, not the instance, and the
-        // supertype graph is fixed once the class is registered. Every `==`
-        // between instances asks this question, so memoize it per class.
+        // A property of the class, and every `==` between instances asks it.
         const key = cls.identity();
         const slot = &map_entry_memo[(key >> 4) % map_entry_memo.len];
         if (slot.key == key) return slot.val;
@@ -3127,12 +2649,8 @@ pub const Value = union(enum) {
         return found;
     }
 
-    /// The `key`/`value` pair of any value that satisfies the `Map.Entry`
-    /// contract: a builtin `MapEntry` box, or a user `Instance` implementing
-    /// `Map.Entry` (its `key`/`value` are read as stored fields). Returns
-    /// `null` for anything else. The returned values are copies of the
-    /// component slots; the underlying handles stay owned by the source value,
-    /// which the caller keeps alive across the comparison.
+    /// The returned values are copies of the component slots, whose handles
+    /// stay owned by the source value; the caller keeps that alive.
     fn mapEntryParts(v: *const Value) ?struct { key: Value, value: Value } {
         switch (v.*) {
             .MapEntry => |e| return .{ .key = e.key.asPtr().*, .value = e.value.asPtr().* },
@@ -3140,8 +2658,7 @@ pub const Value = union(enum) {
                 if (!instanceImplementsMapEntry(inst)) return null;
                 const g = inst.borrow();
                 defer g.deinit();
-                // `key`/`value` come from the primary-ctor `override val`s, so
-                // they are stored fields read directly.
+                // These come from the primary constructor's `override val`s.
                 const k = g.get().get("key") orelse return null;
                 const val = g.get().get("value") orelse return null;
                 return .{ .key = k, .value = val };
@@ -3150,31 +2667,24 @@ pub const Value = union(enum) {
         }
     }
 
-    /// `Map.Entry` equality contract: two entries are equal iff their keys and
-    /// values are equal, regardless of concrete type (builtin `MapEntry` vs a
-    /// user `Instance` implementing `Map.Entry`, in either direction). Returns
-    /// `null` when the contract does not apply (so the normal equality paths
-    /// handle the operands), `true`/`false` once it does.
+    /// Two entries are equal iff their keys and values are, in either
+    /// direction. Null when the contract does not apply.
     pub fn mapEntryContractEq(a: *const Value, b: *const Value) ?bool {
         const ap = mapEntryParts(a) orelse return null;
         const bp = mapEntryParts(b) orelse return null;
         return structuralEqBoxed(&ap.key, &bp.key) and structuralEqBoxed(&ap.value, &bp.value);
     }
 
-    /// Equality with boxed `Number` semantics (each boxed type only matches
-    /// its own type; collections compare elements boxed too).
+    /// A boxed type matches only its own type, elements included.
     pub fn structuralEqBoxed(a: *const Value, b: *const Value) bool {
         // A builtin `MapEntry` and a user `Map.Entry` instance compare by key
-        // and value (the `Map.Entry` contract), so `map.entries.contains(e)`
-        // and `entry == e` work across concrete types. Only fires when at
-        // least one side is a builtin `MapEntry`; two plain instances keep
-        // their own `equals`/structural semantics.
+        // and value, so `map.entries.contains(e)` works across concrete types.
+        // Gated on one side being builtin, so two instances keep `equals`.
         if (a.* == .MapEntry or b.* == .MapEntry) {
             if (mapEntryContractEq(a, b)) |eq| return eq;
         }
         switch (a.*) {
-            // `Double.equals` collapses every NaN to one canonical bit pattern
-            // (`toBits`), so any two NaNs compare equal while `0.0 != -0.0`.
+            // `Double.equals` compares `toBits`: NaNs are equal, `0.0 != -0.0`.
             .Double => |x| if (b.* == .Double) return (std.math.isNan(x) and std.math.isNan(b.Double)) or @as(u64, @bitCast(x)) == @as(u64, @bitCast(b.Double)),
             .Float => |x| if (b.* == .Float) return (std.math.isNan(x) and std.math.isNan(b.Float)) or @as(u32, @bitCast(x)) == @as(u32, @bitCast(b.Float)),
             .Int => |x| if (b.* == .Int) return x == b.Int,
@@ -3202,17 +2712,15 @@ pub const Value = union(enum) {
                     structuralEqBoxed(x.third.asPtr(), b.Triple.third.asPtr()),
             .MapEntry => |x| if (b.* == .MapEntry)
                 return structuralEqBoxed(x.key.asPtr(), b.MapEntry.key.asPtr()) and structuralEqBoxed(x.value.asPtr(), b.MapEntry.value.asPtr()),
-            // `Throwable.equals` is reference identity (Kotlin does not override
-            // it), so `==`/`assertEquals` on exceptions is `===`.
+            // Kotlin does not override `Throwable.equals`.
             .Exception => if (b.* == .Exception) return referenceEq(a, b),
             else => {},
         }
-        // Any other mix of two numerics is a cross-type boxed comparison.
         if (a.isNumeric() and b.isNumeric()) return false;
         return structuralEq(a, b);
     }
 
-    /// The callable wrapped by a `fun interface` SAM wrapper, else null.
+    /// The callable a `fun interface` SAM wrapper holds, else null.
     pub fn samTargetOf(v: *const Value) ?Value {
         if (v.* != .Instance) return null;
         const g = v.Instance.borrow();
@@ -3221,12 +2729,9 @@ pub const Value = union(enum) {
     }
 
     pub fn structuralEq(a: *const Value, b: *const Value) bool {
-        // A `fun interface` SAM wrapper equals the callable it wraps.
-        // Conversion happens at klio's call boundaries and is
-        // timing-dependent (a mask-cache eviction can wrap one
-        // composition's argument and not another's), so equality must see
-        // through the wrapper exactly as Kotlin sees one converted value —
-        // compose's `remember { compute }` memo comparison depends on it.
+        // A SAM wrapper equals the callable it wraps: conversion happens at
+        // call boundaries and is timing-dependent, so equality must see through
+        // it exactly as Kotlin sees one converted value.
         if (samTargetOf(a)) |ta| {
             if (!(b.* == .Instance and ObjRef(InstanceData).ptrEq(a.Instance, b.Instance))) {
                 return structuralEq(&ta, b);
@@ -3279,12 +2784,9 @@ pub const Value = union(enum) {
             .Result => |x| b.* == .Result and x.ok == b.Result.ok and structuralEq(x.payload.asPtr(), b.Result.payload.asPtr()),
             .Class => |x| b.* == .Class and classFqnEq(x, b.Class),
             .IrClosure => |x| b.* == .IrClosure and blk: {
-                // The same materialised closure object.
                 if (IrClosureRef.ptrEq(x, b.IrClosure)) break :blk true;
-                // A non-capturing lambda literal is a singleton in Kotlin: two
-                // evaluations of the same literal (which klio gives distinct
-                // closure ids) are the same value. Compare by the literal's
-                // (module, body-function) identity when neither captures.
+                // A non-capturing lambda literal is a singleton in Kotlin, but
+                // klio gives each evaluation its own closure id.
                 if (objcell.gc.closureSingletonHook) |h| {
                     const sa = h(x.asPtr().id);
                     if (sa != 0 and sa == h(b.IrClosure.asPtr().id)) break :blk true;
@@ -3296,28 +2798,24 @@ pub const Value = union(enum) {
                 x.descending == b.Comparator.descending,
             .BoundMethod => |x| b.* == .BoundMethod and std.mem.eql(u8, x.fqn, b.BoundMethod.fqn) and structuralEq(x.receiver.asPtr(), b.BoundMethod.receiver.asPtr()),
             .Instance => |x| b.* == .Instance and instanceEq(x, b.Instance),
-            // StringBuilder declares no equals override: identity, as on
-            // the JVM — the same builder equals itself, never a sibling
-            // with equal contents.
+            // StringBuilder declares no equals override, so identity.
             .StringBuilder => |x| b.* == .StringBuilder and x.identity() == b.StringBuilder.identity(),
-            // Arrays equal by identity: `intArrayOf(1) == intArrayOf(1)` is
-            // false, an array equals itself (`contentEquals` compares content).
+            // `intArrayOf(1) == intArrayOf(1)` is false; `contentEquals`
+            // compares content.
             .Array => |x| b.* == .Array and x.identity() == b.Array.identity(),
             .Sequence => |x| b.* == .Sequence and ObjRef(SequenceData).ptrEq(x, b.Sequence),
             else => false,
         };
     }
 
-    /// Kotlin referential identity (`===` / `!==`).
+    /// Kotlin referential identity (`===`).
     pub fn referenceEq(a: *const Value, b: *const Value) bool {
         switch (a.*) {
             .Instance => |x| return b.* == .Instance and ObjRef(InstanceData).ptrEq(x, b.Instance),
             .Exception => |x| {
                 if (b.* != .Exception) return false;
                 // A throwable built through a constructor carries a fresh
-                // identity, so `===` is true only between the same object.
-                // Exceptions built outside that path (identity 0) fall back to
-                // structural equality so test-only throwables still compare.
+                // identity; one built elsewhere has identity 0.
                 if (x.identity != 0 and x.identity == b.Exception.identity) return true;
                 if (x.identity != 0 or b.Exception.identity != 0) return false;
                 return structuralEq(a, b);
@@ -3340,7 +2838,7 @@ pub const Value = union(enum) {
         return structuralEq(a, b);
     }
 
-    /// Address-stable identity for use as a `synchronized` monitor key.
+    /// Address-stable identity, for use as a `synchronized` monitor key.
     pub fn lockIdentity(self: Value) ?usize {
         return switch (self) {
             .Instance => |i| i.identity(),
@@ -3354,8 +2852,6 @@ pub const Value = union(enum) {
         };
     }
 
-    /// Render this value the way Kotlin's `toString` / string templates do,
-    /// writing into `writer`.
     pub fn writeTo(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .Cell => |c| {
@@ -3384,10 +2880,8 @@ pub const Value = union(enum) {
             .Char => |v| try writeChar(writer, v),
             .Null => try writer.writeAll("null"),
             .Range => |r| {
-                // Endpoints render in the range's element type: a Char
-                // range shows its characters (`a..c`), a ULong range its
-                // unsigned values (kotlinc's `CharProgression.toString` /
-                // `ULongProgression.toString`).
+                // Endpoints render in the element type: a Char range shows
+                // characters, a ULong range unsigned values.
                 try writeRangeEndpoint(writer, r.kind, r.start);
                 if (r.step == 1 and !r.progression) {
                     try writer.writeAll("..");
@@ -3497,9 +2991,7 @@ pub const Value = union(enum) {
             .Class => |c| {
                 const g = c.borrow();
                 defer g.deinit();
-                // `KClass.toString()` renders the QUALIFIED name (`class
-                // kotlin.Any`), as Kotlin's common/native surface does — a
-                // packageless class's fqn is its simple name, unchanged.
+                // `KClass.toString()` renders the qualified name.
                 try writer.print("class {s}", .{g.get().fqn});
             },
             .Delegate => try writer.writeAll("<delegate>"),
@@ -3541,14 +3033,11 @@ pub const Value = union(enum) {
         }
     }
 
-    /// Render to an owned string via `writeTo`.
     /// Re-read a primitive-array `.asList()` view's element cache from the
-    /// backing array so a later array write shows through on the next read.
-    /// The view is fixed-size, so this only overwrites the existing (scalar,
-    /// non-refcounted) slots in place — no allocation, no retain/release. A
-    /// no-op for any value that is not an `array`-backed list. Reference
-    /// `Array<T>.asList()` views share the boxed buffer directly and carry no
-    /// backing, so they are inherently live and never reach here.
+    /// backing array, so a later array write shows through. Fixed-size, so it
+    /// overwrites the scalar slots in place. A no-op for anything else: a
+    /// reference `Array<T>.asList()` shares the boxed buffer and has no
+    /// backing.
     pub fn refreshArrayView(self: *const Value) void {
         if (self.* != .List) return;
         const b = self.List.backing orelse return;
@@ -3566,13 +3055,8 @@ pub const Value = union(enum) {
         }
     }
 
-    /// Re-read a live `subList` window's element cache from the parent
-    /// list so a parent element write shows through on the next view
-    /// access. In-place, clamped to the window; parent structural
-    /// changes not made through the view are undefined in Kotlin and
-    /// fail fast via the shared mod_count.
-    /// Whether a live `subList` view's backing changed structurally not
-    /// through the view (or a descendant) — the CME predicate.
+    /// Whether the backing changed structurally other than through this view
+    /// or a descendant.
     pub fn sublistViewStale(self: *const Value) bool {
         if (self.* != .List) return false;
         const cell = self.List.backing orelse return false;
@@ -3586,11 +3070,14 @@ pub const Value = union(enum) {
         return (cur & ~FROZEN_MOD_BIT) != (cell.data.sublist.exp_mod & ~FROZEN_MOD_BIT);
     }
 
+    /// Re-read a `subList` window's cache from the parent, so a parent write
+    /// shows through. In place and clamped; a parent structural change made
+    /// elsewhere fails fast via the shared mod_count.
     pub fn refreshSublistView(self: *const Value) void {
         if (self.* != .List) return;
-        // Borrow-overwrite of owned slots: correct only where retain/
-        // release are no-ops (the arena profile; the GC traces the
-        // parent through the backing edge).
+        // Overwriting owned slots under a borrow is correct only where retain
+        // and release are no-ops: the arena, and the GC, which reaches the
+        // parent through the backing edge.
         if (objcell.reclaimEnabled()) return;
         const b = self.List.backing orelse return;
         refreshSublistCell(b, self.List.items);
@@ -3604,14 +3091,11 @@ pub const Value = union(enum) {
     }
 };
 
-/// One key-selector step of a `Comparator`: a callable plus a per-step
-/// descending flag.
 pub const ComparatorStep = struct {
     selector: Value,
     descending: bool,
-    /// `compareBy(comparator, selector)`: compare the selected keys with this
-    /// comparator instead of their natural order. Null for the plain
-    /// `compareBy(selector)` / `compareByDescending(selector)` forms.
+    /// Compares the selected keys with this comparator rather than in natural
+    /// order. Null for the plain `compareBy(selector)` forms.
     key_comparator: ?Value = null,
     pub fn gcTrace(self: *const ComparatorStep, m: *objcell.gc.Marker) void {
         self.selector.gcMark(m);
@@ -3619,16 +3103,13 @@ pub const ComparatorStep = struct {
     }
 };
 
-/// High bit of a shared structural counter: set when a builder freezes its
-/// live views at `build()`. Masked out of comod comparisons so a
-/// leaked-but-unmodified builder view still reads.
+/// High bit of a shared structural counter, set when a builder freezes its live
+/// views at `build()`. Masked out of comparisons, so a leaked but unmodified
+/// builder view still reads.
 pub const FROZEN_MOD_BIT: u64 = 1 << 63;
 
-/// Recursive body of `refreshSublistView`: refresh the parent view first
-/// (so a root write shows through a whole `subList().subList()` chain),
-/// then copy this window from the parent cache. In-place and clamped —
-/// structural growth flows the other way (`syncSublist`), and structural
-/// changes not made through the view fail fast via the comod stamp.
+/// Refreshes the parent view first, so a root write shows through a whole
+/// `subList().subList()` chain. Structural growth flows the other way.
 fn refreshSublistCell(cell: *CollBackingRef.Cell, view_items: ValueList) void {
     if (cell.data != .sublist) return;
     const sb = cell.data.sublist;
@@ -3653,9 +3134,8 @@ fn writeElements(writer: *std.Io.Writer, items: ValueList, container: *const Val
     try writer.writeByte('[');
     for (g.get().items, 0..) |v, i| {
         if (i > 0) try writer.writeAll(", ");
-        // Kotlin's AbstractCollection.toString prints `(this Collection)` for an
-        // element that is the collection itself; matching it avoids unbounded
-        // recursion on a self-referential collection.
+        // Kotlin's AbstractCollection.toString prints `(this Collection)` for
+        // an element that is the collection itself, bounding the recursion.
         if (Value.referenceEq(&v, container)) {
             try writer.writeAll("(this Collection)");
         } else {
@@ -3740,7 +3220,6 @@ fn throwableIsErrorSide(tail: []const u8) bool {
 }
 
 fn simpleNameMatchesIterator(name: []const u8, simple: []const u8) bool {
-    // name == "{simple}Iterator"
     if (!std.mem.endsWith(u8, name, "Iterator")) return false;
     const head = name[0 .. name.len - "Iterator".len];
     return std.mem.eql(u8, head, simple);
@@ -3756,10 +3235,9 @@ fn lastDotSegment(name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The Kotlin source simple name to print for a class. A nested class lifts
-/// to a flat top-level mangle (`Outer$Data`); Kotlin's `toString` shows just
-/// `Data`. `$` cannot occur in a source class name, so the tail after the
-/// last `$` (then the last `.`) is the source simple name.
+/// A nested class lifts to a flat mangle (`Outer$Data`) while Kotlin shows
+/// `Data`, and `$` cannot occur in a source class name, so the tail after the
+/// last `$` then `.` is that name.
 fn classDisplayName(name: []const u8) []const u8 {
     var n = name;
     if (std.mem.lastIndexOfScalar(u8, n, '$')) |i| n = n[i + 1 ..];
@@ -3780,9 +3258,6 @@ fn isFunctionType(self: Value, name: []const u8) bool {
         null;
     if (stripped) |s| {
         _ = std.fmt.parseInt(usize, s, 10) catch return false;
-        // Arity-suffixed FunctionN matching answered only for the retired
-        // AST-interpreter function value; live callables match through the
-        // un-aritied names above, exactly as before.
         return false;
     }
     return false;
@@ -3805,9 +3280,8 @@ fn classFqnEq(a: ObjRef(ClassDef), b: ObjRef(ClassDef)) bool {
     return classFqnSpellingEq(ga.get().fqn, gb.get().fqn);
 }
 
-/// One class may sit in the class table under two spellings of its fqn:
-/// the dotted nesting (`Outer.B`) and the lifted mangle (`Outer$B`). Both
-/// name the same class, so `KClass` equality reads them alike.
+/// One class can sit in the class table under two spellings of its fqn, the
+/// dotted nesting (`Outer.B`) and the lifted mangle (`Outer$B`).
 pub fn classFqnSpellingEq(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
@@ -3897,61 +3371,43 @@ fn instanceEq(a: ObjRef(InstanceData), b: ObjRef(InstanceData)) bool {
     return true;
 }
 
-/// Runtime error data. RuntimeError is DATA, never a Zig `error`; the
-/// control-flow signals (`Return`, `Break`, …) are modeled as variants.
-/// Heap-owning payloads borrow the interpreter's arena; the message
-/// strings are borrowed slices.
+/// Runtime error data, never a Zig `error`: the control-flow signals are
+/// variants of it. Heap-owning payloads borrow the interpreter's arena.
 pub const RuntimeError = union(enum) {
     Unbound: []const u8,
     Type: []const u8,
     Arity: []const u8,
     NoMain,
     Unimplemented: []const u8,
-    /// A function body was entered and failed to resolve an operation.
-    /// Distinct from `Unimplemented` (the dispatch-miss sentinel) so a
-    /// candidate that ran — possibly with side effects — is never retried
-    /// or treated as inapplicable; this error always propagates.
+    /// A function body was entered and failed to resolve an operation. Distinct
+    /// from the `Unimplemented` dispatch-miss sentinel, so a candidate that
+    /// already ran is never retried; this error always propagates.
     CalleeFailed: []const u8,
 
-    // Control-flow signals — caught by the appropriate frame.
     Return: Value,
-    /// `return@label value`.
     LabeledReturn: struct { label: []const u8, value: Value },
     Break,
-    /// `break@label`.
     LabeledBreak: []const u8,
     Continue,
-    /// `continue@label`.
     LabeledContinue: []const u8,
-    /// A thrown Kotlin Throwable.
     Thrown: Value,
-    /// `tailrec` trampoline signal: evaluated args + optional names for the
-    /// next iteration.
+    /// Evaluated arguments and optional names for the next iteration.
     TailContinue: struct { args: []Value, names: []?[]const u8 },
-    /// Mutual `tailrec` hop: callee value, args, optional names.
     TailJump: struct { callee: Value, args: []Value, names: []?[]const u8 },
-    /// Coroutine suspension request (wake after `wake_in_millis` virtual ms).
+    /// Wakes after that many virtual ms.
     Suspend: i64,
 };
 
-/// `Result<Value, RuntimeError>` as data. OOM stays a Zig `error`; this
-/// carries the RuntimeError data path.
+/// OOM stays a Zig `error`; this carries the `RuntimeError` path.
 pub const EvalResult = union(enum) {
     ok: Value,
     err: RuntimeError,
 };
 
-// -------------------------------------------------------------------------
-// Declared element types on container creators.
-// -------------------------------------------------------------------------
-
-/// Stdlib container creators whose call-site type arguments name the
-/// element type of the value they build. Explicit type arguments on these
-/// calls are the only place an empty container's element type is ever
-/// written, so the value records the head name for receiver proofs and
-/// overload refinement (`with(listOf<String>()) { … }` can then bind a
-/// `List<String>` extension). Head names only — the lowering records what
-/// the source wrote, without nested generic arguments.
+/// Stdlib container creators whose call-site type arguments name the element
+/// type they build. That is the only place an empty container's element type is
+/// written, so the value records the head name for receiver proofs and overload
+/// refinement. Head names only.
 const elem_typed_creators = [_][]const u8{
     "listOf",       "mutableListOf", "emptyList",     "arrayListOf", "listOfNotNull",
     "buildList",    "setOf",         "mutableSetOf",  "emptySet",    "hashSetOf",
@@ -3963,17 +3419,6 @@ const pair_typed_creators = [_][]const u8{
     "mapOf", "mutableMapOf", "emptyMap", "hashMapOf", "linkedMapOf", "sortedMapOf", "buildMap",
 };
 
-/// Record the call-site type-argument heads on a container a stdlib
-/// creator just built. `fqn` is the creator's declared FQN (only
-/// `kotlin*` creators qualify — a user function named `listOf` does not),
-/// and the `type_args` strings must outlive the value (they are the
-/// module's interned consts).
-/// Coerce a numeric literal element to the container's explicit element type
-/// (`listOf<Byte>(1, 2)` stores `Byte`s, not the `Int` literals). Returns null
-/// when no coercion applies — the element is already that type, the type is
-/// not a numeric primitive, or the element is non-numeric. Mirrors the
-/// type-directed conversion kotlinc applies to integer/float literals so a
-/// `List<Byte>` compares equal to one built from a `ByteArray`.
 fn elemAsU64(v: Value) ?u64 {
     return switch (v) {
         .UByte => |x| x,
@@ -3985,6 +3430,10 @@ fn elemAsU64(v: Value) ?u64 {
     };
 }
 
+/// Coerce a numeric literal element to the container's explicit element type,
+/// so `listOf<Byte>(1, 2)` stores `Byte`s. This is kotlinc's type-directed
+/// conversion, without which a `List<Byte>` would not equal one built from a
+/// `ByteArray`.
 fn coerceNumericElem(val: Value, head: []const u8) ?Value {
     const eq = std.mem.eql;
     if (eq(u8, head, "Byte")) {
@@ -4017,6 +3466,8 @@ fn coerceListElems(items: ValueList, head: []const u8) void {
     }
 }
 
+/// Only `kotlin*` creators qualify, so a user `listOf` does not, and the
+/// `type_args` strings must outlive the value.
 pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v: *Value) void {
     if (type_args.len == 0) return;
     if (!std.mem.startsWith(u8, fqn, "kotlin")) return;
@@ -4049,9 +3500,6 @@ pub fn attachDeclaredElemTypes(fqn: []const u8, type_args: []const []const u8, v
     }
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 

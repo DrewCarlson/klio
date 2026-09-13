@@ -1,24 +1,7 @@
-//! Host-protection safety backstops.
-//!
-//! A runaway interpreted program (an unbounded range/sequence, an
-//! interpreter regression that materializes too much, a non-terminating
-//! recursion) must never take the host machine down with it. These guards
-//! keep the blast radius to a single process:
-//!
-//! - `startMemoryWatchdog` polls the process's own RSS and aborts the
-//!   instant it crosses a hard cap, before the kernel OOM-killer fires
-//!   and before the machine swaps to death.
-//! - `startRunDeadline` is an opt-in wall-clock timeout that aborts a run
-//!   that outlives its budget (default off so long legitimate runs — a
-//!   pack build, a corpus sweep — are unaffected).
-//! - `runCapped` spawns an external subprocess (kotlinc / java), draining
-//!   both pipes so a chatty child cannot deadlock, and kills it past a
-//!   timeout.
-//!
-//! Each `start*` is call-once: wiring it at every run/test entry point is
-//! safe and idempotent. RSS is read from `/proc/self/statm` on Linux and
-//! from the mach task basic info on macOS; on targets without an RSS source
-//! the watchdog no-ops with a one-time note rather than blocking them.
+//! Host-protection backstops that keep a runaway interpreted program to a
+//! single process: an RSS watchdog that aborts before the OOM killer fires, an
+//! opt-in wall-clock run deadline, and a capped subprocess runner that drains
+//! both pipes so a chatty child cannot deadlock. Each `start*` is call-once.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,32 +10,23 @@ const proc_env = @import("proc_env.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// Default RSS cap: 6 GiB. The in-process harnesses
-/// (differential / e2e / fuzz) run the whole corpus through one long-lived
-/// process, but each program is run on a per-program arena that is reset (or
-/// destroyed) between programs, so the resident peak is a single program's
-/// worth rather than the accumulated corpus. A single runaway program — which
-/// races unbounded toward system OOM, not a bounded plateau — is still aborted
-/// long before the machine is endangered. Override with `KLIO_RSS_CAP_KB` (or
-/// the legacy `KLIO_PARITY_RSS_CAP_KB`) to raise or lower the bound.
+/// Default RSS cap. Each program in an in-process harness gets its own arena,
+/// so the resident peak is one program's worth, and a runaway program races
+/// unbounded toward OOM rather than plateauing. `KLIO_RSS_CAP_KB` overrides.
 const DEFAULT_RSS_CAP_KB: u64 = 6 * 1024 * 1024;
 
-/// How often the watchdogs sample, in nanoseconds (100ms).
+/// Nanoseconds.
 const POLL_NS: u64 = 100 * std.time.ns_per_ms;
 
 var memory_watchdog_started = std.atomic.Value(bool).init(false);
 var run_deadline_started = std.atomic.Value(bool).init(false);
 var noted_no_rss = std.atomic.Value(bool).init(false);
 
-/// Start the RSS watchdog (call-once). Reads `KLIO_RSS_CAP_KB` (or the legacy
-/// `KLIO_PARITY_RSS_CAP_KB`); `0` / unset / unparseable means
-/// `DEFAULT_RSS_CAP_KB`. Spawns a daemon thread that samples RSS every 100ms
-/// and aborts the process the instant RSS exceeds the cap.
+/// `KLIO_RSS_CAP_KB` sets the cap; unset or unparseable means the default.
 pub fn startMemoryWatchdog() void {
     if (memory_watchdog_started.swap(true, .seq_cst)) return;
 
-    // Start only where RSS can be sampled (Linux, macOS); elsewhere the
-    // watchdog is a no-op with a one-time note so other targets never block.
+    // Where RSS cannot be sampled, note it once and no-op.
     if (currentRssKb() == null) {
         noteNoRss();
         return;
@@ -64,8 +38,6 @@ pub fn startMemoryWatchdog() void {
 }
 
 fn readCapKb() u64 {
-    // `procEnvGetVar` reads the whole environment block, so use a real
-    // allocator rather than a small fixed buffer.
     const a = std.heap.page_allocator;
     if (readEnvU64(a, "KLIO_RSS_CAP_KB")) |v| {
         if (v > 0) return v;
@@ -101,7 +73,6 @@ fn sleepNs(ns: u64) void {
         _ = std.c.nanosleep(&ts, null);
         return;
     }
-    // Cross-platform fallback (used by the one-shot deadline on other targets).
     const ms: i64 = @intCast(ns / std.time.ns_per_ms);
     var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer threaded.deinit();
@@ -126,9 +97,8 @@ fn memoryWatchdogLoop(cap_kb: u64) void {
     }
 }
 
-/// Current resident-set size in KiB. Read from `/proc/self/statm` on Linux
-/// (field 2 = resident pages) and from the mach task basic info on macOS.
-/// Returns `null` on any other platform or on a read error.
+/// From `/proc/self/statm` field 2 on Linux and mach task basic info on macOS.
+/// Null on any other platform or on a read error.
 pub fn currentRssKb() ?u64 {
     if (builtin.os.tag == .linux) {
         const linux = std.os.linux;
@@ -142,7 +112,7 @@ pub fn currentRssKb() ?u64 {
         if (linux.errno(n) != .SUCCESS or n == 0) return null;
         const data = buf[0..n];
 
-        // statm: "size resident shared text lib data dt" (pages).
+        // statm is "size resident shared text lib data dt", in pages.
         var it = std.mem.tokenizeScalar(u8, data, ' ');
         _ = it.next() orelse return null; // total program size
         const resident = it.next() orelse return null;
@@ -152,7 +122,7 @@ pub fn currentRssKb() ?u64 {
         return pages * page_kb;
     }
     if (builtin.os.tag.isDarwin()) {
-        // mach `task_info(MACH_TASK_BASIC_INFO)` reports `resident_size` in bytes.
+        // `resident_size` is in bytes.
         var info: std.c.mach_task_basic_info = undefined;
         var count: std.c.mach_msg_type_number_t = std.c.MACH.TASK.BASIC.INFO_COUNT;
         const kr = std.c.task_info(
@@ -172,10 +142,7 @@ fn noteNoRss() void {
     writeStderr("[klio] RSS watchdog unavailable on this platform; memory cap not enforced\n");
 }
 
-/// Start the opt-in wall-clock run deadline (call-once). Reads
-/// `KLIO_RUN_TIMEOUT_S`; `0` / unset disables it (the default, so the test
-/// suite and long legitimate runs are unaffected). When `>0`, a daemon thread
-/// aborts the process once the deadline passes.
+/// `KLIO_RUN_TIMEOUT_S` arms it; unset or zero leaves it off.
 pub fn startRunDeadline() void {
     const secs = readEnvU64(std.heap.page_allocator, "KLIO_RUN_TIMEOUT_S") orelse 0;
     if (secs == 0) return;
@@ -196,24 +163,19 @@ fn runDeadlineLoop(secs: u64) void {
     std.process.abort();
 }
 
-/// Outcome of a capped subprocess run.
 pub const CapResult = union(enum) {
-    /// The child exited (normally or with a signal); stdout/stderr captured.
     done: struct {
         term: std.process.Child.Term,
         stdout: []u8,
         stderr: []u8,
     },
-    /// The child outlived `timeout_ms` and was killed.
     timeout,
-    /// The child could not be spawned or its pipes could not be drained.
     spawn_failed,
 };
 
-/// Spawn `argv`, capturing stdout/stderr while draining both pipes so a
-/// chatty child cannot deadlock on a full pipe buffer, and killing the child
-/// if it outlives `timeout_ms` (0 = no timeout). The caller owns
-/// `done.stdout` / `done.stderr`.
+/// Drains both pipes so a chatty child cannot deadlock on a full pipe buffer,
+/// and kills it past `timeout_ms`, where 0 means no timeout. The caller owns
+/// the captured buffers.
 pub fn runCapped(
     allocator: Allocator,
     io: std.Io,
@@ -239,19 +201,13 @@ pub fn runCapped(
     return .{ .done = .{ .term = r.term, .stdout = r.stdout, .stderr = r.stderr } };
 }
 
-/// Worker stack size for the top-level interpret thread. The IR evaluator's
-/// nested-call chain (each Kotlin call re-enters the evaluator through the
-/// host) is stack-heavy, so a generous stack lets deep-but-finite legitimate
-/// recursion run to completion. The eval-depth cap (`KLIO_MAX_EVAL_DEPTH`,
-/// default well below this stack's frame ceiling) is the backstop that
-/// converts unbounded recursion into a clean `StackOverflowError` before the
-/// stack actually faults.
+/// Each Kotlin call re-enters the evaluator through the host, so the
+/// nested-call chain is stack-heavy. `KLIO_MAX_EVAL_DEPTH` defaults well below
+/// this stack's frame ceiling and turns unbounded recursion into a clean
+/// `StackOverflowError`.
 pub const INTERPRET_STACK_SIZE: usize = 256 * 1024 * 1024;
 
-/// Run `func(ctx)` on a fresh thread with a large stack and return its result.
-/// `func` may be `Allocator.Error!T` or a plain `T`; the result type is
-/// inferred. If the worker thread cannot be spawned, `func` runs inline on the
-/// current stack so behavior is identical (just without the larger stack).
+/// If the thread cannot be spawned, `func` runs inline on the current stack.
 pub fn runOnBigStack(
     comptime Ctx: type,
     comptime Ret: type,
@@ -275,12 +231,11 @@ pub fn runOnBigStack(
     return runner.result;
 }
 
-/// Switch the stack pointer to `sp_top`, call `func(arg)`, then restore it —
-/// running `func` on a caller-supplied stack without leaving the current OS
-/// thread. `sp_top` must point just past a writable region and be 16-byte
-/// aligned. Used to give the interpreter a large stack while keeping it on the
-/// process main thread (macOS AppKit + a single-threaded Skia GPU context both
-/// require the main thread).
+/// Switches the stack pointer to `sp_top`, calls `func(arg)`, then restores it,
+/// so `func` runs on a caller-supplied stack without leaving the OS thread.
+/// `sp_top` must be 16-byte aligned and point just past a writable region. This
+/// keeps the interpreter on the process main thread, which macOS AppKit and the
+/// single-threaded Skia GPU context both require.
 noinline fn callOnStack(
     sp_top: usize,
     func: *const fn (*anyopaque) callconv(.c) void,
@@ -313,13 +268,8 @@ noinline fn callOnStack(
     }
 }
 
-/// Run `func(ctx)` on the current OS thread but on a freshly mmap'd large stack
-/// (via `callOnStack`), returning its result. Unlike `runOnBigStack` this does
-/// not spawn a worker thread, so the interpreter keeps running on the process
-/// main thread — required on macOS, where AppKit windowing and the single-thread
-/// Skia GPU (Metal) context must both live on the main thread. Falls back to an
-/// inline call on the current stack if the mapping fails or the arch is
-/// unsupported (same behavior, just the smaller default stack).
+/// Unlike `runOnBigStack` this spawns no worker, so the interpreter stays on
+/// the process main thread. Falls back to an inline call when mapping fails.
 pub fn runOnBigStackMainThread(
     comptime Ctx: type,
     comptime Ret: type,
@@ -329,8 +279,7 @@ pub fn runOnBigStackMainThread(
     if (comptime builtin.cpu.arch != .aarch64 and builtin.cpu.arch != .x86_64) {
         return func(ctx);
     }
-    // Already switched (the CLI entry maps this stack, the interpreter run asks
-    // for it again): stay on it rather than mapping a second reserve.
+    // Already switched by the CLI entry: do not map a second reserve.
     if (on_big_stack) return func(ctx);
     const Runner = struct {
         ctx: Ctx,
@@ -357,23 +306,16 @@ pub fn runOnBigStackMainThread(
     return runner.result;
 }
 
-/// True while this thread runs on a `runOnBigStackMainThread` stack.
 threadlocal var on_big_stack: bool = false;
 
-/// A process-lifetime interpreter stack for an OS-driven frame loop. The
-/// platform re-enters the VM on its own (small) UI-thread stack each vsync;
-/// `runOnPersistentBigStack` switches onto this large stack so a deep
-/// composition recomposes without overflowing that stack. Mapped once on first
-/// use and never unmapped — the frame loop runs until the process exits. Only
-/// the hosted-UI frame callback maps it, so every non-UI run leaves it null.
+/// A process-lifetime interpreter stack for an OS-driven frame loop, which
+/// re-enters the VM on its own small UI-thread stack each vsync. Mapped on
+/// first use and never unmapped; only the hosted-UI frame callback maps it.
 var persistent_stack: ?[]align(std.heap.page_size_min) u8 = null;
 
-/// Run `func(ctx)` on the shared persistent interpreter stack, returning its
-/// result. Each call starts at the top of that stack, so this is valid only for
-/// a body that fully returns (one frame): the interpreter's suspension state is
-/// heap-resident, never on the C stack, so nothing must survive across the
-/// switch back. Falls back to an inline call on the current stack if the
-/// mapping fails or the arch is unsupported (same behavior, smaller stack).
+/// Each call starts at the top of the shared stack, so this is valid only for a
+/// body that fully returns: nothing may survive across the switch back, which
+/// holds because the interpreter's suspension state is heap-resident.
 pub fn runOnPersistentBigStack(
     comptime Ctx: type,
     comptime Ret: type,
@@ -409,9 +351,7 @@ pub fn runOnPersistentBigStack(
     return runner.result;
 }
 
-/// Write directly to the stderr fd. Used on the abort path, so it must not
-/// allocate (a memory breach has already fired). Linux issues the raw
-/// syscall; other platforms fall back to the buffered file writer.
+/// Used on the abort path, so it must not allocate.
 pub fn writeStderr(msg: []const u8) void {
     if (builtin.os.tag == .linux) {
         var off: usize = 0;
@@ -431,26 +371,21 @@ pub fn writeStderr(msg: []const u8) void {
 const testing = std.testing;
 
 test "startMemoryWatchdog is call-once and does not abort under the default cap" {
-    // Idempotent; a second call is a no-op. The default 6 GiB cap is far
-    // above this test process's RSS, so the watchdog never fires here.
     startMemoryWatchdog();
     startMemoryWatchdog();
 }
 
 test "startRunDeadline default-off is a no-op" {
-    // With KLIO_RUN_TIMEOUT_S unset the deadline never arms.
     startRunDeadline();
 }
 
 test "currentRssKb reads a plausible value on linux" {
     if (builtin.os.tag != .linux) return;
     const rss = currentRssKb() orelse return error.SkipZigTest;
-    // Any live process holds at least a few pages resident.
     try testing.expect(rss > 0);
 }
 
 test "readCapKb falls back to the 6 GiB default" {
-    // Neither cap var is expected to be set in the test environment.
     if (proc_env.isSet(testing.allocator, "KLIO_RSS_CAP_KB")) return;
     if (proc_env.isSet(testing.allocator, "KLIO_PARITY_RSS_CAP_KB")) return;
     try testing.expectEqual(DEFAULT_RSS_CAP_KB, readCapKb());
