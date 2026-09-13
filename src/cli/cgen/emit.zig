@@ -7,6 +7,7 @@ const Func = ir.Func;
 const Module = ir.Module;
 const cgen = @import("../cgen.zig");
 
+const BareResolution = cgen.BareResolution;
 const CapInfo = cgen.CapInfo;
 const ClassLayout = cgen.ClassLayout;
 const Compiled = cgen.Compiled;
@@ -83,6 +84,50 @@ const writeProto = cgen.writeProto;
 const writeSymbol = cgen.writeSymbol;
 const zeroKindOf = cgen.zeroKindOf;
 
+/// One body waiting to be compiled, and the signature it is compiled
+/// against.
+const Pending = struct { f: *const Func, synth: ?[]const ir.Param, caps: []const CapInfo = &.{} };
+
+/// A field read or write whose receiver class the emitter knows.
+const AccessSite = struct { rc: u32, name: ir.ConstId, set: bool };
+
+/// Everything the walk and the writers share: the module being emitted, the
+/// sets the reachability walk fills, and what the output has to declare.
+const Emit = struct {
+    gpa: std.mem.Allocator,
+    m: *const Module,
+    entry: *const Func,
+    globals: []const Global,
+    w: *std.Io.Writer,
+    src_path: []const u8,
+    prog: Program,
+    /// Every body the entry reaches, in the order they were compiled.
+    accepted: *std.ArrayList(Compiled),
+    /// The bodies already queued, so none is compiled twice.
+    seen: *std.AutoHashMap(u32, void),
+    queue: *std.ArrayList(Pending),
+    /// The synthesized signatures and capture tables queue entries point at.
+    synth_owned: *std.ArrayList([]ir.Param),
+    cap_owned: *std.ArrayList([]CapInfo),
+    /// The classes the walk saw constructed, and the slots it saw called.
+    constructed: *std.ArrayList(u32),
+    vsites: *std.ArrayList(ir.MethodSlotId),
+    used_slots: *std.ArrayList(SlotUse),
+    used_singletons: *std.ArrayList(SingletonUse),
+    used_props: *std.ArrayList(PropUse),
+    used_lambdas: *std.ArrayList(LambdaUse),
+    used_classes: *std.ArrayList(u32),
+    ctor_classes: *std.ArrayList(u32),
+    used_globals: *std.ArrayList(Global),
+    /// Whether the program needs the runtime at all, and the hints that
+    /// decide it once every phase has run.
+    uses_objects: bool = false,
+    uses_objects_hint: bool = false,
+    uses_try: bool = false,
+    needs_div: bool = false,
+    needs_cast: bool = false,
+};
+
 /// Emit the whole program. Returns false when `main` itself is outside the
 /// subset, which is the caller's signal to fall back.
 pub fn emit(
@@ -116,42 +161,12 @@ pub fn emit(
     defer gpa.free(parent_table);
     @memset(table, null);
     @memset(parent_table, null);
-    var prog: Program = .{ .fields = table, .parents = parent_table, .layouts = layouts, .throws = throws, .defaults = defaults };
+    const prog: Program = .{ .fields = table, .parents = parent_table, .layouts = layouts, .throws = throws, .defaults = defaults };
     const complete_table = try gpa.alloc(bool, m.classes.items.len);
     defer gpa.free(complete_table);
     @memset(complete_table, false);
-    {
-        const MAX_PASSES: u32 = 8;
-        var pass: u32 = 0;
-        while (pass < MAX_PASSES) : (pass += 1) {
-            var grew_layout = false;
-            const last = pass + 1 == MAX_PASSES;
-            for (table, 0..) |*slot_p, i| {
-                if (complete_table[i]) continue;
-                const prev: ?*const Program = if (pass == 0) null else &prog;
-                const laid = (try classFields(gpa, m, layouts, @enumFromInt(i), prev, globals, last)) orelse continue;
-                const before: usize = if (slot_p.*) |old_fs| old_fs.len else std.math.maxInt(usize);
-                complete_table[i] = laid.complete;
-                if (before == laid.fields.len and !laid.complete) {
-                    gpa.free(laid.fields);
-                    continue;
-                }
-                if (slot_p.*) |old_fs| gpa.free(old_fs);
-                slot_p.* = laid.fields;
-                parent_table[i] = laid.parent;
-                grew_layout = true;
-            }
-            if (!grew_layout) break;
-        }
-        // A class still missing a property has no usable layout: handing out a
-        // partial one would address the wrong field.
-        for (table, 0..) |*slot_p, i| {
-            if (complete_table[i]) continue;
-            if (slot_p.*) |old_fs| gpa.free(old_fs);
-            slot_p.* = null;
-            parent_table[i] = null;
-        }
-    }
+    try resolveClassLayouts(gpa, m, layouts, globals, prog, table, parent_table, complete_table);
+
     var accepted: std.ArrayList(Compiled) = .empty;
     defer {
         for (accepted.items) |*c| c.deinit(gpa);
@@ -159,7 +174,6 @@ pub fn emit(
     }
     var seen = std.AutoHashMap(u32, void).init(gpa);
     defer seen.deinit();
-    const Pending = struct { f: *const Func, synth: ?[]const ir.Param, caps: []const CapInfo = &.{} };
     // Capture signatures outlive the queue entry that carried them.
     var synth_owned: std.ArrayList([]ir.Param) = .empty;
     defer {
@@ -173,12 +187,6 @@ pub fn emit(
     }
     var queue: std.ArrayList(Pending) = .empty;
     defer queue.deinit(gpa);
-
-    // Reachable closure from the entry: only what the program can call is
-    // emitted, which is what keeps a whole-stdlib lowering from becoming tens
-    // of thousands of C functions.
-    try queue.append(gpa, .{ .f = entry, .synth = null });
-    try seen.put(entry.id.int(), {});
     // Only a class the program CONSTRUCTS can answer a virtual call, so the
     // two sets grow together: draining the queue discovers constructions and
     // call sites, and pairing them can queue more bodies, which can construct
@@ -187,562 +195,887 @@ pub fn emit(
     defer constructed.deinit(gpa);
     var vsites: std.ArrayList(ir.MethodSlotId) = .empty;
     defer vsites.deinit(gpa);
+    var used_slots: std.ArrayList(SlotUse) = .empty;
+    defer used_slots.deinit(gpa);
+    var used_singletons: std.ArrayList(SingletonUse) = .empty;
+    defer used_singletons.deinit(gpa);
+    var used_props: std.ArrayList(PropUse) = .empty;
+    defer used_props.deinit(gpa);
+    var used_lambdas: std.ArrayList(LambdaUse) = .empty;
+    defer used_lambdas.deinit(gpa);
+    var used_classes: std.ArrayList(u32) = .empty;
+    defer used_classes.deinit(gpa);
+    var ctor_classes: std.ArrayList(u32) = .empty;
+    defer ctor_classes.deinit(gpa);
+    var used_globals: std.ArrayList(Global) = .empty;
+    defer used_globals.deinit(gpa);
+
+    var e: Emit = .{
+        .gpa = gpa,
+        .m = m,
+        .entry = entry,
+        .globals = globals,
+        .w = w,
+        .src_path = src_path,
+        .prog = prog,
+        .accepted = &accepted,
+        .seen = &seen,
+        .queue = &queue,
+        .synth_owned = &synth_owned,
+        .cap_owned = &cap_owned,
+        .constructed = &constructed,
+        .vsites = &vsites,
+        .used_slots = &used_slots,
+        .used_singletons = &used_singletons,
+        .used_props = &used_props,
+        .used_lambdas = &used_lambdas,
+        .used_classes = &used_classes,
+        .ctor_classes = &ctor_classes,
+        .used_globals = &used_globals,
+    };
+
+    if (!try compileReachableBodies(&e)) return false;
+
+    collectTryRegions(&e);
+    try collectVirtualSlots(&e);
+    try collectSingletons(&e);
+    try collectVirtualProps(&e);
+    try collectLambdas(&e);
+    try collectDescriptorClasses(&e);
+    try collectConstructedClasses(&e);
+    collectObjectUse(&e);
+    try collectGlobals(&e);
+    if (used_globals.items.len != 0 or used_singletons.items.len != 0 or used_slots.items.len != 0 or e.uses_try) e.uses_objects_hint = true;
+    collectArithmeticHelpers(&e);
+
+    try writeFileHeader(&e);
+    // Every hint is in: a program that prints, throws, holds a global or
+    // dispatches needs the runtime, and the header has to say so before the
+    // first declaration that uses it.
+    if (e.uses_objects_hint) e.uses_objects = true;
+    try writeRuntimeDeclarations(&e);
+    try writeTryMachinery(&e);
+    try writeCastHelper(&e);
+    try writeDivHelper(&e);
+    try writeStaticStorage(&e);
+    try writePrototypes(&e);
+    try writeFunctionBodies(&e);
+    if (!try writeVirtualDispatchers(&e)) return false;
+    try writeConstructorBodies(&e);
+    if (!try writeLambdaStarters(&e)) return false;
+    if (!try writeLambdaAdapters(&e)) return false;
+    try writeValueCallDispatchers(&e);
+    try writePropertyDispatchers(&e);
+    if (used_lambdas.items.len != 0) try w.writeAll("\n");
+    try writeSingletonInitializer(&e);
+    try writeGlobalInitializer(&e);
+    try writeMain(&e);
+    return true;
+}
+
+/// Every class's layout, resolved to a fixed point: a pass only ever adds
+/// fields, so it settles once no pass adds one.
+fn resolveClassLayouts(
+    gpa: std.mem.Allocator,
+    m: *const Module,
+    layouts: []const ClassLayout,
+    globals: []const Global,
+    prog: Program,
+    table: []?[]const FieldInfo,
+    parent_table: []?Parent,
+    complete_table: []bool,
+) Error!void {
+    const MAX_PASSES: u32 = 8;
+    var pass: u32 = 0;
+    while (pass < MAX_PASSES) : (pass += 1) {
+        var grew_layout = false;
+        const last = pass + 1 == MAX_PASSES;
+        for (table, 0..) |*slot_p, i| {
+            if (complete_table[i]) continue;
+            const prev: ?*const Program = if (pass == 0) null else &prog;
+            const laid = (try classFields(gpa, m, layouts, @enumFromInt(i), prev, globals, last)) orelse continue;
+            const before: usize = if (slot_p.*) |old_fs| old_fs.len else std.math.maxInt(usize);
+            complete_table[i] = laid.complete;
+            if (before == laid.fields.len and !laid.complete) {
+                gpa.free(laid.fields);
+                continue;
+            }
+            if (slot_p.*) |old_fs| gpa.free(old_fs);
+            slot_p.* = laid.fields;
+            parent_table[i] = laid.parent;
+            grew_layout = true;
+        }
+        if (!grew_layout) break;
+    }
+    // A class still missing a property has no usable layout: handing out a
+    // partial one would address the wrong field.
+    for (table, 0..) |*slot_p, i| {
+        if (complete_table[i]) continue;
+        if (slot_p.*) |old_fs| gpa.free(old_fs);
+        slot_p.* = null;
+        parent_table[i] = null;
+    }
+}
+
+/// Compile everything the entry reaches: drain the queue, pair what it
+/// found against what it built, and repeat until neither set grows.
+fn compileReachableBodies(e: *Emit) Error!bool {
+    const gpa = e.gpa;
+    const entry = e.entry;
+    const seen = e.seen;
+    const queue = e.queue;
+    // Reachable closure from the entry: only what the program can call is
+    // emitted, which is what keeps a whole-stdlib lowering from becoming tens
+    // of thousands of C functions.
+    try queue.append(gpa, .{ .f = entry, .synth = null });
+    try seen.put(entry.id.int(), {});
     // A single refusal anywhere in the reachable set fails the whole emission:
     // a compiled program has no interpreter to fall back INTO, so a body it
     // cannot call is not a slow path, it is a missing one.
     while (true) {
+        if (!try drainCompileQueue(e)) return false;
+        var grew_reach = false;
+        if (!try pairConstructionsWithSites(e, &grew_reach)) return false;
+        if (!grew_reach) break;
+    }
+    return true;
+}
+
+/// Compile each queued body and walk its instructions for what else it
+/// reaches.
+fn drainCompileQueue(e: *Emit) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const globals = e.globals;
+    const accepted = e.accepted;
+    const queue = e.queue;
     while (queue.pop()) |pending| {
         const f = pending.f;
         const c = (try eligible(gpa, m, prog, f, globals, pending.synth, pending.caps)) orelse return false;
         try accepted.append(gpa, c);
         for (f.blocks) |*blk| {
             for (blk.insts) |*inst| {
-                // A function's NAME in value position: the body it refers to
-                // is reachable through the reference alone.
-                if (inst.* == .LoadGlobal) {
-                    if (c.lam[inst.LoadGlobal.dst.int()]) |li11| {
-                        const rfn = m.funcById(li11.body) orelse return false;
-                        if (!seen.contains(rfn.id.int())) {
-                            try seen.put(rfn.id.int(), {});
-                            try queue.append(gpa, .{ .f = rfn, .synth = null });
-                        }
-                    }
-                }
-                // The one instance an `object` declaration has, named either
-                // by its own name or through the class whose companion it is.
-                const singleton_cid: ?u32 = switch (inst.*) {
-                    .LoadGlobal => |lg4| blk4: {
-                        if (lg4.name.int() >= m.consts.items.len) break :blk4 null;
-                        const gn4 = m.consts.items[lg4.name.int()];
-                        if (gn4 != .String) break :blk4 null;
-                        break :blk4 objectClassNamed(m, prog, gn4.String) orelse
-                            companionObjectNamed(m, prog, gn4.String);
-                    },
-                    .CallMember => |cm4| blk6: {
-                        break :blk6 companionReceiver(m, prog, c.types, c.cls, cm4.receiver.int());
-                    },
-                    .GetField => |gf4| blk5: {
-                        if (gf4.field.int() >= m.consts.items.len) break :blk5 null;
-                        const fn4 = m.consts.items[gf4.field.int()];
-                        if (fn4 != .String) break :blk5 null;
-                        if (staticClassOf(c.types, c.cls, gf4.receiver.int())) |sc4| {
-                            if (sc4 >= m.classes.items.len) break :blk5 null;
-                            break :blk5 companionObjectNamed(m, prog, m.classes.items[sc4].fqn);
-                        }
-                        const rc4 = c.cls[gf4.receiver.int()] orelse break :blk5 null;
-                        break :blk5 accessOwner(m, prog, rc4, fn4.String, false);
-                    },
-                    else => null,
-                };
-                if (singleton_cid) |oc| {
-                    var have_o = false;
-                    for (constructed.items) |uo| {
-                        if (uo == oc) have_o = true;
-                    }
-                    if (!have_o) try constructed.append(gpa, oc);
-                    for (prog.of(oc).?) |fd| {
-                        const ifid = fd.init orelse continue;
-                        const ifn = m.funcById(ifid) orelse return false;
-                        if (seen.contains(ifn.id.int())) continue;
-                        try seen.put(ifn.id.int(), {});
-                        try queue.append(gpa, .{ .f = ifn, .synth = null });
-                    }
-                }
-                // A referenced global drags in the thunk that initializes it.
-                // Only referenced ones: the list carries every top-level
-                // property in the program AND its libraries, and pulling them
-                // all in would compile the whole stdlib to run `main`.
-                const gname: ?ir.ConstId = switch (inst.*) {
-                    .LoadGlobal => |lg| lg.name,
-                    .StoreGlobal => |sg| sg.name,
-                    else => null,
-                };
-                if (gname) |cid| {
-                    if (cid.int() < m.consts.items.len) {
-                        const gn = m.consts.items[cid.int()];
-                        if (gn == .String) {
-                            if (globalIndex(globals, gn.String)) |gi| {
-                                const gf = m.funcById(globals[gi].func) orelse return false;
-                                if (!seen.contains(gf.id.int())) {
-                                    try seen.put(gf.id.int(), {});
-                                    try queue.append(gpa, .{ .f = gf, .synth = null });
-                                }
-                            }
-                        }
-                    }
-                    continue;
-                }
-                // Constructing a class runs the thunks that initialize its body
-                // properties, so those are reachable too.
-                if (inst.* == .AstLambda) {
-                    const al2 = inst.AstLambda;
-                    const bfid = al2.body_func orelse return false;
-                    const bfn = m.funcById(bfid) orelse return false;
-                    if (!seen.contains(bfn.id.int())) {
-                        // The body is compiled against what this site captured:
-                        // those values arrive as leading arguments. Its own
-                        // parameters carry no declared types, so they come from
-                        // the function type the value is expected to have —
-                        // the same signature `eligible` typed it against.
-                        const ct = try gpa.alloc(CapInfo, al2.captures.len);
-                        for (al2.captures, 0..) |cr, ci4| ct[ci4] = .{ .ty = c.types[cr.int()], .cls = c.cls[cr.int()], .elem = c.elem[cr.int()] };
-                        try cap_owned.append(gpa, ct);
-                        var lsyn: ?[]ir.Param = null;
-                        if (expectedFnType(m, c.f, al2.dst)) |t6| {
-                            lsyn = try lambdaParams(gpa, bfn, t6);
-                        }
-                        if (lsyn) |ls6| try synth_owned.append(gpa, ls6);
-                        try seen.put(bfn.id.int(), {});
-                        try queue.append(gpa, .{ .f = bfn, .synth = lsyn, .caps = ct });
-                    }
-                    continue;
-                }
-                if (inst.* == .CallMember) {
-                    const cm3 = inst.CallMember;
-                    if (numConv(m, cm3) == null) if (c.cls[cm3.receiver.int()]) |rc8| {
-                        if (!isBuiltinCls(rc8) and cm3.name.int() < m.consts.items.len) {
-                            const nmc = m.consts.items[cm3.name.int()];
-                            if (nmc == .String and fieldIndex(prog, rc8, nmc.String) == null) {
-                                if (memberRoot(m, prog, rc8, plainFieldName(nmc.String), cm3.n_args)) |root8| {
-                                    var have8 = false;
-                                    for (vsites.items) |sv2| {
-                                        if (sv2.int() == root8.id.int()) have8 = true;
-                                    }
-                                    if (!have8) try vsites.append(gpa, ir.MethodSlotId.from(root8.id.int()));
-                                }
-                            }
-                        }
-                    };
-                    continue;
-                }
-                // Rendering a value calls its `toString`, so that slot is a
-                // call site like any other.
-                {
-                    const rendered: ?u32 = switch (inst.*) {
-                        .BinOp => |b3| if (b3.op == .StringConcat or c.types[b3.dst.int()] == .object) b3.lhs.int() else null,
-                        else => null,
-                    };
-                    if (rendered) |rr4| {
-                        for ([_]u32{ rr4, inst.BinOp.rhs.int() }) |reg4| {
-                            if (c.types[reg4] != .object) continue;
-                            const rc4b = c.cls[reg4] orelse continue;
-                            const ts4 = toStringOf(m, prog, rc4b) orelse continue;
-                            var have4b = false;
-                            for (vsites.items) |sv4| {
-                                if (sv4.int() == ts4.id.int()) have4b = true;
-                            }
-                            if (!have4b) try vsites.append(gpa, ir.MethodSlotId.from(ts4.id.int()));
-                        }
-                    }
-                }
-                if (inst.* == .Call) {
-                    const pc4 = m.funcById(inst.Call.func);
-                    if (pc4) |pf4| {
-                        if ((isPrintln(pf4) or scalarIntrinsic(pf4) == .print) and inst.Call.n_args == 1) {
-                            const a4 = inst.Call.args.int();
-                            if (c.types[a4] == .object) {
-                                if (c.cls[a4]) |rc4c| {
-                                    if (toStringOf(m, prog, rc4c)) |ts4b| {
-                                        var have4c = false;
-                                        for (vsites.items) |sv5| {
-                                            if (sv5.int() == ts4b.id.int()) have4c = true;
-                                        }
-                                        if (!have4c) try vsites.append(gpa, ir.MethodSlotId.from(ts4b.id.int()));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if (inst.* == .CallVirtual) {
-                    const cv2 = inst.CallVirtual;
-                    if (numConvVirtual(m, cv2) == null) {
-                        var have_site = false;
-                        for (vsites.items) |sv| {
-                            if (sv == cv2.slot) have_site = true;
-                        }
-                        if (!have_site) try vsites.append(gpa, cv2.slot);
-                    }
-                }
-                // Reading an entry off its enum's name builds that entry:
-                // the thunks its declaration writes for the constructor run,
-                // and so do the enum's own body-property initializers.
-                if (inst.* == .GetField) {
-                    const gq = inst.GetField;
-                    if (staticClassOf(c.types, c.cls, gq.receiver.int())) |sq| {
-                        const eqn = m.consts.items[gq.field.int()];
-                        if (eqn == .String) {
-                            const all_entries = std.mem.eql(u8, plainFieldName(eqn.String), "entries") and
-                                enumEntries(m, prog, sq).len != 0;
-                            if (all_entries) {
-                                var have_q5 = false;
-                                for (constructed.items) |uq| {
-                                    if (uq == sq) have_q5 = true;
-                                }
-                                if (!have_q5) try constructed.append(gpa, sq);
-                                const ents6 = enumEntries(m, prog, sq);
-                                for (ents6) |e6| {
-                                    for (e6.args) |afid6| {
-                                        const afn6 = m.funcById(afid6) orelse return false;
-                                        if (seen.contains(afn6.id.int())) continue;
-                                        try seen.put(afn6.id.int(), {});
-                                        try queue.append(gpa, .{ .f = afn6, .synth = null });
-                                    }
-                                }
-                                for (prog.of(sq).?) |fd6| {
-                                    if (fd6.from_parent or fd6.preset) continue;
-                                    const ifid6 = fd6.init orelse continue;
-                                    const ifn6 = m.funcById(ifid6) orelse return false;
-                                    if (seen.contains(ifn6.id.int())) continue;
-                                    try seen.put(ifn6.id.int(), {});
-                                    try queue.append(gpa, .{ .f = ifn6, .synth = null });
-                                }
-                                continue;
-                            }
-                            if (enumEntryIndex(m, prog, sq, plainFieldName(eqn.String))) |eqi| {
-                                var have_q = false;
-                                for (constructed.items) |uq| {
-                                    if (uq == sq) have_q = true;
-                                }
-                                if (!have_q) try constructed.append(gpa, sq);
-                                const ents3 = enumEntries(m, prog, sq);
-                                for (ents3[eqi].args) |afid| {
-                                    const afn2 = m.funcById(afid) orelse return false;
-                                    if (seen.contains(afn2.id.int())) continue;
-                                    try seen.put(afn2.id.int(), {});
-                                    try queue.append(gpa, .{ .f = afn2, .synth = null });
-                                }
-                                for (prog.of(sq).?) |fd2| {
-                                    if (fd2.from_parent or fd2.preset) continue;
-                                    const ifid2 = fd2.init orelse continue;
-                                    const ifn2 = m.funcById(ifid2) orelse return false;
-                                    if (seen.contains(ifn2.id.int())) continue;
-                                    try seen.put(ifn2.id.int(), {});
-                                    try queue.append(gpa, .{ .f = ifn2, .synth = null });
-                                }
-                                continue;
-                            }
-                        }
-                    }
-                }
-                // A bare name inside an inlined receiver body resolved to a
-                // computed property or to a top-level one; either way what it
-                // resolved to has to be compiled.
-                if (c.bare.get(inst)) |res| {
-                    blkbare: switch (res) {
-                        .field => {},
-                        .construct => |bcid2| {
-                            // Constructing runs the class's own initializers,
-                            // which the construction walk below queues.
-                            var have_bc = false;
-                            for (constructed.items) |uc2| {
-                                if (uc2 == bcid2) have_bc = true;
-                            }
-                            if (!have_bc) try constructed.append(gpa, bcid2);
-                            const bfd2 = prog.of(bcid2) orelse return false;
-                            for (bfd2) |fdx| {
-                                if (fdx.from_parent) continue;
-                                const ifx = fdx.init orelse continue;
-                                const ifnx = m.funcById(ifx) orelse return false;
-                                if (seen.contains(ifnx.id.int())) continue;
-                                try seen.put(ifnx.id.int(), {});
-                                try queue.append(gpa, .{ .f = ifnx, .synth = null });
-                            }
-                            const bdef2 = &m.classes.items[bcid2];
-                            var dpx: usize = 0;
-                            while (dpx < bdef2.primary_params.len) : (dpx += 1) {
-                                const dfx = ctorDefault(prog.layouts, bdef2, dpx) orelse continue;
-                                const dfnx = m.funcById(dfx) orelse return false;
-                                if (seen.contains(dfnx.id.int())) continue;
-                                try seen.put(dfnx.id.int(), {});
-                                const csynx = try gpa.alloc(ir.Param, 1 + bdef2.primary_params.len);
-                                try synth_owned.append(gpa, csynx);
-                                csynx[0] = .{
-                                    .name = "$ctor_default_recv",
-                                    .ty = .{ .name = "", .nullable = true, .args = &.{} },
-                                    .default = null,
-                                };
-                                @memcpy(csynx[1..], bdef2.primary_params);
-                                try queue.append(gpa, .{ .f = dfnx, .synth = csynx });
-                            }
-                            if (prog.parentOf(bcid2) != null) return false;
-                        },
-                        .accessor => |ac| {
-                            const afn3 = m.funcById(ac.func) orelse return false;
-                            if (!seen.contains(afn3.id.int())) {
-                                try seen.put(afn3.id.int(), {});
-                                try queue.append(gpa, .{ .f = afn3, .synth = null });
-                            }
-                        },
-                        .global => {
-                            const bname: ?[]const u8 = switch (inst.*) {
-                                .LoadFromThisOrGlobal => |l3| m.consts.items[l3.name.int()].String,
-                                .StoreToThisOrGlobal => |s3| m.consts.items[s3.name.int()].String,
-                                else => null,
-                            };
-                            if (bname) |bn3| {
-                                if (globalIndex(globals, bn3)) |gi3| {
-                                    const gfn3 = m.funcById(globals[gi3].func) orelse return false;
-                                    if (!seen.contains(gfn3.id.int())) {
-                                        try seen.put(gfn3.id.int(), {});
-                                        try queue.append(gpa, .{ .f = gfn3, .synth = null });
-                                    }
-                                }
-                            }
-                        },
-                        .member => |mb| {
-                            // Every class beneath the receiver's type may
-                            // answer, which the virtual pairing then queues.
-                            var have_m = false;
-                            for (vsites.items) |sv6| {
-                                if (sv6.int() == mb.slot) have_m = true;
-                            }
-                            if (!have_m) try vsites.append(gpa, ir.MethodSlotId.from(mb.slot));
-                        },
-                        .call => |cf| {
-                            const cfn = m.funcById(cf) orelse return false;
-                            if (isPrintln(cfn) or scalarIntrinsic(cfn) != null or
-                                listIntrinsic(cfn) != null or arrayOfIntrinsic(cfn) != null or
-                                isArrayOfNulls(cfn)) break :blkbare;
-                            if (!seen.contains(cfn.id.int())) {
-                                try seen.put(cfn.id.int(), {});
-                                try queue.append(gpa, .{ .f = cfn, .synth = null });
-                            }
-                            // A parameter the call leaves unbound runs the
-                            // thunk the declaration lowered for it.
-                            if (inst.* == .CallMemberOrGlobal) {
-                                const cgq = inst.CallMemberOrGlobal;
-                                if (bindCallArgs(m, cfn.params, cgq.args.int(), cgq.n_args, cgq.arg_names)) |bq| {
-                                    var dq2: u32 = 0;
-                                    while (dq2 < bq.n) : (dq2 += 1) {
-                                        if (bq.regs[dq2] != null) continue;
-                                        const dfq = prog.defaultThunk(cfn.id, dq2) orelse break;
-                                        const dfnq = m.funcById(dfq) orelse return false;
-                                        if (seen.contains(dfnq.id.int())) continue;
-                                        try seen.put(dfnq.id.int(), {});
-                                        try queue.append(gpa, .{ .f = dfnq, .synth = null });
-                                    }
-                                }
-                            }
-                        },
-                    }
-                    continue;
-                }
-                // A computed property reads and writes through its accessors,
-                // so those are reachable wherever the property is touched.
-                const acc: ?struct { rc: u32, name: ir.ConstId, set: bool } = switch (inst.*) {
-                    .GetField => |gf2| blk3: {
-                        const rcx = c.cls[gf2.receiver.int()] orelse break :blk3 null;
-                        break :blk3 .{ .rc = rcx, .name = gf2.field, .set = false };
-                    },
-                    .SetField => |sf2| blk4: {
-                        const rcx = c.cls[sf2.receiver.int()] orelse break :blk4 null;
-                        break :blk4 .{ .rc = rcx, .name = sf2.field, .set = true };
-                    },
-                    else => null,
-                };
-                if (acc) |a2| {
-                    if (!isBuiltinCls(a2.rc) and a2.name.int() < m.consts.items.len) {
-                        const anm = m.consts.items[a2.name.int()];
-                        if (anm == .String) {
-                            switch (accessPlan(m, prog, a2.rc, anm.String, a2.set)) {
-                                .accessor => |fid3| {
-                                    const afn = m.funcById(fid3) orelse return false;
-                                    if (!seen.contains(afn.id.int())) {
-                                        try seen.put(afn.id.int(), {});
-                                        try queue.append(gpa, .{ .f = afn, .synth = null });
-                                    }
-                                },
-                                .virtual => {
-                                    // Every class beneath the receiver's type
-                                    // may answer, so every getter is reachable.
-                                    const pn = plainFieldName(anm.String);
-                                    var pc: u32 = 0;
-                                    while (pc < m.classes.items.len) : (pc += 1) {
-                                        if (prog.of(pc) == null) continue;
-                                        if (!typeReaches(m, pc, a2.rc)) continue;
-                                        const pg = prog.accessor(m, pc, pn, .get) orelse continue;
-                                        const pfn = m.funcById(pg) orelse return false;
-                                        if (seen.contains(pfn.id.int())) continue;
-                                        try seen.put(pfn.id.int(), {});
-                                        try queue.append(gpa, .{ .f = pfn, .synth = null });
-                                    }
-                                },
-                                .field, .none => {},
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if (inst.* == .NewInstance) {
-                    if (inst.NewInstance.class.int() < m.classes.items.len and
-                        (isArrayTypeName(m.classes.items[inst.NewInstance.class.int()].name) or
-                            unsignedTypeOf(m.classes.items[inst.NewInstance.class.int()].name) != null)) continue;
-                    {
-                        const nc2 = inst.NewInstance.class.int();
-                        var have_c = false;
-                        for (constructed.items) |uc| {
-                            if (uc == nc2) have_c = true;
-                        }
-                        if (!have_c) try constructed.append(gpa, nc2);
-                    }
-                    // Constructing a class runs every initializer in its chain:
-                    // each class's body-property thunks, and the thunks it
-                    // passes to its superclass's constructor.
-                    var walk: ?u32 = inst.NewInstance.class.int();
-                    var steps: u32 = 0;
-                    while (walk) |wc| : (steps += 1) {
-                        if (steps > 32) break;
-                        const fds = prog.of(wc) orelse break;
-                        const wdef = &m.classes.items[wc];
-                        // Constructing a class runs its init blocks too.
-                        if (ownLayout(prog, wdef.name)) |ol| {
-                            for (ol.init_blocks) |ibf2| {
-                                const ibn2 = m.funcById(ibf2) orelse return false;
-                                if (seen.contains(ibn2.id.int())) continue;
-                                try seen.put(ibn2.id.int(), {});
-                                try queue.append(gpa, .{ .f = ibn2, .synth = null });
-                            }
-                        }
-                        // And the thunk behind every constructor parameter the
-                        // construction may omit.
-                        if (wc == inst.NewInstance.class.int()) {
-                            var dpi: usize = 0;
-                            while (dpi < wdef.primary_params.len) : (dpi += 1) {
-                                const dfd = ctorDefault(prog.layouts, wdef, dpi) orelse continue;
-                                const dfn5 = m.funcById(dfd) orelse return false;
-                                if (seen.contains(dfn5.id.int())) continue;
-                                try seen.put(dfn5.id.int(), {});
-                                // Like a superclass-argument thunk, it
-                                // declares no parameters and reads its
-                                // caller's positionally: a synthesized
-                                // receiver slot first, then the constructor
-                                // arguments AHEAD of the one it fills.
-                                const csyn = try gpa.alloc(ir.Param, 1 + wdef.primary_params.len);
-                                try synth_owned.append(gpa, csyn);
-                                csyn[0] = .{
-                                    .name = "$ctor_default_recv",
-                                    .ty = .{ .name = "", .nullable = true, .args = &.{} },
-                                    .default = null,
-                                };
-                                @memcpy(csyn[1..], wdef.primary_params);
-                                try queue.append(gpa, .{ .f = dfn5, .synth = csyn });
-                            }
-                        }
-                        for (fds) |fd| {
-                            if (fd.from_parent) continue;
-                            const ifid = fd.init orelse continue;
-                            const ifn = m.funcById(ifid) orelse return false;
-                            if (seen.contains(ifn.id.int())) continue;
-                            try seen.put(ifn.id.int(), {});
-                            try queue.append(gpa, .{ .f = ifn, .synth = null });
-                        }
-                        const pp = prog.parentOf(wc) orelse break;
-                        for (pp.args) |tf| {
-                            const ifn = m.funcById(tf) orelse return false;
-                            if (seen.contains(ifn.id.int())) continue;
-                            try seen.put(ifn.id.int(), {});
-                            // A superclass-argument thunk declares no
-                            // parameters and reads its class's constructor
-                            // arguments positionally, so it compiles against
-                            // them.
-                            try queue.append(gpa, .{ .f = ifn, .synth = wdef.primary_params });
-                        }
-                        walk = pp.cid;
-                    }
-                    continue;
-                }
-                if (inst.* != .Call) continue;
-                const callee = m.funcById(inst.Call.func) orelse return false;
-                if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or
-                    arrayOfIntrinsic(callee) != null or isArrayOfNulls(callee) or isRunBlocking(callee) or
-                    isDelay(callee) or isLaunch(callee)) continue;
-                // A declaration the interpreter implements has no body to
-                // compile: the call reaches the same entry the interpreter
-                // reaches.
-                if (!callee.hasBody() and stdlibEntry(callee) != null) continue;
-                // A call that leaves a parameter unbound runs the thunk for it.
-                const bnd3 = bindCallArgs(m, callee.params, inst.Call.args.int(), inst.Call.n_args, inst.Call.arg_names) orelse
-                    return false;
-                var dq: u32 = 0;
-                while (dq < bnd3.n) : (dq += 1) {
-                    if (bnd3.regs[dq] != null) continue;
-                    const dfid2 = prog.defaultThunk(callee.id, dq) orelse break;
-                    const dfn2 = m.funcById(dfid2) orelse return false;
-                    if (seen.contains(dfn2.id.int())) continue;
-                    try seen.put(dfn2.id.int(), {});
-                    // The thunk reads the parameters ahead of its own
-                    // positionally, so it compiles against the callee's
-                    // signature up to that point.
-                    try queue.append(gpa, .{ .f = dfn2, .synth = callee.params[0..dq] });
-                }
-                if (seen.contains(callee.id.int())) continue;
-                try seen.put(callee.id.int(), {});
-                try queue.append(gpa, .{ .f = callee, .synth = null });
+                if (!try discoverFromInst(e, &c, inst)) return false;
             }
         }
     }
-        // Every construction the walk found, against every virtual call site
-        // it found. A class the program never builds answers nothing, which is
-        // what keeps an abstract library base out of the compile.
-        var grew_reach = false;
-        for (vsites.items) |slot| {
-            for (constructed.items) |cid| {
-                const impl = slotImpl(m, prog, cid, slot) orelse {
-                    // The class has the member in its type but no body for it:
-                    // it satisfies the interface by DELEGATION, which forwards
-                    // to another object at run time. Refusing keeps that a
-                    // refusal rather than an AbstractMethodError in a compiled
-                    // program.
-                    const root9 = m.funcById(ir.FuncId.from(slot.int())) orelse continue;
-                    if (typeHasSlot(m, cid, root9)) {
-                        if (traceOn()) {
-                            std.debug.print("[cgen] refuse {s}: `{s}` is satisfied by delegation\n", .{
-                                m.classes.items[cid].name, root9.name,
-                            });
-                        }
-                        return false;
-                    }
-                    continue;
-                };
-                // An override declaring more parameters than the site supplies
-                // fills them from its own default thunks, so those are
-                // reachable wherever the dispatcher is.
-                const vroot = m.funcById(ir.FuncId.from(slot.int()));
-                var vk: u32 = 1;
-                while (vk < impl.params.len) : (vk += 1) {
-                    const vfid = prog.defaultThunk(impl.id, vk) orelse
-                        (if (vroot) |vr| prog.defaultThunk(vr.id, vk) else null) orelse continue;
-                    const vfn = m.funcById(vfid) orelse return false;
-                    if (seen.contains(vfn.id.int())) continue;
-                    try seen.put(vfn.id.int(), {});
-                    try queue.append(gpa, .{ .f = vfn, .synth = impl.params[0..vk] });
-                    grew_reach = true;
-                }
-                if (seen.contains(impl.id.int())) continue;
-                try seen.put(impl.id.int(), {});
-                try queue.append(gpa, .{ .f = impl, .synth = null });
-                grew_reach = true;
-            }
-        }
-        if (!grew_reach) break;
-    }
+    return true;
+}
 
-    // Printing a floating value is the one place where C's formatting and
-    // Kotlin's disagree, so the helper rides along only when it is used.
-    // A program with any handler carries the try machinery, and its throws go
-    // through it rather than straight out.
-    var uses_try = false;
+/// What one instruction reaches: the bodies it can call, the classes it
+/// builds and the slots it dispatches through. False refuses the emission.
+fn discoverFromInst(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const seen = e.seen;
+    const queue = e.queue;
+    const vsites = e.vsites;
+    // A function's NAME in value position: the body it refers to
+    // is reachable through the reference alone.
+    if (inst.* == .LoadGlobal) {
+        if (c.lam[inst.LoadGlobal.dst.int()]) |li11| {
+            const rfn = m.funcById(li11.body) orelse return false;
+            if (!seen.contains(rfn.id.int())) {
+                try seen.put(rfn.id.int(), {});
+                try queue.append(gpa, .{ .f = rfn, .synth = null });
+            }
+        }
+    }
+    if (!try queueSingletonUse(e, c, inst)) return false;
+    // A referenced global drags in the thunk that initializes it.
+    // Only referenced ones: the list carries every top-level
+    // property in the program AND its libraries, and pulling them
+    // all in would compile the whole stdlib to run `main`.
+    const gname: ?ir.ConstId = switch (inst.*) {
+        .LoadGlobal => |lg| lg.name,
+        .StoreGlobal => |sg| sg.name,
+        else => null,
+    };
+    if (gname) |cid| {
+        if (!try queueGlobalThunk(e, cid)) return false;
+        return true;
+    }
+    // Constructing a class runs the thunks that initialize its body
+    // properties, so those are reachable too.
+    if (inst.* == .AstLambda) {
+        if (!try queueLambdaBody(e, c, inst)) return false;
+        return true;
+    }
+    if (inst.* == .CallMember) {
+        try noteMemberCallSite(e, c, inst);
+        return true;
+    }
+    try noteRenderedToString(e, c, inst);
+    try notePrintedToString(e, c, inst);
+    if (inst.* == .CallVirtual) {
+        const cv2 = inst.CallVirtual;
+        if (numConvVirtual(m, cv2) == null) {
+            var have_site = false;
+            for (vsites.items) |sv| {
+                if (sv == cv2.slot) have_site = true;
+            }
+            if (!have_site) try vsites.append(gpa, cv2.slot);
+        }
+    }
+    // Reading an entry off its enum's name builds that entry:
+    // the thunks its declaration writes for the constructor run,
+    // and so do the enum's own body-property initializers.
+    if (inst.* == .GetField) {
+        const gq = inst.GetField;
+        if (staticClassOf(c.types, c.cls, gq.receiver.int())) |sq| {
+            const eqn = m.consts.items[gq.field.int()];
+            if (eqn == .String) {
+                const all_entries = std.mem.eql(u8, plainFieldName(eqn.String), "entries") and
+                    enumEntries(m, prog, sq).len != 0;
+                if (all_entries) {
+                    if (!try queueAllEnumEntries(e, sq)) return false;
+                    return true;
+                }
+                if (enumEntryIndex(m, prog, sq, plainFieldName(eqn.String))) |eqi| {
+                    if (!try queueEnumEntry(e, sq, eqi)) return false;
+                    return true;
+                }
+            }
+        }
+    }
+    // A bare name inside an inlined receiver body resolved to a
+    // computed property or to a top-level one; either way what it
+    // resolved to has to be compiled.
+    if (c.bare.get(inst)) |res| {
+        if (!try queueBareTarget(e, inst, res)) return false;
+        return true;
+    }
+    // A computed property reads and writes through its accessors,
+    // so those are reachable wherever the property is touched.
+    const acc: ?AccessSite = switch (inst.*) {
+        .GetField => |gf2| blk3: {
+            const rcx = c.cls[gf2.receiver.int()] orelse break :blk3 null;
+            break :blk3 .{ .rc = rcx, .name = gf2.field, .set = false };
+        },
+        .SetField => |sf2| blk4: {
+            const rcx = c.cls[sf2.receiver.int()] orelse break :blk4 null;
+            break :blk4 .{ .rc = rcx, .name = sf2.field, .set = true };
+        },
+        else => null,
+    };
+    if (acc) |a2| {
+        if (!try queuePropertyAccessors(e, a2)) return false;
+        return true;
+    }
+    if (inst.* == .NewInstance) {
+        if (!try queueConstruction(e, inst)) return false;
+        return true;
+    }
+    if (inst.* != .Call) return true;
+    return try queueDirectCall(e, inst);
+}
+
+/// The one instance an `object` declaration has, named either
+/// by its own name or through the class whose companion it is.
+fn queueSingletonUse(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const seen = e.seen;
+    const queue = e.queue;
+    const constructed = e.constructed;
+    const singleton_cid: ?u32 = switch (inst.*) {
+        .LoadGlobal => |lg4| blk4: {
+            if (lg4.name.int() >= m.consts.items.len) break :blk4 null;
+            const gn4 = m.consts.items[lg4.name.int()];
+            if (gn4 != .String) break :blk4 null;
+            break :blk4 objectClassNamed(m, prog, gn4.String) orelse
+                companionObjectNamed(m, prog, gn4.String);
+        },
+        .CallMember => |cm4| blk6: {
+            break :blk6 companionReceiver(m, prog, c.types, c.cls, cm4.receiver.int());
+        },
+        .GetField => |gf4| blk5: {
+            if (gf4.field.int() >= m.consts.items.len) break :blk5 null;
+            const fn4 = m.consts.items[gf4.field.int()];
+            if (fn4 != .String) break :blk5 null;
+            if (staticClassOf(c.types, c.cls, gf4.receiver.int())) |sc4| {
+                if (sc4 >= m.classes.items.len) break :blk5 null;
+                break :blk5 companionObjectNamed(m, prog, m.classes.items[sc4].fqn);
+            }
+            const rc4 = c.cls[gf4.receiver.int()] orelse break :blk5 null;
+            break :blk5 accessOwner(m, prog, rc4, fn4.String, false);
+        },
+        else => null,
+    };
+    if (singleton_cid) |oc| {
+        var have_o = false;
+        for (constructed.items) |uo| {
+            if (uo == oc) have_o = true;
+        }
+        if (!have_o) try constructed.append(gpa, oc);
+        for (prog.of(oc).?) |fd| {
+            const ifid = fd.init orelse continue;
+            const ifn = m.funcById(ifid) orelse return false;
+            if (seen.contains(ifn.id.int())) continue;
+            try seen.put(ifn.id.int(), {});
+            try queue.append(gpa, .{ .f = ifn, .synth = null });
+        }
+    }
+    return true;
+}
+
+/// The thunk that initializes a referenced top-level property.
+fn queueGlobalThunk(e: *Emit, cid: ir.ConstId) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const globals = e.globals;
+    const seen = e.seen;
+    const queue = e.queue;
+    if (cid.int() < m.consts.items.len) {
+        const gn = m.consts.items[cid.int()];
+        if (gn == .String) {
+            if (globalIndex(globals, gn.String)) |gi| {
+                const gf = m.funcById(globals[gi].func) orelse return false;
+                if (!seen.contains(gf.id.int())) {
+                    try seen.put(gf.id.int(), {});
+                    try queue.append(gpa, .{ .f = gf, .synth = null });
+                }
+            }
+        }
+    }
+    return true;
+}
+
+/// The body a lambda literal runs, compiled against what this site
+/// captured.
+fn queueLambdaBody(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const seen = e.seen;
+    const queue = e.queue;
+    const synth_owned = e.synth_owned;
+    const cap_owned = e.cap_owned;
+    const al2 = inst.AstLambda;
+    const bfid = al2.body_func orelse return false;
+    const bfn = m.funcById(bfid) orelse return false;
+    if (!seen.contains(bfn.id.int())) {
+        // The body is compiled against what this site captured:
+        // those values arrive as leading arguments. Its own
+        // parameters carry no declared types, so they come from
+        // the function type the value is expected to have —
+        // the same signature `eligible` typed it against.
+        const ct = try gpa.alloc(CapInfo, al2.captures.len);
+        for (al2.captures, 0..) |cr, ci4| ct[ci4] = .{ .ty = c.types[cr.int()], .cls = c.cls[cr.int()], .elem = c.elem[cr.int()] };
+        try cap_owned.append(gpa, ct);
+        var lsyn: ?[]ir.Param = null;
+        if (expectedFnType(m, c.f, al2.dst)) |t6| {
+            lsyn = try lambdaParams(gpa, bfn, t6);
+        }
+        if (lsyn) |ls6| try synth_owned.append(gpa, ls6);
+        try seen.put(bfn.id.int(), {});
+        try queue.append(gpa, .{ .f = bfn, .synth = lsyn, .caps = ct });
+    }
+    return true;
+}
+
+/// The slot a member call dispatches through.
+fn noteMemberCallSite(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const vsites = e.vsites;
+    const cm3 = inst.CallMember;
+    if (numConv(m, cm3) == null) if (c.cls[cm3.receiver.int()]) |rc8| {
+        if (!isBuiltinCls(rc8) and cm3.name.int() < m.consts.items.len) {
+            const nmc = m.consts.items[cm3.name.int()];
+            if (nmc == .String and fieldIndex(prog, rc8, nmc.String) == null) {
+                if (memberRoot(m, prog, rc8, plainFieldName(nmc.String), cm3.n_args)) |root8| {
+                    var have8 = false;
+                    for (vsites.items) |sv2| {
+                        if (sv2.int() == root8.id.int()) have8 = true;
+                    }
+                    if (!have8) try vsites.append(gpa, ir.MethodSlotId.from(root8.id.int()));
+                }
+            }
+        }
+    };
+}
+
+/// Rendering a value calls its `toString`, so that slot is a
+/// call site like any other.
+fn noteRenderedToString(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const vsites = e.vsites;
+    const rendered: ?u32 = switch (inst.*) {
+        .BinOp => |b3| if (b3.op == .StringConcat or c.types[b3.dst.int()] == .object) b3.lhs.int() else null,
+        else => null,
+    };
+    if (rendered) |rr4| {
+        for ([_]u32{ rr4, inst.BinOp.rhs.int() }) |reg4| {
+            if (c.types[reg4] != .object) continue;
+            const rc4b = c.cls[reg4] orelse continue;
+            const ts4 = toStringOf(m, prog, rc4b) orelse continue;
+            var have4b = false;
+            for (vsites.items) |sv4| {
+                if (sv4.int() == ts4.id.int()) have4b = true;
+            }
+            if (!have4b) try vsites.append(gpa, ir.MethodSlotId.from(ts4.id.int()));
+        }
+    }
+}
+
+/// Printing a value calls its `toString` too.
+fn notePrintedToString(e: *Emit, c: *const Compiled, inst: *const ir.Inst) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const vsites = e.vsites;
+    if (inst.* == .Call) {
+        const pc4 = m.funcById(inst.Call.func);
+        if (pc4) |pf4| {
+            if ((isPrintln(pf4) or scalarIntrinsic(pf4) == .print) and inst.Call.n_args == 1) {
+                const a4 = inst.Call.args.int();
+                if (c.types[a4] == .object) {
+                    if (c.cls[a4]) |rc4c| {
+                        if (toStringOf(m, prog, rc4c)) |ts4b| {
+                            var have4c = false;
+                            for (vsites.items) |sv5| {
+                                if (sv5.int() == ts4b.id.int()) have4c = true;
+                            }
+                            if (!have4c) try vsites.append(gpa, ir.MethodSlotId.from(ts4b.id.int()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Every entry of an enum, built where the program reads `entries`.
+fn queueAllEnumEntries(e: *Emit, sq: u32) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const seen = e.seen;
+    const queue = e.queue;
+    const constructed = e.constructed;
+    var have_q5 = false;
+    for (constructed.items) |uq| {
+        if (uq == sq) have_q5 = true;
+    }
+    if (!have_q5) try constructed.append(gpa, sq);
+    const ents6 = enumEntries(m, prog, sq);
+    for (ents6) |e6| {
+        for (e6.args) |afid6| {
+            const afn6 = m.funcById(afid6) orelse return false;
+            if (seen.contains(afn6.id.int())) continue;
+            try seen.put(afn6.id.int(), {});
+            try queue.append(gpa, .{ .f = afn6, .synth = null });
+        }
+    }
+    for (prog.of(sq).?) |fd6| {
+        if (fd6.from_parent or fd6.preset) continue;
+        const ifid6 = fd6.init orelse continue;
+        const ifn6 = m.funcById(ifid6) orelse return false;
+        if (seen.contains(ifn6.id.int())) continue;
+        try seen.put(ifn6.id.int(), {});
+        try queue.append(gpa, .{ .f = ifn6, .synth = null });
+    }
+    return true;
+}
+
+/// One entry of an enum, built where the program names it.
+fn queueEnumEntry(e: *Emit, sq: u32, eqi: u32) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const seen = e.seen;
+    const queue = e.queue;
+    const constructed = e.constructed;
+    var have_q = false;
+    for (constructed.items) |uq| {
+        if (uq == sq) have_q = true;
+    }
+    if (!have_q) try constructed.append(gpa, sq);
+    const ents3 = enumEntries(m, prog, sq);
+    for (ents3[eqi].args) |afid| {
+        const afn2 = m.funcById(afid) orelse return false;
+        if (seen.contains(afn2.id.int())) continue;
+        try seen.put(afn2.id.int(), {});
+        try queue.append(gpa, .{ .f = afn2, .synth = null });
+    }
+    for (prog.of(sq).?) |fd2| {
+        if (fd2.from_parent or fd2.preset) continue;
+        const ifid2 = fd2.init orelse continue;
+        const ifn2 = m.funcById(ifid2) orelse return false;
+        if (seen.contains(ifn2.id.int())) continue;
+        try seen.put(ifn2.id.int(), {});
+        try queue.append(gpa, .{ .f = ifn2, .synth = null });
+    }
+    return true;
+}
+
+/// What a resolved bare name reaches: a construction, an accessor, a
+/// global, a member slot or a call.
+fn queueBareTarget(e: *Emit, inst: *const ir.Inst, res: BareResolution) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const globals = e.globals;
+    const seen = e.seen;
+    const queue = e.queue;
+    const vsites = e.vsites;
+    blkbare: switch (res) {
+        .field => {},
+        .construct => |bcid2| {
+            if (!try queueConstructedFromBare(e, bcid2)) return false;
+        },
+        .accessor => |ac| {
+            const afn3 = m.funcById(ac.func) orelse return false;
+            if (!seen.contains(afn3.id.int())) {
+                try seen.put(afn3.id.int(), {});
+                try queue.append(gpa, .{ .f = afn3, .synth = null });
+            }
+        },
+        .global => {
+            const bname: ?[]const u8 = switch (inst.*) {
+                .LoadFromThisOrGlobal => |l3| m.consts.items[l3.name.int()].String,
+                .StoreToThisOrGlobal => |s3| m.consts.items[s3.name.int()].String,
+                else => null,
+            };
+            if (bname) |bn3| {
+                if (globalIndex(globals, bn3)) |gi3| {
+                    const gfn3 = m.funcById(globals[gi3].func) orelse return false;
+                    if (!seen.contains(gfn3.id.int())) {
+                        try seen.put(gfn3.id.int(), {});
+                        try queue.append(gpa, .{ .f = gfn3, .synth = null });
+                    }
+                }
+            }
+        },
+        .member => |mb| {
+            // Every class beneath the receiver's type may
+            // answer, which the virtual pairing then queues.
+            var have_m = false;
+            for (vsites.items) |sv6| {
+                if (sv6.int() == mb.slot) have_m = true;
+            }
+            if (!have_m) try vsites.append(gpa, ir.MethodSlotId.from(mb.slot));
+        },
+        .call => |cf| {
+            const cfn = m.funcById(cf) orelse return false;
+            if (isPrintln(cfn) or scalarIntrinsic(cfn) != null or
+                listIntrinsic(cfn) != null or arrayOfIntrinsic(cfn) != null or
+                isArrayOfNulls(cfn)) break :blkbare;
+            if (!seen.contains(cfn.id.int())) {
+                try seen.put(cfn.id.int(), {});
+                try queue.append(gpa, .{ .f = cfn, .synth = null });
+            }
+            // A parameter the call leaves unbound runs the
+            // thunk the declaration lowered for it.
+            if (inst.* == .CallMemberOrGlobal) {
+                const cgq = inst.CallMemberOrGlobal;
+                if (bindCallArgs(m, cfn.params, cgq.args.int(), cgq.n_args, cgq.arg_names)) |bq| {
+                    var dq2: u32 = 0;
+                    while (dq2 < bq.n) : (dq2 += 1) {
+                        if (bq.regs[dq2] != null) continue;
+                        const dfq = prog.defaultThunk(cfn.id, dq2) orelse break;
+                        const dfnq = m.funcById(dfq) orelse return false;
+                        if (seen.contains(dfnq.id.int())) continue;
+                        try seen.put(dfnq.id.int(), {});
+                        try queue.append(gpa, .{ .f = dfnq, .synth = null });
+                    }
+                }
+            }
+        },
+    }
+    return true;
+}
+
+/// Constructing runs the class's own initializers,
+/// which the construction walk below queues.
+fn queueConstructedFromBare(e: *Emit, bcid2: u32) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const seen = e.seen;
+    const queue = e.queue;
+    const synth_owned = e.synth_owned;
+    const constructed = e.constructed;
+    var have_bc = false;
+    for (constructed.items) |uc2| {
+        if (uc2 == bcid2) have_bc = true;
+    }
+    if (!have_bc) try constructed.append(gpa, bcid2);
+    const bfd2 = prog.of(bcid2) orelse return false;
+    for (bfd2) |fdx| {
+        if (fdx.from_parent) continue;
+        const ifx = fdx.init orelse continue;
+        const ifnx = m.funcById(ifx) orelse return false;
+        if (seen.contains(ifnx.id.int())) continue;
+        try seen.put(ifnx.id.int(), {});
+        try queue.append(gpa, .{ .f = ifnx, .synth = null });
+    }
+    const bdef2 = &m.classes.items[bcid2];
+    var dpx: usize = 0;
+    while (dpx < bdef2.primary_params.len) : (dpx += 1) {
+        const dfx = ctorDefault(prog.layouts, bdef2, dpx) orelse continue;
+        const dfnx = m.funcById(dfx) orelse return false;
+        if (seen.contains(dfnx.id.int())) continue;
+        try seen.put(dfnx.id.int(), {});
+        const csynx = try gpa.alloc(ir.Param, 1 + bdef2.primary_params.len);
+        try synth_owned.append(gpa, csynx);
+        csynx[0] = .{
+            .name = "$ctor_default_recv",
+            .ty = .{ .name = "", .nullable = true, .args = &.{} },
+            .default = null,
+        };
+        @memcpy(csynx[1..], bdef2.primary_params);
+        try queue.append(gpa, .{ .f = dfnx, .synth = csynx });
+    }
+    if (prog.parentOf(bcid2) != null) return false;
+    return true;
+}
+
+/// The accessors a property read or write goes through.
+fn queuePropertyAccessors(e: *Emit, a2: AccessSite) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const seen = e.seen;
+    const queue = e.queue;
+    if (!isBuiltinCls(a2.rc) and a2.name.int() < m.consts.items.len) {
+        const anm = m.consts.items[a2.name.int()];
+        if (anm == .String) {
+            switch (accessPlan(m, prog, a2.rc, anm.String, a2.set)) {
+                .accessor => |fid3| {
+                    const afn = m.funcById(fid3) orelse return false;
+                    if (!seen.contains(afn.id.int())) {
+                        try seen.put(afn.id.int(), {});
+                        try queue.append(gpa, .{ .f = afn, .synth = null });
+                    }
+                },
+                .virtual => {
+                    // Every class beneath the receiver's type
+                    // may answer, so every getter is reachable.
+                    const pn = plainFieldName(anm.String);
+                    var pc: u32 = 0;
+                    while (pc < m.classes.items.len) : (pc += 1) {
+                        if (prog.of(pc) == null) continue;
+                        if (!typeReaches(m, pc, a2.rc)) continue;
+                        const pg = prog.accessor(m, pc, pn, .get) orelse continue;
+                        const pfn = m.funcById(pg) orelse return false;
+                        if (seen.contains(pfn.id.int())) continue;
+                        try seen.put(pfn.id.int(), {});
+                        try queue.append(gpa, .{ .f = pfn, .synth = null });
+                    }
+                },
+                .field, .none => {},
+            }
+        }
+    }
+    return true;
+}
+
+/// Constructing a class runs every initializer in its chain, so each one
+/// is reachable wherever the construction is.
+fn queueConstruction(e: *Emit, inst: *const ir.Inst) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const seen = e.seen;
+    const queue = e.queue;
+    const synth_owned = e.synth_owned;
+    const constructed = e.constructed;
+    if (inst.NewInstance.class.int() < m.classes.items.len and
+        (isArrayTypeName(m.classes.items[inst.NewInstance.class.int()].name) or
+            unsignedTypeOf(m.classes.items[inst.NewInstance.class.int()].name) != null)) return true;
+    {
+        const nc2 = inst.NewInstance.class.int();
+        var have_c = false;
+        for (constructed.items) |uc| {
+            if (uc == nc2) have_c = true;
+        }
+        if (!have_c) try constructed.append(gpa, nc2);
+    }
+    // Constructing a class runs every initializer in its chain:
+    // each class's body-property thunks, and the thunks it
+    // passes to its superclass's constructor.
+    var walk: ?u32 = inst.NewInstance.class.int();
+    var steps: u32 = 0;
+    while (walk) |wc| : (steps += 1) {
+        if (steps > 32) break;
+        const fds = prog.of(wc) orelse break;
+        const wdef = &m.classes.items[wc];
+        // Constructing a class runs its init blocks too.
+        if (ownLayout(prog, wdef.name)) |ol| {
+            for (ol.init_blocks) |ibf2| {
+                const ibn2 = m.funcById(ibf2) orelse return false;
+                if (seen.contains(ibn2.id.int())) continue;
+                try seen.put(ibn2.id.int(), {});
+                try queue.append(gpa, .{ .f = ibn2, .synth = null });
+            }
+        }
+        // And the thunk behind every constructor parameter the
+        // construction may omit.
+        if (wc == inst.NewInstance.class.int()) {
+            var dpi: usize = 0;
+            while (dpi < wdef.primary_params.len) : (dpi += 1) {
+                const dfd = ctorDefault(prog.layouts, wdef, dpi) orelse continue;
+                const dfn5 = m.funcById(dfd) orelse return false;
+                if (seen.contains(dfn5.id.int())) continue;
+                try seen.put(dfn5.id.int(), {});
+                // Like a superclass-argument thunk, it
+                // declares no parameters and reads its
+                // caller's positionally: a synthesized
+                // receiver slot first, then the constructor
+                // arguments AHEAD of the one it fills.
+                const csyn = try gpa.alloc(ir.Param, 1 + wdef.primary_params.len);
+                try synth_owned.append(gpa, csyn);
+                csyn[0] = .{
+                    .name = "$ctor_default_recv",
+                    .ty = .{ .name = "", .nullable = true, .args = &.{} },
+                    .default = null,
+                };
+                @memcpy(csyn[1..], wdef.primary_params);
+                try queue.append(gpa, .{ .f = dfn5, .synth = csyn });
+            }
+        }
+        for (fds) |fd| {
+            if (fd.from_parent) continue;
+            const ifid = fd.init orelse continue;
+            const ifn = m.funcById(ifid) orelse return false;
+            if (seen.contains(ifn.id.int())) continue;
+            try seen.put(ifn.id.int(), {});
+            try queue.append(gpa, .{ .f = ifn, .synth = null });
+        }
+        const pp = prog.parentOf(wc) orelse break;
+        for (pp.args) |tf| {
+            const ifn = m.funcById(tf) orelse return false;
+            if (seen.contains(ifn.id.int())) continue;
+            try seen.put(ifn.id.int(), {});
+            // A superclass-argument thunk declares no
+            // parameters and reads its class's constructor
+            // arguments positionally, so it compiles against
+            // them.
+            try queue.append(gpa, .{ .f = ifn, .synth = wdef.primary_params });
+        }
+        walk = pp.cid;
+    }
+    return true;
+}
+
+/// The body a direct call runs, and the thunk behind every parameter it
+/// leaves unbound.
+fn queueDirectCall(e: *Emit, inst: *const ir.Inst) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const seen = e.seen;
+    const queue = e.queue;
+    const callee = m.funcById(inst.Call.func) orelse return false;
+    if (isPrintln(callee) or listIntrinsic(callee) != null or scalarIntrinsic(callee) != null or
+        arrayOfIntrinsic(callee) != null or isArrayOfNulls(callee) or isRunBlocking(callee) or
+        isDelay(callee) or isLaunch(callee)) return true;
+    // A declaration the interpreter implements has no body to
+    // compile: the call reaches the same entry the interpreter
+    // reaches.
+    if (!callee.hasBody() and stdlibEntry(callee) != null) return true;
+    // A call that leaves a parameter unbound runs the thunk for it.
+    const bnd3 = bindCallArgs(m, callee.params, inst.Call.args.int(), inst.Call.n_args, inst.Call.arg_names) orelse
+        return false;
+    var dq: u32 = 0;
+    while (dq < bnd3.n) : (dq += 1) {
+        if (bnd3.regs[dq] != null) continue;
+        const dfid2 = prog.defaultThunk(callee.id, dq) orelse break;
+        const dfn2 = m.funcById(dfid2) orelse return false;
+        if (seen.contains(dfn2.id.int())) continue;
+        try seen.put(dfn2.id.int(), {});
+        // The thunk reads the parameters ahead of its own
+        // positionally, so it compiles against the callee's
+        // signature up to that point.
+        try queue.append(gpa, .{ .f = dfn2, .synth = callee.params[0..dq] });
+    }
+    if (seen.contains(callee.id.int())) return true;
+    try seen.put(callee.id.int(), {});
+    try queue.append(gpa, .{ .f = callee, .synth = null });
+    return true;
+}
+
+/// Every construction the walk found, against every virtual call site
+/// it found. A class the program never builds answers nothing, which is
+/// what keeps an abstract library base out of the compile.
+fn pairConstructionsWithSites(e: *Emit, grew_reach: *bool) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const seen = e.seen;
+    const queue = e.queue;
+    const constructed = e.constructed;
+    const vsites = e.vsites;
+    for (vsites.items) |slot| {
+        for (constructed.items) |cid| {
+            const impl = slotImpl(m, prog, cid, slot) orelse {
+                // The class has the member in its type but no body for it:
+                // it satisfies the interface by DELEGATION, which forwards
+                // to another object at run time. Refusing keeps that a
+                // refusal rather than an AbstractMethodError in a compiled
+                // program.
+                const root9 = m.funcById(ir.FuncId.from(slot.int())) orelse continue;
+                if (typeHasSlot(m, cid, root9)) {
+                    if (traceOn()) {
+                        std.debug.print("[cgen] refuse {s}: `{s}` is satisfied by delegation\n", .{
+                            m.classes.items[cid].name, root9.name,
+                        });
+                    }
+                    return false;
+                }
+                continue;
+            };
+            // An override declaring more parameters than the site supplies
+            // fills them from its own default thunks, so those are
+            // reachable wherever the dispatcher is.
+            const vroot = m.funcById(ir.FuncId.from(slot.int()));
+            var vk: u32 = 1;
+            while (vk < impl.params.len) : (vk += 1) {
+                const vfid = prog.defaultThunk(impl.id, vk) orelse
+                    (if (vroot) |vr| prog.defaultThunk(vr.id, vk) else null) orelse continue;
+                const vfn = m.funcById(vfid) orelse return false;
+                if (seen.contains(vfn.id.int())) continue;
+                try seen.put(vfn.id.int(), {});
+                try queue.append(gpa, .{ .f = vfn, .synth = impl.params[0..vk] });
+                grew_reach.* = true;
+            }
+            if (seen.contains(impl.id.int())) continue;
+            try seen.put(impl.id.int(), {});
+            try queue.append(gpa, .{ .f = impl, .synth = null });
+            grew_reach.* = true;
+        }
+    }
+    return true;
+}
+
+// Printing a floating value is the one place where C's formatting and
+// Kotlin's disagree, so the helper rides along only when it is used.
+// A program with any handler carries the try machinery, and its throws go
+// through it rather than straight out.
+fn collectTryRegions(e: *Emit) void {
+    const accepted = e.accepted;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
-            if (blk.catches.len != 0) uses_try = true;
+            if (blk.catches.len != 0) e.uses_try = true;
         }
     }
+}
 
-    // Virtual call sites: each distinct slot gets one dispatcher, switching on
-    // the receiver's class.
-    var used_slots: std.ArrayList(SlotUse) = .empty;
-    defer used_slots.deinit(gpa);
+/// Virtual call sites: each distinct slot gets one dispatcher, switching on
+/// the receiver's class.
+fn collectVirtualSlots(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const accepted = e.accepted;
+    const used_slots = e.used_slots;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
@@ -833,11 +1166,16 @@ pub fn emit(
             }
         }
     }
+}
 
-    // `object` declarations the program names. Each has ONE instance, created
-    // before the program runs and rooted for its whole life.
-    var used_singletons: std.ArrayList(SingletonUse) = .empty;
-    defer used_singletons.deinit(gpa);
+/// `object` declarations the program names. Each has ONE instance, created
+/// before the program runs and rooted for its whole life.
+fn collectSingletons(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const accepted = e.accepted;
+    const used_singletons = e.used_singletons;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
@@ -923,12 +1261,17 @@ pub fn emit(
             }
         }
     }
+}
 
-    // Properties read through a type that declares them without storage. One
-    // dispatcher per (receiver type, name): which getter runs is the
-    // receiver's class, exactly as for a method.
-    var used_props: std.ArrayList(PropUse) = .empty;
-    defer used_props.deinit(gpa);
+/// Properties read through a type that declares them without storage. One
+/// dispatcher per (receiver type, name): which getter runs is the
+/// receiver's class, exactly as for a method.
+fn collectVirtualProps(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const accepted = e.accepted;
+    const used_props = e.used_props;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
@@ -950,13 +1293,16 @@ pub fn emit(
             }
         }
     }
+}
 
-    // Lambdas whose value has to exist. Each becomes a class the emitter
-    // synthesizes for that body, one field per capture: the collector traces
-    // it like any instance, and a call through the value finds the body again
-    // by its class handle.
-    var used_lambdas: std.ArrayList(LambdaUse) = .empty;
-    defer used_lambdas.deinit(gpa);
+/// Lambdas whose value has to exist. Each becomes a class the emitter
+/// synthesizes for that body, one field per capture: the collector traces
+/// it like any instance, and a call through the value finds the body again
+/// by its class handle.
+fn collectLambdas(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const accepted = e.accepted;
+    const used_lambdas = e.used_lambdas;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
@@ -996,12 +1342,17 @@ pub fn emit(
             }
         }
     }
+}
 
-    // Classes the program constructs or reads through. Emitted as descriptors
-    // and registered before main: a compiled program carries its own layout
-    // because there is no module to ask.
-    var used_classes: std.ArrayList(u32) = .empty;
-    defer used_classes.deinit(gpa);
+/// Classes the program constructs or reads through. Emitted as descriptors
+/// and registered before main: a compiled program carries its own layout
+/// because there is no module to ask.
+fn collectDescriptorClasses(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const prog = e.prog;
+    const accepted = e.accepted;
+    const used_singletons = e.used_singletons;
+    const used_classes = e.used_classes;
     for (used_singletons.items) |su2| {
         var seen_o = false;
         for (used_classes.items) |u| {
@@ -1025,61 +1376,74 @@ pub fn emit(
             if (!seen_cls) try used_classes.append(gpa, cid);
         }
     }
-    // Classes the program actually constructs, and every superclass in their
-    // chains: each gets an initializer, and a subclass's calls its parent's.
-    var ctor_classes: std.ArrayList(u32) = .empty;
-    defer ctor_classes.deinit(gpa);
-    {
-        var want: std.ArrayList(u32) = .empty;
-        defer want.deinit(gpa);
-        for (used_singletons.items) |su3| try want.append(gpa, su3.cid);
-        for (accepted.items) |*cc| {
-            for (cc.f.blocks) |*blk| {
-                for (blk.insts) |*inst| {
-                    if (inst.* != .NewInstance) continue;
-                    const nc = inst.NewInstance.class.int();
-                    if (isThrowableClass(m, nc)) continue;
-                    // An array is a runtime value, not an instance the emitter
-                    // lays out or initializes.
-                    if (nc < m.classes.items.len and
-                        (isArrayTypeName(m.classes.items[nc].name) or unsignedTypeOf(m.classes.items[nc].name) != null)) continue;
-                    try want.append(gpa, nc);
-                }
+}
+
+/// Classes the program actually constructs, and every superclass in their
+/// chains: each gets an initializer, and a subclass's calls its parent's.
+fn collectConstructedClasses(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const prog = e.prog;
+    const accepted = e.accepted;
+    const used_singletons = e.used_singletons;
+    const ctor_classes = e.ctor_classes;
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(gpa);
+    for (used_singletons.items) |su3| try want.append(gpa, su3.cid);
+    for (accepted.items) |*cc| {
+        for (cc.f.blocks) |*blk| {
+            for (blk.insts) |*inst| {
+                if (inst.* != .NewInstance) continue;
+                const nc = inst.NewInstance.class.int();
+                if (isThrowableClass(m, nc)) continue;
+                // An array is a runtime value, not an instance the emitter
+                // lays out or initializes.
+                if (nc < m.classes.items.len and
+                    (isArrayTypeName(m.classes.items[nc].name) or unsignedTypeOf(m.classes.items[nc].name) != null)) continue;
+                try want.append(gpa, nc);
             }
-        }
-        var wi: usize = 0;
-        while (wi < want.items.len) : (wi += 1) {
-            const cid = want.items[wi];
-            if (prog.of(cid) == null) continue;
-            var have = false;
-            for (ctor_classes.items) |u| {
-                if (u == cid) have = true;
-            }
-            if (have) continue;
-            try ctor_classes.append(gpa, cid);
-            if (prog.parentOf(cid)) |pp| try want.append(gpa, pp.cid);
         }
     }
+    var wi: usize = 0;
+    while (wi < want.items.len) : (wi += 1) {
+        const cid = want.items[wi];
+        if (prog.of(cid) == null) continue;
+        var have = false;
+        for (ctor_classes.items) |u| {
+            if (u == cid) have = true;
+        }
+        if (have) continue;
+        try ctor_classes.append(gpa, cid);
+        if (prog.parentOf(cid)) |pp| try want.append(gpa, pp.cid);
+    }
+}
 
-    // A string is a reference too: a program that only concatenates still needs
-    // the runtime for its collector and renderer.
-    var uses_objects_hint = false;
-    var uses_objects = used_classes.items.len != 0;
+/// A string is a reference too: a program that only concatenates still needs
+/// the runtime for its collector and renderer.
+fn collectObjectUse(e: *Emit) void {
+    const accepted = e.accepted;
+    const used_classes = e.used_classes;
+    e.uses_objects = used_classes.items.len != 0;
     for (accepted.items) |*c| {
         for (c.types) |t| {
             // A `Char` prints as a character, a `Short`/`Byte` as itself, and
             // an unsigned value as unsigned, so a program holding one needs the
             // runtime's renderer even if it never touches the heap.
             switch (t) {
-                .object, .char, .short, .byte, .u32, .u64, .u16, .u8 => uses_objects = true,
+                .object, .char, .short, .byte, .u32, .u64, .u16, .u8 => e.uses_objects = true,
                 else => {},
             }
         }
     }
+}
 
-    // Only the globals the program actually touches get storage.
-    var used_globals: std.ArrayList(Global) = .empty;
-    defer used_globals.deinit(gpa);
+/// Only the globals the program actually touches get storage.
+fn collectGlobals(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const globals = e.globals;
+    const accepted = e.accepted;
+    const used_globals = e.used_globals;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
@@ -1110,34 +1474,42 @@ pub fn emit(
             }
         }
     }
-    if (used_globals.items.len != 0 or used_singletons.items.len != 0 or used_slots.items.len != 0 or uses_try) uses_objects_hint = true;
+}
 
-    var needs_div = false;
-    var needs_cast = false;
+/// Whether the program's arithmetic and casts need their helpers, and
+/// whether either forces the runtime in.
+fn collectArithmeticHelpers(e: *Emit) void {
+    const m = e.m;
+    const accepted = e.accepted;
     for (accepted.items) |*c| {
         for (c.f.blocks) |*blk| {
             for (blk.insts) |*inst| {
                 switch (inst.*) {
                     .Cast => |ca| {
-                        if (!ca.safe) needs_cast = true;
-                        uses_objects_hint = true;
+                        if (!ca.safe) e.needs_cast = true;
+                        e.uses_objects_hint = true;
                     },
-                    .InstanceOf => uses_objects_hint = true,
+                    .InstanceOf => e.uses_objects_hint = true,
                     .BinOp => |b| {
-                        if ((b.op == .Div or b.op == .Mod) and !c.types[b.dst.int()].isFloat()) needs_div = true;
+                        if ((b.op == .Div or b.op == .Mod) and !c.types[b.dst.int()].isFloat()) e.needs_div = true;
                     },
                     // Printing goes through the runtime's renderer, so a
                     // program that prints anything links it.
                     .Call => |call| {
                         const callee = m.funcById(call.func) orelse continue;
-                        if (isPrintln(callee) or scalarIntrinsic(callee) == .print) uses_objects_hint = true;
+                        if (isPrintln(callee) or scalarIntrinsic(callee) == .print) e.uses_objects_hint = true;
                     },
                     else => {},
                 }
             }
         }
     }
+}
 
+/// What generated the file, and what the C compiler has to include.
+fn writeFileHeader(e: *Emit) Error!void {
+    const w = e.w;
+    const src_path = e.src_path;
     try w.print(
         \\/* Generated by `klio transpile --native {s}`. Do not edit.
         \\ * The program, not a launcher for it: no image is loaded and no
@@ -1150,10 +1522,15 @@ pub fn emit(
         \\#include <setjmp.h>
         \\
     , .{src_path});
-    // Every hint is in: a program that prints, throws, holds a global or
-    // dispatches needs the runtime, and the header has to say so before the
-    // first declaration that uses it.
-    if (uses_objects_hint) uses_objects = true;
+}
+
+/// The runtime header, and the handles a program that needs it declares.
+fn writeRuntimeDeclarations(e: *Emit) Error!void {
+    const w = e.w;
+    const accepted = e.accepted;
+    const used_lambdas = e.used_lambdas;
+    const used_classes = e.used_classes;
+    const uses_objects = e.uses_objects;
     if (uses_objects) {
         try w.writeAll(
             \\#include <klio_rt.h>
@@ -1170,62 +1547,79 @@ pub fn emit(
                 try w.print("static klio_value kcs_{d}(klio_value self);\n", .{lu.body.int()});
             }
         }
-        try w.writeAll("\nstatic void klio_register_classes(void) {\n");
-        for (used_classes.items) |cid| {
-            const cdef = &m.classes.items[cid];
-            const fields = prog.of(cid).?;
-            try w.print("  {{ static const char *const fn[] = {{", .{});
-            for (fields, 0..) |fld, i| {
-                if (i != 0) try w.writeAll(", ");
-                try w.writeByte('"');
-                try w.writeAll(fld.name);
-                try w.writeByte('"');
-            }
-            if (fields.len == 0) try w.writeAll("0");
-            // The primary constructor's properties are the fields this class
-            // contributes from its own arguments: the parent's come first and
-            // belong to the parent.
-            var plo: u32 = 0;
-            var phi: u32 = 0;
-            for (fields, 0..) |fld2, fi2| {
-                if (fld2.from_parent or fld2.arg == null) continue;
-                if (phi == 0) plo = @intCast(fi2);
-                phi = @intCast(fi2 + 1);
-            }
-            var flags: u32 = 0;
-            if (layoutFor(prog.layouts, cdef)) |l2| {
-                if (l2.is_data) flags |= 1;
-            }
-            if (cdef.is_enum) flags |= 2;
-            if (cdef.is_object) flags |= 4;
-            try w.writeAll("};\n    static const unsigned char fz[] = {");
-            for (fields, 0..) |fld3, fz_i| {
-                if (fz_i != 0) try w.writeAll(", ");
-                try w.print("{d}", .{zeroKindOf(fld3.ty)});
-            }
-            if (fields.len == 0) try w.writeAll("0");
-            try w.writeAll("};\n");
-            try w.print("    KCLS_{d} = klio_nat_class(\"{s}\", {d}, fn, {d}, {d}, {d}, fz); }}\n", .{
-                cid, cdef.name, fields.len, plo, phi, flags,
-            });
-        }
-        for (used_lambdas.items) |lu| {
-            try w.print("  {{ static const char *const fn[] = {{", .{});
-            var ci7: u32 = 0;
-            while (ci7 < lu.n_caps) : (ci7 += 1) {
-                if (ci7 != 0) try w.writeAll(", ");
-                try w.print("\"k{d}\"", .{ci7});
-            }
-            if (lu.n_caps == 0) try w.writeAll("0");
-            try w.print("}}; KLAM_{d} = klio_nat_class(\"Function{d}\", {d}, fn, 0, 0, 0, 0); }}\n", .{ lu.body.int(), lu.arity, lu.n_caps });
-            for (accepted.items) |*cc| {
-                if (cc.f.id != lu.body) continue;
-                if (!cc.suspends) continue;
-                try w.print("  klio_nat_coro_starter(KLAM_{d}, kcs_{d});\n", .{ lu.body.int(), lu.body.int() });
-            }
-        }
-        try w.writeAll("}\n\n");
+        try writeClassRegistry(e);
     }
+}
+
+/// The class and lambda descriptors, registered before the program runs.
+fn writeClassRegistry(e: *Emit) Error!void {
+    const m = e.m;
+    const w = e.w;
+    const prog = e.prog;
+    const accepted = e.accepted;
+    const used_lambdas = e.used_lambdas;
+    const used_classes = e.used_classes;
+    try w.writeAll("\nstatic void klio_register_classes(void) {\n");
+    for (used_classes.items) |cid| {
+        const cdef = &m.classes.items[cid];
+        const fields = prog.of(cid).?;
+        try w.print("  {{ static const char *const fn[] = {{", .{});
+        for (fields, 0..) |fld, i| {
+            if (i != 0) try w.writeAll(", ");
+            try w.writeByte('"');
+            try w.writeAll(fld.name);
+            try w.writeByte('"');
+        }
+        if (fields.len == 0) try w.writeAll("0");
+        // The primary constructor's properties are the fields this class
+        // contributes from its own arguments: the parent's come first and
+        // belong to the parent.
+        var plo: u32 = 0;
+        var phi: u32 = 0;
+        for (fields, 0..) |fld2, fi2| {
+            if (fld2.from_parent or fld2.arg == null) continue;
+            if (phi == 0) plo = @intCast(fi2);
+            phi = @intCast(fi2 + 1);
+        }
+        var flags: u32 = 0;
+        if (layoutFor(prog.layouts, cdef)) |l2| {
+            if (l2.is_data) flags |= 1;
+        }
+        if (cdef.is_enum) flags |= 2;
+        if (cdef.is_object) flags |= 4;
+        try w.writeAll("};\n    static const unsigned char fz[] = {");
+        for (fields, 0..) |fld3, fz_i| {
+            if (fz_i != 0) try w.writeAll(", ");
+            try w.print("{d}", .{zeroKindOf(fld3.ty)});
+        }
+        if (fields.len == 0) try w.writeAll("0");
+        try w.writeAll("};\n");
+        try w.print("    KCLS_{d} = klio_nat_class(\"{s}\", {d}, fn, {d}, {d}, {d}, fz); }}\n", .{
+            cid, cdef.name, fields.len, plo, phi, flags,
+        });
+    }
+    for (used_lambdas.items) |lu| {
+        try w.print("  {{ static const char *const fn[] = {{", .{});
+        var ci7: u32 = 0;
+        while (ci7 < lu.n_caps) : (ci7 += 1) {
+            if (ci7 != 0) try w.writeAll(", ");
+            try w.print("\"k{d}\"", .{ci7});
+        }
+        if (lu.n_caps == 0) try w.writeAll("0");
+        try w.print("}}; KLAM_{d} = klio_nat_class(\"Function{d}\", {d}, fn, 0, 0, 0, 0); }}\n", .{ lu.body.int(), lu.arity, lu.n_caps });
+        for (accepted.items) |*cc| {
+            if (cc.f.id != lu.body) continue;
+            if (!cc.suspends) continue;
+            try w.print("  klio_nat_coro_starter(KLAM_{d}, kcs_{d});\n", .{ lu.body.int(), lu.body.int() });
+        }
+    }
+    try w.writeAll("}\n\n");
+}
+
+/// The handler stack a program with any `catch` throws through.
+fn writeTryMachinery(e: *Emit) Error!void {
+    const w = e.w;
+    const uses_try = e.uses_try;
     if (uses_try) try w.writeAll(
         \\/* A try region. The handler stack and the in-flight value live here rather
         \\ * than in the runtime: `setjmp` has to be called in the frame that catches,
@@ -1244,6 +1638,14 @@ pub fn emit(
         \\
         \\
     );
+}
+
+/// The helper a failed `as` throws through.
+fn writeCastHelper(e: *Emit) Error!void {
+    const w = e.w;
+    const prog = e.prog;
+    const uses_try = e.uses_try;
+    const needs_cast = e.needs_cast;
     if (needs_cast) {
         // A failed `as` is a ClassCastException, a real throwable a handler in
         // the same program can catch.
@@ -1257,6 +1659,14 @@ pub fn emit(
             \\
         , .{ if (uses_try) "klio_do_throw" else "klio_nat_throw", if (cce) |t| t.lo else 0 });
     }
+}
+
+/// The helper an integer division by zero throws through.
+fn writeDivHelper(e: *Emit) Error!void {
+    const w = e.w;
+    const prog = e.prog;
+    const uses_try = e.uses_try;
+    const needs_div = e.needs_div;
     if (needs_div) {
         // Kotlin THROWS on integer division by zero; C leaves it undefined.
         // It is a real throwable, so a `catch` in compiled code sees it and
@@ -1272,8 +1682,14 @@ pub fn emit(
             \\
         , .{ if (uses_try) "klio_do_throw" else "klio_nat_throw", if (az) |t| t.lo else 0 });
     }
+}
 
-
+/// Storage for the singletons, the capture-less lambdas and the globals.
+fn writeStaticStorage(e: *Emit) Error!void {
+    const w = e.w;
+    const used_singletons = e.used_singletons;
+    const used_lambdas = e.used_lambdas;
+    const used_globals = e.used_globals;
     if (used_singletons.items.len != 0) {
         try w.print("\n/* `object` declarations: one instance each, built before the program\n" ++
             " * runs and rooted for its whole life. */\n", .{});
@@ -1300,9 +1716,18 @@ pub fn emit(
         try w.print("static klio_value KG[{d}];\n", .{used_globals.items.len});
         try w.print("static klio_nat_frame KGF;\n", .{});
     }
+}
 
-    // Prototypes first: the call graph has cycles (recursion, mutual calls),
-    // and a dispatcher is defined after the bodies it selects between.
+/// Prototypes first: the call graph has cycles (recursion, mutual calls),
+/// and a dispatcher is defined after the bodies it selects between.
+fn writePrototypes(e: *Emit) Error!void {
+    const m = e.m;
+    const w = e.w;
+    const accepted = e.accepted;
+    const used_slots = e.used_slots;
+    const used_props = e.used_props;
+    const used_lambdas = e.used_lambdas;
+    const ctor_classes = e.ctor_classes;
     for (accepted.items) |*c| {
         try writeProto(w, c);
         try w.writeAll(";\n");
@@ -1369,8 +1794,35 @@ pub fn emit(
         }
     }
     try w.writeAll("\n");
-    for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try, accepted.items, used_classes.items, used_lambdas.items);
+}
 
+/// Every accepted body, in the order they were compiled.
+fn writeFunctionBodies(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const w = e.w;
+    const prog = e.prog;
+    const accepted = e.accepted;
+    const used_slots = e.used_slots;
+    const used_singletons = e.used_singletons;
+    const used_lambdas = e.used_lambdas;
+    const used_classes = e.used_classes;
+    const used_globals = e.used_globals;
+    const uses_objects = e.uses_objects;
+    const uses_try = e.uses_try;
+    for (accepted.items) |*c| try writeBody(gpa, w, m, prog, c, uses_objects, used_globals.items, used_singletons.items, used_slots.items, uses_try, accepted.items, used_classes.items, used_lambdas.items);
+}
+
+/// One dispatcher per virtual call site, switching on the receiver's
+/// class. False refuses the emission.
+fn writeVirtualDispatchers(e: *Emit) Error!bool {
+    const gpa = e.gpa;
+    const m = e.m;
+    const w = e.w;
+    const prog = e.prog;
+    const accepted = e.accepted;
+    const used_slots = e.used_slots;
+    const used_classes = e.used_classes;
     for (used_slots.items) |su| {
         const root = m.funcById(ir.FuncId.from(su.slot)).?;
         const rt5 = funcRetTy2(m, root) orelse .unit;
@@ -1453,11 +1905,27 @@ pub fn emit(
         }
         try w.writeAll("}\n");
     }
+    return true;
+}
+
+/// One initializer per class the program constructs.
+fn writeConstructorBodies(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const w = e.w;
+    const prog = e.prog;
+    const ctor_classes = e.ctor_classes;
     if (ctor_classes.items.len != 0) try w.writeAll("\n");
     for (ctor_classes.items) |cid| try writeCtorBody(gpa, w, m, prog, cid);
     if (ctor_classes.items.len != 0) try w.writeAll("\n");
-    // A lambda that suspends and can be handed to `launch` needs a starter:
-    // the driver is given the closure VALUE and has to find the code.
+}
+
+/// A lambda that suspends and can be handed to `launch` needs a starter:
+/// the driver is given the closure VALUE and has to find the code.
+fn writeLambdaStarters(e: *Emit) Error!bool {
+    const w = e.w;
+    const accepted = e.accepted;
+    const used_lambdas = e.used_lambdas;
     for (used_lambdas.items) |lu| {
         const sc9 = blk10: {
             for (accepted.items) |*cc| {
@@ -1484,6 +1952,16 @@ pub fn emit(
         }
         try w.writeAll("), klio_nat_box_unit());\n}\n");
     }
+    return true;
+}
+
+/// One adapter per materialised lambda: its arguments and its result pass
+/// boxed, because which body runs is a run-time answer.
+fn writeLambdaAdapters(e: *Emit) Error!bool {
+    const gpa = e.gpa;
+    const w = e.w;
+    const accepted = e.accepted;
+    const used_lambdas = e.used_lambdas;
     for (used_lambdas.items) |lu| {
         const bc2 = blk9: {
             for (accepted.items) |*cc| {
@@ -1529,32 +2007,49 @@ pub fn emit(
         var bb15: [400]u8 = undefined;
         try w.print("  return {s};\n}}\n", .{boxExpr(bc2.ret, call9.written(), &bb15)});
     }
-    {
-        var seen_ar2: [FUNC_MAX_ARITY + 1]bool = @splat(false);
-        for (used_lambdas.items) |lu| {
-            if (seen_ar2[lu.arity]) continue;
-            seen_ar2[lu.arity] = true;
-            try w.print("static klio_value klam_call_{d}(klio_value f", .{lu.arity});
-            var ai10: u32 = 0;
-            while (ai10 < lu.arity) : (ai10 += 1) try w.print(", klio_value a{d}", .{ai10});
-            try w.writeAll(") {\n  uint32_t k = klio_nat_class_of(f);\n  (void)k;\n");
-            for (used_lambdas.items) |lu2| {
-                if (lu2.arity != lu.arity) continue;
-                try w.print("  if (k == KLAM_{d}) return klam_{d}(f", .{ lu2.body.int(), lu2.body.int() });
-                var aj10: u32 = 0;
-                while (aj10 < lu.arity) : (aj10 += 1) try w.print(", a{d}", .{aj10});
-                try w.writeAll(");\n");
-            }
-            try w.writeAll("  klio_nat_no_method(\"invoke\");\n  return klio_nat_box_unit();\n}\n");
-            // The same dispatcher in the uniform shape a stdlib entry calls
-            // back through: `forEach` and its kind hand the runtime a closure
-            // VALUE and an argument array.
-            try w.print("static klio_value klam_inv_{d}(klio_value f, const klio_value *a) {{\n  (void)a;\n  return klam_call_{d}(f", .{ lu.arity, lu.arity });
-            var ai11: u32 = 0;
-            while (ai11 < lu.arity) : (ai11 += 1) try w.print(", a[{d}]", .{ai11});
-            try w.writeAll(");\n}\n");
+    return true;
+}
+
+/// One dispatcher per arity called through a function value, and the
+/// uniform shape a stdlib entry calls back through.
+fn writeValueCallDispatchers(e: *Emit) Error!void {
+    const w = e.w;
+    const used_lambdas = e.used_lambdas;
+    var seen_ar2: [FUNC_MAX_ARITY + 1]bool = @splat(false);
+    for (used_lambdas.items) |lu| {
+        if (seen_ar2[lu.arity]) continue;
+        seen_ar2[lu.arity] = true;
+        try w.print("static klio_value klam_call_{d}(klio_value f", .{lu.arity});
+        var ai10: u32 = 0;
+        while (ai10 < lu.arity) : (ai10 += 1) try w.print(", klio_value a{d}", .{ai10});
+        try w.writeAll(") {\n  uint32_t k = klio_nat_class_of(f);\n  (void)k;\n");
+        for (used_lambdas.items) |lu2| {
+            if (lu2.arity != lu.arity) continue;
+            try w.print("  if (k == KLAM_{d}) return klam_{d}(f", .{ lu2.body.int(), lu2.body.int() });
+            var aj10: u32 = 0;
+            while (aj10 < lu.arity) : (aj10 += 1) try w.print(", a{d}", .{aj10});
+            try w.writeAll(");\n");
         }
+        try w.writeAll("  klio_nat_no_method(\"invoke\");\n  return klio_nat_box_unit();\n}\n");
+        // The same dispatcher in the uniform shape a stdlib entry calls
+        // back through: `forEach` and its kind hand the runtime a closure
+        // VALUE and an argument array.
+        try w.print("static klio_value klam_inv_{d}(klio_value f, const klio_value *a) {{\n  (void)a;\n  return klam_call_{d}(f", .{ lu.arity, lu.arity });
+        var ai11: u32 = 0;
+        while (ai11 < lu.arity) : (ai11 += 1) try w.print(", a[{d}]", .{ai11});
+        try w.writeAll(");\n}\n");
     }
+}
+
+/// One dispatcher per storage-less property, switching on the receiver's
+/// class exactly as a method does.
+fn writePropertyDispatchers(e: *Emit) Error!void {
+    const m = e.m;
+    const w = e.w;
+    const prog = e.prog;
+    const accepted = e.accepted;
+    const used_props = e.used_props;
+    const used_classes = e.used_classes;
     for (used_props.items) |pu| {
         var mb2: [96]u8 = undefined;
         try w.print("static {s} kprop_{d}_{s}(klio_value recv) {{\n  uint32_t k = klio_nat_class_of(recv);\n  (void)k;\n", .{
@@ -1587,7 +2082,16 @@ pub fn emit(
             try w.writeAll("  return 0;\n}\n");
         }
     }
-    if (used_lambdas.items.len != 0) try w.writeAll("\n");
+}
+
+/// The one instance of each `object` and enum entry, built and rooted
+/// before the program runs.
+fn writeSingletonInitializer(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const w = e.w;
+    const prog = e.prog;
+    const used_singletons = e.used_singletons;
     if (used_singletons.items.len != 0) {
         try w.writeAll("static void klio_init_singletons(void) {\n");
         try w.print("  for (unsigned i = 0; i < {d}; i++) KO[i] = klio_nat_box_unit();\n", .{used_singletons.items.len});
@@ -1633,6 +2137,15 @@ pub fn emit(
         }
         try w.writeAll("}\n\n");
     }
+}
+
+/// The top-level properties, initialized in declaration order.
+fn writeGlobalInitializer(e: *Emit) Error!void {
+    const gpa = e.gpa;
+    const m = e.m;
+    const w = e.w;
+    const accepted = e.accepted;
+    const used_globals = e.used_globals;
     if (used_globals.items.len != 0) {
         try w.writeAll("static void klio_init_globals(void) {\n");
         try w.print("  for (unsigned i = 0; i < {d}; i++) KG[i] = klio_nat_box_unit();\n", .{used_globals.items.len});
@@ -1654,7 +2167,17 @@ pub fn emit(
         }
         try w.writeAll("}\n\n");
     }
+}
 
+/// `main`: start the runtime, build what the program roots, call the entry.
+fn writeMain(e: *Emit) Error!void {
+    const w = e.w;
+    const entry = e.entry;
+    const used_singletons = e.used_singletons;
+    const used_lambdas = e.used_lambdas;
+    const used_globals = e.used_globals;
+    const uses_objects = e.uses_objects;
+    const uses_try = e.uses_try;
     try w.writeAll("int main(void) {\n");
     if (uses_objects) try w.writeAll("  klio_nat_init(0);\n  klio_register_classes();\n");
     if (uses_try) try w.writeAll(
@@ -1701,5 +2224,4 @@ pub fn emit(
     try w.writeAll("  ");
     try writeSymbol(w, entry);
     try w.writeAll("();\n  return 0;\n}\n");
-    return true;
 }
