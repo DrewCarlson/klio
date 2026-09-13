@@ -1,9 +1,7 @@
-//! Static call return-type derivation — the on-demand answer to "what type
-//! does this call expression have?". Given a call site, the ladder here walks
-//! the bare / FQN / member / local-function arms in turn, deriving a declared
-//! return where one exists and refusing where the evidence is ambiguous. The
-//! answers feed overload selection, receiver typing and local-init typing back
-//! in `expr.zig`; nothing here emits instructions.
+//! Static call return-type derivation: the on-demand answer to what type a call
+//! expression has. The ladder walks the bare, FQN, member and local-function arms
+//! in turn, refusing where the evidence is ambiguous. The answers feed overload
+//! selection, receiver typing and local-init typing; nothing here emits code.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -30,7 +28,6 @@ const TypeRef = ir.TypeRef;
 const exprSpan = helpers.exprSpan;
 const collectDottedFqn = ast_scan.collectDottedFqn;
 
-// Re-aliases for the expression-lowering free functions used below.
 const allNull = expr.allNull;
 const argDeclTypeRefLazy = expr.argDeclTypeRefLazy;
 const bareStaticRecvHead = expr.bareStaticRecvHead;
@@ -54,10 +51,8 @@ const staticExprTypeRef = expr.staticExprTypeRef;
 const staticTypeClassId = expr.staticTypeClassId;
 const typeHead = expr.typeHead;
 
-/// The caller's body has the target's OWNER type parameters in lexical
-/// scope: every one of the owner's params is a registered type-param name
-/// on this builder. True only inside the owner's own (or a nested)
-/// declaration context.
+/// Whether the caller's body has the target's owner type parameters in lexical
+/// scope, true only inside the owner's own or a nested declaration context.
 fn ownerParamsInScope(b: *FuncBuilder, target: FuncId) bool {
     const ds = b.module.decl_sigs.get(target.int()) orelse return false;
     const oid = ds.enclosing_class orelse return false;
@@ -70,9 +65,8 @@ fn ownerParamsInScope(b: *FuncBuilder, target: FuncId) bool {
     return true;
 }
 
-/// The bare-call arm's extension attempt: a bare name in a receiver context
-/// that no member serves may be an extension of the implicit receiver.
-/// Gated by `KLIO_BARE_EXT` for single-binary A/B.
+/// The bare-call arm's extension attempt: a bare name in a receiver context that
+/// no member serves may be an extension of the implicit receiver.
 fn bareExtensionTarget(
     b: *FuncBuilder,
     name: ast.Ident,
@@ -96,15 +90,13 @@ fn bareExtensionTarget(
     };
     {
         const r = b.module.resolveExtensionCall(name.name, recv, shapes, ctx);
-        // TYPING-only consumer: a strict-key winner withheld solely on an
-        // unknown argument still lends its RETURN TYPE (never emission).
+        // Typing only: a strict-key winner withheld solely on an unknown argument
+        // still lends its return type, never an emission.
         if (r.target orelse r.sole_unknown) |t| return t;
     }
-    // Kotlin resolves a bare call against EVERY implicit receiver,
-    // innermost first. When the innermost head serves no extension, the
-    // OUTER tower entries are the remaining candidates (`collect {}`
-    // inside an operator's flow-lambda belongs to `this@drop : Flow`).
-    // Derivation-side only; gated for single-binary A/B.
+    // Kotlin resolves a bare call against every implicit receiver, innermost first,
+    // so when the innermost head serves no extension the outer tower entries are the
+    // remaining candidates.
     if (!std.mem.eql(u8, runtime.envOnce("KLIO_TOWER_EXT") orelse "1", "0")) {
         const recv_head = typeHead(std.mem.trimEnd(u8, recv.name, "?"));
         for (b.implicit_receiver_tower.items) |entry| {
@@ -116,9 +108,9 @@ fn bareExtensionTarget(
     return null;
 }
 
-/// Replace each use-site-projected argument name (`in#K`, `out#E`) with the
-/// plain parameter, recursively. The owned name is re-allocated so `deinit`
-/// still frees what `clone` allocated.
+/// Replace each use-site-projected argument name (`in#K`, `out#E`) with the plain
+/// parameter, recursively. The owned name is re-allocated so `deinit` still frees
+/// what `clone` allocated.
 fn stripUseSiteProjections(a: Allocator, ty: *ir.TypeRef) Allocator.Error!void {
     for (ty.args) |*arg| {
         const suffix: ?[]const u8 = if (std.mem.startsWith(u8, arg.name, "in#"))
@@ -136,8 +128,7 @@ fn stripUseSiteProjections(a: Allocator, ty: *ir.TypeRef) Allocator.Error!void {
     }
 }
 
-/// The receiver-type chain used by the `Member` and `Index` arms. Gated so the
-/// widening can be measured against the narrower answer it replaced.
+/// The receiver-type chain used by the `Member` and `Index` arms.
 fn recvChainTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
     if (std.mem.eql(u8, runtime.envOnce("KLIO_RECV_CHAIN") orelse "1", "0")) {
         if (argDeclTypeRefLazy(b, e)) |known| return try known.clone(b.allocator);
@@ -146,19 +137,16 @@ fn recvChainTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef
     return staticExprTypeRef(b, e);
 }
 
-/// The user-argument count of a `.Call` expression (named or not).
+/// The user-argument count of a `.Call` expression, named or not.
 fn memberArgCount(call_expr: *const Expr) usize {
     if (call_expr.* != .Call) return 0;
     return call_expr.Call.args.len;
 }
 
-/// The declared RETURN type of a call whose callee is a function-typed local
-/// or parameter. `assertIterableContentEquals(… , iterator: T.() -> Iterator<*>)`
-/// calls the parameter as `expected.iterator()`, and without this the result
-/// local carries no type at all, so every `hasNext`/`next` on it resolves by
-/// name. A lowered function type keeps its return as the LAST entry of `args`
-/// (after the optional `#suspend` marker, the optional receiver, and the
-/// parameters), which is the shape `loweredTypeRef` writes.
+/// The declared return type of a call whose callee is a function-typed local or
+/// parameter, without which the result local carries no type. A lowered function
+/// type keeps its return as the last entry of `args`, after the optional `#suspend`
+/// marker, the optional receiver, and the parameters.
 fn fnTypedCalleeReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
     if (call_expr.* != .Call) return null;
     const callee = call_expr.Call.callee;
@@ -167,13 +155,11 @@ fn fnTypedCalleeReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator
         .Member => |m| m.name.name,
         else => return null,
     };
-    // A recorded declared type is evidence on its own: a PROBE builder
-    // (the scope-fn tail derive) carries the enclosing scope's decl types
-    // without its registers, and a captured `arg1: (String) -> CharSequence`
-    // must still answer through its declared return.
+    // A recorded declared type is evidence on its own: a probe builder carries the
+    // enclosing scope's decl types without its registers.
     const ty = b.localDeclTypeRef(name) orelse return null;
-    // Both fn-type spellings: the registry's `FunctionN` and the local
-    // channel's `<function>` head.
+    // Both fn-type spellings: the registry's `FunctionN` and the local channel's
+    // `<function>` head.
     if (!std.mem.startsWith(u8, ty.name, "Function") and
         !std.mem.eql(u8, ty.name, "<function>")) return null;
     if (ty.args.len == 0) return null;
@@ -182,10 +168,8 @@ fn fnTypedCalleeReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator
     return try ret.clone(b.allocator);
 }
 
-/// The return type of a call whose callee spells a dotted FQN
-/// (`kotlin.math.floor(x)`). The declaration is picked the same way the
-/// emission picks it — exact FQN, matching arity — so the answer is the one
-/// declaration the call runs, never a same-tail namesake in another package.
+/// The return type of a call whose callee spells a dotted FQN, picked the way the
+/// emission picks it, by exact FQN and matching arity.
 fn fqnCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
     if (call_expr.* != .Call) return null;
     const callee = call_expr.Call.callee;
@@ -207,18 +191,16 @@ fn fqnCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error
     return null;
 }
 
-/// The declared return of a bare call to a LOCAL `fun`. A local function is
-/// lifted under a mangled module name, so the simple-name index cannot answer
-/// for it — `expect("'-'", i) { it == '-' }?.let { ... }` inside `parseIso`
-/// left the whole chain untyped. Only an unambiguous answer is taken: same
-/// return type across every same-named declaration in scope.
+/// The declared return of a bare call to a local `fun`, which is lifted under a
+/// mangled module name the simple-name index cannot answer for. Only an unambiguous
+/// answer is taken: the same return across every same-named declaration in scope.
 fn localFnReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
     if (call_expr.* != .Call) return null;
     const callee = call_expr.Call.callee;
     if (callee.* != .Path or callee.Path.segments.len != 1) return null;
     const nm = callee.Path.segments[0].name;
-    // A local `fun` is ALSO bound to a register holding its closure, so a
-    // non-null `resolve` says nothing here — the name is the function.
+    // A local `fun` is also bound to a register holding its closure, so a non-null
+    // `resolve` says nothing here; the name is the function.
     if (!b.isLocalFn(nm)) return null;
     const decls = b.localFnDecls(nm) orelse return null;
     var agreed: ?ir.TypeRef = null;
@@ -234,11 +216,9 @@ fn localFnReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error
     return try ret.clone(b.allocator);
 }
 
-/// The declared return of a BARE top-level / extension call, when the
-/// call-site evidence commits one candidate: an `as`-cast pick, the trailing
-/// lambda's derived return (the sumOf family), or a sole arity-matching
-/// body-carrying candidate. `val totalSizeLong = sumOf { it.size.toLong() }`
-/// types Long here; an unresolvable set stays untyped.
+/// The declared return of a bare top-level or extension call when the call-site
+/// evidence commits one candidate: an `as`-cast pick, the trailing lambda's derived
+/// return, or a sole arity-matching body-carrying candidate.
 fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
     if (call_expr.* != .Call) return null;
     const call = call_expr.Call;
@@ -261,9 +241,8 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
     var pick: ?FuncId = (try overloadPickByCast(b, cands, call.args, want)) orelse
         try overloadPickByLambdaReturn(b, cands, call.args, want);
     if (pick == null and want != 0 and want <= 4) exact: {
-        // EXACT argument-head discrimination for a scalar overload family:
-        // `getProgressionLastElement(Int, Int, Int): Int` vs the
-        // `(Long, Long, Long): Long` sibling picks by the derived heads.
+        // Exact argument-head discrimination for a scalar overload family, where
+        // the Int and Long siblings pick by the derived heads.
         var heads: [4]?ir.TypeRef = .{ null, null, null, null };
         defer for (heads[0..want]) |*h| if (h.*) |*t| t.deinit(b.allocator);
         if (expr.od_depth >= 3) break :exact;
@@ -299,23 +278,18 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
     if (runtime.envOnce("KLIO_VARARG_TRACE") != null and std.mem.eql(u8, nm, "listOf"))
         std.debug.print("[vaf-enter] {s} pick={} want={d} depth={d}\n", .{ nm, pick != null, want, expr.od_depth });
     if (pick == null and want != 0 and want <= 8 and expr.od_depth < 3) vararg_full: {
-        // A SOLE trailing-vararg candidate whose EVERY argument derives one
-        // concrete head yields its return FULLY instantiated —
-        // `listOf("foo", "bar")` is a `List<String>`. The reverted
-        // head-only variant broke user extensions precisely because it
-        // dropped the arguments; a complete record is what kotlinc infers.
-        // Every qualifying candidate (trailing vararg, one value param, one
-        // fn type param, declared return `Head<T>`): the record derives
-        // only when they all AGREE on the return head — a duplicated
-        // source-set `listOf` in the commontest image is one answer, a
-        // genuinely different-returning sibling refuses as before.
+        // A sole trailing-vararg candidate whose every argument derives one concrete
+        // head yields its return fully instantiated, which is what kotlinc infers.
+        // Every qualifying candidate has a trailing vararg, one value param, one fn
+        // type param, and a declared return `Head<T>`; the record derives only when
+        // they all agree on the return head.
         var sole_v: ?FuncId = null;
         var agree_head: ?[]const u8 = null;
         for (cands) |fid| {
             const f3 = b.module.funcById(fid) orelse continue;
-            // No body requirement: this arm derives a TYPE record from the
-            // declared signature alone, and the image's lazy-header
-            // `listOf` is bodyless until materialized.
+            // No body requirement: this arm derives from the declared signature
+            // alone, and the image's lazy-header `listOf` is bodyless until
+            // materialized.
             const base: usize = if (f3.params.len != 0 and std.mem.eql(u8, f3.params[0].name, "this")) 1 else 0;
             const has_va = f3.params.len != 0 and f3.params[f3.params.len - 1].is_vararg;
             if (!has_va or f3.params.len -| base != 1) continue;
@@ -336,10 +310,10 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             if (std.mem.startsWith(u8, ra3, "in#")) ra3 = ra3[3..];
             if (std.mem.startsWith(u8, ra3, "out#")) ra3 = ra3[4..];
             var tp3: []const u8 = tps3.items[0];
-            // Identity-mangled spellings (`T#owner`) compare by their bare
-            // parameter name.
-            if (std.mem.indexOfScalar(u8, ra3, '#')) |hx| ra3 = ra3[0..hx];
-            if (std.mem.indexOfScalar(u8, tp3, '#')) |hx| tp3 = tp3[0..hx];
+            // Identity-mangled spellings (`T#owner`) compare by their bare parameter
+            // name.
+            if (std.mem.findScalar(u8, ra3, '#')) |hx| ra3 = ra3[0..hx];
+            if (std.mem.findScalar(u8, tp3, '#')) |hx| tp3 = tp3[0..hx];
             if (!std.mem.eql(u8, ra3, tp3)) {
                 if (vtr) std.debug.print("[vaf-cand] {s} ra={s} tp={s}\n", .{ f3.fqn, ra3, tp3 });
                 break :vararg_full;
@@ -361,10 +335,8 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
         const f2 = b.module.funcById(vf) orelse break :vararg_full;
         var elem_owned: ?ir.TypeRef = null;
         var elem_ok = true;
-        // Heterogeneous elements infer their least upper bound; the head
-        // this record needs is `Any` (`listOf('a', "b", sb, null)` is a
-        // `List<Any?>` wherever the local dispatches). A null literal
-        // contributes only nullability.
+        // Heterogeneous elements infer their least upper bound, and the head this
+        // record needs is `Any`. A null literal contributes only nullability.
         var diverged = false;
         var saw_null = false;
         var heads_buf: [16][]const u8 = undefined;
@@ -390,10 +362,10 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             }
             const th = typeHead(t2.name);
             if (nheads < heads_buf.len) {
-                // The qualified head (`Holder.Child1`), not the simple one: a
-                // nested class resolves by its qualified name.
+                // The qualified head, not the simple one: a nested class resolves by
+                // its qualified name.
                 var full = std.mem.trimEnd(u8, t2.name, "?");
-                if (std.mem.indexOfScalar(u8, full, '<')) |lt| full = full[0..lt];
+                if (std.mem.findScalar(u8, full, '<')) |lt| full = full[0..lt];
                 heads_buf[nheads] = b.allocator.dupe(u8, full) catch th;
                 nheads += 1;
             }
@@ -409,11 +381,9 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             if (elem_owned) |prev| {
                 const same = std.mem.eql(u8, prev.name, t2.name);
                 if (!same) {
-                    // Kotlin joins heterogeneous elements at their least
-                    // upper bound, not at `Any`: `listOf(Derived(), Base())`
-                    // is a `List<Base>`, and the declared element is what
-                    // extensions bind against. A subtype pair joins at the
-                    // wider head; unrelated heads keep the Any degrade.
+                    // Kotlin joins heterogeneous elements at their least upper bound,
+                    // not at `Any`, and the declared element is what extensions bind
+                    // against; unrelated heads keep the Any degrade.
                     const ph = typeHead(std.mem.trimEnd(u8, prev.name, "?"));
                     const th2 = typeHead(std.mem.trimEnd(u8, t2.name, "?"));
                     if (b.module.classIsOrExtends(th2, ph)) {
@@ -439,20 +409,17 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             break :vararg_full;
         }
         if (diverged) {
-            // Unrelated element classes widen to their least upper bound
-            // (`listOf(ResponseInt(10), NoResponse, ResponseString("foo"))`
-            // is a `List<I>` over the sealed interface); `Any` only when no
-            // common class exists.
+            // Unrelated element classes widen to their least upper bound, `Any` only
+            // when no common class exists.
             elem_owned.?.deinit(b.allocator);
             const lub = leastUpperBoundOfHeads(b, heads_buf[0..nheads]) orelse "Any";
             elem_owned = .{ .name = try b.allocator.dupe(u8, lub), .nullable = saw_null, .args = &.{} };
         } else if (saw_null) {
             elem_owned.?.nullable = true;
         }
-        // An EXPLICIT type argument outranks argument-head inference —
-        // `listOf<Base>(Derived())` is a `List<Base>`, exactly as kotlinc
-        // instantiates it, and the static extension binding downstream
-        // depends on the declared element, not the runtime one.
+        // An explicit type argument outranks argument-head inference, as kotlinc
+        // instantiates it, and the static extension binding downstream depends on
+        // the declared element.
         if (call.type_args.len == 1) {
             const ta = &call.type_args[0];
             if (ta.name.name.len != 0 and !b.isTypeParam(ta.name.name)) {
@@ -471,13 +438,9 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
         return .{ .name = ret_head, .nullable = f2.return_ty.nullable, .args = out_args };
     }
     if (pick == null) {
-        // The sole-survivor rule must respect the EXTENSION RECEIVER: with
-        // the stdlib's declarations bodyless in a pack-loaded universe, the
-        // one BODIED same-arity candidate can be an unrelated-receiver
-        // extension (kotlinx's deprecated `Flow.flatMap` served a bare
-        // `flatMap { }` on a Set receiver and stamped `declared=Flow` on
-        // the chained call). A non-generic declared receiver the context
-        // receiver cannot serve is not a candidate at all.
+        // The sole-survivor rule must respect the extension receiver: with the
+        // stdlib bodyless in a pack-loaded universe, the one bodied same-arity
+        // candidate can be an unrelated-receiver extension.
         const actual_head: ?[]const u8 = blk_ah: {
             const h = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse break :blk_ah null;
             break :blk_ah typeHead(std.mem.trimEnd(u8, h, "?"));
@@ -491,7 +454,7 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
             if (f.params.len -| base != want) continue;
             if (base == 1) {
                 var dr = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
-                if (std.mem.indexOfScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
+                if (std.mem.findScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
                 const dh = typeHead(dr);
                 const generic = dh.len <= 2 or
                     ir.parseClassTypeParamIdentity(f.params[0].ty.name) != null;
@@ -511,16 +474,13 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
     if (bareTypeParamHead(f.return_ty.name) or
         ir.parseClassTypeParamIdentity(f.return_ty.name) != null) return null;
     if (staticTypeClassId(b, f.return_ty) == null) return null;
-    // A generic return keeps only its head unless every argument is
-    // concrete — a poisoned `List<T>` record disproves more than it types.
+    // A generic return keeps only its head unless every argument is concrete; a
+    // poisoned `List<T>` record disproves more than it types.
     for (f.return_ty.args) |arg| {
         if (bareTypeParamHead(arg.name) or ir.parseClassTypeParamIdentity(arg.name) != null) {
-            // The IMPLICIT receiver instantiates an EXTENSION's generic
-            // return: bare `toMutableList()` inside `Iterable<Base>.f()`
-            // is `MutableList<Base>` — without the record, the local it
-            // initializes stays untyped and a value read from it binds
-            // extensions against its RUNTIME class instead of the
-            // declared element.
+            // The implicit receiver instantiates an extension's generic return, so
+            // a bare `toMutableList()` inside `Iterable<Base>.f()` is
+            // `MutableList<Base>`; without it the local stays untyped.
             if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) recv_inst: {
                 const fr: ir.TypeRef = if (b.spliceRecvTyRef()) |r| r.* else (b.recvTypeRef() orelse break :recv_inst);
                 if (fr.args.len == 0) break :recv_inst;
@@ -542,11 +502,8 @@ fn bareCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Erro
                     out2.deinit(b.allocator);
                 }
             }
-            // An EXPLICIT type-argument list instantiates the generic
-            // return directly: `emptyList<Int>()` IS `List<Int>` — kotlinc
-            // resolves the overload set on it statically, and dropping it
-            // left an empty value's runtime pick to a value-shape memo
-            // that replays whichever caller ran first.
+            // An explicit type-argument list instantiates the generic return
+            // directly, and kotlinc resolves the overload set on it statically.
             if (call.type_args.len != 0) explicit: {
                 const expl_trace = if (runtime.envOnce("KLIO_SCRT_TRACE")) |w| std.mem.eql(u8, w, nm) else false;
                 const tp = b.module.registry.func_type_params.get(fid) orelse {
@@ -614,11 +571,9 @@ fn scrtVia(call_expr: *const Expr, via: []const u8, t: ir.TypeRef) ir.TypeRef {
     return t;
 }
 
-/// Whether `target` belongs to an overload family whose members return
-/// DIFFERENT primitive types and whose choice this call cannot prove — every
-/// candidate takes one scalar parameter and returns it, so the argument's own
-/// type is the only discriminator, and an unproven argument leaves the family
-/// undecided. A bare-name call only.
+/// Whether `target` belongs to an overload family whose members return different
+/// primitive types and whose choice this call cannot prove: every candidate takes
+/// one scalar parameter and returns it. A bare-name call only.
 fn scalarOverloadUnproven(b: *FuncBuilder, call: anytype, target: FuncId) Allocator.Error!bool {
     if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return false;
     if (call.args.len != 1) return false;
@@ -648,9 +603,8 @@ fn scalarOverloadUnproven(b: *FuncBuilder, call: anytype, target: FuncId) Alloca
     return true;
 }
 
-/// The nearest class every head is or extends, walking the first head's
-/// supertype chain outward (breadth first); null when no class short of
-/// `Any` is common to all of them.
+/// The nearest class every head is or extends, walking the first head's supertype
+/// chain outward breadth-first; null when no class short of `Any` is common.
 fn leastUpperBoundOfHeads(b: *const FuncBuilder, heads: []const []const u8) ?[]const u8 {
     if (heads.len < 2) return null;
     const lub_trace = runtime.envOnce("KLIO_LUB_TRACE") != null;
@@ -690,10 +644,9 @@ fn leastUpperBoundOfHeads(b: *const FuncBuilder, heads: []const []const u8) ?[]c
     return null;
 }
 
-/// A bare type-parameter result (`decodeFromString<T>(...): T`, bare or
-/// member call) takes the EXPLICIT type argument written at the call
-/// (`json.decodeFromString<List<Cases>>(...)`), type arguments included, so
-/// a local initialized by the call is typed `List<Cases>` rather than `T`.
+/// A bare type-parameter result takes the explicit type argument written at the
+/// call, type arguments included, so a local initialized by it is typed by that
+/// argument rather than by `T`.
 fn explicitBareReturn(b: *FuncBuilder, call_expr: *const Expr, r: ?ir.TypeRef) Allocator.Error!?ir.TypeRef {
     const t = r orelse return null;
     if (call_expr.* != .Call) return r;
@@ -756,10 +709,9 @@ fn staticCallReturnTypeRefInner(
             std.debug.print("[scrt-in] {s} nargs={d}\n", .{ w, call_expr.Call.args.len });
         }
     }
-    // The Any members' returns are fixed by their signatures — every
-    // override keeps them — so a chain does not die at `.toString()` on a
-    // receiver nothing could type (`(...).toString().substring(1)`). A
-    // safe call carries the `?`.
+    // The `Any` members' returns are fixed by their signatures, every override
+    // keeping them, so a chain does not die on an untypeable receiver. A safe call
+    // carries the `?`.
     if (call_expr.* == .Call) {
         const c = call_expr.Call;
         if (c.callee.* == .Member) {
@@ -774,10 +726,8 @@ fn staticCallReturnTypeRefInner(
             if (c.args.len == 1 and std.mem.eql(u8, nm2, "equals")) {
                 return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = m.safe, .args = &.{} };
             }
-            // The scalar CONVERSIONS have fixed returns on a primitive
-            // receiver (`it.size.toLong()` in the pick's probe builder -
-            // the builtin class rows carry no method ids for the member
-            // resolution to answer through).
+            // The scalar conversions have fixed returns on a primitive receiver,
+            // whose builtin class rows carry no method ids to resolve through.
             if (c.args.len == 0 and !m.safe and expr.od_depth < 4) conv: {
                 const table = [_]struct { n: []const u8, t: []const u8 }{
                     .{ .n = "toInt", .t = "Int" },       .{ .n = "toLong", .t = "Long" },
@@ -807,11 +757,9 @@ fn staticCallReturnTypeRefInner(
             }
         }
     }
-    // The universal scope functions have fixed semantics (the emission
-    // already treats them as no-dispatch splices): `.also`/`.apply` return
-    // their RECEIVER, `.let`/`.run` return their lambda's tail, derived
-    // under the receiver-bound parameter. Depth-guarded like every other
-    // recursive derivation.
+    // The universal scope functions have fixed semantics, the emission already
+    // treating them as no-dispatch splices: `.also`/`.apply` return their receiver,
+    // `.let`/`.run` their lambda's tail. Depth-guarded like every recursive derivation.
     if (call_expr.* == .Call) scope_fns: {
         const c = call_expr.Call;
         if (c.callee.* != .Member) break :scope_fns;
@@ -822,10 +770,9 @@ fn staticCallReturnTypeRefInner(
         if (!is_echo and !is_tail) break :scope_fns;
         const sfx_trace = runtime.envOnce("KLIO_SCOPEFN_TRACE") != null;
         if (sfx_trace) std.debug.print("[scopefn] {s} enter depth={d}\n", .{ nm2, expr.od_depth });
-        // The ambient derivation chain often sits at depth 3 when a local's
-        // `.let` init derives (emission ladder -> init chain -> nested
-        // derivations); this arm does constant extra work per level, so it
-        // gets its own slightly higher constant bound.
+        // The ambient derivation chain often sits at depth 3 when a local's `.let`
+        // init derives, and this arm does constant work per level, so it gets a
+        // slightly higher bound.
         if (expr.od_depth >= 6) {
             if (sfx_trace) std.debug.print("[scopefn] {s} bail=depth {d}\n", .{ nm2, expr.od_depth });
             break :scope_fns;
@@ -835,9 +782,8 @@ fn staticCallReturnTypeRefInner(
             break :scope_fns;
         }
         // Only when no competing declaration could own the name: every
-        // same-simple-name candidate must be a kotlin-package extension (a
-        // user's own `let` keeps its declared return), and the receiver's
-        // class hierarchy must not declare a member of the name.
+        // same-simple-name candidate must be a kotlin-package extension, and the
+        // receiver's hierarchy must not declare a member of the name.
         for (b.module.funcsBySimpleName(nm2)) |fid2| {
             const f2 = b.module.funcById(fid2) orelse continue;
             const is_ext2 = f2.params.len != 0 and std.mem.eql(u8, f2.params[0].name, "this");
@@ -854,10 +800,9 @@ fn staticCallReturnTypeRefInner(
             if (sfx_trace) std.debug.print("[scopefn] {s} bail=recv_untyped\n", .{nm2});
             break :scope_fns;
         };
-        // No hierarchy-name check here: the registry's transitive-name
-        // records list the scope functions as reachable on every builtin
-        // head, and a USER class's member of the name registers in the
-        // simple-name index the candidate gate above already walks.
+        // No hierarchy-name check here: the registry lists the scope functions as
+        // reachable on every builtin head, and a user class's member registers in
+        // the simple-name index the gate above walks.
         if (is_echo) {
             var echo = recv_owned;
             if (m.safe) echo.nullable = true;
@@ -870,10 +815,8 @@ fn staticCallReturnTypeRefInner(
         var nb2 = FuncBuilder.init(b.allocator, b.module) catch break :scope_fns;
         nb2.census_quiet = true;
         defer nb2.deinit();
-        // The lambda's free names resolve in the ENCLOSING scope
-        // (`if (it == 0) perLine else it` reads the fn's param): seed the
-        // probe builder with its declared types; the receiver-bound
-        // parameter below shadows.
+        // The lambda's free names resolve in the enclosing scope, so seed the probe
+        // builder with its declared types; the receiver-bound parameter shadows.
         {
             var dit2 = b.local_decl_types.iterator();
             while (dit2.next()) |e2| {
@@ -883,8 +826,7 @@ fn staticCallReturnTypeRefInner(
         if (std.mem.eql(u8, nm2, "let")) {
             const pname = if (lam.params.len != 0) lam.params[0].name else "it";
             var seed = recv_owned.clone(b.allocator) catch break :scope_fns;
-            // A safe call unwraps: the parameter inside `x?.let { }` is
-            // non-null.
+            // A safe call unwraps: the parameter inside `x?.let { }` is non-null.
             if (m.safe) seed.nullable = false;
             nb2.setLocalDeclTypeOwned(pname, seed) catch break :scope_fns;
         } else {
@@ -893,7 +835,7 @@ fn staticCallReturnTypeRefInner(
         if (staticExprTypeRef(&nb2, &stmts2[stmts2.len - 1].Expr) catch null) |derived| {
             var dt = derived;
             var h = std.mem.trimEnd(u8, dt.name, "?");
-            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
             const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
                 ir.parseClassTypeParamIdentity(h) != null;
             if (h.len != 0 and !bare) {
@@ -940,15 +882,14 @@ fn staticCallReturnTypeRefInner(
         var inferred_receiver: ?ir.TypeRef = null;
         defer if (inferred_receiver) |*ty| ty.deinit(b.allocator);
         const receiver = argDeclTypeRefLazy(b, bin.lhs) orelse blk: {
-            // The FULL deriver, not the call-return subset: an Index lhs
-            // (`s[index] - '0'`) types through the element arm only there.
+            // The full deriver, not the call-return subset: an Index lhs types
+            // through the element arm only there.
             inferred_receiver = try staticExprTypeRef(b, bin.lhs);
             break :blk inferred_receiver orelse return null;
         };
         if (isPrimitiveTypeName(typeHead(receiver.name))) {
-            // A primitive operand's arithmetic RESULT type is table-driven —
-            // no operator resolution needed. `it * 2` in a `List(3) { … }`
-            // init lambda must derive `Int` for the lambda-return channel.
+            // A primitive operand's arithmetic result type is table-driven, needing
+            // no operator resolution.
             if (primitiveBinResultHead(b, typeHead(std.mem.trimEnd(u8, receiver.name, "?")), bin)) |head| {
                 return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
             }
@@ -964,15 +905,15 @@ fn staticCallReturnTypeRefInner(
         var target: ?FuncId = null;
         var member_applicable = false;
         var identity = std.mem.trimEnd(u8, receiver.name, "?");
-        if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+        if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
         const head = typeHead(identity);
-        const owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+        const owner_id = if (std.mem.findScalar(u8, identity, '.') != null)
             b.module.classIdByFqn(identity)
         else
             b.module.uniqueClassIdBySimpleName(head);
         if (owner_id) |owner| {
             const lexical_owner: ?ir.ClassId = if (b.ownerClass()) |owner_name|
-                (if (std.mem.indexOfScalar(u8, owner_name, '.') != null)
+                (if (std.mem.findScalar(u8, owner_name, '.') != null)
                     b.module.classIdByFqn(owner_name)
                 else
                     (b.module.classIdIndexed(
@@ -1034,9 +975,8 @@ fn staticCallReturnTypeRefInner(
             &.{},
         );
     }
-    // `a[i]` is `a.get(i)`, so the element's static type is `get`'s return
-    // type on the container. Lowering emits it as an Index instruction, but the
-    // TYPE question is the ordinary member one.
+    // `a[i]` is `a.get(i)`, so the element's static type is `get`'s return type on
+    // the container, the ordinary member question even though lowering emits Index.
     if (call_expr.* == .Index and
         !std.mem.eql(u8, runtime.envOnce("KLIO_OPERATOR_TY") orelse "1", "0"))
     {
@@ -1052,8 +992,8 @@ fn staticCallReturnTypeRefInner(
         const owned_bounds = try b.typeParamBoundsSlice();
         defer if (owned_bounds) |bounds| b.allocator.free(bounds);
         var identity = std.mem.trimEnd(u8, recv_owned.name, "?");
-        if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
-        const owner = (if (std.mem.indexOfScalar(u8, identity, '.') != null)
+        if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+        const owner = (if (std.mem.findScalar(u8, identity, '.') != null)
             b.module.classIdByFqn(identity)
         else
             b.module.uniqueClassIdBySimpleName(typeHead(identity))) orelse {
@@ -1084,9 +1024,8 @@ fn staticCallReturnTypeRefInner(
         return idx_ret;
     }
     if (call_expr.* != .Call) return null;
-    // A DIRECT constructor expression names its own type
-    // (`SlotTable().also { it.write { … } }` types `it` without a local
-    // in between); the guards inside decline shadowing locals/functions.
+    // A direct constructor expression names its own type, and the guards inside
+    // decline shadowing locals and functions.
     if (!std.mem.eql(u8, runtime.envOnce("KLIO_CTOR_RET") orelse "1", "0")) {
         if (try ctorInitTypeRef(b, call_expr)) |ctor_ty| return ctor_ty;
     }
@@ -1135,11 +1074,8 @@ fn staticCallReturnTypeRefInner(
                 });
                 return null;
             }
-            // A name the enclosing receiver declares is a MEMBER call written
-            // without `this.`, not a top-level one — so it is exactly the case
-            // the implicit-receiver resolution below answers, and returning
-            // null here is what kept 908 bare `iterator()` initializers from
-            // lending their type.
+            // A name the enclosing receiver declares is a member call written
+            // without `this.`, which the implicit-receiver resolution below answers.
             const member_of_enclosing = enclosingHasMemberNamed(b, name.name);
             const res = if (member_of_enclosing)
                 ir.Module.Resolution{ .target = null, .confidence = .deferred, .emit_form = .Call }
@@ -1161,25 +1097,18 @@ fn staticCallReturnTypeRefInner(
                 );
             defer b.allocator.free(res.candidate_set);
             var from_implicit_receiver = false;
-            // A top-level pick made under a lambda's conservative receiver is
-            // not evidence, and neither is no pick at all — but the implicit
-            // RECEIVER may still prove one. Measured, a bare `iterator()`
-            // inside a stdlib extension body lands here with a non-exact
-            // top-level pick, and it is 908 of the 1,346 initializers that
-            // yield no type. An inline SPLICE window is a receiver context
-            // too: its receiver lives in the window hint, not recvTy, and a
-            // non-exact `iterator` pick there handed a Map-family
-            // declaration's `Iterator<Entry>` to a List splice, poisoning
-            // every `next()` after it.
+            // A top-level pick made under a lambda's conservative receiver is not
+            // evidence, and neither is no pick, but the implicit receiver may still
+            // prove one. An inline splice window is a receiver context too, its
+            // receiver living in the window hint rather than `recvTy`, and a
+            // non-exact pick there poisons every chained call after it.
             const top_level_usable = res.target != null and
                 (res.confidence == .exact or
                     (b.recvTy() == null and b.spliceRecvTy() == null and
                         !b.isParamThunk()));
-            // A refused top-level pick is still the ONLY answer when the name
-            // has exactly one declaration program-wide and no enclosing
-            // receiver declares a member of that name: there is nothing else
-            // it could resolve to, whatever the receiver context is. Used only
-            // where the receiver walk below finds nothing.
+            // A refused top-level pick is still the only answer when the name has
+            // exactly one declaration program-wide and no enclosing receiver
+            // declares a member of it. Used only where the receiver walk finds none.
             const sole_global: ?FuncId = blk_sole: {
                 if (std.mem.eql(u8, runtime.envOnce("KLIO_SOLE_GLOBAL") orelse "1", "0")) break :blk_sole null;
                 if (top_level_usable) break :blk_sole null;
@@ -1190,17 +1119,10 @@ fn staticCallReturnTypeRefInner(
                 if (f.kind != .plain) break :blk_sole null;
                 break :blk_sole t;
             };
-            // When EVERY plain declaration of the name agrees on a concrete
-            // return head, the head is authoritative without picking a fid:
-            // `listOf(x)` beside `listOf(vararg)` both answer List, and the
-            // receiver context that blocks a confident pick cannot change
-            // what any pick would return. Args are kept only when every
-            // declaration's full return matches.
-            //
-            // Both downstream collaterals that once parked this channel are
-            // fixed (the JIT stale-tag rebox; the arity gate's positional
-            // trailing-lambda blindness) — KLIO_AGREED_RET=0 re-parks it
-            // for A/B.
+            // When every plain declaration of the name agrees on a concrete return
+            // head, that head is authoritative without picking a fid, the receiver
+            // context blocking the pick not changing what any pick returns. Args are
+            // kept only when every declaration's full return matches.
             const agreed_return: ?ir.TypeRef = blk_agree: {
                 const atrace = if (runtime.envOnce("KLIO_AGREED_TRACE")) |w|
                     (std.mem.eql(u8, w, "*") or std.mem.eql(u8, w, name.name))
@@ -1215,10 +1137,8 @@ fn staticCallReturnTypeRefInner(
                     if (atrace) std.debug.print("[agreed] {s}: enclosing has member\n", .{name.name});
                     break :blk_agree null;
                 }
-                // A name ANY class declares as a member may be a receiver
-                // member here (`iterator()` inside a Sequence extension is
-                // `this.iterator()`) — the agreed top-level return would
-                // type it from the wrong declarations entirely.
+                // A name any class declares as a member may be a receiver member
+                // here, which the agreed top-level return would type wrongly.
                 if (b.module.registry.class_member_names.contains(name.name)) {
                     if (atrace) std.debug.print("[agreed] {s}: some class declares this member name\n", .{name.name});
                     break :blk_agree null;
@@ -1254,16 +1174,11 @@ fn staticCallReturnTypeRefInner(
             }
             target = (if (top_level_usable) res.target else null) orelse blk: {
                 from_implicit_receiver = true;
-                // A BARE call in a receiver context is usually a member of the
-                // implicit receiver written without `this.` — measured, 908 of
-                // the 1,439 initializers that yield no type are a bare
-                // `iterator()`, another 165 a bare `listIterator()`. Their
-                // result type is exactly what the local needs.
+                // A bare call in a receiver context is usually a member of the
+                // implicit receiver written without `this.`.
                 const bt = bareRetTraceFor(b, name.name);
-                // Inside a plain METHOD body the implicit receiver is the
-                // owner class itself (`findClause(x)` in trySelectInternal
-                // is `this.findClause(x)`); the head channels only cover
-                // extension receivers and narrows.
+                // Inside a plain method body the implicit receiver is the owner class
+                // itself; the head channels cover only extension receivers and narrows.
                 const head_name = bareStaticRecvHead(b) orelse b.ownerClass() orelse {
                     if (bt) std.debug.print("[bareret] {s} no recv head\n", .{name.name});
                     break :blk sole_global orelse {
@@ -1277,9 +1192,8 @@ fn staticCallReturnTypeRefInner(
                     };
                 };
                 const recv_ref = if (b.spliceHintActive())
-                    // The window's ACTUAL receiver type wins over the
-                    // declared one: `Iterable<String>` instantiates the
-                    // bare `iterator()`'s return where `Iterable<T>`
+                    // The window's actual receiver type wins over the declared one,
+                    // instantiating the bare call's return where the declared type
                     // leaves the callee's own parameter in it.
                     (if (b.spliceRecvTyRef()) |art|
                         try art.clone(b.allocator)
@@ -1295,21 +1209,18 @@ fn staticCallReturnTypeRefInner(
                     .args = &.{},
                 };
                 if (!std.mem.eql(u8, typeHead(bare_recv.name), head_name)) {
-                    // A window receiver whose head differs from the declared
-                    // one is usually its SUBTYPE (`List<String>` under an
-                    // `Iterable`-declared splice): project it so the type
-                    // arguments survive — dropping to a bare head star-filled
-                    // `iterator()` to `Iterator<*>` and untyped every
-                    // spliced selector's parameter after it.
+                    // A window receiver whose head differs from the declared one is
+                    // usually its subtype, so project it and keep the type arguments;
+                    // a bare head star-fills the return and untypes every spliced
+                    // selector's parameter after it.
                     const projected: ?ir.TypeRef = blk_pj: {
-                        const head_cid = (if (std.mem.indexOfScalar(u8, head_name, '.') != null)
+                        const head_cid = (if (std.mem.findScalar(u8, head_name, '.') != null)
                             b.module.classIdByFqn(head_name)
                         else
                             b.module.uniqueClassIdBySimpleName(typeHead(head_name))) orelse break :blk_pj null;
-                        // projectTypeToClass borrows from its input (arena
-                        // semantics — it may return the input itself), so
-                        // project in a scratch arena and clone out before the
-                        // input dies.
+                        // `projectTypeToClass` borrows from its input under arena
+                        // semantics and may return the input, so project in a scratch
+                        // arena and clone out before the input dies.
                         var pj_scratch = std.heap.ArenaAllocator.init(b.allocator);
                         defer pj_scratch.deinit();
                         const p = (try b.module.projectTypeToClass(pj_scratch.allocator(), bare_recv, head_cid)) orelse break :blk_pj null;
@@ -1322,15 +1233,12 @@ fn staticCallReturnTypeRefInner(
                         .args = &.{},
                     };
                 }
-                // The bare receiver may be a TYPE PARAMETER (`C.drain`'s
-                // bare `iterator()` inside `C : MutableCollection<T>`):
-                // resolve against its full declared bound so instantiation
-                // carries the bound's type arguments — the same substitution
-                // the `.Member` arm applies. Head-only heads keep today's
-                // path.
+                // The bare receiver may be a type parameter, so resolve against its
+                // full declared bound and let instantiation carry the bound's type
+                // arguments, the substitution the `.Member` arm applies.
                 if (!std.mem.eql(u8, runtime.envOnce("KLIO_TP_RECV") orelse "1", "0")) {
                     const cur_head = typeHead(std.mem.trimEnd(u8, bare_recv.name, "?"));
-                    const head_names_class = (if (std.mem.indexOfScalar(u8, cur_head, '.') != null)
+                    const head_names_class = (if (std.mem.findScalar(u8, cur_head, '.') != null)
                         b.module.classIdByFqn(cur_head)
                     else
                         b.module.uniqueClassIdBySimpleName(cur_head)) != null;
@@ -1344,16 +1252,15 @@ fn staticCallReturnTypeRefInner(
                 }
                 receiver = bare_recv;
                 var ident = std.mem.trimEnd(u8, bare_recv.name, "?");
-                if (std.mem.indexOfScalar(u8, ident, '<')) |lt| ident = ident[0..lt];
+                if (std.mem.findScalar(u8, ident, '<')) |lt| ident = ident[0..lt];
                 const bare_head = typeHead(ident);
-                const owner = (if (std.mem.indexOfScalar(u8, ident, '.') != null)
+                const owner = (if (std.mem.findScalar(u8, ident, '.') != null)
                     b.module.classIdByFqn(ident)
                 else
                     b.module.classIdIndexed(bare_head, b.self_package, name.span.file) orelse
                         b.module.classId(bare_head)) orelse {
-                    // A receiver head with no class id (`UShortArray`) still
-                    // has EXTENSIONS — resolution over them never needed the
-                    // class, only the member walk below does.
+                    // A receiver head with no class id still has extensions;
+                    // resolution over them never needed the class.
                     if (try bareExtensionTarget(b, name, bare_recv, shape_set.shapes, owned_type_param_bounds)) |t| {
                         if (bt) std.debug.print("[bareret] {s} on {s} ext target\n", .{ name.name, ident });
                         break :blk t;
@@ -1369,10 +1276,10 @@ fn staticCallReturnTypeRefInner(
                         return null;
                     };
                 };
-                // The lexical owner makes PRIVATE members visible to their
-                // own class's bodies (`findClause` inside trySelectInternal).
+                // The lexical owner makes private members visible to their own
+                // class's bodies.
                 const bare_lexical: ?ir.ClassId = if (b.ownerClass()) |oc|
-                    (if (std.mem.indexOfScalar(u8, oc, '.') != null)
+                    (if (std.mem.findScalar(u8, oc, '.') != null)
                         b.module.classIdByFqn(oc)
                     else
                         b.module.classIdIndexed(oc, b.self_package, name.span.file) orelse
@@ -1410,23 +1317,19 @@ fn staticCallReturnTypeRefInner(
                     }
                 }
                 if (bare_resolved.target) |member_target| break :blk member_target;
-                // No member serves it, and none is even applicable: a bare
-                // call in a receiver context may be an EXTENSION of the
-                // implicit receiver written without `this.` — `toMutableList()`
-                // inside an `Iterable<T>` extension body. Members were tried
-                // first, exactly as Kotlin orders them, and an applicable-but-
-                // unproven member still wins the deferral.
+                // No member serves it and none is even applicable, so a bare call in
+                // a receiver context may be an extension of the implicit receiver.
+                // Members were tried first, as Kotlin orders them, and an applicable
+                // but unproven member still wins the deferral.
                 if (!bare_resolved.applicable) {
                     if (try bareExtensionTarget(b, name, bare_recv, shape_set.shapes, owned_type_param_bounds)) |t| {
                         if (bt) std.debug.print("[bareret] {s} on {s} ext target\n", .{ name.name, ident });
                         break :blk t;
                     }
                 }
-                // Same-class FORWARD reference: while a class's own bodies
-                // lower its method list is incomplete, so a member declared
-                // LATER (`findClause` below trySelectInternal) resolves to
-                // nothing. The pre-pass AST registry answers the DECLARED
-                // return directly.
+                // Same-class forward reference: while a class's own bodies lower its
+                // method list is incomplete, so the pre-pass AST registry answers the
+                // declared return.
                 if (bare_resolved.target == null) {
                     if (inline_state.exprBodyMemberAst(bare_head, name.name, call.args.len)) |fa| {
                         if (fa.return_type) |*rt| {
@@ -1435,16 +1338,14 @@ fn staticCallReturnTypeRefInner(
                             return fwd;
                         }
                     }
-                    // The OUTER implicit receivers: a bare `iterator()`
-                    // inside a `sequence { }` receiver lambda resolves
-                    // against the enclosing extension's receiver when
-                    // SequenceScope misses — the same tower the emission
-                    // walk consults.
+                    // The outer implicit receivers: a bare call inside a receiver
+                    // lambda resolves against the enclosing extension's receiver when
+                    // the inner one misses.
                     for (b.implicit_receiver_tower.items) |entry| {
                         var outer_head = std.mem.trimEnd(u8, entry.head, "?");
-                        if (std.mem.indexOfScalar(u8, outer_head, '<')) |lt| outer_head = outer_head[0..lt];
+                        if (std.mem.findScalar(u8, outer_head, '<')) |lt| outer_head = outer_head[0..lt];
                         if (std.mem.eql(u8, typeHead(outer_head), bare_head)) continue;
-                        const outer_cid = (if (std.mem.indexOfScalar(u8, outer_head, '.') != null)
+                        const outer_cid = (if (std.mem.findScalar(u8, outer_head, '.') != null)
                             b.module.classIdByFqn(outer_head)
                         else
                             b.module.uniqueClassIdBySimpleName(typeHead(outer_head))) orelse continue;
@@ -1484,18 +1385,15 @@ fn staticCallReturnTypeRefInner(
                         return null;
                     };
             };
-            // A plain lambda that captures its lexical class receiver makes
-            // bare-call emission conservative, but an unknown receiver lambda
-            // still cannot lend its target's return type to another proof.
-            // `top_level_usable` already applied the confidence check to the
-            // other branch; a receiver-proved target has none to check.
+            // A plain lambda capturing its lexical class receiver makes bare-call
+            // emission conservative, but an unknown receiver lambda still cannot lend
+            // its target's return type to another proof.
             _ = &from_implicit_receiver;
         },
         .Member => |member| {
             const mt = bareRetTraceFor(b, member.name.name);
-            // The full chain, not just the declared-type probe: a local whose
-            // only type comes from its own INITIALIZER is invisible to the
-            // lazy answer, and `val xs = listOf<Base>(...)` is that shape.
+            // The full chain, not just the declared-type probe: a local whose only
+            // type comes from its own initializer is invisible to the lazy answer.
             receiver = try recvChainTypeRef(b, member.receiver);
             if (receiver == null) {
                 if (mt) {
@@ -1505,7 +1403,7 @@ fn staticCallReturnTypeRefInner(
                         if (span.active_map) |m| {
                             if (m.getChecked(cs.file)) |sf| {
                                 const lc = sf.lineCol(cs.start);
-                                const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                                const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
                                 break :lblk std.fmt.bufPrint(&loc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
                             }
                         }
@@ -1516,13 +1414,11 @@ fn staticCallReturnTypeRefInner(
                 return null;
             }
             var identity = std.mem.trimEnd(u8, receiver.?.name, "?");
-            if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+            if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
             var head = typeHead(identity);
-            // `invoke` on a FUNCTION-typed receiver returns the function
-            // type's declared return — the last type argument of the
-            // lowered `FunctionN` head (alias-resolved:
-            // `onCancellationConstructor?.invoke(...)` on a typealiased
-            // constructor type yields the handler function it builds).
+            // `invoke` on a function-typed receiver returns the function type's
+            // declared return, the last type argument of the lowered `FunctionN`
+            // head, alias-resolved.
             if (std.mem.eql(u8, member.name.name, "invoke")) {
                 var fn_ref: ?ir.TypeRef = null;
                 defer if (fn_ref) |*t| t.deinit(b.allocator);
@@ -1548,32 +1444,28 @@ fn staticCallReturnTypeRefInner(
                     return out;
                 }
             }
-            var owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+            var owner_id = if (std.mem.findScalar(u8, identity, '.') != null)
                 b.module.classIdByFqn(identity)
             else
                 b.module.uniqueClassIdBySimpleName(head);
-            // A receiver typed by a TYPE PARAMETER names no class. Kotlin
-            // resolves the call against the parameter's declared upper bound,
-            // and the full bound carries the type arguments instantiation
-            // needs: `M : MutableMap<in K, MutableList<T>>` makes `getOrPut`
-            // return `MutableList<T>`.
+            // A receiver typed by a type parameter names no class, so Kotlin resolves
+            // the call against its declared upper bound, whose full form carries the
+            // type arguments instantiation needs.
             if (owner_id == null and
                 !std.mem.eql(u8, runtime.envOnce("KLIO_TP_RECV") orelse "1", "0"))
             {
                 if (b.typeParamBoundRef(head)) |bref| {
                     receiver.?.deinit(b.allocator);
                     receiver = try bref.clone(b.allocator);
-                    // A use-site projection in the bound (`MutableMap<in K,
-                    // MutableList<T>>`) would need capture conversion the
-                    // engine does not model. For deriving a RETURN type the
-                    // captured argument behaves as the plain parameter, and a
-                    // projected parameter that survives into the result is an
-                    // unresolved name later guards refuse anyway.
+                    // A use-site projection in the bound would need capture conversion
+                    // the engine does not model. For a return type the captured
+                    // argument behaves as the plain parameter, and a projected one
+                    // surviving into the result is refused by later guards anyway.
                     try stripUseSiteProjections(b.allocator, &receiver.?);
                     identity = std.mem.trimEnd(u8, receiver.?.name, "?");
-                    if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+                    if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
                     head = typeHead(identity);
-                    owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+                    owner_id = if (std.mem.findScalar(u8, identity, '.') != null)
                         b.module.classIdByFqn(identity)
                     else
                         b.module.uniqueClassIdBySimpleName(head);
@@ -1585,7 +1477,7 @@ fn staticCallReturnTypeRefInner(
             var member_applicable = false;
             if (owner_id) |owner| {
                 const lexical_owner: ?ir.ClassId = if (b.ownerClass()) |owner_name|
-                    (if (std.mem.indexOfScalar(u8, owner_name, '.') != null)
+                    (if (std.mem.findScalar(u8, owner_name, '.') != null)
                         b.module.classIdByFqn(owner_name)
                     else
                         (b.module.classIdIndexed(
@@ -1607,24 +1499,18 @@ fn staticCallReturnTypeRefInner(
                     },
                 );
                 member_applicable = resolved.applicable;
-                // A deferred resolution that still NAMES one declaration is
-                // enough for a RETURN type — an override may only narrow it
-                // (the same rule nullaryMemberReturnTypeRef applies).
+                // A deferred resolution that still names one declaration is enough
+                // for a return type; an override may only narrow it.
                 resolved_target = resolved.target;
             }
-            // Same-class FORWARD references: while a class's own bodies
-            // lower, its IR method list is incomplete, so a member declared
-            // LATER in the class resolves to nothing. The pre-pass AST
-            // registry answers the return type directly — a declared
-            // annotation as-is, an un-annotated expression body by on-demand
-            // derivation.
+                // Same-class forward references: while a class's own bodies lower its
+                // IR method list is incomplete, so the pre-pass AST registry answers
+                // directly, a declared annotation as-is and an expression body by
+                // derivation.
             if (resolved_target == null) {
-                // A member-EXTENSION registers under its DECLARING class,
-                // not its receiver head (`private fun IntRange.toLong()`
-                // inside RangesTest registers as (RangesTest, toLong));
-                // consult the lexical owner too so an un-annotated
-                // expression body still derives at its receiver-typed
-                // call sites.
+                // A member extension registers under its declaring class, not its
+                // receiver head, so consult the lexical owner too and let an
+                // un-annotated expression body derive at its call sites.
                 const fa_hit = inline_state.exprBodyMemberAst(head, member.name.name, memberArgCount(call_expr)) orelse blk_fa: {
                     const ow2 = b.ownerClass() orelse {
                         if (mt) std.debug.print("[bareret] .{s} fa: no owner\n", .{member.name.name});
@@ -1634,9 +1520,8 @@ fn staticCallReturnTypeRefInner(
                         if (mt) std.debug.print("[bareret] .{s} fa: miss (owner={s} argc={d})\n", .{ member.name.name, ow2, memberArgCount(call_expr) });
                         break :blk_fa null;
                     };
-                    // Only a member-extension whose declared receiver serves
-                    // this receiver head qualifies; a plain same-named member
-                    // of the owner is a different callee entirely.
+                    // Only a member extension whose declared receiver serves this
+                    // head qualifies; a plain same-named member is a different callee.
                     const rt2 = cand.receiver_type orelse break :blk_fa null;
                     const dh2 = typeHead(std.mem.trimEnd(u8, rt2.name.name, "?"));
                     if (!(std.mem.eql(u8, dh2, head) or b.module.classIsOrExtends(head, dh2))) break :blk_fa null;
@@ -1646,13 +1531,10 @@ fn staticCallReturnTypeRefInner(
                     if (fa.return_type) |*rt| {
                         var out = try loweredOwnedLocalTypeRef(b, rt);
                         if (member.safe) out.nullable = true;
-                        // A bare type-parameter return resolves in the
-                        // DECLARING scope, not the caller's: a fn-level
-                        // `<T : Bound>` on the declaration itself, else the
-                        // declaring class's `<T : Bound>`. Kotlin types the
-                        // call at that upper bound — `EagerScope<T : Number>`
-                        // returning `T` is a Number to every caller, even one
-                        // whose own `T` shadows the name differently.
+                        // A bare type-parameter return resolves in the declaring
+                        // scope, not the caller's: a fn-level `<T : Bound>` on the
+                        // declaration, else the declaring class's. Kotlin types the
+                        // call at that upper bound.
                         if (bareTypeParamHead(out.name)) resolve_bound: {
                             const h2 = typeHead(std.mem.trimEnd(u8, out.name, "?"));
                             var bound: ?[]const u8 = null;
@@ -1702,9 +1584,8 @@ fn staticCallReturnTypeRefInner(
                             defer nb.deinit();
                             nb.setOwnerClass(head);
                             nb.setRecvTy(head);
-                            // The owner's ctor properties are the body's
-                            // lexical bindings (`onCancellationConstructor`
-                            // inside ClauseData's members).
+                            // The owner's ctor properties are the body's lexical
+                            // bindings.
                             if (b.module.uniqueClassIdBySimpleName(head)) |ocid| {
                                 if (ocid.int() < b.module.classes.items.len) {
                                     for (b.module.classes.items[ocid.int()].primary_params) |*pp| {
@@ -1803,21 +1684,16 @@ fn staticCallReturnTypeRefInner(
             });
         }
     }
-    // A SCALAR overload family (`kotlin.math.abs`, `min`, `max`) answers a
-    // different type per argument type, so a target picked without proving
-    // the argument's type is a guess — and a guess here is worse than no
-    // answer: `for (t in range) abs(t).pad()` typed `abs(t)` as Double, and
-    // the local `Int.pad()` extension was dropped as inapplicable. Withdraw
-    // the claim rather than let declaration order decide it.
+    // A scalar overload family answers a different type per argument type, so a
+    // target picked without proving the argument's type is a guess, and a wrongly
+    // widened result drops a local extension as inapplicable. Withdraw the claim.
     if (inferred != null and try scalarOverloadUnproven(b, call, target)) {
         inferred.?.deinit(b.allocator);
         inferred = null;
     }
-    // Invoke convention: the pick is a fn-typed PROPERTY's accessor (zero
-    // value params) while the call supplies arguments — `createFrom("a")`
-    // reads the property and invokes the value, so the call's type is the
-    // fn type's declared RETURN (its last argument). The zero-params-with-
-    // args guard is the discriminator against fn-RETURNING functions.
+    // Invoke convention: the pick is a fn-typed property's accessor, with zero value
+    // params, while the call supplies arguments, so the call's type is the fn type's
+    // declared return. The zero-params-with-args guard discriminates it.
     if (inferred == null) {
         if (b.module.funcById(target)) |tf| {
             const has_this = tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this");
@@ -1835,11 +1711,9 @@ fn staticCallReturnTypeRefInner(
             }
         }
     }
-    // Declaration order must not decide whether a caller's local types:
-    // when the target is an un-annotated EXPRESSION body whose own decl
-    // pass has not run yet (its return still the Unit placeholder),
-    // derive the return from the registered AST on demand, in the
-    // target's own class context.
+    // Declaration order must not decide whether a caller's local types: when the
+    // target is an un-annotated expression body whose decl pass has not run, derive
+    // the return from the registered AST in the target's own class context.
     if (inferred == null and expr.od_depth < 3) {
         expr.od_depth += 1;
         defer expr.od_depth -= 1;
@@ -1858,12 +1732,8 @@ fn staticCallReturnTypeRefInner(
                                     defer nb.deinit();
                                     nb.setOwnerClass(oc.name);
                                     nb.setRecvTy(oc.name);
-                                    // The owner's ctor properties are the
-                                    // body's lexical bindings — seed their
-                                    // declared types so a bare property read
-                                    // (`onCancellationConstructor?.invoke`)
-                                    // resolves, the pattern
-                                    // lowerPropertyInitExpr already uses.
+                                    // The owner's ctor properties are the body's
+                                    // lexical bindings, so seed their declared types.
                                     for (oc.primary_params) |*pp| {
                                         try nb.setLocalDeclTypeOwned(pp.name, try pp.ty.clone(b.allocator));
                                         if (pp.ty.nullable) try nb.setLocalDeclNullable(pp.name);
@@ -1908,8 +1778,8 @@ fn staticCallReturnTypeRefInner(
     return inferred;
 }
 
-/// `KLIO_BARERET=<name>` (or `*`) traces why a bare call does or does not lend
-/// its return type to the local it initializes.
+/// `KLIO_BARERET=<name>` or `*` traces why a bare call does or does not lend its
+/// return type to the local it initializes.
 fn bareRetTraceFor(b: *const FuncBuilder, name: []const u8) bool {
     _ = b;
     const want = runtime.envOnce("KLIO_BARERET") orelse return false;
@@ -1929,22 +1799,17 @@ pub const StaticReturnArgShapes = struct {
     }
 };
 
-/// Static call shapes enriched by recursively resolved call return types.
-/// Unlike the eager type-head channel, every inferred entry here comes from a
-/// unique declaration identity and can therefore participate in exact
-/// overload selection.
-/// Enrich a resolved call's argument shapes with LAMBDA RETURN types: when
-/// the target's declared parameter is a `Function{N}` whose return names a
-/// bare type parameter and whose value-parameter types are all concrete, an
-/// unannotated lambda literal's single-block tail is derived in a scratch
-/// builder under those parameter types, and the shape gains the full
-/// instantiated function type — `bindCallType` then binds the callee's `T`
-/// from it (`List(3) { it * 2 }` yields `List<Int>`). Evidence for the
-/// RETURN channel only; never a dispatch commitment.
-/// The result-type head of a primitive-operand binary arithmetic op, by
-/// Kotlin's numeric promotion (Byte/Short promote to Int; the wider of the
-/// two otherwise; unsigned only same-kind; `String + x` is String). Null
-/// where the table does not decide (Char arithmetic, mixed unsigned).
+/// Static call shapes enriched by recursively resolved call return types. Unlike
+/// the eager type-head channel, every inferred entry comes from a unique
+/// declaration identity and can participate in exact overload selection.
+/// `enrichLambdaReturnShapes` adds lambda return types: when the target's declared
+/// parameter is a `Function{N}` whose return names a bare type parameter and whose
+/// value-parameter types are concrete, an unannotated lambda literal's single-block
+/// tail is derived in a scratch builder under those types and the shape gains the
+/// instantiated function type. Return-channel evidence only.
+/// `binaryResultHead` is the result-type head of a primitive-operand binary
+/// arithmetic op under Kotlin's numeric promotion: Byte and Short promote to Int,
+/// the wider of the two otherwise, unsigned only same-kind, `String + x` is String.
 fn primitiveBinResultHead(b: *FuncBuilder, lhs_head: []const u8, bin: anytype) ?[]const u8 {
     switch (bin.op) {
         .Add, .Sub, .Mul, .Div, .Rem => {},
@@ -2027,8 +1892,8 @@ fn enrichLambdaArgShapes(
         const pty = tf.params[pi].ty;
         if (!std.mem.startsWith(u8, typeHead(pty.name), "Function") or pty.args.len == 0) continue;
         const ret = pty.args[pty.args.len - 1];
-        // Only a bare type-parameter return needs the body, and only
-        // concrete value-parameter types can seed it.
+        // Only a bare type-parameter return needs the body, and only concrete
+        // value-parameter types can seed it.
         if (staticTypeClassId(b, ret) != null) continue;
         var params_concrete = true;
         for (pty.args[0 .. pty.args.len - 1]) |pa| {
@@ -2042,13 +1907,8 @@ fn enrichLambdaArgShapes(
         const stmts = lam.body.stmts;
         if (stmts.len == 0 or stmts[stmts.len - 1] != .Expr) continue;
         const tail = &stmts[stmts.len - 1].Expr;
-        // Only self-contained tail kinds derive. Call/Member tails were
-        // re-tried once the mis-attributed XorWow corruption resolved (the
-        // real cause was the unbound-ref companion arg-shift) and measured
-        // NET NEGATIVE: stdlib no_receiver_type 1,353 -> 1,403 and
-        // bound_virtual 5,730 -> 5,666 — a derived call-tail binding (the
-        // getOrPut `V := ArrayList` shape) narrows generic instantiations
-        // in ways that disprove more downstream than the typed local buys.
+        // Only self-contained tail kinds derive: a derived call-tail binding narrows
+        // generic instantiations in ways that disprove more than the typed local buys.
         switch (tail.*) {
             .Path, .Binary, .StringTemplate, .IntLit, .FloatLit, .BoolLit, .CharLit => {},
             else => continue,
@@ -2057,22 +1917,18 @@ fn enrichLambdaArgShapes(
         var nb = try FuncBuilder.init(b.allocator, b.module);
     nb.census_quiet = true;
         defer nb.deinit();
-        // The block's decls and tail read the ENCLOSING scope's names too
-        // (`(bytesPerLine - 1) / bytesPerGroup` inside the run block reads
-        // the fn's params): seed the probe builder with the enclosing
-        // builder's declared types first — the lambda's own params and
-        // block decls shadow them below, the same order the source scopes.
+        // The block's decls and tail read the enclosing scope's names too, so seed
+        // the probe builder with the enclosing builder's declared types first; the
+        // lambda's own params and block decls shadow them, as the source scopes.
         {
             var dit = b.local_decl_types.iterator();
             while (dit.next()) |e| {
                 nb.setLocalDeclTypeOwned(e.key_ptr.*, e.value_ptr.clone(b.allocator) catch continue) catch {};
             }
         }
-        // DERIVED-init enclosing locals never enter the declared-type map
-        // (`val lineSeparators = (n - 1) / perLine`): derive each recorded
-        // init IN THE ENCLOSING BUILDER (its own scope) and seed the
-        // result, so the block's tail can read them. Declared types above
-        // stay authoritative.
+        // Derived-init enclosing locals never enter the declared-type map, so derive
+        // each recorded init in the enclosing builder and seed the result. Declared
+        // types above stay authoritative.
         {
             expr.od_depth += 1;
             var iit = b.localInitExprIterator();
@@ -2080,7 +1936,7 @@ fn enrichLambdaArgShapes(
                 if (nb.localDeclTypeRef(e.key_ptr.*) != null) continue;
                 var dt = (staticExprTypeRef(b, e.value_ptr.*) catch null) orelse continue;
                 var h = std.mem.trimEnd(u8, dt.name, "?");
-                if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
                 const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
                     ir.parseClassTypeParamIdentity(h) != null;
                 if (h.len == 0 or bare) {
@@ -2101,10 +1957,8 @@ fn enrichLambdaArgShapes(
                 try nb.setLocalDeclTypeOwned(p.name, try pa.clone(b.allocator));
             }
         }
-        // The tail may read the block's OWN earlier declarations
-        // (`run { var p = 1.0; ...; p }`): record each preceding local
-        // whose annotated or derivable init type is concrete, in order,
-        // so a later decl can read an earlier one.
+        // The tail may read the block's own earlier declarations, so record each
+        // preceding local whose annotated or derivable init type is concrete.
         expr.od_depth += 1;
         for (stmts[0 .. stmts.len - 1]) |*st| {
             if (st.* != .Decl or st.Decl != .Property) continue;
@@ -2118,7 +1972,7 @@ fn enrichLambdaArgShapes(
             }
             var dt = decl_owned orelse continue;
             var h = std.mem.trimEnd(u8, dt.name, "?");
-            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
             const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
                 ir.parseClassTypeParamIdentity(h) != null;
             if (h.len == 0 or bare) {
@@ -2169,15 +2023,11 @@ fn enrichLambdaArgShapes(
 }
 
 /// A callable-reference argument's function type, read from the referenced
-/// declaration — `map(Int::toUInt)` carries `Function1<Int, UInt>` so the
-/// callee's `R` binds from the reference's declared return exactly as kotlinc
-/// sees it. Declaration-read, never derived from a body, so it is
-/// authoritative evidence. An unbound class reference contributes its
-/// receiver as the leading parameter; a bound reference contributes the
-/// member's own parameters only. With no expected arity (pre-resolution,
-/// where the shape itself disambiguates the outer overload set), the member
-/// is probed at arities 0..2 and the first commitment wins; a member the
-/// probe cannot commit stays unshaped.
+/// declaration, so the callee's `R` binds from its declared return as kotlinc sees
+/// it. Declaration-read, never derived from a body, so it is authoritative. An
+/// unbound class reference contributes its receiver as the leading parameter; a
+/// bound one contributes the member's own parameters only. With no expected arity
+/// the member is probed at arities 0 to 2 and the first commitment wins.
 pub fn callableRefDeclTypeRef(
     b: *FuncBuilder,
     mr: anytype,
@@ -2259,8 +2109,8 @@ fn resolveRefMemberAtArity(
         .receiver_type = recv_ty,
     });
     if (resolved.target) |fid| return b.module.funcById(fid);
-    // `Int::toUInt` names an EXTENSION — the reference resolves through the
-    // same extension engine its call form uses.
+    // `Int::toUInt` names an extension, so the reference resolves through the same
+    // extension engine its call form uses.
     const ext = b.module.resolveExtensionCall(name.name, recv_ty, shape_buf[0..arity], .{
         .caller_file = name.span.file,
         .caller_package = b.module.packageOfFile(name.span.file) orelse b.self_package,
@@ -2295,23 +2145,15 @@ fn enrichCallableRefArgShapes(
     }
 }
 
-/// The declared return type of a MEMBER call, so a chained call
-/// (`sb.append(x).deleteAt(0)`, `(a shr 8).toByte()`) types its receiver.
-///
-/// `not_simple_callee` is the largest leaf of the unbound residue: the
-/// receiver is itself a call, and every channel that reads a call's return
-/// handles only a bare simple name. Resolution here mirrors
-/// `memberCallArgArities` — the receiver's own static type picks candidates
-/// whose declared receiver it extends, ranked by scope tier, and the answer
-/// counts only when every best-tier candidate agrees.
-///
-/// A declared return is evidence only when it NAMES something: a bare type
-/// parameter (`fun <R> map(...): R`) resolves to no class, and committing to
-/// it disproves candidates a null type leaves open.
-/// The type the RECEIVER gives one of the owner class's type parameters.
-/// `List<E>.get` on a `List<Named>` receiver substitutes `E` := Named. Only
-/// the direct-instantiation case is taken — the receiver's head IS the
-/// declaring class, so the arguments line up positionally.
+/// The declared return type of a member call, so a chained call types its receiver.
+/// Resolution mirrors `memberCallArgArities`: the receiver's static type picks
+/// candidates whose declared receiver it extends, ranked by scope tier, and the
+/// answer counts only when every best-tier candidate agrees. A declared return is
+/// evidence only when it names something, a bare type parameter resolving to no
+/// class and disproving candidates a null type leaves open.
+/// `ownerTypeArgFromReceiver` is the type the receiver gives one of the owner
+/// class's type parameters, only for the direct-instantiation case where the
+/// receiver's head is the declaring class so the arguments line up positionally.
 fn ownerTypeParamSubstitution(
     b: *FuncBuilder,
     member_fid: FuncId,
@@ -2352,9 +2194,8 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     defer if (recv_owned) |*t| t.deinit(b.allocator);
     const recv_ty: ir.TypeRef = blk: {
         if (argDeclTypeRefLazy(b, recv)) |known| {
-            // A bare TYPE-PARAMETER lazy answer (`expected: T` on a typed
-            // receiver) blocks the full deriver, whose implicit-property
-            // channel substitutes the receiver's instantiation.
+            // A bare type-parameter lazy answer blocks the full deriver, whose
+            // implicit-property channel substitutes the receiver's instantiation.
             const kh = typeHead(std.mem.trimEnd(u8, known.name, "?"));
             const bare_k = (kh.len > 0 and kh.len <= 2 and std.ascii.isUpper(kh[0])) or
                 b.isTypeParam(kh) or ir.parseClassTypeParamIdentity(kh) != null;
@@ -2363,12 +2204,9 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         recv_owned = try staticExprTypeRef(b, recv);
         break :blk recv_owned orelse return null;
     };
-    // A nullable receiver reaches its member only through a SAFE call, and
-    // then the result is nullable in turn. Written as one, the member is
-    // looked up on the non-null type and the answer carries the `?` back;
-    // written without it the expression does not type-check at all. Without
-    // this the middle of an `a?.self()?.b?.twice()` chain had no type, so
-    // every link after the first resolved by name.
+    // A nullable receiver reaches its member only through a safe call, and then the
+    // result is nullable in turn, so the member is looked up on the non-null type
+    // and the answer carries the `?` back.
     const safe_call = call.callee.Member.safe;
     if (runtime.envOnce("KLIO_MCRT_TRACE")) |w| {
         if (std.mem.eql(u8, w, mname))
@@ -2384,8 +2222,8 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     var agreed: ?ir.TypeRef = null;
     var agreed_fid: ?FuncId = null;
 
-    // A declared member of the receiver's own class outranks every
-    // extension, exactly as Kotlin resolves it.
+    // A declared member of the receiver's own class outranks every extension,
+    // exactly as Kotlin resolves it.
     {
         var probe: usize = call.args.len;
         while (probe <= call.args.len + 3) : (probe += 1) {
@@ -2393,14 +2231,12 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             defer b.allocator.free(key);
             const fid = b.module.registry.member_method_fids.get(key) orelse continue;
             const f = b.module.funcById(fid) orelse continue;
-            // An expression body with no annotation records `Unit` as a
-            // PLACEHOLDER, so an undeclared return is not a fact.
+            // An expression body with no annotation records `Unit` as a placeholder,
+            // so an undeclared return is not a fact.
             if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
-            // A generic member returns one of its OWNER's type parameters:
-            // `List<E>.get(index): E` on a `List<Named>` receiver returns
-            // Named, and the receiver now carries the arguments that say so.
-            // The member stays the declaration — Kotlin picks it over any
-            // extension — this only names what it returns.
+            // A generic member returns one of its owner's type parameters, and the
+            // receiver carries the arguments that say which. The member stays the
+            // declaration, Kotlin picking it over any extension.
             if (bareTypeParamHead(f.return_ty.name)) {
                 const sub = ownerTypeParamSubstitution(b, fid, recv_ty, f.return_ty.name) orelse return null;
                 var out_sub = try sub.clone(b.allocator);
@@ -2428,13 +2264,9 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             if (!b.module.classIsOrExtends(lexical_owner, owner)) continue;
         }
         const candidate_head = typeHead(f.params[0].ty.name);
-        // An IDENTITY extension returns its own receiver: `fun <T> T.apply(
-        // block: T.() -> Unit): T`. Its declared receiver is a bare type
-        // PARAMETER, so the head filter below never admits it, and its
-        // declared return names nothing on its own — but the receiver
-        // instantiates both. `StringBuilder().apply(builderAction).toString()`
-        // inside `buildString` is the shape: a forwarded lambda argument the
-        // splice cannot take, leaving the chain untyped.
+        // An identity extension returns its own receiver: `fun <T> T.apply(block:
+        // T.() -> Unit): T`. Its declared receiver is a bare type parameter, so the
+        // head filter below never admits it, but the receiver instantiates both.
         if (f.return_ty_declared and bareTypeParamHead(candidate_head) and
             bareTypeParamHead(f.return_ty.name) and
             std.mem.eql(u8, typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?")), candidate_head))
@@ -2452,14 +2284,10 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         if (!f.return_ty_declared or f.return_ty.name.len == 0 or
             bareTypeParamHead(f.return_ty.name))
         {
-            // An UN-ANNOTATED member-extension expression body derives its
-            // return on demand from the registered AST — the same channel
-            // class members use for forward references. Without it, a
-            // private `IntRange.toLong() = start.toLong()..endInclusive
-            // .toLong()` left `expected.map { it.toLong() }` untyped, and
-            // the untyped list then failed to refute a same-name member's
-            // invariant generic parameter (the RangesTest assertEquals
-            // self-recursion).
+            // An un-annotated member-extension expression body derives its return on
+            // demand from the registered AST, the channel class members use for
+            // forward references; without it the result fails to refute a same-name
+            // member's invariant generic parameter.
             if (!f.return_ty_declared) {
                 const owner: ?[]const u8 = blk_own: {
                     break :blk_own b.module.registry.member_ext_owner_class.get(fid) orelse b.ownerClass();
@@ -2495,13 +2323,10 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
                     }
                 }
             }
-            // A DECLARED bare-parameter return resolves in the CALLEE's own
-            // scope: the owner class's `<T : Bound>`. Kotlin types the call
-            // at the parameter's upper bound, so the bound IS the static
-            // type — `EagerScope<T : Number>` returning `T` is a Number to
-            // every caller, even one whose own `T` shadows the name with a
-            // different bound. A fn-level `<T>` stays unknown (its default
-            // bound Any names nothing useful).
+            // A declared bare-parameter return resolves in the callee's own scope,
+            // the owner class's `<T : Bound>`. Kotlin types the call at the
+            // parameter's upper bound even for a caller whose own `T` shadows the
+            // name. A fn-level `<T>` stays unknown, its default bound naming nothing.
             if (f.return_ty_declared and bareTypeParamHead(f.return_ty.name) and
                 b.module.staticFuncTypeParamBound(fid, typeHead(std.mem.trimEnd(u8, f.return_ty.name, "?"))) == null)
             {
@@ -2547,17 +2372,14 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         }
         if (agreed) |*old| {
             if (!std.mem.eql(u8, old.name, f.return_ty.name)) {
-                // A return-variant family (`maxOf { }`'s Double/Float/R
-                // overloads) discriminates by the trailing lambda's derived
-                // return, exactly as the emission's pick does; without a
-                // pick the disagreement stands and the record refuses.
+                // A return-variant family discriminates by the trailing lambda's
+                // derived return, as the emission's pick does; without a pick the
+                // disagreement stands and the record refuses.
                 old.deinit(b.allocator);
                 agreed = null;
                 agreed_fid = null;
-                // No lambda to discriminate: an exactly-instantiated
-                // receiver variant (`Iterable<Float>.minOrNull()` for a
-                // List<Float> receiver) outranks the generic sibling —
-                // kotlinc's most-specific rule.
+                // No lambda to discriminate: an exactly-instantiated receiver variant
+                // outranks the generic sibling, per kotlinc's most-specific rule.
                 if (recv_ty.args.len == 1 and allNull(call.arg_names)) {
                     const actual_arg_head = typeHead(std.mem.trimEnd(u8, recv_ty.args[0].name, "?"));
                     var exact_fid: ?FuncId = null;
@@ -2620,11 +2442,9 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
             ret.deinit(b.allocator);
             return null;
         }
-        // The winning extension's return can mention its own fn type params
-        // in ARGUMENT position (`Iterable<T>.drop(n): List<T>`); the receiver
-        // instantiates them, and a raw `T` in the record poisons every
-        // downstream binding built from the local. Solve the receiver
-        // bindings and substitute; an unsolvable param keeps the raw record.
+        // The winning extension's return can mention its own fn type params in
+        // argument position, which the receiver instantiates; a raw `T` in the record
+        // poisons every downstream binding. An unsolvable param keeps the raw record.
         if (agreed_fid != null and tyMentionsBareTp(ret.*)) sub_ret: {
             const wf = b.module.funcById(agreed_fid.?) orelse break :sub_ret;
             var sc = std.heap.ArenaAllocator.init(b.allocator);
@@ -2641,13 +2461,10 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
                 false,
             ) catch null) orelse break :sub_ret;
             const substituted = ir.Module.substituteBoundType(a2, ret.*, solved.bindings) catch break :sub_ret;
-            // With every one of the callee's OWN type parameters solved the
-            // substitution is complete, and a residual bare head belongs to
-            // the CALLER's scope — `List<Box<T>>.asReversed()` yields
-            // `List<Box<T>>`, as instantiated as this call site can be.
-            // Keeping the raw `List<T>` record there types a loop variable as
-            // the callee's erased parameter, which then refutes extensions on
-            // the real element type.
+            // With every one of the callee's own type parameters solved the
+            // substitution is complete, and a residual bare head belongs to the
+            // caller's scope. Keeping the raw record types a loop variable as the
+            // callee's erased parameter, refuting extensions on the real element type.
             var all_solved = true;
             if (b.module.registry.func_type_params.get(agreed_fid.?)) |tps| {
                 for (tps.items) |tp| {
@@ -2675,8 +2492,8 @@ fn memberCallReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
     return null;
 }
 
-/// Whether any head in the type (itself or a nested argument) is a bare
-/// function/class type parameter rather than a nameable class.
+/// Whether any head in the type, itself or a nested argument, is a bare function or
+/// class type parameter rather than a nameable class.
 fn tyMentionsBareTp(ty: ir.TypeRef) bool {
     var h = std.mem.trimEnd(u8, ty.name, "?");
     if (std.mem.startsWith(u8, h, "in#")) h = h[3..];
@@ -2688,23 +2505,20 @@ fn tyMentionsBareTp(ty: ir.TypeRef) bool {
     return false;
 }
 
-/// The declared return of a BARE call that is really a member call on the
-/// implicit receiver — the shape a spliced inline body is written in:
-/// `val iterator = listIterator(size)` inside `List.takeLastWhile` reads
-/// `List`'s own member, and the local it initializes carried no type at all
-/// because every return channel expects a spelled-out receiver.
+/// The declared return of a bare call that is really a member call on the implicit
+/// receiver, the shape a spliced inline body is written in. Every other return
+/// channel expects a spelled-out receiver.
 fn bareMemberReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Error!?ir.TypeRef {
     if (call_expr.* != .Call) return null;
     const call = call_expr.Call;
     if (call.callee.* != .Path or call.callee.Path.segments.len != 1) return null;
     const nm = call.callee.Path.segments[0].name;
-    // A local binding, a local `fun`, or a top-level namesake resolves the
-    // call some other way; only a name the receiver's class declares and
-    // nothing else shadows is unambiguously the member.
+    // A local binding, a local `fun`, or a top-level namesake resolves the call some
+    // other way; only a name the receiver's class declares and nothing else shadows
+    // is unambiguously the member.
     if (b.resolve(nm) != null or b.knowsOuter(nm) or b.isLocalFn(nm)) return null;
-    // No top-level-namesake bail: when the implicit receiver's own class
-    // DECLARES the member (the key lookup below), Kotlin's receiver scope
-    // resolves the member over any top-level namesake.
+    // No top-level-namesake bail: when the implicit receiver's own class declares
+    // the member, Kotlin's receiver scope resolves it over any top-level namesake.
     const recv_head = b.spliceRecvTy() orelse b.recvTy() orelse b.ownerClass() orelse return null;
     const rh = typeHead(std.mem.trimEnd(u8, recv_head, "?"));
     if (rh.len == 0) return null;
@@ -2715,9 +2529,8 @@ fn bareMemberReturnTypeRef(b: *FuncBuilder, call_expr: *const Expr) Allocator.Er
         const fid = b.module.registry.member_method_fids.get(key) orelse continue;
         const f = b.module.funcById(fid) orelse continue;
         if (!f.return_ty_declared or f.return_ty.name.len == 0) return null;
-        // Instantiate through the FULL implicit receiver when it carries
-        // arguments: `listIterator(size)` inside the dropLastWhile splice
-        // returns ListIterator<String>, never ListIterator<T>.
+        // Instantiate through the full implicit receiver when it carries arguments,
+        // so the return keeps the caller's element type.
         const full_recv: ?ir.TypeRef = if (b.spliceRecvTyRef()) |r| r.* else b.recvTypeRef();
         if (full_recv) |fr| {
             if (fr.args.len != 0) {

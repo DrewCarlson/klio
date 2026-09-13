@@ -48,15 +48,11 @@ pub fn indexDeferReason(res: ir.Module.BareCallResolution) ?ir.Module.ResolveDef
     };
 }
 
-/// Kotlin does not resolve a value-position reference — `::name`, a
-/// `::Ctor`, or a bare read — whose only declaration lives in a package
-/// the caller neither declares, imports, nor sees by default. Record the
-/// unresolved diagnostic (the same one the bare-call path emits) when the
-/// reference would otherwise bind such an out-of-scope declaration. A
-/// reference denotes the declaration itself, so there is no arity or
-/// member-redispatch shape to defer on: a tier-5 verdict is final, exactly
-/// as for the call form. Returns true when the diagnostic was recorded so
-/// the caller can suppress the lenient bind.
+/// Kotlin does not resolve a value-position reference whose only declaration
+/// lives in a package the caller neither declares, imports, nor sees by default.
+/// Record the unresolved diagnostic in that case; a reference denotes the
+/// declaration itself, so a tier-5 verdict is final. True when recorded, so the
+/// caller can suppress the lenient bind.
 pub fn recordOutOfScopeRef(
     b: *FuncBuilder,
     name: []const u8,
@@ -65,16 +61,11 @@ pub fn recordOutOfScopeRef(
     tier: ?u8,
 ) Allocator.Error!bool {
     if (tier != ir.Module.other_package_tier) return false;
-    // The verdict is trustworthy only when the declaration carries a real
-    // package: a bare FQN (no package prefix) is a lift artifact whose
-    // scoping metadata is unreliable — an upstream class such as
-    // `io.ktor.utils.io.ClosedByteChannelException` can lose its package
-    // during the lift and read as the empty package even when the
-    // reference is same-package and genuinely in scope. The resolver still
-    // binds it (`classIdIndexed`/`resolveBareRefIndexed` return the best
-    // pick); rejecting it would be a false positive, so a bare-FQN
-    // declaration is never reported out of scope.
-    if (std.mem.indexOfScalar(u8, fqn, '.') == null) return false;
+    // The verdict is trustworthy only for a declaration with a real package: a
+    // bare FQN is a lift artifact whose scoping metadata is unreliable, since an
+    // upstream class can lose its package during the lift and read as the empty
+    // package. Rejecting it would be a false positive.
+    if (std.mem.findScalar(u8, fqn, '.') == null) return false;
     if (runtime.envOnce("KLIO_UNRES_TRACE") != null) {
         std.debug.print("[unres] name={s} fqn={s} inline_fn={s} owner={s} window={} depth={d}\n", .{
             name, fqn, b.currentInlineFn() orelse "-", b.owner_class orelse "-",
@@ -91,17 +82,15 @@ pub fn recordOutOfScopeRef(
     return true;
 }
 
-/// The FQN of a class by id, for an out-of-scope value-reference
-/// diagnostic.
+/// The FQN of a class by id, for an out-of-scope value-reference diagnostic.
 pub fn classFqnOf(b: *FuncBuilder, id: ir.ClassId) []const u8 {
     if (idGet(ir.Class, b.module.classes.items, id.int())) |c| return c.fqn;
     return "<invalid>";
 }
 
-/// Record an ambiguous bare call into the module's lowering diagnostics.
-/// The build driver reports these before the program runs. Each
-/// candidate carries its declaration span (from the phase-1 header
-/// record) so a true duplicate's report can point at both declarations.
+/// Record an ambiguous bare call into the module's lowering diagnostics, which
+/// the build driver reports before the program runs. Each candidate carries its
+/// declaration span so a true duplicate's report can point at both.
 pub fn recordAmbiguousCall(b: *FuncBuilder, name: []const u8, call_span: ir.Span, res: ir.Module.BareCallResolution) Allocator.Error!void {
     const fqn_a = if (res.first) |f| fqnOf(b, f) else "?";
     const fqn_b = if (res.second) |s| fqnOf(b, s) else "?";
@@ -117,16 +106,12 @@ pub fn recordAmbiguousCall(b: *FuncBuilder, name: []const u8, call_span: ir.Span
     });
 }
 
-/// Kotlin does not resolve an unqualified call whose every candidate
-/// lives in a package the caller neither declares, imports, nor sees by
-/// default (kotlinc: "unresolved reference"). When the bound target is a
-/// plain top-level function in such a package, record the unresolved
-/// diagnostic — naming the candidates and how to import them — and tell
-/// the caller to suppress the bind. Receiver-bound extensions are the
-/// heuristic's domain and never classify as out of scope here. The
-/// corpus sweep (examples + coroutine fixtures + the lowered stdlib and
-/// pack sources, KLIO_RESOLVE_AUDIT) resolves zero calls at this tier,
-/// so the error only fires on programs kotlinc already rejects.
+/// Kotlin does not resolve an unqualified call whose every candidate lives in a
+/// package the caller neither declares, imports, nor sees by default. When the
+/// bound target is a plain top-level function in such a package, record the
+/// unresolved diagnostic and tell the caller to suppress the bind.
+/// Receiver-bound extensions are the heuristic's domain and never classify as
+/// out of scope here.
 pub fn recordOutOfScopeCall(
     b: *FuncBuilder,
     name: []const u8,
@@ -135,37 +120,24 @@ pub fn recordOutOfScopeCall(
     index_res: ir.Module.BareCallResolution,
 ) Allocator.Error!bool {
     const file = call_span.file;
-    // A bare call whose name is a known class member and that sits in a
-    // receiver context is routed to runtime member-or-global dispatch by
-    // `emitBareFuncCall` (`CallMemberOrGlobal`): the implicit receiver may
-    // supply the member, so the reference is not out of scope even when
-    // the only package-scope candidate is unimported. kotlinc resolves
-    // `fun Source.discard() { request(count) }` to the receiver's
-    // `request` member, not the package-scope `request` function.
+    // A bare call whose name is a known class member in a receiver context is
+    // routed to runtime member-or-global dispatch: the implicit receiver may
+    // supply the member, so the reference is not out of scope even when the only
+    // package-scope candidate is unimported.
     if (inReceiverContext(b) and anyReceiverClassDeclares(b, name)) return false;
-    // Only the index's own out-of-scope verdicts count: a unique
-    // exact-arity match, or a tier-5 candidate set (identical or
-    // type-distinct). Loose-shape deferrals (arity/default/vararg/
-    // bodyless) stay with the heuristic — those binds are provisional
-    // and the runtime may still dispatch a member or re-pick an
-    // overload (`list.apply { add(x) }` must not error because a
-    // user file declares a top-level `add`).
+    // Only the index's own out-of-scope verdicts count: a unique exact-arity
+    // match, or a tier-5 candidate set. Loose-shape deferrals stay with the
+    // heuristic, since those binds are provisional and the runtime may still
+    // dispatch a member or re-pick an overload.
     const precise = switch (index_res.outcome) {
         .resolved => true,
         .deferred => |r| r == .unimported_set or r == .type_overload,
     };
-    // A loose-shape deferral (default/vararg/trailing-lambda arity, an
-    // unmatched arity, a low-priority-only or bodyless-only set) is
-    // unresolved too WHEN every rankable candidate is out of scope — the
-    // winning tier is `other_package_tier`, i.e. there is no in-scope
-    // candidate of any shape the runtime could re-pick. The member-
-    // redispatch guard is `inReceiverContext`: inside a receiver context a
-    // runtime member of the same name may still bind (kotlinc resolves
-    // `g.apply { greet() }` to `g`'s member even when a top-level `greet`
-    // is out of scope), so the loose-shape rejection only fires outside
-    // any receiver context, where no implicit receiver can supply the
-    // call. The bare-call member-shadowable routing already sends those
-    // receiver-context calls to `CallMemberOrGlobal` rather than here.
+    // A loose-shape deferral is unresolved too when every rankable candidate is
+    // out of scope, that is when the winning tier is `other_package_tier`. The
+    // member-redispatch guard is `inReceiverContext`: inside one, a runtime
+    // member of the same name may still bind, so the loose-shape rejection fires
+    // only outside any receiver context.
     const loose_out_of_scope = switch (index_res.outcome) {
         .resolved => false,
         .deferred => |r| switch (r) {
@@ -176,35 +148,27 @@ pub fn recordOutOfScopeCall(
             .low_priority_only,
             .bodyless_only,
             => index_res.tier == ir.Module.other_package_tier and !inReceiverContext(b),
-            // The index defers a vararg/default call to `extension_form`
-            // when an in-scope extension namesake exists, since it cannot
-            // tell whether the receiver applies. Outside any receiver
-            // context no receiver can supply such an extension, so a
-            // heuristic that landed on a tier-5 NON-extension top-level
-            // function is the same unresolved reference kotlinc rejects.
-            // The `isNonExt(final_id)` + tier-5 checks below confirm the
-            // bound target is out of scope before this fires.
+            // The index defers a vararg or default call to `extension_form` when
+            // an in-scope extension namesake exists, unable to tell whether the
+            // receiver applies. Outside a receiver context no receiver can supply
+            // one, so a heuristic landing on a tier-5 non-extension top-level
+            // function is the unresolved reference kotlinc rejects.
             .extension_form => !inReceiverContext(b),
             else => false,
         },
     };
     if (!precise and !loose_out_of_scope) return false;
-    // The index ranked at least one candidate in a visible tier (a named
-    // import, own package, wildcard, or default import): the call resolves
-    // among those in-scope candidates at runtime — a type-dispatched overload
-    // set the runtime picks by argument types. A heuristic fallback that
-    // happened to land on an invisible same-name namesake (e.g. Brush.kt's
-    // `lerp(Offset, Offset, Float)` when many packs contribute out-of-scope
-    // `lerp` overloads) does NOT make it an out-of-scope reference. Only a set
-    // whose every rankable candidate is out of scope is genuinely unresolved.
+    // With at least one candidate ranked in a visible tier the call resolves among
+    // those at runtime, by argument types. A heuristic fallback that happened to
+    // land on an invisible same-name namesake does not make it out of scope; only
+    // a set whose every rankable candidate is out of scope is unresolved.
     if (index_res.tier < ir.Module.other_package_tier) return false;
     if (!isNonExt(b, final_id)) return false;
     const tier = b.module.bareCallTierOf(final_id, name, b.self_package, file) orelse return false;
     if (tier != ir.Module.other_package_tier) return false;
-    // A bare-FQN target (no package prefix) is a lift artifact with
-    // unreliable scoping metadata; never report it out of scope (see
-    // `recordOutOfScopeRef`).
-    if (std.mem.indexOfScalar(u8, fqnOf(b, final_id), '.') == null) return false;
+    // A bare-FQN target is a lift artifact with unreliable scoping metadata; see
+    // `recordOutOfScopeRef`.
+    if (std.mem.findScalar(u8, fqnOf(b, final_id), '.') == null) return false;
     const fqn_a = if (index_res.first) |f| fqnOf(b, f) else fqnOf(b, final_id);
     const fqn_b = if (index_res.second) |s2| fqnOf(b, s2) else "";
     try b.module.resolve_diags.append(b.allocator, .{
@@ -217,25 +181,16 @@ pub fn recordOutOfScopeCall(
     return true;
 }
 
-/// True when a bare name in this builder's context can be shadowed by a
-/// runtime implicit receiver: lambda bodies (the bound receiver is only
-/// known at invoke time), method / extension / ctor-thunk bodies (`this`
-/// in scope). In every other context — a plain top-level function body —
-/// no implicit receiver exists, so member-vs-global is statically
-/// decidable: kotlinc rejects resolving a bare name against a *caller's*
-/// receiver (dynamic scope), so those sites emit the static global form.
-/// Whether the CURRENT `this` is a spliced receiver-lambda SUBJECT of a
-/// known type that is not the enclosing owner and does not declare `name`:
-/// an own-member read must then take the walking load, not a GetField on
-/// the subject (a companion `tag` inside `with(Other()) { tag }` is the
-/// enclosing class's, never a field of Other). Mirrors the write side's
-/// `spliceReceiverHidesMember`.
+/// Whether the current `this` is a spliced receiver-lambda subject of a known
+/// type that is not the enclosing owner and does not declare `name`. An
+/// own-member read must then take the walking load rather than a GetField on the
+/// subject. Mirrors the write side's `spliceReceiverHidesMember`.
 pub fn spliceSubjectHidesOwnMember(b: *FuncBuilder, name: []const u8) bool {
     if (!inline_call.rfsEnabled() or b.encl_tower_depth == 0) return false;
     const recv = b.spliceRecvTy() orelse b.spliceHintRecv() orelse return false;
     var head = std.mem.trimEnd(u8, recv, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
-    if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalarLast(u8, head, '.')) |d| head = head[d + 1 ..];
     const owner = b.ownerClass() orelse return false;
     if (std.mem.eql(u8, head, owner)) return false;
     if (inline_state.memberPropAst(head, name) != null) return false;
@@ -251,38 +206,33 @@ pub fn spliceSubjectHidesOwnMember(b: *FuncBuilder, name: []const u8) bool {
 }
 
 pub fn inReceiverContext(b: *const FuncBuilder) bool {
-    // A binding named `this` that is an ordinary user parameter (backtick-
-    // quoted on a receiver-less function) is not a dispatch receiver.
+    // A binding named `this` that is an ordinary user parameter, backtick-quoted
+    // on a receiver-less function, is not a dispatch receiver.
     const this_binding = !b.this_is_plain_param and b.resolve("this") != null;
     return b.capturesThisSlot() or this_binding or b.ownerClass() != null or
         b.isParamThunk() or b.recvTy() != null;
 }
 
-/// An extension declared on a *function type* (`(suspend () -> T).start…`)
-/// has a receiver with no members a bare call could bind: a function value's
-/// only member surface is `invoke`/`call`. Deferring a resolved top-level call
-/// to the runtime member-first walk from such a body is not just unnecessary,
-/// it is wrong — the runtime's SAM arm invokes a callable receiver for any
-/// member name no extension claims, so `runSafely(completion) { … }` inside
-/// `startCoroutineCancellable` would call the suspend block itself instead of
-/// the same-file top-level `runSafely`, silently discarding the completion.
+/// An extension declared on a function type has a receiver with no members a bare
+/// call could bind, `invoke`/`call` being its whole surface. Deferring a resolved
+/// top-level call to the runtime member-first walk from such a body is wrong: the
+/// runtime's SAM arm invokes a callable receiver for any member name no extension
+/// claims, calling the suspend block itself.
 pub fn fnTypedRecvCannotShadow(b: *const FuncBuilder, name: []const u8) bool {
     const rt = b.recvTy() orelse return false;
     if (!recvHeadIsFunctionType(rt)) return false;
     return !std.mem.eql(u8, name, "invoke") and !std.mem.eql(u8, name, "call");
 }
 
-/// Whether a recorded receiver-type head denotes a function type in any of
-/// its spellings: the parser's `"<function>"` tag, a spelled-out
-/// `(P) -> R`, or the erased builtin names (`Function1`,
-/// `SuspendFunction0`, ...). Deliberately tighter than `headIsFunctionType`
-/// — the erased names must end in digits so a user class named
-/// `FunctionTable` never claims the closed no-member surface.
+/// Whether a recorded receiver-type head denotes a function type in any spelling:
+/// the parser's `"<function>"` tag, a spelled-out `(P) -> R`, or the erased
+/// builtin names. Tighter than `headIsFunctionType`: the erased names must end in
+/// digits so a user class named `FunctionTable` never claims the closed surface.
 pub fn recvHeadIsFunctionType(rt: []const u8) bool {
     if (std.mem.eql(u8, rt, "<function>")) return true;
-    if (std.mem.indexOf(u8, rt, "->") != null) return true;
+    if (std.mem.find(u8, rt, "->") != null) return true;
     var head = rt;
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     for ([_][]const u8{ "Function", "SuspendFunction", "KFunction", "KSuspendFunction" }) |p| {
         if (std.mem.startsWith(u8, head, p) and head.len > p.len) {
             var all_digits = true;
@@ -298,24 +248,16 @@ pub fn recvHeadIsFunctionType(rt: []const u8) bool {
     return false;
 }
 
-/// Whether a bare name in an implicit-receiver context could bind to a member
-/// of that receiver, so a static bind to a same-named top-level function would
-/// wrongly shadow it. Used to decide whether to defer a resolved bare call to
-/// the runtime member-first walk (`CallMemberOrGlobal`).
+/// Whether a bare name in an implicit-receiver context could bind to a member of
+/// that receiver, so a static bind to a same-named top-level function would
+/// shadow it. Decides whether to defer a resolved bare call to the runtime
+/// member-first walk.
 ///
-/// A lambda / scope-function / parameter-thunk / extension body has an implicit
-/// receiver whose concrete type is unknown at lowering time — it may be a
-/// builtin (e.g. `StringBuilder`) whose members are not in `class_member_names`
-/// — so such a body always defers. A plain method body's receiver type IS
-/// known: its own hierarchy (cross-file supertypes included, through the
-/// transitive per-class member set) decides precisely — a member of some
-/// unrelated class elsewhere in the program cannot shadow this call. Only a
-/// receiver whose type is genuinely unknown falls back to the program-wide
+/// A lambda, scope-function, parameter-thunk or extension body has an implicit
+/// receiver whose concrete type is unknown at lowering time, so it always defers.
+/// A plain method body's receiver type is known, and its own hierarchy decides
+/// precisely. Only a genuinely unknown receiver falls back to the program-wide
 /// member-name set.
-/// The E2.3 precise answer for a lambda/thunk context: does the
-/// typeck-recorded receiver head's hierarchy declare `name`? Null when
-/// no head is recorded or its shadow set is missing/incomplete — the
-/// caller stays conservative.
 fn lambdaRecvHeadDeclares(b: *const FuncBuilder, name: []const u8) ?bool {
     const h = eagerLambdaRecvHead(b) orelse return null;
     const hs = b.module.registry.hierarchy_shadow_names.get(h) orelse return null;
@@ -327,10 +269,9 @@ fn memberShadowPossible(b: *const FuncBuilder, name: []const u8) bool {
     if (b.capturesThisSlot() or b.isParamThunk() or
         (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name)))
     {
-        // E2.3: the recorded receiver head answers precisely; when it
-        // does NOT declare the name, the remaining implicit receivers
-        // (enclosing class, outer chain) are checked below instead of
-        // answering a blanket true.
+        // Where the recorded receiver head does not declare the name, the
+        // remaining implicit receivers are checked below rather than answering a
+        // blanket true.
         if (lambdaRecvHeadDeclares(b, name)) |ans| {
             if (ans) return true;
         } else {
@@ -344,11 +285,10 @@ fn memberShadowPossible(b: *const FuncBuilder, name: []const u8) bool {
     return b.module.registry.class_member_names.contains(name);
 }
 
-/// Whether `name` is a member anywhere along the owner class's hierarchy
-/// OR any of its lifted outer classes' hierarchies (`A$B$C` also checks
-/// `A$B` and `A` — a nested class's method body sees the outer classes as
-/// implicit receivers). Null when any set along the chain is missing or
-/// incomplete: the caller must then stay conservative.
+/// Whether `name` is a member along the owner class's hierarchy or any of its
+/// lifted outer classes' hierarchies, since a nested class's method body sees the
+/// outer classes as implicit receivers. Null when any set along the chain is
+/// missing or incomplete, and the caller must stay conservative.
 pub fn ownerChainShadowContains(b: *const FuncBuilder, owner: []const u8, name: []const u8) ?bool {
     var found = false;
     var end = owner.len;
@@ -356,33 +296,26 @@ pub fn ownerChainShadowContains(b: *const FuncBuilder, owner: []const u8, name: 
         const hs = b.module.registry.hierarchy_shadow_names.get(owner[0..end]) orelse return null;
         if (!hs.complete) return null;
         if (name.len != 0 and hs.names.contains(name)) found = true;
-        const dollar = std.mem.lastIndexOfScalar(u8, owner[0..end], '$') orelse break;
+        const dollar = std.mem.findScalarLast(u8, owner[0..end], '$') orelse break;
         end = dollar;
     }
     return found;
 }
 
-/// The receiver type at this body is statically known (a plain method
-/// body with no unknown-receiver context layered on top), so the
-/// member-shadow question is answered by its own hierarchy rather than
-/// the program-wide name universe. Mirrored into `ResolveCtx` so
-/// `resolveCall`'s Phase C asks the identical question.
-/// The direct-bind guards' question — "does any class this context's
-/// receiver could be declare `name` as a member". Unlike
-/// `memberShadowPossible`, an unknown-receiver context (lambda, thunk,
-/// extension body) does NOT answer true: the alias / container-creator /
-/// prop-read guards bind DIRECT precisely when no class declares the name,
-/// and only a plain method body (receiver types statically known) may
-/// narrow the program-wide universe to its own+outer hierarchies.
+/// The direct-bind guards' question: does any class this context's receiver could
+/// be declare `name` as a member. Unlike `memberShadowPossible`, an
+/// unknown-receiver context does not answer true, since those guards bind direct
+/// precisely when no class declares the name, and only a plain method body may
+/// narrow the program-wide universe to its own and outer hierarchies.
 pub fn anyReceiverClassDeclares(b: *const FuncBuilder, name: []const u8) bool {
     if (receiverTypeKnown(b, name)) {
         if (b.ownerClass()) |oc| {
             if (ownerChainShadowContains(b, oc, name)) |ans| return ans;
         }
     }
-    // E2.3: a lambda context whose receiver head is recorded answers from
-    // that head plus the enclosing chain — the program-wide name universe
-    // is the fallback only when neither is known.
+    // A lambda context whose receiver head is recorded answers from that head plus
+    // the enclosing chain; the program-wide name universe is the fallback only
+    // when neither is known.
     if (lambdaRecvHeadDeclares(b, name)) |ans| {
         if (ans) return true;
         if (b.ownerClass()) |oc| {
@@ -397,10 +330,8 @@ pub fn receiverTypeKnown(b: *const FuncBuilder, name0: []const u8) bool {
     if (b.capturesThisSlot() or b.isParamThunk() or
         (b.recvTy() != null and !fnTypedRecvCannotShadow(b, name0)))
     {
-        // E2.3: a receiver-LAMBDA body whose receiver head typeck
-        // recorded is a known-receiver context — the membership walk can
-        // answer from that head instead of the conservative fallback.
-        // Audit-only until the sweep is adjudicated.
+        // A receiver-lambda body whose head typeck recorded is a known-receiver
+        // context, so the membership walk can answer from that head.
         if (recvheadAuditOn()) {
             if (eagerLambdaRecvHead(b)) |h| {
                 const precise = b.module.registry.hierarchy_shadow_names.get(h) != null;
@@ -439,11 +370,9 @@ pub fn isNonExt(b: *FuncBuilder, fid: FuncId) bool {
     return f.params.len == 0 or !std.mem.eql(u8, f.params[0].name, "this");
 }
 
-/// Whether the enclosing class (or any of its supertypes) declares a member
-/// named `name`. Scoped to the current `owner_class` — a bare `::name` /
-/// `this.name` can only resolve to the enclosing class's members or a global,
-/// never an unrelated class's member, so a program-wide member-name set would
-/// over-suppress the global-alias path.
+/// Whether the enclosing class or a supertype declares a member named `name`.
+/// Scoped to the current `owner_class`, since a bare `::name` or `this.name` can
+/// only resolve to the enclosing class's members or a global.
 pub fn enclosingDeclaresMember(b: *const FuncBuilder, name: []const u8) bool {
     const oc = b.ownerClass() orelse return false;
     const methods = b.module.registry.hierarchy_methods.get(oc) orelse return false;
@@ -452,12 +381,9 @@ pub fn enclosingDeclaresMember(b: *const FuncBuilder, name: []const u8) bool {
 
 /// True when `f` shares its simple name and arity with another overload whose
 /// parameter at `pidx` has a different declared type. A bare call is lowered to
-/// one (arbitrarily-picked) overload before the runtime types its arguments, so
-/// when the overloads disagree on a parameter's type that pick is not an
-/// authoritative coercion target — re-typing a numeric literal to it (e.g.
-/// turning the `Int` literal `50` into `UInt` because the lowering happened to
-/// pick `minOf(UInt, UInt)`) is wrong. Leaving the literal at its natural type
-/// lets the runtime overload resolver select the right form.
+/// one arbitrarily-picked overload before the runtime types its arguments, so a
+/// disagreeing parameter is not an authoritative coercion target: leaving a
+/// numeric literal at its natural type lets the runtime resolver pick.
 pub fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: usize) bool {
     if (pidx >= f.params.len) return false;
     const want_ty = f.params[pidx].ty.name;
@@ -476,10 +402,10 @@ pub fn overloadParamTypeConflicts(module: *const Module, f: *const Func, pidx: u
 /// arguments (`kotlin.collections.Iterable<Int>` -> `Iterable`).
 pub fn typeHead(s: []const u8) []const u8 {
     var t = s;
-    if (std.mem.indexOfScalar(u8, t, '<')) |lt| t = t[0..lt];
-    if (std.mem.lastIndexOfScalar(u8, t, '.')) |dot| t = t[dot + 1 ..];
-    // A use-site projection keeps the underlying name as its head: an
-    // `out#T` receiver is a `T` for class/bound lookups.
+    if (std.mem.findScalar(u8, t, '<')) |lt| t = t[0..lt];
+    if (std.mem.findScalarLast(u8, t, '.')) |dot| t = t[dot + 1 ..];
+    // A use-site projection keeps the underlying name as its head: an `out#T`
+    // receiver is a `T` for class and bound lookups.
     if (std.mem.startsWith(u8, t, "in#"))
         t = t["in#".len..]
     else if (std.mem.startsWith(u8, t, "out#"))
@@ -514,15 +440,10 @@ pub fn argStaticHead(b: *FuncBuilder, a: *const Expr) ?[]const u8 {
     return null;
 }
 
-/// The fallback member-call path: local-callable shadowing, super, cast-receiver
-/// static dispatch, and plain CallMember.
-/// Expected per-argument lambda arities for a member call whose RECEIVER is
-/// a class name (`Snapshot.withMutableSnapshot { … }`, explicit `.Companion`
-/// included): the lifted companion / class method registry resolves the
-/// member's declared signature statically. Null when nothing is provable —
-/// dynamic dispatch then proceeds exactly as before. The channel exists so
-/// a `() -> R` block drops its parser-injected `it` and an `it` inside
-/// captures the enclosing lambda's, instead of binding a null parameter.
+/// Expected per-argument lambda arities for a member call whose receiver is a
+/// class name: the lifted companion and class method registry resolves the
+/// member's declared signature statically. Null when nothing is provable. The
+/// channel exists so a `() -> R` block drops its parser-injected `it`.
 fn classMemberArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const u8, args: []const Expr, ast_arg_names: []const ?[]const u8) Allocator.Error!?[]i16 {
     if (receiver.* != .Path) return null;
     const rsegs = receiver.Path.segments;
@@ -546,11 +467,10 @@ fn classMemberArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const 
     return null;
 }
 
-/// Expected lambda arities for an explicit-receiver call. Class/object
-/// members are authoritative; otherwise a statically typed receiver can
-/// select visible extension candidates by their declared receiver head. If
-/// every best-scope candidate agrees, that common shape is safe to lower even
-/// though runtime overload dispatch still chooses the callable.
+/// Expected lambda arities for an explicit-receiver call. Class and object members
+/// are authoritative; otherwise a statically typed receiver selects visible
+/// extension candidates by declared receiver head, and a shape every best-scope
+/// candidate agrees on is safe to lower.
 pub fn memberCallArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []const u8, args: []const Expr, ast_arg_names: []const ?[]const u8) Allocator.Error!?[]i16 {
     if (try classMemberArgArities(b, receiver, mname, args, ast_arg_names)) |arities| return arities;
     const recv_ty = argDeclTypeRef(b, receiver) orelse return null;
@@ -598,24 +518,20 @@ pub fn memberCallArgArities(b: *FuncBuilder, receiver: *const Expr, mname: []con
     return agreed;
 }
 
-/// A short all-caps head (`T`, `R`, `K1`) is a type PARAMETER spelling, not
-/// a class name. `staticTypeClassId` rejects it too, but only after a lookup.
+/// A short all-caps head (`T`, `R`, `K1`) is a type parameter spelling, not a
+/// class name. `staticTypeClassId` rejects it too, but only after a lookup.
 pub fn bareTypeParamHead(name: []const u8) bool {
     const h = typeHead(std.mem.trimEnd(u8, name, "?"));
     return h.len != 0 and h.len <= 2 and std.ascii.isUpper(h[0]);
 }
 
-/// Whether the receiver's STATIC type (head-resolved) declares a visible
-/// member of `name` applicable at `argc` unnamed arguments. kotlinc
-/// resolves members before extensions, so an applicable member blocks the
-/// inference-opened reified-extension splice.
-/// Whether the receiver's static class (or a supertype) declares an inline
-/// member named `name` with a reified type parameter that takes `nargs`
-/// arguments: such a member is honored only by splicing.
+/// Whether the receiver's static class or a supertype declares an inline member
+/// named `name` with a reified type parameter taking `nargs` arguments, which is
+/// honored only by splicing.
 pub fn receiverMemberIsReifiedInline(b: *FuncBuilder, receiver: *const Expr, name: []const u8, nargs: usize) Allocator.Error!bool {
     const head = (try inline_call.gateReceiverHead(b, receiver)) orelse return false;
     var h = std.mem.trimEnd(u8, head, "?");
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
     const cands = inline_state.candidatesForName(name) orelse return false;
     for (cands) |cf| {
         if (cf.receiver_type != null or !anyReified(cf.type_params)) continue;
@@ -635,18 +551,16 @@ pub fn receiverMemberIsReifiedInline(b: *FuncBuilder, receiver: *const Expr, nam
 pub fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name: []const u8, args: []const Expr, arg_names: []const ?[]const u8, caller_file: span.FileId) Allocator.Error!bool {
     const head = (try inline_call.gateReceiverHead(b, receiver)) orelse return false;
     var h = std.mem.trimEnd(u8, head, "?");
-    if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+    if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
     if (h.len == 0) return false;
-    const cid = (if (std.mem.indexOfScalar(u8, h, '.') != null)
+    const cid = (if (std.mem.findScalar(u8, h, '.') != null)
         b.module.classIdByFqn(h)
     else
         b.module.uniqueClassIdBySimpleName(h)) orelse return false;
     const argc = args.len;
     if (argc > 8) return false;
-    // The arguments' declared-type evidence decides, not arity alone:
-    // `Json.encodeToString(P(1), mode)` never binds Json's
-    // `(serializer, value)` member, so the reified member extension is
-    // the target and must splice.
+    // The arguments' declared-type evidence decides, not arity alone, so a
+    // reified member extension is the target and must splice.
     const shapes = try buildArgShapes(b, args, arg_names);
     defer b.allocator.free(shapes);
     const res = b.module.resolveMemberCall(cid, name, shapes[0..argc], .{
@@ -663,12 +577,9 @@ pub fn receiverStaticMemberApplies(b: *FuncBuilder, receiver: *const Expr, name:
     return res.applicable;
 }
 
-/// The scalar bitwise/logical infix members with intrinsic BinOp forms.
-/// The reified type-argument name a call binds from its EXPECTED type: a
-/// single reified parameter that is the declared return type takes the
-/// expected head (`assertEquals(obj, json.decodeFromString(text, mode))`
-/// binds `T := CList1` from the sibling). Spelled as the class table holds
-/// it (a nested class by its lifted name).
+/// The reified type-argument name a call binds from its expected type: a single
+/// reified parameter that is the declared return type takes the expected head.
+/// Spelled as the class table holds it, a nested class by its lifted name.
 pub fn reifiedNamesFromExpected(b: *FuncBuilder, cf: *const ast.Function, exp: ?*const ast.TypeRef) Allocator.Error!?[]const []const u8 {
     const e = exp orelse return null;
     const rt = cf.return_type orelse return null;
@@ -681,15 +592,14 @@ pub fn reifiedNamesFromExpected(b: *FuncBuilder, cf: *const ast.Function, exp: ?
     return out;
 }
 
-/// An expected type spelled as the class table holds it, WITH its type
-/// arguments (`GenericNullableBox<StringHolder>` keeps the argument the
-/// runtime `typeOf<T>()` needs): heads rename through the scope, dotted
+/// An expected type spelled as the class table holds it, with its type arguments,
+/// which the runtime `typeOf<T>()` needs. Heads rename through the scope, dotted
 /// heads through the qualified-suffix lookup.
 fn renderExpectedTypeName(b: *FuncBuilder, e: *const ast.TypeRef) Allocator.Error![]const u8 {
     const head0 = std.mem.trimEnd(u8, e.name.name, "?");
     if (head0.len == 0) return "";
     var head: []const u8 = head0;
-    if (std.mem.indexOfScalar(u8, head0, '.') != null) {
+    if (std.mem.findScalar(u8, head0, '.') != null) {
         if (b.module.classIdByQualifiedSuffix(head0)) |cid| {
             if (cid.int() < b.module.classes.items.len) head = b.module.classes.items[cid.int()].name;
         }
@@ -716,20 +626,18 @@ fn renderExpectedTypeName(b: *FuncBuilder, e: *const ast.TypeRef) Allocator.Erro
     return out.toOwnedSlice(b.allocator);
 }
 
-/// A receiver/context type's bare head: no nullability, type arguments,
+/// A receiver or context type's bare head: no nullability, type arguments,
 /// package or outer-class prefix.
 fn receiverTypeSimple(ty: []const u8) []const u8 {
     const head = typeHead(std.mem.trimEnd(u8, ty, "?"));
-    return if (std.mem.lastIndexOfScalar(u8, head, '$')) |i| head[i + 1 ..] else head;
+    return if (std.mem.findScalarLast(u8, head, '$')) |i| head[i + 1 ..] else head;
 }
 
-/// The innermost implicit receiver whose static type head is `ty`: a
-/// spliced receiver-lambda subject (bound as the innermost `this`), else the
-/// declaration's own receiver or owner instance. Null when no receiver in
-/// scope has that type.
+/// The innermost implicit receiver whose static type head is `ty`: a spliced
+/// receiver-lambda subject, else the declaration's own receiver or owner instance.
 pub fn implicitReceiverOfType(b: *FuncBuilder, ty: []const u8) Allocator.Error!?Reg {
     const want = receiverTypeSimple(ty);
-    // Spliced receiver-lambda subjects (`with(2) { … }`), innermost first.
+    // Spliced receiver-lambda subjects, innermost first.
     var si = b.subject_binds.items.len;
     while (si > 0) {
         si -= 1;
@@ -755,9 +663,8 @@ fn receiverHeadIs(b: *const FuncBuilder, head: []const u8, want: []const u8) boo
     return std.mem.eql(u8, h, want) or b.module.classIsOrExtends(h, want);
 }
 
-/// For a bare inner-class construction: the spliced receiver-lambda subject
-/// bound as the innermost `this` when its static type is the inner class's
-/// outer, else null.
+/// For a bare inner-class construction: the spliced receiver-lambda subject bound
+/// as the innermost `this` when its static type is the inner class's outer.
 pub fn spliceSubjectOuterFor(b: *FuncBuilder, class_id: ir.ClassId) ?Reg {
     if (class_id.int() >= b.module.classes.items.len) return null;
     const cls = &b.module.classes.items[class_id.int()];
@@ -778,13 +685,12 @@ pub fn spliceSubjectOuterFor(b: *FuncBuilder, class_id: ir.ClassId) ?Reg {
 /// Whether `cls_name`'s companion object carries the simple name `name`.
 pub fn ownCompanionNamed(b: *const FuncBuilder, cls_name: []const u8, name: []const u8) bool {
     const comp = b.module.registry.companion_singletons.get(cls_name) orelse return false;
-    const simple = if (std.mem.lastIndexOfScalar(u8, comp, '$')) |i| comp[i + 1 ..] else comp;
+    const simple = if (std.mem.findScalarLast(u8, comp, '$')) |i| comp[i + 1 ..] else comp;
     return std.mem.eql(u8, simple, name);
 }
 
-/// Every named argument names a declared parameter (Kotlin binds named
-/// arguments by parameter name; a candidate lacking the name is not
-/// applicable).
+/// Every named argument names a declared parameter; Kotlin binds named arguments
+/// by parameter name, and a candidate lacking the name is not applicable.
 pub fn namedArgsNameParams(params: []const ir.Param, arg_names: []const ?[]const u8) bool {
     for (arg_names) |maybe| {
         const an = maybe orelse continue;
@@ -800,9 +706,9 @@ pub fn namedArgsNameParams(params: []const ir.Param, arg_names: []const ?[]const
     return true;
 }
 
-/// Whether the primary constructor's declared parameter types definitely
-/// cannot accept the literal argument types (the constructor-side twin of
-/// `factorySigRejectsArgs`).
+/// Whether the primary constructor's declared parameter types definitely cannot
+/// accept the literal argument types, the constructor-side twin of
+/// `factorySigRejectsArgs`.
 pub fn ctorSigRejectsArgs(b: *FuncBuilder, params: []const ir.Param, args: []const Expr) bool {
     for (args, 0..) |*a, i| {
         if (i >= params.len) break;

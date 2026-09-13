@@ -1,5 +1,4 @@
-//! Resolved member and extension call lowering, and the member call
-//! fallback.
+//! Member and extension call lowering, plus the member-call fallback.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -119,22 +118,20 @@ const orEmitAudit = audit_mod.orEmitAudit;
 const tests_shapes_mod = @import("tests_shapes.zig");
 const span = tests_shapes_mod.span;
 
-/// Lower a member call once the shared resolver identifies its declaration.
-/// Final/private declarations become `Call(FuncId)`; overridable class members
-/// become `CallVirtual(MethodSlotId)`. Both forms leave no runtime name lookup.
+/// Lower a member call once the shared resolver names its declaration. Final
+/// and private declarations become `Call(FuncId)`, overridable class members
+/// `CallVirtual(MethodSlotId)`.
 const ResolvedMemberLowering = union(enum) {
     none,
     deferred,
     lowered: Reg,
 };
 
-/// How a caller has already constrained the receiver of a member call.
 const ReceiverState = struct {
-    /// The receiver, already lowered. A safe call evaluates it once to test it
-    /// for null, so re-lowering it here would evaluate it twice.
+    /// Already lowered, by a safe call that must not evaluate it twice.
     reg: ?Reg = null,
-    /// The receiver cannot be null at this point regardless of its declared
-    /// type, so a nullable declared type does not disqualify a member.
+    /// Non-null here regardless of declared type, so a nullable declared type
+    /// does not disqualify a member.
     non_null: bool = false,
 };
 
@@ -150,13 +147,8 @@ pub fn lowerResolvedMemberCall(
 ) Allocator.Error!ResolvedMemberLowering {
     if (ast_type_args.len != 0 or receiver.* == .Super) return .none;
     last_member_refuted = false;
-    // The checker's own pick needs NO receiver type: it resolved the call
-    // from the declarations, which is the whole point of running it. Asked
-    // before the receiver-type requirement, because that requirement is a
-    // property of the LAZY engine and this answer did not come from it.
-    // Restricted to an image-declared extension for the same reasons the
-    // later consumer is: an extension's ABI is receiver-in-the-leading-slot
-    // whatever the receiver turns out to be, so the emit is decided.
+    // The checker's pick needs no receiver type, so it is asked ahead of the
+    // lazy engine's receiver-type requirement. Image-declared extensions only.
     if (declared_ty == null and !std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) {
         if (b.module.eagerExternCallTarget(name.span)) |ep| ez: {
             audit_mod.lm_eager_norecv[0] += 1;
@@ -197,13 +189,8 @@ pub fn lowerResolvedMemberCall(
                 std.debug.print("[member-static] {s} recv=<unknown>\n", .{name.name});
             }
         }
-        // A call every value answers, on a receiver nothing could name.
-        // `toString()` and `hashCode()` are declared as `Any?` EXTENSIONS in
-        // the stdlib, and those are what Kotlin binds when the receiver may
-        // be null; for a non-null receiver they delegate to the member, so
-        // the observable result is the same either way. Only a UNIQUE `Any?`
-        // extension of that name and arity is taken, so a same-named
-        // declaration on a real type can never be reached through here.
+    // Kotlin binds the stdlib's `Any?` extensions `toString`/`hashCode` for a
+    // possibly-null receiver. Taken only when that extension is unique here.
         if (recv_state.reg == null and ast_type_args.len == 0) {
             if (allNull(ast_arg_names)) {
                 if (uniqueAnyNullableExtension(b, name.name, args.len)) |fid| {
@@ -231,24 +218,15 @@ pub fn lowerResolvedMemberCall(
                 }
             }
         }
-        // A call whose only declaration is a UNIVERSAL INLINE extension —
-        // `fun <T, R> T.let(block: (T) -> R): R` and its family — is not a
-        // dispatch at all: the body is spliced at this site whatever the
-        // receiver turns out to be. Verified with `KLIO_MISS_TRACE=let`,
-        // which reports no runtime miss for an untyped receiver. Counting
-        // it against the receiver-typing residue measured work that does
-        // not exist.
+    // A name whose only declaration is a universal inline extension (`T.let`
+    // and family) splices rather than dispatches.
         if (uniqueUniversalInlineExtension(b, name.name, args.len) != null) {
             lmNote(.bound_static);
             return .none;
         }
-        // `expected.getter()` — the callee is a RECEIVER-TAKING callable
-        // VALUE in scope (`getter: T.() -> P`) and the receiver's declared
-        // type is a bare type parameter: kotlinc resolves against the
-        // parameter's bound, finds no member, and commits the value
-        // (invoke) protocol. There is no class slot to bind BY DESIGN —
-        // the same census category as a function-typed receiver; the
-        // member-emission arm below commits `CallValueWithThis`.
+    // Receiver typed by a bare type parameter with a receiver-taking callable
+    // value in scope: Kotlin resolves against the bound, finds no member, and
+    // commits the invoke protocol.
         if ((b.resolve(name.name) != null or b.knowsOuter(name.name)) and
             (b.isReceiverLambdaParam(name.name) or b.isLocalExtFn(name.name) or
                 b.localDeclRecvFn(name.name)) and
@@ -356,7 +334,7 @@ pub fn lowerResolvedMemberCall(
                         if (span.active_map) |m| {
                             if (m.getChecked(name.span.file)) |sf| {
                                 const lc = sf.lineCol(name.span.start);
-                                const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |si| sf.path[si + 1 ..] else sf.path;
+                                const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |si| sf.path[si + 1 ..] else sf.path;
                                 break :nblk std.fmt.bufPrint(&nloc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
                             }
                         }
@@ -380,11 +358,7 @@ pub fn lowerResolvedMemberCall(
                 if (b.localInitExpr(rn)) |ini| {
                     audit_mod.lm_norecv_init[1] += 1;
                     audit_mod.lm_norecv_call[@intFromEnum(classifyCallReturn(b, ini))] += 1;
-                    // `KLIO_NORECV_WHY=<name>`: at a counted site whose init
-                    // IS recorded, re-run the lazy deriver and print its
-                    // terminal, so the failing channel is named instead of
-                    // guessed (the self-shadow fix measured census-neutral;
-                    // this finds where these sites actually die).
+                    // `KLIO_NORECV_WHY=<name>`: print the lazy deriver's terminal.
                     if (runtime.envOnce("KLIO_NORECV_WHY")) |want| {
                         if (std.mem.eql(u8, want, "*") or std.mem.eql(u8, want, rn)) {
                             const redo = argDeclTypeRefLazy(b, receiver);
@@ -399,7 +373,7 @@ pub fn lowerResolvedMemberCall(
                                 if (span.active_map) |m| {
                                     if (m.getChecked(wcs.file)) |sf| {
                                         const lc = sf.lineCol(wcs.start);
-                                        const base = if (std.mem.lastIndexOfScalar(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                                        const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
                                         break :wblk std.fmt.bufPrint(&wloc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
                                     }
                                 }
@@ -434,18 +408,11 @@ pub fn lowerResolvedMemberCall(
         }
         return .none;
     };
-    // A nullable receiver keeps a member call off the static path, because an
-    // extension declared on `T?` outranks a member there — `x.f()` on a
-    // nullable `x` is only legal when such an extension exists. A SAFE call is
-    // different: its member runs on the non-null branch, which is exactly the
-    // receiver a member declaration expects.
+    // An extension on `T?` outranks a member, so `x.f()` on a nullable `x` is
+    // only legal when one exists. A safe call's member runs on the non-null branch.
     if (ty.nullable and !recv_state.non_null) {
-        // ...unless no such extension EXISTS. The rule above is about an
-        // extension on `T?` outranking the member; where the name declares
-        // none, Kotlin has only one legal target for `x.f()` on a nullable
-        // `x` — the member — and the call binds to it. Checked across the
-        // whole module, so a later-loaded pack cannot introduce one behind
-        // this decision.
+        // Unless the name declares no such extension, leaving the member as
+        // Kotlin's only legal target. Checked module-wide.
         const nn_head = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
         var any_nullable_ext = false;
         for (b.module.funcsBySimpleName(name.name)) |fid| {
@@ -461,12 +428,8 @@ pub fn lowerResolvedMemberCall(
             }
         }
         if (any_nullable_ext) {
-            // The extension that outranks the member is a DECLARATION like
-            // any other, and Kotlin binds an extension statically — its
-            // receiver rides the leading `this` slot. Resolve it here rather
-            // than handing the whole call to the runtime. Only when the
-            // receiver has not already been lowered, since this path lowers
-            // it itself and a second evaluation would be visible.
+            // Kotlin binds an extension statically, receiver in the leading
+            // `this` slot. Only if unlowered, since this path lowers it.
             if (recv_state.reg == null and ast_type_args.len == 0) {
                 ext_route_tag = "lowerResolvedMemberCall:19392";
                 if (try lowerResolvedExtensionCall(
@@ -494,62 +457,45 @@ pub fn lowerResolvedMemberCall(
     else
         ty;
     var identity = std.mem.trimEnd(u8, ty.name, "?");
-    if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+    if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     const head = typeHead(identity);
-    // A simple head shared by several classes (geometry's `Size` value
-    // class and the `androidx.annotation.Size` annotation) is decided the
-    // way the source decides it: by the call site's imports and package.
-    var owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+    // A simple head shared by several classes (geometry's `Size`, the
+    // `androidx.annotation.Size` annotation) is decided by the call site's
+    // imports and package.
+    var owner_id = if (std.mem.findScalar(u8, identity, '.') != null)
         b.module.classIdByFqn(identity)
     else
         b.module.uniqueClassIdBySimpleName(head) orelse
             (if (b.isTypeParam(head)) null else b.module.classIdIndexed(head, b.self_package, name.span.file));
-    // A receiver typed by a TYPE PARAMETER names no class, and that was the
-    // whole of the `no_class_id` bucket — `C`, `M`, `A`, `T`, `R` accounted for
-    // 769 of 915 sites. Kotlin resolves a member call on such a value against
-    // the parameter's declared upper bound, so resolve the head through it.
-    // Only a `complete` bound is used: an incomplete record dropped
-    // intersection or structural information and cannot stand in for the type.
+    // A receiver typed by a type parameter names no class; Kotlin resolves the
+    // member against its upper bound. Only a `complete` bound: an incomplete
+    // record dropped intersection or structural information.
     if (owner_id == null) {
         if (b.typeParamBound(head)) |tpb| {
-            // The bound's ARGUMENTS do not matter here: this asks only which
-            // class owns a member call on the parameter, and `C` bounded by
-            // `MutableCollection<in T>` answers `MutableCollection`. Those two
-            // parameters were 6,590 of the 8,702 sites in this bucket.
             if (tpb.complete or (tpb.head_only and
                 !std.mem.eql(u8, runtime.envOnce("KLIO_TP_HEAD") orelse "1", "0")))
             {
                 var bound_identity = std.mem.trimEnd(u8, tpb.bound, "?");
-                if (std.mem.indexOfScalar(u8, bound_identity, '<')) |lt| bound_identity = bound_identity[0..lt];
-                owner_id = if (std.mem.indexOfScalar(u8, bound_identity, '.') != null)
+                if (std.mem.findScalar(u8, bound_identity, '<')) |lt| bound_identity = bound_identity[0..lt];
+                owner_id = if (std.mem.findScalar(u8, bound_identity, '.') != null)
                     b.module.classIdByFqn(bound_identity)
                 else
                     b.module.uniqueClassIdBySimpleName(typeHead(bound_identity));
             }
         }
     }
-    // A declared type the module-wide lookups miss can still name a class
-    // the DECLARATION SITE can see: `Outer.Inner` written without its
-    // package resolves as a `.`-aligned FQN suffix (the type-position
-    // convention), and a bare nested-class name resolves through the
-    // enclosing classifier chain — inside `HexFormat`, `BytesHexFormat`
-    // names its nested sibling even though nested classes are deliberately
-    // invisible to the module-wide simple-name index.
+    // Nested classes are deliberately absent from the module-wide simple-name
+    // index, so resolve `Outer.Inner` as a `.`-aligned FQN suffix and a bare
+    // nested name through the enclosing classifier chain.
     if (owner_id == null) {
-        if (std.mem.indexOfScalar(u8, identity, '.') != null) {
+        if (std.mem.findScalar(u8, identity, '.') != null) {
             owner_id = b.module.classIdByQualifiedSuffix(identity);
         } else if (!b.isTypeParam(head)) {
             owner_id = nestedClassIdAtLexicalSite(b, head);
         }
     }
-    // A head shaped like a type PARAMETER that names no class and carries no
-    // bound record in this scope is still a type parameter — one declared by
-    // an enclosing generic the body does not have in scope (`Map.Entry<K, V>`
-    // read inside `AbstractMap.Companion.entryHashCode`). Kotlin's floor for
-    // any type parameter is `Any?`, and a call on it can only target a member
-    // of that floor, so resolve there rather than giving up on the receiver.
-    // A class-param IDENTITY MANGLE (`$class$ N i:E`) is the same shape
-    // under a stable spelling.
+    // A type-parameter-shaped head with no class and no bound in scope belongs
+    // to an enclosing generic, whose floor in Kotlin is `Any?`.
     if (owner_id == null and head.len != 0 and
         (((head.len <= 2) and std.ascii.isUpper(head[0]) and b.module.classId(head) == null) or
             ir.parseClassTypeParamIdentity(head) != null))
@@ -557,12 +503,8 @@ pub fn lowerResolvedMemberCall(
         owner_id = b.module.uniqueClassIdBySimpleName("Any") orelse
             b.module.classIdByFqn("kotlin.Any");
     }
-    // A FUNCTION-typed receiver dispatches by the invoke convention, not a
-    // class slot: `startCoroutineUninterceptedOrReturn` on a
-    // `DeepRecursiveFunctionBlock` (a typealias to a suspend fn type) has no
-    // class row to bind BY DESIGN. The backends compile these to the value
-    // (invoke) protocol; the census counts them as their own category so
-    // the bindable share reads honestly.
+    // A function-typed receiver dispatches by the invoke convention, not a
+    // class slot, so it has no class row to bind.
     if (owner_id == null) {
         const fhead = blk_f: {
             if (std.mem.startsWith(u8, head, "Function") or
@@ -587,10 +529,8 @@ pub fn lowerResolvedMemberCall(
             return .none;
         }
     }
-    // An argument written `expr as Any` fits no member whose parameter has
-    // a concrete class type: kotlinc binds the same-named extension instead
-    // (`zs.contains(object {} as Any)` on a `Collection<Z>` implementation
-    // is `Iterable<T>.contains`, never the member `contains(element: Z)`).
+    // An argument written `expr as Any` fits no member whose parameter has a
+    // concrete class type; kotlinc binds the same-named extension instead.
     if (owner_id) |oid| {
         if (recv_state.reg == null and ast_type_args.len == 0 and anyCastToAny(args) and
             b.module.classHierarchyDeclaresMember(oid, name.name))
@@ -611,16 +551,13 @@ pub fn lowerResolvedMemberCall(
             }
         }
     }
-    // A LOCAL-CLASS typing record: no class row, but the mangled head
-    // registered its methods as headers — probe the member table directly
-    // and bind the virtual slot (the runtime slot's by-name fallback
-    // executes the RegisterClass method).
+    // A local-class typing record has no class row, but its mangled head
+    // registered methods as headers, so bind the virtual slot directly.
     if (owner_id == null and ast_type_args.len == 0 and allNull(ast_arg_names) and
-        // ONLY the local-class typing records (the `$lc` mangle):
-        // class_super_names is the GENERAL super registry, and probing it
-        // for any row-less head bound atomicfu's pack stubs over their
-        // host bindings (every CAS deadlocked).
-        std.mem.indexOf(u8, head, "$lc") != null and
+        // Only the `$lc` mangle: `class_super_names` is the general super
+        // registry, and probing it for any row-less head binds pack stubs over
+        // their host bindings.
+        std.mem.find(u8, head, "$lc") != null and
         b.module.registry.class_super_names.get(head) != null)
     {
         var probe: usize = args.len;
@@ -647,7 +584,7 @@ pub fn lowerResolvedMemberCall(
         lmNote(.no_class_id);
         noteNoClassHead(head);
         if (norecvCensusOn()) {
-            const k: NoClassKind = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+            const k: NoClassKind = if (std.mem.findScalar(u8, identity, '.') != null)
                 .fqn_unknown
             else if (b.module.classId(head) != null)
                 .simple_ambiguous
@@ -673,18 +610,12 @@ pub fn lowerResolvedMemberCall(
     };
     if (receiver.* == .Path and receiver.Path.segments.len != 0) {
         const receiver_name = receiver.Path.segments[receiver.Path.segments.len - 1].name;
-        // A bare name resolving to nothing lexically is a CLASS-name access
-        // (whose members live on the companion) only when no enclosing
-        // receiver declares a property of the name: `iterator` inside
-        // `object : Iterator<T> { val iterator = ... }` is a `this` property
-        // read typed by the head channel, and redirecting it to a companion
-        // silently dropped the whole resolution.
+        // A bare name resolving to nothing lexically is a class-name access
+        // (members on the companion) only when no enclosing receiver declares a
+        // property of that name.
         if (b.resolve(receiver_name) == null and !b.knowsOuter(receiver_name) and
             !enclosingHasMemberNamed(b, receiver_name) and
-            // A TOP-LEVEL PROPERTY read is a VALUE receiver, never a
-            // classifier access: `asserter.assertEquals(...)` inside
-            // kotlin.test resolved to Asserter's (absent) companion and
-            // dropped the whole member resolution to the walk.
+            // A top-level property read is a value receiver, not a classifier.
             b.module.registry.top_level_prop_pkgs.get(receiver_name) == null and
             static_owner.int() < b.module.classes.items.len)
         {
@@ -699,7 +630,7 @@ pub fn lowerResolvedMemberCall(
     defer shape_set.deinit(b.allocator);
     const shapes = shape_set.shapes;
     const lexical_owner: ?ir.ClassId = if (b.ownerClass()) |owner_name|
-        (if (std.mem.indexOfScalar(u8, owner_name, '.') != null)
+        (if (std.mem.findScalar(u8, owner_name, '.') != null)
             b.module.classIdByFqn(owner_name)
         else
             (b.module.classIdIndexed(owner_name, b.self_package, name.span.file) orelse b.module.classId(owner_name)))
@@ -736,15 +667,9 @@ pub fn lowerResolvedMemberCall(
             }
         }
     }
-    // A SELF-recursive member pick with a non-authoritative argument defers
-    // to the runtime walk: kotlinc rejects the member when an invariant
-    // generic argument mismatches (RangesTest's private
-    // `assertEquals(List<IntRange>, List<LongRange>)` delegates to
-    // kotlin.test's on `expected.map { it.toLong() }` — binding itself
-    // statically recursed forever), and only the runtime holds the argument
-    // values that decide it. A genuinely recursive call still binds through
-    // the walk; this trades the static commit for a deferred dispatch on
-    // exactly the shape that can self-capture.
+    // kotlinc rejects a member whose invariant generic argument mismatches and
+    // only the runtime holds the deciding values, so a self-recursive pick with
+    // a non-authoritative argument defers to the runtime walk.
     if (resolved.target) |rt| self_rec: {
         const cur = build.currentRealFn() orelse break :self_rec;
         if (!std.mem.eql(u8, cur, name.name)) break :self_rec;
@@ -768,9 +693,7 @@ pub fn lowerResolvedMemberCall(
         for (shapes) |sh| {
             const undecided = blk: {
                 const t = sh.ty orelse break :blk sh.literal_kind == null and !sh.is_lambda;
-                // A derived head whose generic CONTENT is unresolved
-                // (`List<*>`, a bare type variable) cannot prove the
-                // invariant argument the member declares.
+                // An unresolved generic head cannot prove the invariant argument.
                 for (t.args) |ta| {
                     const an = std.mem.trimEnd(u8, ta.name, "?");
                     if (std.mem.eql(u8, an, "*")) break :blk true;
@@ -781,28 +704,15 @@ pub fn lowerResolvedMemberCall(
             if (undecided) return .none;
         }
     }
-    // The checker's own pick, when it made one. Its candidate set for a
-    // member call on a known receiver class is complete (the image publishes
-    // every extension on the class and its supertype chain) and it ranks by
-    // ARGUMENT TYPE, which is the one thing the lazy engine's shape-based
-    // ranking cannot do. It is preferred exactly where the bare-call arm
-    // prefers it — and where the resolver reached no target at all, it is the
-    // only answer, so a deferral becomes a static bind.
-    // Only where the resolver reached NO target: everything downstream of
-    // this point reads `resolved` for dispatch kind, owner, and arity, so a
-    // pick that disagrees with it would be spliced into a resolution
-    // describing something else. Where the resolver has no target there is
-    // nothing to disagree with, and the checker's answer is the only one.
+    // The checker's pick ranks by argument type, which the shape-based lazy
+    // ranking cannot. Taken only where the resolver reached no target, since
+    // downstream reads `resolved` for dispatch kind, owner, and arity.
     const eager_pick: ?FuncId = if (!std.mem.eql(u8, runtime.envOnce("KLIO_EAGER_MEMBER") orelse "1", "0")) blk: {
         const ep = b.module.eagerExternCallTarget(name.span) orelse break :blk null;
         const ef = b.module.funcById(ep) orelse break :blk null;
         if (ef.params.len == 0 or !std.mem.eql(u8, ef.params[0].name, "this")) break :blk null;
-        // Where the resolver DID name a declaration, the pick may replace it
-        // only if both are the same call form — an extension, receiver in the
-        // leading slot. Everything downstream reads `resolved` for the shape
-        // of the call, and swapping a declaration of one shape for another is
-        // what broke `d += x` on Duration. Same shape, and the swap is just
-        // which declaration the identical emit names.
+        // Where the resolver did name one, the pick replaces it only for the
+        // same call form: downstream reads `resolved` for the call shape.
         if (resolved.target) |rt| {
             if (rt.int() == ep.int()) break :blk null;
             const rf = b.module.funcById(rt) orelse break :blk null;
@@ -822,9 +732,8 @@ pub fn lowerResolvedMemberCall(
         last_member_refuted = !resolved.applicable;
         return if (resolved.applicable) .deferred else .none;
     };
-    // A HOST-SHADOWED declaration (a pack stub whose installed binding is
-    // authoritative — atomicfu's atomics) must never statically bind its
-    // interpreted body; the runtime walk's binding preference arbitrates.
+    // A host-shadowed declaration (a pack stub whose installed binding is
+    // authoritative) must never statically bind its interpreted body.
     if (b.module.funcById(func_id)) |cf| {
         if (cf.hasBody() and b.module.registry.host_shadowed_fqns.contains(cf.fqn)) {
             return .deferred;
@@ -837,20 +746,9 @@ pub fn lowerResolvedMemberCall(
             std.debug.print("[EAGER-MEMBER-HIT] '{s}': eager={d}({s}) lazy={d}\n", .{ name.name, ep.int(), efqn, lazy_str });
         }
     }
-    // The resolver identifies a single candidate but withholds dispatch when an
-    // argument's type is unknown, so its applicability is unproven. Measured,
-    // that is EVERY deferral reaching this point — sites with a fully proven
-    // declaration identity that emitted no static binding at all.
-    //
-    // The identity is not in doubt there; only whether Kotlin would pick this
-    // member. The one thing that beats an applicable member is an EXTENSION of
-    // the same name, so ask exactly that. `extCouldApply` is chain-aware and
-    // conservative — a generic-receiver extension, a supertype's extension, or a
-    // stale index all answer yes — so a `false` means nothing else could bind
-    // and the member's identity is sufficient.
-    // Computed for stub/value receivers too: their direct-dispatch escape
-    // below still requires the extension-shadow question answered — String
-    // and the unsigned shells carry extension families everywhere.
+    // The resolver withholds dispatch on an unknown argument type though the
+    // identity is certain. Only a same-name extension beats an applicable
+    // member, and `extCouldApply` is conservative, so `false` settles it.
     const promo_ext_why: ir.Module.ExtCouldApplyWhy =
         if (resolved.dispatch == .deferred and resolved.target != null)
             b.module.extCouldApplyWhy(b.allocator, head, name.name, args.len)
@@ -875,14 +773,10 @@ pub fn lowerResolvedMemberCall(
             .declared_super => audit_mod.lm_promo[@intFromEnum(PromoBlock.ext_declared_super)] += 1,
         }
     }
-    // Third-derivation promotion: the extension-shadow question answers by
-    // PROOF when every argument is authoritative — the member compatible,
-    // every reachable same-name extension refuted (`KLIO_MEMBER_PROMO=0`
-    // disables for A/B).
-    // The stub/value receiver no longer blocks the proof: the runtime
-    // resolves a virtual slot against the receiver's runtime class and
-    // prefers the FQN-keyed intrinsic for host values, which is the same
-    // rule the no-extension branch below already relies on.
+    // Proof by refutation: the member compatible and every reachable same-name
+    // extension refuted (`KLIO_MEMBER_PROMO=0` disables). A stub/value receiver
+    // does not block it, since the runtime resolves the slot against the
+    // receiver's class and prefers the FQN-keyed intrinsic for host values.
     if (promo_ext_why != .none and
         resolved.dispatch == .deferred and resolved.target != null and
         !std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_PROMO") orelse "1", "0"))
@@ -913,11 +807,8 @@ pub fn lowerResolvedMemberCall(
                     }
                 }
             }
-            // A member REFUTED by an authoritative argument is not the
-            // binding at all: fall to the extension path with the
-            // refutation recorded, so the ranker's strict-winner rule can
-            // commit the extension kotlinc binds
-            // (`set.removeAll(iterable)` -> MutableCollection.removeAll).
+            // A refuted member is not the binding: fall to the extension path
+            // with the refutation recorded, so the strict-winner rule commits.
             if (std.mem.eql(u8, ir.Module.mpp_why, "member-arg-refuted")) {
                 last_member_refuted = true;
                 return .none;
@@ -927,47 +818,24 @@ pub fn lowerResolvedMemberCall(
     if (promo_ext_why == .none and
         resolved.dispatch == .deferred and resolved.target != null)
     {
-        // Ask the resolver's own direct-vs-virtual rule rather than assuming
-        // virtual: a final or private method has no vtable slot, and a virtual
-        // emission for one fails at runtime even when the receiver's class is
-        // exactly the declaring class. A stub/value receiver (no vtable at
-        // all) still takes a DIRECT answer — a final method on a closed
-        // host-backed class binds by fid; only a virtual answer stays
-        // deferred for it.
-        // A VIRTUAL answer is accepted for stub/value receivers too: the
-        // runtime resolves the slot against an interpreted receiver's class
-        // and prefers the FQN-keyed intrinsic for host values (the VOWN
-        // model) — holding the deferral for blocked classes predates that
-        // and left every bodyless expect member (`Long.shl`,
-        // `MutableList.add`) and unsigned-array member dynamic.
+        // A final or private method has no vtable slot and a virtual emission
+        // for one fails at runtime, so ask the resolver rather than assume.
         if (b.module.dispatchForTarget(static_owner, resolved.target.?)) |d| {
             resolved.dispatch = d;
         }
     }
     if (eager_pick) |ep| {
-        // The resolver reached no target, so its `deferred` says nothing
-        // about THIS declaration — it says the resolver could not name one.
-        // The checker named one by argument type, and how that declaration
-        // dispatches follows from the declaration: an extension carries its
-        // receiver as a leading `this` parameter and is statically bound in
-        // Kotlin; anything else goes through the receiver's slot.
-        // EXTENSIONS only. An extension carries its receiver as a leading
-        // `this` parameter and Kotlin binds it statically, so the call form
-        // follows from the declaration alone. A class MEMBER does not: it
-        // needs a method slot on the receiver's runtime class, and asserting
-        // one the resolver never proved broke `d += x` on Duration — the
-        // slot was not there to call.
+        // The resolver named no target, so its `deferred` means only that. An
+        // extension's call form follows from the declaration; a class member
+        // needs a slot the resolver never proved.
         if (b.module.funcById(ep)) |ef| {
             if (ef.params.len != 0 and std.mem.eql(u8, ef.params[0].name, "this")) {
                 resolved.dispatch = .direct;
             }
         }
     }
-    // A VALUE-CLASS owner has no runtime dispatch to defer to: its instances
-    // travel unboxed, so a deferred member call would look for the member on
-    // the underlying value's class and miss (`set(value) { … }` on
-    // `Updater<T>`, whose receiver is the Composer at run time). The class is
-    // final and the target is its only unrefuted member, so bind it directly.
+    // A value class has no runtime dispatch to defer to: its instances travel
+    // unboxed, so a deferred call would miss on the underlying value's class.
     if (resolved.dispatch == .deferred and resolved.target != null and resolved.applicable) {
         const owner_cls = &b.module.classes.items[static_owner.int()];
         if (owner_cls.is_value) {
@@ -995,12 +863,8 @@ pub fn lowerResolvedMemberCall(
     };
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
-        // A stub/value owner whose target is FINAL on a closed class never
-        // needs the slot — and its vtable-less representation cannot serve
-        // one. Downgrade to the direct fid call (`Result.exceptionOrNull`
-        // as a virtual slot misdispatched on the value representation and
-        // `runCatching { }.fold` took the success arm holding the thrown
-        // exception).
+        // A final target on a closed stub/value class never needs the slot, and
+        // its vtable-less representation cannot serve one.
         if (owner.is_value or owner.is_stub) {
             if (b.module.dispatchForTarget(static_owner, func_id)) |d2| {
                 if (d2 == .direct) resolved.dispatch = .direct;
@@ -1014,24 +878,11 @@ pub fn lowerResolvedMemberCall(
     }
     if (resolved.dispatch == .virtual) {
         const owner = &b.module.classes.items[static_owner.int()];
-        // Numeric virtual slots operate on `Value.Instance`. Classifier ABI
-        // metadata keeps mixed host-backed receivers on the host member path
-        // while source-backed stdlib classes use the same static ABI as user
-        // classes. Named, defaulted, and vararg interface calls bind against
-        // the numeric declaration ABI.
-        // A `specialized` classifier's values are host-represented, so a slot
-        // cannot index a vtable on them. It is still the right EMISSION:
-        // `invokeVirtualMember` resolves the slot against an interpreted
-        // receiver's own class (honouring a user subtype's override) and
-        // falls back to the member's name only for a host-backed value, which
-        // is what the site did unconditionally before.
-        // Stub/value owners emit their virtual slot (`KLIO_VOWN=0`
-        // disables): the runtime resolves the slot against an interpreted
-        // receiver's class and name-falls-back for host values. The
-        // prerequisite was the FINAL-member direct downgrade above — the
-        // Uuid/Result family broke precisely because a final value-class
-        // member (`Result.exceptionOrNull`) rode a slot its value
-        // representation could not serve.
+        // Numeric virtual slots operate on `Value.Instance`; classifier ABI
+        // metadata keeps mixed host-backed receivers on the host member path.
+        // Stub/value owners emit their slot too (`KLIO_VOWN=0` disables):
+        // `invokeVirtualMember` resolves it against an interpreted receiver's
+        // own class and name-falls-back for a host-backed value.
         const vown_hold = (owner.is_value or owner.is_stub) and
             std.mem.eql(u8, runtime.envOnce("KLIO_VOWN") orelse "1", "0");
         if (vown_hold or ast_type_args.len != 0) {
@@ -1080,17 +931,14 @@ pub fn lowerResolvedMemberCall(
     b.pending_arg_lambda_param_types = lambda_param_types;
 
     const recv_reg = recv_state.reg orelse try lowerReceiver(b, receiver);
-    // Lowering the receiver expression can append functions (a lambda in the
-    // receiver lowers into the module's func table) and reallocate it,
-    // invalidating `target`; re-fetch the pointer before reading it again.
+    // Lowering the receiver can append functions to the module's table and
+    // reallocate it, invalidating `target`; re-fetch before reading it again.
     target = b.module.funcById(func_id) orelse {
         declineNote(.target_unresolvable);
         return .deferred;
     };
     if (resolved.dispatch == .virtual) {
-        // A virtual target without even a receiver param cannot be bound
-        // here on any path (the named/vararg mapping below already deferred
-        // it); defer before the receiver-skipping scans slice params[1..].
+        // Defer before the receiver-skipping scans slice `params[1..]`.
         if (target.params.len == 0) {
             declineNote(.virtual_no_receiver_param);
             return .deferred;
@@ -1172,9 +1020,8 @@ pub fn lowerResolvedMemberCall(
 }
 
 /// Bind an explicit-receiver top-level extension to its declaration identity.
-/// Extensions are statically dispatched in Kotlin; the module resolver only
-/// returns a target when receiver compatibility, visibility, and overload
-/// ranking are all provable without a runtime value.
+/// The resolver returns a target only when receiver compatibility, visibility,
+/// and overload ranking are provable without a runtime value.
 fn lowerMemberExtensionDispatchReceiver(
     b: *FuncBuilder,
     owner: ir.ClassId,
@@ -1220,12 +1067,9 @@ fn lowerMemberExtensionDispatchReceiver(
     return dst;
 }
 
-/// The DECLARED type head of each argument, interned, for a construction
-/// site. Kotlin picks a constructor overload from the STATIC types; an
-/// interpreted instance carries no class name the runtime ranking can read,
-/// so without this a subtype argument could not outrank a supertype slot.
-/// Null where lowering has no declared type — the runtime keeps its own
-/// value-shaped ranking for those slots.
+/// Declared type head of each argument, interned. Kotlin picks a constructor
+/// overload from the static types, which an interpreted instance cannot supply
+/// at run time. Null where no declared type exists.
 pub fn ctorArgStaticHeads(b: *FuncBuilder, args: []const Expr) Allocator.Error![]?ir.ConstId {
     const out = try b.allocator.alloc(?ir.ConstId, args.len);
     errdefer b.allocator.free(out);
@@ -1234,7 +1078,7 @@ pub fn ctorArgStaticHeads(b: *FuncBuilder, args: []const Expr) Allocator.Error![
         out[i] = null;
         const ty = argDeclTypeRef(b, a) orelse continue;
         var h = typeHead(std.mem.trimEnd(u8, ty.name, "?"));
-        if (std.mem.lastIndexOfScalar(u8, h, '.')) |d| h = h[d + 1 ..];
+        if (std.mem.findScalarLast(u8, h, '.')) |d| h = h[d + 1 ..];
         if (h.len == 0 or bareTypeParamHead(h)) continue;
         out[i] = try b.module.internConst(b.allocator, .{ .String = h });
         any = true;
@@ -1246,16 +1090,9 @@ pub fn ctorArgStaticHeads(b: *FuncBuilder, args: []const Expr) Allocator.Error![
     return out;
 }
 
-/// The one extension of this name and arity whose declared receiver is
-/// `Any?` — the universal surface every value has (`toString`, `hashCode`).
-/// Null unless exactly one such declaration exists and no other declaration
-/// of the name could compete, so an untyped receiver can never be handed to
-/// a namesake meant for a real type.
-/// The one extension of this name and arity that is INLINE and declares an
-/// unbounded type PARAMETER as its receiver — the scope-function family,
-/// which applies to every value and is spliced rather than dispatched.
-/// Null unless exactly one such declaration exists and no other extension
-/// of the name could compete.
+/// The sole inline extension of this name and arity whose receiver is an
+/// unbounded type parameter: the scope-function family, which applies to every
+/// value and splices rather than dispatches.
 fn uniqueUniversalInlineExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?FuncId {
     var found: ?FuncId = null;
     for (b.module.funcsBySimpleName(name)) |fid| {
@@ -1277,22 +1114,17 @@ fn uniqueAnyNullableExtension(b: *FuncBuilder, name: []const u8, nargs: usize) ?
     var found: ?FuncId = null;
     for (b.module.funcsBySimpleName(name)) |fid| {
         const f = b.module.funcById(fid) orelse continue;
-        // A MEMBER of the same name is not competition: `Any?.toString()`
-        // delegates to it, so the two agree wherever both apply.
+        // A same-named member is not competition: `Any?.toString()` delegates
+        // to it.
         const is_ext = f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this");
         if (!is_ext) continue;
         if (f.params.len != nargs + 1) continue;
-        // An INLINE extension must reach its splice: a non-local `return`
-        // inside its lambda argument depends on the body being expanded
-        // here, and a real call would strand it.
+        // A non-local `return` in the lambda argument needs the splice.
         if (f.is_inline) return null;
         const rt = f.params[0].ty;
         const rt_head = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
-        // `Any?` receivers, and UNBOUNDED bare-type-param receivers
-        // (`fun <A, B> A.to(that: B)`) — the same universal shape: the
-        // declaration applies to every receiver, so no receiver typing is
-        // needed to commit it. A same-named class MEMBER anywhere refuses
-        // (the member would win on its receiver at run time).
+    // `Any?` and unbounded bare-type-param receivers are the same universal
+    // shape. A same-named class member refuses, since it would win at run time.
         const universal_tp = rt.args.len == 0 and bareTypeParamHead(rt_head) and blk: {
             const bound = b.module.staticFuncTypeParamBound(fid, rt_head) orelse break :blk true;
             break :blk std.mem.eql(u8, applicability.simpleName(typeHead(std.mem.trimEnd(u8, bound, "?"))), "Any");
@@ -1321,8 +1153,7 @@ pub fn lowerResolvedExtensionCall(
     declared_ty: ?TypeRef,
 ) Allocator.Error!?Reg {
     // Explicit call-site type arguments constrain the eligible generic
-    // declarations before ordinary overload ranking. The exact extension
-    // path defers until it carries and proves that substitution.
+    // declarations before overload ranking.
     if (ast_type_args.len != 0) return null;
     const recv_ty = declared_ty orelse return null;
     const resolution = try resolveExtensionCallForArgs(
@@ -1333,10 +1164,8 @@ pub fn lowerResolvedExtensionCall(
         ast_arg_names,
     );
     const func_id = resolution.target orelse blk: {
-        // A return-variant tie on the MEMBER form discriminates by the
-        // trailing lambda's derived return exactly as the bare form does
-        // (`a.sumOf { it.size.toLong() }` on a typed receiver ran the
-        // Double variant through the runtime re-pick).
+        // A return-variant tie discriminates by the trailing lambda's derived
+        // return, as the bare form does.
         if (allNull(ast_arg_names)) {
             const cands = try b.module.bareCallCandidates(b.allocator, name.name, name.span.file);
             defer b.allocator.free(cands);
@@ -1368,18 +1197,15 @@ pub fn lowerResolvedExtensionCall(
         recv_ty,
         1,
     );
-    // An image header stub of an inline extension carries no `is_inline`
-    // flag on its Func row but does have its declaration in the inline
-    // table: it must splice (a direct call reaches a bodiless stub whose
-    // reified parameters nothing binds).
+    // An image header stub of an inline extension has no `is_inline` flag but
+    // does have its declaration in the inline table, and must splice: a direct
+    // call reaches a bodiless stub whose reified parameters nothing binds.
     if (target.is_inline or inline_state.inlineAstById(func_id.int()) != null) {
         const inline_decl = inline_state.inlineAstById(func_id.int()) orelse return null;
         inline_state.ensureInlineBody(inline_decl);
-        // The splice lowers its lambda arguments in its OWN arg loop, which
-        // bypasses `lowerArgRun`'s typing transfer — yet each lambda still
-        // lowers a closure body eagerly at emit. Compute the instantiated
-        // expected param types here so those bodies type their params; the
-        // spliced copy gets the same facts through the window channels.
+        // The splice lowers lambda arguments in its own loop, bypassing
+        // `lowerArgRun`'s typing transfer, so instantiate expected param types
+        // here for the eagerly lowered closure bodies.
         if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] inlineSplice fn={s}\n", .{target.name});
         const inline_lambda_param_types = try argLambdaParamTypesRecv(
             b,
@@ -1392,21 +1218,15 @@ pub fn lowerResolvedExtensionCall(
         );
         defer if (inline_lambda_param_types) |types|
             deinitArgLambdaParamTypes(b.allocator, types);
-        // The splice binds its lambda arguments by expanding their bodies,
-        // not through `lowerArgRun`, so the `-> Unit` mask that typing set
-        // on `pending_arg_lambda_unit` has no consumer on this path. Clear
-        // it now: left set, it dangles into any call lowered inside the
-        // spliced body (a nested `accept { }` predicate) and is mistaken
-        // there for that call's own mask, coercing the lambda to Unit.
+        // The splice expands lambda bodies rather than going through
+        // `lowerArgRun`, so the `-> Unit` mask has no consumer and would dangle
+        // into calls lowered inside the spliced body.
         if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
         b.pending_arg_lambda_unit = null;
         b.pending_arg_lambda_param_types = inline_lambda_param_types;
         defer b.pending_arg_lambda_param_types = null;
-        // Engine step four: solve the callee's bindings ONCE (receiver +
-        // typed args) and hand them to the WINDOW as full bound refs —
-        // every in-window consumer (the bare return arm, substitutionRecv,
-        // element typing) then sees the call-site instantiation for every
-        // fn type parameter, argument-bound ones included. Registry-stable
+        // Solve the callee's bindings once (receiver plus typed args) so every
+        // in-window consumer sees the call-site instantiation. Registry-stable
         // fn-tp names only; owner identities stay per-channel.
         {
             var sc2 = std.heap.ArenaAllocator.init(b.allocator);
@@ -1483,9 +1303,8 @@ pub fn lowerResolvedExtensionCall(
         deinitArgLambdaParamTypes(b.allocator, types);
     b.pending_arg_lambda_param_types = lambda_param_types;
 
-    // `lowerMemberExtensionDispatchReceiver` and `lowerReceiver` can lower
-    // lambda bodies, which appends to the module's function table and moves
-    // it — `target` points into that table and must not be read after them.
+    // The two calls below lower lambda bodies, which appends to the module's
+    // function table and moves it; `target` points into it.
     const target_is_member_extension = target.kind == .member_extension;
     const dispatch_reg: ?Reg = if (target_is_member_extension)
         (try lowerMemberExtensionDispatchReceiver(
@@ -1559,9 +1378,8 @@ pub fn lowerResolvedExtensionCall(
     return dst;
 }
 
-/// Whether the immediately preceding member resolution statically refuted
-/// every candidate (consumed by the extension leg that runs next, so a
-/// sole receiver-proven extension can commit).
+/// Whether the preceding member resolution statically refuted every candidate,
+/// so the extension leg running next can commit a sole receiver-proven one.
 threadlocal var last_member_refuted: bool = false;
 
 fn resolveExtensionCallForArgs(
@@ -1665,10 +1483,8 @@ pub fn localOverloadReceiverCouldApply(
     defer if (owned_bounds) |bounds| b.allocator.free(bounds);
     const actual_bounds: []const ir.ModuleRegistry.TypeParamBound =
         owned_bounds orelse &.{};
-    // An ALIAS head (`Ints = MutableList<Int>`) names no class, so without
-    // resolution it fell into the unresolvable-type-parameter escape below
-    // and the overload applied to a receiver its real type refutes. Resolve
-    // the alias the same way global extension resolution does.
+    // An alias head (`Ints = MutableList<Int>`) names no class, so unresolved it
+    // falls to the type-parameter escape below and applies a refuted overload.
     var alias_arena = std.heap.ArenaAllocator.init(b.allocator);
     defer alias_arena.deinit();
     const actual_scoped = b.module.resolveTypeAliasAt(
@@ -1678,27 +1494,19 @@ pub fn localOverloadReceiverCouldApply(
         b.self_package,
     ) catch raw_actual;
     const actual = actual_scoped;
-    // An actual head that names NO known classifier and carries no bound
-    // here is a type parameter of a spliced/generic context (`it: T` inside
-    // `compareBy`'s SAM lambda, where T instantiates to the caller's
-    // element type) — statically unresolvable, so it must not DISPROVE the
-    // overload; the runtime receiver decides.
+    // An actual head naming no classifier and carrying no bound belongs to a
+    // spliced or generic context: unresolvable, so it must not disprove.
     {
         const head = typeHead(actual.name);
-        // A derived `Any` head is the deriver's own erasure product (a
-        // generic return the channel could not instantiate), not a proof
-        // the receiver is unrelated: dropping the local extension on it
-        // emitted a member walk that misses at runtime. The runtime
-        // receiver arbitrates instead.
+        // A derived `Any` head is the deriver's erasure product, not proof the
+        // receiver is unrelated.
         if (std.mem.eql(u8, head, "Any")) return true;
         var bound_known = false;
         for (actual_bounds) |tb| {
             if (std.mem.eql(u8, tb.param, head)) bound_known = true;
         }
-        // Builtin heads (`Nothing?`, primitives, `Any`, `String`, ...) are
-        // known classifiers even without a module class entry — they keep
-        // the full subtype judgment (a `Nothing?` actual must still refute
-        // a `String` receiver).
+        // Builtin heads are known classifiers without a module class entry and
+        // keep the full subtype judgment: `Nothing?` must still refute `String`.
         const builtin_head = isPrimitiveTypeName(head) or
             std.mem.eql(u8, head, "Nothing") or std.mem.eql(u8, head, "Any") or
             std.mem.eql(u8, head, "Unit") or std.mem.eql(u8, head, "String") or
@@ -1708,12 +1516,9 @@ pub fn localOverloadReceiverCouldApply(
         {
             return true;
         }
-        // The same reasoning one level down: a type ARGUMENT that names no
-        // classifier and no in-scope parameter is an uninstantiated class
-        // parameter (`this.followedBy` inside `ParserStructure<in Output>`
-        // types as `ParserStructure<Output>`), which the invariance check
-        // then reads as a nominal mismatch against `ParserStructure<T>`.
-        // A REAL caller parameter is bound-known here and keeps refuting.
+    // Likewise one level down: a type argument naming no classifier and no
+    // in-scope parameter is an uninstantiated class parameter, which the
+    // invariance check would read as a nominal mismatch.
         for (actual.args) |arg| {
             var ah = std.mem.trimEnd(u8, arg.name, "?");
             if (std.mem.startsWith(u8, ah, "in#")) ah = ah[3..];
@@ -1825,15 +1630,10 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
     const ast_type_args = call.type_args;
     const receiver = callee.Member.receiver;
     const name = callee.Member.name;
-    // `BytesHexFormat.Builder()` — a class-named receiver whose member names
-    // a NESTED CONSTRUCTIBLE CLASS is a constructor call. Emit the
-    // statically bound NewInstance the bare form gets (the same resolution
-    // the derivation arm and the runtime walk's nested-construction tail
-    // perform), instead of a member walk on the companion value.
+    // A class-named receiver whose member names a nested constructible class is
+    // a constructor call, so emit NewInstance rather than a companion walk.
     if (receiver.* == .Path and receiver.Path.segments.len >= 1 and receiver.Path.segments.len <= 3) {
         const outer_name = receiver.Path.segments[0].name;
-        // Every path segment must look like a classifier reference
-        // (`TimeSource.Monotonic.ValueTimeMark(reading)` — three segments).
         var all_class_like = true;
         for (receiver.Path.segments) |seg| {
             if (seg.name.len == 0 or !std.ascii.isUpper(seg.name[0])) {
@@ -1882,11 +1682,9 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
         }
     }
     const declared_from_expr = argDeclTypeRef(b, receiver);
-    // The FULL static deriver, not just the call-return channel: a BINARY
-    // receiver (`(a * bitsPerSymbol) / bitsPerByte).toInt()`) types by the
-    // numeric-promotion arm, a bare companion-const read by the Path arm —
-    // channels the emission never consulted while the derivation side did,
-    // which is the two-channel trap recorded twice already.
+    // The full static deriver, not just the call-return channel: a binary
+    // receiver types by the numeric-promotion arm, a companion-const read by
+    // the Path arm.
     var inferred_declared_ty: ?ir.TypeRef = if (declared_from_expr == null)
         try staticExprTypeRef(b, receiver)
     else
@@ -1902,8 +1700,7 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
     const declared_ty = declared_from_expr orelse inferred_declared_ty;
 
     // Member declarations take precedence over local callables and extensions.
-    // A unique static declaration commits here as either an exact function or
-    // a virtual slot; only ambiguous/incomplete receiver shapes continue below.
+    // Only ambiguous or incomplete receiver shapes continue below.
     const static_member = try lowerResolvedMemberCall(
         b,
         receiver,
@@ -1920,21 +1717,14 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
     }
     const member_shadows_extensions = static_member == .deferred;
 
-    // A bound local/param/captured-outer of this name shadows the member.
-    // A plain bound local (`for (module in modules) { application.module() }`,
-    // a `T.() -> R` value invoked with receiver syntax) is included too: the
-    // member is still tried first at runtime, with the local as the fallback.
+    // A bound local, param, or captured-outer shadows the member, including a
+    // plain local; the member is still tried first at runtime.
     const anon_cap = isLowerAnonCapture(name.name) and b.resolve(name.name) == null and
         !b.isLocalFn(name.name) and !b.isParam(name.name) and !b.knowsOuter(name.name);
-    // A parameter whose declared type is a function type with NO receiver can
-    // never serve an EXPLICIT-receiver call. Kotlin resolves `recv.name(args)` to
-    // a member or extension of `recv`; a local competes only when its type is an
-    // EXTENSION-function type (`Modifier.() -> Unit`, which is why `up.update()`
-    // binds a `Up.() -> Unit` param). A plain `(FocusState) -> Unit` is not that —
-    // and treating it as a candidate made `.onFocusChanged(onFocusChanged)` inside
-    // `textFieldFocusModifier` INVOKE the callback with itself as its argument
-    // instead of dispatching `Modifier.onFocusChanged`, recursing until the native
-    // stack blew (every `BasicTextField`).
+    // Kotlin resolves `recv.name(args)` to a member or extension of `recv`; a
+    // local competes only when its type is an extension-function type
+    // (`Modifier.() -> Unit`). Treating a plain `(FocusState) -> Unit` as a
+    // candidate makes the call invoke the callback with itself.
     const plain_fn_local = b.isPlainFnParam(name.name);
     const local_receiver_applicable = !b.isLocalExtFn(name.name) or
         try localExtensionReceiverCouldApply(b, name.name, declared_ty);
@@ -1942,18 +1732,10 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
         (b.isLocalFn(name.name) or b.isParam(name.name) or
             b.knowsOuter(name.name) or anon_cap or b.resolve(name.name) != null);
     if (local_callable) {
-        // Same-named local siblings share the plain-name slot, which for a
-        // multi-declaration name may hold a non-extension sibling or the
-        // boxed self-cell's placeholder. A receiver-full call binds only an
-        // EXTENSION sibling, so select it by signature and call through its
-        // mangled cell — the plain slot misbound `this.Test(showThree)` to
-        // an uninitialized cell whenever composable and extension `Test`
-        // overloads coexisted.
-        // The DIRECT local-ext commitment needs a derived receiver: with the
-        // receiver untyped, a same-named global extension may be the Kotlin
-        // target (the test-local `String?.contentEquals` recursed into
-        // itself over the stdlib `CharSequence?.contentEquals`), so the
-        // arbitrated emission below decides at run time instead.
+        // Same-named local siblings share the plain-name slot, which may hold a
+        // non-extension sibling or the boxed self-cell's placeholder, so select
+        // the extension by signature. Needs a derived receiver: untyped, a
+        // same-named global extension may be the target.
         if (declared_ty != null) {
             if (b.localFnOverloads(name.name)) |ovs| {
                 if (try selectLocalExtOverload(b, ovs, declared_ty, args, ast_arg_names)) |mangled| {
@@ -1968,10 +1750,8 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
                 try b.push(.{ .LoadCapture = .{ .dst = r, .idx = idx } });
                 break :blk r;
             }
-            // A directly-bound local (a loop variable / `val`) uses its own
-            // register; `resolveCapture` would mint a bogus capture slot
-            // (resolving to `Nothing`) for a name that is not actually
-            // closed over.
+            // A directly-bound local uses its own register; `resolveCapture`
+            // would mint a bogus slot for a name that is not closed over.
             if (b.resolve(name.name)) |reg| {
                 if (b.isBoxed(name.name)) {
                     const c = b.allocReg();
@@ -1987,9 +1767,8 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
         const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
         const dst = b.allocReg();
-        // A receiver whose static type is an unbounded type parameter declares
-        // no members, so the runtime class must not be consulted at all: the
-        // in-scope callable is the only candidate Kotlin ever had.
+    // A receiver statically typed by an unbounded type parameter declares no
+    // members, so the in-scope callable is Kotlin's only candidate.
         const recv_erased = receiver.* == .Path and
             receiver.Path.segments.len == 1 and
             (b.isErasedRecvParam(receiver.Path.segments[0].name) or
@@ -2029,7 +1808,6 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
         return dst;
     }
 
-    // `super.method(...)`.
     if (receiver.* == .Super) {
         const sup = receiver.Super;
         if (try superBase(b, sup)) |base| {
@@ -2053,11 +1831,9 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
         }
     }
 
-    // The Compose syntax pass may conservatively thread a same-named call
-    // before overload resolution. Re-resolve the explicit receiver against
-    // its source argument list; a source-shaped member or extension proves
-    // that the selected declaration is not composable, so the compiler ABI
-    // pair does not belong to this call.
+    // The Compose syntax pass may thread a same-named call before overload
+    // resolution; a source-shaped member or extension proves the declaration is
+    // not composable, so the ABI pair does not belong here.
     if (hasComposerArgPair(ast_arg_names) and args.len >= 2) {
         const source_args = args[0 .. args.len - 2];
         const source_names = ast_arg_names[0 .. ast_arg_names.len - 2];
@@ -2143,19 +1919,13 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
     }
 
     const recv = try lowerReceiver(b, receiver);
-    // A class-named receiver (`Snapshot.withMutableSnapshot { … }`, or an
-    // explicit `.Companion`) resolves its member's declared signature
-    // statically through the lifted companion / class method registry, so
-    // each lambda argument learns its expected value arity — a `() -> R`
-    // block then drops its parser-injected `it` and an `it` inside
-    // captures the enclosing lambda's, instead of binding a spurious null
-    // parameter.
+    // A class-named receiver resolves its member's signature through the lifted
+    // companion / class method registry, so each lambda argument learns its
+    // expected value arity and a `() -> R` block drops its injected `it`.
     const uarg_arity: ?[]const i16 = try memberCallArgArities(b, receiver, name.name, args, ast_arg_names);
-    // The dispatch stays deferred (a runtime subtype might serve the name
-    // as a MEMBER), but kotlinc types the argument lambdas against the
-    // STATIC declared-type resolution — which, with no member on the
-    // static type, is the extension candidate. Thread its instantiated
-    // param types so the closure bodies type their params.
+    // Dispatch stays deferred (a runtime subtype might serve the name as a
+    // member), but kotlinc types argument lambdas against the static
+    // resolution, which with no member on that type is the extension candidate.
     var deferred_lambda_param_types: ?[]?[]ir.TypeRef = null;
     defer if (deferred_lambda_param_types) |types|
         deinitArgLambdaParamTypes(b.allocator, types);
@@ -2169,11 +1939,8 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
         }
         if (!any_lambda) break :blk;
         const ext = try resolveExtensionCallForArgs(b, recv_ty, name, args, ast_arg_names);
-        // Typing-only consumer: the withheld strict-key winner's param
-        // types are as good as a committed target's for the closures, and
-        // so are a TIED set's when every candidate declares the same
-        // parameter list up to function-return positions (`flatMapIndexed`
-        // overloads on the lambda's return alone).
+        // Typing only: the withheld strict-key winner's param types serve the
+        // closures, as does a tied set agreeing up to function-return positions.
         const target_id = ext.target orelse ext.sole_unknown orelse
             ext.param_rep orelse break :blk;
         const target = b.module.funcById(target_id) orelse break :blk;
@@ -2194,13 +1961,10 @@ pub fn lowerMemberCallFallback(b: *FuncBuilder, expr: *const Expr) Allocator.Err
     const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
     const dst = b.allocReg();
     const nm = try b.module.internConst(b.allocator, .{ .String = name.name });
-    // Kotlin resolves the member-vs-extension question against the
-    // receiver's DECLARED type; carry it for the extension-selection
-    // filter (a channel separate from static_recv, whose meaning is the
-    // extension-body receiver). A nullable declared receiver carries its
-    // HEAD too: null-accepting extensions overload by the underlying
-    // type (`String?.orEmpty()` vs `List?.orEmpty()`), and a Null
-    // runtime receiver offers the filter nothing else to go on.
+    // Kotlin resolves member-vs-extension against the receiver's declared type;
+    // this channel is separate from `static_recv`, the extension-body receiver.
+    // A nullable declared receiver carries its head too, since null-accepting
+    // extensions overload by the underlying type.
     const declared_recv: ?ConstId = blk: {
         const t = declared_ty orelse break :blk null;
         var alias_scratch = std.heap.ArenaAllocator.init(b.allocator);

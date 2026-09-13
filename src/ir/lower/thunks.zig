@@ -1,8 +1,5 @@
-//! Lowering helpers that wrap an expression or block as a synthetic
-//! 0/1/2-arg IR function. Used by the build pass to materialise
-//! default-arg producers, accessors, init blocks, and similar
-//! "expression-bodied" pieces of code without the surrounding fn /
-//! method machinery.
+//! Lowering helpers that wrap an expression or block as a synthetic 0-, 1- or
+//! 2-arg IR function, for default-arg producers, accessors and init blocks.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -31,16 +28,14 @@ const lowerExpr = expr_mod.lowerExpr;
 const stmt_mod = @import("stmt.zig");
 const lowerBlock = expr_mod.lowerBlock;
 
-/// The allocator backing a `Module`'s growable tables. The module's
-/// containers are unmanaged, so recover the allocator from a managed
-/// member (`func_name_index`) it was initialised with.
+/// The allocator backing a `Module`'s growable tables, recovered from a managed
+/// member since the containers are unmanaged.
 fn moduleAllocator(module: *Module) Allocator {
     return module.func_name_index.allocator;
 }
 
-/// `pushFunc` + a decl_span stamp: a synthesized fn carries the file its
-/// body was written in, which the import-scoped member-extension probe
-/// (and any other frame-file attribution) reads at run time.
+/// `pushFunc` plus a decl_span stamp, so a synthesized fn carries the file its body
+/// was written in, which the import-scoped member-extension probe reads.
 fn pushFuncSpanned(module: *Module, func_in: Func, body_span: ast.Span) Allocator.Error!FuncId {
     const id = try pushFunc(module, func_in);
     try module.decl_span.put(id.int(), body_span);
@@ -54,12 +49,9 @@ fn pushFunc(module: *Module, func_in: Func) Allocator.Error!FuncId {
     var func = func_in;
     func.id = id;
     try module.appendFunc(func);
-    // An extension-property getter is looked up BY NAME under the
-    // `__ext_get_<Head>_<name>` contract (`extPropGetterReturn` types a
-    // bare `indices` read from the getter's declared return); without the
-    // index entry no accessor was ever findable and the channel answered
-    // nothing. Mangled names never collide with user identifiers, so the
-    // simple-name heuristics are untouched.
+    // An extension-property getter is looked up by name under the
+    // `__ext_get_<Head>_<name>` contract, so without the index entry no accessor is
+    // findable. Mangled names never collide with user identifiers.
     if (std.mem.startsWith(u8, func.name, "__ext_get_")) {
         const a = moduleAllocator(module);
         try module.func_index.append(a, .{ .name = func.name, .id = id });
@@ -70,8 +62,8 @@ fn pushFunc(module: *Module, func_in: Func) Allocator.Error!FuncId {
     return id;
 }
 
-/// Clone a borrowed own-member set into a fresh owned `StringSet` (sharing
-/// the borrowed key slices) for `setOwnMembers`, which takes ownership.
+/// Clone a borrowed own-member set into a fresh owned `StringSet`, sharing the key
+/// slices, for `setOwnMembers`, which takes ownership.
 fn cloneOwnMembers(allocator: Allocator, src: *const StringSet) Allocator.Error!StringSet {
     var out = StringSet.init(allocator);
     var it = src.keyIterator();
@@ -79,15 +71,11 @@ fn cloneOwnMembers(allocator: Allocator, src: *const StringSet) Allocator.Error!
     return out;
 }
 
-/// Lower an arbitrary expression as a 0-arg synthetic function whose
-/// body returns the expression's value. The synthetic function is
-/// pushed onto the module so a downstream caller can invoke it via
-/// `eval_with` against `module.funcs[id]`.
-/// Emit a contextual property accessor's context-load prologue when the
-/// declaration lowering stashed its context parameters. A no-op otherwise.
-/// Record the declared type of each bound parameter when the declaration
-/// lowering stashed them. A no-op otherwise, so a thunk whose caller knows
-/// no types behaves exactly as before.
+/// Lower an arbitrary expression as a 0-arg synthetic function returning its value,
+/// pushed onto the module for `eval_with`.
+/// `emitCtxPrologueIfAny` emits a contextual property accessor's context-load
+/// prologue, and `recordThunkParamTypes` the declared type of each bound parameter,
+/// when the declaration lowering stashed them; both are no-ops otherwise.
 fn consumePendingParamTypes(b: *FuncBuilder, params: []const []const u8) Allocator.Error!void {
     const types = b.module.pending_param_types orelse return;
     b.module.pending_param_types = null;
@@ -97,7 +85,7 @@ fn consumePendingParamTypes(b: *FuncBuilder, params: []const []const u8) Allocat
         if (ty.function != null or ty.name.name.len == 0) continue;
         var lowered = try decl.loweredTypeRef(b.allocator, ty, true);
         var head = std.mem.trimEnd(u8, lowered.name, "?");
-        if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+        if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
         if (head.len != 0 and head.len <= 2 and std.ascii.isUpper(head[0])) {
             lowered.deinit(b.allocator);
             continue;
@@ -107,8 +95,8 @@ fn consumePendingParamTypes(b: *FuncBuilder, params: []const []const u8) Allocat
 }
 
 /// Bind a member extension property accessor's receiver under its label
-/// (`this@<prop>`) and record its dispatch owner when the declaration
-/// lowering stashed them. A no-op otherwise.
+/// (`this@<prop>`) and record its dispatch owner when the declaration lowering
+/// stashed them.
 fn consumePendingAccessorReceiver(b: *FuncBuilder, params: []const []const u8) Allocator.Error!void {
     const label = b.module.pending_accessor_this_label;
     const owner = b.module.pending_accessor_dispatch_owner;
@@ -125,9 +113,7 @@ fn consumePendingAccessorReceiver(b: *FuncBuilder, params: []const []const u8) A
 }
 
 /// Install the owner class's member arity mask when the declaration lowering
-/// stashed one. A no-op otherwise, so a thunk whose caller records no arities
-/// keeps the permissive default (`ownMemberApplicable` says yes for an
-/// unrecorded name).
+/// stashed one; otherwise the permissive default stands.
 fn consumePendingOwnMemberArity(b: *FuncBuilder) Allocator.Error!void {
     const src = b.module.pending_own_member_arity orelse return;
     b.module.pending_own_member_arity = null;
@@ -148,8 +134,8 @@ pub fn lowerExprAsThunk(module: *Module, expr: *const Expr, name: []const u8) Al
     return lowerExprAsThunkTyped(module, expr, name, null);
 }
 
-/// A top-level delegated property's delegate thunk: the expression, then
-/// the `provideDelegate` convention with a null receiver.
+/// A top-level delegated property's delegate thunk: the expression, then the
+/// `provideDelegate` convention with a null receiver.
 pub fn lowerDelegateExprAsThunk(module: *Module, expr: *const Expr, name: []const u8, prop_name: []const u8) Allocator.Error!FuncId {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
@@ -161,9 +147,8 @@ pub fn lowerDelegateExprAsThunk(module: *Module, expr: *const Expr, name: []cons
     return pushFuncSpanned(module, func, expr.span());
 }
 
-/// As [`lowerExprAsThunk`], seeding the declared type as the body's
-/// tail-position expected type: `var g: Long = 0` widens its literal
-/// exactly as a local `val x: Long = 0` does.
+/// As `lowerExprAsThunk`, seeding the declared type as the tail-position expected
+/// type, so `var g: Long = 0` widens its literal as a local `val x: Long = 0` does.
 pub fn lowerExprAsThunkTyped(module: *Module, expr: *const Expr, name: []const u8, expected: ?TypeRef) Allocator.Error!FuncId {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
@@ -177,8 +162,8 @@ pub fn lowerExprAsThunkTyped(module: *Module, expr: *const Expr, name: []const u
     return pushFuncSpanned(module, func, expr.span());
 }
 
-/// Lower a block as a 0-arg synthetic function. The block's trailing
-/// expression becomes the implicit return value.
+/// Lower a block as a 0-arg synthetic function, its trailing expression becoming
+/// the implicit return value.
 pub fn lowerBlockAsThunk(module: *Module, block: *const ast.Block, name: []const u8) Allocator.Error!FuncId {
     var b = try FuncBuilder.init(moduleAllocator(module), module);
     defer b.deinit();
@@ -206,9 +191,8 @@ pub fn lowerBlockAsUnaryThunk(
     return pushFuncSpanned(module, func, block.span);
 }
 
-/// Lower an expression as a 2-arg synthetic function bound under
-/// the supplied parameter names. Used for instance accessors whose
-/// first arg is `this` and second is the new value.
+/// Lower an expression as a 2-arg synthetic function bound under the supplied
+/// parameter names, for instance accessors taking `this` and the new value.
 pub fn lowerBinaryExprAsThunk(
     module: *Module,
     param_a: []const u8,
@@ -234,8 +218,8 @@ pub fn lowerExprAsParamThunk(
     return lowerExprAsParamThunkScopedEnclosing(module, params, expr, name, null, null, null);
 }
 
-/// Like [`lowerExprAsParamThunk`] but additionally puts the
-/// enclosing class's name and own-member set in scope.
+/// Like `lowerExprAsParamThunk` but also puts the enclosing class's name and
+/// own-member set in scope.
 pub fn lowerExprAsParamThunkScoped(
     module: *Module,
     params: []const []const u8,
@@ -247,11 +231,9 @@ pub fn lowerExprAsParamThunkScoped(
     return lowerExprAsParamThunkScopedEnclosing(module, params, expr, name, owner_class, own_members, null);
 }
 
-/// Full form: additionally threads the lexically-enclosing class chain's
-/// member names, so a bare name in a nested class's ctor default that
-/// names an OUTER member resolves through the receiver walk (an inner
-/// class's defaults see the enclosing instance) instead of binding a
-/// same-named top-level declaration.
+/// Full form: also threads the lexically enclosing class chain's member names, so a
+/// bare name in a nested class's ctor default that names an outer member resolves
+/// through the receiver walk.
 pub fn lowerExprAsParamThunkScopedEnclosing(
     module: *Module,
     params: []const []const u8,
@@ -276,9 +258,8 @@ pub fn lowerExprAsParamThunkScopedEnclosing(
     }
     try consumePendingOwnMemberArity(&b);
     if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
-    // The declared parameter type the thunk's expression must satisfy
-    // (`serializer()` as a parent constructor argument binds its reified
-    // parameter from it).
+    // The declared parameter type the thunk's expression must satisfy, from which a
+    // parent-constructor argument binds its reified parameter.
     const expected = module.pending_thunk_expected;
     module.pending_thunk_expected = null;
     const prev_expected = b.pushExpected(expected);
@@ -286,11 +267,9 @@ pub fn lowerExprAsParamThunkScopedEnclosing(
     _ = b.pushExpected(prev_expected);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
-    // Record the bound params for a `this`-leading thunk (an INNER class's
-    // ctor-default): the eval `this`-parameter fallback reads them to
-    // recover the receiver, so a bare outer-member read resolves through
-    // the receiver walk. Other param thunks keep the empty metadata their
-    // callers expect.
+    // Record the bound params for a `this`-leading thunk, an inner class's
+    // ctor-default: the eval `this`-parameter fallback reads them to recover the
+    // receiver. Other param thunks keep the empty metadata their callers expect.
     if (leadsWithThis(params)) {
         func.params = try accessorParams(allocator, params, owner_class orelse "", null);
     }
@@ -298,19 +277,15 @@ pub fn lowerExprAsParamThunkScopedEnclosing(
     return pushFuncSpanned(module, func, expr.span());
 }
 
-/// Whether a synthesized param list leads with the implicit `this`
-/// receiver. Thunk/accessor/init param lists are compiler-built, so a
-/// leading `this` is always the synthesized receiver (never a user
-/// backtick parameter).
+/// Whether a synthesized param list leads with the implicit `this` receiver. These
+/// lists are compiler-built, so a leading `this` is never a user backtick parameter.
 fn leadsWithThis(params: []const []const u8) bool {
     return params.len != 0 and std.mem.eql(u8, params[0], "this");
 }
 
-/// Lower an init-style block with arbitrary bound parameter names.
-/// Records the bound params (incl. `this`) like the accessor-expression
-/// form, so the eval `this`-parameter fallback recovers the receiver — a
-/// bare companion-method call inside an init block resolves against the
-/// constructed instance's chain.
+/// Lower an init-style block with arbitrary bound parameter names, recording the
+/// bound params including `this` so the eval `this`-parameter fallback recovers the
+/// receiver and a bare companion-method call resolves against the instance's chain.
 pub fn lowerInitBlockWithParams(
     module: *Module,
     owner_class: []const u8,
@@ -326,14 +301,12 @@ pub fn lowerInitBlockWithParams(
     b.setOwnerClass(owner_class);
     b.setRecvTy(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
-    // Box body `var`s (and params) a nested lambda mutates into shared cells,
-    // exactly as a normal function body does — otherwise a `var` an init block
-    // mutates from inside a lambda captures a copy and the write is lost.
+    // Box body `var`s and params a nested lambda mutates into shared cells, as a
+    // normal function body does; otherwise the lambda's write is lost.
     try setInitBlockBoxedVars(&b, allocator, params, block);
     try bindParams(&b, params);
-    // An init block reads the constructor's parameters, and its builder knew
-    // their NAMES alone — the same gap the delegation and default thunks had.
-    // `array.copyOf()` inside `AtomicIntArray`'s init had no receiver type.
+    // An init block reads the constructor's parameters, whose names alone its
+    // builder knew.
     try consumePendingParamTypes(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
@@ -354,8 +327,7 @@ pub fn lowerEmptyThunk(module: *Module, params: []const []const u8, name: []cons
     return pushFunc(module, func);
 }
 
-/// Lower a class init block as a 1-arg IR function whose only
-/// parameter binds `this`.
+/// Lower a class init block as a 1-arg IR function whose only parameter binds `this`.
 pub fn lowerInitBlock(
     module: *Module,
     owner_class: []const u8,
@@ -377,9 +349,8 @@ pub fn lowerInitBlock(
     return pushFuncSpanned(module, func, block.span);
 }
 
-/// Compute the set of `var`s (body decls plus params) that a nested lambda in
-/// the init block mutates, and mark them for boxing so the lambda closes over
-/// a shared cell. Mirrors the body-`var` boxing in `lowerFunctionBody`.
+/// The set of `var`s, body decls plus params, that a nested lambda in the init block
+/// mutates, marked for boxing so the lambda closes over a shared cell.
 fn setInitBlockBoxedVars(
     b: *FuncBuilder,
     allocator: Allocator,
@@ -408,12 +379,9 @@ pub fn lowerAccessorExpr(
     return lowerAccessorExprFull(module, owner_class, own_members, null, params, null, expr, name, null);
 }
 
-/// Like [`lowerAccessorExpr`] but seeds the lexically-enclosing class's
-/// member set, so a body-property initializer / accessor in a *nested*
-/// class resolves a bare name the enclosing class (or its companion)
-/// declares — e.g. `HexFormat.Builder.upperCase = Default.upperCase`, where
-/// `Default` is the enclosing companion's member — against the enclosing
-/// scope instead of an unrelated global class of the same simple name.
+/// Like `lowerAccessorExpr` but seeds the lexically enclosing class's member set, so
+/// a nested class's initializer or accessor resolves a bare name the enclosing class
+/// or its companion declares, not an unrelated global of the same simple name.
 pub fn lowerAccessorExprEnclosing(
     module: *Module,
     owner_class: []const u8,
@@ -427,10 +395,9 @@ pub fn lowerAccessorExprEnclosing(
     return lowerAccessorExprFull(module, owner_class, own_members, enclosing_members, params, null, expr, name, expected);
 }
 
-/// Lower a body-property initializer while preserving the declared types of
-/// the primary-constructor parameters captured by its synthetic function.
-/// Those static types participate in overload resolution inside the
-/// initializer just as they do in an ordinary function body.
+/// Lower a body-property initializer preserving the declared types of the
+/// primary-constructor parameters its synthetic function captures, which participate
+/// in overload resolution as in an ordinary function body.
 pub fn lowerPropertyInitExpr(
     module: *Module,
     owner_class: []const u8,
@@ -445,11 +412,8 @@ pub fn lowerPropertyInitExpr(
     return lowerAccessorExprFull(module, owner_class, own_members, enclosing_members, params, declared_params, expr, name, expected);
 }
 
-/// Like [`lowerAccessorExpr`] but seeds the tail-position expected
-/// type so a reified inline call in the body (a member property
-/// initializer `val key: AttributeKey<T> = AttributeKey(name)`) infers
-/// its type argument from the property's declared type — the same hint
-/// a local `val x: T = …` already supplies.
+/// Like `lowerAccessorExpr` but seeds the tail-position expected type, so a reified
+/// inline call infers its type argument from the property's declared type.
 pub fn lowerAccessorExprWithExpected(
     module: *Module,
     owner_class: []const u8,
@@ -477,12 +441,9 @@ fn lowerAccessorExprFull(
     var b = try FuncBuilder.init(allocator, module);
     defer b.deinit();
     b.setOwnerClass(owner_class);
-    // The accessor body runs with `this` of type `owner_class`, so a bare
-    // call inside resolves against that receiver — record it so the
-    // overload/inline resolver prefers a member of the receiver over a
-    // same-named imported extension with a different receiver type (e.g.
-    // `get(Job)` inside `CoroutineContext.job` binds the context's `get`
-    // operator, not ktor's inline `HttpClient.get`).
+    // The accessor body runs with `this` of type `owner_class`, so record it and let
+    // the resolver prefer a member of the receiver over a same-named imported
+    // extension with a different receiver type.
     b.setRecvTy(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
     if (enclosing_members) |em| b.setEnclosingMembers(try cloneOwnMembers(allocator, em));
@@ -492,16 +453,15 @@ fn lowerAccessorExprFull(
         try b.setLocalDeclType("this", owner_class);
         for (typed) |p| {
             if (b.resolve(p.name) == null) continue;
-            // A `vararg names: String` parameter's VALUE is an Array; typing
-            // it by its element sent `names.toList()` in a property
-            // initializer to the CharSequence extension.
+    // A `vararg names: String` parameter's value is an Array; typing it by its
+    // element sends a `names.toList()` to the CharSequence extension.
             try b.setLocalDeclType(p.name, if (p.is_vararg) "Array" else p.ty.name);
             if (p.ty.nullable and !p.is_vararg) try b.setLocalDeclNullable(p.name);
         }
     }
     const prev = b.pushExpected(expected);
-    // `var first: Long = 0` — the initializer literal takes the property's
-    // declared type, exactly as a local `val x: Long = 0` does.
+    // `var first: Long = 0`: the initializer literal takes the property's declared
+    // type, as a local `val x: Long = 0` does.
     const widened: ?Expr = if (expected) |*ty| literals.widenNumericLiteral(expr, ty) else null;
     const v = try lowerExpr(&b, if (widened) |*w| w else expr);
     b.restoreExpected(prev);
@@ -510,17 +470,17 @@ fn lowerAccessorExprFull(
     func.params = try accessorParams(allocator, params, owner_class, declared_params);
     func.has_receiver_param = leadsWithThis(params);
     const fid = try pushFunc(module, func);
-    // A synthesized accessor/initializer carries its declaring file: the
-    // import-scoped member-extension probe resolves against the frame
-    // fn's decl_span file, and a property initializer using an imported
-    // companion extension (`val xs = listOf(1.seconds)`) is legal there.
+    // A synthesized accessor or initializer carries its declaring file: the
+    // import-scoped member-extension probe resolves against the frame fn's
+    // decl_span file, and a property initializer using an imported companion
+    // extension is legal there.
     try module.decl_span.put(fid.int(), expr.span());
     return fid;
 }
 
-/// The accessor's declared property type as its IR return type, so the
-/// getter's return head is readable where the naming-contract lookup
-/// consumes it. Unit when the property declares none.
+/// The accessor's declared property type as its IR return type, so the getter's
+/// return head is readable where the naming-contract lookup consumes it. Unit when
+/// the property declares none.
 fn accessorReturnTy(allocator: Allocator, expected: ?TypeRef) Allocator.Error!ir.TypeRef {
     const ty = expected orelse return build.typeUnit();
     if (ty.name.name.len == 0) return build.typeUnit();
@@ -532,10 +492,10 @@ fn accessorReturnTy(allocator: Allocator, expected: ?TypeRef) Allocator.Error!ir
 }
 
 /// Record the accessor's bound parameters as `Func.params` so the eval
-/// `this`-parameter fallback can recover the receiver. Each one carries the
-/// type it was declared with where that is known: a body-property initializer
-/// reading `side * 2` off an `Int` constructor parameter is an integer
-/// multiply, and a caller that only sees `Unit` cannot tell.
+/// `this`-parameter fallback can recover the receiver. Each carries the type it was
+/// declared with where known: a body-property initializer reading `side * 2` off an
+/// `Int` constructor parameter is an integer multiply, which a caller seeing only
+/// `Unit` cannot tell.
 fn accessorParams(
     allocator: Allocator,
     params: []const []const u8,
@@ -550,7 +510,7 @@ fn accessorParams(
         } else if (declared) |typed| {
             for (typed) |d| {
                 if (!std.mem.eql(u8, d.name, n)) continue;
-                // A `vararg` parameter's VALUE is an Array, not one element.
+                // A `vararg` parameter's value is an Array, not one element.
                 ty = if (d.is_vararg)
                     .{ .name = "Array", .nullable = false, .args = &.{} }
                 else
@@ -582,8 +542,8 @@ pub fn lowerAccessorBlock(
     return lowerAccessorBlockRet(module, owner_class, own_members, params, block, name, null);
 }
 
-/// `lowerAccessorBlock` carrying the property's declared type as the
-/// accessor's return type (the ext-getter naming-contract lookup reads it).
+/// `lowerAccessorBlock` carrying the property's declared type as the accessor's
+/// return type, which the ext-getter naming-contract lookup reads.
 pub fn lowerAccessorBlockRet(
     module: *Module,
     owner_class: []const u8,
@@ -599,26 +559,23 @@ pub fn lowerAccessorBlockRet(
     b.setOwnerClass(owner_class);
     b.setRecvTy(owner_class);
     b.setOwnMembers(try cloneOwnMembers(allocator, own_members));
-    // Box body `var`s (and params) a nested lambda mutates into shared cells,
-    // exactly as a normal function body does — a block-body accessor
-    // (`val x get() { var acc = 0; xs.forEach { acc += it }; acc }`) that
-    // mutates a local from inside a non-inline lambda would otherwise capture
-    // a copy and lose the write.
+    // Box body `var`s and params a nested lambda mutates into shared cells, exactly
+    // as a normal function body does; otherwise a block-body accessor mutating a
+    // local from inside a non-inline lambda captures a copy and loses the write.
     try setInitBlockBoxedVars(&b, allocator, params, block);
     try bindParams(&b, params);
     try consumePendingAccessorReceiver(&b, params);
-    // A secondary constructor's BODY reads that constructor's parameters,
-    // and this builder knew their names alone.
+    // A secondary constructor's body reads that constructor's parameters, and this
+    // builder knew their names alone.
     try consumePendingParamTypes(&b, params);
     const v = try lowerBlock(&b, block);
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, try accessorReturnTy(allocator, expected));
-    // Record the synthesized parameter list. Without it the frame's `this`
-    // is invisible to `frameThisParam`, so a bare member call in the body
-    // finds NO implicit receiver and falls through to the global tier —
-    // an inner class's accessor calling the OUTER class's member died as
-    // `unresolved global` (the receiver walk never ran, so it never
-    // followed the `outer` link).
+    // Record the synthesized parameter list. Without it the frame's `this` is
+    // invisible to `frameThisParam`, so a bare member call in the body finds no
+    // implicit receiver and falls through to the global tier: an inner class's
+    // accessor calling the outer class's member dies as `unresolved global`, the
+    // receiver walk never following the `outer` link.
     func.params = try accessorParams(allocator, params, owner_class, null);
     func.has_receiver_param = leadsWithThis(params);
     const fid = try pushFunc(module, func);
@@ -627,10 +584,9 @@ pub fn lowerAccessorBlockRet(
     return fid;
 }
 
-/// `lowerAccessorBlock`/`lowerAccessorExpr` with the SETTER's value
-/// parameter typed: `set(value) { if (value <= 0) ... }` resolves `value`
-/// against the property's declared type, so its member calls and templates
-/// bind statically.
+/// `lowerAccessorBlock` and `lowerAccessorExpr` with the setter's value parameter
+/// typed, so `set(value) { … }` resolves `value` against the property's declared
+/// type and its member calls and templates bind statically.
 pub fn lowerSetterBlockTyped(
     module: *Module,
     owner_class: []const u8,
@@ -658,9 +614,9 @@ pub fn lowerSetterBlockTyped(
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     func.params = try accessorParams(allocator, params, owner_class, null);
-    // The value parameter's declared type belongs on the signature too: a
-    // consumer that reads `Func.params` — the native emitter — has no other
-    // place to learn what a setter takes.
+    // The value parameter's declared type belongs on the signature too: a consumer
+    // reading `Func.params`, such as the native emitter, has no other place to learn
+    // what a setter takes.
     if (value_ty_head) |vh| {
         for (func.params) |*fp| {
             if (!std.mem.eql(u8, fp.name, value_name)) continue;
@@ -697,9 +653,9 @@ pub fn lowerSetterExprTyped(
     b.terminate(.{ .Return = v });
     var func = try b.finish(name, name, build.typeUnit());
     func.params = try accessorParams(allocator, params, owner_class, null);
-    // The value parameter's declared type belongs on the signature too: a
-    // consumer that reads `Func.params` — the native emitter — has no other
-    // place to learn what a setter takes.
+    // The value parameter's declared type belongs on the signature too: a consumer
+    // reading `Func.params`, such as the native emitter, has no other place to learn
+    // what a setter takes.
     if (value_ty_head) |vh| {
         for (func.params) |*fp| {
             if (!std.mem.eql(u8, fp.name, value_name)) continue;
@@ -725,9 +681,6 @@ pub fn lowerUnaryExprAsThunk(
     return pushFuncSpanned(module, func, expr.span());
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 const span = @import("span");
@@ -744,9 +697,9 @@ fn intLit(v: i64) Expr {
     return .{ .IntLit = .{ .value = v, .kind = .Int, .span = dummySpan() } };
 }
 
-/// Free the per-block instruction / catch slices and the params /
-/// capture-name lists of every func a thunk lowering pushed onto a
-/// module (the module's `deinit` only frees the func list itself).
+/// Free the per-block instruction and catch slices and the params and capture-name
+/// lists of every func a thunk lowering pushed onto a module; the module's `deinit`
+/// frees only the func list itself.
 fn freeModuleFuncs(module: *Module) void {
     const a = testing.allocator;
     for (module.funcs.items) |func| {

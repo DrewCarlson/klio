@@ -57,13 +57,8 @@ pub fn inlineTargetForBareCall(
     shape: CallShape,
 ) Allocator.Error!?*const ast.Function {
     const nm = seg.name;
-    // A renamed import (`import a.b.f as g`) fixes the declaration family
-    // by exact FQN, but the inline candidate table is keyed by DECLARED
-    // name — the aliased call must look the target up under its own name,
-    // or a same-named declaration in scope preempts the aliased one.
-    // kotlinx-coroutines aliases `unsafeTransform as transform` inside the
-    // flow operators; the name-keyed pick spliced the public safe
-    // `transform` and made every unsafe-chain flow cancellable.
+    // The inline candidate table is keyed by declared name, so an aliased call
+    // must look its target up under that name.
     const inline_nm: []const u8 = blk: {
         if (b.module.importAliasIn(seg.span.file, nm)) |asegs| {
             if (asegs.len != 0 and !std.mem.eql(u8, asegs[asegs.len - 1], nm) and
@@ -74,30 +69,18 @@ pub fn inlineTargetForBareCall(
         }
         break :blk nm;
     };
-    // The active splice's declared receiver serves as evidence when the
-    // caller context has none of its own (a bare reified call inside a
-    // spliced extension body); it feeds only this pick, not binding.
+    // The active splice's declared receiver serves as evidence when the caller
+    // context has none; it feeds only this pick, not binding.
     const evid_chain = try inlineBodyRecvChain(b);
 
-    // Host-backed default imports suppress the simple-name candidate table,
-    // but not an exact FuncId resolved by the scope-aware index below. The
-    // source declaration remains the semantic target of an inline call and
-    // must be available when reification, non-local return, or suspension
-    // requires a splice; ordinary calls still fall through to the host binding
-    // because `bareInlineNeedsSplice` rejects them.
+    // Host-backed default imports suppress the simple-name candidate table but not
+    // an exact FuncId from the scope-aware index. The source declaration stays the
+    // semantic target where a splice is required.
     const narrowed = inlineFnAstForRecv(inline_nm, shape, evid_chain);
-    // A receiver is in scope and the splice picked a RECEIVERLESS candidate,
-    // while a same-named non-inline EXTENSION fits that receiver: the correct
-    // target is not in the inline candidate set at all, so no comparison among
-    // inline candidates can find it. kotlinx-coroutines declares
-    // `Flow<T1>.combine(flow, transform)` as a plain `public fun` and
-    // `combine(vararg flows, transform)` as `inline` + `reified`, so a bare
-    // `combine(other, transform)` inside a Flow extension spliced a vararg and
-    // its body iterated `flows`:
-    //   Vm::call_member `iterator` on `kotlinx.coroutines.flow.SafeFlow`
-    // Declining hands the call to normal dispatch, which binds the extension.
-    // Gated on the extension existing, so a reified splice with no such
-    // sibling still splices and keeps its type argument.
+    // The correct target is not in the inline candidate set when a receiverless
+    // candidate is picked while a same-named non-inline extension fits the
+    // in-scope receiver, so decline to normal dispatch. Gated on that extension
+    // existing, so a reified splice with no sibling keeps its type argument.
     if (runtime.envOnce("KLIO_SPLICEDECL")) |w| if (std.mem.eql(u8, w, nm)) {
         std.debug.print("[splicedecl] {s} narrowed={} recvty={?s} chain={?d} fits={}\n", .{
             nm, narrowed != null,
@@ -106,19 +89,14 @@ pub fn inlineTargetForBareCall(
             if (evid_chain) |c| nonInlineExtensionFits(b, nm, c, seg.span.file) else false,
         });
     };
-    // Whether the splice that would happen is RECEIVERLESS: either the
-    // receiver-narrowed pick is one, or narrowing found nothing at all and the
-    // indexed resolution below will choose among the receiverless namesakes.
+    // Whether the splice that would happen is receiverless: the receiver-narrowed
+    // pick is, or narrowing found nothing and the index picks among namesakes.
     const splice_would_be_receiverless = if (narrowed) |p|
         (p.receiver_type == null and inline_state.inlineMemberOwner(p) == null)
     else blk: {
-        // Narrowing found nothing, so the indexed resolution below will pick
-        // among the inline candidates. Only decline when NONE of them takes a
-        // receiver — otherwise the inline EXTENSION is the right target and
-        // declining would strand the call (`Flow<T>.collect { … }` is an
-        // inline extension, and declining it left `collect` unresolved).
-        // The candidate table is keyed by the DECLARED name, so an aliased
-        // call (`import … .combine as combineOriginal`) must unalias first.
+        // Decline only when no candidate takes a receiver, since an inline
+        // extension is otherwise the right target. The table is keyed by declared
+        // name, so an aliased call must unalias first.
         var cname = nm;
         if (b.module.importAliasIn(seg.span.file, nm)) |segs| {
             if (segs.len != 0) cname = segs[segs.len - 1];
@@ -131,9 +109,8 @@ pub fn inlineTargetForBareCall(
     };
     if (splice_would_be_receiverless) {
         if (evid_chain) |chain| {
-            // Abandon the splice outright: clearing `narrowed` is not enough,
-            // because the indexed resolution below re-picks the same
-            // receiverless namesake and splices it anyway.
+        // Abandon the splice outright: clearing `narrowed` is not enough, since
+        // the indexed resolution re-picks the same receiverless namesake.
             if (nonInlineExtensionFits(b, nm, chain, seg.span.file)) return null;
         }
     }
@@ -161,21 +138,14 @@ pub fn inlineTargetForBareCall(
     }
     var pick: ?*const ast.Function = switch (ires.outcome) {
         .resolved => |fid| blk: {
-            // Receiver preference: an extension the receiver narrowing matched
-            // (and that the
-            // splice gate accepts) outranks the index's receiverless
-            // namesake — Kotlin resolves the in-scope receiver's
-            // extension over the top-level function, and the index
-            // never models receivers.
+            // Kotlin resolves an in-scope receiver's extension over a top-level
+            // function, and the index never models receivers.
             if (narrowed) |nf| {
                 if (nf.receiver_type != null and bareInlineNeedsSplice(b, nm, nf, args)) {
                     break :blk nf;
                 }
-                // Same reasoning for a companion member reached through
-                // the enclosing class's hierarchy (`ContentType.Companion
-                // .parse` calling the inherited `HeaderValueWithParameters
-                // .Companion.parse`): companion scope is invisible to the
-                // index, and Kotlin ranks it above a top-level namesake.
+                // Companion scope is likewise invisible to the index, and Kotlin
+                // ranks it above a top-level namesake.
                 if (nf.receiver_type == null and bareInlineNeedsSplice(b, nm, nf, args)) {
                     if (inline_state.inlineMemberOwner(nf)) |nowner| {
                         if (companionOwnerInEnclosingHierarchy(b, nowner)) break :blk nf;
@@ -183,13 +153,8 @@ pub fn inlineTargetForBareCall(
                 }
             }
             const idx_pick = inline_state.inlineAstById(fid.int());
-            // A trailing-lambda call cannot bind a candidate whose last
-            // parameter is not function-typed: the lambda would land on a
-            // scalar parameter (`group(metadata: LongArray, offset: Int)`
-            // absorbing `group(200) { … }`). When the index resolves such a
-            // namesake for a trailing-lambda call, decline the inline splice so
-            // the ordinary path resolves the lambda-hosting overload (the
-            // receiver extension) instead.
+            // A trailing-lambda call cannot bind a candidate whose last parameter
+            // is not function-typed.
             if (shape.last_is_lambda) {
                 if (idx_pick) |ip| {
                     if (!astLastParamHostsLambda(ip)) break :blk null;
@@ -197,22 +162,16 @@ pub fn inlineTargetForBareCall(
             }
             break :blk idx_pick;
         },
-        // The index declined; the shape-narrowed pick stands in — but a
-        // plain (receiverless) inline fn is only a legal target when its
-        // declaring package is in scope at the call site. Without the
-        // filter, `max(permits, 0)` under `import kotlin.math.*` splices
-        // an unrelated pack's `max(a: Dp, b: Dp)`. Extension picks stay:
-        // receiver narrowing, not package scope, is their discriminator.
+        // A receiverless inline fn is a legal target only when its declaring
+        // package is in scope; extension picks stay, discriminated by receiver
+        // narrowing rather than package scope.
         .deferred => blk: {
             var nf = narrowed orelse break :blk null;
-            // A plain pick re-ranks by call-site scope tier: with several
-            // same-name plain inline candidates across packs (`synchronized`
-            // actuals), the registration-order pick is bake-order-sensitive.
+            // A plain pick re-ranks by call-site scope tier: the registration-order
+            // pick across packs is bake-order-sensitive.
             nf = retierPlainInlinePick(b, nf, nm, shape, seg.span.file);
-            // Member-inline fns are exempt: their discriminator is the
-            // enclosing class hierarchy (checked below), not package
-            // scope — `propertyFailsWith` on an implicit CompareContext
-            // receiver must splice from any file.
+            // Member-inline fns are exempt: their discriminator is the enclosing
+            // class hierarchy, checked below, not package scope.
             if (nf.receiver_type == null and
                 inline_state.inlineMemberOwner(nf) == null and
                 !bareInlineVisibleFrom(b, nf, seg.span.file))
@@ -222,36 +181,25 @@ pub fn inlineTargetForBareCall(
             break :blk nf;
         },
     };
-    // Vararg-vs-container siblings: the index resolves by NAME and ARITY,
-    // and `combine(vararg flows: Flow<T>, transform)` and
-    // `combine(flows: Iterable<Flow<T>>, transform)` are both arity 2. A
-    // single `Flow` argument only fits the vararg one — a `Flow` is not an
-    // `Iterable` — but the index cannot see that, and splicing the
-    // container overload made its body iterate the flow itself
-    // (`Vm::call_member iterator`). Swap in the vararg sibling when the
-    // argument disproves the container parameter.
+    // Vararg-versus-container siblings are the same arity, so the index cannot
+    // separate them; swap in the vararg sibling when the argument disproves the
+    // container parameter.
     if (pick) |pf| {
         if (try varargSiblingForContainerMismatch(b, nm, pf, args)) |alt| pick = alt;
     }
 
-    // Same-simple-name inline MEMBER overloads declared in unrelated classes:
-    // a bare call inside a member binds `this.<name>`, so the overload must be
-    // one declared in the enclosing class's own hierarchy — never a namesake
-    // member of an unrelated class. The index resolves the bare name without a
-    // receiver, so it can pick either; correct it here. (`performingMeasure` is
-    // a member of both `NodeCoordinator` and the unrelated `LookaheadDelegate`;
-    // inside `InnerNodeCoordinator.measure` only the `NodeCoordinator` one is in
-    // scope, and the two bodies differ.)
+    // A bare call inside a member binds `this.<name>`, so the overload must be
+    // declared in the enclosing class's own hierarchy, which the receiverless
+    // index resolution cannot enforce.
     if (pick) |pf| {
         if (b.ownerClass()) |enclosing| {
-            // The pick is an inline member of a class the enclosing class does
-            // NOT belong to. A bare call inside a member binds `this.<name>`, so
-            // an unrelated class's namesake is never the target.
+            // The pick is an inline member of a class the enclosing class does not
+            // belong to, and a bare call binds `this.<name>`.
             if (pf.receiver_type == null) {
                 if (inline_state.inlineMemberOwner(pf)) |powner| {
                     if (!classIsOrExtendsHosted(b, enclosing, powner)) {
                         // Prefer a same-name inline overload declared in the
-                        // enclosing class's own hierarchy, if one exists.
+                        // enclosing class's own hierarchy.
                         var replaced = false;
                         if (inline_state.candidatesForName(nm)) |cands| {
                             if (cands.len >= 2) {
@@ -265,16 +213,9 @@ pub fn inlineTargetForBareCall(
                                 }
                             }
                         }
-                        // Otherwise, if the enclosing class declares its own
-                        // member of this name, decline the splice so the normal
-                        // member-call path binds it — a class's own `head`
-                        // (even non-inline) wins over an unrelated class's
-                        // inline `head`, whose body would run on the wrong `this`.
-                        // Only an APPLICABLE own member outranks the pick:
-                        // JsonTestBase's `encodeToString(value, mode)` must
-                        // not send a one-argument `encodeToString(tree)` to
-                        // the dynamic path (where the reified `T` of Json's
-                        // member reads a stale binding).
+                        // Otherwise decline so the normal member-call path binds
+                        // the enclosing class's own member, even a non-inline one.
+                        // Only an applicable own member outranks the pick.
                         if (!replaced and b.hasEnclosingMember(nm) and
                             enclosingMemberTakes(b, nm, args.len) and !ownMemberRejectsLambdas(b, nm, args))
                         {
@@ -285,14 +226,9 @@ pub fn inlineTargetForBareCall(
                 }
             }
         } else if (pf.receiver_type == null) {
-            // No enclosing class at all (a top-level extension body): a
-            // member-inline pick can only be in scope through an implicit
-            // receiver, and the receiver chain is known here. When the
-            // pick's owner is not on the chain, prefer the same-name
-            // EXTENSION overload whose declared receiver IS — inside
-            // `List<T>.fastFirstOrNull`, bare `fastForEach { }` must
-            // splice `List.fastForEach`, never `SlotIdsSet`'s member
-            // (whose body reads the wrong class's `set` field).
+            // With no enclosing class a member-inline pick is in scope only through
+            // an implicit receiver, so when its owner is not on the known chain
+            // prefer the same-name extension whose declared receiver is.
             if (inline_state.inlineMemberOwner(pf)) |powner| {
                 const chain: ?[]const []const u8 = try narrowingRecvChain(b);
                 if (chain) |ch| {
@@ -322,12 +258,8 @@ pub fn inlineTargetForBareCall(
             }
         }
     }
-    // An inline overload whose last parameter is a function type does not
-    // apply when its matching argument is an object instance — e.g. a
-    // `FlowCollector` passed to `Flow.collect`, where the real target is the
-    // member `collect(collector)`, not the inline `collect(action: (T) -> Unit)`
-    // extension. Splicing it would bind the object to the function parameter and
-    // invoke it as `obj.invoke(...)`. Decline the splice so the member wins.
+    // An inline overload whose last parameter is a function type does not apply to
+    // an object-instance argument, which splicing would invoke as `obj.invoke(…)`.
     if (pick) |pf| {
         const inline_takes_fn = pf.params.len != 0 and pf.params[pf.params.len - 1].ty.function != null;
         if (inline_takes_fn and lastArgIsObjectNotFunction(b, args) and
@@ -337,14 +269,9 @@ pub fn inlineTargetForBareCall(
             return null;
         }
     }
-    // Argument type evidence corrects a shape-picked sibling: the splice
-    // selectors above rank by NAME + arity + receiver only, so two inline
-    // overloads that differ in a parameter's TYPE tie and the first
-    // registered one wins — `visitAncestors(mask: Int, ...)` binding a
-    // `NodeKind` argument whose real target is the `(type: NodeKind<T>, ...)`
-    // sibling. When the declared/derived head of an argument DISPROVES the
-    // pick's parameter (a user-class head against a primitive parameter, or
-    // two distinct known classes), re-pick the sibling the evidence fits.
+    // The selectors above rank by name, arity, and receiver only, so overloads
+    // differing in a parameter type tie and the first registered wins. Re-pick the
+    // sibling the argument evidence fits.
     if (pick) |pf| {
         if (inlineEvidenceRejects(b, pf, args, arg_names)) {
             var better: ?*const ast.Function = null;
@@ -358,22 +285,17 @@ pub fn inlineTargetForBareCall(
                     break;
                 }
             }
-            // No sibling fits either: decline the splice entirely so the
-            // dynamic call path resolves on runtime values.
+            // No sibling fits either, so decline and let the dynamic call path
+            // resolve on runtime values.
             if (runtime.envOnce("KLIO_INLINE_PICK")) |w| {
                 if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-why] {s} evidence re-pick better={}\n", .{ nm, better != null });
             }
             pick = better;
         }
     }
-    // The enclosing class's OWN applicable member outranks an inline
-    // EXTENSION whose declared receiver is not evidenced by the receiver
-    // chain: a bare `withCurrent { }` inside SnapshotStateMap (which
-    // declares a private inline member `withCurrent`) must bind the
-    // member, never splice the unrelated `T : StateRecord`.withCurrent
-    // extension onto the map. An extension whose receiver IS on the
-    // chain keeps the splice — the innermost receiver's extension is
-    // Kotlin's pick there.
+    // The enclosing class's own applicable member outranks an inline extension
+    // whose declared receiver the chain does not evidence; one on the chain keeps
+    // the splice, being Kotlin's pick.
     if (pick) |pf| {
         if (runtime.envOnce("KLIO_INLINE_PICK")) |w| {
             if (std.mem.eql(u8, w, nm)) std.debug.print("[ipick-tail] {s} recv={s} hasOwn={} applicable={}\n", .{ nm, if (pf.receiver_type) |rt| rt.name.name else "-", b.hasOwnMember(nm), b.ownMemberApplicable(nm, args.len) });
@@ -394,14 +316,9 @@ pub fn inlineTargetForBareCall(
             if (!evidenced) return null;
         }
     }
-    // An ABSTRACT member on the implicit-receiver tower that can take this
-    // call outranks an EXTENSION / top-level inline candidate in Kotlin's
-    // resolution order (`respond(message, typeInfo<T>())` inside an
-    // `ApplicationCall` extension binds the interface's bodyless member,
-    // never the reified 2-arg `respond(status, message)` extension).
-    // Member-inline picks are exempt: they are themselves tower members
-    // (DebugPipelineContext's own `proceed` must keep splicing over the
-    // base class's abstract slot).
+    // An abstract member on the implicit-receiver tower that can take this call
+    // outranks an extension or top-level inline candidate. Member-inline picks are
+    // exempt, being themselves tower members.
     if (pick) |pf| {
         if (inline_state.inlineMemberOwner(pf) == null and
             receiverMemberTakesCall(b, evid_chain, nm, args.len))
@@ -416,23 +333,17 @@ pub fn inlineTargetForBareCall(
     return pick;
 }
 
-/// Whether argument type evidence definitely excludes inline candidate `f`
-/// for this call: a positional argument whose evidence head is a known user
-/// class bound to a builtin-kind parameter (`NodeKind` -> `Int`), or two
-/// distinct known class heads with no shared name. Conservative — unknown
-/// evidence or parameter kinds never reject.
+/// Whether argument type evidence definitely excludes inline candidate `f`: a
+/// known user class bound to a builtin-kind parameter, or two distinct known class
+/// heads. Conservative, so unknown evidence never rejects.
 pub fn inlineEvidenceRejects(b: *FuncBuilder, f: *const ast.Function, args: []const Expr, arg_names: []const ?[]const u8) bool {
     const positional_n = if (args.len > 0 and switch (args[args.len - 1]) {
         .Lambda, .AnonFun => true,
         else => false,
     }) args.len - 1 else args.len;
     for (args[0..positional_n], 0..) |*a, i| {
-        // A NAMED argument fills its declared parameter, not the slot at its
-        // call-site position: comparing it against `params[i]` disproves the
-        // candidate on a parameter it never binds (`element<T>(name,
-        // isOptional = true)` judged the Boolean against the skipped
-        // `annotations: List<Annotation>`), which declined the splice and
-        // left the reified parameter unbound.
+        // A named argument fills its declared parameter, not the slot at its
+        // call-site position.
         const pi: usize = blk: {
             const nm = if (i < arg_names.len) arg_names[i] else null;
             const n = nm orelse break :blk i;
@@ -447,23 +358,20 @@ pub fn inlineEvidenceRejects(b: *FuncBuilder, f: *const ast.Function, args: []co
         const pname = f.params[pi].ty.name.name;
         const phead = std.mem.trimEnd(u8, pname, "?");
         if (std.mem.eql(u8, ehead, phead)) continue;
-        // A top-type parameter accepts every argument; evidence can never
-        // disprove it (`classify(x: Any, block: (T) -> String)` called
-        // with an Int must keep the reified splice).
+        // A top-type parameter accepts every argument, so evidence can never
+        // disprove it.
         if (std.mem.eql(u8, phead, "Any")) continue;
         const e_builtin = paramLitKind(ehead);
         const p_builtin = paramLitKind(phead);
-        // A known user class where a builtin kind is required (or vice
-        // versa) is a definite mismatch.
+        // A known user class where a builtin kind is required, or the reverse, is
+        // a definite mismatch.
         if (p_builtin != null and e_builtin == null and b.module.classId(ehead) != null) return true;
         if (p_builtin == null and e_builtin != null and b.module.classId(phead) != null and
             !classHasBoundedTypeParam(b, phead) and
             !typeNameIsParam(f, phead)) return true;
     }
-    // A trailing lambda binds the LAST parameter; a builtin-typed one
-    // (`cast(value, serialName, tag: String)`) can never take it, so the
-    // same-named overload whose last parameter is a function type is the
-    // target (`cast(value, serialName, path: () -> String)`).
+    // A trailing lambda binds the last parameter, which a builtin-typed one cannot
+    // take, so the overload whose last parameter is a function type is the target.
     if (positional_n + 1 == args.len and f.params.len > positional_n) {
         const lp = &f.params[f.params.len - 1].ty;
         if (lp.function == null and paramLitKind(std.mem.trimEnd(u8, lp.name.name, "?")) != null) return true;
@@ -471,12 +379,11 @@ pub fn inlineEvidenceRejects(b: *FuncBuilder, f: *const ast.Function, args: []co
     return false;
 }
 
-/// Whether the class named `phead` declares a type parameter with a real
-/// (non-`Any`) upper bound. The registry records every class type param
-/// (unbounded ones under an `Any` bound), so presence alone is not the
-/// signal this evidence check keys on.
+/// Whether the class named `phead` declares a type parameter with a real,
+/// non-`Any` upper bound. The registry records unbounded params under an `Any`
+/// bound, so presence alone is not the signal.
 fn classHasBoundedTypeParam(b: *FuncBuilder, phead: []const u8) bool {
-    const key = if (std.mem.indexOfScalar(u8, phead, '.') != null)
+    const key = if (std.mem.findScalar(u8, phead, '.') != null)
         phead
     else if (b.module.uniqueClassIdBySimpleName(phead)) |id|
         b.module.classes.items[id.int()].fqn
@@ -497,9 +404,8 @@ fn typeNameIsParam(f: *const ast.Function, name: []const u8) bool {
     return false;
 }
 
-/// Shape fit for an evidence re-pick: every positional argument has a
-/// parameter slot, a trailing lambda has a last parameter to bind, and every
-/// unfilled parameter carries a default.
+/// Shape fit for an evidence re-pick: every positional argument has a slot, a
+/// trailing lambda has a last parameter to bind, and unfilled parameters default.
 fn inlineShapeFits(f: *const ast.Function, args: []const Expr, shape: CallShape) bool {
     const has_trailing = shape.last_is_lambda;
     const positional_n = if (has_trailing and args.len > 0) args.len - 1 else args.len;
@@ -513,21 +419,9 @@ fn inlineShapeFits(f: *const ast.Function, args: []const Expr, shape: CallShape)
     return true;
 }
 
-/// Whether a bare call to inline fn `f` must be spliced at the call
-/// site rather than dispatched: a `suspend inline` builder (its
-/// `suspendCoroutineUninterceptedOrReturn` must capture the caller's
-/// continuation), a lambda argument performing a non-local return, a
-/// reified type parameter, or a member shadowing the trailing-lambda
-/// shape. A receiver mismatch vetoes the splice (the call belongs to a
-/// different receiver's overload). The receiver judged is the
-/// innermost one in scope — the enclosing extension's declared
-/// receiver, or inside a class method the enclosing class itself — and
-/// matching is subtype-aware: an extension declared on a base class
-/// accepts a subclass receiver.
-/// Whether the last argument is definitely an object instance, not a
-/// function value: an `object : Foo {}` expression, or a local bound to
-/// one. Such an argument cannot satisfy a function-typed parameter, so an
-/// inline overload that wants a lambda there is the wrong target.
+/// Whether the last argument is definitely an object instance rather than a
+/// function value, so an inline overload wanting a lambda there is the wrong
+/// target.
 fn lastArgIsObjectNotFunction(b: *FuncBuilder, args: []const Expr) bool {
     if (args.len == 0) return false;
     switch (args[args.len - 1]) {
@@ -540,11 +434,9 @@ fn lastArgIsObjectNotFunction(b: *FuncBuilder, args: []const Expr) bool {
     }
 }
 
-/// Whether any of `f`'s value parameters is a RECEIVER-formed function type
-/// (`block: R.() -> T`).
-/// A body cheap enough to splice into every caller: an expression body
-/// or a short block, containing no try machinery (whose splice drags the
-/// finally/catch lowering into each call site).
+/// A body cheap enough to splice into every caller: an expression body or a short
+/// block with no try machinery, whose splice drags finally and catch lowering into
+/// each call site.
 fn smallInlineBody(f: *const ast.Function) bool {
     const body = &(f.body orelse return false);
     switch (body.*) {
@@ -609,10 +501,9 @@ pub fn anyCrossOrNoinlineParam(f: *const ast.Function) bool {
     return false;
 }
 
-/// Whether `f`'s body contains a `this` reference INSIDE a nested lambda /
-/// anon-fun. Such a `this` may belong to a receiver-formed block invoked
-/// dynamically (`withCurrent { this }`), which a member-body splice would
-/// statically capture to the wrong receiver.
+/// Whether `f`'s body contains a `this` inside a nested lambda or anon-fun, which
+/// may belong to a receiver-formed block invoked dynamically and would be captured
+/// to the wrong receiver by a member-body splice.
 fn bodyLambdaBindsThis(f: *const ast.Function) bool {
     const body = &(f.body orelse return false);
     return switch (body.*) {
@@ -727,69 +618,42 @@ pub fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Fun
         }
         break :blk false;
     };
-    // An inline member of a COMPANION object reached through the enclosing
-    // class's hierarchy (`ContentType.Companion.parse` calling the inherited
-    // `HeaderValueWithParameters.Companion.parse`): the splice is the only
-    // route — member dispatch has no enclosing-supertype-companion walk on
-    // the call side, and the bare-global fallback binds an unrelated
-    // namesake (or nothing). Kotlin resolves this statically, so splice it.
+    // An inline member of a companion reached through the enclosing class's
+    // hierarchy: member dispatch has no enclosing-supertype-companion walk, while
+    // Kotlin resolves this statically.
     const companion_super_member = f.receiver_type == null and blk: {
         const owner = inline_state.inlineMemberOwner(f) orelse break :blk false;
         break :blk companionOwnerInEnclosingHierarchy(b, owner);
     };
-    // A bare inline-EXT call inside a class MEMBER body: `this` there is
-    // always an interpreted Instance, so the no-splice route's host binding
-    // can only serve it by draining the whole receiver into a host value
-    // per call (`indexOfFirst` inside `AbstractList.indexOf` drained the
-    // list on every `contains`). The splice keeps the operation in place,
-    // exactly as kotlinc inlines it. Ext-body contexts (recvTy set) keep
-    // the host fast path — their values are host-repr. RECEIVER-formed
-    // lambda params (`block: R.() -> T`) are excluded: a nested splice of
-    // `withCurrent { this }` bound the block's `this` to the OUTER member
-    // receiver (`current.modification` read off the list instead of the
-    // record) — those keep the dynamic route until the nested receiver
-    // rebinding is fixed.
+    // A bare inline-extension call inside a class member body: `this` there is an
+    // interpreted Instance, which the host binding could serve only by draining
+    // the receiver per call. Ext-body contexts keep the host fast path.
+    // Receiver-formed lambda params are excluded, since a nested splice would bind
+    // the block's `this` to the outer member receiver.
     const rfs_on = inline_call.rfsEnabled();
     const member_body_ext = f.receiver_type != null and
         b.lambda_splice_resolve == null and b.spliceRecvTy() == null and
         b.recvTy() == null and b.ownerClass() != null and
         (rfs_on or !anyReceiverFormedFnParam(f)) and !bodyLambdaBindsThis(f) and
         !std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_EXT_SPLICE") orelse "1", "0");
-    // Literal-lambda inline calls splice by default (kotlinc semantics);
-    // KLIO_LLP=0 restores the framed route for bisecting. A CLASS MEMBER
-    // callee is excluded: its bare member reads need the decl class's
-    // `this`, which the splice does not thread.
-    // Receiver-formed lambda params (`block: R.() -> T`) are excluded for
-    // the same reason as member_body_ext: the nested receiver rebinding
-    // is not implemented, so `with(x) { field }` would bind the block's
-    // bare reads to the wrong receiver. A lambda that `return@<callee>`s
-    // its own label is also excluded — a nested member-inline call inside
-    // it stays framed, so the label must live on a real frame to be
-    // found at unwind.
-    // `crossinline`/`noinline` params embed the lambda in a result
-    // closure rather than calling it in place; that capture wiring is
-    // not spliced correctly yet (compareBy { it.name } handed the
-    // selector the comparator's other operand), so those stay framed.
-    // Exact positional fit only: `f` is the name's inline candidate, not
-    // a resolved overload, so a call whose arity differs (the 4-arg
-    // compareValuesBy against the 1-selector inline) must stay on the
-    // dynamic path where real overload resolution runs.
-    // Positional fit under Kotlin's trailing-lambda rule: the trailing
-    // lambda binds the LAST param, leading args bind positionally, and
-    // the gap in between must be default-filled. `f` is the name's
-    // inline pick, not a type-resolved overload, so a call that does not
-    // fit (the 4-arg compareValuesBy against the 1-selector inline) must
-    // stay on the dynamic path where real overload resolution runs.
+    // Literal-lambda inline calls splice by default, as kotlinc does; `KLIO_LLP=0`
+    // restores the framed route. Exclusions: a class-member callee, whose bare
+    // member reads need the declaring class's `this`; receiver-formed lambda
+    // params, whose nested receiver rebinding is not spliced; a lambda that
+    // `return@<callee>`s its own label, which needs a real frame to unwind to;
+    // and `crossinline`/`noinline` params, which embed the lambda in a closure.
+    // Positional fit under Kotlin's trailing-lambda rule: the trailing lambda
+    // binds the last param, leading args bind positionally, and the gap must be
+    // default-filled. `f` is the name's inline pick, not a resolved overload, so
+    // a call that does not fit stays on the dynamic path.
     const llp_arity_fits = want >= 1 and want <= f.params.len and blk: {
         for (f.params) |*p| {
             if (p.is_vararg) break :blk false;
         }
         var pi: usize = 0;
         while (pi + 1 < want) : (pi += 1) {
-            // A lambda literal must land on a function-typed param —
-            // compareValuesBy(a, b, sel, sel) arity-matches the
-            // (a, b, Comparator, selector) inline overload, but its
-            // third lambda lands on the Comparator slot.
+            // A lambda literal must land on a function-typed param: an arity match
+            // alone can put it on a Comparator slot.
             const arg_is_lambda = args[pi] == .Lambda or args[pi] == .AnonFun;
             if (arg_is_lambda and f.params[pi].ty.function == null) break :blk false;
         }
@@ -797,18 +661,15 @@ pub fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Fun
         while (gi + 1 < f.params.len) : (gi += 1) {
             if (f.params[gi].default == null) break :blk false;
         }
-        // Several same-shape inline candidates (sumOf's per-numeric
-        // selectors, Grouping.fold's two-fn-param variant) tie on shape
-        // alone — stay dynamic. Receiver-ness separates plain `run`
-        // from `T.run`.
+        // Several same-shape inline candidates tie on shape alone and stay
+        // dynamic. Receiver-ness separates plain `run` from `T.run`.
         if (inline_state.candidatesForName(nm)) |cands| {
             var fitting: usize = 0;
             for (cands) |cf| {
                 if (cf.params.len != f.params.len) continue;
                 if ((cf.receiver_type == null) != (f.receiver_type == null)) continue;
-                // Only same-package candidates form a genuine overload
-                // set (kotlin.synchronized vs the compose platform
-                // namesake are separated by scope, not types).
+                // Only same-package candidates form a genuine overload set;
+                // cross-pack namesakes are separated by scope, not types.
                 if (cf != f and cf.name.span.file.int() != f.name.span.file.int()) {
                     const cf_pkg = b.module.packageOfFile(cf.name.span.file) orelse "";
                     const f_pkg = b.module.packageOfFile(f.name.span.file) orelse "";
@@ -820,31 +681,21 @@ pub fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Fun
         }
         break :blk true;
     };
-    // A same-named member or in-scope binding can win by Kotlin's scope
-    // ranking (a class property `run: CallableHolder.((Int) -> Unit) ->
-    // Unit` invoked as `run { total += it }` outranks kotlin.run) — the
-    // dynamic path resolves those; the splice must not preempt them.
+    // A same-named member or in-scope binding can win by Kotlin's scope ranking,
+    // which the dynamic path resolves, so the splice must not preempt it.
     const llp_unshadowed = !b.hasOwnMember(nm) and !b.hasEnclosingMember(nm) and
         b.resolve(nm) == null and !b.knowsOuter(nm);
-    // A MEMBER-inline callee taking a lambda (`drain { ... }` inside
-    // Operations' own methods) splices when the call sits in the OWNER's
-    // hierarchy — the member-splice window threads `this` and the owner
-    // scope, exactly as the no-lambda tier relies on. Outside the owner
-    // the dynamic path keeps its member ranking. The shadowing test
-    // differs from the top-level tier: the callee IS an own member.
+    // A member-inline callee taking a lambda splices when the call sits in the
+    // owner's hierarchy, where the splice window threads `this` and the owner
+    // scope; outside it the dynamic path keeps its member ranking.
     const member_inline_lambda = inline_takes_fn and trailing_lambda and
         llp_arity_fits and rfs_on and
         b.resolve(nm) == null and
         !anyCrossOrNoinlineParam(f) and
         !inline_call.argLambdaTargetsLabel(args, nm) and
-        // COST gate, not a semantics gate: a plain member-inline is
-        // semantically identical framed or spliced (reified/non-local
-        // returns have their own mandatory tiers), and splicing a LARGE
-        // body into every hot caller inflates frames past the no-fill
-        // mask — the map path lost a third of its throughput to
-        // per-activation fill/alloc when `edit`'s try machinery spliced
-        // everywhere. Small try-free bodies (`drain`, `forEach`,
-        // `peekOperation`) splice; the rest stay framed.
+        // A cost gate, not a semantics gate: a plain member-inline is identical
+        // framed or spliced, while splicing a large body into every hot caller
+        // inflates frames past the no-fill mask. Small try-free bodies splice.
         smallInlineBody(f) and blk: {
         const owner = inline_state.inlineMemberOwner(f) orelse break :blk false;
         const enc = b.ownerClass() orelse break :blk false;
@@ -859,29 +710,20 @@ pub fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Fun
         !anyCrossOrNoinlineParam(f) and
         !inline_call.argLambdaTargetsLabel(args, nm) and
         !std.mem.eql(u8, runtime.envOnce("KLIO_LLP") orelse "1", "0");
-    // Kotlin inlines EVERY `inline fun`, lambda parameters or not — a
-    // no-lambda member inline (`private inline fun peekOperation() =
-    // opCodes[opCodesSize - 1]`) otherwise dispatches a full frame per
-    // call (311k activations in one vpd window). Splice when the call is
-    // bare inside the OWNER's own hierarchy (the member-splice window
-    // threads `this`/owner scope), positional args fit with a defaulted
-    // tail, and no local binding shadows the name. Top-level no-lambda
-    // inlines already lower flat; receiver-typed ones ride the ext tiers.
+    // Kotlin inlines every `inline fun`, so a no-lambda member inline otherwise
+    // dispatches a full frame per call. Splice when the call is bare inside the
+    // owner's hierarchy, positional args fit with a defaulted tail, and no local
+    // shadows the name.
     const plain_inline_nolambda = !inline_takes_fn and !trailing_lambda and
         f.receiver_type == null and !f.is_suspend and
         b.resolve(nm) == null and blk: {
-        // An explicit call-site type argument on a NON-reified inline
-        // (`listOf<String>()`) carries element knowledge the receiver
-        // proofs read off the CALL; the splice would replace the call
-        // with its body (`emptyList()`) and drop it. Keep those framed.
+        // An explicit type argument on a non-reified inline carries element
+        // knowledge the receiver proofs read off the call, which the splice drops.
         if (has_explicit_type_args and !anyReified(f.type_params)) break :blk false;
-        // The splice stands in for OVERLOAD RESOLUTION, so it may only
-        // engage when resolution is trivial — a lone candidate under the
-        // name. Committing by name+inline picked the sole INLINE overload
-        // over its non-inline siblings: `plusAssign(element: E)` swallowed
-        // `plusAssign(elements: List<E>)` inside MutableObjectList.addAll
-        // (an unbounded E accepts the List, and the runtime rank that
-        // prefers the List form never ran).
+        // The splice stands in for overload resolution, so it engages only when
+        // resolution is trivial: a lone candidate under the name. Committing by
+        // name plus inline picks the sole inline overload over its non-inline
+        // siblings, and the runtime rank that prefers the other never runs.
         if (b.module.funcsBySimpleName(nm).len != 1) break :blk false;
         for (f.params) |*p| {
             if (p.is_vararg) break :blk false;
@@ -920,11 +762,10 @@ pub fn bareInlineNeedsSpliceT(b: *FuncBuilder, nm: []const u8, f: *const ast.Fun
             inline_call.argLambdaMaySuspend(b, f, args));
 }
 
-/// True when `owner` names a companion object (a `$Companion`-mangled
-/// lifted class) whose HOST class is the enclosing class — or an
-/// ancestor of it. Both sides reduce to their host class: a bare call
-/// written inside `Sub.Companion` or inside `Sub`'s own body sees the
-/// companion members of `Sub`'s superclasses (Kotlin's static scope).
+/// True when `owner` names a companion object whose host class is the enclosing
+/// class or an ancestor of it. Both sides reduce to their host class: a bare call
+/// inside `Sub.Companion` or `Sub`'s body sees the companion members of `Sub`'s
+/// superclasses, per Kotlin's static scope.
 fn companionOwnerInEnclosingHierarchy(b: *FuncBuilder, owner: []const u8) bool {
     const o_host = hostClassOfCompanion(owner) orelse return false;
     const e = b.ownerClass() orelse return false;
@@ -932,30 +773,21 @@ fn companionOwnerInEnclosingHierarchy(b: *FuncBuilder, owner: []const u8) bool {
     return b.module.classIsOrExtends(e_host, o_host);
 }
 
-/// The class a `$Companion` mangle belongs to (`Base$Companion` →
-/// `Base`), or null when `name` is not a companion mangle.
+/// The class a `$Companion` mangle belongs to, or null when `name` is not one.
 pub fn hostClassOfCompanion(name: []const u8) ?[]const u8 {
-    const idx = std.mem.indexOf(u8, name, "$Companion") orelse return null;
+    const idx = std.mem.find(u8, name, "$Companion") orelse return null;
     if (idx == 0) return null;
     return name[0..idx];
 }
 
-/// Audit one inline-target resolution (the `inline` records of
-/// KLIO_RESOLVE_AUDIT): the simple-name narrowing's pick against the
-/// index-first pick, compared on the splice that would actually occur —
-/// a candidate failing the needs-splice gate never splices, so a
-/// difference confined to non-splicing picks is not a divergence.
-/// Divergences are graded like the bare-call audit's: the index
-/// resolving an exact-arity overload where the simple-name table —
-/// which only ever holds the inline overloads — fell back to a
-/// vararg/default/arity-mismatched candidate is a `shape_correction`
-/// (the pick takes the index's exact target), and the index resolving
-/// in a strictly better scope tier than the simple-name pick ranks in
-/// is a `tier_correction` (Kotlin's scope order — a named import
-/// outranks even a same-package inline declaration — is a program
-/// property the simple-name table cannot see). Anything else is
-/// unexplained: an interpreter bug. KLIO_RESOLVE_STRICT turns an
-/// unexplained divergence into a hard failure.
+/// Audit one inline-target resolution for `KLIO_RESOLVE_AUDIT`: the simple-name
+/// narrowing's pick against the index-first pick, compared on the splice that
+/// would actually occur, since a candidate failing the needs-splice gate never
+/// splices. Two divergences are explained: `shape_correction`, where the index
+/// resolves an exact-arity overload the inline-only simple-name table could not
+/// offer, and `tier_correction`, where the index resolves in a strictly better
+/// scope tier. Anything else is an interpreter bug; `KLIO_RESOLVE_STRICT` makes
+/// it a hard failure.
 fn inlineResolveAudit(
     b: *FuncBuilder,
     nm: []const u8,
@@ -1015,13 +847,9 @@ fn inlineResolveAudit(
     }
 }
 
-/// Whether an inline candidate matches the call less exactly than any
-/// index pick can: a vararg at any position, a default parameter, or a
-/// declared arity differing from the call's (a trailing-lambda gap the
-/// candidate's fn-typed last parameter absorbs is exact enough).
 /// Whether `f`'s last parameter is function-typed, so it can host a trailing
-/// lambda argument. A candidate that fails this cannot be the target of a
-/// `name(args) { … }` call — the block would bind a scalar parameter.
+/// lambda argument. A candidate failing this cannot be the target of a
+/// `name(args) { … }` call, whose block would bind a scalar parameter.
 fn astLastParamHostsLambda(f: *const ast.Function) bool {
     if (f.params.len == 0) return false;
     const last = f.params[f.params.len - 1];
@@ -1045,9 +873,9 @@ fn astPickInexact(f: *const ast.Function, want: usize, last_is_lambda: bool) boo
     return false;
 }
 
-/// Audit label classifying an inline candidate's declaration shape
-/// (overloads share the simple name; receiver-ness, suspend-ness, and
-/// the printed parameter count identify the declaration).
+/// Audit label classifying an inline candidate's declaration shape; overloads
+/// share the simple name, so receiver-ness, suspend-ness, and the printed
+/// parameter count identify the declaration.
 fn inlineCandLabel(f: ?*const ast.Function) []const u8 {
     const fp = f orelse return "-";
     if (fp.receiver_type != null) {

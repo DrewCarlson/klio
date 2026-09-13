@@ -1,5 +1,4 @@
-//! Statement lowering. Free functions over the shared `FuncBuilder`;
-//! filled in alongside the expression dispatch.
+//! Statement lowering. Free functions over the shared `FuncBuilder`.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -110,19 +109,18 @@ fn localTypeParamBounds(
     return bounds;
 }
 
-/// Lower a statement. Returns the register holding the statement's value
-/// when it is an expression statement in tail position, else `null`.
+/// Lower a statement, returning the register holding its value when it is a
+/// tail-position expression statement, else null.
 pub fn lowerStmt(b: *FuncBuilder, stmt: *const Stmt) Allocator.Error!?Reg {
-    // Record the executing source position for stack-trace capture: a `Trace`
-    // marks each statement so a throw (here or in any call it makes) reports the
-    // line each frame is on. Cheap (a single span store at eval time); the JIT
-    // hot loops bypass the eval dispatch entirely.
+    // A `Trace` marks each statement's source position so a throw, here or in any
+    // call it makes, reports the line each frame is on. One span store at eval
+    // time; the JIT hot loops bypass the eval dispatch entirely.
     switch (stmt.*) {
         .Expr => |*e| try b.push(.{ .Trace = .{ .span = helpers.exprSpan(e) } }),
         .Assign => |a| try b.push(.{ .Trace = .{ .span = a.span } }),
         .DestructuringDecl => |dd| try b.push(.{ .Trace = .{ .span = dd.span } }),
-        // A `val x = expr` initializer can throw (or call something that does),
-        // so mark its line too; other declarations carry no executable head.
+    // A `val x = expr` initializer can throw; other declarations have no
+    // executable head.
         .Decl => |*d| switch (d.*) {
             .Property => |p| try b.push(.{ .Trace = .{ .span = p.span } }),
             else => {},
@@ -149,8 +147,7 @@ pub fn lowerStmt(b: *FuncBuilder, stmt: *const Stmt) Allocator.Error!?Reg {
     }
 }
 
-/// `obj?.items[i] = v` — an `Index` target whose receiver chain is a
-/// safe-`Member`.
+/// `obj?.items[i] = v`: an `Index` target whose receiver chain is a safe `Member`.
 fn isSafeIndexTarget(target: *const Expr) bool {
     return switch (target.*) {
         .Index => |idx| switch (idx.receiver.*) {
@@ -161,7 +158,7 @@ fn isSafeIndexTarget(target: *const Expr) bool {
     };
 }
 
-/// `obj?.field = v` — a safe-`Member` target.
+/// `obj?.field = v`: a safe-`Member` target.
 fn isSafeMemberTarget(target: *const Expr) bool {
     return switch (target.*) {
         .Member => |m| m.safe,
@@ -187,13 +184,9 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             std.debug.print("\n", .{});
         }
     }
-    // `val x = expr` / `var x = expr`. The init is lowered
-    // into a fresh register and bound in the current scope;
-    // mutability is enforced by typeck, not the IR.
-    // A local holding a contextual function — declared with a contextual
-    // function type, or initialized by an anonymous context function — has
-    // a call shape: `name(c.., a..)` splits its leading context args
-    // (`CtxCall`), as a parameter of that type does.
+    // `val x = expr` / `var x = expr`: the init lowers into a fresh register and
+    // binds in the current scope, mutability being enforced by typeck. A local
+    // holding a contextual function has a call shape, splitting leading context args.
     if (p.ty) |ty| {
         if (ty.function) |ft| if (ft.context_params.len != 0 and ft.receiver == null) {
             const ctx_types = try b.allocator.alloc([]const u8, ft.context_params.len);
@@ -207,19 +200,13 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         try b.markContextFnParam(p.name.name, ctx_types, af.params.len);
     };
     const init: Reg = if (p.delegate) |de| blk: {
-        // `val x by D` binds the delegate (after the `provideDelegate`
-        // convention) under a hidden binding (`x$klio_delegate`) for BOTH
-        // `val` and `var`. Kotlin dispatches `getValue` on every read (and
-        // `setValue` on every write) and never at the declaration, so a read
-        // of `x` goes through `lowerDelegateRead` -> `D.getValue(null, ::x)`.
-        // A `val x by derivedStateOf { … }` must re-read the delegate: its
-        // value changes over time and is never written; a `lazy { … }`
-        // delegate caches internally, so read-through only costs a method
-        // call. Bound as an immutable val — the delegate reference itself
-        // does not change — so a nested lambda captures it by value; `var`
-        // additionally uses it for setValue write-through (see
-        // storeCombinedToTarget). The plain name binds the delegate too, for
-        // the paths that resolve the name without the delegate read.
+    // `val x by D` binds the delegate, after the `provideDelegate` convention, under
+    // a hidden `x$klio_delegate` binding for both `val` and `var`. Kotlin dispatches
+    // `getValue` on every read and `setValue` on every write, never at the
+    // declaration, so a read goes through `lowerDelegateRead`. Bound as an immutable
+    // val, the delegate reference itself not changing, so a nested lambda captures it
+    // by value. The plain name binds the delegate too, for paths that resolve the
+    // name without the delegate read.
         const delegate_expr = try lowerExpr(b, de);
         const delegate = try emitProvideDelegate(b, delegate_expr, p.name.name);
         {
@@ -230,9 +217,8 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
     } else switch (p.init != null) {
         true => blk: {
             const e = &p.init.?;
-            // The declared type is the initializer's expectation, through
-            // generic factories too (`val m: Map<String, Long> = mapOf("a" to 1)`
-            // makes the `1` a `Long`).
+    // The declared type is the initializer's expectation, through generic
+    // factories too.
             if (p.ty) |*ty| {
                 if (expr_mod.loweredOwnedLocalTypeRef(b, ty)) |lt| {
                     var owned = lt;
@@ -241,36 +227,30 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                 } else |_| {}
             }
             const widened: ?Expr = if (p.ty) |*ty| widenNumericLiteral(e, ty) else null;
-            // A type-annotated initializer puts its declared type in
-            // tail position so a reified inline call (`val u: User =
-            // resp.body()`) can infer its type argument.
+    // A type-annotated initializer puts its declared type in tail position so a
+    // reified inline call can infer its type argument.
             const prev = b.pushExpected(p.ty);
             const r = try lowerExpr(b, if (widened) |*w| w else e);
             b.restoreExpected(prev);
             break :blk r;
         },
-        // A `lateinit var` starts as `Null`, the state every read checks
-        // for (`LateinitCheck`); a deferred-init `val` has no read before
-        // its definite assignment and needs no sentinel.
+        // A `lateinit var` starts as `Null`, the state every read checks for; a
+        // deferred-init `val` has no read before its definite assignment.
         false => try b.emitConst(if (p.is_lateinit) .Null else .Unit),
     };
-    // Allocate a "home" register and Move the init value
-    // into it for `var`, or for `val` declared without an
-    // initializer (deferred init — multiple branches assign
-    // before the first read). This gives reads through the
-    // home reg slot semantics under the flat block IR.
-    // For a `val foo = expr` the binding is fixed at decl
-    // time and can skip the slot.
-    // Track `: Any` annotations so subsequent `==` against
-    // this var routes through the boxed-equality path.
+    // Allocate a home register and Move the init value into it for `var`, or for a
+    // `val` with no initializer, where multiple branches assign before the first
+    // read; that gives reads slot semantics under the flat block IR, while a
+    // `val foo = expr` is fixed at decl time. `: Any` annotations are tracked so a
+    // later `==` routes through the boxed-equality path.
     if (p.ty) |ty| {
         if (std.mem.eql(u8, ty.name.name, "Any")) {
             try b.markAnyTyped(p.name.name);
         }
     }
-    // Record the local's declared type (or its initializer expression when
-    // un-annotated) so inline-overload receiver narrowing can type a plain
-    // local receiver (`val resp = client.get(url); resp.body<T>()`).
+    // Record the local's declared type, or its initializer expression when
+    // un-annotated, so inline-overload receiver narrowing can type a plain local
+    // receiver.
     if (p.ty) |ty| {
         try b.setLocalDeclTypeOwned(
             p.name.name,
@@ -288,18 +268,16 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             try b.markNonFnLocal(p.name.name);
         }
     } else if (p.init) |*e| {
-        // Preserve the inferred static type of a simple receiver alias. This
-        // is the type kotlinc assigns to `val outerScope = this`, and later
-        // explicit-receiver extension calls need it before runtime dispatch
-        // (notably to type a trailing receiver lambda correctly).
+        // Preserve the inferred static type of a simple receiver alias, the type
+        // kotlinc assigns to `val outerScope = this`, which later explicit-receiver
+        // extension calls need before runtime dispatch.
         switch (e.*) {
             .This => |t| if (t.qualifier == null) {
                 if (b.enclosingRecvTy()) |ty| {
                     try b.setLocalDeclType(p.name.name, ty);
                 } else if (b.ownerClass()) |owner| {
-                    // Inside an ordinary member, `val self = this` is the
-                    // declaring class — no extension receiver is in scope to
-                    // supply it, and without this the local stayed untyped.
+                    // Inside an ordinary member, `val self = this` is the declaring
+                    // class, no extension receiver being in scope.
                     try b.setLocalDeclType(p.name.name, owner);
                 }
             },
@@ -309,32 +287,27 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                     if (b.localDeclNullable(path.segments[0].name)) try b.setLocalDeclNullable(p.name.name);
                 }
             },
-            // A cast initializer IS the local's static type: `val cont =
-            // curState as CancellableContinuation<Unit>` types `cont` with
-            // the full generic reference, so a member call on it reaches
-            // resolution with the type arguments applicability needs.
+            // A cast initializer is the local's static type, with the full generic
+            // reference, so a member call on it reaches resolution with the type
+            // arguments applicability needs.
             .As => |cast| {
                 try b.setLocalDeclTypeOwned(
                     p.name.name,
                     try expr_mod.loweredOwnedLocalTypeRef(b, &cast.ty),
                 );
-                // `as?` yields the cast type OR null, so the local is
-                // nullable; the type head is still exact, which is what a
-                // member call on it needs.
+                // `as?` yields the cast type or null, so the local is nullable
+                // while its head stays exact.
                 if (cast.ty.nullable or cast.safe) try b.setLocalDeclNullable(p.name.name);
             },
-            // A call initializer's declared RETURN type is the local's
-            // static type (`val onCancellation = clause
-            // .createOnCancellationAction(...)`), the same derivation the
-            // destructuring arm already trusts. Argument shapes built from
-            // the local then refute inapplicable members.
+            // A call initializer's declared return type is the local's static type,
+            // the same derivation the destructuring arm trusts. Argument shapes
+            // built from the local then refute inapplicable members.
             .Call => {
                 const vt = runtime.envOnce("KLIO_VALTY_TRACE");
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct0| {
                     var ct = ct0;
-                    // A star-erased RETURN-position parameter re-derives
-                    // from the call's trailing lambda (recorder-level only;
-                    // resolution shapes are untouched).
+                    // A star-erased return-position parameter re-derives from the
+                    // call's trailing lambda; recorder-level only.
                     try expr_mod.patchStarredCallRecord(b, &ct, e);
                     if (vt) |w| if (std.mem.eql(u8, w, p.name.name))
                         std.debug.print("[valty] {s} = {s} nargs={d} a0={s} mod={x} classes={d}\n", .{ p.name.name, ct.name, ct.args.len, if (ct.args.len != 0) ct.args[0].name else "-", @intFromPtr(b.module) & 0xffff, b.module.classes.items.len });
@@ -346,8 +319,7 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                         std.debug.print("[valty] {s} = <null> mod={x} classes={d}\n", .{ p.name.name, @intFromPtr(b.module) & 0xffff, b.module.classes.items.len });
                 }
             },
-            // `val clause = findClause(x) ?: continue` — the elvis arm of
-            // staticExprTypeRef strips the null.
+            // The elvis arm of `staticExprTypeRef` strips the null.
             .Binary => |bin| if (bin.op == .Elvis) {
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
                     const was_nullable = ct.nullable;
@@ -355,16 +327,13 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                     if (was_nullable) try b.setLocalDeclNullable(p.name.name);
                 }
             } else {
-                // A predicate operator (`a == b`, `a in xs`, `a && b`) types
-                // the local `Boolean` outright.
+                // A predicate operator types the local `Boolean` outright.
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
                     try b.setLocalDeclTypeOwned(p.name.name, ct);
                 }
             },
-            // An INDEX initializer is an operator `get` call: its resolved
-            // return types the local (`val interceptor =
-            // context[ContinuationInterceptor]`), including the key-solved
-            // type parameter the operator arm derives.
+            // An index initializer is an operator `get` call, so its resolved
+            // return types the local, key-solved type parameter included.
             .Index => {
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
                     const was_nullable = ct.nullable;
@@ -372,20 +341,16 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
                     if (was_nullable) try b.setLocalDeclNullable(p.name.name);
                 }
             },
-            // An object literal's denotable type is its single supertype,
-            // and that supertype is the only place its type ARGUMENTS are
-            // written (`object : KSerializer<Int> by …`). Recording the head
-            // alone left a call taking `KSerializer<T>` with nothing to
-            // solve a reified `T` from.
+            // An object literal's denotable type is its single supertype, and that
+            // supertype is the only place its type arguments are written; the head
+            // alone leaves a reified `T` with nothing to solve from.
             .ObjectExpr => {
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
                     try b.setLocalDeclTypeOwned(p.name.name, ct);
                 }
             },
             // Shapes that name their own type: a cast states it, `this` is the
-            // enclosing class, `!x` is Boolean and `-x` keeps its operand's
-            // type. Each of these left the local untyped, so every member call
-            // on it had to resolve by name at run time.
+            // enclosing class, `!x` is Boolean, `-x` keeps its operand's type.
             .Unary, .If, .When => {
                 if (try expr_mod.staticExprTypeRef(b, e)) |ct| {
                     const was_nullable = ct.nullable;
@@ -395,43 +360,35 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             },
             else => {},
         }
-        // Literal initializers are recorded too: a call site uses them as
-        // definite NON-callable evidence (`var nodeIndex = 0` beside
-        // `fun nodeIndex(...)` — the call resolves to the function).
+        // Literal initializers are recorded as definite non-callable evidence.
         switch (e.*) {
-            // A property read is recorded too: `val node = coord.layoutNode`
-            // lends the property's registered type head to the local, which
-            // the declared-type channel then reads back.
-            // A BINARY init carries the numeric-promotion evidence the
-            // deriver's arm answers (`val lineSeparators = (n - 1) / perLine`).
+            // A property read lends the property's registered type head to the
+            // local, which the declared-type channel reads back. A binary init
+            // carries the numeric-promotion evidence the deriver's arm answers.
             .Call, .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate, .Binary, .Unary, .Postfix => try b.setLocalInitExprAt(p.name.name, e, p.name.span),
-            // A property read and an INDEXED read both carry a static type of
-            // their own: `val held = row[1]` is `Row.get`'s return type.
+            // A property read and an indexed read each carry a static type of their
+            // own: `val held = row[1]` is `Row.get`'s return type.
             .Member, .Index, .Path => if (!std.mem.eql(u8, runtime.envOnce("KLIO_MEMBER_INIT") orelse "1", "0"))
                 try b.setLocalInitExprAt(p.name.name, e, p.name.span),
-            // Recorded as an init too: a single-supertype literal's denotable
-            // type is that supertype, which the deriver's ObjectExpr arm
-            // answers for the local's reads.
+            // A single-supertype object literal's denotable type is that supertype,
+            // which the deriver's ObjectExpr arm answers.
             .ObjectExpr => {
                 try b.markObjectInitLocal(p.name.name);
                 try b.setLocalInitExprAt(p.name.name, e, p.name.span);
             },
             else => {},
         }
-        // A literal init is definite NON-callable evidence that must also
-        // survive into nested lambda bodies: a captured `var key = 0` does
-        // not shadow the `key(...) {}` composable for a CALL.
+        // A literal init is definite non-callable evidence that must survive into
+        // nested lambda bodies: a captured `var key = 0` does not shadow the
+        // `key(...) {}` composable for a call.
         switch (e.*) {
             .IntLit, .FloatLit, .BoolLit, .CharLit, .StringTemplate => try b.markNonFnLocal(p.name.name),
             .Lambda, .AnonFun => b.clearNonFnLocal(p.name.name),
             else => {
-                // Any initializer whose static TYPE is a class with no
-                // `invoke` is non-callable evidence too, whatever its shape:
-                // `val flow = flowOf(1, 2)` beside the `flow { … }` builder
-                // must leave the builder reachable, including from a nested
-                // lambda that captures the local. Gated on a same-named
-                // bare-call candidate existing, so the derivation runs only
-                // where the answer can matter.
+                // Any initializer whose static type is a class with no `invoke` is
+                // non-callable evidence too, whatever its shape. Gated on a
+                // same-named bare-call candidate existing, so the derivation runs
+                // only where the answer can matter.
                 if (b.module.hasBareCallCandidate(p.name.name, p.name.span.file) and
                     try initTypeIsNonInvokable(b, e))
                 {
@@ -440,15 +397,13 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
             },
         }
     }
-    // Keep the source annotation for later plain assignments to this name:
-    // the value of `h = { ... }` lowers under the declared type exactly as
-    // the initializer did (a `Ctx.() -> R` receiver lambda keeps its
-    // receiver context on reassignment).
+    // Keep the source annotation for later plain assignments to this name: the
+    // value of `h = { ... }` lowers under the declared type exactly as the
+    // initializer did, so a receiver lambda keeps its receiver context.
     if (p.ty) |*ty| b.setLocalAstTy(p.name.name, ty);
     if (b.isBoxed(p.name.name)) {
-        // Captured `var` — box into a shared cell so writes
-        // from a nested closure / coroutine are visible
-        // here (Kotlin `Ref` semantics).
+        // A captured `var` boxes into a shared cell so writes from a nested closure
+        // are visible here, per Kotlin `Ref` semantics.
         const home = b.allocReg();
         try b.push(.{ .MakeCell = .{ .dst = home, .src = init } });
         try b.setMutableHome(p.name.name, home);
@@ -465,11 +420,9 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
         try b.bind(p.name.name, home);
         if (p.is_lateinit) try b.bind(try expr_mod.lateinitMarkerName(b, p.name.name), home);
     } else {
-        // `val x = y` where `y` is a reassignable var reads `y`'s home register
-        // directly; a later write to `y` (`y = …`) Moves into that home and
-        // would alias into `x`. Snapshot the value into a fresh register so the
-        // val is an independent binding (Kotlin: a val captures the value, not
-        // the variable).
+        // `val x = y` where `y` is a reassignable var reads `y`'s home register, and
+        // a later write to `y` would alias into `x`. Snapshot into a fresh register:
+        // in Kotlin a val captures the value, not the variable.
         if (p.init) |*ie| {
             if (ie.* == .Path and ie.Path.segments.len == 1 and
                 b.mutableHome(ie.Path.segments[0].name) != null)
@@ -486,14 +439,9 @@ fn lowerPropertyDecl(b: *FuncBuilder, p: *const ast.Property) Allocator.Error!?R
 }
 
 fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Reg {
-    // Local fn: lower as a closure whose body captures the
-    // enclosing scope's visible names. Bound to its
-    // declared name so subsequent calls resolve to the
-    // closure Value. Equivalent to `val name = { ... }`.
-    // Both block-body (`fun foo() { ... }`) and
-    // expression-body (`fun foo() = expr`) forms map to a
-    // synthetic Block carrying the expression as its only
-    // statement.
+    // A local fn lowers as a closure capturing the enclosing scope's visible names,
+    // bound to its declared name, equivalent to `val name = { ... }`. Block-body and
+    // expression-body forms both map to a synthetic single-statement Block.
     const span_mod = @import("span");
     const dummy_span = span_mod.Span.init(span_mod.FileId.from(0), 0, 0);
     const body_block: ?ast.Block = if (f.body) |fb| switch (fb) {
@@ -506,23 +454,19 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
     } else null;
     if (body_block) |body| {
         const self_cell = try localFnSelfCell(b, f, &body);
-        // A recursive local EXTENSION binds its own name before the body
-        // lowers, so `(this - 1).fact()` inside it resolves to the in-scope
-        // closure (which takes the receiver as its leading parameter) instead
-        // of falling through to a runtime member lookup on `Int`.
+        // A recursive local extension binds its own name before the body lowers, so
+        // a self-call inside resolves to the in-scope closure, which takes the
+        // receiver as its leading parameter, instead of a runtime member lookup.
         if (self_cell != null and f.receiver_type != null) {
             const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name.name, "this")) 1 else 0;
             try b.markLocalFn(f.name.name);
             try b.markLocalExtFn(f.name.name, @intCast(@min(f.params.len - recv_off, 127)));
         }
-        // Same-named sibling declarations are OVERLOADS, not rebindings.
-        // Register this declaration's signature and bind its mangled
-        // sibling name to a dedicated cell BEFORE the body lowers, so a
-        // call inside any sibling's body (including this one) selects
-        // the applicable overload — the second `assertCompareResult`
-        // must reach the first, not recurse into itself through the
-        // shared plain-name self-cell. The closure lands in the cell
-        // after it is built, below.
+        // Same-named sibling declarations are overloads, not rebindings, so register
+        // this declaration's signature and bind its mangled sibling name to a
+        // dedicated cell before the body lowers; a call inside any sibling's body
+        // then selects the applicable overload instead of recursing through the
+        // shared plain-name self-cell.
         var mangled_name: []const u8 = undefined;
         const mangled_cell: Reg = mangled_blk: {
             const ov_tys = try b.allocator.alloc(?[]const u8, f.params.len);
@@ -538,10 +482,8 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                 if (p.is_vararg) has_vararg = true else if (p.default == null) n_required += 1;
             }
             // A pass-threaded composable local fn carries a trailing
-            // ($composer, $changed) pair the CALL SITE never writes: the
-            // pair never counts toward the required arity, or a 3-arg call
-            // to `fun Composition(a, b, c)` judged inapplicable and the
-            // classifier arms constructed the pack's `interface Composition`.
+            // ($composer, $changed) pair the call site never writes, so the pair
+            // never counts toward the required arity.
             if (f.params.len >= 2 and n_required >= 2 and
                 std.mem.eql(u8, f.params[f.params.len - 1].name.name, "$changed") and
                 std.mem.eql(u8, f.params[f.params.len - 2].name.name, "$composer"))
@@ -549,8 +491,8 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                 n_required -= 2;
             }
             const ordinal = if (b.local_fn_overloads.getPtr(f.name.name)) |l| l.items.len else 0;
-            // Module-lifetime: the mangled name ships inside the AstLambda
-            // instruction's captured-name list, read at runtime.
+        // Module-lifetime: the mangled name ships inside the AstLambda
+        // instruction's captured-name list, read at runtime.
             const mangled = try std.fmt.allocPrint(b.module.func_name_index.allocator, "{s}$ovl{d}", .{ f.name.name, ordinal });
             mangled_name = mangled;
             const null_v = try b.emitConst(.Null);
@@ -567,11 +509,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             if (f.return_type) |*rt| {
                 try b.setLocalFnReturnTy(mangled, try expr_mod.loweredOwnedLocalTypeRef(b, rt));
             } else if (f.body != null and f.body.? == .Expr) {
-                // An unannotated EXPRESSION body's return derives at the
-                // declaration under the params' declared types, so a
-                // val-init calling the local fn types
-                // (`fun twoDigitNumber(index: Int) = (s[index]-'0')*10+...`
-                // records Int for `val month = twoDigitNumber(i + 1)`).
+                // An unannotated expression body's return derives at the
+                // declaration under the params' declared types, so a val-init
+                // calling the local fn types.
                 const PSave = struct { name: []const u8, ty: ?ir.TypeRef };
                 var psaves: std.ArrayList(PSave) = .empty;
                 defer {
@@ -605,7 +545,7 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                     if (expr_mod.staticExprTypeRef(b, &f.body.?.Expr) catch null) |derived0| {
                         var derived = derived0;
                         var h = std.mem.trimEnd(u8, derived.name, "?");
-                        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                        if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
                         const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
                             ir.parseClassTypeParamIdentity(h) != null;
                         if (h.len != 0 and !bare) {
@@ -648,10 +588,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         try b.stashRecvHeadsForLambda();
         var outer_boxed = try b.boxedVarsSnapshot();
         defer outer_boxed.deinit();
-        // A local *extension* function (`fun List<T>.mid() =
-        // …`) binds its receiver as the implicit first `this`
-        // param, so the body's bare member refs (`sorted()`,
-        // `size`) resolve. Call sites prepend the receiver.
+        // A local extension function binds its receiver as the implicit first
+        // `this` param so the body's bare member refs resolve. Call sites prepend
+        // the receiver.
         const is_ext = f.receiver_type != null;
         var param_idents = try b.allocator.alloc(ast.Ident, f.params.len + @intFromBool(is_ext));
         defer b.allocator.free(param_idents);
@@ -678,8 +617,8 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         const encl_recv = b.capturesThisSlot() or
             (!b.this_is_plain_param and b.resolve("this") != null) or
             b.ownerClass() != null or b.isParamThunk() or b.recvTy() != null;
-        // A local contextual function binds its context parameters in the
-        // body; stash them for the shared lambda-body lowering to consume.
+        // A local contextual function binds its context parameters in the body;
+        // stash them for the shared lambda-body lowering.
         if (f.context_params.len != 0) {
             b.module.has_context_decls = true;
             b.module.pending_ctx = .{ .params = f.context_params, .type_params = f.type_params };
@@ -711,19 +650,17 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         defer pending_bounds.deinit(b.allocator);
         b.module.pending_lambda_type_param_bound_refs = try b.typeParamBoundRefsSlice();
         b.module.pending_lambda_ctx_fn_shapes = try b.contextFnShapesSlice();
-        // The receiver type in scope inside this body: a local EXTENSION fn's
-        // own declared receiver (innermost, wins bare-call disambiguation —
-        // `fun MockViewValidator.value() { Text(…) }` must pick the
-        // MockViewValidator ext over a same-named top-level fn), else the
-        // enclosing receiver, exactly as a receiver lambda carries it.
+        // The receiver type in scope inside this body: a local extension fn's own
+        // declared receiver, innermost and winning bare-call disambiguation, else
+        // the enclosing receiver, exactly as a receiver lambda carries it.
         b.module.pending_lambda_receiver_tower = try b.collectReceiverTowerLabeled(
             b.allocator,
             if (f.receiver_type) |r| r.name.name else null,
             if (f.receiver_type != null) f.name.name else null,
         );
-        // The local extension fn's receiver answers to `this@<name>` exactly
-        // as a top-level extension's does; the body binds the label so
-        // nested scopes (and the tower emission path) reach the value.
+        // The local extension fn's receiver answers to `this@<name>` exactly as a
+        // top-level extension's does, so the body binds the label and nested scopes
+        // reach the value.
         if (f.receiver_type != null) b.module.pending_lambda_this_label = f.name.name;
         b.module.pending_lambda_enclosing_recv = if (f.receiver_type) |r|
             r.name.name
@@ -734,24 +671,19 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             b.module.pending_lambda_own_recv_type =
                 try expr_mod.loweredOwnedLocalTypeRef(b, receiver);
         }
-        // A local `fun` with a BLOCK body returns Unit on fall-through,
-        // never its tail statement's value (an expression body keeps the
-        // expression as the return — it lowered to a single-statement
-        // synthetic block above). Mirrors the top-level/member block-body
-        // rule in `lowerFunctionBodyWithImplicitOwnerEnclosing`.
+        // A local `fun` with a block body returns Unit on fall-through, never its
+        // tail statement's value; an expression body keeps the expression as the
+        // return. Mirrors the top-level and member block-body rule.
         b.module.pending_lambda_fn_block_body = f.body != null and f.body.? == .Block;
-        // The body (and any lambda nested in it) must route a bare
-        // self-reference through the mangled cell: the plain-name slot is
-        // rebound by a later same-named sibling declaration, so a self
-        // re-invoke captured by name would run the sibling.
+        // The body, and any lambda nested in it, must route a bare self-reference
+        // through the mangled cell: the plain-name slot is rebound by a later
+        // same-named sibling, so a self re-invoke captured by name would run it.
         b.module.pending_lambda_self_fn = .{ .name = f.name.name, .mangled = mangled_name };
         // Non-callable-local evidence flows into the body.
         b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
-        // The enclosing locals' declared types cross into the local fn's
-        // body exactly as they cross into a lambda's — `isoString` (an
-        // annotated fn param) read inside a local `parseFailure` lowered
-        // untyped without this. Derived-init locals resolve HERE, the only
-        // scope their initializers were written in.
+        // The enclosing locals' declared types cross into the local fn's body
+        // exactly as they cross into a lambda's. Derived-init locals resolve here,
+        // the only scope their initializers were written in.
         b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
         if (b.module.pending_lambda_local_decl_types) |*locals| {
             var init_it = b.localInitExprIterator();
@@ -761,8 +693,8 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                 if (derived) |ty| try locals.types.put(e.key_ptr.*, ty);
             }
         }
-        // Vararg param names: the body registers those as the materialized
-        // array head rather than the annotated element type.
+        // Vararg param names: the body registers the materialized array head, not
+        // the annotated element type.
         var vararg_names: std.ArrayList([]const u8) = .empty;
         defer vararg_names.deinit(b.allocator);
         for (f.params) |p| {
@@ -770,10 +702,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
         }
         b.module.pending_lambda_vararg_params = if (vararg_names.items.len != 0) vararg_names.items else null;
         defer b.module.pending_lambda_vararg_params = null;
-        // A bare `return` in an argument lambda nested in THIS local fn
-        // returns from the local fn, not from the enclosing real function.
-        // Push the local fn's name so such returns stamp it as their label,
-        // and (below) name the body func so the runtime unwind stops here.
+        // A bare `return` in an argument lambda nested in this local fn returns
+        // from the local fn, not the enclosing real function, so push the local
+        // fn's name as the label and name the body func so the unwind stops here.
         const prev_real_fn = build.pushCurrentRealFn(f.name.name);
         defer build.popCurrentRealFn(prev_real_fn);
         const lowered = try lowerLambdaBodyCapturingKindWith(
@@ -794,10 +725,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             enclosing_owner,
         );
         const body_func = lowered.func;
-        // The lambda-body lowering builds params with `is_vararg = false`
-        // (lambdas cannot declare varargs) — a local FUNCTION can, and the
-        // closure invocation's vararg packing keys on the flag. Stamp the
-        // declared flags back onto the lowered body func.
+        // The lambda-body lowering builds params with `is_vararg = false`, lambdas
+        // being unable to declare varargs, while a local function can and the
+        // closure invocation's packing keys on the flag, so stamp them back.
         {
             const offset = @intFromBool(is_ext);
             if (b.module.funcByIdMut(body_func)) |bf| {
@@ -805,8 +735,8 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                     const pi = offset + i;
                     if (pi < bf.params.len) bf.params[pi].is_vararg = p.is_vararg;
                 }
-                // Carry the declared name so `frameMatchesLabel` stops a
-                // nested lambda's non-local return at this frame.
+                // Carry the declared name so `frameMatchesLabel` stops a nested
+                // lambda's non-local return at this frame.
                 bf.name = f.name.name;
                 bf.lambda_receiver_shape_known = true;
             }
@@ -831,10 +761,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             .absorb_return = true,
             .body_func = body_func,
         } });
-        // A same-named local PROPERTY owns the plain-name binding: the fun
-        // is reachable through its mangled overload cell and the overload
-        // registry, while bare `seen` reads stay on the var (Kotlin resolves
-        // the bare reference to the property; only a call picks the fun).
+        // A same-named local property owns the plain-name binding; the fun is
+        // reachable through its mangled overload cell, since Kotlin resolves the
+        // bare reference to the property and only a call picks the fun.
         const name_is_property = self_cell == null and b.mutableHome(f.name.name) != null and
             !b.isLocalFn(f.name.name);
         if (self_cell) |home| {
@@ -847,9 +776,9 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
             const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name.name, "this")) 1 else 0;
             try b.markLocalExtFn(f.name.name, @intCast(@min(f.params.len - recv_off, 127)));
         }
-        // Record positional parameter type names (drop a leading `this`
-        // receiver) so a literal argument coerces to a numeric primitive
-        // parameter at the call site.
+        // Record positional parameter type names, dropping a leading `this`
+        // receiver, so a literal argument coerces to a numeric primitive parameter
+        // at the call site.
         {
             const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name.name, "this")) 1 else 0;
             if (f.params.len > recv_off) {
@@ -862,19 +791,17 @@ fn lowerLocalFnDecl(b: *FuncBuilder, f: *const ast.Function) Allocator.Error!?Re
                 try b.setLocalFnParamTys(f.name.name, tys);
             }
         }
-        // The overload's mangled sibling binding (registered above, before
-        // the body lowered) receives the built closure.
+        // The mangled sibling binding, registered before the body lowered, receives
+        // the built closure.
         try b.push(.{ .CellSet = .{ .cell = mangled_cell, .value = dst } });
     }
     return null;
 }
 
 // A local function that calls itself is desugared like
-// `var name = null; name = { … name(…) … }`: a shared cell is created
-// first so the body can capture it and the closure stores itself into
-// it once built. This is the same boxed-self-reference path a recursive
-// `lateinit var f = { … f(…) … }` already uses. A cell pre-hoisted by
-// `lower_block` (so sibling local fns can capture each other) is reused.
+// `var name = null; name = { … name(…) … }`: a shared cell is created first so the
+// body can capture it, and the closure stores itself there once built. A cell
+// pre-hoisted by `lowerBlock` for mutually capturing siblings is reused.
 fn localFnSelfCell(
     b: *FuncBuilder,
     f: *const ast.Function,
@@ -882,21 +809,18 @@ fn localFnSelfCell(
 ) Allocator.Error!?Reg {
     var self_refs = StringSet.init(b.allocator);
     defer self_refs.deinit();
-    // A local EXTENSION function refers to itself in member-call position
-    // (`fun Int.fact(): Int = ... (this - 1).fact()`), which the bare-identifier
-    // scan never reaches — collect member-call names into the same set so the
-    // recursion cell gets built.
+    // A local extension function refers to itself in member-call position, which
+    // the bare-identifier scan never reaches, so collect member-call names into the
+    // same set and let the recursion cell be built.
     var call_names = StringSet.init(b.allocator);
     defer call_names.deinit();
     for (body.stmts) |*s| try ast_scan.collectIdentsAndCallNamesStmt(s, &self_refs, &call_names);
     if (f.receiver_type != null and call_names.contains(f.name.name)) {
         try self_refs.put(f.name.name, {});
     }
-    // Reuse an existing mutable home only when it belongs to a previous
-    // LOCAL FN of the name (a redeclaration/recursion cell). A same-named
-    // local PROPERTY keeps its own cell: `var seen = ...; fun seen(x) { seen
-    // = x }` assigns the var from the fun body, and storing the closure into
-    // the var's cell would clobber the property every bare `seen` read.
+    // Reuse an existing mutable home only when it belongs to a previous local fn of
+    // the name. A same-named local property keeps its own cell: storing the closure
+    // into the var's cell would clobber the property on every bare read.
     if (b.mutableHome(f.name.name)) |home| {
         if (b.isLocalFn(f.name.name)) return home;
         return null;
@@ -914,10 +838,9 @@ fn localFnSelfCell(
     }
 }
 
-// Per-param defaults: lower each default expression as a thunk binding
-// the lowered param prefix (so `b = a + 1` can read an earlier param)
-// and register it under the body FuncId. The Vm pads missing trailing
-// args from these the same way it does for top-level functions.
+// Per-param defaults: lower each default expression as a thunk binding the lowered
+// param prefix, so `b = a + 1` can read an earlier param, and register it under the
+// body FuncId. The Vm pads missing trailing args from these.
 fn registerLocalFnDefaults(
     b: *FuncBuilder,
     f: *const ast.Function,
@@ -969,8 +892,8 @@ fn lowerSafeIndexAssign(
     op: ast.AssignOp,
     value: *const Expr,
 ) Allocator.Error!?Reg {
-    // `obj?.items[i] = v` — null-guard the outer Index
-    // assignment when the receiver chain is a safe-Member.
+    // `obj?.items[i] = v`: null-guard the outer Index assignment when the receiver
+    // chain is a safe Member.
     const idx = target.Index;
     const receiver = idx.receiver;
     const idx_args = idx.args;
@@ -1027,10 +950,9 @@ fn lowerSafeMemberAssign(
     op: ast.AssignOp,
     value: *const Expr,
 ) Allocator.Error!?Reg {
-    // `obj?.field = v` (or compound `?.field += v`):
-    //   if obj is null → skip the assignment entirely.
-    //   otherwise → fall through to the regular non-safe
-    //              assign path with the safe flag cleared.
+    // `obj?.field = v`, or compound `?.field += v`: a null receiver skips the
+    // assignment entirely, otherwise fall through to the regular non-safe assign
+    // path with the safe flag cleared.
     const member = target.Member;
     const receiver = member.receiver;
     const name = member.name;
@@ -1050,9 +972,8 @@ fn lowerSafeMemberAssign(
     const join = try b.allocBlock();
     b.terminate(.{ .Branch = .{ .cond = is_null, .t = skip, .f = do_set } });
     b.switchTo(do_set);
-    // Synthesize an equivalent non-safe assign and recurse
-    // through Stmt::Assign so compound semantics, setters,
-    // and class property setters reuse the existing path.
+    // Synthesize an equivalent non-safe assign and recurse through `Stmt::Assign`,
+    // so compound semantics and property setters reuse that path.
     const inner_target = Expr{ .Member = .{
         .receiver = receiver,
         .name = name,
@@ -1073,15 +994,14 @@ fn lowerSafeMemberAssign(
     return null;
 }
 
-/// Whether the CURRENT `this` is an inline-splice receiver whose type is
-/// known, is not the enclosing member's owner class, and does not declare
-/// `name` as a property — i.e. a bare write here must NOT SetField on it.
-/// Unknown shapes answer false (the SetField arm keeps its behavior).
+/// Whether the current `this` is an inline-splice receiver whose type is known, is
+/// not the enclosing member's owner class, and does not declare `name` as a
+/// property, so a bare write must not SetField on it. Unknown shapes answer false.
 fn spliceReceiverHidesMember(b: *FuncBuilder, name: []const u8) bool {
     const recv = b.spliceRecvTy() orelse b.spliceHintRecv() orelse return false;
     var head = std.mem.trimEnd(u8, recv, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
-    if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalarLast(u8, head, '.')) |d| head = head[d + 1 ..];
     const owner = b.ownerClass() orelse return false;
     if (std.mem.eql(u8, head, owner)) return false;
     // The receiver type declares the property itself: the SetField is right.
@@ -1097,7 +1017,7 @@ fn spliceReceiverHidesMember(b: *FuncBuilder, name: []const u8) bool {
     return true;
 }
 
-/// Heads that carry an element type for `+=` / `-=` purposes.
+/// Heads that carry an element type for `+=` and `-=` purposes.
 fn containerHead(name: []const u8) bool {
     const heads = [_][]const u8{
         "List",           "MutableList",  "ArrayList",       "Collection",
@@ -1108,16 +1028,14 @@ fn containerHead(name: []const u8) bool {
     return false;
 }
 
-/// `xs += y` where `xs: MutableList<List<T>>` and `y: List<T>` appends ONE
-/// element: `plusAssign(element: T)` beats `plusAssign(elements: Iterable<T>)`
-/// because a `List<T>` is not an `Iterable<List<T>>`. The runtime decides on
-/// the argument's TAG alone and would flatten, so when the receiver's declared
-/// ELEMENT type is itself the container being added, name the single-element
-/// member directly. `y`'s own element type settles the ambiguity: a
-/// `List<List<T>>` really is the iterable form and keeps flattening.
-/// The declared type (with arguments) of a compound-assignment target: a
-/// local's annotation, or the owning class's property declaration when the
-/// target names a member bare or through an explicit receiver.
+/// `xs += y` where `xs: MutableList<List<T>>` and `y: List<T>` appends one element:
+/// `plusAssign(element: T)` beats `plusAssign(elements: Iterable<T>)` because a
+/// `List<T>` is not an `Iterable<List<T>>`. The runtime decides on the argument's
+/// tag alone and would flatten, so when the receiver's declared element type is
+/// itself the container being added, name the single-element member directly.
+/// `compoundTargetDeclType` is the declared type, with arguments, of a
+/// compound-assignment target: a local's annotation, or the owning class's property
+/// declaration when the target names a member.
 fn declaredTargetTypeRef(b: *FuncBuilder, target: *const Expr) ?ast.TypeRef {
     switch (target.*) {
         .Path => |pth| {
@@ -1152,10 +1070,9 @@ fn compoundSingleElementMember(
         .Sub => "remove",
         else => return null,
     };
-    // The receiver's DECLARED type, with its arguments: a local's annotation,
-    // or the owning class's property declaration for `field += y` /
-    // `this.field += y`. The static deriver answers heads without arguments
-    // for a member, which is exactly the fact this rule needs.
+    // The receiver's declared type with its arguments: a local's annotation, or the
+    // owning class's property declaration for a member. The static deriver answers
+    // heads without arguments for a member, which is what this rule needs.
     const decl_ty: ast.TypeRef = (declaredTargetTypeRef(b, target) orelse return null);
     if (decl_ty.type_args.len != 1 or decl_ty.type_args[0].is_star) return null;
     if (!containerHead(expr_mod.typeHead(decl_ty.name.name))) return null;
@@ -1166,15 +1083,15 @@ fn compoundSingleElementMember(
     defer val_ty.deinit(b.allocator);
     const val_head = expr_mod.typeHead(std.mem.trimEnd(u8, val_ty.name, "?"));
     if (!containerHead(val_head)) return null;
-    // A value whose OWN element type is the receiver's element type is the
-    // iterable form (`MutableList<List<T>> += listOf(listOf(t))`).
+    // A value whose own element type is the receiver's element type is the
+    // iterable form.
     if (val_ty.args.len == 1 and
         std.mem.eql(u8, expr_mod.typeHead(std.mem.trimEnd(u8, val_ty.args[0].name, "?")), elem_head)) return null;
     return member;
 }
 
-/// Whether an initializer's static type is a class that can never take a
-/// call: it declares no `invoke` member and no `invoke` extension applies.
+/// Whether an initializer's static type is a class that can never take a call:
+/// no `invoke` member and no applicable `invoke` extension.
 fn initTypeIsNonInvokable(b: *FuncBuilder, e: *const Expr) Allocator.Error!bool {
     var ty = (expr_mod.staticExprTypeRef(b, e) catch null) orelse return false;
     defer ty.deinit(b.allocator);
@@ -1197,16 +1114,13 @@ fn lowerAssign(
     op: ast.AssignOp,
     value: *const Expr,
 ) Allocator.Error!?Reg {
-    // A plain assignment of a LAMBDA lowers under the TARGET's declared
-    // type, exactly as the declaration's initializer did — a receiver
-    // lambda (`h = { onDraw(...) }` into a `CacheDrawScope.() -> DrawResult`
-    // local or field) must keep its receiver context on reassignment.
-    // Restricted to lambda values: only they consume the receiver context,
-    // and the Member arm's receiver-type derivation is too costly to run
-    // on every member assignment in a re-lowering pack.
+    // A plain assignment of a lambda lowers under the target's declared type, as the
+    // declaration's initializer did, so a receiver lambda keeps its receiver context
+    // on reassignment. Restricted to lambda values, which alone consume that context
+    // and whose receiver-type derivation is too costly to run on every assignment.
     if (indexNeedsCaching(target)) {
-        // `getArray()[getIndex()] += v` evaluates the receiver and every
-        // index once, before the value, for the read and the write.
+        // `getArray()[getIndex()] += v` evaluates the receiver and every index once,
+        // before the value, for the read and the write.
         try b.pushScope();
         defer b.popScope() catch {};
         const cached = try cacheIndexTarget(b, &target.Index);
@@ -1223,24 +1137,20 @@ fn lowerAssign(
             var rty = (expr_mod.staticExprTypeRef(b, m.receiver) catch null) orelse break :blk null;
             defer rty.deinit(b.allocator);
             var head = std.mem.trimEnd(u8, rty.name, "?");
-            if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
-            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+            if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+            if (std.mem.findScalarLast(u8, head, '.')) |d| head = head[d + 1 ..];
             const prop = @import("inline_state.zig").memberPropAst(head, m.name.name) orelse break :blk null;
             if (prop.ty) |t| break :blk t;
             break :blk null;
         },
         else => null,
     };
-    // A compound assignment evaluates its target — the receiver of the
-    // operator — before the operand, as kotlinc orders `a = a.plus(b)` and
-    // `a.plusAssign(b)`: an operand whose evaluation writes the target (a
-    // class initializer it triggers) is folded into the value read first.
-    // A member target evaluates its receiver expression first for the same
-    // reason. The own-member compound below reads through `this` instead.
+    // A compound assignment evaluates its target, the operator's receiver, before the
+    // operand, as kotlinc orders `a = a.plus(b)` and `a.plusAssign(b)`. A member
+    // target evaluates its receiver expression first for the same reason.
     var pre_cur: ?Reg = null;
     var pre_recv: ?Reg = null;
-    // A plain assignment evaluates its target's receiver BEFORE the value
-    // (`bar("A", a).prop = try { … }` runs `bar` first).
+    // A plain assignment evaluates its target's receiver before the value.
     if (op == .Assign) {
         switch (target.*) {
             .Member => |m| if (!m.safe and m.receiver.* != .Path and m.receiver.* != .This and m.receiver.* != .Super) {
@@ -1267,11 +1177,9 @@ fn lowerAssign(
     const prev_expected = if (assign_expected != null) b.pushExpected(assign_expected) else null;
     const v = try lowerExpr(b, value);
     if (assign_expected != null) b.restoreExpected(prev_expected);
-    // `xs += y` where the DECLARED element type is itself the container being
-    // added is a single-element `add`, not a flattening `addAll`. Every route
-    // below (the `<op>Assign` member call, `CompoundField`, the compound
-    // `BinOp`) decides on the argument's runtime TAG alone, so settle it here
-    // where the declared types are still in hand.
+    // `xs += y` where the declared element type is itself the container being added
+    // is a single-element `add`, not a flattening `addAll`. Every route below decides
+    // on the argument's runtime tag alone, so settle it here.
     if (op == .Add or op == .Sub) {
         if (try compoundSingleElementMember(b, target, value, op)) |single| {
             const cur = pre_cur orelse try lowerExpr(b, target);
@@ -1290,46 +1198,20 @@ fn lowerAssign(
             return null;
         }
     }
-    // Compound assigns first try `<op>Assign` as a member
-    // call on the target — covers user types declaring
-    // `operator fun plusAssign(...)` and built-in mutable
-    // collections (MutableList += elem). When the call
-    // raises (no method, immutable target), fall through
-    // to the rebind path below. Today this fires only
-    // when the target is a Path-bound local — Member /
-    // Index targets need their own routing.
-    // Only attempt `plusAssign`-style member dispatch when the
-    // target is NOT a mutable local Path. For a `var` local the
-    // primitive rebind path below is what Kotlin actually does
-    // (Int has no plusAssign). For a `val` Path the value's type
-    // declares plusAssign (operator on a class, or built-in
-    // collection mutation), so CallMember is correct.
-    // The plusAssign / minusAssign-style member dispatch only
-    // fires for a Path target naming a `val` LOCAL (e.g.
-    // `val h = Histogram(); h += w` or `val xs = mutableListOf<Int>(); xs += 1`).
-    // A Path target whose name doesn't resolve locally is a
-    // top-level binding; route it through the BinOp +
-    // StoreGlobal path below so top-level `var` compound
-    // assigns + delegated-property setters fire.
-    // A boxed var or a captured outer binding is an
-    // assignable variable, not a `val` whose value type
-    // declares an `<op>Assign` operator. Excluding both
-    // keeps a second compound-assign (after the first
-    // rebinds the name to a plain reg) on the rebind path
-    // instead of mis-dispatching `plusAssign` on the Int.
-    // A captured outer VAL (knowsOuter, never locally bound, not boxed —
-    // boxing covers every captured-and-written `var`) is also on this
-    // path: `xs += y` inside a closure over `val xs = mutableListOf(..)`
-    // must dispatch `xs.plusAssign(y)` on the capture. Routing it to the
-    // rebind path instead loses the write — and when a same-named member
-    // field exists, `storeCombinedToTarget`'s member fallback overwrites
-    // THAT field with the combined value.
-    // A name that is BOTH locally resolvable and known-outer is a captured
-    // immutable (a lambda capturing the enclosing fn's parameter): Kotlin
-    // can only mean `<op>Assign` on it — the rebind path wrote a fresh
-    // value into the capture cell and the caller's map stayed empty
-    // (`dest += transform(element)` inside `Flow.associateTo`'s collect).
-    // A captured written `var` is boxed and stays excluded.
+    // Compound assigns first try `<op>Assign` as a member call on the target,
+    // covering a user `operator fun plusAssign` and the built-in mutable collections;
+    // a raise falls through to the rebind path below.
+    //
+    // Only attempted when the target is not a mutable local Path: for a `var` local
+    // the primitive rebind path is what Kotlin does, Int having no plusAssign, while
+    // for a `val` Path the value's type declares it. A Path target whose name does
+    // not resolve locally is a top-level binding and routes through the BinOp plus
+    // StoreGlobal path, so top-level compound assigns and delegated setters fire.
+    //
+    // A boxed var is an assignable variable and stays on the rebind path, while a
+    // captured outer `val`, never locally bound and not boxed, takes this one, the
+    // rebind path losing the write. A name both locally resolvable and known-outer
+    // is a captured immutable, which Kotlin can only mean `<op>Assign` on.
     const path_is_val = switch (target.*) {
         .Path => |p| p.segments.len == 1 and
             !b.isMutable(p.segments[0].name) and
@@ -1338,10 +1220,8 @@ fn lowerAssign(
         else => false,
     };
     if (op != .Assign and path_is_val) {
-        // A bare name the enclosing class declares as a MEMBER (`count++`
-        // inside an anon object's method, with `override var count`) is a
-        // compound on `this.count` — never an `<op>Assign` dispatch on the
-        // member's VALUE (an Int has no plusAssign).
+        // A bare name the enclosing class declares as a member is a compound on
+        // `this.count`, never an `<op>Assign` on the member's value.
         blk: {
             const pname = target.Path.segments[0].name;
             if (b.resolve(pname) != null or !b.hasOwnMember(pname)) break :blk;
@@ -1386,18 +1266,13 @@ fn lowerAssign(
         } });
         return null;
     }
-    // Compound assign to a property (`recv.field += x`). Kotlin resolves
-    // this in place when the field's type carries the `<op>Assign` operator
-    // (built-in mutable collections, a user `operator fun plusAssign`),
-    // mutating the field value and NOT reassigning the property — so
-    // `map.entries += e` dispatches `entries.plusAssign(e)` on the read-only
-    // view (which throws) rather than trying to SET the read-only `entries`.
-    // The current value's type is only known at runtime, so emit a single
-    // `CompoundField` that reads the field, dispatches `<op>Assign` when the
-    // value supports it, and otherwise falls back to read-modify-write
-    // (needed for scalar properties like `obj.count += 1`).
-    // `super.prop += x` reads through the supertype's accessor and writes
-    // the base cell, so it takes the read-modify-write path below.
+    // Compound assign to a property. Kotlin resolves this in place when the field's
+    // type carries the `<op>Assign` operator, mutating the field value rather than
+    // reassigning the property, so `map.entries += e` dispatches on the read-only
+    // view. The value's type is only known at runtime, so emit a single
+    // `CompoundField` that reads the field, dispatches `<op>Assign` when supported,
+    // and otherwise falls back to read-modify-write. `super.prop += x` reads through
+    // the supertype's accessor, so it takes the read-modify-write path below.
     if (op != .Assign) {
         if (target.* == .Member and !target.Member.safe and target.Member.receiver.* != .Super) {
             const m = target.Member;
@@ -1424,10 +1299,9 @@ fn lowerAssign(
         .Assign => v,
         .Add, .Sub, .Mul, .Div, .Rem => blk: {
             const cur0 = pre_cur orelse try lowerExpr(b, target);
-            // `xs += y` / `xs -= y` on a statically broad collection
-            // (`Iterable`/`Collection`) rebinds to a `List`; coerce a `Set`
-            // runtime value to a list first so the `List`-returning operator
-            // is dispatched (mirrors the `lowerBinary` receiver coercion).
+            // `xs += y` on a statically broad collection rebinds to a `List`, so
+            // coerce a `Set` runtime value to a list first and let the
+            // `List`-returning operator dispatch.
             const cur = if (op == .Add or op == .Sub)
                 try helpers.coerceBroadCollectionToList(b, target, cur0)
             else
@@ -1440,22 +1314,13 @@ fn lowerAssign(
                 .Rem => .Mod,
                 .Assign => unreachable,
             };
-            // Mark the combine step so a mutable-collection left operand can
-            // mutate in place via `<op>Assign`. Only do so when the rebind is
-            // NOT viable: a reassignable local (`var`/boxed) target follows
-            // Kotlin's `a = a.plus(b)` form, which for a read-only-typed local
-            // holding a mutable value (`var x: List = mutableListOf()`) must
-            // produce a fresh list and leave the original untouched. A val /
-            // member / global target cannot be rebound, so the in-place
-            // operator is what Kotlin uses there.
-            // A boxed name is a captured-and-written `var`: it is always
-            // reassignable through its shared cell, whether or not the name
-            // also `resolve`s to a reg in this frame (inside a lambda nested
-            // in a property GETTER the capture is reached only through the
-            // cell, so `resolve` returns null even though the write-back path
-            // rebinds it fine). Treating it as a reassignable local keeps the
-            // combine on Kotlin's `a = a.plus(b)` form instead of dispatching
-            // the in-place `plusAssign`, which an `Int` does not declare.
+            // Mark the combine step so a mutable-collection left operand can mutate
+            // in place via `<op>Assign`, but only when the rebind is not viable: a
+            // reassignable local follows Kotlin's `a = a.plus(b)` form, which for a
+            // read-only-typed local holding a mutable value must produce a fresh
+            // list, while a val, member or global target cannot be rebound. A boxed
+            // name is a captured-and-written `var`, always reassignable through its
+            // shared cell, so it keeps the `a = a.plus(b)` form.
             const target_reassignable_local = switch (target.*) {
                 .Path => |p| p.segments.len == 1 and
                     (b.isBoxed(p.segments[0].name) or
@@ -1481,9 +1346,9 @@ fn lowerAssign(
     return null;
 }
 
-/// Emit `delegate.setValue(null, ::prop, value)` for a `var x by D` write-through
-/// (the delegate is bound under `dname`). Capture-aware resolve so the write works
-/// inside a closure that captured the delegate.
+/// Emit `delegate.setValue(null, ::prop, value)` for a `var x by D` write-through,
+/// the delegate being bound under `dname`. Capture-aware resolve, so the write
+/// works inside a closure that captured the delegate.
 fn emitDelegateSetValue(b: *FuncBuilder, dname: []const u8, prop: []const u8, value: Reg) Allocator.Error!void {
     const delegate = try lambda_body.resolveCapture(b, dname);
     const null_arg = try b.emitConst(.Null);
@@ -1509,10 +1374,9 @@ fn emitDelegateSetValue(b: *FuncBuilder, dname: []const u8, prop: []const u8, va
     } });
 }
 
-// Route the already-combined value to the assignment target: a single
-// Path name (local / cell / capture / member / global), a Member field,
-// or an Index `set` call. Shared by compound-assign, prefix ++/--, and
-// postfix ++/-- so the write-back decision lives in exactly one place.
+// Route the already-combined value to the assignment target: a single Path name
+// (local, cell, capture, member, global), a Member field, or an Index `set` call.
+// Shared by compound-assign and prefix and postfix `++`/`--`.
 fn exprMayHaveSideEffects(e: *const Expr) bool {
     return switch (e.*) {
         .Path, .This, .Super, .IntLit, .FloatLit, .BoolLit, .NullLit, .CharLit => false,
@@ -1520,8 +1384,8 @@ fn exprMayHaveSideEffects(e: *const Expr) bool {
     };
 }
 
-/// An `recv[args]` target whose receiver or an index is an expression
-/// that must be evaluated exactly once for a read-modify-write.
+/// A `recv[args]` target whose receiver or index must be evaluated exactly once
+/// for a read-modify-write.
 pub fn indexNeedsCaching(e: *const Expr) bool {
     if (e.* != .Index) return false;
     const ix = e.Index;
@@ -1536,9 +1400,9 @@ fn cachedPath(b: *FuncBuilder, name: []const u8, sp: @FieldType(ast.Ident, "span
     return .{ .Path = .{ .segments = segs, .span = sp } };
 }
 
-/// Evaluate an index target's receiver and indices into registers bound
-/// under scoped names (the caller owns the scope) and return the same
-/// target rewritten to read those locals.
+/// Evaluate an index target's receiver and indices into registers bound under
+/// scoped names, the caller owning the scope, and return the same target rewritten
+/// to read those locals.
 pub fn cacheIndexTarget(b: *FuncBuilder, ix: *const @FieldType(ast.Expr, "Index")) Allocator.Error!Expr {
     const recv_reg = try lowerExpr(b, ix.receiver);
     try b.bind("$lv$recv", recv_reg);
@@ -1554,9 +1418,9 @@ pub fn cacheIndexTarget(b: *FuncBuilder, ix: *const @FieldType(ast.Expr, "Index"
     return .{ .Index = .{ .receiver = recv, .args = args, .span = ix.span } };
 }
 
-/// Store `value` into member `m` of an ALREADY EVALUATED receiver: the
-/// register is bound under a scoped name so the member store lowers a
-/// plain local read instead of re-evaluating the receiver expression.
+/// Store `value` into member `m` of an already evaluated receiver: the register is
+/// bound under a scoped name so the member store lowers a plain local read instead
+/// of re-evaluating the receiver expression.
 pub fn storeMemberThroughReg(b: *FuncBuilder, m: *const @FieldType(ast.Expr, "Member"), recv_reg: Reg, value: Reg) Allocator.Error!void {
     try b.pushScope();
     defer b.popScope() catch {};
@@ -1577,8 +1441,8 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 return;
             }
             const seg = p.segments[0].name;
-            // A bare name brought in by `import Object.member` writes the
-            // object's property, exactly as its read goes through the object.
+            // A bare name brought in by `import Object.member` writes the object's
+            // property, as its read goes through the object.
             if (b.resolve(seg) == null and !b.knowsOuter(seg) and !b.hasOwnMember(seg)) {
                 if (expr_mod.importCompanionRewrite(b, p.segments[0].span.file, seg)) |rw| {
                     if (rw.segs.len >= 2) {
@@ -1592,31 +1456,19 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                     }
                 }
             }
-            // The boxed set is computed for the whole body and carries no
-            // declaration POSITION, so a name is "boxed" even at sites that
-            // precede its `var`. Require the name to actually be in scope as a
-            // local here — bound in this frame, or a capture from an enclosing
-            // one. Without that, a bare write in a receiver lambda that merely
-            // shares a name with a `var` declared FURTHER DOWN wrote that
-            // local's cell instead of the receiver's property, and the later
-            // declaration then overwrote it:
-            //
-            //     with(slot) { value = "written" }   // lost
-            //     var value = "local"
-            //
-            // `knowsOuter` is what keeps genuine captures on the cell path: a
-            // lambda nested in a property getter reaches its capture only
-            // through the cell, so `resolve` is null there even though the
-            // write must still go to it.
+            // The boxed set is computed for the whole body and carries no declaration
+            // position, so a name reads as boxed even at sites preceding its `var`.
+            // Require the name to be in scope as a local here, bound in this frame or
+            // captured from an enclosing one, or a bare write in a receiver lambda
+            // sharing a name with a later `var` writes that local's cell instead of
+            // the receiver's property. `knowsOuter` keeps genuine captures on the
+            // cell path, where `resolve` is null.
             const boxed_in_scope = b.isBoxed(seg) and
                 (b.resolve(seg) != null or b.knowsOuter(seg) or decl_mod.isLowerAnonCapture(seg));
             if (boxed_in_scope) {
                 // A captured-and-written outer var is boxed into a shared
-                // `Value.Cell` at its binding site (var decl, function /
-                // lambda parameter, or inline-splice parameter), so the
-                // write lands on the cell and is visible at the declaration
-                // site on every closure-execution path. This subsumes the
-                // former captured-outer `StoreGlobal` fallback.
+                // `Value.Cell` at its binding site, so the write lands on the cell
+                // and is visible at the declaration site on every path.
                 const cell = try boxedCellReg(b, seg);
                 try b.push(.{ .CellSet = .{ .cell = cell, .value = combined } });
             } else if (b.mutableHome(seg)) |home| {
@@ -1625,19 +1477,13 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 try b.rebind(seg, combined);
             } else if (b.hasOwnMember(seg) and b.resolve("this") != null and
                 !spliceReceiverHidesMember(b, seg)) {
-                // Method-body `this.field` write — route
-                // SetField on the receiver so the bare-
-                // name assign reaches the instance, not
-                // a synthetic global. A private SHADOW of a
-                // supertype's same-name property writes ITS OWN
-                // owner-mangled cell, never the base class's.
-                // NOT taken inside an inline-spliced receiver lambda
-                // (`scope.apply { result = ... }`) whose receiver type
-                // does not declare the member: `this` is the SPLICE
-                // receiver there, and a SetField on it would invent a
-                // dynamic field on the wrong object while the enclosing
-                // class's property silently keeps its value. The
-                // walking store below finds the right owner.
+                // A method-body `this.field` write routes SetField on the receiver so
+                // the bare-name assign reaches the instance, not a synthetic global.
+                // A private shadow of a supertype's same-name property writes its own
+                // owner-mangled cell. Not taken inside an inline-spliced receiver
+                // lambda whose receiver type does not declare the member, where a
+                // SetField would invent a field on the wrong object; the walking
+                // store below finds the right owner.
                 const this_reg = b.resolve("this").?;
                 const store_name: []const u8 = blk: {
                     const oc = b.ownerClass() orelse break :blk seg;
@@ -1652,18 +1498,13 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                     .value = combined,
                 } });
             } else if (b.capturesThisSlot() or b.resolve("this") != null) {
-                // Unqualified write inside a lambda body or a
-                // method/extension body whose name is not a local/
-                // param/captured-outer/own-member. By Kotlin scoping
-                // it is either a property of the receiver — a member,
-                // or an extension-property setter (`var T.x set(…)`)
-                // on the receiver's type or a supertype
-                // (`receiveType = …` inside `PipelineCall.receiveNullable`)
-                // — or a genuine top-level binding. Decide at runtime,
-                // symmetric to the read side's LoadFromThisOrGlobal:
-                // capture `this` on demand so a receiver-binding invoke
-                // populates the slot, then StoreToThisOrGlobal sets the
-                // receiver's property when present, else globals.
+                // An unqualified write whose name is not a local, param,
+                // captured-outer or own-member is, by Kotlin scoping, either a
+                // property of the receiver, a member or an extension-property setter
+                // on its type or a supertype, or a top-level binding. Decide at
+                // runtime, symmetric to the read side's `LoadFromThisOrGlobal`:
+                // capture `this` on demand, then `StoreToThisOrGlobal` sets the
+                // receiver's property when present.
                 const this_idx = try b.recordCapture("this");
                 const name_c = try b.module.internConst(b.allocator, .{ .String = seg });
                 expr_mod.orEmitAudit(b, "bare_name_assign", "StoreToThisOrGlobal", seg);
@@ -1671,28 +1512,24 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                     .this_idx = this_idx,
                     .name = name_c,
                     .value = combined,
-                    // Hand over the receiver register when lowering has one:
-                    // in a spliced inline body it is the only way the runtime
-                    // can reach the receiver. Ownership is still checked at
-                    // run time, so passing it can never capture a write the
-                    // receiver does not declare.
+                    // Hand over the receiver register when lowering has one: in a
+                    // spliced inline body it is the only way the runtime can reach
+                    // the receiver. Ownership is still checked at run time, so
+                    // passing it cannot capture a write the receiver does not declare.
                     .recv = b.resolve("this"),
                 } });
             } else {
-                // Top-level binding: route through StoreGlobal so
-                // the tree-walker setter / delegate fires. A renamed
-                // file-private property writes its per-file global.
+                // Top-level binding: route through StoreGlobal so the tree-walker
+                // setter or delegate fires. A renamed file-private property writes
+                // its per-file global.
                 const target_name = expr_mod.filePrivatePropRename(b, seg, p.segments[0].span.file.int()) orelse seg;
                 const n = try b.module.internConst(b.allocator, .{ .String = target_name });
                 try b.push(.{ .StoreGlobal = .{ .name = n, .value = combined } });
             }
-            // Write-through for a `var x by D` delegate: if the hidden delegate
-            // binding (bound at the decl) is in scope here — directly or as a
-            // captured outer inside a closure — dispatch setValue so a MutableState
-            // (or any writable delegate) receives the write and it survives
-            // recomposition, not just the eager-once local cache above. A stack
-            // buffer avoids allocating for the common (non-delegated) case; only a
-            // real match heap-dupes a stable name for resolveCapture.
+            // Write-through for a `var x by D` delegate: when the hidden delegate
+            // binding is in scope, directly or as a captured outer, dispatch setValue
+            // so a writable delegate receives the write. A stack buffer avoids
+            // allocating for the common non-delegated case.
             var namebuf: [512]u8 = undefined;
             if (std.fmt.bufPrint(&namebuf, "{s}$klio_delegate", .{seg})) |dname_stack| {
                 if ((b.resolve(dname_stack) != null or b.knowsOuter(dname_stack)) and
@@ -1706,8 +1543,8 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
         .Member => |m| {
             const recv = try lowerReceiver(b, m.receiver);
             // Explicit `this.x = v` where the enclosing class declares `x` as a
-            // private SHADOW of a supertype's same-name stored property writes
-            // ITS OWN owner-mangled cell, matching the bare-name write and read.
+            // private shadow of a supertype's same-name stored property writes its
+            // own owner-mangled cell, matching the bare-name write and read.
             const store_field_name: []const u8 = blk: {
                 if (m.receiver.* != .This or m.receiver.This.qualifier != null) break :blk m.name.name;
                 const oc = b.ownerClass() orelse break :blk m.name.name;
@@ -1716,10 +1553,10 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 break :blk b.module.registry.private_shadow_props.getKey(probe) orelse m.name.name;
             };
             const field = try b.module.internConst(b.allocator, .{ .String = store_field_name });
-            // `super.prop = v` lowers to a SetField on `this` (super is not a
-            // value), so the setter search would find the OVERRIDING setter and
-            // re-enter it. Carry the writing class so the runtime starts the
-            // search at its supertypes, the same way a `super.prop` read does.
+            // `super.prop = v` lowers to a SetField on `this`, super not being a
+            // value, so the setter search would find the overriding setter and
+            // re-enter it. Carry the writing class so the search starts at its
+            // supertypes, as a `super.prop` read does.
             const super_owner: ?ir.ConstId = blk: {
                 if (m.receiver.* != .Super) break :blk null;
                 const oc = if (m.receiver.Super.label) |l|
@@ -1729,9 +1566,8 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
                 break :blk try b.module.internConst(b.allocator, .{ .String = oc });
             };
             if (m.safe) {
-                // `a?.b = v` stores only when the receiver is non-null
-                // (dropping the store entirely lost `parent?.count++`
-                // updates on every non-null parent).
+                // `a?.b = v` stores only when the receiver is non-null; dropping
+                // the store entirely lost updates on non-null parents.
                 const null_r = try b.emitConst(.Null);
                 const is_null = b.allocReg();
                 try b.push(.{ .BinOp = .{ .dst = is_null, .op = .Eq, .lhs = recv, .rhs = null_r } });
@@ -1759,17 +1595,13 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
             } });
         },
         .Index => |idx| {
-            // `m[k] = v` lowers to receiver.set(k, v) so
-            // map / mutable-list assignment dispatches
-            // through the same call_member path that
-            // handles built-in collection mutation.
+            // `m[k] = v` lowers to `receiver.set(k, v)` so map and mutable-list
+            // assignment dispatch through the same `call_member` path built-in
+            // collection mutation uses.
             const recv = try lowerReceiver(b, idx.receiver);
-            // Reserve a contiguous run of slots for keys +
-            // value BEFORE lowering the key expressions,
-            // since lowering each key may allocate auxiliary
-            // registers (e.g. for Const literals) and we
-            // need the run to stay tight so read_arg_run
-            // picks up the value reg right after the keys.
+            // Reserve a contiguous run of slots for keys and value before lowering
+            // the key expressions, since lowering each key may allocate auxiliary
+            // registers and the run must stay tight for `read_arg_run`.
             const n_keys = idx.args.len;
             const key_start = b.allocReg();
             var key_slots = try b.allocator.alloc(Reg, if (n_keys == 0) 1 else n_keys);
@@ -1801,16 +1633,13 @@ pub fn storeCombinedToTarget(b: *FuncBuilder, target: *const Expr, combined: Reg
 }
 
 fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Reg {
-    // Local class declaration inside a function body. Capture
-    // the visible scope so the class methods can read names
-    // from the enclosing fn (`val factor = 10; class Scaled { … n * factor … }`).
+    // A local class declaration inside a function body captures the visible scope
+    // so its methods can read the enclosing fn's names.
     var visible = try b.visibleNames();
     defer visible.deinit();
-    // Inside a member extension (`class C { fun A.a() { class B { … this@C … } } }`)
-    // the body's `this` is the extension receiver and the dispatch receiver
-    // lives only on the runtime receiver chain, so it is not a visible name.
-    // Read it here through the qualified-this walk and capture it under its
-    // label, so `this@C` inside the class body reads the capture.
+    // Inside a member extension the body's `this` is the extension receiver and the
+    // dispatch receiver lives only on the runtime receiver chain, so read it here
+    // through the qualified-this walk and capture it under its label.
     var owner_label: ?[]const u8 = null;
     var owner_reg: Reg = undefined;
     if (b.dispatchClass()) |oc| {
@@ -1836,11 +1665,9 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
         captured_names[visible.count()] = label;
         captures[visible.count()] = owner_reg;
     }
-    // Bind the class name to its registered `.Class` value so a `C(args)` call
-    // in scope constructs the local class. Kotlin: a local class shadows a
-    // same-named top-level function; without the binding the call resolved the
-    // function and passed the constructor args to it. The binding also flows
-    // into nested lambdas / local functions through the normal capture path.
+    // Bind the class name to its registered `.Class` value so a `C(args)` call in
+    // scope constructs the local class, which in Kotlin shadows a same-named
+    // top-level function. The binding flows into nested lambdas through capture.
     const dst = b.allocReg();
     try b.push(.{ .RegisterClass = .{
         .class = FF(ast.Class).fromPtr(c),
@@ -1849,14 +1676,12 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
         .dst = dst,
     } });
     try b.bind(c.name.name, dst);
-    // A nested lambda's bare `C(args)` must construct this local class
-    // through the captured binding, not a same-simple-name module class.
+    // A nested lambda's bare `C(args)` must construct this local class through the
+    // captured binding, not a same-simple-name module class.
     build.pushLocalClassName(c.name.name);
-    // Lowering-time TYPING record: the local class's transitive supertype
-    // chain under a function-scoped mangle, so a local initialized from
-    // its constructor carries a head that proves Collection-ness to
-    // extension binding (`coll.toTypedArray()`); the runtime
-    // RegisterClass path stays the executor.
+    // Lowering-time typing record: the local class's transitive supertype chain under
+    // a function-scoped mangle, so a local initialized from its constructor carries a
+    // head that proves Collection-ness to extension binding.
     {
         const ra = b.module.registry.allocator;
         if (std.fmt.allocPrint(ra, "{s}$lc{s}", .{ c.name.name, build.currentRealFn() orelse "" }) catch null) |key| {
@@ -1885,19 +1710,16 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
                 if (!chain_ok) break;
             }
             if (chain_ok) {
-                // An empty chain still registers: the KEY's presence is the
-                // typing record (a supertype-less local class's methods
-                // bind through it).
+                // An empty chain still registers: the key's presence is the typing
+                // record a supertype-less local class's methods bind through.
                 const owned = chain.toOwnedSlice(ra) catch null;
                 if (owned) |sl| b.module.registry.class_super_names.put(key, sl) catch {};
             } else {
                 chain.deinit(ra);
             }
-            // The RESERVED-FID METHOD HEADERS: each of the local class's own
-            // methods gets a bodyless header row under the mangled owner,
-            // so a member call on a local-class-typed receiver binds its
-            // virtual slot at lowering; the runtime resolves the slot's
-            // by-name fallback to the RegisterClass-registered method.
+            // Reserved-fid method headers: each of the local class's own methods gets
+            // a bodyless header row under the mangled owner, so a member call on a
+            // local-class-typed receiver binds its virtual slot at lowering.
             for (c.members) |*m| {
                 if (m.* != .Function) continue;
                 const mf = &m.Function;
@@ -1909,11 +1731,9 @@ fn lowerLocalClassDecl(b: *FuncBuilder, c: *const ast.Class) Allocator.Error!?Re
     return null;
 }
 
-/// The `provideDelegate` convention at a delegated property's creation:
-/// `val x by e` first offers `e` the call `provideDelegate(thisRef, ::x)`,
-/// and the delegate is its result when a member or extension operator
-/// applies (a miss keeps `e`). The host serves the `$provideDelegate` name
-/// with exactly that fallback, so the lowering needs no static resolution.
+/// The `provideDelegate` convention at a delegated property's creation: `val x by e`
+/// first offers `e` the call `provideDelegate(thisRef, ::x)`, and the delegate is its
+/// result when a member or extension operator applies, a miss keeping `e`.
 pub fn emitProvideDelegate(b: *FuncBuilder, delegate: Reg, prop_name: []const u8) Allocator.Error!Reg {
     const null_arg = try b.emitConst(.Null);
     const prop_ref = b.allocReg();
@@ -1936,13 +1756,13 @@ pub fn emitProvideDelegate(b: *FuncBuilder, delegate: Reg, prop_name: []const u8
     return dst;
 }
 
-/// A destructured name binds like a local: a `var` gets a home register the
-/// way `lowerPropertyDecl` gives one to `var x = …`, so `p += 1` updates the
-/// slot instead of dispatching `plusAssign` on the value.
+/// A destructured name binds like a local: a `var` gets a home register the way
+/// `lowerPropertyDecl` gives one to `var x = …`, so `p += 1` updates the slot
+/// instead of dispatching `plusAssign` on the value.
 fn bindDestructured(b: *FuncBuilder, name: []const u8, value: Reg, mutable: bool) Allocator.Error!void {
     if (b.isBoxed(name)) {
-        // Captured `var`: a shared cell, so writes from a nested closure or
-        // coroutine are visible here.
+        // A captured `var` takes a shared cell so writes from a nested closure are
+        // visible here.
         const home = b.allocReg();
         try b.push(.{ .MakeCell = .{ .dst = home, .src = value } });
         try b.setMutableHome(name, home);
@@ -1957,10 +1777,9 @@ fn bindDestructured(b: *FuncBuilder, name: []const u8, value: Reg, mutable: bool
     try b.bind(name, home);
 }
 
-/// A destructuring entry named `_` is a positional skip placeholder only
-/// when it is written bare. A backtick-escaped `` `_` `` is a real name
-/// (its span carries the backticks, so it is longer than the stripped
-/// name), and it binds and reads like any other identifier.
+/// A destructuring entry named `_` is a positional skip placeholder only when
+/// written bare. A backtick-escaped `` `_` `` is a real name, its span carrying the
+/// backticks, and binds and reads like any other identifier.
 pub fn isUnderscorePlaceholder(name: ast.Ident) bool {
     return std.mem.eql(u8, name.name, "_") and name.span.len() == 1;
 }
@@ -1973,23 +1792,18 @@ fn lowerDestructuringDecl(
     mutable: bool,
     init: *const Expr,
 ) Allocator.Error!?Reg {
-    // `val (a, b, ...) = expr` desugars to repeated
-    // `expr.componentN()` calls. `_` placeholders skip the
-    // call entirely. Tree walker handles this via
-    // eval_stmt; the IR's CallMember + Host dispatch covers
-    // the same surface, so we lower it inline.
+    // `val (a, b, ...) = expr` desugars to repeated `expr.componentN()` calls, `_`
+    // placeholders skipping the call.
     const recv = try lowerExpr(b, init);
     // Each name's type is its `componentN()`'s declared return type on the
     // initializer's type, so the destructured names carry a receiver type into
     // dispatch instead of arriving untyped.
     var recv_ty = try expr_mod.staticExprTypeRef(b, init);
     defer if (recv_ty) |*t| t.deinit(b.allocator);
-    // The name-based form reads each entry's property off the initializer
-    // (`(val a, val n = prop) = x` is `x.a` and `x.prop`).
+    // The name-based form reads each entry's property off the initializer.
     if (by_name) {
-        // A discarded name-based entry (`_ = prop`) still reads its
-        // property: the read is the entry's effect, unlike a positional
-        // `_`, which skips its `componentN` call.
+        // A discarded name-based entry still reads its property, unlike a
+        // positional `_`, which skips its `componentN`.
         for (names, 0..) |name, i| {
             const field = try b.module.internConst(b.allocator, .{ .String = sources[i].name });
             const dst = b.allocReg();
@@ -2023,9 +1837,6 @@ fn lowerDestructuringDecl(
     return null;
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 const span = @import("span");
@@ -2067,8 +1878,8 @@ test "expr statement returns its register" {
     b.terminate(.{ .Return = r.? });
     const func = try b.finish("f", "test.f", build.typeInt());
     defer freeFunc(func);
-    // The statement is preceded by a `Trace` position marker (stack-trace
-    // support); the value materializes in the following `Const`.
+    // A `Trace` position marker precedes the statement; the value materializes in
+    // the following `Const`.
     try testing.expect(func.blocks[0].insts[0] == .Trace);
     try testing.expect(func.blocks[0].insts[1] == .Const);
 }
@@ -2175,9 +1986,8 @@ test "var declaration gets a mutable home slot" {
     b.terminate(.{ .Return = null });
     const func = try b.finish("f", "test.f", build.typeUnit());
     defer freeFunc(func);
-    // Trace position marker, then the const fused straight into the home
-    // slot (the single-use `Const T; Move home <- T` pair coalesces at
-    // `finish`).
+    // Trace marker, then the const fused into the home slot: the single-use
+    // `Const T; Move home <- T` pair coalesces at `finish`.
     try testing.expect(func.blocks[0].insts[0] == .Trace);
     try testing.expect(func.blocks[0].insts.len == 2);
     try testing.expect(func.blocks[0].insts[1] == .Const);
@@ -2362,8 +2172,8 @@ test "assign to var rebinds through the home slot" {
     defer freeFunc(func);
     // Last instruction is a Move into the home register.
     const insts = func.blocks[0].insts;
-    // The assignment's value fuses straight into the home register (the
-    // single-use `Const T; Move home <- T` pair coalesces at `finish`).
+    // The assignment's value fuses into the home register, the single-use
+    // `Const T; Move home <- T` pair coalescing at `finish`.
     const last = insts[insts.len - 1];
     try testing.expect(last == .Const);
     try testing.expectEqual(home, last.Const.dst);
@@ -2592,8 +2402,8 @@ test "safe member assign branches on null" {
     try testing.expect(func.blocks[0].terminator == .Branch);
 }
 
-/// Type names whose values are definitely not callable — a local declared
-/// with one never shadows a same-named function for a CALL.
+/// Type names whose values are definitely not callable, so a local declared with
+/// one never shadows a same-named function for a call.
 fn isDefiniteNonFnTypeName(name: []const u8) bool {
     const names = [_][]const u8{
         "Int",   "Long",   "Short",  "Byte", "Char",  "Boolean",

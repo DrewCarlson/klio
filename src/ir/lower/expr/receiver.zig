@@ -1,5 +1,5 @@
-//! Receiver lowering: the shared `this`-register resolver and the overload
-//! picks a receiver's static shape decides.
+//! Receiver lowering: the shared `this`-register resolver and the overload picks
+//! a receiver's static shape decides.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -38,14 +38,12 @@ const block_mod = @import("block.zig");
 const rsplitLast = block_mod.rsplitLast;
 
 /// The single lowering-time `this`-register resolver shared by the bare
-/// `::name`/member-ref site and the bare-extension-call sites. A bound
-/// local `this` always wins; otherwise `this` is recovered from an outer
-/// capture when it is a known outer name — and, when `in_lambda_body` is
-/// set, also for any lambda body (whose implicit `this` arrives via the
-/// closure's own capture slot even without a `knowsOuter` record). When
-/// `bind_local` is set the recovered capture register is bound as the
-/// frame's `this` so later references reuse it. Returns `null` at top
-/// level / in a non-receiver context.
+/// `::name`/member-ref site and the bare-extension-call sites. A bound local
+/// `this` wins; otherwise it is recovered from an outer capture when the name is
+/// a known outer, and with `in_lambda_body` set, for any lambda body, whose
+/// implicit `this` arrives via the closure's capture slot without a `knowsOuter`
+/// record. `bind_local` binds the recovered register as the frame's `this` so
+/// later references reuse it. Null at top level or in a non-receiver context.
 pub fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: bool) Allocator.Error!?Reg {
     if (b.resolve("this")) |r| return r;
     if (b.knowsOuter("this") or (in_lambda_body and b.capturesThisSlot())) {
@@ -59,40 +57,35 @@ pub fn resolveThisRegKind(b: *FuncBuilder, in_lambda_body: bool, bind_local: boo
     return null;
 }
 
-/// The register holding the current implicit receiver (`this`), if one is
-/// in scope: either bound directly (a method / extension / receiver lambda
-/// body) or reachable as an outer capture. Returns `null` at top level / in
-/// a non-receiver context. Used to bind a bare `::name` member reference to
-/// its receiver at creation time.
+/// The register holding the current implicit receiver, bound directly in a
+/// method, extension or receiver-lambda body, or reachable as an outer capture.
+/// Null at top level or in a non-receiver context. Binds a bare `::name` member
+/// reference to its receiver at creation time.
 fn resolveThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
     return resolveThisRegKind(b, false, false);
 }
 
-/// Resolve the instance selected by `super`. A lambda nested in a class
-/// member keeps the member's lexical receiver in its closure capture slot,
-/// even though the lambda frame has no locally bound `this` parameter.
+/// Resolve the instance selected by `super`. A lambda nested in a class member
+/// keeps the member's lexical receiver in its closure capture slot, though the
+/// lambda frame has no locally bound `this` parameter.
 pub fn resolveSuperThisReg(b: *FuncBuilder) Allocator.Error!?Reg {
     return resolveThisRegKind(b, true, false);
 }
 
-/// Lower an expression that appears as the *receiver / qualifier head* of a
-/// member access or call. A bare single-segment class/interface name here
-/// is a *qualifier* — it stays the class value so nested-class
-/// (`Outer.Inner`) and companion-member forwarding work — unlike the same
-/// Path in value position, which resolves to the companion object.
-/// Everything else defers to `lowerExpr`.
+/// Lower an expression appearing as the receiver or qualifier head of a member
+/// access or call. A bare single-segment class or interface name here is a
+/// qualifier and stays the class value, so nested-class and companion-member
+/// forwarding work, unlike the same Path in value position, which resolves to the
+/// companion object. Everything else defers to `lowerExpr`.
 pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
-    // A receiver is a NESTED expression: the enclosing call's per-arg
-    // typing stash must never reach the receiver's own lambdas —
-    // `ByteArray(2) { it.toByte() }.scan("") { op }` typed the factory's
-    // `it` from scan's operation through exactly this leak. Shield the
-    // stash for the whole receiver lowering.
+    // A receiver is a nested expression, so the enclosing call's per-arg typing
+    // stash must never reach the receiver's own lambdas. Shield the stash for the
+    // whole receiver lowering.
     const sh_bm = b.pending_arg_broad_masks;
     const sh_fg = b.pending_arg_fn_generic;
     const sh_lp = b.pending_arg_lambda_param_types;
-    // The `-> Unit` coercion mask belongs to the enclosing call's args too:
-    // a receiver splicing a `-> Unit` operator (map -> unsafeTransform) must
-    // not tag the outer call's lambda (`X.map { }.firstOrNull { }`).
+    // The `-> Unit` coercion mask belongs to the enclosing call's args too: a
+    // receiver splicing a `-> Unit` operator must not tag the outer call's lambda.
     const sh_lu = b.pending_arg_lambda_unit;
     b.pending_arg_broad_masks = null;
     b.pending_arg_fn_generic = null;
@@ -108,19 +101,15 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     if (expr.* == .Path and expr.Path.segments.len == 1) {
         const segments = expr.Path.segments;
         const n = segments[0].name;
-        // Skip the class-name shortcut when the scope renames this name to
-        // a (mangled) nested class/object or a file-private type: a bare
-        // `Inner` inside `Outer` must reach `Outer$Inner` even though a
-        // same-named top-level class owns the bare `class_id`. Falling
-        // through to `lowerExpr` applies the rewrite in the `Path` arm.
+        // Skip the class-name shortcut when the scope renames this name to a
+        // mangled nested class or a file-private type: a bare `Inner` inside
+        // `Outer` must reach `Outer$Inner` even though a same-named top-level
+        // class owns the bare `class_id`. `lowerExpr`'s Path arm applies it.
         const aliased = scopeTypeRename(b, n, segments[0].span.file.int()) != null;
         // A class whose bare simple name is unregistered because it
-        // collision-mangled (two `internal` classes named `TrieNode` in
-        // different packages) is still pinned by the file's named import:
-        // resolve `import …immutableMap.TrieNode` through its FQN. Without
-        // this the receiver of `TrieNode.EMPTY` in an importing file falls to
-        // a member access on the implicit receiver (`get_field TrieNode on
-        // Companion`).
+        // collision-mangled is still pinned by the file's named import, so resolve
+        // it through its FQN; otherwise the receiver falls to a member access on
+        // the implicit receiver.
         var imported_fqn: ?[]const u8 = null;
         const imported_cid: ?ir.ClassId = if (!aliased and b.module.classId(n) == null) blk: {
             for (b.module.importAliasPathsIn(segments[0].span.file, n)) |p| {
@@ -135,22 +124,15 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             (b.module.classId(n) != null or imported_cid != null) and !enclosingMemberShadowsClass(b, n))
         {
             const dst = b.allocReg();
-            // A collision-mangled import has no name-published singleton under
-            // its bare simple name; key the load on the FQN so the name-keyed
-            // fallback (used when the singleton is not yet published) drives
-            // the object/companion init by its fully-qualified name instead of
-            // missing on the bare simple name.
+            // A collision-mangled import has no name-published singleton under its
+            // bare simple name, so key the load on the FQN and let the name-keyed
+            // fallback drive the object or companion init by that name.
             const nm = try b.module.internConst(b.allocator, .{ .String = imported_fqn orelse n });
             // The index-resolved class rides as the exact identity so a
-            // same-simple-name class/object from an invisible package
-            // cannot swap in at runtime (a nested `State` inside the
-            // caller's class must not resolve to another package's
-            // file-private `object State`). A same-named top-level
-            // property keeps the name-keyed read — the property wins in
-            // value position — but only when it is at least as visible
-            // as the class at this site: a materialised stdlib property
-            // from an unimported package (`kotlin.math.E` at the shipped
-            // tier) must not outrank a user classifier named `E`.
+            // same-simple-name class from an invisible package cannot swap in at
+            // runtime. A same-named top-level property keeps the name-keyed read,
+            // winning in value position, but only when at least as visible as the
+            // class at this site.
             const cls_pick: ?ir.ClassId = blk: {
                 if (imported_cid) |cid| break :blk cid;
                 if (isTopLevelProp(n)) {
@@ -160,27 +142,24 @@ pub fn lowerReceiver(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
                 break :blk b.module.classIdIndexed(n, b.self_package, segments[0].span.file);
             };
-            // A collision-mangled import target has no name-published singleton
-            // to fall back on (`TrieNode` is registered only under its mangled
-            // simple name), so load the class value by id directly — the
-            // subsequent `.EMPTY` reads its companion off that value.
+            // A collision-mangled import target has no name-published singleton to
+            // fall back on, so load the class value by id directly; the subsequent
+            // `.EMPTY` reads its companion off that value.
             try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm, .class = cls_pick, .ctor_ref = imported_cid != null } });
             return dst;
         }
     }
-    // A receiver is not in the call's tail position; drop the
-    // expected-type hint so it does not reach a reified inline call here.
+    // A receiver is not in the call's tail position, so drop the expected-type
+    // hint before it reaches a reified inline call here.
     const prev_expected = b.pushExpected(null);
     const r = try lowerExpr(b, expr);
     b.restoreExpected(prev_expected);
     return r;
 }
 
-/// Among same-name overload candidates, prefer the one whose parameter type
-/// at an explicitly-cast argument position (`x as T`) matches the cast
-/// target `T`. Returns `null` when no cast argument disambiguates an
-/// arity-matching candidate, so the caller falls back to its arity-first
-/// pick.
+/// Among same-name overload candidates, prefer the one whose parameter type at an
+/// explicitly cast argument position matches the cast target. Null when no cast
+/// argument disambiguates an arity-matching candidate.
 pub fn overloadPickByCast(
     b: *FuncBuilder,
     cands: []const FuncId,
@@ -222,16 +201,11 @@ pub fn overloadPickByCast(
     return best;
 }
 
-/// Candidates that agree on a trailing lambda parameter's PARAMETER types
-/// but differ only in its declared RETURN (`sumOf`'s `(T) -> Int / Long /
-/// UInt / ULong / Double` variants) discriminate by the literal's derived
-/// return under the agreed binding, exactly as kotlinc infers. The
-/// derivation feeds only this pick among a FIXED set — it never
-/// instantiates a type variable, which is the hazard the member-tail
-/// enrichment refutation recorded. No unique match leaves the tie.
-/// Whether a declared receiver head can serve a value whose static head is
-/// `actual` — the head itself, a builtin supertype, or a declared supertype
-/// by simple name.
+/// Candidates agreeing on a trailing lambda parameter's parameter types but
+/// differing only in its declared return discriminate by the literal's derived
+/// return under the agreed binding, exactly as kotlinc infers. The derivation
+/// feeds only this pick among a fixed set and never instantiates a type variable.
+/// No unique match leaves the tie.
 pub fn receiverHeadServes(b: *const FuncBuilder, actual: []const u8, declared: []const u8) bool {
     if (std.mem.eql(u8, actual, declared)) return true;
     for (applicability.builtinSupersOf(actual)) |sup| {
@@ -282,8 +256,8 @@ pub fn overloadPickByLambdaReturnFull(
     var family: std.ArrayList(Entry) = .empty;
     defer family.deinit(b.allocator);
     // The implicit receiver's head filters extension candidates before the
-    // agreement check — the CharSequence variants' `(Char) -> R` params must
-    // not disagree a UByteArray family into a bail.
+    // agreement check, so an unrelated family's parameter spelling cannot
+    // disagree the pick into a bail.
     const actual_recv_head: ?[]const u8 = blk: {
         if (explicit_recv_head) |h| break :blk h;
         const h = b.recvTy() orelse b.spliceRecvTy() orelse b.enclosingRecvTy() orelse break :blk null;
@@ -295,7 +269,7 @@ pub fn overloadPickByLambdaReturnFull(
             if (lamret_why != null) std.debug.print("[lamret-why] #{d} skip=null_func\n", .{fid.int()});
             continue;
         };
-        const why = lamret_why != null and std.mem.indexOf(u8, f.fqn, lamret_why.?) != null;
+        const why = lamret_why != null and std.mem.find(u8, f.fqn, lamret_why.?) != null;
         if (!f.hasBody() and !expr_mod.lamret_allow_bodyless) {
             if (why) std.debug.print("[lamret-why] {s}#{d} skip=no_body\n", .{ f.fqn, fid.int() });
             continue;
@@ -312,7 +286,7 @@ pub fn overloadPickByLambdaReturnFull(
                 continue;
             };
             var dr = std.mem.trimEnd(u8, f.params[0].ty.name, "?");
-            if (std.mem.indexOfScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
+            if (std.mem.findScalar(u8, dr, '<')) |lt| dr = dr[0..lt];
             const dh = typeHead(dr);
             exact_recv = std.mem.eql(u8, ah, dh);
             if (!(exact_recv or dh.len <= 2 or ir.parseClassTypeParamIdentity(f.params[0].ty.name) != null or
@@ -333,11 +307,9 @@ pub fn overloadPickByLambdaReturnFull(
         try family.append(b.allocator, .{ .fid = fid, .ret = ret_head, .params = params, .exact_recv = exact_recv });
     }
     const lamret_trace = runtime.envOnce("KLIO_LAMRET_TRACE") != null;
-    // Receiver specificity narrows before the return pick, exactly as
-    // kotlinc ranks: an exact-receiver family (`UByteArray.sumOf`) beats
-    // supertype-receiver applicables (`Iterable<T>.sumOf` through
-    // `UByteArray : Collection<UByte>`), whose different param spelling
-    // must not disagree the pick into a bail.
+    // Receiver specificity narrows before the return pick, as kotlinc ranks: an
+    // exact-receiver family beats supertype-receiver applicables, whose different
+    // param spelling must not disagree the pick into a bail.
     var any_exact = false;
     for (family.items) |e| any_exact = any_exact or e.exact_recv;
     if (any_exact) {
@@ -350,8 +322,8 @@ pub fn overloadPickByLambdaReturnFull(
         }
         family.items.len = w;
     }
-    // The surviving set must agree on the lambda-slot's parameter types;
-    // return variety is what the pick discriminates.
+    // The surviving set must agree on the lambda slot's parameter types; return
+    // variety is what the pick discriminates.
     var agreed_params: ?[]const ir.TypeRef = null;
     var distinct_returns: usize = 0;
     for (family.items) |e| {
@@ -385,15 +357,13 @@ pub fn overloadPickByLambdaReturnFull(
         return null;
     }
     const fparams = agreed_params orelse return null;
-    // Bind the lambda's value parameters from the agreed declared types; a
-    // sole bare-type-parameter param is the receiver's ELEMENT (the
-    // collection-selector family this pick exists for).
+    // Bind the lambda's value parameters from the agreed declared types; a sole
+    // bare-type-parameter param is the receiver's element.
     var nb = try FuncBuilder.init(b.allocator, b.module);
     nb.census_quiet = true;
     defer nb.deinit();
-    // The lambda body's calls resolve in the CALLER's lexical class scope:
-    // `it.toLong()` inside `expected.map { it.toLong() }` binds the
-    // enclosing class's private member-extension.
+    // The lambda body's calls resolve in the caller's lexical class scope, so
+    // `it.toLong()` binds the enclosing class's private member extension.
     if (b.ownerClass()) |oc0| nb.setOwnerClass(oc0);
     var elem_owned: ?ir.TypeRef = null;
     defer if (elem_owned) |*t| t.deinit(b.allocator);
@@ -407,9 +377,8 @@ pub fn overloadPickByLambdaReturnFull(
             return null;
         const declared = fparams[i];
         const dh = typeHead(std.mem.trimEnd(u8, declared.name, "?"));
-        // A scalar head (the unsigned types among them) has no class row but
-        // the deriver types its members from the declaration tables, so the
-        // declared param type still binds.
+        // A scalar head has no class row, but the deriver types its members from
+        // the declaration tables, so the declared param type still binds.
         if (staticTypeClassId(b, declared) != null or isPrimitiveTypeName(dh)) {
             try nb.setLocalDeclTypeOwned(pname, try declared.clone(b.allocator));
         } else if (dh.len <= 2 or ir.parseClassTypeParamIdentity(declared.name) != null) {

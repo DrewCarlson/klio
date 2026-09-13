@@ -1,6 +1,5 @@
-//! Pure AST-walking helpers used by lowering. Kept separate from the
-//! main lowering module because they only consume the AST — they touch
-//! no `FuncBuilder` state and have no IR-side dependencies.
+//! Pure AST-walking helpers used by lowering: no `FuncBuilder` state, no IR-side
+//! dependency.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -10,21 +9,19 @@ const Expr = ast.Expr;
 const Stmt = ast.Stmt;
 pub const StringSet = std.StringHashMap(void);
 
-/// `expr as Any` (or transitively wrapped) — used by the
-/// boxed-equality routing.
+/// `expr as Any`, or transitively wrapped, for the boxed-equality routing.
 pub fn isBoxedToAnyForm(e: *const Expr) bool {
     return switch (e.*) {
         .As => |a| std.mem.eql(u8, a.ty.name.name, "Any"),
-        // A var binding annotated `: Any` — the IR lowering can't see
-        // types here, so be conservative.
+        // A var binding annotated `: Any`: the IR lowering cannot see types here,
+        // so be conservative.
         .Path => false,
         else => false,
     };
 }
 
-/// Recursively collect every single-segment `Path` identifier that
-/// appears anywhere in an expression. Used to find which names a nested
-/// lambda references.
+/// Recursively collect every single-segment `Path` identifier anywhere in an
+/// expression, to find which names a nested lambda references.
 fn collectIdents(e: *const Expr, out: *StringSet, member_out: ?*StringSet) Allocator.Error!void {
     switch (e.*) {
         .Path => |p| {
@@ -88,12 +85,9 @@ fn collectIdents(e: *const Expr, out: *StringSet, member_out: ?*StringSet) Alloc
                 .Expr => |*ex| try collectIdents(ex, out, member_out),
             };
         },
-        // An anonymous object's member bodies reference captured outer
-        // locals like a lambda body does. Without this arm a `var` whose
-        // ONLY references sit inside an object-expression's methods (an
-        // `order++` stamp counter built by a factory lambda) never counted
-        // as referenced, the enclosing lambda skipped boxing it, and the
-        // object captured a dead value copy.
+        // An anonymous object's member bodies reference captured outer locals like a
+        // lambda body does; without this arm a `var` referenced only inside them
+        // never counts as referenced and the object captures a dead value copy.
         .ObjectExpr => |o| {
             try classBodyIdents(o.members, o.init_blocks, out, member_out);
             for (o.supertype_args) |sa| if (sa) |sargs| {
@@ -135,16 +129,13 @@ fn collectIdentsStmt(s: *const Stmt, out: *StringSet, member_out: ?*StringSet) A
         .Decl => |d| switch (d) {
             .Property => |p| {
                 if (p.init) |*e| try collectIdents(e, out, member_out);
-                // A `by`-delegate lambda references (and may mutate) an outer
+                // A `by`-delegate lambda references, and may mutate, an outer
                 // capture just as an initializer does.
                 if (p.delegate) |e| try collectIdents(e, out, member_out);
             },
-            // A nested local `fun` (declared inside a lambda) references —
-            // and may mutate — a captured outer `var` in its body; without
-            // scanning it the var is not seen as referenced here, so the
-            // enclosing lambda skips propagating its boxed status and the
-            // write lands on an unboxed capture copy (or hits an increment on
-            // the raw cell).
+            // A nested local `fun` inside a lambda references, and may mutate, a
+            // captured outer `var`; unscanned, the enclosing lambda skips
+            // propagating its boxed status and the write lands on a copy.
             .Function => |f| {
                 if (f.body) |fb| switch (fb) {
                     .Block => |blk| {
@@ -153,7 +144,7 @@ fn collectIdentsStmt(s: *const Stmt, out: *StringSet, member_out: ?*StringSet) A
                     .Expr => |*ex| try collectIdents(ex, out, member_out),
                 };
             },
-            // A nested local class's member / init-block bodies reference
+            // A nested local class's member and init-block bodies reference
             // captured outer locals exactly as an anonymous object's do.
             .Class => |*c| try classBodyIdents(c.members, c.init_blocks, out, member_out),
             .Object => |*o| try classBodyIdents(o.members, o.init_blocks, out, member_out),
@@ -162,11 +153,10 @@ fn collectIdentsStmt(s: *const Stmt, out: *StringSet, member_out: ?*StringSet) A
     }
 }
 
-/// Every identifier referenced inside a class or object body: method
-/// bodies, property initializers / delegates / accessors, init blocks, and
-/// the bodies of the classes and objects nested inside it. A nested class
-/// reaches the enclosing function's locals through the same capture, so
-/// its references count against the same names.
+/// Every identifier referenced inside a class or object body: method bodies,
+/// property initializers, delegates and accessors, init blocks, and nested classes
+/// and objects. A nested class reaches the enclosing function's locals through the
+/// same capture, so its references count against the same names.
 fn classBodyIdents(members: []const ast.Decl, init_blocks: []const ast.Block, out: *StringSet, member_out: ?*StringSet) Allocator.Error!void {
     for (members) |*m| switch (m.*) {
         .Function => |*f| {
@@ -201,8 +191,8 @@ fn accessorIdents(acc: *const ast.Accessor, out: *StringSet, member_out: ?*Strin
     }
 }
 
-/// Names referenced anywhere inside a nested `Lambda` / `AnonFun` within
-/// these statements (recursing into nested lambdas too).
+/// Names referenced anywhere inside a nested `Lambda` or `AnonFun` within these
+/// statements, recursing into nested lambdas too.
 pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.Error!void {
     for (stmts) |*s| {
         switch (s.*) {
@@ -215,10 +205,8 @@ pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.
             .Decl => |d| switch (d) {
                 .Property => |p| {
                     if (p.init) |*e| try scanLambdaRefsExpr(e, out);
-                    // A `by`-delegate expression (`val x by derivedStateOf { v++ }`)
-                    // holds the lambda that captures — and may mutate — an outer
-                    // `var`; without scanning it the var is never boxed and the
-                    // write lands on a transient capture copy.
+                    // A `by`-delegate expression holds the lambda that captures, and
+                    // may mutate, an outer `var`.
                     if (p.delegate) |e| try scanLambdaRefsExpr(e, out);
                 },
                 .Function => |f| {
@@ -229,9 +217,8 @@ pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.
                         .Expr => |*ex| try collectPathIdents(ex, out),
                     };
                 },
-                // A LOCAL class's member bodies reference (and write)
-                // captured outer locals exactly as an anonymous object's
-                // do; a written capture must box, so its references count.
+                // A local class's member bodies reference and write captured outer
+                // locals exactly as an anonymous object's do.
                 .Class => |*c| try classBodyPathIdents(c.members, c.init_blocks, out),
                 .Object => |*o| try classBodyPathIdents(o.members, o.init_blocks, out),
                 else => {},
@@ -240,9 +227,9 @@ pub fn namesReferencedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.
     }
 }
 
-/// The closure-side reference scan of a class or object body (see
-/// `classBodyIdents` for the walk): every body inside it runs as a
-/// closure over the enclosing function's locals.
+/// The closure-side reference scan of a class or object body, walked as in
+/// `classBodyIdents`: every body inside runs as a closure over the enclosing
+/// function's locals.
 fn classBodyPathIdents(members: []const ast.Decl, init_blocks: []const ast.Block, out: *StringSet) Allocator.Error!void {
     for (members) |*m| switch (m.*) {
         .Function => |*f| {
@@ -277,9 +264,8 @@ fn accessorPathIdents(acc: *const ast.Accessor, out: *StringSet) Allocator.Error
     }
 }
 
-/// Recursively collect every single-segment `Path` identifier that
-/// appears anywhere in an expression. Used to find which names a nested
-/// lambda references.
+/// Recursively collect every single-segment `Path` identifier anywhere in an
+/// expression, to find which names a nested lambda references.
 pub fn collectPathIdents(e: *const Expr, out: *StringSet) Allocator.Error!void {
     return collectIdents(e, out, null);
 }
@@ -288,10 +274,9 @@ pub fn collectPathIdentsStmt(s: *const Stmt, out: *StringSet) Allocator.Error!vo
     return collectIdentsStmt(s, out, null);
 }
 
-/// As [`collectPathIdentsStmt`], additionally recording the NAME of every
-/// member call (`x.f(...)`) into `member_out`. A local extension function
-/// refers to itself in member-call position (`(this - 1).fact()`), which
-/// the plain-identifier scan never sees.
+/// As `collectPathIdentsStmt`, also recording every member call's name into
+/// `member_out`, since a local extension function refers to itself in member-call
+/// position, which the plain-identifier scan never sees.
 pub fn collectIdentsAndCallNamesStmt(
     s: *const Stmt,
     out: *StringSet,
@@ -315,9 +300,8 @@ fn scanLambdaRefsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
             };
         },
         .Member => |m| try scanLambdaRefsExpr(m.receiver, out),
-        // An anonymous object's member bodies reference (and write)
-        // captured outer locals exactly as a lambda body does; a written
-        // capture must box, so its references count here.
+        // An anonymous object's member bodies reference and write captured outer
+        // locals exactly as a lambda body does, and a written capture must box.
         .ObjectExpr => |o| try classBodyPathIdents(o.members, o.init_blocks, out),
         .Unary => |u| try scanLambdaRefsExpr(u.expr, out),
         .Postfix => |u| try scanLambdaRefsExpr(u.expr, out),
@@ -370,12 +354,9 @@ fn scanLambdaRefsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
             if (t.finally) |fb| try namesReferencedInLambdas(fb.stmts, out);
         },
         .StringTemplate => |st| {
-            // A template is not a lambda: only lambdas INSIDE an interp
-            // expression count. A bare `$name` must not mark the var as
-            // lambda-referenced — that boxed every `var` a same-function
-            // template mentioned, putting a CellGet/CellSet on each hot
-            // access (rangebench's `s` paid one per loop iteration for
-            // the final `println("sum=$s")`).
+            // A template is not a lambda: only lambdas inside an interp expression
+            // count, or every `var` a same-function template mentions gets a
+            // CellGet/CellSet on each hot access.
             for (st.parts) |*p| switch (p.*) {
                 .Interp => |ex| try scanLambdaRefsExpr(ex, out),
                 .ShortInterp, .Text => {},
@@ -385,11 +366,9 @@ fn scanLambdaRefsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
     }
 }
 
-/// `var` names declared directly in these statements (not inside a
-/// nested lambda — those open their own frame). Also includes a
-/// deferred-init plain `val` (no initializer / delegate / accessor),
-/// because a later write from a nested lambda needs the same
-/// `Ref`-boxing as a captured `var` to be visible at the decl site.
+/// `var` names declared directly in these statements, not inside a nested lambda,
+/// which opens its own frame. Includes a deferred-init plain `val`, since a later
+/// write from a nested lambda needs the same `Ref`-boxing as a captured `var`.
 pub fn collectVarDecls(stmts: []const Stmt, out: *StringSet) Allocator.Error!void {
     for (stmts) |*s| {
         switch (s.*) {
@@ -398,8 +377,8 @@ pub fn collectVarDecls(stmts: []const Stmt, out: *StringSet) Allocator.Error!voi
                     const deferred_val = p.init == null and p.delegate == null and
                         p.getter == null and p.setter == null;
                     if (p.mutable or deferred_val) try out.put(p.name.name, {});
-                    // `val r = if (...) { var c ... }` — the initializer's
-                    // expression blocks declare capturable vars too.
+                    // The initializer's expression blocks declare capturable vars
+                    // too.
                     if (p.init) |*e| try collectVarDeclsExpr(e, out);
                     if (p.delegate) |e| try collectVarDeclsExpr(e, out);
                 },
@@ -420,8 +399,7 @@ pub fn collectVarDecls(stmts: []const Stmt, out: *StringSet) Allocator.Error!voi
 fn collectVarDeclsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
     switch (e.*) {
         .Block => |b| try collectVarDecls(b.stmts, out),
-        // `return if (...) { var c ... }` — the returned expression's
-        // blocks declare capturable vars.
+        // The returned expression's blocks declare capturable vars.
         .Return => |r| {
             if (r.value) |v| try collectVarDeclsExpr(v, out);
         },
@@ -447,13 +425,10 @@ fn collectVarDeclsExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
     }
 }
 
-/// Names that any nested lambda inside these statements *assigns to*
-/// (plain `=`, compound `+=`, or `++`/`--`) — the write half of capture
-/// analysis. Recurses into nested lambdas. Unlike `namesReferencedInLambdas`
-/// (which records reads and writes alike), this records only mutation
-/// targets, so a caller can box exactly the captured names a closure
-/// writes regardless of whether they are `var` decls in the same scope or
-/// names bound elsewhere (e.g. an inlined function's parameters).
+/// Names any nested lambda inside these statements assigns to, by `=`, `+=`, or
+/// `++`/`--`: the write half of capture analysis. Unlike `namesReferencedInLambdas`,
+/// which records reads and writes alike, this records only mutation targets, so a
+/// caller can box exactly the captured names a closure writes.
 pub fn namesAssignedInLambdas(stmts: []const Stmt, out: *StringSet) Allocator.Error!void {
     for (stmts) |*s| try assignedInLambdasStmt(s, out);
 }
@@ -478,11 +453,8 @@ fn assignedInLambdasStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
                     .Expr => |*ex| try collectAssignTargets(ex, out),
                 };
             },
-            // A LOCAL class's method bodies write captured outer locals
-            // exactly as an anonymous object's do; without this the local
-            // is never boxed and the write lands on a transient capture
-            // copy (a local `class Bumper { fun bump() { count++ } }`
-            // silently dropped the increment).
+            // A local class's method bodies write captured outer locals exactly as
+            // an anonymous object's do.
             .Class => |*c| try classBodyAssigns(c.members, c.init_blocks, out),
             .Object => |*o| try classBodyAssigns(o.members, o.init_blocks, out),
             else => {},
@@ -490,10 +462,9 @@ fn assignedInLambdasStmt(s: *const Stmt, out: *StringSet) Allocator.Error!void {
     }
 }
 
-/// The assignment targets inside a class or object body (see
-/// `classBodyIdents` for the walk): a write anywhere inside it, including
-/// an inner class's method or a property accessor, lands on the enclosing
-/// function's variable.
+/// The assignment targets inside a class or object body, walked as in
+/// `classBodyIdents`: a write anywhere inside, an inner class's method or a property
+/// accessor included, lands on the enclosing function's variable.
 fn classBodyAssigns(members: []const ast.Decl, init_blocks: []const ast.Block, out: *StringSet) Allocator.Error!void {
     for (members) |*m| switch (m.*) {
         .Function => |*f| {
@@ -522,9 +493,8 @@ fn accessorAssigns(acc: *const ast.Accessor, out: *StringSet) Allocator.Error!vo
     }
 }
 
-/// Recurse through non-lambda expression forms looking for a nested
-/// `Lambda`/`AnonFun`; once inside a lambda body, collect every assignment
-/// target it names.
+/// Recurse through non-lambda expression forms looking for a nested `Lambda` or
+/// `AnonFun`; once inside a lambda body, collect every assignment target it names.
 fn assignedInLambdasExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
     switch (e.*) {
         .Lambda => |l| try collectLambdaBodyAssigns(l.body.stmts, out),
@@ -536,11 +506,8 @@ fn assignedInLambdasExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
         },
         .Member => |m| try assignedInLambdasExpr(m.receiver, out),
         .MemberRef => |m| try assignedInLambdasExpr(m.receiver, out),
-        // An anonymous object's method bodies write captured outer locals
-        // exactly as a lambda body does (`result = ...` inside an
-        // `object : Continuation<T> { override fun resumeWith(...) }`);
-        // without this the local is never boxed and the write lands on a
-        // transient capture copy.
+        // An anonymous object's method bodies write captured outer locals exactly as
+        // a lambda body does.
         .ObjectExpr => |o| try classBodyAssigns(o.members, o.init_blocks, out),
         .Unary => |u| try assignedInLambdasExpr(u.expr, out),
         .Postfix => |u| try assignedInLambdasExpr(u.expr, out),
@@ -601,16 +568,12 @@ fn assignedInLambdasExpr(e: *const Expr, out: *StringSet) Allocator.Error!void {
     }
 }
 
-/// Inside a lambda body, collect every single-segment assignment target
-/// (the names the lambda mutates), recursing into deeper lambdas too.
-/// Bare-name targets a nested lambda REBINDS (`x = ...`), as opposed to
-/// compound-assigns: `dest += e` on an immutable (a parameter, a `val`)
-/// means `dest.plusAssign(e)` and is not a write to the binding at all.
-/// Recorded into the thread-set only when a caller opts in via
-/// `collect_compound_targets`; the `var`-boxing scan keeps them (a captured
-/// `var n` under `n += 1` rebinds), while the PARAMETER-boxing scan must
-/// not (a parameter can never be reassigned in Kotlin — boxing it detached
-/// the caller's value, so `Flow.associateTo`'s destination stayed empty).
+/// Inside a lambda body, collect every single-segment assignment target, recursing
+/// into deeper lambdas. Bare-name targets a nested lambda rebinds, as opposed to
+/// compound-assigns: `dest += e` on an immutable means `dest.plusAssign(e)` and is
+/// not a write to the binding. Compound targets are recorded only under
+/// `collect_compound_targets`: the `var`-boxing scan keeps them, since `n += 1` on a
+/// captured `var` rebinds, while the parameter-boxing scan must not.
 threadlocal var collect_compound_targets: bool = true;
 
 pub fn namesAssignedInLambdasRebindsOnly(stmts: []const Stmt, out: *StringSet) Allocator.Error!void {
@@ -641,9 +604,8 @@ fn collectLambdaBodyAssigns(stmts: []const Stmt, out: *StringSet) Allocator.Erro
     }
 }
 
-/// Collect single-segment assignment / increment targets reachable through
-/// expression forms (covers `++`/`--`, and assignments nested in control
-/// flow), and recurse into any deeper lambda via `assignedInLambdasExpr`.
+/// Collect single-segment assignment and increment targets reachable through
+/// expression forms, and recurse into any deeper lambda via `assignedInLambdasExpr`.
 fn collectAssignTargets(e: *const Expr, out: *StringSet) Allocator.Error!void {
     switch (e.*) {
         .Postfix => |u| {
@@ -692,10 +654,8 @@ fn collectAssignTargetPath(e: *const Expr, out: *StringSet) Allocator.Error!void
     }
 }
 
-/// `var`s declared in this frame and captured by a nested lambda need to
-/// be boxed into a shared `Value.Cell` (Kotlin `Ref` semantics) so a
-/// write from a coroutine / closure is visible at the decl site. The
-/// caller owns the returned set.
+/// `var`s declared in this frame and captured by a nested lambda need boxing into a
+/// shared `Value.Cell`, per Kotlin `Ref` semantics. The caller owns the set.
 pub fn computeBoxedVars(allocator: Allocator, stmts: []const Stmt) Allocator.Error!StringSet {
     var decls = StringSet.init(allocator);
     errdefer decls.deinit();
@@ -715,10 +675,8 @@ pub fn computeBoxedVars(allocator: Allocator, stmts: []const Stmt) Allocator.Err
     return decls;
 }
 
-/// Flatten a `Member{receiver: Member{...,Path}}` chain into a dotted
-/// FQN like `kotlin.math.PI`. Returns `null` when the chain is not
-/// purely identifier segments (e.g. it has a Call, Index, or arbitrary
-/// expression). The caller owns the returned string.
+/// Flatten a `Member{receiver: Member{...,Path}}` chain into a dotted FQN. Null when
+/// the chain is not purely identifier segments; the caller owns the string.
 pub fn collectDottedFqn(allocator: Allocator, expr: *const Expr) Allocator.Error!?[]const u8 {
     var parts: std.ArrayList([]const u8) = .empty;
     defer parts.deinit(allocator);
@@ -744,9 +702,6 @@ pub fn collectDottedFqn(allocator: Allocator, expr: *const Expr) Allocator.Error
     return try std.mem.join(allocator, ".", parts.items);
 }
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 const span = @import("span");
@@ -871,9 +826,8 @@ test "compute boxed vars keeps only captured var decls" {
 }
 
 test "compute boxed vars does not box a var a string template mentions" {
-    // var s = 0; println("sum=$s") — a template is not a lambda; `s`
-    // must stay a plain register (a false box put a CellGet/CellSet on
-    // every hot access of any var a same-function template printed).
+    // A template is not a lambda, so `s` must stay a plain register; a false box
+    // puts a CellGet/CellSet on every hot access.
     const lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
     var prop_s = ast.Property{
         .mutable = true,
@@ -913,7 +867,7 @@ test "compute boxed vars does not box a var a string template mentions" {
 
 test "compute boxed vars boxes a var captured in a by-delegate lambda" {
     // var captured = 0
-    // val answer by delegateFn { captured }   // lambda lives in the delegate
+    // val answer by delegateFn { captured }   // the lambda lives in the delegate
     const lit0 = Expr{ .IntLit = .{ .value = 0, .kind = .Int, .span = dummySpan() } };
     var prop_captured = ast.Property{
         .mutable = true,
@@ -938,8 +892,7 @@ test "compute boxed vars boxes a var captured in a by-delegate lambda" {
         .span = dummySpan(),
     };
 
-    // Delegate: `delegateFn { captured }` — a Call whose trailing lambda
-    // references the outer `captured` var.
+    // Delegate: a Call whose trailing lambda references the outer `captured` var.
     var refseg = [_]ast.Ident{.{ .name = "captured", .span = dummySpan() }};
     var refexpr = Expr{ .Path = .{ .segments = &refseg, .span = dummySpan() } };
     var lambda_stmts = [_]Stmt{.{ .Expr = refexpr }};
@@ -997,9 +950,8 @@ test "compute boxed vars boxes a var captured in a by-delegate lambda" {
 }
 
 test "collect path idents recurses into a nested local fun body" {
-    // { fun bump() { captured } }  — a lambda whose only reference to
-    // `captured` sits inside a nested local function. The scan must see it so
-    // the enclosing lambda propagates the var's boxed status.
+    // A lambda whose only reference to `captured` sits inside a nested local
+    // function, which the scan must see so the boxed status propagates.
     var refseg = [_]ast.Ident{.{ .name = "captured", .span = dummySpan() }};
     const refexpr = Expr{ .Path = .{ .segments = &refseg, .span = dummySpan() } };
     var fn_stmts = [_]Stmt{.{ .Expr = refexpr }};
@@ -1035,8 +987,8 @@ test "collect path idents recurses into a nested local fun body" {
 }
 
 test "names assigned in lambdas reports writes but not bare reads" {
-    // { x -> written = x }  — `written` is an assignment target inside a
-    // nested lambda; `onlyread` is referenced but never assigned.
+    // `written` is an assignment target inside a nested lambda; `onlyread` is
+    // referenced but never assigned.
     var wseg = [_]ast.Ident{.{ .name = "written", .span = dummySpan() }};
     var wtarget = Expr{ .Path = .{ .segments = &wseg, .span = dummySpan() } };
     var rseg = [_]ast.Ident{.{ .name = "onlyread", .span = dummySpan() }};
@@ -1084,11 +1036,9 @@ test "names assigned in lambdas catches postfix increment target" {
     try testing.expect(out.contains("count"));
 }
 
-/// Does anything inside these statements read `this@<label>` — at any depth,
-/// including nested lambdas and an anonymous object's member bodies and
-/// property accessors? An argument lambda's implicit label (`runTest { … }`)
-/// names its receiver, so the body must bind that receiver under the label
-/// for the reference to reach it rather than the innermost `this`.
+/// Whether anything inside these statements reads `this@<label>` at any depth. An
+/// argument lambda's implicit label names its receiver, so the body must bind that
+/// receiver under the label for the reference to reach it.
 pub fn referencesQualifiedThis(stmts: []const Stmt, label: []const u8) bool {
     for (stmts) |*s| if (qthisStmt(s, label)) return true;
     return false;
@@ -1208,12 +1158,9 @@ fn qthisExpr(e: *const Expr, label: []const u8) bool {
     };
 }
 
-/// Whether any `return@label` targeting `label` appears in this expression,
-/// including inside nested lambdas, anonymous functions, object-expression
-/// members, and local declarations. The splicer consults this to decide
-/// whether an inline body needs a runtime labeled-return absorption region
-/// (a closure created in the spliced body can carry the label across a real
-/// frame, where lowering-time resolution cannot reach).
+/// Whether any `return@label` targeting `label` appears in this expression, nested
+/// lambdas and object-expression members included. The splicer consults this to
+/// decide whether an inline body needs a runtime labeled-return absorption region.
 pub fn containsLabeledReturn(e: *const Expr, label: []const u8) bool {
     switch (e.*) {
         .Return => |r| {

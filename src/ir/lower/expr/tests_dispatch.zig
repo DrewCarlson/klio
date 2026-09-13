@@ -1,5 +1,4 @@
-//! Expression lowering tests: paths, members, literals and the dispatch
-//! ladder.
+//! Expression lowering tests: paths, members, literals and the dispatch ladder.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -412,10 +411,9 @@ test "bare is-check type normalises to the file's exact-import class FQN" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer m.deinit(a);
-    // Two packages declare a nested `Marker` under a same-named outer class:
-    // both lift as `Operation$Marker`, so the bare simple name identifies
-    // neither. The file's explicit import names exactly one; the check type
-    // must carry that class's canonical FQN so the runtime compares identity.
+    // Two packages declare a nested `Marker` under a same-named outer class, both
+    // lifting as `Operation$Marker`, so the check type must carry the imported
+    // class's canonical FQN for the runtime to compare identity.
     _ = try m.reserveClassFqn(a, "Operation$Marker", "com.ga.Operation.Marker", "com.ga", false);
     _ = try m.reserveClassFqn(a, "Operation$Marker", "com.gb.Operation.Marker", "com.gb", false);
     {
@@ -483,11 +481,10 @@ test "trailing-lambda arity host accepts a signature-only candidate" {
     const a = testing.allocator;
     var m = Module.default(a);
     defer m.deinit(a);
-    // `launch(context, start, block)` as it looks to a file lowered BEFORE
-    // the file that declares it: the signature (params, function-typed
-    // tail) is lifted, but no body is attached yet. The arity host must
-    // still pick it — skipping it left the trailing receiver lambda with a
-    // spurious implicit `it` bound to the invocation's receiver argument.
+    // `launch(context, start, block)` as it looks to a file lowered before the file
+    // declaring it: the signature is lifted, but no body is attached. The arity
+    // host must still pick it, or the trailing receiver lambda keeps a spurious
+    // implicit `it`.
     const params = try a.alloc(ir.Param, 4);
     params[0] = .{ .name = "this", .ty = .{ .name = "CoroutineScope", .nullable = false, .args = &.{} }, .default = null };
     params[1] = .{ .name = "context", .ty = .{ .name = "CoroutineContext", .nullable = false, .args = &.{} }, .default = null, .has_default = true };
@@ -620,8 +617,7 @@ test "inherited member receiver lambda uses abstract defaults" {
 }
 
 test "headCompatible: literal heads disprove scalar params only" {
-    // Literal Boolean disproves a String param — the local-fn overload
-    // shape that recursed before selection existed.
+    // Literal Boolean disproves a String param.
     try std.testing.expect(!headCompatible("Boolean", "String", true));
     try std.testing.expect(headCompatible("Boolean", "Boolean", true));
     // Numeric literals coerce across the numeric family.
@@ -633,20 +629,17 @@ test "headCompatible: literal heads disprove scalar params only" {
     try std.testing.expect(headCompatible("->", "T", true));
     try std.testing.expect(!headCompatible("->", "String", true));
     try std.testing.expect(!headCompatible("String", "(Int) -> Int", true));
-    // A parsed function type carries the synthetic `<function>` tag; a
-    // lambda binds it under either strictness. `expect(…, predicate:
-    // (Char) -> Boolean) { it == '-' }` regressed when the tag was not
-    // recognized and the local fn was deemed inapplicable.
+    // A parsed function type carries the synthetic `<function>` tag; a lambda binds
+    // it under either strictness.
     try std.testing.expect(headCompatible("->", "<function>", true));
     try std.testing.expect(headCompatible("->", "<function>", false));
-    // A user class head never disproves another named type (supertypes
-    // are unknown here); generic/Any params accept anything.
+    // A user class head never disproves another named type, supertypes being
+    // unknown here; generic and `Any` params accept anything.
     try std.testing.expect(headCompatible("MyThing", "Other", true));
     try std.testing.expect(headCompatible("String", "Any", true));
     try std.testing.expect(headCompatible("Int", "T", true));
-    // Disproof-only lambda case (applicability decision): a lambda may
-    // bind an unknown class name (a possible function typealias), so it
-    // is not ruled inapplicable — but a definite scalar still disproves.
+    // Disproof-only lambda case: a lambda may bind an unknown class name, a
+    // possible function typealias, but a definite scalar still disproves.
     try std.testing.expect(headCompatible("->", "MyPredicate", false));
     try std.testing.expect(!headCompatible("->", "MyPredicate", true));
     try std.testing.expect(!headCompatible("->", "String", false));
@@ -825,10 +818,9 @@ test "shared member resolution selects overloads and dispatch forms" {
     const virtual_inst = b.blocks.items[b.cur.int()].insts[b.blocks.items[b.cur.int()].insts.len - 1];
     try testing.expect(virtual_inst == .CallVirtual);
     try testing.expectEqual(ir.MethodSlotId.fromFunc(virtual_pick), virtual_inst.CallVirtual.slot);
-    // A `specialized` classifier's values are host-represented, and a virtual
-    // slot is still the right emission for one: `invokeVirtualMember` resolves
-    // it against an interpreted receiver's own class and falls back to the
-    // member's name for a host-backed value.
+    // A `specialized` classifier's values are host-represented, and a virtual slot
+    // is still the right emission: `invokeVirtualMember` resolves it against an
+    // interpreted receiver's own class and name-falls-back otherwise.
     m.classes.items[owner.int()].receiver_abi = .specialized;
     try testing.expect((try lowerResolvedMemberCall(
         &b,
@@ -850,8 +842,8 @@ test "shared member resolution selects overloads and dispatch forms" {
     try testing.expectEqual(final_pick, stub_result.target.?);
     m.classes.items[owner.int()].is_stub = false;
     m.classes.items[owner.int()].is_value = true;
-    // A value-class receiver arrives boxed like any instance, so its final
-    // members take the ordinary direct rule.
+    // A value-class receiver arrives boxed like any instance, so its final members
+    // take the ordinary direct rule.
     const value_result = m.resolveMemberCall(owner, "finalPick", int_shapes, .{});
     try testing.expectEqual(ir.Module.MemberDispatch.direct, value_result.dispatch);
     try testing.expectEqual(final_pick, value_result.target.?);
@@ -911,11 +903,9 @@ test "shared member resolution selects overloads and dispatch forms" {
     try testing.expect(nullable_inst.Call.exact);
     try testing.expect(nullable_inst.Call.func != member_plus);
 
-    // A receiver typed by a TYPE PARAMETER resolves through the parameter's
-    // upper bound. The bound record drops the bound's type ARGUMENTS, which
-    // is what `head_only` reports and what `complete` refuses — and the
-    // stdlib's two most common parameters (`C : MutableCollection<in T>`,
-    // `M : MutableMap<in K, in V>`) are exactly that shape.
+    // A receiver typed by a type parameter resolves through the parameter's upper
+    // bound. The bound record drops the bound's type arguments, which is what
+    // `head_only` reports and `complete` refuses.
     m.classes.items[owner.int()].is_open = true;
     try b.bind("bounded", b.allocReg());
     try b.setLocalDeclType("bounded", "C");
@@ -960,9 +950,8 @@ test "the declared-type walk terminates on a cyclic initializer chain" {
     var b = try FuncBuilder.init(a, &m);
     defer b.deinit();
 
-    // `a`'s type comes from `b.field`, and `b`'s from `a.field`. Kotlin cannot
-    // write that, but lowering asks about both from a point where both are
-    // bound, and the walk followed the chain forever.
+    // `a`'s type comes from `b.field` and `b`'s from `a.field`. Kotlin cannot write
+    // that, but lowering asks about both from a point where both are bound.
     var a_path = [_]ast.Ident{.{ .name = "a", .span = dummySpan() }};
     var b_path = [_]ast.Ident{.{ .name = "b", .span = dummySpan() }};
     var a_recv = Expr{ .Path = .{ .segments = &a_path, .span = dummySpan() } };
@@ -1182,8 +1171,8 @@ test "receiver callable emission respects members and lazy extensions" {
     try testing.expect(receiver_fallback.fallback_receiver_shape_known);
 
     // A receiver-function-typed local is the same proven callable shape as a
-    // parameter, even when its underlying value is an ordinary function
-    // adapted at the assignment.
+    // parameter, even when its underlying value is an ordinary function adapted at
+    // the assignment.
     try b.bind("typed", b.allocReg());
     try b.setLocalDeclRecvFn("typed");
     try Expect.lower(&b, &receiver, "typed", .CallValueWithThis);
@@ -1192,8 +1181,8 @@ test "receiver callable emission respects members and lazy extensions" {
     ].CallValueWithThis;
     try testing.expect(typed_call.receiver_shape_exact);
 
-    // A plain local remains on the member-or-value compatibility form and
-    // never receives the call receiver positionally.
+    // A plain local stays on the member-or-value compatibility form and never
+    // receives the call receiver positionally.
     try b.bind("plain", b.allocReg());
     try b.markLocalFn("plain");
     try Expect.lower(&b, &receiver, "plain", .CallMemberOrValue);
@@ -1203,9 +1192,8 @@ test "receiver callable emission respects members and lazy extensions" {
     try testing.expect(!plain_fallback.fallback_takes_receiver);
     try testing.expect(plain_fallback.fallback_receiver_shape_known);
 
-    // An erased receiver removes the member leg, but does not by itself prove
-    // that a same-named local is callable. Exact value dispatch still requires
-    // the local's declared receiver-function shape.
+    // An erased receiver removes the member leg but does not prove a same-named
+    // local callable; exact value dispatch still needs its declared shape.
     try b.bind("unknown", b.allocReg());
     try b.markParam("unknown");
     try b.markErasedRecvParam("target");
@@ -1229,11 +1217,10 @@ test "lowers postfix not-null assert" {
 }
 
 test "trailing lambda's implicit label survives a call-shaped receiver" {
-    // `Stack().apply { … }`: lowering the receiver `Stack()` re-arms the
-    // ambient pending label with "Stack"; the argument lambda must still
-    // record "apply" so `return@apply` unwinds to the lambda, not into
-    // the `apply` frame itself. Arena-backed: lambda lowering hangs side
-    // tables off the module that outlive the builder.
+    // Lowering the receiver `Stack()` re-arms the ambient pending label with
+    // "Stack", but the argument lambda must still record "apply" so `return@apply`
+    // unwinds to the lambda. Arena-backed: lambda lowering hangs side tables off
+    // the module that outlive the builder.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1274,7 +1261,7 @@ test "trailing lambda's implicit label survives a call-shaped receiver" {
     } };
     const r = try lowerExpr(&b, &e);
     b.terminate(.{ .Return = r });
-    // Arena-owned: no freeFunc — the arena reclaims the whole build.
+    // Arena-owned, so no freeFunc: the arena reclaims the whole build.
     _ = try b.finish("f", "f", build.typeUnit());
     var found = false;
     for (m.funcs.items) |*f| {
@@ -1490,8 +1477,8 @@ test "bare call commits an outer tower extension through its label slot" {
     defer _ = build.setLowerSelfPackage(previous_package);
     var b = try FuncBuilder.init(a, &m);
     defer b.deinit();
-    // A lambda body whose own receiver is Inner; the enclosing extension
-    // fn's Outer receiver sits one tower level out under `this@probe`.
+    // A lambda body whose own receiver is Inner; the enclosing extension fn's Outer
+    // receiver sits one tower level out under `this@probe`.
     b.setRecvTy("Inner");
     try b.bind("this", b.allocReg());
     const outer_reg = b.allocReg();
@@ -1517,8 +1504,7 @@ test "bare call commits an outer tower extension through its label slot" {
     try testing.expect(inst == .Call);
     try testing.expectEqual(ext, inst.Call.func);
     try testing.expect(inst.Call.exact);
-    // The receiver argument is the labeled outer slot, not the lambda's
-    // own `this`.
+    // The receiver argument is the labeled outer slot, not the lambda's own `this`.
     var moved_from_outer = false;
     for (insts) |candidate| {
         if (candidate != .Move) continue;
@@ -1537,8 +1523,8 @@ test "a member reference on a scope-renamed nested class loads the lifted name" 
     var m = Module.default(a);
     defer m.deinit(a);
     const sp = dummySpan();
-    // `Box` is a nested class of `Holder`, lifted to `Holder$Box`: it has no
-    // binding under its bare simple name.
+    // `Box` is a nested class of `Holder`, lifted to `Holder$Box`, with no binding
+    // under its bare simple name.
     var aliases = std.StringHashMap([]const u8).init(a);
     try aliases.put("Box", "Holder$Box");
     try m.registry.nested_object_aliases.put("Holder", aliases);
@@ -1568,8 +1554,8 @@ test "a member reference on a scope-renamed nested class loads the lifted name" 
     } };
     _ = try lowerExpr(&b, &ref);
 
-    // The qualifier resolves through the lifted name, never the bare `Box`
-    // (which has no binding of its own and would raise an unresolved global).
+    // The qualifier resolves through the lifted name, never the bare `Box`, which
+    // would raise an unresolved global.
     var lifted = false;
     var bare = false;
     for (b.blocks.items[b.cur.int()].insts) |inst| {

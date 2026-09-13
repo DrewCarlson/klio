@@ -65,14 +65,11 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
         }
     }
     if (arg.* == .This and arg.This.qualifier == null) {
-        // An extension body spliced into a member function binds a new `this`
-        // register while the builder's flat declaration metadata still names
-        // the enclosing member receiver. The splice receiver is the lexical
-        // `this` for this body and must win. A spliced lambda argument skips
-        // it because that lambda's receiver/free-name window is independent.
+        // An extension body spliced into a member binds a new `this` while the
+        // flat declaration metadata still names the enclosing member receiver, so
+        // the splice receiver wins. A spliced lambda argument skips it.
         if (b.lambda_splice_resolve == null) {
-            // The window's full receiver record wins over the head-only
-            // channel: iterating `this` needs the type arguments.
+            // The window's full receiver record wins over the head-only channel.
             if (b.spliceRecvTyRef()) |ref| return ref.*;
             if (b.spliceRecvTy()) |head| {
                 return .{ .name = head, .nullable = false, .args = &.{} };
@@ -85,10 +82,8 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
         }
         return null;
     }
-    // `this@label`: the receiver bound under that label — the builder's own
-    // receiver when its label matches (an ext body's label is its fn name),
-    // else the tower entry carrying it. `this@runningReduce.iterator()`
-    // inside the `sequence { }` body types as the OUTER Sequence receiver.
+    // `this@label`: the builder's own receiver when its label matches (an ext
+    // body's label is its fn name), else the tower entry carrying it.
     if (arg.* == .This) {
         if (arg.This.qualifier) |q| {
             if (b.own_this_label) |own| {
@@ -129,24 +124,14 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
         .NullLit => return .{ .name = "Nothing", .nullable = true, .args = &.{} },
         else => {},
     }
-    // An unsafe cast fixes the argument's static type for overload
-    // resolution — kotlinc sees exactly the cast target. That is the
-    // documented way to force a sibling overload (ktor's deprecated
-    // `P.install` delegates with `install(plugin as Plugin<P, B, F>,
-    // configure)`; without the cast evidence the call binds itself and
-    // recurses forever).
+    // An unsafe cast fixes the argument's static type for overload resolution.
     if (arg.* == .As and !arg.As.safe) {
         return .{ .name = loweredTypeName(b, &arg.As.ty), .nullable = arg.As.ty.nullable, .args = &.{} };
     }
-    // A member PROPERTY READ as a receiver (`this.indices.reversed()`):
-    // the receiver's head plus the property's declared head answers —
-    // class properties through their recorded heads, extension
-    // properties through the getter contract and its supertype walk.
+    // A member property read as a receiver: receiver head plus property head.
     if (arg.* == .Member and !arg.Member.safe) {
         const m = arg.Member;
-        // A CLASS-named receiver reads the companion's property
-        // (`Byte.MAX_VALUE.toLong()`): consult the companion's lifted key
-        // and the class's own record.
+        // A class-named receiver reads the companion's property.
         if (m.receiver.* == .Path and m.receiver.Path.segments.len == 1) {
             const on = m.receiver.Path.segments[0].name;
             if (on.len != 0 and std.ascii.isUpper(on[0]) and
@@ -163,10 +148,7 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
                 }
             }
         }
-        // An enum ENTRY (`AlternateEnumNames.VALUE_A`, `Cases.hasSerialName`)
-        // is a value of its enum class, nested enums included: a reified
-        // sibling beside it (`assertEquals(E.A, json.decodeFromString(...))`)
-        // solves `T` as the enum.
+        // An enum entry is a value of its enum class, nested enums included.
         if (m.receiver.* == .Path and !std.mem.eql(u8, m.name.name, "entries")) {
             if (enumClassOfPath(b, m.receiver)) |enum_name| {
                 return .{ .name = enum_name, .nullable = false, .args = &.{} };
@@ -174,13 +156,11 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
         }
         if (argDeclTypeRefLazy(b, m.receiver)) |rt| {
             var h = std.mem.trimEnd(u8, rt.name, "?");
-            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
             const head = typeHead(h);
-            // The site's own view of the owner class first: two packages
-            // can share a simple name with a same-named property of
-            // different types (`graphics.Shadow.offset: Offset` beside
-            // `graphics.shadow.Shadow.offset: DpOffset`), and the simple
-            // key holds only one of them.
+            // The site's own view of the owner class first: two packages can share
+            // a simple name with differently typed properties, and the simple key
+            // holds only one.
             const scoped_key = declTypePropOwnerKey(b, &rt, m.name.span.file);
             if (runtime.envOnce("KLIO_CIX_TRACE")) |w| {
                 if (std.mem.eql(u8, w, head)) {
@@ -196,10 +176,7 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
                     return .{ .name = ph, .nullable = false, .args = &.{} };
                 }
             }
-            // The property's FULL declared type, with the owner's type
-            // parameters substituted from the receiver's own arguments:
-            // `Map<K, V>.values` read off a `Map<String, Named>` is a
-            // `Collection<Named>`, and iterating it needs the element.
+            // The full declared type, with the owner's type parameters substituted.
             if (propTypeRefOn(b, head, m.name.name)) |declared| {
                 if (substitutedPropType(b, head, rt, declared)) |full| return full;
             }
@@ -209,22 +186,13 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
                 return .{ .name = ph, .nullable = false, .args = &.{} };
             }
             // Builtin properties with no Kotlin declaration to read.
-            // `source[index].code` in Base64's decoder is the live case: the
-            // receiver types as Char and the read stopped there.
             if (std.mem.eql(u8, head, "Char") and std.mem.eql(u8, m.name.name, "code")) {
                 return .{ .name = "Int", .nullable = false, .args = &.{} };
             }
         }
     }
-    // `x++` / `x--` evaluates to the operand's PRIOR value, so it carries the
-    // operand's type. The inline splice types a lambda parameter from the
-    // argument expression, and half the indexed stdlib family invokes its
-    // lambda that way — `action(index++, item)` inside
-    // `CharSequence.forEachIndexed` — so the parameter arrived untyped and
-    // every call on it resolved by name.
+    // `x++`/`x--` evaluates to the operand's prior value and carries its type.
     if (arg.* == .Postfix) return argDeclTypeRefLazy(b, arg.Postfix.expr);
-    // `!x` is Boolean; `-x` / `+x` keep their operand's type. Same reason as
-    // the postfix arm: these are argument shapes the splice must type.
     if (arg.* == .Unary) {
         switch (arg.Unary.op) {
             .Not => return .{ .name = "Boolean", .nullable = false, .args = &.{} },
@@ -232,18 +200,15 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
             else => {},
         }
     }
-    // Arithmetic on PRIMITIVES promotes to the wider operand, and comparison
-    // and logic are Boolean. Both rules already exist for the eager walk;
-    // the splice consults this function instead and had neither.
+    // Arithmetic on primitives promotes to the wider operand.
     if (arg.* == .Binary) {
         switch (arg.Binary.op) {
             .Eq, .Neq, .IdentEq, .IdentNeq, .Lt, .Le, .Gt, .Ge, .In, .NotIn, .And, .Or => {
                 return .{ .name = "Boolean", .nullable = false, .args = &.{} };
             },
             .Add, .Sub, .Mul, .Div, .Rem => arith: {
-                // Falls THROUGH on anything it cannot answer: the class
-                // operator-member arm below handles a non-primitive left
-                // operand, and returning null here would skip it.
+                // Falls through on anything it cannot answer, so the class
+                // operator-member arm below still sees a non-primitive operand.
                 const lt = argDeclTypeRefLazy(b, arg.Binary.lhs) orelse
                     break :arith;
                 const rt = argDeclTypeRefLazy(b, arg.Binary.rhs) orelse
@@ -252,14 +217,10 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
                 const lh = typeHead(std.mem.trimEnd(u8, lt.name, "?"));
                 const rh = typeHead(std.mem.trimEnd(u8, rt.name, "?"));
                 if (!isPrimitiveTypeName(lh) or !isPrimitiveTypeName(rh)) break :arith;
-                // Kotlin's numeric promotion order. A String on either side
-                // is concatenation, and `Char + Int` is a Char; neither is
-                // in this table, so both decline.
-                // Kotlin's UNSIGNED arithmetic is a closed family: it never
-                // mixes with the signed types, `UByte`/`UShort` widen to
-                // `UInt`, and a `ULong` operand makes the result `ULong`.
-                // Absent from the signed table below, `(to - 1u).toUInt()`
-                // inside `UInt.until` had no receiver at all.
+                // Kotlin's numeric promotion order. A String on either side is
+                // concatenation and `Char + Int` is a Char, so both decline.
+                // Unsigned arithmetic never mixes with the signed types:
+                // `UByte`/`UShort` widen to `UInt`, a `ULong` operand wins.
                 const unsigned = [_][]const u8{ "UByte", "UShort", "UInt", "ULong" };
                 var l_unsigned = false;
                 var r_unsigned = false;
@@ -276,8 +237,7 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
                 const order = [_][]const u8{ "Double", "Float", "Long", "Int" };
                 for (order) |w| {
                     if (std.mem.eql(u8, lh, w) or std.mem.eql(u8, rh, w)) {
-                        // Byte/Short arithmetic is Int in Kotlin, which the
-                        // Int entry already produces.
+                        // Byte/Short arithmetic is Int in Kotlin.
                         return .{ .name = w, .nullable = false, .args = &.{} };
                     }
                 }
@@ -291,9 +251,7 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
             else => {},
         }
     }
-    // `a..b` is a range whose class follows from its endpoints. Named here
-    // because the range CLASSES exist (`IntRange`, `CharRange`, …) while the
-    // operator producing them is builtin with no declaration to read.
+    // The range classes exist while the operator producing them is builtin.
     if (arg.* == .Binary and arg.Binary.op == .Range) {
         if (argDeclTypeRefLazy(b, arg.Binary.lhs)) |lt| {
             if (!lt.nullable) {
@@ -305,17 +263,11 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
                 };
                 for (ranges) |rr| {
                     if (std.mem.eql(u8, lh, rr.e)) {
-                        // A USER class that shadows the builtin range's
-                        // simple name (`class IntRange`) must NOT capture
-                        // `1..2`'s members: typing the range as that name
-                        // would bind the user class's `contains` (an
-                        // unbounded recursion in `IntRange.contains =
-                        // (1..2).contains(a)`). Drop the static type so the
-                        // member dispatches dynamically to the builtin range
-                        // value. The stdlib's OWN range classes
-                        // (`kotlin.ranges.UIntRange`, ...) are legitimate and
-                        // keep their static type — the shadow guard fires
-                        // only for a non-`kotlin.` (program) class.
+                        // A user class shadowing a builtin range's simple name
+                        // must not capture `1..2`'s members, which would bind that
+                        // class's own `contains` and recurse; dropping the static
+                        // type dispatches dynamically. The stdlib's own range
+                        // classes keep their static type.
                         const shadow_cid = b.module.classIdIndexed(rr.r, b.self_package, arg.span().file) orelse b.module.classId(rr.r);
                         if (shadow_cid) |cid| {
                             if (cid.int() < b.module.classes.items.len) {
@@ -329,11 +281,7 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
             }
         }
     }
-    // `a / b` on a CLASS is an operator member, and its declared return is
-    // the answer: `val half = duration / 2` in the saturating-math helpers
-    // types `half` as Duration. The arithmetic arm beside this one promotes
-    // NUMERIC operands and declines everything else, so a class receiver
-    // reached no channel at all.
+    // `a / b` on a class is an operator member; its declared return is the answer.
     if (arg.* == .Binary) {
         const opname: ?[]const u8 = switch (arg.Binary.op) {
             .Add => "plus",
@@ -347,17 +295,14 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
             if (argDeclTypeRefLazy(b, arg.Binary.lhs)) |lt| {
                 if (!lt.nullable) {
                     var identity = std.mem.trimEnd(u8, lt.name, "?");
-                    if (std.mem.indexOfScalar(u8, identity, '<')) |ltp| identity = identity[0..ltp];
+                    if (std.mem.findScalar(u8, identity, '<')) |ltp| identity = identity[0..ltp];
                     const lh = typeHead(identity);
                     if (lh.len != 0 and !isPrimitiveTypeName(lh)) {
-                        // The operator member is chosen by the SAME engine that
-                        // dispatches it, with the rhs's own static type as the
-                        // argument evidence. A name+arity shortcut is wrong the
-                        // moment overloads diverge on return type
-                        // (`ValueTimeMark.minus(Duration): ValueTimeMark` vs
-                        // `minus(ValueTimeMark): Duration`); an unresolvable
-                        // overload set stays untyped rather than guessing.
-                        const owner_id = if (std.mem.indexOfScalar(u8, identity, '.') != null)
+                        // The operator member is chosen by the same engine that
+                        // dispatches it, with the rhs's static type as evidence.
+                        // A name-plus-arity shortcut breaks once overloads diverge
+                        // on return type, so an unresolvable set stays untyped.
+                        const owner_id = if (std.mem.findScalar(u8, identity, '.') != null)
                             b.module.classIdByFqn(identity)
                         else
                             b.module.uniqueClassIdBySimpleName(lh);
@@ -389,9 +334,7 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
             }
         }
     }
-    // `xs[i]` — the element of what `xs` indexes. Stated for the shapes that
-    // have no declaration to read (a CharSequence's Char, a primitive
-    // array's scalar) and taken from the sole type argument otherwise.
+    // The sole type argument, or a stated element where there is no declaration.
     if (arg.* == .Index and arg.Index.args.len == 1) {
         if (argDeclTypeRefLazy(b, arg.Index.receiver)) |rt| {
             if (!rt.nullable) {
@@ -422,10 +365,9 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
         if (b.localCallReturn(seg.name)) |ret| {
             return .{ .name = ret.name, .nullable = ret.nullable, .args = &.{} };
         }
-        // A unique concrete classifier with no same-named plain function is
-        // a constructor call, so its result head is statically authoritative.
-        // The conservative function gate leaves factory/class collisions for
-        // the ordinary call resolver instead of inventing a receiver type.
+        // A unique concrete classifier with no same-named plain function is a
+        // constructor call, so its result head is authoritative; collisions are
+        // left to the ordinary call resolver.
         if (b.resolve(seg.name) == null and !b.isLocalFn(seg.name) and
             !enclosingHasMemberNamed(b, seg.name))
         {
@@ -467,17 +409,12 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
             }
         }
     }
-    // A qualified object/class property read (`Nodes.Traversable`, parsed
-    // as a Member access on a bare class-name receiver): the registered
-    // per-class property type head is the argument's static type —
-    // `visitAncestors(Nodes.Traversable) { }` must resolve against
-    // `NodeKind`, not bind the sibling `(mask: Int, ...)` overload.
+    // A class-named receiver's property head is the static type.
     if (arg.* == .Member) {
         const recv = arg.Member.receiver;
-        // A SAFE read reaches its property through a nullable receiver and
-        // yields a nullable result: look the property up on the non-null
-        // owner and hand the `?` back. A plain read of a nullable receiver
-        // does not type-check at all, so it keeps declining.
+        // A safe read yields a nullable result, so look the property up on the
+        // non-null owner and hand the `?` back; a plain read of a nullable
+        // receiver keeps declining.
         const safe_read = arg.Member.safe;
         if (recv.* == .Path and recv.Path.segments.len == 1) {
             const owner = recv.Path.segments[0].name;
@@ -489,10 +426,9 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
                 }
             }
         }
-        // Resolve each property segment from its receiver's declared type so
-        // the final member call can use the shared declaration resolver. A
-        // receiver that is itself a CALL has no declared type to read; its
-        // resolved return is the same fact one step further along the chain.
+        // Resolve each property segment from its receiver's declared type, so the
+        // final member call can use the shared resolver; a call receiver has only
+        // a resolved return.
         var owned_recv: ?ir.TypeRef = null;
         defer if (owned_recv) |*t| t.deinit(b.allocator);
         const recv_ty_opt: ?ir.TypeRef = argDeclTypeRefLazy(b, recv) orelse blk: {
@@ -524,7 +460,6 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
     }
     if (arg.* != .Path) return null;
     const p = arg.Path;
-    // Same qualified property-read evidence for the two-segment Path form.
     if (p.segments.len == 2) {
         const owner = p.segments[0].name;
         if (owner.len != 0 and std.ascii.isUpper(owner[0]) and
@@ -533,9 +468,7 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
             if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = p.segments[1].name })) |head| {
                 return .{ .name = head, .nullable = false, .args = &.{} };
             }
-            // A class-named access reads the COMPANION's property
-            // (`Byte.MAX_VALUE.toLong()`): the head is recorded under the
-            // companion's lifted name.
+        // A class-named access reads the companion's property, under its lifted key.
             var cb: [96]u8 = undefined;
             if (std.fmt.bufPrint(&cb, "{s}$Companion", .{owner}) catch null) |ck| {
                 if (b.module.registry.class_prop_type_heads.get(.{ .a = ck, .b = p.segments[1].name })) |head| {
@@ -546,29 +479,20 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
         return null;
     }
     if (p.segments.len != 1) return null;
-    // An inlined function's parameters live in the caller builder, but their
-    // declared types belong to the spliced declaration rather than the
-    // caller's local-declaration table. Keep that source type as static
-    // applicability evidence while lowering the inline body. A spliced
-    // lambda argument deliberately skips this channel: its free names resolve
-    // in the caller scopes and may shadow a same-named inline parameter.
+    // An inlined function's parameters live in the caller builder while their
+    // declared types belong to the spliced declaration, so keep the source type as
+    // evidence. A spliced lambda argument skips this channel: its free names
+    // resolve in the caller scopes and may shadow a same-named inline parameter.
     if (b.lambda_splice_resolve == null or
         (b.resolve(p.segments[0].name) == null and
             !b.knowsOuter(p.segments[0].name)))
     {
-        // The spliced-caller-lambda skip exists for CALLER names that
-        // shadow an inline parameter. A name the caller WINDOW cannot see
-        // at all (`destination.append` inside filterIndexedTo's predicate
-        // splice — the window deliberately skips the inline fn's own
-        // scopes) can only mean the spliced parameter, so its declared
-        // source type stays as evidence.
+        // A name the caller window cannot see can only be the spliced parameter.
         if (b.spliceParamTy(p.segments[0].name)) |declared| {
             if (declared.function == null) {
-                // A declared head that is itself a TYPE PARAMETER of the
-                // spliced declaration (`destination: M`) names nothing the
-                // receiving scope can bind; the entry records the
-                // ARGUMENT's derived type under the local-decl channel
-                // below, and that concrete head must win.
+                // A declared head that is itself a type parameter of the spliced
+                // declaration names nothing here, so the argument's derived type
+                // under the local-decl channel wins.
                 const dh = declared.name.name;
                 const tp_head = ((dh.len > 0 and dh.len <= 2 and
                     std.ascii.isUpper(dh[0])) or b.isTypeParam(dh));
@@ -587,13 +511,9 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
         result.nullable = result.nullable or b.localDeclNullable(p.segments[0].name);
         return result;
     }
-    // A bare implicit-`this` property read: the name is the enclosing class's
-    // own `val`, not a local (`assertEquals(expected, decode(…))` where
-    // `expected` is a class-level property whose static type a sibling-driven
-    // reified inference needs). Resolve it against the receiver's own property
-    // table and QUALIFY a nested-class head through the enclosing scope so a
-    // reified `serializer<T>()` binds `Outer$Nested`, not a bare unresolvable
-    // name. A local would have won above.
+    // A bare implicit-`this` property read of the enclosing class's own `val`,
+    // resolved against the receiver's property table with a nested-class head
+    // qualified through the enclosing scope.
     {
         const rhead: ?[]const u8 = if (b.recvTypeRef()) |rt|
             typeHead(std.mem.trimEnd(u8, rt.name, "?"))
@@ -609,31 +529,23 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
         }
     }
     if (b.localInitExpr(p.segments[0].name)) |init| {
-        // Following a local's initializer can re-enter this local. Kotlin has
-        // no such cycle — a local cannot be initialized from one declared
-        // after it — but lowering re-asks from a later point in the block,
-        // where every local is already bound, so `val a = b.x` beside
-        // `val b = a.y` reaches itself and recurses until the stack ends.
-        // Refuse to re-enter a local already on the chain.
+        // Kotlin has no initializer cycle, since a local cannot be initialized
+        // from one declared after it, but lowering re-asks from a later point in
+        // the block where every local is bound, so mutually referencing inits
+        // recurse. Refuse to re-enter a local already on the chain.
         if (init != arg and pushInitChain(p.segments[0].name)) {
             defer popInitChain();
-            // The initializer is read in its DECLARATION scope: the local's
-            // own name was free there (recorded at the decl), so the init's
-            // bare calls must not see the binding that now exists at the
-            // READ point — `iterator.hasNext()` follows `val iterator =
-            // iterator()`, whose init resolves the RECEIVER member, never
-            // the local itself.
+        // The initializer is read in its declaration scope, where the local's own
+        // name was free, so its bare calls must not see the binding that exists at
+        // the read point.
             const prev_self = expr_mod.init_self_name;
             if (b.localInitNameFree(p.segments[0].name) and
                 !std.mem.eql(u8, runtime.envOnce("KLIO_INIT_SELF") orelse "1", "0"))
                 expr_mod.init_self_name = p.segments[0].name;
             defer expr_mod.init_self_name = prev_self;
             if (argDeclTypeRefLazy(b, init)) |inferred| return inferred;
-            // A MEMBER-call or elvis initializer needs the full derivation
-            // the lazy reader lacks (`val clause = findClause(x) ?:
-            // continue; val onCancellation = clause.create...(a, b)`), so a
-            // pass whose statement arm recorded nothing still types the
-            // shape. Depth-guarded with the on-demand counter.
+            // Depth-guarded: an elvis or member-call initializer needs the full
+            // derivation the lazy reader lacks.
             if (expr_mod.od_depth < 3) {
                 expr_mod.od_depth += 1;
                 defer expr_mod.od_depth -= 1;
@@ -641,22 +553,18 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
             }
         }
     }
-    // The full declared type wins over its head: `items[0].tag()` and
-    // `for (i in items)` need the ARGUMENTS the head throws away.
+    // The full declared type wins over its head, which throws the arguments away.
     if (staticBareReceiverTypeRef(b, p.segments[0].name)) |full| return full;
     if (staticBareReceiverType(b, p.segments[0].name)) |head| {
         return .{ .name = head, .nullable = false, .args = &.{} };
     }
-    // A bare class name used as a value is its companion object: carry the
-    // owner class's head as type evidence so `install(RoutingRoot, ...)`
-    // cannot bind an overload whose parameter is an unrelated object type.
+    // A bare class name used as a value is its companion object.
     const nm = p.segments[0].name;
     if (b.resolve(nm) == null and !b.knowsOuter(nm) and b.module.classId(nm) != null) {
         return .{ .name = nm, .nullable = false, .args = &.{} };
     }
-    // A bare read of a TOP-LEVEL property carries its declared type head
-    // (`asserter.assertEquals(...)` resolves against `Asserter`): the same
-    // scoping walk a bare call ranks by picks the declaration.
+    // A top-level property read carries its declared type head, picked by the same
+    // scoping walk a bare call ranks by.
     if (b.resolve(nm) == null and !b.knowsOuter(nm) and !enclosingHasMemberNamed(b, nm)) {
         const file = p.segments[0].span.file;
         const pkg = b.module.packageOfFile(file) orelse b.self_package;
@@ -668,9 +576,7 @@ pub fn argDeclTypeRefLazyUncached(b: *FuncBuilder, arg: *const Expr) ?ir.TypeRef
     return null;
 }
 
-/// Locals whose initializer the declared-type walk is currently inside, so it
-/// can refuse to re-enter one. Bounded: past the cap the walk simply stops
-/// deriving, which is the same answer a null type already stands for.
+/// Locals whose initializer the walk is inside, so it refuses to re-enter one.
 var init_chain: [16][]const u8 = @splat(&.{});
 pub var init_chain_len: usize = 0;
 
@@ -690,8 +596,8 @@ pub fn popInitChain() void {
 
 pub fn staticTypeClassId(b: *const FuncBuilder, ty: ir.TypeRef) ?ir.ClassId {
     var identity = std.mem.trimEnd(u8, ty.name, "?");
-    if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
-    return if (std.mem.indexOfScalar(u8, identity, '.') != null)
+    if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+    return if (std.mem.findScalar(u8, identity, '.') != null)
         b.module.classIdByFqn(identity)
     else
         b.module.uniqueClassIdBySimpleName(typeHead(identity));
@@ -748,7 +654,7 @@ pub fn staticDispatchReceiverTypeRef(
         }
     }
     const lexical = b.ownerClass() orelse return null;
-    const lexical_id = if (std.mem.indexOfScalar(u8, lexical, '.') != null)
+    const lexical_id = if (std.mem.findScalar(u8, lexical, '.') != null)
         b.module.classIdByFqn(lexical)
     else
         b.module.classIdIndexed(lexical, b.self_package, caller_file);
@@ -759,17 +665,13 @@ pub fn staticDispatchReceiverTypeRef(
     return try ownedClassSelfType(b.allocator, lexical_class);
 }
 
-/// `val x = Foo()` — a constructor call names its own type, so no return-type
-/// derivation is needed at all. These reach the census as `no_func`: the callee
-/// resolves to a CLASS rather than to a function.
+/// A constructor call names its own type, so no return derivation is needed.
 pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!?ir.TypeRef {
     if (init_expr.* != .Call) return null;
     const call = init_expr.Call;
-    // `Inner.Deep(2)` — a nested class constructed through its OWN enclosing
-    // class name. The bare form (`Inner(1)`) resolves through the lexical
-    // nested-class walk; the qualified one reached no class at all, so the
-    // value it constructs had no type and every call on it resolved by name.
-    // `HexFormat.Builder` builds `BytesHexFormat.Builder` exactly this way.
+    // A nested class constructed through its own enclosing class name; the bare
+    // form resolves through the lexical nested-class walk, the qualified one
+    // reached no class at all.
     if (call.callee.* == .Member and call.callee.Member.receiver.* == .Path and
         call.callee.Member.receiver.Path.segments.len == 1)
     {
@@ -793,9 +695,8 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
                 if (b.module.classIdByQualifiedSuffix(qualified)) |ncid| {
                     if (ncid.int() < b.module.classes.items.len) {
                         const ncls = &b.module.classes.items[ncid.int()];
-                        // A class declared in a file whose bodies have not
-                        // lowered yet is still a header row (`is_stub`); the
-                        // constructed type is its name all the same.
+                        // A class whose bodies have not lowered is still a header
+                        // row; the constructed type is its name.
                         if (!ncls.is_object and !ncls.is_value and !ncls.is_abstract) {
                             return ir.TypeRef{
                                 .name = try b.allocator.dupe(u8, ncls.name),
@@ -812,14 +713,10 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
     const ident = call.callee.Path.segments[0];
     const citr_trace = if (runtime.envOnce("KLIO_CITR_TRACE")) |w| std.mem.eql(u8, w, ident.name) else false;
     if (citr_trace) std.debug.print("[citr] {s} enter\n", .{ident.name});
-    // A LOCAL class registers only at runtime (`RegisterClass` with its
-    // captures): no lowering-time row exists, and the module index would
-    // answer an unrelated same-named class — the resolve() bail below
-    // already catches it (the declaration binds the name), noted here so
-    // the local-class tail is not re-probed as a missed lookup.
-    // A LOCAL CLASS constructor call: the lowering-time typing record's
-    // mangled head (its registered supertype chain proves extension
-    // applicability; the runtime RegisterClass binding stays the ctor).
+    // A local class registers only at runtime, with its captures, so no
+    // lowering-time row exists and the module index would answer an unrelated
+    // same-named class. The typing record's mangled head proves extension
+    // applicability; the runtime binding stays the ctor.
     if (build.isLocalClassInScope(ident.name)) {
         var lc_buf: [160]u8 = undefined;
         if (std.fmt.bufPrint(&lc_buf, "{s}$lc{s}", .{ ident.name, build.currentRealFn() orelse "" }) catch null) |key| {
@@ -829,7 +726,6 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
             }
         }
     }
-    // A local or a function of the same name is not a constructor call.
     if (b.resolve(ident.name) != null or b.knowsOuter(ident.name)) {
         if (citr_trace) std.debug.print("[citr] {s} bail=local_or_outer\n", .{ident.name});
         return null;
@@ -838,38 +734,28 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
         if (citr_trace) std.debug.print("[citr] {s} bail=func_namesake\n", .{ident.name});
         return null;
     }
-    // A collision-mangled internal class (`SlotTable$fN`) is absent from the
-    // simple-name index. A same-file/package reference reaches it through
-    // the scope rename ladder; a cross-package one through its exact import,
-    // which still resolves by FQN.
-    // Inside a splice's argument binding the callee frame is already
-    // pushed: a nested class written in the CALLER (`listOf(B(1))` as a
-    // reified argument) renames through the caller's lexical owner.
+    // A collision-mangled internal class is absent from the simple-name index: a
+    // same-package reference reaches it through the scope rename ladder, a
+    // cross-package one through its exact import. Inside a splice's argument
+    // binding the callee frame is pushed, so renaming uses the caller's owner.
     const ref_name = scopeTypeRenameFrom(b, inline_call.spliceLexicalOwner() orelse b.ownerClass(), ident.name, ident.span.file.int()) orelse ident.name;
     const cid = b.module.classIdIndexed(ref_name, b.self_package, ident.span.file) orelse
         b.module.classIdExactImport(ident.name, ident.span.file) orelse {
         if (citr_trace) std.debug.print("[citr] {s} bail=no_class ref_name={s}\n", .{ ident.name, ref_name });
         return null;
     };
-    // A MEMBER of the enclosing receiver shadows the constructor, exactly as
-    // the emission router decides it (`fun Foo(): Bar` inside Host makes a
-    // bare `Foo()` the member call). Typing the local as the class here bound
-    // later calls against the wrong receiver class.
+    // A member of the enclosing receiver shadows the constructor, as the emission
+    // router decides it.
     if (enclosingHasMemberNamed(b, ident.name) and !classNestedInEnclosing(b, cid)) {
         if (citr_trace) std.debug.print("[citr] {s} bail=enclosing_member_shadow owner={s}\n", .{ ident.name, b.ownerClass() orelse "-" });
         return null;
     }
     if (cid.int() >= b.module.classes.items.len) return null;
     const class = &b.module.classes.items[cid.int()];
-    // A STUB generic class constructed positionally (`Triple("1", 2, x)`,
-    // `Pair(a, b)`): its header lists no primary parameters, so each type
-    // argument binds from the argument at its position when the counts
-    // line up — the reified consumer of the local needs `Triple<String,
-    // Int, Box<Int>>`, not the bare head.
+    // A positionally constructed stub generic lists no primary parameters, so each
+    // type argument binds from the argument at its position.
     if (citr_trace) std.debug.print("[citr] {s} class={s} stub={} tps={d} pps={d} nargs={d}\n", .{ ident.name, class.fqn, class.is_stub, class.type_params.len, class.primary_params.len, call.args.len });
-    // `Array(size) { init }`: the element type is the initializer
-    // lambda's tail expression (kotlinc infers `Array<Box<String>>` from
-    // `Array(1) { Box("foo") }`).
+    // `Array(size) { init }`: the element type is the lambda's tail expression.
     if (std.mem.eql(u8, class.fqn, "kotlin.Array") and call.type_args.len == 0 and call.args.len == 2 and
         call.args[1] == .Lambda and call.args[1].Lambda.body.stmts.len != 0)
     {
@@ -880,7 +766,7 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
             if (citr_trace) std.debug.print("[citr] Array elem={?s}\n", .{if (try staticExprTypeRef(b, &tail.Expr)) |e| e.name else null});
             if (try staticExprTypeRef(b, &tail.Expr)) |elem| {
                 var eh = std.mem.trimEnd(u8, elem.name, "?");
-                if (std.mem.indexOfScalar(u8, eh, '<')) |lt| eh = eh[0..lt];
+                if (std.mem.findScalar(u8, eh, '<')) |lt| eh = eh[0..lt];
                 const bare_tp = (eh.len > 0 and eh.len <= 2 and std.ascii.isUpper(eh[0])) or
                     b.isTypeParam(eh) or ir.parseClassTypeParamIdentity(eh) != null;
                 if (eh.len != 0 and !bare_tp) {
@@ -909,7 +795,7 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
                 break;
             };
             var bh = std.mem.trimEnd(u8, bt.name, "?");
-            if (std.mem.indexOfScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
+            if (std.mem.findScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
             const bare_tp = (bh.len > 0 and bh.len <= 2 and std.ascii.isUpper(bh[0])) or
                 b.isTypeParam(bh) or ir.parseClassTypeParamIdentity(bh) != null;
             if (bh.len == 0 or bare_tp) {
@@ -934,7 +820,7 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
         }
         return null;
     }
-    // An object is not constructed; a stub or value class has no instance
+    // An object is not constructed, and a stub or value class has no instance
     // identity for a member call to bind against.
     if (class.is_object or class.is_stub or class.is_value) return null;
     var args = try b.allocator.alloc(ir.TypeRef, call.type_args.len);
@@ -942,12 +828,9 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
     for (call.type_args, args) |*ty, *out| {
         out.* = try decl_mod.loweredTypeRef(b.allocator, ty, true);
     }
-    // With no explicit `<...>`, a generic class's arguments infer from the
-    // CONSTRUCTOR arguments (kotlinc's inference): a primary param declared
-    // bare `E` takes its argument's own type; one declared `X<..., E, ...>`
-    // takes the argument's type argument at that position when the arities
-    // line up. Every class parameter must bind or the head-only refusal
-    // below stands.
+    // With no explicit `<...>` a generic class's arguments infer from the
+    // constructor arguments: a param declared bare `E` takes its argument's own
+    // type, one declared `X<..., E, ...>` its argument's type argument there.
     if (args.len == 0 and class.type_params.len != 0 and call.args.len != 0) infer: {
         const inferred = try b.allocator.alloc(ir.TypeRef, class.type_params.len);
         var got: usize = 0;
@@ -983,7 +866,7 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
                 break :infer;
             };
             var bh = std.mem.trimEnd(u8, bt.name, "?");
-            if (std.mem.indexOfScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
+            if (std.mem.findScalar(u8, bh, '<')) |lt| bh = bh[0..lt];
             const bare_tp = (bh.len > 0 and bh.len <= 2 and std.ascii.isUpper(bh[0])) or
                 b.isTypeParam(bh) or ir.parseClassTypeParamIdentity(bh) != null;
             if (bh.len == 0 or bare_tp) {
@@ -1010,44 +893,33 @@ pub fn ctorInitTypeRef(b: *FuncBuilder, init_expr: *const Expr) Allocator.Error!
     return derived;
 }
 
-/// The element type a `for (x in xs)` binds `x` to: the sole type ARGUMENT of
-/// the iterable's declared type. A loop variable has no initializer to derive
-/// from and is one of the three shapes making up the `no_initializer` census
-/// bucket, alongside a lambda parameter and a destructured component.
-///
-/// Conservative on purpose. A head with any argument count other than one is
-/// not an element sequence this can read, and an argument that is still a type
-/// PARAMETER names nothing — committing to it would disprove candidates a null
-/// type leaves open.
+/// The element type a `for (x in xs)` binds `x` to: the sole type argument of the
+/// iterable's declared type. Conservative on purpose, since committing to a bare
+/// type parameter would disprove candidates a null type leaves open.
 pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Error!?ir.TypeRef {
     var owned: ?ir.TypeRef = null;
     defer if (owned) |*t| t.deinit(b.allocator);
     var ty: ir.TypeRef = blk: {
         if (argDeclTypeRef(b, iter)) |known| break :blk known;
-        // The LAZY channel serves `this` (the splice window's full
-        // receiver) — `for (element in this)` inside the associateWithTo
-        // splice iterates List<String>, and the ladder below never
-        // reached it. Borrowed, like argDeclTypeRef's answer.
+        // The lazy channel serves `this`, the window's full receiver. Borrowed.
         if (argDeclTypeRefLazy(b, iter)) |lazy_known| break :blk lazy_known;
         owned = (try staticCallReturnTypeRef(b, iter)) orelse
             (try staticExprTypeRef(b, iter)) orelse return null;
         break :blk owned.?;
     };
-    // A type-parameter head resolves through its full bound ref: iterating
-    // a `T : Iterable<String>` receiver binds String elements.
+    // A type-parameter head resolves through its bound: `T : Iterable<String>`
+    // binds String elements.
     {
         var h0 = std.mem.trimEnd(u8, ty.name, "?");
-        if (std.mem.indexOfScalar(u8, h0, '<')) |lt| h0 = h0[0..lt];
+        if (std.mem.findScalar(u8, h0, '<')) |lt| h0 = h0[0..lt];
         if (ty.args.len == 0) {
             if (b.typeParamBoundRef(typeHead(h0))) |bref| ty = bref.*;
         }
     }
-    // Char sequences iterate Chars by their iterator, not by a type
-    // argument — `for (element in this)` inside `CharSequence.all`'s
-    // spliced body is the live case.
+    // Char sequences iterate Chars by their iterator, not by a type argument.
     {
         var h = std.mem.trimEnd(u8, ty.name, "?");
-        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+        if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
         h = typeHead(h);
         if (std.mem.eql(u8, h, "CharSequence") or std.mem.eql(u8, h, "String") or
             std.mem.eql(u8, h, "StringBuilder"))
@@ -1058,7 +930,6 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
                 .args = &.{},
             }).clone(b.allocator);
         }
-        // Primitive arrays iterate their scalar kind the same way.
         const prim_arrays = [_]struct { a: []const u8, e: []const u8 }{
             .{ .a = "BooleanArray", .e = "Boolean" }, .{ .a = "ByteArray", .e = "Byte" },
             .{ .a = "ShortArray", .e = "Short" },     .{ .a = "IntArray", .e = "Int" },
@@ -1076,10 +947,8 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
                 }).clone(b.allocator);
             }
         }
-        // Ranges and progressions carry their element in the CLASS NAME, not
-        // in a type argument, so the `args.len == 1` path below cannot reach
-        // them: `for (i in lastIndex downTo 1)` left `i` untyped and every
-        // call taking `i` unproven.
+    // Ranges and progressions carry their element in the class name, so the
+    // single-argument path below cannot reach them.
         const progressions = [_]struct { p: []const u8, e: []const u8 }{
             .{ .p = "IntRange", .e = "Int" },               .{ .p = "LongRange", .e = "Long" },
             .{ .p = "CharRange", .e = "Char" },             .{ .p = "UIntRange", .e = "UInt" },
@@ -1100,39 +969,30 @@ pub fn iterableElementTypeRef(b: *FuncBuilder, iter: *const Expr) Allocator.Erro
     if (ty.args.len != 1) return null;
     var elem = ty.args[0].name;
     // Declaration-site variance is spelling, not structure: the element of
-    // `Array<out Array<out T>>` is the inner Array, not a name the head
-    // tables could ever hold.
+    // `Array<out Array<out T>>` is the inner Array.
     if (std.mem.startsWith(u8, elem, "in#")) elem = elem[3..];
     if (std.mem.startsWith(u8, elem, "out#")) elem = elem[4..];
     if (elem.len == 0) return null;
-    // A STAR projection's element is `Any?` — the projection's own upper
-    // bound, which is what Kotlin resolves a call on it against.
-    // `Collection<*>` is how the stdlib's own `orderedHashCode` and
-    // `unorderedHashCode` take their argument, and their loop variables had
-    // no type at all.
+    // A star projection's element is `Any?`, its own upper bound.
     if (std.mem.eql(u8, elem, "*")) {
         return try (ir.TypeRef{ .name = "Any", .nullable = true, .args = &.{} }).clone(b.allocator);
     }
     if (ty.args[0].nullable) return null;
-    // A bare type-PARAMETER element is carried, not discarded, when the
-    // scope records a bound for it: a generic body is lowered once with no
-    // call site to read an instantiation from, and its parameter's declared
-    // upper bound is what Kotlin resolves such a call against. Without a
-    // bound record the head still names nothing and the old answer stands.
+    // A bare type-parameter element is carried when the scope records a bound: a
+    // generic body lowers once with no call site, and the declared upper bound is
+    // what Kotlin resolves against.
     if (elem.len <= 2 and std.ascii.isUpper(elem[0])) {
         if (b.typeParamBound(elem) == null) return null;
         return try cloneElemStripped(b, &ty.args[0], elem);
     }
     var head = elem;
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.module.classIdByFqn(head) == null and
         b.module.uniqueClassIdBySimpleName(typeHead(head)) == null) return null;
     return try cloneElemStripped(b, &ty.args[0], elem);
 }
 
-/// Clone the element type with the variance mangle stripped from its NAME —
-/// the checks above judged the stripped spelling, and every consumer keys
-/// heads by it.
+/// Clone the element type with the variance mangle stripped; consumers key by it.
 fn cloneElemStripped(b: *FuncBuilder, arg: *const ir.TypeRef, stripped: []const u8) Allocator.Error!ir.TypeRef {
     var out = try arg.clone(b.allocator);
     if (!std.mem.eql(u8, out.name, stripped)) {
@@ -1149,16 +1009,12 @@ pub fn iterableElementTypeName(b: *FuncBuilder, iter: *const Expr) Allocator.Err
     return try b.allocator.dupe(u8, elem.name);
 }
 
-/// Every resolution arm that needs an operand's type asks for it again, so a
-/// chain of infix calls (`a and 1 + b and 1 + ...`) re-typed its whole left
-/// operand once per arm: 24 terms cost 20M type queries and 17s of lowering.
-/// One outermost query now types each subexpression once. The memo lives only
-/// for that query — builder state (splice windows, narrowed locals) cannot
-/// change while it runs, and the stamp below drops the memo if it does.
+/// Memo for one outermost type query, so a chain of infix calls types each
+/// subexpression once. It lives only for that query: builder state cannot change
+/// while it runs, and the stamp below drops the memo if it does.
 const TyMemo = struct {
     map: std.AutoHashMapUnmanaged(u64, ?ir.TypeRef) = .{},
-    /// Lazy answers are BORROWED (the deriver returns registry/AST slices
-    /// without cloning), so this map never frees what it holds.
+    /// Lazy answers are borrowed slices, so this map never frees what it holds.
     lazy: std.AutoHashMapUnmanaged(u64, ?ir.TypeRef) = .{},
     owner: ?*FuncBuilder = null,
     stamp: u64 = 0,
@@ -1166,8 +1022,7 @@ const TyMemo = struct {
 };
 threadlocal var ty_memo: TyMemo = .{};
 
-/// The memo outlives any one function build, so its own storage comes from a
-/// process-lifetime allocator instead of the builder's arena.
+/// The memo outlives any one function build, so its storage is process-lifetime.
 fn memoAlloc() std.mem.Allocator {
     return std.heap.smp_allocator;
 }
@@ -1257,8 +1112,7 @@ pub fn staticExprTypeRef(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.Ty
     return r;
 }
 
-/// Memo entry point for the call-return deriver, which several arms re-enter
-/// on the same subexpression.
+/// Memo entry point for the call-return deriver, re-entered on the same subexpression.
 pub fn tyMemoCall(b: *FuncBuilder, e: *const Expr) ?TyMemoHit {
     return tyMemoGet(b, e, 1);
 }
@@ -1270,8 +1124,7 @@ pub fn tyMemoCallLeave(b: *FuncBuilder, owns: bool, e: *const Expr, r: ?ir.TypeR
 }
 
 fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
-    // Literals name their own type (`var result = 0` is an Int wherever
-    // the var is read, including across a capture boundary).
+    // Literals name their own type, including across a capture boundary.
     switch (e.*) {
         .IntLit => |lit| return .{ .name = try b.allocator.dupe(u8, switch (lit.kind) {
             .Long => "Long",
@@ -1286,9 +1139,7 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
         else => {},
     }
     if (argDeclTypeRef(b, e)) |known| {
-        // A bare TYPE-PARAMETER answer for an implicit property read
-        // (`expected: T` on a `Ctx<Map<K, V>>` receiver) substitutes the
-        // receiver's instantiation instead of stopping at `T`.
+        // A bare type-parameter answer substitutes the receiver's instantiation.
         const kh = typeHead(std.mem.trimEnd(u8, known.name, "?"));
         const bare_k = (kh.len > 0 and kh.len <= 2 and std.ascii.isUpper(kh[0])) or
             b.isTypeParam(kh) or ir.parseClassTypeParamIdentity(kh) != null;
@@ -1305,8 +1156,7 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                     break :blk2 .{ .name = head, .nullable = false, .args = &.{} };
                 };
                 const dh = typeHead(std.mem.trimEnd(u8, declared.name, "?"));
-                // The declared type IS the owner's parameter: map it by
-                // position under the receiver's instantiation.
+                // The declared type is the owner's parameter, mapped by position.
                 if (bareTypeParamHead(dh) and declared.args.len == 0) {
                     const cid = (b.module.uniqueClassIdBySimpleName(rh) orelse
                         b.module.classIdByFqn(rh)) orelse break :sub_head;
@@ -1330,10 +1180,8 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                 }
             }
         }
-        // A generic CONSTRUCTOR call the eager typer answers head-only
-        // (`Triple("1", 2, x)` as `kotlin.Triple`): the constructor
-        // derivation instantiates the arguments the reified consumer of
-        // the local needs.
+        // A generic constructor call the eager typer answers head-only; the ctor
+        // derivation instantiates the arguments a reified consumer needs.
         if (e.* == .Call and known.args.len == 0) {
             if (try ctorInitTypeRef(b, e)) |t| {
                 if (t.args.len != 0) return t;
@@ -1345,9 +1193,7 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
     }
     if (try ctorInitTypeRef(b, e)) |t| return t;
     if (try staticCallReturnTypeRef(b, e)) |t| return t;
-    // `lhs ?: <jump>` carries the lhs type made NON-null: `val clause =
-    // findClause(x) ?: continue` types `clause` as the call's declared
-    // return without its `?` — the jump arm never produces a value.
+    // `lhs ?: <jump>` carries the lhs type made non-null; the jump yields nothing.
     if (e.* == .Binary and e.Binary.op == .Elvis) {
         const bin = e.Binary;
         if (try staticExprTypeRef(b, bin.lhs)) |lhs_ty| {
@@ -1359,13 +1205,10 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                 },
                 else => {},
             }
-            // A value rhs makes the result the JOIN of both branches, not
-            // the lhs type: `pendingPausedComposition?.pausableApplier ?:
-            // applier` is an `Applier<*>`, and typing it as the final lhs
-            // class devirtualizes member calls to bodies the runtime
-            // receiver overrides. When one branch's type subsumes the
-            // other, the supertype side is the result; unrelated heads
-            // yield no static type (dynamic dispatch is always sound).
+            // A value rhs makes the result the join of both branches, not the lhs
+            // type, which would devirtualize member calls to bodies the runtime
+            // receiver overrides. Where one branch subsumes the other the supertype
+            // wins; unrelated heads yield no static type.
             out.nullable = false;
             const lhs_head = typeHead(std.mem.trimEnd(u8, out.name, "?"));
             if (try staticExprTypeRef(b, bin.rhs)) |rhs_ty| {
@@ -1391,34 +1234,26 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
             return out;
         }
     }
-    // Shapes that name their own type outright. Each one is exact — the cast
-    // states the type, `this` is the enclosing class, a predicate operator
-    // yields Boolean — and each was reaching the call sites below with no
-    // receiver type at all, which is what forces a runtime name walk.
+    // Shapes that name their own type outright.
     self_named: {
         switch (e.*) {
-            // `x as T` / `x as? T` — the cast IS the answer; `as?` carries the
-            // null the safe form can produce.
+            // The cast is the answer; `as?` carries the null the safe form produces.
         .As => |cast| {
             var out = try decl_mod.loweredTypeRef(b.allocator, &cast.ty, true);
             if (cast.safe) out.nullable = true;
             return out;
         },
-        // An object EXPRESSION with a single supertype has that supertype
-        // as its denotable static type (kotlinc: `object : List<String> by
-        // coll {}` is a List<String> everywhere outside the literal). More
-        // than one supertype is the anonymous intersection — refused.
+        // A single supertype is the object expression's denotable static type;
+        // more than one is the anonymous intersection.
         .ObjectExpr => |obj| {
-            // A bare `object {}` with no supertype: its denotable type
-            // outside the literal is `Any` (the marker-object idiom —
-            // `(object {}).let { ... }` must splice like any receiver).
+            // A bare `object {}` has denotable type `Any` outside the literal.
             if (obj.supertypes.len == 0) {
                 return .{ .name = try b.allocator.dupe(u8, "Any"), .nullable = false, .args = &.{} };
             }
             if (obj.supertypes.len != 1) break :self_named;
             var out = try decl_mod.loweredTypeRef(b.allocator, &obj.supertypes[0], true);
             var h = std.mem.trimEnd(u8, out.name, "?");
-            if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+            if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
             const bare = (h.len > 0 and h.len <= 2 and std.ascii.isUpper(h[0])) or
                 ir.parseClassTypeParamIdentity(h) != null;
             if (h.len == 0 or bare) {
@@ -1427,17 +1262,13 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
             }
             return out;
         },
-        // `this` (or `this@Outer`) inside a class body, an extension body,
-        // or an inline splice window.
         .This => |this_e| {
             if (this_e.qualifier) |q| {
                 if (b.module.uniqueClassIdBySimpleName(q.name) != null) {
                     return .{ .name = try b.allocator.dupe(u8, q.name), .nullable = false, .args = &.{} };
                 }
-                // A FUNCTION-labeled `this@thenBy` names an enclosing
-                // receiver the tower records with its label — including
-                // the inline-splice window's receiver, which the tower
-                // collection now carries into closure bodies.
+                // A function-labeled `this@f` names an enclosing receiver the tower
+                // records with its label, splice windows included.
                 for (b.implicit_receiver_tower.items) |entry| {
                     if (entry.label) |lbl| {
                         if (std.mem.eql(u8, lbl, q.name)) {
@@ -1445,12 +1276,9 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                         }
                     }
                 }
-                // `this@<ownFn>` inside the function's own body (through
-                // any spliced receiver-lambda window) is the declared
-                // extension receiver — WITH its type arguments, so an
-                // overload rank on the labeled value keeps its element
-                // knowledge (`putAll(this@toMap)` must pick the
-                // Iterable-of-pairs extension, not a sibling).
+                // `this@<ownFn>` inside the function's own body is the declared
+                // extension receiver, with its type arguments, so an overload rank
+                // keeps its element knowledge.
                 if (build.currentRealFn()) |rf| {
                     if (std.mem.eql(u8, rf, q.name)) {
                         if (b.recvTypeRef()) |declared| return try declared.clone(b.allocator);
@@ -1461,9 +1289,8 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                 }
                 return null;
             }
-            // The declared extension receiver, then the splice window's
-            // ACTUAL receiver (`this.fill(...)` inside an IntArray splice),
-            // then the enclosing class.
+            // Declared extension receiver, then the splice window's actual
+            // receiver, then the enclosing class.
             if (b.recvTypeRef()) |declared| return try declared.clone(b.allocator);
             if (b.spliceRecvTyRef()) |art| return try art.clone(b.allocator);
             if (b.spliceRecvTy()) |head| {
@@ -1474,11 +1301,9 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
             }
             return null;
         },
-        // A conditional's type is the type its branches AGREE on. Kotlin's
-        // answer is their least upper bound, which needs the full hierarchy;
-        // this takes the exact case — every branch derives the same head —
-        // which is what a member call on the local needs and is never a
-        // widening. A branch whose type is unknown declines the whole shape.
+        // A conditional's type is what its branches agree on. Kotlin's answer is
+        // their least upper bound; this takes the exact case, every branch deriving
+        // the same head, which is never a widening.
         .If => |iff| {
             const else_e = iff.else_branch orelse return null;
             const t_then = (try staticExprTypeRef(b, iff.then_branch)) orelse return null;
@@ -1509,11 +1334,8 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
             .Eq, .Neq, .IdentEq, .IdentNeq, .Lt, .Le, .Gt, .Ge, .In, .NotIn, .And, .Or => {
                 return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} };
             },
-            // Arithmetic over the BUILT-IN numeric types has a type Kotlin
-            // fixes by promotion, so `(hi - lo).toLong()` reaches its member
-            // call with a known receiver instead of none. Only both-sides-
-            // known, non-nullable primitives qualify; anything else falls
-            // through to the operator-method derivation below.
+            // Kotlin fixes built-in numeric arithmetic by promotion; only
+            // both-sides-known non-nullable primitives qualify.
             .Add, .Sub, .Mul, .Div, .Rem => {
                 var lhs_owned = try staticExprTypeRef(b, bin.lhs);
                 defer if (lhs_owned) |*t| t.deinit(b.allocator);
@@ -1529,12 +1351,9 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
         },
         .Unary => |un| switch (un.op) {
             .Not => return .{ .name = try b.allocator.dupe(u8, "Boolean"), .nullable = false, .args = &.{} },
-            // `-x` / `+x` keep the operand's type.
             .Neg, .Pos => return try staticExprTypeRef(b, un.expr),
             else => {},
         },
-        // `x!!` is the operand's type made NON-null (`val step =
-        // nextStep!!` on a `Continuation<Unit>?` property).
         .Postfix => |pf| if (pf.op == .NotNull) {
             var t = (try staticExprTypeRef(b, pf.expr)) orelse break :self_named;
             t.nullable = false;
@@ -1545,12 +1364,9 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
             }
             return t;
         },
-        // A bare name that reads an ENCLOSING class or companion property
-        // lends its declared type: `payload shl bitsPerSymbol` inside a
-        // Base64 member needs the companion const to answer Int before the
-        // Binary promotion above can type the operation. Locals were
-        // consulted first (argDeclTypeRef), and a same-named local WITHOUT
-        // a type must keep shadowing — Kotlin resolves the local.
+        // A bare name reading an enclosing class or companion property lends its
+        // declared type. Locals were consulted first, and a same-named local
+        // without a type keeps shadowing, since Kotlin resolves the local.
         .Path => |p| {
             if (p.segments.len != 1) break :self_named;
             const nm = p.segments[0].name;
@@ -1560,15 +1376,13 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
             }
             if (b.resolve(nm) != null or b.isLocalFn(nm) or b.knowsOuter(nm)) break :self_named;
             if (b.ownerClass()) |owner| {
-                // The full-ref table records only arg-carrying declared
-                // types; a scalar property (`const val bitsPerSymbol: Int`)
-                // lives in the HEAD table.
+                // The full-ref table records only arg-carrying declared types.
                 if (propTypeRefOn(b, owner, nm)) |t| return try t.clone(b.allocator);
                 if (b.module.registry.class_prop_type_heads.get(.{ .a = owner, .b = nm })) |head| {
                     return .{ .name = try b.allocator.dupe(u8, head), .nullable = false, .args = &.{} };
                 }
-                // The companion's properties are in scope in the class body;
-                // they record under the lifted `{Owner}$Companion` key.
+                // Companion properties are in scope in the class body, recorded
+                // under the lifted `{Owner}$Companion` key.
                 var ckey_buf: [160]u8 = undefined;
                 if (std.fmt.bufPrint(&ckey_buf, "{s}$Companion", .{owner})) |ckey| {
                     if (propTypeRefOn(b, ckey, nm)) |t| return try t.clone(b.allocator);
@@ -1577,10 +1391,8 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                     }
                 } else |_| {}
             }
-            // A property of the IMPLICIT receiver — the declared receiver
-            // or the splice window — with a type-parameter head chased to
-            // its declared bound: `entries` inside the apply-spliced
-            // onEachIndexed body reads `Map<out K, V>.entries`.
+            // A property of the implicit receiver, with a type-parameter head
+            // chased to its bound.
             impl: {
                 const h0 = b.recvTy() orelse b.spliceRecvTy() orelse break :impl;
                 var hh = typeHead(std.mem.trimEnd(u8, h0, "?"));
@@ -1596,14 +1408,12 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                         bound_full = bref;
                         hh = typeHead(std.mem.trimEnd(u8, bref.name, "?"));
                     } else if (b.typeParamBound(hh)) |tpb| {
-                        // Head-only bound record: the head still names the
-                        // property's owner for the head-table answer.
+                        // Head-only bound record: the head still names the owner.
                         hh = typeHead(std.mem.trimEnd(u8, tpb.bound, "?"));
                     } else if (b.enclosingRecvTy()) |eh2| {
                         // The lambda's own receiver head may be the spliced
-                        // callee's literal param (apply's `T` inside
-                        // `M.onEachIndexed`); the ENCLOSING receiver's head
-                        // carries the real parameter and its bound.
+                        // callee's literal param, while the enclosing receiver's
+                        // head carries the real parameter and its bound.
                         const hh2 = typeHead(std.mem.trimEnd(u8, eh2, "?"));
                         if (b.typeParamBoundRef(hh2)) |bref2| {
                             bound_full = bref2;
@@ -1616,10 +1426,9 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                             hh = implBoundScan(b, nm) orelse break :impl;
                         }
                     } else {
-                        // The window's head names a param with no recorded
-                        // bound at all: the UNIQUE in-scope bound whose
-                        // class declares the property is the receiver
-                        // (`entries` under `M : Map<out K, V>`).
+                        // The window's head names a param with no recorded bound,
+                        // so the unique in-scope bound whose class declares the
+                        // property is the receiver.
                         hh = implBoundScan(b, nm) orelse break :impl;
                     }
                 }
@@ -1641,9 +1450,8 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                     }
                 }
             }
-            // A TOP-LEVEL property read lends its recorded declared type
-            // under the caller's own scope tiers (`DAYS_PER_CYCLE` inside
-            // the ofEpochDay run block).
+            // A top-level property read lends its declared type under the caller's
+            // own scope tiers.
             if (b.module.topLevelPropTypeRef(nm, b.self_package, p.segments[0].span.file)) |t| {
                 return try t.clone(b.allocator);
             }
@@ -1655,10 +1463,8 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
             }
             break :self_named;
         },
-        // A CLASS-NAMED member read: `TimeSource.Monotonic` (a nested
-        // OBJECT, whose type is its own qualified class) or a companion
-        // property (`Formats.iso`), which the class-prop head tables
-        // record under the lifted companion key.
+        // A class-named member read: a nested object, or a companion property under
+        // the lifted companion key.
         .Member => |m| {
             if (m.safe) break :self_named;
             const recv_p = m.receiver;
@@ -1667,11 +1473,9 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                 b.knowsOuter(recv_p.Path.segments[0].name) or
                 b.module.uniqueClassIdBySimpleName(recv_p.Path.segments[0].name) == null)
             {
-                // Not a class-named read: a PROPERTY READ on any receiver
-                // the deriver can type answers the property's recorded
-                // declared type (`this@Duration.absoluteValue`), with the
-                // owner's parameters substituted from the receiver's own
-                // arguments where both sides carry them.
+                // Not a class-named read: a property read on any typeable receiver
+                // answers the property's declared type, with the owner's
+                // parameters substituted from the receiver's arguments.
                 if (expr_mod.od_depth >= 3) break :self_named;
                 expr_mod.od_depth += 1;
                 const recv_owned = staticExprTypeRef(b, m.receiver) catch null;
@@ -1679,7 +1483,7 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
                 var rt = recv_owned orelse break :self_named;
                 defer rt.deinit(b.allocator);
                 var rh = std.mem.trimEnd(u8, rt.name, "?");
-                if (std.mem.indexOfScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
+                if (std.mem.findScalar(u8, rh, '<')) |lt| rh = rh[0..lt];
                 const head = typeHead(rh);
                 if (head.len == 0) break :self_named;
                 if (runtime.envOnce("KLIO_IMPLPROP_TRACE")) |w| {
@@ -1726,10 +1530,9 @@ fn staticExprTypeRefUncached(b: *FuncBuilder, e: *const Expr) Allocator.Error!?i
     return try localInitTypeRef(b, e);
 }
 
-/// The declared return type of a nullary member on a known receiver type, with
-/// the receiver's own type arguments substituted in. This is what a
-/// DESTRUCTURED component needs: `for ((a, b) in xs)` binds each name to the
-/// element's `componentN()`, so each one's type is that accessor's return type.
+/// The declared return type of a nullary member on a known receiver type, with the
+/// receiver's type arguments substituted in. This is what a destructured
+/// component needs, each name binding to the element's `componentN()`.
 pub fn nullaryMemberReturnTypeRef(
     b: *FuncBuilder,
     recv: ir.TypeRef,
@@ -1738,9 +1541,9 @@ pub fn nullaryMemberReturnTypeRef(
 ) Allocator.Error!?ir.TypeRef {
     const trace = runtime.envOnce("KLIO_COMP_TRACE") != null;
     var identity = std.mem.trimEnd(u8, recv.name, "?");
-    if (std.mem.indexOfScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
+    if (std.mem.findScalar(u8, identity, '<')) |lt| identity = identity[0..lt];
     if (identity.len == 0) return null;
-    const owner = (if (std.mem.indexOfScalar(u8, identity, '.') != null)
+    const owner = (if (std.mem.findScalar(u8, identity, '.') != null)
         b.module.classIdByFqn(identity)
     else
         b.module.uniqueClassIdBySimpleName(typeHead(identity))) orelse {
@@ -1757,9 +1560,8 @@ pub fn nullaryMemberReturnTypeRef(
         .actual_type_param_bounds = owned_bounds orelse &.{},
         .receiver_type = recv,
     });
-    // A deferred resolution that still names one declaration is enough here:
-    // this reads a RETURN TYPE, not a dispatch commitment, and an override
-    // may only narrow it.
+    // A deferred resolution naming one declaration suffices: this reads a return
+    // type, not a dispatch commitment, and an override may only narrow it.
     const target = resolved.target orelse {
         if (trace) std.debug.print("[comp] {s}.{s} no target applicable={} methods={d}\n", .{
             identity,
@@ -1782,11 +1584,9 @@ pub fn nullaryMemberReturnTypeRef(
         if (trace) std.debug.print("[comp] {s}.{s} no return type\n", .{ identity, name });
         return null;
     };
-    // A return type left as the owner's own type PARAMETER names no class —
-    // the receiver was written without its arguments. Committing to it would
-    // disprove candidates a null type leaves open.
+    // A return type left as the owner's own type parameter names no class.
     var head = std.mem.trimEnd(u8, out.name, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.module.classIdByFqn(head) == null and
         b.module.uniqueClassIdBySimpleName(typeHead(head)) == null)
     {

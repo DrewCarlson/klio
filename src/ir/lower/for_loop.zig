@@ -1,5 +1,4 @@
-//! `for (x in xs) body` loop lowering. Free functions over the shared
-//! `FuncBuilder`; filled in alongside the expression dispatch.
+//! `for (x in xs) body` loop lowering, over the shared `FuncBuilder`.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -45,24 +44,21 @@ pub fn lowerForLabeled(
     body: *const Expr,
     label: ?[]const u8,
 ) Allocator.Error!Reg {
-    // COUNTED-RANGE strength reduction: `for (i in a until b)` and
-    // `for (i in a..b)` over same-typed Int/Long operands lower to a plain
-    // register loop — no Range object, no iterator, no virtual protocol
-    // calls per iteration. The iterator form dominated the interpreter's
-    // loop profile (two CallVirtuals per iteration plus the range fields).
-    // `KLIO_COUNTED=0` restores the iterator lowering for bisection.
+    // Counted-range strength reduction: `for (i in a until b)` and `for (i in a..b)`
+    // over same-typed Int/Long operands lower to a plain register loop, with no Range
+    // object, iterator, or virtual protocol call per iteration. `KLIO_COUNTED=0`
+    // restores the iterator lowering.
     if (vars.len == 1 and !by_name and !destructured and countedEnabled()) counted: {
         var lo_e: ?*const Expr = null;
         var hi_e: ?*const Expr = null;
         var inclusive = false;
-        // `a downTo b`: start at `a`, step -1, inclusive `b` — the same
+        // `a downTo b` starts at `a` with step -1 and inclusive `b`: the same
         // equality-exit loop with the compare and step reversed.
         var descending = false;
-        // `… step k` with a positive INT-LITERAL k: the same equality-exit
-        // register loop with the exit bound snapped to the progression's
-        // real last element (`lo ± ((span / k) * k)`). A non-literal step
-        // keeps the iterator lowering (the step-positive throw and the
-        // dynamic last belong to the progression object).
+        // `… step k` with a positive Int-literal k is the same loop with the exit
+        // bound snapped to the progression's real last element. A non-literal step
+        // keeps the iterator lowering, its step-positive throw and dynamic last
+        // belonging to the progression object.
         var step_lit: i64 = 1;
         var iter_shape = iter;
         if (iter.* == .Call) {
@@ -80,8 +76,8 @@ pub fn lowerForLabeled(
                         std.mem.eql(u8, ic.callee.Path.segments[0].name, "downTo"),
                     else => false,
                 };
-                // The floorMod shift below adds k to a |x| < k value; cap
-                // the literal so that sum cannot wrap even in Int domain.
+                // The floorMod shift below adds k to a |x| < k value, so cap the
+                // literal to keep that sum from wrapping.
                 if (inner_counted and c.args[1].IntLit.value <= (1 << 30)) {
                     step_lit = c.args[1].IntLit.value;
                     iter_shape = inner;
@@ -119,17 +115,16 @@ pub fn lowerForLabeled(
                         break :blk;
                     }
                 }
-                // A call whose STATIC type is a range still counts (below).
+                // A call whose static type is a range still counts, below.
             },
             else => {},
         }
         if (step_lit != 1 and lo_e == null) break :counted;
         var is_int = false;
         var is_long = false;
-        // Char ranges run the same register loop: Char comparisons order by
-        // code and `Char +/- Int` yields Char, so the induction register
-        // holds real Char values. The step-snap arithmetic is Int-only, so
-        // a stepped char progression keeps the iterator lowering.
+        // Char ranges run the same register loop: Char comparisons order by code and
+        // `Char +/- Int` yields Char. The step-snap arithmetic is Int-only, so a
+        // stepped char progression keeps the iterator lowering.
         var is_char = false;
         if (lo_e != null) {
             var lo_ty = (expr.staticExprTypeRef(b, lo_e.?) catch null) orelse break :counted;
@@ -142,18 +137,14 @@ pub fn lowerForLabeled(
             if ((!is_int and !is_long and !is_char) or lo_ty.nullable or hi_ty.nullable) break :counted;
             if (is_char and step_lit != 1) break :counted;
         } else {
-            // TYPE-DRIVEN prong: any iterable whose static type is a
-            // non-nullable IntRange/LongRange (a hoisted `val`, a
-            // range-returning call, `list.indices`) iterates
-            // `[first, last]` step 1 by construction — read the two
-            // bounds once and run the same register loop. Progressions
-            // (`downTo`, `step`, `reversed`) type as IntProgression and
-            // keep the iterator lowering.
+            // Type-driven prong: an iterable whose static type is a non-nullable
+            // IntRange or LongRange iterates `[first, last]` step 1 by construction.
+            // Progressions type as IntProgression and keep the iterator lowering.
             var ity = (expr.staticExprTypeRef(b, iter) catch null) orelse break :counted;
             defer ity.deinit(b.allocator);
             if (ity.nullable) break :counted;
             var head = ity.name;
-            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
+            if (std.mem.findScalarLast(u8, head, '.')) |d| head = head[d + 1 ..];
             is_int = std.mem.eql(u8, head, "IntRange");
             is_long = std.mem.eql(u8, head, "LongRange");
             is_char = std.mem.eql(u8, head, "CharRange");
@@ -184,16 +175,13 @@ pub fn lowerForLabeled(
             try b.emitConst(.{ .Long = step_lit })
         else
             try b.emitConst(.{ .Int = @intCast(step_lit) });
-        // With a step above 1, the equality exit must hit the
-        // progression's real LAST element. kotlinc's overflow-free form
-        // (getProgressionLastElement): the bounds only enter modulo-k
-        // arithmetic, never a wide subtraction —
+        // With a step above 1 the equality exit must hit the progression's real last
+        // element. kotlinc's overflow-free `getProgressionLastElement` keeps the
+        // bounds in modulo-k arithmetic rather than a wide subtraction:
         //   asc:  last = hi - floorMod(hi % k - lo % k, k)
         //   desc: last = hi + floorMod(lo % k - hi % k, k)
-        // floorMod(x, k) for |x| < k is ((x + k) % k); the step-literal
-        // cap above keeps x + k in range. The header's emptiness check
-        // keeps the ORIGINAL bound (the snapped last is meaningless when
-        // the range is empty).
+        // `floorMod(x, k)` for |x| < k is `((x + k) % k)`, and the step cap keeps
+        // `x + k` in range. The header's emptiness check keeps the original bound.
         var eq_bound = hi;
         if (step_lit != 1) {
             const hi_mod = b.allocReg();
@@ -227,12 +215,10 @@ pub fn lowerForLabeled(
         const exit = try b.allocBlock();
         b.terminate(.{ .Goto = header });
 
-        // ENTRY check once. The INCLUSIVE form must terminate at
-        // `hi == MAX_VALUE`, where increment-then-compare would wrap and
-        // spin — so its per-iteration exit is an EQUALITY check before the
-        // increment (`i == hi` → done, else `i < hi` so `i + 1` cannot
-        // overflow). The exclusive form's `i < hi` compare is
-        // overflow-free as is.
+        // The entry check runs once. The inclusive form must terminate at
+        // `hi == MAX_VALUE`, where increment-then-compare would wrap, so its exit is
+        // an equality check before the increment: `i == hi` is done, else `i < hi`
+        // and `i + 1` cannot overflow. The exclusive form's compare is safe as is.
         b.switchTo(header);
         const cond = b.allocReg();
         try b.push(.{ .BinOp = .{
@@ -251,8 +237,8 @@ pub fn lowerForLabeled(
             .nullable = false,
             .args = &.{},
         });
-        // `continue` re-enters at the per-iteration EXIT CHECK, never the
-        // body or the increment.
+        // `continue` re-enters at the per-iteration exit check, never the body or
+        // the increment.
         try b.pushLoop(label, tail_blk, exit);
         _ = try lowerExpr(b, body);
         b.popLoop();
@@ -284,13 +270,10 @@ pub fn lowerForLabeled(
     const it_reg = b.allocReg();
     const zero = b.allocReg();
     try b.push(.{ .Move = .{ .dst = zero, .src = recv } });
-    // Static protocol binding: when the iterable's `iterator()` return
-    // resolves to the `Iterator` INTERFACE itself, `hasNext`/`next` emit
-    // slot-bound against its roots — the runtime serves those by FuncId
-    // (`iterator_protocol` for host iterators, the override slot for
-    // interpreted implementors). A convention-based custom iterator (any
-    // `operator hasNext/next` without the interface) keeps the by-name
-    // form, exactly as before.
+    // Static protocol binding: when the iterable's `iterator()` return resolves to
+    // the `Iterator` interface itself, `hasNext` and `next` emit slot-bound against
+    // its roots, which the runtime serves by FuncId. A convention-based iterator
+    // with no interface keeps the by-name form.
     var hn_root: ?ir.FuncId = null;
     var next_root: ?ir.FuncId = null;
     var iter_ext_fid: ?ir.FuncId = null;
@@ -299,12 +282,12 @@ pub fn lowerForLabeled(
         var ity = ity0;
         defer ity.deinit(b.allocator);
         const file = vars[0].span.file;
-        // The receiver's own MEMBER `iterator()` binds through its virtual
-        // slot (an IntRange for-loop no longer walks the name each entry).
+    // The receiver's own member `iterator()` binds through its virtual slot, so a
+    // range for-loop no longer walks the name on each entry.
         {
             var rhead = std.mem.trimEnd(u8, ity.name, "?");
-            if (std.mem.indexOfScalar(u8, rhead, '<')) |lt| rhead = rhead[0..lt];
-            const rcid = (if (std.mem.indexOfScalar(u8, rhead, '.') != null)
+            if (std.mem.findScalar(u8, rhead, '<')) |lt| rhead = rhead[0..lt];
+            const rcid = (if (std.mem.findScalar(u8, rhead, '.') != null)
                 b.module.classIdByFqn(rhead)
             else
                 b.module.uniqueClassIdBySimpleName(rhead));
@@ -315,8 +298,7 @@ pub fn lowerForLabeled(
                     if (it_decls.len != 0) {
                         iter_root = it_decls[0];
                     } else {
-                        // Inherited member (IntRange's iterator lives on
-                        // IntProgression): the resolver chases supers.
+                        // An inherited member: the resolver chases supers.
                         const resolved = b.module.resolveMemberCall(cid, "iterator", &.{}, .{
                             .caller_file = file,
                             .lexical_owner = null,
@@ -328,28 +310,23 @@ pub fn lowerForLabeled(
                 }
             }
         }
-        // A member `iterator()` first; a receiver served only by the
-        // UNIQUE top-level extension (`CharSequence.iterator():
-        // CharIterator`) binds through its declared return the same way,
-        // and the `iterator()` invocation itself binds to that extension.
+        // A member `iterator()` first; a receiver served only by the unique top-level
+        // extension binds through its declared return the same way.
         if ((try expr.nullaryMemberReturnTypeRef(b, ity, "iterator", file)) orelse
             (try expr.extensionNullaryReturnTypeRef(b, ity, "iterator", &iter_ext_fid))) |irt0|
         {
             var irt = irt0;
             defer irt.deinit(b.allocator);
             var head = std.mem.trimEnd(u8, irt.name, "?");
-            if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
-            if (std.mem.lastIndexOfScalar(u8, head, '.')) |d| head = head[d + 1 ..];
-            // The interface itself, or a primitive-iterator abstract class
-            // (`ByteIterator`): `hasNext` roots on the interface; `next`
-            // prefers the head class's own override (whose source body
-            // delegates to the `nextByte()`-family the protocol handler
-            // serves) and falls back to the interface root.
+            if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
+            if (std.mem.findScalarLast(u8, head, '.')) |d| head = head[d + 1 ..];
+            // The interface itself, or a primitive-iterator abstract class: `hasNext`
+            // roots on the interface, while `next` prefers the head class's own
+            // override, which delegates to the `nextByte()`-family.
             const iterator_family = std.mem.eql(u8, head, "Iterator") or
                 (std.mem.endsWith(u8, head, "Iterator") and blk_fam: {
-                    // The kotlin.collections primitive-iterator family ONLY:
-                    // a pack class that happens to end in `Iterator`
-                    // (compose's path iterators) has its own dispatch story.
+                    // The kotlin.collections primitive-iterator family only; a pack
+                    // class ending in `Iterator` has its own dispatch story.
                     const cid = b.module.uniqueClassIdBySimpleName(head) orelse break :blk_fam false;
                     if (cid.int() >= b.module.classes.items.len) break :blk_fam false;
                     break :blk_fam std.mem.startsWith(u8, b.module.classes.items[cid.int()].fqn, "kotlin.collections.");
@@ -474,8 +451,7 @@ pub fn lowerForLabeled(
             std.debug.print("[forvar] {s} elem=null iter_tag={s} fn={s} splice={s}\n", .{ vars[0].name, @tagName(std.meta.activeTag(iter.*)), build.currentRealFn() orelse "-", b.spliceRecvTy() orelse "-" });
         }
     } else if (by_name) {
-        // `for ((val k, val v) in xs)`: each name reads its property off the
-        // element.
+        // `for ((val k, val v) in xs)`: each name reads its property off the element.
         for (vars, 0..) |v, i| {
             const dst = b.allocReg();
             const field = try b.module.internConst(b.allocator, .{ .String = sources[i].name });
@@ -484,13 +460,13 @@ pub fn lowerForLabeled(
             try b.bind(v.name, dst);
         }
     } else {
-        // Each destructured name is bound to the element's `componentN()`, so
-        // its type is that accessor's declared return type on the element.
+        // Each destructured name binds to the element's `componentN()`, so its type
+        // is that accessor's declared return on the element.
         var elem_ty = try expr.iterableElementTypeRef(b, iter);
         defer if (elem_ty) |*t| t.deinit(b.allocator);
         for (vars, 0..) |v, i| {
-            // A bare positional `_` skips its `componentN()` call entirely
-            // (kotlinc never invokes the accessor for a discarded slot).
+            // A bare positional `_` skips its `componentN()` call, as kotlinc never
+            // invokes the accessor for a discarded slot.
             if (stmt_mod.isUnderscorePlaceholder(v)) continue;
             const comp = b.allocReg();
             const comp_name = try std.fmt.allocPrint(b.allocator, "component{d}", .{i + 1});

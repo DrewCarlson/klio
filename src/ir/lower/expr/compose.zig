@@ -24,12 +24,10 @@ const allNull = bare_call_mod.allNull;
 const tests_shapes_mod = @import("tests_shapes.zig");
 const Module = tests_shapes_mod.Module;
 
-/// The constructor-call half of the P12 shape repair: for each lambda
-/// argument bound to a primary-constructor parameter with a declared
-/// composable arity, re-shape it against that arity (inserting the implicit
-/// `it` a bare-pair-shaped sink lambda dropped). Alignment mirrors
-/// `ctorArgFnArities`: an unnamed trailing lambda binds the last
-/// function-typed parameter; leading positionals map 1:1 when unnamed.
+/// The constructor-call half of the shape repair: for each lambda argument bound
+/// to a primary-constructor parameter with a declared composable arity, re-shape
+/// it against that arity, inserting the implicit `it` a bare-pair-shaped sink
+/// lambda dropped. Alignment mirrors `ctorArgFnArities`.
 pub fn transformCtorComposableArgs(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!void {
     if (args.len == 0) return;
     for (args) |*a| if (a.* == .Spread) return;
@@ -62,11 +60,9 @@ pub fn transformCtorComposableArgs(b: *FuncBuilder, class_id: ir.ClassId, args: 
     }
 }
 
-/// `argFnArities` for a constructor call: the per-argument expected lambda
-/// arity from the class's primary-constructor parameters. A `T.() -> R`
-/// receiver-lambda parameter reports arity 0 so the lambda drops its `it` and
-/// resolves bare members through the receiver bound at invocation (the same as
-/// a function-call argument).
+/// `argFnArities` for a constructor call: the per-argument expected lambda arity
+/// from the class's primary-constructor parameters. A `T.() -> R` receiver-lambda
+/// parameter reports arity 0 so the lambda drops its `it`.
 pub fn ctorArgFnArities(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!?[]i16 {
     if (args.len == 0) return null;
     for (args) |*a| if (a.* == .Spread) return null;
@@ -76,10 +72,8 @@ pub fn ctorArgFnArities(b: *FuncBuilder, class_id: ir.ClassId, args: []const Exp
     for (out) |*o| o.* = -1;
     const trailing_lambda = args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun;
     if (trailing_lambda) {
-        // An unnamed trailing lambda binds the LAST function-typed parameter
-        // (intervening defaulted/named params are skipped) — find it and take
-        // its arity, so `Op(desc, named = x) { member() }` still detects the
-        // receiver lambda.
+        // An unnamed trailing lambda binds the last function-typed parameter,
+        // intervening defaulted or named params being skipped.
         var pi = params.len;
         while (pi > 0) : (pi -= 1) {
             if (fnTypeArityAlias(b, params[pi - 1].ty)) |ar| {
@@ -97,13 +91,9 @@ pub fn ctorArgFnArities(b: *FuncBuilder, class_id: ir.ClassId, args: []const Exp
     return out;
 }
 
-/// When an unnamed trailing lambda binds a constructor's function-typed
-/// parameter that sits *after* one or more defaulted parameters (`Op("d") {…}`
-/// for `Op(d: String, flag: Boolean = true, f: C.() -> Unit)`), positional
-/// binding would put the lambda in the defaulted slot. Returns an arg-name
-/// vector that names the trailing lambda with the function parameter so the
-/// named-arg constructor path realigns it (the gap params take their defaults).
-/// Null when no realignment is needed.
+/// An arg-name vector naming the trailing lambda with its function parameter, so
+/// the named-arg constructor path realigns a lambda that positional binding would
+/// put in a preceding defaulted slot. Null when no realignment is needed.
 pub fn ctorRealignedArgNames(b: *FuncBuilder, class_id: ir.ClassId, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!?[]?[]const u8 {
     if (args.len == 0 or !allNull(arg_names)) return null;
     if (!(args[args.len - 1] == .Lambda or args[args.len - 1] == .AnonFun)) return null;
@@ -130,11 +120,10 @@ pub fn ctorRealignedArgNames(b: *FuncBuilder, class_id: ir.ClassId, args: []cons
     return out;
 }
 
-/// Resolve a source-shaped call first, then retry with the hidden Compose ABI
-/// only when the current function has a real threaded composer and ordinary
-/// Kotlin resolution found no target. The retry must itself select a
-/// declaration whose lowered signature proves the synthetic pair; this keeps
-/// same-name non-composable overloads on the ordinary path.
+/// Resolve a source-shaped call first, then retry with the hidden Compose ABI only
+/// when the current function has a real threaded composer and ordinary Kotlin
+/// resolution found no target. The retry must itself select a declaration whose
+/// lowered signature proves the synthetic pair.
 pub fn resolveCallWithComposerAbi(
     b: *FuncBuilder,
     name: []const u8,
@@ -250,11 +239,10 @@ fn sameDeclSig(a: ir.Module.DeclSig, b: ir.Module.DeclSig) bool {
     return true;
 }
 
-/// Whether the declaration selected during lowering has the transformed
-/// Compose call ABI. A reserved declaration header retains the source
-/// parameter list while its body-carrying sibling owns the synthetic tail, so
-/// match that sibling by the canonical declaration signature rather than by
-/// simple name.
+/// Whether the declaration selected during lowering has the transformed Compose
+/// call ABI. A reserved declaration header retains the source parameter list while
+/// its body-carrying sibling owns the synthetic tail, so match that sibling by the
+/// canonical declaration signature rather than by simple name.
 pub fn selectedCallHasComposerAbi(module: *const Module, func_id: FuncId, f: *const Func) bool {
     if (hasThreadedComposerParams(f)) return true;
     for (f.annotation_names) |ann| {
@@ -307,11 +295,10 @@ pub fn hasComposerArgPair(names: []const ?[]const u8) bool {
         std.mem.eql(u8, changed_name, "$changed");
 }
 
-/// Complete the exact selected Compose ABI from the current lowered scope.
-/// The AST pass normally supplies this pair, but a cross-pack caller may have
-/// been transformed before the callee joined its simple-name oracle. The
-/// selected declaration and the synthesized `$composer` binding are direct
-/// evidence, so emission can still produce the same static call.
+/// Complete the exact selected Compose ABI from the current lowered scope. The AST
+/// pass normally supplies this pair, but a cross-pack caller may have been
+/// transformed before the callee joined its simple-name oracle; the selected
+/// declaration and the synthesized `$composer` binding are direct evidence.
 pub fn selectedCallArgsForBuilder(
     b: *FuncBuilder,
     func_id: FuncId,
@@ -375,14 +362,12 @@ pub fn selectedCallArgsForBuilder(
 }
 
 /// The `$changed` value for a lowering-completed composable call: per-arg
-/// certainty bits at the RESOLVED callee's triple positions (3 bits per
-/// value param above the forced bit, kotlinc's layout). A literal argument
-/// is STATIC (`0b110 << 3i`, a compile-time constant of the site); a bare
-/// forward of one of the caller's own value params recombines the caller's
-/// live `$dirty` triple into the callee position, so the callee's guarded
-/// probe (`if ($changed and (0b110 << 3i) == 0)`) skips and its slot is
-/// never taken — the drop from klio's 22 slots to kotlinc's 18 on the
-/// checkboxLike anchor. Everything else claims nothing.
+/// certainty bits at the resolved callee's triple positions, 3 bits per value
+/// param above the forced bit, in kotlinc's layout. A literal argument is static
+/// (`0b110 << 3i`); a bare forward of one of the caller's own value params
+/// recombines the caller's live `$dirty` triple into the callee position, so the
+/// callee's guarded probe skips and its slot is never taken. Everything else
+/// claims nothing.
 fn composeChangedBits(
     b: *FuncBuilder,
     f: *const Func,
@@ -423,11 +408,9 @@ fn composeChangedBits(
             .IntLit, .BoolLit, .CharLit, .FloatLit, .NullLit => {
                 const_bits |= @as(i64, 6) << @intCast(3 * triple);
             },
-            // `$composer.cache(false, { … })` — the plugin's memo of a
-            // ZERO-capture lambda: the cached instance never invalidates,
-            // so the argument is static exactly like kotlinc's lifted
-            // singleton lambda; the callee's changedInstance probe (and
-            // its slot) is unnecessary.
+            // `$composer.cache(false, { … })` is the plugin's memo of a
+            // zero-capture lambda, whose cached instance never invalidates, so the
+            // argument is static exactly like kotlinc's lifted singleton lambda.
             .Call => |cc| {
                 if (cc.callee.* == .Member and std.mem.eql(u8, cc.callee.Member.name.name, "cache") and
                     cc.args.len >= 1 and cc.args[0] == .BoolLit and !cc.args[0].BoolLit.value)
@@ -437,17 +420,16 @@ fn composeChangedBits(
             },
             .Path => |p| fwd: {
                 if (p.segments.len != 1) break :fwd;
-                // A lifted memo singleton is a permanent instance — static.
+                // A lifted memo singleton is a permanent instance, so static.
                 if (std.mem.startsWith(u8, p.segments[0].name, "$klio$memo$")) {
                     const_bits |= @as(i64, 6) << @intCast(3 * triple);
                     break :fwd;
                 }
                 if (!caller_dirty) break :fwd;
                 const nm = p.segments[0].name;
-                // A DEFAULTED caller param was renamed `p$arg` by the plugin
-                // and the body reads the prologue local `p` — its triple is
-                // still live (the probe reads the resolved value; a taken
-                // default sets the same-bit), so it forwards like any other.
+                // A defaulted caller param was renamed `p$arg` by the plugin and
+                // the body reads the prologue local `p`; its triple is still live,
+                // so it forwards like any other.
                 var renamed_default = false;
                 const j = for (b.compose_value_params, 0..) |*cp2, k| {
                     if (std.mem.eql(u8, cp2.name.name, nm)) break k;
@@ -462,9 +444,9 @@ fn composeChangedBits(
                 if (j >= 9) break :fwd;
                 const cp = &b.compose_value_params[j];
                 if (cp.is_vararg) break :fwd;
-                // A body local shadowing the param name would misattribute
-                // the triple; only a binding that is still the parameter's
-                // own (or its defaults-prologue local) may recombine.
+                // A body local shadowing the param name would misattribute the
+                // triple, so only a binding still the parameter's own, or its
+                // defaults-prologue local, may recombine.
                 if (!renamed_default and !b.isParam(nm)) break :fwd;
                 const sp = call_span;
                 const dirty_ref = try composeBitsPath(b.allocator, "$dirty", sp);
@@ -584,10 +566,10 @@ fn transformSelectedComposableArgs(
                 );
             }
         }
-        // The synthetic slot count comes from the RESOLVED parameter: its
-        // declared arity plus, for a non-inline sink, the receiver/context
-        // slots the value protocol flattens in front (an inline sink
-        // splices with the receiver bound as `this`, no slot).
+        // The synthetic slot count comes from the resolved parameter: its declared
+        // arity plus, for a non-inline sink, the receiver and context slots the
+        // value protocol flattens in front. An inline sink splices with the
+        // receiver bound as `this`, taking no slot.
         const expected_slots: u8 = if (f.is_inline)
             expected
         else

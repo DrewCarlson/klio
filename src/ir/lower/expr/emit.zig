@@ -73,17 +73,9 @@ const expected_mod = @import("expected.zig");
 const applyExpectedLiteralKindsToArgs = expected_mod.applyExpectedLiteralKindsToArgs;
 const spliceReifiedTypeArgs = expected_mod.spliceReifiedTypeArgs;
 
-/// The argument expressions a tailrec self-call re-binds the parameters
-/// from: the receiver first when the function carries an implicit `this`,
-/// the written arguments placed by name where the call names them, then
-/// the defaults of the parameters the call omits (Kotlin evaluates them in
-/// parameter order after the given arguments). Null when an omitted
-/// parameter has no default here (an override inheriting one): that call
-/// stays a call. Caller frees.
-/// Lower a tail jump's arguments in Kotlin's evaluation order — the written
-/// arguments as written, then the omitted parameters' defaults in parameter
-/// order — and lay the values out by parameter slot for `TailJump`. Null
-/// when the call cannot become a jump.
+/// Lower a tail jump's arguments in Kotlin's evaluation order, written arguments
+/// first and then omitted parameters' defaults in parameter order, laid out by
+/// parameter slot. Null when the call cannot become a jump.
 pub fn emitTailJumpRun(b: *FuncBuilder, receiver: ?*const Expr, args: []const Expr, arg_names: []const ?[]const u8) Allocator.Error!?[2]Reg {
     const params = b.tailrecParams();
     const lead: usize = if (receiver != null) 1 else 0;
@@ -142,8 +134,7 @@ fn tailJumpArgs(b: *FuncBuilder, receiver: ?*const Expr, args: []const Expr, arg
         any_named = true;
     };
     if (!any_named and args.len > params.len) {
-        // More arguments than declared parameters (a vararg): keep them as
-        // written.
+        // More arguments than declared parameters (a vararg): keep as written.
         const all = try b.allocator.alloc(Expr, lead + args.len);
         if (receiver) |r| all[0] = r.*;
         for (args, 0..) |arg, i| all[lead + i] = arg;
@@ -181,11 +172,9 @@ fn tailJumpArgs(b: *FuncBuilder, receiver: ?*const Expr, args: []const Expr, arg
     return all;
 }
 
-/// The `Call` emit form: a resolved bare-name static call. A committed
-/// non-extension target lowers to a direct `Call` (or a `TailCallFunc` in a
-/// tailrec body); an extension target routes through `emitExtBareCall`, which
-/// prepends `this`. `resolveCall` has already decided this is a static call, so
-/// the member-vs-global walk lives in `emitMemberOrGlobal`, not here.
+/// The `Call` emit form: a resolved bare-name static call, lowering to a direct
+/// `Call` or a `TailCallFunc`. An extension target routes through
+/// `emitExtBareCall`, which prepends `this`.
 pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
     if (runtime.envOnce("KLIO_EMIT_TRACE") != null) {
@@ -206,8 +195,7 @@ pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: b
     defer _ = b.setCallTrailingLambda(prev_trailing);
 
     // The committed target is overload-precise, so its receiver-function
-    // parameter types are authoritative even when the source callee is an
-    // alias with no same-named entry in the function index.
+    // parameter types are authoritative even for an alias callee.
     if (b.module.funcById(func_id)) |f| {
         const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, recv_off);
@@ -232,7 +220,7 @@ pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: b
             };
             return emitExtBareCall(b, expr, func_id, this_reg, was_cast);
         }
-        // No `this` in scope — fall through to the unmodified Call below.
+        // No `this` in scope: fall through to the unmodified Call below.
     }
 
     const callee_is_tailrec = blk: {
@@ -241,8 +229,7 @@ pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: b
         }
         break :blk false;
     };
-    // Only a call in tail position is a tail call: `return 1 + f(x - 1)`
-    // recurses and adds.
+    // Only a call in tail position is a tail call: `return 1 + f(x - 1)` adds.
     if (b.tail_call_ok and b.tailrecSelf() != null and callee_is_tailrec and allNull(ast_arg_names)) {
         const run = try lowerArgRun(b, args);
         b.terminate(.{ .TailCallFunc = .{ .func = func_id, .args = run[0], .n_args = run[1] } });
@@ -250,10 +237,8 @@ pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: b
         b.switchTo(dead);
         return b.emitConst(.Unit);
     }
-    // A bare call a runtime implicit receiver could shadow is routed by
-    // `resolveCall` to the `CallMemberOrGlobal` emit form (`emitMemberOrGlobal`),
-    // never here: reaching `emitCall` means the resolver already committed to the
-    // static call, so this emitter only ever emits the direct `Call`.
+    // `resolveCall` routes a call a runtime receiver could shadow to
+    // `emitMemberOrGlobal`, so the static call is already committed here.
     const arg_arity: ?[]const i16 = blk: {
         if (b.module.funcById(func_id)) |f| {
             const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
@@ -299,10 +284,8 @@ pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: b
         const f = b.module.funcById(func_id) orelse break :blk null;
         const recv_off: usize = if (f.params.len != 0 and
             std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-        // A MEMBER-form call to an extension carries its receiver in the
-        // callee: derive it so the lambda's params instantiate
-        // (`dropped.associateWith { name -> ... }` on a DERIVED local left
-        // the slot at bare `T`; the annotated form already bound String).
+        // A member-form call to an extension carries its receiver in the callee,
+        // so derive it and let the lambda's params instantiate.
         const recv_ptr: ?*const ir.TypeRef = rp: {
             if (recv_off != 1) break :rp null;
             const ce = expr.Call.callee;
@@ -325,12 +308,9 @@ pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: b
         deinitArgLambdaParamTypes(b.allocator, types);
     b.pending_arg_lambda_param_types = lambda_param_types;
     const run = try lowerArgRunFull(b, args, arg_arity, param_ty_names);
-    // A trailing lambda always binds the target's last (function-typed)
-    // parameter. When a vararg parameter precedes it, positional binding
-    // would otherwise pack the lambda into the vararg and leave the last
-    // parameter unfilled (Kotlin forbids a positional argument after a
-    // vararg, so the trailing lambda is the only filler). Name the lambda
-    // to the last parameter so the runtime binds it correctly.
+    // A trailing lambda always binds the target's last, function-typed parameter.
+    // With a vararg before it, positional binding would pack the lambda into the
+    // vararg, since Kotlin forbids a positional argument after a vararg.
     const arg_names = try trailingLambdaArgNames(b, func_id, args, ast_arg_names);
     var type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
     if (type_args.len == 0) {
@@ -350,12 +330,9 @@ pub fn emitCall(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: b
     return dst;
 }
 
-/// The `CallMember` emit form: a resolved extension bound on the implicit
-/// `this` with member precedence — a member of the receiver outranks the
-/// same-named top-level extension. Routes through `emitExtBareCall`, which
-/// selects the static-receiver `CallMember` (or, for a vararg trailing-lambda
-/// gap / cast, the prepended static `Call`). With no `this` in scope the bind
-/// degrades to the static `Call` of `emitCall`.
+/// The `CallMember` emit form: a resolved extension bound on the implicit `this`
+/// with member precedence. Routes through `emitExtBareCall`; with no `this` in
+/// scope it degrades to `emitCall`.
 pub fn emitCallMember(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     if (try resolveThisForBareCall(b)) |this_reg0| {
         const this_reg = blk: {
@@ -370,15 +347,9 @@ pub fn emitCallMember(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_c
     return emitCall(b, expr, func_id, was_cast);
 }
 
-/// The receiver a BARE call to member `name` actually dispatches on when
-/// spliced-subject binds shadow `this` (`with(rec) { writable { … } }`
-/// where `writable` is the enclosing class's member): the innermost
-/// subject whose class declares the member, else the receiver beneath
-/// the whole subject run. Anything unprovable keeps the supplied reg.
-/// Whether an extension property (or extension function) named `name` is
-/// declared for `head` or one of its registered supertypes: the getter is
-/// a registered function with a leading `this` whose declared receiver
-/// the head is or extends.
+/// Whether an extension property or function named `name` is declared for `head`
+/// or a registered supertype: its getter has a leading `this` whose declared
+/// receiver the head is or extends.
 fn extensionPropOnHead(b: *FuncBuilder, head_in: []const u8, name: []const u8) bool {
     const head = typeHead(std.mem.trimEnd(u8, head_in, "?"));
     if (head.len == 0) return false;
@@ -395,8 +366,8 @@ fn extensionPropOnHead(b: *FuncBuilder, head_in: []const u8, name: []const u8) b
     return false;
 }
 
-/// An extension property `val <head>.<name>` is known either by its
-/// declared-type record or by its lowered getter `__ext_get_<head>_<name>`.
+/// An extension property `val <head>.<name>` is known either by its declared-type
+/// record or by its lowered getter `__ext_get_<head>_<name>`.
 fn extPropExistsOn(b: *const FuncBuilder, head: []const u8, name: []const u8) bool {
     if (b.module.registry.ext_prop_type_heads.get(.{ .a = head, .b = name }) != null) return true;
     var buf: [160]u8 = undefined;
@@ -404,8 +375,7 @@ fn extPropExistsOn(b: *const FuncBuilder, head: []const u8, name: []const u8) bo
     return b.module.funcsBySimpleName(gname).len != 0;
 }
 
-/// Whether the smart-cast `this` (`when (this) { is ScatterSetWrapper<T> ->
-/// set… }`) declares `name` as a member or property: such a bare name is the
+/// Whether the smart-cast `this` declares `name`. Such a bare name is the
 /// narrowed receiver's own, ahead of any same-named global or outer `this`.
 pub fn narrowedThisDeclares(b: *const FuncBuilder, name: []const u8, file: ir.FileId) bool {
     const nh = b.thisNarrow() orelse return false;
@@ -421,16 +391,14 @@ pub fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg
     const sct = if (runtime.envOnce("KLIO_SCT_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     const sbs = b.subject_binds.items;
     if (sbs.len == 0) return this_reg;
-    // Only correct when the ambient `this` IS the innermost subject —
-    // otherwise scope already resolved beneath the subjects.
+    // Only correct when the ambient `this` is the innermost subject; otherwise
+    // scope already resolved beneath the subjects.
     if (sbs[sbs.len - 1].reg != this_reg) {
         if (sct) std.debug.print("[sct] {s}: this r{d} != innermost subject r{d}\n", .{ name, this_reg.int(), sbs[sbs.len - 1].reg.int() });
         return this_reg;
     }
-    // A smart-cast `this` (`when (this) { is ScatterSetWrapper<T> -> set… }`)
-    // narrows the innermost subject: the NARROWED class's member is this
-    // subject's, and the walk below (by the subjects' declared heads —
-    // `Set`, which has no `set`) must not hand the read to an outer `this`.
+    // A smart-cast `this` narrows the innermost subject, so the walk below, which
+    // goes by the subjects' declared heads, must not reach an outer `this`.
     if (narrowedThisDeclares(b, name, ir.FileId.from(0))) {
         if (sct) std.debug.print("[sct] {s}: narrowed this declares it\n", .{name});
         return this_reg;
@@ -452,10 +420,8 @@ pub fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg
             if (sct) std.debug.print("[sct] {s}: subject {d} ({s}) declares it\n", .{ name, i, h });
             return sbs[i].reg;
         }
-        // An EXTENSION property declared on the subject's type (or a
-        // supertype) binds the bare name to that subject the same way a
-        // member does: `isSpecified` inside a spliced `Dp.takeOrElse`,
-        // `indices` inside `List.fastForEach`.
+        // An extension property declared on the subject's type or a supertype
+        // binds the bare name to that subject the same way a member does.
         if (extensionPropOnHead(b, h, name)) {
             if (sct) std.debug.print("[sct] {s}: subject {d} ({s}) has an extension property\n", .{ name, i, h });
             return sbs[i].reg;
@@ -469,11 +435,9 @@ pub fn subjectCorrectedBareThis(b: *FuncBuilder, name: []const u8, this_reg: Reg
     return sbs[0].prior_this orelse this_reg;
 }
 
-/// The `CallMemberOrGlobal` emit form: the bare name dispatches member-first on
-/// the runtime implicit receiver, falling back to the resolved global. A
-/// non-extension target carries its resolved `func` as the global arm; a
-/// resolved extension a member could shadow defers to the pure member-first
-/// walk (`lowerUnresolvedBareCall`), which carries no static arm.
+/// The `CallMemberOrGlobal` emit form: member-first dispatch on the runtime
+/// implicit receiver, falling back to the resolved global. A resolved extension a
+/// member could shadow defers to the pure member-first walk instead.
 pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, was_cast: bool) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
@@ -488,12 +452,8 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
     );
     defer _ = b.setCallTrailingLambda(prev_trailing);
 
-    // An APPLICABLE own member shadows the same-named top-level function in
-    // Kotlin's scope order (`private fun Json(arrays: Boolean, build:
-    // PolymorphicModuleBuilder<Any>.() -> Unit)` beside the library's
-    // `Json { … }` builder): the implicit-this path binds the MEMBER's
-    // lambda shapes and receivers, where the deferred form below would read
-    // them off the global candidate.
+    // An applicable own member shadows the same-named top-level function in
+    // Kotlin's scope order, and binds the member's lambda shapes and receivers.
     if (callee.Path.segments.len == 1 and b.resolve("this") != null and
         b.hasOwnMember(name0) and b.ownFunctionApplicable(name0, call.args.len) and
         !ownMemberRejectsLambdas(b, name0, call.args))
@@ -505,14 +465,10 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
         if (try lowerUnresolvedBareCall(b, callee, args, ast_arg_names, ast_type_args, func_id)) |r| return r;
         return emitCall(b, expr, func_id, was_cast);
     }
-    // The whole reason for the member-first form is that a member of the
-    // implicit receiver could shadow the resolved global. With NO receiver
-    // in scope there is no member to find, and the runtime walk resolves the
-    // name only to arrive at the declaration already in hand.
-    // A TRAILING LAMBDA keeps the member-or-global path: it does more than
-    // dispatch there — the committed candidate shapes the lambda's arity,
-    // its receiver and the composable broad masks, and the static emit does
-    // not carry that.
+    // The member-first form exists because a member could shadow the resolved
+    // global, which no receiver in scope makes impossible. A trailing lambda keeps
+    // this path anyway: the committed candidate shapes its arity, receiver and
+    // composable masks, which the static emit does not carry.
     if (!call.has_trailing_lambda and
         b.resolve("this") == null and b.ownerClass() == null and
         b.recvTy() == null and b.spliceRecvTy() == null)
@@ -529,29 +485,21 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
     };
     defer if (broad_masks) |m| b.allocator.free(m);
     b.pending_arg_broad_masks = broad_masks;
-    // The dispatch is deferred, but the trailing lambda's static shape comes
-    // from the committed global candidate: read the per-arg lambda arities
-    // from it so a `T.() -> R` receiver lambda drops its synthetic `it` here
-    // exactly as on the static-call path (`it` then resolves to the
-    // enclosing lambda's, matching kotlinc).
+    // The trailing lambda's static shape still comes from the committed global
+    // candidate, so a `T.() -> R` receiver lambda drops its synthetic `it` here as
+    // on the static path.
     const arg_arity: ?[]const i16 = blk: {
         if (b.module.funcById(func_id)) |f| {
             const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-            // The receiver-type head of a receiver-lambda argument comes from
-            // the same committed candidate: a deferred `validate { … }` must
-            // lower its block with `MockViewValidator` as the body's receiver,
-            // or bare ext-overload selection inside (`Composition(a, b, c)`
-            // beside a local `MockViewValidator.Composition`) has no receiver
-            // evidence and picks the wrong sibling.
+            // Without the candidate's receiver head, bare ext-overload selection
+            // inside the block has no evidence and picks the wrong sibling.
             try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, recv_off);
             break :blk try argFnArities(b, f, args, ast_arg_names, recv_off);
         }
         break :blk null;
     };
-    // The deferred form types lambda params from the committed global
-    // candidate exactly as the static Call emitter does — a bare
-    // `all { it.isWhitespace() }` whose inline callee is still a header
-    // stub defers, and without this the closure's `it` lowers untyped.
+    // The deferred form types lambda params from the committed candidate, or a
+    // closure's `it` lowers untyped whenever the callee is still a header stub.
     const lambda_param_types: ?[]?[]ir.TypeRef = blk: {
         const f = b.module.funcById(func_id) orelse break :blk null;
         const recv_off: usize = if (f.params.len != 0 and
@@ -586,9 +534,8 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
     orEmitAudit(b, "bare_call_member_shadowable", "CallMemberOrGlobal", name0);
     const cmg_static_recv: ?ConstId = try cmgStaticRecv(b);
     var type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
-    // The deferred form keeps the reified splice substitution too: a
-    // spliced `enumEntriesIntrinsic()` lowered in a receiver context
-    // (a lambda body) is otherwise blind at the runtime intrinsic.
+    // The deferred form keeps the reified splice substitution too, or a spliced
+    // intrinsic lowered in a receiver context is blind at run time.
     if (type_args.len == 0) {
         if (try spliceReifiedTypeArgs(b, func_id, args.len)) |stamped| type_args = stamped;
     }
@@ -609,29 +556,22 @@ pub fn emitMemberOrGlobal(b: *FuncBuilder, expr: *const Expr, func_id: FuncId, w
     return dst;
 }
 
-/// The receiver-type tag for a deferred member-or-global bare call: the
-/// enclosing extension's declared receiver head, when this body has one.
-/// The class id a bare classifier read binds, innermost first: a NESTED
-/// class/object of the enclosing class chain (registered under its lifted
-/// `Outer$Name` key, invisible to the flat index) beats the package-scope
-/// pick — `object E : Base(Key)` inside a class declaring `object Key`
-/// reads ITS OWN Key, not `CoroutineContext.Key` from a wildcard import.
+/// The class id a bare classifier read binds, innermost first: a nested class of
+/// the enclosing chain, under its lifted `Outer$Name` key, beats the
+/// package-scope pick.
 pub fn scopedClassIdForRead(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
     if (nestedClassIdAtLexicalSite(b, name0)) |cid| return cid;
     if (b.module.classIdExactImport(name0, file)) |cid| return cid;
-    // A receiver context whose owner chain is unknown here (a super-arg /
-    // default-value thunk, a lambda) may still see a NESTED classifier the
-    // flat index cannot rank; committing the package-scope pick would
-    // override the runtime's scope walk with the wrong declaration
-    // (CoroutineContext.Key shadowing a nested `object Key`). Decline —
-    // the name-keyed runtime path owns the scoped resolution.
+    // A receiver context with an unknown owner chain may still see a nested
+    // classifier the flat index cannot rank, so decline and let the name-keyed
+    // runtime path own the scoped resolution.
     if (inReceiverContext(b)) return null;
     return b.module.classIdIndexed(name0, b.self_package, file);
 }
 
-/// The class visible at a lexical source site without the receiver-context
-/// decline used by an immediately-lowered read. Anonymous-object bodies use
-/// this before moving into their registry-free side modules.
+/// The class visible at a lexical source site, without the receiver-context
+/// decline. Anonymous-object bodies use this before moving into their side
+/// modules.
 pub fn classIdAtLexicalSite(b: *FuncBuilder, name0: []const u8, file: anytype) ?ir.ClassId {
     if (nestedClassIdAtLexicalSite(b, name0)) |cid| return cid;
     if (b.module.classIdExactImport(name0, file)) |cid| return cid;
@@ -640,17 +580,13 @@ pub fn classIdAtLexicalSite(b: *FuncBuilder, name0: []const u8, file: anytype) ?
 
 pub fn nestedClassIdAtLexicalSite(b: *FuncBuilder, name0: []const u8) ?ir.ClassId {
     if (b.ownerClass()) |oc| {
-        // Resolve the OWNER to an id once (its lifted simple name is in the
-        // class index), then answer through the nesting tree — the one
-        // scoped classifier lookup, no string-mangled probing.
+        // Resolve the owner to an id once, its lifted simple name being in the
+        // class index, then answer through the nesting tree.
         if (b.module.classId(oc)) |owner_id| {
             if (b.module.classIdNestedIn(owner_id, name0)) |cid| return cid;
-            // The nesting tree (`class_children`) is built at VM setup, AFTER
-            // this lowering runs for a baked pack's bodies, so it can be empty
-            // here. Derive the nesting directly from FQNs (which `classIdByFqn`
-            // resolves without the tree): a bare `Nested` inside `a.b.Outer`
-            // resolves to `a.b.Outer.Nested`, walking up the enclosing-class
-            // FQNs so a reference to an outer-scope nested class still binds.
+            // `class_children` is built at VM setup, after this lowering runs for
+            // a baked pack's bodies, so derive the nesting from FQNs instead,
+            // walking up the enclosing-class FQNs.
             if (b.module.classFqnById(owner_id)) |ofqn| {
                 var pfqn: []const u8 = ofqn;
                 var hops: usize = 0;
@@ -658,7 +594,7 @@ pub fn nestedClassIdAtLexicalSite(b: *FuncBuilder, name0: []const u8) ?ir.ClassI
                     const cand = std.fmt.allocPrint(b.allocator, "{s}.{s}", .{ pfqn, name0 }) catch break;
                     defer b.allocator.free(cand);
                     if (b.module.classIdByFqn(cand)) |cid| return cid;
-                    const dot = std.mem.lastIndexOfScalar(u8, pfqn, '.') orelse break;
+                    const dot = std.mem.findScalarLast(u8, pfqn, '.') orelse break;
                     pfqn = pfqn[0..dot];
                     if (b.module.classIdByFqn(pfqn) == null) break; // left the class nest
                 }
@@ -668,12 +604,9 @@ pub fn nestedClassIdAtLexicalSite(b: *FuncBuilder, name0: []const u8) ?ir.ClassI
     return null;
 }
 
-/// Whether the currently bound `this` is the tower's INNERMOST pushed
-/// subject (already on the runtime chain, so emissions defer to the
-/// chain) rather than a nested inline-EXT splice receiver (not on the
-/// chain — must stay pinned; `resumeWith` inside a spliced
-/// `Continuation.resume` dispatches on the CAST receiver, which no walk
-/// can find).
+/// Whether the bound `this` is the tower's innermost pushed subject, already on
+/// the runtime chain, rather than a nested inline-extension splice receiver,
+/// which is not and must stay pinned.
 fn boundThisIsTowerTop(b: *FuncBuilder) bool {
     if (b.encl_tower_depth == 0) return false;
     const top = b.encl_tower_top orelse return false;
@@ -682,43 +615,28 @@ fn boundThisIsTowerTop(b: *FuncBuilder) bool {
 }
 
 pub fn cmgStaticRecv(b: *FuncBuilder) Allocator.Error!?ConstId {
-    // Under an active subject tower the runtime chain ranks the
-    // receivers; a static head would pin the strict-ext arm to the
-    // innermost SUBJECT and raise where the walk must fall outward
-    // (`eachInline` inside `with(sb) { ... }` is the enclosing class's
-    // member-inline, StringBuilder declares nothing by that name).
+    // Under an active subject tower the runtime chain ranks the receivers; a
+    // static head would raise where the walk must fall outward.
     if (boundThisIsTowerTop(b)) return null;
     const rt = bareStaticRecvHead(b) orelse return null;
     return try b.module.internConst(b.allocator, .{ .String = rt });
 }
 
-/// The static-receiver head a BARE call's dispatch hint should carry.
-/// Inside an active inline splice this is the spliced fn's own receiver
-/// (null for a receiver-less inline fn) — Kotlin inline bodies are
-/// hygienic, so a bare call written in the stdlib body must never resolve
-/// against the inline SITE's class. Outside a splice: the enclosing
-/// function's receiver, as before.
+/// The static-receiver head a bare call's dispatch hint carries: inside an active
+/// splice the spliced fn's own receiver, since inline bodies are hygienic and a
+/// bare call in a stdlib body must not resolve against the site's class.
+/// Outside a splice, the enclosing function's receiver.
 pub fn bareStaticRecvHead(b: *const FuncBuilder) ?[]const u8 {
     if (b.thisNarrow()) |t| return t;
     if (b.spliceHintActive()) return b.spliceHintRecv();
-    // An `is`-narrow of `this` is the innermost receiver truth: inside
-    // `if (this is Collection)`, a bare call resolves against Collection
-    // exactly as kotlinc smart-casts — `Iterable.contains`'s own
-    // `contains(element)` binds the Collection MEMBER, never itself. The
-    // narrow lives in the local-decl map under "this" (`narrowLocal`);
-    // consulted AFTER the splice hint so a spliced stdlib body never
-    // resolves against the inline site's caller context. Default ON with
-    // the genuine-narrow gate below — the earlier 4.3x DeepRecursive
-    // slowdown and the ArrayDeque mis-bind were both the UNGATED consult
-    // trusting an enclosing method's `this` decl through receiver-less
-    // lambdas. `KLIO_THIS_NARROW=0` disables for single-binary A/B.
+    // An `is`-narrow of `this` is the innermost receiver truth, exactly as kotlinc
+    // smart-casts. It lives in the local-decl map under "this", consulted after
+    // the splice hint so a spliced body never resolves against the caller
+    // context. `KLIO_THIS_NARROW=0` disables.
     if (!std.mem.eql(u8, runtime.envOnce("KLIO_THIS_NARROW") orelse "1", "0")) {
-        // Only a genuine NARROW counts: the entry must differ from this
-        // frame's own declared receiver. A lambda with no receiver of its
-        // own sees the ENCLOSING method's `this` decl through the shared
-        // local map, and trusting that bound a bare `clear()` inside
-        // `apply { }` to the enclosing test method (the ArrayDeque armed
-        // recursion) instead of the runtime receiver walk.
+        // Only a genuine narrow counts: a lambda with no receiver of its own sees
+        // the enclosing method's `this` decl through the shared local map, and
+        // trusting that binds bare calls to the wrong receiver.
         if (b.recvTy()) |declared| {
             if (b.localDeclType("this")) |narrowed| {
                 if (!std.mem.eql(u8, typeHead(narrowed), typeHead(declared)))
@@ -727,25 +645,21 @@ pub fn bareStaticRecvHead(b: *const FuncBuilder) ?[]const u8 {
         }
     }
     if (b.recvTy()) |own| return own;
-    // A lambda DECLARED receiverless (shape known) chains to the enclosing
-    // receiver, exactly Kotlin's implicit-receiver resolution; an untyped
-    // receiver-lambda must not (the ArrayDeque hazard above).
+    // A lambda declared receiverless chains to the enclosing receiver, exactly
+    // Kotlin's implicit-receiver resolution; an untyped receiver-lambda must not.
     if (b.own_recv_known_none) return b.enclosingRecvTy();
     return null;
 }
 
-/// Package/import-scoped declarations carried by a deferred bare call. The
-/// optional distinction is intentional: null means the remaining host-only or
-/// incomplete-header boundary has no rankable declaration metadata; a non-null
-/// (possibly empty) slice is authoritative and prevents the runtime from
-/// widening back to the program-wide simple-name index.
+/// Package- and import-scoped declarations carried by a deferred bare call. Null
+/// means no rankable metadata; a non-null, possibly empty slice is authoritative
+/// and keeps the runtime from widening to the program-wide simple-name index.
 pub fn cmgCandidates(b: *FuncBuilder, name: []const u8, file: ir.FileId, user_arg_count: usize) Allocator.Error!?[]const FuncId {
     return b.module.boundedCallCandidates(b.allocator, name, b.self_package, file, user_arg_count);
 }
 
 /// The `CallValue` emit form for a bare name with no committed target: load the
-/// global by name and invoke it. Used for a host-intrinsic alias whose user
-/// overloads do not apply (no class declares the name as a member).
+/// global by name and invoke it, for a host-intrinsic alias.
 pub fn emitValueCall(
     b: *FuncBuilder,
     args: []const Expr,
@@ -800,10 +714,8 @@ pub fn emitObjectValueCall(
     return dst;
 }
 
-/// Arg names for a bare `Call`, synthesizing a name for a trailing lambda
-/// that follows a vararg parameter so it binds the target's last
-/// (function-typed) parameter rather than being packed into the vararg.
-/// Returns the plain interned names otherwise.
+/// Arg names for a bare `Call`, synthesizing a name for a trailing lambda after a
+/// vararg parameter so it binds the last, function-typed parameter.
 pub fn trailingLambdaArgNames(
     b: *FuncBuilder,
     func_id: FuncId,
@@ -828,10 +740,9 @@ pub fn trailingLambdaArgNames(
                     if (p.is_vararg) has_earlier_vararg = true;
                 }
             }
-            // Only the vararg-before-trailing-lambda shape needs the
-            // synthesized name; a plain positional trailing lambda already
-            // lands on the last parameter. A final vararg of function values
-            // absorbs every lambda positionally and must remain unnamed.
+            // Only the vararg-before-trailing-lambda shape needs it; a plain
+            // positional trailing lambda already lands on the last parameter, and
+            // a final vararg of function values absorbs every lambda.
             if (last_is_fixed_fn and has_earlier_vararg) {
                 const tagged = try b.allocator.alloc(?ConstId, args.len);
                 for (tagged) |*t| t.* = null;
@@ -849,10 +760,9 @@ const ThreadedTrailingLambda = struct {
     param_name: []const u8,
 };
 
-/// The source trailing lambda immediately before the Compose synthetic pair
-/// binds the selected declaration's last user parameter. The AST pass appends
-/// the pair and clears `has_trailing_lambda`, so carrying this exact parameter
-/// name into IR preserves Kotlin's across-default binding.
+/// The source trailing lambda before the Compose synthetic pair binds the selected
+/// declaration's last user parameter. The AST pass clears `has_trailing_lambda`,
+/// so carrying the name into IR preserves Kotlin's across-default binding.
 pub fn threadedTrailingLambdaParam(
     f: *const Func,
     args: []const Expr,
@@ -875,17 +785,14 @@ pub fn threadedTrailingLambdaParam(
     return .{ .arg_index = arg_index, .param_name = param.name };
 }
 
-/// The extension-fn bare-call path: prepend `this`, with trailing-lambda
-/// arg-name synthesis and the member-precedence routing.
+/// The extension-fn bare-call path: prepend `this`, with trailing-lambda arg-name
+/// synthesis and the member-precedence routing.
 fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_reg: Reg, was_cast_in: bool) Allocator.Error!Reg {
     const call = expr.Call;
     const callee = call.callee;
-    // The THIRD emission channel for a return-variant family: a bare
-    // extension call on the implicit receiver reached here with the
-    // heuristic sibling committed, and the member-precedence CallMember
-    // below would hand the runtime walk a first-declared re-pick (the
-    // Double sumOf, 3.0 where kotlinc prints 3). The trailing lambda's
-    // derived return discriminates here exactly as on the other two paths.
+    // A bare extension call can reach here with a heuristic sibling committed, and
+    // the CallMember below would hand the walk a first-declared re-pick, so the
+    // trailing lambda's derived return discriminates a return-variant family.
     var func_id = func_id_in;
     var was_cast = was_cast_in;
     if (!was_cast and lastArgIsLambda(call.args) and allNull(call.arg_names) and
@@ -919,21 +826,16 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_
     for (args, 0..) |a, i| all[i + 1] = a;
     const arg_arity: ?[]const i16 = blk: {
         if (allNull(ast_arg_names)) {
-            // The trailing lambda lands on whichever same-name overload
-            // declares a function-typed last parameter of the call's user
-            // arity — the bare-call heuristic may have resolved a sibling
-            // (`List.get(index)`) that cannot host the lambda, leaving the
-            // receiver lambda's `it` unsuppressed. Prefer the overload that
-            // actually hosts the trailing lambda for the arity readout.
+            // The trailing lambda lands on whichever same-name overload declares a
+            // function-typed last parameter of the call's user arity.
             const arity_fid: ?FuncId = if (lastArgIsLambda(args))
                 (overloadHostingTrailingLambda(b, callee.Path.segments[0].name, args.len) orelse func_id)
             else
                 func_id;
             if (arity_fid) |fid| {
                 if (b.module.funcById(fid)) |f| {
-                    // `all` leads with the synthesized `this`, aligned with
-                    // the function's own leading `this` parameter, so no
-                    // offset.
+                    // `all` leads with the synthesized `this`, aligned with the
+                    // function's own leading `this` parameter, so no offset.
                     break :blk try argFnArities(b, f, all, &.{}, 0);
                 }
             }
@@ -967,11 +869,9 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_
     const type_args = try helpers.internTypeArgsScoped(b, ast_type_args);
 
     if (!synth_names_needed and !was_cast) {
-        // Member-of-receiver precedence: route through call_member on `this`.
-        // Carry the trailing lambda's expected arity (from the overload that
-        // hosts it) so a `T.() -> R` receiver handler drops its synthetic
-        // `it` and resolves bare members through the receiver bound at
-        // invocation, even on this member-dispatch arm.
+        // Member-of-receiver precedence: route through call_member on `this`,
+        // carrying the hosting overload's lambda arity so a `T.() -> R` handler
+        // drops its synthetic `it` here too.
         const uarg_arity: ?[]const i16 = ablk: {
             if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
                 if (overloadHostingTrailingLambda(b, callee.Path.segments[0].name, args.len)) |fid| {
@@ -986,13 +886,9 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_
         const uarg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
         const nmc = try b.module.internConst(b.allocator, .{ .String = callee.Path.segments[0].name });
         const dst = b.allocReg();
-        // A captured-`this` receiver context routes through `emitMemberOrGlobal`
-        // (the `CallMemberOrGlobal` emit form), never here — `resolveCall` never
-        // reaches the static-receiver `CallMember` bind for such a call.
-        //
-        // Inside an extension body the implicit `this` has the
-        // extension's declared receiver type; record it so dispatch
-        // resolves extensions against the STATIC type, as kotlinc does.
+        // A captured-`this` receiver context routes through `emitMemberOrGlobal`.
+        // Inside an extension body the implicit `this` has the declared receiver
+        // type, so record it and resolve extensions statically, as kotlinc does.
         const static_recv: ?ConstId = if (bareStaticRecvHead(b)) |rt|
             try b.module.internConst(b.allocator, .{ .String = rt })
         else
@@ -1009,10 +905,9 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_
         } });
         return dst;
     }
-    // The member-precedence branch above lowers its own argument run and
-    // returns; only the static-call path reaches here, so the `this`-prepended
-    // run is lowered now — lowering it earlier would emit (and execute) every
-    // argument's side effects a second time on the member path.
+    // Only the static-call path reaches here, so the `this`-prepended run lowers
+    // now; lowering it earlier would execute every argument's side effects a
+    // second time on the member path.
     const run = try lowerArgRunWithArity(b, all, arg_arity);
     const dst = b.allocReg();
     try b.push(.{ .Call = .{
@@ -1028,39 +923,30 @@ fn emitExtBareCall(b: *FuncBuilder, expr: *const Expr, func_id_in: FuncId, this_
     return dst;
 }
 
-/// Emit a dotted `pkg.Outer.Inner.member…` reference by binding the LONGEST
-/// prefix that names a class to its EXACT id, then reading each remaining
-/// segment as a field. Riding the class id keeps a same-simple-name class in
-/// another package from swapping in at runtime (the `gapbuffer` vs
-/// `linkbuffer` `Operation.Ins` collision), which a plain name-keyed global
-/// load cannot do. Returns null when no prefix names a class — the caller
-/// falls back to the name-keyed load.
+/// Emit a dotted `pkg.Outer.Inner.member…` reference by binding the longest
+/// class-naming prefix to its exact id and reading each remaining segment as a
+/// field, so a same-simple-name class elsewhere cannot swap in at runtime.
 pub fn emitFqnWithClassPrefix(b: *FuncBuilder, fqn: []const u8) Allocator.Error!?Reg {
     var end = fqn.len;
     while (true) {
         if (b.module.classIdByFqn(fqn[0..end])) |cid| {
-            // Ride the exact id ONLY when the prefix's simple name is
-            // genuinely ambiguous — collision-mangled out of the flat index
-            // (null) or resolving to a DIFFERENT first-registered class.
-            // When the simple name resolves to this very class the name-keyed
-            // load is already correct AND preferable: an id load returns a
-            // class's companion (or misses a same-named factory function),
-            // so overriding an unambiguous `kotlinx.coroutines.Job` would
-            // hand back `Job.Key` instead of the Job factory.
+            // Ride the exact id only when the prefix's simple name is genuinely
+            // ambiguous. Where it resolves to this very class the name-keyed load
+            // is preferable, since an id load returns a class's companion or
+            // misses a same-named factory function.
             const prefix = fqn[0..end];
-            const simple = if (std.mem.lastIndexOfScalar(u8, prefix, '.')) |d| prefix[d + 1 ..] else prefix;
+            const simple = if (std.mem.findScalarLast(u8, prefix, '.')) |d| prefix[d + 1 ..] else prefix;
             const simple_cid = b.module.classId(simple);
             if (simple_cid != null and simple_cid.?.int() == cid.int()) return null;
-            // The id table resolves an `object` prefix straight to its
-            // singleton; a plain class prefix loads its class value, off which
-            // each remaining segment reads its nested classifier / member.
+            // The id table resolves an `object` prefix to its singleton; a class
+            // prefix loads its class value, off which the remaining segments read.
             var cur = b.allocReg();
             const n = try b.module.internConst(b.allocator, .{ .String = fqn[0..end] });
             try b.push(.{ .LoadGlobal = .{ .dst = cur, .name = n, .class = cid } });
             var rest = fqn[end..];
             while (rest.len > 0) {
                 rest = rest[1..]; // skip '.'
-                const dot = std.mem.indexOfScalar(u8, rest, '.') orelse rest.len;
+                const dot = std.mem.findScalar(u8, rest, '.') orelse rest.len;
                 const next = b.allocReg();
                 const field = try b.module.internConst(b.allocator, .{ .String = rest[0..dot] });
                 try b.push(.{ .GetField = .{ .dst = next, .receiver = cur, .field = field } });
@@ -1069,7 +955,7 @@ pub fn emitFqnWithClassPrefix(b: *FuncBuilder, fqn: []const u8) Allocator.Error!
             }
             return cur;
         }
-        const dot = std.mem.lastIndexOfScalar(u8, fqn[0..end], '.') orelse break;
+        const dot = std.mem.findScalarLast(u8, fqn[0..end], '.') orelse break;
         end = dot;
     }
     return null;

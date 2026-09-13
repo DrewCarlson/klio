@@ -1,5 +1,5 @@
-//! Lambda and anonymous function lowering, and the function-type shape
-//! probes that bind their parameters.
+//! Lambda and anonymous function lowering, and the function-type shape probes
+//! that bind their parameters.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -90,28 +90,20 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
     const lambda_has_receiver = receiver_head != null or
         (eager_shape != null and eager_shape.?.has_receiver);
     b.module.pending_lambda_no_receiver = lambda_receiver_shape_known and !lambda_has_receiver;
-    // Consume the per-argument expected lambda arity set by the call
-    // lowering for this argument slot before the body recurses (which
-    // re-arms it for the body's own nested calls).
+    // Consumed before the body recurses, which re-arms it for nested calls.
     var expected_arity = b.pending_lambda_arity;
     b.pending_lambda_arity = -1;
-    // Broad-collection mask for this lambda's params (set by the call lowering
-    // from the callee parameter's function type). Consumed before the body
-    // recurses so a nested lambda does not inherit it.
+    // Broad-collection mask for this lambda's params, set by the call lowering.
+    // Consumed before the body recurses so a nested lambda does not inherit it.
     const lambda_broad_mask = b.pending_lambda_broad_mask;
     b.pending_lambda_broad_mask = 0;
-    // Callee-generic slot flag: the expected function type's parameters are
-    // all the callee's own type parameters, so this lambda's params carry
-    // Kotlin's generic static typing. Consumed the same way.
+    // Callee-generic slot flag: the expected function type's parameters are all
+    // the callee's own type parameters, so these params carry generic typing.
     const lambda_fn_generic = b.pending_ref_fn_generic;
     b.pending_ref_fn_generic = false;
-    // A lambda assigned to a typed binding (`val h: Ctx.() -> Unit = { … }`)
-    // never reaches the call-argument arity path; derive the arity from the
-    // binding's functional type so a `T.() -> R` receiver lambda (zero value
-    // parameters) drops its `it` and resolves bare members through the
-    // receiver bound at invocation, rather than a spurious `it` parameter.
-    // The arity recorded at the call site (by span), authoritative when the
-    // per-argument `pending_lambda_arity` was not set on this emit path.
+    // A lambda assigned to a typed binding never reaches the call-argument arity
+    // path, so derive the arity from the binding's functional type; else the
+    // arity recorded at the call site by span.
     var arity_src: []const u8 = "pending";
     if (expected_arity == -1) {
         if (b.lambdaArgArity(expr.span())) |ar| {
@@ -127,38 +119,25 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             }
         }
     }
-    // Last resort: typeck's own answer for this lambda, keyed by its body span.
-    // The AST-side sources above all need the callee's signature, which a
-    // CROSS-PACK member call does not have — the callee is absent from the
-    // lowering module's name index (`onDrawWithContent { … }` on a
-    // `CacheDrawScope` declared in another pack). Typeck resolved the expected
-    // type across packs, so it knows the value arity even when the lowering
-    // cannot see the declaration.
+    // Last resort: typeck's answer, keyed by body span. A cross-pack member call
+    // lacks the callee signature the AST-side sources need.
     if (expected_arity == -1) {
         if (eager_shape) |shape| {
             expected_arity = @intCast(shape.arity);
             arity_src = if (shape.has_receiver) "eager-recv" else "eager-plain";
         }
     }
-    // A zero-`->` lambda gets its implicit `it` only when its own
-    // functional type takes exactly one parameter. A `() -> R` and a
-    // `T.() -> R` receiver lambda both encode arity 0, so the
-    // parser-injected `it` is dropped and an `it` reference inside resolves
-    // to the nearest enclosing lambda's `it` (or is rejected when none
-    // exists). Suppression applies only to the arity-0 shapes; an unknown
-    // arity (-1, an unconstrained value position) keeps the single-`it`
-    // binding unchanged.
+    // A zero-`->` lambda gets its implicit `it` only when its functional type
+    // takes exactly one parameter. `() -> R` and `T.() -> R` both encode arity 0,
+    // so `it` resolves to the nearest enclosing lambda's; -1 keeps the single `it`.
     const suppress_it = lam.implicit_it and expected_arity == 0;
     if (orAuditOn() and lam.implicit_it)
         std.debug.print("[IT-AUDIT] lambda f{d}:{d}..{d} expected_arity={d} src={s} suppress={}\n", .{ lam.body.span.file.int(), lam.body.span.start, lam.body.span.end, expected_arity, arity_src, suppress_it });
     const eff_params: []const ast.Ident = if (suppress_it) &.{} else lam.params;
     const eff_param_tys: []const ?ast.TypeRef = if (suppress_it) &.{} else lam.param_tys;
-    // Names of lambda params (including the implicit `it`) whose effective
-    // static type — the lambda's own annotation, else the expected functional
-    // type's parameter — is a broad collection (`Iterable`/`Collection`).
-    // Recorded on the body builder so `it + x` over a runtime `Set` produces a
-    // `List`. Derived here (not via the body's `param_tys`) so the implicit
-    // `it`'s runtime overload-dispatch placeholder type is left untouched.
+    // Lambda params whose effective static type is a broad collection, so `it + x`
+    // over a runtime `Set` produces a `List`. Derived here rather than from
+    // `param_tys`, to leave the implicit `it`'s dispatch placeholder untouched.
     var broad_names: std.ArrayList([]const u8) = .empty;
     defer broad_names.deinit(b.allocator);
     if (!suppress_it and eff_params.len != 0) {
@@ -171,17 +150,15 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             else
                 null;
             const by_ty = ty != null and ty.?.function == null and helpers.isBroadCollectionTypeName(ty.?.name.name);
-            // Also honor the callee-parameter mask: a call-argument lambda has
-            // no expected functional type on the stack, so its `it`'s declared
-            // `Iterable` type lives only in the callee's parameter signature.
+            // A call-argument lambda has no expected functional type on the
+            // stack, so its `it`'s declared type lives in the callee signature.
             const by_mask = i < 32 and (lambda_broad_mask >> @intCast(i)) & 1 != 0;
             if (by_ty or by_mask) {
                 try broad_names.append(b.allocator, p.name);
             }
         }
     }
-    // Params of a callee-generic slot (unannotated only — an explicit
-    // annotation is the stronger static fact and wins).
+    // Unannotated params only: an explicit annotation is the stronger fact.
     var generic_names: std.ArrayList([]const u8) = .empty;
     defer generic_names.deinit(b.allocator);
     if (lambda_fn_generic and !suppress_it) {
@@ -200,16 +177,10 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
 
     const inherited_lef = try b.localExtFnNames();
     const inherited_erp = try b.erasedRecvParamNames();
-    // The implicit label this lambda carries (`runTest { … }` → "runTest").
-    // The body binds `this@<label>` to its receiver.
+    // The implicit label this lambda carries; the body binds `this@<label>`.
     b.module.pending_lambda_this_label = b.pending_lambda_label;
-    // The receiver type in scope at the body's site: a receiver lambda
-    // (`T.() -> R`) rebinds the implicit `this` to `T`, otherwise a plain
-    // block captures the enclosing `this`. Carried into the body so a bare
-    // call there can still disambiguate a receiver-lambda argument's arity.
-    // A receiver-lambda ARGUMENT whose receiver type the resolved callee made
-    // concrete (recorded by `recordLambdaArgReceivers`) — reached when the
-    // call is deferred so no expected type carries the receiver to lowerLambda.
+    // The receiver in scope at the body's site: a `T.() -> R` lambda rebinds the
+    // implicit `this` to `T`, a plain block captures the enclosing `this`.
     b.module.pending_lambda_receiver_tower = try b.collectReceiverTowerLabeled(
         b.allocator,
         receiver_head,
@@ -219,10 +190,8 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         if (receiver_head) |rr| break :blk rr;
         break :blk b.enclosingRecvTy();
     };
-    // The body owns that receiver as its extension receiver, so a bare call
-    // there prefers an extension on it over a same-file plain namesake —
-    // `validate { contact(c) }` binds `MockViewValidator.contact`, not the
-    // same-file `@Composable contact`.
+    // The body owns that receiver as its extension receiver, so a bare call there
+    // prefers an extension on it over a same-file plain namesake.
     if (std.c.getenv("KLIO_LAR_TRACE") != null) {
         std.debug.print("[lar-stash] s={d}..{d} head={s} ty={s}\n", .{ expr.span().start, expr.span().end, receiver_head orelse "-", if (receiver_type) |r| r.name else "-" });
     }
@@ -249,26 +218,22 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.module.pending_lambda_param_types = owned;
         }
     }
-    // Carry the enclosing non-reified type-parameter names so an `x as T`
-    // cast inside the lambda body is still erased.
+    // Carry the enclosing non-reified type-parameter names so an `x as T` cast
+    // inside the body is still erased.
     b.module.pending_lambda_type_params = try b.typeParamNamesSlice();
     b.module.pending_lambda_reified_names = try b.reifiedTypeNamesSlice();
     b.module.pending_lambda_type_param_bounds = try b.typeParamBoundsSlice();
     b.module.pending_lambda_type_param_bound_refs = try b.typeParamBoundRefsSlice();
     b.module.pending_lambda_ctx_fn_shapes = try b.contextFnShapesSlice();
-    // A lambda inside a local fn's body keeps that fn's self-identity (a
-    // named local fn overrides this with its own before its body lowers).
+    // A lambda inside a local fn keeps that fn's self-identity; a named local fn
+    // overrides this before its own body lowers.
     if (b.module.pending_lambda_self_fn == null) b.module.pending_lambda_self_fn = b.selfLocalFn();
-    // Non-callable-local evidence flows into the body (transitively — this
-    // builder's set already includes what it inherited).
+    // Non-callable-local evidence flows in transitively.
     b.module.pending_lambda_nonfn_locals = try b.nonFnLocalNames();
     b.module.pending_lambda_local_decl_types = try b.localDeclTypesSnapshot();
     if (std.c.getenv("KLIO_LAMINH") != null) std.debug.print("[laminh] produce lambda b={x} n={d}\n", .{ @intFromPtr(b) & 0xffff, b.localDeclTypeCount() });
-    // Fold ACTIVE inline-splice param types into the snapshot: a nested
-    // closure inside a spliced body captures the callee's parameter by
-    // name (`destination.add(it)` inside `transform(element)?.let { ... }`
-    // spliced from mapNotNullTo), and the local-decl snapshot never saw
-    // the splice channel.
+    // Fold active inline-splice param types into the snapshot: a nested closure
+    // in a spliced body captures the callee's parameter by name.
     if (b.module.pending_lambda_local_decl_types) |*locals| {
         var sp_it = b.spliceParamTyIterator();
         while (sp_it.next()) |e| {
@@ -276,20 +241,15 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const lowered_ty = try decl_mod.loweredTypeRef(b.allocator, e.value_ptr, true);
             try locals.types.put(e.key_ptr.*, lowered_ty);
         }
-        // Pre-derive the lazily-typed outer locals INTO the snapshot: a
-        // closure capturing `val iterator = listIterator(size)` sees only
-        // an on-demand derivation that cannot run in the closure's scope.
-        // Deriving here runs in the OUTER builder — the only scope the
-        // initializer was written in — and the closure inherits a plain
-        // declared type.
+        // Pre-derive lazily-typed outer locals into the snapshot: the derivation
+        // must run in the outer builder, the scope the initializer was written in.
         var init_it = b.localInitExprIterator();
         while (init_it.next()) |e| {
             if (locals.types.contains(e.key_ptr.*)) continue;
             const prev_self = expr_mod.init_self_name;
             if (b.localInitNameFree(e.key_ptr.*)) expr_mod.init_self_name = e.key_ptr.*;
-            // The FULL deriver, not just the call-return channel: a literal
-            // or member-read init crosses the capture boundary too
-            // (`var result = 0` read inside the repeat lambda).
+            // The full deriver, not just the call-return channel: a literal or
+            // member-read init crosses the capture boundary too.
             const derived = staticExprTypeRef(b, e.value_ptr.*) catch null;
             expr_mod.init_self_name = prev_self;
             if (derived) |ty| try locals.types.put(e.key_ptr.*, ty);
@@ -322,16 +282,10 @@ pub fn lowerLambda(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         f.lambda_receiver_shape_known = lambda_receiver_shape_known;
         f.lambda_has_receiver = lambda_has_receiver;
         f.lambda_it_unconstrained = lam.implicit_it and expected_arity == -1;
-        // The receiver HEAD is this lambda's OWN derivation — the body
-        // builder's recvTy can carry the ENCLOSING lambda's receiver (a
-        // placement block nested in a measure lambda recorded
-        // "MeasureScope"), and the runtime's compatibility receiver
-        // inference then re-selects a chain value satisfying the wrong
-        // head, silently swapping the invoke's real receiver (the
-        // coordinator displaced the PlacementScope and every placement
-        // pass lost its member-extension owner). When the shape is known,
-        // record exactly the derived head — or null for a plain lambda,
-        // which disables re-selection and keeps the passed receiver.
+        // The receiver head is this lambda's own derivation; the body builder's
+        // `recvTy` can carry the enclosing lambda's, and the runtime would then
+        // re-select a chain value satisfying the wrong head. Null for a plain
+        // lambda disables re-selection and keeps the passed receiver.
         if (lambda_receiver_shape_known) {
             f.lambda_receiver_ty = if (receiver_head) |h| try b.allocator.dupe(u8, h) else null;
         }
@@ -473,10 +427,8 @@ fn lambdaParamNames(allocator: Allocator, params: []const ast.Ident) Allocator.E
     return out;
 }
 
-/// The non-receiver parameter count encoded in a lowered function-type
-/// head (`Function{N}` from `decl.loweredTypeRef`), or null when the type
-/// is not a function type. A `T.() -> R` receiver lambda and a `() -> R`
-/// lambda both encode `Function0`; a `(T) -> R` lambda encodes `Function1`.
+/// The non-receiver parameter count encoded in a lowered `Function{N}` head, or
+/// null for a non-function type. `T.() -> R` and `() -> R` both encode `Function0`.
 fn fnTypeArity(ty: ir.TypeRef) ?i16 {
     const head = ty.name;
     if (!std.mem.startsWith(u8, head, "Function")) return null;
@@ -486,8 +438,8 @@ fn fnTypeArity(ty: ir.TypeRef) ?i16 {
     return n;
 }
 
-/// A function-typed parameter whose declared return is `Unit`: the
-/// `Function{N}` tag's trailing type argument (before any `#` markers).
+/// A function-typed parameter whose declared return is `Unit`: the `Function{N}`
+/// tag's trailing type argument, before any `#` markers.
 fn fnTypeReturnsUnit(b: *FuncBuilder, ty: ir.TypeRef) bool {
     if (fnTypeArityAlias(b, ty) == null) return false;
     var hi = ty.args.len;
@@ -497,8 +449,7 @@ fn fnTypeReturnsUnit(b: *FuncBuilder, ty: ir.TypeRef) bool {
     return (std.mem.eql(u8, ret.name, "Unit") or std.mem.eql(u8, ret.name, "kotlin.Unit")) and !ret.nullable;
 }
 
-/// `fnTypeArity` resolving an aliased function-typed parameter
-/// (`RoutingHandler = RoutingContext.() -> Unit` → `Function0`) through the
+/// `fnTypeArity` resolving an aliased function-typed parameter through the
 /// typealias registry before reading the `Function{N}` tag.
 pub fn fnTypeArityAlias(b: *FuncBuilder, ty: ir.TypeRef) ?i16 {
     if (fnTypeArity(ty)) |n| return n;
@@ -511,29 +462,10 @@ pub fn fnTypeArityAlias(b: *FuncBuilder, ty: ir.TypeRef) ?i16 {
     return null;
 }
 
-/// Per-argument expected lambda arity for a call dispatched to the
-/// resolved runtime `func`, parallel to `args`. Each entry is the
-/// non-receiver parameter count of the matching parameter's function type,
-/// or `-1` when the parameter is not a function type or cannot be aligned.
-/// `recv_offset` skips a leading implicit `this` parameter (member /
-/// extension calls). Positional alignment only: a named or spread argument
-/// list yields all-unknown so a misaligned guess never suppresses an `it`.
-/// The extension overload named `name` that hosts a trailing lambda for a
-/// call of `user_arg_count` arguments: an extension (leading `this`) whose
-/// last parameter is function-typed and whose non-receiver arity equals
-/// `user_arg_count`. The bare-call heuristic resolves one FuncId by
-/// declaration order, which for an overloaded name (`get` — `List.get`,
-/// `Map.get`, `Route.get(path, body)`) may not be the overload the trailing
-/// lambda lands on; the per-argument arity readout must read the lambda's
-/// expected arity from the hosting overload so a `T.() -> R` handler drops
-/// its synthetic `it`.
-/// Whether `f`'s trailing function-typed parameter declares more
-/// parameters than the call's trailing lambda supplies, leaving a reified
-/// type parameter that appears in that lambda-parameter list unbound. Used
-/// to reject a reified inline overload a bare/underfilled lambda cannot
-/// instantiate (`post<reified R>(path, RoutingContext.(R) -> Unit)` for a
-/// zero-parameter handler). Conservative: only fires when the last
-/// parameter resolves to a function type whose arity exceeds the lambda's.
+/// Per-argument expected lambda arity for a call dispatched to `func`: the
+/// non-receiver parameter count of the matching parameter's function type, or
+/// `-1` when unalignable. `recv_offset` skips a leading implicit `this`.
+/// Positional alignment only, so named or spread arguments yield all-unknown.
 pub fn reifiedNeedsLambdaArity(b: *FuncBuilder, f: *const ast.Function, lambda_arity: usize) bool {
     if (f.params.len == 0) return false;
     const ty = f.params[f.params.len - 1].ty;
@@ -546,13 +478,9 @@ pub fn reifiedNeedsLambdaArity(b: *FuncBuilder, f: *const ast.Function, lambda_a
     return fn_arity > lambda_arity;
 }
 
-/// Whether any same-named lowered candidate is an extension whose value-
-/// parameter shape can bind this call's argument count through an implicit
-/// receiver — `to(x)` inside a class is `this.to(x)`, so the receiver-bound
-/// candidate keeps the bare call on the member/extension dispatch path. The
-/// host global serves the call only when no receiver-bound binding is
-/// possible (no such candidate, or none fits the arity: `iterator { … }`
-/// against the zero-arg `Map.iterator()` family).
+/// Whether any same-named candidate is an extension whose value-parameter shape
+/// can bind this argument count through an implicit receiver, since `to(x)` inside
+/// a class is `this.to(x)`. The host global serves only when none can.
 pub fn extensionCandidateFitsArity(b: *FuncBuilder, name: []const u8, user_arg_count: usize) bool {
     for (b.module.funcsBySimpleName(name)) |fid| {
         const f = b.module.funcById(fid) orelse continue;
@@ -576,17 +504,10 @@ pub fn extensionCandidateFitsArity(b: *FuncBuilder, name: []const u8, user_arg_c
     return false;
 }
 
-/// The class MEMBER that hosts a trailing lambda for a bare call, reached
-/// owner-scoped through `member_method_fids`. `Module.func_name_index` indexes
-/// only TOP-LEVEL functions, so a bare call to a member (`onDrawWithContent { … }`
-/// inside a `CacheDrawScope` extension) could not reach its signature at lower
-/// time: the trailing lambda's expected arity came back unknown and a
-/// `T.() -> R` receiver lambda kept the parser's synthetic `it`, which then
-/// swallowed the receiver at invocation.
-///
-/// The candidate classes are the enclosing owner and the declared extension
-/// receiver, each walked up its supertype chain — the member may be declared on
-/// a supertype of the receiver we are lowering against.
+/// The class member hosting a trailing lambda for a bare call, reached
+/// owner-scoped through `member_method_fids`, since `func_name_index` holds only
+/// top-level functions. Candidates are the enclosing owner and the declared
+/// extension receiver, each walked up its supertype chain.
 pub fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_count: usize) ?FuncId {
     const mhtl_trace = if (runtime.envOnce("KLIO_MISS_TRACE")) |w| std.mem.eql(u8, w, name) else false;
     var roots: [2]?[]const u8 = .{ b.ownerClass(), null };
@@ -594,7 +515,7 @@ pub fn memberHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg_c
     if (mhtl_trace) std.debug.print("[mhtl] {s}: owner={?s} recv_root={?s} argc={d}\n", .{ name, roots[0], roots[1], user_arg_count });
     for (roots) |root_opt| {
         const root = root_opt orelse continue;
-        // The class itself, then its transitive supertype names (nearest first).
+        // The class itself, then its transitive supertypes, nearest first.
         const supers: []const []const u8 = b.module.registry.class_super_names.get(root) orelse &.{};
         var i: usize = 0;
         while (i < 1 + supers.len) : (i += 1) {
@@ -688,9 +609,7 @@ fn memberHostsTrailingLambdaAtArity(b: *FuncBuilder, cls: []const u8, f: *const 
     const last = f.params[f.params.len - 1];
     if (last.is_vararg or fnTypeArityAlias(b, last.ty) == null) return false;
     // Positional arguments before a trailing lambda fill parameters from the
-    // front. Every gap before the last parameter must therefore have a
-    // declaration-site default, including one inherited from an expect or
-    // abstract member by its concrete implementation.
+    // front, so every earlier gap needs a declaration-site default.
     var pi = off + user_arg_count - 1;
     while (pi < f.params.len - 1) : (pi += 1) {
         if (!memberParamHasDefault(b, cls, fid, pi)) return false;
@@ -698,8 +617,8 @@ fn memberHostsTrailingLambdaAtArity(b: *FuncBuilder, cls: []const u8, f: *const 
     return true;
 }
 
-/// The declared RETURN type head of a function-typed parameter — the last type
-/// argument of its `FunctionN`. Null when the shape is not a function type.
+/// The declared return type head of a function-typed parameter: the last type
+/// argument of its `FunctionN`.
 fn lambdaReturnHead(ty: ir.TypeRef) ?[]const u8 {
     if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
     if (ty.args.len == 0) return null;
@@ -719,42 +638,29 @@ pub fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg
         return memberHostingTrailingLambda(b, name, user_arg_count);
     };
     if (ohtl_trace) std.debug.print("[ohtl] {s}: {d} candidates argc={d}\n", .{ name, list.items.len, user_arg_count });
-    // With several same-named overloads that all host a trailing lambda
-    // (`SnapshotStateList.withCurrent(block: T.() -> R)` and
-    // `StateRecord.withCurrent(block: (r: T) -> R)`), declaration order is not
-    // evidence: the block's arity differs per overload (0 vs 1), and picking
-    // the wrong one records the wrong arity, so a receiver-lambda argument
-    // keeps a spurious `it` and its bare member reads fall through to globals.
-    // Prefer the overload whose leading `this` matches the enclosing receiver
-    // type; only fall back to declaration order when none matches.
+    // With several trailing-lambda overloads declaration order is not evidence,
+    // the block's arity differing per overload, so prefer the one whose leading
+    // `this` matches the enclosing receiver type.
     const recv_simple: ?[]const u8 = if (b.enclosingRecvTy()) |r| simpleTypeHead(r) else null;
     var fallback: ?FuncId = null;
-    // A candidate whose body has not been attached yet still answers the
-    // arity question — its SIGNATURE is what the lambda shape needs. A file
-    // lowered before the file that declares its callee (a user file whose
-    // package places it ahead of a pack's own sources) sees the callee
-    // body-less at this point; skipping it left the trailing receiver-lambda
-    // with a spurious implicit `it` bound to the invocation argument
-    // (`launch(Dispatchers.Default) { it }` read the StandaloneCoroutine).
-    // With-body candidates still outrank body-less ones: an `expect`
-    // declaration shadowed by its actual keeps losing to the real one.
+    // A body-less candidate still answers the arity question, its signature being
+    // what the lambda shape needs. With-body candidates outrank it, so an
+    // `expect` keeps losing to its actual.
     var bodyless: ?FuncId = null;
     var fallback_ret: ?[]const u8 = null;
     var ret_conflict = false;
     for (list.items) |fid| {
         const f = b.module.funcById(fid) orelse continue;
         if (ohtl_trace) std.debug.print("[ohtl] {s}: cand #{d} params={d} body={} last_ty={s} last_arity={?d}\n", .{ name, fid.int(), f.params.len, f.hasBody(), if (f.params.len != 0) f.params[f.params.len - 1].ty.name else "-", if (f.params.len != 0) fnTypeArityAlias(b, f.params[f.params.len - 1].ty) else null });
-        // Both shapes host a trailing lambda: an extension/member (leading
-        // `this`) and a plain top-level fn — the offset generalizes.
+        // Both shapes host a trailing lambda, so the offset generalizes.
         const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
         const user_params = f.params.len - off;
         if (user_params < user_arg_count) continue;
         const last = f.params[f.params.len - 1];
         if (last.is_vararg) continue;
         if (fnTypeArityAlias(b, last.ty) == null) continue;
-        // Under-applied (`launch { … }` against `launch(context = …,
-        // start = …, block)`): the trailing lambda binds the last param
-        // out of sequence, so every skipped parameter must be defaulted.
+        // Under-applied: the trailing lambda binds the last param out of
+        // sequence, so every skipped parameter must be defaulted.
         if (user_params != user_arg_count) {
             var i: usize = off + user_arg_count - 1; // leading args fill params[off..]
             var gap_defaulted = true;
@@ -770,8 +676,8 @@ pub fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg
             if (bodyless == null) bodyless = fid;
             continue;
         }
-        // Receiver match wins outright; otherwise remember the first valid
-        // candidate as the declaration-order fallback.
+        // Receiver match wins outright; otherwise keep the first valid candidate
+        // as the declaration-order fallback.
         if (recv_simple) |rs| {
             if (off == 1 and std.mem.eql(u8, simpleTypeHead(f.params[0].ty.name), rs))
                 return fid;
@@ -783,26 +689,16 @@ pub fn overloadHostingTrailingLambda(b: *FuncBuilder, name: []const u8, user_arg
             ret_conflict = true;
         }
     }
-    // Several surviving candidates whose trailing lambdas differ in RETURN
-    // type — `sumOf(selector: (T) -> Int)` against `(T) -> Double`, 80 of them
-    // for that name. Kotlin picks by the lambda's inferred return type, which
-    // lowering does not have, so declaration order here is a guess. The pick
-    // is used to STAMP the lambda's parameter types as if it were proven, and
-    // a wrong stamp is worse than none: the call resolves correctly when
-    // nothing is recorded. Decline instead.
+    // Candidates whose trailing lambdas differ only in return type: Kotlin picks
+    // by the lambda's inferred return, which lowering lacks, and a wrong stamp of
+    // the parameter types is worse than none.
     if (ret_conflict) {
         if (ohtl_trace) std.debug.print("[ohtl] {s}: declined, candidates differ in lambda return type\n", .{name});
         return null;
     }
     if (fallback) |fid| return fid;
-    // A member on the enclosing/receiver class outranks a SIGNATURE-ONLY
-    // top-level namesake: at pack bake the StateRecord.withCurrent extension
-    // is still body-less while SnapshotStateMap.mutate's call to its own
-    // private withCurrent lowers, and letting the extension's (r: T) -> R
-    // arity re-shape the member call's `{ this }` block made a fresh engine
-    // pack return the outer map from every mutate (the get_field-map
-    // family). A WITH-BODY top-level (the fallback above) still wins as
-    // before.
+    // A member on the enclosing or receiver class outranks a signature-only
+    // top-level namesake; a with-body one still wins through the fallback above.
     if (memberHostingTrailingLambda(b, name, user_arg_count)) |fid| return fid;
     if (bodyless) |fid| return fid;
     return null;
@@ -814,13 +710,10 @@ pub fn anyNamedArg(arg_names: []const ?[]const u8) bool {
     return false;
 }
 
-/// Map each argument to the callee parameter it fills, honoring Kotlin's
-/// named-argument rules: a named argument matches the parameter of that name; an
-/// unnamed trailing lambda binds the last parameter; the remaining unnamed
-/// (positional) arguments fill the still-unassigned parameters left to right.
-/// `params` is the callee's parameter slice with any receiver already removed.
-/// Returns a per-argument target index (parallel to `args`), null for an
-/// argument whose parameter can't be determined. Caller frees the slice.
+/// Map each argument to the callee parameter it fills, per Kotlin's rules: a named
+/// argument matches the parameter of that name, an unnamed trailing lambda binds
+/// the last parameter, and remaining unnamed arguments fill the free parameters
+/// left to right. `params` has any receiver removed. Caller frees.
 pub fn mapArgsToParams(
     b: *FuncBuilder,
     params: []const ir.Param,
@@ -832,13 +725,9 @@ pub fn mapArgsToParams(
     const used = try b.allocator.alloc(bool, params.len);
     defer b.allocator.free(used);
     for (used) |*u| u.* = false;
-    // 1. Named arguments bind their same-named parameter. A named argument
-    // that matches NO parameter makes the whole call inapplicable to this
-    // callee (Kotlin rejects the candidate outright), so the map must fail
-    // rather than silently drop the argument — otherwise an unnamed trailing
-    // lambda still "binds" the last parameter of a callee that cannot take
-    // this call, and downstream heuristics record that parameter's lambda
-    // shape (receiver head, arity) against the wrong lambda.
+    // A named argument matching no parameter makes the whole call inapplicable in
+    // Kotlin, so the map fails rather than drop it; otherwise a trailing lambda
+    // binds the last parameter of a callee that cannot take the call.
     for (args, 0..) |_, j| {
         const an = if (j < arg_names.len) arg_names[j] else null;
         if (an) |name| {
@@ -853,7 +742,7 @@ pub fn mapArgsToParams(
             used[idx] = true;
         }
     }
-    // 2. An unnamed trailing lambda binds the last (still-free) parameter.
+    // An unnamed trailing lambda binds the last still-free parameter.
     var trailing_done = false;
     if (args.len != 0) {
         const last = args.len - 1;
@@ -865,7 +754,7 @@ pub fn mapArgsToParams(
             trailing_done = true;
         }
     }
-    // 3. Remaining unnamed arguments fill the free parameters front to back.
+    // Remaining unnamed arguments fill the free parameters front to back.
     var pidx: usize = 0;
     for (args, 0..) |_, j| {
         const an = if (j < arg_names.len) arg_names[j] else null;
@@ -883,9 +772,8 @@ pub fn mapArgsToParams(
     return out;
 }
 
-/// The element type of a function-typed VARARG parameter. The lowered
-/// parameter may carry the element type directly (`Function0`) rather than a
-/// materialized array, so try it as-is before stripping an array layer.
+/// The element type of a function-typed vararg parameter, which may be carried
+/// directly rather than as a materialized array.
 fn varargFnElemTy(b: *FuncBuilder, ty: ir.TypeRef) ir.TypeRef {
     if (fnTypeArityAlias(b, ty) != null) return ty;
     return applicability.varargElementRef(&ty);
@@ -898,10 +786,8 @@ pub fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_
     const params = func.params[recv_offset..];
     const out = try b.allocator.alloc(i16, args.len);
     for (out) |*o| o.* = -1;
-    // Named arguments: resolve each lambda's expected arity through its target
-    // parameter (by name) so a receiver lambda passed by name is still detected
-    // as arity-0 — otherwise it is mistaken for an `it`-lambda and its bare
-    // member accesses fall through to unresolved globals.
+    // Named arguments resolve each lambda's expected arity through its target
+    // parameter by name, so a receiver lambda passed by name is still arity-0.
     if (anyNamedArg(arg_names)) {
         const map = (try mapArgsToParams(b, params, args, arg_names)) orelse {
             b.allocator.free(out);
@@ -913,14 +799,10 @@ pub fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_
         }
         return out;
     }
-    // A trailing lambda fills the last function-typed parameter even when
-    // earlier defaulted parameters are omitted; align the trailing lambda
-    // with the last parameter and the leading args from the front.
-    // Same vararg run as the receiver recorder below. Without this the
-    // literals keep their implicit `it` parameter, so the closure reports one
-    // value parameter, and the VM's receiver rule — bind the extra leading
-    // argument when a receiver-carrying closure is called with `n_params + 1`
-    // arguments — cannot fire.
+    // A trailing lambda fills the last function-typed parameter even when earlier
+    // defaulted parameters are omitted. Without this the literals keep their
+    // implicit `it`, and the VM's receiver rule (bind the extra leading argument
+    // at `n_params + 1`) cannot fire.
     for (params, 0..) |p, vp| {
         if (!p.is_vararg) continue;
         const n_after = params.len - vp - 1;
@@ -957,11 +839,9 @@ pub fn argFnArities(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_
     return out;
 }
 
-/// The declared receiver-type head of a receiver-lambda parameter type
-/// (`MockViewValidator.() -> Unit`), or null when the type is not a direct
-/// receiver function. The lowered encoding is
-/// `[#suspend?] [receiver?] params(n) ret(1) [#markers]`; a receiver is present
-/// when the non-marker, non-suspend arg count is `n + 2`.
+/// The declared receiver-type head of a receiver-lambda parameter type. The
+/// lowered encoding is `[#suspend?] [receiver?] params(n) ret(1) [#markers]`; a
+/// receiver is present when the non-marker, non-suspend arg count is `n + 2`.
 pub fn fnTypeReceiver(b: *FuncBuilder, ty: ir.TypeRef) ?ir.TypeRef {
     if (!std.mem.startsWith(u8, ty.name, "Function")) return null;
     const arity = fnTypeArityAlias(b, ty) orelse return null;
@@ -990,10 +870,9 @@ fn funcDeclaresTypeParam(b: *const FuncBuilder, func: *const Func, name: []const
     return false;
 }
 
-/// Substitute a receiver-function parameter's direct function type parameter
-/// from authoritative call-argument evidence. This is the common
-/// `with(receiver, block: T.() -> R)` shape: the block's implicit receiver is
-/// the static type of `receiver`, not the unbound declaration name `T`.
+/// Substitute a receiver-function parameter's type from call-argument evidence:
+/// in `with(receiver, block: T.() -> R)` the block's receiver is `receiver`'s
+/// static type, not the unbound name `T`.
 pub fn callBoundLambdaReceiverType(
     b: *FuncBuilder,
     func: *const Func,
@@ -1006,10 +885,8 @@ pub fn callBoundLambdaReceiverType(
 ) Allocator.Error!ir.TypeRef {
     const head = declared_receiver.name;
     if (!funcDeclaresTypeParam(b, func, head)) {
-        // The head can be the ENCLOSING CLASS's type parameter, whose
-        // instantiation the call receiver's own type arguments carry:
-        // `propertyEquals { }` on a `CompareContext<Map<K, V>>` receiver
-        // binds its `T.() -> P` lambda's receiver to `Map<K, V>`.
+        // The head can be the enclosing class's type parameter, whose
+        // instantiation the call receiver's own type arguments carry.
         if (classParamReceiverInstantiation(b, func, head, call_receiver)) |inst| {
             return inst.clone(b.allocator);
         }
@@ -1072,11 +949,9 @@ pub fn callBoundLambdaReceiverType(
         declared_receiver.clone(b.allocator);
 }
 
-/// `head` as a type parameter of `func`'s ENCLOSING CLASS, instantiated by
-/// the call receiver's own type arguments. Answers a borrowed ref into the
-/// receiver's arg list; the caller clones. The receiver must name the
-/// declaring class itself so its argument list aligns with the class's
-/// parameter list, and the instantiation must be concrete.
+/// `head` as a type parameter of `func`'s enclosing class, instantiated by the
+/// call receiver's type arguments. Borrowed ref into the receiver's arg list; the
+/// caller clones. The receiver must name the declaring class so the lists align.
 fn classParamReceiverInstantiation(
     b: *FuncBuilder,
     func: *const Func,
@@ -1084,9 +959,8 @@ fn classParamReceiverInstantiation(
     call_receiver: ?ir.TypeRef,
 ) ?*const ir.TypeRef {
     const cpt = runtime.envOnce("KLIO_CPT_TRACE") != null;
-    // The declared receiver's head is usually the class param's IDENTITY
-    // MANGLE, which names its owning class and parameter directly; a plain
-    // param name falls back to the declaration's enclosing class.
+    // The declared receiver's head is usually the class param's identity mangle,
+    // which names its owning class and parameter directly.
     var owner: ir.ClassId = undefined;
     var param_name: []const u8 = head;
     if (ir.parseClassTypeParamIdentity(head)) |identity| {
@@ -1121,7 +995,7 @@ fn classParamReceiverInstantiation(
         return null;
     };
     var rhead = std.mem.trimEnd(u8, recv.name, "?");
-    if (std.mem.indexOfScalar(u8, rhead, '<')) |lt| rhead = rhead[0..lt];
+    if (std.mem.findScalar(u8, rhead, '<')) |lt| rhead = rhead[0..lt];
     rhead = typeHead(rhead);
     if (!std.mem.eql(u8, rhead, cls.name) and !std.mem.eql(u8, rhead, applicability.simpleName(cls.fqn))) {
         if (cpt) std.debug.print("[cpt] {s} head={s}: recv {s} != cls {s}\n", .{ func.name, head, rhead, cls.name });
@@ -1161,9 +1035,8 @@ fn recordCallBoundLambdaReceiver(
         type_args,
         call_receiver,
     );
-    // An answer that is still the UNINSTANTIATED declared parameter — the
-    // function's own type param or a class param's identity mangle — must
-    // never clobber an instantiated record another resolution pass made.
+    // An answer that is still the uninstantiated declared parameter must never
+    // clobber an instantiated record another resolution pass made.
     if (resolved.eql(declared_receiver) and
         (funcDeclaresTypeParam(b, func, declared_receiver.name) or
             ir.parseClassTypeParamIdentity(declared_receiver.name) != null) and
@@ -1178,9 +1051,8 @@ fn recordCallBoundLambdaReceiver(
     try b.recordLambdaArgRecvOwned(call_span, resolved);
 }
 
-/// Record the receiver-type head of each receiver-lambda ARGUMENT so its body
-/// owns that receiver even when the call is deferred and no expected type
-/// reaches `lowerLambda`. Mirrors `argFnArities`' arg→param alignment.
+/// Record the receiver-type head of each receiver-lambda argument so its body owns
+/// that receiver even when the call is deferred. Mirrors `argFnArities`' alignment.
 pub fn recordLambdaArgReceivers(
     b: *FuncBuilder,
     func: *const Func,
@@ -1225,13 +1097,8 @@ pub fn recordLambdaArgReceiversForCallReceiver(
         }
         return;
     }
-    // A function-typed VARARG parameter binds EVERY argument in its run.
-    // `f(vararg blocks: Sink.() -> Unit)` called with two lambda literals
-    // matches neither shape below — two arguments never equal the one
-    // declared parameter, nor fit `args.len <= params.len` — so neither
-    // literal was recorded. kotlinx-datetime's `alternativeParsing(vararg
-    // others: T.() -> Unit, primary: T.() -> Unit)` is the shape RFC_1123
-    // parses through.
+    // A function-typed vararg parameter binds every argument in its run, a shape
+    // neither branch below matches.
     for (params, 0..) |p, vp| {
         if (!p.is_vararg) continue;
         const n_after = params.len - vp - 1;
@@ -1289,12 +1156,9 @@ pub fn recordLambdaArgReceiversForCallReceiver(
     }
 }
 
-/// A bitmask of which of a `FunctionN`-typed parameter's `arity` value
-/// parameters are declared as a broad collection (`Iterable`/`Collection`).
-/// Used so a lambda bound to that parameter marks those of its own params
-/// broad — then `it + x` over a runtime `Set` produces a `List`, matching the
-/// declared (not runtime) receiver type. Only direct `Function{N}` types are
-/// decoded (a typealias gives arity but not parameter types → mask 0).
+/// Bitmask of which of a `Function{N}` parameter's value parameters are declared
+/// as a broad collection, so a lambda bound there marks its own params broad.
+/// Only direct `Function{N}` types decode; a typealias gives arity but mask 0.
 fn fnTypeBroadMask(ty: ir.TypeRef, arity: i16) u32 {
     if (arity <= 0) return 0;
     const n: usize = @intCast(arity);
@@ -1321,8 +1185,8 @@ fn fnTypeBroadMask(ty: ir.TypeRef, arity: i16) u32 {
     return mask;
 }
 
-/// Per-argument broad-collection lambda-parameter masks for a call dispatched
-/// to `func`, parallel to `args` and aligned exactly like `argFnArities`.
+/// Per-argument broad-collection lambda-parameter masks for a call dispatched to
+/// `func`, aligned exactly like `argFnArities`.
 pub fn argLambdaBroadMasks(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]u32 {
     if (args.len == 0) return null;
     for (arg_names) |an| if (an != null) return null;
@@ -1347,11 +1211,9 @@ pub fn argLambdaBroadMasks(b: *FuncBuilder, func: *const Func, args: []const Exp
     return out;
 }
 
-/// Whether a callee parameter's declared function type takes only values
-/// typed by the callee's own type parameters (`f2t: (T, T) -> T` inside
-/// `fun <T : Comparable<T>> ...`). A callable reference in such a slot
-/// denotes the GENERIC overload of the referenced name: kotlinc substitutes
-/// the call-site type argument, so only the generic candidate applies.
+/// Whether a callee parameter's function type takes only values typed by the
+/// callee's own type parameters. A callable reference in such a slot denotes the
+/// generic overload, since kotlinc substitutes the call-site type argument.
 fn fnTypeIsCalleeGeneric(b: *FuncBuilder, func: *const Func, ty: ir.TypeRef, arity: i16) bool {
     if (arity <= 0) return false;
     const tps = b.module.registry.func_type_params.get(func.id) orelse return false;
@@ -1385,7 +1247,7 @@ fn fnTypeIsCalleeGeneric(b: *FuncBuilder, func: *const Func, ty: ir.TypeRef, ari
 }
 
 /// Per-argument callee-generic function-type flags for a call dispatched to
-/// `func`, parallel to `args` and aligned exactly like `argFnArities`.
+/// `func`, aligned exactly like `argFnArities`.
 pub fn argFnGenericFlags(b: *FuncBuilder, func: *const Func, args: []const Expr, arg_names: []const ?[]const u8, recv_offset: usize) Allocator.Error!?[]bool {
     if (args.len == 0) return null;
     for (arg_names) |an| if (an != null) return null;
@@ -1410,13 +1272,9 @@ pub fn argFnGenericFlags(b: *FuncBuilder, func: *const Func, args: []const Expr,
     return out;
 }
 
-/// Pseudo-explicit type args solved from the call site's EXPECTED type: when
-/// the declared return's head matches the expected head, its argument count
-/// matches, and EVERY one of the callee's type parameters appears as a
-/// direct return type argument, each binds to the expected's argument at
-/// that position. `compareBy`'s `Comparator<T>` against an expected
-/// `Comparator<String>` yields `[String]`; a partial or mismatched shape
-/// yields nothing.
+/// Pseudo-explicit type args solved from the call site's expected type: when the
+/// declared return's head and argument count match, and every callee type
+/// parameter appears as a direct return type argument, each binds positionally.
 pub fn expectedReturnTypeArgsFor(b: *FuncBuilder, func: *const Func) Allocator.Error!?[]ir.TypeRef {
     const exp = b.peekExpected() orelse return null;
     if (exp.function != null or exp.type_args.len == 0) return null;
@@ -1458,21 +1316,17 @@ pub fn expectedReturnTypeArgsFor(b: *FuncBuilder, func: *const Func) Allocator.E
             return null;
         }
         out[filled] = try loweredOwnedLocalTypeRef(b, &ta.ty);
-        // A declared `T?` return position already carries the `?`: the
-        // binding is the expected argument WITHOUT it (`Comparator<T?>`
-        // against `Comparator<String?>` binds T := String, satisfying
-        // `T : Any` exactly as kotlinc solves nullsFirst).
+        // A declared `T?` return position already carries the `?`, so the binding
+        // is the expected argument without it, satisfying `T : Any` as kotlinc does.
         if (declared_nullable) out[filled].nullable = false;
         filled += 1;
     }
     return out;
 }
 
-/// PARTIAL bindings solved from the call site's EXPECTED type: each of the
-/// callee's type parameters that appears as a direct return type argument
-/// binds to the expected's argument at that position; the rest stay unbound
-/// (unlike `expectedReturnTypeArgsFor`, which needs every one for the
-/// positional explicit-args slot). The caller owns the bindings' types.
+/// Partial bindings from the call site's expected type: each callee type parameter
+/// appearing as a direct return type argument binds positionally, the rest staying
+/// unbound. The caller owns the types.
 fn expectedReturnPartialBindings(b: *FuncBuilder, func: *const Func) Allocator.Error!?[]ir.Module.TypeBinding {
     const exp = b.peekExpected() orelse return null;
     if (exp.function != null or exp.type_args.len == 0) return null;
@@ -1538,10 +1392,8 @@ fn instantiatedLambdaValueParams(
     for (type_args, explicit) |*src, *dst| {
         dst.* = try loweredOwnedLocalTypeRef(b, src);
     }
-    // An expected type at the call site binds like explicit type args:
-    // compareBy's declared `Comparator<T>` against an expected
-    // `Comparator<String>` binds T := String, instantiating the selector's
-    // `(T) -> ...` so the literal's parameter types.
+    // An expected type at the call site binds like explicit type args, so a
+    // declared `Comparator<T>` against `Comparator<String>` binds T := String.
     var expected_explicit: ?[]ir.TypeRef = null;
     defer if (expected_explicit) |ea| {
         for (ea) |*t| t.deinit(b.allocator);
@@ -1554,11 +1406,8 @@ fn instantiatedLambdaValueParams(
         explicit
     else
         (expected_explicit orelse explicit);
-    // A PARTIAL expected binding still instantiates the lambda slot's
-    // inputs: two-arg `compareBy(comparator, selector)` declares [T, K]
-    // and its `Comparator<T>` return binds only T from the expected type —
-    // exactly the parameter the selector's `it` needs; K stays bare and
-    // the per-slot guard below handles it.
+    // A partial expected binding still instantiates the lambda slot's inputs; the
+    // per-slot guard below handles the parameters that stay bare.
     var fn_ty_sub: ?ir.TypeRef = null;
     defer if (fn_ty_sub) |*t| t.deinit(b.allocator);
     if (type_args.len == 0 and expected_explicit == null) {
@@ -1579,10 +1428,8 @@ fn instantiatedLambdaValueParams(
     }
     const fn_ty_eff: ir.TypeRef = fn_ty_sub orelse fn_ty;
     var instantiated = blk: {
-        // The ENGINE: solve every binding the call site offers — receiver,
-        // typed value arguments, explicit type args — in one pass and
-        // substitute the lambda's declared fn type through it. The bare-tp
-        // guard below refuses whatever stays unsubstituted.
+        // Solve every binding the call site offers, receiver, typed value
+        // arguments, and explicit type args, in one pass.
         engine: {
             if (std.mem.eql(u8, runtime.envOnce("KLIO_ENGINE_LAMBDA") orelse "1", "0")) break :engine;
             const sh = shapes orelse break :engine;
@@ -1603,14 +1450,12 @@ fn instantiatedLambdaValueParams(
             const substituted = ir.Module.substituteBoundType(a, fn_ty_eff, solved.bindings) catch break :engine;
             break :blk try substituted.clone(b.allocator);
         }
-        // With no explicit type args, the ACTUAL receiver may bind the
-        // callee's params (`Iterable<String>.count` binds T := String).
+        // With no explicit type args, the actual receiver may bind the callee's
+        // params (`Iterable<String>.count` binds T := String).
         if (type_args.len == 0) {
             if (recv) |r| {
-                // Partial substitution: a return-only parameter (`R` in
-                // `minOfWith`'s selector) must not block binding the ones
-                // the receiver proves; the bare-tp guard below refuses any
-                // entry that stayed unsubstituted.
+                // Partial substitution: a return-only parameter must not block
+                // binding the ones the receiver proves.
                 if (try b.module.instantiatedTypeFromReceiverPartial(
                     b.allocator,
                     func.id,
@@ -1647,16 +1492,13 @@ fn instantiatedLambdaValueParams(
         for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
         b.allocator.free(out);
     }
-    // A slice that still quotes one of the CALLEE's own type parameters is
-    // not an answer: the head names nothing in the receiving scope, and
-    // recording it feeds the no-class bucket and disproves candidates a
-    // null leaves open (the splice-inheritance rule). Refuse the whole
-    // slice when any entry's head stayed unsubstituted.
+    // A slice still quoting one of the callee's own type parameters names nothing
+    // in the receiving scope, and would disprove candidates a null leaves open.
     const callee_tps = b.module.registry.func_type_params.get(func.id);
     for (out, instantiated.args[start .. start + count]) |*dst, src| {
         const h = typeHead(std.mem.trimEnd(u8, src.name, "?"));
-        // A star-erased head names nothing either — the engine's erasure
-        // marks an UNSOLVED parameter, which is a null answer here.
+        // A star-erased head names nothing either; the engine's erasure marks an
+        // unsolved parameter.
         if (std.mem.eql(u8, h, "*")) {
             for (out[0..initialized]) |*ty| ty.deinit(b.allocator);
             b.allocator.free(out);
@@ -1690,23 +1532,19 @@ pub fn deinitArgLambdaParamTypes(
     allocator.free(types);
 }
 
-/// The receiver to substitute a generic callee's params from: a declared
-/// receiver carrying ARGUMENTS is authoritative; a bare type-param head
-/// resolves through its full bound ref when one was recorded
-/// (`T : Iterable<String>` answers `Iterable<String>`); a head-only
-/// receiver substitutes nothing.
+/// The receiver to substitute a generic callee's params from: a declared receiver
+/// carrying arguments is authoritative, a bare type-param head resolves through
+/// its recorded bound, and a head-only receiver substitutes nothing.
 pub fn substitutionRecv(b: *FuncBuilder, declared: ?*const ir.TypeRef) ?*const ir.TypeRef {
     const d = declared orelse return null;
     var head = std.mem.trimEnd(u8, d.name, "?");
-    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.typeParamBoundRef(typeHead(head))) |ref| return ref;
     if (d.args.len != 0) return d;
     if (std.mem.eql(u8, runtime.envOnce("KLIO_SUBST_NONGEN") orelse "1", "0")) return null;
-    // A head-only receiver naming a NON-GENERIC class is complete: the head
-    // is the whole type, so `SlotWriter.let { writer -> }` binds
-    // `T := SlotWriter` exactly. Only a generic class's bare head (a `List`
-    // missing its element) says nothing.
-    const cid = (if (std.mem.indexOfScalar(u8, head, '.') != null)
+    // A head-only receiver naming a non-generic class is complete, the head being
+    // the whole type; only a generic class's bare head says nothing.
+    const cid = (if (std.mem.findScalar(u8, head, '.') != null)
         b.module.classIdByFqn(head)
     else
         b.module.uniqueClassIdBySimpleName(typeHead(head))) orelse return null;
@@ -1715,8 +1553,8 @@ pub fn substitutionRecv(b: *FuncBuilder, declared: ?*const ir.TypeRef) ?*const i
     return null;
 }
 
-/// Instantiated expected value-parameter types for each lambda argument,
-/// aligned through the same positional/named/trailing-lambda map as arity.
+/// Instantiated expected value-parameter types for each lambda argument, aligned
+/// through the same positional, named, and trailing-lambda map as arity.
 pub fn argLambdaParamTypes(
     b: *FuncBuilder,
     func: *const Func,
@@ -1753,8 +1591,8 @@ pub fn argLambdaParamTypesRecv(
     }
     if (args.len == 0 or func.params.len < recv_offset) return null;
     for (args) |*arg| if (arg.* == .Spread) return null;
-    // One shape build per call: the engine consumes value-argument
-    // evidence alongside the receiver and explicit type args.
+    // One shape build per call: the engine consumes value-argument evidence
+    // alongside the receiver and explicit type args.
     var lam_shape_set = try buildStaticReturnArgShapes(b, args, arg_names);
     defer lam_shape_set.deinit(b.allocator);
     const lam_shapes = lam_shape_set.shapes;
@@ -1763,9 +1601,8 @@ pub fn argLambdaParamTypesRecv(
     for (out) |*slot| slot.* = null;
     errdefer deinitArgLambdaParamTypes(b.allocator, out);
     var any = false;
-    // Lambda literals bound to a `-> Unit` parameter return Unit whatever
-    // their tail expression yields; the mask rides the same per-argument
-    // channel as the instantiated parameter types.
+    // Lambda literals bound to a `-> Unit` parameter return Unit whatever their
+    // tail expression yields; the mask rides the per-argument channel.
     const unit_mask = try b.allocator.alloc(bool, args.len);
     for (unit_mask) |*u| u.* = false;
     if (b.pending_arg_lambda_unit) |m| b.allocator.free(m);
@@ -1837,14 +1674,10 @@ pub fn argLambdaParamTypesRecv(
     return out;
 }
 
-/// The unique body-bearing generic overload of `name` with `arity` value
-/// params (every one typed by the func's own type parameters), or null when
-/// none or several exist. The target a callee-generic `::name` slot binds.
-///
-/// Reads the placed `Func` when phase 2 has lowered the body, else the
-/// phase-1 header metadata (`decl_user_sig` + `decl_ast_body`) — the
-/// in-memory two-phase build lowers user files while the stdlib funcs are
-/// still header stubs, and the answer must not depend on that state.
+/// The unique body-bearing generic overload of `name` with `arity` value params,
+/// each typed by the func's own type parameters, which a callee-generic `::name`
+/// slot binds. Reads the placed `Func` once lowered, else the phase-1 header
+/// metadata, so the answer does not depend on build state.
 pub fn genericRefTarget(
     b: *FuncBuilder,
     name: []const u8,
@@ -1860,8 +1693,7 @@ pub fn genericRefTarget(
     var found: ?FuncId = null;
     cands: for (candidates) |id| {
         const f = b.module.funcById(id) orelse continue;
-        // An extension (a placed leading `this`, or a header stub's
-        // synthesized receiver param) never binds a bare `::name`.
+        // An extension never binds a bare `::name`.
         if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) continue;
         const tps = b.module.registry.func_type_params.get(id) orelse continue;
         if (tps.items.len == 0) continue;
@@ -1872,8 +1704,8 @@ pub fn genericRefTarget(
                 if (!nameInList(p.ty.name, tps.items)) continue :cands;
             }
         } else {
-            // Phase-1 header stub: judge by the declared metadata, so the
-            // answer is the same whether the body is placed yet or not.
+        // Phase-1 header stub: judge by declared metadata, so the answer does not
+        // depend on whether the body is placed.
             if (!b.module.decl_ast_body.contains(id.int())) continue;
             const sig = b.module.decl_user_sig.get(id.int()) orelse continue;
             if (sig.len != arity or arity == 0) continue;
@@ -1901,8 +1733,8 @@ const CallableRefArgShapes = struct {
     }
 };
 
-/// Expected argument types for a callable reference. A typed local initializer
-/// contributes its source function type; an argument position contributes the
+/// Expected argument types for a callable reference: a typed local initializer
+/// contributes its source function type, an argument position the
 /// callee-instantiated lambda parameter types, falling back to arity alone.
 pub fn callableRefArgShapes(
     b: *FuncBuilder,
@@ -2027,10 +1859,8 @@ fn nameInList(name: []const u8, list: []const []const u8) bool {
     return false;
 }
 
-/// Lambda-param types for a CONSTRUCTOR call's lambda arguments, read from
-/// the class's primary params whose declared types are CONCRETE function
-/// types. Positional args only; a param mentioning a type parameter or the
-/// suspend marker contributes nothing.
+/// Lambda-param types for a constructor call's lambda arguments, from the class's
+/// primary params with concrete function types. Positional args only.
 pub fn ctorLambdaParamTypes(
     b: *FuncBuilder,
     class_id: ir.ClassId,
@@ -2042,9 +1872,8 @@ pub fn ctorLambdaParamTypes(
     if (runtime.envOnce("KLIO_CTORLPT_TRACE") != null) {
         std.debug.print("[ctorlpt] {s} nparams={d} p_last_ty={s}<{d}>\n", .{ cls.name, cls.primary_params.len, if (cls.primary_params.len != 0) cls.primary_params[cls.primary_params.len - 1].ty.name else "-", if (cls.primary_params.len != 0) cls.primary_params[cls.primary_params.len - 1].ty.args.len else 0 });
     }
-    // The array ctors' trailing init lambda takes the element INDEX
-    // whatever the class row records (the (size, init) form is an
-    // intrinsic, not the row's primary constructor).
+    // The array ctors' trailing init lambda takes the element index whatever the
+    // class row records; the (size, init) form is an intrinsic.
     {
         const n = cls.name;
         const is_array_ctor = std.mem.eql(u8, n, "Array") or
@@ -2104,12 +1933,9 @@ pub fn ctorLambdaParamTypes(
     return out;
 }
 
-/// The lambda-param types a fun-interface SAM conversion hands its sole
-/// lambda argument: the interface's single abstract method's value-param
-/// types, substituted under the class's type params as bound by the call's
-/// explicit type arguments or the site's EXPECTED type. Null when neither
-/// binds, when the interface has no sole abstract method, or when the
-/// method takes no value params.
+/// The lambda-param types a fun-interface SAM conversion hands its sole lambda
+/// argument: the interface's single abstract method's value-param types, under the
+/// class's type params as bound by explicit type arguments or the expected type.
 pub fn samLambdaParamTypes(
     b: *FuncBuilder,
     class_id: ir.ClassId,
@@ -2128,8 +1954,8 @@ pub fn samLambdaParamTypes(
         }
         sam_fid = mfid;
     }
-    // An image class row can carry no method list (lazy header); the
-    // member registry still records the interface's declared methods.
+    // An image class row can carry no method list; the member registry still
+    // records the interface's declared methods.
     if (sam_fid == null) {
         var prefix_buf: [160]u8 = undefined;
         const prefix = std.fmt.bufPrint(&prefix_buf, "{s}\x00", .{cls.name}) catch return null;
@@ -2157,8 +1983,8 @@ pub fn samLambdaParamTypes(
         for (cls.type_params, ast_type_args) |tp, *ta| {
             const ty = try decl_mod.loweredTypeRef(a, ta, true);
             try binds.append(a, .{ .name = tp, .ty = ty });
-            // The registry may spell the method's params with the class
-            // identity mangle; bind that spelling too.
+            // The registry may spell the method's params with the class identity
+            // mangle, so bind that spelling too.
             try binds.append(a, .{ .name = try ir.classTypeParamIdentity(a, class_id, tp), .ty = ty });
         }
     } else if (b.peekExpected()) |exp| {

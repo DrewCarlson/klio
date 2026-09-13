@@ -1,8 +1,6 @@
-//! Expression lowering — the central recursive dispatch. Every sibling
-//! lower file calls back into `lowerExpr`. Covers literals, binary /
-//! unary primitive operations, paths, member access, calls (including
-//! the overload-resolution ladder), when / if / try as expressions,
-//! lambdas, and the remaining grammar.
+//! Expression lowering: the central recursive dispatch every sibling lower file
+//! calls back into. Literals, primitive binary and unary operations, paths,
+//! member access, calls, when/if/try as expressions, lambdas, and the rest.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -46,7 +44,6 @@ const CatchHandler = ir.CatchHandler;
 const TypeRef = ir.TypeRef;
 const StringSet = std.StringHashMap(void);
 
-// Helper re-aliases for the sibling free functions used below.
 const astBinop = helpers.astBinop;
 const boxedCellReg = helpers.boxedCellReg;
 const calleeLabel = helpers.calleeLabel;
@@ -92,10 +89,8 @@ const staticCallReturnTypeRef = static_call_type.staticCallReturnTypeRef;
 const callableRefDeclTypeRef = static_call_type.callableRefDeclTypeRef;
 const StaticReturnArgShapes = static_call_type.StaticReturnArgShapes;
 
-// -------------------------------------------------------------------------
-// Sub-module imports and re-exports. Every name below moved out of this
-// file; the aliases keep every call site resolving through `expr`.
-// -------------------------------------------------------------------------
+// Aliases for names that moved into sibling files, so call sites keep
+// resolving through `expr`.
 
 const receiver_mod = @import("expr/receiver.zig");
 const resolveThisRegKind = receiver_mod.resolveThisRegKind;
@@ -263,31 +258,27 @@ const tests_shapes_mod = @import("expr/tests_shapes.zig");
 
 const tests_dispatch_mod = @import("expr/tests_dispatch.zig");
 
-/// Deriver-only leniency: a TYPE record can pick among bodyless expect
-/// headers whose signatures discriminate; an emission pick never can.
+/// Deriver-only leniency: a type record can pick among bodyless expect headers
+/// whose signatures discriminate; an emission pick never can.
 pub threadlocal var lamret_allow_bodyless: bool = false;
 
-/// Lower one expression into the current block, returning the register
-/// holding its value. Value-less forms (assignments, declarations) return a
-/// synthetic `Unit` register so downstream code stays uniform.
+/// Lower one expression into the current block, returning the register holding
+/// its value. Value-less forms return a synthetic `Unit` register.
 pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
-    // Arm the implicit-label for a call's argument lambdas with the
-    // callee's simple name (`with(n) { … }` → "with"). `lowerArgRun`
-    // consumes and re-arms it per argument; `Lambda` reads it.
+    // Arm the implicit label for a call's argument lambdas with the callee's
+    // simple name; `lowerArgRun` re-arms it per argument.
     if (expr.* == .Call) {
         b.pending_lambda_label = calleeLabel(expr.Call.callee);
     }
-    // Tail position is consumed here and handed on only by the forms that
-    // keep it (`if`/`when` arms, an elvis right side, a block's last
-    // statement); every other child lowers outside tail position.
+    // Tail position is consumed here and handed on only by the forms that keep
+    // it: `if`/`when` arms, an elvis right side, a block's last statement.
     const tail_here = b.tail_pos;
     b.tail_pos = false;
     b.tail_here = tail_here;
     b.call_tail = expr.* == .Call and tail_here;
     switch (expr.*) {
         .IntLit => |lit| {
-            // Honour the literal's declared kind (`1L`, `1U`, `1uL`)
-            // rather than letting the value range pick.
+    // Honour the literal's declared kind (`1L`, `1U`, `1uL`) over its range.
             return switch (lit.kind) {
                 .Long => b.emitConst(.{ .Long = lit.value }),
                 .UInt => b.emitConst(.{ .UInt = @intCast(lit.value) }),
@@ -312,17 +303,16 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .Binary => |bin| return lowerBinary(b, bin),
 
         .Unary => |u| {
-            // `-2147483648` parses as Neg(IntLit(2147483648)); the operand's
-            // value doesn't fit in i32 so general IntLit-lowering would widen
-            // to Long. Special-case Int.MIN_VALUE so it stays Int.
+            // `-2147483648` parses as Neg(IntLit(2147483648)), whose operand
+            // does not fit in i32, so general lowering would widen it to Long.
             if (u.op == .Neg and u.expr.* == .IntLit) {
                 const il = u.expr.IntLit;
                 if (il.kind == .Int and il.value == @as(i64, std.math.maxInt(i32)) + 1) {
                     return b.emitConst(.{ .Int = std.math.minInt(i32) });
                 }
             }
-            // Prefix ++ / -- need both an Inc/Dec UnOp AND a write-back to
-            // the lvalue; return the NEW value.
+            // Prefix `++`/`--` need both an Inc/Dec UnOp and a write-back to the
+            // lvalue, and evaluate to the new value.
             if (u.op == .PreInc or u.op == .PreDec) {
                 if (try nullableIncDecCall(b, u.expr, u.op == .PreInc)) |r| {
                     try writeBackLvalue(b, u.expr, r);
@@ -372,16 +362,16 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return dst;
         },
         .If => |f| {
-            // A single destination register both arms write into via Move
-            // before jumping to the join.
+            // A single destination register both arms write into via Move before
+            // jumping to the join.
             const cond_r = try lowerExpr(b, f.cond);
             const t_block = try b.allocBlock();
             const f_block = try b.allocBlock();
             const join = try b.allocBlock();
             const dst = b.allocReg();
             b.terminate(.{ .Branch = .{ .cond = cond_r, .t = t_block, .f = f_block } });
-            // Then arm. An `if (x is T)` guard smart-casts `x` to `T` for the
-            // arm, and extension resolution is static — see `narrowIsCheck`.
+            // An `if (x is T)` guard smart-casts `x` for the arm, and extension
+            // resolution is static; see `narrowIsCheck`.
             b.switchTo(t_block);
             var narrowed: std.ArrayList(build.FuncBuilder.NarrowedLocal) = .empty;
             defer narrowed.deinit(b.allocator);
@@ -446,16 +436,11 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .Member => return lowerMember(b, expr),
         .Index => |ix| {
-            // `r[a, b, ...]` → r.get(a, b, ...). The `get` resolves against
-            // the receiver's STATIC type, as kotlinc does: carry the declared
-            // head so a runtime subtype's own generic `get<T>` cannot shadow
-            // the statically-visible member. `map[local]` on a
-            // `PersistentMap<CompositionLocal, ValueHolder>`-typed local must
-            // bind the plain map `get` (returning the holder), never
-            // `PersistentCompositionLocalHashMap.get<T>` (the composition-
-            // local READ, which returns the resolved value). A head that is
-            // not an ancestor of the runtime receiver disengages the static
-            // scope, so an imprecise head degrades to the unhinted walk.
+            // `r[a, b, ...]` becomes `r.get(a, b, ...)`, resolved against the
+            // receiver's static type as kotlinc does, so a runtime subtype's own
+            // generic `get<T>` cannot shadow the statically visible member. A
+            // head that is not an ancestor of the runtime receiver degrades to
+            // the unhinted walk.
             const recv = try lowerReceiver(b, ix.receiver);
             const run = try lowerArgRun(b, ix.args);
             const dst = b.allocReg();
@@ -480,8 +465,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .Call => return lowerCall(b, expr),
         .DoWhile => |w| {
             const body_blk = try b.allocBlock();
-            // `continue` in a do-while goes to the condition, never back to
-            // the body's start.
+            // `continue` in a do-while goes to the condition, not the body start.
             const cond_blk = try b.allocBlock();
             const exit = try b.allocBlock();
             b.terminate(.{ .Goto = body_blk });
@@ -489,9 +473,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             b.switchTo(body_blk);
             try b.pushLoop(null, cond_blk, exit);
             // Kotlin scopes the do-body's declarations into the `while`
-            // condition; when the body is a block, lower its statements and the
-            // condition in one shared scope so `do { val x = … } while (x …)`
-            // resolves `x` instead of treating it as a stray global.
+            // condition, so a block body and the condition lower in one shared
+            // scope.
             if (w.body) |body| {
                 if (body.* == .Block) {
                     const block = &body.Block;
@@ -528,15 +511,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         },
         .When => |w| {
             b.tail_arm = tail_here;
-            // `when (val v = subject) { ... }` binds `v` to the subject's
-            // value so pattern arms can refer to it.
+            // `when (val v = subject)` binds `v` so pattern arms can refer to it.
             if (w.subject != null and w.subject_binding != null) {
                 try b.pushScope();
                 const sv = try lowerExpr(b, w.subject.?);
                 try b.bind(w.subject_binding.?.name.name, sv);
-                // The subject is evaluated exactly once: the bound register
-                // doubles as the when's subject (re-lowering would re-run a
-                // side-effecting subject like a queue poll).
+            // The subject is evaluated exactly once: the bound register doubles
+            // as the when's subject, since re-lowering would re-run a
+            // side-effecting subject.
                 const r = try when_expr.lowerWhenWithSubjectReg(b, w.subject, sv, w.branches, exprSpan(expr));
                 try b.popScope();
                 return r;
@@ -580,11 +562,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             const s = try lowerExpr(b, ck.expr);
             const dst = b.allocReg();
             // A function-type `is` check tests the erased `FunctionN` /
-            // `SuspendFunctionN` name (the arity counting a receiver), as
-            // kotlinc's `instanceof` does. A cast to a function type stays
-            // erased (`loweredCheckTypeName`), matching kotlinc's arity-only
-            // CHECKCAST that never narrows past the value already being a
-            // function.
+            // `SuspendFunctionN` name, the arity counting a receiver, and a cast
+            // to a function type stays erased, both as kotlinc does.
             if (ck.ty.function) |ft| {
                 const arity = ft.params.len + @as(usize, @intFromBool(ft.receiver != null));
                 const prefix: []const u8 = if (ft.is_suspend) "SuspendFunction" else "Function";
@@ -598,10 +577,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 return dst;
             }
             // An enclosing splice's reified parameter is substituted here,
-            // NULLABILITY included. Leaving the parameter name for the
-            // runtime to resolve through its bound class value loses the
-            // `?`: `filterIsInstance<Int?>()` then dropped every null,
-            // because a class value cannot carry nullability.
+            // nullability included; a class value cannot carry the `?`.
             var check_name = loweredCheckTypeName(b, &ck.ty);
             var check_nullable = ck.ty.nullable;
             if (ck.ty.type_args.len == 0) {
@@ -611,11 +587,10 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         head = head[0 .. head.len - 1];
                         check_nullable = true;
                     }
-                    // The bound name carries the FULL spelling
-                    // (`BufferedChannel<*>`); an `is` check is on the head
-                    // alone, exactly as the runtime's class-value fallback
-                    // was.
-                    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+                    // The bound name carries the full spelling
+                    // (`BufferedChannel<*>`), while an `is` check is on the
+                    // head alone.
+                    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
                     if (head.len != 0) check_name = head;
                 }
             }
@@ -640,15 +615,11 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .NotNullAssert = .{ .dst = dst, .src = s } });
                 return dst;
             }
-            // A cast to a NON-reified type parameter (`x as T`) is erased: the
-            // JVM `checkcast` targets the bound and passes any value (including
-            // null), so it is a runtime no-op — a genuine mismatch surfaces
-            // only when the value is later used as `T`. Return the value as-is,
-            // so a type parameter named like a concrete class (`class
-            // ScopeMap<Key, Scope>` alongside a test's `class Scope`) is not
-            // checked against that class and a nullable instantiation does not
-            // throw. A REIFIED parameter the enclosing splice bound is a
-            // checked cast to the bound type, nullability included.
+            // A cast to a non-reified type parameter is erased: `checkcast`
+            // targets the bound and passes any value, null included. Returning
+            // the value as-is also keeps a type parameter named like a concrete
+            // class from being checked against it. A reified parameter the splice
+            // bound is a checked cast to the bound type.
             if (cast.ty.type_args.len == 0) {
                 if (b.resolveReifiedTypeName(cast.ty.name.name)) |bound| {
                     var head = bound;
@@ -657,7 +628,7 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         head = head[0 .. head.len - 1];
                         nullable = true;
                     }
-                    if (std.mem.indexOfScalar(u8, head, '<')) |lt| head = head[0..lt];
+                    if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
                     if (head.len != 0) {
                         const dst = b.allocReg();
                         try b.push(.{ .Cast = .{
@@ -683,35 +654,28 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .Postfix => return lowerPostfix(b, expr),
         .Labeled => return lowerLabeled(b, expr),
         .PropertyRef => |pr| {
-            // `::enumEntries` against a declared `() -> Head<E>` function
-            // type: the expected return solves the target's single reified
-            // type parameter, and the plain fn VALUE cannot carry it —
-            // lower the reference as a zero-arg closure over the stamped
-            // call instead.
+            // `::enumEntries` against a declared `() -> Head<E>`: the expected
+            // return solves the target's reified type parameter, which a plain fn
+            // value cannot carry, so lower a zero-arg closure over the call.
             if (try reifiedRefClosure(b, pr.name.name, pr.name.span)) |r| return r;
             // `::Array` / `::IntArray`: the array constructors are intrinsics
-            // with no function value to load; the reference forwards to the
-            // constructor call.
+            // with no function value, so the reference forwards to the call.
             if (isArrayCtorRefName(pr.name.name) and b.resolve(pr.name.name) == null and
                 !b.knowsOuter(pr.name.name) and b.module.funcsBySimpleName(pr.name.name).len == 0)
             {
                 if (try arrayCtorRefClosure(b, pr.name.name, pr.name.span)) |r| return r;
             }
-            // `::arrayOf` against `(Array<T>) -> …`: a vararg intrinsic
-            // reference whose slot takes the array itself spreads it.
+            // `::arrayOf` against `(Array<T>) -> …`: a vararg intrinsic whose
+            // slot takes the array itself spreads it.
             if (isVarargIntrinsicName(pr.name.name) and b.resolve(pr.name.name) == null and
                 !b.knowsOuter(pr.name.name) and !userFunctionDeclared(b, pr.name.name))
             {
                 if (try varargIntrinsicRefClosure(b, pr.name.name, pr.name.span)) |r| return r;
             }
-            // `::name` naming a file-private top-level function mangled per
-            // file (two files in one package each declaring the same
-            // `private fun`) references the calling file's mangled name.
-            // Without the rewrite the bare name has no declaration at all
-            // and the reference degrades to a member ref on the enclosing
-            // `this` — kotlinx's `::createSegment` inside SemaphoreImpl.
-            // Locals, outer captures and own members still shadow it, the
-            // same scope order the bare CALL rewrite honors.
+            // `::name` naming a per-file mangled private top-level function
+            // references the calling file's mangled name; otherwise the bare name
+            // has no declaration and degrades to a member ref on `this`. Locals,
+            // captures, and own members still shadow it.
             if (build.filePrivateFuncRename(pr.name.name, pr.name.span.file.int())) |renamed| {
                 if (b.resolve(pr.name.name) == null and !b.knowsOuter(pr.name.name) and
                     !b.hasOwnMember(pr.name.name))
@@ -721,32 +685,21 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return lowerExpr(b, &rewritten);
                 }
             }
-            // `::greet` — a registered top-level fn loads the function value;
-            // a tracked local / top-level prop keeps the unbound PropertyRef;
-            // an untracked own-receiver member binds a MemberRef. The symbol
-            // index resolves the name from this file's package and imports,
-            // and a unique pick is carried as an exact identity — a class
-            // first (`::Ctor`; the runtime gives a class value precedence
-            // over a same-named function), then a non-extension function —
-            // so a same-simple-name declaration from another package cannot
-            // swap in at runtime. Deferred shapes (overload sets, extension
-            // forms) keep the name-keyed emission.
+            // A registered top-level fn loads the function value, a tracked local
+            // or top-level prop keeps the unbound PropertyRef, and an untracked
+            // own-receiver member binds a MemberRef. A unique index pick is
+            // carried as an exact identity, a class first since the runtime gives
+            // a class value precedence over a same-named function.
             const dst = b.allocReg();
             const nm = try b.module.internConst(b.allocator, .{ .String = pr.name.name });
-            // `::localFn` names a local function, which is lowered to a closure
-            // value bound to a register. The reference loads that closure — it
-            // is the referenced callable, not an unbound property of whatever
-            // the use site later applies it to.
-            // A LOCAL EXTENSION fn's closure takes its receiver as the
-            // leading parameter, but a bare `::ref` to it is
-            // receiver-BOUND — kotlinc binds the enclosing implicit
-            // receiver, so `handles.forEach(::validateGroupState)` inside
-            // `table.edit { }` invokes with the edit receiver. Forward
-            // through a synthesized lambda whose bare call re-resolves the
-            // local ext against `this` (capture machinery included); the
-            // reference then has the value-parameter arity the use site
-            // expects. The mark set is inherited into nested lambda
-            // builders, where the closure itself is an outer capture.
+            // `::localFn` loads the closure the local function lowered to: it is
+            // the referenced callable, not an unbound property of a use site.
+            // A local extension fn's closure takes its receiver as the leading
+            // parameter, but a bare `::ref` to it is receiver-bound, kotlinc
+            // binding the enclosing implicit receiver. Forward through a
+            // synthesized lambda whose bare call re-resolves the local extension
+            // against `this`. The mark set is inherited into nested lambda
+            // builders, where the closure is an outer capture.
             if (runtime.envOnce("KLIO_REF_TRACE")) |w| {
                 if (std.mem.eql(u8, w, pr.name.name)) std.debug.print("[ref-trace] {s} lef={} recvctx={} resolve={} outer={} arity_tys={} pending={d} expected_fn={}\n", .{ pr.name.name, b.isLocalExtFn(pr.name.name), inReceiverContext(b), b.resolve(pr.name.name) != null, b.knowsOuter(pr.name.name), b.localFnParamTys(pr.name.name) != null, b.pending_lambda_arity, if (b.peekExpected()) |e| e.function != null else false });
             }
@@ -761,21 +714,18 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return dst;
                 }
             }
-            // `::A` naming a LOCAL class is its constructor: the declaration
-            // bound the class value under the name, and calling a class value
-            // constructs it.
+            // `::A` naming a local class is its constructor: the declaration
+            // bound the class value under the name, and calling one constructs.
             if (build.isLocalClassInScope(pr.name.name)) {
                 if (b.resolve(pr.name.name)) |reg| {
                     try b.push(.{ .Move = .{ .dst = dst, .src = reg } });
                     return dst;
                 }
             }
-            // `::rec` referencing the ENCLOSING local fn from inside its own
-            // body (or a lambda nested in it): the plain name is unbound here
-            // — and a later same-named sibling would rebind it — so the
-            // reference loads the fn's own closure through its mangled cell,
-            // the same binding a bare self-call uses. Extension locals need a
-            // bound receiver and keep the member/property forms below.
+            // `::rec` inside the enclosing local fn's own body loads that fn's
+            // closure through its mangled cell, the binding a bare self-call
+            // uses, since the plain name is unbound here. Extension locals need a
+            // bound receiver and keep the forms below.
             if (b.selfLocalFn()) |slf| {
                 if (std.mem.eql(u8, slf.name, pr.name.name) and !b.isLocalExtFn(slf.mangled)) {
                     const cell: ?Reg = if (b.resolve(slf.mangled)) |r|
@@ -791,11 +741,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
             // The innermost implicit receiver declaring `name` as a member
-            // outranks every top-level pick: kotlinc binds `::proceed`
-            // inside `intercept { handler(context, ::proceed) }` to the
-            // pipeline context, not a same-named global. Stdlib alias
-            // intrinsics keep their global form (a receiver class does not
-            // shadow `::minOf`-style refs it never declares).
+            // outranks every top-level pick. Stdlib alias intrinsics keep their
+            // global form, never being declared by a receiver class.
             if (!ir.isAliasName(pr.name.name)) receiver_member: {
                 const rh = b.recvTy() orelse break :receiver_member;
                 const cid = (b.module.uniqueClassIdBySimpleName(rh) orelse
@@ -815,23 +762,18 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 }
             }
             const is_tracked = b.resolve(pr.name.name) != null or isTopLevelProp(pr.name.name);
-            // A same-named enclosing member only shadows the global for `::name`
-            // when it could actually be the referenced callable: if the use
-            // site expects a specific arity (a function-typed parameter slot)
-            // and the member cannot accept it, the global wins — e.g.
-            // `propagateOf2(::minOf, …)` from a `@Test fun minOf()` references
-            // the stdlib `minOf`, not the zero-arg test method.
+            // A same-named enclosing member shadows the global only when it could
+            // be the referenced callable; where the use site expects an arity the
+            // member cannot accept, the global wins.
             const ref_arity = b.pending_lambda_arity;
             const member_shadows_ref = enclosingDeclaresMember(b, pr.name.name) and
                 (ref_arity < 0 or b.ownMemberApplicable(pr.name.name, @intCast(ref_arity)));
             var class_pick: ?ir.ClassId = b.module.classIdIndexed(pr.name.name, b.self_package, pr.name.span.file);
             var ref_shapes = try callableRefArgShapes(b, ref_arity);
             defer if (ref_shapes) |*shapes| shapes.deinit(b.allocator);
-            // A sealed/abstract class constructs nothing through a reference:
-            // under a TYPED expected function type, the same-named function
-            // overloads are the reference's target, picked by those types
-            // (`val g: (String?) -> P = ::P` binds the `String?` overload,
-            // which a runtime `null` could never tell from `Number?`).
+            // A sealed or abstract class constructs nothing through a reference,
+            // so under a typed expected function type the same-named function
+            // overloads are the target, picked by those types.
             if (class_pick) |cid| typed: {
                 if (cid.int() >= b.module.classes.items.len or !b.module.classes.items[cid.int()].is_abstract) break :typed;
                 if (b.module.funcsBySimpleName(pr.name.name).len == 0) break :typed;
@@ -855,22 +797,17 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             else
                 b.module.resolveBareRefIndexed(pr.name.name, b.self_package, pr.name.span.file);
             refAudit(b, pr.name.name, ref_pick);
-            // A callable reference whose only declaration is in an
-            // unimported package is unresolved (kotlinc rejects `::name` /
-            // `::Ctor` the same as a bare call to it). Record the
-            // diagnostic before binding the lenient pick.
+            // A callable reference whose only declaration is in an unimported
+            // package is unresolved, as kotlinc rejects it. Record the diagnostic
+            // before binding the lenient pick.
             if (class_pick) |cid| {
                 _ = try recordOutOfScopeRef(b, pr.name.name, pr.name.span, classFqnOf(b, cid), b.module.classRefTier(pr.name.name, b.self_package, pr.name.span.file));
             } else if (ref_pick) |fid| {
                 _ = try recordOutOfScopeRef(b, pr.name.name, pr.name.span, fqnOf(b, fid), b.module.bareRefTier(pr.name.name, b.self_package, pr.name.span.file));
             }
-            // `::name` in a slot whose declared function type is written
-            // entirely in the callee's type parameters
-            // (`totalOrderMinOf2<Comparable<Any>>(::minOf)` against
-            // `f2t: (T, T) -> T`) denotes the GENERIC overload: kotlinc
-            // substitutes the call-site type argument, so only the generic
-            // candidate is applicable. Bind the reference by id; a numeric
-            // or otherwise-typed slot keeps the plain alias/global forms.
+            // `::name` in a slot typed entirely in the callee's type parameters
+            // denotes the generic overload, since kotlinc substitutes the
+            // call-site type argument. Other slots keep the global forms.
             if (class_pick == null and ref_pick == null and b.pending_ref_fn_generic and
                 !member_shadows_ref and ref_arity >= 0)
             {
@@ -888,9 +825,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     return dst;
                 }
             }
-            // `::ext` with no receiver, naming only EXTENSION functions whose
-            // receiver an enclosing `this` satisfies, is bound to that
-            // receiver.
+            // `::ext` with no receiver, naming only extensions whose receiver an
+            // enclosing `this` satisfies, is bound to that receiver.
             if (class_pick == null and !member_shadows_ref and !is_tracked) ext_ref: {
                 const target_cls = bareRefExtensionReceiverClass(b, pr.name.name);
                 if (runtime.envOnce("KLIO_REF_TRACE")) |w| {
@@ -902,10 +838,9 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         std.debug.print("\n", .{});
                     }
                 }
-                // No receiver type is known here (a receiver lambda lowered
-                // without its expected type), but a `this` is in scope and
-                // every candidate is an extension: bind it and let dispatch
-                // check the receiver.
+                // No receiver type is known here, but a `this` is in scope and
+                // every candidate is an extension: bind it and let dispatch check
+                // the receiver.
                 const target_cls_v = target_cls orelse {
                     if (!bareRefNamesOnlyExtensions(b, pr.name.name)) break :ext_ref;
                     const this_reg = (try resolveThisRegKind(b, true, false)) orelse break :ext_ref;
@@ -946,30 +881,21 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             } else if ((b.module.funcId(pr.name.name) != null or b.module.classId(pr.name.name) != null) and !member_shadows_ref) {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             } else if (ir.isAliasName(pr.name.name) and !member_shadows_ref) {
-                // `::minOf` / `::maxOf` / `::listOf` … name a stdlib host
-                // intrinsic. A bare `LoadGlobal` resolves it to its
-                // `.Intrinsic` callable value; binding it to the enclosing
-                // `this` (the `!is_tracked` branch below) would emit a
-                // `this.<name>` member ref that misses at runtime. The member
-                // test is scoped to the ENCLOSING class's hierarchy — a
-                // program-wide member-name set is poisoned by an unrelated
-                // sibling class that happens to declare a `minOf`/`maxOf`
-                // `@Test`, which `::minOf` here can never refer to.
+                // `::minOf` and friends name a stdlib host intrinsic, which a
+                // bare `LoadGlobal` resolves to its `.Intrinsic` value; binding
+                // it to `this` would emit a member ref that misses. The member
+                // test is scoped to the enclosing class's hierarchy, a
+                // program-wide name set being poisoned by unrelated namesakes.
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
             } else if (!is_tracked) {
-                // Lambda-aware: a receiver lambda's `this` lives in the
-                // capture slot the runtime receiver-binding fills, so a bare
-                // `::proceed` inside `intercept { handler(context, ::proceed) }`
-                // binds the pipeline context, not a KProperty shell.
+                // Lambda-aware: a receiver lambda's `this` lives in the capture
+                // slot the runtime receiver-binding fills, so a bare `::proceed`
+                // binds the enclosing receiver, not a KProperty shell.
                 if (try resolveThisRegKind(b, true, false)) |this_reg| {
-                    // Inside a MEMBER EXTENSION the frame's `this` is the
-                    // extension receiver; a `::name` referencing an OWNER
-                    // member must bind the dispatch receiver instead
-                    // (`::requestFocus` inside `SemanticsPropertyReceiver.
-                    // applySemantics()` of FocusableNode). Route through
-                    // the qualified-this runtime walk, which resolves the
-                    // enclosing owner instance over the outer/receiver
-                    // chains.
+                    // Inside a member extension the frame's `this` is the
+                    // extension receiver, so a `::name` on an owner member routes
+                    // through the qualified-this walk, which resolves the
+                    // enclosing owner over the outer and receiver chains.
                     var recv_reg = this_reg;
                     if (member_shadows_ref) {
                         if (b.ownerClass()) |own| {
@@ -982,8 +908,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                             }
                         }
                     } else if (enclosingClassDeclaringMember(b, pr.name.name)) |decl| {
-                        // A member of an ENCLOSING class (`::outerMember`
-                        // inside an inner class) binds that class's instance.
+                        // A member of an enclosing class binds that class's
+                        // instance.
                         const own = b.ownerClass() orelse decl;
                         if (!std.mem.eql(u8, decl, own)) {
                             const qnm = try b.module.internConst(b.allocator, .{ .String = decl });
@@ -1002,43 +928,34 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return dst;
         },
         .MemberRef => |mr| {
-            // `TypeName::class` on a bare type name: load the receiver with
-            // constructor-reference semantics so a class that declares a
-            // `companion object` yields the CLASS value, not its companion
-            // singleton. Without `ctor_ref` a class-name read resolves to the
-            // published companion (Kotlin's `C` ⇒ `C.Companion` value rule),
-            // and `.class` then takes the companion's class — so once the
-            // companion is constructed, `C::class` degrades to
-            // `C$Companion$Companion` and `isInstance` / the name diverge.
-            // `.class` is the identity on the resulting class value (and the
-            // object's class for an `object` singleton), so it is kept.
+            // `TypeName::class` loads the receiver with constructor-reference
+            // semantics, so a class declaring a `companion object` yields the
+            // class value; without `ctor_ref` the read resolves to the published
+            // companion, per Kotlin's `C` yields `C.Companion` rule. `.class` is
+            // the identity on the result, and the object's class for a singleton.
             if (std.mem.eql(u8, mr.name.name, "class") and
                 mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1)
             {
                 const rn0 = mr.receiver.Path.segments[0].name;
                 if (b.resolve(rn0) == null and !b.knowsOuter(rn0)) {
-                    // A reified parameter bound by the enclosing splice IS
-                    // its actual (`T::class` inside a spliced
-                    // `assertFailsWith<reified T>`): the bound head, never
-                    // a runtime read of the process-global `T`.
+                    // A reified parameter bound by the enclosing splice is its
+                    // actual: the bound head, never a runtime read of the
+                    // process-global `T`.
                     const reified_head: ?[]const u8 = blk: {
                         const bound = b.resolveReifiedTypeName(rn0) orelse break :blk null;
                         var h = std.mem.trimEnd(u8, bound, "?");
-                        if (std.mem.indexOfScalar(u8, h, '<')) |lt| h = h[0..lt];
+                        if (std.mem.findScalar(u8, h, '<')) |lt| h = h[0..lt];
                         if (h.len == 0) break :blk null;
                         break :blk h;
                     };
-                    // A nested class referenced by bare name inside its
-                    // declaring subtree lives in the class table under its
-                    // lifted name: that alias outranks every same-named
-                    // class elsewhere (`A::class` inside a member extension
-                    // of the outer that declares `class A`).
+                    // A nested class referenced by bare name inside its declaring
+                    // subtree lives in the class table under its lifted name, and
+                    // that alias outranks every same-named class elsewhere.
                     const rn = reified_head orelse (scopeTypeRename(b, rn0, mr.receiver.Path.segments[0].span.file.int()) orelse rn0);
                     // Resolve by the reference's own file and package first: a
-                    // user declaration whose simple name collides with a
-                    // builtin (`object Target` beside `kotlin.annotation
-                    // .Target`) owns the name at its own site, and the
-                    // simple-name index answers whichever registered last.
+                    // user declaration colliding with a builtin owns the name at
+                    // its own site, while the simple-name index answers whichever
+                    // registered last.
                     if (b.module.classIdIndexed(rn, b.self_package, mr.receiver.Path.segments[0].span.file) orelse
                         b.module.classId(rn)) |cid|
                     {
@@ -1052,18 +969,15 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     }
                 }
             }
-            // `String::countVowels` where the member names an in-scope
-            // LOCAL extension function: kotlinc resolves the reference to
-            // that local, not to a member of the type. The local lowered
-            // as a closure bound to its name; the closure takes the
-            // receiver as its first param, exactly the callable shape a
-            // `Type::ext` reference must have.
+            // A member naming an in-scope local extension function resolves to
+            // that local, not to a member of the type; its closure takes the
+            // receiver first, exactly the shape a `Type::ext` ref needs.
             if (!std.mem.eql(u8, mr.name.name, "class") and
                 mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1 and
                 b.isLocalExtFn(mr.name.name))
             {
-                // `value::localExt` is BOUND: a lambda forwarding its
-                // arguments to `value.localExt(...)`.
+                // `value::localExt` is bound: a lambda forwarding its arguments
+                // to `value.localExt(...)`.
                 const rn = mr.receiver.Path.segments[0].name;
                 if (b.resolve(rn) != null or b.knowsOuter(rn)) {
                     if (try boundLocalExtRefClosure(b, mr.receiver, mr.name.name, mr.span)) |r| return r;
@@ -1103,9 +1017,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     }
                 }
             }
-            // `Outer::Nested` where `Nested` is a class is a constructor
-            // reference, not a bound member ref — load the class value. A
-            // receiver naming a VALUE in scope (`outer::Inner`) is the bound
+            // `Outer::Nested` naming a class is a constructor reference, so load
+            // the class value. A receiver naming a value in scope is the bound
             // form of an inner class's constructor and keeps the receiver.
             if (!std.mem.eql(u8, mr.name.name, "class") and
                 mr.receiver.* == .Path and
@@ -1118,20 +1031,14 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .LoadGlobal = .{ .dst = dst, .name = nm } });
                 return dst;
             }
-            // `X::member` where `X` is a bare type/constructor name that has
-            // no IR classId (e.g. an unsigned array `ULongArray`) must load
-            // the type reference directly. Routing it through
-            // `lowerReceiver` -> the implicit-`this` path inside a method
-            // would emit `this.X(...)` and invoke the constructor instead of
-            // taking the type value (`UIntArray::copyInto` inside a test
-            // class constructed a UIntArray from the ref's first use).
+            // `X::member` where `X` is a bare type name with no IR classId loads
+            // the type reference directly; the implicit-`this` path would emit
+            // `this.X(...)` and invoke the constructor instead.
             if (mr.receiver.* == .Path and mr.receiver.Path.segments.len == 1) {
                 const rn = mr.receiver.Path.segments[0].name;
-                // A scope-renamed name has no bare `class_id` either, but it
-                // is a real classifier — a nested `Box` inside its declaring
-                // class lifts to `Holder$Box`. Loading the bare name would
-                // strand the reference on an unresolved global; defer to
-                // `lowerReceiver`, which applies the rewrite.
+                // A scope-renamed name has no bare `class_id` but is a real
+                // classifier, so defer to `lowerReceiver`, which applies the
+                // rewrite.
                 const renamed = scopeTypeRename(b, rn, mr.receiver.Path.segments[0].span.file.int()) != null;
                 if (!renamed and b.resolve(rn) == null and !b.knowsOuter(rn) and
                     b.module.classId(rn) == null and !b.hasOwnMember(rn) and
@@ -1153,17 +1060,15 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return dst;
         },
         .ObjectExpr => {
-            // Anonymous-object expressions carry rich AST shape; emit a
-            // `BuildObject` Inst whose host synthesises a fresh ClassDef
-            // with the snapshotted env on each call.
+            // Anonymous-object expressions carry rich AST shape, so emit a
+            // `BuildObject` whose host synthesises a fresh ClassDef with the
+            // snapshotted env on each call.
             var outer_names = try b.visibleNames();
             defer outer_names.deinit();
-            // A receiver lambda binds `this` through the closure's capture
-            // slot rather than a scope binding, so `visibleNames` misses it
-            // (a method body binds it as a param and includes it). The
-            // enclosing receiver is part of the anon's closed-over env: a
-            // supertype ctor arg (`object : Prov(this)`) evaluates against
-            // this snapshot before the object exists.
+            // A receiver lambda binds `this` through the closure's capture slot
+            // rather than a scope binding, so `visibleNames` misses it. The
+            // enclosing receiver is part of the closed-over env: a supertype ctor
+            // arg evaluates against this snapshot before the object exists.
             if (!outer_names.contains("this") and
                 (b.resolve("this") != null or b.capturesThisSlot() or b.knowsOuter("this")))
             {
@@ -1188,10 +1093,9 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
         .AnonFun => return lowerAnonFun(b, expr),
         .This => |t| {
             if (t.qualifier) |q| {
-                // A labeled receiver `this@fn` for an enclosing (extension)
-                // function: resolve / capture the `this@<fn>` slot bound at
-                // that function's entry — possibly through nested lambdas — so
-                // it is the function's receiver, not the lambda's own `this`.
+                // A labeled receiver `this@fn` for an enclosing function:
+                // resolve or capture the `this@<fn>` slot bound at that
+                // function's entry, possibly through nested lambdas.
                 const label = try std.fmt.allocPrint(b.allocator, "this@{s}", .{q.name});
                 if (b.resolve(label)) |r| return r;
                 if (b.knowsOuter(label)) {
@@ -1199,24 +1103,19 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                     try b.bind(label, dst2);
                     return dst2;
                 }
-                // The enclosing ANON OBJECT closed over the labeled
-                // receiver (`this@minus` inside an anon method): read the
-                // capture. The class-label walk below would resolve to the
-                // anon instance itself. No scope bind: a read inside a
-                // conditional branch must not cache its register for reads
-                // on paths where the branch never ran.
+                // The enclosing anon object closed over the labeled receiver, so
+                // read the capture; the class-label walk below would resolve to
+                // the anon instance. No scope bind: a read inside a conditional
+                // branch must not cache its register for other paths.
                 if (decl_mod.isLowerAnonCapture(label)) {
                     const idx = try b.recordCapture(label);
                     const dst2 = b.allocReg();
                     try b.push(.{ .LoadCapture = .{ .dst = dst2, .idx = idx } });
                     return dst2;
                 }
-                // Inside a spliced receiver-lambda region, `this@<fn>`
-                // naming the enclosing REAL function is that function's
-                // OWN receiver — the innermost `this` is the splice
-                // subject (`destination.apply { putAll(this@toMap) }`
-                // read the destination back and built an empty map). The
-                // outermost scope's `this` binding is the function's own.
+                // Inside a spliced receiver-lambda region, `this@<fn>` naming the
+                // enclosing real function is that function's own receiver, while
+                // the innermost `this` is the splice subject.
                 if (inline_call.rfsEnabled() and
                     (b.lambda_splice_resolve != null or b.encl_tower_depth > 0))
                 {
@@ -1226,8 +1125,8 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                         }
                     }
                 }
-                // Otherwise a class-name label (`this@Outer`): walk at runtime
-                // from the nearest `this` over the class/outer chain.
+                // A class-name label walks at runtime from the nearest `this`
+                // over the class and outer chain.
                 const this_reg = b.resolve("this") orelse blk: {
                     break :blk try b.loadCaptureHoisted("this");
                 };
@@ -1236,12 +1135,9 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
                 try b.push(.{ .QualifiedThis = .{ .dst = dst, .receiver = this_reg, .qualifier = nm } });
                 return dst;
             }
-            // `this` bare resolves to the implicit first param, or the
-            // captured `this` slot inside a lambda body.
-            // `KLIO_THIS_TRACE=1` — every bare-`this` lowering: the active
-            // splice window, each scope index holding a `this` binding, and
-            // the resolved register (`resolve` applies the window + the
-            // enclosing splice's hidden bands).
+            // `this` bare resolves to the implicit first param, or the captured
+            // `this` slot inside a lambda body. `KLIO_THIS_TRACE=1` prints the
+            // splice window, each scope index holding a `this`, and the register.
             if (runtime.envOnce("KLIO_THIS_TRACE") != null) {
                 std.debug.print("[this-trace] span={}:{} depth={d}", .{ exprSpan(expr).file, exprSpan(expr).start, b.scopes.items.len });
                 if (b.lambda_splice_resolve) |w| std.debug.print(" window=caller<{d} own>={d}", .{ w.caller_depth, w.own_base });
@@ -1257,38 +1153,32 @@ pub fn lowerExpr(b: *FuncBuilder, expr: *const Expr) Allocator.Error!Reg {
             return this_reg;
         },
         .Super => {
-            // `super` bare reads the same instance value as `this`
-            // (`this@Outer` for a labeled `super@Outer`).
+            // `super` bare reads the same instance value as `this`.
             if (try superBase(b, expr.Super)) |base| return base.this_reg;
             if (try resolveSuperThisReg(b)) |this_reg| return this_reg;
             try b.push(.{ .Trace = .{ .span = exprSpan(expr) } });
             return b.emitConst(.Unit);
         },
         .Spread => |sp| {
-            // A spread outside a call's argument run is a supertype
-            // constructor argument (`: Base(s, *ints)`) lowered as its own
-            // thunk: its value is the array itself, which the constructor
-            // path adopts as the packed vararg.
+            // A spread outside a call's argument run is a supertype constructor
+            // argument lowered as its own thunk: its value is the array itself,
+            // which the constructor path adopts as the packed vararg.
             return lowerExpr(b, sp.expr);
         },
     }
 }
 
-/// A statically known type for an arbitrary expression: its own declared type
-/// where it has one, otherwise a constructed class, a resolved call's return
-/// type, or the type a local's initializer lends it. Owned by the caller.
-/// On-demand return-derivation nesting: a body deriving a body must
-/// terminate on mutual recursion.
+/// A statically known type for an arbitrary expression: its own declared type,
+/// otherwise a constructed class, a resolved call's return type, or the type a
+/// local's initializer lends it. Owned by the caller.
+/// The second counter bounds on-demand return-derivation nesting.
 pub threadlocal var od_depth: u8 = 0;
 
-/// The local whose own initializer is currently being typed. Its name is not
-/// in scope there, so a bare call of that name inside the initializer resolves
-/// past it. Saved and restored by `localInitTypeRef`, which nests.
+/// The local whose own initializer is being typed. Its name is not in scope
+/// there, so a bare call of that name inside the initializer resolves past it.
+/// Saved and restored by `localInitTypeRef`, which nests.
 pub var init_self_name: ?[]const u8 = null;
 
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
