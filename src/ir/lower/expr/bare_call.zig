@@ -4,6 +4,7 @@ const std = @import("std");
 const ast = @import("ast");
 const runtime = @import("runtime");
 const ir = @import("../../ir.zig");
+const applicability = @import("applicability");
 const build = @import("../../build.zig");
 const helpers = @import("../helpers.zig");
 const literals = @import("../literals.zig");
@@ -145,83 +146,8 @@ pub fn lowerPathCall(
     const segments = callee.Path.segments;
     const name0 = segments[0].name;
 
-    // A bare own-member call with no `this` in scope (secondary-ctor delegation,
-    // default-value thunk) is a companion access, so dispatch it as a member call
-    // on the owner class value; the VM forwards a class receiver to its companion
-    // singleton, walking the superclass chain for an inherited companion member.
-    if (b.isParamThunk() and b.resolve("this") == null and
-        b.hasOwnMember(name0) and b.ownMemberApplicable(name0, args.len) and
-        !ownMemberRejectsLambdas(b, name0, args) and !classWithCompanion(b, name0))
-    {
-        if (b.ownerClass()) |owner| {
-            const cls = b.allocReg();
-            const on = try b.module.internConst(b.allocator, .{ .String = owner });
-            try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on } });
-            const run = try lowerArgRun(b, args);
-            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-            const dst = b.allocReg();
-            const nmc = try b.module.internConst(b.allocator, .{ .String = name0 });
-            try b.push(.{ .CallMember = .{
-                .dst = dst,
-                .receiver = cls,
-                .name = nmc,
-                .trailing_lambda = b.callTrailingLambda(),
-                .args = run[0],
-                .n_args = run[1],
-                .arg_names = arg_names,
-            } });
-            return dst;
-        }
-    }
-
-    // A captured outer that also names a top-level fn routes through value,
-    // unless the outer is a local function that cannot take this call.
-    const local_fn_takes_call = if (b.localFnDecls(name0)) |decls|
-        try anyLocalFnOverloadApplicable(b, decls, args, ast_arg_names)
-    else
-        true;
-    const shadowed_by_local = b.knowsOuter(name0) and b.resolve(name0) == null and
-        b.module.hasBareCallCandidate(name0, segments[0].span.file) and
-        local_fn_takes_call and
-        // A captured local with definite non-callable evidence never serves a
-        // call; the function wins, as in Kotlin.
-        !b.isNonFnLocal(name0);
-    if (shadowed_by_local) {
-        const callee_r = try resolveCapture(b, name0);
-        // Only a captured local extension function or a receiver-lambda param
-        // takes the enclosing receiver as a leading `this`; for a plain one,
-        // `callValueWithThis` would shift `this` into the first value parameter.
-        const wants_this = b.isLocalExtFn(name0) or b.isReceiverLambdaParam(name0);
-        const this_reg: ?Reg = if (wants_this)
-            (if (b.knowsOuter("this") or b.capturesThisSlot())
-                try resolveCapture(b, "this")
-            else
-                b.resolve("this"))
-        else
-            null;
-        const run = try lowerArgRun(b, args);
-        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
-        const dst = b.allocReg();
-        if (this_reg) |recv| {
-            try b.push(.{ .CallValueWithThis = .{
-                .dst = dst,
-                .callee = callee_r,
-                .receiver = recv,
-                .args = run[0],
-                .n_args = run[1],
-                .arg_names = arg_names,
-            } });
-        } else {
-            try b.push(.{ .CallValue = .{
-                .dst = dst,
-                .callee = callee_r,
-                .args = run[0],
-                .n_args = run[1],
-                .arg_names = arg_names,
-            } });
-        }
-        return dst;
-    }
+    if (try tryParamThunkCompanionCall(b, name0, args, ast_arg_names)) |r| return r;
+    if (try tryCapturedLocalShadow(b, segments, args, ast_arg_names)) |r| return r;
 
     // `resolveCall` folds applicability, scope, and the member-vs-global
     // emission decision into one query; the switch below routes its verdict.
@@ -232,64 +158,15 @@ pub fn lowerPathCall(
         segments[0].span.file,
     );
     defer b.allocator.free(cands);
-    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
-        if (std.mem.eql(u8, w, name0)) {
-            std.debug.print("[bare-candidates] {s} file={d} count={d}\n", .{
-                name0,
-                segments[0].span.file.int(),
-                cands.len,
-            });
-            for (cands) |fid| {
-                const f = b.module.funcById(fid) orelse continue;
-                std.debug.print(
-                    "[bare-candidate] {s}#{d} pkg={s} file={?d} params={d} body={} kind={s} sig={} vis={s} mext_owner={s}\n",
-                    .{
-                        f.fqn,
-                        fid.int(),
-                        f.package,
-                        if (b.module.registry.private_fn_files.get(fid)) |file| file.int() else null,
-                        f.params.len,
-                        f.hasBody(),
-                        @tagName(f.kind),
-                        b.module.decl_sigs.get(fid.int()) != null,
-                        if (b.module.decl_sigs.get(fid.int())) |ds| @tagName(ds.visibility) else "-",
-                        b.module.registry.member_ext_owner_class.get(fid) orelse "-",
-                    },
-                );
-                for (f.params) |p| std.debug.print("  [bare-cand-param] {s}: {s}\n", .{ p.name, p.ty.name });
-            }
-        }
-    }
+    traceBareCandidates(b, segments, cands);
     const last_arg_lambda = lastArgIsLambda(args);
 
-    // An own member applicable to this call outranks a same-named top-level
-    // function, so defer to `lowerImplicitThisCall`. A call-site cast overrides.
-    const prefer_member = b.resolve("this") != null and b.hasOwnMember(name0) and
-        b.ownMemberApplicable(name0, args.len) and !ownMemberRejectsLambdas(b, name0, args) and
-        b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0);
 
-    // Call-site evidence pre-picks a same-tier overload: an `as` cast names the
-    // parameter type, a trailing lambda's derived return picks a return variant.
-    const cast_pick: ?FuncId = (try overloadPickByCast(b, cands, args, want)) orelse
-        try overloadPickByLambdaReturn(b, cands, args, want);
+    const pre = try callSitePrePick(b, segments, cands, args, want, last_arg_lambda);
+    const cast_pick = pre.cast_pick;
+    const index_res = pre.index_res;
+    if (pre.prefer_member and cast_pick == null) return null;
 
-    // The index classification, for the ambiguity and out-of-scope diagnostics.
-    // A cast pre-picks a same-tier overload, so no ambiguity is reported.
-    var index_res = b.module.resolveBareCallIndexed(
-        name0,
-        b.self_package,
-        segments[0].span.file,
-        want,
-        last_arg_lambda,
-    );
-    if (cast_pick != null) {
-        const r = indexDeferReason(index_res);
-        if (r == .ambiguous_tier or r == .type_overload) {
-            index_res.outcome = .{ .deferred = .cast_disambiguated };
-        }
-    }
-
-    if (prefer_member and cast_pick == null) return null;
 
     const shapes = try buildArgShapes(b, args, ast_arg_names);
     defer b.allocator.free(shapes);
@@ -369,6 +246,230 @@ pub fn lowerPathCall(
         last_arg_lambda,
         ctx,
     );
+    var res_final = try eagerPinnedResolution(b, segments, res);
+    defer b.allocator.free(res_final.candidate_set);
+    const was_cast = cast_pick != null and res_final.target != null and cast_pick.?.int() == res_final.target.?.int();
+
+    if (try tryPropertyInvokePeer(b, expr, name0, args, res_final, was_cast)) |r| return r;
+    if (try tryHostIntrinsicGlobal(b, name0, args, ast_arg_names, ast_type_args, res_final, shadowed_by_class)) |r| return r;
+    traceBareResolutionMiss(b, segments, res_final, shadowed_by_class);
+    if (try tryTypeOverloadDeferral(b, expr, name0, res_final, index_res, shadowed_by_class)) |r| return r;
+    if (towerParityDefers(b, name0, res_final)) return null;
+    if (res_final.target) |target| {
+        return try emitResolvedBareCall(
+            b,
+            expr,
+            target,
+            res_final,
+            index_res,
+            shadowed_by_class,
+            class_competes,
+            force_static_class,
+            was_cast,
+            cast_pick,
+            shapes,
+            res,
+        );
+    }
+    return null;
+}
+
+/// What call-site evidence says before the resolution engine runs.
+const PrePick = struct {
+    /// An own member applicable to this call outranks a same-named top-level
+    /// function, so the call defers to `lowerImplicitThisCall`.
+    prefer_member: bool,
+    /// A same-tier overload an `as` cast or a trailing lambda's derived return
+    /// already names; it overrides `prefer_member`.
+    cast_pick: ?FuncId,
+    /// The index classification, for the ambiguity and out-of-scope diagnostics.
+    index_res: Module.BareCallResolution,
+};
+
+fn callSitePrePick(
+    b: *FuncBuilder,
+    segments: []const ast.Ident,
+    cands: []const FuncId,
+    args: []const Expr,
+    want: usize,
+    last_arg_lambda: bool,
+) Allocator.Error!PrePick {
+    const name0 = segments[0].name;
+
+    // An own member applicable to this call outranks a same-named top-level
+    // function, so defer to `lowerImplicitThisCall`. A call-site cast overrides.
+    const prefer_member = b.resolve("this") != null and b.hasOwnMember(name0) and
+        b.ownMemberApplicable(name0, args.len) and !ownMemberRejectsLambdas(b, name0, args) and
+        b.resolve(name0) == null and !b.isLocalFn(name0) and !b.isLocalExtFn(name0);
+
+    // Call-site evidence pre-picks a same-tier overload: an `as` cast names the
+    // parameter type, a trailing lambda's derived return picks a return variant.
+    const cast_pick: ?FuncId = (try overloadPickByCast(b, cands, args, want)) orelse
+        try overloadPickByLambdaReturn(b, cands, args, want);
+
+    // The index classification, for the ambiguity and out-of-scope diagnostics.
+    // A cast pre-picks a same-tier overload, so no ambiguity is reported.
+    var index_res = b.module.resolveBareCallIndexed(
+        name0,
+        b.self_package,
+        segments[0].span.file,
+        want,
+        last_arg_lambda,
+    );
+    if (cast_pick != null) {
+        const r = indexDeferReason(index_res);
+        if (r == .ambiguous_tier or r == .type_overload) {
+            index_res.outcome = .{ .deferred = .cast_disambiguated };
+        }
+    }
+
+    return .{ .prefer_member = prefer_member, .cast_pick = cast_pick, .index_res = index_res };
+}
+
+/// A bare own-member call with no `this` in scope (secondary-ctor delegation,
+/// default-value thunk) is a companion access, so dispatch it as a member call
+/// on the owner class value; the VM forwards a class receiver to its companion
+/// singleton, walking the superclass chain for an inherited companion member.
+fn tryParamThunkCompanionCall(
+    b: *FuncBuilder,
+    name0: []const u8,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?Reg {
+
+    if (b.isParamThunk() and b.resolve("this") == null and
+        b.hasOwnMember(name0) and b.ownMemberApplicable(name0, args.len) and
+        !ownMemberRejectsLambdas(b, name0, args) and !classWithCompanion(b, name0))
+    {
+        if (b.ownerClass()) |owner| {
+            const cls = b.allocReg();
+            const on = try b.module.internConst(b.allocator, .{ .String = owner });
+            try b.push(.{ .LoadGlobal = .{ .dst = cls, .name = on } });
+            const run = try lowerArgRun(b, args);
+            const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+            const dst = b.allocReg();
+            const nmc = try b.module.internConst(b.allocator, .{ .String = name0 });
+            try b.push(.{ .CallMember = .{
+                .dst = dst,
+                .receiver = cls,
+                .name = nmc,
+                .trailing_lambda = b.callTrailingLambda(),
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+            return dst;
+        }
+    }
+    return null;
+}
+
+/// A captured outer that also names a top-level fn routes through value, unless
+/// the outer is a local function that cannot take this call.
+fn tryCapturedLocalShadow(
+    b: *FuncBuilder,
+    segments: []const ast.Ident,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?Reg {
+    const name0 = segments[0].name;
+
+    const local_fn_takes_call = if (b.localFnDecls(name0)) |decls|
+        try anyLocalFnOverloadApplicable(b, decls, args, ast_arg_names)
+    else
+        true;
+    const shadowed_by_local = b.knowsOuter(name0) and b.resolve(name0) == null and
+        b.module.hasBareCallCandidate(name0, segments[0].span.file) and
+        local_fn_takes_call and
+        // A captured local with definite non-callable evidence never serves a
+        // call; the function wins, as in Kotlin.
+        !b.isNonFnLocal(name0);
+    if (shadowed_by_local) {
+        const callee_r = try resolveCapture(b, name0);
+        // Only a captured local extension function or a receiver-lambda param
+        // takes the enclosing receiver as a leading `this`; for a plain one,
+        // `callValueWithThis` would shift `this` into the first value parameter.
+        const wants_this = b.isLocalExtFn(name0) or b.isReceiverLambdaParam(name0);
+        const this_reg: ?Reg = if (wants_this)
+            (if (b.knowsOuter("this") or b.capturesThisSlot())
+                try resolveCapture(b, "this")
+            else
+                b.resolve("this"))
+        else
+            null;
+        const run = try lowerArgRun(b, args);
+        const arg_names = try internArgNames(b.allocator, b.module, ast_arg_names);
+        const dst = b.allocReg();
+        if (this_reg) |recv| {
+            try b.push(.{ .CallValueWithThis = .{
+                .dst = dst,
+                .callee = callee_r,
+                .receiver = recv,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+        } else {
+            try b.push(.{ .CallValue = .{
+                .dst = dst,
+                .callee = callee_r,
+                .args = run[0],
+                .n_args = run[1],
+                .arg_names = arg_names,
+            } });
+        }
+        return dst;
+    }
+    return null;
+}
+
+/// `KLIO_BARE_TRACE=<name>`: the candidate set a bare call was ranked against.
+fn traceBareCandidates(b: *FuncBuilder, segments: []const ast.Ident, cands: []const FuncId) void {
+    const name0 = segments[0].name;
+
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name0)) {
+            std.debug.print("[bare-candidates] {s} file={d} count={d}\n", .{
+                name0,
+                segments[0].span.file.int(),
+                cands.len,
+            });
+            for (cands) |fid| {
+                const f = b.module.funcById(fid) orelse continue;
+                std.debug.print(
+                    "[bare-candidate] {s}#{d} pkg={s} file={?d} params={d} body={} kind={s} sig={} vis={s} mext_owner={s}\n",
+                    .{
+                        f.fqn,
+                        fid.int(),
+                        f.package,
+                        if (b.module.registry.private_fn_files.get(fid)) |file| file.int() else null,
+                        f.params.len,
+                        f.hasBody(),
+                        @tagName(f.kind),
+                        b.module.decl_sigs.get(fid.int()) != null,
+                        if (b.module.decl_sigs.get(fid.int())) |ds| @tagName(ds.visibility) else "-",
+                        b.module.registry.member_ext_owner_class.get(fid) orelse "-",
+                    },
+                );
+                for (f.params) |p| std.debug.print("  [bare-cand-param] {s}: {s}\n", .{ p.name, p.ty.name });
+            }
+        }
+    }
+}
+
+/// The checker's recorded pick, where it stands: it is type-derived and
+/// overload-precise where the lazy engine is shape-based, and `target_final`
+/// pins it against runtime value-typed re-picks. A pick resolving the call back
+/// to the enclosing declaration while the lazy engine chose otherwise is
+/// distrusted: stdlib overload families delegate to same-name siblings, and a
+/// mis-picked self-target recurses forever.
+fn eagerPinnedResolution(
+    b: *FuncBuilder,
+    segments: []const ast.Ident,
+    res: ir.Module.Resolution,
+) Allocator.Error!ir.Module.Resolution {
+    const name0 = segments[0].name;
+
     // Compare the engine's answer against typeck's recorded pick. Audit only.
     if (eagerAuditOn() and runtime.envOnce("KLIO_EAGER_HITS") != null) {
         std.debug.print("[EAGER-PROBE] '{s}' f{d}:{d}-{d} map={}\n", .{ name0, segments[0].span.file.int(), segments[0].span.start, segments[0].span.end, b.module.eager_calls != null });
@@ -408,19 +509,28 @@ pub fn lowerPathCall(
             }
         }
     }
+    return res_final;
+}
 
-    defer b.allocator.free(res_final.candidate_set);
-    const was_cast = cast_pick != null and res_final.target != null and cast_pick.?.int() == res_final.target.?.int();
+/// Kotlin ranks an implicit receiver's function-typed property, through the
+/// invoke convention, above an outer-scope top-level function. The static
+/// engine ranks functions only, so such a pick re-routes to the walk.
+fn tryPropertyInvokePeer(
+    b: *FuncBuilder,
+    expr: *const Expr,
+    name0: []const u8,
+    args: []const Expr,
+    res_final: ir.Module.Resolution,
+    was_cast: bool,
+) Allocator.Error!?Reg {
 
-    // Kotlin ranks an implicit receiver's function-typed property, through the
-    // invoke convention, above an outer-scope top-level function. The static
-    // engine ranks functions only, so such a pick re-routes to the walk.
-    if (res_final.target != null and !was_cast) peer: {
+    if (res_final.target == null or was_cast) return null;
+    {
         const tgt = res_final.target.?;
-        const tf = b.module.funcById(tgt) orelse break :peer;
-        if (tf.kind != .plain) break :peer;
-        if (tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this")) break :peer;
-        if (b.resolve(name0) != null) break :peer;
+        const tf = b.module.funcById(tgt) orelse return null;
+        if (tf.kind != .plain) return null;
+        if (tf.params.len != 0 and std.mem.eql(u8, tf.params[0].name, "this")) return null;
+        if (b.resolve(name0) != null) return null;
         const recv_heads = [_]?[]const u8{ bareStaticRecvHead(b), b.recvTy(), b.enclosingRecvTy() };
         for (recv_heads) |mh| {
             const h = mh orelse continue;
@@ -436,10 +546,22 @@ pub fn lowerPathCall(
             return try emitMemberOrGlobal(b, expr, tgt, false);
         }
     }
+    return null;
+}
 
-    // A host-intrinsic global whose user overloads do not apply still resolves to
-    // the intrinsic. Bind it directly in a receiver context: no class declares
-    // the name, so a `this.<name>` redispatch would invoke the receiver itself.
+/// A host-intrinsic global whose user overloads do not apply still resolves to
+/// the intrinsic. Bind it directly in a receiver context: no class declares the
+/// name, so a `this.<name>` redispatch would invoke the receiver itself.
+fn tryHostIntrinsicGlobal(
+    b: *FuncBuilder,
+    name0: []const u8,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    res_final: ir.Module.Resolution,
+    shadowed_by_class: bool,
+) Allocator.Error!?Reg {
+
     if (res_final.target == null and !shadowed_by_class and inReceiverContext(b) and
         ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0) and
         !extensionCandidateFitsArity(b, name0, args.len) and
@@ -447,9 +569,19 @@ pub fn lowerPathCall(
     {
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
     }
+    return null;
+}
 
-    // `KLIO_BARE_TRACE=<name>`: print the static resolution for a bare call,
-    // the static complement of `KLIO_MISS_TRACE`.
+/// `KLIO_BARE_TRACE=<name>`: why a bare call reached no static target, the
+/// static complement of `KLIO_MISS_TRACE`.
+fn traceBareResolutionMiss(
+    b: *FuncBuilder,
+    segments: []const ast.Ident,
+    res_final: ir.Module.Resolution,
+    shadowed_by_class: bool,
+) void {
+    const name0 = segments[0].name;
+
     if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
         if (std.mem.eql(u8, w, name0) and res_final.target == null) {
             std.debug.print("[bare] {s} -> NONE recv_ty={s} encl_recv={s} pkg={s} shadowed={} known_none={} at=f{d}:{d}\n", .{
@@ -464,9 +596,20 @@ pub fn lowerPathCall(
             });
         }
     }
-    // A type-dispatched overload set deferred to runtime must reach an emit form
-    // whose tail re-ranks by value types; a bare-name value read would take the
-    // global lookup's first-wins pick.
+}
+
+/// A type-dispatched overload set deferred to runtime must reach an emit form
+/// whose tail re-ranks by value types; a bare-name value read would take the
+/// global lookup's first-wins pick.
+fn tryTypeOverloadDeferral(
+    b: *FuncBuilder,
+    expr: *const Expr,
+    name0: []const u8,
+    res_final: ir.Module.Resolution,
+    index_res: Module.BareCallResolution,
+    shadowed_by_class: bool,
+) Allocator.Error!?Reg {
+
     if (res_final.target == null and !shadowed_by_class and
         indexDeferReason(index_res) == .type_overload)
     {
@@ -475,118 +618,149 @@ pub fn lowerPathCall(
             return try emitMemberOrGlobal(b, expr, first_cand, false);
         }
     }
-    // In a spliced receiver-lambda region a plain top-level pick may be shadowed
-    // by the subject's members, which the framed route's walk ranks first. An
-    // extension pick stands: receiver-compatible evidence the walk can only weaken.
+    return null;
+}
+
+/// In a spliced receiver-lambda region a plain top-level pick may be shadowed
+/// by the subject's members, which the framed route's walk ranks first. An
+/// extension pick stands: receiver-compatible evidence the walk can only weaken.
+fn towerParityDefers(b: *FuncBuilder, name0: []const u8, res_final: ir.Module.Resolution) bool {
+
     if (inline_call.rfsEnabled() and b.encl_tower_depth > 0 and
         res_final.target != null and !nameHasReifiedInlineCandidate(name0))
-    plain_defer: {
-        const tf0 = b.module.funcById(res_final.target.?) orelse break :plain_defer;
+    {
+        const tf0 = b.module.funcById(res_final.target.?) orelse return false;
         const is_ext0 = tf0.params.len != 0 and std.mem.eql(u8, tf0.params[0].name, "this");
-        if (is_ext0) break :plain_defer;
+        if (is_ext0) return false;
         if (!nameHasReceiverCandidate(b, name0, null) and
-            !b.module.registry.class_member_names.contains(name0)) break :plain_defer;
+            !b.module.registry.class_member_names.contains(name0)) return false;
         orEmitAudit(b, "tower_parity_defer", "fallthrough", name0);
-        return null;
+        return true;
     }
-    if (res_final.target) |target| {
-        if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
-            if (std.mem.eql(u8, w, name0)) {
-                const tfn = b.module.funcById(target);
-                const tf = if (tfn) |f| f.fqn else "?";
-                const np: usize = if (tfn) |f| f.params.len else 0;
-                const is_ext_t = if (tfn) |f| f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this") else false;
-                const sel_ret: []const u8 = if (tfn) |f| blk_sr: {
-                    if (f.params.len == 0) break :blk_sr "-";
-                    const lp = f.params[f.params.len - 1].ty;
-                    if (lp.args.len == 0) break :blk_sr "-";
-                    break :blk_sr lp.args[lp.args.len - 1].name;
-                } else "-";
-                std.debug.print("[bare] pick_was={?d} sel_ret={s}\n", .{ if (cast_pick) |cp| cp.int() else null, sel_ret });
-                std.debug.print("[bare] {s} -> {s}#{d} params={d} ext={} form={s} recv_ty={s} encl_recv={s} pkg={s} shadowed={} at=f{d}:{d}\n", .{
-                    name0,
-                    tf,
-                    target.int(),
-                    np,
-                    is_ext_t,
-                    @tagName(res_final.emit_form),
-                    b.recvTy() orelse "-",
-                    b.enclosingRecvTy() orelse "-",
-                    b.self_package,
-                    shadowed_by_class,
-                    @intFromEnum(segments[0].span.file),
-                    segments[0].span.start,
-                });
-                for (shapes) |*sh| std.debug.print("  [bare-shape] {s}\n", .{if (sh.ty) |t| t.name else "?"});
-                std.debug.print("[bare-res] {s} tier={d} reason={?s} final={} tier_count={d} index={s} lazy={?d}\n", .{ name0, res_final.tier, if (res_final.reason) |r| @tagName(r) else null, res_final.target_final, res_final.tier_count, @tagName(index_res.outcome), if (res.target) |t| t.int() else null });
-            }
+    return false;
+}
+
+/// The static target the engine committed to: emit the call form its verdict
+/// names.
+fn emitResolvedBareCall(
+    b: *FuncBuilder,
+    expr: *const Expr,
+    target: FuncId,
+    res_final: ir.Module.Resolution,
+    index_res: Module.BareCallResolution,
+    shadowed_by_class: bool,
+    class_competes: bool,
+    force_static_class: *bool,
+    was_cast: bool,
+    cast_pick: ?FuncId,
+    shapes: []const applicability.ArgShape,
+    res: ir.Module.Resolution,
+) Allocator.Error!?Reg {
+    const call = expr.Call;
+    const callee = call.callee;
+    const args = call.args;
+    const ast_arg_names = call.arg_names;
+    const ast_type_args = call.type_args;
+    const segments = callee.Path.segments;
+    const name0 = segments[0].name;
+
+    if (runtime.envOnce("KLIO_BARE_TRACE")) |w| {
+        if (std.mem.eql(u8, w, name0)) {
+            const tfn = b.module.funcById(target);
+            const tf = if (tfn) |f| f.fqn else "?";
+            const np: usize = if (tfn) |f| f.params.len else 0;
+            const is_ext_t = if (tfn) |f| f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this") else false;
+            const sel_ret: []const u8 = if (tfn) |f| blk_sr: {
+                if (f.params.len == 0) break :blk_sr "-";
+                const lp = f.params[f.params.len - 1].ty;
+                if (lp.args.len == 0) break :blk_sr "-";
+                break :blk_sr lp.args[lp.args.len - 1].name;
+            } else "-";
+            std.debug.print("[bare] pick_was={?d} sel_ret={s}\n", .{ if (cast_pick) |cp| cp.int() else null, sel_ret });
+            std.debug.print("[bare] {s} -> {s}#{d} params={d} ext={} form={s} recv_ty={s} encl_recv={s} pkg={s} shadowed={} at=f{d}:{d}\n", .{
+                name0,
+                tf,
+                target.int(),
+                np,
+                is_ext_t,
+                @tagName(res_final.emit_form),
+                b.recvTy() orelse "-",
+                b.enclosingRecvTy() orelse "-",
+                b.self_package,
+                shadowed_by_class,
+                @intFromEnum(segments[0].span.file),
+                segments[0].span.start,
+            });
+            for (shapes) |*sh| std.debug.print("  [bare-shape] {s}\n", .{if (sh.ty) |t| t.name else "?"});
+            std.debug.print("[bare-res] {s} tier={d} reason={?s} final={} tier_count={d} index={s} lazy={?d}\n", .{ name0, res_final.tier, if (res_final.reason) |r| @tagName(r) else null, res_final.target_final, res_final.tier_count, @tagName(index_res.outcome), if (res.target) |t| t.int() else null });
         }
-        if (!shadowed_by_class) {
-            // Constructors occupy no `resolveCall` candidate slot but share the
-            // classifier scope tier. A nearer class constructs, a nearer function
-            // commits, and only an equal-tier family needs the runtime comparison.
-            if (class_competes and !was_cast) {
-                const caller_pkg = b.module.packageOfFile(
-                    segments[0].span.file,
-                ) orelse b.self_package;
-                const class_tier = b.module.classRefTier(
-                    name0,
-                    caller_pkg,
-                    segments[0].span.file,
-                ) orelse ir.Module.other_package_tier;
-                if (class_tier < res_final.tier) {
-                    force_static_class.* = true;
-                    return null;
-                }
-                if (class_tier == res_final.tier) return null;
+    }
+    if (!shadowed_by_class) {
+        // Constructors occupy no `resolveCall` candidate slot but share the
+        // classifier scope tier. A nearer class constructs, a nearer function
+        // commits, and only an equal-tier family needs the runtime comparison.
+        if (class_competes and !was_cast) {
+            const caller_pkg = b.module.packageOfFile(
+                segments[0].span.file,
+            ) orelse b.self_package;
+            const class_tier = b.module.classRefTier(
+                name0,
+                caller_pkg,
+                segments[0].span.file,
+            ) orelse ir.Module.other_package_tier;
+            if (class_tier < res_final.tier) {
+                force_static_class.* = true;
+                return null;
             }
-            if (indexDeferReason(index_res) == .ambiguous_tier) {
-                try recordAmbiguousCall(b, name0, segments[0].span, index_res);
-            }
-            // A target in a package the caller cannot see is an unresolved
-            // reference; the diagnostic fails the program before it runs.
-            _ = try recordOutOfScopeCall(b, name0, segments[0].span, target, index_res);
-            // A per-file import alias resolves to a target the name-keyed inline
-            // table cannot see; when that target is an inline header stub, splice
-            // its registered AST by id rather than enter a bodyless frame.
-            if (b.module.funcById(target)) |tfi| {
-                // Alias calls only: on a matching name the name-keyed inline path
-                // already decided, and a second splice re-lowers bodies in
-                // foreign file scopes.
-                if (tfi.is_inline and !tfi.hasBody() and !std.mem.eql(u8, name0, tfi.name)) {
-                    if (inline_state.inlineAstById(target.int())) |inline_ast| {
-                        inline_state.ensureInlineBody(inline_ast);
-                        const iexp = b.peekExpected();
-                        const iexp_ptr: ?*const ast.TypeRef = if (iexp) |*_e| _e else null;
-                        var iselected = try selectedCallArgsForBuilder(
-                            b,
-                            target,
-                            args,
-                            ast_arg_names,
-                            exprSpan(callee),
-                            call.has_trailing_lambda,
-                        );
-                        defer iselected.deinit(b.allocator);
-                        inline_call.splice_route_tag = "lowerPathCall:14624";
-                        if (try tryInlineCallWithTypeArgs(b, name0, inline_ast, iselected.args, iselected.names, null, ast_type_args, iexp_ptr)) |r| {
-                            return r;
-                        }
+            if (class_tier == res_final.tier) return null;
+        }
+        if (indexDeferReason(index_res) == .ambiguous_tier) {
+            try recordAmbiguousCall(b, name0, segments[0].span, index_res);
+        }
+        // A target in a package the caller cannot see is an unresolved
+        // reference; the diagnostic fails the program before it runs.
+        _ = try recordOutOfScopeCall(b, name0, segments[0].span, target, index_res);
+        // A per-file import alias resolves to a target the name-keyed inline
+        // table cannot see; when that target is an inline header stub, splice
+        // its registered AST by id rather than enter a bodyless frame.
+        if (b.module.funcById(target)) |tfi| {
+            // Alias calls only: on a matching name the name-keyed inline path
+            // already decided, and a second splice re-lowers bodies in
+            // foreign file scopes.
+            if (tfi.is_inline and !tfi.hasBody() and !std.mem.eql(u8, name0, tfi.name)) {
+                if (inline_state.inlineAstById(target.int())) |inline_ast| {
+                    inline_state.ensureInlineBody(inline_ast);
+                    const iexp = b.peekExpected();
+                    const iexp_ptr: ?*const ast.TypeRef = if (iexp) |*_e| _e else null;
+                    var iselected = try selectedCallArgsForBuilder(
+                        b,
+                        target,
+                        args,
+                        ast_arg_names,
+                        exprSpan(callee),
+                        call.has_trailing_lambda,
+                    );
+                    defer iselected.deinit(b.allocator);
+                    inline_call.splice_route_tag = "lowerPathCall:14624";
+                    if (try tryInlineCallWithTypeArgs(b, name0, inline_ast, iselected.args, iselected.names, null, ast_type_args, iexp_ptr)) |r| {
+                        return r;
                     }
                 }
             }
-            return switch (res_final.emit_form) {
-                // A finalized pick is as definitive as a cast pick; the runtime's
-                // value-typed re-pick must not override it.
-                .Call => try emitCall(b, expr, target, was_cast or res_final.target_final),
-                .CallMember => try emitCallMember(b, expr, target, was_cast),
-                .CallMemberOrGlobal => try emitMemberOrGlobal(b, expr, target, was_cast),
-                // The resolver never emits a value call with a committed target.
-                .CallValue => unreachable,
-            };
         }
+        return switch (res_final.emit_form) {
+            // A finalized pick is as definitive as a cast pick; the runtime's
+            // value-typed re-pick must not override it.
+            .Call => try emitCall(b, expr, target, was_cast or res_final.target_final),
+            .CallMember => try emitCallMember(b, expr, target, was_cast),
+            .CallMemberOrGlobal => try emitMemberOrGlobal(b, expr, target, was_cast),
+            // The resolver never emits a value call with a committed target.
+            .CallValue => unreachable,
+        };
     }
     return null;
 }
+
 
 /// The active inline splice's receiver head, for a name the spliced body does
 /// not bind itself. A spliced function's own parameter shadows its receiver's
@@ -764,7 +938,8 @@ pub fn resolvePrivateMemberCall(
     });
 }
 
-/// Inside a method body: unqualified `name(...)` is a method call on `this`.
+/// A bare `name(...)` an own member serves: the member call written without
+/// `this.`.
 pub fn lowerImplicitThisCall(
     b: *FuncBuilder,
     callee: *const Expr,
@@ -772,6 +947,7 @@ pub fn lowerImplicitThisCall(
     ast_arg_names: []const ?[]const u8,
     ast_type_args: []const ast.TypeRef,
 ) Allocator.Error!?Reg {
+
     const segments = callee.Path.segments;
     if (segments.len != 1) return null;
     const name0 = segments[0].name;
@@ -793,6 +969,7 @@ pub fn lowerImplicitThisCall(
     if (ownMemberRejectsLambdas(b, name0, args)) return null;
     const this_reg0 = b.resolve("this") orelse return null;
     const this_reg = subjectCorrectedBareThis(b, name0, this_reg0);
+
 
     const member_lambda_shape: ?ir.ModuleRegistry.MemberTrailingLambdaShape = if (allNull(ast_arg_names) and lastArgIsLambda(args))
         predeclaredMemberTrailingLambdaShape(b, name0, args.len)
@@ -823,68 +1000,108 @@ pub fn lowerImplicitThisCall(
         ast_arg_names,
     );
     if (private_resolution.dispatch == .direct and ast_type_args.len == 0) {
-        const fid = private_resolution.target.?;
-        // Reserve the receiver slot first, then lower arguments into a contiguous
-        // run after it. `lowerArgRun` reserves every argument slot before lowering
-        // any, so scratch registers cannot clobber an already-lowered slot.
-        const args_start = b.allocReg();
-        b.pending_arg_broad_masks = itc_broad;
-        if (b.module.funcById(fid)) |pf| {
-            const recv_off: usize = if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0;
-            try recordLambdaArgReceivers(b, pf, args, ast_arg_names, ast_type_args, recv_off);
-        }
-        const priv_arity: ?[]const i16 = if (b.module.funcById(fid)) |pf|
-            (try argFnArities(b, pf, args, ast_arg_names, if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0))
-        else
-            null;
-        defer if (priv_arity) |arities| b.allocator.free(arities);
-        const priv_fn_generic: ?[]bool = if (b.module.funcById(fid)) |pf|
-            (try argFnGenericFlags(b, pf, args, ast_arg_names, if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0))
-        else
-            null;
-        defer if (priv_fn_generic) |m| b.allocator.free(m);
-        b.pending_arg_fn_generic = priv_fn_generic;
-        const priv_lambda_param_types: ?[]?[]ir.TypeRef = if (b.module.funcById(fid)) |pf|
-            blk_priv: {
-                if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] privBare fn={s}\n", .{pf.name});
-                break :blk_priv try argLambdaParamTypes(
-                b,
-                pf,
-                args,
-                ast_arg_names,
-                ast_type_args,
-                if (pf.params.len != 0 and
-                    std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0,
-            );
-            }
-        else
-            null;
-        defer if (priv_lambda_param_types) |types|
-            deinitArgLambdaParamTypes(b.allocator, types);
-        b.pending_arg_lambda_param_types = priv_lambda_param_types;
-        const run = try lowerArgRunWithArity(b, args, priv_arity);
-        try b.push(.{ .Move = .{ .dst = args_start, .src = this_reg } });
-        var user_arg_names = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
-        defer b.allocator.free(user_arg_names);
-        user_arg_names[0] = null;
-        for (ast_arg_names, 0..) |n, i| user_arg_names[i + 1] = n;
-        const arg_names = try internArgNames(b.allocator, b.module, user_arg_names);
-        const dst = b.allocReg();
-        try b.push(.{ .Call = .{
-            .dst = dst,
-            .func = fid,
-            .trailing_lambda = b.callTrailingLambda(),
-            .args = args_start,
-            .n_args = run[1] + 1,
-            .arg_names = arg_names,
-            .type_args = &.{},
-            .exact = true,
-        } });
-        return dst;
+        return try emitPrivateMemberCall(b, args, ast_arg_names, ast_type_args, private_resolution.target.?, this_reg, itc_broad);
     }
-    // A member the receiver type provably declares wins over any same-named
-    // top-level in Kotlin's scope order: direct for final or private, a virtual
-    // slot otherwise. Only an unproven member keeps the OrGlobal fallback.
+    if (try tryProvenMemberDispatch(b, callee, args, ast_arg_names, ast_type_args, this_reg)) |r| return r;
+    return try emitImplicitThisCall(
+        b,
+        callee,
+        args,
+        ast_arg_names,
+        ast_type_args,
+        this_reg,
+        itc_broad,
+        private_resolution.target orelse member_lambda_fid,
+        member_lambda_shape,
+    );
+}
+
+/// Reserve the receiver slot first, then lower arguments into a contiguous run
+/// after it. `lowerArgRun` reserves every argument slot before lowering any, so
+/// scratch registers cannot clobber an already-lowered slot.
+fn emitPrivateMemberCall(
+    b: *FuncBuilder,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    fid: FuncId,
+    this_reg: Reg,
+    itc_broad: ?[]u32,
+) Allocator.Error!Reg {
+
+    // Reserve the receiver slot first, then lower arguments into a contiguous
+    // run after it. `lowerArgRun` reserves every argument slot before lowering
+    // any, so scratch registers cannot clobber an already-lowered slot.
+    const args_start = b.allocReg();
+    b.pending_arg_broad_masks = itc_broad;
+    if (b.module.funcById(fid)) |pf| {
+        const recv_off: usize = if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0;
+        try recordLambdaArgReceivers(b, pf, args, ast_arg_names, ast_type_args, recv_off);
+    }
+    const priv_arity: ?[]const i16 = if (b.module.funcById(fid)) |pf|
+        (try argFnArities(b, pf, args, ast_arg_names, if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0))
+    else
+        null;
+    defer if (priv_arity) |arities| b.allocator.free(arities);
+    const priv_fn_generic: ?[]bool = if (b.module.funcById(fid)) |pf|
+        (try argFnGenericFlags(b, pf, args, ast_arg_names, if (pf.params.len != 0 and std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0))
+    else
+        null;
+    defer if (priv_fn_generic) |m| b.allocator.free(m);
+    b.pending_arg_fn_generic = priv_fn_generic;
+    const priv_lambda_param_types: ?[]?[]ir.TypeRef = if (b.module.funcById(fid)) |pf|
+        blk_priv: {
+            if (runtime.envOnce("KLIO_ALPT") != null) std.debug.print("[alpt-site] privBare fn={s}\n", .{pf.name});
+            break :blk_priv try argLambdaParamTypes(
+            b,
+            pf,
+            args,
+            ast_arg_names,
+            ast_type_args,
+            if (pf.params.len != 0 and
+                std.mem.eql(u8, pf.params[0].name, "this")) 1 else 0,
+        );
+        }
+    else
+        null;
+    defer if (priv_lambda_param_types) |types|
+        deinitArgLambdaParamTypes(b.allocator, types);
+    b.pending_arg_lambda_param_types = priv_lambda_param_types;
+    const run = try lowerArgRunWithArity(b, args, priv_arity);
+    try b.push(.{ .Move = .{ .dst = args_start, .src = this_reg } });
+    var user_arg_names = try b.allocator.alloc(?[]const u8, ast_arg_names.len + 1);
+    defer b.allocator.free(user_arg_names);
+    user_arg_names[0] = null;
+    for (ast_arg_names, 0..) |n, i| user_arg_names[i + 1] = n;
+    const arg_names = try internArgNames(b.allocator, b.module, user_arg_names);
+    const dst = b.allocReg();
+    try b.push(.{ .Call = .{
+        .dst = dst,
+        .func = fid,
+        .trailing_lambda = b.callTrailingLambda(),
+        .args = args_start,
+        .n_args = run[1] + 1,
+        .arg_names = arg_names,
+        .type_args = &.{},
+        .exact = true,
+    } });
+    return dst;
+}
+
+/// A member the receiver type provably declares wins over any same-named
+/// top-level in Kotlin's scope order: direct for final or private, a virtual
+/// slot otherwise. Only an unproven member keeps the OrGlobal fallback.
+fn tryProvenMemberDispatch(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    this_reg: Reg,
+) Allocator.Error!?Reg {
+    const segments = callee.Path.segments;
+    const name0 = segments[0].name;
+
     const itc_gate = runtime.envOnce("KLIO_ITC_MEMBER") orelse "1";
     const itc_on = blk: {
         if (std.mem.eql(u8, itc_gate, "0")) break :blk false;
@@ -895,7 +1112,8 @@ pub fn lowerImplicitThisCall(
         }
         break :blk false;
     };
-    if (itc_on) attempt: {
+    if (!itc_on) return null;
+    attempt: {
         const head_name = bareStaticRecvHead(b) orelse b.ownerClass() orelse break :attempt;
     // A same-named function-typed property is an invoke-convention peer the
     // member resolver cannot rank, and Kotlin binds its invoke when the member's
@@ -960,11 +1178,30 @@ pub fn lowerImplicitThisCall(
             .deferred, .none => {},
         }
     }
+    return null;
+}
+
+/// The own member and a same-named top-level function both stand: emit the
+/// arbitrated form, which lets member dispatch win when callable and fall
+/// through otherwise.
+fn emitImplicitThisCall(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    this_reg: Reg,
+    itc_broad: ?[]u32,
+    member_signature_fid: ?FuncId,
+    member_lambda_shape: ?ir.ModuleRegistry.MemberTrailingLambdaShape,
+) Allocator.Error!?Reg {
+    const segments = callee.Path.segments;
+    const name0 = segments[0].name;
+
     b.pending_arg_broad_masks = itc_broad;
     var member_arity: ?[]i16 = null;
     var member_fn_generic: ?[]bool = null;
     var member_lambda_param_types: ?[]?[]ir.TypeRef = null;
-    const member_signature_fid = private_resolution.target orelse member_lambda_fid;
     if (member_signature_fid) |fid| {
         if (b.module.funcById(fid)) |f| {
             const recv_off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
@@ -1071,10 +1308,25 @@ pub fn lowerUnresolvedBareCall(
     static_ext: ?FuncId,
 ) Allocator.Error!?Reg {
     const name0 = callee.Path.segments[0].name;
-    // Inside its own inline splice, a bare call of the spliced function's name
-    // binds the receiver's member, never the enclosing extension; keeping the
-    // self hint re-enters the splice on every receiver miss.
+    const ext_hint = spliceSelfExtHint(b, name0, static_ext);
+    if (try tryAnonCaptureInvoke(b, callee, args, ast_arg_names)) |r| return r;
+    if (try tryContainerCreatorGlobal(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+    if (try tryOutsideReceiverContext(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+    if (try tryAliasIntrinsicGlobal(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+    if (try tryPlainThisParamGlobal(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+    if (try tryMangledLocalFnCapture(b, name0, args, ast_arg_names, ast_type_args)) |r| return r;
+    traceBareChannel(b, name0);
+    if (try tryBareMemberOnReceiver(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+    if (try tryTypeArgumentedGlobal(b, callee, args, ast_arg_names, ast_type_args)) |r| return r;
+    return try emitDeferredBareCall(b, callee, args, ast_arg_names, ast_type_args, ext_hint);
+}
+
+/// Inside its own inline splice, a bare call of the spliced function's name
+/// binds the receiver's member, never the enclosing extension; keeping the self
+/// hint re-enters the splice on every receiver miss.
+fn spliceSelfExtHint(b: *FuncBuilder, name0: []const u8, static_ext: ?FuncId) ?FuncId {
     var ext_hint = static_ext;
+
     if (ext_hint) |hint| {
         if (b.currentInlineDecl()) |decl| {
             if (inline_state.inlineIdByAst(decl)) |own| {
@@ -1082,7 +1334,19 @@ pub fn lowerUnresolvedBareCall(
             }
         }
     }
-    // A bare call to a name the enclosing anon object closes over.
+    _ = name0;
+    return ext_hint;
+}
+
+/// A bare call to a name the enclosing anon object closes over.
+fn tryAnonCaptureInvoke(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+) Allocator.Error!?Reg {
+    const name0 = callee.Path.segments[0].name;
+
     if (isLowerAnonCapture(name0)) {
         const idx = try b.recordCapture(name0);
         const callee_r = b.allocReg();
@@ -1099,9 +1363,21 @@ pub fn lowerUnresolvedBareCall(
         } });
         return dst;
     }
-    // A stdlib container creator called with type args inside a method body is a
-    // host-intrinsic global, never a class member, and the receiver-context path
-    // drops the type args, so bind the global directly and carry them.
+    return null;
+}
+
+/// A stdlib container creator called with type args inside a method body is a
+/// host-intrinsic global, never a class member, and the receiver-context path
+/// drops the type args, so bind the global directly and carry them.
+fn tryContainerCreatorGlobal(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?Reg {
+    const name0 = callee.Path.segments[0].name;
+
     if (ast_type_args.len != 0 and emptyContainerCreatorArity(name0) != 0 and
         b.module.funcId(name0) == null and !anyReceiverClassDeclares(b, name0))
     {
@@ -1123,8 +1399,20 @@ pub fn lowerUnresolvedBareCall(
         } });
         return dst;
     }
-    // Outside any receiver context no member can serve the call, and
-    // `funcId == null` here means the overload tier has no candidates either.
+    return null;
+}
+
+/// Outside any receiver context no member can serve the call, and a null
+/// `funcId` here means the overload tier has no candidates either.
+fn tryOutsideReceiverContext(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?Reg {
+    const name0 = callee.Path.segments[0].name;
+
     if (!inReceiverContext(b)) {
         // A name with no local, capture, global candidate, classifier, or
         // top-level property is provably unresolved and kotlinc rejects it.
@@ -1165,9 +1453,21 @@ pub fn lowerUnresolvedBareCall(
         } });
         return dst;
     }
-    // A known top-level stdlib function no class declares is never a member of
-    // the implicit receiver, and `CallMemberOrGlobal` would let the extension
-    // probe prepend the receiver into its varargs.
+    return null;
+}
+
+/// A known top-level stdlib function no class declares is never a member of the
+/// implicit receiver, and `CallMemberOrGlobal` would let the extension probe
+/// prepend the receiver into its varargs.
+fn tryAliasIntrinsicGlobal(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?Reg {
+    const name0 = callee.Path.segments[0].name;
+
     if (ir.isAliasName(name0) and !anyReceiverClassDeclares(b, name0) and
         !extensionCandidateFitsArity(b, name0, args.len))
     {
@@ -1189,31 +1489,55 @@ pub fn lowerUnresolvedBareCall(
         } });
         return dst0;
     }
-    // When `this` is the frame's own receiver param rather than an outer closure
-    // capture, pass it explicitly: a non-closure extension has no capture frame,
-    // so `recordCapture("this")` would leave the slot empty. Where the only
-    // `this` is an ordinary parameter of that name, the bare name binds a global.
+    return null;
+}
+
+/// When `this` is the frame's own receiver param rather than an outer closure
+/// capture, pass it explicitly: a non-closure extension has no capture frame,
+/// so `recordCapture("this")` would leave the slot empty. Where the only `this`
+/// is an ordinary parameter of that name, the bare name binds a global.
+fn tryPlainThisParamGlobal(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?Reg {
+    const name0 = callee.Path.segments[0].name;
+
     if (b.this_is_plain_param and b.recvTy() == null and b.ownerClass() == null and
         !b.capturesThisSlot())
     {
         return try emitValueCall(b, args, ast_arg_names, ast_type_args, name0);
     }
-    // A relowered body calling a local fn captured under its mangled overload
-    // name routes through the captured value; the CMG name walk cannot see frame
-    // captures and would fall to a same-named classifier.
-    {
-        var ovl_i: usize = 0;
-        while (ovl_i < 4) : (ovl_i += 1) {
-            var mb: [96]u8 = undefined;
-            const mangled = std.fmt.bufPrint(&mb, "{s}$ovl{d}", .{ name0, ovl_i }) catch break;
-            if (isLowerAnonCapture(mangled)) {
-                return try emitValueCall(b, args, ast_arg_names, ast_type_args, try b.module.func_name_index.allocator.dupe(u8, mangled));
-            }
+    return null;
+}
+
+/// A relowered body calling a local fn captured under its mangled overload name
+/// routes through the captured value; the CMG name walk cannot see frame
+/// captures and would fall to a same-named classifier.
+fn tryMangledLocalFnCapture(
+    b: *FuncBuilder,
+    name0: []const u8,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?Reg {
+
+    var ovl_i: usize = 0;
+    while (ovl_i < 4) : (ovl_i += 1) {
+        var mb: [96]u8 = undefined;
+        const mangled = std.fmt.bufPrint(&mb, "{s}$ovl{d}", .{ name0, ovl_i }) catch break;
+        if (isLowerAnonCapture(mangled)) {
+            return try emitValueCall(b, args, ast_arg_names, ast_type_args, try b.module.func_name_index.allocator.dupe(u8, mangled));
         }
     }
-    // A bare call in a receiver context is usually a member call written without
-    // `this.`, with the same static answer the explicit-receiver path computes.
-    // The receiver may be a capture, so materialise it before asking.
+    return null;
+}
+
+/// `KLIO_CHAN=<name>`: which channel a bare call in a receiver context took.
+fn traceBareChannel(b: *FuncBuilder, name0: []const u8) void {
+
     if (runtime.envOnce("KLIO_CHAN")) |w| {
         if (std.mem.eql(u8, w, name0)) {
             std.debug.print("[chan] {s} narrow={?s} hint_active={} hint={?s} splice_recv={?s} recv_ty={?s} owner={?s} lam_splice={} this_decl={?s} head={?s}\n", .{
@@ -1230,7 +1554,22 @@ pub fn lowerUnresolvedBareCall(
             });
         }
     }
-    if (bareStaticRecvHead(b)) |head_name| bare_member: {
+}
+
+/// A bare call in a receiver context is usually a member call written without
+/// `this.`, with the same static answer the explicit-receiver path computes.
+/// The receiver may be a capture, so materialise it before asking.
+fn tryBareMemberOnReceiver(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?Reg {
+    const name0 = callee.Path.segments[0].name;
+    const head_name = bareStaticRecvHead(b) orelse return null;
+    bare_member: {
+
         const head_fqn = blk: {
             if (std.mem.findScalar(u8, head_name, '.') != null) break :blk head_name;
             const cid = b.module.classIdIndexed(head_name, b.self_package, callee.Path.segments[0].span.file) orelse
@@ -1329,86 +1668,129 @@ pub fn lowerUnresolvedBareCall(
         // extension serving a tower entry commits statically with its receiver
         // bound through the entry's `this@<label>` slot; entries without a
         // reachable label stay dynamic.
-        if (bare_member != .deferred and
-            !std.mem.eql(u8, runtime.envOnce("KLIO_TOWER_EMIT") orelse "1", "0"))
-        {
-            const inner_tail = if (std.mem.findScalarLast(u8, head_name, '.')) |i|
-                head_name[i + 1 ..]
+        if (try tryOuterReceiverExtension(b, callee, args, ast_arg_names, ast_type_args, head_name, bare_member != .deferred)) |reg| return reg;
+        traceBareArmMiss(b, callee, name0, recv_ty, args);
+    }
+    return null;
+}
+
+/// Kotlin tries the outer implicit receivers, innermost first. An extension
+/// serving a tower entry commits statically with its receiver bound through the
+/// entry's `this@<label>` slot; entries without a reachable label stay dynamic.
+fn tryOuterReceiverExtension(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    head_name: []const u8,
+    member_not_deferred: bool,
+) Allocator.Error!?Reg {
+    const name0 = callee.Path.segments[0].name;
+
+    if (member_not_deferred and
+        !std.mem.eql(u8, runtime.envOnce("KLIO_TOWER_EMIT") orelse "1", "0"))
+    {
+        const inner_tail = if (std.mem.findScalarLast(u8, head_name, '.')) |i|
+            head_name[i + 1 ..]
+        else
+            head_name;
+        for (b.implicit_receiver_tower.items) |entry| {
+            const lbl = entry.label orelse continue;
+            const entry_tail = if (std.mem.findScalarLast(u8, entry.head, '.')) |i|
+                entry.head[i + 1 ..]
             else
-                head_name;
-            for (b.implicit_receiver_tower.items) |entry| {
-                const lbl = entry.label orelse continue;
-                const entry_tail = if (std.mem.findScalarLast(u8, entry.head, '.')) |i|
-                    entry.head[i + 1 ..]
-                else
-                    entry.head;
-                if (std.mem.eql(u8, entry_tail, inner_tail)) continue;
-                var slot_buf: [160]u8 = undefined;
-                const slot = std.fmt.bufPrint(&slot_buf, "this@{s}", .{lbl}) catch continue;
-                if (b.resolve(slot) == null and !b.knowsOuter(slot) and
-                    !decl_mod.isLowerAnonCapture(slot)) continue;
-                const outer_fqn = blk2: {
-                    if (std.mem.findScalar(u8, entry.head, '.') != null) break :blk2 entry.head;
-                    const cid = b.module.classIdIndexed(entry.head, b.self_package, callee.Path.segments[0].span.file) orelse
-                        b.module.classId(entry.head) orelse break :blk2 entry.head;
-                    if (cid.int() >= b.module.classes.items.len) break :blk2 entry.head;
-                    break :blk2 b.module.classes.items[cid.int()].fqn;
-                };
-                const outer_ty = TypeRef{ .name = outer_fqn, .nullable = false, .args = &.{} };
-                // A member the outer receiver declares beats every extension at
-                // its own level, so it keeps the call dynamic and stops the walk.
-                if (b.module.classIdByFqn(outer_fqn) orelse b.module.classId(entry_tail)) |ocid| {
-                    var outer_shapes = try buildStaticReturnArgShapes(b, args, ast_arg_names);
-                    defer outer_shapes.deinit(b.allocator);
-                    const om = b.module.resolveMemberCall(ocid, name0, outer_shapes.shapes, .{
-                        .caller_file = callee.Path.segments[0].span.file,
-                        .receiver_type = outer_ty,
-                    });
-                    if (om.target != null or om.applicable) break;
-                }
-                const outer_this = Expr{ .This = .{
-                    .qualifier = .{ .name = lbl, .span = callee.Path.segments[0].span },
-                    .span = callee.Path.segments[0].span,
-                } };
-                member_call_mod.ext_route_tag = "lowerUnresolvedBareCall:18108";
-                if (try lowerResolvedExtensionCall(
-                    b,
-                    &outer_this,
-                    .{ .name = name0, .span = callee.Path.segments[0].span },
-                    args,
-                    ast_arg_names,
-                    ast_type_args,
-                    outer_ty,
-                )) |reg| {
-                    orEmitAudit(b, "unresolved_bare_call", "Call/bare-tower-extension", name0);
-                    return reg;
-                }
-            }
-        }
-        if (runtime.envOnce("KLIO_BAREARM") != null) {
-            var loc_buf: [256]u8 = undefined;
-            const cs = callee.Path.segments[0].span;
-            const loc: []const u8 = blk2: {
-                if (span.active_map) |m| {
-                    if (m.getChecked(cs.file)) |sf| {
-                        const lc = sf.lineCol(cs.start);
-                        const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
-                        break :blk2 std.fmt.bufPrint(&loc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
-                    }
-                }
-                break :blk2 std.fmt.bufPrint(&loc_buf, "f{d}:{d}", .{ cs.file.int(), cs.start }) catch "?";
+                entry.head;
+            if (std.mem.eql(u8, entry_tail, inner_tail)) continue;
+            var slot_buf: [160]u8 = undefined;
+            const slot = std.fmt.bufPrint(&slot_buf, "this@{s}", .{lbl}) catch continue;
+            if (b.resolve(slot) == null and !b.knowsOuter(slot) and
+                !decl_mod.isLowerAnonCapture(slot)) continue;
+            const outer_fqn = blk2: {
+                if (std.mem.findScalar(u8, entry.head, '.') != null) break :blk2 entry.head;
+                const cid = b.module.classIdIndexed(entry.head, b.self_package, callee.Path.segments[0].span.file) orelse
+                    b.module.classId(entry.head) orelse break :blk2 entry.head;
+                if (cid.int() >= b.module.classes.items.len) break :blk2 entry.head;
+                break :blk2 b.module.classes.items[cid.int()].fqn;
             };
-            std.debug.print("[barearm-miss] {s} {s} recv={s} nargs={d} splice={}\n", .{
-                loc, name0, recv_ty.name, args.len, b.spliceHintActive(),
-            });
-            for (args, 0..) |*a, i| {
-                const t = argDeclTypeRefLazy(b, a);
-                std.debug.print("[barearm-miss]   arg{d} ty={?s}\n", .{ i, if (t) |tt| tt.name else null });
+            const outer_ty = TypeRef{ .name = outer_fqn, .nullable = false, .args = &.{} };
+            // A member the outer receiver declares beats every extension at
+            // its own level, so it keeps the call dynamic and stops the walk.
+            if (b.module.classIdByFqn(outer_fqn) orelse b.module.classId(entry_tail)) |ocid| {
+                var outer_shapes = try buildStaticReturnArgShapes(b, args, ast_arg_names);
+                defer outer_shapes.deinit(b.allocator);
+                const om = b.module.resolveMemberCall(ocid, name0, outer_shapes.shapes, .{
+                    .caller_file = callee.Path.segments[0].span.file,
+                    .receiver_type = outer_ty,
+                });
+                if (om.target != null or om.applicable) break;
+            }
+            const outer_this = Expr{ .This = .{
+                .qualifier = .{ .name = lbl, .span = callee.Path.segments[0].span },
+                .span = callee.Path.segments[0].span,
+            } };
+            member_call_mod.ext_route_tag = "lowerUnresolvedBareCall:18108";
+            if (try lowerResolvedExtensionCall(
+                b,
+                &outer_this,
+                .{ .name = name0, .span = callee.Path.segments[0].span },
+                args,
+                ast_arg_names,
+                ast_type_args,
+                outer_ty,
+            )) |reg| {
+                orEmitAudit(b, "unresolved_bare_call", "Call/bare-tower-extension", name0);
+                return reg;
             }
         }
     }
-    // A call with explicit type arguments cannot be answered by a same-named own
-    // member declaring none, so commit the top-level function.
+    return null;
+}
+
+/// `KLIO_BAREARM=1`: the site and argument types of a bare call no receiver
+/// arm could serve.
+fn traceBareArmMiss(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    name0: []const u8,
+    recv_ty: TypeRef,
+    args: []const Expr,
+) void {
+
+    if (runtime.envOnce("KLIO_BAREARM") != null) {
+        var loc_buf: [256]u8 = undefined;
+        const cs = callee.Path.segments[0].span;
+        const loc: []const u8 = blk2: {
+            if (span.active_map) |m| {
+                if (m.getChecked(cs.file)) |sf| {
+                    const lc = sf.lineCol(cs.start);
+                    const base = if (std.mem.findScalarLast(u8, sf.path, '/')) |i| sf.path[i + 1 ..] else sf.path;
+                    break :blk2 std.fmt.bufPrint(&loc_buf, "{s}:{d}", .{ base, lc.line }) catch "?";
+                }
+            }
+            break :blk2 std.fmt.bufPrint(&loc_buf, "f{d}:{d}", .{ cs.file.int(), cs.start }) catch "?";
+        };
+        std.debug.print("[barearm-miss] {s} {s} recv={s} nargs={d} splice={}\n", .{
+            loc, name0, recv_ty.name, args.len, b.spliceHintActive(),
+        });
+        for (args, 0..) |*a, i| {
+            const t = argDeclTypeRefLazy(b, a);
+            std.debug.print("[barearm-miss]   arg{d} ty={?s}\n", .{ i, if (t) |tt| tt.name else null });
+        }
+    }
+}
+
+/// A call with explicit type arguments cannot be answered by a same-named own
+/// member declaring none, so commit the top-level function.
+fn tryTypeArgumentedGlobal(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?Reg {
+    const name0 = callee.Path.segments[0].name;
+
     if (ast_type_args.len != 0 and !b.ownMemberAcceptsTypeArgs(name0)) {
         if (b.module.funcId(name0)) |gid| {
             if (b.module.funcById(gid)) |gf| {
@@ -1434,47 +1816,26 @@ pub fn lowerUnresolvedBareCall(
             }
         }
     }
+    return null;
+}
+
+/// Nothing bound the call statically, so emit the runtime member-or-global
+/// walk, carrying every static hint the arms above established.
+fn emitDeferredBareCall(
+    b: *FuncBuilder,
+    callee: *const Expr,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+    ext_hint_in: ?FuncId,
+) Allocator.Error!?Reg {
+    const name0 = callee.Path.segments[0].name;
+    var ext_hint = ext_hint_in;
+
     const nm = try b.module.internConst(b.allocator, .{ .String = name0 });
     const dst = b.allocReg();
     orEmitAudit(b, "unresolved_bare_call", "CallMemberOrGlobal", name0);
-    // A trailing lambda's expected shape still has a static answer with no
-    // committed target: read the per-arg arities from the same-name overload
-    // hosting it at this arity, so a `T.() -> R` handler drops its synthetic `it`.
-    const bare_arity: ?[]const i16 = blk: {
-        if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
-            if (overloadHostingTrailingLambda(b, name0, args.len)) |fid| {
-                if (b.module.funcById(fid)) |f| {
-                    // The receiver offset depends on the candidate's own shape:
-                    // a top-level fn has no leading `this`.
-                    const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
-                    // A `T.() -> R` parameter also owns the block's `this`, and
-                    // without the receiver record the block lowers receiverless
-                    // and captures the enclosing instance. Recorded only for an
-                    // owner-scoped member pick, whose signature is scope-proven;
-                    // a top-level namesake pick is declaration-order heuristic
-                    // and a wrong stamp overrides correct shapes from elsewhere.
-                    const member_pick = blk2: {
-                        const tl = b.module.func_name_index.get(name0) orelse break :blk2 true;
-                        for (tl.items) |tfid| {
-                            if (tfid == fid) break :blk2 false;
-                        }
-                        break :blk2 true;
-                    };
-                    // A single-candidate top-level pick is equally scope-proven,
-                    // and skipping it strands a receiver lambda's `this` on the
-                    // creation-time lexical receiver.
-                    const single_toplevel = blk2: {
-                        const tl = b.module.func_name_index.get(name0) orelse break :blk2 false;
-                        break :blk2 tl.items.len == 1 and tl.items[0] == fid;
-                    };
-                    if (member_pick or single_toplevel)
-                        try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, off);
-                    break :blk try argFnArities(b, f, args, ast_arg_names, off);
-                }
-            }
-        }
-        break :blk null;
-    };
+    const bare_arity = try deferredTrailingLambdaArity(b, name0, args, ast_arg_names, ast_type_args);
     // Lambda params still type from the resolved extension hint on the deferred
     // form, so `it` gets the committed candidate's declared parameter type. Only
     // the resolved hint is trusted; the namesake pick above stays arity- and
@@ -1574,6 +1935,52 @@ pub fn lowerUnresolvedBareCall(
 }
 
 /// Built-in stdlib companion shortcuts: `Result.success(x)`, `Result.failure(e)`.
+
+/// A trailing lambda's expected shape still has a static answer with no
+/// committed target: read the per-arg arities from the same-name overload
+/// hosting it at this arity, so a `T.() -> R` handler drops its synthetic `it`.
+fn deferredTrailingLambdaArity(
+    b: *FuncBuilder,
+    name0: []const u8,
+    args: []const Expr,
+    ast_arg_names: []const ?[]const u8,
+    ast_type_args: []const ast.TypeRef,
+) Allocator.Error!?[]const i16 {
+    if (allNull(ast_arg_names) and lastArgIsLambda(args)) {
+        if (overloadHostingTrailingLambda(b, name0, args.len)) |fid| {
+            if (b.module.funcById(fid)) |f| {
+                // The receiver offset depends on the candidate's own shape:
+                // a top-level fn has no leading `this`.
+                const off: usize = if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) 1 else 0;
+                // A `T.() -> R` parameter also owns the block's `this`, and
+                // without the receiver record the block lowers receiverless
+                // and captures the enclosing instance. Recorded only for an
+                // owner-scoped member pick, whose signature is scope-proven;
+                // a top-level namesake pick is declaration-order heuristic
+                // and a wrong stamp overrides correct shapes from elsewhere.
+                const member_pick = blk2: {
+                    const tl = b.module.func_name_index.get(name0) orelse break :blk2 true;
+                    for (tl.items) |tfid| {
+                        if (tfid == fid) break :blk2 false;
+                    }
+                    break :blk2 true;
+                };
+                // A single-candidate top-level pick is equally scope-proven,
+                // and skipping it strands a receiver lambda's `this` on the
+                // creation-time lexical receiver.
+                const single_toplevel = blk2: {
+                    const tl = b.module.func_name_index.get(name0) orelse break :blk2 false;
+                    break :blk2 tl.items.len == 1 and tl.items[0] == fid;
+                };
+                if (member_pick or single_toplevel)
+                    try recordLambdaArgReceivers(b, f, args, ast_arg_names, ast_type_args, off);
+                return try argFnArities(b, f, args, ast_arg_names, off);
+            }
+        }
+    }
+    return null;
+}
+
 pub fn lowerCompanionShortcut(
     b: *FuncBuilder,
     callee: *const Expr,
