@@ -106,6 +106,34 @@ Where the code generates something, compare the generated artifact
 directly: the emitted C, the synthesized Kotlin, the JIT's gate-decision
 trace under `KLIO_JIT_DEBUG=1`. That is stronger than any test.
 
+### The labelled-block trap
+
+`label: { ... break :label; ... }` followed by more rungs means "this rung
+does not apply, carry on". Converting that `break` to `return null` is
+correct ONLY when the helper contains that one block and the driver runs
+the next rung on null. If the extraction swept the following rungs into the
+same helper, `return null` skips them.
+
+That is how `::tag` inside an `object` stopped reaching the enclosing-object
+rung: the reference bound to nothing and `e.arg()` failed with no member
+`arg`. The token diff does not catch this, because nothing is lost; only the
+corpus did. After any extraction, list the labels that disappeared and check,
+for each, where the code that followed its block now lives.
+
+## Where this landed
+
+| | before | after |
+|---|---|---|
+| comment lines | 54798 | 23168 |
+| comment share of code | 20% | 8% |
+| files over 5000 lines | 11 | 0 |
+| largest hand-written file | 27008 | 4708 |
+| functions over 150 lines | 165 | 117 |
+
+The 117 that remain are mostly the VM dispatch tails and the interpreter's
+own loop. `runFrameExec` and `LoopTramp` stay whole on purpose: they are the
+dispatch loop and its trampoline, and their shape is their throughput.
+
 ## Verification
 
 - `python3 scripts/comment_only_check.py <base-rev> [paths...]` proves a
