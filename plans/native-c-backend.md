@@ -435,6 +435,32 @@ has to BE a reference to be passed, returned or stored; demanding its layout
 everywhere refused every interface type, and relaxing it moved more programs
 than any feature did.
 
+## What the language surface now covers
+
+Beyond the scalar core, classes, strings, lists, closures, exceptions and
+coroutines above:
+
+- `for (x in …)` over lists, mutable lists, arrays and ranges, through the
+  interpreter's own iterators.
+- A range held as a value, with the bounds and step the evaluator computes.
+- A class name as a qualifier: companions, nested types, and a companion member
+  read from an instance method of the class.
+- `vararg` parameters, and constructor parameters with defaults.
+- `is` and `as`, tested against the class handles the program laid out.
+- Generic classes and functions: an erased type argument is a reference.
+- An enum's `entries`, and what a container holds — so a member call on a loop
+  variable dispatches.
+- `toString()`, dispatched when a class declares one and rendered through the
+  runtime otherwise.
+- A function's name in value position (`::f`).
+- `++`/`--`, `===`, and the Kotlin answers for `Char + Int` and for negating a
+  Byte or a Short.
+
+A lambda literal that captures nothing is a SINGLETON in Kotlin — every
+evaluation of it yields the same instance — which the emitter had been getting
+wrong by allocating one per evaluation. They are built before the program runs
+and rooted for its life, like an `object` declaration's.
+
 ## Iteration, ranges, qualifiers and varargs
 
 `for (x in …)` is the iteration protocol: the container answers an iterator and
@@ -606,8 +632,8 @@ override, so one `next()` call pulled whole families of unrelated iterators
 into the compile and the program refused on one of them. With that and the
 unsigned types, a `for` over a range compiles.
 
-The sweep now reports every accepted program matching the interpreter: 94 of
-the 562 examples compile and print what the interpreter prints.
+The sweep now reports every accepted program matching the interpreter: 112 of
+the 569 examples compile and print what the interpreter prints.
 
 Four more holes the wider net found once more library bodies compiled, all of
 them wrong answers rather than missing features:
