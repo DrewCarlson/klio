@@ -1074,5 +1074,20 @@ test "discarded member probes release their owned miss message" {
 
 test {
     testing.refAllDecls(@This());
-    inline for (.{ receiver_probe, member_presence, applicability_probe, flat_call, static_tail, binding_probe, reflect_anon, resolve_method, slot_ops, virtual_tail, caches, stdlib_tail, member_ext_visibility, ext_fallback, named_call, member_ref_super }) |m| testing.refAllDecls(m);
+    testing.refAllDecls(@import("host_call_member/applicability_probe.zig"));
+    testing.refAllDecls(@import("host_call_member/binding_probe.zig"));
+    testing.refAllDecls(@import("host_call_member/caches.zig"));
+    testing.refAllDecls(@import("host_call_member/ext_fallback.zig"));
+    testing.refAllDecls(@import("host_call_member/flat_call.zig"));
+    testing.refAllDecls(@import("host_call_member/member_ext_visibility.zig"));
+    testing.refAllDecls(@import("host_call_member/member_presence.zig"));
+    testing.refAllDecls(@import("host_call_member/member_ref_super.zig"));
+    testing.refAllDecls(@import("host_call_member/named_call.zig"));
+    testing.refAllDecls(@import("host_call_member/receiver_probe.zig"));
+    testing.refAllDecls(@import("host_call_member/reflect_anon.zig"));
+    testing.refAllDecls(@import("host_call_member/resolve_method.zig"));
+    testing.refAllDecls(@import("host_call_member/slot_ops.zig"));
+    testing.refAllDecls(@import("host_call_member/static_tail.zig"));
+    testing.refAllDecls(@import("host_call_member/stdlib_tail.zig"));
+    testing.refAllDecls(@import("host_call_member/virtual_tail.zig"));
 }
