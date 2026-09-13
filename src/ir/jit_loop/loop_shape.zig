@@ -33,7 +33,7 @@ const isScalarRt = type_infer.isScalarRt;
 
 // --- loop detection ---------------------------------------------------------
 
-pub fn succEach(term: ir.Terminator, out: *std.ArrayListUnmanaged(BlockId), a: Allocator) Allocator.Error!void {
+pub fn succEach(term: ir.Terminator, out: *std.ArrayList(BlockId), a: Allocator) Allocator.Error!void {
     switch (term) {
         .Goto => |b| try out.append(a, b),
         .Branch => |br| {
@@ -45,7 +45,7 @@ pub fn succEach(term: ir.Terminator, out: *std.ArrayListUnmanaged(BlockId), a: A
 }
 
 /// Every CFG successor of a terminator (all kinds), for dominance analysis.
-fn fullSucc(term: ir.Terminator, out: *std.ArrayListUnmanaged(BlockId), a: Allocator) Allocator.Error!void {
+fn fullSucc(term: ir.Terminator, out: *std.ArrayList(BlockId), a: Allocator) Allocator.Error!void {
     switch (term) {
         .Goto => |b| try out.append(a, b),
         .Branch => |br| {
@@ -67,9 +67,9 @@ fn dominatedSet(a: Allocator, func: *const Func, nb: usize, header: BlockId) All
     const reach_no_h = try a.alloc(bool, nb);
     defer a.free(reach_no_h);
     @memset(reach_no_h, false);
-    var stack: std.ArrayListUnmanaged(BlockId) = .empty;
+    var stack: std.ArrayList(BlockId) = .empty;
     defer stack.deinit(a);
-    var succ: std.ArrayListUnmanaged(BlockId) = .empty;
+    var succ: std.ArrayList(BlockId) = .empty;
     defer succ.deinit(a);
     const entry = func.entry;
     if (entry.int() < nb and entry.int() != header.int()) {
@@ -102,9 +102,9 @@ pub fn collectLoop(a: Allocator, func: *const Func, header: BlockId) Allocator.E
     const reach = try a.alloc(bool, nb);
     defer a.free(reach);
     @memset(reach, false);
-    var stack: std.ArrayListUnmanaged(BlockId) = .empty;
+    var stack: std.ArrayList(BlockId) = .empty;
     defer stack.deinit(a);
-    var succ: std.ArrayListUnmanaged(BlockId) = .empty;
+    var succ: std.ArrayList(BlockId) = .empty;
     defer succ.deinit(a);
     reach[header.int()] = true;
     try stack.append(a, header);
@@ -172,7 +172,7 @@ pub fn collectLoop(a: Allocator, func: *const Func, header: BlockId) Allocator.E
         }
     }
 
-    var body: std.ArrayListUnmanaged(BlockId) = .empty;
+    var body: std.ArrayList(BlockId) = .empty;
     errdefer body.deinit(a);
     for (0..nb) |i| {
         if (inloop[i]) try body.append(a, BlockId.from(@intCast(i)));
@@ -184,10 +184,10 @@ pub fn collectLoop(a: Allocator, func: *const Func, header: BlockId) Allocator.E
     return try body.toOwnedSlice(a);
 }
 
-fn buildPreds(a: Allocator, func: *const Func, nb: usize, reach: []const bool) Allocator.Error![]std.ArrayListUnmanaged(BlockId) {
-    const preds = try a.alloc(std.ArrayListUnmanaged(BlockId), nb);
+fn buildPreds(a: Allocator, func: *const Func, nb: usize, reach: []const bool) Allocator.Error![]std.ArrayList(BlockId) {
+    const preds = try a.alloc(std.ArrayList(BlockId), nb);
     for (preds) |*p| p.* = .empty;
-    var succ: std.ArrayListUnmanaged(BlockId) = .empty;
+    var succ: std.ArrayList(BlockId) = .empty;
     defer succ.deinit(a);
     for (func.blocks, 0..) |*blk, i| {
         if (!reach[i]) continue;
@@ -420,7 +420,7 @@ pub fn computeSets(a: Allocator, module: *const Module, func: *const Func, body:
         live_in[b.int()] = try a.alloc(bool, n_regs);
         @memset(live_in[b.int()], false);
     }
-    var succ: std.ArrayListUnmanaged(BlockId) = .empty;
+    var succ: std.ArrayList(BlockId) = .empty;
     defer succ.deinit(a);
     var changed = true;
     var iters: usize = 0;
