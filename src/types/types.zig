@@ -1,10 +1,7 @@
-//! Kotlin type system.
-//!
-//! A `Type` enum modelling the slice of Kotlin's type system the interpreter
-//! consumes: the primitive builtins, `Unit`, `Any`, `Nothing`, nullability
-//! through `T?`, function types, integer ranges, and user-class generics as
-//! `Type.Generic`. Anything that needs further type-parameter machinery is
-//! modeled as `Type.Unresolved`.
+//! Kotlin type system: a `Type` enum over the primitive builtins, `Unit`,
+//! `Any`, `Nothing`, nullability through `T?`, function types, integer ranges,
+//! and user-class generics as `Type.Generic`. Anything needing further
+//! type-parameter machinery is modeled as `Type.Unresolved`.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -13,11 +10,8 @@ const Allocator = std.mem.Allocator;
 
 pub const TypeRef = ast.TypeRef;
 
-/// Kotlin type-constraint system: inference variables, bound sets, the
-/// constraint pool, and reduction / incorporation / fixation passes.
 pub const constraints = @import("constraints.zig");
 
-/// Variance marker on a generic instantiation argument.
 pub const Variance = enum {
     Invariant,
     Out,
@@ -34,12 +28,10 @@ pub const Variance = enum {
     }
 };
 
-/// One type argument inside a `Type.Generic` instantiation, carrying the
-/// use-site projection (`out`, `in`, invariant) so subtyping applies the right
-/// variance per pair.
+/// Carries the use-site projection, so subtyping applies the right variance.
 pub const GenericArg = struct {
     variance: Variance,
-    /// `*` star-projection. When true, `ty` is `Type.Any` (read view).
+    /// When true, `ty` is `Type.Any` (the read view).
     is_star: bool,
     ty: Type,
 
@@ -65,12 +57,10 @@ pub const GenericArg = struct {
 pub const FunctionType = struct {
     params: []Type,
     return_type: *Type,
-    /// Distinguishes `suspend (T) -> R` from `(T) -> R`. These are distinct
-    /// function types; one is not assignable to the other.
+    /// `suspend (T) -> R` and `(T) -> R` are distinct; neither is assignable to the other.
     is_suspend: bool,
-    /// Head name of the extension receiver in a `T.() -> R` shape, `null` for a
-    /// plain function type. A receiver lambda checked against this type binds
-    /// `this` to that class.
+    /// Head name of the receiver in a `T.() -> R` shape. A receiver lambda
+    /// checked against this type binds `this` to that class.
     receiver_head: ?[]const u8 = null,
 };
 
@@ -94,27 +84,21 @@ pub const Type = union(enum) {
     Nullable: *Type,
     Function: FunctionType,
     Range: *Type,
-    /// Reference to a generic type parameter declared on an enclosing function
-    /// or class. Treated as `Unresolved`-compatible for subtyping until the
-    /// checker has a binding.
+    /// `Unresolved`-compatible for subtyping until the checker has a binding.
     TypeParam: []const u8,
-    /// Instantiation of a generic class: `Box<Int>`, `List<out Any>`. The base
-    /// name is the simple class name, short even for builtin instantiations.
     Generic: struct {
         name: []const u8,
         args: []GenericArg,
     },
-    /// Intersection `A & B`, the greatest lower bound of its components, which
-    /// smart-cast composition (`if (x is A && x is B)`) materializes. `T <: A &
-    /// B` iff `T <: A ∧ T <: B`; `A & B <: T` iff some component is a subtype
-    /// of `T`. Kept normalized by `Type.intersect`: flattened, with no `Any`,
-    /// `Unresolved` or duplicate components.
+    /// The greatest lower bound, materialized by smart-cast composition.
+    /// `T <: A & B` iff `T` subtypes both; `A & B <: T` iff some component
+    /// does. `Type.intersect` keeps it flattened, free of `Any`, `Unresolved`
+    /// and duplicates.
     Intersection: []Type,
     /// A type the resolver could not name. Compatible with everything, so an
     /// unrelated error does not cascade.
     Unresolved,
 
-    /// Structural equality.
     pub fn eql(self: Type, other: Type) bool {
         if (@as(std.meta.Tag(Type), self) != @as(std.meta.Tag(Type), other)) {
             return false;
@@ -153,7 +137,7 @@ pub const Type = union(enum) {
         };
     }
 
-    /// Deep copy. The result owns its heap data; free it with `deinit`.
+    /// Deep copy; the result owns its heap data, freed with `deinit`.
     pub fn clone(self: Type, allocator: Allocator) Allocator.Error!Type {
         return switch (self) {
             .Unit, .Boolean, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .Char, .String, .Any, .Nothing, .Unresolved => self,
@@ -177,7 +161,6 @@ pub const Type = union(enum) {
         };
     }
 
-    /// Free heap data owned by this type. A no-op for scalar variants.
     pub fn deinit(self: *Type, allocator: Allocator) void {
         switch (self.*) {
             .Nullable, .Range => |inner| {
@@ -204,7 +187,6 @@ pub const Type = union(enum) {
         }
     }
 
-    /// Strip a single `Nullable` wrapper if present.
     pub fn nonNull(self: *const Type) *const Type {
         return switch (self.*) {
             .Nullable => |inner| inner,
@@ -212,13 +194,11 @@ pub const Type = union(enum) {
         };
     }
 
-    /// `true` if values of this type can be `null`.
     pub fn isNullable(self: Type) bool {
         return self == .Nullable;
     }
 
-    /// Wrap in `Nullable` unless already nullable. Consumes `self`, and an
-    /// already-nullable input is returned unchanged without allocating.
+    /// Consumes `self`; an already-nullable input returns unchanged without allocating.
     pub fn asNullable(self: Type, allocator: Allocator) Allocator.Error!Type {
         if (self.isNullable()) return self;
         const boxed = try allocator.create(Type);
@@ -226,13 +206,11 @@ pub const Type = union(enum) {
         return .{ .Nullable = boxed };
     }
 
-    /// Intersection constructor with normalization. Flattens nested
-    /// intersections, drops `Any` and `Unresolved` (no-ops in a greatest lower
-    /// bound), and removes any component whose subtype is already present. One
-    /// component collapses to itself; an empty intersection collapses to `Any`.
-    ///
-    /// Takes ownership of `parts`, slice and elements: the slice is freed and
-    /// each element is either moved into the result or freed.
+    /// Normalizing intersection: flattens nested intersections, drops `Any` and
+    /// `Unresolved`, and removes a component whose subtype is already present.
+    /// One component collapses to itself, an empty intersection to `Any`. Takes
+    /// ownership of `parts` and its elements, each moved into the result or
+    /// freed.
     pub fn intersect(allocator: Allocator, parts: []Type) Allocator.Error!Type {
         var flat: std.ArrayList(Type) = .empty;
         defer flat.deinit(allocator);
@@ -240,8 +218,6 @@ pub const Type = union(enum) {
         for (parts) |p| {
             switch (p) {
                 .Intersection => |inner| {
-                    // Move the inner components up a level, then free the now
-                    // empty intersection slice.
                     try flat.appendSlice(allocator, inner);
                     allocator.free(inner);
                 },
@@ -254,7 +230,6 @@ pub const Type = union(enum) {
         }
         allocator.free(parts);
 
-        // Drop duplicates and supertypes-of-members.
         var keep: std.ArrayList(Type) = .empty;
         defer keep.deinit(allocator);
         outer: for (flat.items) |t| {
@@ -265,7 +240,6 @@ pub const Type = union(enum) {
                     continue :outer;
                 }
             }
-            // Remove kept components that are supertypes of `t`.
             var i: usize = 0;
             while (i < keep.items.len) {
                 if (t.isSubtypeOf(keep.items[i])) {
@@ -285,23 +259,18 @@ pub const Type = union(enum) {
         }
     }
 
-    /// Subtyping check covering the rules typeck consumes:
-    ///
-    /// * `Nothing <: T` for every `T`.
-    /// * `T <: T?` for every non-null `T`.
-    /// * `Any` is the top of the non-null lattice, `Any?` the absolute top.
-    /// * `Nullable(A) <: Nullable(B)` iff `A <: B`.
-    /// * Function types compare by arity, contravariant parameters and a
-    ///   covariant return.
-    /// * `Unresolved` is compatible with everything in both directions, so
-    ///   errors do not cascade.
+    /// Subtyping rules typeck consumes: `Nothing <: T`; `T <: T?`; `Any` tops
+    /// the non-null lattice and `Any?` everything; `Nullable(A) <: Nullable(B)`
+    /// iff `A <: B`; function types compare by arity, contravariant parameters
+    /// and covariant return; `Unresolved` is compatible both ways so errors do
+    /// not cascade.
     pub fn isSubtypeOf(self: Type, other: Type) bool {
         if (self == .Unresolved or other == .Unresolved) {
             return true;
         }
-        // Type parameters act as permissive wildcards at the subtype boundary
-        // unless both sides name the same parameter. The constraint solver
-        // narrows them when inference runs.
+        // Type parameters are permissive wildcards at the subtype boundary
+        // unless both sides name the same one; the constraint solver narrows
+        // them when inference runs.
         if (self == .TypeParam or other == .TypeParam) {
             if (self == .TypeParam and other == .TypeParam) {
                 return std.mem.eql(u8, self.TypeParam, other.TypeParam);
@@ -314,14 +283,12 @@ pub const Type = union(enum) {
         if (self == .Nothing) {
             return true;
         }
-        // Intersection on the right: must be a subtype of every component.
         if (other == .Intersection) {
             for (other.Intersection) |p| {
                 if (!self.isSubtypeOf(p)) return false;
             }
             return true;
         }
-        // Intersection on the left: any component being a subtype suffices.
         if (self == .Intersection) {
             for (self.Intersection) |p| {
                 if (p.isSubtypeOf(other)) return true;
@@ -341,10 +308,8 @@ pub const Type = union(enum) {
             .Function => |lf| {
                 if (other != .Function) return false;
                 const rf = other.Function;
-                // Suspending and non-suspending function types are distinct,
-                // and neither is a subtype of the other. Passing a lambda
-                // literal to a `suspend` parameter is a call-site assignability
-                // conversion, not general subtyping.
+                // Passing a lambda literal to a `suspend` parameter is a
+                // call-site conversion, not subtyping.
                 if (lf.is_suspend != rf.is_suspend) return false;
                 if (lf.params.len != rf.params.len) return false;
                 for (lf.params, rf.params) |l, r| {
@@ -373,8 +338,7 @@ pub const Type = union(enum) {
                         .Out => l.ty.isSubtypeOf(r.ty),
                         .In => r.ty.isSubtypeOf(l.ty),
                         // Type parameters and unresolved slots stay permissive
-                        // wildcards inside a type-argument list, as at the top
-                        // level above.
+                        // inside a type-argument list, as at the top level.
                         .Invariant => l.ty.eql(r.ty) or
                             l.ty == .TypeParam or r.ty == .TypeParam or
                             l.ty == .Unresolved or r.ty == .Unresolved,
@@ -445,7 +409,6 @@ pub const Type = union(enum) {
         }
     }
 
-    /// Render to an owned string. Caller frees the result.
     pub fn toString(self: Type, allocator: Allocator) Allocator.Error![]u8 {
         var aw: std.Io.Writer.Allocating = .init(allocator);
         errdefer aw.deinit();
@@ -466,7 +429,7 @@ fn cloneSlice(allocator: Allocator, src: []const Type) Allocator.Error![]Type {
     return out;
 }
 
-/// Errors produced by the typing utilities. These are data, not Zig errors.
+/// Typing-utility errors as data, not Zig errors.
 pub const TypeError = union(enum) {
     UnknownType: []const u8,
     Mismatch: struct { lhs: Type, rhs: Type },
@@ -482,8 +445,6 @@ pub const TypeError = union(enum) {
     }
 };
 
-/// Result of the typing utilities: a `Type` on success, a `TypeError` on
-/// failure.
 pub const TypeResult = union(enum) {
     ok: Type,
     err: TypeError,
@@ -493,8 +454,6 @@ pub const TypeResult = union(enum) {
     }
 };
 
-/// Look up a builtin by short name (`Int`) or fully qualified name
-/// (`kotlin.Int`); `null` when unknown.
 pub fn builtinByName(name: []const u8) ?Type {
     const short = if (std.mem.startsWith(u8, name, "kotlin."))
         name["kotlin.".len..]
@@ -524,7 +483,6 @@ pub fn builtinByName(name: []const u8) ?Type {
     return null;
 }
 
-/// Convert an AST `TypeRef` into a `Type`. Unknown names yield an error.
 pub fn convertTypeRef(allocator: Allocator, t: *const TypeRef) Allocator.Error!TypeResult {
     if (builtinByName(t.name.name)) |ty| {
         const out = if (t.nullable) try ty.asNullable(allocator) else ty;
@@ -533,12 +491,10 @@ pub fn convertTypeRef(allocator: Allocator, t: *const TypeRef) Allocator.Error!T
     return .{ .err = .{ .UnknownType = try allocator.dupe(u8, t.name.name) } };
 }
 
-/// Like `convertTypeRef`, but an unknown name yields `Type.Unresolved`.
-///
-/// A user-defined generic (`Box<T>`, `Producer<T>`) stays `Type.Unresolved` so
-/// subtyping stays permissive; variance and bound enforcement happen
-/// declaration-side in the type checker. `Type.Generic` is reserved for the
-/// cases the checker builds explicitly.
+/// Like `convertTypeRef`, but an unknown name yields `Type.Unresolved`, as does
+/// a user-defined generic (`Box<T>`), which keeps subtyping permissive while
+/// variance and bounds are enforced declaration-side. `Type.Generic` is reserved
+/// for the cases the checker builds explicitly.
 pub fn convertTypeRefLossy(allocator: Allocator, t: *const TypeRef) Allocator.Error!Type {
     if (std.mem.eql(u8, t.name.name, "*")) {
         return .Any;
@@ -559,9 +515,8 @@ pub fn convertTypeRefLossy(allocator: Allocator, t: *const TypeRef) Allocator.Er
     return if (t.nullable) try base.asNullable(allocator) else base;
 }
 
-/// Unify two concrete types: structural equality with `Unresolved` acting as a
-/// wildcard. The result owns its heap data, and on error the returned
-/// `TypeError` owns clones of the mismatched operands.
+/// Structural equality with `Unresolved` as a wildcard. The result owns its
+/// heap data; on error the `TypeError` owns clones of the mismatched operands.
 pub fn unify(allocator: Allocator, lhs: *const Type, rhs: *const Type) Allocator.Error!TypeResult {
     if (lhs.* == .Unresolved) {
         return .{ .ok = try rhs.clone(allocator) };
@@ -647,9 +602,8 @@ fn arena() std.heap.ArenaAllocator {
     return std.heap.ArenaAllocator.init(testing.allocator);
 }
 
-// Typed scalar `Type` values for tests. A bare `Type.Int` denotes the union's
-// tag, not a `Type` value, so these give methods a real receiver and an
-// address for the `*const Type` parameters.
+// A bare `Type.Int` is the union's tag, not a value, so these give the methods
+// a receiver and an address for `*const Type` parameters.
 const t_int: Type = .Int;
 const t_string: Type = .String;
 const t_unresolved: Type = .Unresolved;
@@ -793,8 +747,6 @@ test "function subtyping is variance aware" {
     } };
     try testing.expect(id_any_in_int_out.isSubtypeOf(id_int));
     try testing.expect(!id_int.isSubtypeOf(id_any_in_int_out));
-    // Suspending and non-suspending function types are distinct; neither is a
-    // subtype of the other.
     const id_int_susp = Type{ .Function = .{
         .params = try a.dupe(Type, &.{.Int}),
         .return_type = box(a, .Int),
@@ -961,13 +913,11 @@ test {
 
 /// One extension declaration recovered from a prebuilt image, in the flat form
 /// an image can supply: type HEADS, not full types. The checker rebuilds a
-/// `FnSig` from these, which is all overload ranking needs to compare argument
-/// types.
+/// `FnSig` from these, enough for overload ranking.
 pub const ExternExt = struct {
     name: []const u8,
-    /// The declaration's FuncId in the loaded module. An image declaration has
-    /// no source span, so this is the only identity a recorded pick carries
-    /// back to lowering.
+    /// An image declaration has no source span, so its FuncId is the only
+    /// identity a recorded pick carries back to lowering.
     fid: u32,
     param_heads: [][]const u8,
     param_nullable: []bool,
@@ -977,17 +927,13 @@ pub const ExternExt = struct {
 };
 
 /// Declarations the checker cannot see in source because they arrived as a
-/// prebuilt image: the stdlib-image path hands over a built module and never
-/// parses pack sources. Published by the image loader before the eager pass and
-/// consumed once by `typecheckModule`.
+/// prebuilt image, which is never parsed. Published by the image loader before
+/// the eager pass and consumed once by `typecheckModule`.
 pub const ExternDecls = struct {
     classes: std.StringHashMap(void),
     fn_return_class: std.StringHashMap([]const u8),
-    /// Receiver class simple name -> the extensions declared on it. Empty
-    /// when no image supplied any.
     extensions: std.StringHashMap(std.ArrayList(ExternExt)) = undefined,
-    /// Class simple name -> its declared supertype simple names. The
-    /// candidate walk climbs this: `List.min` is declared on `Iterable`.
+    /// The candidate walk climbs this, since `List.min` is on `Iterable`.
     supertypes: std.StringHashMap([][]const u8) = undefined,
     has_extensions: bool = false,
 };

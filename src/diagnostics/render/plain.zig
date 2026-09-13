@@ -1,13 +1,7 @@
 //! Plain-text renderer matching `kotlinc`'s `MessageRenderer.PLAIN`:
-//!
-//! ```text
-//! file.kt:10:5: error: Unresolved reference: foo
-//!         foo()
-//!         ^^^
-//! ```
-//!
-//! The source line and an underline caret are included when the span fits on a
-//! single line; a multi-line span marks only its start.
+//! `file.kt:10:5: error: Unresolved reference: foo`, then the source line and an
+//! underline caret when the span fits on one line; a multi-line span marks only
+//! its start.
 
 const std = @import("std");
 const span = @import("span");

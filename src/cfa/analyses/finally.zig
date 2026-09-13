@@ -1,11 +1,7 @@
-//! `finally`-divergence pruning.
-//!
-//! When a `finally` block always diverges (`return`, `throw`, an infinite
-//! loop), the `try` it wraps cannot reach its normal continuation: every path
-//! out of the `try` ends in the `finally`'s divergent terminator. The CFG
-//! records this by placing a copy of the finally body on each exit path, and
-//! this analysis detects the divergent case and prunes the normal-exit edge
-//! from that copy to the join, leaving only the divergent terminators.
+//! `finally`-divergence pruning. When a `finally` block always diverges, the
+//! `try` it wraps cannot reach its normal continuation. The CFG places a copy of
+//! the finally body on each exit path, and this analysis prunes the normal-exit
+//! edge from that copy to the join, leaving only the divergent terminators.
 
 const std = @import("std");
 const ir = @import("../ir.zig");
@@ -28,8 +24,7 @@ pub fn pruneDivergentFinally(allocator: Allocator, cfg: *Cfg) Allocator.Error!us
         if (!reach.isReachable(bid)) {
             continue;
         }
-        // A FinallyExit edge whose source's terminator is divergent
-        // is unreachable and should be detached from the join.
+        // A FinallyExit edge whose source diverges is unreachable.
         var to_prune: std.ArrayList(usize) = .empty;
         defer to_prune.deinit(allocator);
         {

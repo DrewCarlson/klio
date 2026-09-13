@@ -1,6 +1,5 @@
-//! Textual CFG printer for snapshot tests. The output is dense and stable, so
-//! golden-file diffs stay readable, and line-oriented text carries the same
-//! information as the block diagram.
+//! Textual CFG printer for snapshot tests: dense and stable, so golden-file
+//! diffs stay readable.
 
 const std = @import("std");
 const ir = @import("ir.zig");
@@ -19,7 +18,6 @@ const Type = ir.Type;
 const GenericArg = types.GenericArg;
 const Variance = types.Variance;
 
-/// Thin formatting sink over an owned `std.ArrayList(u8)`.
 const Out = struct {
     buf: *std.ArrayList(u8),
     allocator: Allocator,
@@ -35,7 +33,6 @@ const Out = struct {
     }
 };
 
-/// Render `cfg` to an owned string. Caller frees with `allocator`.
 pub fn printCfg(allocator: Allocator, cfg: *const Cfg) Allocator.Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -176,9 +173,8 @@ fn formatPattern(w: Out, p: Pattern) Allocator.Error!void {
     }
 }
 
-/// Render a type in a stable debug shape: tuple variants render as
-/// `Name(inner)`, struct variants as `Name { field: value, ... }`,
-/// vectors as `[a, b]`, and strings quoted.
+/// Stable debug shape: tuple variants as `Name(inner)`, struct variants as
+/// `Name { field: value, ... }`, vectors as `[a, b]`, strings quoted.
 fn formatType(w: Out, t: Type) Allocator.Error!void {
     switch (t) {
         .Unit, .Boolean, .Byte, .Short, .Int, .Long, .UByte, .UShort, .UInt, .ULong, .Float, .Double, .Char, .String, .Any, .Nothing, .Unresolved => try w.writeAll(@tagName(t)),
@@ -246,9 +242,8 @@ fn formatGenericArg(w: Out, a: GenericArg) Allocator.Error!void {
     try w.writeAll(" }");
 }
 
-/// Render a string in double quotes with the standard escapes. Only
-/// type-parameter and class identifiers reach this path, but the escaping is
-/// faithful for any content.
+/// Double quotes with the standard escapes. Only type-parameter and class
+/// identifiers reach this path, but the escaping is faithful for any content.
 fn formatStrDebug(w: Out, s: []const u8) Allocator.Error!void {
     try w.writeAll("\"");
     for (s) |c| {
@@ -264,8 +259,6 @@ fn formatStrDebug(w: Out, s: []const u8) Allocator.Error!void {
     try w.writeAll("\"");
 }
 
-/// Render a single type through the CFG printer's Debug formatter,
-/// used by the type-rendering tests below. Caller frees the result.
 fn typeToDebug(allocator: Allocator, t: Type) Allocator.Error![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);

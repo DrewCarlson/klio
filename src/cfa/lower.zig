@@ -1,14 +1,10 @@
-//! AST to CFG lowering. Walks an `ast.Block` (function, accessor or init body)
-//! and produces a `Cfg`.
+//! AST to CFG lowering: walks an `ast.Block` into a `Cfg`.
 //!
-//! Lowering carries a "current block" that later nodes append to. Control-flow
-//! forms (`if`, `when`, `while`, `try`, `&&`, `||`, `?:`, `?.`, `!!`, `as`,
-//! `return`/`throw`/`break`/`continue`) split the current block and rewire it
-//! through the blocks they create. A terminator-emitting form leaves the current
-//! block set to a fresh dead block with no predecessors, so later statements
-//! still lower cleanly and reachability prunes them.
-//!
-//! Lowering consults no type information: every `Eval` node is emitted with
+//! Lowering carries a "current block" that later nodes append to; control-flow
+//! forms split it and rewire it through the blocks they create. A
+//! terminator-emitting form leaves the current block set to a fresh dead block
+//! with no predecessors, so later statements still lower and reachability prunes
+//! them. No type information is consulted: every `Eval` carries
 //! `Type.Unresolved`.
 
 const std = @import("std");
@@ -49,10 +45,9 @@ const SwitchArm = ir.SwitchArm;
 const Symbol = ir.Symbol;
 const Terminator = ir.Terminator;
 
-/// A `(start, end)` span key for the side tables, in file-relative offsets.
+/// Span key for the side tables, in file-relative offsets.
 pub const SpanKey = struct { start: u32, end: u32 };
 
-/// Position of a node within the CFG: the block plus the node index.
 pub const NodePos = struct { block: BlockId, node_idx: usize };
 
 const SpanKeyContext = struct {
@@ -88,14 +83,11 @@ pub const RegPlaceMap = std.HashMap(Reg, Place, RegContext, std.hash_map.default
 pub const AliasMap = std.HashMap(Symbol, Place, SymbolContext, std.hash_map.default_max_load_percentage);
 const RefinementMap = std.HashMap(Reg, Refinement, RegContext, std.hash_map.default_max_load_percentage);
 
-/// Lowered output: the CFG plus side tables.
-///
-/// * `reg_for_span`: expression span to the register holding its value, last
-///   write wins.
-/// * `reg_to_place`: register to the `Place` it reads, so an `AssumeIs(reg, T)`
-///   on a path refines the original place.
-/// * `span_to_pos`: span to the `(block, node_idx)` where its `Eval` lands.
-/// * `aliases`: `val b = a` bindings, so smart-cast lookups follow the chain.
+/// The CFG plus side tables: `reg_for_span` maps an expression span to the
+/// register holding its value (last write wins), `reg_to_place` a register to
+/// the `Place` it reads (so an `AssumeIs` refines that place), `span_to_pos` a
+/// span to where its `Eval` lands, and `aliases` the `val b = a` bindings a
+/// smart-cast lookup follows.
 pub const Lowered = struct {
     cfg: Cfg,
     reg_for_span: SpanKeyMap,
@@ -106,33 +98,28 @@ pub const Lowered = struct {
 
 const LoopFrame = struct {
     id: LoopId,
-    /// Block that `continue` jumps to (typically the loop head).
     cont_target: BlockId,
-    /// Block that `break` jumps to (typically the loop exit).
     break_target: BlockId,
     label: ?[]const u8,
 };
 
 const LabelFrame = struct {
     name: []const u8,
-    /// Block that `return@name` / `break@name` jumps to.
     target: BlockId,
-    /// Register for the lambda or block's value, set by `return@name expr`.
     result: ?Reg,
 };
 
 const TryFrame = struct {
     /// (exception-type, handler-entry-block) in source order; first match wins.
     handlers: []Handler,
-    /// Block to flow into for the normal-exit copy of the finally, when present.
+    /// Normal-exit copy of the finally, when there is one.
     finally_entry: ?BlockId,
 };
 
 const Handler = struct { ty: ?Type, block: BlockId };
 
-/// Refinement implied by the truthiness of a boolean-typed register. Carried in
-/// `pending_refinements` so `lowerIf` / `lowerWhen` / `lowerShortCircuit` emit
-/// the matching `AssumeIs` or `AssumeNull` on the right branch arm.
+/// Refinement implied by the truthiness of a boolean register, carried in
+/// `pending_refinements` so branch lowering emits the matching `Assume*`.
 const Refinement = union(enum) {
     Is: struct {
         reg: Reg,
@@ -146,20 +133,15 @@ const Refinement = union(enum) {
         span: Span,
         eq_null: bool,
     },
-    /// Reference equality of two registers that both hold a `Place`, narrowing
-    /// each place to their intersection on the truthy branch.
+    /// Narrows each place to the intersection of the two on the truthy branch.
     RefEq: struct {
         reg_a: Reg,
         reg_b: Reg,
         span: Span,
     },
-    /// `!cond` flips polarity of every contained refinement.
     Not: *Refinement,
-    /// `&&` of several refinements: all hold on the true branch.
     And: []Refinement,
-    /// `||` of several refinements: only their intersection holds on the true
-    /// branch and their union on the false branch, so only the symmetric facts
-    /// are emitted.
+    /// Only the intersection holds on the true branch, so only the symmetric facts are emitted.
     Or: []Refinement,
 
     fn clone(self: Refinement, allocator: Allocator) Allocator.Error!Refinement {
@@ -219,16 +201,14 @@ pub const Lowering = struct {
         };
     }
 
-    /// Lower a function body. The CFG has one entry block and one synthetic exit
-    /// block that every `return` jumps to; falling off the end of a `Unit`-typed
-    /// body reaches it through an explicit `Goto`.
+    /// One entry block and one synthetic exit that every `return` jumps to;
+    /// falling off a `Unit`-typed body reaches it through a `Goto`.
     pub fn lowerFunction(self: *Lowering, body: *const Block, source: Span) Allocator.Error!Lowered {
         const a = self.allocator;
         const entry = try self.b.newBlock(a);
         const exit = try self.b.newBlock(a);
         var cur = entry;
-        // Establish a synthetic "function" label so `return` (no label)
-        // can jump to `exit` without a separate codepath.
+        // A synthetic "function" label lets an unlabeled `return` jump to `exit`.
         try self.label_stack.append(a, .{
             .name = "<fn>",
             .target = exit,
@@ -255,9 +235,8 @@ pub const Lowering = struct {
         };
     }
 
-    /// Emit the `AssumeIs` / `AssumeNull` nodes a refinement implies onto `blk`.
-    /// `truth` is the polarity to read the refinement under: `true` for the
-    /// then-arm, `false` for the else-arm.
+    /// Emit the `Assume*` nodes a refinement implies onto `blk`. `truth` is the
+    /// polarity to read it under: the then-arm or the else-arm.
     fn emitRefinement(self: *Lowering, blk: BlockId, refinement: *const Refinement, truth: bool) Allocator.Error!void {
         const a = self.allocator;
         switch (refinement.*) {
@@ -272,8 +251,6 @@ pub const Lowering = struct {
                 } });
             },
             .NullEq => |r| {
-                // `x == null` holds on the then-arm. `truth=true` keeps
-                // eq_null, `truth=false` flips it.
                 const effective = r.eq_null == truth;
                 try self.b.push(a, blk, .{ .AssumeNull = .{
                     .reg = r.reg,
@@ -296,8 +273,8 @@ pub const Lowering = struct {
                         try self.emitRefinement(blk, p, true);
                     }
                 }
-                // On the false arm of `a && b` neither part is individually
-                // known, so the refinements are dropped.
+                // On the false arm of `a && b` neither part is known alone, so
+                // the refinements are dropped.
             },
             .Or => |parts| {
                 if (!truth) {
@@ -305,8 +282,8 @@ pub const Lowering = struct {
                         try self.emitRefinement(blk, p, false);
                     }
                 }
-                // On the true arm of `a || b` neither part is individually
-                // known, so the refinements are dropped.
+                // On the true arm of `a || b` neither part is known alone, so
+                // the refinements are dropped.
             },
         }
     }
@@ -333,10 +310,8 @@ pub const Lowering = struct {
                     } });
                     if (p.init) |init_expr| {
                         const r = try self.lowerExpr(&init_expr, cur);
-                        // Bound smart casts: an immutable local bound to a
-                        // place expression (another local or a member chain)
-                        // records the aliasing, so smart-cast lookups for the
-                        // new name follow the chain.
+                        // An immutable local bound to a place records the
+                        // aliasing, so lookups for the new name follow the chain.
                         if (!p.mutable) {
                             if (try exprToPlace(a, &init_expr)) |src| {
                                 try self.aliases.put(
@@ -359,9 +334,8 @@ pub const Lowering = struct {
                 const rhs = try self.lowerExpr(&asn.value, cur);
                 const lhs_place = try exprToPlace(a, &asn.target);
                 const place = lhs_place orelse Place{ .Local = .{ .name = try a.dupe(u8, "<expr>") } };
-                // Record the assignment span and the LHS target's span as the
-                // position just before the `Assign` node executes; the
-                // typechecker queries this for the val-first-write check.
+                // Both spans map to the position just before the `Assign`
+                // executes; typeck queries it for val-first-write.
                 const pos = self.b.currentNodeCount(cur.*) orelse 0;
                 try self.span_to_pos.put(.{ .start = asn.span.start, .end = asn.span.end }, .{ .block = cur.*, .node_idx = pos });
                 const lhs_span = asn.target.span();
@@ -396,7 +370,6 @@ pub const Lowering = struct {
     }
 
     fn freshDeadBlock(self: *Lowering) Allocator.Error!BlockId {
-        // The default terminator is Unreachable, which is what a dead block needs.
         return try self.b.newBlock(self.allocator);
     }
 
@@ -405,17 +378,15 @@ pub const Lowering = struct {
         return reg;
     }
 
-    /// Queryable position of a jump statement (`return`, `break`, `continue`,
-    /// `throw`): the end of the block it terminates, where the statement
-    /// executes. Only its `Nothing` value lives in the dead continuation block.
+    /// The end of the block it terminates; only its `Nothing` value lives in the
+    /// dead continuation.
     fn jumpStmtPos(self: *Lowering, cur: BlockId) NodePos {
         return .{ .block = cur, .node_idx = self.b.currentNodeCount(cur).? };
     }
 
-    /// Emit the jump statement's `Nothing`-value eval into the dead continuation
-    /// block while pinning the span's queryable position to the block the
-    /// statement executes in, so a reachability query on the statement's own
-    /// span never sees the dead block.
+    /// Emit the jump's `Nothing`-value eval into the dead continuation block but
+    /// pin the span's position to the block the statement executes in, so a
+    /// reachability query on that span never sees the dead block.
     fn emitJumpEval(self: *Lowering, dead: BlockId, sp: Span, stmt_at: NodePos) Allocator.Error!Reg {
         const reg = try self.emitEval(dead, sp);
         try self.span_to_pos.put(.{ .start = sp.start, .end = sp.end }, stmt_at);
@@ -425,9 +396,8 @@ pub const Lowering = struct {
     fn emitEval(self: *Lowering, cur: BlockId, sp: Span) Allocator.Error!Reg {
         const a = self.allocator;
         const reg = self.b.newReg();
-        // Capture the position the eval lands at before pushing it, so
-        // smart-cast queries read the in-state just before the expression
-        // evaluates.
+        // Capture the position before pushing, so smart-cast queries read the
+        // in-state just before the expression evaluates.
         const pos = self.b.currentNodeCount(cur).?;
         try self.span_to_pos.put(.{ .start = sp.start, .end = sp.end }, .{ .block = cur, .node_idx = pos });
         try self.b.push(a, cur, .{ .Eval = .{
@@ -437,7 +407,6 @@ pub const Lowering = struct {
         return try self.recordReg(sp, reg);
     }
 
-    // single dispatch over every Expr variant; arms are grouped by lowering category
     fn lowerExpr(self: *Lowering, expr: *const Expr, cur: *BlockId) Allocator.Error!Reg {
         const a = self.allocator;
         switch (expr.*) {
@@ -499,18 +468,15 @@ pub const Lowering = struct {
             },
 
             .Call => |e| {
-                // callsInPlace(EXACTLY_ONCE): when the callee is a stdlib scope
-                // function and the last argument is a lambda literal, inline
-                // the body into the current block ahead of any contract
-                // effects, so later statements see its assignments and
-                // narrowings.
+                // callsInPlace(EXACTLY_ONCE): with a stdlib scope function and a
+                // trailing lambda literal, inline the body into the current
+                // block ahead of any contract effects, so later statements see
+                // its assignments and narrowings.
                 const exactly_once = lambdaCallsInPlace(e.callee, e.args);
                 var arg_regs: std.ArrayList(Reg) = .empty;
                 defer arg_regs.deinit(a);
                 _ = try self.lowerExpr(e.callee, cur);
                 if (exactly_once) {
-                    // Lower all non-lambda args normally; the trailing
-                    // lambda body is inlined directly into `cur`.
                     const lambda_idx = e.args.len - 1;
                     for (e.args, 0..) |*arg, i| {
                         if (i == lambda_idx) break;
@@ -742,9 +708,7 @@ pub const Lowering = struct {
                         .eq_null = eq_op,
                     } });
                 } else if (self.reg_to_place.contains(l) and self.reg_to_place.contains(r)) {
-                    // Cross-variable reference equality on two place
-                    // expressions; negation flips at branch-emission time
-                    // through `emitRefinement(truth=...)`.
+                    // Negation flips at branch-emission time through `emitRefinement(truth=...)`.
                     const refinement: Refinement = .{ .RefEq = .{
                         .reg_a = l,
                         .reg_b = r,
@@ -767,8 +731,7 @@ pub const Lowering = struct {
         }
     }
 
-    /// `a && b` evaluates `a`, then `b` when `a` is true; the result is the
-    /// boolean of the joined block. `a || b` is symmetric.
+    /// `a && b` evaluates `b` only when `a` is true; `a || b` is symmetric.
     fn lowerShortCircuit(
         self: *Lowering,
         lhs: *const Expr,
@@ -794,9 +757,6 @@ pub const Lowering = struct {
             .polarity = short_on_false,
         } });
         if (lhs_refinement) |*r| {
-            // On the rhs-eval block the lhs's truth polarity matches
-            // `short_on_false`: `&&` evaluates rhs when lhs is true, `||` when
-            // it is false.
             try self.emitRefinement(rhs_blk, r, short_on_false);
         }
         var rhs_cur = rhs_blk;
@@ -831,8 +791,7 @@ pub const Lowering = struct {
         return result;
     }
 
-    /// `a ?: b` evaluates `a` and takes it when non-null, else evaluates `b`.
-    /// Lowered as a null-check branch.
+    /// Lowered as a null-check branch on `a`.
     fn lowerElvis(self: *Lowering, lhs: *const Expr, rhs: *const Expr, sp: Span, cur: *BlockId) Allocator.Error!Reg {
         const a = self.allocator;
         const l = try self.lowerExpr(lhs, cur);
@@ -938,15 +897,14 @@ pub const Lowering = struct {
             try self.b.setTerminator(a, arm_cur, .{ .Goto = join });
             next = fall;
         }
-        // The no-arm-matched fallthrough flows to the join; a subject-bound
-        // `when` without `else` throws at runtime, which is not a CFG concern.
+        // A subject-bound `when` without `else` throws at runtime, which is not
+        // a CFG concern, so the fallthrough flows to the join.
         try self.b.setTerminator(a, next, .{ .Goto = join });
         cur.* = join;
         return try self.emitEval(cur.*, sp);
     }
 
-    /// Lower one `when` pattern: matched against `subj` when set, else read as a
-    /// boolean condition; branches to `match_blk` or `miss_blk`.
+    /// Matched against `subj` when set, else read as a boolean condition.
     fn lowerWhenPattern(
         self: *Lowering,
         kind: *const WhenPatternKind,
@@ -1137,10 +1095,8 @@ pub const Lowering = struct {
     }
 
     fn lowerFor(self: *Lowering, iter: *const Expr, body: *const Expr, sp: Span, cur: *BlockId) Allocator.Error!Reg {
-        // `for (x in xs) body` desugars to an iterator while loop. The lowering
-        // is conservative: evaluate `xs`, then loop the body an indeterminate
-        // number of times. Reachability and killDataFlow need only the backedge
-        // and the standard loop shape.
+        // `for (x in xs)` desugars to an iterator while loop; reachability and
+        // killDataFlow need only the backedge.
         const a = self.allocator;
         _ = try self.lowerExpr(iter, cur);
         const head = try self.b.newBlock(a);
@@ -1197,20 +1153,18 @@ pub const Lowering = struct {
             .finally_entry = finally_entry_blk,
         });
 
-        // Body
         const body_blk = try self.b.newBlock(a);
         try self.b.setTerminator(a, cur.*, .{ .Goto = body_blk });
         var body_cur = body_blk;
         _ = try self.lowerBlock(body, &body_cur);
         const body_exit_to = normal_finally_blk orelse join;
         try self.b.setTerminator(a, body_cur, .{ .Goto = body_exit_to });
-        // Exception edges from the body to each handler.
         for (handlers_entry) |h| {
             try self.b.addEdge(a, body_blk, h.block, .{ .Exception = .{ .ty = if (h.ty) |t| try t.clone(a) else null } });
         }
 
-        // Handlers: each catch body lowers like a block; its normal exit
-        // flows into the finally (if any) and then to the join.
+        // Each catch body lowers like a block, its normal exit flowing into the
+        // finally and then the join.
         for (catches, handlers_entry) |*c, h| {
             var h_cur = h.block;
             _ = try self.lowerBlock(&c.body, &h_cur);
@@ -1220,10 +1174,9 @@ pub const Lowering = struct {
 
         _ = self.try_stack.pop();
 
-        // The finally has two copies: one for the normal exit and one shared by
-        // the exception paths. The normal-exit copy is emitted inline; the
-        // exception-path copy sits at `finally_entry_blk` and is reached from
-        // any uncaught throw through the try-stack walk.
+        // The finally has two copies: the normal-exit one emitted inline, and one
+        // shared by the exception paths at `finally_entry_blk`, reached from any
+        // uncaught throw through the try-stack walk.
         if (finally != null and normal_finally_blk != null and finally_entry_blk != null) {
             const fin = finally.?;
             var nf_cur = normal_finally_blk.?;
@@ -1234,8 +1187,7 @@ pub const Lowering = struct {
             var tf_cur = finally_entry_blk.?;
             _ = try self.lowerBlock(fin, &tf_cur);
             // The exception-path finally re-throws into the enclosing try, or
-            // leaves the function when there is none. It is wired to `join`,
-            // and reachability prunes it.
+            // leaves the function; it is wired to `join` and pruned later.
             try self.b.setTerminator(a, tf_cur, .{ .Goto = join });
             try self.b.addEdge(a, tf_cur, join, .FinallyExit);
         }
@@ -1245,8 +1197,6 @@ pub const Lowering = struct {
     }
 
     fn routeThrow(self: *Lowering, from: BlockId, reg: Reg) Allocator.Error!void {
-        // Wire the throw terminator on `from`; the topmost try frame's handlers
-        // get the exception edges.
         const a = self.allocator;
         try self.b.setTerminator(a, from, .{ .Throw = reg });
         if (self.try_stack.items.len != 0) {
@@ -1274,7 +1224,6 @@ pub const Lowering = struct {
     }
 
     fn fnTarget(self: *const Lowering) BlockId {
-        // The function frame is always the bottom-most label frame.
         return self.label_stack.items[0].target;
     }
 
@@ -1321,10 +1270,8 @@ pub const Lowering = struct {
         }
     }
 
-    /// Apply contract effects to the post-call block. The effect catalogue lives
-    /// in `contracts.stdlibContract`; lowering translates each `ContractEffect`
-    /// into the matching `Assume*` node and replays any pending refinement on
-    /// the predicate register.
+    /// Translate each `ContractEffect` into the matching `Assume*` node on the
+    /// post-call block, replaying any pending refinement on the predicate reg.
     fn applyContractEffects(
         self: *Lowering,
         callee: *const Expr,
@@ -1402,17 +1349,14 @@ fn simpleName(callee: *const Expr) ?[]const u8 {
 }
 
 /// True when `callee` is a stdlib scope function whose contract invokes the
-/// trailing lambda argument exactly once on the normal path. The body's effects
-/// (assignments, narrowings, declarations) propagate to the caller scope, so the
-/// CFG inlines them and VIA and smart-cast see them without crossing a lambda
-/// boundary.
+/// trailing lambda exactly once, so the CFG inlines its body and VIA and
+/// smart-cast see its effects without crossing a lambda boundary.
 fn lambdaCallsInPlace(callee: *const Expr, args: []const Expr) bool {
     if (args.len == 0) return false;
     const last = &args[args.len - 1];
     if (last.* != .Lambda) return false;
     switch (callee.*) {
-        // Member form `recv.let/run/apply/also { ... }`. `with` is top-level
-        // but takes its receiver as a positional argument.
+        // Member form. `with` is top-level but takes its receiver positionally.
         .Member => |m| {
             if (m.safe) return false;
             const n = m.name.name;
@@ -1422,14 +1366,11 @@ fn lambdaCallsInPlace(callee: *const Expr, args: []const Expr) bool {
         .Path => |p| {
             if (p.segments.len != 1) return false;
             const name = p.segments[0].name;
-            // Top-level scope functions `run { ... }` / `with(x) { ... }`.
             if (std.mem.eql(u8, name, "run") or std.mem.eql(u8, name, "with")) {
                 return true;
             }
-            // User-declared `contract { callsInPlace(block, EXACTLY_ONCE) }`:
-            // when the registry records the trailing argument as exactly-once,
-            // treat the call like a scope function so the lambda body's
-            // assignments and smart casts flow to the caller scope.
+            // A user `contract { callsInPlace(block, EXACTLY_ONCE) }` is treated
+            // like a scope function, so the body's effects reach the caller.
             const user_params = contracts.userExactlyOnceParams(name);
             return user_params.len != 0;
         },
@@ -1448,8 +1389,6 @@ const Lexer = @import("lexer").Lexer;
 const Parser = @import("parser").Parser;
 const print = @import("print.zig");
 
-/// Parse the first function in `src`, lower its body, and render the CFG to
-/// text. Everything is allocated from `arena`.
 fn lowerFirstFun(arena: Allocator, src: []const u8) ![]u8 {
     const file = span.FileId.from(0);
     var lexer = try Lexer.init(arena, file, src);

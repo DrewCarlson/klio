@@ -1,27 +1,16 @@
-//! Contract-effect catalogue consumed by the lowering. A contract describes a
-//! function's effect on the surrounding flow: a precondition that holds on the
-//! post-call path, a lambda that runs a fixed number of times, or a smart cast
-//! established by a runtime check.
-//!
-//! Stdlib contracts live in `stdlibContract`, keyed by simple name. A user
-//! contract declared with `kotlin.contracts.contract { ... }` populates the
-//! user-inline-contract registry before lowering: the build pass walks every
-//! `inline fun` body once for the contract block and records each
-//! `callsInPlace(blockName, EXACTLY_ONCE)` it finds. Lowering then treats a call
-//! to that function the way it treats `let { ... }`.
+//! Contract-effect catalogue consumed by the lowering: a precondition holding
+//! on the post-call path, a lambda that runs a fixed number of times, or a smart
+//! cast from a runtime check. Stdlib contracts live in `stdlibContract`; a user
+//! `kotlin.contracts.contract { ... }` populates the registry before lowering,
+//! and a call to such a function lowers the way `let { ... }` does.
 
 const std = @import("std");
 
-/// One effect a contract imposes on the call site's post-call state. Several
-/// effects can apply to one call, as for a function that narrows its first
-/// argument and propagates the second argument's refinement.
 pub const ContractEffect = union(enum) {
-    /// `arg(arg_idx)` is non-null after this call returns normally.
-    /// Modeled as an `AssumeNull(eq_null=false)` on the arg's reg.
+    /// Modeled as an `AssumeNull(eq_null=false)` on the argument's register.
     AssumeNonNull: struct { arg_idx: usize },
-    /// The condition expression at `arg(arg_idx)` holds after the call returns
-    /// normally. Any `AssumeIs` / `AssumeNull` / `AssumeRefEq` refinement
-    /// lowering recorded for that register is replayed on the post-call block.
+    /// The condition at `arg(arg_idx)` holds after a normal return: any
+    /// refinement recorded for that register is replayed on the post-call block.
     AssumePredicate: struct { arg_idx: usize },
 
     pub fn eql(self: ContractEffect, other: ContractEffect) bool {
@@ -35,27 +24,25 @@ pub const ContractEffect = union(enum) {
     }
 };
 
-/// User-declared `contract { callsInPlace(p, EXACTLY_ONCE) }` records, keyed by
-/// the inline function's simple name. Each value lists the parameter names
-/// invoked exactly once on the normal path (`InvocationKind.EXACTLY_ONCE`),
-/// which lowering uses to extend its trailing-lambda inlining to user contracts,
-/// so a `val` assigned inside the lambda is definitely assigned at the call site.
+/// User `contract { callsInPlace(p, EXACTLY_ONCE) }` records, keyed by the
+/// inline function's simple name, each value listing the parameters invoked
+/// exactly once on the normal path. Lowering extends its trailing-lambda
+/// inlining to them, so a `val` assigned inside the lambda is definitely
+/// assigned at the call site.
 pub const UserInlineContracts = std.StringHashMap([]const []const u8);
 
 /// Module-level state under a single-build-at-a-time contract: the build driver
 /// installs the registry before lowering starts.
 var user_inline_contracts: ?UserInlineContracts = null;
 
-/// Replace the user-contract registry, once per module build and before any
-/// per-function lowering. An empty map clears it between modules. Takes
-/// ownership of `map`; any previously installed registry is freed.
+/// Once per module build, before any per-function lowering; an empty map clears
+/// it. Takes ownership of `map` and frees any prior registry.
 pub fn setUserInlineContracts(map: UserInlineContracts) void {
     if (user_inline_contracts) |*old| old.deinit();
     user_inline_contracts = map;
 }
 
-/// Parameter names of the user inline function `name` whose contract declares
-/// `callsInPlace(p, EXACTLY_ONCE)`; empty when none is registered.
+/// Empty when no user contract is registered for `name`.
 pub fn userExactlyOnceParams(name: []const u8) []const []const u8 {
     if (user_inline_contracts) |*c| {
         if (c.get(name)) |params| return params;
@@ -63,8 +50,6 @@ pub fn userExactlyOnceParams(name: []const u8) []const []const u8 {
     return &.{};
 }
 
-/// Release the installed user-contract registry, for tests and for a build
-/// driver tearing down between builds.
 pub fn resetForTest() void {
     if (user_inline_contracts) |*m| {
         m.deinit();
@@ -72,8 +57,7 @@ pub fn resetForTest() void {
     }
 }
 
-/// Lookup table for the stdlib functions that carry contract effects. The
-/// returned slice lists every effect to emit on the post-call path.
+/// Every effect to emit on the post-call path of a stdlib function.
 pub fn stdlibContract(name: []const u8) []const ContractEffect {
     const nonnull = &[_]ContractEffect{.{ .AssumeNonNull = .{ .arg_idx = 0 } }};
     const require = &[_]ContractEffect{.{ .AssumePredicate = .{ .arg_idx = 0 } }};
@@ -111,7 +95,6 @@ test "stdlib contract lookup" {
 
 test "user inline contracts round-trip" {
     defer resetForTest();
-    // Empty registry yields no params.
     try testing.expectEqual(@as(usize, 0), userExactlyOnceParams("run").len);
 
     var map = UserInlineContracts.init(testing.allocator);
@@ -124,7 +107,6 @@ test "user inline contracts round-trip" {
     try testing.expectEqualStrings("block", got[0]);
     try testing.expectEqual(@as(usize, 0), userExactlyOnceParams("missing").len);
 
-    // Replacing with an empty map clears the registry.
     setUserInlineContracts(UserInlineContracts.init(testing.allocator));
     try testing.expectEqual(@as(usize, 0), userExactlyOnceParams("withResource").len);
 }

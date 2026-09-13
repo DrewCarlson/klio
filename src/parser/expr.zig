@@ -26,28 +26,23 @@ const Keyword = lexer.Keyword;
 const TokenKind = lexer.TokenKind;
 const Span = span.Span;
 
-/// Box an expression onto the parser arena.
 fn boxExpr(p: *Parser, e: Expr) *Expr {
     const ptr = p.allocator.create(Expr) catch @panic("OOM boxing expr");
     ptr.* = e;
     return ptr;
 }
 
-/// The token kind `i` positions ahead of the cursor, or `null` past the end.
 fn kindAt(p: *const Parser, i: usize) ?TokenKind {
     if (i >= p.tokens.len) return null;
     return p.tokens[i].kind;
 }
 
-/// Look ahead from index `i`, which must sit on an `@`, past one or more
-/// annotation forms (`@Foo`, `@Foo(...)`, `@Foo.Bar`, `@[Foo Bar]`), to the
-/// first token after them. Detects an annotation prefixing a trailing lambda
-/// (`run @Suppress("x") { ... }`).
+/// Look ahead from an `@` at index `i` past one or more annotation forms, to
+/// spot an annotation prefixing a trailing lambda.
 fn skipAnnotationTokens(p: *const Parser, i: usize) usize {
     var j = i;
     while (j < p.tokens.len and p.tokens[j].kind.isAt()) {
         j += 1;
-        // `@[Foo Bar]` bracketed form: skip to matching `]`.
         if (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .LBracket) {
             var depth: i32 = 1;
             j += 1;
@@ -60,7 +55,6 @@ fn skipAnnotationTokens(p: *const Parser, i: usize) usize {
                 }
             }
         } else {
-            // `Foo`, dotted `Foo.Bar`, then optional `(...)` arg list.
             while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Ident) {
                 j += 1;
                 if (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Dot) {
@@ -85,8 +79,7 @@ fn skipAnnotationTokens(p: *const Parser, i: usize) usize {
     return j;
 }
 
-// Cross-module helpers. These parse routines live in the sibling modules
-// (`types`, `file`, `control`, `primary`) and are reached through a `@hasDecl`
+// These parse routines live in sibling modules, reached through a `@hasDecl`
 // gate that yields an empty result when the declaration is absent.
 
 fn parseQualifiedType(p: *Parser) ?TypeRef {
@@ -128,12 +121,10 @@ pub fn parseExpr(p: *Parser) ?Expr {
     return parseDisjunction(p);
 }
 
-/// Consume and discard a leading expression annotation. Kotlin allows an
-/// annotation to prefix an expression (`@Suppress("UNCHECKED_CAST") (x as T)`,
-/// as the stdlib's `Comparator.reversed()` when-branches do) and they are
-/// runtime no-ops. Applied only at control-structure-body and when-branch
-/// position, so it never shadows the label, `this@` and `return@` uses of `@`
-/// that the unary and primary layers parse.
+/// Consume and discard a leading expression annotation, which Kotlin allows
+/// (`@Suppress("UNCHECKED_CAST") (x as T)`) and which is a runtime no-op.
+/// Applied only at control-structure-body and when-branch position, so it never
+/// shadows the label, `this@` and `return@` uses of `@`.
 pub fn skipLeadingExprAnnotation(p: *Parser) void {
     if (atExpressionAnnotation(p)) {
         _ = parseAnnotations(p);
@@ -141,9 +132,6 @@ pub fn skipLeadingExprAnnotation(p: *Parser) void {
     }
 }
 
-/// True when the cursor is at an annotation prefixing an expression (`@Foo`,
-/// `@Foo(...)`, `@[Foo Bar]`) rather than at a label (`loop@`), where the `@`
-/// follows an identifier and so is not in leading position.
 pub fn atExpressionAnnotation(p: *const Parser) bool {
     if (!support.peekKind(p).isAt()) return false;
     return switch (kindAt(p, p.pos + 1) orelse return false) {
@@ -152,10 +140,7 @@ pub fn atExpressionAnnotation(p: *const Parser) bool {
     };
 }
 
-/// Parse a function expression body (`fun f() = <expr>`). Kotlin allows an
-/// annotation on the body expression itself (`= @Suppress("UNCHECKED_CAST")
-/// if (...) this as E else null`, as in `CoroutineContext.Element.get`).
-/// Annotations are runtime no-ops here, so they are consumed and discarded.
+/// Kotlin allows an annotation on the body expression; it is discarded.
 pub fn parseExprBody(p: *Parser) ?Expr {
     if (support.peekKind(p).isAt()) {
         _ = parseAnnotations(p);
@@ -168,8 +153,7 @@ pub fn parseDisjunction(p: *Parser) ?Expr {
     var lhs = parseConjunction(p) orelse return null;
     while (true) {
         support.skipSoftNl(p);
-        // A wrapped line may begin with `||`; it cannot start a
-        // statement, so this is an unambiguous continuation.
+        // `||` cannot start a statement, so a line beginning with it continues the expression.
         if (support.newlineThen(p, .PipePipe)) {
             support.skipNl(p);
         }
@@ -194,8 +178,7 @@ pub fn parseConjunction(p: *Parser) ?Expr {
     var lhs = parseEquality(p) orelse return null;
     while (true) {
         support.skipSoftNl(p);
-        // A wrapped line may begin with `&&`; it cannot start a statement, so
-        // this is an unambiguous continuation.
+        // `&&` cannot start a statement, so a line beginning with it continues the expression.
         if (support.newlineThen(p, .AmpAmp)) {
             support.skipNl(p);
         }
@@ -245,8 +228,7 @@ pub fn parseComparison(p: *Parser) ?Expr {
     var lhs = parseNamedChecks(p) orelse return null;
     while (true) {
         support.skipSoftNl(p);
-        // `in` / `!in` sit at the comparison precedence level, and `!in` is the
-        // two tokens `!` then `in`. Recognized only when not followed by a type;
+        // `in` / `!in` sit at comparison precedence, `!in` being two tokens;
         // `!is` is handled inside `parseNamedChecks`.
         const op: BinOp = switch (support.peekKind(p).*) {
             .Lt => .Lt,
@@ -280,9 +262,7 @@ pub fn parseComparison(p: *Parser) ?Expr {
     return lhs;
 }
 
-/// `expr is Type` and `expr !is Type`. Lower precedence than comparison,
-/// higher than elvis. `is` is a hard keyword in the lexer; `!is` is the
-/// two tokens `!` and `is`.
+/// Lower precedence than comparison, higher than elvis. `!is` is two tokens.
 pub fn parseNamedChecks(p: *Parser) ?Expr {
     var lhs = parseElvis(p) orelse return null;
     while (true) {
@@ -319,8 +299,7 @@ pub fn parseElvis(p: *Parser) ?Expr {
     var lhs = parseInfixFn(p) orelse return null;
     while (true) {
         support.skipSoftNl(p);
-        // A line beginning with `?:` continues the expression: Kotlin lets elvis
-        // lead a wrapped line, and `?:` can never start a statement.
+        // `?:` cannot start a statement, so a line beginning with it continues the expression.
         if (support.newlineThen(p, .QuestionColon)) {
             support.skipNl(p);
         }
@@ -341,10 +320,8 @@ pub fn parseElvis(p: *Parser) ?Expr {
     return lhs;
 }
 
-/// Infix function call `lhs <name> rhs`, where `<name>` is a bare identifier
-/// naming a function declared with the `infix` modifier. Desugars to
-/// `Call(Path[name], [lhs, rhs])`; typeck enforces that the resolved function
-/// carries `infix` (T0029).
+/// Desugared to `Call(Path[name], [lhs, rhs])`; typeck enforces the `infix`
+/// modifier (T0029).
 pub fn parseInfixFn(p: *Parser) ?Expr {
     var lhs = parseRange(p) orelse return null;
     while (true) {
@@ -390,14 +367,12 @@ pub fn parseInfixFn(p: *Parser) ?Expr {
     return lhs;
 }
 
-/// After tentatively reading an infix-candidate identifier, confirm that an
-/// expression continues. A newline normally ends the statement, but inside
-/// `(`/`[` (soft newlines) the right operand may start on the next line, so
-/// the scan looks past soft newlines there.
+/// After tentatively reading an infix-candidate identifier, confirm an
+/// expression continues: inside `(`/`[` the right operand may start on the next
+/// line.
 pub fn lookaheadInfixRhsStarter(p: *const Parser) bool {
-    // A valid infix-function name has already been read on this line and it
-    // demands a right operand, so a following newline is a continuation
-    // (`(a) or\n (b)`), not a statement boundary, whatever the bracket nesting.
+    // A valid infix name demands a right operand, so a following newline is a
+    // continuation, whatever the bracket nesting.
     var i = p.pos + 1;
     while (kindAt(p, i)) |k| {
         if (std.meta.activeTag(k) != .Newline) break;
@@ -493,15 +468,13 @@ pub fn parseMultiplicative(p: *Parser) ?Expr {
     return lhs;
 }
 
-/// `expr as Type` / `expr as? Type`, left-associative. The lexer emits `?` as
-/// `QuestNoWs` only when adjacent to `as`, so the safe form is recognized on
-/// exactly that shape.
+/// Left-associative. The lexer emits `?` as `QuestNoWs` only next to `as`, so
+/// the safe form needs that shape.
 pub fn parseAs(p: *Parser) ?Expr {
     var lhs = parsePrefix(p) orelse return null;
     while (true) {
-        // `as` / `as?` is an infix operator that can never begin a statement,
-        // so a leading `as` on a continuation line always applies to the
-        // preceding expression.
+        // `as` cannot begin a statement, so a leading `as` on a continuation
+        // line applies to the preceding expression.
         if (!peekIsAsAcrossNewlines(p)) break;
         support.skipNl(p);
         _ = support.bump(p); // `as`
@@ -541,8 +514,8 @@ pub fn parsePrefix(p: *Parser) ?Expr {
             .span = sp,
         } };
     }
-    // `!!p` in prefix position is two negations (the lexer folds `!!` into
-    // one token for the postfix not-null assertion).
+    // The lexer folds `!!` into one token for the postfix assertion, so in
+    // prefix position it is two negations.
     if (std.meta.activeTag(support.peekKind(p).*) == .BangBang) {
         _ = support.bump(p);
         const e = parsePrefix(p) orelse return null;
@@ -558,313 +531,326 @@ pub fn parsePostfix(p: *Parser) ?Expr {
     return parsePostfixFrom(p, first);
 }
 
-/// The postfix tail (`++`, `!!`, calls, indexing, member access, trailing
-/// lambdas) applied to an already-parsed primary. A `{ ... }` value argument is
-/// parsed as a lambda literal and arrives here, so `f(b = { ... }())` invokes
-/// the literal instead of ending the argument at its `}`.
+/// The postfix tail applied to an already-parsed primary. A `{ ... }` value
+/// argument arrives here as a lambda literal, so `f(b = { ... }())` invokes the
+/// literal instead of ending the argument at its `}`.
+/// What one postfix operator did to the chain: read another operator, end the
+/// chain with what is built so far, or abandon the parse.
+const Step = enum { advance, stop, fail };
+
+/// The state every postfix operator reads and updates: the expression built so
+/// far, and the call-site type arguments waiting for the next `Call`.
+const PostfixChain = struct {
+    p: *Parser,
+    expr: Expr,
+    pending_type_args: []TypeRef = &.{},
+
+    /// The pending type arguments, cleared so a later call cannot reuse them.
+    fn takeTypeArgs(chain: *PostfixChain) []TypeRef {
+        const t = chain.pending_type_args;
+        chain.pending_type_args = &.{};
+        return t;
+    }
+
+    /// Fold `lam` into the receiver as its trailing-lambda argument.
+    fn attachTrailingLambda(chain: *PostfixChain, lam: Expr, lam_span: Span) void {
+        const sp = chain.expr.span().join(lam_span);
+        const extra_type_args = chain.takeTypeArgs();
+        chain.expr = appendTrailingLambda(chain.p, chain.expr, lam, extra_type_args, sp);
+    }
+};
+
 pub fn parsePostfixFrom(p: *Parser, first: Expr) ?Expr {
-    var expr = first;
-    // Generic type args at a call site (`foo<String>(…)`) are captured here
-    // and attached to the next `Call` constructed in this loop.
-    var pending_type_args: []TypeRef = &.{};
-    loop: while (true) {
-        switch (support.peekKind(p).*) {
-            .PlusPlus => {
-                const tok = support.bump(p);
-                const sp = expr.span().join(tok.span);
-                expr = Expr{ .Postfix = .{
-                    .op = .Inc,
-                    .expr = boxExpr(p, expr),
-                    .span = sp,
-                } };
-            },
-            .MinusMinus => {
-                const tok = support.bump(p);
-                const sp = expr.span().join(tok.span);
-                expr = Expr{ .Postfix = .{
-                    .op = .Dec,
-                    .expr = boxExpr(p, expr),
-                    .span = sp,
-                } };
-            },
-            .BangBang => {
-                const tok = support.bump(p);
-                const sp = expr.span().join(tok.span);
-                expr = Expr{ .Postfix = .{
-                    .op = .NotNull,
-                    .expr = boxExpr(p, expr),
-                    .span = sp,
-                } };
-            },
-            .Dot, .QuestionDot => {
-                const safe = std.meta.activeTag(support.peekKind(p).*) == .QuestionDot;
-                _ = support.bump(p);
-                support.skipNl(p);
-                // `recv.(f)(args)`: a parenthesized callee invoked with `recv`
-                // as its extension receiver, which Kotlin defines as
-                // `f(recv, args)`, the receiver taking the callee's first
-                // parameter exactly as `f.invoke(recv, args)` would.
-                if (!safe and std.meta.activeTag(support.peekKind(p).*) == .LParen) {
-                    const callee = parsePrimary(p) orelse return null;
-                    support.skipNl(p);
-                    if (std.meta.activeTag(support.peekKind(p).*) != .LParen) {
-                        _ = support.expect(p, .LParen, "`(` (a parenthesized callee after `.` must be invoked)") orelse return null;
-                        return null;
-                    }
-                    _ = support.bump(p);
-                    var args: std.ArrayList(Expr) = .empty;
-                    var arg_names: std.ArrayList(?[]const u8) = .empty;
-                    args.append(p.allocator, expr) catch @panic("OOM");
-                    arg_names.append(p.allocator, null) catch @panic("OOM");
-                    while (true) {
-                        support.skipNl(p);
-                        if (std.meta.activeTag(support.peekKind(p).*) == .RParen) break;
-                        const name = tryConsumeNamedArgName(p);
-                        const arg = parseValueArgument(p) orelse return null;
-                        args.append(p.allocator, arg) catch @panic("OOM");
-                        arg_names.append(p.allocator, name) catch @panic("OOM");
-                        support.skipNl(p);
-                        if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
-                            _ = support.bump(p);
-                        } else break;
-                    }
-                    const rparen = support.expect(p, .RParen, "`)`") orelse return null;
-                    const sp = expr.span().join(rparen.span);
-                    expr = Expr{ .Call = .{
-                        .callee = boxExpr(p, callee),
-                        .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                        .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                        .type_args = &.{},
-                        .is_infix = false,
-                        .span = sp,
-                    } };
-                    continue;
-                }
-                const name = support.parseIdent(p, "member name") orelse return expr;
-                const sp = expr.span().join(name.span);
-                expr = Expr{ .Member = .{
-                    .receiver = boxExpr(p, expr),
-                    .name = name,
-                    .safe = safe,
-                    .span = sp,
-                } };
-            },
-            .QuestNoWs, .QuestWs => {
-                // Nullable-receiver callable reference: `Any?::toString`,
-                // `Array<*>?::contentToString`. The `?` makes the reference's
-                // receiver type nullable, which does not change member
-                // resolution, so it is consumed and the `::` branch builds the
-                // reference. Valid only immediately before `::`; otherwise the
-                // chain ends here.
-                const after = kindAt(p, p.pos + 1);
-                if (after == null or std.meta.activeTag(after.?) != .ColonColon) break;
-                _ = support.bump(p);
-            },
-            .ColonColon => {
-                _ = support.bump(p);
-                support.skipNl(p);
-                // `Foo::class`, a class literal. The soft `class` keyword is
-                // accepted as the right-hand name, else a member identifier.
-                const name: Ident = if (std.meta.activeTag(support.peekKind(p).*) == .Keyword and
-                    support.peekKind(p).Keyword == .Class)
-                blk: {
-                    const tok = support.bump(p);
-                    break :blk Ident{ .name = "class", .span = tok.span };
-                } else (support.parseIdent(p, "callable reference name") orelse return null);
-                if (std.mem.eql(u8, name.name, "class") and pending_type_args.len != 0) {
-                    // Class literals erase their type arguments, so writing
-                    // them is rejected.
-                    const span_first = if (pending_type_args.len > 0) pending_type_args[0].span else name.span;
-                    const span_last = if (pending_type_args.len > 0) pending_type_args[pending_type_args.len - 1].span else name.span;
-                    support.err(
-                        p,
-                        "T0104",
-                        "class literal does not take type arguments — type arguments are erased on `::class`.",
-                        span_first.join(span_last),
-                    );
-                }
-                pending_type_args = &.{};
-                const sp = expr.span().join(name.span);
-                expr = Expr{ .MemberRef = .{
-                    .receiver = boxExpr(p, expr),
-                    .name = name,
-                    .span = sp,
-                } };
-            },
-            .Lt => {
-                // Generic call type args like `ArrayList<Int>()` or
-                // `compareBy<String> { ... }`, disambiguated from less-than by
-                // `trySkipGenericCallArgs` (look-ahead for a matching `>`
-                // followed by `(`/`{`/`.`/`?.`/`::`). Without that shape `<` is
-                // a binary operator and the postfix loop ends; with it the args
-                // are parsed and held for the next `Call`.
-                if (trySkipGenericCallArgs(p)) {
-                    pending_type_args = parseCallTypeArgs(p);
-                    // The trailing lambda may start on the next line
-                    // (`x.aggregate<K, V, R>\n{ ... }`); consume the break so
-                    // the postfix loop reaches the `{`.
-                    if (std.meta.activeTag(support.peekKind(p).*) == .Newline) {
-                        const save = p.pos;
-                        support.skipNl(p);
-                        if (std.meta.activeTag(support.peekKind(p).*) != .LBrace) p.pos = save;
-                    }
-                    continue;
-                }
-                break;
-            },
-            .LParen => {
-                _ = support.bump(p);
-                var args: std.ArrayList(Expr) = .empty;
-                var arg_names: std.ArrayList(?[]const u8) = .empty;
-                while (true) {
-                    support.skipNl(p);
-                    if (std.meta.activeTag(support.peekKind(p).*) == .RParen) {
-                        break;
-                    }
-                    // Capture `name` part of `name = expr` for reorder.
-                    const name = tryConsumeNamedArgName(p);
-                    const arg = parseValueArgument(p) orelse return null;
-                    args.append(p.allocator, arg) catch @panic("OOM");
-                    arg_names.append(p.allocator, name) catch @panic("OOM");
-                    support.skipNl(p);
-                    if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
-                        _ = support.bump(p);
-                    } else {
-                        break;
-                    }
-                }
-                const rparen = support.expect(p, .RParen, "`)`") orelse return null;
-                const sp = expr.span().join(rparen.span);
-                const type_args = pending_type_args;
-                pending_type_args = &.{};
-                expr = Expr{ .Call = .{
-                    .callee = boxExpr(p, expr),
-                    .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                    .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                    .type_args = type_args,
-                    .is_infix = false,
-                    .span = sp,
-                } };
-                // A trailing lambda may start on the next line
-                // (`assertFailsWith("x")\n{ ... }`): Kotlin's call suffix allows
-                // line breaks before the lambda literal, so consume the break.
-                if (!p.suppress_trailing_lambda and std.meta.activeTag(support.peekKind(p).*) == .Newline) {
-                    const save = p.pos;
-                    support.skipNl(p);
-                    if (std.meta.activeTag(support.peekKind(p).*) != .LBrace) p.pos = save;
-                }
-            },
-            .LBracket => {
-                _ = support.bump(p);
-                var args: std.ArrayList(Expr) = .empty;
-                while (true) {
-                    support.skipNl(p);
-                    if (std.meta.activeTag(support.peekKind(p).*) == .RBracket) {
-                        break;
-                    }
-                    const arg = parseExpr(p) orelse return null;
-                    args.append(p.allocator, arg) catch @panic("OOM");
-                    support.skipNl(p);
-                    if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
-                        _ = support.bump(p);
-                    } else {
-                        break;
-                    }
-                }
-                const rbr = support.expect(p, .RBracket, "`]`") orelse return null;
-                const sp = expr.span().join(rbr.span);
-                expr = Expr{ .Index = .{
-                    .receiver = boxExpr(p, expr),
-                    .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
-                    .span = sp,
-                } };
-            },
-            // Labeled trailing lambda `call lbl@ { ... }`. The label binds the
-            // lambda for `return@lbl`, as kotlinx-coroutines writes pervasively
-            // (`suspendCoroutineUninterceptedOrReturn sc@ { ... }`).
-            .Ident => {
-                if (p.suppress_trailing_lambda or !root.isTrailingLambdaCallable(&expr)) {
-                    break;
-                }
-                const at_next = kindAt(p, p.pos + 1);
-                const at_ok = at_next != null and switch (at_next.?) {
-                    .AtNoWs, .AtPostWs => true,
-                    else => false,
-                };
-                const brace_next = kindAt(p, p.pos + 2);
-                const brace_ok = brace_next != null and std.meta.activeTag(brace_next.?) == .LBrace;
-                if (!(at_ok and brace_ok)) {
-                    break;
-                }
-                const name_span = support.currentSpan(p);
-                const label = Ident{
-                    .name = support.identName(p, name_span),
-                    .span = name_span,
-                };
-                _ = support.bump(p); // label ident
-                _ = support.bump(p); // `@`
-                const lam = parseTrailingLambda(p) orelse return null;
-                const lspan = label.span.join(lam.span());
-                const labeled = Expr{ .Labeled = .{
-                    .label = label,
-                    .expr = boxExpr(p, lam),
-                    .span = lspan,
-                } };
-                const sp = expr.span().join(lspan);
-                const extra_type_args = pending_type_args;
-                pending_type_args = &.{};
-                expr = appendTrailingLambda(p, expr, labeled, extra_type_args, sp);
-            },
-            // Annotated trailing lambda `run @Suppress("x") { ... }`. The
-            // annotation prefixes the lambda argument and is a runtime no-op,
-            // so discard it and parse the trailing lambda.
-            .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => {
-                if (p.suppress_trailing_lambda or !root.isTrailingLambdaCallable(&expr)) {
-                    break;
-                }
-                const past = skipAnnotationTokens(p, p.pos);
-                const after = kindAt(p, past);
-                if (after == null or std.meta.activeTag(after.?) != .LBrace) {
-                    break;
-                }
-                _ = parseAnnotations(p);
-                support.skipNl(p);
-                const lam = parseTrailingLambda(p) orelse return null;
-                const sp = expr.span().join(lam.span());
-                const extra_type_args = pending_type_args;
-                pending_type_args = &.{};
-                expr = appendTrailingLambda(p, expr, lam, extra_type_args, sp);
-            },
-            .LBrace => {
-                if (!root.isTrailingLambdaCallable(&expr) or p.suppress_trailing_lambda) {
-                    break;
-                }
-                const lam = parseTrailingLambda(p) orelse return null;
-                const sp = expr.span().join(lam.span());
-                const extra_type_args = pending_type_args;
-                pending_type_args = &.{};
-                expr = appendTrailingLambda(p, expr, lam, extra_type_args, sp);
-            },
-            .Newline => {
-                // Kotlin continues a postfix chain across a newline when the
-                // first non-whitespace on the next line is `.`, `?.`, `!!` or
-                // `[`. Peek past the newlines and swallow them in that case;
-                // otherwise the chain ends here.
-                if (nextNonNewlineIsChainContinuation(p)) {
-                    support.skipNl(p);
-                    continue :loop;
-                }
-                break;
-            },
-            else => break,
+    var chain: PostfixChain = .{ .p = p, .expr = first };
+    while (true) {
+        const step: Step = switch (support.peekKind(p).*) {
+            .PlusPlus => postfixOperator(&chain, .Inc),
+            .MinusMinus => postfixOperator(&chain, .Dec),
+            .BangBang => postfixOperator(&chain, .NotNull),
+            .Dot, .QuestionDot => memberOrParenthesizedCallee(&chain),
+            .QuestNoWs, .QuestWs => nullableReceiverMark(&chain),
+            .ColonColon => callableReference(&chain),
+            .Lt => callTypeArguments(&chain),
+            .LParen => callArguments(&chain),
+            .LBracket => indexArguments(&chain),
+            .Ident => labeledTrailingLambda(&chain),
+            .AtNoWs, .AtPostWs, .AtPreWs, .AtBothWs => annotatedTrailingLambda(&chain),
+            .LBrace => braceTrailingLambda(&chain),
+            .Newline => chainContinuation(&chain),
+            else => .stop,
+        };
+        switch (step) {
+            .advance => {},
+            .stop => break,
+            .fail => return null,
         }
     }
-    return expr;
+    return chain.expr;
 }
 
-/// Attach `lam` as the trailing-lambda argument of `expr`, folding into an
-/// ungrouped `Call` so `f(a) { … }` stays a single call. A grouped call such
-/// as `(factory()) { … }` is wrapped because the lambda invokes its result.
+/// `x++`, `x--` and `x!!`.
+fn postfixOperator(chain: *PostfixChain, op: PostfixOp) Step {
+    const p = chain.p;
+    const tok = support.bump(p);
+    const sp = chain.expr.span().join(tok.span);
+    chain.expr = Expr{ .Postfix = .{
+        .op = op,
+        .expr = boxExpr(p, chain.expr),
+        .span = sp,
+    } };
+    return .advance;
+}
+
+/// `a.b` and `a?.b`, plus the parenthesized callee Kotlin defines as an
+/// extension receiver: `a.(f)(args)` is `f(a, args)`.
+fn memberOrParenthesizedCallee(chain: *PostfixChain) Step {
+    const p = chain.p;
+    const safe = std.meta.activeTag(support.peekKind(p).*) == .QuestionDot;
+    _ = support.bump(p);
+    support.skipNl(p);
+    if (!safe and std.meta.activeTag(support.peekKind(p).*) == .LParen) {
+        const callee = parsePrimary(p) orelse return .fail;
+        support.skipNl(p);
+        if (std.meta.activeTag(support.peekKind(p).*) != .LParen) {
+            _ = support.expect(p, .LParen, "`(` (a parenthesized callee after `.` must be invoked)") orelse return .fail;
+            return .fail;
+        }
+        _ = support.bump(p);
+        var args: std.ArrayList(Expr) = .empty;
+        var arg_names: std.ArrayList(?[]const u8) = .empty;
+        args.append(p.allocator, chain.expr) catch @panic("OOM");
+        arg_names.append(p.allocator, null) catch @panic("OOM");
+        if (!parseCallArgs(p, &args, &arg_names)) return .fail;
+        const rparen = support.expect(p, .RParen, "`)`") orelse return .fail;
+        const sp = chain.expr.span().join(rparen.span);
+        chain.expr = Expr{ .Call = .{
+            .callee = boxExpr(p, callee),
+            .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
+            .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
+            .type_args = &.{},
+            .is_infix = false,
+            .span = sp,
+        } };
+        return .advance;
+    }
+    const name = support.parseIdent(p, "member name") orelse return .stop;
+    const sp = chain.expr.span().join(name.span);
+    chain.expr = Expr{ .Member = .{
+        .receiver = boxExpr(p, chain.expr),
+        .name = name,
+        .safe = safe,
+        .span = sp,
+    } };
+    return .advance;
+}
+
+/// `Any?::toString`: the `?` makes the receiver type nullable without changing
+/// member resolution, and is valid only before `::`.
+fn nullableReceiverMark(chain: *PostfixChain) Step {
+    const p = chain.p;
+    const after = kindAt(p, p.pos + 1);
+    if (after == null or std.meta.activeTag(after.?) != .ColonColon) return .stop;
+    _ = support.bump(p);
+    return .advance;
+}
+
+/// `a::b`, including the `::class` literal.
+fn callableReference(chain: *PostfixChain) Step {
+    const p = chain.p;
+    _ = support.bump(p);
+    support.skipNl(p);
+    // The soft `class` keyword is accepted as the right-hand name.
+    const name: Ident = if (std.meta.activeTag(support.peekKind(p).*) == .Keyword and
+        support.peekKind(p).Keyword == .Class)
+    blk: {
+        const tok = support.bump(p);
+        break :blk Ident{ .name = "class", .span = tok.span };
+    } else (support.parseIdent(p, "callable reference name") orelse return .fail);
+    if (std.mem.eql(u8, name.name, "class") and chain.pending_type_args.len != 0) {
+        const args = chain.pending_type_args;
+        const span_first = if (args.len > 0) args[0].span else name.span;
+        const span_last = if (args.len > 0) args[args.len - 1].span else name.span;
+        support.err(
+            p,
+            "T0104",
+            "class literal does not take type arguments — type arguments are erased on `::class`.",
+            span_first.join(span_last),
+        );
+    }
+    chain.pending_type_args = &.{};
+    const sp = chain.expr.span().join(name.span);
+    chain.expr = Expr{ .MemberRef = .{
+        .receiver = boxExpr(p, chain.expr),
+        .name = name,
+        .span = sp,
+    } };
+    return .advance;
+}
+
+/// `<` after a callee starts type arguments only when `trySkipGenericCallArgs`
+/// finds a matching `>` followed by `(`/`{`/`.`/`?.`/`::`; otherwise it is a
+/// binary operator and the chain ends here.
+fn callTypeArguments(chain: *PostfixChain) Step {
+    const p = chain.p;
+    if (!trySkipGenericCallArgs(p)) return .stop;
+    chain.pending_type_args = parseCallTypeArgs(p);
+    skipNewlineBeforeTrailingLambda(p);
+    return .advance;
+}
+
+/// `f(...)`, consuming any type arguments the chain is holding.
+fn callArguments(chain: *PostfixChain) Step {
+    const p = chain.p;
+    _ = support.bump(p);
+    var args: std.ArrayList(Expr) = .empty;
+    var arg_names: std.ArrayList(?[]const u8) = .empty;
+    if (!parseCallArgs(p, &args, &arg_names)) return .fail;
+    const rparen = support.expect(p, .RParen, "`)`") orelse return .fail;
+    const sp = chain.expr.span().join(rparen.span);
+    const type_args = chain.takeTypeArgs();
+    chain.expr = Expr{ .Call = .{
+        .callee = boxExpr(p, chain.expr),
+        .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
+        .arg_names = arg_names.toOwnedSlice(p.allocator) catch @panic("OOM"),
+        .type_args = type_args,
+        .is_infix = false,
+        .span = sp,
+    } };
+    if (!p.suppress_trailing_lambda) skipNewlineBeforeTrailingLambda(p);
+    return .advance;
+}
+
+/// `a[i]`, `a[i, j]`.
+fn indexArguments(chain: *PostfixChain) Step {
+    const p = chain.p;
+    _ = support.bump(p);
+    var args: std.ArrayList(Expr) = .empty;
+    while (true) {
+        support.skipNl(p);
+        if (std.meta.activeTag(support.peekKind(p).*) == .RBracket) {
+            break;
+        }
+        const arg = parseExpr(p) orelse return .fail;
+        args.append(p.allocator, arg) catch @panic("OOM");
+        support.skipNl(p);
+        if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
+            _ = support.bump(p);
+        } else {
+            break;
+        }
+    }
+    const rbr = support.expect(p, .RBracket, "`]`") orelse return .fail;
+    const sp = chain.expr.span().join(rbr.span);
+    chain.expr = Expr{ .Index = .{
+        .receiver = boxExpr(p, chain.expr),
+        .args = args.toOwnedSlice(p.allocator) catch @panic("OOM"),
+        .span = sp,
+    } };
+    return .advance;
+}
+
+/// `call lbl@ { ... }`: the label binds the lambda for `return@lbl`.
+fn labeledTrailingLambda(chain: *PostfixChain) Step {
+    const p = chain.p;
+    if (p.suppress_trailing_lambda or !root.isTrailingLambdaCallable(&chain.expr)) {
+        return .stop;
+    }
+    const at_next = kindAt(p, p.pos + 1);
+    const at_ok = at_next != null and switch (at_next.?) {
+        .AtNoWs, .AtPostWs => true,
+        else => false,
+    };
+    const brace_next = kindAt(p, p.pos + 2);
+    const brace_ok = brace_next != null and std.meta.activeTag(brace_next.?) == .LBrace;
+    if (!(at_ok and brace_ok)) {
+        return .stop;
+    }
+    const name_span = support.currentSpan(p);
+    const label = Ident{
+        .name = support.identName(p, name_span),
+        .span = name_span,
+    };
+    _ = support.bump(p); // label ident
+    _ = support.bump(p); // `@`
+    const lam = parseTrailingLambda(p) orelse return .fail;
+    const lspan = label.span.join(lam.span());
+    const labeled = Expr{ .Labeled = .{
+        .label = label,
+        .expr = boxExpr(p, lam),
+        .span = lspan,
+    } };
+    chain.attachTrailingLambda(labeled, lspan);
+    return .advance;
+}
+
+/// `call @Ann { ... }`.
+fn annotatedTrailingLambda(chain: *PostfixChain) Step {
+    const p = chain.p;
+    if (p.suppress_trailing_lambda or !root.isTrailingLambdaCallable(&chain.expr)) {
+        return .stop;
+    }
+    const past = skipAnnotationTokens(p, p.pos);
+    const after = kindAt(p, past);
+    if (after == null or std.meta.activeTag(after.?) != .LBrace) {
+        return .stop;
+    }
+    _ = parseAnnotations(p);
+    support.skipNl(p);
+    const lam = parseTrailingLambda(p) orelse return .fail;
+    chain.attachTrailingLambda(lam, lam.span());
+    return .advance;
+}
+
+/// `call { ... }`.
+fn braceTrailingLambda(chain: *PostfixChain) Step {
+    const p = chain.p;
+    if (!root.isTrailingLambdaCallable(&chain.expr) or p.suppress_trailing_lambda) {
+        return .stop;
+    }
+    const lam = parseTrailingLambda(p) orelse return .fail;
+    chain.attachTrailingLambda(lam, lam.span());
+    return .advance;
+}
+
+/// Kotlin continues a postfix chain across a newline when the next line starts
+/// with `.`, `?.`, `!!` or `[`.
+fn chainContinuation(chain: *PostfixChain) Step {
+    const p = chain.p;
+    if (!nextNonNewlineIsChainContinuation(p)) return .stop;
+    support.skipNl(p);
+    return .advance;
+}
+
+/// Value arguments up to the closing `)`, which is left unconsumed. False when
+/// an argument failed to parse.
+fn parseCallArgs(p: *Parser, args: *std.ArrayList(Expr), arg_names: *std.ArrayList(?[]const u8)) bool {
+    while (true) {
+        support.skipNl(p);
+        if (std.meta.activeTag(support.peekKind(p).*) == .RParen) break;
+        const name = tryConsumeNamedArgName(p);
+        const arg = parseValueArgument(p) orelse return false;
+        args.append(p.allocator, arg) catch @panic("OOM");
+        arg_names.append(p.allocator, name) catch @panic("OOM");
+        support.skipNl(p);
+        if (std.meta.activeTag(support.peekKind(p).*) == .Comma) {
+            _ = support.bump(p);
+        } else break;
+    }
+    return true;
+}
+
+/// A trailing lambda may start on the next line; consume the break so the chain
+/// reaches the `{`.
+fn skipNewlineBeforeTrailingLambda(p: *Parser) void {
+    if (std.meta.activeTag(support.peekKind(p).*) != .Newline) return;
+    const save = p.pos;
+    support.skipNl(p);
+    if (std.meta.activeTag(support.peekKind(p).*) != .LBrace) p.pos = save;
+}
+
+/// Attach `lam` as the trailing-lambda argument, folding into an ungrouped
+/// `Call` so `f(a) { ... }` stays one call. A grouped `(factory()) { ... }` is
+/// wrapped instead, since the lambda invokes its result.
 fn appendTrailingLambda(
     p: *Parser,
     expr: Expr,
@@ -910,8 +896,7 @@ fn appendTrailingLambda(
     } };
 }
 
-/// Parse one value argument at a call site. A leading `*` is the spread marker
-/// (`foo(*arr)`); everything else goes to the regular expression parser.
+/// A leading `*` is the spread marker; everything else goes to the regular expression parser.
 pub fn parseValueArgument(p: *Parser) ?Expr {
     if (std.meta.activeTag(support.peekKind(p).*) == .Star) {
         const star = support.bump(p);
@@ -924,8 +909,7 @@ pub fn parseValueArgument(p: *Parser) ?Expr {
             .span = sp,
         } };
     }
-    // A `{ ... }` value-argument is always a lambda literal, even without an
-    // explicit `->` header (binds an implicit `it`).
+    // A `{ ... }` value argument is always a lambda literal, implicit `it` and all.
     if (std.meta.activeTag(support.peekKind(p).*) == .LBrace) {
         const lam = parseLambdaLiteral(p) orelse return null;
         const e = parsePostfixFrom(p, lam) orelse return null;
@@ -937,9 +921,8 @@ pub fn parseValueArgument(p: *Parser) ?Expr {
     return e;
 }
 
-/// Consume `Ident =` when both are next and return the identifier text: the
-/// label of a named argument, which callers use to reorder against a callable's
-/// parameter list.
+/// Consume `Ident =` and return the identifier: a named argument's label, used
+/// to reorder against the parameter list.
 pub fn tryConsumeNamedArgName(p: *Parser) ?[]const u8 {
     if (std.meta.activeTag(support.peekKind(p).*) != .Ident) {
         return null;
@@ -955,8 +938,6 @@ pub fn tryConsumeNamedArgName(p: *Parser) ?[]const u8 {
     return name;
 }
 
-/// True when the next token past any run of `Newline`s is the `as` keyword,
-/// the start of an `as` / `as?` cast.
 fn peekIsAsAcrossNewlines(p: *const Parser) bool {
     var i = p.pos;
     while (kindAt(p, i)) |k| {
@@ -967,8 +948,6 @@ fn peekIsAsAcrossNewlines(p: *const Parser) bool {
     return std.meta.activeTag(next) == .Keyword and next.Keyword == .As;
 }
 
-/// True when the next token past any run of `Newline`s is a postfix-chain
-/// continuation starter.
 pub fn nextNonNewlineIsChainContinuation(p: *const Parser) bool {
     var i = p.pos;
     while (kindAt(p, i)) |k| {

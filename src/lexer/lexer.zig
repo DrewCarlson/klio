@@ -1,13 +1,10 @@
-//! Kotlin lexer.
+//! Kotlin lexer: trivia (line and nested block comments), identifiers and
+//! keywords, numeric literals in all four bases with suffixes, character
+//! literals, template-aware string literals, and the operator set.
 //!
-//! Covers the lexical structure the parser needs: trivia (line and nested block
-//! comments), identifiers and keywords, numeric literals in all four bases with
-//! suffixes, character literals, template-aware string literals (regular and
-//! triple-quoted raw), and the operator and punctuation set.
-//!
-//! A string template lexes as the token sequence `StringQuote StringText
-//! InterpStart ... InterpEnd StringText StringQuote`. Inside `${...}` the lexer
-//! returns to normal mode and tracks brace depth so nested braces stay balanced.
+//! A string template lexes as `StringQuote StringText InterpStart ... InterpEnd
+//! StringText StringQuote`. Inside `${...}` the lexer returns to normal mode and
+//! tracks brace depth so nested braces stay balanced.
 
 const std = @import("std");
 const diagnostics = @import("diagnostics");
@@ -106,14 +103,12 @@ pub const TokenKind = union(enum) {
     LineComment,
     BlockComment,
 
-    // Literals (text-bearing; cooked numeric value is parsed downstream)
     IntLiteral: struct { base: NumBase, suffix: IntSuffix },
     FloatLiteral: struct { suffix: FloatSuffix },
     BoolLiteral: bool,
     NullLiteral,
     CharLiteral: u16,
 
-    // String tokens (template-aware)
     StringQuote: struct { triple: bool },
     /// Owned UTF-8 text; freed via `Token.deinit`.
     StringText: []const u8,
@@ -214,7 +209,6 @@ pub const Token = struct {
     kind: TokenKind,
     span: Span,
 
-    /// Frees any heap text owned by this token's kind.
     pub fn deinit(self: *Token, allocator: std.mem.Allocator) void {
         switch (self.kind) {
             .StringText => |s| allocator.free(s),
@@ -227,8 +221,7 @@ pub const Token = struct {
 pub const LexResult = struct {
     tokens: []Token,
     diagnostics: DiagnosticSink,
-    /// Heap-allocated diagnostic message strings whose lifetime the
-    /// `DiagnosticSink` borrows. Freed alongside the diagnostics.
+    /// Borrowed by the `DiagnosticSink`; freed alongside the diagnostics.
     owned_messages: []const []const u8,
 
     pub fn deinit(self: *LexResult, allocator: std.mem.Allocator) void {
@@ -242,9 +235,8 @@ pub const LexResult = struct {
 
 const Mode = union(enum) {
     Normal,
-    /// `dollars` is the interpolation-marker length: 1 for a plain string,
-    /// N for a multi-dollar string (`$$"..."`), where a template needs N
-    /// consecutive `$` and shorter runs are literal text.
+    /// Interpolation-marker length: 1 for a plain string, N for `$$"..."`,
+    /// where a template needs N consecutive `$` and shorter runs are literal.
     StringRegular: struct { dollars: u8 },
     StringRaw: struct { dollars: u8 },
     Interp: struct { brace_depth: u32 },
@@ -277,8 +269,8 @@ pub const Lexer = struct {
         };
     }
 
-    /// Consumes the lexer and returns the tokens plus diagnostics. The
-    /// returned `LexResult` owns both; free it with `LexResult.deinit`.
+    /// Consumes the lexer; the returned `LexResult` owns the tokens and
+    /// diagnostics and is freed with `LexResult.deinit`.
     pub fn tokenize(self: *Lexer) !LexResult {
         var tokens: std.ArrayList(Token) = .empty;
         loop: while (true) {
@@ -325,8 +317,7 @@ pub const Lexer = struct {
         };
     }
 
-    /// Format a diagnostic message and record it for cleanup. The returned
-    /// slice is borrowed by the `DiagnosticSink` and freed with the `LexResult`.
+    /// The returned slice is borrowed by the `DiagnosticSink` and freed with the `LexResult`.
     fn allocMessage(self: *Lexer, comptime fmt: []const u8, args: anytype) ![]const u8 {
         const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
         try self.owned_messages.append(self.allocator, msg);
@@ -355,7 +346,6 @@ pub const Lexer = struct {
         if (self.pos >= self.src.len) return null;
         const rest = self.src[self.pos..];
         const seq = std.unicode.utf8ByteSequenceLength(rest[0]) catch {
-            // Not a valid UTF-8 lead byte: consume one byte.
             self.pos += 1;
             return rest[0];
         };
@@ -389,7 +379,6 @@ pub const Lexer = struct {
             return .{ .kind = .Eof, .span = self.span(start) };
         };
 
-        // Shebang line at file position 0.
         if (start == 0 and b == '#' and self.peekByte(1) == @as(?u8, '!')) {
             while (self.peekByte(0)) |c| {
                 if (c == '\n') break;
@@ -442,9 +431,8 @@ pub const Lexer = struct {
             return .{ .kind = .BlockComment, .span = self.span(start) };
         }
 
-        // Strings, including the multi-dollar interpolation prefix
-        // (`$$"..."` / `$$"""..."""`): N leading dollars set the template
-        // marker length; runs of fewer than N dollars inside are literal.
+        // Strings, including the `$$"..."` prefix: N leading dollars set the
+        // template marker length, and shorter runs inside are literal.
         if (b == '"' or (b == '$' and self.multiDollarPrefixLen() != null)) {
             var dollars: u8 = 1;
             if (b == '$') {
@@ -491,9 +479,8 @@ pub const Lexer = struct {
         if (std.ascii.isDigit(b)) {
             return self.lexNumber(start);
         }
-        // Leading-dot float (`.15f`): Kotlin makes the integer part optional.
-        // A member name cannot start with a digit and `..` is a range token, so
-        // a `.` immediately before a digit is unambiguously a float literal.
+        // Leading-dot float (`.15f`): a member name cannot start with a digit
+        // and `..` is a range token, so `.` before a digit is unambiguous.
         if (b == '.') {
             if (self.peekByte(1)) |b1| {
                 if (std.ascii.isDigit(b1)) return self.lexNumber(start);
@@ -504,14 +491,13 @@ pub const Lexer = struct {
             return tok;
         }
 
-        // Backtick-escaped identifier: the quoted form admits any character
-        // but a backtick, newline, CR or NUL. The identifier carries the backticks in
-        // its span; the parser strips them when materializing names.
+        // A backtick-escaped identifier admits any character but a backtick,
+        // newline, CR or NUL, and carries the backticks in its span; the parser
+        // strips them when materializing names.
         if (b == '`') {
             return self.lexBacktickIdent(start);
         }
 
-        // Identifiers / keywords. Unicode XID for the start; ASCII fast path first.
         if (isIdentStartByte(b) or isXidStartChar(self.peekChar())) {
             return self.lexIdentOrKeyword(start);
         }
@@ -524,8 +510,7 @@ pub const Lexer = struct {
         return .{ .kind = .Unknown, .span = self.span(start) };
     }
 
-    /// Length of a `$`-run directly followed by a quote (`$$"`), i.e. a
-    /// multi-dollar string prefix. Null when the run does not end at `"`.
+    /// Null when the `$`-run does not end at a quote.
     fn multiDollarPrefixLen(self: *const Lexer) ?u32 {
         var n: u32 = 0;
         while (self.peekByte(n) == @as(?u8, '$')) n += 1;
@@ -599,7 +584,7 @@ pub const Lexer = struct {
         self.eatDigitsWithUnderscores(10);
 
         var is_float = false;
-        // Fractional part, only if followed by a digit (so `1.toString()` still works).
+        // Fractional part only when a digit follows, so `1.toString()` works.
         if (self.peekByte(0) == @as(?u8, '.')) {
             if (self.peekByte(1)) |b1| {
                 if (std.ascii.isDigit(b1)) {
@@ -624,9 +609,9 @@ pub const Lexer = struct {
             }
         }
 
-        // A trailing `f`/`F` that is not part of a longer identifier makes this
-        // a Float literal even with no decimal point (`2f`). The next byte must
-        // not continue an identifier, so `1foo` stays an error, not `1f` + `oo`.
+        // A trailing `f`/`F` makes this a Float literal even with no decimal
+        // point (`2f`), but only when the next byte does not continue an
+        // identifier, so `1foo` stays an error rather than `1f` + `oo`.
         if (!is_float) {
             switch (self.peekByte(0) orelse 0) {
                 'f', 'F' => {
@@ -716,8 +701,7 @@ pub const Lexer = struct {
             const c = self.bumpChar() orelse 0xFFFD;
             const cp: u32 = c;
             if (cp > 0xFFFF) {
-                // A Kotlin `Char` is one UTF-16 code unit, so an astral scalar
-                // such as an emoji cannot be one: it needs a surrogate pair.
+                // A Kotlin `Char` is one UTF-16 code unit, so an astral scalar cannot be one.
                 var d = Diagnostic.err(
                     "character literal must be a single UTF-16 code unit",
                     self.span(start),
@@ -725,7 +709,6 @@ pub const Lexer = struct {
                 _ = d.withCode("E0041").withFactory(&kf.INCORRECT_CHARACTER_LITERAL);
                 try self.emit(d);
             } else {
-                // `cp <= 0xFFFF` here, so it is a single UTF-16 code unit.
                 ch = @intCast(cp);
             }
         }
@@ -739,13 +722,12 @@ pub const Lexer = struct {
         return .{ .kind = .{ .CharLiteral = ch }, .span = self.span(start) };
     }
 
-    /// Append one UTF-16 code unit from a string escape to the UTF-8 `text`
-    /// buffer. A high surrogate immediately followed by a `\uXXXX` low-surrogate
-    /// escape combines into the astral scalar; an unpaired surrogate is emitted
-    /// lossily as U+FFFD, since UTF-8 cannot store a lone surrogate.
+    /// Append one UTF-16 code unit from a string escape to `text`. A high
+    /// surrogate followed by a `\uXXXX` low surrogate combines into the astral
+    /// scalar; an unpaired one becomes U+FFFD, since UTF-8 cannot store a lone
+    /// surrogate.
     fn pushStringUnit(self: *Lexer, text: *std.ArrayList(u8), unit: u16) !void {
         if (unit >= 0xD800 and unit <= 0xDBFF) {
-            // High surrogate: try to pair with a following escape.
             if (self.peekByte(0) == @as(?u8, '\\')) {
                 const lo = try self.lexEscape(self.pos);
                 if (lo >= 0xDC00 and lo <= 0xDFFF) {
@@ -796,10 +778,9 @@ pub const Lexer = struct {
         };
     }
 
-    /// `\uXXXX` is exactly four hex digits, so the value always fits
-    /// `0x0000..=0xFFFF`, one UTF-16 code unit. Surrogates (`\uD800`..`\uDFFF`)
-    /// are valid `Char` literals, a Kotlin `Char` being a code unit rather than
-    /// a scalar, so no scalar-validity check applies.
+    /// Four hex digits, so the value always fits one UTF-16 code unit.
+    /// Surrogates are valid `Char` literals, a Kotlin `Char` being a code unit,
+    /// so no scalar-validity check applies.
     fn lexUnicodeEscape(self: *Lexer, esc_start: u32) !u16 {
         var value: u32 = 0;
         var count: u32 = 0;
@@ -859,9 +840,8 @@ pub const Lexer = struct {
             if (b0 == '.' and b1 == @as(?u8, '.')) break :blk .DotDot;
             if (b0 == ':' and b1 == @as(?u8, ':')) break :blk .ColonColon;
             if (b0 == '?' and b1 == @as(?u8, '.')) break :blk .QuestionDot;
-            // `?:` is elvis, but `?::` is a `?` (nullable receiver) followed by
-            // `::` (callable reference), as in `Any?::toString`, so it must not
-            // be swallowed as elvis.
+            // `?::` is a `?` (nullable receiver) plus `::`, as in
+            // `Any?::toString`, so it must not be swallowed as elvis.
             if (b0 == '?' and b1 == @as(?u8, ':') and b2 != @as(?u8, ':')) break :blk .QuestionColon;
             if (b0 == '!' and b1 == @as(?u8, '!')) break :blk .BangBang;
             if (b0 == ';' and b1 == @as(?u8, ';')) break :blk .DoubleSemicolon;
@@ -872,7 +852,6 @@ pub const Lexer = struct {
             return .{ .kind = k, .span = self.span(start) };
         }
 
-        // WS-sensitive single-char tokens.
         if (b0 == '@') {
             self.pos += 1;
             const pre = self.ws_before or self.nl_before;
@@ -975,12 +954,10 @@ pub const Lexer = struct {
                 return;
             };
 
-            // Closing quotes. A raw string closes on the LAST three quotes of a
-            // quote run: `""""v""""` has content `"v"`, matching kotlinc.
+            // A raw string closes on the LAST three quotes of a run: `""""v""""`
+            // has content `"v"`, matching kotlinc.
             if (b == '"') {
                 if (raw) {
-                    // Scan the whole run: any quotes beyond the closing triple
-                    // belong to the content.
                     var run: u32 = 1;
                     while (self.peekByte(run) == @as(?u8, '"')) run += 1;
                     if (run >= 3) {
@@ -1012,7 +989,6 @@ pub const Lexer = struct {
                 return;
             }
 
-            // Newline: error in regular strings, allowed in raw.
             if (b == '\n' and !raw) {
                 try self.flushStringText(tokens, &text, segment_start);
                 var d = Diagnostic.err("newline in regular string literal", self.span(pos));
@@ -1022,16 +998,15 @@ pub const Lexer = struct {
                 return;
             }
 
-            // Escapes (regular strings only; raw strings keep `\` verbatim).
             if (b == '\\' and !raw) {
                 const ch = try self.lexEscape(pos);
                 try self.pushStringUnit(&text, ch);
                 continue;
             }
 
-            // Templates. For a run of R dollars in an N-dollar string, R < N is
-            // literal text; at R >= N the leading R-N stay literal and the
-            // trailing N form the marker when `{` or an identifier follows.
+            // For a run of R dollars in an N-dollar string, R < N is literal
+            // text; at R >= N the leading R-N stay literal and the trailing N
+            // form the marker when `{` or an identifier follows.
             if (b == '$') {
                 var run: u32 = 0;
                 while (self.peekByte(run) == @as(?u8, '$')) run += 1;
@@ -1043,7 +1018,6 @@ pub const Lexer = struct {
                 }
                 const extra = run - dollars;
                 const after = self.peekByte(run);
-                // `${expr}` form.
                 if (after == @as(?u8, '{')) {
                     var i: u32 = 0;
                     while (i < extra) : (i += 1) try text.append(self.allocator, '$');
@@ -1058,8 +1032,6 @@ pub const Lexer = struct {
                     try self.modes.append(self.allocator, .{ .Interp = .{ .brace_depth = 0 } });
                     return;
                 }
-                // `$ident` short form, including a backtick-escaped name
-                // (`` $`_` ``): `simpleIdentifier` admits the escaped form.
                 if (after) |b1| {
                     if (isIdentStartByte(b1) or b1 == '`') {
                         var i: u32 = 0;
@@ -1094,7 +1066,6 @@ pub const Lexer = struct {
                         return;
                     }
                 }
-                // Dollar run with no template after it: literal dollars.
                 var i: u32 = 0;
                 while (i < run) : (i += 1) try text.append(self.allocator, '$');
                 self.pos += run;
@@ -1107,10 +1078,9 @@ pub const Lexer = struct {
     }
 };
 
-/// Append a lone UTF-16 surrogate in its 3-byte WTF-8 form so it survives in
-/// the string's byte buffer, which real UTF-8 could not hold. `Utf16View`
-/// decodes it back to the surrogate code unit, and `coalesceSurrogates`
-/// combines a high+low pair into the astral scalar when a string is built.
+/// Append a lone UTF-16 surrogate in its 3-byte WTF-8 form, which real UTF-8
+/// could not hold. `Utf16View` decodes it back to the code unit, and
+/// `coalesceSurrogates` combines a high+low pair into the astral scalar.
 fn appendSurrogate(text: *std.ArrayList(u8), allocator: std.mem.Allocator, unit: u16) !void {
     try text.append(allocator, 0xE0 | @as(u8, @intCast(unit >> 12)));
     try text.append(allocator, 0x80 | @as(u8, @intCast((unit >> 6) & 0x3F)));
@@ -1182,13 +1152,11 @@ fn bsearchRangeTable(c: u32, table: []const Range) bool {
 }
 
 fn isXidStart(c: u32) bool {
-    // Fast-path for ascii idents.
     if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z')) return true;
     return c > 0x7F and bsearchRangeTable(c, &xid_start_table);
 }
 
 fn isXidContinue(c: u32) bool {
-    // Fast-path for ascii idents.
     if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_') return true;
     return c > 0x7F and bsearchRangeTable(c, &xid_continue_table);
 }
@@ -1689,8 +1657,7 @@ test "integer-form float suffix" {
 }
 
 test "digits then identifier is not a float suffix" {
-    // `1foo` must not lex as `1f` + `oo`: the trailing `f` continues an
-    // identifier, so the number stays an integer and `foo` follows.
+    // `1foo` must not lex as `1f` + `oo`: the trailing `f` continues an identifier.
     var ks = try kindsAlloc("1foo");
     defer ks.deinit(testing.allocator);
     var sig: std.ArrayList(TokenKind) = .empty;
@@ -1837,8 +1804,8 @@ test "triple quoted raw string keeps backslashes and newlines" {
 }
 
 test "raw string closes on the last three quotes of a run" {
-    // """a"""" is the raw string `a"`: the run of four quotes ends the
-    // literal with its final three, and the first belongs to the content.
+    // `"""a""""` is the raw string `a"`: the four-quote run ends the literal
+    // with its final three.
     var r = try lex("\"\"\"a\"\"\"\"");
     defer r.deinit(testing.allocator);
     try testing.expect(!r.diagnostics.hasErrors());
@@ -1852,8 +1819,7 @@ test "raw string closes on the last three quotes of a run" {
 }
 
 test "raw string quote runs around an interpolation" {
-    // `""""${x}""""` is `"`, the interpolation, then `"`, the ktor
-    // RoutingResolveTrace form.
+    // `""""${x}""""` is `"`, the interpolation, then `"`.
     var r = try lex("\"\"\"\"${x}\"\"\"\"");
     defer r.deinit(testing.allocator);
     try testing.expect(!r.diagnostics.hasErrors());

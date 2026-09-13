@@ -1,23 +1,15 @@
-//! Typealias expansion over a parsed program. A `typealias` is transparent in
-//! Kotlin: wherever the alias name appears, the program means the aliased type
-//! with the alias's type parameters substituted. This pass rewrites every such
-//! reference in place, before lowering, so later phases only see the target:
+//! Typealias expansion: a `typealias` is transparent in Kotlin, so this pass
+//! rewrites every reference to the aliased type, with type parameters
+//! substituted, before lowering. It covers type positions, constructor calls,
+//! value positions (`Alias.member` for an alias of an object) and callable
+//! references.
 //!
-//! - type positions (declarations, `is`/`as`, type arguments, supertypes of
-//!   classes and object literals, function types, catch clauses, ...);
-//! - constructor calls `Alias(args)` / `Alias<T>(args)` / `recv.Alias(args)`
-//!   for an alias of a class, inner class, nested class or a builtin such as
-//!   `Array<T>`;
-//! - value positions (`Alias.member` for an alias of an object or companion);
-//! - callable references `::Alias`, `Recv::Alias`.
-//!
-//! Name resolution follows Kotlin scoping: aliases declared in an enclosing
-//! class body, then explicit imports, then the file's own package (a private
-//! alias only within its own file), then star imports. An alias's target is
-//! resolved in the scope of its declaration, so the rewritten reference keeps
-//! the target's own spans and the declaring file's imports govern the name. An
-//! alias name the program also declares as a classifier, function or value is
-//! left alone: such a reference is decided by lowering's full scope model.
+//! Name resolution follows Kotlin scoping: enclosing class bodies, explicit
+//! imports, the file's own package (a private alias only within its own file),
+//! then star imports. An alias's target resolves in the scope of its
+//! declaration, so the declaring file's imports govern the name. A name the
+//! program also declares as a classifier, function or value is left to
+//! lowering's scope model.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -39,16 +31,13 @@ const Alias = struct {
     target: *const TypeRef,
     file: usize,
     pkg: []const u8,
-    /// Dotted path of the declaring class within its package; empty for a
-    /// top-level alias.
+    /// Dotted path of the declaring class; empty for a top-level alias.
     owner: []const u8,
-    /// `pkg.owner.name` with empty parts omitted.
     fqn: []const u8,
     private: bool,
 };
 
 const ClassInfo = struct {
-    /// Dotted path within the package (`Outer.Inner`).
     path: []const u8,
     pkg: []const u8,
     is_inner: bool,
@@ -137,8 +126,7 @@ fn packageOf(a: Allocator, f: *const KotlinFile) Allocator.Error![]const u8 {
     return joinIdents(a, pkg.path);
 }
 
-/// A package of the shipped stdlib or a library pack rather than of the program
-/// being built.
+/// A package of the shipped stdlib or a library pack, not of the program.
 fn shippedPackage(pkg: []const u8) bool {
     for ([_][]const u8{ "kotlin", "kotlinx", "androidx", "io.ktor", "org.jetbrains" }) |root| {
         if (std.mem.eql(u8, pkg, root)) return true;
@@ -147,7 +135,6 @@ fn shippedPackage(pkg: []const u8) bool {
     return false;
 }
 
-/// Expand every typealias reference in `files` in place.
 pub fn expandFiles(a: Allocator, files: []const KotlinFile) Allocator.Error!void {
     var any = false;
     for (files) |*f| {
@@ -177,10 +164,9 @@ pub fn expandFiles(a: Allocator, files: []const KotlinFile) Allocator.Error!void
     var w = Walker{ .idx = &idx, .a = a, .mode = .rewrite, .file = 0, .pkg = "", .imports = &.{} };
     defer w.deinit();
     for (files, 0..) |*f, i| {
-        // The program's own files are rewritten; a shipped library keeps its
-        // source spelling, its aliases still collected so a program that uses
-        // them expands them, because a library's private extension on an
-        // aliased scalar resolves by the alias head.
+        // A shipped library keeps its source spelling, its aliases still
+        // collected so a program using them expands them, because a library's
+        // private extension on an aliased scalar resolves by the alias head.
         if (shippedPackage(idx.file_pkgs[i])) continue;
         w.file = i;
         w.pkg = idx.file_pkgs[i];
@@ -251,7 +237,6 @@ const Walker = struct {
     imports: []const ast.ImportDecl,
     /// Dotted paths of the lexically enclosing classes, innermost last.
     class_stack: std.ArrayListUnmanaged([]const u8) = .empty,
-    /// Type parameter names in scope.
     type_params: std.ArrayListUnmanaged([]const u8) = .empty,
 
     fn deinit(w: *Walker) void {
@@ -289,8 +274,6 @@ const Walker = struct {
         w.a.free(p);
     }
 
-    // ---- scope queries -------------------------------------------------
-
     fn packageVisible(w: *const Walker, pkg: []const u8, head: []const u8) bool {
         if (std.mem.eql(u8, pkg, w.pkg)) return true;
         for (w.imports) |imp| {
@@ -307,13 +290,11 @@ const Walker = struct {
         return false;
     }
 
-    /// The alias a simple name denotes at this point of the walk.
     fn findAlias(w: *const Walker, name: []const u8) ?Alias {
         if (w.typeParamInScope(name)) return null;
         if (w.idx.blocked.contains(name)) return null;
         const list = w.idx.aliases.get(name) orelse return null;
         const cands = list.items;
-        // Lexically enclosing class bodies, innermost first.
         var depth = w.class_stack.items.len;
         while (depth > 0) {
             depth -= 1;
@@ -322,8 +303,6 @@ const Walker = struct {
                 if (al.owner.len != 0 and std.mem.eql(u8, al.owner, path) and std.mem.eql(u8, al.pkg, w.pkg)) return al;
             }
         }
-        // Explicit imports (`import pkg.Alias`, `import pkg.Owner.Alias`,
-        // `import pkg.Alias as Name`).
         var found: ?Alias = null;
         var ambiguous = false;
         for (w.imports) |imp| {
@@ -338,7 +317,6 @@ const Walker = struct {
         }
         if (ambiguous) return null;
         if (found) |al| return al;
-        // Own package.
         for (cands) |al| {
             if (al.owner.len != 0 or !std.mem.eql(u8, al.pkg, w.pkg)) continue;
             if (al.private and al.file != w.file) continue;
@@ -346,7 +324,6 @@ const Walker = struct {
             found = al;
         }
         if (found) |al| return al;
-        // Star imports.
         for (w.imports) |imp| {
             if (!imp.wildcard) continue;
             for (cands) |al| {
@@ -359,8 +336,7 @@ const Walker = struct {
         return found;
     }
 
-    /// The alias a dotted path denotes: fully qualified, class-qualified
-    /// (`Owner.Alias`), or relative to an enclosing class body.
+    /// Fully qualified, class-qualified (`Owner.Alias`), or relative to an enclosing class body.
     fn findAliasByPath(w: *const Walker, path: []const u8) ?Alias {
         const name = lastSegment(path);
         if (name.len == path.len) return w.findAlias(name);
@@ -370,8 +346,7 @@ const Walker = struct {
             if (std.mem.eql(u8, al.fqn, path)) return al;
             if (al.owner.len == 0) continue;
             if (pathEndsWith(al.fqn, path)) {
-                // `Owner.Alias` relative to the package: the owner class
-                // must be visible here.
+                // `Owner.Alias` relative to the package: the owner class must be visible here.
                 const rel = al.fqn[al.fqn.len - path.len ..];
                 const head = rel[0 .. std.mem.indexOfScalar(u8, rel, '.') orelse rel.len];
                 if (al.pkg.len == 0 or al.fqn.len == path.len or w.packageVisible(al.pkg, head)) return al;
@@ -412,10 +387,7 @@ const Walker = struct {
         return identPathEql(idents, dotted);
     }
 
-    // ---- expansion -----------------------------------------------------
-
-    /// The scope an alias's target is written in: its declaring file and
-    /// class body, with no type parameters of the use site in view.
+    /// Its declaring file and class body, with no type parameters of the use site in view.
     fn declScope(w: *const Walker, al: Alias) Allocator.Error!Walker {
         var s = Walker{
             .idx = w.idx,
@@ -436,14 +408,13 @@ const Walker = struct {
 
     const Expanded = struct {
         ty: TypeRef,
-        /// True when the alias is generic and the use site supplied no
-        /// arguments: every parameter position became a star projection.
+        /// The alias is generic and the use site gave no arguments, so every
+        /// parameter position became a star projection.
         inferred: bool,
     };
 
-    /// The target of `al` with `args` substituted for its type parameters.
-    /// `null` when the argument count does not fit or the target is a bare
-    /// parameter that the use site leaves unbound.
+    /// `null` when the argument count does not fit, or the target is a bare
+    /// parameter the use site leaves unbound.
     fn expandAlias(w: *Walker, al: Alias, args: []const TypeArg, use_span: Span) Allocator.Error!?Expanded {
         if (args.len != 0 and args.len != al.type_params.len) return null;
         const inferred = args.len == 0 and al.type_params.len != 0;
@@ -491,8 +462,8 @@ const Walker = struct {
                     if (ty.annotations.len != 0) sub.annotations = ty.annotations;
                     return sub;
                 }
-                // Unbound: keep the parameter name; the enclosing type
-                // argument becomes a star projection (see below).
+                // Unbound: keep the parameter name; the enclosing type argument
+                // becomes a star projection below.
                 return out;
             }
         }
@@ -537,8 +508,7 @@ const Walker = struct {
         return out;
     }
 
-    /// Rewrite `ty` in place when it names an alias. Type arguments are
-    /// expanded first so the substituted target carries expanded arguments.
+    /// Type arguments are expanded first, so the substituted target carries expanded arguments.
     fn expandType(w: *Walker, ty: *TypeRef, depth: u8) Allocator.Error!bool {
         if (ty.function) |ft| {
             if (ft.receiver) |*r| _ = try w.expandType(r, depth);
@@ -570,9 +540,9 @@ const Walker = struct {
         return true;
     }
 
-    /// Path segments naming the expanded target's classifier, for a
-    /// constructor call or value reference. An inner class collapses to its
-    /// own name: its outer part is the receiver, never a path prefix.
+    /// Path segments naming the expanded target's classifier. An inner class
+    /// collapses to its own name: its outer part is the receiver, never a path
+    /// prefix.
     fn targetSegments(w: *Walker, al: Alias, target: *const TypeRef, collapse_inner: bool) Allocator.Error![]Ident {
         const path = target.qualified_path orelse target.name.name;
         if (collapse_inner and target.qualified_path != null and w.idx.classIsInner(al.pkg, path)) {
@@ -599,8 +569,7 @@ const Walker = struct {
         return out;
     }
 
-    /// `Alias(args)` / `Owner.Alias(args)`: the aliased classifier's
-    /// constructor, with the alias's type arguments mapped onto it.
+    /// `Alias(args)`: the aliased constructor, with the type arguments mapped.
     fn rewriteCalleePath(w: *Walker, c: anytype, p: anytype) Allocator.Error!bool {
         const al: Alias = if (p.segments.len == 1)
             w.findAlias(p.segments[0].name) orelse return false
@@ -618,8 +587,8 @@ const Walker = struct {
         return true;
     }
 
-    /// `recv.Alias(args)`: an alias of an inner or nested class constructed
-    /// through the receiver takes the target's own name.
+    /// An alias of an inner or nested class constructed through the receiver
+    /// takes the target's own name.
     fn rewriteCalleeMember(w: *Walker, c: anytype, m: anytype) Allocator.Error!void {
         const al = w.findAlias(m.name.name) orelse return;
         const args = try typeRefsAsArgs(w.a, c.type_args);
@@ -635,8 +604,7 @@ const Walker = struct {
         return out;
     }
 
-    /// `Alias.member` / `Owner.Alias.member` / bare `Alias`: an alias of an
-    /// object or companion denotes that object.
+    /// `Alias.member` or bare `Alias`: an alias of an object denotes it.
     fn rewritePath(w: *Walker, p: anytype) Allocator.Error!void {
         var consumed: usize = 0;
         var al: ?Alias = null;
@@ -673,8 +641,6 @@ const Walker = struct {
         if (expanded.ty.function != null) return;
         name.* = .{ .name = expanded.ty.name.name, .span = expanded.ty.name.span };
     }
-
-    // ---- walk ----------------------------------------------------------
 
     fn walkType(w: *Walker, ty: *TypeRef) Allocator.Error!void {
         _ = try w.expandType(ty, 0);
