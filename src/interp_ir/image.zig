@@ -1,40 +1,25 @@
-//! Baked stdlib image: serialize a lowered `StdlibBase` to bytes and load
-//! it back without re-running the lowering driver.
+//! Baked stdlib image: serialize a lowered `StdlibBase` to bytes and load it
+//! back without re-running the lowering driver.
 //!
-//! The wire format is the pack codec's postcard style (varints,
-//! length-prefixed sequences, in-order struct fields) extended with a
-//! shared-graph protocol so the snapshot's pointer structure survives a
-//! round trip:
+//! The wire format is the pack codec's postcard style (varints, length-prefixed
+//! sequences, in-order struct fields) plus a shared-graph protocol:
 //!
-//! - Every slice is a define/backref: the first encode of a given
-//!   `(address, length)` writes its elements inline and registers it; a
-//!   later encode of the same slice writes a backref. The decoder keeps a
-//!   registry in define order, so a backref resolves to the exact slice
-//!   the first define produced and sharing (lifted classes share member
-//!   slices with their declaring class) is preserved.
-//! - A closed set of AST node types is *watched*: every watched value is
-//!   registered (in traversal order) as it is encoded/decoded, and a
-//!   pointer to a watched node encodes as a reference to that registry.
-//!   This is what lets `Inst.BuildObject.ast`, `ClassDef.methods[].decl`,
-//!   `StdlibBase.inline_ids` and friends point INTO the decoded
-//!   `lifted_decls` tree, interior addresses included, exactly as they do
-//!   in a freshly lowered base.
-//! - `[]const u8` decodes as a borrow of the image buffer, so strings cost
-//!   nothing to materialize. The buffer must outlive the loaded base; the
-//!   CLI keeps it on the same process-lifetime arena as the base itself.
+//! - Every slice is a define/backref. The first encode of an `(address, length)`
+//!   writes its elements inline and registers it; a later encode writes a
+//!   backref. The decoder's registry is in define order, so sharing survives.
+//! - A closed set of AST node types is watched: each registers in traversal
+//!   order as it encodes and decodes, and a pointer to one encodes as a registry
+//!   reference, which is what lets IR and `ClassDef` edges point into the
+//!   decoded `lifted_decls` tree, interior addresses included.
+//! - `[]const u8` decodes as a borrow, so the buffer must outlive the base.
 //!
-//! What is serialized: the SourceMap files, the post-lift AST decls, the
-//! lowered `ir.Module` (registry flattened to index/pair tables), its
-//! owner-scoped member groups and linked numeric method dispatch table,
-//! every `BuiltModule` side table, the runtime `ClassDef` graph (ObjRef
-//! edges as def-table indexes), and the `StdlibBase` gate sets. What is
-//! rebuilt at load: hash-map spines, `func_name_index`, ObjRef cells, and
-//! the run-mutable `ClassDef` cells (companion/object singletons, captured
-//! envs) that `cloneBuiltForRun` resets per run anyway.
+//! Serialized: SourceMap files, post-lift AST decls, the lowered `ir.Module`
+//! with its registry flattened to index/pair tables, the `BuiltModule` side
+//! tables, the `ClassDef` graph with ObjRef edges as def-table indexes, and the
+//! `StdlibBase` gate sets. Rebuilt at load: hash-map spines, `func_name_index`,
+//! ObjRef cells, and the run-mutable `ClassDef` cells `cloneBuiltForRun` resets.
 //!
-//! `bake` refuses (returns null) when the base holds anything outside the
-//! serializable build-time surface (e.g. a SAM-converted method value);
-//! callers then simply keep the unbaked path.
+//! `bake` returns null when the base holds anything outside that surface.
 
 const std = @import("std");
 
@@ -62,18 +47,15 @@ const TypeShape = runtime.TypeShape;
 const StdlibBase = build.StdlibBase;
 const BuiltModule = build.BuiltModule;
 
-/// Bump on ANY change to the encoded layout or to the types it reaches
-/// (AST, IR, ClassDef shapes). A version mismatch refuses to load and the
-/// caller rebakes.
+/// Bump on any change to the encoded layout or to the types it reaches. A
+/// mismatch refuses the load and the caller rebakes.
 pub const FORMAT_VERSION: u32 = 60;
 
 pub const MAGIC = "KIMG";
 const TRAILER = "GMIK";
 
-// -------------------------------------------------------------------------
-// Watched AST node types: externally referenced by pointer from the IR,
-// the ClassDef graph, or the base's inline-fn registry.
-// -------------------------------------------------------------------------
+// Watched AST node types: pointed at from the IR, ClassDef graph, or inline-fn
+// registry.
 
 const watched_types = [_]type{
     ast.Expr,
@@ -92,29 +74,20 @@ fn isWatched(comptime T: type) bool {
     return false;
 }
 
-/// A `forest.ForestField(T)` union — the codec encodes it as a forest reference
-/// (or an inline fallback) instead of via the generic union path.
 fn isForestField(comptime T: type) bool {
     return @typeInfo(T) == .@"union" and @hasDecl(T, "is_forest_field");
 }
 
-/// Bake-time map from a forest AST node address to its `(decl, ord)` reference,
-/// built while emitting the per-decl sections. Set for the duration of the final
-/// `ImageRoot` encode so a `ForestField.ptr` into the forest encodes lazily.
-/// Null outside a bake (and in the self-contained per-decl/body encodes, which
-/// must stay inline).
+/// Forest AST node address -> `(decl, ord)`, installed for the final `ImageRoot`
+/// encode so a `ForestField.ptr` encodes lazily. Null elsewhere.
 var bake_forest_map: ?*const std.AutoHashMap(usize, runtime.forest.ForestRef) = null;
 
-/// Decl-index base of the forest slot reserved for the image currently being
-/// loaded. Refs are baked image-local; `decodeForestField` adds this while the
-/// root payload decodes (zero outside a load — the self-contained per-decl /
-/// per-func sections carry no lazy refs, so runtime decodes are unaffected).
+/// Decl-index base of the loading image's forest slot. Refs bake image-local, so
+/// `decodeForestField` adds this while the root payload decodes; zero elsewhere.
 var load_forest_rebase: u32 = 0;
 
-/// Encode a `ForestField`: tag 0 + `(decl, ord)` when the pointer resolves to a
-/// forest node (the lazy path), else tag 1 + the node encoded inline (synthetic
-/// nodes outside `lifted_decls`, and any encode with no forest map installed —
-/// e.g. the per-decl sections themselves). `.ref` re-encodes verbatim.
+/// Encode a `ForestField`: tag 0 plus `(decl, ord)` when the pointer resolves to
+/// a forest node, else tag 1 plus the node inline. `.ref` re-encodes verbatim.
 fn encodeForestField(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!void {
     const Child = T.Child;
     switch (value.*) {
@@ -152,10 +125,6 @@ fn decodeForestField(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
     }
 }
 
-// -------------------------------------------------------------------------
-// Encoder
-// -------------------------------------------------------------------------
-
 const NodeKey = struct { addr: usize, ty: usize };
 const SliceKey = struct { addr: usize, len: usize, ty: usize };
 
@@ -185,10 +154,8 @@ const Encoder = struct {
         self.slices.deinit();
     }
 
-    /// Clear the shared-graph registries (keeping the output buffer) so the
-    /// next value encodes self-contained — every node/slice defined inline,
-    /// no backref into anything written before. Used to bake each deferred
-    /// body as an independently decodable unit appended to one buffer.
+    /// Clear the shared-graph registries, keeping the buffer, so the next value
+    /// encodes self-contained.
     fn resetRegistry(self: *Encoder) void {
         self.nodes.clearRetainingCapacity();
         self.slices.clearRetainingCapacity();
@@ -233,8 +200,7 @@ fn encodeInt(comptime T: type, e: *Encoder, value: T) Allocator.Error!void {
     }
 }
 
-/// Encode one value, traversing by const pointer so registered addresses
-/// are the original object addresses (interior pointers included).
+/// Encode one value by const pointer, so registered addresses are the originals.
 fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!void {
     if (comptime isForestField(T)) {
         try encodeForestField(T, e, value);
@@ -251,9 +217,7 @@ fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!v
         .bool => try e.byte(if (value.*) 1 else 0),
         .int => try encodeInt(T, e, value.*),
         // Floats are written as their IEEE-754 bit pattern in little-endian
-        // byte order, so an image baked on one host is byte-consumable on any
-        // other (all supported targets are little-endian; this removes the
-        // native-order dependence outright).
+        // order, so an image baked on one host is consumable on any other.
         .float => {
             const Bits = std.meta.Int(.unsigned, @bitSizeOf(T));
             const raw: Bits = @bitCast(value.*);
@@ -285,7 +249,7 @@ fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!v
             .slice => {
                 const s = value.*;
                 if (s.len == 0) {
-                    // Tag 1: the empty slice — no registry entry.
+                    // Tag 1: the empty slice, no registry entry.
                     try e.varint(1);
                     return;
                 }
@@ -332,10 +296,6 @@ fn encodeValue(comptime T: type, e: *Encoder, value: *const T) Allocator.Error!v
         else => @compileError("unsupported type in image encode: " ++ @typeName(T)),
     }
 }
-
-// -------------------------------------------------------------------------
-// Decoder
-// -------------------------------------------------------------------------
 
 const DecodeError = error{ OutOfMemory, Malformed };
 
@@ -426,9 +386,8 @@ pub fn dumpDecodeStats() void {
     }
 }
 
-/// Decode one value in place. Decoding writes through `out` so the final
-/// resting address of every watched node / defined slice is registered,
-/// mirroring the encoder's traversal exactly.
+/// Decode one value in place through `out`, so every watched node and defined
+/// slice registers at its final address.
 fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
     if (comptime isForestField(T)) {
         try decodeForestField(T, d, out);
@@ -453,23 +412,15 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
             if (tag == 0) {
                 out.* = null;
             } else switch (@typeInfo(o.child)) {
-                // Optional pointers/slices pack `null` into the pointer
-                // bits: there is no separate tag to pre-set, so writing an
-                // undefined payload and unwrapping would read undefined.
-                // Decode into a temporary and assign whole. (Pointer
-                // optionals never hold watched VALUES inline -- pointees
-                // are allocated and registered independently -- so the
-                // temporary costs no identity.)
+                // Optional pointers and slices pack `null` into the pointer bits
+                // with no tag, so decode into a temporary and assign whole.
                 .pointer => {
                     var tmp: o.child = undefined;
                     try decodeInto(o.child, d, &tmp);
                     out.* = tmp;
                 },
-                // Non-pointer optionals carry a separate tag; setting a
-                // non-null wrapper gives `&out.*.?` a stable payload
-                // address, which watched-node registration needs (e.g.
-                // `ast.Property.getter: ?Accessor` is referenced by
-                // interior pointer from `ClassDef.body_properties`).
+                // Non-pointer optionals carry a tag; a non-null wrapper set first
+                // gives `&out.*.?` the stable address registration needs.
                 else => {
                     out.* = @as(o.child, undefined);
                     try decodeInto(o.child, d, &out.*.?);
@@ -562,11 +513,7 @@ fn decodeInto(comptime T: type, d: *Decoder, out: *T) DecodeError!void {
     }
 }
 
-// -------------------------------------------------------------------------
-// Image schema: the StdlibBase flattened to codec-friendly tables.
-// HashMap/ArrayList/ObjRef spines become index- or pair-keyed slices;
-// everything else is the live type encoded as-is.
-// -------------------------------------------------------------------------
+// Image schema: HashMap, ArrayList and ObjRef spines flattened to slices.
 
 fn KV(comptime K: type, comptime V: type) type {
     return struct { k: K, v: V };
@@ -581,11 +528,8 @@ const PairTypeEntry = struct { a: []const u8, b: []const u8, v: ir.TypeRef };
 const NameTypeEntry = struct { name: []const u8, v: ir.TypeRef };
 const NameFuncs = struct { name: []const u8, funcs: []const FuncId };
 const NameOptFuncs = struct { name: []const u8, slots: []const ?FuncId };
-/// A class name paired with the argument labels of its super-constructor call
-/// (`: Base(objects = 2)` -> `[ "objects" ]`, positional args -> `null`). Kept
-/// parallel to `parent_ctor_args` so an image-loaded class binds a named
-/// super-constructor argument to the matching base parameter instead of
-/// positionally (which would drop it onto an earlier defaulted parameter).
+/// A class name plus its super-ctor argument labels (`: Base(objects = 2)` ->
+/// `["objects"]`, positional -> `null`), so the call binds by name.
 const NameArgNames = struct { name: []const u8, arg_names: []const ?[]const u8 };
 
 const FileEntry = struct { path: []const u8, source: []const u8 };
@@ -653,15 +597,12 @@ const ModuleImage = struct {
     decl_span: []KV(u32, Span),
     member_decl_groups: []Module.MemberDeclGroup,
     method_dispatch: []Module.MethodDispatchEntry,
-    /// Lazy IR: the self-contained `blocks` of AST-free functions, decoded on
-    /// first execution. A deferred function carries its `offset + 1` into this
-    /// section in `Func.deferred_offset` (its `blocks` is empty in the image).
+    /// Self-contained `blocks` of AST-free funcs; a deferred func holds
+    /// `offset + 1` in `Func.deferred_offset`.
     deferred_func_section: []const u8,
 };
 
-/// Executable-image projection of `Module.DeclSig`: runtime and extending
-/// lowerers retain receiver identity, structural user parameters, arity,
-/// ownership, callable kind, and executable-form flags.
+/// Executable-image projection of `Module.DeclSig`.
 pub const DeclSigLite = struct {
     fid: u32,
     enclosing_class: ?ir.ClassId,
@@ -671,9 +612,7 @@ pub const DeclSigLite = struct {
     required: u32,
     total: u32,
     has_vararg: bool,
-    /// Full structural user-parameter signature. Virtual-slot linking on an
-    /// image-loaded pack must make the same generic override associations as
-    /// source lowering, so this is part of the executable image contract.
+    /// Full structural signature; virtual-slot linking needs it to match source.
     sig: []const ir.TypeRef,
     kind: ir.FuncKind,
     visibility: ast.Visibility,
@@ -684,8 +623,8 @@ pub const DeclSigLite = struct {
     host_symbol: []const u8,
 };
 
-/// Build-time `Value` reachable from an enum entry or a primitive-zero
-/// slot. Anything outside this set refuses the bake.
+/// Build-time `Value` reachable from an enum entry or a primitive-zero slot;
+/// anything outside this set refuses the bake.
 const ValueImage = union(enum) {
     Unit,
     Null,
@@ -785,10 +724,7 @@ const ClassDefImage = struct {
     is_abstract: bool,
     is_inner: bool,
     is_anonymous: bool,
-    /// A class declaring only secondary constructors has NO primary. Without
-    /// this the decoder's default (`true`) made every restored class look like
-    /// it had an empty primary, so a zero-argument construction picked that
-    /// instead of the defaulted secondary and its parameter defaults never ran.
+    /// A class with only secondary constructors has no primary; never default it.
     has_primary_ctor: bool = true,
     secondary_ctors: []const FF(ast.SecondaryCtor),
     enum_entries: []struct { name: []const u8, value: ValueImage, annotation_records: []const runtime.AnnotationRecord },
@@ -831,8 +767,7 @@ const BuiltImage = struct {
 const ImageRoot = struct {
     /// SourceMap files in FileId order; the base occupies [0..len).
     files: []FileEntry,
-    /// Post-lift dependency decls. Encoded first: this walk defines the
-    /// AST node registry every later pointer backrefs into.
+    /// Post-lift dependency decls, encoded first to define the node registry.
     lifted_decls: []ast.Decl,
     module: ModuleImage,
     built: BuiltImage,
@@ -842,51 +777,35 @@ const ImageRoot = struct {
     param_type_names: []const []const u8,
     type_names: []const []const u8,
     inline_ids: []InlineIdImage,
-    /// Simple-name -> base inline-fn forest refs, the lazy replacement for the
-    /// load-time `collectInline` walk over `lifted_decls`.
+    /// Simple-name -> base inline-fn forest refs, replacing `collectInline`.
     inline_by_name: []InlineNamesImage = &.{},
-    /// Class simple-name -> base class forest ref (lazy `file_classes` seed).
     file_classes: []ClassRefImage = &.{},
-    /// Base top-level property scope data (lazy `notePropScope` replay).
     top_props: []TopPropImage = &.{},
     fn_returns: []FnReturnImage = &.{},
     ext_returns: []ExtReturnImage = &.{},
     eager_calls: []EagerCallImage = &.{},
     enum_id_next: u64,
-    /// CLI replay data: packages registered while loading the dependency
-    /// sources and the host-binding FQNs installed alongside them.
+    /// CLI replay data: packages registered and host-binding FQNs installed.
     known_packages: []const []const u8,
     binding_fqns: []const []const u8,
-    /// Self-contained encodings of deferred `inline` function bodies (marked in
-    /// the skeleton by `span.DEFERRED_BODY_FILE`). Each entry is a
-    /// `FunctionBody` encoded with a fresh node/slice registry, so it decodes
-    /// standalone from its byte offset.
+    /// Deferred `inline` bodies, marked in the skeleton by `DEFERRED_BODY_FILE`.
     deferred_bodies: []const u8,
-    /// Per-decl self-contained encodings of `lifted_decls`, parallel to
-    /// `lifted_decl_offsets` (decl `i` lives at `lifted_decl_offsets[i]`). Backs
-    /// the lazy forest: a decl decodes on first runtime touch from this section
-    /// instead of materialising the whole forest eagerly. Mirrors the post-
-    /// deferral form of `lifted_decls` (inline bodies are markers).
+    /// Self-contained `lifted_decls`, decl `i` at `lifted_decl_offsets[i]`.
     lifted_decl_section: []const u8 = &.{},
     lifted_decl_offsets: []const u32 = &.{},
-    /// Per-func self-contained header encodings, decoded on first `funcById`.
     func_header_section: []const u8 = &.{},
     func_header_offsets: []const u32 = &.{},
-    /// Ids of bodyless funcs (no blocks, not deferred) — the lazy link input.
+    /// Ids of bodyless funcs (no blocks, not deferred), the lazy link input.
     bodyless_func_ids: []const u32 = &.{},
     /// Distinct first fqn segments of the funcs (for packageHeadDeclared).
     func_fqn_heads: []const []const u8 = &.{},
-    /// `main`'s FuncId + 1 for a whole-program image (`klio bundle`);
-    /// 0 for a dependency base.
+    /// `main`'s FuncId + 1 for a whole-program image, 0 for a dependency base.
     main_func: u64 = 0,
 };
 
 const DEFERRED_MAGIC: u32 = span.DEFERRED_BODY_FILE;
 
-/// Decode one deferred `FunctionBody` from `section` at `offset` (the value the
-/// marker block's `span.start` carried), allocating into `a`. The body was
-/// baked self-contained (fresh registry), so a fresh decoder reads it
-/// standalone. Returns null on a malformed section (a corrupt image).
+/// Decode a deferred `FunctionBody` at its marker block's span offset, into `a`.
 pub fn decodeDeferredBody(a: Allocator, section: []const u8, offset: u32) ?ast.FunctionBody {
     var d = Decoder{ .a = a, .buf = section, .pos = offset };
     var body: ast.FunctionBody = undefined;
@@ -894,12 +813,7 @@ pub fn decodeDeferredBody(a: Allocator, section: []const u8, offset: u32) ?ast.F
     return body;
 }
 
-/// Decode one whole top-level `ast.Decl` from the per-decl section at `offset`,
-/// allocating into `a`. Each decl is baked self-contained (fresh registry — the
-/// deferred-body pattern generalised to a whole decl), so a fresh decoder reads
-/// it standalone. Backs the lazy forest: a decl decodes on first runtime touch
-/// instead of materialising the whole forest at load. Returns null on a
-/// malformed section.
+/// Decode one top-level `ast.Decl` from the per-decl section at `offset`.
 pub fn decodeLiftedDecl(a: Allocator, section: []const u8, offset: u32) ?ast.Decl {
     var d = Decoder{ .a = a, .buf = section, .pos = offset };
     var decl: ast.Decl = undefined;
@@ -907,10 +821,8 @@ pub fn decodeLiftedDecl(a: Allocator, section: []const u8, offset: u32) ?ast.Dec
     return decl;
 }
 
-/// Decode a whole top-level decl plus its node-ordinal registry (the
-/// decode-order watched-node address table), for the lazy forest resolver. The
-/// registry lets a `ForestRef{decl, ord}` in `built`/`module` resolve to the
-/// exact node by ordinal. Allocates into `a` (the process-lifetime base arena).
+/// Decode a top-level decl plus its watched-node table, so `ForestRef{decl, ord}`
+/// resolves by ordinal. `a` is the process-lifetime base arena.
 pub fn decodeLiftedDeclReg(a: Allocator, section: []const u8, offset: u32) ?runtime.forest.DeclReg {
     var d = Decoder{ .a = a, .buf = section, .pos = offset };
     const decl = a.create(ast.Decl) catch return null;
@@ -919,22 +831,13 @@ pub fn decodeLiftedDeclReg(a: Allocator, section: []const u8, offset: u32) ?runt
     return .{ .decl = decl, .nodes = nodes };
 }
 
-/// Process-global memo for `decodeFuncBlocks`. A deferred func body is immutable
-/// and identical for a given `(section, offset)`, but the per-`Func`
-/// `deferred_offset` flag that gates `ensureFuncBody` is reset whenever the
-/// module's func table is rebuilt (a per-program `cloneForExtend`, a fresh Vm
-/// for a `runBlocking` body), so a long-running server re-enters
-/// `decodeFuncBlocks` for the same offset on every request and the decoded
-/// blocks — allocated into the process-lifetime `deferred_func_arena` — pile up
-/// unfreed. Memoising by `(section, offset)` decodes each body exactly once ever:
-/// the cache is bounded by the reachable-func set, not by request count.
+/// Process-global memo for `decodeFuncBlocks`. A deferred body is immutable per
+/// `(section, offset)`, but the gating `deferred_offset` resets when the func
+/// table is rebuilt, so without this decodes pile up in a never-freed arena.
 const BlockCacheKey = struct { section: [*]const u8, offset: u32, len: usize, sig: u64 };
 
-/// Content fingerprint for a cache key: the section length plus the raw
-/// bytes at the decode offset. A freed section's ADDRESS can be reused by a
-/// later pack image (six installed packs made `"A".repeat` run another
-/// pack's one-arg body via a stale (ptr, offset) hit); the fingerprint makes
-/// such a reuse miss instead.
+/// Cache-key fingerprint: section length plus the raw bytes at the offset. A
+/// freed section's address can be reused, and this makes such a reuse miss.
 fn blockCacheSig(section: []const u8, offset: u32) u64 {
     var sig: u64 = 0;
     const avail = section.len -| offset;
@@ -954,8 +857,7 @@ inline fn blockCacheUnlock() void {
     block_cache_lock.store(false, .release);
 }
 
-/// Decode one func HEADER from the per-func section at `offset` (blocks stay
-/// body-deferred). Self-contained (fresh registry), allocating into `a`.
+/// Decode one func header at `offset`, blocks left body-deferred, into `a`.
 pub fn decodeFuncHeader(a: Allocator, section: []const u8, offset: u32) ?ir.Func {
     var d = Decoder{ .a = a, .buf = section, .pos = offset };
     var f: ir.Func = undefined;
@@ -963,10 +865,7 @@ pub fn decodeFuncHeader(a: Allocator, section: []const u8, offset: u32) ?ir.Func
     return f;
 }
 
-/// Decode a deferred function's `blocks` from the lazy-IR section at `offset`,
-/// allocating into `a`. Self-contained (fresh registry), like the AST bodies.
-/// Memoised: a repeated `(section, offset)` returns the first decode's blocks
-/// rather than re-decoding into the never-freed `deferred_func_arena`.
+/// Decode a deferred function's `blocks` at `offset` into `a`, memoised.
 pub fn decodeFuncBlocks(a: Allocator, section: []const u8, offset: u32) ?[]ir.Block {
     const key = BlockCacheKey{ .section = section.ptr, .offset = offset, .len = section.len, .sig = blockCacheSig(section, offset) };
     blockCacheLock();
@@ -982,20 +881,15 @@ pub fn decodeFuncBlocks(a: Allocator, section: []const u8, offset: u32) ?[]ir.Bl
 
     blockCacheLock();
     defer blockCacheUnlock();
-    // Re-check under the lock: a racing thread may have decoded the same key
-    // while this one was decoding. Keep the winner; the loser's blocks are
-    // arena-backed and reclaimed with the process.
+    // Re-check under the lock: a racer's blocks are arena-backed, so dropping
+    // the loser leaks nothing.
     if (block_cache.get(key)) |cached| return cached;
     block_cache.put(std.heap.page_allocator, key, blocks) catch {};
     return blocks;
 }
 
-/// Whether a function's `blocks` must stay eager (cannot be deferred to the
-/// self-contained lazy-IR section). Now always false: the AST-referencing insts
-/// carry their AST self-contained — `RegisterClass.class`/`BuildObject.ast` are
-/// `ForestField` (encode as a forest ref, or inline when no forest map is
-/// installed, as in the deferred-body section), and `AstLambda.body_ast` is an
-/// inline `ast.Block` value — so every body decodes standalone on first call.
+/// Whether `blocks` must stay eager. Always false: every AST-referencing inst
+/// carries its AST self-contained.
 fn funcRefsAst(func: *const ir.Func) bool {
     _ = func;
     return false;
@@ -1006,32 +900,21 @@ const InlineNamesImage = struct { k: []const u8, v: []const runtime.forest.Fores
 const ClassRefImage = struct { k: []const u8, v: runtime.forest.ForestRef };
 const TopPropImage = struct { name: []const u8, fqn: []const u8, package: []const u8, type_head: []const u8 = "" };
 
-/// A top-level function's simple name and the class head it returns, baked
-/// while the funcs are still decoded. The checker needs it to type a call's
-/// result on a cached image, where the funcs themselves never materialise.
+/// A top-level function's name and returned class head, for the checker.
 const FnReturnImage = struct { name: []const u8, head: []const u8 };
 
 /// An extension's return class head under `<receiver head>\x00<name>`.
 const ExtReturnImage = struct { key: []const u8, head: []const u8 };
 
-/// A base call site and the FuncId the checker resolved it to, baked so a
-/// cached run has the answer without re-parsing the base.
 const EagerCallImage = struct { call: Span, fid: u32 };
 
-// -------------------------------------------------------------------------
-// Bake: StdlibBase -> bytes
-// -------------------------------------------------------------------------
-
-/// Extra CLI-side state replayed at load time.
 pub const BakeExtras = struct {
     known_packages: []const []const u8 = &.{},
     binding_fqns: []const []const u8 = &.{},
 };
 
-/// Serialize `base` (and the SourceMap its spans resolve through) to an
-/// owned byte buffer. Returns null when the base holds state outside the
-/// serializable surface; callers keep the unbaked path. `gpa` is used for
-/// scratch and the returned buffer.
+/// Serialize `base` and its SourceMap into an owned `gpa` buffer; null when the
+/// base holds state outside the serializable surface.
 pub fn bake(
     gpa: Allocator,
     base: *const StdlibBase,
@@ -1044,10 +927,8 @@ pub fn bake(
 
     const root = (try rootFromBase(a, base, map, extras)) orelse return null;
 
-    // Defer `inline`, object-free function bodies into a self-contained side
-    // section, replacing each in the skeleton with a marker block whose span
-    // encodes its offset. The mutation is on the live base (shared with the
-    // current run), so the bodies are restored after the encode.
+    // Defer `inline`, object-free bodies into a side section, each replaced by
+    // a marker block whose span encodes its offset. The base is restored after.
     var body_enc = Encoder.init(gpa);
     defer body_enc.deinit();
     const Saved = struct { f: *ast.Function, body: ast.FunctionBody };
@@ -1072,9 +953,7 @@ pub fn bake(
     }
     root.deferred_bodies = body_enc.out.items;
 
-    // Defer AST-free function `blocks` into a second self-contained section,
-    // recording each function's `offset + 1` in `deferred_offset` and emptying
-    // its live blocks. Restored after the encode, like the AST bodies.
+    // Defer AST-free `blocks` likewise, recording `offset + 1` per func.
     var fn_blk_enc = Encoder.init(gpa);
     defer fn_blk_enc.deinit();
     var fn_saved: std.ArrayList(struct { f: *ir.Func, blocks: []ir.Block }) = .empty;
@@ -1092,11 +971,8 @@ pub fn bake(
         root.module.deferred_func_section = fn_blk_enc.out.items;
     }
 
-    // Per-func HEADER sections: each func encoded self-contained (blocks already
-    // body-deferred, so the header carries only its deferred_offset marker),
-    // decoded on first `funcById`. Also bake the bodyless-id list + fqn-head set
-    // (the lazy-friendly link/packageHeadDeclared inputs), then null the eager
-    // funcs so the whole table no longer materialises at load.
+    // Per-func headers, decoded on first `funcById`, plus the bodyless-id list
+    // and fqn-head set. The eager func table is then nulled.
     var fn_hdr_enc = Encoder.init(gpa);
     defer fn_hdr_enc.deinit();
     {
@@ -1109,11 +985,8 @@ pub fn bake(
             fn_hdr_enc.resetRegistry();
             try encodeValue(ir.Func, &fn_hdr_enc, f);
             if (f.deferred_offset == 0 and f.blocks.len == 0) try bodyless.append(a, @intCast(i));
-            // Only a DOTTED fqn contributes a package head. A dotless
-            // name is not package-qualified: recording it whole would
-            // make every bare stdlib func name (`done`, `run`, …) a
-            // "package", flattening any user `x.member` read whose `x`
-            // collides into an unresolvable dotted global.
+            // Only a dotted fqn contributes a package head; recording a dotless
+            // name would make every bare stdlib func name a "package".
             if (std.mem.indexOfScalar(u8, f.fqn, '.')) |dot| {
                 const h = f.fqn[0..dot];
                 if (h.len != 0) try heads.put(h, {});
@@ -1129,17 +1002,11 @@ pub fn bake(
         root.module.funcs = &.{};
     }
 
-    // Per-decl self-contained sections: each top-level decl encoded with a
-    // fresh registry so the loader can decode it standalone on first touch
-    // (the lazy forest). Emitted after the body/IR deferral above so the
-    // sections capture the final baked decl form (marker bodies). Additive: the
-    // eager `lifted_decls` stay in the payload until the lazy path is the
-    // default; the loader picks one.
+    // Per-decl sections, emitted after the deferral so they capture the final
+    // baked form. The eager decls stay; the loader picks one.
     var decl_enc = Encoder.init(gpa);
     defer decl_enc.deinit();
-    // Map every forest node's address to its `(decl, ord)` reference as each
-    // decl's self-contained section is emitted, so a `ForestField.ptr` into the
-    // forest encodes as a lazy ref (the decoder reads the same ordinals back).
+    // Map each forest node's address to its ref, so a `ptr` encodes lazily.
     var forest_map = std.AutoHashMap(usize, runtime.forest.ForestRef).init(gpa);
     defer forest_map.deinit();
     {
@@ -1157,8 +1024,6 @@ pub fn bake(
         root.lifted_decl_offsets = offsets;
     }
 
-    // Bake the base inline-fn name index as forest refs, so load installs it
-    // without walking lifted_decls (the lazy replacement for collectInline).
     {
         var by_name = std.StringHashMap(std.ArrayList(FF(ast.Function))).init(gpa);
         defer {
@@ -1183,8 +1048,6 @@ pub fn bake(
         root.inline_by_name = try list.toOwnedSlice(a);
     }
 
-    // Bake the base class index (simple-name -> class forest ref), the lazy
-    // replacement for seeding `file_classes` from lifted_decls at load.
     {
         var list: std.ArrayList(ClassRefImage) = .empty;
         for (root.lifted_decls) |*d| {
@@ -1196,9 +1059,7 @@ pub fn bake(
         root.file_classes = try list.toOwnedSlice(a);
     }
 
-    // Bake the base top-level property scope data from the base's registry (it
-    // was populated by notePropScope when the base was first built), so load
-    // replays it without walking lifted_decls.
+    // Bake the top-level property scope data so load skips a lifted_decls walk.
     {
         var list: std.ArrayList(TopPropImage) = .empty;
         const mg = base.built.module.borrow();
@@ -1217,9 +1078,7 @@ pub fn bake(
         root.top_props = try list.toOwnedSlice(a);
     }
 
-    // Bake top-level function return heads. Only an unambiguous answer is
-    // kept: a name with two declarations returning different classes tells
-    // the checker nothing, and a wrong head is worse than none.
+    // Bake top-level function return heads, unambiguous answers only.
     {
         const mg = base.built.module.borrow();
         defer mg.deinit();
@@ -1282,19 +1141,14 @@ pub fn bake(
         root.ext_returns = try eout.toOwnedSlice(a);
     }
 
-    // Eager call resolutions the caller collected from the base's own
-    // sources, which exist only here.
     {
         var out: std.ArrayList(EagerCallImage) = .empty;
         for (base.eager_calls) |ec| try out.append(a, .{ .call = ec.call, .fid = ec.fid });
         root.eager_calls = try out.toOwnedSlice(a);
     }
 
-    // Drop the eager forest from the payload: the per-decl sections (lazy
-    // `ForestField.get()`) plus the baked `inline_by_name` / `file_classes` /
-    // `top_props` indices now cover everything load reads, so the whole AST
-    // forest no longer materialises at startup. Any still-raw forest pointer in
-    // built/module finds no global-registry entry and inline-encodes (correct).
+    // Drop the eager forest: the per-decl sections plus the baked indices cover
+    // everything load reads, and a still-raw forest pointer inline-encodes.
     root.lifted_decls = &.{};
 
     var e = Encoder.init(gpa);
@@ -1302,7 +1156,6 @@ pub fn bake(
 
     try e.bytes(MAGIC);
     try e.bytes(&std.mem.toBytes(std.mem.nativeToLittle(u32, FORMAT_VERSION)));
-    // Payload-length slot, filled below.
     const len_slot = e.out.items.len;
     try e.bytes(&[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
     const payload_start = e.out.items.len;
@@ -1313,7 +1166,6 @@ pub fn bake(
     @memcpy(e.out.items[len_slot .. len_slot + 8], &std.mem.toBytes(std.mem.nativeToLittle(u64, payload_len)));
     try e.bytes(TRAILER);
 
-    // Restore the live base's bodies and func blocks before handing back bytes.
     for (saved.items) |s| s.f.body = s.body;
     for (fn_saved.items) |s| {
         s.f.blocks = s.blocks;
@@ -1331,7 +1183,6 @@ fn rootFromBase(
 ) Allocator.Error!?*ImageRoot {
     const root = try a.create(ImageRoot);
 
-    // Source files.
     {
         const files = try a.alloc(FileEntry, map.files.items.len);
         for (map.files.items, 0..) |*sf, i| {
@@ -1388,7 +1239,6 @@ fn moduleToImage(a: Allocator, m: *const Module, out: *ModuleImage) Allocator.Er
     out.func_index = m.func_index.items;
     out.package = m.package;
     out.tailrec_fn_names = m.tailrec_fn_names.items;
-    // The lazy-IR deferral runs in `bake` after this; default to eager.
     out.deferred_func_section = &.{};
 
     out.decl_user_params = try autoMapToSlice(u32, u32, a, &m.decl_user_params);
@@ -1625,8 +1475,7 @@ fn strMapToSlice(comptime V: type, a: Allocator, m: *const std.StringHashMap(V))
 const strMapToSliceKV = strMapToSlice;
 
 fn builtToImage(a: Allocator, b: *const BuiltModule, out: *BuiltImage) Allocator.Error!bool {
-    // The ClassDef graph first: every def reachable from the table gets an
-    // index, so edges and enum-entry instances can refer by index.
+    // The ClassDef graph first, so edges and enum entries can refer by index.
     var def_index = std.AutoHashMap(usize, u32).init(a);
     var defs: std.ArrayList(ObjRef(ClassDef)) = .empty;
     {
@@ -1812,8 +1661,7 @@ fn nameArgNamesToSlice(a: Allocator, m: *const std.StringHashMap([]const ?[]cons
     return out;
 }
 
-/// Queue the ClassDefs reachable from a build-time enum-entry value, and
-/// verify the value is within the serializable surface.
+/// Queue the ClassDefs an enum-entry value reaches, refusing an unbakeable one.
 fn collectValueClasses(a: Allocator, worklist: *std.ArrayList(ObjRef(ClassDef)), v: Value) Allocator.Error!bool {
     switch (v) {
         .Unit, .Null, .Bool, .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Char, .String => return true,
@@ -2020,10 +1868,6 @@ fn classDefToImage(
     return true;
 }
 
-// -------------------------------------------------------------------------
-// Load: bytes -> StdlibBase
-// -------------------------------------------------------------------------
-
 pub const Loaded = struct {
     base: *StdlibBase,
     map: *SourceMap,
@@ -2031,18 +1875,15 @@ pub const Loaded = struct {
     binding_fqns: []const []const u8,
 };
 
-/// Why the most recent `load` on this thread returned null; empty when it
-/// succeeded. Trace/diagnostic only.
+/// Why the most recent `load` on this thread returned null; diagnostic only.
 threadlocal var load_failure: []const u8 = "";
 
 pub fn lastLoadFailure() []const u8 {
     return load_failure;
 }
 
-/// Reconstruct a `StdlibBase` from image bytes. `a` must be a
-/// process-lifetime arena; `bytes` must stay alive as long as the base
-/// (decoded strings borrow from it). Returns null on any format/version
-/// mismatch or malformed input — callers rebake.
+/// Reconstruct a `StdlibBase`. `a` must be a process-lifetime arena and `bytes`
+/// must outlive the base, whose strings borrow from it.
 pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
     load_failure = "";
     if (bytes.len < MAGIC.len + 4 + 8 + TRAILER.len) {
@@ -2071,9 +1912,8 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
     }
 
     decode_stats_on = if (@import("builtin").link_libc) (runtime.envSetOnce("KLIO_DECODE_STATS")) else false;
-    // Reserve this image's forest slot before decoding: every `ForestRef`
-    // in the payload is image-local and rebases onto the slot as it
-    // decodes, so bases from several images coexist in one process.
+    // Reserve the forest slot first: every `ForestRef` is image-local and
+    // rebases onto it, so several bases coexist.
     const slot = runtime.forest.reserveSlot() orelse {
         load_failure = "forest slot registry full";
         return null;
@@ -2105,25 +1945,22 @@ pub fn load(a: Allocator, bytes: []const u8) Allocator.Error!?Loaded {
 }
 
 fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error!?Loaded {
-    // Install the lazy-forest resolver first: building the base below resolves
-    // forest refs (e.g. `inline_ids`), so the section/offset table and decode
-    // hook must be live before any `ForestField.get()`.
+    // Building the base resolves forest refs, so the section table must be live
+    // before any `ForestField.get()`.
     runtime.forest.fillSlot(slot, root.lifted_decl_section, root.lifted_decl_offsets, a, decodeLiftedDeclReg);
     const rebase = runtime.forest.slotBase(slot);
 
     const map = try a.create(SourceMap);
     map.* = SourceMap.init(a);
-    // The image's file paths/sources are borrows of the process-lifetime mmap,
-    // so register them borrowed: no whole-stdlib source dupe, no eager line
-    // tables. Saves ~7 MB at startup.
+    // Paths and sources borrow the process-lifetime mmap: no dupe, no eager
+    // line tables.
     for (root.files) |f| {
         _ = map.addBorrowed(f.path, f.source) catch return error.OutOfMemory;
     }
 
     var module = Module.default(a);
     try moduleFromImage(a, &root.module, &module);
-    // Install lazy func headers: the eager `funcs` slice is empty in the image;
-    // a func decodes from its per-func section on first `funcById`.
+    // The eager `funcs` slice is empty; a func decodes on first `funcById`.
     if (root.func_header_offsets.len != 0) {
         module.func_header_section = root.func_header_section;
         module.func_header_offsets = root.func_header_offsets;
@@ -2154,8 +1991,6 @@ fn baseFromRoot(a: Allocator, root: *const ImageRoot, slot: u32) Allocator.Error
             }
             break :blk ids;
         },
-        // The name-index tables decode as plain `ForestRef` structs (not
-        // `ForestField`s), so their image-local decl indexes rebase here.
         .inline_by_name = blk: {
             const out = try a.alloc(StdlibBase.InlineNames, root.inline_by_name.len);
             for (root.inline_by_name, 0..) |entry, i| {
@@ -2225,8 +2060,6 @@ fn sliceToSet(a: Allocator, items: []const []const u8) Allocator.Error!std.Strin
 
 fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocator.Error!void {
     try out.funcs.appendSlice(a, img.funcs);
-    // Lazy IR: a deferred function (its `deferred_offset` set in `img.funcs`)
-    // materialises its blocks on first execution from this section.
     out.deferred_func_section = img.deferred_func_section;
     out.deferred_func_arena = a;
     out.deferred_func_decode = decodeFuncBlocks;
@@ -2349,8 +2182,7 @@ fn moduleFromImage(a: Allocator, img: *const ModuleImage, out: *Module) Allocato
 }
 
 fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Allocator.Error!bool {
-    // ClassDef graph: shells first, then links — mirrors the two-phase
-    // shape of `cloneClassTableForRun`.
+    // ClassDef graph: shells first, then links, like `cloneClassTableForRun`.
     const defs = try a.alloc(ObjRef(ClassDef), img.class_defs.len);
     for (img.class_defs, 0..) |*ci, i| {
         defs[i] = try ObjRef(ClassDef).init(a, .{
@@ -2426,7 +2258,6 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
             .object_singleton = try ObjRef(?ObjRef(InstanceData)).init(a, null),
         });
     }
-    // Link pass.
     for (img.class_defs, 0..) |*ci, i| {
         const cg = defs[i].borrowMut();
         defer cg.deinit();
@@ -2488,8 +2319,6 @@ fn builtFromImage(a: Allocator, img: *const BuiltImage, out: *BuiltModule) Alloc
         if (kv.v >= defs.len) return false;
         try out.classes.put(kv.k, defs[kv.v].clone());
     }
-    // The defs slice holds the construction handles; the table's clones
-    // keep the cells alive (the arena owns the memory either way).
     for (defs) |*def| def.deinit();
 
     for (img.body_prop_inits) |entry| try out.body_prop_inits.put(.{ .a = entry.a, .b = entry.b }, entry.func);
@@ -2544,8 +2373,6 @@ fn methodsFromImage(a: Allocator, imgs: []const MethodImage) Allocator.Error![]r
     for (imgs, 0..) |m, i| {
         out[i] = .{
             .name = m.name,
-            // The image stores `decl` as a `ForestField` already (lazy `.ref`
-            // for forest methods, inline `.ptr` for synthetic ones); copy it.
             .decl = m.decl,
             .is_operator = m.is_operator,
             .is_open = m.is_open,
@@ -2596,8 +2423,7 @@ fn valueFromImage(a: Allocator, defs: []const ObjRef(ClassDef), v: ValueImage) A
                 .outer = null,
                 .identity = inst.identity,
                 .native_state = null,
-                // The buffer belongs to the adoption arena; runtime growth
-                // must re-buffer instead of freeing it across allocators.
+                // The buffer belongs to the adoption arena; growth re-buffers.
                 .fields_foreign = true,
             });
             return Value{ .Instance = copy };
@@ -2605,10 +2431,6 @@ fn valueFromImage(a: Allocator, defs: []const ObjRef(ClassDef), v: ValueImage) A
         else => return scalarFromImage(v),
     }
 }
-
-// -------------------------------------------------------------------------
-// Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 
@@ -2822,8 +2644,6 @@ test "codec resolves watched AST pointers to the decoded tree" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // A decl slice plus an external pointer at one of its interior
-    // functions — the shape ClassDef method decls and inline-fn ids have.
     const sp = Span.init(FileId.from(0), 0, 0);
     const fn_decl = ast.Function{
         .name = .{ .name = "f", .span = sp },
@@ -2853,7 +2673,6 @@ test "codec resolves watched AST pointers to the decoded tree" {
     const bytes = try encodeOne(Holder, a, &v);
     const got = try decodeOne(Holder, a, bytes);
     try testing.expectEqualStrings("f", got.ref.name.name);
-    // The external pointer aliases the decoded decl, not a copy.
     try testing.expect(got.ref == &got.decls[0].Function);
 }
 
@@ -2897,8 +2716,6 @@ test "codec resolves an external pointer aliasing a boxed Param default" {
         .span = sp,
     };
     var decls = [_]ast.Decl{.{ .Function = fn_decl }};
-    // `ref` aliases the param's default Expr by pointer — the shape
-    // `ClassParamDef.default`/`parent_ctor_args` have into the AST forest.
     const Holder = struct { decls: []ast.Decl, ref: *const ast.Expr };
     const v = Holder{ .decls = &decls, .ref = &def_expr };
     const bytes = try encodeOne(Holder, a, &v);
@@ -2913,8 +2730,6 @@ test "per-decl self-contained sections decode standalone" {
     const a = arena.allocator();
     const sp = Span.init(FileId.from(0), 0, 0);
 
-    // Two top-level function decls; bake each self-contained (fresh registry)
-    // into one buffer, recording offsets — exactly the per-decl section bake.
     const names = [_][]const u8{ "alpha", "beta" };
     var decls: [2]ast.Decl = undefined;
     for (&decls, names) |*d, nm| {
@@ -2950,7 +2765,6 @@ test "per-decl self-contained sections decode standalone" {
         try encodeValue(ast.Decl, &enc, d);
     }
     const section = enc.out.items;
-    // Decode each standalone from its offset and check it round-trips.
     for (offsets, names) |off, nm| {
         const got = decodeLiftedDecl(a, section, off) orelse return error.TestUnexpectedResult;
         try testing.expect(got == .Function);
@@ -2964,7 +2778,6 @@ test "forest resolver resolves a ForestRef to the decoded node" {
     const a = arena.allocator();
     const sp = Span.init(FileId.from(0), 0, 0);
 
-    // One decl: a function (the decl's watched node 0, registered first).
     var decl = ast.Decl{ .Function = .{
         .name = .{ .name = "f", .span = sp },
         .receiver_type = null,
@@ -2991,15 +2804,13 @@ test "forest resolver resolves a ForestRef to the decoded node" {
     defer enc.deinit();
     enc.resetRegistry();
     try encodeValue(ast.Decl, &enc, &decl);
-    // Capture the bake-time ForestRef for the function node (ordinal in the
-    // decl's fresh registry) — node 0 is the Function (registered first).
+    // The bake-time ForestRef for the function node: ordinal 0 in its registry.
     const fn_ord: u32 = enc.nodes.get(.{ .addr = @intFromPtr(&decl.Function), .ty = typeId(ast.Function) }).?;
 
     const offsets = [_]u32{0};
     const base = runtime.forest.setSection(enc.out.items, &offsets, a, decodeLiftedDeclReg);
     const got = runtime.forest.resolveFunction(.{ .decl = base, .ord = fn_ord }) orelse return error.TestUnexpectedResult;
     try testing.expectEqualStrings("f", got.name.name);
-    // A second resolve hits the memo (same decoded pointer).
     const got2 = runtime.forest.resolveFunction(.{ .decl = base, .ord = fn_ord }).?;
     try testing.expect(got == got2);
 }
@@ -3008,8 +2819,7 @@ test "codec floats are little-endian IEEE-754 bits on the wire" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    // 1.5f64 = 0x3FF8000000000000; the wire bytes must be the little-endian
-    // bit pattern regardless of host byte order.
+    // 1.5f64 = 0x3FF8000000000000, written little-endian whatever the host.
     const v: f64 = 1.5;
     const bytes = try encodeOne(f64, a, &v);
     try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 0, 0, 0xf8, 0x3f }, bytes);

@@ -1,49 +1,28 @@
-//! Threaded-litmus suite. Each program in the litmus directory pins down one
-//! observable guarantee of multi-threaded execution (mutual exclusion,
-//! publication, no lost update). Expected stdout is encoded as leading `//> `
-//! comment lines, exactly like the memory-model `conformance` suite.
+//! Threaded-litmus suite: each program pins one observable guarantee of
+//! multi-threaded execution, with its expected stdout in leading `//> `
+//! comment lines. The parallel ones run on real OS threads.
 //!
-//! Programs assert exact stdout (`RUNNABLE`); the genuinely parallel
-//! ones run on real OS threads — via `kotlin.concurrent.thread` or the
-//! shared dispatcher worker pool behind `Dispatchers.Default`/`IO`
-//! (wall-time overlap, worker thread names, cross-pump park/resume,
-//! `limitedParallelism`, and the elastic IO cap are each pinned by a
-//! fixture). A program expected to FAIL — an uncaught exception crossing
-//! the dispatcher boundary must crash the run, exactly as kotlinc+kotlinx
-//! crash the JVM — pins the failure with a leading `//>! substring`
-//! comment instead: the run must end in an error whose message contains
-//! every such substring. Programs blocked on a missing capability are
-//! listed in `PENDING`, keyed by the blocker, and run by an ignored test
-//! until it lands.
-//! Run with `KLIO_RACE_JITTER=1` to widen borrow interleavings so a
-//! lost-update or double-init race reproduces reliably.
+//! A program expected to fail carries `//>! substring` lines instead, and the
+//! run must end in an error containing every substring. `KLIO_RACE_JITTER=1`
+//! widens borrow interleavings so a race reproduces reliably.
 const std = @import("std");
 const parity = @import("parity");
 const runtime = @import("runtime");
 
-/// The litmus corpus directory, relative to the workspace root (cwd).
 const LITMUS_DIR = "tests/fixtures/threaded_litmus";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// One file-scoped arena: the pipeline installs process-global state backed by
+// the run's allocator, which a per-test arena would tear down under it.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 const Expectation = struct {
-    /// Exact expected stdout (the `//> ` lines).
     stdout: []u8,
-    /// Substrings the run's terminal error must contain (the `//>! `
-    /// lines). Non-empty ⇒ the program must FAIL.
+    /// From the `//>! ` lines. Non-empty means the program must fail.
     err_contains: [][]u8,
 };
 
-/// Expected outcome = the leading run of `//> ` comment lines (one
-/// stdout line each, matching `runWithPacks`'s join convention) and/or
-/// `//>! ` lines (error-message substrings; their presence makes the
-/// expectation "the run fails"). Mirrors the `conformance` harness.
-/// Returns owned bytes.
+/// Each `//> ` line is one stdout line and each `//>! ` line an error-message
+/// substring. Returns owned bytes.
 fn expectedOutcome(allocator: std.mem.Allocator, io: std.Io, file: []const u8) !Expectation {
     const src = try std.Io.Dir.cwd().readFileAlloc(io, file, allocator, .unlimited);
     defer allocator.free(src);
@@ -62,12 +41,11 @@ fn expectedOutcome(allocator: std.mem.Allocator, io: std.Io, file: []const u8) !
         } else if (std.mem.startsWith(u8, t, "//>")) {
             var rest = t[3..];
             if (rest.len != 0 and rest[0] == ' ') rest = rest[1..];
-            // Strip a trailing CR left by the `\n` split on CRLF input.
+            // Strip the CR the `\n` split leaves on CRLF input.
             rest = std.mem.trimEnd(u8, rest, "\r");
             try out.appendSlice(allocator, rest);
             try out.append(allocator, '\n');
         } else if (std.mem.startsWith(u8, t, "//") or (out.items.len == 0 and errs.items.len == 0)) {
-            // Skip leading comments and blank lead-in.
         } else {
             break;
         }
@@ -79,9 +57,7 @@ fn expectedOutcome(allocator: std.mem.Allocator, io: std.Io, file: []const u8) !
 }
 
 fn check(stem: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
+    // Reclaim the previous program; the globals live on the page allocator.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -104,9 +80,6 @@ fn check(stem: []const u8) !void {
     }
     const res = try parity.runWithPacks(a, io, file);
     if (want.err_contains.len != 0) {
-        // Failure pin: the run must end in an error carrying every
-        // expected substring (an uncaught exception crossing the
-        // dispatcher boundary crashes the run, as kotlinc+kotlinx do).
         switch (res) {
             .ok => |got| {
                 std.debug.print("threaded litmus {s}: expected a failing run, got success with stdout:\n{s}\n", .{ stem, got });
@@ -135,7 +108,6 @@ fn check(stem: []const u8) !void {
     }
 }
 
-/// Guarantees enforced now, on real OS threads.
 const RUNNABLE = [_][]const u8{
     "tl_smoke",
     "tl_thread_join",
@@ -189,15 +161,10 @@ const RUNNABLE = [_][]const u8{
     "nested_sibling_prop_head",
 };
 
-/// Guarantees that only become meaningful with real OS-thread spawning.
-/// `(stem, blocker)`. Each moves into `RUNNABLE` when its blocker lands.
-/// Empty today: the threaded corpus grows here.
+/// Fixtures waiting on a capability, keyed by the blocker.
 const PENDING = [_]struct { stem: []const u8, blocker: []const u8 }{
-    // .{ .stem = "tl_two_thread_monitor", .blocker = "needs real thread spawn" },
-    // .{ .stem = "tl_safe_publication", .blocker = "needs real thread spawn" },
 };
 
-// Each litmus stem is its own `test` so they run as separate cases.
 test "tl_smoke" {
     try check("tl_smoke");
 }
@@ -337,13 +304,9 @@ test "tl_early_error_with_thread" {
     try check("tl_early_error_with_thread");
 }
 
-// Continuously exercise the cross-thread `DriverWakeup` escape seam: a
-// batch of `Dispatchers.Default` jobs route their completion resume
-// through the single driver's wakeup mailbox (the global `SlotOwners`
-// registry escape) while the driver pump drains it concurrently. Looped so
-// a borrow-ordering regression on the wakeup cell as it escapes to a worker
-// thread aborts here instead of flaking through. `tl_wakeup_hammer` itself
-// launches 60 in-flight awaits over 20 rounds per run.
+// Hammers the cross-thread `DriverWakeup` seam: completion resumes route
+// through the driver's wakeup mailbox while the pump drains it concurrently.
+// Looped so a borrow-ordering regression aborts here rather than flaking.
 test "tl_wakeup_hammer repeated stress" {
     var i: usize = 0;
     while (i < 12) : (i += 1) {
@@ -351,15 +314,12 @@ test "tl_wakeup_hammer repeated stress" {
     }
 }
 
-// Memory-model conformance suite. Each litmus program in
-// `tests/fixtures/conformance/` is the executable form of one rule in the
-// memory model. Expected stdout is encoded as leading `//> ` comment lines.
+// Memory-model conformance suite: each program in
+// `tests/fixtures/conformance/` is the executable form of one rule.
 
 const CONFORMANCE_DIR = "tests/fixtures/conformance";
 
-/// Expected stdout = the leading run of `//> ` comment lines, each contributing
-/// one output line, terminated by a newline (matching the join convention of
-/// the runner). Caller owns the returned bytes.
+/// Caller owns the returned bytes.
 fn expectedStdout(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -373,7 +333,6 @@ fn expectedStdout(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
             try out.appendSlice(allocator, body);
             try out.append(allocator, '\n');
         } else if (std.mem.startsWith(u8, t, "//") or out.items.len == 0) {
-            // Skip leading comments and blank lead-in.
         } else {
             break;
         }
@@ -382,9 +341,7 @@ fn expectedStdout(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
 }
 
 fn checkConformance(stem: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
+    // Reclaim the previous program; the globals live on the page allocator.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -443,9 +400,7 @@ test "mm11_no_lost_tearing" {
     try checkConformance("mm11_no_lost_tearing");
 }
 
-// Every litmus file is accounted for in exactly one bucket, and every rule
-// MM1..MM11 has a file. Guards against silently orphaned or missing litmus
-// programs.
+// Every rule MM1..MM11 has a file and no file is orphaned.
 test "conformance_suite_is_complete" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -510,8 +465,7 @@ test "conformance_suite_is_complete" {
     }
 }
 
-// Every litmus file on disk is classified exactly once. Guards against an
-// orphaned or unlisted program slipping in.
+// Every litmus file on disk is classified exactly once.
 test "threaded_litmus_suite_is_complete" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -553,12 +507,8 @@ test "threaded_litmus_suite_is_complete" {
     }
 }
 
-// The eager pipeline is the only pipeline; there is no `KLIO_EAGER` to
-// toggle. What this still pins is the OUTPUT: the shapes that motivated the
-// channel (an overload picked by argument type, a shadowed identity pick, a
-// collection-plus-sequence mix) must produce exactly this text. Running the
-// program twice also pins determinism, which is what caught the span-keyed
-// param-shape channel aliasing synthesized nodes.
+// Runs twice because a span-keyed shape channel can alias two synthesized
+// nodes and diverge only between runs.
 test "eager pipeline output parity" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -593,9 +543,8 @@ test "eager pipeline output parity" {
     var env = std.process.Environ.Map.init(al);
     runtime.procEnvPutAllInto(al, &env);
     const bin = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
-    // Fork can transiently fail (EAGAIN) when the whole gate batch spawns
-    // children at once; a failed SPAWN is machine pressure, not a verdict —
-    // retry briefly and NAME the error when it sticks.
+    // Fork returns EAGAIN when the gate batch spawns children at once, which
+    // is machine pressure, not a verdict.
     const S = struct {
         fn runRetry(a2: std.mem.Allocator, io2: std.Io, argv: []const []const u8, env2: *const std.process.Environ.Map) !std.process.RunResult {
             var attempt: usize = 0;
@@ -624,8 +573,7 @@ test "eager pipeline output parity" {
 
     const eager_ir = try S.runRetry(al, io, &.{ bin, "dump-ir", "/tmp/klio_eager_itest/e1.kt", "--func", "shadowedIdentityPick" }, &env);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, eager_ir.term);
-    // Each pin names itself and dumps the IR on failure — a bare `expect`
-    // reported "failed without output" from the gate batch, unactionably.
+    // Each pin names itself and dumps the IR, which a bare `expect` cannot.
     const pins = [_]struct { needle: []const u8, expect_present: bool }{
         .{ .needle = "[DIRECT member-ext dispatch=r", .expect_present = true },
         .{ .needle = " -> scopedIdentityValue#", .expect_present = true },

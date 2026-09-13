@@ -1,13 +1,7 @@
-//! End-to-end gate for the baked stdlib image: the `klio run` fast path
-//! (bake on miss, hit on rerun) must be byte-identical to the legacy
-//! whole-program build — stdout, stderr, and exit code — including the
-//! base-name-collision fallback, the no-main error path, a pack-using
-//! program, a corrupted image, and a stale stdlib source.
-//!
-//! Each scenario runs the real `klio` binary (KLIO_ITEST_BIN) against a
-//! scratch HOME so the image cache under test never touches the real
-//! `~/.klio`. The in-process test bakes + reloads a lowered base directly
-//! and deep-compares the tables that drive dispatch.
+//! Gate for the baked stdlib image: the `klio run` image path (bake on miss,
+//! hit on rerun) must match the whole-program build byte for byte. Scenarios
+//! run the real `klio` binary (KLIO_ITEST_BIN) against a scratch HOME, so the
+//! image cache under test never touches `~/.klio`.
 
 const std = @import("std");
 const interp_ir = @import("interp_ir");
@@ -24,14 +18,9 @@ var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 const TMP_ROOT = "/tmp/klio_itest_stdlib_image";
 
-// -------------------------------------------------------------------------
-// Child-process plumbing.
-// -------------------------------------------------------------------------
-
 fn klioBin(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]const u8 {
     const rel = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
-    // Scenarios spawn with a non-repo cwd, so the binary path must be
-    // absolute.
+    // Scenarios spawn with a non-repo cwd, so the path must be absolute.
     return std.Io.Dir.cwd().realPathFileAlloc(io, rel, a) catch rel;
 }
 
@@ -78,9 +67,7 @@ fn writeProgram(a: std.mem.Allocator, io: std.Io, name: []const u8, src: []const
     return path;
 }
 
-/// Run `argv` twice against a fresh image cache (cold bake, then hit) and
-/// once with the cache disabled; assert all three runs are byte-identical
-/// on stdout + stderr + exit code.
+/// Run `argv` cold, warm, and with the cache disabled; all three must agree.
 fn assertImageMatchesLegacy(
     a: std.mem.Allocator,
     io: std.Io,
@@ -140,10 +127,6 @@ fn firstImagePath(a: std.mem.Allocator, io: std.Io, home: []const u8) ?[]const u
     return null;
 }
 
-// -------------------------------------------------------------------------
-// Programs.
-// -------------------------------------------------------------------------
-
 const P_BASIC =
     \\enum class Paint(val code: Int) {
     \\    RED(10),
@@ -162,8 +145,7 @@ const P_BASIC =
     \\
 ;
 
-/// Redeclares a stdlib top-level name: must take the whole-program
-/// fallback and still behave exactly like the legacy path.
+/// Redeclares a stdlib top-level name, forcing the whole-program fallback.
 const P_FALLBACK =
     \\fun listOf(x: Int): Int = x + 1
     \\fun main() {
@@ -187,10 +169,8 @@ const P_KX =
     \\
 ;
 
-/// A package member used by fully-qualified name with no `import`. The load
-/// gate must harvest the qualified prefix identically on the image and
-/// legacy paths so the gated sources load (and fold into the same image key)
-/// regardless of cache state.
+/// A package member reached by fully-qualified name with no `import`: both
+/// paths must harvest the prefix to load the gated sources.
 const P_QUALIFIED_IMPLICIT =
     \\fun main() {
     \\    println(kotlin.math.max(3, 7))
@@ -199,9 +179,7 @@ const P_QUALIFIED_IMPLICIT =
     \\
 ;
 
-/// The same shape against a non-implicit gated package (`kotlin.coroutines`):
-/// the qualified reference alone must open the curated sources, byte-identical
-/// across cache modes.
+/// The same shape against a non-implicit gated package.
 const P_QUALIFIED_GATED =
     \\fun main() {
     \\    val ctx = kotlin.coroutines.EmptyCoroutineContext
@@ -209,10 +187,6 @@ const P_QUALIFIED_GATED =
     \\}
     \\
 ;
-
-// -------------------------------------------------------------------------
-// CLI scenarios.
-// -------------------------------------------------------------------------
 
 test "image path is byte-identical to legacy: basic, fallback, no-main" {
     const a = file_arena.allocator();
@@ -277,7 +251,6 @@ test "corrupted image is rejected and rebaked transparently" {
     const again = try runKlio(a, io, &env, null, &.{ bin, "run", basic });
     try std.testing.expectEqual(@as(u32, 0), again.code);
     try std.testing.expectEqualStrings(first.stdout, again.stdout);
-    // Rebaked: the file is whole again.
     const rebaked = try std.Io.Dir.cwd().readFileAlloc(io, img, a, .unlimited);
     try std.testing.expectEqual(bytes.len, rebaked.len);
 }
@@ -289,8 +262,7 @@ test "editing a stdlib source rebakes under a new key" {
     const io = threaded.io();
     const cwd = std.Io.Dir.cwd();
 
-    // Sandbox with a private copy of every stdlib source the bake reads,
-    // so editing one never touches the repo.
+    // A private copy, so the edit below never touches the repo.
     const sandbox = try std.fmt.allocPrint(a, "{s}/stale_sandbox", .{TMP_ROOT});
     cwd.deleteTree(io, sandbox) catch {};
     const pb = stdlib.pack_builder;
@@ -319,7 +291,6 @@ test "editing a stdlib source rebakes under a new key" {
     try std.testing.expectEqual(@as(u32, 0), first.code);
     try std.testing.expectEqual(@as(usize, 1), countImages(a, io, home));
 
-    // Edit one stdlib source (content change, semantics preserved).
     const edited = try std.fmt.allocPrint(a, "{s}/{s}/src/kotlin/util/Standard.kt", .{ sandbox, pb.UPSTREAM_STDLIB_ROOT });
     const old = try cwd.readFileAlloc(io, edited, a, .unlimited);
     const patched = try std.fmt.allocPrint(a, "{s}\n// stale-test edit\n", .{old});
@@ -328,7 +299,6 @@ test "editing a stdlib source rebakes under a new key" {
     const second = try runKlio(a, io, &env, sandbox, &.{ bin, "run", prog });
     try std.testing.expectEqual(@as(u32, 0), second.code);
     try std.testing.expectEqualStrings(first.stdout, second.stdout);
-    // A second image under the new content key.
     try std.testing.expectEqual(@as(usize, 2), countImages(a, io, home));
 
     const third = try runKlio(a, io, &env, sandbox, &.{ bin, "run", prog });
@@ -344,10 +314,8 @@ test "outside a checkout the embedded pack serves the stdlib" {
     const io = threaded.io();
     const cwd = std.Io.Dir.cwd();
 
-    // Empty cwd: no kotlin/ checkout, no kotlin-klio/. The binary's
-    // embedded pack must serve the curated sources (inline `run`/`let`
-    // come from them), and the image cache must key off the embedded
-    // bytes (bake once, hit on rerun).
+    // No checkout in cwd, so the embedded pack must serve the curated sources
+    // and the cache must key off the embedded bytes.
     const sandbox = try std.fmt.allocPrint(a, "{s}/outside_sandbox", .{TMP_ROOT});
     cwd.deleteTree(io, sandbox) catch {};
     try cwd.createDirPath(io, sandbox);
@@ -389,7 +357,6 @@ test "pack-using program: image path matches legacy with installed packs" {
     defer env.deinit();
     const bin = try klioBin(a, io, &env);
 
-    // Build + install the kotlinx packs into the scratch HOME.
     const pack_dirs = [_][]const u8{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlinx-coroutines",
@@ -419,10 +386,7 @@ test "pack-using program: image path matches legacy with installed packs" {
     try assertImageMatchesLegacy(a, io, &env, null, &.{ bin, "run", kx });
 }
 
-// -------------------------------------------------------------------------
-// In-process round trip: bake a lowered base and deep-compare the loaded
-// copy's tables against the original.
-// -------------------------------------------------------------------------
+// In-process round trip: bake a lowered base, then compare the loaded tables.
 
 fn parseOne(a: std.mem.Allocator, map: *SourceMap, name: []const u8, src: []const u8) !ast.KotlinFile {
     const fid = try map.add(name, src);
@@ -480,7 +444,6 @@ test "bake/load round-trips the lowered base tables" {
     };
     const got = loaded.base;
 
-    // Module spine.
     {
         const mg0 = base.built.module.borrow();
         defer mg0.deinit();
@@ -488,17 +451,14 @@ test "bake/load round-trips the lowered base tables" {
         defer mg1.deinit();
         const m0 = mg0.get();
         const m1 = mg1.get();
-        // The loaded module's funcs are lazy (per-func header sections); decode
-        // each through funcById and compare to the eager fresh-built func.
+        // Loaded funcs are lazy per-func sections; funcById decodes them.
         try std.testing.expectEqual(m0.funcCount(), m1.funcCount());
         for (m0.funcs.items) |*f0| {
             const f1 = m1.funcById(f0.id).?;
             try std.testing.expectEqualStrings(f0.name, f1.name);
             try std.testing.expectEqualStrings(f0.fqn, f1.fqn);
             try std.testing.expectEqual(f0.id, f1.id);
-            // Materialise lazily-deferred bodies ON BOTH SIDES so the
-            // round-trip is checked through the lazy-IR decode, not against
-            // an empty deferred marker (the fresh build defers bodies too).
+            // Both sides defer bodies, so materialise before comparing.
             _ = m0.ensureFuncBody(@constCast(f0));
             _ = m1.ensureFuncBody(@constCast(f1));
             if (f0.blocks.len != f1.blocks.len)
@@ -537,7 +497,6 @@ test "bake/load round-trips the lowered base tables" {
         try eqn("decl_user_arity", m0.decl_user_arity.count(), m1.decl_user_arity.count());
     }
 
-    // Runtime class table: same keys, linked parents, enum entries.
     try std.testing.expectEqual(base.built.classes.count(), got.built.classes.count());
     {
         var it = base.built.classes.iterator();
@@ -557,7 +516,6 @@ test "bake/load round-trips the lowered base tables" {
         }
     }
 
-    // Base gate sets + extras.
     try std.testing.expectEqual(base.decl_names.count(), got.decl_names.count());
     try std.testing.expect(got.decl_names.contains("depHelper"));
     try std.testing.expect(got.decl_names.contains("Mode"));
@@ -571,24 +529,18 @@ test "bake/load round-trips the lowered base tables" {
     }
     try std.testing.expectEqual(base.enum_id_next, got.enum_id_next);
     try std.testing.expectEqual(base.user_file_start, got.user_file_start);
-    // The loaded image drops the eager forest: decls decode lazily from the
-    // per-decl sections on first `ForestField.get()`, so `lifted_decls` is empty.
+    // The image drops the eager forest: decls decode on first
+    // `ForestField.get()`, leaving `lifted_decls` empty.
     try std.testing.expectEqual(@as(usize, 0), got.lifted_decls.len);
     try std.testing.expectEqual(@as(usize, 1), loaded.known_packages.len);
     try std.testing.expectEqualStrings("dep.lib", loaded.known_packages[0]);
     try std.testing.expectEqual(@as(usize, 1), loaded.binding_fqns.len);
 
-    // The loaded map mirrors the baked one.
     try std.testing.expectEqual(map.files.items.len, loaded.map.files.items.len);
     try std.testing.expectEqualStrings(map.files.items[0].path, loaded.map.files.items[0].path);
 
-    // Both bases accept and extend the same user program identically.
-    // The base here is DEP-ONLY (no stdlib), so the user program must stay
-    // within that surface: a bare `println` against a base with no candidate
-    // is now a recorded pre-run resolve diagnostic (correctly — see the
-    // provably-unresolved bare-call rejection), and this test asserts a
-    // diag-free lowering. The values still flow through every dep shape the
-    // table comparison exercises.
+    // This base is dep-only, so the program stays inside that surface: a bare
+    // `println` would record a resolve diagnostic and fail the check below.
     const USER_SRC =
         \\import dep.lib.*
         \\fun main(): Int {

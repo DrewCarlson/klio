@@ -1,20 +1,15 @@
-//! Object-initialization parity: lazy first-access `object` / companion
-//! construction, once-only initialization (including under racing OS
-//! threads), declaration-order interleaving of init blocks and property
-//! initializers in object literals, and init-failure propagation
-//! (`FileFailedToInitializeException` at the access site, no retry).
-//! Every expectation here is pinned against kotlinc-native 2.3.10,
-//! except where a test notes kotlinc JVM 2.3.21 explicitly.
+//! Object-initialization parity: lazy first-access `object` and companion
+//! construction, once-only initialization, declaration-order interleaving in
+//! object literals, and init-failure propagation. Expectations are pinned
+//! against kotlinc-native 2.3.10 unless a test names kotlinc JVM 2.3.21.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_object_init";
 
-// One file-scoped arena over the page allocator backs every run here, same
-// as the sibling parity suites: the pipeline installs process-global
-// lowering/VM state backed by the run's allocator, so a per-test arena
-// would be torn down while those globals still point into it.
+// A file-scoped arena backs every run: the pipeline installs process-global
+// state owned by the run's allocator, which outlives any per-test arena.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 fn runProgram(name: []const u8, src: []const u8) !parity.SResult([]u8) {
@@ -32,7 +27,6 @@ fn runProgram(name: []const u8, src: []const u8) !parity.SResult([]u8) {
     return parity.runWithPacks(a, io, path);
 }
 
-/// Run `src` and assert stdout equals `expected` byte-for-byte.
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     const res = try runProgram(name, src);
     switch (res) {
@@ -44,8 +38,6 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     }
 }
 
-/// Run `src` and assert it fails with an error message containing
-/// `expected_fragment`.
 fn assertKlioError(name: []const u8, src: []const u8, expected_fragment: []const u8) !void {
     const res = try runProgram(name, src);
     switch (res) {
@@ -62,8 +54,6 @@ fn assertKlioError(name: []const u8, src: []const u8, expected_fragment: []const
     }
 }
 
-// A thrown exception captures the call stack at the throw site: the uncaught
-// report names each frame and resolves its source position to a file + line.
 test "uncaught exception reports a stack trace with source positions" {
     const src =
         \\
@@ -96,9 +86,7 @@ test "uncaught exception reports a stack trace with source positions" {
     }
 }
 
-// The trace is captured at construction (JVM `fillInStackTrace`), not at the
-// throw: an exception built in one function and thrown from another reports the
-// construction site, and the (later) throw site is absent.
+// Kotlin captures the trace at construction (JVM `fillInStackTrace`).
 test "stack trace is captured at construction, not at throw" {
     const src =
         \\
@@ -126,8 +114,6 @@ test "stack trace is captured at construction, not at throw" {
     }
 }
 
-// A user Throwable subclass also captures at construction (its parent chain
-// bottoms out at a builtin Throwable), not at the later throw site.
 test "user exception subclass captures at construction" {
     const src =
         \\
@@ -156,7 +142,6 @@ test "user exception subclass captures at construction" {
     }
 }
 
-// A wrapped exception reports its cause chain in the uncaught render.
 test "uncaught exception reports the cause chain" {
     const src =
         \\
@@ -187,9 +172,6 @@ test "uncaught exception reports the cause chain" {
     }
 }
 
-// kotlinc-native: an object the program never references never runs its
-// init blocks or property initializers; a referenced one initializes at
-// its first access, after `main` has already started.
 test "unused_object_never_initializes" {
     const src =
         \\
@@ -201,9 +183,6 @@ test "unused_object_never_initializes" {
     try assertKlio("unused_never_inits", src, "main-start\nUSED-INIT\n7\n");
 }
 
-// kotlinc-native: repeated access never re-runs the initializer, and the
-// interleaving of property initializers and init blocks inside the object
-// follows declaration order.
 test "object_initializes_once_at_first_access" {
     const src =
         \\
@@ -228,9 +207,7 @@ test "object_initializes_once_at_first_access" {
     );
 }
 
-// Kotlin guarantees once-only initialization across threads: two workers
-// racing the first access observe one construction. `once-init` prints
-// exactly once, before either read completes.
+// Kotlin guarantees once-only initialization across threads.
 test "object_init_once_under_racing_threads" {
     const src =
         \\import kotlin.concurrent.thread
@@ -250,9 +227,6 @@ test "object_init_once_under_racing_threads" {
     try assertKlio("object_once_threads", src, "once-init\n10\n");
 }
 
-// kotlinc-native: an object expression's init blocks run during
-// construction, interleaved with the property initializers in declaration
-// order (`prop:y`, init, `prop:z`).
 test "anon_object_init_interleaves_with_props" {
     const src =
         \\
@@ -271,8 +245,6 @@ test "anon_object_init_interleaves_with_props" {
     try assertKlio("anon_init_interleave", src, "main\nprop:y\nanon-init y=y\nprop:z\ndone z\n");
 }
 
-// Object-literal init blocks close over enclosing locals like method
-// bodies do.
 test "anon_object_init_sees_captured_locals" {
     const src =
         \\
@@ -291,9 +263,6 @@ test "anon_object_init_sees_captured_locals" {
     try assertKlio("anon_init_captures", src, "init sees n=5 a=6\nsecond init b=12\n18\n");
 }
 
-// kotlinc-native: constructing an object literal over a superclass runs
-// the superclass's init blocks and property initializers (in declaration
-// order) before the literal's own.
 test "anon_object_runs_parent_init_blocks" {
     const src =
         \\
@@ -311,8 +280,6 @@ test "anon_object_runs_parent_init_blocks" {
     try assertKlio("anon_parent_init", src, "start\nbase-init x\nbase-prop\nanon-init\ndone 1\n");
 }
 
-// Every superclass delegation in an anonymous object's constructor chain
-// receives the preceding class's primary-constructor arguments.
 test "anon_object_evaluates_transitive_parent_ctor_args" {
     const src =
         \\
@@ -335,9 +302,7 @@ test "anon_object_evaluates_transitive_parent_ctor_args" {
     );
 }
 
-// An anonymous method retains every implicit receiver visible at the object
-// expression, including an outer class receiver displaced by a receiver
-// lambda's subject.
+// An enclosing receiver displaced by a receiver lambda's subject is retained.
 test "anon_object_method_retains_lexical_receiver_chain" {
     const src =
         \\
@@ -361,11 +326,8 @@ test "anon_object_method_retains_lexical_receiver_chain" {
     );
 }
 
-// kotlinc-native: a throw inside an object initializer surfaces at the
-// access site as FileFailedToInitializeException with the user exception
-// as its cause; a second access throws the same wrapper without the cause
-// (the initializer is never retried) and partial init state is never
-// observable.
+// The access site sees FileFailedToInitializeException wrapping the user
+// exception; a second access rethrows it without the cause.
 test "object_init_throw_propagates_and_is_not_retried" {
     const src =
         \\
@@ -392,9 +354,6 @@ test "object_init_throw_propagates_and_is_not_retried" {
     );
 }
 
-// kotlinc-native: the init-failure wrapper is on the `Error` side of the
-// throwable hierarchy — `catch (e: Exception)` does not match it,
-// `catch (e: Error)` does.
 test "object_init_failure_is_error_not_exception" {
     const src =
         \\
@@ -413,8 +372,6 @@ test "object_init_failure_is_error_not_exception" {
     );
 }
 
-// An uncaught init failure aborts the program with the wrapper exception
-// (kotlinc-native exits non-zero with FileFailedToInitializeException).
 test "object_init_failure_uncaught_aborts" {
     const src =
         \\
@@ -429,10 +386,7 @@ test "object_init_failure_uncaught_aborts" {
     );
 }
 
-// kotlinc-native: the first instantiation of a class initializes its
-// companion (property initializers + init blocks, declaration order)
-// before the instance's own initialization; a later companion-member
-// access does not re-run it.
+// The companion initializes before the instance's own initialization.
 test "companion_initializes_at_first_instantiation" {
     const src =
         \\
@@ -458,8 +412,6 @@ test "companion_initializes_at_first_instantiation" {
     );
 }
 
-// kotlinc-native: instantiating a subclass initializes the subclass's
-// companion first, then its superclass's.
 test "subclass_instantiation_initializes_companion_chain" {
     const src =
         \\
@@ -475,9 +427,6 @@ test "subclass_instantiation_initializes_companion_chain" {
     );
 }
 
-// kotlinc-native: a companion member access initializes the companion at
-// that point, and an object the companion's initializer reads initializes
-// nested-first-access during it.
 test "companion_lazy_at_member_access_drives_nested_object" {
     const src =
         \\
@@ -491,8 +440,6 @@ test "companion_lazy_at_member_access_drives_nested_object" {
     try assertKlio("companion_lazy_nested", src, "start\ncomp-init\nholder-init\n11\n");
 }
 
-// kotlinc-native: a companion init failure surfaces at the owning class's
-// first instantiation; subsequent access throws the no-cause wrapper.
 test "companion_init_failure_at_instantiation_site" {
     const src =
         \\
@@ -511,8 +458,6 @@ test "companion_init_failure_at_instantiation_site" {
     );
 }
 
-// kotlinc-native: a nested object initializes lazily at its first
-// qualified access.
 test "nested_object_lazy_at_qualified_access" {
     const src =
         \\
@@ -523,9 +468,8 @@ test "nested_object_lazy_at_qualified_access" {
     try assertKlio("nested_object_lazy", src, "main\nnested-init\n3\n");
 }
 
-// A nested object whose simple name collides with a top-level type is
-// lifted under a mangled name; the qualified access still constructs it
-// lazily, once.
+// The nested object's simple name collides with a top-level type, so it lifts
+// under a mangled name.
 test "mangled_nested_object_lazy_once" {
     const src =
         \\
@@ -537,7 +481,6 @@ test "mangled_nested_object_lazy_once" {
     try assertKlio("mangled_nested_lazy", src, "start\nitem-init\n9\n10\n");
 }
 
-// kotlinc-native: `data object` follows the same lazy first-access rule.
 test "data_object_lazy" {
     const src =
         \\
@@ -548,8 +491,6 @@ test "data_object_lazy" {
     try assertKlio("data_object_lazy", src, "start\nd-init\nD\n");
 }
 
-// kotlinc-native: an object used only as an extension receiver still
-// initializes when the receiver expression is evaluated.
 test "object_as_extension_receiver_initializes" {
     const src =
         \\
@@ -561,8 +502,6 @@ test "object_as_extension_receiver_initializes" {
     try assertKlio("object_ext_receiver", src, "main\ne-init\ntagged\n");
 }
 
-// kotlinc-native: one object's initializer reading another drives the
-// dependency at that point; each initializes exactly once.
 test "cross_object_dependency_initializes_in_access_order" {
     const src =
         \\
@@ -574,9 +513,7 @@ test "cross_object_dependency_initializes_in_access_order" {
     try assertKlio("cross_object_dep", src, "main\na-init\nb-init: 1\n2\n");
 }
 
-// Top-level property initializers stay eager (file order at program
-// start, kotlinc main-file semantics); an object they construct on the
-// way initializes nested-first-access during them, before `main`.
+// Top-level property initializers run eagerly, in file order, before `main`.
 test "top_level_prop_init_stays_eager_and_drives_object" {
     const src =
         \\
@@ -588,16 +525,10 @@ test "top_level_prop_init_stays_eager_and_drives_object" {
     try assertKlio("top_level_drives_object", src, "t-init\no-init\nmain 1\n");
 }
 
-// A top-level property initializer driven on demand by an earlier
-// initializer (through an object's init reading a later property) runs
-// exactly once — the startup pass does not re-run it. Here `b`'s
-// initializer is a HOF call (`run { … }`) whose inferred type the lowering
-// cannot recover without a type checker, so the forward read drives it
-// (klio: 11) where kotlinc reads the inferred field default (1). The side
-// effects and their order match. An unannotated property with a
-// trivially-typed LITERAL initializer is now kotlinc-faithful (see
-// `forward_read_of_unannotated_literal_through_function_sees_typed_default`);
-// only this non-literal, inference-required shape remains divergent.
+// Known divergence: `b`'s initializer is a HOF call whose inferred type the
+// lowering cannot recover without a type checker, so the forward read drives it
+// (klio prints 11) where kotlinc reads the inferred field default (1). The side
+// effects and their order match.
 test "forward_referenced_top_level_prop_initializes_once" {
     const src =
         \\
@@ -610,11 +541,8 @@ test "forward_referenced_top_level_prop_initializes_once" {
     try assertKlio("forward_ref_once", src, "a-init\nb-init\nmain 11 10\n");
 }
 
-// kotlinc (JVM 2.3.21): a forward read of a NOT-yet-initialized top-level
-// property with an explicit `Int` annotation observes the typed field
-// default 0 (so `O.v` is 1), the read does not drive `b`'s initializer
-// out of order, and `b` still initializes exactly once at its file-order
-// turn (`b-init` after `a-init`, `b` is 10 in main).
+// kotlinc (JVM 2.3.21): an `Int`-annotated forward read observes the typed
+// field default 0, and the initializer still runs once in file order.
 test "forward_read_of_annotated_int_prop_sees_typed_default" {
     const src =
         \\
@@ -627,9 +555,7 @@ test "forward_read_of_annotated_int_prop_sees_typed_default" {
     try assertKlio("forward_ref_int_default", src, "a-init\nb-init\nmain 1 10\n");
 }
 
-// kotlinc (JVM 2.3.21): a `String`-annotated forward read observes the
-// reference default null (printed "null"), with the initializer still
-// running once in file order.
+// kotlinc (JVM 2.3.21): a `String`-annotated forward read observes null.
 test "forward_read_of_annotated_string_prop_sees_null_default" {
     const src =
         \\
@@ -642,7 +568,6 @@ test "forward_read_of_annotated_string_prop_sees_null_default" {
     try assertKlio("forward_ref_string_default", src, "a-init\ns-init\nmain null hello\n");
 }
 
-// kotlinc (JVM 2.3.21): a `Boolean`-annotated forward read observes false.
 test "forward_read_of_annotated_boolean_prop_sees_false_default" {
     const src =
         \\
@@ -655,12 +580,8 @@ test "forward_read_of_annotated_boolean_prop_sees_false_default" {
     try assertKlio("forward_ref_bool_default", src, "a-init\nflag-init\nmain false true\n");
 }
 
-// kotlinc (JVM 2.3.21): an UNANNOTATED property whose initializer is a
-// trivially-typed literal (`val n = 5` -> Int) defaults a forward read from
-// the inferred field type just like an explicit annotation. `peek()` runs
-// during `a`'s init and reads `n` before its turn, observing the inferred
-// default 0; `n` then initializes normally for main. The lowering infers the
-// typed default from the literal without a type checker.
+// kotlinc (JVM 2.3.21): an unannotated property with a trivially-typed literal
+// initializer defaults a forward read from the inferred field type.
 test "forward_read_of_unannotated_literal_through_function_sees_typed_default" {
     const src =
         \\
@@ -673,9 +594,7 @@ test "forward_read_of_unannotated_literal_through_function_sees_typed_default" {
     try assertKlio("forward_ref_unannot_literal", src, "0\n5\n");
 }
 
-// kotlinc (JVM 2.3.21): the forward read may be mediated by a function
-// call — `peek()` runs during `a`'s initializer and reads `b` before its
-// turn, observing 0; `b` then initializes normally for main.
+// kotlinc (JVM 2.3.21): a function call may mediate the forward read.
 test "forward_read_through_function_call_sees_typed_default" {
     const src =
         \\
@@ -690,8 +609,7 @@ test "forward_read_through_function_call_sees_typed_default" {
 }
 
 /// Run `src` under both in-process load modes (`EmbeddedOnly` and
-/// `SourcePacks`) and assert stdout equals `expected` in each. Pins
-/// behavior the two stdlib assemblies must agree on.
+/// `SourcePacks`) and assert stdout equals `expected` in each.
 fn assertKlioBothModes(name: []const u8, src: []const u8, expected: []const u8) !void {
     const modes = [_]parity.LoadMode{ .EmbeddedOnly, .SourcePacks };
     for (modes) |mode| {
@@ -720,11 +638,8 @@ fn assertKlioBothModes(name: []const u8, src: []const u8, expected: []const u8) 
     }
 }
 
-// An anonymous object's property initializer that calls an inline
-// stdlib HOF (`run`): the lambda is a closure created inside the
-// runtime-lowered init thunk's sub-module, so its body must resolve
-// against that sub-module, never the main func table (kotlinc:
-// "anon: first" then "1").
+// The lambda is a closure created inside the init thunk's sub-module, so its
+// body resolves against that sub-module, not the main func table.
 test "anon_object_prop_init_through_inline_hof" {
     const src =
         \\fun main() {
@@ -738,10 +653,7 @@ test "anon_object_prop_init_through_inline_hof" {
     try assertKlioBothModes("anon_prop_init_inline_hof", src, "anon: first\n1\n");
 }
 
-// An anonymous Continuation whose overridden `context` property is
-// initialized from the `EmptyCoroutineContext` singleton by bare name:
-// the initializer must bind the object singleton, not null and not the
-// bare class value (kotlinc: "hi").
+// The bare name binds the object singleton, not null and not the class value.
 test "anon_continuation_context_initializer_binds_singleton" {
     const src =
         \\import kotlin.coroutines.*
@@ -760,11 +672,6 @@ test "anon_continuation_context_initializer_binds_singleton" {
     try assertKlioBothModes("anon_continuation_ctx_init", src, "hi\n");
 }
 
-// Anonymous-object property initializers reading enclosing-scope names
-// by bare identifier: a top-level `val`, a user `object` singleton (the
-// value is the singleton — its `toString` override dispatches), and a
-// stdlib singleton, alongside a call and a constructor (kotlinc:
-// 7 / 9 / true / MyObj! / EmptyCoroutineContext).
 test "anon_object_prop_init_reads_globals_and_singletons" {
     const src =
         \\import kotlin.coroutines.*
@@ -795,9 +702,6 @@ test "anon_object_prop_init_reads_globals_and_singletons" {
     );
 }
 
-// Supertype constructor args of an object expression evaluate for real
-// in the enclosing scope: a top-level `val` by bare name, a compound
-// expression over it, and a captured local (kotlinc: 5 / 6 / 4).
 test "anon_object_super_ctor_args_evaluate_in_enclosing_scope" {
     const src =
         \\val g = 5

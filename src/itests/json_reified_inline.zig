@@ -1,22 +1,11 @@
-//! Reified inline `Json` extension gate: a real `klio` child process runs
-//! `Json.encodeToString` / `Json.decodeFromString` through the installed
-//! kotlinx-serialization pack (`klio pack build` + `pack install` into a
-//! scratch HOME, then `klio run --feature kotlinx.serialization/json`).
-//!
-//! Pins the two call shapes the inline-splice machinery must cover: a
-//! plain program body, and a hook-style lambda with no expected type —
-//! the shape where the call head `Json` is a companioned class name and
-//! the splice site has no type context. Expected outputs are
-//! kotlinc-verified (kotlinc-jvm 2.3.21 + the kotlinx-serialization
-//! compiler plugin); the fixtures live here rather than the parity corpus
-//! because the in-process parity harness folds in only the coroutines /
-//! atomicfu / io packs.
+//! Reified inline `Json` extensions through a real `klio` child process: the
+//! kotlinx-serialization pack is built and installed into a scratch HOME, then
+//! `klio run --feature kotlinx.serialization/json`.
 
 const std = @import("std");
 const runtime = @import("runtime");
 
-/// The `klio` binary to spawn: `KLIO_ITEST_BIN` when set (the build run
-/// step points it at the harness-optimized install), else the Debug install.
+/// `KLIO_ITEST_BIN` when the build run step sets it, else the Debug install.
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
 }
@@ -49,8 +38,6 @@ fn runKlio(
     return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-/// Build + install the kotlinx-serialization pack into a scratch HOME,
-/// once per test-process.
 fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, home) catch {};
@@ -126,10 +113,8 @@ test "reified Json round-trip in a plain program body" {
 }
 
 test "@SerialName renames keys on encode and decode" {
-    // kotlinc emits the serial name as the wire key for every placement it
-    // honors: no use-site target (defaults to the property anchor —
-    // SerialName is @Target(PROPERTY, CLASS), so `param` never applies),
-    // explicit @property:, and @all: (expands to the property anchor only).
+    // SerialName is @Target(PROPERTY, CLASS), so bare, @property: and @all: all
+    // anchor on the property and produce the same wire key.
     try runProgram("json_serial_names",
         \\import kotlinx.serialization.SerialName
         \\import kotlinx.serialization.Serializable

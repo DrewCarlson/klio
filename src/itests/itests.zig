@@ -1,60 +1,28 @@
-//! Integration test suite. Each file runs through
-//! the real pipeline and asserts behavior/diagnostics.
+//! Integration suite root: every imported file runs programs through the
+//! real pipeline and asserts output or diagnostics.
 test {
-    // parity_advanced_idioms and parity_functional_patterns were
-    // redistributed into the suites that own their surfaces
-    // (operator_edge_cases, resolve_ambiguity, extension_resolution,
-    // lambdas_and_dispatch, object_init, collections_intensive,
-    // nullability_deep, type_system_shapes, exceptions_and_flow,
-    // data_class_features, sealed_when_patterns); both files are deleted.
     _ = @import("parity_array_bulk_ops.zig");
-    // parity_atomicfu_arrays.zig and parity_kotlinx_io_read.zig are deleted,
-    // not skipped: their resolution pins were moved verbatim into
-    // resolve_ambiguity.zig; the library-behavior tests are owned by the
-    // atomicfu/io commontest census suites.
-    // parity_closures_advanced folded into parity_closures_deep (its unique
-    // tests run there now; the one dropped test was a duplicate of
-    // captured_var_sibling_closures_and_hof).
     _ = @import("parity_closures_deep.zig");
-    // parity_iterables_special and parity_maps_intensive folded into
-    // parity_collections_intensive (all their tests run there now, and the
-    // two donor files are deleted, so their imports are gone below).
     _ = @import("parity_collections_intensive.zig");
-    // parity_conformance.zig is deleted, not skipped: the mm1..mm11 litmus
-    // tests and the conformance_suite_is_complete guard were moved verbatim
-    // into parity_threaded_litmus.zig (one binary, both fixture dirs).
     _ = @import("parity_corpus_pinned.zig");
     _ = @import("ktor_client_get.zig");
     _ = @import("ktor_channel_async.zig");
     _ = @import("json_reified_inline.zig");
-    // parity_coroutine_smoke folded into parity_coroutines_realistic (the
-    // cs1..cs9 fixture tests run there now).
     _ = @import("parity_coroutines_realistic.zig");
     _ = @import("parity_data_class_features.zig");
     _ = @import("parity_dsl_operators.zig");
     _ = @import("parity_exceptions_and_flow.zig");
     _ = @import("parity_extension_resolution.zig");
-    // parity_functional_patterns.zig is deleted, not skipped: its tests were
-    // moved verbatim into the owning suites (see the note at the top of this
-    // block), so the import has no file to point at.
     _ = @import("parity_generics_advanced.zig");
     _ = @import("parity_inheritance_dispatch.zig");
     _ = @import("parity_inner_classes.zig");
-    // parity_interfaces_visibility.zig is deleted, not skipped: its
-    // interface/dispatch tests were moved verbatim into
-    // parity_inheritance_dispatch; parity_visibility_modifiers remains the
-    // visibility suite.
     _ = @import("parity_lambdas_and_dispatch.zig");
     _ = @import("parity_named_args_defaults.zig");
     _ = @import("parity_nullability_deep.zig");
     _ = @import("parity_object_init.zig");
     _ = @import("parity_operator_edge_cases.zig");
     _ = @import("parity_properties_accessors.zig");
-    // parity_ranges_arrays folded into parity_array_bulk_ops (all its tests
-    // run there now; the donor file is deleted).
     _ = @import("parity_sealed_when_patterns.zig");
-    // parity_string_processing folded into parity_strings_numbers (all its
-    // tests run there now; the donor file is deleted).
     _ = @import("parity_strings_numbers.zig");
     _ = @import("parity_suspend_shapes.zig");
     _ = @import("parity_threaded_litmus.zig");

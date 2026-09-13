@@ -1,7 +1,5 @@
-//! Parser corpus tests. Each `.kt`
-//! snippet is parsed end-to-end and the pretty-printed AST + any diagnostics are
-//! compared against the checked-in expected rendering; the embedded source
-//! string and its expected output are kept inline per test.
+//! Each snippet is parsed end to end and its pretty-printed AST plus diagnostics
+//! are compared against the rendering embedded in the test.
 
 const std = @import("std");
 const ast = @import("ast");
@@ -26,8 +24,7 @@ const AssignOp = ast.AssignOp;
 const FunctionBody = ast.FunctionBody;
 const WhenPatternKind = ast.WhenPatternKind;
 
-/// Lex + parse `src` and produce the pretty-printed AST followed by any
-/// diagnostics. Allocates into `arena`.
+/// Renders `src` as a pretty-printed AST plus diagnostics, allocated in `arena`.
 fn render(arena: Allocator, src: []const u8) ![]u8 {
     const id = span.FileId.from(0);
     var lx = try lexer.Lexer.init(arena, id, src);
@@ -40,8 +37,7 @@ fn render(arena: Allocator, src: []const u8) ![]u8 {
     var printer = Printer{ .out = &out, .arena = arena, .indent = 0 };
     try printer.file(&file_ast);
 
-    // Lexer diagnostics first, then parser diagnostics: `lexed.diagnostics`
-    // extended with the parser diagnostics.
+    // Lexer diagnostics render before parser diagnostics.
     const lex_diags = lexed.diagnostics.diags();
     const parse_diags = p.diagnostics.diags();
     if (lex_diags.len + parse_diags.len != 0) {
@@ -598,8 +594,6 @@ fn renderAssignOp(op: AssignOp) []const u8 {
     };
 }
 
-/// Render a string wrapped in double quotes with `\`, `"`, newline, tab,
-/// carriage-return and other control characters escaped.
 fn debugStr(arena: Allocator, s: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.append(arena, '"');
@@ -623,7 +617,6 @@ fn debugStr(arena: Allocator, s: []const u8) ![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// Render a char wrapped in single quotes with common escapes.
 fn debugChar(arena: Allocator, value: u16) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.append(arena, '\'');
@@ -649,8 +642,7 @@ fn debugChar(arena: Allocator, value: u16) ![]u8 {
     return out.toOwnedSlice(arena);
 }
 
-/// Each test uses an arena over the page allocator so the leak-checking test
-/// allocator is never used for the parse pipeline.
+/// Page-allocator arena: the leak-checking test allocator never drives the parser.
 fn check(src: []const u8, expected: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();

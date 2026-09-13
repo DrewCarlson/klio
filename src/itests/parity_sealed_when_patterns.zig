@@ -1,23 +1,14 @@
-//! Sealed-hierarchy + when-expression patterns: nested sealed types,
-//! exhaustive when over object subtypes, pattern matching on data
-//! classes, multi-branch arms with destructured bindings.
+//! Sealed hierarchies under `when`: nesting, exhaustive arms, destructuring.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_sealed_when_patterns";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) allocated from the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so a single file-scoped arena over the page allocator backs every run here
-// (the leak-checking test allocator is never used, matching the e2e harness).
+// One arena for the whole file: process-global lowering/VM state outlives any per-test arena.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -174,7 +165,6 @@ test "when_inside_lambda_body" {
         \\}
         \\
     ;
-    // 1+3=4; 4*2=8; 8+7=15; 15*10=150
     try assertKlio("when_lambda", src, "150\n");
 }
 

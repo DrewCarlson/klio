@@ -1,19 +1,14 @@
-//! Pinned parity-corpus fixtures. Each test runs one real
-//! `tests/fixtures/parity_corpus/*.kt` program through the in-process
-//! pipeline and asserts kotlinc's output (kotlinc-jvm 2.3.21), so the
-//! fixtures gate under `zig build test` — the kotlinc-backed corpus
-//! sweep (`klio-parity --sweep corpus`) needs a kotlinc install and runs
-//! out-of-band.
+//! Pinned parity-corpus fixtures: each test runs one
+//! `tests/fixtures/parity_corpus/*.kt` program in process and asserts
+//! kotlinc's output, so the corpus gates without a kotlinc install.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const CORPUS_DIR = "tests/fixtures/parity_corpus";
 
-// One arena shared by every pipeline run in this file. The pipeline
-// installs process-global tables backed by the build allocator; a fresh
-// per-test arena would free that memory out from under the still-live
-// globals. Mirrors the e2e harness.
+// One shared arena: the pipeline installs process-global tables backed by the
+// build allocator, which a per-test arena would free out from under them.
 var shared_arena: ?std.heap.ArenaAllocator = null;
 
 fn arenaAllocator() std.mem.Allocator {
@@ -25,7 +20,6 @@ fn arenaAllocator() std.mem.Allocator {
     return shared_arena.?.allocator();
 }
 
-/// Run `tests/fixtures/parity_corpus/<stem>.kt` and assert its stdout.
 fn check(stem: []const u8, expected: []const u8) !void {
     const a = arenaAllocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -43,9 +37,7 @@ fn check(stem: []const u8, expected: []const u8) !void {
     }
 }
 
-/// Run `tests/fixtures/parity_corpus/<stem>.kt` and assert the program is
-/// rejected before it runs, the rejection message containing `needle`.
-/// Mirrors a kotlinc compile error (e.g. `unresolved reference 'it'`).
+/// Assert `<stem>.kt` is rejected before it runs, with `needle` in the message.
 fn checkErr(stem: []const u8, needle: []const u8) !void {
     const a = arenaAllocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -803,9 +795,8 @@ test "unimported_object_member_extension" {
     );
 }
 
-// kotlinc-native 2.3.10 is the oracle: kotlinc-jvm rejects this overload
-// pair under JVM erasure (platform declaration clash), the native compiler
-// resolves it by the full declared type.
+// kotlinc-native is the oracle: kotlinc-jvm rejects this pair as a platform
+// declaration clash under JVM erasure.
 test "overload_generic_args" {
     try check("overload_generic_args",
         \\pick(List<String>)
@@ -816,9 +807,8 @@ test "overload_generic_args" {
     );
 }
 
-// kotlinc-native 2.3.10 is the oracle: kotlinc-jvm rejects this overload
-// pair under JVM erasure (platform declaration clash), the native compiler
-// resolves it by the full declared type.
+// kotlinc-native is the oracle: kotlinc-jvm rejects this pair as a platform
+// declaration clash under JVM erasure.
 test "overload_function_shapes" {
     try check("overload_function_shapes",
         \\call((String)->String)
@@ -843,14 +833,9 @@ test "empty_container_declared_elem" {
     );
 }
 
-// An empty container typed by its binding annotation (`val xs: List<String>
-// = emptyList()`) binds the `List<String>.describe()` extension over the
-// enclosing class's `describe()` member, matching kotlinc — the lowering
-// reads the annotation's element head and stamps it where an explicit
-// creation-site type argument would. The erased-generic-return shape
-// (`fun <T> make(): List<T> = emptyList()`) is the documented residue:
-// `T` carries no runtime element identity, so that one keeps on-demand
-// dispatch.
+// An empty container takes its element type from the binding annotation, so
+// `val xs: List<String> = emptyList()` binds the `List<String>` extension over
+// the enclosing member. An erased generic return keeps on-demand dispatch.
 test "empty_container_binding_elem" {
     try check("empty_container_binding_elem",
         \\ext List<String>
@@ -859,9 +844,8 @@ test "empty_container_binding_elem" {
     );
 }
 
-// A package member used by fully-qualified name with no `import` needs no
-// import in Kotlin; the load gate harvests the qualified prefix so the
-// gated sources load just as an import of it would.
+// Kotlin needs no `import` for a fully-qualified name; the gate harvests the
+// qualified prefix instead.
 test "qualified_unimported_ref" {
     try check("qualified_unimported_ref",
         \\7
@@ -871,19 +855,12 @@ test "qualified_unimported_ref" {
     );
 }
 
-// A `with(x) { … }` subject exposes only `x`; its enclosing-instance tower
-// is NOT in scope, so a bare call to a member of the subject's outer class
-// is unresolved (kotlinc: `unresolved reference 'describe'`). The
-// dispatch-receiver tower stays in scope (see
-// `inner_member_calls_outer_member`); the difference is subject vs dispatch
-// receiver.
+// A `with(x)` subject exposes only `x`, not its enclosing-instance tower,
+// unlike a dispatch receiver.
 test "with_subject_outer_member_call_rejected" {
     try checkErr("with_subject_outer_member_call_rejected", "describe");
 }
 
-// The positive companion: an inner-class method calling a bare member of
-// its enclosing class resolves through the real dispatch-receiver `this`
-// tower (`this@Inner` → `this@Outer`). Must keep working.
 test "inner_member_calls_outer_member" {
     try check("inner_member_calls_outer_member",
         \\outer-describe
@@ -906,10 +883,7 @@ test "imported_function_over_noncallable_member" {
     );
 }
 
-// A user parameter named `this` (backticked, since `this` is a hard
-// keyword) is an ordinary parameter, not a dispatch receiver, so a bare
-// call in the function body is unresolved (kotlinc: `unresolved reference
-// 'show'`).
+// A backticked `this` parameter is ordinary, not a dispatch receiver.
 test "capitalized_extension_fn" {
     try check("capitalized_extension_fn", "validator installed expectSuccess=true\n");
 }
@@ -918,9 +892,7 @@ test "backtick_this_param_not_receiver" {
     try checkErr("backtick_this_param_not_receiver", "show");
 }
 
-/// Run a multi-file program and assert it is rejected before it runs, the
-/// rejection containing `needle`. Mirrors kotlinc's `unresolved reference`
-/// for an unimported cross-package reference.
+/// Assert a multi-file program is rejected, with `needle` in the message.
 fn checkErrFiles(files: []const []const u8, needle: []const u8) !void {
     const a = arenaAllocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -941,7 +913,6 @@ fn checkErrFiles(files: []const []const u8, needle: []const u8) !void {
     }
 }
 
-/// Run a multi-file program and assert its stdout.
 fn checkFiles(files: []const []const u8, expected: []const u8) !void {
     const a = arenaAllocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -960,12 +931,8 @@ fn checkFiles(files: []const []const u8, expected: []const u8) !void {
 const T5_VALUE = CORPUS_DIR ++ "/tier5_value_ref";
 const T5_LOOSE = CORPUS_DIR ++ "/tier5_loose_calls";
 
-// An unimported cross-package value reference is unresolved exactly as
-// kotlinc rejects it (kotlinc-jvm 2.3.21). A callable reference `::name`,
-// a `::Ctor`, and a bare read of an unimported cross-package top-level
-// property each report `unresolved reference`; before this they ran
-// leniently (the function ran, the property's value printed, the
-// constructor built).
+// An unimported cross-package reference is unresolved in every form: `::name`,
+// `::Ctor`, and a bare read of a top-level property.
 test "tier5_value_ref_fn_callable_reference_rejected" {
     try checkErrFiles(&.{ T5_VALUE ++ "/lib.kt", T5_VALUE ++ "/app_fnref.kt" }, "unresolved reference `helper`");
 }
@@ -978,12 +945,8 @@ test "tier5_value_ref_ctor_reference_rejected" {
     try checkErrFiles(&.{ T5_VALUE ++ "/lib.kt", T5_VALUE ++ "/app_ctorref.kt" }, "unresolved reference `Box`");
 }
 
-// Loose-shape calls (default-arg / vararg / default+trailing-lambda /
-// vararg+trailing-lambda) to an unimported cross-package target are
-// unresolved too — the heuristic could bind them only because the runtime
-// member-redispatch path can also claim them, but no receiver is in scope
-// here. kotlinc rejects all four; the vararg+trailing-lambda one even
-// misrouted and crashed (`get_field 'entries' on kotlin.Int`) before.
+// Loose shapes are unresolved too: only member redispatch could claim them,
+// and no receiver is in scope.
 test "tier5_loose_default_arg_call_rejected" {
     try checkErrFiles(&.{ T5_LOOSE ++ "/lib.kt", T5_LOOSE ++ "/app_default.kt" }, "unresolved reference `greet`");
 }
@@ -1000,9 +963,6 @@ test "tier5_loose_vararg_plus_lambda_call_rejected" {
     try checkErrFiles(&.{ T5_LOOSE ++ "/lib.kt", T5_LOOSE ++ "/app_vlam.kt" }, "unresolved reference `vlam`");
 }
 
-// Positive counterparts that MUST still resolve. An imported cross-package
-// program references every shape with explicit imports; kotlinc compiles
-// and runs it. The same shapes in a single same-package file resolve too.
 test "tier5_value_ref_imported_resolves" {
     try checkFiles(&.{
         CORPUS_DIR ++ "/tier5_value_ref_positive/lib.kt",
@@ -1032,10 +992,8 @@ test "tier5_loose_same_package_resolves" {
     );
 }
 
-// A loose-shape bare call inside a receiver context (`g.apply { greet() }`)
-// must bind the runtime receiver's member even when a same-named top-level
-// function is out of scope — the member-redispatch shape the tightening
-// must NOT over-reject (kotlinc resolves it to the member).
+// The bound those rejections must not cross: inside a receiver context a
+// loose-shape bare call still binds the runtime receiver's member.
 test "tier5_loose_member_redispatch_resolves" {
     try checkFiles(&.{
         CORPUS_DIR ++ "/tier5_loose_calls_positive/mr_lib.kt",
@@ -1046,9 +1004,6 @@ test "tier5_loose_member_redispatch_resolves" {
     );
 }
 
-// `++`/`--` write-back must reach the real binding for every lvalue shape,
-// not a dead local. Regression: prefix/postfix on a top-level `var` mutated
-// from a non-reader function dropped the write. All outputs match kotlinc.
 test "incdec_toplevel_postinc" {
     try check("incdec_toplevel_postinc",
         \\2
@@ -2565,9 +2520,8 @@ test "nested_expected_comparator_chain" {
 }
 
 test "bare_tp_receiver_lambda_invoke" {
-    // `item.getter()` on a bare-tp property with `getter: T.() -> P` in
-    // scope commits the VALUE (invoke) protocol as kotlinc resolves it —
-    // a runtime class's same-named member must not win the arbitration.
+    // `item.getter()` with `getter: T.() -> P` in scope commits the invoke
+    // protocol; a runtime class's same-named member must not win.
     try check("bare_tp_receiver_lambda_invoke",
         \\2
         \\value
@@ -2593,10 +2547,7 @@ test "comparator_sibling_expected" {
     );
 }
 
-// The trailing `3` row pins the NEW fixture line (`outer(arrayOf(...))` —
-// the member-form lambda-return pick committing the Long sumOf variant;
-// kotlinc prints 3 where the runtime re-pick had printed 3.0). The prior
-// rows are unchanged.
+// `outer(arrayOf(...))` commits the Long `sumOf` variant, not the Double one.
 test "lambda_return_overload_pick" {
     try check("lambda_return_overload_pick",
         \\6
@@ -2708,16 +2659,8 @@ test "type_param_bounded_by_type_param" {
     );
 }
 
-// The derived-receiver static-binding mechanisms in one program: extension
-// returns instantiated from receivers (associateWith on a derived local),
-// heterogeneous-vararg LUB records, SAM lambda typing (expected-type,
-// explicit-args, and chained forms), bare-tp property substitution
-// (isEmpty().not() on Ctx<Map<K, V>>), the object-let marker splice, the
-// local-class supertype typing record, Array flatten, the repeat protocol,
-// and a qualified value-class ctor. Every row is kotlinc's output.
-// The `[ab]` row pins the NEW fixture lines (`byLength[2].orEmpty()` on a
-// groupBy result — the recorder-level star patch derives K from the
-// trailing lambda; kotlinc prints [ab]). The prior rows are unchanged.
+// The derived-receiver static-binding mechanisms in one program, including a
+// `groupBy` result whose key type comes from the trailing lambda's return.
 test "derived_receiver_static_binds" {
     try check("derived_receiver_static_binds",
         \\{beta=2}

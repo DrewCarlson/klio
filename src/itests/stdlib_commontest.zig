@@ -1,35 +1,18 @@
-//! Bootstrapping proof: run Kotlin's own stdlib `commonTest` sources through
-//! `klio test` against the installed `kotlin.test` pack.
-//!
-//! The whole common test tree (`kotlin/libraries/stdlib/test`, minus the `js/`
-//! platform source set) is discovered automatically — there is no per-test
-//! include/exclude list. Files without `@Test` are shared fixtures (testUtils,
-//! the comparison DSLs); they are compiled into every test file's module. KLIO
-//! actuals for the test infrastructure's `expect` declarations live in
-//! `tests/stdlib_commontest_actuals`.
-//!
-//! Each test file runs in its own child `klio` (a crash isolates to one file),
-//! and the run asserts the total number of passing tests stays at or above a
-//! ratchet baseline. Raise `BASELINE` as interpreter gaps close; never lower it.
+//! Run Kotlin's own stdlib `commonTest` sources through `klio test` against
+//! the installed `kotlin.test` pack. The tree is discovered automatically with
+//! no include or exclude list; files without `@Test` are shared fixtures and
+//! compile into every test file's module. Each test file runs in its own child
+//! `klio`, so a crash isolates to one file.
 
 const std = @import("std");
 const census_support = @import("commontest_support.zig");
 const runtime = @import("runtime");
 
-/// Minimum number of stdlib commonTest cases that must pass. A ratchet: bump it
-/// up as fixes land, never down. (Total discovered is ~2082.)
-/// 2301 = the measured pass count (1024 + 1277 across the two shards) with
-/// a zero failure ceiling: CI run 33953220015 and the local ReleaseSafe
-/// shards agree. A baseline moves up with the count; down only with a
-/// root-caused record.
+/// Pass floor. Rises as fixes land, falls only with a root-caused record.
 const BASELINE: usize = 2301;
 
-/// Ceiling on *failing* cases, the mirror of `BASELINE`. A pass floor cannot
-/// see a regression inside the red mass; this bounds the other direction.
-/// Measured solo across both shards: 1024+1277 passed, 0 failed, 0
-/// build-blocked — every stdlib case that runs, passes, so a single new
-/// failure is a real regression and trips this. A file that cannot produce a
-/// summary at all is counted as `build-blocked`, not as a failure.
+/// Failure ceiling, the mirror of `BASELINE`. A file that produces no summary
+/// at all counts as build-blocked, not as a failure.
 const MAX_FAILED: usize = 0;
 
 const TEST_ROOT = "kotlin/libraries/stdlib/test";
@@ -63,16 +46,11 @@ fn runKlio(
     const r = std.process.run(allocator, threaded.io(), .{
         .argv = argv,
         .environ_map = env,
-        // A test file that makes the interpreter hang (infinite loop, not a
-        // crash) must not stall the suite; cap each child. Sized above the
-        // slowest legitimate job (DeepRecursiveTest interprets ~400k
-        // coroutine resumes and needs ~300s solo — the unwind-cost residual
-        // in the resolution-unification plan) so a slow-but-linear pass is
-        // never miscounted as blocked.
+        // Caps a child that hangs rather than crashes, sized well above the
+        // slowest legitimate file so a slow pass is never counted as blocked.
         .timeout = .{ .duration = .{ .raw = std.Io.Duration.fromMilliseconds(480_000 * census_support.harnessSlowdown(env)), .clock = .awake } },
     }) catch |e| {
-        // A timed-out (hanging) child is reported as a blocked file, not a
-        // hard spawn failure.
+        // A hung child counts as a blocked file, not a spawn failure.
         if (e == error.Timeout) return .{ .term = .{ .exited = 124 }, .stdout = "", .stderr = "" };
         std.debug.print("stdlib_commontest: spawn {s} failed: {s}\n", .{ argv[0], @errorName(e) });
         return error.SpawnFailed;
@@ -94,17 +72,13 @@ fn installKotlinTestPack(allocator: std.mem.Allocator, io: std.Io, env: *std.pro
     }
 }
 
-/// Concurrent child count. Each child is one `klio test` process; the pool
-/// keeps the cores busy while the slowest files run.
 fn workerCount() usize {
     const cores = std.Thread.getCpuCount() catch 4;
-    // Half the cores, capped low: suites run beside sweeps and editors,
-    // and each child is itself a multi-threaded interpreter.
+    // Capped low: each child is itself a multi-threaded interpreter.
     return std.math.clamp(cores / 2, 1, 4);
 }
 
-/// Recursively collect every `.kt` under `dir`, skipping the `js/` platform
-/// source set. Paths are arena-owned.
+/// Skips the `js/` platform source set. Paths are arena-owned.
 fn collectKt(a: std.mem.Allocator, io: std.Io, dir: []const u8, out: *std.ArrayList([]u8)) !void {
     var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return;
     defer d.close(io);
@@ -125,13 +99,13 @@ fn fileHasTest(a: std.mem.Allocator, io: std.Io, path: []const u8) bool {
     return std.mem.indexOf(u8, bytes, "@Test") != null;
 }
 
-/// Number of `@Test` occurrences in a file — the shard-balancing weight.
+/// The shard-balancing weight.
 fn testCount(a: std.mem.Allocator, io: std.Io, path: []const u8) usize {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .unlimited) catch return 0;
     return std.mem.count(u8, bytes, "@Test");
 }
 
-/// Parse the "<n> tests, <p> passed, ..." summary line for the passed count.
+/// Passed count from the child's "<n> tests, <p> passed, <f> failed" line.
 fn passedCount(stdout: []const u8) ?usize {
     const idx = std.mem.indexOf(u8, stdout, " passed,") orelse return null;
     var end = idx;
@@ -142,9 +116,6 @@ fn passedCount(stdout: []const u8) ?usize {
     return std.fmt.parseInt(usize, stdout[start..end], 10) catch null;
 }
 
-/// Parse the "<n> tests, <p> passed, <f> failed" summary line for the failed
-/// count. The mirror of `passedCount`: a pass floor cannot see a regression
-/// inside the red mass, so the failure total is bounded too.
 fn failedCount(stdout: []const u8) ?usize {
     const idx = std.mem.indexOf(u8, stdout, " failed,") orelse
         std.mem.lastIndexOf(u8, stdout, " failed") orelse return null;
@@ -156,7 +127,7 @@ fn failedCount(stdout: []const u8) ?usize {
     return std.fmt.parseInt(usize, stdout[start..end], 10) catch null;
 }
 
-/// Extract the symbol name from `import test.<pkg>.<Name>` (null otherwise).
+/// Symbol name from an `import test.<pkg>.<Name>` line.
 fn importedTestName(line: []const u8) ?[]const u8 {
     const t = std.mem.trim(u8, line, " \t\r");
     if (!std.mem.startsWith(u8, t, "import ")) return null;
@@ -174,7 +145,7 @@ fn isIdentChar(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-/// Whether `hay` contains `word` bounded by non-identifier characters.
+/// Whether `word` appears in `hay` bounded by non-identifier characters.
 fn hasWord(hay: []const u8, word: []const u8) bool {
     if (word.len == 0) return false;
     var i: usize = 0;
@@ -188,7 +159,6 @@ fn hasWord(hay: []const u8, word: []const u8) bool {
     return false;
 }
 
-/// Whether `content` has a top-level declaration line naming `name`.
 fn declaresTopLevel(content: []const u8, name: []const u8) bool {
     const kws = [_][]const u8{ "val", "var", "fun", "class", "object", "interface", "typealias", "enum" };
     var it = std.mem.splitScalar(u8, content, '\n');
@@ -214,8 +184,7 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     };
 
     var env = try envWithHome(a, SCRATCH_HOME);
-    // A Debug harness interprets several times slower than the ReleaseSafe
-    // build the per-test wall caps are tuned on; scale them to match.
+    // The wall caps are tuned on ReleaseSafe; Debug runs several times slower.
     const slowdown = census_support.harnessSlowdown(&env);
     if (slowdown != 1) try census_support.scaleWallCaps(a, &env, slowdown);
     try installKotlinTestPack(a, io, &env, SCRATCH_HOME);
@@ -228,7 +197,6 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
         }
     }.lt);
 
-    // Fixtures (no `@Test`) are compiled into every test file's module.
     var support: std.ArrayList([]const u8) = .empty;
     for (ACTUALS) |p| try support.append(a, p);
     var targets: std.ArrayList([]const u8) = .empty;
@@ -236,12 +204,9 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
         if (fileHasTest(a, io, p)) try targets.append(a, p) else try support.append(a, p);
     }
 
-    // A `@Test` file may also export a top-level helper (e.g. a shared
-    // Comparator) that tests in another directory import via `import test.X.Y`.
-    // The real Kotlin module compiles every file together; mirror that by
-    // compiling the UNIQUE provider of each imported `test.*` symbol as extra
-    // context. Ambiguous names (declared by more than one target) are skipped
-    // so no name clash is introduced.
+    // The real Kotlin module compiles every file together, so the unique
+    // provider of each imported `test.*` symbol joins the target's module as
+    // context. A name two targets declare is dropped rather than clashed.
     var imported_names: std.StringHashMap(void) = .init(a);
     for (targets.items) |t| {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, t, a, .unlimited) catch continue;
@@ -267,26 +232,10 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     var ait = ambiguous.keyIterator();
     while (ait.next()) |k| _ = provider.remove(k.*);
 
-    // Build every child's argv up front (file reads stay on the shared
-    // arena), then drain the queue with a worker pool. Each child is one
-    // isolated `klio test` process, so the only cross-thread state is the
-    // two counters.
-    //
-    // Each child is bounded with `timeout`: a test file that makes the
-    // interpreter hang (infinite loop, not a crash) must not stall the
-    // whole suite. A killed child yields no summary -> counted as blocked.
-    //
-    // A test file's top-level helpers (a shared `data class Sortable`, an
-    // `assertAlmostEquals`) frequently live in a *sibling* test file that
-    // also carries its own `@Test`s — the real Kotlin module compiles
-    // every file together. Compile every same-directory sibling target as
-    // context so those helpers resolve, and restrict the run to this
-    // target's own tests with `--only-file` so siblings' tests do not
-    // double-count.
-    // KLIO_COMMONTEST_SHARD=K/N slices the sorted target list by stride so
-    // CI fans this suite across parallel jobs; sibling-context resolution
-    // still sees the full target set. The ratchet applies proportionally
-    // (with a small slack for uneven per-file pass counts) when sharded.
+    // Each job compiles its same-directory siblings as context, since their
+    // shared helpers live beside their own `@Test`s, and passes `--only-file`
+    // so those siblings' tests do not double-count. KLIO_COMMONTEST_SHARD=K/N
+    // slices the target list; sibling resolution still sees all of it.
     var shard_k: usize = 0;
     var shard_n: usize = 1;
     if (runtime.envOnce("KLIO_COMMONTEST_SHARD")) |s| {
@@ -300,13 +249,9 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
         }
     }
 
-    // Weighted shard assignment. Stride slicing splits pass-mass badly —
-    // passes cluster in a few big files, and a slice's share of the total
-    // swung well past the ±25% the coarse ratchet's slack assumes (shard
-    // halves measured 720 vs 1394). Weight each target by its `@Test`
-    // count and greedy-assign to the lightest shard: every shard process
-    // computes the same assignment from the same file contents, and the
-    // weight split lands within a few percent of proportional.
+    // Passes cluster in a few big files, so an even slice of the file list is
+    // an uneven slice of the pass mass. Greedy-assigning by `@Test` count
+    // splits it proportionally, identically in every shard process.
     const shard_of = try a.alloc(usize, targets.items.len);
     var my_weight: usize = 0;
     var total_weight: usize = 0;
@@ -342,7 +287,6 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
             const sdir = std.fs.path.dirname(sibling) orelse "";
             if (std.mem.eql(u8, sdir, tdir)) try argv.append(a, sibling);
         }
-        // Cross-directory providers of imported `test.*` symbols.
         {
             const bytes = std.Io.Dir.cwd().readFileAlloc(io, target, a, .unlimited) catch "";
             var seen: std.StringHashMap(void) = .init(a);
@@ -381,8 +325,7 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
                 const i = pnext.fetchAdd(1, .monotonic);
                 if (i >= queue.len) return;
                 _ = arena.reset(.retain_capacity);
-                // The job's target file is the argv tail (jobs append it last).
-                const target = queue[i][queue[i].len - 1];
+                        const target = queue[i][queue[i].len - 1];
                 const r = runKlio(arena.allocator(), penv, queue[i]) catch |e| {
                     std.debug.print("build-blocked (spawn: {t}): {s}\n", .{ e, target });
                     _ = pblocked.fetchAdd(1, .monotonic);
@@ -392,8 +335,6 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
                     _ = ppassed.fetchAdd(p, .monotonic);
                     if (failedCount(r.stdout)) |f| {
                         _ = pfailed.fetchAdd(f, .monotonic);
-                        // Name every failing case (with its first detail
-                        // line) so a red run is actionable from the log.
                         if (f != 0) {
                             var lines = std.mem.splitScalar(u8, r.stdout, '\n');
                             var prev_failed = false;
@@ -421,11 +362,8 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
     }
     for (threads.items) |t| t.join();
 
-    // Sharded: a coarse ratchet — the weighted assignment lands each
-    // shard within a few percent of its proportional share, so the slack
-    // only has to absorb pass/fail clustering inside files. The slice
-    // gate catches collapse-class regressions; the EXACT ratchet is
-    // enforced by every unsharded run (local test-all, nightly).
+    // A shard gets a coarse proportional floor; every unsharded run still
+    // enforces the exact ratchet.
     const min_pass = if (shard_n == 1)
         BASELINE
     else
@@ -450,12 +388,11 @@ test "stdlib commonTest pass count holds at or above the ratchet baseline" {
 }
 
 test "failedCount parses the child summary (negative control for a zero)" {
-    // A zero failure total is only trustworthy if the parser can see a
-    // non-zero one. Same shapes the child actually prints.
+    // A zero failure total only means something if the parser can see a
+    // non-zero one.
     try std.testing.expectEqual(@as(?usize, 7), failedCount("40 tests, 33 passed, 7 failed, 0 skipped\n"));
     try std.testing.expectEqual(@as(?usize, 0), failedCount("40 tests, 40 passed, 0 failed, 0 skipped\n"));
     try std.testing.expectEqual(@as(?usize, 12), failedCount("12 failed"));
     try std.testing.expectEqual(@as(?usize, null), failedCount("no summary here\n"));
-    // The pass parser must not be fooled by the failure field, and vice versa.
     try std.testing.expectEqual(@as(?usize, 33), passedCount("40 tests, 33 passed, 7 failed\n"));
 }

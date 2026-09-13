@@ -1,18 +1,13 @@
-//! Realistic coroutine shapes drawn from kotlinx-coroutines patterns:
-//! cancellation race, supervisorScope, async with explicit start, channels,
-//! flow collection, parallel decomposition.
+//! Coroutine shapes drawn from kotlinx-coroutines usage: cancellation, scope
+//! builders, channels, `select`, and flows.
 
 const std = @import("std");
 const parity = @import("parity");
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// The pipeline's process-global state points into the run allocator, so one
+// file-scoped arena must outlive every test here.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-/// Write `src` to a unique temp `.kt` path under a per-file dir and return it.
 fn writeSrc(a: std.mem.Allocator, io: std.Io, name: []const u8, src: []const u8) ![]const u8 {
     const dir = "/tmp/klio_coroutines_realistic";
     std.Io.Dir.cwd().createDirPath(io, dir) catch {};
@@ -22,9 +17,6 @@ fn writeSrc(a: std.mem.Allocator, io: std.Io, name: []const u8, src: []const u8)
 }
 
 fn assertKlio(name: []const u8, src: []const u8, want: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -107,10 +99,7 @@ test "cancellation_propagates_to_children" {
         \\}
         \\
     ;
-    // Order of c1;c2;p; is unspecified — accept any permutation by sorting.
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
+    // The order of c1;c2;p; is unspecified, so sort before comparing.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -225,9 +214,7 @@ test "channel_send_receive" {
 }
 
 test "launch_in_repeat_resolves_enclosing_it" {
-    // `launch { ch.send(it) }` is a receiver lambda (`suspend
-    // CoroutineScope.() -> Unit`) with no `it` of its own, so `it` resolves
-    // to the enclosing `repeat` lambda's index — kotlinc prints [0, 1, 2].
+    // A receiver lambda has no `it`, so `it` is the `repeat` lambda's index.
     const src =
         \\
         \\import kotlinx.coroutines.*
@@ -321,9 +308,7 @@ test "channel_buffered_send_receive_pairs" {
     try assertKlio("channel_buffered", src, "abc\n");
 }
 
-// A bare `coroutineContext` inside an extension of a `CoroutineScope` reads the
-// receiver's own stored context (the member shadows the ambient intrinsic), not
-// the running coroutine's context.
+// The scope's stored context shadows the ambient `coroutineContext` intrinsic.
 test "coroutine_scope_extension_reads_receiver_context" {
     const src =
         \\
@@ -346,9 +331,7 @@ test "coroutine_scope_extension_reads_receiver_context" {
     try assertKlio("scope_extension_context", src, "held\nambient-none\n");
 }
 
-// `select { }` over channel clauses: a buffered `onReceive` is ready and wins
-// over an empty channel's clause in biased registration order. The selected
-// clause's block runs with the received value.
+// `select` is biased by registration order among ready clauses.
 test "select_onreceive_ready_clause_wins" {
     const src =
         \\
@@ -370,7 +353,6 @@ test "select_onreceive_ready_clause_wins" {
     try assertKlio("select_onreceive_ready", src, "a=7\n");
 }
 
-// `onTimeout(0)` is selected immediately when no other clause is ready.
 test "select_ontimeout_zero_is_immediate" {
     const src =
         \\
@@ -390,10 +372,6 @@ test "select_ontimeout_zero_is_immediate" {
     try assertKlio("select_ontimeout_zero", src, "timeout\n");
 }
 
-// A binary `Semaphore` serializes two `launch` coroutines through
-// `withPermit` under contention: the second acquirer suspends until the first
-// releases, so both critical sections run exactly once and the permit is
-// returned at the end.
 test "semaphore_withpermit_serializes_under_contention" {
     const src =
         \\
@@ -413,10 +391,7 @@ test "semaphore_withpermit_serializes_under_contention" {
     try assertKlio("semaphore_contention", src, "permits=1 ran=2\n");
 }
 
-// A fan-in `select` over a rendezvous channel: the sender parks between its
-// two sends, and each `onReceive` select takes a value handed off by the
-// parked sender (the first directly, the second from the sender now waiting
-// in the channel). Both values arrive in order.
+// Each `onReceive` takes a value handed off directly by the parked sender.
 test "select_onreceive_parks_then_woken_by_rendezvous_sender" {
     const src =
         \\
@@ -435,9 +410,7 @@ test "select_onreceive_parks_then_woken_by_rendezvous_sender" {
     try assertKlio("select_onreceive_parks", src, "[1, 2]\n");
 }
 
-// An `onSend` select that parks before any receiver exists is woken when a
-// later `receive` arrives: the parked select hands its value straight to the
-// new receiver. The receiver then takes a second plain send.
+// A later `receive` wakes an `onSend` select that parked before it existed.
 test "select_onsend_parks_then_woken_by_receiver" {
     const src =
         \\
@@ -458,8 +431,7 @@ test "select_onsend_parks_then_woken_by_receiver" {
     try assertKlio("select_onsend_parks", src, "[7, 9]\n");
 }
 
-// A parked `onReceiveCatching` select is woken by a `close` with the closed
-// result (not a spurious `null` value); a parked plain `onReceive` throws.
+// `close` wakes a parked `onReceiveCatching` with the closed result, not null.
 test "select_onreceive_observes_close_while_parked" {
     const src =
         \\
@@ -480,9 +452,7 @@ test "select_onreceive_observes_close_while_parked" {
     try assertKlio("select_onreceive_close", src, "[v=1, v=2, closed]\n");
 }
 
-// An `onSend` select feeds a `for (x in channel)` iterator consumer: the
-// iterator's parked `hasNext` is woken by a registered `onSend` select for
-// each element, not just the first.
+// A registered `onSend` select wakes the iterator's parked `hasNext`.
 test "select_onsend_feeds_channel_iterator" {
     const src =
         \\
@@ -503,15 +473,11 @@ test "select_onsend_feeds_channel_iterator" {
     try assertKlio("select_onsend_iterator", src, "got 1\ngot 2\ndone\n");
 }
 
-// Regression net for the fixture-driven coroutine subset. Locks down
-// behavior across the layer-split and coroutine stages: a pure refactor must
-// not change any of these outputs. Expected stdout is encoded as leading
-// `//> ` comment lines in each program under `tests/fixtures/coroutine_smoke`.
+// Fixture programs carry their expected stdout as leading `//> ` lines.
 
 const SMOKE_DIR = "tests/fixtures/coroutine_smoke";
 
-/// Expected stdout = the leading run of `//> ` comment lines. Caller owns the
-/// returned bytes.
+/// The leading run of `//> ` lines in `src`, owned by the caller.
 fn expected(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -525,7 +491,7 @@ fn expected(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
             try out.appendSlice(allocator, body);
             try out.append(allocator, '\n');
         } else if (std.mem.startsWith(u8, t, "//") or out.items.len == 0) {
-            // Skip leading comments and blank lead-in.
+            // Skip other leading comments and the blank lead-in.
         } else {
             break;
         }
@@ -534,9 +500,6 @@ fn expected(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
 }
 
 fn runSmoke(stem: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});

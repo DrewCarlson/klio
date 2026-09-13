@@ -1,17 +1,8 @@
-//! End-to-end gate for UI bundles: a Compose program bundles with the
-//! Skia rendering backend embedded, runs against an EMPTY home with no
-//! `KLIO_SKIA_LIB` and no repo `LD_LIBRARY_PATH`, extracts the shim to
-//! the content-addressed per-user cache on first launch (skipping the
-//! write on the second), and renders the offscreen scene to a PNG that
-//! is byte-identical to a direct `klio run` against the dev shim — the
-//! established headless pixel gate.
-//!
-//! Windowed behavior (double-click open, window icon via
-//! `klio_win_set_icon_png`, default title) needs a display and is
-//! verified manually; this suite gates everything up to the rasterized
-//! pixels. Requires the built Skia backend at `zig-out/lib/`
-//! (`scripts/fetch-skia.sh` + `zig build`); the suite skips without it,
-//! exactly as UI rendering itself degrades to headless.
+//! End-to-end gate for UI bundles. A Compose program bundles with the Skia
+//! backend embedded, runs against an empty home with no `KLIO_SKIA_LIB` and no
+//! repo `LD_LIBRARY_PATH`, extracts the shim into the per-user cache on first
+//! launch only, and rasterizes a PNG byte-identical to a direct `klio run`
+//! against the dev shim. Skips without the built backend at `zig-out/lib/`.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -106,8 +97,6 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     const io = threaded.io();
     const cwd = std.Io.Dir.cwd();
 
-    // The built Skia backend is the embed source; without it there is
-    // nothing to bundle (matches the pack's own headless degradation).
     _ = cwd.statFile(io, "zig-out/lib/libklio_skia.so", .{}) catch {
         std.debug.print("bundle_ui: zig-out/lib/libklio_skia.so absent; skipping (run scripts/fetch-skia.sh + zig build)\n", .{});
         return error.SkipZigTest;
@@ -125,7 +114,6 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     try run_env.put("XDG_CACHE_HOME", cache_dir);
     const bin = try klioBin(a, io, &build_env);
 
-    // Compose pack closure for the klio.compose.ui scene.
     const pack_dirs = [_][]const u8{
         "kotlin-klio/klio-kotlinx-atomicfu",
         "kotlin-klio/klio-kotlinx-io",
@@ -160,19 +148,18 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     const program = try std.fmt.allocPrint(a, "{s}/scene.kt", .{TMP_ROOT});
     try cwd.writeFile(io, .{ .sub_path = program, .data = SCENE });
 
-    // Baseline: `klio run` with the dev shim (explicit KLIO_SKIA_LIB).
     const shim_abs = try cwd.realPathFileAlloc(io, "zig-out/lib/libklio_skia.so", a);
     try build_env.put("KLIO_SKIA_LIB", shim_abs);
     const expect = try runChild(a, io, &build_env, &.{ bin, "run", program });
     _ = build_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_SKIA_LIB"));
     try std.testing.expectEqual(@as(u32, 0), expect.code);
     try std.testing.expect(std.mem.startsWith(u8, expect.stdout, "checksum="));
-    // A real render (0 = headless fallback, which would make this gate vacuous).
+    // Checksum 0 is the headless fallback, which would make the gate vacuous.
     try std.testing.expect(!std.mem.eql(u8, std.mem.trim(u8, expect.stdout, "\n"), "checksum=0"));
     const expect_png = try cwd.readFileAlloc(io, TMP_ROOT ++ "/scene.png", a, .unlimited);
     try cwd.deleteFile(io, TMP_ROOT ++ "/scene.png");
 
-    // Bundle. Flavor must auto-detect UI off the klio.compose.ui pack.
+    // The ui flavor must be auto-detected from the klio.compose.ui pack.
     const out = try std.fmt.allocPrint(a, "{s}/uibin", .{TMP_ROOT});
     const bundled = try runChild(a, io, &build_env, &.{ bin, "bundle", program, "-o", out });
     if (bundled.code != 0) {
@@ -182,7 +169,6 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     try std.testing.expect(std.mem.indexOf(u8, bundled.stdout, ", ui)") != null);
     try std.testing.expect(std.mem.indexOf(u8, bundled.stdout, "skia backend") != null);
 
-    // Inspect shape: ui flavor + a skia-shim section.
     const abs = try cwd.realPathFileAlloc(io, out, a);
     try run_env.put("KLIO_BUNDLE_INSPECT", "1");
     const inspect = try runChild(a, io, &run_env, &.{abs});
@@ -191,15 +177,13 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     try std.testing.expect(std.mem.indexOf(u8, inspect.stdout, "flavor: ui\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, inspect.stdout, "  skia-shim ") != null);
 
-    // First launch: renders through the EXTRACTED shim (empty home, no
-    // KLIO_SKIA_LIB, no LD_LIBRARY_PATH), byte-identical pixels.
+    // First launch renders through the extracted shim, not the dev one.
     const first = try runChild(a, io, &run_env, &.{abs});
     try std.testing.expectEqual(@as(u32, 0), first.code);
     try std.testing.expectEqualStrings(expect.stdout, first.stdout);
     const got_png = try cwd.readFileAlloc(io, TMP_ROOT ++ "/scene.png", a, .unlimited);
     try std.testing.expect(std.mem.eql(u8, expect_png, got_png));
 
-    // The shim landed in the scratch content-addressed cache.
     const shim_root = try std.fmt.allocPrint(a, "{s}/klio/shim", .{cache_dir});
     const extracted = findShim(a, io, shim_root) orelse {
         std.debug.print("bundle_ui: no extracted shim under {s}\n", .{shim_root});
@@ -207,7 +191,7 @@ test "ui bundle renders the pixel gate offline with shim extraction" {
     };
     const st_before = try cwd.statFile(io, extracted, .{});
 
-    // Second launch: extraction is skipped (the cached file untouched).
+    // Second launch reuses the cache, so the mtime must not move.
     const second = try runChild(a, io, &run_env, &.{abs});
     try std.testing.expectEqual(@as(u32, 0), second.code);
     try std.testing.expectEqualStrings(expect.stdout, second.stdout);

@@ -4,21 +4,11 @@ const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_named_args_defaults";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// One arena for the whole file: process-global lowering/VM state outlives any per-test arena.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
-/// Run `src` through the in-process klio pipeline and assert stdout equals
-/// `expected`: write the embedded source to a unique temp `.kt`, then
-/// `runWithPacks`.
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -89,9 +79,6 @@ test "default_expression_references_prior_param" {
         \\}
         \\
     ;
-    // rect(3): w=3, h=6, p=2*(3+6)=18
-    // rect(3,5): w=3, h=5, p=2*8=16
-    // rect(3,5,20): w=3, h=5, p=20
     try assertKlio("default_prior", src, "w=3 h=6 p=18|w=3 h=5 p=16|w=3 h=5 p=20\n");
 }
 

@@ -1,14 +1,6 @@
-//! Negative-case corpus.
-//!
-//! Each `.kt` fixture under tests/fixtures/typeck_negative/ MUST produce
-//! at least one type-checker diagnostic carrying the expected legacy code.
-//! The fixtures are read from disk, run through the real pipeline
-//! lexer -> parser -> resolver -> typeck, and the emitted legacy codes are
-//! asserted against the expected ones.
-//!
-//! A handful of cases embed their source inline (the `pos_*` no-diagnostic
-//! cases) or merge two parsed files into one analysis unit (the cross-file
-//! visibility cases).
+//! Negative-case corpus: every `.kt` fixture under
+//! `tests/fixtures/typeck_negative/` must emit at least one diagnostic
+//! carrying its expected legacy code.
 
 const std = @import("std");
 
@@ -25,9 +17,7 @@ const FileId = span.FileId;
 
 const NEG_DIR = "tests/fixtures/typeck_negative";
 
-/// Run lexer -> parser -> resolver -> typeck over `src` (a single file with
-/// `file_id`) and return the list of legacy diagnostic codes the type checker
-/// emitted. Everything is allocated from `a` (an arena owned by the caller).
+/// Allocates from `a`, an arena the caller owns.
 fn codesForSource(a: std.mem.Allocator, file_id: FileId, src: []const u8) ![]const []const u8 {
     var lx = try Lexer.init(a, file_id, src);
     const lexed = try lx.tokenize();
@@ -44,7 +34,6 @@ fn codesForSource(a: std.mem.Allocator, file_id: FileId, src: []const u8) ![]con
     return codes.items;
 }
 
-/// Read a fixture under tests/negative/ and return the emitted legacy codes.
 fn codesForFixture(a: std.mem.Allocator, name: []const u8) ![]const []const u8 {
     var threaded: std.Io.Threaded = .init(a, .{});
     defer threaded.deinit();
@@ -55,10 +44,8 @@ fn codesForFixture(a: std.mem.Allocator, name: []const u8) ![]const []const u8 {
     return codesForSource(a, FileId.from(0), src);
 }
 
-/// Merge two source files into one analysis unit and return the emitted
-/// legacy codes. Each source keeps
-/// its own `FileId` so the visibility check, which keys off `Span::file`,
-/// sees them as distinct files.
+/// Two sources, one analysis unit. Each keeps its own `FileId` so the
+/// visibility check, which keys off the span's file, still separates them.
 fn codesForMerged(a: std.mem.Allocator, src_a: []const u8, src_b: []const u8) ![]const []const u8 {
     var lx_a = try Lexer.init(a, FileId.from(0), src_a);
     const lexed_a = try lx_a.tokenize();
@@ -98,7 +85,6 @@ fn hasCode(codes: []const []const u8, want: []const u8) bool {
     return false;
 }
 
-/// Assert that the fixture `name` emits at least one diagnostic with code `want`.
 fn expectFixtureCode(name: []const u8, want: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -720,9 +706,6 @@ test "neg_suspend_delegate_get_value" {
     try expectFixtureCode("neg_suspend_delegate_get_value.kt", "T0114");
 }
 
-// The eager engine's resolution record: the overload checker's pick is
-// recorded per call span (one oracle, recorded once) so lowering-side
-// audits and typeck-informed evidence can consume it.
 test "overload checker records its pick per call span" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -747,7 +730,7 @@ test "overload checker records its pick per call span" {
     while (it.next()) |e| {
         if (std.mem.indexOf(u8, e.value_ptr.render, "p0=Int") != null) {
             found = true;
-            // The identity channel: the pick names its declaration.
+            // The record names the declaration, not just its shape.
             try std.testing.expect(e.value_ptr.decl_span != null);
         }
     }

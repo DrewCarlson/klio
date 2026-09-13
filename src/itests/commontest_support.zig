@@ -1,14 +1,8 @@
-//! Shared driver for library `commonTest` suites: discover a library's own
-//! upstream common test tree, build and install its pack (plus deps), and run
-//! every `@Test`-bearing file through a child `klio test` against the pack.
-//!
-//! A file without `@Test` is a shared fixture, compiled into every test file's
-//! module; `extra_support` files (klio-authored platform actuals) are added the
-//! same way. Pass counting is per-`PASSED`-line so a file killed mid-run still
-//! contributes the cases it printed before the kill. The suite ratchets on the
-//! total pass count; raise the baseline as fixes land, never lower it.
-//! `max_failed`/`max_incomplete` bound the other direction — a floor alone
-//! cannot see a regression inside the red mass.
+//! Shared driver for library `commonTest` suites: discover a library's upstream
+//! common test tree, build and install its pack (plus deps), and run every
+//! `@Test`-bearing file through a child `klio test` against the pack. A file
+//! without `@Test` is a shared fixture compiled into every test file's module,
+//! and passes are counted per `PASSED` line so a killed file still counts.
 
 const std = @import("std");
 const runtime = @import("runtime");
@@ -16,60 +10,38 @@ const runtime = @import("runtime");
 pub const Pack = struct { dir: []const u8, artifact: []const u8 };
 
 pub const Config = struct {
-    /// Short label for log lines (e.g. "atomicfu").
     name: []const u8,
-    /// One or more common test directories to discover recursively.
+    /// Common test directories, discovered recursively.
     test_roots: []const []const u8,
-    /// Per-suite scratch HOME the child packs install into.
     scratch_home: []const u8,
-    /// Packs to build+install, in dependency order (deps before dependents).
+    /// Packs to build and install, dependencies first.
     packs: []const Pack,
-    /// Minimum total passing cases. A ratchet floor; raise as fixes land.
+    /// Ratchet floor on total passing cases: raise as fixes land, never lower.
     baseline: usize,
-    /// klio-authored actual/fixture files added to every test file's module.
+    /// klio-authored actuals added to every test file's module.
     extra_support: []const []const u8 = &.{},
-    /// Per-file child timeout.
     timeout_ms: i64 = 60_000,
-    /// Once a suite reaches full coverage, set true to also fail on any
-    /// non-passing case (a hard 100% gate on top of the ratchet).
     require_no_failures: bool = false,
-    /// Ceiling on failing cases. A pass-count floor alone cannot see a
-    /// regression INSIDE the red mass — a suite can trade a fixed test for
-    /// a broken one, or grow new failures, and still clear its floor. Seed
-    /// from the measured solo census and lower it as fixes land, never
-    /// raise it. Null leaves the suite floor-only (state why).
+    /// Ceiling on failing cases, the mirror of the floor: a suite can trade a
+    /// fixed test for a broken one and still clear it. Lower only.
     max_failed: ?usize = null,
-    /// Compile the WHOLE test source set into every child and run only the
-    /// target file's `@Test` methods (`--only-file`). Upstream commonTest is
-    /// one compilation unit, so a helper declared top-level in one
-    /// `@Test`-bearing file is visible from another (`checkComponents` in
-    /// kotlinx-datetime's LocalDateTimeTest.kt, used by InstantTest.kt); the
-    /// default one-target-per-child model cannot see it. Costs compile time
-    /// per child, so it is opted into per suite.
+    /// Compile the whole source set into every child, running only the target
+    /// file's `@Test` methods: upstream commonTest is one compilation unit, so a
+    /// top-level helper in one `@Test`-bearing file is visible from another.
     whole_source_set: bool = false,
-    /// Ceiling on cases that never reported (timeout / crash). These are
-    /// invisible to both the floor and `max_failed`, so they get their own
-    /// bound: a suite whose children start hanging is regressing even when
-    /// the surviving cases still pass.
+    /// Ceiling on cases that never reported, which the floor and `max_failed`
+    /// both miss.
     max_incomplete: ?usize = null,
-    /// Files whose children are emitted ONE PER `@Test` (matched by path
-    /// suffix): a file with two 100s compute tests otherwise serializes the
-    /// suite wall behind one child. The split child compiles the same
-    /// closure and runs `--filter=Class.test`, so counting is unchanged.
+    /// Files, matched by path suffix, emitted one child per `@Test`. The split
+    /// child compiles the same closure, so counting is unchanged.
     split_files: []const []const u8 = &.{},
-    /// One child per MODULE directory (the path up to `/src/commonTest`),
-    /// running every file of that directory in one process. For a suite
-    /// whose per-child cost is loading large packs (the compose ui modules:
-    /// ~23 s per child against sub-second tests), this trades 42 pack loads
-    /// for six. Pure unit-test modules only: classes must not share state
-    /// across files.
+    /// One child per module directory (the path up to `/src/commonTest`). Pure
+    /// unit-test modules only: classes must not share state across files.
     batch_dirs: bool = false,
-    /// Extra environment for every child of this suite (name/value pairs):
-    /// a measured compute-heavy test declares its per-test wall budget
-    /// through `KLIO_TEST_WALL_CAP_FOR` here rather than tripping the
-    /// hang detector's default window.
+    /// Extra environment for every child. A compute-heavy test declares its
+    /// per-test wall budget through `KLIO_TEST_WALL_CAP_FOR` here.
     extra_env: []const [2][]const u8 = &.{},
-    /// Extra `klio test` arguments every child gets (`--feature …`).
+    /// Extra `klio test` arguments for every child (`--feature …`).
     extra_args: []const []const u8 = &.{},
 };
 
@@ -77,11 +49,7 @@ fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
 }
 
-/// Every child deadline here (per-child timeout, pack build caps, the
-/// runner's per-test wall caps) is tuned on the ReleaseSafe harness. A Debug
-/// harness interprets several times slower, so the same deadlines cut off
-/// healthy children; scale them by this factor when the itest binary is the
-/// Debug build.
+/// Child deadlines are tuned on ReleaseSafe; a Debug harness scales them by this.
 const debug_harness_slowdown: i64 = 4;
 
 pub fn harnessSlowdown(env: *const std.process.Environ.Map) i64 {
@@ -134,9 +102,8 @@ fn envWithHome(allocator: std.mem.Allocator, home: []const u8) !std.process.Envi
 }
 
 fn workerCount() usize {
-    // KLIO_ITEST_JOBS overrides (the compose gate honors the same env);
-    // the default clamp keeps a full-stack run from oversubscribing when
-    // every suite spawns its own pool.
+    // KLIO_ITEST_JOBS overrides the width; the clamp keeps a full-stack run
+    // from oversubscribing when every suite spawns its own pool.
     if (std.c.getenv("KLIO_ITEST_JOBS")) |v| {
         if (std.fmt.parseInt(usize, std.mem.span(v), 10) catch null) |n| {
             if (n >= 1) return @min(n, 64);
@@ -207,14 +174,12 @@ fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
-/// What one test source contributes to, and needs from, its compilation unit:
-/// the package it declares, the names it declares at TOP level (column zero,
-/// so a nested or member declaration never provides for another file), and
-/// every identifier it mentions.
+/// What one test source contributes to, and needs from, its compilation unit.
+/// Declarations count only at column zero, so a member never provides for
+/// another file.
 const DeclScan = struct {
     package: []const u8,
-    /// Every package whose top-level declarations this file resolves an
-    /// unqualified name against: its own, plus each import's package.
+    /// Packages this file resolves unqualified names against.
     scopes: []const []const u8,
     declares: []const []const u8,
     words: []const []const u8,
@@ -245,7 +210,6 @@ fn isDeclModifier(w: []const u8) bool {
 }
 
 /// The name a top-level declaration binds, given the text after its keyword.
-/// Skips a `fun`'s type parameters and extension receiver so
 /// `inline fun<T: Flow<Int>> CoroutineScope.helper(...)` yields `helper`.
 fn declaredName(tail: []const u8, is_fun: bool) ?[]const u8 {
     var i: usize = 0;
@@ -267,7 +231,6 @@ fn declaredName(tail: []const u8, is_fun: bool) ?[]const u8 {
     }
     if (i >= tail.len or !(std.ascii.isAlphabetic(tail[i]) or tail[i] == '_')) return null;
     if (!is_fun) return wordAt(tail, i);
-    // Walk the receiver/name path to the identifier the call site uses.
     var name = wordAt(tail, i);
     var k = i + name.len;
     while (k < tail.len) {
@@ -299,7 +262,7 @@ fn declaredName(tail: []const u8, is_fun: bool) ?[]const u8 {
     return name;
 }
 
-/// The first `class X` name in the file (the test class for --filter).
+/// The first `class X` name in the file, the test class for `--filter`.
 fn classNameOf(src: []const u8) ?[]const u8 {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, src, i, "class ")) |p| {
@@ -312,14 +275,13 @@ fn classNameOf(src: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Every `fun NAME` following an `@Test` annotation (the split-file child
-/// list). Modifier lines between the annotation and the fn are tolerated.
+/// Every `fun NAME` following an `@Test`, tolerating modifier lines between.
 fn collectTestFns(a: std.mem.Allocator, src: []const u8, out: *std.ArrayList([]const u8)) !void {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, src, i, "@Test")) |p| {
         i = p + 5;
         const fnp = std.mem.indexOfPos(u8, src, i, "fun ") orelse return;
-        // The fn must belong to this annotation: no further @Test between.
+        // The fn belongs to this annotation only if no further @Test precedes it.
         if (std.mem.indexOfPos(u8, src, i, "@Test")) |nxt| {
             if (nxt < fnp) continue;
         }
@@ -353,8 +315,6 @@ fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
         const w = wordAt(src, i);
         try words.append(a, w);
         if (line_start and (i == 0 or src[i - 1] == '\n')) {
-            // A declaration at column zero: skip its modifiers, then read
-            // the bound name.
             if (std.mem.eql(u8, w, "package")) {
                 var p = i + w.len;
                 while (p < src.len and (src[p] == ' ' or src[p] == '\t')) p += 1;
@@ -367,8 +327,7 @@ fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
                 var e = p;
                 while (e < src.len and (isIdentByte(src[e]) or src[e] == '.' or src[e] == '*')) e += 1;
                 const path = src[p..e];
-                // `import a.b.*` scopes package `a.b`; `import a.b.Name`
-                // scopes `a.b` too — the leaf is the declaration.
+                // `import a.b.*` and `import a.b.Name` both scope package `a.b`.
                 if (std.mem.lastIndexOfScalar(u8, path, '.')) |dot| {
                     try scopes.append(a, path[0..dot]);
                 }
@@ -394,12 +353,9 @@ fn scanDecls(a: std.mem.Allocator, src: []const u8) !DeclScan {
     return .{ .package = package, .scopes = scopes.items, .declares = declares.items, .words = words.items };
 }
 
-/// Test files that `target` must be compiled with because it names something
-/// they declare at top level in its own package, transitively. Upstream
-/// commonTest is one compilation unit, so a `@Test`-bearing file may extend a
-/// base class or call a helper declared in ANOTHER `@Test`-bearing file
-/// (`FlattenConcatTest : FlatMapBaseTest()`); compiled alone it resolves the
-/// name against whatever else matches and loses the inherited cases outright.
+/// Test files `target` must compile with, transitively, because it names
+/// something they declare at top level in its own package. Compiled alone it
+/// silently loses the inherited cases.
 fn providerClosure(
     a: std.mem.Allocator,
     scans: []const DeclScan,
@@ -434,8 +390,7 @@ fn providerClosure(
     return out.items;
 }
 
-/// Count per-test `PASSED` lines (`<Class>.<method> PASSED`). Robust to a file
-/// killed mid-run: passes printed before the kill still count.
+/// Count per-test `PASSED` lines (`<Class>.<method> PASSED`).
 fn passedLineCount(stdout: []const u8) usize {
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, stdout, '\n');
@@ -445,8 +400,7 @@ fn passedLineCount(stdout: []const u8) usize {
     return n;
 }
 
-/// Sum the `N failed` counts from every `M tests, ... N failed, ...` summary
-/// line the run printed.
+/// Sum the `N failed` counts from every `M tests, ... N failed, ...` line.
 fn failedCount(stdout: []const u8) usize {
     var n: usize = 0;
     var it = std.mem.splitScalar(u8, stdout, '\n');
@@ -462,13 +416,8 @@ fn failedCount(stdout: []const u8) usize {
 
 var arena_inst = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-/// Run one library's commonTest suite and assert the pass-count ratchet.
-
-/// The suite registry: ONE source of truth for every commontest census
-/// config, consumed by the itest gates (CI authority) AND the link-free
-/// `klio-census` driver (`zig build klio-census`; iteration path per
-/// plans/verification-latency-campaign.md (git history) Task 2). Floors/ceilings are
-/// the ratchets — tighten only.
+/// The suite registry, shared by the itest gates and the `klio-census` driver.
+/// Floors and ceilings are ratchets: tighten only.
 pub const suites = [_]Config{
     .{
         .name = "coroutines",
@@ -485,14 +434,9 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-kotlinx-coroutines/upstream/test-utils/common/src/MainDispatcherTestBase.kt",
             "kotlin-klio/klio-kotlinx-coroutines/klioTestUtils/kotlinx/coroutines/testing/TestBase.kt",
         },
-        // The hot children (SharedFlowTest 37s, BufferedChannelTest 34s
-        // solo) legitimately cross the 60s default child cap under the
-        // stack's shared-domain load — BufferedChannelTest (11 cases)
-        // DNC'd twice at exactly that line. The cap is a hang guard,
-        // not a wall ratchet; 150s keeps it one.
+        // The hot children cross the 60s default under load; the cap is a hang
+        // guard, not a wall ratchet.
         .timeout_ms = 150_000,
-        // 1295 (2026-09-01): solo 1299; the 10-case margin covered the
-        // pre-L3-split load DNCs, the isolated structure runs 1299/0/0.
         .baseline = 1299,
         .max_failed = 0,
         .max_incomplete = 1,
@@ -511,13 +455,8 @@ pub const suites = [_]Config{
         },
         .whole_source_set = true,
         .timeout_ms = 1_000_000,
-        // LocalDateTest.fromEpochDays/toEpochDays are compute-bound (190s /
-        // 114s alone on the ReleaseSafe harness): give them their own
-        // per-test wall caps so a slower runner does not count them failed.
+        // These two are compute-bound and run for minutes.
         .extra_env = &.{.{ "KLIO_TEST_WALL_CAP_FOR", "LocalDateTest.fromEpochDays=900,LocalDateTest.toEpochDays=600" }},
-        // fromEpochDays (100s) + toEpochDays (56s) are dispatch-heavy
-        // compute (JIT-neutral, measured); split so they parallelize
-        // instead of walling the suite behind one 168s child.
         .split_files = &.{"common/test/LocalDateTest.kt"},
         .baseline = 519,
         .max_failed = 0,
@@ -537,9 +476,6 @@ pub const suites = [_]Config{
         .max_incomplete = 0,
     },
     .{
-        // Upstream kotlinx-serialization's JSON suite against the real
-        // upstream json module + klio's generated serializers. First
-        // count 2026-09-02: see plans/serialization-surface-campaign.md (git history).
         .name = "serialization_json",
         .test_roots = &.{"kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-tests/commonTest/src"},
         .scratch_home = "/tmp/klio_itest_serialization_json_home",
@@ -555,20 +491,10 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-kotlinx-serialization/upstream/formats/json-okio/commonMain/src/kotlinx/serialization/json/okio/internal/OkioJsonStreams.kt",
         },
         .extra_args = &.{ "--feature", "kotlinx.serialization/json" },
-        // Two files are compute-heavy (10,000 nested nodes round-tripped
-        // four ways; 10,000 random strings of up to 2047 chars escaped and
-        // restored): split so each test is its own child and the files'
-        // fast tests count regardless.
+        // Two compute-heavy files; splitting keeps their fast tests counted.
         .split_files = &.{ "json/JsonHugeDataSerializationTest.kt", "json/JsonUnicodeTest.kt" },
         .extra_env = &.{.{ "KLIO_TEST_WALL_CAP_FOR", "JsonUnicodeTest.testRandomEscapeSequences=900,JsonHugeDataSerializationTest.test=900" }},
-        // The two heavy children (10,000 random escaped strings; 10,000
-        // nested nodes round-tripped four ways) are interpreter-bound
-        // compute measured at ~3-5 min solo; they run first, in parallel
-        // with the rest, so the wider cap does not wall the suite.
         .timeout_ms = 1_000_000,
-        // 2026-09-04 census: 747 passed, 0 failed, 0 did not complete (the
-        // split children each count the support file's ContextualTest).
-        // Standing at zero: any failure or incomplete child fails the gate.
         .baseline = 747,
         .max_failed = 0,
         .max_incomplete = 0,
@@ -610,12 +536,8 @@ pub const suites = [_]Config{
             "kotlin-klio/klio-ktor/upstream/ktor-http/common/test",
         },
         .scratch_home = "/tmp/klio_itest_ktor_home",
-        // The commonTest surface is ktor-io / ktor-utils / ktor-http; pin
-        // the http feature (which pulls utils -> io) so the load does not
-        // also activate the content-negotiation / serialization features,
-        // whose sources need the kotlinx.serialization pack this home does
-        // not carry. The typed serialization surface is covered by the
-        // ktor_client_get / ktor_server e2e gates.
+        // Pinning http (which pulls utils and io) keeps the load from
+        // activating serialization, whose sources need a pack this home lacks.
         .extra_args = &.{ "--feature", "io.ktor/http", "--feature", "io.ktor/test-base" },
         .packs = &.{
             .{ .dir = "kotlin-klio/klio-kotlin-test", .artifact = "target/packs/kotlin.test.klio-pack" },
@@ -624,20 +546,13 @@ pub const suites = [_]Config{
             .{ .dir = "kotlin-klio/klio-kotlinx-coroutines", .artifact = "target/packs/kotlinx.coroutines.klio-pack" },
             .{ .dir = "kotlin-klio/klio-ktor", .artifact = "target/packs/io.ktor.klio-pack" },
         },
-        // The WriterReaderTest.testWriterOnCancelled flake was an upstream
-        // ByteChannel race (awaitContent swallowing a close cause that
-        // landed between its entry rethrow and the sleep condition), fixed
-        // in the curated shim copy of ByteChannel.kt.
         .baseline = 450,
         .max_failed = 0,
         .max_incomplete = 2,
     },
     .{
-        // The compose ui modules' upstream conformance suites (commonTest of
-        // ui-util / ui-geometry / ui-unit / ui-graphics / ui-text / ui) run
-        // against the installed ui packs. Kruth's assertion surface is a
-        // klio-authored stand-in under tests/compose_ui_commontest_actuals.
-        // First count 2026-09-02: see plans/compose-ui-census-campaign.md (git history).
+        // Kruth's assertion surface is a klio-authored stand-in under
+        // tests/compose_ui_commontest_actuals.
         .name = "compose_ui",
         .test_roots = &.{
             "kotlin-klio/klio-compose-runtime/upstream/compose/ui/ui-util/src/commonTest/kotlin",
@@ -665,15 +580,9 @@ pub const suites = [_]Config{
             "tests/compose_ui_commontest_actuals/androidx/kruth/Kruth.kt",
         },
         .batch_dirs = true,
-        // One child per ui module (batch_dirs): each compiles its module's
-        // whole commonTest set once (~115s on 4 local cores, longer on a
-        // CI runner), so the cap leaves room for a slower machine.
+        // Each child compiles its module's whole commonTest set once (~115s on
+        // four cores), so the cap leaves room for a slower machine.
         .timeout_ms = 600_000,
-        // 2026-09-03 census: 451 / 452 (1 failed, 0 did not complete). The
-        // lone failure is ShadowTest.testLerp — a pack-image overload
-        // resolution that picks the same-package Color `lerp` for a Float
-        // argument; it does not reproduce from source. Floor holds the
-        // observed pass count.
         .baseline = 452,
         .max_failed = 0,
         .max_incomplete = 0,
@@ -741,8 +650,7 @@ pub fn runSuite(cfg: Config) !void {
     }
 
     var jobs: std.ArrayList([]const []const u8) = .empty;
-    // Split-file children carry the longest tests — the suite wall — so they
-    // go to the FRONT of the queue and start with the first free workers.
+    // Split-file children carry the longest tests, so they head the queue.
     var split_jobs: std.ArrayList([]const []const u8) = .empty;
     if (cfg.batch_dirs) {
         var group_index = std.StringHashMap(usize).init(a);
@@ -823,8 +731,8 @@ pub fn runSuite(cfg: Config) !void {
         } else {
             const bases = try providerClosure(a, scans.items, &owner, ti);
             if (bases.len != 0) {
-                // The provider files carry their own cases; `--only-file`
-                // keeps them compiled but unrun so each case counts once.
+                // `--only-file` keeps providers compiled but unrun, so each
+                // case counts once.
                 try argv.append(a, "--only-file");
                 try argv.append(a, target);
             }
@@ -870,12 +778,8 @@ pub fn runSuite(cfg: Config) !void {
                     std.debug.print("[census-hung] {s} <- {s}\n", .{ @errorName(e), queue[i][queue[i].len - 1] });
                     continue;
                 };
-                // Latency census: per-child wall, argv size, and pass count —
-                // the budget table's raw rows (KLIO_CENSUS_TIMES=1).
                 if (std.c.getenv("KLIO_CENSUS_TIMES") != null) {
-                    // The child's TARGET: the value after --only-file when
-                    // present (whole_source_set argv ends with the whole
-                    // list), else the last argument.
+                    // The target follows `--only-file`, else it is the last arg.
                     var tgt: []const u8 = queue[i][queue[i].len - 1];
                     for (queue[i], 0..) |arg2, qi| {
                         if (std.mem.eql(u8, arg2, "--only-file") and qi + 1 < queue[i].len) {
@@ -893,10 +797,8 @@ pub fn runSuite(cfg: Config) !void {
                 _ = ppassed.fetchAdd(passedLineCount(r.stdout), .monotonic);
                 const nf = failedCount(r.stdout);
                 _ = pfailed.fetchAdd(nf, .monotonic);
-                // Census diagnosis: name every failing case (and its file) so
-                // a red census is actionable without a by-hand re-run.
-                // Always name the failing cases: a red census on CI has no
-                // other way to say which test drifted.
+                // Name every failing case: a red census has no other way to say
+                // what drifted.
                 if (nf != 0) {
                     const want_err = std.c.getenv("KLIO_CENSUS_ERRS") != null;
                     var itn = std.mem.splitScalar(u8, r.stdout, '\n');
@@ -914,8 +816,6 @@ pub fn runSuite(cfg: Config) !void {
                 }
                 if (std.mem.indexOf(u8, r.stdout, " passed,") == null) {
                     _ = phung.fetchAdd(1, .monotonic);
-                    // A child that produced no summary crashed or was cut
-                    // off: name it, with the tail of what it said.
                     const tail_from = if (r.stderr.len > 400) r.stderr.len - 400 else 0;
                     std.debug.print("[census-nosummary] <- {s}\n{s}\n", .{ queue[i][queue[i].len - 1], r.stderr[tail_from..] });
                 }
@@ -998,9 +898,7 @@ test "top-level declarations provide for other files in the same package" {
     try std.testing.expectEqualStrings("kotlinx.coroutines.flow", s_base.package);
     try std.testing.expectEqual(@as(usize, 2), s_base.declares.len);
     try std.testing.expectEqualStrings("FlatMapBaseTest", s_base.declares[0]);
-    // A `fun`'s type parameters and extension receiver are not its name.
     try std.testing.expectEqualStrings("helper", s_base.declares[1]);
-    // An indented member declaration provides for nobody.
     try std.testing.expectEqual(@as(usize, 1), s_sub.declares.len);
     try std.testing.expectEqualStrings("FlattenConcatTest", s_sub.declares[0]);
 
@@ -1015,16 +913,11 @@ test "top-level declarations provide for other files in the same package" {
         }
     }
 
-    // The subclass pulls in the file declaring its base and its helper; the
-    // same-named class in another package is not a provider.
     const need = try providerClosure(aa, &scans, &owner, 1);
     try std.testing.expectEqual(@as(usize, 1), need.len);
     try std.testing.expectEqual(@as(usize, 0), need[0]);
-    // A file that needs nothing pulls in nothing.
     try std.testing.expectEqual(@as(usize, 0), (try providerClosure(aa, &scans, &owner, 2)).len);
 
-    // An IMPORTED package is a provider scope too: a helper declared in
-    // `kotlinx.coroutines.channels` reaches a file that wildcard-imports it.
     const importer =
         \\package kotlinx.coroutines.flow
         \\

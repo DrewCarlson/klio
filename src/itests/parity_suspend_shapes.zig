@@ -4,20 +4,13 @@ const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_suspend_shapes";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// One file-scoped arena: the pipeline installs process-global state backed by
+// the run's allocator, which a per-test arena would tear down under it.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
-/// Write `src` to a unique temp `.kt` path under this file's temp dir and run
-/// it through the klio pipeline, asserting stdout equals `expected`.
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
+    // Reclaim the previous program; the globals live on the page allocator.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -57,9 +50,8 @@ test "suspend_chain_of_calls" {
 }
 
 test "suspend_main_drives_real_delay" {
-    // A `suspend fun main` runs under an implicit driver (kotlinc wraps it in
-    // `runSuspend`), so a real suspension like `delay` parks and resumes
-    // rather than escaping as "coroutine suspended outside a driver".
+    // kotlinc wraps `suspend fun main` in `runSuspend`, so `delay` has a
+    // driver to park under.
     const src =
         \\
         \\import kotlinx.coroutines.delay
@@ -185,13 +177,9 @@ test "coroutine_returns_through_run_blocking" {
     try assertKlio("rb_returns", src, "300\n");
 }
 
-// A `suspend` method of a *local class* (lowered into its own per-method
-// sub-module) parks at a `delay` and resumes correctly. The frame
-// snapshot records which module the method was lowered into, so resume
-// resolves its `FuncId` against that sub-module rather than the main
-// module (where the same index is a different function — which fed the
-// resumed value back garbage). Nested-`private`-class methods (ktor's
-// `HttpSend.DefaultSender`) take the same per-method sub-module path.
+// A local class's `suspend` method is lowered into its own sub-module, so the
+// frame snapshot carries that module: the same `FuncId` index names a
+// different function in the main module.
 test "local_class_suspend_method_resumes_in_its_module" {
     const src =
         \\
@@ -227,16 +215,9 @@ test "local class retains transitive interfaces" {
     try assertKlio("local_class_transitive_interfaces", src, "true\ntrue\n");
 }
 
-// A deprecated overload that delegates to the general one via an
-// explicit cast — kotlinx.coroutines' `async(context: Job, …) =
-// async(context as CoroutineContext, …)` — must reach the general
-// `async(CoroutineContext)` overload, not re-select the `Job` overload
-// (the runtime value is still a `Job`) and recurse forever. Here the
-// receiver-lambda `ic.invoke(next, r)` calls a suspend method whose body
-// is `async(coroutineContext + Job()) { … }.await()` inside a
-// `coroutineScope` (the lexical `CoroutineScope` receiver `async`
-// requires — kotlinc rejects a bare `async` in a plain suspend method),
-// exercising the delegation through the real coroutines library.
+// An overload delegating through an explicit cast dispatches on the cast
+// type: `async(Job)` calls `async(CoroutineContext)`, and re-selecting on the
+// still-`Job` runtime value recurses forever.
 test "async_job_overload_delegates_without_recursing" {
     const src =
         \\
@@ -261,13 +242,8 @@ test "async_job_overload_delegates_without_recursing" {
     try assertKlio("async_job_overload_delegates", src, "R1[E(x)]\n");
 }
 
-// A bare name inside a `CoroutineScope`-receiver block must resolve to
-// the enclosing class's own property, not to a same-named member that a
-// *different* library file imported. kotlinx.coroutines' BufferedChannel
-// does `import …ChannelResult.Companion.closed`; a global import table
-// leaked that `closed` into every file, so a user `val closed` read in
-// an `async { … }` block was rewritten to the `ChannelResult` companion
-// access and mis-dispatched. Named imports are file-scoped.
+// Named imports are file-scoped, so a library file importing
+// `ChannelResult.Companion.closed` cannot capture a user's `val closed`.
 test "user_property_not_shadowed_by_other_files_named_import" {
     const src =
         \\
@@ -290,14 +266,9 @@ test "user_property_not_shadowed_by_other_files_named_import" {
     try assertKlio("user_prop_not_shadowed", src, "closed=false\n");
 }
 
-// A bare `coroutineContext` inside a member/extension of a
-// `CoroutineScope` is that receiver's own property — a member of the
-// implicit receiver shadows the top-level suspend `coroutineContext`
-// intrinsic. ktor's `HttpClientEngine.closed` reads
-// `coroutineContext[Job]?.isActive` on the engine's own supervisor; if
-// it instead saw the ambient runBlocking context the engine would look
-// permanently closed. A bare intrinsic in a plain suspend fn (no such
-// receiver, e.g. `yield()`) still resolves to the running context.
+// A member of the implicit receiver shadows the same-named top-level
+// intrinsic, so bare `coroutineContext` here is the receiver's own property,
+// not the ambient context. With no such receiver the intrinsic still wins.
 test "bare_coroutine_context_in_scope_member_is_own_property" {
     const src =
         \\
@@ -326,16 +297,9 @@ test "bare_coroutine_context_in_scope_member_is_own_property" {
     try assertKlio("bare_cc_scope_member", src, "EXEC(req)\n");
 }
 
-// The enclosing-`this` (implicit receiver) chain must survive a coroutine
-// park. A `suspend` member-extension declared inside `Owner` has the `Helper`
-// receiver as its own `this`; a bare `owned()` inside its body resolves to the
-// enclosing `this@Owner`, reachable only through the implicit-receiver chain
-// (it is neither the body's `this` param nor a closed-over capture). The body
-// parks at `delay` and references `owned()` strictly *after* resume, so the
-// chain must travel with the parked continuation and be restored on resume —
-// not recovered from whatever process-global receiver state the resuming
-// driver iteration happens to hold. Without the frame-carried chain this
-// reports `unresolved global 'owned'` after the park.
+// The implicit-receiver chain travels with a parked continuation: `owned()`
+// reaches `this@Owner` only through that chain, being neither the body's
+// `this` param nor a capture, and it runs after the park.
 test "enclosing_this_chain_survives_suspend" {
     const src =
         \\
@@ -367,10 +331,8 @@ test "enclosing_this_chain_survives_suspend" {
     );
 }
 
-// A bare `Inner()` constructed strictly *after* a `delay` park inside a
-// suspend member of the enclosing class must capture the right outer for
-// each interleaved coroutine: the frame's `this` param is snapshotted with
-// the continuation, and outer selection reads it on resume.
+// Outer selection for an `Inner()` built after a park reads the frame's
+// `this` param, which the continuation snapshots per coroutine.
 test "inner_class_constructed_after_park" {
     const src =
         \\
@@ -396,10 +358,8 @@ test "inner_class_constructed_after_park" {
     try assertKlio("inner_after_park", src, "outer=A\nouter=B\nouter=seq\n");
 }
 
-// The receiver-lambda variant: after the park, `with(h) { Inner() }` runs
-// in a lambda whose innermost receiver is the unrelated Helper. Outer
-// selection must key on Inner's enclosing class through the restored
-// implicit-receiver chain, while `hid` still resolves on the with-subject.
+// With an unrelated innermost receiver, outer selection keys on Inner's
+// enclosing class while `hid` still resolves on the with-subject.
 test "inner_class_in_receiver_lambda_after_park" {
     const src =
         \\
@@ -425,12 +385,8 @@ test "inner_class_in_receiver_lambda_after_park" {
     try assertKlio("inner_with_after_park", src, "outer=A+x\nouter=B+y\n");
 }
 
-// A member of Inner constructing a sibling `Inner()` strictly after a park:
-// the outer must come through the dispatch receiver's own outer link for
-// each interleaved coroutine, even when one coroutine's restored chain
-// carries an unrelated `with(w)` subject of the same Outer class from its
-// caller. The frame's `this` param travels with the continuation; the
-// `with(w)` receiver in `drive` is not in scope inside `sibling()`.
+// A sibling `Inner()` takes its outer from the dispatch receiver's own outer
+// link; the caller's `with(w)` subject is not in scope inside `sibling()`.
 test "sibling_inner_constructed_after_park" {
     const src =
         \\
@@ -460,13 +416,9 @@ test "sibling_inner_constructed_after_park" {
     try assertKlio("inner_sibling_after_park", src, "outer=A\nouter=B\n");
 }
 
-// A `suspend Receiver.() -> Unit` value invoked with a bound receiver
-// (`b.block()`, where `block` is a fun-typed parameter) must park at a
-// `delay` inside its body and resume. The receiver-bound value-call runs
-// on the main evaluator path so the suspension snapshots frames up the
-// call chain instead of being flattened to a "suspended outside a driver"
-// runtime error. A bare `n` inside the body resolves to the bound `Bar`
-// receiver both before and after the park.
+// A `suspend Receiver.() -> Unit` parameter called as `b.block()` runs on the
+// main evaluator path, so a `delay` in its body snapshots the whole call
+// chain rather than reporting a suspension with no driver.
 test "receiver_bound_suspend_value_call_parks" {
     const src =
         \\
@@ -535,9 +487,6 @@ test "suspension survives host-backed inline lambda forwarding" {
     );
 }
 
-// The same shape parking multiple times across one body: the continuation
-// re-enters the closure body at each suspension point and threads the bound
-// receiver `this` through every resume.
 test "receiver_bound_suspend_value_call_multi_park" {
     const src =
         \\
@@ -560,9 +509,6 @@ test "receiver_bound_suspend_value_call_multi_park" {
     try assertKlio("receiver_bound_suspend_value_call_multi", src, "a7|b7|c7\n");
 }
 
-// Two receiver-bound suspend value-calls interleave under `async`: each
-// parks and resumes against its OWN bound receiver, and the awaited results
-// preserve per-coroutine receiver identity across the parks.
 test "receiver_bound_suspend_value_call_interleaved_async" {
     const src =
         \\
@@ -597,12 +543,8 @@ test "receiver_bound_suspend_value_call_interleaved_async" {
 }
 
 test "manual_continuation_slot_park_and_resume" {
-    // The ByteChannel Slot wakeup protocol in miniature: a reader parks
-    // through `suspendCancellableCoroutine` storing its continuation in
-    // a slot, and a sibling coroutine's send/close resumes it by hand —
-    // including the in-block immediate-resume race check and the
-    // data-already-present no-park path. kotlinc+kotlinx-coroutines
-    // byte-parity.
+    // The ByteChannel slot wakeup protocol in miniature, including the
+    // in-block immediate-resume race and the no-park path.
     const src =
         \\
         \\import kotlinx.coroutines.*

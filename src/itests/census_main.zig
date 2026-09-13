@@ -1,15 +1,9 @@
-//! `klio-census` — the link-free census driver
-//! (plans/verification-latency-campaign.md (git history) Task 2). Runs any commontest
-//! suite from the SHARED registry (`commontest_support.suites`) against the
-//! installed `zig-out/bin/klio-harness`, so iterating on the interpreter
-//! costs one harness rebuild instead of a whole-program itest link per
-//! suite. The itest gates remain the CI authority; both consume the same
-//! configs, floors, and ceilings, so this can never drift green.
+//! Runs commontest suites from the shared registry (`commontest_support.suites`)
+//! against the installed `zig-out/bin/klio-harness`, on the same floors and
+//! ceilings as the itest gates.
 //!
-//! Usage: klio-census <suite>[,<suite>...] | all
-//! Env: KLIO_ITEST_BIN overrides the child binary (default
-//! zig-out/bin/klio-harness); KLIO_ITEST_JOBS the per-suite worker count;
-//! KLIO_CENSUS_NAMES / KLIO_CENSUS_TIMES as in the gates.
+//! Usage: klio-census <suite>[,<suite>...] | all. Env: KLIO_ITEST_BIN (child
+//! binary), KLIO_ITEST_JOBS (workers), KLIO_CENSUS_NAMES, KLIO_CENSUS_TIMES.
 
 const std = @import("std");
 const support = @import("commontest_support.zig");

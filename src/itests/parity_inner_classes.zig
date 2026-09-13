@@ -1,25 +1,17 @@
-//! Inner / nested class scoping: outer-this resolution, qualified
-//! this@Outer, inner-class members capturing outer fields.
+//! Inner and nested class scoping: which instance an inner class captures as
+//! its outer, and how its body reaches outer members.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_parity_inner_classes";
 
-// One arena shared by every test in this file. The pipeline installs
-// process-global tables (inline-fn ASTs, the enclosing-`this` stack, ...)
-// backed by the build allocator; a fresh per-test arena would free that
-// memory out from under the still-live globals and the next run would touch
-// freed pages. A single file-scoped arena keeps them valid across all tests,
-// and stays off the leak-checking test allocator (which would abort on the
-// pipeline's intentional arena lifetime). Mirrors the e2e harness.
+// The pipeline's process-global state points into the run allocator, so one
+// file-scoped arena must outlive every test here.
 var shared_arena: ?std.heap.ArenaAllocator = null;
 
 fn arenaAllocator() std.mem.Allocator {
     if (shared_arena) |*a| {
-        // Reset the per-program arena so each program's allocations are
-        // reclaimed instead of accumulating across this file's tests. Safe:
-        // the cross-program globals are page_allocator-backed, not this arena.
         _ = a.reset(.retain_capacity);
     } else {
         shared_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -251,11 +243,8 @@ test "anon_object_subclass_uses_inherited_helper_in_lambda" {
     try assertKlio("anon_abstract_pipeline", src, "1:4,2:4,3:4\n1:9,2:9,3:9\n");
 }
 
-// A bare `Inner()` inside a receiver lambda must capture this@Outer as its
-// outer, not the lambda's receiver: inside Inner's body, `tag` resolves
-// lexically to the enclosing class instance, and the `with` subject is not
-// in scope there. The outer is selected by the inner class's enclosing
-// class, so the innermost unrelated receiver (`Other`) is never captured.
+// The outer is chosen by the inner class's enclosing class, never by whatever
+// receiver happens to be innermost.
 test "inner_class_constructed_inside_with_lambda" {
     const src =
         \\
@@ -276,8 +265,6 @@ test "inner_class_constructed_inside_with_lambda" {
     try assertKlio("inner_with_lambda", src, "outer-T:other-o\n");
 }
 
-// The same selection inside an HOF lambda: the lambda frame has no `this`
-// param, so the outer comes from the enclosing implicit-receiver chain.
 test "inner_class_constructed_inside_map_lambda" {
     const src =
         \\
@@ -295,10 +282,7 @@ test "inner_class_constructed_inside_map_lambda" {
     try assertKlio("inner_map_lambda", src, "outer-M\n");
 }
 
-// The with-subject declaring a property with the same name as the outer's
-// must NOT shadow it inside Inner's body: `tag` in `show()` resolves
-// lexically to this@Outer, never to the with-subject, in every
-// construction context (with-lambda, map-of-with, with-of-map).
+// A with-subject never shadows the outer's members inside Inner's body.
 test "inner_class_in_with_lambda_ignores_shadowing_subject" {
     const src =
         \\
@@ -322,11 +306,8 @@ test "inner_class_in_with_lambda_ignores_shadowing_subject" {
     try assertKlio("inner_with_shadow", src, "outer-T\nouter-T\nouter-T\n");
 }
 
-// A lambda whose body touches nothing of the enclosing instance except
-// the bare `Inner()` construction itself still depends on this@Outer:
-// the construction forces the `this` capture (as kotlinc's `this$0`
-// does), so the outer binds even through a user-defined HOF whose own
-// frame carries no receiver.
+// The construction alone forces the `this` capture, even when the lambda
+// touches nothing else of the enclosing instance.
 test "inner_class_constructed_inside_user_hof_lambda" {
     const src =
         \\
@@ -345,10 +326,8 @@ test "inner_class_constructed_inside_user_hof_lambda" {
     try assertKlio("inner_user_hof", src, "outer-U\n");
 }
 
-// Two levels of `inner`: C inside B inside A. A bare `C()` in a member of
-// B — directly or inside a `with` over an unrelated A instance — captures
-// the B instance, and C's body reaches both `b` (via outer) and `a` (via
-// outer.outer).
+// Through two levels of `inner`, the innermost body reaches its grandparent
+// through outer.outer.
 test "inner_class_two_level_nesting" {
     const src =
         \\
@@ -372,9 +351,8 @@ test "inner_class_two_level_nesting" {
     try assertKlio("inner_two_level", src, "a1/b1\na1/b1\n");
 }
 
-// An Inner constructed inside a lambda and *escaping* the enclosing
-// member must still carry its outer link: resolution outside the member
-// has no enclosing-receiver chain to rescue an unstamped instance.
+// An escaping Inner carries its outer link: outside the member there is no
+// receiver chain to rescue an unstamped instance.
 test "inner_class_escapes_lambda_with_outer" {
     const src =
         \\
@@ -393,13 +371,8 @@ test "inner_class_escapes_lambda_with_outer" {
     try assertKlio("inner_escape_lambda", src, "outer-E\n");
 }
 
-// A member of Inner constructing a sibling `Inner()` means
-// `this@Outer.Inner()`: the outer comes through the dispatch receiver's own
-// outer link, never through an unrelated receiver inherited from a caller
-// frame. The `with(w)` subject in main is not a receiver in scope inside
-// `sibling()`'s body, so it must not be captured even though it is the
-// innermost entry on the dynamically-inherited chain. kotlinc-native
-// 2.3.10 prints outer=A for all four lines.
+// A sibling `Inner()` means `this@Outer.Inner()`, taken through the dispatch
+// receiver's own outer link. The caller's `with` subject is not in scope here.
 test "sibling_inner_construction_ignores_caller_receivers" {
     const src =
         \\
@@ -424,12 +397,8 @@ test "sibling_inner_construction_ignores_caller_receivers" {
     try assertKlio("inner_sibling_polluted_chain", src, "outer=A\nouter=A\nouter=A\nouter=A\n");
 }
 
-// Member declaration order is semantically irrelevant: a lambda inside one
-// inner class constructing a sibling inner class declared LATER in the
-// body must capture the enclosing `this` exactly as the earlier-declared
-// order does. Pins the construction-site capture rule against the
-// reserve-stub `is_inner` (a forward-referenced class is only a stub when
-// the lambda lowers).
+// A forward-referenced class is still a reserve stub when the lambda lowers,
+// so the capture must not depend on its `is_inner` flag being filled in.
 test "later_declared_sibling_inner_class_from_lambda" {
     const src =
         \\
@@ -453,10 +422,6 @@ test "later_declared_sibling_inner_class_from_lambda" {
     try assertKlio("inner_sibling_decl_order", src, "outer=T\nouter=T\nouter=U\n");
 }
 
-// A `with` subject of the enclosing class IS the innermost receiver in
-// scope, so it supplies the outer — `with(w) { Inner() }` constructs
-// `w.Inner()` whether written in a member of Outer or of Inner.
-// kotlinc-native 2.3.10 prints outer=W for both.
 test "with_subject_of_enclosing_class_supplies_outer" {
     const src =
         \\
@@ -479,10 +444,6 @@ test "with_subject_of_enclosing_class_supplies_outer" {
     try assertKlio("inner_with_outer_subject", src, "outer=W\nouter=W\n");
 }
 
-// A `with` subject brings only itself into scope, never its own enclosing
-// instances: a subject that is an Inner of a DIFFERENT Outer must not leak
-// that Outer as the new sibling's outer — the construction resolves
-// through the member's own `this@Outer`. kotlinc-native 2.3.10: outer=A.
 test "with_subject_outer_links_not_in_scope" {
     const src =
         \\
@@ -501,10 +462,8 @@ test "with_subject_outer_links_not_in_scope" {
     try assertKlio("inner_with_inner_subject", src, "outer=A\n");
 }
 
-// Inside a member of Inner, `with(x) { Inner() }` over an unrelated
-// subject reaches this@Outer through the dispatch receiver's outer link —
-// the receivers in scope are the subject, this@Inner, and this@Outer.
-// kotlinc-native 2.3.10: outer=A.
+// An unrelated `with` subject offers no outer, so the construction falls to
+// `this@Outer` through the dispatch receiver's link.
 test "with_unrelated_subject_in_inner_member_reaches_outer" {
     const src =
         \\

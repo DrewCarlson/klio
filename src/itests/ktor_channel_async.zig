@@ -1,22 +1,10 @@
-//! Async `ByteChannel` gate: a real `klio` child process drives the
-//! upstream ktor-io channel (read side + the async write side with its
-//! `Slot` suspension protocol) through the installed packs (`klio pack
-//! build` + `pack install` into a scratch HOME, then `klio run`).
-//!
-//! Three shapes, each through real upstream `ByteChannel` code:
-//!  - a buffered write → `flushAndClose` → `readRemaining` round trip
-//!    (no suspension; pins the closed-state getters and the
-//!    `CloseToken` companion-extension dispatch);
-//!  - a reader parked on `awaitContent` (`suspendCancellableCoroutine`
-//!    + `Slot.Read`) resumed by a later writer's flush;
-//!  - a writer parked on `flush` (payload past `CHANNEL_MAX_SIZE`,
-//!    `Slot.Write`) resumed by the reader draining the flush buffer.
+//! Async `ByteChannel` gate: a child `klio` process drives upstream ktor-io
+//! channel code, including the `Slot` suspension protocol, against packs
+//! installed into a scratch HOME.
 
 const std = @import("std");
 const runtime = @import("runtime");
 
-/// The `klio` binary to spawn: `KLIO_ITEST_BIN` when set (the build run
-/// step points it at the harness-optimized install), else the Debug install.
 fn klioBin(env: *const std.process.Environ.Map) []const u8 {
     return env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
 }
@@ -49,8 +37,6 @@ fn runKlio(
     return .{ .ok = ok, .stdout = r.stdout, .stderr = r.stderr };
 }
 
-/// Build + install the dependency packs and the ktor pack into a scratch
-/// HOME, once per test-process.
 fn installPacks(allocator: std.mem.Allocator, io: std.Io, env: *std.process.Environ.Map, home: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, home) catch {};
@@ -92,12 +78,8 @@ fn runProgram(name: []const u8, src: []const u8, expected: []const u8) !void {
     return runProgramReclaim(name, src, expected, false);
 }
 
-/// Like `runProgram` but selects the tracing GC reclaim mode with a low
-/// collection threshold (256 KB) so a collection fires repeatedly *during* the
-/// channel I/O. This is the regression gate for coroutine GC-root completeness:
-/// a closure body (a `launch`ed block) or a not-yet-started launched block that
-/// outlives a mid-flight collection must keep its side-table slot and capture
-/// store rooted, or the resumed body reads reclaimed/swept state and crashes.
+/// Tracing GC with a 256 KB threshold, so collections fire throughout the
+/// channel I/O and a launched block must stay rooted across them.
 fn runProgramGc(name: []const u8, src: []const u8, expected: []const u8) !void {
     return runProgramReclaim(name, src, expected, true);
 }
@@ -218,15 +200,8 @@ test "writer parks on flush past CHANNEL_MAX_SIZE and the reader resumes it" {
 }
 
 test "writer parks past CHANNEL_MAX_SIZE survives repeated GC mid-write (reclaim=gc)" {
-    // Same 1 MB+ channel write as above, but under the tracing GC with a 256 KB
-    // collection floor: a collection fires many times *while the writer body
-    // runs and parks*. The writer is a `launch`ed closure whose block lives only
-    // in the pump's drained-launched slice and whose body frame holds a copy of
-    // its captures — neither pins the closure side-table slot, so without the
-    // launched-block keepalive + the frame's `closure_id` root the slot is
-    // reclaimed (its id recycled) and its capture store swept out from under the
-    // resumed body. The pre-fix failure was `BinOp.Less on null` /
-    // `compareTo on KlioBlockingCoroutine` inside the kotlinx-io transfer path.
+    // The parked writer's block lives only in the pump's drained-launched
+    // slice, so the keepalive and the frame's `closure_id` are its only roots.
     try runProgramGc("channel_writer_parks_gc",
         \\import io.ktor.utils.io.*
         \\import kotlinx.coroutines.*

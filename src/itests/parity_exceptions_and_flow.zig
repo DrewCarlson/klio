@@ -1,27 +1,15 @@
-//! Exception handling, finally semantics, multi-catch, rethrow,
-//! try-as-expression, and exception inside lambda capture.
+//! Exception flow: `finally`, multi-catch, rethrow, `try` as an expression.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_exceptions_and_flow";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// One arena for the whole file: process-global lowering/VM state outlives any per-test arena.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
-/// Write `src` to a unique temp `.kt` path, run it through the in-process
-/// klio pipeline, and assert stdout equals `expected`. Uses a per-call arena
-/// over the page allocator so the leak-checking test allocator never drives
-/// the pipeline (which would abort on its intentional arena lifetimes).
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
 

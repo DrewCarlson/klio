@@ -1,12 +1,7 @@
-//! Parity harness: locate / install the reference Kotlin compilers
-//! (`kotlinc` on the JVM by default; Kotlin/Native is also supported) so a
-//! `.kt` file can be compiled and run as a baseline against `klio`.
-//!
-//! We default to the JVM compiler because native compilation per-file is
-//! dominated by LLVM codegen and linking, which makes a corpus sweep take
-//! hours. JVM `kotlinc` compiles each file in ~1s and the produced jar runs
-//! under `java` in ~200ms, keeping the full sweep tractable. The native path
-//! is kept for callers that need a native runtime baseline (e.g. `klio-bench`).
+//! Parity harness: locate or install the reference Kotlin compilers (`kotlinc`
+//! on the JVM by default, Kotlin/Native also supported) so a `.kt` file can be
+//! compiled and run as a baseline against `klio`. JVM `kotlinc` compiles a file
+//! in ~1s, where per-file native codegen and linking take hours over a corpus.
 
 const std = @import("std");
 
@@ -35,16 +30,12 @@ const SourceMap = span.SourceMap;
 const KotlinFile = ast.KotlinFile;
 const HostBindings = stdlib.HostBindings;
 
-/// Harness entry point (`klio-parity <file.kt>`). The orchestrator wires the
-/// real exe; `main.run` is the program logic.
 pub const main = @import("main.zig");
 
-/// Default kotlinc version we target (applies to both JVM and Native).
 pub const TARGET_VERSION: []const u8 = "2.3.21";
 
-/// Diagnostic outcomes for a locate/install/compile attempt. Carried as data
-/// so the caller decides how to surface it. Variants owning heap text document
-/// the owner; `deinit` frees them.
+/// Diagnostic outcomes for a locate/install/compile attempt, carried as data;
+/// `deinit` frees the variants owning heap text.
 pub const ParityError = union(enum) {
     NoKotlinc,
     NoJava,
@@ -82,19 +73,16 @@ pub const ParityError = union(enum) {
     }
 };
 
-/// `Result<PathBuf, ParityError>` carried as data. `ok` is an owned path; the
-/// caller frees it.
+/// `Result<PathBuf, ParityError>` carried as data; `ok` is a caller-owned path.
 pub const PathResult = union(enum) {
     ok: []u8,
     err: ParityError,
 };
 
-/// Which Kotlin compiler distribution to download/locate.
 pub const KotlincKind = enum {
     /// JVM `kotlinc` (`kotlin-compiler-<v>.zip` from JetBrains GitHub).
     Jvm,
-    /// `kotlinc-native` (`kotlin-native-prebuilt-<slug>-<v>.tar.gz` from the
-    /// JetBrains CDN, extracted under `~/.konan/`).
+    /// `kotlinc-native` (`kotlin-native-prebuilt-<slug>-<v>.tar.gz`, under `~/.konan/`).
     Native,
 
     fn binaryName(self: KotlincKind) []const u8 {
@@ -116,15 +104,11 @@ fn javaFilename() []const u8 {
     return "java";
 }
 
-/// Get a throwaway threaded `Io` for the duration of a call that does its own
-/// filesystem work without an externally-threaded `Io`. Mirrors the in-repo
-/// `stdlib_pack.readFile` pattern.
 fn threadedIo(allocator: Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(allocator, .{});
 }
 
-/// Look up one environment variable from the parent process. Reads
-/// `/proc/self/environ`; returns an owned copy of the value or `null`.
+/// One environment variable of the parent, via `/proc/self/environ`; owned.
 fn getEnvVar(allocator: Allocator, io: Io, name: []const u8) Allocator.Error!?[]u8 {
     const data = std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/environ", allocator, .unlimited) catch
         return null;
@@ -140,8 +124,7 @@ fn getEnvVar(allocator: Allocator, io: Io, name: []const u8) Allocator.Error!?[]
     return null;
 }
 
-/// Build an `Environ.Map` from the parent process environment so spawned
-/// children inherit PATH/JAVA_HOME/etc. Caller deinits the map.
+/// An `Environ.Map` of the parent environment, so children inherit PATH and JAVA_HOME.
 fn procEnvMap(allocator: Allocator, io: Io) Allocator.Error!std.process.Environ.Map {
     var map = std.process.Environ.Map.init(allocator);
     errdefer map.deinit();
@@ -174,8 +157,6 @@ fn termOk(term: std.process.Child.Term) bool {
     };
 }
 
-/// The workspace root; resolves to the current directory, since we run from
-/// the workspace directory.
 fn workspaceRoot(allocator: Allocator) Allocator.Error![]u8 {
     return allocator.dupe(u8, ".");
 }
@@ -208,9 +189,7 @@ const NativeSlug = struct {
     ext: []const u8,
 };
 
-/// Kotlin/Native distribution descriptor: (archive os-arch slug, CDN subdir,
-/// archive extension). Returns the unsupported-platform string on no match;
-/// caller owns it.
+/// Kotlin/Native distribution descriptor: os-arch slug, CDN subdir, extension.
 fn nativePlatformSlug(allocator: Allocator) Allocator.Error!union(enum) { ok: NativeSlug, err: []u8 } {
     const builtin = @import("builtin");
     const os = builtin.os.tag;
@@ -236,19 +215,13 @@ fn jvmInstallDir(allocator: Allocator, io: Io, version: []const u8) Allocator.Er
     return std.fs.path.join(allocator, &.{ cache, name });
 }
 
-/// Backwards-compatible alias for `findKotlinc(.Jvm)`.
 pub fn findKotlinc(allocator: Allocator, io: Io) Allocator.Error!PathResult {
     _ = io;
     return findKotlincKind(allocator, .Jvm);
 }
 
-/// Locate the requested `kotlinc` binary. Search order (per kind):
-///   1. Kind-specific env var (`KLIO_KOTLINC_JVM_HOME` / `KLIO_KOTLINC_NATIVE`).
-///   2. Default cached install location.
-///   3. `PATH`.
-///
-/// When not found, attempts to auto-install unless
-/// `KLIO_NO_AUTO_INSTALL_KOTLINC=1`. The returned path is owned by the caller.
+/// Locate the requested `kotlinc`: the kind-specific env var, the default cached
+/// install location, then `PATH`. `KLIO_NO_AUTO_INSTALL_KOTLINC=1` bars install.
 pub fn findKotlincKind(allocator: Allocator, kind: KotlincKind) Allocator.Error!PathResult {
     var threaded = threadedIo(allocator);
     defer threaded.deinit();
@@ -277,9 +250,7 @@ fn locateKotlinc(allocator: Allocator, io: Io, kind: KotlincKind) Allocator.Erro
     const binary = kind.binaryName();
     if (try getEnvVar(allocator, io, kind.envOverride())) |v| {
         defer allocator.free(v);
-        // The JVM override is a kotlinc dist root (with bin/kotlinc inside);
-        // the native override historically points at the kotlinc-native
-        // binary directly. Accept either form for both.
+        // Accept either override form: a dist root holding `bin/kotlinc`, or the binary.
         if (isFile(io, v)) {
             return try allocator.dupe(u8, v);
         }
@@ -300,9 +271,7 @@ fn locateKotlinc(allocator: Allocator, io: Io, kind: KotlincKind) Allocator.Erro
             allocator.free(p);
         },
         .Native => {
-            // Match any kotlin-native-prebuilt-*-{TARGET_VERSION} dir under
-            // ~/.konan (not just our default slug), to honor pre-existing
-            // installs.
+            // Match any kotlin-native-prebuilt-*-{TARGET_VERSION} dir under ~/.konan.
             switch (try konanRoot(allocator, io)) {
                 .err => |e| e.deinit(allocator),
                 .ok => |root| {
@@ -363,14 +332,11 @@ fn locateJava(allocator: Allocator, io: Io) Allocator.Error!PathResult {
     return .{ .err = .NoJava };
 }
 
-/// Backwards-compatible alias for `installKotlincKind(.Jvm, ...)`.
 pub fn installKotlinc(allocator: Allocator, io: Io, version: []const u8) Allocator.Error!PathResult {
     return installKotlincKind(allocator, io, .Jvm, version);
 }
 
-/// Download + extract the requested kotlinc distribution. Idempotent: if the
-/// destination already has a working binary, this is a no-op. The returned
-/// path is the install directory, owned by the caller.
+/// Download and extract the distribution, a no-op when it already works.
 pub fn installKotlincKind(allocator: Allocator, io: Io, kind: KotlincKind, version: []const u8) Allocator.Error!PathResult {
     return switch (kind) {
         .Jvm => installJvm(allocator, io, version),
@@ -574,8 +540,7 @@ fn installNative(allocator: Allocator, io: Io, version: []const u8) Allocator.Er
     return .{ .ok = dest };
 }
 
-/// Download `url` to `dest`, trying curl then wget. Returns a `ParityError` on
-/// failure, or `null` on success.
+/// Download `url` to `dest` via curl then wget; a `ParityError` or null.
 fn download(allocator: Allocator, io: Io, env: *std.process.Environ.Map, url: []const u8, dest: []const u8) Allocator.Error!?ParityError {
     const tmp = try std.fmt.allocPrint(allocator, "{s}.part", .{dest});
     defer allocator.free(tmp);
@@ -611,8 +576,7 @@ fn download(allocator: Allocator, io: Io, env: *std.process.Environ.Map, url: []
     return null;
 }
 
-/// Extract `archive` into `into` (zip via unzip, otherwise tar). Returns a
-/// `ParityError` on failure, or `null` on success.
+/// Extract `archive` into `into`, zip via unzip and otherwise tar.
 fn extractArchive(allocator: Allocator, io: Io, env: *std.process.Environ.Map, archive: []const u8, into: []const u8, ext: []const u8) Allocator.Error!?ParityError {
     const r = if (std.mem.eql(u8, ext, "zip"))
         std.process.run(allocator, io, .{
@@ -639,8 +603,7 @@ fn extractArchive(allocator: Allocator, io: Io, env: *std.process.Environ.Map, a
     return null;
 }
 
-/// Worker count for a parallel sweep. Capped at 6 regardless of core count;
-/// override with `KLIO_PARITY_JOBS`.
+/// Worker count for a parallel sweep, capped at 6; `KLIO_PARITY_JOBS` overrides.
 pub fn defaultJobs(allocator: Allocator) usize {
     var threaded = threadedIo(allocator);
     defer threaded.deinit();
@@ -660,19 +623,13 @@ pub fn corpusDir(allocator: Allocator) Allocator.Error![]u8 {
     return std.fs.path.join(allocator, &.{ "tests", "fixtures", "parity_corpus" });
 }
 
-/// The workspace `examples/` directory.
 pub fn examplesDir(allocator: Allocator) Allocator.Error![]u8 {
     return allocator.dupe(u8, "examples");
 }
 
-/// Every `.kt` file directly under `dir`, sorted by path. Each path is owned by
-/// the caller; the outer slice too.
-/// Group `files` so programs sharing a dependency-base key run
-/// consecutively: grouped, a base cache of ONE covers a whole corpus with
-/// one rebuild per distinct mask instead of one per alphabetical mask
-/// switch — the difference between a bounded-RSS corpus run and the
-/// watchdog cap. Stable (alphabetical) within a group. Best-effort: a file
-/// that fails to read/parse keys as 0 and runs first.
+/// Every `.kt` file directly under `dir`, sorted and caller-owned, grouped so
+/// programs sharing a dependency-base key run consecutively: one cache entry
+/// then covers a corpus with one rebuild per mask.
 pub fn groupByBaseKey(allocator: Allocator, io: Io, files: [][]u8) void {
     const Keyed = struct { key: u64, file: []u8 };
     const keyed = allocator.alloc(Keyed, files.len) catch return;
@@ -759,14 +716,8 @@ fn printErr(comptime fmt: []const u8, args: anytype) void {
     writeFd(2, s);
 }
 
-// =========================================================================
-// kotlinc compile + run, expected-output cache, the klio in-process runners,
-// the full parity check + diff, and the corpus build + parallel sweep.
-// =========================================================================
-
 pub const ExpectedHit = struct { stdout: []u8, exit: ?i32 };
 
-/// `Result<T, ParityError>` carried as data.
 pub fn PResult(comptime T: type) type {
     return union(enum) {
         ok: T,
@@ -774,8 +725,6 @@ pub fn PResult(comptime T: type) type {
     };
 }
 
-/// `Result<T, String>` carried as data, for the klio-side runners that
-/// return a plain string on error.
 pub fn SResult(comptime T: type) type {
     return union(enum) {
         ok: T,
@@ -811,14 +760,12 @@ fn writeFile(io: Io, path: []const u8, contents: []const u8) void {
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents }) catch {};
 }
 
-/// 16-hex-digit render of the std default hasher over `bytes`. Matches the
-/// stable rendering the corpus cache keys rely on.
+/// 16-hex-digit render of the std default hasher, the corpus cache key format.
 fn hashHex(allocator: Allocator, bytes: []const u8) Allocator.Error![]u8 {
     const h = std.hash.Wyhash.hash(0, bytes);
     return std.fmt.allocPrint(allocator, "{x:0>16}", .{h});
 }
 
-/// Content-hash key for `file`, over the file bytes, rendered as 16 hex digits.
 fn cacheKey(allocator: Allocator, io: Io, file: []const u8) Allocator.Error![]u8 {
     const bytes = readFileOrEmpty(allocator, io, file);
     defer allocator.free(bytes);
@@ -852,8 +799,7 @@ fn javaTimeout(allocator: Allocator, io: Io) Io.Timeout {
     return .{ .duration = .{ .raw = Io.Duration.fromSeconds(@intCast(secs)), .clock = .awake } };
 }
 
-/// Compile a `.kt` file with JVM `kotlinc` into a self-contained jar, cached
-/// by content hash. The returned jar path is owned.
+/// Compile a `.kt` file into a self-contained jar, cached by content hash.
 pub fn compileWithKotlinc(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!PResult([]u8) {
     const kotlinc = switch (try findKotlinc(allocator, io)) {
         .err => |e| return .{ .err = e },
@@ -896,8 +842,7 @@ pub fn compileWithKotlinc(allocator: Allocator, io: Io, file: []const u8) Alloca
     return .{ .ok = out };
 }
 
-/// Run a previously-compiled jar under `java -jar`, returning captured stdout
-/// and exit code (stdout owned).
+/// Run a compiled jar under `java -jar`, returning owned stdout and exit code.
 pub fn runKotlincJar(allocator: Allocator, io: Io, jar: []const u8) Allocator.Error!PResult(ExpectedHit) {
     const java = switch (try locateJava(allocator, io)) {
         .err => |e| return .{ .err = e },
@@ -918,8 +863,6 @@ pub fn runKotlincJar(allocator: Allocator, io: Io, jar: []const u8) Allocator.Er
     allocator.free(r.stderr);
     return .{ .ok = .{ .stdout = r.stdout, .exit = termExit(r.term) } };
 }
-
-// ---------------------- expected-output cache ----------------------
 
 fn expectedCacheDir(allocator: Allocator, io: Io) Allocator.Error![]u8 {
     const cache = try parityCacheDir(allocator, io);
@@ -961,8 +904,7 @@ fn writeExpected(allocator: Allocator, io: Io, key: []const u8, stdout: []const 
     }
 }
 
-/// kotlinc output for a single `.kt` file, cached by content hash. The
-/// returned stdout is owned.
+/// kotlinc output for one `.kt` file, cached by content hash; stdout is owned.
 pub fn kotlincOutput(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!PResult(ExpectedHit) {
     const key = try cacheKey(allocator, io, file);
     defer allocator.free(key);
@@ -980,11 +922,7 @@ pub fn kotlincOutput(allocator: Allocator, io: Io, file: []const u8) Allocator.E
     return .{ .ok = run };
 }
 
-// ---------------------- stdout capture sink ----------------------
-
-/// Stdout sink that captures every `println` line for parity diffing. Lines
-/// accumulate in `cur` and split on `\n`, trimming the trailing `\n` per
-/// line.
+/// Stdout sink for parity diffing: lines accumulate in `cur` and split on `\n`.
 pub const CaptureOutput = struct {
     lines: std.ArrayList([]u8),
     cur: std.ArrayList(u8),
@@ -1030,8 +968,7 @@ pub const CaptureOutput = struct {
         return .{ .ctx = self, .vtable = &vtable };
     }
 
-    /// Join captured lines into the final program-output string. Owned by
-    /// `allocator`.
+    /// Join the captured lines, owned by `allocator`.
     pub fn intoJoined(self: *CaptureOutput, allocator: Allocator) Allocator.Error![]u8 {
         if (self.cur.items.len != 0) {
             const trailing = try self.allocator.dupe(u8, self.cur.items);
@@ -1048,8 +985,6 @@ pub const CaptureOutput = struct {
         return joined.toOwnedSlice(allocator);
     }
 };
-
-// ---------------------- klio in-process runners ----------------------
 
 fn joinIdentPath(allocator: Allocator, path: []const ast.Ident) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -1076,12 +1011,9 @@ fn collectImportPrefixes(allocator: Allocator, file: *const KotlinFile, set: *st
     }
 }
 
-/// Qualified references reach stdlib/pack code without an import statement
-/// (`kotlin.time.Duration` is legal bare), so the import list alone
-/// under-opens the stdlib gate and the pack mask. Scan the raw source for
-/// `kotlin`/`kotlinx`-rooted dotted tokens and record their two-segment
-/// prefix. A match inside a comment or string over-opens the gate, which
-/// costs base-build time only — never correctness.
+/// A qualified reference reaches stdlib and pack code with no import, so the
+/// import list alone under-opens the stdlib gate and pack mask. Scan for
+/// `kotlin`/`kotlinx`-rooted dotted tokens; a hit inside a comment only over-opens.
 fn collectQualifiedPrefixes(allocator: Allocator, text: []const u8, set: *std.StringHashMap(void)) Allocator.Error!void {
     var i: usize = 0;
     while (std.mem.indexOfPos(u8, text, i, "kotlin")) |at| {
@@ -1125,9 +1057,7 @@ fn formatVmError(allocator: Allocator, e: interp_ir.VmError) Allocator.Error![]u
     };
 }
 
-/// Parse the embedded stdlib pack's curated `SOURCES` and return the subset
-/// whose declared packages are imported (directly or by prefix) somewhere in
-/// `existing`. ASTs are allocated into `arena`.
+/// The stdlib pack's curated `SOURCES` whose packages `existing` imports.
 fn embeddedStdlibSources(arena: Allocator, io: Io, existing: []const KotlinFile, map: *SourceMap) Allocator.Error![]KotlinFile {
     var import_prefixes = std.StringHashMap(void).init(arena);
     for (existing) |*f| {
@@ -1136,8 +1066,6 @@ fn embeddedStdlibSources(arena: Allocator, io: Io, existing: []const KotlinFile,
     return embeddedStdlibSourcesPrefixed(arena, io, &import_prefixes, map);
 }
 
-/// `embeddedStdlibSources` over an explicit import-prefix set; the
-/// shared-base loader computes the gate from prefixes alone.
 fn embeddedStdlibSourcesPrefixed(arena: Allocator, io: Io, import_prefixes: *const std.StringHashMap(void), map: *SourceMap) Allocator.Error![]KotlinFile {
     var perr: pack.PackError = undefined;
     var env = try procEnvMap(arena, io);
@@ -1201,39 +1129,27 @@ fn embeddedStdlibSourcesPrefixed(arena: Allocator, io: Io, import_prefixes: *con
     return out.toOwnedSlice(arena);
 }
 
-// ---------------------- canonical program loader ----------------------
-
-/// How a program's dependency ASTs are assembled. All three modes flow through
-/// the same `buildModuleFiles` + `Vm.run` tail; they differ only in which
-/// dependency sources are folded in and how the kotlinx packs are materialized.
+/// How a program's dependency ASTs are assembled; all three share one tail.
 pub const LoadMode = enum {
     /// Embedded stdlib only (what `check`'s kotlinc oracle compares against).
     EmbeddedOnly,
     /// Embedded stdlib + the in-repo kotlinx packs parsed straight from source.
     SourcePacks,
-    /// Embedded stdlib + the in-repo kotlinx packs round-tripped through a
-    /// compiled `.klio-pack` byte image (encode -> decode -> parse), exercising
-    /// the compiled-pack load path rather than the raw-source one.
+    /// Embedded stdlib plus the kotlinx packs round-tripped through a compiled image.
     CompiledPacks,
 };
 
-/// A program assembled for one `LoadMode`: the full AST set in build order
-/// (deps first, user last), the host bindings to install (none for
-/// `EmbeddedOnly`), and the source map the ASTs were parsed against (for
-/// locating lowering diagnostics). Everything is allocated into the
-/// caller-provided arena.
+/// A program assembled for one `LoadMode`: the AST set in build order, the host
+/// bindings, and the source map it was parsed against, all in the caller's arena.
 pub const LoadedProgram = struct {
     asts: []KotlinFile,
     bindings: ?HostBindings,
     map: *const SourceMap,
 };
 
-/// One in-repo kotlinx pack source file: path (for spans / pack rel_path) and
-/// its UTF-8 bytes, both arena-owned.
+/// One in-repo kotlinx pack source file, path and bytes both arena-owned.
 const PackSource = struct { path: []u8, text: []u8 };
 
-/// The in-repo kotlinx pack directories, in load order.
-/// Number of in-repo packs the parity pipeline can load from source.
 pub const N_PACK_DIRS = 17;
 /// One bit per in-repo pack dir (`kotlinxPackDirs` order).
 pub const PackMask = u32;
@@ -1261,10 +1177,7 @@ fn kotlinxPackDirs(arena: Allocator) Allocator.Error![N_PACK_DIRS][]u8 {
     };
 }
 
-/// Gather the source files of every in-repo kotlinx pack the user program pulls
-/// in (by import prefix; coroutines also pulls atomicfu). The returned records
-/// are the inputs both `SourcePacks` (parse directly) and `CompiledPacks`
-/// (pack-roundtrip then parse) consume.
+/// Source files of every kotlinx pack the program imports; coroutines pulls atomicfu.
 fn collectKotlinxPackSources(
     arena: Allocator,
     io: Io,
@@ -1274,9 +1187,7 @@ fn collectKotlinxPackSources(
 ) Allocator.Error!SResult([]PackSource) {
     var out: std.ArrayList(PackSource) = .empty;
     defer out.deinit(arena);
-    // One selection authority: the same import-prefix + manifest-dependency
-    // closure the baked-base key uses, so collected content can never
-    // diverge from the base identity.
+    // One selection authority: the same closure the baked-base key uses.
     const mask = try packMaskFor(io, import_prefixes, imports_coroutines, arena);
     for (pack_dirs, 0..) |pack_dir, idx| {
         if (mask & (@as(PackMask, 1) << @intCast(idx)) == 0) continue;
@@ -1295,11 +1206,7 @@ fn collectKotlinxPackSources(
     return .{ .ok = try out.toOwnedSlice(arena) };
 }
 
-/// Round-trip the collected pack sources through a compiled `.klio-pack` byte
-/// image: encode a `SourceBundle` into the `SOURCES` section, then read it back
-/// out. This drives the compiled-pack codepath (encode -> decode) for the same
-/// bytes `SourcePacks` parses directly, so the differential harness can compare
-/// the two load paths. Returns the decoded source files, arena-owned.
+/// Round-trip the pack sources through a compiled `.klio-pack` image, arena-owned.
 fn packRoundtrip(arena: Allocator, sources: []const PackSource) Allocator.Error!SResult([]pack.schema.SourceFile) {
     var files = try arena.alloc(pack.schema.SourceFile, sources.len);
     for (sources, 0..) |s, i| {
@@ -1328,20 +1235,12 @@ fn packRoundtrip(arena: Allocator, sources: []const PackSource) Allocator.Error!
     return .{ .ok = decoded.files };
 }
 
-/// Build the full AST set (and host bindings) for `file` under `mode`. The
-/// canonical loader behind `runWithKtc` / `runWithPacks`: each runner is this
-/// plus the shared build + `Vm.run` tail. ASTs and bindings live in `arena`.
 pub fn loadProgram(arena: Allocator, io: Io, file: []const u8, mode: LoadMode) Allocator.Error!SResult(LoadedProgram) {
     return loadProgramFiles(arena, io, &.{file}, mode);
 }
 
-/// Multi-file variant of `loadProgram`: every path in `files` is a user
-/// source file, assembled (in order, after packs + stdlib) into one
-/// program — the in-process mirror of `klio run a.kt b.kt`.
 pub fn loadProgramFiles(arena: Allocator, io: Io, files: []const []const u8, mode: LoadMode) Allocator.Error!SResult(LoadedProgram) {
-    // The SourceMap is borrowed by the parsed ASTs (and returned to the
-    // caller for diagnostic rendering) for the arena's lifetime; it is
-    // never deinit'd so spans stay valid through build + run.
+    // The SourceMap is borrowed by the ASTs for the arena's life and never deinit'd.
     const map = try arena.create(SourceMap);
     map.* = SourceMap.init(arena);
 
@@ -1369,7 +1268,6 @@ pub fn loadProgramFiles(arena: Allocator, io: Io, files: []const []const u8, mod
         return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = null, .map = map } };
     }
 
-    // SourcePacks / CompiledPacks: fold in the in-repo kotlinx packs.
     const pack_dirs = try kotlinxPackDirs(arena);
 
     var user_import_prefixes = std.StringHashMap(void).init(arena);
@@ -1439,8 +1337,7 @@ pub fn loadProgramFiles(arena: Allocator, io: Io, files: []const []const u8, mod
     return .{ .ok = .{ .asts = try asts.toOwnedSlice(arena), .bindings = bindings, .map = map } };
 }
 
-/// Host bindings installed for the pack load modes: stdlib defaults plus
-/// the kotlinx coroutines/atomicfu/serialization/datetime overlays.
+/// Host bindings for the pack load modes: stdlib defaults plus the kotlinx overlays.
 fn packHostBindings(arena: Allocator) Allocator.Error!HostBindings {
     var b = try HostBindings.withStdlibDefaults(arena);
     {
@@ -1489,38 +1386,24 @@ fn packHostBindings(arena: Allocator) Allocator.Error!HostBindings {
     return b;
 }
 
-// ---------------------- once-per-process stdlib base ----------------------
-//
-// Every in-process run used to parse + lower the full embedded stdlib (and
-// the kotlinx packs) from scratch. The harnesses run hundreds of programs
-// per process, so the dependency set is lowered ONCE per (load mode, pack
-// subset, stdlib gate) into an immutable `StdlibBase` on a process-lifetime
-// arena; each program then clones the mutable parts onto its own arena and
-// lowers only its own declarations (`buildModuleFilesExtend`). A program
-// whose top-level names overlap the base's falls back to the original
-// whole-program build, so cross-boundary renames and resolution decisions
-// are never approximated.
+// Once-per-process stdlib base: the dependency set is lowered ONCE per (load
+// mode, pack subset, stdlib gate) onto a process-lifetime arena, and each
+// program clones the mutable parts and lowers only its own decls.
 
 const StdlibBase = interp_ir.build.StdlibBase;
 
-/// One published snapshot: the lowered base plus the SourceMap its spans
-/// resolve through. Immutable after publication; read concurrently.
+/// One published snapshot: the lowered base and its SourceMap, read concurrently.
 const BaseEntry = struct {
     base: *const StdlibBase,
     map: *const SourceMap,
-    /// The cache entry's own arena. Values the enum-entry patch writes into
-    /// the SHARED base instances must live exactly as long as the entry, not
-    /// as long as the program that happened to evaluate them.
+    /// The entry's own arena: enum-entry patch values live as long as the entry.
     patch_allocator: ?Allocator = null,
 };
 
 var base_lock: runtime.SpinMutex = .{};
 var base_arena_state: ?*std.heap.ArenaAllocator = null;
 
-/// A cached dependency base plus the arena that owns its memory, so an
-/// evicted base's ~stdlib-sized footprint returns to the OS. `entry` is null
-/// when the base for this key is not snapshot-safe (cached so callers stop
-/// retrying); such placeholders own no arena and are never evicted.
+/// A cached base plus its arena; `entry` is null when the key is not snapshot-safe.
 const CachedBase = struct {
     entry: ?*const BaseEntry,
     arena: ?*std.heap.ArenaAllocator,
@@ -1530,13 +1413,8 @@ const CachedBase = struct {
 var base_entries: ?std.AutoHashMap(u64, CachedBase) = null;
 var base_tick: u64 = 0;
 
-/// Max number of real (arena-owning) bases to retain; 0 means unbounded (the
-/// default, so `klio run` and the reuse-heavy harnesses are unaffected). A
-/// batch harness that runs many programs across many pack masks — the e2e
-/// corpus — sets a small bound so the process does not accumulate one full
-/// stdlib clone per mask. Safe to evict: a base is only referenced inside
-/// `getOrBuildBase`/`prepareWithBase` (the run clones what it needs), and the
-/// batch harnesses drive it from a single thread.
+/// Max real (arena-owning) bases retained; 0 is unbounded, the default. A batch
+/// harness spanning many pack masks bounds it. Eviction is single-threaded.
 pub var base_cache_max: usize = 0;
 var stdlib_meta_cache: ?StdlibMeta = null;
 var pack_meta_cache: [N_PACK_DIRS]?PackMeta = @splat(null);
@@ -1547,26 +1425,19 @@ const StdlibMeta = struct {
     any_non_implicit: bool,
 };
 
-/// One in-repo kotlinx pack's identity + import surface.
 const PackMeta = struct {
     lib_id: []const u8,
     import_prefixes: []const []const u8,
-    /// `[[deps]]` ids from the pack manifest (transitively chased when
-    /// selecting packs: importing compose pulls kotlinx.coroutines and
-    /// androidx.collection even though the program never names them).
+    /// `[[deps]]` ids from the manifest, chased transitively.
     deps: []const []const u8,
 };
 
 fn baseKey(mode: LoadMode, mask: PackMask, full: bool) u64 {
-    // `mask` occupies a full PackMask (one bit per in-repo pack, up to
-    // N_PACK_DIRS), so it lands in bits 1..32 and `mode` sits above it (bit
-    // 40+), no overlap even when the top mask bit is set.
+    // `mask` fills a PackMask in bits 1..32, so `mode` above bit 40 never overlaps.
     return (@as(u64, @intFromEnum(mode)) << 40) | (@as(u64, mask) << 1) | @intFromBool(full);
 }
 
-/// `KLIO_TRACE_STDLIB_BASE=1` prints one fast/fallback line per program.
-/// Read with a raw `read` loop: `/proc/self/environ` stats as 0 bytes, so
-/// the stat-trusting `readFileAlloc` behind `getEnvVar` sees it empty.
+/// `KLIO_TRACE_STDLIB_BASE=1` traces per program; `/proc/self/environ` stats as 0.
 var trace_base_flag: ?bool = null;
 fn traceBaseEnabled() bool {
     if (trace_base_flag) |v| return v;
@@ -1608,8 +1479,7 @@ fn baseArenaAllocator() Allocator {
     return base_arena_state.?.allocator();
 }
 
-/// Stdlib bundle package metadata, parsed once per process (under the
-/// base lock).
+/// Stdlib bundle package metadata, parsed once per process under the base lock.
 fn stdlibMeta(io: Io) Allocator.Error!*const StdlibMeta {
     if (stdlib_meta_cache) |*m| return m;
     const a = baseArenaAllocator();
@@ -1647,8 +1517,7 @@ fn stdlibMeta(io: Io) Allocator.Error!*const StdlibMeta {
     return &stdlib_meta_cache.?;
 }
 
-/// Import prefixes + library id of one in-repo kotlinx pack, parsed once
-/// per process (under the base lock).
+/// Import prefixes and library id of one in-repo kotlinx pack, parsed once.
 fn packMeta(io: Io, idx: usize) Allocator.Error!*const PackMeta {
     if (pack_meta_cache[idx]) |*m| return m;
     const a = baseArenaAllocator();
@@ -1681,8 +1550,7 @@ fn packMeta(io: Io, idx: usize) Allocator.Error!*const PackMeta {
     return &pack_meta_cache[idx].?;
 }
 
-/// `[[deps]]` ids declared by a pack manifest ("stdlib" included; the
-/// mask closure simply finds no pack dir for it).
+/// `[[deps]]` ids a pack manifest declares; "stdlib" finds no pack dir.
 fn manifestDepIds(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     defer out.deinit(allocator);
@@ -1706,9 +1574,7 @@ fn manifestDepIds(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.
     return try out.toOwnedSlice(allocator);
 }
 
-/// Which in-repo packs `import_prefixes` pulls in, as a bitmask over
-/// `kotlinxPackDirs` order. Mirrors `collectKotlinxPackSources`' selection
-/// (including coroutines forcing atomicfu).
+/// Which packs `import_prefixes` pulls in, as a mask over `kotlinxPackDirs`.
 fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_coroutines: bool, scratch: Allocator) Allocator.Error!PackMask {
     var mask: PackMask = 0;
     var idx: usize = 0;
@@ -1729,9 +1595,7 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
         if (std.mem.eql(u8, meta.lib_id, "kotlinx.atomicfu") and imports_coroutines) wanted = true;
         if (wanted) mask |= @as(PackMask, 1) << @intCast(idx);
     }
-    // Manifest-dependency closure: a selected pack pulls the packs its
-    // klio.toml declares, transitively (compose -> kotlinx.coroutines +
-    // androidx.collection -> kotlinx.atomicfu).
+    // Manifest-dependency closure: a selected pack transitively pulls its deps.
     var changed = true;
     while (changed) {
         changed = false;
@@ -1755,8 +1619,7 @@ fn packMaskFor(io: Io, import_prefixes: *const std.StringHashMap(void), imports_
     return mask;
 }
 
-/// Whether the stdlib load gate opens fully for this prefix set (mirrors
-/// `embeddedStdlibSources`' `load_gated`).
+/// Whether the stdlib load gate opens fully for this prefix set.
 fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask: PackMask, scratch: Allocator) Allocator.Error!bool {
     const meta = try stdlibMeta(io);
     if (!meta.any_non_implicit) return true;
@@ -1779,14 +1642,11 @@ fn stdlibGateFull(io: Io, import_prefixes: *const std.StringHashMap(void), mask:
     return false;
 }
 
-/// Get or build the dependency snapshot for (mode, pack mask, gate).
-/// Returns null when that base is not snapshot-safe.
+/// The dependency snapshot for (mode, pack mask, gate); null when unsafe.
 fn getOrBuildBase(io: Io, mode: LoadMode, mask: PackMask, full: bool) Allocator.Error!?*const BaseEntry {
     base_lock.lock();
     defer base_lock.unlock();
-    // A cached base outlives every program: its permanent cells must NOT
-    // land on the program-perm list of whichever program happened to build
-    // it first.
+    // A cached base outlives every program, so its cells stay off the program-perm list.
     const saved_ppc = runtime.gc.program_perm_collect;
     runtime.gc.program_perm_collect = false;
     defer runtime.gc.program_perm_collect = saved_ppc;
@@ -1799,13 +1659,8 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: PackMask, full: bool) Allocator.
         return hit.entry;
     }
 
-    // Evict down BEFORE the build, not after the insert: a full-source base
-    // build is the process's RSS spike, and stacking it on top of a full
-    // cache put peak-RSS at (cap + 1) bases plus the build transient —
-    // exactly what trips the watchdog on the capped harnesses. Making room
-    // first bounds coexistence at the cap itself.
+    // Evict before the build: stacking the RSS spike on a full cache peaks at cap + 1.
     if (base_cache_max > 0) evictBasesToAtMost(base_cache_max - 1);
-    // Ride the build transient on a trimmed floor.
     if (@import("builtin").os.tag == .linux) _ = malloc_trim(0);
     // Build each base in its own arena so eviction can hand its pages back.
     const holder = try std.heap.page_allocator.create(std.heap.ArenaAllocator);
@@ -1818,7 +1673,6 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: PackMask, full: bool) Allocator.
     };
     base_tick += 1;
     if (entry == null) {
-        // Not snapshot-safe: keep no arena, just remember the miss.
         runtime.gc.drainRemembered();
         holder.deinit();
         std.heap.page_allocator.destroy(holder);
@@ -1830,15 +1684,12 @@ fn getOrBuildBase(io: Io, mode: LoadMode, mask: PackMask, full: bool) Allocator.
     return entry;
 }
 
-/// Drop least-recently-used real bases until at most `base_cache_max` remain
-/// (no-op when the cap is 0). Only arena-owning entries count and are evicted;
-/// null placeholders are free and kept.
+/// Drop least-recently-used real bases to `base_cache_max`; placeholders stay.
 fn evictBasesBeyondCap() void {
     if (base_cache_max == 0) return;
     evictBasesToAtMost(base_cache_max);
 }
 
-/// Drop least-recently-used real bases until at most `limit` remain.
 fn evictBasesToAtMost(limit: usize) void {
     while (true) {
         var owning: usize = 0;
@@ -1856,11 +1707,7 @@ fn evictBasesToAtMost(limit: usize) void {
         if (owning <= limit) return;
         const removed = base_entries.?.fetchRemove(lru_key).?;
         const arena = removed.value.arena.?;
-        // The evicted base's cells may sit in the GC's remembered set (they
-        // were patched by past programs); drain while they are still mapped,
-        // or a later collection clears flags through unmapped pages. Safe to
-        // drain wholesale here: eviction runs during base resolution, before
-        // any nursery cell exists, so no old-to-young edge can be lost.
+        // Drain while the evicted cells are still mapped; eviction precedes any nursery cell.
         runtime.gc.drainRemembered();
         arena.deinit();
         std.heap.page_allocator.destroy(arena);
@@ -1872,11 +1719,7 @@ fn buildBaseEntry(a: Allocator, io: Io, mode: LoadMode, mask: PackMask, full: bo
     return buildBaseEntryFromSource(a, io, mode, mask, full);
 }
 
-/// Load a build-time-baked dependency base for this key. The build graph
-/// owns freshness: the generator re-runs whenever the stdlib sources or the
-/// interpreter modules change, and each test run step's cache manifest
-/// covers the image bytes. Only the EmbeddedOnly bases are baked; other
-/// keys — and any read/decode failure — take the source build below.
+/// A build-time-baked base; only EmbeddedOnly keys are baked, decode failure falls through.
 fn loadBakedBase(a: Allocator, io: Io, mode: LoadMode, mask: PackMask, full: bool) Allocator.Error!?*const BaseEntry {
     if (mode != .EmbeddedOnly or mask != 0) return null;
     const dir = (runtime.procEnvGetVar(a, "KLIO_PARITY_BASE_IMAGES") catch null) orelse return null;
@@ -1889,10 +1732,7 @@ fn loadBakedBase(a: Allocator, io: Io, mode: LoadMode, mask: PackMask, full: boo
     return entry;
 }
 
-/// Build the EmbeddedOnly dependency base for one stdlib-gate variant and
-/// bake it to image bytes. Null when the base is not snapshot-safe or holds
-/// state outside the serializable surface. Entry point for the build-time
-/// generator; always builds from source (never round-trips a prior image).
+/// Build the EmbeddedOnly base for one gate variant and bake it, always from source.
 pub fn bakeEmbeddedBase(allocator: Allocator, io: Io, full: bool) Allocator.Error!?[]u8 {
     const entry = (try buildBaseEntryFromSource(allocator, io, .EmbeddedOnly, 0, full)) orelse return null;
     return try interp_ir.image.bake(allocator, entry.base, entry.map, .{});
@@ -1949,9 +1789,7 @@ fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: PackMask
         }
     }
 
-    // Synthetic prefix set reproducing the gate: the selected stdlib subset
-    // is a pure function of the gate boolean, so the snapshot is identical
-    // for every program that maps to this key.
+    // The stdlib subset is a pure function of the gate, so this prefix set reproduces it.
     var gate_prefixes = std.StringHashMap(void).init(a);
     if (full) {
         const meta = try stdlibMeta(io);
@@ -1973,8 +1811,6 @@ fn buildBaseEntryFromSource(a: Allocator, io: Io, mode: LoadMode, mask: PackMask
     return entry;
 }
 
-/// Program assembled on the fast path: the extended module plus the map
-/// and bindings the shared tail consumes.
 const PreparedProgram = struct {
     built: interp_ir.build.BuiltModule,
     map: *const SourceMap,
@@ -1982,13 +1818,10 @@ const PreparedProgram = struct {
     patch_allocator: ?Allocator = null,
 };
 
-/// Try to assemble `files` against the shared dependency base. Returns
-/// null when the program must take the whole-program fallback; `.err` when
-/// the program itself is invalid (unreadable/unparseable), matching the
-/// fallback's failure text.
+/// Assemble `files` against the shared base: null to take the whole-program
+/// fallback, `.err` when the program itself is invalid.
 fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: LoadMode) Allocator.Error!?SResult(PreparedProgram) {
-    // First parse on a scratch map: the reuse gate and the base key need
-    // the user program's decls and imports before the base is chosen.
+    // Parse on a scratch map first: the reuse gate and base key need the decls.
     var scratch_map = SourceMap.init(arena);
     var texts = try arena.alloc([]const u8, files.len);
     var scratch_asts = try arena.alloc(KotlinFile, files.len);
@@ -2034,8 +1867,7 @@ fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: Lo
     const entry = (try getOrBuildBase(io, mode, mask, full)) orelse return null;
     if (!interp_ir.build.canExtendBase(entry.base, scratch_asts)) return null;
 
-    // Re-parse the user files onto a map that extends the base's, so user
-    // FileIds continue after the base's and base spans stay resolvable.
+    // Re-parse onto a map extending the base's, so user FileIds continue after it.
     const map = try arena.create(SourceMap);
     map.* = SourceMap.init(arena);
     try map.files.appendSlice(map.arena.allocator(), entry.map.files.items);
@@ -2047,9 +1879,7 @@ fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: Lo
         };
     }
 
-    // Lowering reads source text through the active map (the serialization
-    // pass copies default values and annotation arguments verbatim), so the
-    // map is installed before the build, not only for the VM run.
+    // Lowering reads source through the active map, so it is installed before the build.
     span.active_map = map;
     const built = try interp_ir.build.buildModuleFilesExtend(arena, entry.base, user_asts);
     const bindings: ?HostBindings = if (mode == .EmbeddedOnly) null else try packHostBindings(arena);
@@ -2061,32 +1891,23 @@ fn prepareWithBase(arena: Allocator, io: Io, files: []const []const u8, mode: Lo
     } };
 }
 
-/// Assemble `file` under `mode`, build the module, and run `main`, returning
-/// captured stdout (ok) or an error message (err), owned by `allocator`. The
-/// single tail shared by all three load configurations.
+/// Assemble, build, and run `main`, returning stdout or an error owned by `allocator`.
 pub fn runInMode(allocator: Allocator, io: Io, file: []const u8, mode: LoadMode) Allocator.Error!SResult([]u8) {
     return runFilesInMode(allocator, io, &.{file}, mode);
 }
 
-/// Multi-file `runInMode`.
 pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, mode: LoadMode) Allocator.Error!SResult([]u8) {
-    // In-process run path shared by e2e / itests / differential / fuzzer:
-    // cap RSS and arm the opt-in deadline so a runaway program can't OOM or
-    // hang the harness process. Call-once.
+    // Cap RSS and arm the deadline so a runaway program cannot OOM the harness.
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
-    // Per-run diagnostic state: the lenient-bind warning prints once per
-    // function per PROGRAM, and the memo is process-global.
+    // The lenient-bind warning prints once per function per program.
     interp_ir.resetLenientWarned();
 
     var arena_inst = std.heap.ArenaAllocator.init(allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
 
-    // Match the production `safe` profile for execution: compiler/lowering
-    // data remains phase-scoped in the arena, while runtime cells use the
-    // tracing collector's page-returning slab allocator. `off` deliberately
-    // retains the arena path as the diagnostic no-GC profile.
+    // Match the production `safe` profile: phase-scoped compiler data, slab runtime cells.
     const gc_run = runtime.perf.get().reclaim == .gc;
     const prev_gc_enabled = runtime.gc.gc_enabled;
     const prev_program_started = runtime.gc.program_started;
@@ -2103,14 +1924,8 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         if (runtime.envOnce("KLIO_GC_DEBUG")) |v| runtime.gc.gc_debug = v.len != 0 and !std.mem.eql(u8, v, "0");
         if (runtime.envOnce("KLIO_GC_HIST")) |v| runtime.gc.gc_hist = v.len != 0 and !std.mem.eql(u8, v, "0");
         if (runtime.envOnce("KLIO_GC_STRESS")) |v| runtime.gc.gc_stress = v.len != 0 and !std.mem.eql(u8, v, "0");
-        // Program-perm window: permanent cells minted while THIS program
-        // builds and runs belong to the program, and the boundary frees
-        // them (`freeProgramPerm`). Shared mints are excluded surgically:
-        // `getOrBuildBase` masks the flag around the cached-base build.
+        // Program-perm window; `getOrBuildBase` masks the flag around the base build.
         runtime.gc.program_perm_collect = true;
-        // The mmap-site tracer normally arms in `main`; the in-process
-        // harness needs the same diagnosis surface for its multi-program
-        // RSS profile (`kill -TERM` dumps the top live sites).
         if (runtime.envOnce("KLIO_SLAB_TRACE") != null and !runtime.slab.trace_enabled) {
             runtime.slab.trace_enabled = true;
             runtime.slab.trace_all = runtime.envOnce("KLIO_SLAB_TRACE_ALL") != null;
@@ -2120,25 +1935,11 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         if (runtime.envOnce("KLIO_GC_EXT")) |v| runtime.gc.external_accounting = v.len != 0 and !std.mem.eql(u8, v, "0");
     }
     defer {
-        // Every path out of a program — including a diagnostic failure that
-        // never constructed a Vm — releases `arena_inst` next; remembered
-        // entries pointing into it must not survive that, and the program's
-        // permanent cells go with it (the Vm teardown already freed them on
-        // the success path; this covers the diag/error exits).
-        // The write barrier records cells whatever the reclaim mode, so the
-        // remembered set is drained on every path out (an undrained set left
-        // entries into this arena for the next program's base eviction to
-        // write through, a SIGSEGV once the pages were returned to the OS).
+        // Every path out releases `arena_inst`, so remembered entries into it must not survive.
         runtime.gc.drainRemembered();
         if (gc_run) {
             runtime.gc.program_perm_collect = false;
-            // Drain AGAIN, here. The earlier drain was before `vm.deinit` and
-            // the final collect, and both re-remember through the write
-            // barrier — a tenured cell mutated during teardown rejoins the set
-            // after that drain and before these cells are freed. On Linux the
-            // trim below then hands the page back to the OS and the next
-            // drain writes through it; macOS leaves it mapped and the same bug
-            // is a silent write into freed memory.
+            // Drain again: `vm.deinit` and the final collect both re-remember through the barrier.
             runtime.gc.drainRemembered();
             runtime.gc.freeProgramPerm();
         }
@@ -2151,28 +1952,21 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         runtime.gc.gc_enabled = prev_gc_enabled;
     }
 
-    // Arena-backed run: every cell allocates from `arena_inst`, which frees
-    // en masse on `deinit` above, so per-cell `ObjRef.deinit` teardown is
-    // wasted work. Switch this thread to the reclaim fast path for the run
-    // and restore the prior mode after (the harness runs many programs on
-    // one thread, and other tests on it leak-check on `testing.allocator`).
+    // Every cell comes from `arena_inst`, freed en masse above, so per-cell teardown
+    // is wasted; restore the prior mode, since other tests here leak-check.
     const prev_reclaim = runtime.reclaimEnabled();
     runtime.setReclaim(false);
     defer runtime.setReclaim(prev_reclaim);
 
-    // Catch any receiver/coroutine thread-local state leaked from a prior run
-    // on this thread before assembling the next program.
+    // Catch receiver/coroutine thread-local state leaked from a prior run.
     interp_ir.resetReceiverThreadLocals();
     interp_ir.resetRunGlobalCaches();
-    // Drop the previous program's JIT state: the per-program arena is about to be
-    // recycled, so a reused `*Func` address must not inherit stale native code.
+    // Drop the last program's JIT state: a reused `*Func` address must not inherit code.
     interp_ir.resetJitForTest();
 
     interp_ir.setCoroutineTimeMode(.Virtual);
 
-    // Fast path: extend the once-per-process dependency base with just this
-    // program's decls. Falls back to the whole-program build when the
-    // program redeclares a base name (or the base is not snapshot-safe).
+    // Fast path: extend the shared base, falling back on a redeclared base name.
     var built: interp_ir.build.BuiltModule = undefined;
     defer span.active_map = null;
     var prog_map: *const SourceMap = undefined;
@@ -2202,8 +1996,7 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     if (traceBaseEnabled()) {
         printErr("[stdlib-base] {s}: {s}\n", .{ if (used_base) "fast" else "fallback", files[0] });
     }
-    // Lowering-time resolution diagnostics (ambiguous bare calls) fail
-    // the program before it runs, mirroring the `klio run` pipeline.
+    // Lowering-time resolution diagnostics fail the program before it runs.
     const amb_msg: ?[]u8 = blk: {
         const mg = built.module.borrow();
         defer mg.deinit();
@@ -2219,65 +2012,33 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
         built.deinit();
         return .{ .err = try allocator.dupe(u8, "no main function in module") };
     };
-    // VM-structural cells (the class graph, globals table, closure spine,
-    // output sink) must be PERMANENT: `gcMarkAllVms` deliberately does not
-    // shade the closure spine (a strong root there leaked every capture), and
-    // it never shades the output sink at all — a nursery-minted spine or sink
-    // is swept by the first mid-run major and every later borrow reads freed
-    // memory. `vmRun` closes the permanent generation itself right before the
-    // program body, exactly like the CLI path.
+    // VM-structural cells (class graph, globals, closure spine, sink) must be
+    // PERMANENT: `gcMarkAllVms` shades neither spine nor sink, so a nursery-minted
+    // one is swept by the first mid-run major.
     const vm_allocator = if (gc_run) runtime.slab.allocator else arena;
     const pair = try interp_ir.Vm.fromBuilt(vm_allocator, &built);
     built.deinit();
     var vm = pair.vm;
-    // A base-backed program patches the SHARED cached instances, so its
-    // values must live with the cache entry; a whole-program fallback owns
-    // its instances outright, and the run arena (which outlives the Vm) is
-    // the allocator its field lists were built from.
+    // A base-backed program patches SHARED instances, so its values live with the entry.
     vm.patch_allocator = prog_patch_alloc orelse arena;
     defer {
         if (gc_run) interp_ir.resetRunGlobalCaches();
-        // Before the VM frees its permanent cells: the remembered set may
-        // hold pointers into them (whatever the reclaim mode), and a later
-        // drain would otherwise clear flags through freed (possibly
-        // unmapped) memory.
+        // The remembered set may point into the permanent cells the VM is about to free.
         runtime.gc.drainRemembered();
         vm.deinit();
         if (gc_run) {
-            // The final collect runs with the program's closure/suspend hooks
-            // STILL INSTALLED: they are the only path that frees closure
-            // metadata (capture-name/chain arrays) and parked suspension
-            // snapshots, and clearing them first leaked every program's
-            // worth. The hooks' backing (the Vm's closure spine) is a
-            // program-perm cell — alive until `freeProgramPerm` below.
+            // The closure/suspend hooks are the only path that frees closure metadata and
+            // parked snapshots, so the final collect runs with them installed.
             runtime.gc.collect();
-            // NOW nothing from the finished program may remain rooted while
-            // its compiler arena is about to be released.
             interp_ir.gcResetProgramHooks();
-            // The finished program's build-phase permanent cells (its own VM
-            // class/global graph) — the Vm is already out of the root set and
-            // the remembered set was drained while these were still mapped.
-            // Drain AGAIN, here. The earlier drain was before `vm.deinit` and
-            // the final collect, and both re-remember through the write
-            // barrier — a tenured cell mutated during teardown rejoins the set
-            // after that drain and before these cells are freed. On Linux the
-            // trim below then hands the page back to the OS and the next
-            // drain writes through it; macOS leaves it mapped and the same bug
-            // is a silent write into freed memory.
+            // The build-phase permanent cells; drain again after the collect's re-remembers.
             runtime.gc.drainRemembered();
             runtime.gc.freeProgramPerm();
-            // The collect's own trim is rate-limited (32MB of sweep credit);
-            // a program boundary is exactly when dormant slab pages should
-            // go back regardless, so hundreds of small programs in one
-            // process do not ratchet the slab high-water into the RSS cap.
-            // Repeated passes step the per-slab idle hysteresis so pages the
-            // finished program just vacated actually decommit now.
+            // The collect's trim is rate-limited to 32MB of sweep credit, but a program
+            // boundary returns dormant slab pages regardless, stepping the idle hysteresis.
             var trim_pass: usize = 0;
             while (trim_pass < 4) : (trim_pass += 1) runtime.slab.reclaimDormant();
-            // Frame register buffers live on glibc malloc (`regsAlloc`),
-            // which hoards freed memory per-thread-arena indefinitely; a
-            // multi-program process must hand it back or the high-water
-            // ratchets into the RSS cap.
+            // Frame register buffers live on glibc malloc, which hoards per thread arena.
             if (@import("builtin").os.tag == .linux) _ = malloc_trim(0);
             runtime.gc.program_started = false;
             runtime.gc.alloc_perm = true;
@@ -2287,8 +2048,7 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
 
     var out = CaptureOutput.init(allocator);
     defer out.deinit();
-    // Make the source map reachable from inside the VM so a thrown exception's
-    // captured frames resolve to file paths + lines (same as the CLI run path).
+    // Reach the source map from inside the VM so thrown frames resolve to files.
     span.active_map = prog_map;
     defer span.active_map = null;
     const result = runMainBigStack(&vm, main_id, out.output());
@@ -2299,9 +2059,7 @@ pub fn runFilesInMode(allocator: Allocator, io: Io, files: []const []const u8, m
     return .{ .ok = try out.intoJoined(allocator) };
 }
 
-/// Run `main` on a large-stack worker thread so deep legitimate recursion
-/// runs to completion rather than overflowing the harness's main stack. The
-/// coroutine time mode is thread-local, so it is re-established on the worker.
+/// Run `main` on a large-stack worker; the coroutine time mode is thread-local.
 const MainRunCtx = struct {
     vm: *interp_ir.Vm,
     main: interp_ir.FuncId,
@@ -2321,10 +2079,8 @@ fn runMainBigStack(vm: *interp_ir.Vm, main_id: interp_ir.FuncId, out: interp_ir.
     return runtime.runOnBigStackMainThread(MainRunCtx, interp_ir.VmResult, runMainEntry, ctx);
 }
 
-/// Per-program wall cap (ms) for the in-process itest harnesses: a spinning
-/// program then fails "test wall-clock deadline exceeded" and names itself
-/// instead of hanging the binary for minutes. Default 60s (a legit in-process
-/// program runs in seconds); `KLIO_ITEST_WALL_CAP` overrides (seconds; 0 = off).
+/// Per-program wall cap in ms: a spinning program fails "test wall-clock deadline
+/// exceeded". Default 60s; `KLIO_ITEST_WALL_CAP` overrides in seconds, 0 for off.
 fn itestWallCapMs() i64 {
     const s = runtime.envOnce("KLIO_ITEST_WALL_CAP") orelse return 60_000;
     const secs = std.fmt.parseInt(i64, s, 10) catch return 60_000;
@@ -2339,15 +2095,10 @@ fn runMainEntry(ctx: MainRunCtx) interp_ir.VmResult {
     return ctx.vm.run(ctx.main, ctx.out) catch return .{ .err = .{ .Eval = "out of memory" } };
 }
 
-/// Run a `.kt` file directly through the `klio` interpreter library, returning
-/// captured stdout (ok) or an error message (err), owned by `allocator`.
-/// Embedded stdlib only — the configuration `check`'s kotlinc oracle compares
-/// against.
+/// Run a `.kt` file through the library, embedded stdlib only, as `check` compares.
 pub fn runWithKtc(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
     return runInMode(allocator, io, file, .EmbeddedOnly);
 }
-
-// ---------------------- klio.toml manifest parsing ----------------------
 
 const ManifestRoot = struct {
     root: []const u8,
@@ -2524,8 +2275,7 @@ fn anyMatch(rel: []const u8, pats: [][]const u8) bool {
     return false;
 }
 
-/// Collect a pack's Kotlin sources from its `klio.toml`. Returns owned absolute
-/// paths sorted by root-relative path, deduplicated.
+/// A pack's Kotlin sources from its `klio.toml`: owned paths, sorted, deduplicated.
 fn collectManifestSources(allocator: Allocator, io: Io, pack_dir: []const u8) Allocator.Error!SResult([][]u8) {
     const toml_path = try std.fs.path.join(allocator, &.{ pack_dir, "klio.toml" });
     defer allocator.free(toml_path);
@@ -2635,22 +2385,14 @@ fn registerAstPackage(arena: Allocator, file_ast: *const KotlinFile) Allocator.E
     }
 }
 
-/// Run a `.kt` file through the `klio` interpreter with the in-repo kotlinx
-/// packs (coroutines, atomicfu, io) loaded from source and their host bindings
-/// installed.
+/// Run a `.kt` file with the in-repo kotlinx packs and their host bindings.
 pub fn runWithPacks(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!SResult([]u8) {
-    // `runInMode` runs `main` on a 64 MiB worker stack, so deep recursion has
-    // headroom.
     return runInMode(allocator, io, file, .SourcePacks);
 }
 
-/// Multi-file variant of `runWithPacks` — the in-process mirror of
-/// `klio run a.kt b.kt`, for itests exercising cross-package shapes.
 pub fn runFilesWithPacks(allocator: Allocator, io: Io, files: []const []const u8) Allocator.Error!SResult([]u8) {
     return runFilesInMode(allocator, io, files, .SourcePacks);
 }
-
-// ---------------------- staging helpers ----------------------
 
 const RESERVED = [_][]const u8{
     "as",        "break",     "class",        "continue",  "do",       "else",
@@ -2764,8 +2506,6 @@ fn injectJvmInline(allocator: Allocator, src: []const u8) Allocator.Error![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-// ---------------------- float-diff tolerance ----------------------
-
 /// True when the two outputs differ only by a ULP-1 double on `double_pow.kt`.
 pub fn knownJvmFloatDiff(path: []const u8, kotlinc_out: []const u8, klio_out: []const u8) bool {
     const files = [_][]const u8{"double_pow.kt"};
@@ -2806,10 +2546,7 @@ fn splitLines(s: []const u8, buf: [][]const u8) ?usize {
     return n;
 }
 
-// ---------------------- full parity check + diff ----------------------
-
-/// Full parity check: compile + run both compilers, return a report. The
-/// report's strings are owned by `allocator`.
+/// Full parity check over both compilers; the report's strings are owned.
 pub fn check(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!PResult(ParityReport) {
     runtime.startMemoryWatchdog();
     runtime.startRunDeadline();
@@ -2842,8 +2579,7 @@ pub fn check(allocator: Allocator, io: Io, file: []const u8) Allocator.Error!PRe
     }
 }
 
-/// Render a unified-style diff between the two outputs. Empty string when they
-/// match. The returned string is owned by `allocator`.
+/// A unified-style diff, empty when the outputs match. Owned by `allocator`.
 pub fn renderDiff(allocator: Allocator, report: *const ParityReport) Allocator.Error![]u8 {
     if (report.matched) return allocator.alloc(u8, 0);
     var out: std.ArrayList(u8) = .empty;
@@ -2903,8 +2639,6 @@ fn collectLines(allocator: Allocator, s: []const u8, out: *std.ArrayList([]const
         _ = out.pop();
     }
 }
-
-// ---------------------- corpus build + parallel sweep ----------------------
 
 pub const CorpusEntry = struct {
     original: []u8,
@@ -3019,7 +2753,6 @@ pub fn corpusOutputsAllCached(allocator: Allocator, io: Io, staged: []const []co
     return true;
 }
 
-/// Run a specific fully-qualified main class out of `jar`.
 pub fn runClass(allocator: Allocator, io: Io, jar: []const u8, fqcn: []const u8) Allocator.Error!PResult(ExpectedHit) {
     const java = switch (try locateJava(allocator, io)) {
         .err => |e| return .{ .err = e },
@@ -3041,8 +2774,7 @@ pub fn runClass(allocator: Allocator, io: Io, jar: []const u8, fqcn: []const u8)
     return .{ .ok = .{ .stdout = r.stdout, .exit = termExit(r.term) } };
 }
 
-/// kotlinc output for one corpus entry, cached by staged-source hash. On a miss
-/// the class is run via `runClass`.
+/// kotlinc output for one corpus entry, cached by staged-source hash.
 pub fn corpusEntryOutput(allocator: Allocator, io: Io, staged: []const u8, jar: []const u8, fqcn: []const u8) Allocator.Error!PResult(ExpectedHit) {
     const key = try corpusEntryKey(allocator, io, staged);
     defer allocator.free(key);
@@ -3055,8 +2787,7 @@ pub fn corpusEntryOutput(allocator: Allocator, io: Io, staged: []const u8, jar: 
     return .{ .ok = run };
 }
 
-/// Compile a whole list of `.kt` files in one `kotlinc` invocation, each staged
-/// under a unique package. Cached by `(label, file contents)`.
+/// Compile a list of `.kt` files in one `kotlinc` run, each staged under a unique package.
 pub fn compileCorpus(allocator: Allocator, io: Io, label: []const u8, files: []const []const u8) Allocator.Error!PResult(CorpusBuild) {
     const kotlinc = switch (try findKotlinc(allocator, io)) {
         .err => |e| return .{ .err = e },
@@ -3204,7 +2935,6 @@ fn sweepWorker(ctx: *SweepCtx) void {
     }
 }
 
-/// Run the corpus/examples parity sweep for `paths`.
 pub fn runSweep(allocator: Allocator, io: Io, label: []const u8, paths: []const []const u8, jobs: usize) Allocator.Error!PResult(SweepResult) {
     const build = switch (try compileCorpus(allocator, io, label, paths)) {
         .err => |e| return .{ .err = e },
@@ -3250,8 +2980,6 @@ pub fn runSweep(allocator: Allocator, io: Io, label: []const u8, paths: []const 
     }
     return .{ .ok = .{ .results = results } };
 }
-
-// ---------------------- additional tests ----------------------
 
 test "plain_value_class_gets_annotation" {
     const out = try injectJvmInline(std.testing.allocator, "value class UserId(val raw: Int)\n");

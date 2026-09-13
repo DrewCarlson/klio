@@ -1,27 +1,16 @@
-//! Property + accessor parity: custom getters/setters, backing-field
-//! mutation, computed properties, lateinit, delegate setValue, open
-//! property override with getter.
+//! Properties and accessors: getters, setters, backing fields, `lateinit`,
+//! delegates, overrides.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_properties_accessors";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// One arena for the whole file: process-global lowering/VM state outlives any per-test arena.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
-/// Write `src` to a unique temp `.kt` path, run it through the klio pipeline,
-/// and assert stdout equals `expected`. Uses an arena per test so the
-/// leak-checking test allocator never drives the pipeline.
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
 
@@ -198,11 +187,8 @@ test "property_with_secondary_setter_logic" {
     try assertKlio("temp_prop", src, "100.0 212.0\n");
 }
 
-// An `object` whose init block references the singleton by its own name
-// (and through a bare member call) must observe the instance being
-// constructed — published before init runs — rather than re-driving its
-// own constructor. Also pins that a top-level `object`'s init blocks run
-// at all.
+// A singleton is published before its init block runs, so init sees the
+// instance under construction instead of re-entering the constructor.
 test "object_self_reference_during_init" {
     const src =
         \\

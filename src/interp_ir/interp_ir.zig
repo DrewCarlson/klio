@@ -1,12 +1,5 @@
-//! IR-native interpreter.
-//!
-//! This module executes a frozen `ir.Module` end-to-end with no AST
-//! evaluator and no callback into a tree walker. The `Vm` grows until
-//! every Kotlin shape we support has a Vm-native execution path.
-//!
-//! Module construction goes through `ir.lower` directly; the driver
-//! parses + type-checks via the shared front-end modules and hands the
-//! resulting AST to this module's `build_module`.
+//! IR-native interpreter: `Vm` executes a frozen `ir.Module` end-to-end, with
+//! no AST evaluator behind it. `build_module` lowers the driver's AST.
 
 const std = @import("std");
 
@@ -30,30 +23,23 @@ const run_mod = @import("vm/run.zig");
 pub const VmHost = vmhost.VmHost;
 pub const VmIntrinsicHost = vmhost.VmIntrinsicHost;
 
-/// `@Composable` implicit-composer support: the composer-stack host intrinsics
-/// (`__compose_pushComposer` / `__compose_popComposer` /
-/// `__compose_currentComposer`) the loader merges into the host bindings.
+/// Composer-stack intrinsics the loader merges into the host bindings.
 pub const compose = @import("vm/compose.zig");
 pub const coroutines_diag = @import("vm/coroutines.zig");
 
-/// Assert-empty + clear the process-wide receiver/coroutine thread-locals at a
-/// run boundary. Called by `Vm.deinit` and by the public runners so leaked
-/// cross-run state is a loud Debug failure.
+/// Assert empty and clear the process-wide receiver/coroutine thread-locals at
+/// a run boundary; leaked cross-run state is a loud Debug failure.
 pub const resetReceiverThreadLocals = vmhost.resetReceiverThreadLocals;
 pub const resetRunGlobalCaches = vmhost.resetRunGlobalCaches;
-/// Drop this thread's per-function JIT state between programs (the test/parity
-/// harness runs many programs in one process on recycled module memory).
+/// Drop this thread's per-function JIT state between programs.
 pub const resetJitForTest = ir.jit_loop.resetForTest;
 pub const resetLenientWarned = @import("vm/host_call_member.zig").resetLenientWarned;
 
-/// Member dispatch, exposed for the consumers that hold a declaration rather
-/// than a live interpreter: the native backend classifies a call site against
-/// `hostSlotOpOfFqn` at compile time, and the compiled program's runtime runs
-/// the classified op through `runHostFreeSlotOp`.
+/// Member dispatch for consumers holding a declaration rather than a live
+/// interpreter: the native backend classifies call sites with `hostSlotOpOfFqn`.
 pub const member_dispatch = @import("vm/host_call_member.zig");
 
-/// Field reads, for the same reason: a compiled program reads a builtin
-/// receiver's own properties through `hostFreeProperty`.
+/// Field reads for the same consumers, through `hostFreeProperty`.
 pub const member_fields = @import("vm/host_fields.zig");
 
 const Value = runtime.Value;
@@ -68,10 +54,8 @@ pub const FuncId = ir.FuncId;
 const TypeRef = ir.TypeRef;
 const RuntimeError = runtime.RuntimeError;
 
-/// Normalized head of a declared parameter type for the type-qualified
-/// anon-method key. Every function-type spelling collapses to one token: the
-/// same parameter reads `(T) -> R` where it is written and `Function1` once
-/// lowered, and neither form is more authoritative than the other.
+/// Normalized head of a declared parameter type. Every function-type spelling
+/// collapses to `Function`: `(T) -> R` as written, `Function1` once lowered.
 pub fn anonParamTypeHead(name: []const u8) []const u8 {
     if (std.mem.indexOf(u8, name, "->") != null) return "Function";
     if (std.mem.startsWith(u8, name, "Function")) return "Function";
@@ -82,12 +66,8 @@ pub fn anonParamTypeHead(name: []const u8) []const u8 {
     return bare[dot + 1 ..];
 }
 
-/// Whether two declarations name the same parameter types, comparing each
-/// parameter's normalized head. A leading `this` is the receiver, not a
-/// parameter. Two same-name, same-arity overrides on one anonymous class
-/// share the arity key, so this is what tells them apart
-/// (`SerializersModuleCollector.contextual` declares a serializer form and a
-/// provider form, both of arity two).
+/// Whether two declarations name the same parameter types, by normalized head;
+/// a leading `this` is the receiver. Separates same-name, same-arity overrides.
 pub fn anonParamsMatch(a: []const ir.Param, b: []const ir.Param) bool {
     const skip_a: usize = if (a.len != 0 and std.mem.eql(u8, a[0].name, "this")) 1 else 0;
     const skip_b: usize = if (b.len != 0 and std.mem.eql(u8, b[0].name, "this")) 1 else 0;
@@ -100,9 +80,8 @@ pub fn anonParamsMatch(a: []const ir.Param, b: []const ir.Param) bool {
     return true;
 }
 
-/// `name#arity#<n>`: the arity key plus the declaration's occurrence index
-/// among the class's same-name, same-arity members. The plain arity key holds
-/// only the LAST such declaration; the indexed keys keep every one reachable.
+/// `name#arity#<n>`: the arity key plus the declaration's index among the
+/// class's same-name, same-arity members, which the plain key cannot reach.
 pub fn anonOverloadMemberName(
     allocator: Allocator,
     arity_name: []const u8,
@@ -111,9 +90,7 @@ pub fn anonOverloadMemberName(
     return std.fmt.allocPrint(allocator, "{s}#{d}", .{ arity_name, index });
 }
 
-/// Runtime-lowered method bodies for anonymous-object / local classes,
-/// keyed by `(class, method)`: the owning module, the body's `FuncId`,
-/// and the captured-name/value pairs to bind on call.
+/// A runtime-lowered anon-object or local-class method body and its captures.
 pub const AnonMethodEntry = struct {
     module: ObjRef(Module),
     func: FuncId,
@@ -141,235 +118,127 @@ pub const StrFunc = build.StrFunc;
 pub const NameFunc = build.NameFunc;
 pub const EnumEntryArgInit = build.EnumEntryArgInit;
 
-/// One top-level property's on-demand init entry: the 0-arg initializer
-/// thunk plus the declared type's pre-init default category (`.none` when
-/// the declaration carries no usable annotation).
+/// A top-level property's initializer thunk and pre-init default category.
 pub const TopLevelPropInit = struct { func: FuncId, default: build.TypedDefault, file: u32 = 0 };
 
-/// Build-time-immutable program metadata. Produced once by
-/// `build.build_module` and shared by handle with every OS thread the
-/// program spawns. Nothing here is mutated after construction.
+/// Program metadata built once by `build.build_module` and shared by handle
+/// with every OS thread. Declaration tables are fixed; caches fill in lazily.
 pub const ProgramImage = struct {
-    /// Top-level property name → initializer thunk + typed default.
     top_level_prop_inits: std.StringHashMap(TopLevelPropInit),
-    /// The same top-level props in DECLARATION order (the map above is
-    /// unordered). Used to drive a file's `<clinit>` in order on demand.
-    /// Borrows the Vm's `top_level_props` slice (run-stable).
+    /// The same props in declaration order, borrowed from the Vm's slice.
     top_level_props_ordered: []const NameFunc = &.{},
-    /// Enum-entry constructor-argument thunks, borrowed from the Vm for
-    /// the run; `host_globals.ensureEnumInit` evaluates them on the enum's
-    /// first active use.
+    /// Enum-entry ctor-arg thunks, borrowed from the Vm, evaluated on first use.
     enum_entry_arg_inits: []const EnumEntryArgInit = &.{},
-    /// Allocator for values stored into a base-cached enum entry (they
-    /// must share the cache's lifetime); null means the Vm allocator.
+    /// Allocator sharing a base-cached enum entry's lifetime; null is the Vm's.
     patch_allocator: ?Allocator = null,
     body_prop_inits: PairFuncMap,
     instance_prop_getters: PairFuncMap,
-    /// Property names having ANY custom getter (across all classes). Gates
-    /// the member-miss accessor probe (`state.value()`), which must never
-    /// pay a full property resolution for ordinary method-miss names.
+    /// Every property name with a custom getter; gates the accessor probe.
     getter_prop_names: std.StringHashMap(void),
     instance_prop_setters: PairFuncMap,
-    /// Getter-backed body properties declared `private` (never virtual).
+    /// Getter-backed body properties declared `private`; never virtual.
     instance_prop_private: PairFuncMap,
     parent_ctor_args: std.StringHashMap([]FuncId),
-    /// Argument labels parallel to `parent_ctor_args` when a super-ctor call
-    /// named any argument; used to bind those arguments to the base
-    /// parameters of matching name rather than by position.
+    /// Labels parallel to `parent_ctor_args`, bound by name rather than position.
     parent_ctor_arg_names: std.StringHashMap([]const ?[]const u8),
     init_blocks: std.StringHashMap([]FuncId),
     extension_props: PairFuncMap,
-    /// Property names that have at least one OWNER-QUALIFIED extension-prop
-    /// key (`"<Owner>\x00<recv>"`). The lexical-tower probe in
-    /// `resolveExtensionPropImpl` is gated on membership so the common
-    /// lookup never pays the frame-chain walk.
+    /// Property names with an owner-qualified extension-prop key
+    /// (`"<Owner>\x00<recv>"`); gates the lexical-tower probe's frame walk.
     owner_keyed_ext_names: std.StringHashMap(void),
-    /// Nullable-receiver extension-property getters by property name (unique
-    /// pick or null for ambiguous) — the dispatch key for a null receiver.
+    /// Extension-property getters for a null receiver; null means ambiguous.
     nullable_ext_props: std.StringHashMap(?FuncId),
     extension_prop_setters: PairFuncMap,
-    /// Delegated extension properties: (receiver, prop) -> delegate thunk.
     extension_prop_delegates: PairFuncMap,
     secondary_ctors: std.StringHashMap([]build.SecondaryCtorEntry),
     primary_ctor_default_thunks: std.StringHashMap([]?FuncId),
-    /// Names of every top-level `object` / synthesised companion. The
-    /// startup pass initializes these eagerly but defers any whose
-    /// initializer throws; `lookupGlobal` initializes a deferred object
-    /// on first access — matching Kotlin's lazy `object` init.
+    /// Every top-level `object` and synthesised companion. Startup defers any
+    /// whose initializer throws to `lookupGlobal`, as Kotlin's lazy init does.
     object_names: std.StringHashMap(void),
     class_delegates: std.StringHashMap([]StrFunc),
     func_defaults: std.AutoHashMap(u32, []?FuncId),
     installed_bindings: ObjRef(HostBindings),
-    /// Link-time resolved executable form per top-level `FuncId`
-    /// (keyed by `FuncId.int()`). A present entry binds that symbol's
-    /// single executable form to the native binding it maps to; an
-    /// absent entry runs the lowered body. Populated once by
-    /// `linkResolvedForms` after both the module funcs and
-    /// `installed_bindings` exist, so pack-vs-source identity is settled
-    /// up front, deterministically, independent of load order. The VM
-    /// dispatch paths consult this directly instead of re-deciding the
-    /// form per call against `installed_bindings`.
+    /// Executable form per top-level symbol, keyed by `FuncId.int()`: present
+    /// is the native binding, absent runs the lowered body. Load-order free.
     resolved_native: std.AutoHashMap(u32, StdlibFn),
-    /// Adapter classification for `resolved_native` entries whose Kotlin
-    /// declaration takes a trailing `vararg`: today's intrinsics expect the
-    /// SPREAD convention, so a call arriving in the SHARED SHAPE (vararg
-    /// PACKED at its slot) unpacks at the dispatch boundary. This table is
-    /// the vararg row of the C-transpiler's shim list.
+    /// Slot of the trailing `vararg` for `resolved_native` entries declaring
+    /// one. Intrinsics take the spread convention, so a packed slot unpacks.
     vararg_spread_adapters: std.AutoHashMap(u32, u32),
-    /// Link-settled redirect for bodyless top-level decls (`expect` /
-    /// header-only): the same-simple-name body-bearing siblings in
-    /// declaration order. Dispatch picks the first sibling whose arity
-    /// fits the call; replaces the per-call `funcsBySimpleName` scan.
+    /// Body-bearing siblings of a bodyless decl, in declaration order.
     resolved_redirect: std.AutoHashMap(u32, []FuncId),
-    /// Deterministic bare-name → FQN map over the stdlib packages a
-    /// bare reference may bind into implicitly. Built once at link time
-    /// from the embedded intrinsic registry plus the installed pack
-    /// overlay; the first package in `bare_probe_packages` order wins a
-    /// cross-package collision. Replaces the per-call prefix-probe
-    /// ladder in `lookupGlobal`. Keys and values are subslices of the
-    /// registry / overlay FQNs, which outlive this image.
+    /// Bare name → FQN over the stdlib packages an unqualified reference may
+    /// bind into implicitly; the first package in `bare_probe_packages` order
+    /// wins a collision. Keys and values borrow FQN bytes outliving this image.
     default_import_globals: std.StringHashMap([]const u8),
-    /// Bare-name → FQN aliases for *package-level* installed pack
-    /// bindings (`runBlocking` → `kotlinx.coroutines.runBlocking`).
-    /// Receiver-qualified bindings (`kotlinx.coroutines.Job.join`) are
-    /// member forms a bare name can never mean and are excluded. The
-    /// lexicographically smallest FQN wins a collision, so the answer
-    /// is independent of hash iteration order. Replaces the suffix scan
-    /// over `installed_bindings`.
+    /// Bare name → FQN for package-level pack bindings. Receiver-qualified
+    /// bindings are member forms a bare name can never mean and are excluded;
+    /// the smallest FQN wins a collision, so hash order cannot change the pick.
     pack_bare_aliases: std.StringHashMap([]const u8),
-    /// Bare-name → FQN map over the builtin member-extension surfaces
-    /// (`kotlin.io`, `kotlin.AutoCloseable`, `kotlin.Any`) the member
-    /// dispatcher probes for an instance receiver with no user
-    /// extension. Same construction as `default_import_globals`.
+    /// Bare name → FQN over the `any_member_prefixes` surfaces, probed for an
+    /// instance receiver with no user extension.
     any_member_globals: std.StringHashMap([]const u8),
-    /// Whether `linkResolvedForms` has run for the current
-    /// `installed_bindings` snapshot.
     resolved_linked: bool,
-    /// Memoized builtin member-call resolution: `(receiver type, method name,
-    /// args-empty)` → the intrinsic it resolves to (or `null` = no intrinsic,
-    /// fall through to extension/global dispatch). Filled lazily on first call.
-    /// `stdlibMemberDispatch` otherwise rebuilds ~6 probe FQNs and does ~6
-    /// `lookupIntrinsic`s (each a double `prog`/bindings borrow) on EVERY member
-    /// call — the dominant constant-factor cost for member-heavy code. Only
-    /// non-`Instance`, non-array-builder receivers are cached (their resolution
-    /// is a pure function of the key). Method names are canonicalized through
-    /// `member_names` before their pointer identity enters any dispatch cache.
+    /// Builtin member-call resolution memo: `(receiver type, name, args-empty)`
+    /// → the intrinsic, `null` meaning fall through to extension/global
+    /// dispatch. Only non-`Instance`, non-array-builder receivers are cached.
     member_resolve_cache: std.AutoHashMap(MemberResolveKey, MemberResolveEntry),
-    /// Winning intrinsic (or confirmed "none") for `get_field`'s stdlib
-    /// property probe ladder, keyed by (receiver type-fqn identity, name
-    /// identity). The ladder builds five prefix FQNs and runs a
-    /// `lookupIntrinsic` per probe on EVERY non-stored-field property read of
-    /// a built-in receiver; the winner is a pure function of the key.
+    /// Winning intrinsic, or a confirmed "none", for `get_field`'s stdlib
+    /// property probe ladder, keyed by (type-fqn identity, name identity).
     field_probe_cache: std.AutoHashMap(MemberHasKey, MemberResolveEntry),
-    /// Program-lifetime canonical storage for method names used by the dispatch
-    /// caches below. Most calls carry an IR-interned name, but a callable
-    /// reference reads its name from a collected runtime String. Allocator reuse
-    /// can give two different such names the same temporary address; converting
-    /// every name to this content-interned address keeps pointer-keyed caches
-    /// both fast and exact.
+    /// Program-lifetime canonical storage for the names the dispatch caches key
+    /// on. A callable reference's name is a collectable runtime String whose
+    /// address can be reused, so interning by content keeps pointer keys exact.
     member_names: std.StringHashMap(void),
-    /// Identity of the module `canonicalizeProgramNames` last processed, so
-    /// the per-program prepare pass runs once per module.
+    /// Module `canonicalizeProgramNames` last processed; the pass runs once.
     canonicalized_module_identity: usize = 0,
-    /// Monomorphic inline cache for user-class instance-method dispatch. Without
-    /// it, every `inst.method()` re-walks the class hierarchy (linear class +
-    /// method scans, string compares) and heap-allocates a work queue + seen-set
-    /// per call — the dominant cost for member-heavy code (a method called in a
-    /// 1M-iteration loop pays full resolution 1M times). The resolved `FuncId`
-    /// for `(class identity, method-name pointer, arity)` is invariant when the
-    /// name is unambiguous at that arity, so cache it and dispatch straight to
-    /// the method body. Keyed by identity: the class cell pointer and interned
-    /// method-name pointer are stable for the program's lifetime.
+    /// Monomorphic inline cache for user-class instance-method dispatch. The
+    /// `FuncId` for `(class identity, name pointer, arity)` is invariant when
+    /// the name is unambiguous at that arity; both key pointers stay stable.
     instance_method_cache: std.AutoHashMap(InstanceMethodKey, u32),
     /// Linked target for a numeric virtual slot on a runtime-defined class.
-    /// Anonymous-object/local-class bodies still live in side modules, while
-    /// inherited bodies live in the main module; settle that distinction once
-    /// per `(runtime class identity, slot)` so steady-state dispatch is O(1).
+    /// Anon-object and local-class bodies live in side modules while inherited
+    /// bodies live in the main module; settling that once makes dispatch O(1).
     runtime_virtual_cache: std.AutoHashMap(RuntimeVirtualKey, RuntimeVirtualTarget),
-    /// Inline cache for a member-miss that resolves to a top-level *extension*
-    /// function. Same key as `instance_method_cache`; the value is the resolved
-    /// extension `FuncId`. Only owner-independent picks (no member-extension
-    /// candidate competes, no static/declared receiver override, non-strict)
-    /// are stored, so a hit is a pure function of (receiver class, name, arg
-    /// types) and dispatches straight through `callFuncRec` instead of the
-    /// per-call candidate collection + filtering + scoring.
+    /// Inline cache for a member miss resolving to a top-level extension, keyed
+    /// like `instance_method_cache`. Only owner-independent picks are stored:
+    /// no competing member extension, no declared-receiver override, non-strict.
     ext_method_cache: std.AutoHashMap(InstanceMethodKey, u32),
-    /// Inline cache for the pack-binding / stdlib-intrinsic resolution on an
-    /// `Instance` receiver (the `instanceBindingProbe` path). Without it every
-    /// intrinsic instance-method call rebuilds candidate FQN strings, walks the
-    /// supertype chain (heap-allocating a seen-set + queue), and re-resolves
-    /// against the binding table — the dominant cost for an interpreted
-    /// primitive-collection (`MutableIntIntMap.set` in a 1M loop). The resolved
-    /// `(func, fqn)` for `(class identity, method-name pointer, arg-sig)` is
-    /// invariant for a named class (the binding table is static); a `null` func
-    /// is a cached "no intrinsic" so the next call skips the probe and falls
-    /// straight through. The duped `fqn` is owned by this image.
+    /// Inline cache for pack-binding / stdlib-intrinsic resolution on an
+    /// `Instance` receiver. Invariant for a named class since the binding table
+    /// is static; `null` is a cached "no intrinsic". The duped `fqn` is owned here.
     instance_intrinsic_cache: std.AutoHashMap(InstanceMethodKey, MemberResolveEntry),
-    /// Per-class ordered list of ancestor companion-singleton names (BFS over
-    /// the supertype graph + lexical enclosing classes, exactly the walk
-    /// `companionWithMember` performed per call). The graph and the companion
-    /// registry are static, so the list is a pure function of the class; the
-    /// per-name membership check stays dynamic at the call. Name slices are
-    /// program-lifetime registry strings; only the spine is owned here.
+    /// Per-class ancestor companion-singleton names, a BFS over the supertype
+    /// graph and lexical enclosing classes. Names borrow registry strings, only
+    /// the spine is owned; the per-name membership check stays dynamic.
     companion_chain_cache: std.AutoHashMap(usize, []const []const u8),
-    /// Named-argument binding permutations for memoized named member calls
-    /// (see `NamedPerm`); keyed by the same salted key as the resolution
-    /// entry, so a hit replays the binding as a positional dispatch.
+    /// Named-argument bindings, replayed as a positional dispatch on a hit.
     named_perm_cache: std.AutoHashMap(InstanceMethodKey, NamedPerm),
-    /// `hostHasMember(class, name)` decides member-vs-global for a bare call;
-    /// it walks the class hierarchy (heap-allocating a seen-set + queue) every
-    /// call. The answer is a pure function of `(class identity, name pointer)`,
-    /// so memoize the bool — a bare top-level call inside a hot method (e.g.
-    /// `hash(key)` in `MutableIntIntMap.set`) otherwise re-walks every time.
+    /// Memoized `hostHasMember`, which decides member versus global for a bare
+    /// call; a pure function of `(class identity, name pointer)`.
     host_has_member_cache: std.AutoHashMap(MemberHasKey, bool),
-    /// Records a `CallMemberOrGlobal` site that resolved to a global (no member
-    /// or receiver-extension on its single implicit-receiver candidate). A bare
-    /// call to a top-level function inside a hot method (`hash(key)` /
-    /// `group(...)` in `MutableIntIntMap.set`) otherwise runs the full strict +
-    /// lenient member-dispatch passes — which always miss — before falling to
-    /// the global. Keyed by the enclosing function (its candidate structure is
-    /// fixed) plus the runtime receiver class, name pointer, and arity, so a hit
-    /// is safe to skip straight to global. Only single-candidate calls are stored.
+    /// `CallMemberOrGlobal` sites that resolved to a global, so a repeat skips
+    /// the member passes that must miss. Keyed by the enclosing function plus
+    /// the receiver class, name pointer, and arity; single-candidate sites only.
     cmg_global_cache: std.AutoHashMap(CmgGlobalKey, void),
-    /// Overload-resolution cache for global function calls. `pickOverload` scans
-    /// and type-scores every same-name candidate per call — the dominant cost for
-    /// generic stdlib calls (`maxOf`/`minOf`/math) in a hot loop. Its result is a
-    /// pure function of `(module, base func, arg types)`, so memoize it keyed by
-    /// the primitive-arg-type signature (computed only when every arg is a
-    /// primitive scalar, where the tag fully determines selection).
+    /// Overload-resolution memo for global calls, keyed by primitive-arg-type
+    /// signature. That signature exists only when every argument is a primitive
+    /// scalar, where the tag alone determines the pick.
     overload_cache: std.AutoHashMap(OverloadKey, u32),
-    /// Field-READ resolution memo, keyed (receiver class cell identity,
-    /// interned field-name identity — see `memberNameIdentity`) so the hot
-    /// probe hashes two integers instead of the class-fqn + name byte pair:
-    /// whether the read runs a custom getter (`getter` FuncId) or lands in
-    /// a stored slot (`stored_idx` into the instance field list, verified
-    /// by name at each hit since instances can define extras dynamically).
-    /// Both facts derive from the static class graph, so one probe here
-    /// replaces the per-read getter BFS + linear slot scan. Entries exist
-    /// only for main-module classes, whose cells the registry keeps alive
-    /// for the program's life — the identity key can never alias a
-    /// reclaimed cell (the same discipline as `instance_method_cache`).
+    /// Field-read memo keyed by (class cell identity, interned name identity):
+    /// a custom getter, or a stored slot whose index is re-verified by name
+    /// because instances can define extra fields dynamically. Main-module
+    /// classes only, whose cells outlive the program, so a key never aliases.
     field_read_cache: std.AutoHashMap(MemberHasKey, FieldReadHit),
-    /// Field-WRITE resolution memo, keyed like `field_read_cache`:
-    /// whether the write runs a custom setter (`setter` FuncId) or lands in
-    /// a stored slot under `store_name`. Recorded only when every consulted
-    /// fact is class-static (main-module class, no delegate, no dynamic
-    /// forwarding), so one probe replaces the per-write ext-setter /
-    /// delegated / custom-setter / override-cell ladder.
+    /// Field-write memo keyed like `field_read_cache`. Recorded only when every
+    /// consulted fact is class-static: main module, no delegate, no forwarding.
     field_write_cache: std.AutoHashMap(MemberHasKey, FieldWriteHit),
-    /// Declaring-class memo for an instance method's implicit-`this` static
-    /// receiver resolution: `(module, FuncId)` → the simple name of the class
-    /// whose `methods` list owns the FuncId (`null` = no owning class found).
-    /// Invariant per function, so one identity scan of the class table serves
-    /// every later bare call inside that method's body. The name pointer is
-    /// borrowed from the (image-lifetime) module IR, never duped.
+    /// `(module, FuncId)` → simple name of the class owning the func, for an
+    /// instance method's implicit-`this` receiver. The name borrows module IR.
     func_owner_class_cache: std.AutoHashMap(FuncOwnerKey, ?[]const u8),
     allocator: Allocator,
 
-    /// `file`/`argc` are 0 for a file-agnostic resolution. When an imported
-    /// pack extension shadows the stdlib surface the answer depends on the
-    /// call site's import scope and the call's arity, so those entries key by
-    /// (file+1, argc) instead of standing down from the cache entirely.
+    /// `file`/`argc` are 0 for a file-agnostic resolution; an imported pack
+    /// extension shadowing the stdlib surface keys by (file+1, argc) instead.
     pub const MemberResolveKey = struct { type_p: usize, name_p: usize, args_empty: bool, file: u32 = 0, argc: u32 = 0 };
     pub const MemberResolveEntry = struct { func: ?StdlibFn, fqn: []const u8 };
     pub const InstanceMethodKey = struct { class_p: usize, name_p: usize, n_args: u32, sig: u64 };
@@ -379,10 +248,9 @@ pub const ProgramImage = struct {
         side_func: AnonMethodEntry,
     };
     pub const MemberHasKey = struct { class_p: usize, name_p: usize };
-    /// Replayable named-argument binding for a memoized named member call:
-    /// `src[k]` is the caller arg index feeding user-param `k` (receiver
-    /// excluded). `n == 0xFF` is the negative verdict — the shape needs the
-    /// full named binder (defaults, varargs, over/under-application).
+    /// Replayable named-argument binding: `src[k]` is the caller arg index
+    /// feeding user param `k`, receiver excluded. `n == 0xFF` means the shape
+    /// needs the full named binder (defaults, varargs, arity mismatch).
     pub const NamedPerm = struct { n: u8, src: [15]u8 };
     pub const CmgGlobalKey = struct { func_p: usize, class_p: usize, name_p: usize, sig: u64 };
     pub const OverloadKey = struct { module_p: usize, func_p: u32, sig: u64 };
@@ -392,13 +260,10 @@ pub const ProgramImage = struct {
         getter: u32,
         /// Stored-slot index, `NONE` when a getter serves the read.
         stored_idx: u32,
-        /// For an inner-class read answered by an ENCLOSING instance's
-        /// stored slot: how many `outer` links to hop before the slot
-        /// read. Zero = the receiver's own slot/getter.
+        /// `outer` links to hop first; zero is the receiver's own slot.
         outer_hops: u8 = 0,
-        /// Runtime class identity of the outer instance that owned the
-        /// slot, verified at serve time (different receivers of the same
-        /// inner class can have outers of different classes).
+        /// Class identity of the outer that owned the slot, verified at serve
+        /// time: receivers of one inner class can have different outers.
         outer_cls: u64 = 0,
         pub const NONE: u32 = std.math.maxInt(u32);
     };
@@ -406,24 +271,14 @@ pub const ProgramImage = struct {
     pub const FieldWriteHit = struct {
         /// Custom setter to run, `NONE` when the write is a plain store.
         setter: u32,
-        /// Resolved store key for the plain write (the override-cell key or
-        /// the plain name), interned into `member_names` so it outlives the
-        /// slice the write was resolved from.
+        /// Store key, interned into `member_names` so it outlives the resolution.
         store_name: []const u8,
         pub const NONE: u32 = std.math.maxInt(u32);
     };
 
-    /// Packages a bare global name may bind into implicitly, in
-    /// preference order — the prefix order of the deleted `lookupGlobal`
-    /// ladder (top-level packages before the receiver-extension ones so
-    /// `min` resolves to `kotlin.math.min`). The deleted `callFunc`
-    /// bodyless ladder probed a DIFFERENT order (io before math, text
-    /// before collections, ranges before comparisons); the two were
-    /// deliberately unified onto this one. `KLIO_LINK_AUDIT` re-derives
-    /// the old `callFunc` order independently
-    /// (`host_call_func.deleted_bodyless_prefixes`), so a name whose
-    /// pick would differ between the two orders is flagged instead of
-    /// silently absorbed.
+    /// Packages a bare global name may bind into implicitly, in preference
+    /// order: top-level packages rank above the receiver-extension ones, so
+    /// `min` resolves to `kotlin.math.min`. `KLIO_LINK_AUDIT` flags divergence.
     pub const bare_probe_packages = [_][]const u8{
         "kotlin",
         "kotlin.math",
@@ -438,12 +293,9 @@ pub const ProgramImage = struct {
         "kotlin.internal",
     };
 
-    /// Builtin receiver surfaces probed for a member call on an
-    /// instance with no user extension, in the dispatcher's order.
-    /// `kotlin.io` is NOT one: its intrinsics (`println`, `print`,
-    /// `readLine`, ...) are receiver-less top-level functions, and serving
-    /// them member-style prepends the receiver as the printed argument —
-    /// `with(x) { println() }` printed `x` instead of a bare newline.
+    /// Builtin receiver surfaces probed for a member call on an instance with
+    /// no user extension. `kotlin.io` is excluded: its intrinsics are
+    /// receiver-less, so member-style service would print the receiver.
     pub const any_member_prefixes = [_][]const u8{
         "kotlin.AutoCloseable",
         "kotlin.Any",
@@ -560,26 +412,21 @@ pub const ProgramImage = struct {
         self.func_owner_class_cache.deinit();
     }
 
-    /// Read-only probe for an already-interned name identity, so callers
-    /// holding only a shared borrow (the hot path) can resolve without the
-    /// exclusive lock `memberNameIdentity`'s insert arm needs.
+    /// Probe for an already-interned identity, so a caller holding only a
+    /// shared borrow resolves without the lock the insert arm needs.
     pub fn memberNameIdentityExisting(self: *const ProgramImage, name: []const u8) ?usize {
         if (self.member_names.getKey(name)) |stored| return @intFromPtr(stored.ptr);
         return null;
     }
 
-    /// Return the program-lifetime pointer identity for `name`. Cache callers
-    /// must decline to cache when allocation fails rather than keying a
-    /// temporary runtime string directly.
+    /// Program-lifetime pointer identity; null means the caller must not cache.
     pub fn memberNameIdentity(self: *ProgramImage, name: []const u8) ?usize {
         const c = self.memberNameCanonical(name) orelse return null;
         return @intFromPtr(c.ptr);
     }
 
-    /// The program-lifetime copy of `name`. A cache entry that stores a name
-    /// as a *value* (not just as a pointer key) must hold this copy: a name
-    /// reaching the write path through a callable reference is the bytes of a
-    /// runtime String, which the collector can free while the entry lives on.
+    /// The program-lifetime copy of `name`. A cache entry storing a name as a
+    /// value must hold this: a callable reference's name is collectable.
     pub fn memberNameCanonical(self: *ProgramImage, name: []const u8) ?[]const u8 {
         if (self.member_names.getKey(name)) |stored| return stored;
         const owned = self.allocator.dupe(u8, name) catch return null;
@@ -590,16 +437,9 @@ pub const ProgramImage = struct {
         return owned;
     }
 
-    /// Rewrite every short name-bearing string in the program to its
-    /// program-lifetime canonical copy, so hot-path name compares exit on
-    /// `mem.eql`'s pointer-equality check instead of scanning bytes: every
-    /// field read/write compares its instruction name operand against
-    /// instance-field storage names, and every string-keyed cache probe
-    /// compares its key on a hit. Instance-field storage names come from
-    /// `ClassDef` param/property descriptors, name operands from the const
-    /// pool; canonicalizing both sides makes the pointers meet. Strings
-    /// over the cap are data, not identifiers, and stay put — a non-canonical
-    /// name is never wrong, only slower.
+    /// Rewrite every identifier-sized string to its program-lifetime canonical
+    /// copy, so hot-path compares exit on `mem.eql`'s pointer check. Longer
+    /// strings are data and stay put; a non-canonical name is only slower.
     pub fn canonicalizeProgramNames(self: *ProgramImage, module: *Module, classes: *ClassTable) void {
         for (module.consts.items) |*c| {
             if (c.* != .String) continue;
@@ -624,9 +464,7 @@ pub const ProgramImage = struct {
             f.fqn = self.canonName(f.fqn);
             f.package = self.canonName(f.package);
         }
-        // Re-key the per-read/per-write accessor maps and the member-decl
-        // index with canonical parts, so a successful probe's key compare
-        // exits on pointer equality instead of scanning both strings.
+        // Re-key with canonical parts so a probe's compare exits on pointers.
         self.rekeyPairMap(&self.body_prop_inits);
         self.rekeyPairMap(&self.instance_prop_getters);
         self.rekeyPairMap(&self.instance_prop_setters);
@@ -634,9 +472,6 @@ pub const ProgramImage = struct {
         self.rekeyPairMap(&module.member_name_index);
     }
 
-    /// The canonical copy of `s` when it is identifier-sized, else `s`
-    /// unchanged (long strings are data; a non-canonical name is never
-    /// wrong, only slower to compare).
     fn canonName(self: *ProgramImage, s: []const u8) []const u8 {
         if (s.len == 0 or s.len > 160) return s;
         return self.memberNameCanonical(s) orelse s;
@@ -663,25 +498,13 @@ pub const ProgramImage = struct {
         self.resolved_redirect.clearRetainingCapacity();
     }
 
-    /// Resolve each symbol's single executable form ONCE: for every
-    /// body-bearing top-level `FuncId` whose FQN maps to a native
-    /// binding in `installed_bindings`, record that binding as the
-    /// symbol's form. Funcs with no matching binding run their lowered
-    /// body and are simply absent from the table.
-    ///
-    /// This is the link/finalize step of the two-phase build: it settles
-    /// pack-vs-source identity deterministically, as a pure function of
-    /// `(FuncId → fqn, installed_bindings)`, with no per-call FQN probe.
-    /// It mirrors exactly what the per-call short-circuit in
-    /// `callFunc`/`callValue` used to decide on every dispatch
-    /// (`installed_bindings.resolve(func.fqn)`), but does it once.
-    /// Idempotent: re-running after an `installed_bindings` change
-    /// rebuilds the table.
+    /// Resolve each symbol's single executable form once: a top-level `FuncId`
+    /// whose FQN maps to a binding in `installed_bindings` records it, one with
+    /// no match runs its lowered body. A pure function of `(FuncId → fqn,
+    /// bindings)`, so it is load-order free and idempotent.
     pub fn linkResolvedForms(self: *ProgramImage, module: *const Module) Allocator.Error!void {
-        // Unpublish before touching the tables: the VM's steady-state fast
-        // paths read them unguarded gated on this flag, and a relink (run
-        // setup, overlay install) must push those readers back onto the
-        // locked path first.
+        // Unpublish first: the steady-state fast paths read these tables
+        // unguarded behind this flag and must go back on the locked path.
         @atomicStore(bool, &self.resolved_linked, false, .release);
         self.resolved_native.clearRetainingCapacity();
         self.vararg_spread_adapters.clearRetainingCapacity();
@@ -693,12 +516,9 @@ pub const ProgramImage = struct {
         defer bg.deinit();
         const bindings = bg.get();
 
-        // The declaration manifest is authoritative for bodyless declarations:
-        // join each such FuncId directly to its exact host ABI symbol before
-        // compatibility linking considers FQN groups or bare aliases. A
-        // body-bearing receiver declaration keeps its Kotlin body because the
-        // native representation may cover only builtin receiver values, while
-        // Kotlin's declaration also accepts user-defined subtypes.
+        // The declaration manifest is authoritative for bodyless decls: join
+        // each to its exact host symbol first. A body-bearing declaration keeps
+        // its Kotlin body, which accepts user subtypes the native form may not.
         {
             var decl_it = module.decl_sigs.iterator();
             while (decl_it.next()) |entry| {
@@ -707,10 +527,7 @@ pub const ProgramImage = struct {
                 const intrinsic = bindings.resolve(symbol) orelse
                     stdlib.implementation(symbol) orelse continue;
                 try self.resolved_native.put(entry.key_ptr.*, intrinsic);
-                // The vararg adapter row: the declared slot position of a
-                // trailing vararg, so the boundary can unpack a
-                // shared-shape (packed) frame for a spread-expecting
-                // intrinsic.
+                // Record the trailing vararg's slot so a packed frame unpacks.
                 if (module.funcById(FuncId.from(entry.key_ptr.*))) |vf| {
                     if (vf.params.len != 0 and vf.params[vf.params.len - 1].is_vararg) {
                         try self.vararg_spread_adapters.put(entry.key_ptr.*, @intCast(vf.params.len - 1));
@@ -719,11 +536,8 @@ pub const ProgramImage = struct {
             }
         }
 
-        // Bare-name maps: one deterministic name → FQN edge per simple
-        // name, settled here instead of probed per call. Sources are the
-        // embedded intrinsic registry and the installed overlay; ties
-        // across packages resolve by `bare_probe_packages` order, and a
-        // same-package tie cannot occur (FQNs are unique per table).
+        // One deterministic name → FQN edge per simple name. Cross-package ties
+        // resolve by `bare_probe_packages` order; FQNs are unique per table.
         {
             var fqn_it = stdlib.implementations.allFqns();
             while (fqn_it.next()) |fqn| {
@@ -739,19 +553,11 @@ pub const ProgramImage = struct {
         }
 
         if (!bindings.isEmpty()) {
-            // Mark every func under an installed binding's fqn native — iterate
-            // the bindings and resolve each fqn to its funcs (all overloads share
-            // the receiverless fqn), touching the lazy func table only for
-            // same-simple-name candidates instead of sweeping it whole.
-            //
-            // One exception: a body-bearing GENERIC overload (every value param
-            // typed by the func's own type parameters) sharing its FQN with a
-            // same-arity concrete-typed sibling keeps its body. The intrinsic
-            // implements the concrete family's semantics (`kotlin.comparisons.
-            // minOf(Double, Double)` propagates NaN); the generic family's
-            // semantics differ (`minOf<T : Comparable<T>>` is the compareTo
-            // total order), so collapsing the generic body onto the intrinsic
-            // erases the distinction the overload split exists for.
+            // Mark every func under an installed binding's fqn native, through
+            // the simple-name index. One exception: a body-bearing generic
+            // overload whose FQN group holds a same-arity concrete sibling keeps
+            // its body, since the intrinsic implements the concrete family's
+            // semantics (`minOf(Double, Double)` propagates NaN).
             var bk = bindings.table.keyIterator();
             while (bk.next()) |fqn_k| {
                 const fqn = fqn_k.*;
@@ -764,19 +570,10 @@ pub const ProgramImage = struct {
                         try self.resolved_native.put(cand.int(), intrinsic);
                     }
                 }
-                // A member-form binding (`<pkg>.<Class>.<name>`) names a
-                // class method, which the simple-name index does not carry.
-                // A statically resolved call reaches that method's FuncId
-                // directly through `callFunc`, so its placeholder Kotlin
-                // body must be settled to the intrinsic here exactly like a
-                // top-level form (`kotlinx.atomicfu.locks.ReentrantLock.
-                // lock`'s no-op body held no lock under a spliced
-                // `withLock`). CONCRETE classes only: a call resolved to an
-                // INTERFACE / abstract method must dispatch virtually on the
-                // runtime class — its intrinsic serves host-repr builtin
-                // receivers, and settling the header fid ran
-                // `kotlin.collections.List.isEmpty` against an interpreted
-                // `PersistentList` instance.
+                // A member-form binding (`<pkg>.<Class>.<name>`) is not in the
+                // simple-name index, so settle it here like a top-level form.
+                // Concrete classes only: an interface or abstract method must
+                // dispatch virtually, its intrinsic serving only host receivers.
                 if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |dot| {
                     const owner_fqn = fqn[0..dot];
                     if (module.classIdByFqn(owner_fqn)) |cid| {
@@ -796,10 +593,8 @@ pub const ProgramImage = struct {
             }
         }
 
-        // Bodyless decls (`expect` / header-only): settle the executable form in
-        // the dispatcher's order. Base bodyless funcs come from the baked id list
-        // (no full-table scan under the lazy path); this run's own funcs are
-        // scanned directly (eager `funcs.items`, ids past the base range).
+        // Bodyless decls, in dispatch order. Base funcs come from the baked id
+        // list so the lazy table is not swept; this run's own sit past it.
         for (module.bodyless_func_ids) |bid| {
             try self.linkBodyless(module, bindings, FuncId.from(bid));
         }
@@ -811,10 +606,8 @@ pub const ProgramImage = struct {
         @atomicStore(bool, &self.resolved_linked, true, .release);
     }
 
-    /// Settle one bodyless func's executable form: a same-simple-name body
-    /// sibling redirect (declaration order; arity picks at the call) plus the
-    /// exact-fqn / bare-name native fallback. Shared by the base (baked-id) and
-    /// user (table-scan) bodyless passes.
+    /// Settle one bodyless func's form: same-simple-name body siblings in
+    /// declaration order, plus the exact-fqn and bare-name native fallback.
     fn linkBodyless(self: *ProgramImage, module: *const Module, bindings: anytype, fid: FuncId) !void {
         const f = module.funcById(fid) orelse return;
         if (f.hasBody()) return;
@@ -826,21 +619,13 @@ pub const ProgramImage = struct {
             if (cand.int() == fid.int()) continue;
             const cf = module.funcById(cand) orelse continue;
             if (!cf.hasBody()) continue;
-            // An `actual` declares the same package as its `expect`, so only a
-            // same-package sibling can settle a bodyless decl. A same-named
-            // function in another package is an unrelated declaration: without
-            // this, a call to an `expect` klio does not implement silently ran a
-            // stranger's body (`material3.internal.getString` ran
-            // `foundation.text.getString`), and the caller never learned the
-            // expect was missing.
+            // An `actual` declares its `expect`'s package, so only a
+            // same-package sibling can settle a bodyless decl; linking a
+            // stranger would run its body for an unimplemented expect.
             if (!std.mem.eql(u8, cf.package, f.package)) continue;
-            // Same package is not enough for a MEMBER. `kotlin.Double.equals`
-            // and `kotlin.String.equals` share the package `kotlin`, and
-            // settling the first with the second runs an implementation that
-            // rejects the receiver it is handed. A receiver-formed header is
-            // settled only by a declaration of its own class — the FQN up to
-            // its last component. Top-level `expect`/`actual` pairs, whose
-            // owner IS their package, are unaffected.
+            // Same package is not enough for a member: `kotlin.Double.equals`
+            // and `kotlin.String.equals` share `kotlin` and reject each other's
+            // receiver, so a receiver-formed header needs its own class's decl.
             if (receiver_formed and
                 !std.mem.eql(u8, declaringOwnerOfFqn(cf.fqn), declaringOwnerOfFqn(f.fqn))) continue;
             try sibs.append(self.allocator, cand);
@@ -853,18 +638,10 @@ pub const ProgramImage = struct {
         }
     }
 
-    /// Symbols whose host implementation must serve even though the Kotlin
-    /// declaration has a body.
-    ///
-    /// `Sequence.sumOf` declares five overloads that differ ONLY in the
-    /// selector's return type — `(T) -> Double` first, then Int, Long, UInt,
-    /// ULong — and Kotlin picks between them by the lambda's inferred return
-    /// type. A lambda carries no declared return type here, so the pick falls
-    /// to declaration order and `sumOf { it.length }` runs the Double body,
-    /// accumulating 6 as 6.0. The host implementation reads the kind from the
-    /// first value it computes, which is the answer Kotlin's typed selection
-    /// reaches, and it drains a host `.Sequence` and an interpreted one alike
-    /// so it covers the same receivers the Kotlin body does.
+    /// Symbols whose host implementation serves even though the Kotlin
+    /// declaration has a body. `Sequence.sumOf`'s overloads differ only in the
+    /// selector's return type, which Kotlin picks by inference; the host form
+    /// reads the kind from the first value it computes instead.
     fn intrinsicOverridesBody(symbol: []const u8) bool {
         const overrides = [_][]const u8{
             "kotlin.sequences.Sequence.sumOf",
@@ -875,9 +652,7 @@ pub const ProgramImage = struct {
         return false;
     }
 
-    /// The declaring scope of a fully qualified name: everything before its
-    /// last component. For a member that is its class (`kotlin.Double`), for a
-    /// top-level function its package (`kotlin.collections`).
+    /// Everything before an FQN's last component: a member's class, or a package.
     fn declaringOwnerOfFqn(fqn: []const u8) []const u8 {
         const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return "";
         return fqn[0..dot];
@@ -902,10 +677,8 @@ pub const ProgramImage = struct {
         return false;
     }
 
-    /// Whether every value parameter of `f` depends on one of the function's
-    /// own declared type parameters. This includes structural uses such as
-    /// `Comparator<in T>`, not only a bare `T` head. The registry's
-    /// `func_type_params` carries the declared type-parameter names.
+    /// Whether every value parameter of `f` depends on one of the function's own
+    /// type parameters, counting structural uses such as `Comparator<in T>`.
     fn funcHasGenericSig(module: *const Module, fid: FuncId, f: *const ir.Func) bool {
         const tps = module.registry.func_type_params.get(fid) orelse return false;
         if (tps.items.len == 0) return false;
@@ -917,13 +690,9 @@ pub const ProgramImage = struct {
         return true;
     }
 
-    /// The narrow native-marking escape: a body-bearing, non-extension,
-    /// generic-signature overload whose FQN group also holds a same-arity
-    /// NON-generic sibling keeps its Kotlin body instead of being marked
-    /// `resolved_native`. Scoped tightly so intrinsic-over-body funcs stay
-    /// intrinsic: bodyless stubs, extensions, all-generic families
-    /// (`listOf`), and generic funcs with no concrete same-arity namesake
-    /// all keep today's marking.
+    /// A body-bearing, non-extension, generic-signature overload whose FQN group
+    /// holds a same-arity non-generic sibling keeps its Kotlin body. Bodyless
+    /// stubs, extensions, and all-generic families are marked as usual.
     fn genericOverloadKeepsBody(module: *const Module, fid: FuncId, f: *const ir.Func) bool {
         if (!f.hasBody()) return false;
         if (f.params.len != 0 and std.mem.eql(u8, f.params[0].name, "this")) return false;
@@ -939,9 +708,8 @@ pub const ProgramImage = struct {
         return false;
     }
 
-    /// The native form a bodyless decl's per-call ladder would have
-    /// found: the declared FQN against the overlay then the embedded
-    /// registry, then the bare-name map's FQN against both.
+    /// The native form for a bodyless decl: the declared FQN against the overlay
+    /// then the embedded registry, then the bare-name map's FQN against both.
     fn bodylessNativeForm(
         self: *const ProgramImage,
         bindings: *const HostBindings,
@@ -951,11 +719,8 @@ pub const ProgramImage = struct {
     ) ?StdlibFn {
         if (bindings.resolve(fqn)) |i| return i;
         if (stdlib.implementation(fqn)) |i| return i;
-        // The bare-name map names TOP-LEVEL functions, so it cannot settle a
-        // member header: `kotlin.Double.equals` is not implemented by the
-        // package-level `equals`, and running that one rejects the receiver it
-        // is handed. A member's implementation is receiver-qualified and has
-        // already been tried by exact FQN above.
+        // The bare-name map names top-level functions, so it cannot settle a
+        // member header; a member's implementation is receiver-qualified.
         if (receiver_formed) return null;
         if (self.default_import_globals.get(name)) |mapped| {
             if (bindings.resolve(mapped)) |i| return i;
@@ -964,11 +729,8 @@ pub const ProgramImage = struct {
         return null;
     }
 
-    /// Record a package-level installed binding's bare-name alias. A
-    /// binding whose parent segment starts with an uppercase letter is a
-    /// receiver-qualified member form (`...Job.join`) a bare name can
-    /// never mean; it is excluded. The lexicographically smallest FQN
-    /// wins a collision so the alias is hash-order independent.
+    /// Record a package-level binding's bare-name alias. An uppercase parent
+    /// segment is a member form a bare name cannot mean; smallest FQN wins.
     fn notePackAlias(map: *std.StringHashMap([]const u8), fqn: []const u8) Allocator.Error!void {
         const dot = std.mem.lastIndexOfScalar(u8, fqn, '.') orelse return;
         const pkg = fqn[0..dot];
@@ -984,34 +746,24 @@ pub const ProgramImage = struct {
         gop.value_ptr.* = fqn;
     }
 
-    /// The deterministic FQN a bare global name maps to under the
-    /// implicit stdlib surface, or null when the name is not part of it.
     pub fn defaultImportGlobal(self: *const ProgramImage, name: []const u8) ?[]const u8 {
         return self.default_import_globals.get(name);
     }
 
-    /// The pack-installed package-level binding a bare name aliases.
     pub fn packBareAlias(self: *const ProgramImage, name: []const u8) ?[]const u8 {
         return self.pack_bare_aliases.get(name);
     }
 
-    /// The builtin member-extension FQN a member name maps to on the
-    /// `kotlin.io` / `kotlin.AutoCloseable` / `kotlin.Any` surfaces.
     pub fn anyMemberGlobal(self: *const ProgramImage, name: []const u8) ?[]const u8 {
         return self.any_member_globals.get(name);
     }
 
-    /// The link-settled body siblings of a bodyless decl, declaration
-    /// order, or an empty slice.
     pub fn resolvedRedirects(self: *const ProgramImage, func: FuncId) []const FuncId {
         return self.resolved_redirect.get(func.int()) orelse &.{};
     }
 
-    /// The body sibling a call with `argc` args dispatches to for a
-    /// bodyless decl: the first link-settled redirect whose user arity
-    /// matches exactly or whose last param is a vararg. This is the
-    /// dispatch seam `callFunc` consults — kept here so the pick is unit
-    /// testable against synthetic modules.
+    /// The body sibling a call with `argc` args dispatches to: the first settled
+    /// redirect whose user arity matches exactly or whose last param is vararg.
     pub fn resolvedRedirectTarget(self: *const ProgramImage, module: *const Module, func: FuncId, argc: usize) ?FuncId {
         for (self.resolvedRedirects(func)) |cand| {
             const g = module.funcById(cand) orelse continue;
@@ -1024,10 +776,8 @@ pub const ProgramImage = struct {
         return null;
     }
 
-    /// Whether a runtime value can DEFINITELY not bind a parameter whose
-    /// declared head is `pn`: only the unambiguous builtin scalar kinds
-    /// refute. Permissive everywhere else — the filter exists to
-    /// discriminate SAME-ARITY expect redirects, never to re-rank.
+    /// Whether a value definitely cannot bind a parameter headed `pn`; only
+    /// builtin scalar kinds refute. This separates redirects, it does not rank.
     fn redirectParamRefutes(pn: []const u8, v: runtime.Value) bool {
         if (v == .Null) return false;
         var h = pn;
@@ -1055,13 +805,9 @@ pub const ProgramImage = struct {
         return false;
     }
 
-    /// `resolvedRedirectTarget` with the call's VALUES: among same-arity
-    /// siblings the pick skips a candidate whose declared scalar param the
-    /// value run definitely cannot bind. Two 9-param `ActualParagraph`
-    /// actuals differ only at `(ellipsis: Boolean, width: Float)` vs
-    /// `(overflow: TextOverflow, constraints: Constraints)`; the
-    /// declaration-order pick fed a TextOverflow into `ellipsis` and a
-    /// paragraph rendered a value class as its branch condition.
+    /// `resolvedRedirectTarget` using the call's values: among same-arity
+    /// siblings it skips a candidate whose declared scalar parameter the
+    /// arguments cannot bind, which declaration order alone gets wrong.
     pub fn resolvedRedirectTargetShaped(self: *const ProgramImage, module: *const Module, func: FuncId, args: []const runtime.Value) ?FuncId {
         if (runtime.envSetOnce("KLIO_REDIR_TRACE")) {
             if (module.funcById(func)) |hf| {
@@ -1090,38 +836,21 @@ pub const ProgramImage = struct {
         return fallback;
     }
 
-    /// The link-time-resolved native form for `func`, or `null` when the
-    /// symbol's single form is its lowered body. Consulted by the VM
-    /// dispatch paths in place of the deleted per-call FQN short-circuit.
+    /// The link-settled native form, or `null` when the body is the only form.
     pub fn resolvedNativeForm(self: *const ProgramImage, func: FuncId) ?StdlibFn {
         return self.resolved_native.get(func.int());
     }
 };
 
 /// Single exclusive spin lock, re-exported from `runtime.objcell` so the
-/// interpreter, the stdlib concurrency intrinsics, and the shared
-/// output/closure handles all share one definition (`coroutines.zig`
-/// imports it as `root.SpinMutex`).
+/// interpreter, the intrinsics, and the shared handles share one definition.
 pub const SpinMutex = runtime.SpinMutex;
 
-/// Shared serialized stdout sink. The root and every spawned thread
-/// write through this so concurrent `println` is serialized; on
-/// completion the recorded calls replay into the caller's real sink.
-///
-/// The program's output sink, shared by every thread. A thin handle over an
-/// `ObjRef` cell — the same shared cell `ThreadTable` is built on — so every
-/// write takes the cell's exclusive `borrowMut` and concurrent writes serialize.
-///
-/// Writes STREAM to the destination as they happen. A script runtime has to:
-/// `python x.py` and `node x.js` print as they go, and so must klio. Output
-/// withheld until exit is output a hanging, looping, or killed program never
-/// shows — and a long run would hold its entire output in memory besides.
-///
-/// The recording arm survives for the callers that attach no destination (the
-/// in-process harnesses that compare a whole run): with `dest` null the sink
-/// records, and `replayInto` drains it. `attach` flushes whatever was recorded
-/// before the destination was known — a top-level initializer runs before the
-/// run is handed its sink — and streams from then on.
+/// The program's stdout sink, shared by every thread: a handle over an `ObjRef`
+/// cell, so each write takes the cell's exclusive `borrowMut` and concurrent
+/// `println`s serialize. Writes stream as they happen, so a hanging or killed
+/// program still shows its output. With no destination attached the sink
+/// records instead, and `attach` flushes that backlog before streaming.
 pub const SharedOutput = struct {
     obj: ObjRef(State),
 
@@ -1148,8 +877,7 @@ pub const SharedOutput = struct {
         self.obj.deinit();
     }
 
-    /// Stream every write from here on straight to `out`, after flushing
-    /// anything recorded before the destination was known.
+    /// Stream from here on to `out`, flushing anything recorded first.
     pub fn attach(self: SharedOutput, out: Output) void {
         const g = self.obj.borrowMut();
         defer g.deinit();
@@ -1158,8 +886,7 @@ pub const SharedOutput = struct {
         st.dest = out;
     }
 
-    /// Drain the recording into `out`. A no-op once a destination is attached —
-    /// those writes already went straight there.
+    /// Drain the recording into `out`; a no-op once a destination is attached.
     pub fn replayInto(self: SharedOutput, out: Output) void {
         const g = self.obj.borrowMut();
         defer g.deinit();
@@ -1190,74 +917,49 @@ pub const SharedOutput = struct {
     }
 };
 
-/// One element of the lambda/closure side-table.
 pub const ClosureInfo = struct {
     body_func: FuncId,
-    /// A function VALUE loaded from a declaration (`::f`): equal to every
-    /// other load of the same function, but never the same object (a
-    /// non-capturing lambda literal is; a reference is not).
+    /// A function value loaded from a declaration (`::f`): equal to every other
+    /// load but never identical, unlike Kotlin's non-capturing-lambda singleton.
     is_ref: bool = false,
-    /// The module `body_func` indexes when the closure was created inside
-    /// a body lowered into a per-method *sub-module* (an anonymous-object
-    /// method, property-init thunk, or `init` block). Null means the main
-    /// program module. Every invocation site resolves the body against
-    /// this module — sub-module `FuncId`s start at 0 and must never be
-    /// read through the main module's func table. The pointed-to module
-    /// stays live for the whole run (its owning `ObjRef` is held by the
-    /// anon-method table or the run arena).
+    /// The module `body_func` indexes, null for the main program module. A
+    /// sub-module closure must resolve against it: sub-module `FuncId`s start at
+    /// 0. The module lives for the run, owned by the anon table or run arena.
     module: ?*const ir.Module = null,
     n_params: usize,
-    /// Whether lowering supplied a declared receiver-shape answer.
     receiver_shape_known: bool = false,
     /// The callable declares an extension receiver outside `n_params`.
-    /// Invocation uses this bit rather than guessing from arity or captures.
     has_receiver: bool = false,
     /// Capture names, in the same order as the runtime captures vec.
     capture_names: [][]const u8,
-    /// Live capture values. Stored behind a shared interior-mutable
-    /// handle so the lambda body's `StoreGlobal` writes propagate.
+    /// Live capture values, behind a shared handle so `StoreGlobal` propagates.
     captures: ObjRef(std.ArrayList(Value)),
-    /// The enclosing-receiver chain at the closure's creation site
-    /// (storage order, innermost last). Kotlin receiver scope is lexical:
-    /// the body resolves bare names against the receivers in scope where
-    /// the lambda literal was written, so every invocation — from any
-    /// frame, coroutine resume, or worker thread — seeds the body frame's
-    /// chain from this snapshot rather than the dynamic caller's chain.
+    /// The enclosing-receiver chain at the creation site, innermost last. Kotlin
+    /// receiver scope is lexical, so every invocation seeds the frame from this.
     chain: []const ir.eval.EnclosingEntry = &.{},
 
-    /// The collection epoch in which a live value last marked this closure
-    /// (see `markClosureThunk`). The post-sweep reclamation frees a slot's owned
-    /// metadata (`capture_names`, `chain`) once no live value references its id
-    /// — i.e. it was not marked in the just-finished collection — so the
-    /// append-only spine's per-closure bytes stay bounded by the live set rather
-    /// than by total closure-creation events (a per-request leak for a server).
+    /// Epoch in which a live value last marked this closure. Post-sweep
+    /// reclamation frees an unmarked slot's `capture_names` and `chain`.
     mark_epoch: usize = 0,
-    /// True once the slot's metadata has been reclaimed; the id is never reused
-    /// (ids stay append-stable, so no value can dispatch on a stale id).
+    /// True once the metadata is freed and the id is back on the free list.
     reclaimed: bool = false,
 
-    /// No-op tracer: a closure's capture store and receiver chain are kept alive
-    /// ONLY while a live value references the closure id (see `markClosureThunk`
-    /// / `runtime.gc.markClosureHook`), so the side-table spine must not pin
-    /// them — that was the leak. The spine is permanent and never swept, so it
-    /// needs no out-edges of its own.
+    /// No-op tracer. The capture store and chain live only while a value
+    /// references the closure id, so the permanent spine must not pin them.
     pub fn gcTrace(self: *const ClosureInfo, m: *runtime.gc.Marker) void {
         _ = self;
         _ = m;
     }
 };
 
-/// The process-wide closure side-table the GC's `markClosureHook` consults. All
-/// Vms (the main run plus every dispatch/worker child) share one spine by handle
-/// clone, so a single installed handle serves every thread's collector.
+/// The process-wide closure side-table `markClosureHook` consults. Every Vm
+/// shares one spine by handle clone, so one handle serves every collector.
 var active_closures: ?SharedClosures = null;
 
 fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
     const sc = active_closures orelse return;
-    // Mark the slot live for this epoch (so the post-sweep reclamation spares
-    // it), then shade its capture store + receiver chain. Runs during the
-    // stop-the-world mark, so the in-place pointer is stable (no concurrent
-    // push can realloc the spine).
+    // Mark the slot live for this epoch, then shade its capture store and
+    // chain. Stop-the-world, so no push can realloc the spine underneath.
     if (sc.getPtr(id)) |info| {
         info.mark_epoch = m.epoch;
         for (info.chain) |e| e.v.gcMark(m);
@@ -1265,11 +967,8 @@ fn markClosureThunk(id: u64, m: *runtime.gc.Marker) void {
     }
 }
 
-/// Free the owned metadata of every closure slot no live value referenced in
-/// the just-finished collection (`epoch`). Called once after the sweep, still
-/// stop-the-world, so the spine is stable and no slot is concurrently pushed.
-/// The capture-store cell is collected on its own reachability; ids are never
-/// reused.
+/// Free the owned metadata of every closure slot unreferenced in the finished
+/// collection. Stop-the-world, after the sweep, so the spine is stable.
 fn sweepClosuresThunk(epoch: usize) void {
     const sc = active_closures orelse return;
     sc.reclaimDead(epoch);
@@ -1284,15 +983,12 @@ fn sweepClosuresThunk(epoch: usize) void {
 }
 
 /// Singleton identity for a closure id: non-zero and stable per (module, body
-/// function) when the closure captures nothing (a Kotlin non-capturing-lambda
-/// singleton), 0 otherwise. `Value.structuralEq` compares two closures by this
-/// identity so two evaluations of the same non-capturing literal — which klio
-/// materialises as distinct closure ids — compare equal as they do in Kotlin.
+/// function) when the closure captures nothing, 0 otherwise. Kotlin makes a
+/// non-capturing lambda a singleton, so `structuralEq` compares by this.
 fn closureSingletonThunk(id: u64) u64 {
     const sc = active_closures orelse return 0;
     const info = sc.get(id) orelse return 0;
-    // A reclaimed slot's metadata is gone; a captured closure keeps per-instance
-    // identity (Kotlin makes only non-capturing lambdas singletons).
+    // A capturing closure keeps per-instance identity; a reclaimed slot none.
     if (info.reclaimed or info.is_ref or info.capture_names.len != 0 or info.chain.len != 0) return 0;
     const mod_bits: u64 = if (info.module) |m| @intFromPtr(m) else 0;
     var h: u64 = 1469598103934665603;
@@ -1301,22 +997,19 @@ fn closureSingletonThunk(id: u64) u64 {
     return h | 1;
 }
 
-/// Install the closure-liveness hook with this program's shared side-table.
-/// Idempotent across Vms (they share the spine).
+/// Install the closure-liveness hook; idempotent across Vms sharing a spine.
 pub fn gcInstallClosureHook(closures: SharedClosures) void {
     active_closures = closures;
     runtime.gc.markClosureHook = markClosureThunk;
     runtime.gc.sweepClosureHook = sweepClosuresThunk;
     runtime.gc.closureSingletonHook = closureSingletonThunk;
-    // The lazy-`sequence{}` builder holds its parked continuation as an opaque
-    // `*ir.eval.SuspendState` in a `Sequence`'s `Builder` source; wire the
-    // mark/free hooks so the GC roots and reclaims those frames.
+    // A lazy `sequence {}` builder parks its continuation as an opaque
+    // `*ir.eval.SuspendState`, which the GC needs these hooks to reach.
     runtime.gc.markSuspendHook = ir.eval.gcMarkSuspendStateOpaque;
     runtime.gc.freeSuspendHook = ir.eval.freeSuspendStateOpaque;
 }
 
-/// Clear program-owned closure hooks before a repeated in-process runner
-/// collects the completed program graph and releases its phase arena.
+/// Clear program-owned closure hooks before the run's phase arena is released.
 pub fn gcResetProgramHooks() void {
     active_closures = null;
     runtime.gc.markClosureHook = null;
@@ -1324,27 +1017,17 @@ pub fn gcResetProgramHooks() void {
     runtime.gc.closureSingletonHook = null;
 }
 
-/// Lambda/closure side-table shared across every OS thread of one
-/// program. Indices (`Value.IrClosure.id`) are append-stable — `push`
-/// only ever extends — so a shared mutex-guarded list keeps cross-thread
-/// closure creation sound while every existing id stays valid.
+/// Lambda/closure side-table shared across every OS thread of one program. A
+/// slot id stays valid for as long as a live value references it.
 pub const SharedClosures = struct {
     obj: ObjRef(std.ArrayList(ClosureInfo)),
-    /// Free list of slot ids reclaimed by `reclaimDead` (no live value
-    /// referenced them in the last collection). `push` reuses one before
-    /// extending the spine, so the table stays bounded by the live closure set
-    /// rather than growing per closure-creation event (an unbounded per-request
-    /// leak for a server). Reuse is sound: a slot is freed only after a full
-    /// mark proved no live value references its id, and a marked closure value
-    /// always marks its slot (`markClosureThunk`), so a reused id can never
-    /// alias a still-live value. Shared by handle; touched only under the spine
-    /// cell's writer lock or inside the stop-the-world pause.
+    /// Slot ids reclaimed by `reclaimDead`; `push` reuses one before extending
+    /// the spine. Sound because a slot is freed only after a full mark proved no
+    /// live value references its id. Writer lock or stop-the-world only.
     free_ids: ObjRef(std.ArrayList(u64)),
 
     pub fn new(allocator: Allocator) Allocator.Error!SharedClosures {
         const obj = try ObjRef(std.ArrayList(ClosureInfo)).init(allocator, .empty);
-        // The side-table is shared across every thread from creation, so
-        // `get`/`push` go through the cell's reader/writer lock.
         const free_ids = try ObjRef(std.ArrayList(u64)).init(allocator, .empty);
         return .{ .obj = obj, .free_ids = free_ids };
     }
@@ -1366,13 +1049,11 @@ pub const SharedClosures = struct {
         return list.items[id];
     }
 
-    /// In-place slot pointer for the stop-the-world GC mark/sweep only. The
-    /// spine only ever grows, and `push` cannot run concurrently with a
-    /// collection (the world is stopped), so the returned pointer is stable.
+    /// In-place slot pointer, for the stop-the-world GC mark and sweep only:
+    /// `push` cannot run during a collection, so the pointer stays stable.
     pub fn getPtr(self: SharedClosures, id: usize) ?*ClosureInfo {
-        // A shared borrow: the mark phase reads the slot and must not run
-        // the mutable borrow's write barrier (which locks the remembered
-        // set the collector may hold).
+        // A shared borrow: the mark phase must not run the mutable borrow's
+        // write barrier, which locks the remembered set the collector holds.
         const g = self.obj.borrow();
         defer g.deinit();
         const list = g.get();
@@ -1380,9 +1061,8 @@ pub const SharedClosures = struct {
         return @constCast(&list.items[id]);
     }
 
-    /// Free the owned metadata of every slot not marked in `epoch` (no live
-    /// value references its id). The capture-store cell is swept separately by
-    /// reachability; the id is never reused. STW-only.
+    /// Free the owned metadata of every slot not marked in `epoch` and free its
+    /// id. The capture-store cell is swept separately. Stop-the-world only.
     pub fn reclaimDead(self: SharedClosures, epoch: usize) void {
         const g = self.obj.borrowMut();
         defer g.deinit();
@@ -1400,9 +1080,8 @@ pub const SharedClosures = struct {
         }
     }
 
-    /// Bind `info` to a slot, returning its id. Reuses a reclaimed slot (its old
-    /// capture-store cell was already swept by reachability, and its fields are
-    /// overwritten here before any read) before extending the spine.
+    /// Bind `info` to a slot and return its id, reusing a reclaimed slot first.
+    /// A reused slot's fields are overwritten here before any read.
     pub fn push(self: SharedClosures, info: ClosureInfo) Allocator.Error!u64 {
         const g = self.obj.borrowMut();
         defer g.deinit();
@@ -1421,11 +1100,9 @@ pub const SharedClosures = struct {
     }
 };
 
-/// One spawned OS thread tracked by the host. The thread yields the
-/// body's terminal result (an error carries a thrown Kotlin Throwable).
+/// One spawned OS thread; an error result carries a thrown Kotlin Throwable.
 pub const ThreadEntry = struct {
     handle: ?std.Thread,
-    /// Terminal result published by the thread body on exit.
     result: ?ThreadResult = null,
     finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
@@ -1437,26 +1114,14 @@ pub const ThreadResult = union(enum) {
 
 pub const ThreadTable = ObjRef(std.AutoHashMap(u64, ThreadEntry));
 
-/// First-access initialization state for one `object` / companion
-/// singleton, keyed by its lifted global name in `ObjectStates`. A name
-/// with no entry is either not yet initialized or already published in
-/// `globals`; the gate in `host_globals.ensureObjectSingleton` checks
-/// `globals` first, so the table only carries the transient and terminal
-/// non-published states.
+/// First-access init state for one `object` or companion singleton, keyed by
+/// its lifted global name. Only in-flight and failed states are carried here.
 pub const ObjectInitState = union(enum) {
-    /// Construction is running on `thread`. `instance` is set as soon as
-    /// the instance shell is materialized, so re-entrant access from the
-    /// constructing thread (an object referencing itself during its own
-    /// init) observes the partially-initialized singleton, matching
-    /// Kotlin. Any other thread waits for the entry to resolve.
+    /// Construction is running on `thread`; `instance` is set once the shell
+    /// exists, so re-entrant access sees the partial singleton, as Kotlin does.
     InProgress: struct { thread: std.Thread.Id, instance: ?Value },
-    /// The first construction threw. The initializer is never retried.
-    /// `cause` holds the original throwable until the first THROWING read
-    /// surfaces it (a quiet resolution gate may have consumed the
-    /// construction attempt itself, so the wrap-at-construction site never
-    /// reached user code); every later access throws
-    /// `FileFailedToInitializeException` without the cause, matching
-    /// kotlinc.
+    /// The first construction threw and is never retried. `cause` holds the
+    /// throwable until the first throwing read; later accesses carry no cause.
     Failed: struct { cause: ?Value },
 
     pub fn gcTrace(self: *const ObjectInitState, m: *runtime.gc.Marker) void {
@@ -1467,22 +1132,16 @@ pub const ObjectInitState = union(enum) {
     }
 };
 
-/// Shared lazy-`object` init table: one entry per singleton whose
-/// construction is in flight or has failed. Shared by handle with every
-/// OS thread, like `ThreadTable`; the cell's writer lock serializes the
-/// claim that makes first-access construction once-only across threads.
+/// Lazy-`object` init table. The cell's writer lock serializes the claim that
+/// makes first-access construction once-only across threads.
 pub const ObjectStates = ObjRef(std.StringHashMap(ObjectInitState));
-/// Id-keyed singleton table: `ClassId.int() -> published singleton`. The
-/// authoritative read for id-committed class/object/companion value reads;
-/// the name-keyed `globals` publication remains as the view user-code name
-/// reads resolve through. Publication order: id table first, then names.
+/// `ClassId.int()` → published singleton, authoritative for id-committed reads;
+/// name reads go through `globals`. Published to the id table first.
 pub const SingletonsById = ObjRef(std.AutoHashMap(u32, runtime.Value));
 
 /// Vm-level errors, carried as data.
 pub const VmError = union(enum) {
-    /// main function not found in module
     InvalidMain,
-    /// IR eval: {0}
     Eval: []const u8,
 };
 
@@ -1496,7 +1155,7 @@ pub const VmResult = union(enum) {
 pub const TimeMode = enum {
     /// Consume real wall-clock time, matching the JVM.
     Wall,
-    /// Advance a logical clock instantly — deterministic and fast.
+    /// Advance a logical clock instantly, deterministic and fast.
     Virtual,
 
     pub const default: TimeMode = .Wall;
@@ -1504,53 +1163,38 @@ pub const TimeMode = enum {
 
 threadlocal var coroutine_time_mode_tls: TimeMode = .Wall;
 
-/// Set the coroutine time mode for the current thread.
 pub fn setCoroutineTimeMode(mode: TimeMode) void {
     coroutine_time_mode_tls = mode;
 }
 
-/// Current coroutine time mode for this thread.
 pub fn coroutineTimeMode() TimeMode {
     return coroutine_time_mode_tls;
 }
 
-/// One Vm instance executes a single program against the IR module
-/// produced by the front end.
+/// One Vm instance executes one program against a front-end IR module.
 pub const Vm = struct {
     module: ObjRef(Module),
     globals: ObjRef(Env),
-    /// Process-wide monotonic instance-id source.
     instance_id_counter: ObjRef(std.atomic.Value(u64)),
-    /// Per-class runtime metadata produced by `build.build_module`.
     classes: ObjRef(ClassTable),
     /// Top-level property initialiser `FuncIds`, run at `run` start.
     top_level_props: std.ArrayList(NameFunc),
-    /// Enum-entry ctor-arg thunks to evaluate at startup.
     enum_entry_arg_inits: std.ArrayList(EnumEntryArgInit),
     /// Default outer instance to attach to locally-registered classes.
     class_default_outer: ObjRef(OuterTable),
-    /// Runtime-lowered method bodies for anonymous-object / local classes.
     anon_methods: AnonMethods,
-    /// Closure side-table, shared across threads.
     closures: SharedClosures,
-    /// Build-time-immutable program metadata, shared by handle.
     prog: ObjRef(ProgramImage),
-    /// Shared serialized stdout sink.
     out_sink: SharedOutput,
-    /// Host-side registry of live spawned-thread join handles.
     threads: ThreadTable,
-    /// Lazy `object` / companion first-access init states.
     object_states: ObjectStates,
     singletons_by_id: SingletonsById,
     allocator: Allocator,
-    /// When set, the enum-entry ctor-arg patch allocates its values and
-    /// field buffers here instead of `allocator`. The parity drivers point
-    /// it at the shared base cache entry's arena, because the patch writes
-    /// into instances that OUTLIVE the program: a per-program value there is
-    /// swept at end-of-program collect and dangles for the next program.
+    /// Where the enum-entry ctor-arg patch allocates, defaulting to `allocator`.
+    /// The parity drivers point it at the base cache arena, which outlives the
+    /// program whose instances the patch writes into.
     patch_allocator: ?Allocator = null,
-    /// Process argv for the program's `main(args: Array<String>)`. Empty
-    /// under `klio run`; a bundle passes its argv[1..] through.
+    /// Process argv for `main(args)`; empty under `klio run`, set by a bundle.
     program_args: []const []const u8 = &.{},
 
     pub const new = run_mod.vmNew;
@@ -1562,8 +1206,7 @@ pub const Vm = struct {
     pub const run = run_mod.vmRun;
     pub const runInner = run_mod.vmRunInner;
     pub const deinit = run_mod.vmDeinit;
-    // Embedder entry points for driving non-`main` functions (the test
-    // runner): prepare startup, then invoke functions/methods/constructors.
+    // Embedder entry points: prepare startup, then invoke functions or methods.
     pub const prepare = run_mod.vmPrepare;
     pub const runCalls = run_mod.vmRunCalls;
     pub const callNoArg = run_mod.vmCallNoArg;
@@ -1571,12 +1214,10 @@ pub const Vm = struct {
     pub const callMethod = run_mod.vmCallMethod;
 };
 
-/// Outcome of a single embedder-driven call into a prepared Vm.
 pub const CallOutcome = run_mod.CallOutcome;
 
-/// `Send` capture of the shared program state for a new OS thread.
-/// Every field is an owned shared handle, so the seed outlives the
-/// spawning call and carries no borrow.
+/// `Send` capture of the shared program state for a new OS thread. Every field
+/// is an owned shared handle, so the seed outlives the spawning call.
 pub const SendableVmSeed = struct {
     module: ObjRef(Module),
     globals: ObjRef(Env),
@@ -1592,7 +1233,6 @@ pub const SendableVmSeed = struct {
     singletons_by_id: SingletonsById,
     allocator: Allocator,
 
-    /// Materialize a child `Vm` on the current (new) OS thread.
     pub fn materialize(self: SendableVmSeed) Allocator.Error!Vm {
         return .{
             .module = self.module,
@@ -1614,8 +1254,7 @@ pub const SendableVmSeed = struct {
     }
 };
 
-/// Whether `name` names a property (not a function) reachable on
-/// `receiver`'s class. Walks the parent chain and declared supertypes.
+/// Whether `name` names a property, not a function, on `receiver`'s class chain.
 pub fn memberIsProperty(allocator: Allocator, classes: *const ObjRef(ClassTable), receiver: *const Value, name: []const u8) bool {
     const start: ObjRef(ClassDef) = switch (receiver.*) {
         .Instance => |inst| blk: {
@@ -1676,9 +1315,8 @@ pub fn memberIsProperty(allocator: Allocator, classes: *const ObjRef(ClassTable)
     return false;
 }
 
-/// Whether a body's declared primitive parameter type can accept `v`.
-/// Conservative: only a definite concrete-primitive-vs-different-
-/// primitive pairing rejects.
+/// Whether a body's declared primitive parameter type can accept `v`. Only a
+/// definite primitive-versus-different-primitive pairing rejects.
 pub fn primitiveParamAccepts(type_name: []const u8, v: *const Value) bool {
     const arg_is_primitive = switch (v.*) {
         .Int, .Long, .Short, .Byte, .UInt, .ULong, .UShort, .UByte, .Double, .Float, .Char, .Bool, .String => true,
@@ -1714,9 +1352,8 @@ fn allAsciiUpper(s: []const u8) bool {
     return true;
 }
 
-/// Permissive receiver/param-type compatibility used by extension
-/// overload pickers. Returns false only when the runtime value provably
-/// does not satisfy the parameter's nominal type.
+/// Permissive receiver/param-type compatibility for extension overload pickers:
+/// false only when the value provably fails the parameter's nominal type.
 pub fn receiverCompatibleWithParam(receiver: *const Value, param_ty: *const TypeRef) bool {
     if (receiver.* == .Instance) return true;
     const pn_simple = simpleName(param_ty.name);
@@ -1731,9 +1368,8 @@ pub fn receiverCompatibleWithParam(receiver: *const Value, param_ty: *const Type
     return receiver.isRuntimeType(pn_simple);
 }
 
-/// True when an extension's declared receiver type name denotes a user /
-/// pack class — i.e. not a builtin, an open supertype a builtin
-/// satisfies, or a bare type parameter.
+/// True when an extension's declared receiver names a user or pack class, not a
+/// builtin, an open supertype a builtin satisfies, or a bare type parameter.
 pub fn extDeclRecvIsUserClass(ty_name: []const u8) bool {
     const s = simpleName(ty_name);
     if (s.len == 0) return false;
@@ -1754,9 +1390,8 @@ pub fn extDeclRecvIsUserClass(ty_name: []const u8) bool {
     return true;
 }
 
-/// True when `fqn` names a builtin `kotlin.*` Throwable-hierarchy class
-/// that klio constructs as a host `Value.Exception` rather than a
-/// generic Instance.
+/// True when `fqn` names a builtin `kotlin.*` Throwable class that klio
+/// constructs as a host `Value.Exception` rather than a generic Instance.
 pub fn isBuiltinThrowableFqn(fqn: []const u8) bool {
     const names = [_][]const u8{
         "kotlin.Throwable",                       "kotlin.Exception",
@@ -1776,7 +1411,6 @@ pub fn isBuiltinThrowableFqn(fqn: []const u8) bool {
     return false;
 }
 
-/// True for a builtin (non-`Instance`, non-`Class`) value.
 pub fn valueIsBuiltin(v: *const Value) bool {
     return switch (v.*) {
         .String, .StringBuilder, .Int, .Long, .Short, .Byte, .Double, .Float, .Char, .Bool, .Array, .List, .Map, .Result => true,
@@ -1784,14 +1418,12 @@ pub fn valueIsBuiltin(v: *const Value) bool {
     };
 }
 
-/// A `TypeRef` denoting a Kotlin function type.
 pub fn isFunctionType(ty: *const TypeRef) bool {
     const n = simpleName(ty.name);
     return std.mem.startsWith(u8, n, "Function") or
         std.mem.indexOf(u8, ty.name, "->") != null;
 }
 
-/// Whether a runtime value can be invoked as `f(...)`.
 pub fn valueIsCallable(v: *const Value) bool {
     return switch (v.*) {
         .IrClosure, .Intrinsic, .BoundMethod, .PropertyRef => true,
@@ -1799,8 +1431,7 @@ pub fn valueIsCallable(v: *const Value) bool {
     };
 }
 
-/// True when `v` is a `Value.Exception` whose `fqn` names a
-/// `CancellationException` (including the timeout variant).
+/// True when `v` is a `CancellationException`, timeout variant included.
 pub fn isCancellationException(v: *const Value) bool {
     switch (v.*) {
         .Exception => |e| {
@@ -1823,12 +1454,9 @@ pub fn isCancellationException(v: *const Value) bool {
     }
 }
 
-/// Arm the eval-loop wall-clock deadline so an in-process program that spins in
-/// the eval loop aborts with "test wall-clock deadline exceeded" instead of
-/// hanging the whole test binary. For the in-process itest harnesses only (the
-/// CLI runs `Vm.run` directly and is never capped). Catches infinite loops in
-/// the eval loop; a pure deadlock blocked off the eval loop is not covered.
-/// `cap_ms <= 0` disarms.
+/// Arm the eval-loop wall-clock deadline so an in-process program that spins
+/// aborts instead of hanging the test binary. Harnesses only; the CLI is never
+/// capped, and a deadlock outside the eval loop is not covered. `<= 0` disarms.
 pub fn armTestWallDeadlineMs(cap_ms: i64) void {
     if (cap_ms <= 0) {
         ir.eval.test_wall_deadline_ms.store(0, .monotonic);
@@ -1869,9 +1497,6 @@ test "ext_decl_recv_is_user_class rejects builtins and type params" {
     try testing.expect(!extDeclRecvIsUserClass("String"));
     try testing.expect(!extDeclRecvIsUserClass("T"));
     try testing.expect(extDeclRecvIsUserClass("com.example.Widget"));
-    // The primitive-array and unsigned families are builtins too: classifying
-    // ByteArray as a user class made the incompatible-receiver guard strip
-    // the names off `decodeToString(throwOnInvalidSequence = true)`.
     try testing.expect(!extDeclRecvIsUserClass("ByteArray"));
     try testing.expect(!extDeclRecvIsUserClass("kotlin.ByteArray"));
     try testing.expect(!extDeclRecvIsUserClass("UIntArray"));
@@ -1959,23 +1584,16 @@ test "linkResolvedForms binds one form per symbol from the installed overlay" {
     // Two body-bearing funcs; only the first's FQN has a native binding.
     const shimmed = try pushLinkTestFunc(&m, a, "now", "kotlinx.datetime.now");
     const plain = try pushLinkTestFunc(&m, a, "plain", "app.plain");
-    // The link resolves natives by simple name through the name index (as the
-    // real build does after a `rebuildFuncNameIndex`); build it for the test.
     try m.rebuildFuncNameIndex(a);
 
     var prog = try ProgramImage.init(a);
     defer prog.deinit();
 
-    // Empty overlay: every symbol's form is its lowered body.
     try prog.linkResolvedForms(&m);
     try testing.expect(prog.resolved_linked);
     try testing.expect(prog.resolvedNativeForm(shimmed) == null);
     try testing.expect(prog.resolvedNativeForm(plain) == null);
 
-    // Install a binding for the shimmed FQN, re-link, and confirm the
-    // resolved form is the native binding for that symbol and the lowered
-    // body (absent) for the other — exactly what the deleted per-call
-    // `installed_bindings.resolve(fqn)` short-circuit would have picked.
     {
         const bg = prog.installed_bindings.borrowMut();
         defer bg.deinit();
@@ -1987,8 +1605,6 @@ test "linkResolvedForms binds one form per symbol from the installed overlay" {
     try testing.expect(resolved.? == linkTestNativeFn);
     try testing.expect(prog.resolvedNativeForm(plain) == null);
 
-    // Re-linking is idempotent and rebuilds the table from the current
-    // overlay: clearing the binding drops the resolved native form.
     {
         const bg = prog.installed_bindings.borrowMut();
         defer bg.deinit();
@@ -2005,10 +1621,8 @@ test "linkResolvedForms settles a member-form binding onto the class method" {
         for (m.funcs.items) |f| a.free(f.blocks);
         m.deinit(a);
     }
-    // A body-bearing method reached only through its class: member funcs
-    // are not in the simple-name index, so the member leg must resolve the
-    // binding key's class prefix and mark the method native (the
-    // `ReentrantLock.lock` placeholder-body shape).
+    // Member funcs are not in the simple-name index, so the member leg must
+    // resolve the binding key's class prefix and mark the method native.
     const lock_m = try pushLinkTestFunc(&m, a, "lock", "kx.locks.ReentrantLock.lock");
     _ = m.func_index.pop();
     try m.rebuildFuncNameIndex(a);
@@ -2085,9 +1699,8 @@ test "a bodyless expect never links to a same-named function in another package"
         for (m.funcs.items) |f| a.free(f.blocks);
         m.deinit(a);
     }
-    // An `actual` declares its `expect`'s package. A same-named function in a
-    // DIFFERENT package is an unrelated declaration: linking it would make a call
-    // to an unimplemented `expect` silently run a stranger's body.
+    // An `actual` declares its `expect`'s package; linking a same-named function
+    // from another package would silently run a stranger's body.
     const expect_fn = try pushLinkTestFuncPkg(&m, a, "getStr", "p1.getStr", "p1", true);
     const same_pkg = try pushLinkTestFuncPkg(&m, a, "getStr", "p1.getStr", "p1", false);
     _ = try pushLinkTestFuncPkg(&m, a, "getStr", "p2.getStr", "p2", false);
@@ -2112,15 +1725,12 @@ test "linkResolvedForms settles bodyless decls: sibling redirect, FQN native, ma
         for (m.funcs.items) |f| a.free(f.blocks);
         m.deinit(a);
     }
-    // expect→actual shape: bodyless decl with a body-bearing sibling.
     const expect_fn = try pushLinkTestFuncOpts(&m, a, "ping", "app.ping", true);
     const actual_fn = try pushLinkTestFunc(&m, a, "ping", "app.ping.impl");
-    // Bodyless decl whose declared FQN is an embedded intrinsic.
     const abs_decl = try pushLinkTestFuncOpts(&m, a, "abs", "kotlin.math.abs", true);
-    // Bodyless decl whose declared FQN is unknown, but whose simple name
-    // maps into the implicit stdlib surface.
+    // Bodyless decl whose FQN is unknown but whose simple name maps implicitly.
     const sqrt_decl = try pushLinkTestFuncOpts(&m, a, "sqrt", "mylib.sqrt", true);
-    // Body-bearing func: the embedded registry must NOT shadow its body.
+    // Body-bearing func: the embedded registry must not shadow its body.
     const body_abs = try pushLinkTestFunc(&m, a, "abs", "kotlin.math.abs");
     try m.rebuildFuncNameIndex(a);
 
@@ -2128,21 +1738,16 @@ test "linkResolvedForms settles bodyless decls: sibling redirect, FQN native, ma
     defer prog.deinit();
     try prog.linkResolvedForms(&m);
 
-    // Sibling redirect recorded in declaration order; no native form.
     const redirects = prog.resolvedRedirects(expect_fn);
     try testing.expect(redirects.len >= 1);
     try testing.expectEqual(actual_fn.int(), redirects[0].int());
     try testing.expect(prog.resolvedNativeForm(actual_fn) == null);
-    // The dispatch seam picks that sibling for a fitting call and
-    // declines a non-fitting one (zero-param sibling, one-arg call).
     try testing.expectEqual(actual_fn.int(), prog.resolvedRedirectTarget(&m, expect_fn, 0).?.int());
     try testing.expect(prog.resolvedRedirectTarget(&m, expect_fn, 1) == null);
 
-    // Exact-FQN embedded native bound for the bodyless decl only.
     try testing.expect(prog.resolvedNativeForm(abs_decl) != null);
     try testing.expect(prog.resolvedNativeForm(body_abs) == null);
 
-    // Map-resolved native: `sqrt` maps to kotlin.math.sqrt.
     try testing.expect(prog.resolvedNativeForm(sqrt_decl) != null);
     try testing.expectEqualStrings("kotlin.math.sqrt", prog.defaultImportGlobal("sqrt").?);
 }
@@ -2202,12 +1807,9 @@ test "bodyless redirect dispatch picks by exact arity, then vararg" {
     defer prog.deinit();
     try prog.linkResolvedForms(&m);
 
-    // Exact arity wins; a non-matching count falls to the vararg form;
-    // the vararg form also absorbs zero extra args.
     try testing.expectEqual(two.int(), prog.resolvedRedirectTarget(&m, stub, 2).?.int());
     try testing.expectEqual(vararg.int(), prog.resolvedRedirectTarget(&m, stub, 3).?.int());
     try testing.expectEqual(vararg.int(), prog.resolvedRedirectTarget(&m, stub, 0).?.int());
-    // A body-bearing func never redirects.
     try testing.expect(prog.resolvedRedirectTarget(&m, two, 2) == null);
 }
 
@@ -2220,11 +1822,8 @@ test "link-time bare-name maps are deterministic and package-ranked" {
     {
         const bg = prog.installed_bindings.borrowMut();
         defer bg.deinit();
-        // Package-level pack binding: bare-aliasable.
         try bg.get().register("kotlinx.coroutines.runBlocking", linkTestNativeFn);
-        // Receiver-qualified member binding: never bare-aliasable.
         try bg.get().register("kotlinx.coroutines.Job.join", linkTestNativeFn);
-        // Same leaf from two packages: smallest FQN wins, hash-order free.
         try bg.get().register("kotlinx.serialization.encode", linkTestNativeFn);
         try bg.get().register("kotlinx.io.encode", linkTestNativeFn);
     }
@@ -2234,18 +1833,11 @@ test "link-time bare-name maps are deterministic and package-ranked" {
     try testing.expect(prog.packBareAlias("join") == null);
     try testing.expectEqualStrings("kotlinx.io.encode", prog.packBareAlias("encode").?);
 
-    // Default-import map: the embedded registry feeds it (`min` maps to
-    // kotlin.math.min; no other bare-mappable `min` exists today) and the
-    // implicit surface always carries the array builders. Unconditional:
-    // a dropped key must fail, not pass silently.
     try testing.expectEqualStrings("kotlin.math.min", prog.defaultImportGlobal("min").?);
     try testing.expectEqualStrings("kotlin.intArrayOf", prog.defaultImportGlobal("intArrayOf").?);
 
-    // Member-surface map: `kotlin.io`'s receiver-less globals must NOT be
-    // member edges — serving `println` member-style printed the receiver
-    // (`with(x) { println() }` printed `x`). No source registers a
-    // `kotlin.AutoCloseable.*` / `kotlin.Any.*` FQN today — `use` stays
-    // absent too.
+    // `kotlin.io`'s receiver-less globals must not become member edges: serving
+    // `println` member-style would print the receiver. No `use` edge exists.
     try testing.expect(prog.anyMemberGlobal("println") == null);
     try testing.expect(prog.anyMemberGlobal("print") == null);
     try testing.expect(prog.anyMemberGlobal("use") == null);
@@ -2260,23 +1852,16 @@ test "link-time bare-name maps rank a cross-package collision first-package-wins
     {
         const bg = prog.installed_bindings.borrowMut();
         defer bg.deinit();
-        // Same simple name registered under two `bare_probe_packages`
-        // members: the earlier-ranked package must win regardless of
-        // registration or hash order (kotlin.math ranks above kotlin.io).
         try bg.get().register("kotlin.io.zzzCollide", linkTestNativeFn);
         try bg.get().register("kotlin.math.zzzCollide", linkTestNativeFn);
-        // Any-member surface collision: kotlin.AutoCloseable ranks above
-        // kotlin.Any.
         try bg.get().register("kotlin.Any.zzzUse", linkTestNativeFn);
         try bg.get().register("kotlin.AutoCloseable.zzzUse", linkTestNativeFn);
     }
     try prog.linkResolvedForms(&m);
     try testing.expectEqualStrings("kotlin.math.zzzCollide", prog.defaultImportGlobal("zzzCollide").?);
     try testing.expectEqualStrings("kotlin.AutoCloseable.zzzUse", prog.anyMemberGlobal("zzzUse").?);
-    // Production pin for the one real cross-package collision in the
-    // embedded registry: StringBuilder is registered under both `kotlin`
-    // and `kotlin.text`, and `kotlin` ranks first. A rank-order
-    // regression flips this pick.
+    // The one real cross-package collision: StringBuilder is registered under
+    // both `kotlin` and `kotlin.text`, and `kotlin` ranks first.
     try testing.expectEqualStrings("kotlin.StringBuilder", prog.defaultImportGlobal("StringBuilder").?);
 }
 

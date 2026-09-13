@@ -1,16 +1,7 @@
-//! End-to-end gate for `klio bundle`: a bundled program must behave
-//! byte-identically to `klio run` — stdout, stderr, exit code — while
-//! running against an EMPTY home (no `~/.klio`, no packs, no cache) and
-//! a non-repo cwd. Covers the plain-hello case, a pack-using program
-//! (kotlinx.serialization with a baked feature), argv passthrough into
-//! `main(args)`, embedded resources (binary + text + the
-//! missing-resource exception), `exitProcess` exit-code fidelity, stdin
-//! passthrough, payload corruption, `KLIO_BUNDLE_INSPECT` output shape,
-//! and double-bundle byte determinism.
-//!
-//! Each scenario spawns the real `klio` binary (KLIO_ITEST_BIN). Bundling
-//! runs under a scratch HOME seeded with the packs the programs need;
-//! bundles run under a second, empty HOME.
+//! End-to-end gate for `klio bundle`: a bundled program must match `klio run`
+//! while running against an empty home (no `~/.klio`, no packs, no cache) from
+//! a non-repo cwd. Bundling runs under a scratch HOME seeded with the packs
+//! the programs need; the bundles run under a second, empty HOME.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,10 +10,6 @@ const runtime = @import("runtime");
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 const TMP_ROOT = "/tmp/klio_itest_bundle_smoke";
-
-// -------------------------------------------------------------------------
-// Child-process plumbing (mirrors src/itests/stdlib_image.zig).
-// -------------------------------------------------------------------------
 
 fn klioBin(a: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map) ![]const u8 {
     const rel = env.get("KLIO_ITEST_BIN") orelse "zig-out/bin/klio";
@@ -79,8 +66,6 @@ fn freshDir(a: std.mem.Allocator, io: std.Io, name: []const u8) ![]const u8 {
     return dir;
 }
 
-/// Shared per-suite state: one bundling HOME (packs installed once) and
-/// one empty run HOME.
 const Ctx = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -107,7 +92,6 @@ fn ctx() !*Ctx {
     run_env.* = try baseEnv(a, run_home);
     const bin = try klioBin(a, io, build_env);
 
-    // Install the packs the pack-using scenarios bake in.
     const pack_dirs = [_][]const u8{
         "kotlin-klio/klio-kotlinx-serialization",
         "kotlin-klio/klio-bundle",
@@ -142,8 +126,6 @@ fn ctx() !*Ctx {
     return &ctx_state.?;
 }
 
-/// Bundle `program` (plus extra bundle args) to `out_name` under
-/// TMP_ROOT and return the output path.
 fn bundleProgram(c: *Ctx, program: []const u8, out_name: []const u8, extra: []const []const u8) ![]const u8 {
     const out = try std.fmt.allocPrint(c.a, "{s}/{s}", .{ TMP_ROOT, out_name });
     var argv: std.ArrayList([]const u8) = .empty;
@@ -158,9 +140,8 @@ fn bundleProgram(c: *Ctx, program: []const u8, out_name: []const u8, extra: []co
     return out;
 }
 
-/// Assert a bundle's stdout/stderr/exit match `klio run` of the same
-/// program. The bundle runs from an empty, non-repo cwd with the empty
-/// HOME; `klio run` runs under the bundling HOME (packs available).
+/// The bundle runs from an empty non-repo cwd under the empty HOME; `klio
+/// run` runs under the bundling HOME, where the packs live.
 fn assertMatchesRun(c: *Ctx, program: []const u8, bundle_path: []const u8, run_args: []const []const u8) !void {
     var run_argv: std.ArrayList([]const u8) = .empty;
     defer run_argv.deinit(c.a);
@@ -183,10 +164,6 @@ fn assertMatchesRun(c: *Ctx, program: []const u8, bundle_path: []const u8, run_a
         return error.TestUnexpectedResult;
     }
 }
-
-// -------------------------------------------------------------------------
-// Scenarios.
-// -------------------------------------------------------------------------
 
 test "hello bundle matches klio run from an empty home" {
     const c = try ctx();
@@ -269,7 +246,7 @@ test "resources round-trip: text, bytes, exists, list, missing throws" {
         .sub_path = try std.fmt.allocPrint(c.a, "{s}/config.txt", .{assets}),
         .data = "config-line-1\nconfig-line-2\n",
     });
-    // Incompressible binary payload (stays raw) with every byte value.
+    // Incompressible, so the payload stays raw.
     var blob: [4096]u8 = undefined;
     var rng = std.Random.DefaultPrng.init(7);
     rng.random().bytes(&blob);
@@ -304,8 +281,7 @@ test "resources round-trip: text, bytes, exists, list, missing throws" {
     const got = try runChild(c.a, c.io, c.run_env, null, &.{abs});
     try std.testing.expectEqual(@as(u32, 0), got.code);
 
-    // The expected byte checksum, computed the same way (Kotlin's
-    // `Byte.toInt()` is signed).
+    // Kotlin's `Byte.toInt()` is signed.
     var sum: i32 = 0;
     for (blob) |b| sum = @mod(sum + @as(i32, @as(i8, @bitCast(b))) + 256, 9973);
     const expected = try std.fmt.allocPrint(c.a,
@@ -351,7 +327,7 @@ test "stdin passes through to readLine" {
     );
     const bundle_path = try bundleProgram(c, program, "stdinbin", &.{});
     const abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, bundle_path, c.a);
-    // `std.process.run` pins stdin to /dev/null; pipe through the shell.
+    // `std.process.run` pins stdin to /dev/null, so pipe through the shell.
     const cmd = try std.fmt.allocPrint(c.a, "printf 'hello-stdin\\n' | {s}", .{abs});
     const got = try runChild(c.a, c.io, c.run_env, null, &.{ "/bin/sh", "-c", cmd });
     try std.testing.expectEqual(@as(u32, 0), got.code);
@@ -361,11 +337,8 @@ test "stdin passes through to readLine" {
 test "corrupted payload refuses with the hash-mismatch message" {
     const c = try ctx();
     const bundle_path = try bundleProgram(c, "examples/hello.kt", "hello_corrupt", &.{});
-    // Flip one byte inside the payload area. The trailer sits at EOF-72 on
-    // ELF but at LC_CODE_SIGNATURE.dataoff-72 on a re-signed Mach-O (the
-    // signature follows it), so locate the trailer by its magic and corrupt
-    // a byte in the first section — the blake3 payload hash covers it on
-    // every target.
+    // The trailer sits at EOF-72 on ELF but at LC_CODE_SIGNATURE.dataoff-72 on
+    // a re-signed Mach-O, so locate it by its magic.
     const bytes = try std.Io.Dir.cwd().readFileAlloc(c.io, bundle_path, c.a, .unlimited);
     const tpos = std.mem.lastIndexOf(u8, bytes, "KBND\x00KL1") orelse return error.NoTrailer;
     const payload_off = std.mem.readInt(u64, bytes[tpos + 8 ..][0..8], .little);
@@ -375,10 +348,8 @@ test "corrupted payload refuses with the hash-mismatch message" {
     const abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, bundle_path, c.a);
     const got = try runChild(c.a, c.io, c.run_env, null, &.{abs});
     if (builtin.target.os.tag == .macos) {
-        // The payload is inside the ad-hoc code signature's coverage, so the
-        // kernel rejects the tampered page when boot maps it — the process is
-        // killed before the blake3 check can report. OS-enforced integrity
-        // supersedes the payload hash here; it must not run the program.
+        // The code signature covers the payload, so the kernel kills the
+        // process before the blake3 check can report.
         try std.testing.expect(got.code != 0);
         try std.testing.expect(!std.mem.eql(u8, got.stdout, "2\n"));
     } else {
@@ -459,7 +430,6 @@ test "project mode: [application] table, multi-file sources, includes, discovere
     try std.testing.expectEqual(@as(u32, 0), got.code);
     try std.testing.expectEqualStrings("hello project-world\n", got.stdout);
 
-    // The manifest name reached the bundle and the desktop entry.
     try c.run_env.put("KLIO_BUNDLE_INSPECT", "1");
     defer _ = c.run_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_INSPECT"));
     const inspect = try runChild(c.a, c.io, c.run_env, null, &.{abs});
@@ -472,7 +442,6 @@ test "project mode: [application] table, multi-file sources, includes, discovere
 
 test "program-image is the default entry; the src fallback is byte-identical" {
     const c = try ctx();
-    // Default: whole-program image, entry `main`.
     const pi = try bundleProgram(c, "examples/hello.kt", "hello_pi", &.{});
     const pi_abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, pi, c.a);
     try c.run_env.put("KLIO_BUNDLE_INSPECT", "1");
@@ -481,14 +450,13 @@ test "program-image is the default entry; the src fallback is byte-identical" {
     try std.testing.expect(std.mem.indexOf(u8, inspect_pi.stdout, "  program-image ") != null);
     try std.testing.expect(std.mem.indexOf(u8, inspect_pi.stdout, "  base-image ") == null);
 
-    // Forced program-src boot (the refusal fallback path), same output.
     try c.build_env.put("KLIO_BUNDLE_PROGRAM_IMAGE", "0");
     const src = try bundleProgram(c, "examples/hello.kt", "hello_srcboot", &.{});
     _ = c.build_env.array_hash_map.swapRemove(@as([]const u8, "KLIO_BUNDLE_PROGRAM_IMAGE"));
     const src_abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, src, c.a);
     const inspect_src = try runChild(c.a, c.io, c.run_env, null, &.{src_abs});
-    // Operator-disabled (env) is a choice, not a bake refusal: plain
-    // program-src entry, base image present, no program image.
+    // Disabling by env is a choice, not a bake refusal, so the base image
+    // stays present.
     try std.testing.expect(std.mem.indexOf(u8, inspect_src.stdout, "entry: program-src\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, inspect_src.stdout, "  base-image ") != null);
     try std.testing.expect(std.mem.indexOf(u8, inspect_src.stdout, "  program-image ") == null);
@@ -507,8 +475,7 @@ test "bundle boot is at least as fast as a warm klio run" {
     const bundle_path = try bundleProgram(c, "examples/hello.kt", "hello_bench", &.{});
     const abs = try std.Io.Dir.cwd().realPathFileAlloc(c.io, bundle_path, c.a);
 
-    // Warm the image cache, then take the minimum of three timings each
-    // (minimum absorbs scheduler noise on a shared box).
+    // The minimum of three timings absorbs scheduler noise on a shared box.
     _ = try runChild(c.a, c.io, c.build_env, null, &.{ c.bin, "run", "examples/hello.kt" });
     var run_min: u64 = std.math.maxInt(u64);
     var bundle_min: u64 = std.math.maxInt(u64);
@@ -520,9 +487,8 @@ test "bundle boot is at least as fast as a warm klio run" {
         _ = try runChild(c.a, c.io, c.run_env, null, &.{abs});
         bundle_min = @min(bundle_min, runtime.clockMonotonicNanos() - t0);
     }
-    // The bundle skips the pack-cache walk and (with the program image)
-    // all parsing/lowering; a regression to re-lowering at boot would be
-    // several times slower, far outside this bound.
+    // The bundle skips the pack-cache walk and all parsing and lowering, so
+    // re-lowering at boot would land far outside this bound.
     if (bundle_min > run_min + run_min / 3) {
         std.debug.print("bundle_smoke: bundle boot {d}ms > warm run {d}ms\n", .{
             bundle_min / 1_000_000, run_min / 1_000_000,

@@ -1,25 +1,17 @@
-//! Inheritance + dispatch parity: super calls, diamond, generic
-//! inheritance, abstract/final/open interplay, companion through subclass.
+//! Inheritance and dispatch parity: super calls, diamond, generic inheritance,
+//! abstract/final/open interplay, companion through subclass.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_parity_inheritance_dispatch";
 
-// One arena shared by every test in this file. The pipeline installs
-// process-global tables (inline-fn ASTs, the enclosing-`this` stack, ...)
-// backed by the build allocator; a fresh per-test arena would free that
-// memory out from under the still-live globals and the next run would touch
-// freed pages. A single file-scoped arena keeps them valid across all tests,
-// and stays off the leak-checking test allocator (which would abort on the
-// pipeline's intentional arena lifetime). Mirrors the e2e harness.
+// One file-scoped arena, reset per program: the pipeline's process-global
+// tables point into it and must outlive each test.
 var shared_arena: ?std.heap.ArenaAllocator = null;
 
 fn arenaAllocator() std.mem.Allocator {
     if (shared_arena) |*a| {
-        // Reset the per-program arena so each program's allocations are
-        // reclaimed instead of accumulating across this file's tests. Safe:
-        // the cross-program globals are page_allocator-backed, not this arena.
         _ = a.reset(.retain_capacity);
     } else {
         shared_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -200,10 +192,7 @@ test "private_member_not_overridden" {
     try assertKlio("private_not_overridden", src, "S:P-hidden\n");
 }
 
-// A private property shadowing a same-name declaration in a supertype has
-// its OWN storage cell: the base class's methods keep reading the base's
-// value, the derived class's methods its own (kotlinc: private members do
-// not override; each declaration is distinct storage).
+// Private members do not override, so each shadowing property gets its own cell.
 test "private_shadow_field_distinct_cells" {
     const src =
         \\
@@ -228,7 +217,6 @@ test "private_shadow_field_distinct_cells" {
     try assertKlio("c_shadow", src, "1\n2\n1\n1\n");
 }
 
-// The var form: writes inside each class land on that class's own cell.
 test "private_shadow_var_writes_own_cell" {
     const src =
         \\
@@ -254,9 +242,8 @@ test "private_shadow_var_writes_own_cell" {
     try assertKlio("c_shadow_var", src, "11\n99\n");
 }
 
-// An initialized `override val` keeps its own backing cell alongside the
-// base's (JVM semantics): virtual reads see the override, `super.x` reads
-// the base class's own initialized value.
+// An initialized `override val` keeps its own cell alongside the base's, which
+// `super.x` still reads.
 test "override_val_super_reads_base_cell" {
     const src =
         \\
@@ -279,9 +266,6 @@ test "override_val_super_reads_base_cell" {
     ;
     try assertKlio("c_shadow_override", src, "2\n2\n1\n2\n");
 }
-
-// Interface contracts, default methods, fun interfaces, delegation, and
-// access through upcast/downcast.
 
 test "diamond_inheritance_explicit_super" {
     const src =

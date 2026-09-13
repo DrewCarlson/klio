@@ -1,27 +1,15 @@
-//! DSL and operator coverage: infix, operator overloads, builder
-//! receiver chains, invoke convention, get/set conventions.
+//! Operator and DSL conventions: infix, overloads, invoke, get/set, iterator.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_dsl_operators";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// One arena for the whole file: process-global lowering/VM state outlives any per-test arena.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
-/// Write `src` to a unique temp `.kt` path, run it through the in-process
-/// klio pipeline, and assert stdout equals `expected`. Uses a per-call arena
-/// over the page allocator so the leak-checking test allocator never drives
-/// the pipeline (which would abort on its intentional arena lifetimes).
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
 
@@ -108,7 +96,7 @@ test "operator_compare_overload" {
         \\}
         \\
     ;
-    // a == c uses structural equality (default object equality) — NOT cents-equal.
+    // `a == c` calls the default `equals`, which is identity, so it is false.
     try assertKlio("compare", src, "true,false,true,true\n");
 }
 
@@ -159,11 +147,7 @@ test "dsl_html_like_builder" {
 }
 
 test "range_to_in_range" {
-    // Custom user-Iterable through the new Iterable-extension
-    // dispatch fallback. Uses a dedicated iterator class so all
-    // state lives in primary-ctor fields and the dispatch is
-    // exercised without depending on anonymous-object capture
-    // semantics that earlier tracked tasks cover.
+    // A user `Iterable` reaches the stdlib Iterable extensions.
     const src =
         \\
         \\class IntIter(var cur: Int, val end: Int) : Iterator<Int> {

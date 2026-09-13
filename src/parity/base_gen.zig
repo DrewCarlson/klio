@@ -1,12 +1,8 @@
-//! Build-time generator: `parity-base-gen <out-dir>` bakes the parity
-//! harness's EmbeddedOnly dependency bases (both stdlib gate variants) to
-//! `<out-dir>/embedded-gate{0,1}.klio-image`. The build graph runs this with
-//! the repo root as cwd; every parity test binary then loads the lowered
-//! stdlib base instead of re-parsing and re-lowering it per process.
-//!
-//! A gate variant that cannot be baked writes an empty file: loaders reject
-//! it and fall back to the per-process source build, so the build never
-//! fails on serializability, it only loses the speedup.
+//! Build-time generator: `parity-base-gen <out-dir>` bakes the parity harness's
+//! EmbeddedOnly dependency bases (both stdlib gate variants) to
+//! `<out-dir>/embedded-gate{0,1}.klio-image`, run with the repo root as cwd. A
+//! variant that cannot be baked writes an empty file, which loaders reject in
+//! favour of the per-process source build, so only the speedup is lost.
 
 const std = @import("std");
 

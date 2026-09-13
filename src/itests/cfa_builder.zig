@@ -1,7 +1,5 @@
-//! Exercises the IR + builder by constructing canonical CFG shapes by
-//! hand and asserting their printed form; expected outputs are embedded
-//! as strings and compared with the printer output.
-//! Arena per test so the leak-checking allocator never runs the pipeline.
+//! Builds canonical CFG shapes through `CfgBuilder` and compares the printed
+//! form against the rendering embedded in each test.
 
 const std = @import("std");
 
@@ -30,7 +28,6 @@ fn mkSpan(s: u32, e: u32) Span {
     return Span.init(FileId.from(0), s, e);
 }
 
-/// Build a `std.ArrayList(BlockId)` of `exits` for `CfgBuilder.finish`.
 fn exitsOf(a: std.mem.Allocator, ids: []const BlockId) std.mem.Allocator.Error!std.ArrayList(BlockId) {
     var list: std.ArrayList(BlockId) = .empty;
     try list.appendSlice(a, ids);
@@ -38,7 +35,6 @@ fn exitsOf(a: std.mem.Allocator, ids: []const BlockId) std.mem.Allocator.Error!s
 }
 
 test "straight_line" {
-    // r0 = x; r1 = y; tmp = r0; return tmp
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -73,7 +69,6 @@ test "straight_line" {
 }
 
 test "branch_join" {
-    // if (cond) then-blk else else-blk -> join
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -133,7 +128,6 @@ test "branch_join" {
 }
 
 test "is_check_arm_carries_assume_is" {
-    // when (x) { is String -> body; else -> def }
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -203,7 +197,6 @@ test "is_check_arm_carries_assume_is" {
 }
 
 test "loop_with_backedge" {
-    // while (cond) { body }
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -259,7 +252,6 @@ test "loop_with_backedge" {
 }
 
 test "try_catch_finally_edges" {
-    // try { body } catch (e: T) { handler } finally { fin }
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -320,7 +312,6 @@ test "try_catch_finally_edges" {
 }
 
 test "field_place_path" {
-    // p.x.y = r0
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const a = arena.allocator();

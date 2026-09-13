@@ -1,9 +1,6 @@
-//! kotlinc's box-test conformance corpus (`kotlin/compiler/testData/codegen/box`)
-//! run through child `klio run`s: every selected test's `box()` must return
-//! `"OK"`. The pass count is a ratchet floor and the failure count a ceiling
-//! with no slack — both equal the measured census, and each root fix moves
-//! them (floor up, ceiling down). Selection is by directive
-//! (`box_support.zig`); the exclusion census is printed with every run.
+//! kotlinc's box corpus (`kotlin/compiler/testData/codegen/box`) through child
+//! `klio run`s: each selected test's `box()` must return "OK". The pass floor
+//! and failure ceiling sit exactly on the measured census.
 const std = @import("std");
 const box = @import("box_support.zig");
 

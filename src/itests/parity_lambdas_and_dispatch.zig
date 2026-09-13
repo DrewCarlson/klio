@@ -1,26 +1,16 @@
-//! Lambda + dispatch parity: lambda over receiver, lambda inside
-//! generic dispatch, suspended lambda captures, member-ref to
-//! generic methods, scope function chaining with explicit this@.
+//! Parity for lambdas and dispatch: receiver lambdas, implicit-receiver
+//! resolution, callable references, and scope-function chaining.
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_lambdas_and_dispatch";
 
-// The klio pipeline installs process-global lowering/VM state (inline-fn
-// tables, the enclosing-`this` stack) backed by the run's allocator. A
-// per-test arena would be torn down while those globals still point into it,
-// so one file-scoped arena over the page allocator backs every run here (the
-// leak-checking test allocator is never used, matching the e2e harness).
+// The pipeline's process-global state points into the run allocator, so one
+// file-scoped arena must outlive every test here.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 
-/// Run an embedded program through the real pack pipeline and assert its
-/// stdout equals `expected`. Uses an arena per test so the leak-checking
-/// test allocator never backs the pipeline.
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
-    // Reset the per-program arena so each program's ASTs/IR/packs/VM graph
-    // is reclaimed instead of accumulating across this file's tests. Safe:
-    // the cross-program globals are page_allocator-backed, not this arena.
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
     var threaded: std.Io.Threaded = .init(a, .{});
@@ -48,9 +38,7 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     }
 }
 
-/// Run an embedded program expected to FAIL with an unresolved-reference
-/// error naming `unresolved`. Pins kotlinc-rejected shapes (the interpreter
-/// surfaces them as runtime resolution errors).
+/// Assert the program fails with an unresolved-reference error for `unresolved`.
 fn assertKlioUnresolved(name: []const u8, src: []const u8, unresolved: []const u8) !void {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
@@ -494,9 +482,6 @@ test "receiver lambda parameter selects compatible outer receiver" {
 }
 
 test "bare_write_reaches_outer_receiver_member" {
-    // kotlinc-pinned (tests/fixtures/parity_corpus/bare_write_outer_receiver_member.kt):
-    // a bare-name write inside a nested receiver lambda resolves against
-    // the implicit receivers innermost-first, like the read side.
     const src =
         \\
         \\class Outer { var label: String = "init" }
@@ -518,8 +503,6 @@ test "bare_write_reaches_outer_receiver_member" {
 }
 
 test "bare_write_member_beats_same_named_global" {
-    // kotlinc-pinned: an enclosing receiver's member outranks a top-level
-    // `var` of the same name for a bare-name write.
     const src =
         \\
         \\class Outer { var label: String = "init" }
@@ -541,9 +524,7 @@ test "bare_write_member_beats_same_named_global" {
 }
 
 test "extension_on_inner_receiver_beats_outer_member" {
-    // kotlinc-pinned: implicit-receiver call resolution is per-receiver,
-    // innermost-first — an extension applicable to the inner receiver
-    // outranks a member of the outer receiver.
+    // Call resolution is per-receiver, innermost-first.
     const src =
         \\
         \\class Outer { fun describe(): String = "outer-member" }
@@ -562,9 +543,6 @@ test "extension_on_inner_receiver_beats_outer_member" {
 }
 
 test "bare_write_in_inner_class_lambda_reaches_outer_property" {
-    // kotlinc-pinned: a dispatch receiver brings its class-nesting tower
-    // into scope for writes — a lambda in an inner-class method writing a
-    // bare name mutates `this@Owner`'s property.
     const src =
         \\
         \\class Owner {
@@ -586,11 +564,7 @@ test "bare_write_in_inner_class_lambda_reaches_outer_property" {
 }
 
 test "top_level_fn_cannot_see_callers_receiver" {
-    // kotlinc rejects resolving a bare name in a top-level function body
-    // against a *caller's* `with` receiver (dynamic scope). The lowering
-    // classifies the no-receiver-context call as a static global, so the
-    // program fails with an unresolved reference instead of leaking the
-    // caller's receiver.
+    // Kotlin has no dynamic scope, so the bare call lowers to a static global.
     const src =
         \\
         \\class Box { fun payload(): String = "hidden" }
@@ -606,9 +580,7 @@ test "top_level_fn_cannot_see_callers_receiver" {
 }
 
 test "closure_in_no_receiver_scope_writes_top_level" {
-    // kotlinc: a lambda created in `main` (no receivers in scope) resolves
-    // a bare write lexically — the top-level `var`, never the member of
-    // the method it is dynamically invoked from.
+    // A lambda resolves bare names at its creation site, not where it runs.
     const src =
         \\
         \\class Host {
@@ -646,9 +618,6 @@ test "closure_in_no_receiver_scope_reads_top_level" {
 }
 
 test "closure_captures_creation_receivers_lexically" {
-    // The lambda is created inside `with(W())` and invoked later from a
-    // scope with different (or no) receivers: kotlinc resolves `tag`
-    // against the creation-time receiver, not the invocation context.
     const src =
         \\
         \\val tag = "global"
@@ -679,8 +648,6 @@ test "closure_creation_scope_beats_invocation_scope" {
 }
 
 test "anon_fun_resolves_enclosing_receivers" {
-    // An anonymous-function body resolves bare names against the
-    // lexically enclosing receivers exactly like a lambda body.
     const src =
         \\
         \\class Box {
@@ -719,8 +686,7 @@ test "anon_fun_bare_write_reaches_receiver_member" {
 }
 
 test "function_shape_ext_requires_function_receiver" {
-    // `(() -> Int).describe()` is not applicable to a plain instance, so
-    // the outer receiver's member binds.
+    // An inapplicable extension is no candidate, so the outer member binds.
     const src =
         \\
         \\class Outer { fun describe(): String = "outer-member" }
@@ -735,8 +701,6 @@ test "function_shape_ext_requires_function_receiver" {
 }
 
 test "bounded_type_param_ext_requires_bound" {
-    // `<T : Number> T.halve()` is not applicable to a String receiver
-    // (outer member wins) but is to an Int receiver (innermost ext wins).
     const src =
         \\
         \\class Outer { fun halve(): String = "outer-member" }
@@ -751,8 +715,6 @@ test "bounded_type_param_ext_requires_bound" {
 }
 
 test "generic_elem_ext_proof_both_ways" {
-    // `List<String>.render()` is disproven on a list of Ints (outer
-    // member binds) and proven on a list of Strings (innermost ext binds).
     const src =
         \\
         \\class Outer { fun render(): String = "outer-member" }
@@ -796,9 +758,6 @@ test "nullable_ext_receiver_accepts_null_subject" {
 }
 
 test "outer_member_read_beats_top_level_when_inner_misses" {
-    // The innermost receiver does not own `z`; the outer receiver's
-    // member outranks the top-level binding — a candidate probe must not
-    // adopt a global.
     const src =
         \\
         \\class A
@@ -813,9 +772,8 @@ test "outer_member_read_beats_top_level_when_inner_misses" {
 }
 
 test "companion_property_rides_implicit_chain" {
-    // A companion `val` is an implicit receiver at its class's own depth:
-    // it outranks the top-level binding inside the class's members, but
-    // an instance member and a with-subject member outrank it.
+    // A companion `val` is an implicit receiver at its class's own depth: above
+    // the top-level binding, below an instance or with-subject member.
     const src =
         \\
         \\val tag: String = "global"
@@ -875,9 +833,7 @@ test "companion_var_takes_bare_write" {
 }
 
 test "bare_write_skips_method_named_like_var" {
-    // An assignment LHS resolves only to properties: a member *function*
-    // of the written name never captures the write, at any receiver
-    // depth, and compound assignment reads and writes the same binding.
+    // An assignment LHS resolves only to properties, never to a member function.
     const src =
         \\
         \\class Holder { fun label(): String = "fn" }
@@ -901,8 +857,7 @@ test "bare_write_skips_method_named_like_var" {
 }
 
 test "member_prop_invoke_shadows_top_level_fn" {
-    // kotlinc resolves a bare call scope-by-scope: the receiver's member
-    // property + invoke convention outranks the top-level function.
+    // A member property plus the invoke convention outranks a top-level function.
     const src =
         \\
         \\class Host { val handler: () -> String = { "host-property" } }
@@ -927,8 +882,6 @@ test "member_fn_shadows_top_level_fn" {
 }
 
 test "inapplicable_member_falls_to_top_level_fn" {
-    // The member takes an argument the call does not supply, so it is
-    // not a candidate; the top-level function binds.
     const src =
         \\
         \\class Host { fun handler(x: Int): String = "member-$x" }
@@ -940,9 +893,6 @@ test "inapplicable_member_falls_to_top_level_fn" {
 }
 
 test "ext_receiver_brings_no_outer_tower" {
-    // A top-level extension on an inner class sees only the extension
-    // receiver — not the receiver's enclosing-instance tower (kotlinc:
-    // `status` is the top-level var, not `Owner.status`).
     const src =
         \\
         \\class Owner {
@@ -973,11 +923,6 @@ test "unit_valued_member_read_is_a_hit" {
 }
 
 test "local_fn_self_callable_ref_recurses" {
-    // `::visit` inside `visit`'s own body denotes the local fn itself: the
-    // reference loads its closure through the mangled self-cell (a bare
-    // self-call's binding), not a property of the forEach element. Without
-    // this the reference lowered to an unbound property ref and the runtime
-    // read `.visit` on each element.
     const src =
         \\class Node(val id: Int, val kids: List<Node>)
         \\fun preorder(root: Node): List<Int> {

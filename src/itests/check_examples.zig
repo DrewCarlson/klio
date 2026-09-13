@@ -1,12 +1,5 @@
-//! `klio check` pipeline gate.
-//!
-//! Representative example programs must come out of the static checking
-//! pipeline (lexer -> parser -> resolveModule -> typecheckModule, with the
-//! stdlib assembled exactly as `klio check` assembles it) with ZERO
-//! diagnostics anchored in the user file. Each picked example exercises a
-//! shape that has regressed before: string templates with `$ident`
-//! fragments and `when (val v = …)` bindings, `vararg` arity + spread at
-//! call sites, and builder lambdas (`buildList { add(…) }`).
+//! Example programs run the static pipeline with the stdlib assembled as `klio
+//! check` assembles it, and must emit zero diagnostics anchored in the user file.
 
 const std = @import("std");
 const parity = @import("parity");
@@ -30,8 +23,7 @@ fn expectCheckClean(file: []const u8) !void {
             return error.TestUnexpectedResult;
         },
     };
-    // `loadProgram` appends the user file last; diagnostics are filtered to
-    // it the same way `klio check` trusts pack/stdlib shims.
+    // `loadProgram` appends the user file last; pack and stdlib diagnostics are ignored.
     const user_file = loaded.asts[loaded.asts.len - 1].span.file;
 
     var failed = false;
@@ -64,10 +56,8 @@ test "check is clean on builder lambdas" {
     try expectCheckClean("examples/build_helpers.kt");
 }
 
-// Regression: a deep member-call chain must check in linear time. Before the
-// call-type memo, the checker re-typed a chained-call receiver at every level,
-// so this 40-deep chain took O(2^depth) and hung the checker (this test would
-// time out).
+// Checking must stay linear in chain depth; re-typing the receiver per level
+// costs O(2^depth) and never finishes.
 test "check is clean on a deep method-call chain" {
     try expectCheckClean("examples/deep_call_chain.kt");
 }

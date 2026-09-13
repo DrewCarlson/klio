@@ -1,11 +1,7 @@
-//! Explicit backing fields (Kotlin 2.4): the full acceptance matrix.
-//!
-//! `val`-only member/top-level properties may declare `field[: Type][= init]`
-//! in the initializer slot. Reads inside the declaring scope (class body or
-//! declaring file for top-level) see the FIELD type; outside they see the
-//! property type. Runtime rows run through the real parity pipeline and
-//! assert stdout; diagnostic rows run lexer -> parser -> resolver -> typeck
-//! and assert the compiler-named diagnostic and its message.
+//! Explicit backing fields (Kotlin 2.4): a `val` member or top-level property
+//! may declare `field[: Type][= init]` in the initializer slot. Reads inside
+//! the declaring class body, or the declaring file for a top-level property,
+//! see the field type; reads outside it see the property type.
 
 const std = @import("std");
 const parity = @import("parity");
@@ -21,9 +17,7 @@ const Diagnostic = diagnostics.Diagnostic;
 
 const TMP_DIR = "/tmp/klio_itest_explicit_backing_fields";
 
-// The klio pipeline installs process-global lowering/VM state backed by the
-// run's allocator; one file-scoped arena over the page allocator backs every
-// run here (matching the other parity itests).
+// One file-scoped arena: the pipeline's process-global state points into it.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
@@ -48,7 +42,6 @@ fn assertKlio(name: []const u8, src: []const u8, expected: []const u8) !void {
     }
 }
 
-/// Every diagnostic (parser + typeck) the front-end emits for `src`.
 fn frontendDiags(a: std.mem.Allocator, src: []const u8) ![]const Diagnostic {
     var lx = try lexer.Lexer.init(a, FileId.from(0), src);
     const lexed = try lx.tokenize();
@@ -64,8 +57,6 @@ fn frontendDiags(a: std.mem.Allocator, src: []const u8) ![]const Diagnostic {
     return out.items;
 }
 
-/// Assert `src` produces a diagnostic whose factory name is `factory_name`
-/// and whose message contains `msg_needle`.
 fn assertDiag(src: []const u8, factory_name: []const u8, msg_needle: []const u8) !void {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
@@ -83,8 +74,7 @@ fn assertDiag(src: []const u8, factory_name: []const u8, msg_needle: []const u8)
     return error.MissingExpectedDiagnostic;
 }
 
-/// Assert `src` produces a diagnostic whose message contains `msg_needle`
-/// (for parser rows, which carry no compiler-named factory).
+/// Message-only form, for parser rows that carry no factory name.
 fn assertDiagMsg(src: []const u8, msg_needle: []const u8) !void {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
@@ -97,7 +87,6 @@ fn assertDiagMsg(src: []const u8, msg_needle: []const u8) !void {
     return error.MissingExpectedDiagnostic;
 }
 
-/// Assert `src` type-checks with no error diagnostics.
 fn assertNoErrors(src: []const u8) !void {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
@@ -110,7 +99,6 @@ fn assertNoErrors(src: []const u8) !void {
     }
 }
 
-// C1: narrowing inside the declaring class — `items` is MutableList there.
 test "c01_mutable_inside_read_only_outside" {
     const src =
         \\class Cart {
@@ -129,7 +117,6 @@ test "c01_mutable_inside_read_only_outside" {
     try assertKlio("c01", src, "[a]\n");
 }
 
-// C2: no narrowing outside the class — `add` does not exist on List<String>.
 test "c02_no_narrowing_outside_class" {
     try assertDiag(
         \\class Cart {
@@ -147,7 +134,6 @@ test "c02_no_narrowing_outside_class" {
     , "UNRESOLVED_REFERENCE", "unresolved reference `add` on `List<String>`");
 }
 
-// C3: field-typed reads inside the class (`n` is Int in `inc`).
 test "c03_field_type_inside_class" {
     const src =
         \\class C {
@@ -164,7 +150,6 @@ test "c03_field_type_inside_class" {
     try assertKlio("c03", src, "2\n");
 }
 
-// C4: `var` cannot declare an explicit backing field.
 test "c04_var_rejected" {
     try assertDiag(
         \\class C {
@@ -176,7 +161,6 @@ test "c04_var_rejected" {
     , "VAR_PROPERTY_WITH_EXPLICIT_BACKING_FIELD", "Only 'val' properties with explicit backing fields are supported.");
 }
 
-// C5: no accessor bodies alongside a field clause.
 test "c05_accessor_rejected" {
     try assertDiag(
         \\class C {
@@ -189,7 +173,6 @@ test "c05_accessor_rejected" {
     , "PROPERTY_WITH_EXPLICIT_FIELD_AND_ACCESSORS", "Properties with explicit backing fields cannot have accessors.");
 }
 
-// C6: the field type must be a subtype of the property type.
 test "c06_inconsistent_field_type" {
     try assertDiag(
         \\class C {
@@ -201,7 +184,6 @@ test "c06_inconsistent_field_type" {
     , "INCONSISTENT_BACKING_FIELD_TYPE", "The type of the backing field must be a subtype of the property's type.");
 }
 
-// C7: equal field/property types warn but the program still runs.
 test "c07_redundant_field_warns_and_runs" {
     const src =
         \\class C {
@@ -215,7 +197,6 @@ test "c07_redundant_field_warns_and_runs" {
     try assertKlio("c07", src, "1\n");
 }
 
-// C8: the property must be effectively final.
 test "c08_open_property_rejected" {
     try assertDiag(
         \\open class C {
@@ -227,7 +208,6 @@ test "c08_open_property_rejected" {
     , "NON_FINAL_PROPERTY_WITH_EXPLICIT_BACKING_FIELD", "Properties with explicit backing fields must be final.");
 }
 
-// C9: no backing fields inside interfaces.
 test "c09_interface_rejected" {
     try assertDiag(
         \\interface I {
@@ -239,7 +219,6 @@ test "c09_interface_rejected" {
     , "EXPLICIT_BACKING_FIELD_IN_INTERFACE", "Backing fields inside interfaces are prohibited.");
 }
 
-// C10: a private property cannot be less visible than its (private) field.
 test "c10_private_property_rejected" {
     try assertDiag(
         \\class C {
@@ -251,7 +230,6 @@ test "c10_private_property_rejected" {
     , "EXPLICIT_FIELD_VISIBILITY_MUST_BE_LESS_PERMISSIVE", "Private properties cannot have explicit backing fields.");
 }
 
-// C11: no modifiers on the field clause.
 test "c11_modifier_on_field_rejected" {
     try assertDiag(
         \\class C {
@@ -263,7 +241,6 @@ test "c11_modifier_on_field_rejected" {
     , "WRONG_MODIFIER_TARGET", "Modifier 'internal' is not applicable to 'backing field'");
 }
 
-// C12: deferred field initialization in an init block.
 test "c12_deferred_field_init" {
     const src =
         \\class C {
@@ -279,7 +256,6 @@ test "c12_deferred_field_init" {
     try assertKlio("c12", src, "1\n");
 }
 
-// C13: a field with no initializer must be definitely assigned.
 test "c13_field_must_be_initialized" {
     try assertDiag(
         \\class C {
@@ -291,7 +267,6 @@ test "c13_field_must_be_initialized" {
     , "EXPLICIT_FIELD_MUST_BE_INITIALIZED", "Field must be initialized.");
 }
 
-// C14: field clauses are a syntax error on constructor properties.
 test "c14_constructor_property_syntax_error" {
     try assertDiagMsg(
         \\class C(val xs: List<Int> field: MutableList<Int> = mutableListOf())
@@ -300,7 +275,6 @@ test "c14_constructor_property_syntax_error" {
     , "explicit backing fields are not allowed on constructor properties");
 }
 
-// C15: field clauses are a syntax error on local properties.
 test "c15_local_property_syntax_error" {
     try assertDiagMsg(
         \\fun f() {
@@ -312,7 +286,6 @@ test "c15_local_property_syntax_error" {
     , "explicit backing fields are not allowed on local properties");
 }
 
-// C16: no delegate alongside a field clause.
 test "c16_delegate_rejected" {
     try assertDiag(
         \\class C {
@@ -325,7 +298,6 @@ test "c16_delegate_rejected" {
     , "BACKING_FIELD_FOR_DELEGATED_PROPERTY", "Delegated properties cannot have explicit backing field declarations.");
 }
 
-// C17: narrowing holds in inner classes of the declaring class.
 test "c17_narrowing_in_inner_class" {
     const src =
         \\class C {
@@ -342,7 +314,6 @@ test "c17_narrowing_in_inner_class" {
     try assertKlio("c17", src, "2\n");
 }
 
-// C18: top-level narrowing is file-scoped.
 test "c18_top_level_narrowing" {
     const src =
         \\val top: List<Int>

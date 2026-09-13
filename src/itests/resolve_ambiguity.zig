@@ -1,21 +1,15 @@
-//! Bare-call resolution tightening: an unqualified call whose candidate
-//! set holds two same-package same-arity functions with identical FULL
-//! parameter signatures (generic arguments and function-type shapes
-//! included) is rejected at lowering. Two declarations sharing one FQN
-//! report as conflicting overloads naming both declaration sites;
-//! cross-package ties report as an ambiguous reference the caller can
-//! qualify or import. Type-distinguishable overload sets,
-//! cast-disambiguated calls, and default-parameter shapes keep
-//! resolving — the last order-independently.
+//! Bare-call resolution. An unqualified call whose candidate set holds two
+//! same-package same-arity functions with identical full parameter signatures
+//! is rejected at lowering as conflicting overloads naming both sites; a
+//! cross-package tie reports as an ambiguous reference the caller can qualify.
 
 const std = @import("std");
 const parity = @import("parity");
 
 const TMP_DIR = "/tmp/klio_itest_resolve_ambiguity";
 
-// One file-scoped arena over the page allocator backs every run here:
-// the pipeline installs process-global lowering/VM state backed by the
-// run's allocator, so the leak-checking test allocator is never used.
+// A file-scoped arena backs every run: the pipeline installs process-global
+// state owned by the run's allocator, so the test allocator is never used.
 var file_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
 const RunResult = union(enum) {
@@ -27,9 +21,7 @@ fn runKlio(name: []const u8, src: []const u8) !RunResult {
     return runKlioFiles(name, &.{src});
 }
 
-/// Write each source as `{name}_{i}.kt` and run them as one program, in
-/// order — the in-process mirror of `klio run a.kt b.kt`, for the
-/// cross-package shapes that need one package header per file.
+/// Write each source as `{name}_{i}.kt` and run them as one program, in order.
 fn runKlioFiles(name: []const u8, srcs: []const []const u8) !RunResult {
     _ = file_arena.reset(.retain_capacity);
     const a = file_arena.allocator();
@@ -90,10 +82,8 @@ fn expectOutput(name: []const u8, src: []const u8, expected: []const u8) !void {
     }
 }
 
-/// Assert the program is rejected at lowering with EXACTLY the expected
-/// diagnostic. `expected_fmt` receives the program's on-disk path once
-/// per `{s}` placeholder so the test pins the rendered file:line
-/// locations.
+/// Assert the program is rejected at lowering with exactly this diagnostic.
+/// `expected_fmt` takes the program's on-disk path once per `{s}` placeholder.
 fn expectExactErr(name: []const u8, src: []const u8, comptime expected_fmt: []const u8) !void {
     const a = file_arena.allocator();
     switch (try runKlio(name, src)) {
@@ -178,9 +168,7 @@ test "same-arity different-type overloads keep resolving by argument type" {
 }
 
 test "overloads differing only in generic arguments keep resolving" {
-    // `List<Int>` vs `List<String>` is a legal Kotlin overload set —
-    // signature identity is judged on the FULL declared type, so this
-    // classifies as a type overload, never an ambiguity.
+    // Signature identity is judged on the full declared type.
     const src =
         \\fun pick(xs: List<Int>): String = "li:" + xs.size
         \\fun pick(xs: List<String>): String = "ls:" + xs.size
@@ -191,11 +179,6 @@ test "overloads differing only in generic arguments keep resolving" {
 }
 
 test "overloads differing only in function-type shapes keep resolving" {
-    // `(Int) -> Int` vs `(String) -> String`: same arity, same head
-    // (`Function1`), different component types — a legal Kotlin
-    // overload set, never a duplicate. The call exercises the first
-    // declaration so the assertion is independent of the runtime's
-    // overload pick for the other shape.
     const src =
         \\fun call(f: (Int) -> Int): String = "int-fn:" + f(1)
         \\fun call(f: (String) -> String): String = "str-fn:" + f("a")
@@ -226,19 +209,10 @@ test "different arities of the same name keep resolving" {
 }
 
 test "exact-arity overload outranks a reified vararg inline sibling" {
-    // Kotlin specificity: the fixed-arity declaration wins over the
-    // vararg one. The inline-fn fold must not pre-empt this — the
-    // simple-name inline table only ever holds the inline overloads
-    // (the kotlinx `Migration.kt` `combineLatest` mis-bind). The second
-    // call is the fold-sensitive pin: its arity equals the inline
-    // vararg sibling's parameter count, so a name-first pick splices
-    // the reified body with `xs` bound to the scalar `5` and crashes on
-    // `xs.size`; only the index-first pick — with the vararg shape
-    // skipped at ANY parameter position, not just the last — binds the
-    // exact `(Int, transform)` overload kotlinc binds. The first call's
-    // 3-scalar shape never splices under either picker (the vararg body
-    // cannot bind two extra positionals) and pins the plain-ladder
-    // binding instead.
+    // Kotlin specificity: the fixed-arity declaration wins over the vararg one,
+    // and the inline-fn fold must not pre-empt that. The second call's arity
+    // equals the vararg sibling's parameter count, so only a pick that skips
+    // the vararg shape at any parameter position binds what kotlinc binds.
     const src =
         \\inline fun <reified T> pick(vararg xs: T, transform: (Int) -> Int): String = "vararg " + transform(xs.size)
         \\fun pick(a: Int, b: Int, c: Int): String = "exact " + (a + b + c)
@@ -253,14 +227,9 @@ test "exact-arity overload outranks a reified vararg inline sibling" {
 }
 
 test "a named import outranks a same-package reified inline namesake, and strict mode accepts it" {
-    // kotlinc: the file's explicit `import lib2.greet` outranks the
-    // caller's own-package declaration, so the non-inline import wins
-    // and prints "lib-noninline". The index resolves it at the named-
-    // import tier and the non-inline winner suppresses the splice; the
-    // resolve audit must grade the simple-name table's reified pick as
-    // a TIER correction — a program property, not a divergence — so
-    // KLIO_RESOLVE_STRICT (forced on here) accepts the program instead
-    // of panicking on valid Kotlin.
+    // kotlinc: the explicit `import lib2.greet` outranks the caller's
+    // own-package declaration, and the audit grades the suppressed splice as a
+    // tier correction rather than a divergence.
     const ir = @import("ir");
     ir.lower.expr.setResolveStrictForTest(true);
     defer ir.lower.expr.resetResolveStrictForTest();
@@ -293,11 +262,8 @@ test "a cast-disambiguated overload call keeps resolving" {
 }
 
 test "expect/actual top-level pair binds the actual body" {
-    // The build drops a top-level `expect` superseded by its `actual`,
-    // so the call set holds exactly one candidate and the symbol index
-    // resolves it (an expect/actual pair must never report as
-    // conflicting overloads). kotlinc cannot compile this standalone
-    // (multiplatform-only), so it lives here rather than in examples/.
+    // The build drops an `expect` superseded by its `actual`, so the pair never
+    // reports as conflicting overloads.
     const src =
         \\expect fun platformName(): String
         \\actual fun platformName(): String = "klio"
@@ -316,12 +282,8 @@ test "expect/actual top-level pair binds the actual body" {
 }
 
 test "an expect decl over an embedded intrinsic is dropped at build and the call binds the intrinsic" {
-    // What this pins: the BUILD-side drop (`retainDecl` removes an
-    // `expect` whose `kotlin.{name}` FQN is an embedded intrinsic) plus
-    // the link-settled bare-name map edge for `intArrayOf`. The decl
-    // does NOT survive to the VM, so the bodyless redirect / native-form
-    // machinery is never consulted here — that seam is pinned by the
-    // `resolvedRedirectTarget` unit tests in `interp_ir.zig`.
+    // `retainDecl` drops an `expect` whose `kotlin.{name}` FQN is an embedded
+    // intrinsic, so the declaration never reaches the VM.
     const src =
         \\expect fun intArrayOf(vararg elements: Int): IntArray
         \\fun main() {
@@ -335,10 +297,7 @@ test "an expect decl over an embedded intrinsic is dropped at build and the call
 }
 
 test "default-param twins conflict in either declaration order" {
-    // Parameter names and default values are not part of a signature,
-    // so this pair is identical — kotlinc rejects it as conflicting
-    // overloads, and so does klio, regardless of whether the bodies
-    // lowered before the call site.
+    // Parameter names and default values are not part of a signature.
     const decls_first =
         \\fun g(x: Int, y: Int = 0): Int = x + y
         \\fun g(a: Int, b: Int = 1): Int = a + b
@@ -364,9 +323,7 @@ test "default-param twins conflict in either declaration order" {
 }
 
 test "expect-fn default parameter values transfer to the superseding actual" {
-    // Kotlin: defaults are declared on the `expect` only; the `actual`
-    // inherits them. The build transplants the expect's defaults onto
-    // the retained actual before the expect is dropped.
+    // Kotlin declares defaults on the `expect` only; the `actual` inherits them.
     const src =
         \\expect fun greet(who: String = "world"): String
         \\actual fun greet(who: String): String = "hello, " + who
@@ -383,9 +340,8 @@ test "expect-fn default parameter values transfer to the superseding actual" {
 }
 
 test "a bare value reference never binds the extension twin, in either order" {
-    // `fun String.deco` and `fun deco` share the receiverless FQN string;
-    // the reference must bind the plain form regardless of declaration
-    // order (the resolved FuncId is carried on the LoadGlobal).
+    // `fun String.deco` and `fun deco` share the receiverless FQN string, so the
+    // reference binds the plain form whatever the declaration order.
     const ext_first =
         \\package app
         \\fun String.deco(): String = "ext:" + this
@@ -427,7 +383,6 @@ const xpkg_main =
 ;
 
 test "::name binds from the caller's scope, not declaration order" {
-    // kotlinc: app / app / app in both file orders.
     try expectFilesOutput("xpkg_ref_lib_first", &.{ xpkg_lib, xpkg_main }, "app\napp\napp\n");
     try expectFilesOutput("xpkg_ref_main_first", &.{ xpkg_main, xpkg_lib }, "app\napp\napp\n");
 }
@@ -449,7 +404,6 @@ const xcls_main =
 ;
 
 test "cross-package class collision constructs the caller's class in either order" {
-    // kotlinc: root:* for all three forms regardless of file order.
     const want = "root:1\nroot:2\n[root:3]\n";
     try expectFilesOutput("xpkg_cls_main_first", &.{ xcls_main, xcls_lib }, want);
     try expectFilesOutput("xpkg_cls_lib_first", &.{ xcls_lib, xcls_main }, want);
@@ -472,13 +426,9 @@ const xfn_main =
 ;
 
 test "cross-package same-signature function twin never displaces the caller's own, even from a synthesized lambda frame" {
-    // Two packages each declare `internal fun make((){}->String)`; the call
-    // site in `appb` imports neither the other, so kotlinc binds `appb.make`
-    // for BOTH the direct call and the one nested in a `runIt { … }` lambda.
-    // That lambda frame carries no declared package, so the runtime overload
-    // re-pick anchors scope to the lowering-resolved target's package rather
-    // than let the identical-signature `liba.make` win a first-seen tie.
-    // Order-independent.
+    // Neither package imports the other, and the lambda frame carries no
+    // declared package, so the runtime re-pick anchors scope to the
+    // lowering-resolved target's package rather than a first-seen tie.
     const want = "appb:x\nappb:y\n";
     try expectFilesOutput("xpkg_fn_main_first", &.{ xfn_main, xfn_lib }, want);
     try expectFilesOutput("xpkg_fn_lib_first", &.{ xfn_lib, xfn_main }, want);
@@ -547,12 +497,9 @@ const xobj_main =
 ;
 
 test "same-simple-name nested object twins bind own-package singletons in either order" {
-    // Two packages each declare `object Marker` nested in a same-named
-    // sealed class (the gapbuffer/linkbuffer `Operation.*` op shape): both
-    // lift to the same `Operation$Marker` simple name, so every read must
-    // resolve through the declaring class's FQN — a name-keyed pick binds
-    // whichever twin registered the name. The `is` check must compare the
-    // imported class's identity, not the unregistered bare simple name.
+    // Both nested `object Marker`s lift to the same `Operation$Marker` simple
+    // name, so every read resolves through the declaring class's FQN and the
+    // `is` check compares the imported class's identity.
     const want = "1truetrue\n2truetrue\n";
     try expectFilesOutput("xpkg_obj_ga_first", &.{ xobj_main, xobj_ga_decl, xobj_ga_use, xobj_gb_decl, xobj_gb_use }, want);
     try expectFilesOutput("xpkg_obj_gb_first", &.{ xobj_main, xobj_gb_decl, xobj_gb_use, xobj_ga_decl, xobj_ga_use }, want);
@@ -580,8 +527,6 @@ test "cross-package data-class twins keep their own arity and copy() in either o
 }
 
 test "a cross-package bare call without an import is an unresolved reference" {
-    // kotlinc rejects this shape outright; the diagnostic names the
-    // candidates and how to import one. Both file orders.
     const liba =
         \\package liba
         \\fun f(): String = "liba.f"
@@ -599,10 +544,7 @@ test "a cross-package bare call without an import is an unresolved reference" {
     ;
     try expectFilesErrContains("xpkg_unresolved_ab", &.{ liba, libb, caller }, "unresolved reference `f`");
     try expectFilesErrContains("xpkg_unresolved_ba", &.{ libb, liba, caller }, "unresolved reference `f`");
-    // A single out-of-scope candidate is unresolved too, and the
-    // diagnostic says how to import it.
     try expectFilesErrContains("xpkg_unresolved_one", &.{ liba, caller }, "add `import liba.f`");
-    // An explicit import resolves the same call.
     const caller_imp =
         \\package app
         \\import liba.f
@@ -612,12 +554,8 @@ test "a cross-package bare call without an import is an unresolved reference" {
     try expectFilesOutput("xpkg_imported_ok", &.{ liba, libb, caller_imp }, "liba.f\n");
 }
 
-// An `actual` implements the `expect` that shares its package. Matching the
-// pair by SIMPLE NAME let any actual supersede every same-named expect in the
-// program, whatever package it lived in: `p2`'s actual deleted `p1`'s expect
-// from the symbol table, and `p1`'s importers — who name it explicitly — were
-// left with no candidate but `p2`'s, in a package they do not import. The
-// expect survives now, so the call binds it and reports the missing actual.
+// An `actual` implements only the `expect` sharing its package; pairing by
+// simple name would let one package's actual delete another's expect.
 test "an actual supersedes only the expect in its own package" {
     try expectFilesErrContains(
         "expect_actual_pkg",
@@ -646,12 +584,8 @@ test "an actual supersedes only the expect in its own package" {
     );
 }
 
-// The runtime overload re-pick ranks the candidates lowering could not tell
-// apart from argument shapes; it is not a second scope resolution. A BODYLESS
-// target (an `expect` with no `actual` here) has no signature to score, so
-// every body-bearing namesake in the program used to outrank it and the call
-// silently ran an unrelated package's function instead of reporting the
-// missing actual.
+// A bodyless target (an `expect` with no `actual`) has no signature to score,
+// so the runtime re-pick must not let a body-bearing namesake outrank it.
 test "an unimplemented expect reports itself, not a same-named function elsewhere" {
     try expectFilesErrContains(
         "expect_no_actual",
@@ -676,13 +610,8 @@ test "an unimplemented expect reports itself, not a same-named function elsewher
     );
 }
 
-// Two classes sharing a simple name in different packages, each a subtype of a
-// common supertype and each carrying its OWN same-named top-level extension
-// that reads a package-private field. klio stores an extension's receiver as
-// its simple name, so both `Slot.mark` extensions read as receiver `Slot` and
-// either looks applicable to a `Slot` receiver — the sibling twin then runs
-// against a field it lacks. The runtime receiver's actual class FQN decides:
-// a `left.Slot` object binds `left`'s extension, never `right`'s.
+// klio stores an extension's receiver as its simple name, so both `Slot.mark`
+// extensions look applicable; the runtime receiver's class FQN decides.
 test "a runtime receiver picks its own package's same-name extension twin" {
     try expectFilesOutput(
         "ext_twin_runtime_class",
@@ -717,12 +646,8 @@ test "a runtime receiver picks its own package's same-name extension twin" {
     );
 }
 
-// The same twin conflict reached through an ERASED static receiver: the
-// receiver comes from an expression-body factory whose inferred return type is
-// not tracked to the call site (the shape the compose engine hits, where
-// `SlotStorage.asGapBufferSlotTable()` yields an untyped receiver). Neither
-// twin is refuted statically, so both survive to the runtime pick; the actual
-// class `right.Slot` must still bind `right`'s extension, not `left.Slot.mark`.
+// The receiver comes from an expression-body factory whose inferred return
+// type does not reach the call site, so neither twin is refuted statically.
 test "an erased-type receiver still binds its runtime class's extension twin" {
     try expectFilesOutput(
         "ext_twin_erased_static",
@@ -775,11 +700,8 @@ test "overload delegation uses callable parameter return type" {
     try expectOutput("callable_return_overload", src, "true\n");
 }
 
-// kotlinx.atomicfu atomic-array bare simple names (`AtomicIntArray`,
-// `atomicArrayOfNulls`) must not ambiguate with the unimplemented
-// `kotlin.concurrent.atomics` `expect` classes the stdlib pack carried;
-// a user import once failed at runtime until the stdlib pack stopped
-// bundling those array `expect`s.
+// kotlinx.atomicfu's bare array names must not ambiguate with the unimplemented
+// `kotlin.concurrent.atomics` `expect` classes of the same name.
 test "atomic_int_array_get_set_and_size" {
     const src =
         \\
@@ -809,9 +731,8 @@ test "atomic_array_of_nulls" {
     try expectOutput("atomic_array_of_nulls", src, "x,null,4\n");
 }
 
-// Bare `min(Int, Int)` / `maxOf` resolve to the top-level math/comparison
-// functions even when the full kotlinx-io corpus has registered every
-// same-named array/collection receiver-extension intrinsic.
+// The bare math names resolve to the top-level functions even once the full
+// kotlinx-io corpus has registered every same-named receiver extension.
 test "bare_min_max_resolve_to_toplevel_under_full_corpus" {
     const src =
         \\
@@ -830,11 +751,8 @@ test "bare_min_max_resolve_to_toplevel_under_full_corpus" {
     try expectOutput("bare_min_max_corpus", src, "3\n5\n2\n9\n");
 }
 
-// `b.readLine()` dispatches the `Source.readLine()` extension, not the
-// top-level `kotlin.io.readLine` console reader (which the member probe
-// matched via `kotlin.io.{name}` and would have run against empty stdin,
-// returning null). A genuine source extension on the receiver's type
-// chain outranks a same-named non-extension top-level io function.
+// An extension on the receiver's type chain outranks a same-named
+// non-extension top-level io function, so this reads the source, not stdin.
 test "read_line_dispatches_source_extension_not_console" {
     const src =
         \\
