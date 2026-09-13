@@ -5,7 +5,7 @@
 const std = @import("std");
 const parity = @import("parity");
 
-pub const KOTLIN_JVM_VERSION: []const u8 = "2.4.0";
+pub const KOTLIN_JVM_VERSION: []const u8 = "2.4.20";
 
 /// Carried as data; `deinit` frees the heap-text variants.
 pub const RefError = union(enum) {

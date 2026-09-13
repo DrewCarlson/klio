@@ -1,14 +1,14 @@
 # Stdlib strategy
 
-The Kotlin stdlib is **the** runtime surface a program has access to. klio ships a complete implementation that behaves exactly like Kotlin 2.4.0's stdlib on the JVM where semantics are platform-agnostic.
+The Kotlin stdlib is **the** runtime surface a program has access to. klio ships a complete implementation that behaves exactly like Kotlin 2.4.20's stdlib on the JVM where semantics are platform-agnostic.
 
 ## Guiding principles
 
-1. **Upstream source is the implementation.** The stdlib pack's Kotlin source is the upstream tree itself (`kotlin/libraries/stdlib`, pinned at v2.4.0) plus klio-authored actuals under `kotlin-klio/`, interpreted like any other Kotlin. Hand-written Zig intrinsics (`src/stdlib/implementations/`) shadow individual functions at dispatch where host access (IO, clock, threads) or performance demands a native body. This inverts the original plan (all-native, CPython-style): interpreting upstream keeps behavior exactly aligned and makes version bumps a re-pin, not a rewrite.
+1. **Upstream source is the implementation.** The stdlib pack's Kotlin source is the upstream tree itself (`kotlin/libraries/stdlib`, pinned at v2.4.20) plus klio-authored actuals under `kotlin-klio/`, interpreted like any other Kotlin. Hand-written Zig intrinsics (`src/stdlib/implementations/`) shadow individual functions at dispatch where host access (IO, clock, threads) or performance demands a native body. This inverts the original plan (all-native, CPython-style): interpreting upstream keeps behavior exactly aligned and makes version bumps a re-pin, not a rewrite.
 
 2. **The API surface is mined, not maintained by hand.** `stdlib_gen` reads `kotlin/libraries/stdlib/` and produces the symbol index (`SymbolEntry` per public symbol: FQN, kind, signature, modifiers, source span) that the resolver and the Vm's dispatch consult. Bumping Kotlin versions regenerates the surface mechanically.
 
-3. **Pin to Kotlin 2.4.0.** The `kotlin/` submodule is pinned at the tag; bumping is a deliberate, tracked operation.
+3. **Pin to Kotlin 2.4.20.** The `kotlin/` submodule is pinned at the tag; bumping is a deliberate, tracked operation.
 
 4. **Coverage is enforced by upstream's own tests.** The upstream stdlib `commonTest` suite (117 files, ~2,150 tests) runs directly under the interpreter. `src/itests/stdlib_commontest.zig` ratchets the pass count (never lower it); `scripts/commontest-sweep.py` gives per-file iteration. The suite passes per-file at 100% as of 2026-07-06.
 

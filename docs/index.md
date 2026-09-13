@@ -10,7 +10,7 @@ your code also runs it.
 
 ## Highlights
 
-- **Drop-in for interpreting Kotlin.** klio targets Kotlin 2.4.0
+- **Drop-in for interpreting Kotlin.** klio targets Kotlin 2.4.20
   with essentially full language coverage: for running Kotlin
   programs it is a drop-in replacement for `kotlinc`, verified by
   diffing stdout byte-for-byte against the real compiler.
@@ -99,7 +99,7 @@ they are working documents, not user documentation.
 
 ## Status
 
-Experimental, tracking Kotlin **2.4.0**. Two harnesses hold the
+Experimental, tracking Kotlin **2.4.20**. Two harnesses hold the
 drop-in claim up: the parity sweep runs every corpus program (532)
 and example (142) through both `kotlinc` and klio and diffs stdout
 byte-for-byte, and the upstream stdlib's own `commonTest` suite

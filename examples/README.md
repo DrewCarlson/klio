@@ -3,7 +3,7 @@
 Runnable `.kt` programs that exercise klio through the real `klio`
 binary. Every program here produces deterministic output and passes
 the parity sweep — its stdout is byte-identical to `kotlinc`
-(Kotlin 2.4.0). The set grows monotonically: every new language
+(Kotlin 2.4.20). The set grows monotonically: every new language
 feature lands with at least one example demonstrating it end-to-end.
 
 Run any program with:
@@ -90,6 +90,7 @@ Run any program with:
 | `function_types.kt`, `inherit_function_type.kt` | Function types and SAM-shaped values.     |
 | `inline_modifiers.kt`         | `inline` / `crossinline` / `noinline`.                      |
 | `reified.kt`                  | Reified type parameters in `inline` functions.              |
+| `generic_boxed_equality.kt`   | `==` on an operand typed by a type parameter compares by `equals`, so `NaN` equals itself and `0.0` differs from `-0.0`; a statically typed `Double` keeps the IEEE comparison. |
 | `bounds.kt`, `variance.kt`    | Generic bounds and declaration-site variance.               |
 | `extension_functions.kt`, `extension_property.kt`, `extension_nullable_receiver.kt`, `companion_extension_property.kt` | Extensions, incl. nullable receivers and companion-object extension properties accessed via the class name. |
 | `infix_calls.kt`              | `infix` functions.                                          |
@@ -256,6 +257,7 @@ Run any program with:
 |----------------------------|----------------------------------------------------------------|
 | `stdlib_taste.kt`, `stdlib_broad.kt` | `kotlin.math`, String/Int members, conversions.      |
 | `collections.kt`           | List/Set/Map builders, `map`/`filter`/`fold`/`reduce`, iteration, indexing. |
+| `all_distinct_all_equal.kt` | `allDistinct`/`allEqual` and their `By` selectors over iterables, sequences, object and primitive arrays, and the unsigned arrays. |
 | `arrays.kt`                | `Array` and primitive arrays.                                  |
 | `array_bytes.kt`           | Bulk array ops (`copyInto`, `copyOf`, `copyOfRange`, `fill`) and `String` <-> `ByteArray` UTF-8 round-trips (`encodeToByteArray`/`toByteArray`/`decodeToString`). |
 | `base64.kt`                | `kotlin.io.encoding.Base64`: default / URL-safe alphabets, `PaddingOption`, encode/decode round-trips, and a basic-auth credential header. |

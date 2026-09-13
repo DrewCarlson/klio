@@ -1,6 +1,6 @@
 [library]
 id = "kotlin.test"
-version = "2.4.0"
+version = "2.4.20"
 abi = 1
 implicit_packages = []
 auto_bindings = false

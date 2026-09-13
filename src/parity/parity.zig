@@ -32,7 +32,7 @@ const HostBindings = stdlib.HostBindings;
 
 pub const main = @import("main.zig");
 
-pub const TARGET_VERSION: []const u8 = "2.3.21";
+pub const TARGET_VERSION: []const u8 = "2.4.20";
 
 /// Diagnostic outcomes for a locate/install/compile attempt, carried as data;
 /// `deinit` frees the variants owning heap text.
@@ -3076,7 +3076,7 @@ test {
 }
 
 test "TARGET_VERSION is the expected default" {
-    try std.testing.expectEqualStrings("2.3.21", TARGET_VERSION);
+    try std.testing.expectEqualStrings("2.4.20", TARGET_VERSION);
 }
 
 test "KotlincKind binary and env names" {

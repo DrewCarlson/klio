@@ -55,11 +55,11 @@ root file re-exporting the public API.
 ## Reference checkouts
 
 - `kotlin-language-spec/` — spec PDFs by section (gitignored).
-- `kotlin/` — JetBrains/kotlin submodule at tag **v2.4.0**, populated
+- `kotlin/` — JetBrains/kotlin submodule at tag **v2.4.20**, populated
   sparsely (`libraries/stdlib` + `libraries/kotlin.test`) by
   `scripts/init-kotlin-submodule.sh`.
 
-Everything targets **Kotlin 2.4.0**. When the spec PDFs and the
+Everything targets **Kotlin 2.4.20**. When the spec PDFs and the
 `kotlin/` source disagree, the source wins, because that is what real
 Kotlin code is compiled against today.
 

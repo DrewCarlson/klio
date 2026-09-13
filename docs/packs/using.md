@@ -20,7 +20,7 @@ $ klio pack list
 androidx.collection               1.11.1      abi 1  deps stdlib, kotlinx.atomicfu
 androidx.compose.runtime          1.11.1      abi 1  deps stdlib, kotlinx.coroutines, androidx.collection
 io.ktor                           3.5.1       abi 1  deps stdlib, kotlinx.coroutines, kotlinx.atomicfu, kotlinx.io
-kotlin.test                       2.4.0       abi 1  deps stdlib
+kotlin.test                       2.4.20      abi 1  deps stdlib
 kotlinx.atomicfu                  0.33.0      abi 1  deps stdlib
 kotlinx.coroutines                1.11.0      abi 1  deps stdlib
 kotlinx.datetime                  0.8.0       abi 1  deps stdlib, kotlinx.serialization

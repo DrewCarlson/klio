@@ -158,13 +158,16 @@ fn stampKotlinVersion(a: std.mem.Allocator, bytes: []const u8) std.mem.Allocator
 
 test stampKotlinVersion {
     const a = std.testing.allocator;
-    const src = "fun get(): KotlinVersion = KotlinVersion(2, 4, 255) // stamped";
+    const head = "fun get(): KotlinVersion = ";
+    const tail = " // stamped";
+    const src = head ++ stdlib_sources.KOTLIN_VERSION_PLACEHOLDER ++ tail;
     const got = (try stampKotlinVersion(a, src)).?;
     defer a.free(got);
     try std.testing.expectEqualStrings(
-        "fun get(): KotlinVersion = KotlinVersion(2, 4, 0) // stamped",
+        head ++ stdlib_sources.KOTLIN_VERSION_STAMPED ++ tail,
         got,
     );
+    try std.testing.expect(std.mem.find(u8, got, "255") == null);
     try std.testing.expectEqual(@as(?[]const u8, null), try stampKotlinVersion(a, "no placeholder here"));
 }
 

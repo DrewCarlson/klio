@@ -54,7 +54,7 @@ The `parity` module is a primary correctness gate:
 - Diffs stdout. Any byte difference fails the sweep.
 
 The harness defaults to JVM `kotlinc` (fast: ~1s compile, jar run)
-and targets Kotlin 2.4.0. It auto-installs a pinned `kotlinc` if
+and targets Kotlin 2.4.20. It auto-installs a pinned `kotlinc` if
 none is found; set `KLIO_KOTLINC_JVM_HOME` to point at an existing
 distribution, or `KLIO_NO_AUTO_INSTALL_KOTLINC=1` to disable
 auto-install (the parity tests then skip).

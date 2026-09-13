@@ -9,10 +9,11 @@
 # present, nothing to do" guard then skips the widen, and packs whose manifests
 # reference the newly-needed files build incomplete (missing-source) packs.
 #
-# reconcile_sparse_submodule always brings the on-disk sparse set into line with
-# the caller's current desired list — widening a stale checkout in place — so
-# re-running an init script (or bootstrap.sh) repairs a narrow checkout instead
-# of skipping it.
+# reconcile_sparse_submodule brings the on-disk checkout into line with the
+# caller every time it runs: it moves the checkout to the ref pinned in
+# .gitmodules (fetching that tag when the shallow clone lacks it) and widens the
+# sparse set to the caller's current list. Re-running an init script, or
+# bootstrap.sh, repairs a stale pin or a narrow checkout instead of skipping it.
 #
 # Must be called with the repo root as the working directory.
 
@@ -33,10 +34,27 @@ reconcile_sparse_submodule() {
     # tries to fetch the submodule's tag from the parent's remote and hangs.
     # Require the submodule to have its own gitdir before treating it as present.
     if [ -e "$path/.git" ] && git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        # Existing checkout: reconcile its sparse set to `want`.
-        local current desired
-        current="$(git -C "$path" sparse-checkout list 2>/dev/null | LC_ALL=C sort)"
+        # Existing checkout: reconcile its ref and its sparse set.
+        local current desired at want_commit
+        # A worktree left non-sparse by a manual checkout makes this exit 128;
+        # treat that as "no sparse set" and fall through to the widen below.
+        current="$(git -C "$path" sparse-checkout list 2>/dev/null | LC_ALL=C sort || true)"
         desired="$(printf '%s\n' "${want[@]}" | LC_ALL=C sort)"
+        # Reconcile the pinned ref first: a bump in .gitmodules has to move the
+        # checkout, and the tag may not be in this shallow clone yet.
+        at="$(git -C "$path" rev-parse HEAD 2>/dev/null || true)"
+        want_commit="$(git -C "$path" rev-parse -q --verify "${ref}^{commit}" 2>/dev/null || true)"
+        if [ -z "$want_commit" ]; then
+            echo "${path}: fetching ${ref} ..."
+            # shellcheck disable=SC2086 # filter is a single intentional token
+            git -C "$path" fetch $filter --depth 1 origin tag "$ref"
+            want_commit="$(git -C "$path" rev-parse -q --verify "${ref}^{commit}")"
+        fi
+        if [ "$at" != "$want_commit" ]; then
+            echo "${path}: moving checkout to ${ref} ..."
+            git -C "$path" checkout --detach "$ref"
+            current=""
+        fi
         if [ "$current" = "$desired" ]; then
             echo "${path}: sparse checkout up to date (${ref})."
             return 0

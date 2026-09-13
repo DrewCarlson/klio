@@ -50,8 +50,7 @@ echo "== unit"
 phase "unit" zig build test
 
 echo "== litmus + ktor + e2e (build-system run steps)"
-# ktor_client_get is excluded while its pre-existing replay failure is
-# open (see resolution-unification-plan, step-2 status); re-add it there
+# ktor_client_get is excluded while its replay failure is open; re-add it
 # the moment it goes green.
 phase "litmus" zig build \
   itest-parity_threaded_litmus itest-parity_corpus_pinned \

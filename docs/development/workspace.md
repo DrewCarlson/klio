@@ -47,7 +47,7 @@ klio/
 ├── docs/                       This site (mkdocs)
 ├── plans/                      Running plan documents and design records
 └── kotlin/                     JetBrains/kotlin submodule (sparse: libraries/stdlib
-                                + libraries/kotlin.test at v2.4.0)
+                                + libraries/kotlin.test at v2.4.20)
 ```
 
 ## Roles

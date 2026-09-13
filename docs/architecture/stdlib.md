@@ -3,7 +3,7 @@
 The Kotlin standard library is delivered as a pack
 (`stdlib.klio-pack`) that's embedded into the `klio` binary at build
 time. The pack's Kotlin source is the upstream stdlib itself
-(`kotlin/libraries/stdlib`, pinned at v2.4.0) plus klio-authored
+(`kotlin/libraries/stdlib`, pinned at v2.4.20) plus klio-authored
 actuals under `kotlin-klio/`; that source is interpreted like any
 other Kotlin, and hand-written Zig intrinsics shadow individual
 functions at dispatch where a native implementation is needed for

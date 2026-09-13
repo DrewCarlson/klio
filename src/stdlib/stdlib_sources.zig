@@ -20,6 +20,8 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "src/kotlin/coroutines/CoroutineContextImpl.kt",
     "src/kotlin/coroutines/ContinuationInterceptor.kt",
     "src/kotlin/coroutines/Continuation.kt",
+    "src/kotlin/coroutines/ExperimentalStdlibCoroutineSupportApi.kt",
+    "src/kotlin/coroutines/debug/StackTraceRecoverable.kt",
     "common/src/generated/_Strings.kt",
     "common/src/generated/_Maps.kt",
     "common/src/generated/_Collections.kt",
@@ -136,6 +138,8 @@ pub const CURATED_UPSTREAM_SOURCES = [_][]const u8{
     "common/src/kotlin/TextH.kt",
     "common/src/kotlin/SequencesH.kt",
     "common/src/kotlin/collections/CollectionsH.kt",
+    // The 256-bit duplicate set `allDistinct` uses on the byte-domain arrays.
+    "common/src/kotlin/collections/UByteValueSet.kt",
     "src/kotlin/coroutines/cancellation/CancellationExceptionH.kt",
     "src/kotlin/collections/ArrayDeque.kt",
     "src/kotlin/collections/UArraySorting.kt",
@@ -252,7 +256,7 @@ pub const KLIO_STDLIB_DIR = "kotlin-klio";
 /// placeholder patch component that kotlinc's own build rewrites to the release
 /// version, and the pack builder applies the same rewrite so
 /// `KotlinVersion.CURRENT` matches kotlinc.
-pub const KOTLIN_RELEASE = .{ .major = 2, .minor = 4, .patch = 0 };
+pub const KOTLIN_RELEASE = .{ .major = 2, .minor = 4, .patch = 20 };
 pub const KOTLIN_VERSION_FILE = "src/kotlin/util/KotlinVersion.kt";
 pub const KOTLIN_VERSION_PLACEHOLDER = std.fmt.comptimePrint(
     "KotlinVersion({d}, {d}, 255)",
