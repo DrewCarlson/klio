@@ -1,7 +1,6 @@
-//! Top-level file parsing: package header, imports, top-level
-//! declarations, modifier/annotation scanning, and `typealias`.
-//!
-//! Free functions over `*Parser`; the entry point is `file.parseFile(p)`.
+//! Top-level file parsing: package header, imports, top-level declarations,
+//! modifier and annotation scanning, and `typealias`. Free functions over
+//! `*Parser`; the entry point is `file.parseFile(p)`.
 
 const std = @import("std");
 
@@ -40,7 +39,6 @@ const Diagnostic = diagnostics.Diagnostic;
 const Keyword = lexer.Keyword;
 const TokenKind = lexer.TokenKind;
 
-/// True when the cursor is at `Keyword(want)`.
 fn atKeyword(p: *const Parser, want: Keyword) bool {
     return switch (support.peekKind(p).*) {
         .Keyword => |kw| kw == want,
@@ -56,24 +54,19 @@ fn kindAt(p: *const Parser, off: usize) ?TokenKind {
     return p.tokens[idx].kind;
 }
 
-/// Span of the last consumed token, mirroring
-/// `self.tokens[self.pos.saturating_sub(1)].span`.
 fn prevSpan(p: *const Parser) Span {
     const idx = if (p.pos == 0) 0 else p.pos - 1;
     return p.tokens[idx].span;
 }
 
-/// Parse the whole compilation unit. Diagnostics accumulate on
-/// `p.diagnostics`.
+/// Parse the whole compilation unit; diagnostics accumulate on `p.diagnostics`.
 pub fn parseFile(p: *Parser) KotlinFile {
     support.skipNl(p);
     const start = support.currentSpan(p);
 
-    // File-use-site annotations (`@file:Suppress(...)`,
-    // `@file:OptIn(...)`, `@file:JvmName(...)`) precede the
-    // package header in Kotlin. Consume them up front; klio
-    // doesn't act on them, but the parser must not treat them as
-    // a declaration sitting before `package`.
+    // File-use-site annotations (`@file:Suppress(...)`, `@file:JvmName(...)`)
+    // precede the package header in Kotlin. Consume them up front so the parser
+    // does not read them as a declaration sitting before `package`.
     const file_annotations = parseFileAnnotations(p);
 
     const package = parsePackageHeader(p);
@@ -144,10 +137,9 @@ pub fn parsePackageHeader(p: *Parser) ?PackageHeader {
     }
     const last_span = if (path.items.len > 0) path.items[path.items.len - 1].span else pkg_tok.span;
     const sp = pkg_tok.span.join(last_span);
-    // `package a.b;` — a trailing semicolon is a legal statement
-    // terminator here exactly as a newline is (kotlinx-serialization's
-    // FormatLanguage.kt writes one); leaving it made the following
-    // `import` look like a post-declaration directive.
+    // `package a.b;`: a trailing semicolon terminates the statement exactly as
+    // a newline does, and without consuming it the following `import` reads as
+    // a post-declaration directive.
     stmt.skipStmtSeparators(p);
     return .{
         .path = path.toOwnedSlice(p.allocator) catch @panic("OOM"),
@@ -228,10 +220,9 @@ pub fn parseImports(p: *Parser) []ImportDecl {
 
 pub fn parseTopDecl(p: *Parser) ?Decl {
     const flags = skipModifiersWithFlags(p);
-    // `companion { ... }` / `companion Name { ... }` — the `object` keyword
-    // omitted (shorthand for `companion object`). When `companion` was the
-    // last modifier and no `object` follows, route to the companion parser,
-    // which now consumes `object` only when present.
+    // `companion { ... }` / `companion Name { ... }`, with the `object` keyword
+    // omitted. When `companion` was the last modifier and no `object` follows,
+    // route to the companion parser, which consumes `object` only if present.
     if (flags.is_companion and !atKeyword(p, .Object)) {
         const at_body = switch (support.peekKind(p).*) {
             .LBrace => true,
@@ -247,7 +238,7 @@ pub fn parseTopDecl(p: *Parser) ?Decl {
     switch (support.peekKind(p).*) {
         .Keyword => |kw| switch (kw) {
             .Fun => {
-                // `fun interface Foo { … }` — SAM-conversion-eligible interface.
+                // `fun interface Foo { ... }`, eligible for SAM conversion.
                 const next = kindAt(p, 1);
                 if (next != null and std.meta.activeTag(next.?) == .Keyword and next.?.Keyword == .Interface) {
                     _ = support.bump(p); // `fun`
@@ -289,9 +280,9 @@ pub fn parseTopDecl(p: *Parser) ?Decl {
             .Class, .Interface => {
                 const visibility = flags.visibility;
                 const annotations = flags.annotations.items;
-                // `inline class` is the deprecated alias for `value class`.
-                // When the user wrote `inline` on a class declaration, promote
-                // it to `is_value` and emit a deprecation warning.
+                // `inline class` is the deprecated alias for `value class`, so
+                // `inline` on a class declaration is promoted to `is_value` and
+                // reported as deprecated.
                 const is_value = flags.is_value or flags.is_inline;
                 if (flags.is_inline and !flags.is_value) {
                     if (flags.inline_span) |sp| {
@@ -390,13 +381,13 @@ pub fn parseTypealias(
     };
 }
 
-/// Recognize leading annotations and soft modifiers, capturing the flags
-/// that affect how the declaration is parsed (`data`, `companion`).
+/// Recognize leading annotations and soft modifiers, capturing the flags that
+/// affect how the declaration parses (`data`, `companion`).
 ///
-/// `at_stmt_level` is true when parsing a statement, where `context(...)`
-/// followed by anything other than a `name: Type` list is a CALL to the
-/// stdlib `context` function, not a context-parameter clause: the loop then
-/// stops without consuming so the expression parser sees it.
+/// At statement level, `context(...)` followed by anything but a `name: Type`
+/// list is a CALL to the stdlib `context` function rather than a
+/// context-parameter clause, so the loop stops without consuming and the
+/// expression parser sees it.
 pub fn skipModifiersWithFlags(p: *Parser) ModifierFlags {
     return skipModifiersWithFlagsLevel(p, false);
 }
@@ -436,9 +427,9 @@ pub fn skipModifiersWithFlagsLevel(p: *Parser, at_stmt_level: bool) ModifierFlag
         }
         switch (support.peekKind(p).*) {
             .Ident => {
-                // A soft-keyword-named modifier immediately followed by `@`
-                // is a LABEL, not a modifier (`inner@ for`, `data@ while`):
-                // leave it for the label/expression path.
+                // A soft-keyword-named modifier immediately followed by `@` is
+                // a LABEL, not a modifier (`inner@ for`, `data@ while`), so it
+                // is left for the label and expression path.
                 if (kindAt(p, 1)) |nk| {
                     if (std.meta.activeTag(nk) == .AtNoWs or std.meta.activeTag(nk) == .AtPostWs) return flags;
                 }
@@ -528,8 +519,8 @@ pub fn skipModifiersWithFlagsLevel(p: *Parser, at_stmt_level: bool) ModifierFlag
     }
 }
 
-/// Advance a token index past a balanced `(...)` starting at `start`
-/// (which must index a `(`). Returns the index just after the matching `)`.
+/// Advance a token index past the balanced `(...)` starting at `start`, which
+/// must index a `(`, to the index just after the matching `)`.
 fn skipBalancedParenIdx(p: *const Parser, start: usize) usize {
     var depth: i32 = 0;
     var i = start;
@@ -547,15 +538,15 @@ fn skipBalancedParenIdx(p: *const Parser, start: usize) usize {
     return i;
 }
 
-/// Peek (without consuming) whether the `context(` at the cursor opens a
-/// context-parameter clause — every element begins `[annotations]
-/// [modifiers] name :` — rather than a call to the stdlib `context`
-/// function. `p.pos` is the `context` ident, `p.pos+1` the `(`.
+/// Peek, without consuming, whether the `context(` at the cursor opens a
+/// context-parameter clause, every element of which begins
+/// `[annotations] [modifiers] name :`, rather than a call to the stdlib
+/// `context` function. `p.pos` is the `context` ident, `p.pos+1` the `(`.
 fn contextParenIsClause(p: *const Parser) bool {
     var i = p.pos + 2; // first token inside `(`
     while (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .Newline) i += 1;
-    // `context()` — an empty list is never a valid call; treat as a clause so
-    // the empty-list diagnostic fires.
+    // `context()`: an empty list is never a valid call, so treat it as a clause
+    // and let the empty-list diagnostic fire.
     if (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .RParen) return true;
     // Skip leading annotations and the parameter modifiers that may precede a
     // context parameter name.
@@ -590,7 +581,7 @@ fn contextParenIsClause(p: *const Parser) bool {
         }
         break;
     }
-    // A context-parameter entry is `name :`. `_` lexes as an `Ident`.
+    // A context-parameter entry is `name :`; `_` lexes as an `Ident`.
     if (i < p.tokens.len and std.meta.activeTag(p.tokens[i].kind) == .Ident) {
         var j = i + 1;
         while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) j += 1;
@@ -620,9 +611,9 @@ pub fn parseContextClause(p: *Parser) ContextClause {
             _ = parseAnnotations(p);
             support.skipNl(p);
         }
-        // Parameter modifiers: `noinline`/`crossinline` are accepted (and
-        // ignored — inlining context parameters is unsupported); anything
-        // else is rejected.
+        // Parameter modifiers: `noinline` and `crossinline` are accepted and
+        // ignored, inlining a context parameter having no effect; anything else
+        // is rejected.
         while (true) {
             const tok = support.peek(p);
             if (std.meta.activeTag(tok.kind) == .Keyword and
@@ -648,7 +639,7 @@ pub fn parseContextClause(p: *Parser) ContextClause {
             }
             break;
         }
-        // `name : Type` — or a bare type (the legacy context-receiver form).
+        // `name : Type`, or a bare type in the older context-receiver form.
         const named = std.meta.activeTag(support.peekKind(p).*) == .Ident and blk: {
             var j = p.pos + 1;
             while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) j += 1;
@@ -697,15 +688,10 @@ pub fn parseContextClause(p: *Parser) ContextClause {
     return .{ .params = list.toOwnedSlice(p.allocator) catch @panic("OOM"), .span = kw.span.join(rp.span) };
 }
 
-/// Parse one annotation set at the cursor. The cursor must be at an
-/// `@` token. Returns `null` if no annotation was consumed (the leading
-/// `@` could not be followed by an identifier or use-site target).
-/// Supports:
-///   - `@Foo`
-///   - `@Foo(args)`
-///   - `@Foo.Bar`
-///   - `@field:Foo` (use-site target)
-///   - `@field:[A B C]` (array form with use-site target)
+/// Parse one annotation set at the cursor, which must be at an `@`. Returns
+/// `null` when nothing was consumed, the `@` being followed by neither an
+/// identifier nor a use-site target. Handles `@Foo`, `@Foo(args)`, `@Foo.Bar`,
+/// `@field:Foo`, and the array form `@field:[A B C]`.
 pub fn parseAnnotationSet(p: *Parser) ?[]Annotation {
     return parseAnnotationSetCtx(p, false);
 }
@@ -752,9 +738,8 @@ fn parseAnnotationSetCtx(p: *Parser, in_type_position: bool) ?[]Annotation {
     return null;
 }
 
-/// Try to consume an annotation use-site target like `field:` / `get:`.
-/// Returns the parsed target or `null` if the cursor wasn't at a
-/// recognized target followed by `:`.
+/// Consume an annotation use-site target such as `field:` or `get:`; `null`
+/// when the cursor is not at a recognized target followed by `:`.
 pub fn tryParseAnnotationUseSite(p: *Parser) ?AnnotationUseSite {
     if (std.meta.activeTag(support.peekKind(p).*) != .Ident) {
         return null;
@@ -858,17 +843,14 @@ pub fn parseUnescapedAnnotationCtx(
     };
 }
 
-/// Consume leading `@file:...` annotations (only file-use-site
-/// ones, so a leading `@JvmName fun` on a package-less file keeps
-/// its annotation). Result is discarded — klio doesn't act on
-/// file annotations.
+/// Consume leading `@file:` annotations only, so a leading `@JvmName fun` on a
+/// package-less file keeps its annotation. The result is discarded.
 pub fn skipFileAnnotations(p: *Parser) void {
     _ = parseFileAnnotations(p);
 }
 
 /// Consume every leading `@file:` annotation set and return the flattened
-/// annotations (a serialization pass reads `@file:UseSerializers` /
-/// `@file:UseContextualSerialization`).
+/// annotations, which a serialization pass reads (`@file:UseSerializers`).
 pub fn parseFileAnnotations(p: *Parser) []Annotation {
     var out: std.ArrayList(Annotation) = .empty;
     while (true) {
@@ -890,10 +872,9 @@ pub fn parseFileAnnotations(p: *Parser) []Annotation {
     return out.toOwnedSlice(p.allocator) catch @panic("OOM");
 }
 
-/// Parse zero or more annotation sets at the cursor. Returns the
-/// flattened annotation list. Useful at sites that don't go through
-/// `skipModifiersWithFlags` (params, type parameters, type-refs,
-/// enum entries, when-bindings).
+/// Parse zero or more annotation sets at the cursor and return them flattened.
+/// For sites outside `skipModifiersWithFlags`: parameters, type parameters,
+/// type refs, enum entries, when-bindings.
 pub fn parseAnnotations(p: *Parser) []Annotation {
     return parseAnnotationsCtx(p, false);
 }
@@ -918,12 +899,11 @@ fn parseAnnotationsCtx(p: *Parser, in_type_position: bool) []Annotation {
     return out.toOwnedSlice(p.allocator) catch @panic("OOM");
 }
 
-/// In type-use position, a `(` immediately following the annotation name
-/// belongs to a function type (`@Composable () -> Unit`,
-/// `@Composable (P) -> Unit`) and must not be eaten as annotation
-/// arguments. We treat the `(...)` as a function-type parameter list when
-/// the matching `)` is followed by `->`. Empty `()` followed by `->` and
-/// non-empty lists are both covered.
+/// In type-use position a `(` right after the annotation name belongs to a
+/// function type (`@Composable () -> Unit`) and must not be eaten as annotation
+/// arguments. The `(...)` counts as a function-type parameter list when the
+/// matching `)` is followed by `->`, which covers both an empty `()` and a
+/// non-empty list.
 fn parenStartsFunctionType(p: *Parser) bool {
     if (std.meta.activeTag(support.peekKind(p).*) != .LParen) return false;
     var depth: usize = 0;
@@ -941,16 +921,14 @@ fn parenStartsFunctionType(p: *Parser) bool {
                     var j = i + 1;
                     while (j < p.tokens.len and std.meta.activeTag(p.tokens[j].kind) == .Newline) j += 1;
                     if (j >= p.tokens.len) return false;
-                    // `(...) ->` is a function type; `(...)?` is a
-                    // parenthesized (usually function) type made nullable —
-                    // `@Composable ((iconColor: Color) -> Unit)?` — never
-                    // annotation arguments. A close followed by `)` with an
-                    // arrow INSIDE is the nested parenthesized form
-                    // `(@Composable (() -> Unit))?` — a type, not args.
-                    // With an arrow INSIDE the parens, a close followed by a
-                    // param-list terminator is the parenthesized function
-                    // type itself (`track: @Composable ((S) -> Unit),`), not
-                    // annotation arguments.
+                    // `(...) ->` is a function type, and `(...)?` is a
+                    // parenthesized type made nullable
+                    // (`@Composable ((iconColor: Color) -> Unit)?`); neither is
+                    // annotation arguments. With an arrow INSIDE the parens, a
+                    // close followed by `)` is the nested parenthesized form
+                    // `(@Composable (() -> Unit))?`, and a close followed by a
+                    // param-list terminator is the parenthesized function type
+                    // itself (`track: @Composable ((S) -> Unit),`).
                     const jk = std.meta.activeTag(p.tokens[j].kind);
                     return jk == .Arrow or
                         p.tokens[j].kind.isQuestion() or

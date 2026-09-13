@@ -1,11 +1,10 @@
 //! Smart-cast and nullability dataflow.
 //!
-//! The lattice is `Map<Place, SmartCastFact>` where each fact bundles
-//! a refined type (intersected as paths join) and a nullability axis
-//! (definitely non-null / definitely null / unknown). Transfer
-//! functions consume `AssumeIs`, `AssumeNull`, `Assign`, and
-//! `KillDataFlow`. The mapping from register-bearing nodes back to
-//! `Place` comes from the lowering's `reg_to_place` table.
+//! The lattice is `Map<Place, SmartCastFact>`, each fact bundling a refined
+//! type (intersected as paths join) with a nullability axis (definitely
+//! non-null, definitely null, unknown). Transfer functions consume `AssumeIs`,
+//! `AssumeNull`, `Assign` and `KillDataFlow`; register-bearing nodes map back to
+//! a `Place` through the lowering's `reg_to_place` table.
 
 const std = @import("std");
 const types = @import("types");
@@ -28,20 +27,17 @@ pub const Nullability = enum {
     DefinitelyNull,
 };
 
-/// A single fact about a `Place` at a program point.
 pub const SmartCastFact = struct {
-    /// The type the place has been narrowed to along this path. `null`
-    /// means "no narrowing" — fall back to the declared type.
+    /// The type the place is narrowed to along this path; `null` means no
+    /// narrowing, so the declared type stands.
     narrowed: ?Type = null,
-    /// User-class narrowing recorded alongside `narrowed` when the
-    /// runtime type is a non-builtin class. The typechecker uses this
-    /// to recover the class-name path it previously kept in its
-    /// `narrowing_class` map.
+    /// User-class narrowing recorded alongside `narrowed` when the runtime type
+    /// is a non-builtin class, from which the typechecker recovers the
+    /// class-name path.
     narrowed_class: ?[]const u8 = null,
-    /// Negative `is` refinements: types the place is known *not* to
-    /// be along this path. Used for exhaustive-`when` propagation.
+    /// Negative `is` refinements: types the place is known NOT to be along this
+    /// path. Used for exhaustive-`when` propagation.
     not_types: std.ArrayList(Type) = .empty,
-    /// Nullability axis.
     null: Nullability = .Unknown,
 
     pub fn unknown() SmartCastFact {
@@ -65,12 +61,11 @@ pub const SmartCastFact = struct {
         self.* = SmartCastFact.unknown();
     }
 
-    /// Compose `self` with an `is T` narrowing. Intersection-on-rhs
-    /// when both are non-trivial; otherwise the more specific one
-    /// wins by direct replacement (`intersect` normalises). The
-    /// optional `class_name` is recorded alongside for user-class
-    /// narrowings whose Type is `Unresolved`. Takes ownership of `ty`
-    /// and `class_name`.
+    /// Compose `self` with an `is T` narrowing: an intersection when both sides
+    /// are non-trivial, otherwise the more specific one replaces the other
+    /// (`intersect` normalises). `class_name` is recorded alongside for a
+    /// user-class narrowing whose `Type` is `Unresolved`. Takes ownership of
+    /// `ty` and `class_name`.
     pub fn assumeIs(self: *SmartCastFact, allocator: Allocator, ty: Type, class_name: ?[]const u8) Allocator.Error!void {
         if (self.narrowed) |prev| {
             self.narrowed = null;
@@ -144,12 +139,11 @@ pub const SmartCastFact = struct {
         };
     }
 
-    /// Join two facts at a control-flow merge. The narrowed type is
-    /// the union of both sides (collapsing to `Any` when they
-    /// disagree, dropping entirely when either side has no narrowing);
-    /// class narrowing survives only on exact agreement; negative
-    /// refinements intersect; nullability collapses to `Unknown` on
-    /// disagreement.
+    /// Join two facts at a control-flow merge. The narrowed type is the union of
+    /// both sides, collapsing to `Any` when they disagree and dropping entirely
+    /// when either side has none; class narrowing survives only on exact
+    /// agreement; negative refinements intersect; nullability collapses to
+    /// `Unknown` on disagreement.
     pub fn join(self: *SmartCastFact, allocator: Allocator, other: *const SmartCastFact) Allocator.Error!bool {
         var changed = false;
 
@@ -184,8 +178,8 @@ pub const SmartCastFact = struct {
             changed = true;
         }
 
-        // Negative refinements intersect: only those known on *both*
-        // sides survive.
+        // Negative refinements intersect: only those known on BOTH sides
+        // survive.
         var new_not: std.ArrayList(Type) = .empty;
         errdefer {
             for (new_not.items) |*t| t.deinit(allocator);
@@ -215,11 +209,10 @@ pub const SmartCastFact = struct {
     }
 };
 
-/// Intersect two smart-cast facts: the narrowed type is the GLB
-/// of both sides (with `null` treated as "no narrowing" so the
-/// other side dominates); class-name agreement survives; the
-/// nullability axis is the stronger of the two. Borrows both inputs;
-/// the result owns freshly cloned heap data.
+/// Intersect two smart-cast facts: the narrowed type is the GLB of both sides,
+/// with `null` read as no narrowing so the other side dominates; class-name
+/// agreement survives; the nullability axis is the stronger of the two. Borrows
+/// both inputs; the result owns freshly cloned heap data.
 fn intersectFacts(allocator: Allocator, a: *const SmartCastFact, b: *const SmartCastFact) Allocator.Error!SmartCastFact {
     var narrowed: ?Type = null;
     errdefer if (narrowed) |*t| t.deinit(allocator);
@@ -276,10 +269,9 @@ fn intersectFacts(allocator: Allocator, a: *const SmartCastFact, b: *const Smart
     };
 }
 
-/// Intersection of two types, materialised as `Type.Intersection`
-/// when both sides are non-trivial. Mirrors the typechecker's
-/// existing intersection construction. Takes ownership of `a` and
-/// `b`; frees `b` when the two are equal.
+/// Intersection of two types, materialised as `Type.Intersection` when both
+/// sides are non-trivial. Takes ownership of `a` and `b`, freeing `b` when the
+/// two are equal.
 fn intersect(allocator: Allocator, a: Type, b: Type) Allocator.Error!Type {
     if (a.eql(b)) {
         var owned = b;
@@ -292,11 +284,10 @@ fn intersect(allocator: Allocator, a: Type, b: Type) Allocator.Error!Type {
     return .{ .Intersection = parts };
 }
 
-/// Union for join points. With only `Type.Intersection` available
-/// for refinement and no explicit union variant, we conservatively
-/// drop the narrowing to `Any` when the two branches disagree — same
-/// as the current typechecker behavior. Borrows both inputs; the
-/// result owns freshly cloned heap data.
+/// Union for join points. With `Type.Intersection` the only refinement form and
+/// no union variant, a disagreement between branches conservatively drops the
+/// narrowing to `Any`, as the typechecker does. Borrows both inputs; the result
+/// owns freshly cloned heap data.
 fn unionOf(allocator: Allocator, a: Type, b: Type) Allocator.Error!Type {
     if (a.eql(b)) return a.clone(allocator);
     return .Any;
@@ -304,9 +295,8 @@ fn unionOf(allocator: Allocator, a: Type, b: Type) Allocator.Error!Type {
 
 pub const SmartCastLattice = dataflow.MapLattice(Place, SmartCastFact);
 
-/// Ordered per-place declared-type map. Borrows place keys and types —
-/// entries are not owned by the map; the transfer holds the borrowed
-/// reference.
+/// Ordered per-place declared-type map. Place keys and types are borrowed, not
+/// owned by the map; the transfer holds the borrowed reference.
 pub const PlaceTypeMap = struct {
     pub const Entry = struct { key: Place, value: Type };
     entries: []const Entry,
@@ -323,14 +313,13 @@ pub const SmartCastBlockStates = std.ArrayList(SmartCastLattice);
 
 pub const SmartCastTransfer = struct {
     reg_to_place: *const lower.RegPlaceMap,
-    /// Declared types per place, supplied by the typechecker before
-    /// the analysis runs. Used by `AssumeRefEq` to seed each side
-    /// with its declaration when no prior narrowing has refined it.
+    /// Declared types per place, supplied by the typechecker before the analysis
+    /// runs. `AssumeRefEq` uses them to seed each side with its declaration when
+    /// no prior narrowing has refined it.
     declared_types: ?PlaceTypeMap,
 
-    /// Fetch the current fact for `place`, falling back to the
-    /// declared type when no narrowing has been recorded. Caller owns
-    /// the returned fact.
+    /// Current fact for `place`, falling back to the declared type when no
+    /// narrowing was recorded. Caller owns the returned fact.
     fn factOrDeclared(self: *const SmartCastTransfer, allocator: Allocator, place: *const Place, state: *const SmartCastLattice) Allocator.Error!SmartCastFact {
         var fact = try state.get(allocator, place.*);
         errdefer fact.deinit(allocator);
@@ -338,9 +327,8 @@ pub const SmartCastTransfer = struct {
             if (self.declared_types) |decl_map| {
                 if (decl_map.get(place)) |t| {
                     fact.narrowed = try t.clone(allocator);
-                    // Nullable declared types get no automatic
-                    // nullability axis — the explicit AssumeNull
-                    // nodes carry that signal.
+                    // A nullable declared type gets no automatic nullability
+                    // axis: the explicit AssumeNull nodes carry that signal.
                 }
             }
         }
@@ -404,9 +392,8 @@ pub const SmartCastTransfer = struct {
     }
 };
 
-/// Run the smart-cast analysis to fixpoint. Returns per-block in-
-/// states; the caller queries facts at the entry of the block
-/// containing a given AST span.
+/// Run the smart-cast analysis to fixpoint, returning per-block in-states. The
+/// caller queries facts at the entry of the block holding a given AST span.
 pub fn solve(
     allocator: Allocator,
     cfg: *const Cfg,
@@ -415,9 +402,8 @@ pub fn solve(
     return solveWithDeclared(allocator, cfg, reg_to_place, null);
 }
 
-/// Like `solve`, but also seeded with a per-place declared-type map
-/// that `AssumeRefEq` consults to bridge cross-variable narrowings
-/// when neither side has a prior fact.
+/// Like `solve`, plus a per-place declared-type map that `AssumeRefEq` consults
+/// to bridge a cross-variable narrowing when neither side has a prior fact.
 pub fn solveWithDeclared(
     allocator: Allocator,
     cfg: *const Cfg,
@@ -438,9 +424,9 @@ pub fn solveWithDeclared(
     );
 }
 
-/// Reproduce the per-node in-state walk inside a block. Mirrors
-/// `analyses.via.statesWithinBlock` for ad-hoc lookups. Consumes
-/// `entry`. Caller owns every returned lattice.
+/// Reproduce the per-node in-state walk inside a block, as
+/// `analyses.via.statesWithinBlock` does. Consumes `entry`; the caller owns
+/// every returned lattice.
 pub fn statesWithinBlock(
     allocator: Allocator,
     cfg: *const Cfg,

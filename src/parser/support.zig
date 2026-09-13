@@ -1,7 +1,6 @@
-//! Shared cursor / peek / expect / recovery helpers for the parser.
-//!
-//! Free functions over `*Parser`, matching the calling convention used
-//! across the parser's sibling files (e.g. `support.peekKind(p)`).
+//! Shared cursor, peek, expect and recovery helpers for the parser. Free
+//! functions over `*Parser`, matching the convention of the sibling parse files
+//! (`support.peekKind(p)`).
 
 const std = @import("std");
 
@@ -22,24 +21,21 @@ const Token = lexer.Token;
 const TokenKind = lexer.TokenKind;
 const Span = span.Span;
 
-/// Are newlines soft at the cursor (inside `(`/`[`)? When true,
-/// the expression grammar may continue across a line break
-/// before or after a binary/infix operator.
+/// Whether newlines are soft at the cursor, that is inside `(` or `[`. When
+/// they are, the expression grammar may continue across a line break before or
+/// after a binary or infix operator.
 pub fn nlIsSoft(p: *const Parser) bool {
     if (p.pos < p.nl_soft.len) return p.nl_soft[p.pos];
     return false;
 }
 
-/// Skip newline tokens, but only where they are soft (inside
-/// round/square brackets). A no-op elsewhere, so block-level
-/// statement separation is unaffected.
+/// Skip newline tokens only where they are soft, inside round or square
+/// brackets. A no-op elsewhere, so block-level statement separation stands.
 pub fn skipSoftNl(p: *Parser) void {
     while (std.meta.activeTag(peekKind(p).*) == .Newline and nlIsSoft(p)) {
         p.pos += 1;
     }
 }
-
-// ---------- cursor helpers ----------
 
 pub fn peek(p: *const Parser) *const Token {
     return &p.tokens[p.pos];
@@ -57,17 +53,17 @@ pub fn bump(p: *Parser) Token {
     return t;
 }
 
-/// Skip soft newlines — newlines that don't terminate a statement.
+/// Skip soft newlines, the ones that do not terminate a statement.
 pub fn skipNl(p: *Parser) void {
     while (std.meta.activeTag(peekKind(p).*) == .Newline) {
         p.pos += 1;
     }
 }
 
-/// Assignments are statements, not expressions. After parsing an
-/// expression in a value-context (paren, `if`/`while`/`do-while`/`when`
-/// condition, `for` range, value-argument), reject a trailing assignment
-/// operator with a clear diagnostic and consume the RHS to recover.
+/// Assignments are statements, not expressions. After an expression in value
+/// context (parens, an `if`/`while`/`when` condition, a `for` range, a value
+/// argument), reject a trailing assignment operator and consume the RHS to
+/// recover.
 pub fn rejectTrailingAssignment(p: *Parser) void {
     const is_assign = switch (peekKind(p).*) {
         .Eq, .PlusEq, .MinusEq, .StarEq, .SlashEq, .PercentEq => true,
@@ -87,11 +83,10 @@ pub fn rejectTrailingAssignment(p: *Parser) void {
 }
 
 /// True when the cursor is at a token that cannot begin an expression, so a
-/// jump keyword before it (`return` / `break` / `continue`) carries no value.
-/// Beyond a statement boundary (newline / `;` / `}` / EOF) this includes the
-/// closers `)` and `]` and the separator `,`, so a bare `return` in expression
-/// position parses — e.g. `x ?: return`, `f(x ?: return)`, `a[x ?: return]`,
-/// `listOf(x ?: return, y)`.
+/// preceding `return` / `break` / `continue` carries no value. Besides a
+/// statement boundary (newline, `;`, `}`, EOF) this covers the closers `)` and
+/// `]` and the separator `,`, so a bare `return` parses in expression position:
+/// `x ?: return`, `f(x ?: return)`, `listOf(x ?: return, y)`.
 pub fn atNewlineOrSemiOrClose(p: *const Parser) bool {
     return switch (peekKind(p).*) {
         .Newline, .Semicolon, .Eof, .RBrace, .RParen, .RBracket, .Comma => true,
@@ -104,11 +99,10 @@ pub fn text(p: *const Parser, sp: Span) []const u8 {
 }
 
 /// Read the identifier name stored in the token's span, stripping the
-/// surrounding backticks when the source uses an escaped identifier
-/// (`` `foo bar` ``). For unescaped identifiers this is a plain slice.
+/// surrounding backticks of an escaped identifier.
 ///
-/// The result borrows from the parser's source buffer for the unescaped
-/// case and from the arena for the stripped case; callers must not free it.
+/// The result borrows from the parser's source buffer when unescaped and from
+/// the arena when stripped; callers must not free it.
 pub fn identName(p: *Parser, sp: Span) []const u8 {
     const raw = text(p, sp);
     if (raw.len >= 2 and raw[0] == '`' and raw[raw.len - 1] == '`') {
@@ -153,8 +147,6 @@ pub fn expect(p: *Parser, kind: TokenKind, what: []const u8) ?Token {
     return null;
 }
 
-// ---------- top-level ----------
-
 pub fn parseIdent(p: *Parser, what: []const u8) ?Ident {
     skipNl(p);
     if (std.meta.activeTag(peekKind(p).*) == .Ident) {
@@ -169,8 +161,6 @@ pub fn parseIdent(p: *Parser, what: []const u8) ?Ident {
     err(p, "E0003", msg, sp);
     return null;
 }
-
-// ---------- recovery ----------
 
 pub fn recoverToTopLevel(p: *Parser) void {
     while (true) {
@@ -196,8 +186,6 @@ pub fn recoverToStmtEnd(p: *Parser) void {
     }
 }
 
-// ---------- blocks / statements ----------
-
 /// Returns the text of the next token if it is an `Ident`, without
 /// consuming.
 pub fn peekIdentText(p: *const Parser) ?[]const u8 {
@@ -209,17 +197,14 @@ pub fn peekIdentText(p: *const Parser) ?[]const u8 {
     return null;
 }
 
-// ---------- types ----------
-
 pub fn peekKeywordIdent(p: *const Parser, name: []const u8) bool {
     return std.meta.activeTag(peekKind(p).*) == .Ident and
         std.mem.eql(u8, text(p, currentSpan(p)), name);
 }
 
-/// True when, skipping any newlines from the cursor, the next
-/// significant token is `kind`. Used so a line that *starts* with
-/// a binary continuation operator (e.g. `?:`) joins the previous
-/// expression rather than ending it.
+/// True when the next significant token, newlines skipped, is `kind`. Lets a
+/// line that STARTS with a binary continuation operator such as `?:` join the
+/// previous expression instead of ending it.
 pub fn newlineThen(p: *const Parser, kind: TokenKind) bool {
     if (std.meta.activeTag(peekKind(p).*) != .Newline) {
         return false;
@@ -232,9 +217,7 @@ pub fn newlineThen(p: *const Parser, kind: TokenKind) bool {
     return std.meta.activeTag(p.tokens[i].kind) == std.meta.activeTag(kind);
 }
 
-// -------------------------------------------------------------------------
 // Tests
-// -------------------------------------------------------------------------
 
 const testing = std.testing;
 

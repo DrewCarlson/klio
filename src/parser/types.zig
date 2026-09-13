@@ -1,7 +1,6 @@
-//! Type-reference parsing: simple/qualified types, nullable markers,
-//! generic arguments, function types, and type parameters.
-//!
-//! Free functions over `*Parser`.
+//! Type-reference parsing: simple and qualified types, nullable markers,
+//! generic arguments, function types, and type parameters. Free functions over
+//! `*Parser`.
 
 const std = @import("std");
 
@@ -36,10 +35,9 @@ fn isKind(k: TokenKind, tag: std.meta.Tag(TokenKind)) bool {
     return std.meta.activeTag(k) == tag;
 }
 
-/// Parse a `<T, out U : Foo, reified V>`-style type-parameter list.
-/// Caller has verified the cursor is at `<`. Returns the parsed params;
-/// `reified` is only accepted when `allow_reified` is set (i.e. on
-/// functions, not classes).
+/// Parse a `<T, out U : Foo, reified V>` type-parameter list; the caller has
+/// verified the cursor is at `<`. `reified` is accepted only when
+/// `allow_reified` is set, that is on functions, not classes.
 pub fn parseTypeParams(p: *Parser, allow_reified: bool) []TypeParam {
     if (!isKind(peekKind(p), .Lt)) {
         return &.{};
@@ -108,9 +106,9 @@ pub fn parseTypeParams(p: *Parser, allow_reified: bool) []TypeParam {
 /// the cursor is not at `where`.
 pub fn parseWhereClause(p: *Parser) []WhereBound {
     var bounds: std.ArrayList(WhereBound) = .empty;
-    // Look across leading newlines without committing — `where` may sit
-    // on the next line, but if it isn't there we must leave the newlines
-    // alone so they continue serving as statement separators.
+    // Look across leading newlines without committing: `where` may sit on the
+    // next line, and when it does not the newlines must stay in place to serve
+    // as statement separators.
     var i = p.pos;
     while (i < p.tokens.len and isKind(p.tokens[i].kind, .Newline)) {
         i += 1;
@@ -146,18 +144,17 @@ pub fn parseWhereClause(p: *Parser) []WhereBound {
     return bounds.toOwnedSlice(p.allocator) catch @panic("OOM in parseWhereClause");
 }
 
-/// Parse `<TypeArg, …>` (with optional `*`, `out`, `in` projection on
-/// each arg). Caller has verified the cursor is at `<`. Used by
-/// `parseSimpleType` to capture generic instantiations like
-/// `List<out Any>`.
+/// Parse `<TypeArg, ...>`, each argument optionally carrying a `*`, `out` or
+/// `in` projection; the caller has verified the cursor is at `<`. Used by
+/// `parseSimpleType` for generic instantiations like `List<out Any>`.
 pub fn parseTypeArgs(p: *Parser) []TypeArg {
     if (!isKind(peekKind(p), .Lt)) {
         return &.{};
     }
     // Type arguments are fully bracketed by `<...>`, so a qualified path inside
-    // one (`Vec<A.B>`, `MutableVector<Modifier.Node>`) never conflicts with a
-    // trailing `.method` the caller is holding `suppress_qualified_path` for
-    // (an extension receiver). Always allow qualified paths within the args.
+    // one (`MutableVector<Modifier.Node>`) never conflicts with a trailing
+    // `.method` that the caller holds `suppress_qualified_path` for (an
+    // extension receiver). Qualified paths are always allowed within the args.
     const saved_sqp = p.suppress_qualified_path;
     p.suppress_qualified_path = false;
     defer p.suppress_qualified_path = saved_sqp;
@@ -221,11 +218,10 @@ pub fn parseTypeArgs(p: *Parser) []TypeArg {
     return args.toOwnedSlice(p.allocator) catch @panic("OOM in parseTypeArgs");
 }
 
-/// Parse a call-site type-arg list like `foo<String>(…)`. Variance
-/// markers (`in`/`out`) on call-site type args are nonsensical and
-/// silently dropped (Kotlin rejects them as a separate diagnostic). `*`
-/// star-projection at a call site is also dropped — call-site star is
-/// only meaningful in *types*, not in invocation generics.
+/// Parse a call-site type-arg list like `foo<String>(...)`. Variance markers
+/// (`in` / `out`) on call-site type args are meaningless and dropped silently,
+/// Kotlin rejecting them through a separate diagnostic. A `*` star projection
+/// is dropped for the same reason: star is meaningful only in types.
 pub fn parseCallTypeArgs(p: *Parser) []TypeRef {
     if (!isKind(peekKind(p), .Lt)) {
         return &.{};
@@ -253,10 +249,9 @@ pub fn parseCallTypeArgs(p: *Parser) []TypeRef {
         } else if (isKind(peekKind(p), .Ident) and
             std.mem.eql(u8, support.text(p, support.currentSpan(p)), "_"))
         {
-            // Underscore type argument — placeholder for partial
-            // inference. Recorded as a TypeRef whose name is `_`;
-            // downstream typeck treats this as Type::Unresolved and lets
-            // the surrounding inference flow set it.
+            // Underscore type argument, the placeholder for partial inference.
+            // Recorded as a `TypeRef` named `_`; typeck reads it as
+            // `Type::Unresolved` and lets the surrounding inference fill it.
             const s = support.bump(p);
             args.append(p.allocator, .{
                 .name = .{ .name = "_", .span = s.span },
@@ -306,15 +301,14 @@ pub fn parseType(p: *Parser) ?TypeRef {
         }
         return rest;
     }
-    // Soft-keyword `suspend` before a function type — accepted on the
-    // type-reference syntax even when downstream enforcement of the
-    // suspending colouring at this site is a future addition.
+    // Soft-keyword `suspend` before a function type, accepted on the
+    // type-reference syntax.
     var is_suspend = false;
     if (support.peekIdentText(p)) |it| {
         if (std.mem.eql(u8, it, "suspend")) {
-            // Only consume as a type modifier when followed by `(` or by an
-            // identifier that begins a receiver type — otherwise we'd eat a
-            // type literally named `suspend`.
+            // Consume it as a type modifier only when followed by `(` or by an
+            // identifier that begins a receiver type; otherwise a type named
+            // `suspend` would be eaten.
             const next: ?TokenKind = if (p.pos + 1 < p.tokens.len) p.tokens[p.pos + 1].kind else null;
             if (next) |n| {
                 if (isKind(n, .LParen) or isKind(n, .Ident)) {
@@ -339,10 +333,10 @@ pub fn parseType(p: *Parser) ?TypeRef {
         }
         return rest;
     }
-    // Type-use-site annotations: `@Foo @Bar Baz` / `@UnsafeVariance T`.
-    // Accept zero or more annotation sets and stash them on the
-    // resulting TypeRef. A `(` after the annotation name belongs to a
-    // function type (`@Composable () -> Unit`), not annotation args.
+    // Type-use-site annotations `@Foo @Bar Baz` / `@UnsafeVariance T`. Zero or
+    // more annotation sets are accepted and stashed on the resulting TypeRef. A
+    // `(` after the annotation name belongs to a function type
+    // (`@Composable () -> Unit`), not to annotation arguments.
     const type_annotations = file.parseTypeAnnotations(p);
     support.skipNl(p);
     const start_span = support.currentSpan(p);
@@ -360,15 +354,14 @@ pub fn parseType(p: *Parser) ?TypeRef {
             ty.annotations = combined;
         }
     }
-    // Trailing `?` makes the whole type nullable.
     if (peekKind(p).isQuestion()) {
         const q = support.bump(p);
         ty.nullable = true;
         ty.span = ty.span.join(q.span);
     }
-    // Definitely-non-nullable type: `T & Any`. Per the language rules only
-    // valid when T is a type parameter, but we accept the shape here and
-    // let typeck diagnose non-type-parameter receivers.
+    // Definitely-non-nullable type `T & Any`. The language allows it only when
+    // T is a type parameter; the shape is accepted here and typeck diagnoses a
+    // non-type-parameter receiver.
     {
         const save_pos = p.pos;
         var i = p.pos;
@@ -396,11 +389,11 @@ pub fn parseType(p: *Parser) ?TypeRef {
             ty.span = ty.span.join(rhs.span);
         }
     }
-    // Receiver-typed function type: `T.(params) -> R`. We look for `.`
-    // immediately followed by `(`; bare `.` after a type would be a path
+    // Receiver-typed function type `T.(params) -> R`, recognized by a `.`
+    // immediately followed by `(`; a bare `.` after a type is a path
     // continuation handled elsewhere. A nullable receiver `T?.(params) -> R`
-    // lexes its `?.` as a single `QuestionDot`; accept that form too and
-    // record the receiver as nullable.
+    // lexes its `?.` as one `QuestionDot`, accepted here with the receiver
+    // recorded as nullable.
     const recv_qdot = isKind(peekKind(p), .QuestionDot);
     if ((isKind(peekKind(p), .Dot) or recv_qdot) and
         p.pos + 1 < p.tokens.len and isKind(p.tokens[p.pos + 1].kind, .LParen))
@@ -418,9 +411,8 @@ pub fn parseType(p: *Parser) ?TypeRef {
         const sp = ty.span.join(ret_span);
         const func = p.allocator.create(FunctionTypeRef) catch @panic("OOM in parseType");
         // Annotations written before the receiver head annotate the whole
-        // function type (`@Composable R.() -> Unit`), not the receiver:
-        // hoist them onto the outer TypeRef so `isComposable`-style
-        // consumers see them.
+        // function type (`@Composable R.() -> Unit`), not the receiver, so they
+        // are hoisted onto the outer TypeRef for `isComposable`-style consumers.
         var recv_ty = ty;
         recv_ty.annotations = &.{};
         func.* = .{
@@ -441,10 +433,9 @@ pub fn parseType(p: *Parser) ?TypeRef {
             .qualified_path = null,
         };
     }
-    // Propagate `suspend` onto the parens-form function type when one
-    // was produced. If `suspend` was claimed but no function type
-    // materialised, we silently drop it (parity-safe; lambdas don't
-    // care).
+    // Propagate `suspend` onto the parens-form function type when one was
+    // produced. A claimed `suspend` with no function type is dropped, which
+    // lambdas do not read.
     if (is_suspend) {
         if (ty.function) |f| {
             f.is_suspend = true;
@@ -453,9 +444,9 @@ pub fn parseType(p: *Parser) ?TypeRef {
     return ty;
 }
 
-/// Parse a simple (named) type with optional generic arguments. Does
-/// NOT consume a trailing `?` — that's the caller's job so function-type
-/// nullability composes correctly.
+/// Parse a simple (named) type with optional generic arguments. Does NOT
+/// consume a trailing `?`: the caller does, so function-type nullability
+/// composes correctly.
 pub fn parseSimpleType(p: *Parser) ?TypeRef {
     const first = support.parseIdent(p, "type") orelse return null;
     var name = first;
@@ -466,15 +457,13 @@ pub fn parseSimpleType(p: *Parser) ?TypeRef {
         parseTypeArgs(p)
     else
         &.{};
-    // Qualified / nested type path: `A.B.C` (each segment may carry
-    // its own type arguments, e.g. `Outer<T>.Inner`). klio resolves
-    // types by simple name against imports + known packages, so the
-    // path collapses to its last segment (the package / outer-class
-    // qualifier is the namespace the resolver already keys on); the
-    // full dotted path is retained in `qualified_path` for the cases
-    // that need it (a nested supertype vs a same-named top-level class).
-    // Stop before `.(` — that is a receiver-function type
-    // (`A.B.() -> R`), consumed by `parseType`.
+    // Qualified or nested type path `A.B.C`, where each segment may carry its
+    // own type arguments (`Outer<T>.Inner`). Types resolve by simple name
+    // against imports and known packages, so the path collapses to its last
+    // segment, and the full dotted path stays in `qualified_path` for the cases
+    // that need it (a nested supertype against a same-named top-level class).
+    // Stop before `.(`, which is a receiver-function type consumed by
+    // `parseType`.
     while (!p.suppress_qualified_path and
         isKind(peekKind(p), .Dot) and
         p.pos + 1 < p.tokens.len and isKind(p.tokens[p.pos + 1].kind, .Ident))
@@ -506,14 +495,12 @@ pub fn parseSimpleType(p: *Parser) ?TypeRef {
     };
 }
 
-/// userType form `simpleUserType ('.' simpleUserType)*`. Used at sites
-/// that may name a nested classifier (`is Outer.Inner`, `as
-/// Outer.Inner`, `catch (e: Outer.Inner)`). Calls `parseType` for the
-/// leading head (which handles nullability, function-type shape, and
-/// type arguments) then folds any trailing `.Ident` segments into the
-/// name. Regular `parseType` returns the bare leading segment so that
-/// extension-function syntax like `operator fun Foo.bar()` keeps the
-/// trailing name as the function's identity.
+/// userType form `simpleUserType ('.' simpleUserType)*`, for sites that may
+/// name a nested classifier (`is Outer.Inner`, `catch (e: Outer.Inner)`). Parses
+/// the head with `parseType`, which handles nullability, function-type shape and
+/// type arguments, then folds trailing `.Ident` segments into the name. Plain
+/// `parseType` stops at the leading segment, so extension syntax like
+/// `operator fun Foo.bar()` keeps the trailing name as the function's identity.
 pub fn parseQualifiedType(p: *Parser) ?TypeRef {
     var head = parseType(p) orelse return null;
     // Function types and nullable suffixes block further dot folding.
@@ -558,9 +545,8 @@ pub fn parseQualifiedType(p: *Parser) ?TypeRef {
     return head;
 }
 
-/// At `(`. Either:
-///   - `(T)` — parenthesized type (returns the inner type).
-///   - `(T1, T2, ...) -> R` — function type parameters.
+/// At `(`, either a parenthesized type `(T)`, whose inner type is returned, or
+/// the parameter list of a function type `(T1, T2, ...) -> R`.
 pub fn parseParensOrFunctionType(p: *Parser, start: Span) ?TypeRef {
     const lp = support.bump(p); // '('
     var items: std.ArrayList(TypeRef) = .empty;
@@ -596,7 +582,6 @@ pub fn parseParensOrFunctionType(p: *Parser, start: Span) ?TypeRef {
     const rp = support.expect(p, .RParen, "`)`") orelse return null;
     support.skipNl(p);
     if (isKind(peekKind(p), .Arrow)) {
-        // Function type.
         const arrow = support.bump(p);
         support.skipNl(p);
         const ret = parseType(p) orelse return null;
@@ -622,7 +607,6 @@ pub fn parseParensOrFunctionType(p: *Parser, start: Span) ?TypeRef {
             .qualified_path = null,
         };
     } else if (items.items.len == 1 and !saw_comma) {
-        // Parenthesized type.
         var inner = items.items[0];
         inner.span = lp.span.join(rp.span);
         return inner;
@@ -638,18 +622,17 @@ pub fn parseParensOrFunctionType(p: *Parser, start: Span) ?TypeRef {
     }
 }
 
-/// Result of `parseFunctionTypeParams`: the parameter type list plus
-/// both paren tokens.
+/// Result of `parseFunctionTypeParams`: the parameter types and both parens.
 pub const FunctionTypeParams = struct {
     params: []TypeRef,
     lp: Token,
     rp: Token,
 };
 
-/// Parse the leading `context(A, B)` block of a contextual function type.
-/// Types only — a named entry (`name: Type`, `_: Type`) is rejected with
-/// `NAMED_CONTEXT_PARAMETER_IN_FUNCTION_TYPE` but its type is still parsed.
-/// The cursor is at `context`; the `(` follows.
+/// Parse the leading `context(A, B)` block of a contextual function type. Types
+/// only: a named entry (`name: Type`, `_: Type`) is rejected with
+/// `NAMED_CONTEXT_PARAMETER_IN_FUNCTION_TYPE`, though its type is still parsed.
+/// The cursor is at `context` and the `(` follows.
 pub fn parseFunctionTypeContextBlock(p: *Parser) []TypeRef {
     _ = support.bump(p); // `context`
     _ = support.bump(p); // `(`
@@ -730,14 +713,12 @@ pub fn parseFunctionTypeParams(p: *Parser) ?FunctionTypeParams {
     return FunctionTypeParams{ .params = params, .lp = lp, .rp = rp };
 }
 
-// ---------- identifiers ----------
-
-/// Generic type arguments at a call site (`f<T>(...)` or `f<T> { … }`).
-/// We don't model the type args, just consume them so the trailing call
-/// or trailing-lambda parses. The disambiguator: scan from `<` for a
-/// matching `>` (tracking `<`/`>` depth and bailing on tokens that
-/// can't appear inside a type list), and only accept when the `>` is
-/// immediately followed by `(`, `{`, `.`, `?.`, or `::`.
+/// Generic type arguments at a call site (`f<T>(...)` or `f<T> { ... }`). The
+/// arguments are consumed rather than modelled, so the trailing call or lambda
+/// parses. The disambiguator scans from `<` for a matching `>`, tracking
+/// `<`/`>` depth and bailing on tokens that cannot appear in a type list, and
+/// accepts only when that `>` is immediately followed by `(`, `{`, `.`, `?.`
+/// or `::`.
 pub fn trySkipGenericCallArgs(p: *const Parser) bool {
     if (!isKind(peekKind(p), .Lt)) {
         return false;
@@ -756,28 +737,26 @@ pub fn trySkipGenericCallArgs(p: *const Parser) bool {
                     if (next) |n| {
                         return switch (n) {
                             .LParen, .LBrace, .Dot, .QuestionDot, .ColonColon => true,
-                            // `Array<*>?::member` — a nullable-receiver
+                            // `Array<*>?::member`, a nullable-receiver
                             // callable reference: `>` then `?` then `::`.
                             .QuestNoWs, .QuestWs => blk: {
                                 const after: ?TokenKind = if (i + 2 < p.tokens.len) p.tokens[i + 2].kind else null;
                                 break :blk after != null and std.meta.activeTag(after.?) == .ColonColon;
                             },
-                            // `f<T> label@{ … }` — a generic call whose
-                            // trailing lambda carries a label (`>` then an
-                            // identifier, an `@`, and the lambda `{`).
-                            // Without this the `<`/`>` are read as comparison
-                            // operators (`suspendCancellableCoroutine<Unit>
-                            // sc@{ … }`).
+                            // `f<T> label@{ ... }`, a generic call whose
+                            // trailing lambda carries a label: `>` then an
+                            // identifier, an `@` and the lambda `{`. Without
+                            // this the `<`/`>` read as comparison operators.
                             .Ident => blk: {
                                 const t1: ?TokenKind = if (i + 2 < p.tokens.len) p.tokens[i + 2].kind else null;
                                 const t2: ?TokenKind = if (i + 3 < p.tokens.len) p.tokens[i + 3].kind else null;
                                 break :blk t1 != null and t1.?.isAt() and
                                     t2 != null and std.meta.activeTag(t2.?) == .LBrace;
                             },
-                            // `f<A, B>` then a line break then the trailing
+                            // `f<A, B>`, a line break, then the trailing
                             // lambda. Kotlin lets a trailing lambda start on
                             // the following line, so the `<`/`>` still open a
-                            // type-argument list — reading them as comparisons
+                            // type-argument list; reading them as comparisons
                             // makes the type list itself (`Map.Entry<K, V>`,
                             // `out T`) unparseable.
                             .Newline => blk: {
@@ -791,10 +770,9 @@ pub fn trySkipGenericCallArgs(p: *const Parser) bool {
                     return false;
                 }
             },
-            // Tokens that wouldn't appear in a type list — bail out.
-            // `*` inside the angle brackets is a star projection
-            // (`Foo<List<*>>()`), not multiplication; only bail on
-            // it at depth 0 where it would be an arithmetic op.
+            // Tokens that cannot appear in a type list end the scan. A `*`
+            // inside the angle brackets is a star projection (`Foo<List<*>>()`),
+            // so bail on it only at depth 0, where it is arithmetic.
             .Star => if (depth == 0) return false,
             .Eq,
             .Semicolon,

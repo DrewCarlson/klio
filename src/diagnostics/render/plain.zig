@@ -6,8 +6,8 @@
 //!         ^^^
 //! ```
 //!
-//! Includes the source line and an underline-caret if the span fits on a
-//! single line. Multi-line spans only mark the start.
+//! The source line and an underline caret are included when the span fits on a
+//! single line; a multi-line span marks only its start.
 
 const std = @import("std");
 const span = @import("span");

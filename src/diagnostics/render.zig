@@ -1,6 +1,6 @@
 //! Diagnostic renderers. Each format consumes the same `[Diagnostic]` slice
-//! against a `SourceMap`; choose the renderer that matches your downstream
-//! consumer (terminal, JSON-consuming tooling, SARIF aggregator).
+//! against a `SourceMap`; pick the renderer matching the downstream consumer:
+//! terminal, JSON-consuming tooling, or a SARIF aggregator.
 
 const std = @import("std");
 

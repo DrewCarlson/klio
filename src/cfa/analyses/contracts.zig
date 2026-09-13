@@ -1,31 +1,27 @@
-//! Contract-effect catalogue consumed by the lowering. Contracts
-//! describe a function's effect on the surrounding flow: a
-//! precondition that holds on the post-call path, a lambda that runs
-//! a specific number of times, or a smart-cast established by a
-//! runtime check.
+//! Contract-effect catalogue consumed by the lowering. A contract describes a
+//! function's effect on the surrounding flow: a precondition that holds on the
+//! post-call path, a lambda that runs a fixed number of times, or a smart cast
+//! established by a runtime check.
 //!
-//! Stdlib contracts live in `stdlibContract` (hardcoded by simple
-//! name). User contracts declared via `kotlin.contracts.contract { … }`
-//! populate the user-inline-contract registry before lowering — the
-//! build pass walks every `inline fun` body once for the contract
-//! block and records each `callsInPlace(blockName, EXACTLY_ONCE)` it
-//! finds. The lowering then treats a call to that user fn the same
-//! way it treats a `let { … }` call.
+//! Stdlib contracts live in `stdlibContract`, keyed by simple name. A user
+//! contract declared with `kotlin.contracts.contract { ... }` populates the
+//! user-inline-contract registry before lowering: the build pass walks every
+//! `inline fun` body once for the contract block and records each
+//! `callsInPlace(blockName, EXACTLY_ONCE)` it finds. Lowering then treats a call
+//! to that function the way it treats `let { ... }`.
 
 const std = @import("std");
 
-/// One effect a contract imposes on the call site's post-call state.
-/// Multiple effects can apply to the same call (e.g. a function that
-/// both narrows its first argument and propagates the second
-/// argument's refinement).
+/// One effect a contract imposes on the call site's post-call state. Several
+/// effects can apply to one call, as for a function that narrows its first
+/// argument and propagates the second argument's refinement.
 pub const ContractEffect = union(enum) {
     /// `arg(arg_idx)` is non-null after this call returns normally.
     /// Modeled as an `AssumeNull(eq_null=false)` on the arg's reg.
     AssumeNonNull: struct { arg_idx: usize },
-    /// The condition expression at `arg(arg_idx)` holds after the
-    /// call returns normally. Any `AssumeIs` / `AssumeNull` /
-    /// `AssumeRefEq` refinement the lowering recorded for that
-    /// register is replayed on the post-call block.
+    /// The condition expression at `arg(arg_idx)` holds after the call returns
+    /// normally. Any `AssumeIs` / `AssumeNull` / `AssumeRefEq` refinement
+    /// lowering recorded for that register is replayed on the post-call block.
     AssumePredicate: struct { arg_idx: usize },
 
     pub fn eql(self: ContractEffect, other: ContractEffect) bool {
@@ -39,36 +35,27 @@ pub const ContractEffect = union(enum) {
     }
 };
 
-/// User-declared `contract { callsInPlace(p, EXACTLY_ONCE) }`
-/// records, keyed by the inline fn's simple name. Each value lists
-/// the parameter names that are invoked exactly once on the normal
-/// path. The lowering uses this to extend its trailing-lambda inline
-/// scheme to user contracts.
+/// User-declared `contract { callsInPlace(p, EXACTLY_ONCE) }` records, keyed by
+/// the inline function's simple name. Each value lists the parameter names
+/// invoked exactly once on the normal path (`InvocationKind.EXACTLY_ONCE`),
+/// which lowering uses to extend its trailing-lambda inlining to user contracts,
+/// so a `val` assigned inside the lambda is definitely assigned at the call site.
 pub const UserInlineContracts = std.StringHashMap([]const []const u8);
 
-/// User-declared `contract { callsInPlace(p, EXACTLY_ONCE) }` records,
-/// keyed by the inline fn's simple name. Each value lists the parameter
-/// names that are invoked exactly once on the normal path (Kotlin's
-/// `InvocationKind.EXACTLY_ONCE`). The lowering uses this to extend its
-/// trailing-lambda inline scheme to user contracts so a `val` assigned
-/// inside the lambda is observed as definitely assigned at the call site.
-///
-/// This holds module-level state under a single-build-at-a-time
-/// contract: the build driver installs it before lowering starts.
+/// Module-level state under a single-build-at-a-time contract: the build driver
+/// installs the registry before lowering starts.
 var user_inline_contracts: ?UserInlineContracts = null;
 
-/// Replace the user-contract registry. Called once per module build,
-/// before any per-function lowering starts. Passing an empty map
-/// effectively clears the registry between modules. Takes ownership of
-/// `map`; any previously-installed registry is freed.
+/// Replace the user-contract registry, once per module build and before any
+/// per-function lowering. An empty map clears it between modules. Takes
+/// ownership of `map`; any previously installed registry is freed.
 pub fn setUserInlineContracts(map: UserInlineContracts) void {
     if (user_inline_contracts) |*old| old.deinit();
     user_inline_contracts = map;
 }
 
-/// Lookup the param names of the user inline fn `name` whose contract
-/// declares `callsInPlace(p, EXACTLY_ONCE)`. Empty when no user
-/// contract is registered for that name.
+/// Parameter names of the user inline function `name` whose contract declares
+/// `callsInPlace(p, EXACTLY_ONCE)`; empty when none is registered.
 pub fn userExactlyOnceParams(name: []const u8) []const []const u8 {
     if (user_inline_contracts) |*c| {
         if (c.get(name)) |params| return params;
@@ -76,8 +63,8 @@ pub fn userExactlyOnceParams(name: []const u8) []const []const u8 {
     return &.{};
 }
 
-/// Release the installed user-contract registry. Used by tests and by a
-/// build driver tearing down between builds.
+/// Release the installed user-contract registry, for tests and for a build
+/// driver tearing down between builds.
 pub fn resetForTest() void {
     if (user_inline_contracts) |*m| {
         m.deinit();
@@ -85,9 +72,8 @@ pub fn resetForTest() void {
     }
 }
 
-/// Lookup table for stdlib functions that participate in contract
-/// effects. The returned slice lists every effect to emit on the
-/// post-call path.
+/// Lookup table for the stdlib functions that carry contract effects. The
+/// returned slice lists every effect to emit on the post-call path.
 pub fn stdlibContract(name: []const u8) []const ContractEffect {
     const nonnull = &[_]ContractEffect{.{ .AssumeNonNull = .{ .arg_idx = 0 } }};
     const require = &[_]ContractEffect{.{ .AssumePredicate = .{ .arg_idx = 0 } }};

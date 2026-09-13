@@ -1,8 +1,6 @@
-//! Low-level CFG construction primitives. The AST → CFG lowering
-//! pass (`lower.zig`) drives this builder; tests construct CFGs
-//! directly through it. The builder is intentionally dumb: it
-//! allocates blocks, registers, and edges; it does not know about
-//! the source language.
+//! Low-level CFG construction primitives, driven by the AST to CFG lowering
+//! pass and by tests that build CFGs directly. The builder allocates blocks,
+//! registers and edges and knows nothing of the source language.
 
 const std = @import("std");
 const span = @import("span");
@@ -60,17 +58,15 @@ pub const CfgBuilder = struct {
         try self.blocks.items[blk.int()].nodes.append(allocator, node);
     }
 
-    /// Number of nodes already in `blk`. Useful for callers that
-    /// want to remember the position a node is about to be pushed
-    /// into — the returned value is the insertion index.
+    /// Number of nodes already in `blk`, which is the index the next pushed
+    /// node lands at.
     pub fn currentNodeCount(self: *const CfgBuilder, blk: BlockId) ?usize {
         if (blk.int() >= self.blocks.items.len) return null;
         return self.blocks.items[blk.int()].nodes.items.len;
     }
 
-    /// Set the terminator for a block and wire up the edges to the
-    /// referenced successors. Replaces any prior terminator on
-    /// `blk` and any preds/succs implied by it.
+    /// Set a block's terminator and wire the edges to its successors, replacing
+    /// any prior terminator and the preds/succs it implied.
     pub fn setTerminator(self: *CfgBuilder, allocator: Allocator, blk: BlockId, term: Terminator) Allocator.Error!void {
         self.unwireSuccs(blk);
         var succs: std.ArrayList(Edge) = .empty;
@@ -100,16 +96,15 @@ pub const CfgBuilder = struct {
         self.blocks.items[blk.int()].succs = succs;
     }
 
-    /// Add an additional out-edge of an arbitrary kind from `from` to
-    /// `to`. Used for exception edges and finally entry/exit, which
-    /// are not implied by the terminator shape.
+    /// Add an out-edge of an arbitrary kind from `from` to `to`, for the
+    /// exception and finally entry/exit edges a terminator shape does not imply.
     pub fn addEdge(self: *CfgBuilder, allocator: Allocator, from: BlockId, to: BlockId, kind: EdgeKind) Allocator.Error!void {
         try self.blocks.items[from.int()].succs.append(allocator, .{ .block = to, .kind = kind });
         try self.blocks.items[to.int()].preds.append(allocator, .{ .block = from, .kind = kind });
     }
 
-    /// Detach any preds that point to `blk`'s prior terminator-implied
-    /// successors so we can replace them cleanly.
+    /// Detach the preds pointing at `blk`'s prior terminator-implied successors
+    /// so they can be replaced cleanly.
     fn unwireSuccs(self: *CfgBuilder, blk: BlockId) void {
         const prior = &self.blocks.items[blk.int()].succs;
         for (prior.items) |edge| {
