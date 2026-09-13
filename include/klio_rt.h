@@ -383,6 +383,9 @@ int32_t klio_nat_is_type(klio_value v, const char *name, int32_t nullable);
 
 /* Kotlin's `===`: referential identity, never a user `equals`. */
 int32_t klio_nat_value_ident(klio_value a, klio_value b);
+
+/* `x.toString()` for a value with no override of its own. */
+klio_value klio_nat_to_string(klio_value v);
 typedef klio_value (*klio_invoke_fn)(klio_value f, const klio_value *argv);
 void klio_nat_lambda_invoker(uint32_t arity, klio_invoke_fn call);
 

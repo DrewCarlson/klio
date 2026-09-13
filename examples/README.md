@@ -332,6 +332,7 @@ Run any program with:
 | `native_ctor_defaults.kt`  | A constructor parameter with a default compiled to C: the construction runs the thunk the declaration lowered, handed the arguments ahead of it. |
 | `native_enum_entries.kt`   | An enum's `entries` compiled to C: the list is assembled from the singletons the program already builds, and iterating it yields registers whose class the emitter knows. |
 | `native_list_elements.kt`  | A list of objects compiled to C: the emitter carries what a container holds, so a member call on a loop variable dispatches. |
+| `native_to_string.kt`      | `toString()` compiled to C: a class that declares one dispatches to it, and every other value renders through the runtime's own renderer. |
 | `native_lambdas.kt`        | Lambdas compiled to C: a lambda whose call site can see which body it holds is called directly with its captures as leading arguments, so no closure object is allocated and no dispatch happens. |
 | `native_interfaces.kt`     | Interfaces and virtual dispatch compiled to C: an interface adds no fields, and which body a call reaches is the receiver's class compared against the handles registered at startup. |
 | `native_char_sized.kt`     | `Char` and the narrow integer kinds compiled to C: integers in the machine but each carrying its kind in the box, since a Char prints as a character and arithmetic on any of them produces an Int. |

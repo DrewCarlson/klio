@@ -488,6 +488,22 @@ fn commonCls(m: *const Module, cls: []const ?u32, base: u32, n: u32) ?u32 {
     return null;
 }
 
+/// `x.toString()` written on a value that declares no override of its own —
+/// a number, a string, a list. The runtime renders it the way it renders it
+/// for printing.
+fn isToStringCall(name: []const u8, n_args: u32) bool {
+    return n_args == 0 and std.mem.eql(u8, plainFieldName(name), "toString");
+}
+
+/// Whether a `toString()` call site renders through the runtime rather than
+/// dispatching: the receiver's class declares no override of its own. Both
+/// passes ask this, so they agree on which route the site takes.
+fn rendersToString(m: *const Module, prog: Program, cls: []const ?u32, recv: u32) bool {
+    const rc = cls[recv] orelse return true;
+    if (isBuiltinCls(rc)) return true;
+    return memberRoot(m, prog, rc, "toString", 0) == null;
+}
+
 fn refElemOf(c: ?u32, t: ir.TypeRef) ?Ty {
     const cid = c orelse return null;
     if (funcClsArity(cid) != null) return functionResultTy(t);
@@ -2473,6 +2489,23 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     known[n.dst.int()] = true;
                 },
                 .CallMember => |cm| {
+                    // `toString()` on a value that declares no override of its
+                    // own: the runtime renders it as it renders it for
+                    // printing. A class that DOES override still dispatches.
+                    if (cm.name.int() < m.consts.items.len) {
+                        const tsn = m.consts.items[cm.name.int()];
+                        if (tsn == .String and isToStringCall(tsn.String, cm.n_args) and
+                            cm.receiver.int() < f.n_locals and known[cm.receiver.int()])
+                        {
+                            if (rendersToString(m, prog, cls, cm.receiver.int())) {
+                                if (cm.dst.int() >= f.n_locals) return no(f, "member dst");
+                                types[cm.dst.int()] = .object;
+                                cls[cm.dst.int()] = STRING_CLS;
+                                known[cm.dst.int()] = true;
+                                continue;
+                            }
+                        }
+                    }
                     // The iteration protocol on a builtin receiver, written
                     // by name rather than bound to a slot. Which members those
                     // are, and what each answers, is the interpreter's — the
@@ -2628,8 +2661,19 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                                     known[cm.dst.int()] = true;
                                     continue;
                                 }
-                                const root5 = memberRoot(m, prog, rc5, plainFieldName(mnm.String), cm.n_args) orelse
+                                const root5 = memberRoot(m, prog, rc5, plainFieldName(mnm.String), cm.n_args) orelse {
+                                    // A value with no `toString` of its own
+                                    // renders the way the runtime renders it
+                                    // for printing: one renderer, two callers.
+                                    if (cm.n_args == 0 and std.mem.eql(u8, plainFieldName(mnm.String), "toString")) {
+                                        if (cm.dst.int() >= f.n_locals) return no(f, "member dst");
+                                        types[cm.dst.int()] = .object;
+                                        cls[cm.dst.int()] = STRING_CLS;
+                                        known[cm.dst.int()] = true;
+                                        continue;
+                                    }
                                     return noName(f, "member", mnm.String);
+                                };
                                 const mrt = funcRetTy2(m, root5) orelse return no(f, "member return type");
                                 var kk5: u32 = 0;
                                 while (kk5 < cm.n_args) : (kk5 += 1) {
@@ -2658,6 +2702,22 @@ pub fn eligible(gpa: std.mem.Allocator, m: *const Module, prog: Program, f: *con
                     known[cm.dst.int()] = true;
                 },
                 .CallVirtual => |cv| {
+                    // `toString()` on a value that declares no override of its
+                    // own renders through the runtime; a class that DOES
+                    // override still dispatches.
+                    if (m.funcById(ir.FuncId.from(cv.slot.int()))) |tsd| {
+                        if (isToStringCall(tsd.name, cv.n_args) and
+                            cv.receiver.int() < f.n_locals and known[cv.receiver.int()])
+                        {
+                            if (rendersToString(m, prog, cls, cv.receiver.int())) {
+                                if (cv.dst.int() >= f.n_locals) return no(f, "virtual dst");
+                                types[cv.dst.int()] = .object;
+                                cls[cv.dst.int()] = STRING_CLS;
+                                known[cv.dst.int()] = true;
+                                continue;
+                            }
+                        }
+                    }
                     // A member the runtime serves from the receiver's own
                     // representation. The receiver has to be a runtime value
                     // rather than a compiled class: a user class that
@@ -4963,6 +5023,17 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     var nb: [32]u8 = undefined;
                     var rb: [32]u8 = undefined;
                     const recv = regName(c, cm.receiver.int(), &rb);
+                    // `toString()` on a value with no override of its own.
+                    if (isToStringCall(m.consts.items[cm.name.int()].String, cm.n_args) and
+                        rendersToString(m, prog, c.cls, cm.receiver.int()))
+                    {
+                        var bx10: [96]u8 = undefined;
+                        try w.print("  {s} = klio_nat_to_string({s});\n", .{
+                            regName(c, cm.dst.int(), &nb),
+                            boxExpr(c.types[cm.receiver.int()], recv, &bx10),
+                        });
+                        continue;
+                    }
                     // The iteration protocol on a builtin receiver, written by
                     // name: the runtime picks the same handler by that name.
                     if (c.cls[cm.receiver.int()]) |brc| {
@@ -5084,7 +5155,14 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                             });
                             continue;
                         }
-                        const root6 = memberRoot(m, prog, rc9, plainFieldName(mn9), cm.n_args).?;
+                        const root6 = memberRoot(m, prog, rc9, plainFieldName(mn9), cm.n_args) orelse {
+                            var bx9: [96]u8 = undefined;
+                            try w.print("  {s} = klio_nat_to_string({s});\n", .{
+                                regName(c, cm.dst.int(), &nb),
+                                boxExpr(c.types[cm.receiver.int()], recv, &bx9),
+                            });
+                            continue;
+                        };
                         try w.print("  {s} = kvirt_{d}({s}", .{
                             regName(c, cm.dst.int(), &nb), root6.id.int(), recv,
                         });
@@ -5104,6 +5182,18 @@ fn writeBody(gpa: std.mem.Allocator, w: *std.Io.Writer, m: *const Module, prog: 
                     var nb: [32]u8 = undefined;
                     var rb: [32]u8 = undefined;
                     const recv = regName(c, cv.receiver.int(), &rb);
+                    if (m.funcById(ir.FuncId.from(cv.slot.int()))) |tsd2| {
+                        if (isToStringCall(tsd2.name, cv.n_args) and
+                            rendersToString(m, prog, c.cls, cv.receiver.int()))
+                        {
+                            var bx11: [96]u8 = undefined;
+                            try w.print("  {s} = klio_nat_to_string({s});\n", .{
+                                regName(c, cv.dst.int(), &nb),
+                                boxExpr(c.types[cv.receiver.int()], recv, &bx11),
+                            });
+                            continue;
+                        }
+                    }
                     if (c.cls[cv.receiver.int()]) |rc0| {
                         if (isBuiltinCls(rc0)) host: {
                             const decl0 = m.funcById(ir.FuncId.from(cv.slot.int())) orelse break :host;
@@ -6498,6 +6588,10 @@ pub fn emit(
                 const cv = inst.CallVirtual;
                 if (c.cls[cv.receiver.int()]) |rc| {
                     if (rc == LIST_CLS) continue;
+                }
+                if (m.funcById(ir.FuncId.from(cv.slot.int()))) |tsd3| {
+                    if (isToStringCall(tsd3.name, cv.n_args) and
+                        rendersToString(m, prog, c.cls, cv.receiver.int())) continue;
                 }
                 if (numConvVirtual(m, cv) != null) continue;
                 var have3 = false;

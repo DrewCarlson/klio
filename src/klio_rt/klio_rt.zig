@@ -631,6 +631,16 @@ export fn klio_nat_println(v: CValue) void {
     natWrite("\n");
 }
 
+/// `x.toString()` for a value with no override of its own: the runtime renders
+/// it the way it renders it for printing, so one renderer answers both.
+export fn klio_nat_to_string(v: CValue) CValue {
+    const a = natAlloc();
+    const val = fromC(v);
+    const txt = val.display(a) catch @panic("klio_nat_to_string: out of memory");
+    return toC(.{ .String = runtime.strInitOwned(a, txt) catch
+        @panic("klio_nat_to_string: out of memory") });
+}
+
 export fn klio_nat_print(v: CValue) void {
     const a = natAlloc();
     const val = fromC(v);
