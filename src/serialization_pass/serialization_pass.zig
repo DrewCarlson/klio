@@ -994,53 +994,102 @@ fn elemPrim(g: *const Gen, e: *const Elem) Prim {
     return primOf(simpleHead(e.ty.name.name));
 }
 
+/// Shared state of the generated-serializer body emitters. Each section writes
+/// into `w` in the order the declaration must read.
+const BodyGen = struct {
+    w: *std.ArrayList(u8),
+    a: Allocator,
+    g: *const Gen,
+    c: *const ast.Class,
+    info: *const Info,
+    elems: []const Elem,
+    self_ty: []const u8,
+    generic: bool,
+    /// One `$seen` bitmask per 32 elements.
+    n_masks: usize,
+};
+
 fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c: *const ast.Class, info: *const Info) Allocator.Error!void {
     const elems = try collectElems(a, g, c);
     const serial = try serialNameOf(a, info);
     const tps = try typeParamList(a, c);
-    const self_ty = try std.fmt.allocPrint(a, "{s}{s}", .{ info.path, tps });
-    const generic = c.type_params.len != 0;
-    try wp(w, a, "    override val descriptor: SerialDescriptor = PluginGeneratedSerialDescriptor(\"{s}\", this, {d}).also {{ `$dd` ->\n", .{ try kq(a, serial), elems.len });
-    for (elems) |*e| {
+    const b = BodyGen{
+        .w = w,
+        .a = a,
+        .g = g,
+        .c = c,
+        .info = info,
+        .elems = elems,
+        .self_ty = try std.fmt.allocPrint(a, "{s}{s}", .{ info.path, tps }),
+        .generic = c.type_params.len != 0,
+        .n_masks = (elems.len + 31) / 32,
+    };
+    try writeDescriptor(&b, serial);
+    try writeChildSerializers(&b);
+    try writeSerialize(&b);
+    try writeDeserialize(&b);
+}
+
+/// The descriptor: the element table in declaration order, each element's
+/// `@SerialInfo` annotations, then the class's own.
+fn writeDescriptor(b: *const BodyGen, serial: []const u8) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
+    try wp(w, a, "    override val descriptor: SerialDescriptor = PluginGeneratedSerialDescriptor(\"{s}\", this, {d}).also {{ `$dd` ->\n", .{ try kq(a, serial), b.elems.len });
+    for (b.elems) |*e| {
         try wp(w, a, "        `$dd`.addElement(\"{s}\", {s})\n", .{ try kq(a, e.serial_name), if (elemOptional(e)) "true" else "false" });
-        for (e.annotations) |*an| {
-            const n = annotationSimpleName(an);
-            if (std.mem.eql(u8, n, "SerialName") or std.mem.eql(u8, n, "Serializable") or std.mem.eql(u8, n, "Transient") or
-                std.mem.eql(u8, n, "Required") or std.mem.eql(u8, n, "EncodeDefault") or std.mem.eql(u8, n, "Contextual") or
-                std.mem.eql(u8, n, "Polymorphic") or std.mem.eql(u8, n, "OptIn") or std.mem.eql(u8, n, "Suppress")) continue;
-            if (!isSerialInfoAnnotation(g.idx, n)) continue;
-            if (sourceOf(an.span)) |txt| {
-                const body = if (txt.len > 0 and txt[0] == '@') txt[1..] else txt;
-                const call = if (std.mem.findScalar(u8, body, '(') == null) try std.fmt.allocPrint(a, "{s}()", .{body}) else body;
-                try wp(w, a, "        `$dd`.pushAnnotation({s})\n", .{call});
-            }
-        }
+        try writeElementAnnotations(b, e);
     }
-    for (try classAnnotationCalls(a, g.idx, info.path)) |call| {
+    for (try classAnnotationCalls(a, b.g.idx, b.info.path)) |call| {
         try wp(w, a, "        `$dd`.pushClassAnnotation({s})\n", .{call});
     }
     try w.appendSlice(a, "    }\n");
+}
+
+/// An element's `@SerialInfo` annotations, re-spelled as constructor calls.
+/// The framework's own annotations carry their meaning elsewhere.
+fn writeElementAnnotations(b: *const BodyGen, e: *const Elem) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
+    for (e.annotations) |*an| {
+        const n = annotationSimpleName(an);
+        if (std.mem.eql(u8, n, "SerialName") or std.mem.eql(u8, n, "Serializable") or std.mem.eql(u8, n, "Transient") or
+            std.mem.eql(u8, n, "Required") or std.mem.eql(u8, n, "EncodeDefault") or std.mem.eql(u8, n, "Contextual") or
+            std.mem.eql(u8, n, "Polymorphic") or std.mem.eql(u8, n, "OptIn") or std.mem.eql(u8, n, "Suppress")) continue;
+        if (!isSerialInfoAnnotation(b.g.idx, n)) continue;
+        if (sourceOf(an.span)) |txt| {
+            const body = if (txt.len > 0 and txt[0] == '@') txt[1..] else txt;
+            const call = if (std.mem.findScalar(u8, body, '(') == null) try std.fmt.allocPrint(a, "{s}()", .{body}) else body;
+            try wp(w, a, "        `$dd`.pushAnnotation({s})\n", .{call});
+        }
+    }
+}
+
+/// The element serializers, plus the type-argument serializers a generic
+/// serializer carries.
+fn writeChildSerializers(b: *const BodyGen) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
     try w.appendSlice(a, "    override fun childSerializers(): Array<KSerializer<*>> = arrayOf<KSerializer<*>>(");
-    for (elems, 0..) |*e, i| {
+    for (b.elems, 0..) |*e, i| {
         if (i > 0) try w.appendSlice(a, ", ");
-        try w.appendSlice(a, try g.serializerExpr(e.ty, e.annotations));
+        try w.appendSlice(a, try b.g.serializerExpr(e.ty, e.annotations));
     }
     try w.appendSlice(a, ")\n");
-    if (generic) {
-        try wp(w, a, "    override fun typeParametersSerializers(): Array<KSerializer<*>> = arrayOf<KSerializer<*>>({s})\n", .{try typeSerialArgs(a, c)});
+    if (b.generic) {
+        try wp(w, a, "    override fun typeParametersSerializers(): Array<KSerializer<*>> = arrayOf<KSerializer<*>>({s})\n", .{try typeSerialArgs(a, b.c)});
     }
-    try wp(w, a, "    override fun serialize(encoder: Encoder, value: {s}) {{\n", .{self_ty});
+}
+
+/// `serialize`: one encode call per element, guarded where a default need not
+/// be written out.
+fn writeSerialize(b: *const BodyGen) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
+    try wp(w, a, "    override fun serialize(encoder: Encoder, value: {s}) {{\n", .{b.self_ty});
     try w.appendSlice(a, "        val `$d` = descriptor\n        val `$out` = encoder.beginStructure(`$d`)\n");
-    for (elems, 0..) |*e, i| {
-        const p = elemPrim(g, e);
-        const enc = if (p != .none)
-            try std.fmt.allocPrint(a, "`$out`.encode{s}Element(`$d`, {d}, value.{s})", .{ primSuffix(p), i, e.name })
-        else if (e.ty.nullable) blk: {
-            if (try g.nullableTargetRef(e.ty, e.annotations)) |ref|
-                break :blk try std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, ref, e.name });
-            break :blk try std.fmt.allocPrint(a, "`$out`.encodeNullableSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExprNonNull(e.ty, e.annotations), e.name });
-        } else
-            try std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExpr(e.ty, e.annotations), e.name });
+    for (b.elems, 0..) |*e, i| {
+        const enc = try encodeElementCall(b, e, i);
         if (elemOptional(e) and e.encode_default != .always) {
             const dflt = e.default_text.?;
             if (e.encode_default == .never) {
@@ -1053,25 +1102,65 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
         }
     }
     try w.appendSlice(a, "        `$out`.endStructure(`$d`)\n    }\n");
-    try wp(w, a, "    override fun deserialize(decoder: Decoder): {s} {{\n", .{self_ty});
-    try w.appendSlice(a, "        val `$d` = descriptor\n        val `$c` = decoder.beginStructure(`$d`)\n");
-    const n_masks: usize = (elems.len + 31) / 32;
-    {
-        var mi: usize = 0;
-        while (mi < n_masks) : (mi += 1) try wp(w, a, "        var `$seen{d}` = 0\n", .{mi});
+}
+
+/// The encode call for element `i`: the primitive element codec where the type
+/// takes it, a nullable-target serializer where one handles null itself, and
+/// the nullable element codec otherwise.
+fn encodeElementCall(b: *const BodyGen, e: *const Elem, i: usize) Allocator.Error![]const u8 {
+    const a = b.a;
+    const g = b.g;
+    const p = elemPrim(g, e);
+    if (p != .none)
+        return std.fmt.allocPrint(a, "`$out`.encode{s}Element(`$d`, {d}, value.{s})", .{ primSuffix(p), i, e.name });
+    if (e.ty.nullable) {
+        if (try g.nullableTargetRef(e.ty, e.annotations)) |ref|
+            return std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, ref, e.name });
+        return std.fmt.allocPrint(a, "`$out`.encodeNullableSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExprNonNull(e.ty, e.annotations), e.name });
     }
-    for (elems, 0..) |*e, i| {
-        const p = elemPrim(g, e);
+    return std.fmt.allocPrint(a, "`$out`.encodeSerializableElement(`$d`, {d}, {s}, value.{s})", .{ i, try g.serializerExpr(e.ty, e.annotations), e.name });
+}
+
+/// `deserialize`: the slots and seen masks, the sequential and index-driven
+/// decode paths, the missing-field check, then the construction.
+fn writeDeserialize(b: *const BodyGen) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
+    try wp(w, a, "    override fun deserialize(decoder: Decoder): {s} {{\n", .{b.self_ty});
+    try w.appendSlice(a, "        val `$d` = descriptor\n        val `$c` = decoder.beginStructure(`$d`)\n");
+    try writeDecodeSlots(b);
+    const dec_stmts = try decodeElementStmts(b);
+    try writeDecodeDispatch(b, dec_stmts);
+    try writeMissingFieldCheck(b);
+    try writeConstruction(b);
+}
+
+/// One `$seen` mask per 32 elements, then one slot per element: a primitive
+/// slot starts at its zero, everything else at null.
+fn writeDecodeSlots(b: *const BodyGen) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
+    var mi: usize = 0;
+    while (mi < b.n_masks) : (mi += 1) try wp(w, a, "        var `$seen{d}` = 0\n", .{mi});
+    for (b.elems, 0..) |*e, i| {
+        const p = elemPrim(b.g, e);
         if (p != .none) {
             try wp(w, a, "        var `$v{d}`: {s} = {s}\n", .{ i, primSuffix(p), primZero(p) });
         } else {
-            const tt = try g.typeText(e.ty);
+            const tt = try b.g.typeText(e.ty);
             const nn = if (e.ty.nullable) tt else try std.fmt.allocPrint(a, "{s}?", .{tt});
             try wp(w, a, "        var `$v{d}`: {s} = null\n", .{ i, nn });
         }
     }
+}
+
+/// One decode-and-mark statement per element, indexed by element number: the
+/// sequential path runs them in order, the index-driven path dispatches on them.
+fn decodeElementStmts(b: *const BodyGen) Allocator.Error![]const []const u8 {
+    const a = b.a;
+    const g = b.g;
     var dec_stmts: std.ArrayList([]const u8) = .empty;
-    for (elems, 0..) |*e, i| {
+    for (b.elems, 0..) |*e, i| {
         const p = elemPrim(g, e);
         // Bit 31 and a full golden mask overflow a Kotlin Int literal, so both
         // are spelled as the signed value the `and` sees.
@@ -1087,88 +1176,128 @@ fn genClassSerializerBody(w: *std.ArrayList(u8), a: Allocator, g: *const Gen, c:
             try std.fmt.allocPrint(a, "`$v{d}` = `$c`.decodeSerializableElement(`$d`, {d}, {s}, `$v{d}`); `$seen{d}` = `$seen{d}` or {d}", .{ i, i, try g.serializerExpr(e.ty, e.annotations), i, mk, mk, bit });
         try dec_stmts.append(a, st);
     }
+    return dec_stmts.items;
+}
+
+/// The two decode paths over the same statements: the sequential run, and the
+/// loop that dispatches on the decoded element index.
+fn writeDecodeDispatch(b: *const BodyGen, dec_stmts: []const []const u8) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
     try w.appendSlice(a, "        if (`$c`.decodeSequentially()) {\n");
-    for (dec_stmts.items) |st| try wp(w, a, "            {s}\n", .{st});
+    for (dec_stmts) |st| try wp(w, a, "            {s}\n", .{st});
     try w.appendSlice(a, "        } else {\n            while (true) {\n                val `$index` = `$c`.decodeElementIndex(`$d`)\n                if (`$index` == -1) break\n                when (`$index`) {\n");
-    for (dec_stmts.items, 0..) |st, i| try wp(w, a, "                    {d} -> {{ {s} }}\n", .{ i, st });
+    for (dec_stmts, 0..) |st, i| try wp(w, a, "                    {d} -> {{ {s} }}\n", .{ i, st });
     try w.appendSlice(a, "                    else -> throw UnknownFieldException(`$index`)\n                }\n            }\n        }\n        `$c`.endStructure(`$d`)\n");
-    // Missing-field check over the required elements, one mask per 32.
-    {
-        var mi: usize = 0;
-        while (mi < n_masks) : (mi += 1) {
-            var golden_u: u32 = 0;
-            for (elems, 0..) |*e, i| {
-                if (i / 32 != mi) continue;
-                if (!elemOptional(e)) golden_u |= @as(u32, 1) << @intCast(i % 32);
-            }
-            const golden: i32 = @bitCast(golden_u);
-            if (golden != 0) {
-                try wp(w, a, "        if ((`$seen{d}` and {d}) != {d}) throwMissingFieldException(`$seen{d}`, {d}, `$d`)\n", .{ mi, golden, golden, mi, golden });
-            }
+}
+
+/// Missing-field check over the required elements, one mask per 32.
+fn writeMissingFieldCheck(b: *const BodyGen) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
+    var mi: usize = 0;
+    while (mi < b.n_masks) : (mi += 1) {
+        var golden_u: u32 = 0;
+        for (b.elems, 0..) |*e, i| {
+            if (i / 32 != mi) continue;
+            if (!elemOptional(e)) golden_u |= @as(u32, 1) << @intCast(i % 32);
+        }
+        const golden: i32 = @bitCast(golden_u);
+        if (golden != 0) {
+            try wp(w, a, "        if ((`$seen{d}` and {d}) != {d}) throwMissingFieldException(`$seen{d}`, {d}, `$d`)\n", .{ mi, golden, golden, mi, golden });
         }
     }
-    // Constructor properties re-evaluate their defaults in declaration order,
-    // shadowed so a default can reference an earlier property.
+}
+
+/// The construction: locals for the constructor properties, the constructor
+/// call, then the properties written after it.
+fn writeConstruction(b: *const BodyGen) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
     try w.appendSlice(a, "        return run {\n");
+    try writeCtorLocals(b);
+    try writeInstanceCall(b);
+    try writeAfterConstructionWrites(b);
+    try w.appendSlice(a, "            `$inst`\n        }\n    }\n");
+}
+
+/// Constructor properties re-evaluate their defaults in declaration order,
+/// shadowed so a default can reference an earlier property.
+fn writeCtorLocals(b: *const BodyGen) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
     // A `@Transient` property is never decoded, but its default still binds a
     // local for the defaults after it.
-    for (c.primary_params) |*pp| {
+    for (b.c.primary_params) |*pp| {
         if (pp.property == null) continue;
         if (hasAnnotation(pp.annotations, "Transient")) {
             if (pp.default) |*d| {
-                if (exprText(d)) |dt| try wp(w, a, "            val {s}: {s} = ({s})\n", .{ pp.name.name, try g.typeText(&pp.ty), dt });
+                if (exprText(d)) |dt| try wp(w, a, "            val {s}: {s} = ({s})\n", .{ pp.name.name, try b.g.typeText(&pp.ty), dt });
             }
             continue;
         }
         var ei: ?usize = null;
-        for (elems, 0..) |*cand, ci| {
+        for (b.elems, 0..) |*cand, ci| {
             if (cand.in_ctor and std.mem.eql(u8, cand.name, pp.name.name)) {
                 ei = ci;
                 break;
             }
         }
         const i = ei orelse continue;
-        const e = &elems[i];
-        const tt = try g.typeText(e.ty);
+        const e = &b.elems[i];
+        const tt = try b.g.typeText(e.ty);
         const bit: i32 = @bitCast(@as(u32, 1) << @intCast(i % 32));
-        const val_expr = if (e.ty.nullable) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else blk: {
-            const p = primOf(simpleHead(e.ty.name.name));
-            if (p != .none) break :blk try std.fmt.allocPrint(a, "`$v{d}`", .{i});
-            if (g.typeParamIndex(simpleHead(e.ty.name.name)) != null) break :blk try std.fmt.allocPrint(a, "(`$v{d}` as {s})", .{ i, tt });
-            break :blk try std.fmt.allocPrint(a, "`$v{d}`!!", .{i});
-        };
+        const val_expr = try decodedValueExpr(b, e, i);
         if (e.default_text) |dflt| {
             try wp(w, a, "            val {s}: {s} = if ((`$seen{d}` and {d}) == 0) ({s}) else {s}\n", .{ e.name, tt, i / 32, bit, dflt, val_expr });
         } else {
             try wp(w, a, "            val {s}: {s} = {s}\n", .{ e.name, tt, val_expr });
         }
     }
-    try wp(w, a, "            val `$inst` = {s}(", .{info.path});
+}
+
+/// The constructor call, named argument per constructor element.
+fn writeInstanceCall(b: *const BodyGen) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
+    try wp(w, a, "            val `$inst` = {s}(", .{b.info.path});
     var first = true;
-    for (elems) |*e| {
+    for (b.elems) |*e| {
         if (!e.in_ctor) continue;
         if (!first) try w.appendSlice(a, ", ");
         first = false;
         try wp(w, a, "{s} = {s}", .{ e.name, e.name });
     }
     try w.appendSlice(a, ")\n");
-    for (elems, 0..) |*e, i| {
+}
+
+/// Elements the constructor does not take: decoded, then assigned onto the
+/// instance when the decode saw them.
+fn writeAfterConstructionWrites(b: *const BodyGen) Allocator.Error!void {
+    const w = b.w;
+    const a = b.a;
+    for (b.elems, 0..) |*e, i| {
         if (e.in_ctor) continue;
         // An init block runs after field assignment, so decode the element but
         // leave the construction alone.
         if (e.default_text == null and !e.is_lateinit) continue;
         const bit: i32 = @bitCast(@as(u32, 1) << @intCast(i % 32));
-        const val_expr = if (e.ty.nullable) try std.fmt.allocPrint(a, "`$v{d}`", .{i}) else blk: {
-            const p = primOf(simpleHead(e.ty.name.name));
-            if (p != .none) break :blk try std.fmt.allocPrint(a, "`$v{d}`", .{i});
-            // A type-parameter element may be instantiated nullable, so the
-            // value is cast, never asserted.
-            if (g.typeParamIndex(simpleHead(e.ty.name.name)) != null) break :blk try std.fmt.allocPrint(a, "(`$v{d}` as {s})", .{ i, try g.typeText(e.ty) });
-            break :blk try std.fmt.allocPrint(a, "`$v{d}`!!", .{i});
-        };
+        const val_expr = try decodedValueExpr(b, e, i);
         try wp(w, a, "            if ((`$seen{d}` and {d}) != 0) `$inst`.{s} = {s}\n", .{ i / 32, bit, e.name, val_expr });
     }
-    try w.appendSlice(a, "            `$inst`\n        }\n    }\n");
+}
+
+/// The decoded slot of element `i`, adapted to the element's declared type: a
+/// nullable or primitive slot reads straight through, a type-parameter element
+/// may be instantiated nullable so it is cast, anything else is asserted.
+fn decodedValueExpr(b: *const BodyGen, e: *const Elem, i: usize) Allocator.Error![]const u8 {
+    const a = b.a;
+    if (e.ty.nullable) return std.fmt.allocPrint(a, "`$v{d}`", .{i});
+    const p = primOf(simpleHead(e.ty.name.name));
+    if (p != .none) return std.fmt.allocPrint(a, "`$v{d}`", .{i});
+    if (b.g.typeParamIndex(simpleHead(e.ty.name.name)) != null)
+        return std.fmt.allocPrint(a, "(`$v{d}` as {s})", .{ i, try b.g.typeText(e.ty) });
+    return std.fmt.allocPrint(a, "`$v{d}`!!", .{i});
 }
 
 /// The class's own non-framework annotations plus every
