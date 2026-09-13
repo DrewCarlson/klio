@@ -1,7 +1,6 @@
-//! Mines `FirErrors.kt` + `FirErrorsDefaultMessages.kt` from the upstream
-//! Kotlin compiler for canonical diagnostic factory IDs, default
-//! severities, and message templates. Emits Zig constants into
-//! `src/diagnostics/generated/factories.zig`.
+//! Mines factory IDs, default severities, and message templates out of the
+//! upstream compiler's `FirErrors.kt` and `FirErrorsDefaultMessages.kt` and
+//! emits them as Zig constants in `src/diagnostics/generated/factories.zig`.
 
 const std = @import("std");
 
@@ -15,8 +14,7 @@ pub const Severity = enum {
     Error,
     Warning,
 
-    /// Render the severity as it appears in the generated Zig factories table
-    /// (the enum-literal form of `diagnostics.Severity`).
+    /// Enum-literal form of `diagnostics.Severity` for the generated table.
     pub fn asZig(self: Severity) []const u8 {
         return switch (self) {
             .Error => ".Error",
@@ -60,12 +58,10 @@ fn lessByFactoryName(_: void, a: Factory, b: Factory) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-/// Parse a `FirErrors.kt`-shaped file. Returns `(name → severity)` for every
+/// Severity per factory, read from every
 /// `val NAME: KtDiagnosticFactoryN<…> = KtDiagnosticFactoryN("NAME", SEVERITY, …)`
-/// declaration we recognize, sorted by name with later duplicates winning.
-///
-/// The returned slice and every `name` it borrows are owned by the caller and
-/// must be freed (see `freeSeverityEntries`).
+/// line, sorted by name with later duplicates winning. Caller frees the slice
+/// and its names with `freeSeverityEntries`.
 pub fn parseFactories(allocator: Allocator, src: []const u8) Allocator.Error![]SeverityEntry {
     var map = std.StringHashMap(Severity).init(allocator);
     defer map.deinit();
@@ -80,8 +76,7 @@ pub fn parseFactories(allocator: Allocator, src: []const u8) Allocator.Error![]S
         if (!std.mem.startsWith(u8, line, "val ")) continue;
         const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const rhs = trim(line[eq + 1 ..]);
-        // Look for KtDiagnosticFactory{0,1,2,3,4}( ... or
-        // KtDiagnosticFactoryForDeprecationN(…
+        // Matches KtDiagnosticFactoryN( and KtDiagnosticFactoryForDeprecationN(.
         if (!std.mem.startsWith(u8, rhs, "KtDiagnosticFactory")) continue;
         const open = std.mem.indexOfScalar(u8, rhs, '(') orelse continue;
         const args = rhs[open + 1 ..];
@@ -123,12 +118,9 @@ pub fn freeSeverityEntries(allocator: Allocator, entries: []SeverityEntry) void 
     allocator.free(entries);
 }
 
-/// Parse the default-messages map. Returns `(name → template)` from every
-/// `map.put(NAME, "template", …)` line, sorted by name with later duplicates
-/// winning.
-///
-/// The returned slice and every `name`/`template` it borrows are owned by the
-/// caller and must be freed (see `freeMessageEntries`).
+/// Template per factory, read from every `map.put(NAME, "template", …)` line,
+/// sorted by name with later duplicates winning. Caller frees the slice and its
+/// strings with `freeMessageEntries`.
 pub fn parseMessages(allocator: Allocator, src: []const u8) Allocator.Error![]MessageEntry {
     var map = std.StringHashMap([]const u8).init(allocator);
     defer map.deinit();
@@ -198,11 +190,8 @@ fn lookupMessage(messages: []const MessageEntry, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Read and parse the upstream `FirErrors.kt` / `FirErrorsDefaultMessages.kt`
-/// under `stdlib_root`, producing the sorted factory table. Missing or
-/// unreadable files are treated as empty.
-///
-/// The returned factories and the strings they own must be freed with
+/// Sorted factory table from the two upstream files under `stdlib_root`; a
+/// missing or unreadable file reads as empty. Caller frees with
 /// `freeFactories`.
 pub fn mine(allocator: Allocator, io: Io, stdlib_root: []const u8) Allocator.Error![]Factory {
     const fir_errors = try std.fs.path.join(allocator, &.{
@@ -249,9 +238,8 @@ pub fn freeFactories(allocator: Allocator, factories: []Factory) void {
     allocator.free(factories);
 }
 
-/// Append a Zig string literal for `s` to `out`, escaping (`\` → `\\`,
-/// `"` → `\"`, control chars as escapes). The escapes produced are all
-/// valid Zig string escapes.
+/// Append `s` to `out` as a Zig string literal: backslash and quote are
+/// escaped, control bytes become `\n`, `\r`, `\t`, or `\xNN`.
 fn writeEscaped(out: *std.ArrayList(u8), allocator: Allocator, s: []const u8) Allocator.Error!void {
     try out.append(allocator, '"');
     for (s) |c| {
@@ -275,7 +263,7 @@ fn writeEscaped(out: *std.ArrayList(u8), allocator: Allocator, s: []const u8) Al
     try out.append(allocator, '"');
 }
 
-/// Render the generated Zig module. Returns an owned, NUL-free byte slice.
+/// Render the generated Zig module. Caller owns the returned bytes.
 pub fn render(allocator: Allocator, factories: []const Factory) Allocator.Error![]u8 {
     var s: std.ArrayList(u8) = .empty;
     errdefer s.deinit(allocator);

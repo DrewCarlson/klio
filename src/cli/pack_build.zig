@@ -1,14 +1,11 @@
-//! Pack subcommand: build a `.klio-pack` artifact, migrate one, and talk
-//! to a local-filesystem registry.
+//! Pack subcommand: build a `.klio-pack` artifact, migrate one, and talk to a
+//! local-filesystem registry. `runPack` dispatches one arm per `PackCmd`; the
+//! cache helpers it calls (`inspectPack`, `installPackIntoCache`, ...) live in
+//! `pack_cache.zig`.
 //!
-//! The `run_pack` dispatch over every `PackCmd` subcommand wires one
-//! command apiece; the cache helpers it dispatches to (`inspect_pack`,
-//! `install_pack_into_cache`, …) live in `pack_cache.zig`.
-//!
-//! This build has no zstd codec, so every section that would otherwise use
-//! `Compression.Zstd` is stored uncompressed here (same caveat as the
-//! embedded stdlib pack builder). `migrate` re-emits plain sections and
-//! `train-dict` reports the missing encoder as data.
+//! This build has no zstd codec: every section that would use
+//! `Compression.Zstd` is stored uncompressed, `migrate` re-emits plain
+//! sections, and `train-dict` reports the missing encoder as data.
 
 const std = @import("std");
 
@@ -59,7 +56,7 @@ const PathResult = pack_cache.PathResult;
 const VoidResult = pack_cache.VoidResult;
 const ManifestResult = pack_cache.ManifestResult;
 
-/// `klio pack <cmd>` subcommands. Mirrors `main::PackCmd`.
+/// `klio pack <cmd>` subcommands.
 pub const PackCmd = union(enum) {
     /// Build a `.klio-pack` from a library directory.
     Build: struct { dir: []const u8, out: ?[]const u8 = null },
@@ -101,15 +98,13 @@ pub const PackCmd = union(enum) {
     },
 };
 
-/// A failure carried as data. Owned by `gpa`; rendered by the dispatch
-/// arm and then freed.
+/// A `gpa`-owned failure string; the dispatch arm renders and frees it.
 const Failure = []u8;
 
 fn fail(gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) Failure {
     return std.fmt.allocPrint(gpa, fmt, args) catch @constCast("out of memory");
 }
 
-/// single dispatch over every PackCmd subcommand; each arm wires one command
 pub fn runPack(gpa: std.mem.Allocator, cmd: PackCmd) u8 {
     switch (cmd) {
         .Build => |b| switch (buildLibraryPack(gpa, b.dir, b.out)) {
@@ -270,18 +265,14 @@ pub fn runPack(gpa: std.mem.Allocator, cmd: PackCmd) u8 {
     }
 }
 
-/// `Result<T, String>` for the helpers whose success carries a value (a
-/// path, bytes). Reuses the same `.ok`/`.err` shape as `pack_cache.PathResult`.
+/// For helpers whose success carries a value (a path, bytes). Same `.ok`/`.err`
+/// shape as `pack_cache.PathResult`.
 fn Outcome(comptime T: type) type {
     return union(enum) {
         ok: T,
         err: Failure,
     };
 }
-
-// ---------------------------------------------------------------------
-// filesystem helpers
-// ---------------------------------------------------------------------
 
 fn threadedIo(allocator: std.mem.Allocator) std.Io.Threaded {
     return std.Io.Threaded.init(allocator, .{});
@@ -295,7 +286,7 @@ pub fn readFileOwned(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     return std.Io.Dir.cwd().readFileAlloc(tio, path, gpa, .unlimited) catch null;
 }
 
-/// `std.fs::create_dir_all(parent)` for the parent of `path`, then write.
+/// Create `path`'s parent directories, then write the file.
 fn writeFileWithParents(gpa: std.mem.Allocator, path: []const u8, data: []const u8) VoidResult {
     var threaded = threadedIo(gpa);
     defer threaded.deinit();
@@ -335,7 +326,6 @@ fn packErrText(gpa: std.mem.Allocator, err: PackError) Failure {
     return std.fmt.allocPrint(gpa, "{f}", .{err}) catch @constCast("pack error");
 }
 
-/// Open a pack from `path`, returning a reader or a `String` failure.
 fn openReader(gpa: std.mem.Allocator, path: []const u8) Outcome(PackReader) {
     const bytes = readFileOwned(gpa, path) orelse
         return .{ .err = fail(gpa, "read {s}: file unreadable", .{path}) };
@@ -346,18 +336,11 @@ fn openReader(gpa: std.mem.Allocator, path: []const u8) Outcome(PackReader) {
     return .{ .ok = reader };
 }
 
-// ---------------------------------------------------------------------
-// migrate
-// ---------------------------------------------------------------------
-
-/// Re-encode a pack against the currently-supported `FORMAT_VERSION`.
-///
-/// Today the writer only knows how to emit one version, so a successful
-/// migrate is a no-op round-trip that validates the input pack and
-/// rewrites it deterministically. Dictionary-compressed sections are
-/// re-emitted as plain sections; this build has no zstd codec, so any
-/// already-compressed section is unreadable and the migrate surfaces the
-/// reader's error.
+/// Re-encode a pack against the currently-supported `FORMAT_VERSION`. The writer
+/// emits one version, so a successful migrate is a round-trip that validates the
+/// input and rewrites it deterministically. Dictionary-compressed sections
+/// re-emit as plain; with no zstd codec in this build an already-compressed
+/// section is unreadable and the reader's error surfaces.
 fn migratePack(gpa: std.mem.Allocator, input: []const u8, output: []const u8) VoidResult {
     const reader_res = openReader(gpa, input);
     switch (reader_res) {
@@ -388,8 +371,7 @@ fn migratePack(gpa: std.mem.Allocator, input: []const u8, output: []const u8) Vo
         };
         section.deinit(gpa);
         payloads.append(gpa, owned) catch return .{ .err = fail(gpa, "out of memory", .{}) };
-        // None and Zstd/ZstdDict alike re-emit as plain: this build has no
-        // zstd encoder, so re-training a dictionary is the user's call.
+        // None and Zstd/ZstdDict alike re-emit as plain: no zstd encoder here.
         _ = writer.addSection(entry.name, owned, .None) catch
             return .{ .err = fail(gpa, "out of memory", .{}) };
     }
@@ -400,10 +382,6 @@ fn migratePack(gpa: std.mem.Allocator, input: []const u8, output: []const u8) Vo
     defer bytes.deinit(gpa);
     return writeFileWithParents(gpa, output, bytes.items);
 }
-
-// ---------------------------------------------------------------------
-// Local-filesystem registry
-// ---------------------------------------------------------------------
 
 fn registryDir(gpa: std.mem.Allocator, override_path: ?[]const u8) Outcome([]u8) {
     if (override_path) |p| {
@@ -428,9 +406,9 @@ fn registryIndexPath(gpa: std.mem.Allocator, root: []const u8) ?[]u8 {
     return std.fs.path.join(gpa, &.{ root, "index.json" }) catch null;
 }
 
-/// Read the registry's `index.json`. An absent or unreadable file yields
-/// an empty list; a malformed file is a failure. The returned slice +
-/// every string are owned by `gpa`.
+/// Read the registry's `index.json`. An absent or unreadable file yields an
+/// empty list; a malformed one is a failure. The returned slice and every string
+/// in it are owned by `gpa`.
 fn readRegistryIndex(gpa: std.mem.Allocator, root: []const u8) Outcome([]RegistryEntry) {
     const path = registryIndexPath(gpa, root) orelse return .{ .err = fail(gpa, "out of memory", .{}) };
     defer gpa.free(path);
@@ -525,7 +503,7 @@ fn publishToRegistry(
         .ok => {},
     }
 
-    // `dest.strip_prefix(root)` -> the path under the registry root.
+    // The destination path relative to the registry root.
     const relative = blk: {
         const prefix = std.fmt.allocPrint(gpa, "{s}{c}", .{ root, std.fs.path.sep }) catch {
             gpa.free(dest);
@@ -661,13 +639,9 @@ fn fetchFromRegistry(
     return installPackIntoCache(gpa, src);
 }
 
-// ---------------------------------------------------------------------
-// train dict
-// ---------------------------------------------------------------------
-
-/// Train a zstd dictionary from the AST + sources sections of the
-/// supplied packs. This build ships no zstd encoder, so the training
-/// path reports the missing codec as data once the inputs are validated.
+/// Train a zstd dictionary from the AST + sources sections of the supplied
+/// packs. This build ships no zstd encoder, so the path validates the inputs and
+/// then reports the missing codec as data.
 fn trainZstdDict(
     gpa: std.mem.Allocator,
     inputs: []const []const u8,
@@ -703,10 +677,6 @@ fn trainZstdDict(
     }
     return .{ .err = fail(gpa, "zstd dict training failed: no zstd encoder in this build", .{}) };
 }
-
-// ---------------------------------------------------------------------
-// scaffold
-// ---------------------------------------------------------------------
 
 fn scaffoldLibrary(gpa: std.mem.Allocator, dir: []const u8, id_override: ?[]const u8) VoidResult {
     if (pathExists(gpa, dir)) {
@@ -774,10 +744,6 @@ fn sanitizePackage(gpa: std.mem.Allocator, id: []const u8) ![]u8 {
     return out;
 }
 
-// ---------------------------------------------------------------------
-// stdlib pack
-// ---------------------------------------------------------------------
-
 fn buildStdlibPack(gpa: std.mem.Allocator, compress_symbols: bool) Outcome([]u8) {
     var err: PackError = undefined;
     var bytes = (stdlib.build_stdlib_pack(gpa, compress_symbols, &err) catch
@@ -787,21 +753,16 @@ fn buildStdlibPack(gpa: std.mem.Allocator, compress_symbols: bool) Outcome([]u8)
     return .{ .ok = gpa.dupe(u8, bytes.items) catch return .{ .err = fail(gpa, "out of memory", .{}) } };
 }
 
-// ---------------------------------------------------------------------
-// source-root walk + filtering
-// ---------------------------------------------------------------------
-
 /// One source root with optional include/exclude filtering, used by the
-/// `[[source]]` manifest table. See `patMatch` for the supported pattern
-/// forms.
+/// `[[source]]` manifest table. `patMatch` defines the pattern forms.
 pub const SourceRoot = struct {
     root: []const u8,
     include: [][]const u8 = &.{},
     exclude: [][]const u8 = &.{},
 };
 
-/// Match `rel` (a slash-normalized path relative to a source root)
-/// against a single pattern.
+/// Match `rel`, a slash-normalized path relative to a source root, against one
+/// pattern.
 pub fn patMatch(rel: []const u8, pat: []const u8) bool {
     if (pat.len > 0 and pat[pat.len - 1] == '/') {
         // Directory prefix: the directory itself or anything under it.
@@ -821,9 +782,8 @@ pub fn patMatch(rel: []const u8, pat: []const u8) bool {
 }
 
 /// Walk every root in `roots` for `.kt` files, applying each root's
-/// include/exclude rules, and return the collected source files sorted by
-/// crate-dir-relative path. `dir` is the directory holding `klio.toml`.
-/// All returned strings are allocated from `a`.
+/// include/exclude rules, and return the sources sorted by pack-dir-relative
+/// path. `dir` holds `klio.toml`. All returned strings come from `a`.
 pub fn collectPackSources(
     a: std.mem.Allocator,
     dir: []const u8,
@@ -838,19 +798,17 @@ pub fn collectPackSources(
 
     for (roots) |sr| {
         const root_path = std.fs.path.join(a, &.{ dir, sr.root }) catch return .{ .err = fail(a, "out of memory", .{}) };
-        // .kt files under this root that pass its include/exclude rules. A
-        // declared source root that yields none means its sources are absent —
-        // almost always an `update = none` upstream submodule that was never
-        // checked out. Building would silently emit a missing-source pack that
-        // fails to resolve at load, so fail fast here instead. This is generic:
-        // no pack needs to name its own submodule.
+        // A declared source root matching no .kt file means its sources are
+        // absent, almost always an `update = none` upstream submodule that was
+        // never checked out. Building would emit a missing-source pack that
+        // fails to resolve at load, so fail fast here instead.
         var matched: usize = 0;
         open: {
             var root_dir = std.Io.Dir.cwd().openDir(tio, root_path, .{ .iterate = true }) catch break :open;
             defer root_dir.close(tio);
 
-            // Collect this root's entries, then sort by file path so the order
-            // matches walkdir's `sort_by_file_name` before the final rel sort.
+            // Collect this root's entries and sort by file path, so the walk
+            // order is deterministic before the final rel sort.
             var paths: std.ArrayList([]const u8) = .empty;
             defer paths.deinit(a);
             var walker = root_dir.walk(a) catch return .{ .err = fail(a, "walk {s}: out of memory", .{root_path}) };
@@ -873,7 +831,7 @@ pub fn collectPackSources(
                 if (anyMatch(rel_to_root, sr.exclude)) continue;
                 matched += 1;
 
-                // Crate-dir-relative path (`<root>/<rel_to_root>`).
+                // Pack-dir-relative path (`<root>/<rel_to_root>`).
                 const rel = std.fs.path.join(a, &.{ sr.root, rel_to_root }) catch return .{ .err = fail(a, "out of memory", .{}) };
                 const gop = seen.getOrPut(rel) catch return .{ .err = fail(a, "out of memory", .{}) };
                 if (gop.found_existing) continue;
@@ -913,10 +871,6 @@ fn lessStr(_: void, a: []const u8, b: []const u8) bool {
 fn lessSourceFile(_: void, a: schema.SourceFile, b: schema.SourceFile) bool {
     return std.mem.order(u8, a.rel_path, b.rel_path) == .lt;
 }
-
-// ---------------------------------------------------------------------
-// klio.toml model + parser
-// ---------------------------------------------------------------------
 
 const BindingValue = union(enum) {
     Symbol: []const u8,
@@ -959,9 +913,9 @@ const FeaturesToml = struct {
     defs: []FeatureTomlDef = &.{},
 };
 
-/// A `[[test]]` source set: like `[[source]]` but for `klio test` only —
-/// never packed or symbol-indexed. `feature` scopes it to a pack feature
-/// (an untagged test set is core, always active).
+/// A `[[test]]` source set: like `[[source]]` but for `klio test` only, never
+/// packed or symbol-indexed. `feature` scopes it to a pack feature; an untagged
+/// set is core and always active.
 pub const TestRoot = struct {
     root: []const u8 = "",
     include: [][]const u8 = &.{},
@@ -969,9 +923,8 @@ pub const TestRoot = struct {
     feature: []const u8 = "",
 };
 
-/// The `[application]` table: how `klio bundle <dir>` packages the
-/// project. `main` may be omitted when the source roots contain exactly
-/// one `main` function.
+/// The `[application]` table: how `klio bundle <dir>` packages the project.
+/// `main` may be omitted when the source roots hold exactly one `main` function.
 pub const ApplicationToml = struct {
     name: []const u8 = "",
     icon: []const u8 = "",
@@ -991,10 +944,9 @@ pub const LibraryToml = struct {
 
 /// Minimal TOML reader for the `klio.toml` shape the builder consumes:
 /// `[library]`, `[[deps]]`, `[bindings]`, `[[source]]`, `[features]`, and
-/// `[features.<name>]` tables. Values are bare scalars, double-quoted
-/// strings, or single-line arrays of double-quoted strings. Comments
-/// (`#`) and blank lines are skipped. Parses into `a`. Returns the error
-/// text on a malformed document.
+/// `[features.<name>]` tables. Values are bare scalars, double-quoted strings,
+/// or single-line arrays of those. `#` comments and blank lines are skipped.
+/// Parses into `a`; returns the error text on a malformed document.
 pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryToml) {
     var cfg = LibraryToml{};
     var deps: std.ArrayList(DepEntry) = .empty;
@@ -1012,11 +964,10 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
         var line = stripComment(std.mem.trim(u8, raw_line, " \t\r"));
         if (line.len == 0) continue;
 
-        // Fold a multi-line array/inline-table value (e.g. `include = [`
-        // continued over several lines) into one logical line, matching
-        // the runtime pack loader's manifest reader. A value line that
-        // opens a bracket without closing it on the same line absorbs the
-        // following lines until one carries the closing `]`.
+        // Fold a multi-line array or inline table into one logical line, as the
+        // runtime pack loader's manifest reader does: a value line that opens a
+        // bracket without closing it absorbs following lines until one carries
+        // the closing `]`.
         if (line[0] != '[' and
             std.mem.indexOfScalar(u8, line, '=') != null and
             std.mem.indexOfScalar(u8, line, '[') != null and
@@ -1089,8 +1040,7 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
                 if (std.mem.eql(u8, key, "default")) {
                     cfg.features.default = parseStrArray(a, val) catch return .{ .err = fail(a, "out of memory", .{}) };
                 } else if (std.mem.startsWith(u8, std.mem.trimStart(u8, val, " \t"), "{")) {
-                    // Inline-table feature def, e.g.
-                    //   json = { sources = [...], deps = [...], requires = [...] }
+                    // Inline-table feature def: `json = { sources = [...] }`.
                     const def = parseInlineFeatureDef(a, key, val) catch
                         return .{ .err = fail(a, "out of memory", .{}) };
                     feature_defs.append(a, def) catch return .{ .err = fail(a, "out of memory", .{}) };
@@ -1102,8 +1052,7 @@ pub fn parseLibraryToml(a: std.mem.Allocator, text: []const u8) Outcome(LibraryT
     }
 
     cfg.deps = deps.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
-    // Bindings sort by FQN so the `[bindings]` table is order-independent,
-    // mirroring serde's BTreeMap.
+    // Sort bindings by FQN so the `[bindings]` table is order-independent.
     std.mem.sort(BindingPair, bindings.items, {}, lessBindingPair);
     cfg.bindings = bindings.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
     cfg.source = sources.toOwnedSlice(a) catch return .{ .err = fail(a, "out of memory", .{}) };
@@ -1131,8 +1080,8 @@ fn stripComment(line: []const u8) []const u8 {
     return line;
 }
 
-/// Unquote a double-quoted scalar; bare scalars pass through. Duplicated
-/// into `a` so the result outlives the source text.
+/// Unquote a double-quoted scalar; bare scalars pass through. Duplicated into
+/// `a` so the result outlives the source text.
 fn tomlString(a: std.mem.Allocator, val: []const u8) []const u8 {
     if (val.len >= 2 and val[0] == '"' and val[val.len - 1] == '"') {
         return a.dupe(u8, val[1 .. val.len - 1]) catch "";
@@ -1238,9 +1187,9 @@ fn assignFeatureDef(a: std.mem.Allocator, f: *FeatureTomlDef, key: []const u8, v
 }
 
 /// Parse an inline-table feature def under `[features]`, e.g.
-/// `json = { sources = [...], deps = [...], requires = [...] }`. The
-/// array values may themselves contain commas, so each field's array is
-/// sliced by its `[ .. ]` span rather than split on commas.
+/// `json = { sources = [...], deps = [...], requires = [...] }`. Array values
+/// may contain commas, so each field's array is sliced by its `[ .. ]` span
+/// rather than split on commas.
 fn parseInlineFeatureDef(a: std.mem.Allocator, name: []const u8, val: []const u8) !FeatureTomlDef {
     var def = FeatureTomlDef{ .name = a.dupe(u8, name) catch "" };
     const fields = [_][]const u8{ "sources", "deps", "requires" };
@@ -1257,15 +1206,15 @@ fn parseInlineFeatureDef(a: std.mem.Allocator, name: []const u8, val: []const u8
     return def;
 }
 
-/// Return the `[ ... ]` array text for `field = [ ... ]` inside an inline
-/// table, or null when the field is absent. Includes the brackets so the
-/// result feeds straight into `parseStrArray`.
+/// The `[ ... ]` array text for `field = [ ... ]` inside an inline table, or
+/// null when the field is absent. Brackets included, so the result feeds
+/// straight into `parseStrArray`.
 fn sliceInlineArray(table: []const u8, field: []const u8) ?[]const u8 {
     var search_from: usize = 0;
     while (std.mem.indexOfPos(u8, table, search_from, field)) |at| {
         const after = at + field.len;
-        // Require the match to be a whole key: preceded by `{`/`,`/space and
-        // followed (after spaces) by `=`.
+        // Require a whole-key match: preceded by `{`, `,` or space and followed
+        // (after spaces) by `=`.
         const before_ok = at == 0 or table[at - 1] == '{' or table[at - 1] == ',' or table[at - 1] == ' ';
         var i = after;
         while (i < table.len and (table[i] == ' ' or table[i] == '\t')) : (i += 1) {}
@@ -1280,9 +1229,9 @@ fn sliceInlineArray(table: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
-/// One `[bindings]` entry: `"fqn" = "host_symbol"` (the Symbol form) or
-/// `"fqn" = { host_symbol = "...", kind = "...", overrides_interpreter =
-/// .., platform_actual = .. }` (the Detailed form).
+/// One `[bindings]` entry: `"fqn" = "host_symbol"` (Symbol) or `"fqn" = {
+/// host_symbol = "...", kind = "...", overrides_interpreter = ..,
+/// platform_actual = .. }` (Detailed).
 fn parseBindingPair(a: std.mem.Allocator, key: []const u8, val: []const u8) !BindingPair {
     const fqn = tomlString(a, key);
     const trimmed = std.mem.trim(u8, val, " \t");
@@ -1311,16 +1260,7 @@ fn parseBindingPair(a: std.mem.Allocator, key: []const u8, val: []const u8) !Bin
     return .{ .fqn = fqn, .value = .{ .Symbol = tomlString(a, val) } };
 }
 
-// ---------------------------------------------------------------------
-// frozen front-end bundles
-// ---------------------------------------------------------------------
-
-/// Parse every source file at pack-build time. Files that fail to lex or
-/// parse are dropped from the returned bundle; the loader falls back to
-/// the `sources` section to re-parse them later. Spans inside the bundle
-/// carry `SourceMap` `FileId`s allocated during the build. Allocated from
-/// `a`.
-/// The 1-based line + column of a byte offset in `src`, for a loud error.
+/// The 1-based line and column of a byte offset in `src`.
 fn lineColOf(src: []const u8, byte: usize) struct { line: usize, col: usize } {
     var line: usize = 1;
     var col: usize = 1;
@@ -1334,11 +1274,11 @@ fn lineColOf(src: []const u8, byte: usize) struct { line: usize, col: usize } {
     return .{ .line = line, .col = col };
 }
 
-/// Parse each source file into a frozen AST. A lex or parse error is FATAL: the
-/// pack must never be built with a file silently dropped (a dropped file loses
-/// its classes while leaving dangling references, which surfaces much later as
-/// an opaque runtime miss). `out_err` is set to a file:line:col diagnostic on
-/// the first failing file so `buildLibraryPack` aborts loudly.
+/// Parse each source file into a frozen AST, allocated from `a`. A lex or parse
+/// error is fatal: a dropped file loses its classes while leaving dangling
+/// references, surfacing much later as an opaque runtime miss. `out_err` takes a
+/// file:line:col diagnostic for the first failing file so `buildLibraryPack`
+/// aborts loudly.
 fn buildAstBundle(gpa: std.mem.Allocator, a: std.mem.Allocator, files: []const schema.SourceFile, out_err: *?Failure) schema.AstBundle {
     var out_files: std.ArrayList(schema.AstFile) = .empty;
     var map = SourceMap.init(a);
@@ -1390,14 +1330,13 @@ fn buildAstBundle(gpa: std.mem.Allocator, a: std.mem.Allocator, files: []const s
     return .{ .files = out_files.toOwnedSlice(a) catch &.{} };
 }
 
-/// Run typecheck over the parsed AST bundle and produce the
-/// per-expression type map. Best-effort: any file whose typecheck reports
-/// errors causes the whole bundle to be skipped. Allocated from `a`.
+/// Typecheck the parsed AST bundle into a per-expression type map, allocated
+/// from `a`. A bundle whose typecheck reports any error is skipped entirely.
 fn buildTypeckBundle(a: std.mem.Allocator, asts: []const KotlinFile) schema.TypeckBundle {
     if (asts.len == 0) return .{};
-    // `a` is a build-scoped arena: the resolver and checker allocate their
-    // whole workspace from it and free nothing, so the entries the bundle
-    // clones out stay valid until the arena is reclaimed by the caller.
+    // `a` is a build-scoped arena: the resolver and checker allocate their whole
+    // workspace from it and free nothing, so the entries the bundle clones out
+    // stay valid until the caller reclaims the arena.
     const r = resolver.resolveModule(a, asts) catch return .{};
     const tc = typeck.typecheckModule(a, asts, &r) catch return .{};
     if (tc.diagnostics.hasErrors()) return .{};
@@ -1420,14 +1359,9 @@ fn lessTypeckEntry(_: void, a: schema.TypeckEntry, b: schema.TypeckEntry) bool {
     return a.span.end < b.span.end;
 }
 
-// ---------------------------------------------------------------------
-// bindings
-// ---------------------------------------------------------------------
-
-/// Build the sorted binding list for a pack: the explicit `[bindings]`
-/// entries from `klio.toml` plus, when `auto_bindings` is set, every
-/// `merged_host_bindings` entry whose FQN matches a configured prefix.
-/// Allocated from `a`.
+/// The sorted binding list for a pack: the explicit `[bindings]` entries from
+/// `klio.toml` plus, when `auto_bindings` is set, every `mergedHostBindings`
+/// entry whose FQN matches a configured prefix. Allocated from `a`.
 fn collectPackBindings(
     a: std.mem.Allocator,
     binding_cfg: []const BindingPair,
@@ -1451,8 +1385,7 @@ fn collectPackBindings(
         }) catch return bindings.items;
     }
 
-    // Auto-emit: pull every entry from `merged_host_bindings` whose FQN
-    // matches a configured prefix.
+    // Default prefix is the library id when none is configured.
     if (library.auto_bindings) {
         var prefixes: std.ArrayList([]const u8) = .empty;
         if (library.binding_auto_prefixes.len == 0) {
@@ -1504,14 +1437,9 @@ fn lessBinding(_: void, a: schema.Binding, b: schema.Binding) bool {
     return std.mem.order(u8, a.fqn, b.fqn) == .lt;
 }
 
-// ---------------------------------------------------------------------
-// build library pack
-// ---------------------------------------------------------------------
-
 fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) PathResult {
-    // Everything the build allocates lives in this arena and is freed at
-    // scope exit. The single survivor is the returned `out_path`, allocated
-    // from gpa.
+    // Everything the build allocates lives in this arena, freed at scope exit.
+    // The single survivor is the returned `out_path`, allocated from gpa.
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
@@ -1527,9 +1455,8 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     }
     const cfg = cfg_res.ok;
 
-    // Source files. The plain `source_roots` strings become unfiltered
-    // roots; the `[[source]]` tables follow with their include/exclude
-    // rules.
+    // The plain `source_roots` strings become unfiltered roots; the `[[source]]`
+    // tables follow with their include/exclude rules.
     var effective: std.ArrayList(SourceRoot) = .empty;
     if (cfg.library.source_roots.len == 0 and cfg.source.len == 0) {
         effective.append(a, .{ .root = "src" }) catch return .{ .err = fail(gpa, "out of memory", .{}) };
@@ -1549,7 +1476,6 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     }
     const files = files_res.ok;
 
-    // Manifest.
     const feature_defs = a.alloc(schema.FeatureDef, cfg.features.defs.len) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     for (cfg.features.defs, feature_defs) |src, *dst| {
         dst.* = .{ .name = src.name, .sources = src.sources, .deps = src.deps, .requires = src.requires };
@@ -1576,18 +1502,16 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     const manifest_bytes = (schema.encode(schema.PackManifest, a, &manifest, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
-    // Bindings.
     const bindings = collectPackBindings(a, cfg.bindings, &cfg.library);
     const binding_manifest = schema.BindingManifest{ .bindings = bindings };
     const bindings_bytes = (schema.encode(schema.BindingManifest, a, &binding_manifest, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
-    // Sources.
     const source_bundle = schema.SourceBundle{ .files = files };
     const sources_bytes = (schema.encode(schema.SourceBundle, a, &source_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
-    // Frozen AST. A lex/parse failure in any file is fatal — never ship a pack
+    // Frozen AST. A lex/parse failure in any file is fatal: never ship a pack
     // with a source silently dropped.
     var ast_err: ?Failure = null;
     const ast_bundle = buildAstBundle(gpa, a, files, &ast_err);
@@ -1595,24 +1519,22 @@ fn buildLibraryPack(gpa: std.mem.Allocator, dir: []const u8, out: ?[]const u8) P
     const ast_bytes = (schema.encode(schema.AstBundle, a, &ast_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
-    // Imports: package headers + import paths per source, derived from the
-    // same parse. Loaders that only need the import graph (the stdlib-image
-    // hit path) read this instead of re-parsing `sources`.
+    // Imports: package headers + import paths per source, from the same parse.
+    // Loaders that only need the import graph (the stdlib-image hit path) read
+    // this instead of re-parsing `sources`.
     const imports_bundle = buildImportsBundle(a, &ast_bundle) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     const imports_bytes = (schema.encode(schema.ImportsBundle, a, &imports_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
-    // Frozen typeck. Collect the parsed `KotlinFile`s directly: in the
-    // arena the bundle's files outlive this call, so a borrow is cheaper
-    // than a clone.
+    // Frozen typeck. The bundle's files outlive this call in the arena, so
+    // borrow the parsed `KotlinFile`s instead of cloning them.
     const asts = a.alloc(KotlinFile, ast_bundle.files.len) catch return .{ .err = fail(gpa, "out of memory", .{}) };
     for (ast_bundle.files, asts) |f, *dst| dst.* = f.kotlin_file;
     const typeck_bundle = buildTypeckBundle(a, asts);
     const typeck_bytes = (schema.encode(schema.TypeckBundle, a, &typeck_bundle, &perr) catch
         return .{ .err = fail(gpa, "out of memory", .{}) }) orelse return .{ .err = packErrText(gpa, perr) };
 
-    // Assemble. This build has no zstd codec, so every section is stored
-    // uncompressed.
+    // Assemble. Every section stores uncompressed: no zstd codec in this build.
     var writer = PackWriter.init(a);
     defer writer.deinit();
     _ = writer.addRaw(section_names.MANIFEST, manifest_bytes.items) catch return .{ .err = fail(gpa, "out of memory", .{}) };
@@ -1644,9 +1566,9 @@ fn writePack(gpa: std.mem.Allocator, out: []const u8, bytes: []const u8) VoidRes
     return writeFileWithParents(gpa, out, bytes);
 }
 
-/// Package header + import paths per parsed source, in `ast` bundle
-/// order. Joined with `.` exactly as the pack loader's source-parse path
-/// joins them, so the two produce identical import-fixed-point inputs.
+/// Package header + import paths per parsed source, in `ast` bundle order.
+/// Joined with `.` exactly as the pack loader's source-parse path joins them, so
+/// the two produce identical import-fixed-point inputs.
 fn buildImportsBundle(a: std.mem.Allocator, ast_bundle: *const schema.AstBundle) std.mem.Allocator.Error!schema.ImportsBundle {
     const out_files = try a.alloc(schema.ImportsFile, ast_bundle.files.len);
     for (ast_bundle.files, out_files) |f, *dst| {
@@ -1669,28 +1591,20 @@ fn joinDottedPath(a: std.mem.Allocator, path: []const ast.Ident) std.mem.Allocat
     return buf.toOwnedSlice(a);
 }
 
-// ---------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------
-
 test "pack cmd tag names" {
     const c: PackCmd = .List;
     try std.testing.expectEqualStrings("List", @tagName(c));
 }
 
 test "pat_match: exact, directory prefix, suffix glob, prefix glob" {
-    // Exact.
     try std.testing.expect(patMatch("Buffer.kt", "Buffer.kt"));
     try std.testing.expect(!patMatch("Buffer.kt", "Other.kt"));
-    // Directory prefix.
     try std.testing.expect(patMatch("files", "files/"));
     try std.testing.expect(patMatch("files/Foo.kt", "files/"));
     try std.testing.expect(!patMatch("filesystem/Foo.kt", "files/"));
-    // Suffix glob.
     try std.testing.expect(patMatch("a/b/Foo.kt", "*.kt"));
     try std.testing.expect(patMatch("a/b/PlatformWindows.kt", "*Windows.kt"));
     try std.testing.expect(!patMatch("a/b/Foo.java", "*.kt"));
-    // Prefix glob.
     try std.testing.expect(patMatch("internal/Utf8.kt", "internal/*"));
     try std.testing.expect(!patMatch("public/Utf8.kt", "internal/*"));
 }
@@ -1879,8 +1793,8 @@ test "buildAstBundle fails loudly on a parse error" {
     };
     var err: ?Failure = null;
     _ = buildAstBundle(std.testing.allocator, a, &files, &err);
-    // A broken file is NOT silently dropped — it is reported as a fatal error
-    // naming the file, so the pack is never built with a source missing.
+    // A broken file is reported as a fatal error naming the file, never silently
+    // dropped.
     try std.testing.expect(err != null);
     try std.testing.expect(std.mem.indexOf(u8, err.?, "bad/Broken.kt") != null);
     std.testing.allocator.free(err.?);

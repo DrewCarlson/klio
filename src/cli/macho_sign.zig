@@ -1,21 +1,17 @@
 //! Mach-O ad-hoc code signing for `klio bundle` on macOS targets.
 //!
-//! Appending an overlay to a Mach-O and leaving the linker's signature in
-//! place produces a binary the arm64 kernel refuses (`codesign --verify`
-//! reports trailing data past the signature) and that cannot be re-signed
-//! with a real identity. So a macOS bundle strips the stub's own
-//! signature, appends the payload + trailer in its place, extends the
-//! `__LINKEDIT` segment to cover them, and writes a fresh ad-hoc SHA-256
-//! `CodeDirectory` over the whole image. The trailer lands immediately
-//! before the new signature, at `LC_CODE_SIGNATURE.dataoff - 72`, which is
-//! where the boot probe reads it. A developer re-signing with a real
-//! identity (`codesign -f -s "Developer ID" app`) replaces only the
-//! signature blob and keeps `dataoff` pointing just past the trailer, so
-//! the probe still lands.
+//! An overlay appended past the linker's signature makes a binary the arm64
+//! kernel refuses and that cannot be re-signed, so a macOS bundle strips the
+//! stub's signature, appends the payload plus the 72-byte trailer in its
+//! place, extends `__LINKEDIT` to cover them, and writes a fresh ad-hoc
+//! SHA-256 `CodeDirectory` over the whole image. The trailer therefore sits
+//! at `LC_CODE_SIGNATURE.dataoff - 72`, where the boot probe reads it;
+//! `codesign -f -s "Developer ID"` replaces only the signature blob and
+//! leaves `dataoff` just past the trailer, so the probe still lands.
 //!
-//! This is pure byte surgery in Zig — no host `codesign` — so a Linux host
-//! can cross-assemble a signed macOS bundle. Only thin 64-bit little-endian
-//! Mach-O (`MH_MAGIC_64`) is handled; the release stubs are thin per-arch.
+//! Byte surgery only, no host `codesign`, so a Linux host can cross-assemble
+//! a signed macOS bundle. Thin 64-bit little-endian (`MH_MAGIC_64`) only,
+//! which is what the release stubs are.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -32,10 +28,10 @@ const CS_ADHOC: u32 = 0x0000_0002;
 const CS_LINKER_SIGNED: u32 = 0x0002_0000;
 const CS_HASHTYPE_SHA256: u8 = 2;
 const CS_EXECSEG_MAIN_BINARY: u64 = 0x1;
-/// CodeDirectory version carrying the exec-segment fields (required for the
-/// main executable on arm64).
+/// CodeDirectory version carrying the exec-segment fields, required for an
+/// arm64 main executable.
 const CD_VERSION: u32 = 0x2_0400;
-/// Fixed CodeDirectory header length for `CD_VERSION` (through execSegFlags),
+/// CodeDirectory header length for `CD_VERSION`, through execSegFlags and
 /// before the identifier string and the hash slots.
 const CD_HEADER_LEN: u32 = 88;
 /// Code pages hash at 4 KiB (pageSize = log2(4096) = 12).
@@ -43,13 +39,12 @@ const CS_PAGE: u64 = 4096;
 const PAGE_LOG2: u8 = 12;
 const HASH_LEN: u32 = 32;
 
-/// Trailer size, mirrored from `pack.bundle_format.TRAILER_LEN` (kept local
-/// so this module has no cross-module dependency).
+/// Trailer size, mirrored from `pack.bundle_format.TRAILER_LEN` to keep this
+/// module free of cross-module dependencies.
 pub const TRAILER_LEN: u64 = 72;
 
-/// The fields of a parsed thin Mach-O the signer and the boot probe need.
-/// Load-command offsets are absolute file offsets into the header region,
-/// unchanged by stripping the trailing signature.
+/// Parsed thin Mach-O fields the signer and the boot probe need. Load-command
+/// offsets are absolute file offsets, unchanged by stripping the signature.
 pub const MachoInfo = struct {
     /// `__TEXT` file range, published as the CodeDirectory exec segment.
     text_fileoff: u64,
@@ -70,10 +65,9 @@ fn readU64(b: []const u8, off: usize) u64 {
     return std.mem.readInt(u64, b[off..][0..8], .little);
 }
 
-/// Parse a thin 64-bit Mach-O far enough to sign it. `bytes` must cover at
-/// least the mach header plus all load commands (the whole file is fine, as
-/// is a header-only prefix read for the boot probe). Null when the input is
-/// not a thin `MH_MAGIC_64` image carrying an `LC_CODE_SIGNATURE`.
+/// Parse a thin 64-bit Mach-O far enough to sign it. `bytes` must cover the
+/// mach header plus all load commands; a header-only prefix is enough. Null
+/// unless the input is a thin `MH_MAGIC_64` image with an `LC_CODE_SIGNATURE`.
 pub fn parse(bytes: []const u8) ?MachoInfo {
     if (bytes.len < 32) return null;
     if (readU32(bytes, 0) != MH_MAGIC_64) return null;
@@ -119,18 +113,16 @@ pub fn parse(bytes: []const u8) ?MachoInfo {
     return info;
 }
 
-/// The trailer position for a signed macOS bundle: `LC_CODE_SIGNATURE.dataoff
-/// - 72`. Null when `bytes` is not a signable Mach-O (the caller falls back
-/// to the plain EOF-72 probe).
+/// Trailer position in a signed macOS bundle, `LC_CODE_SIGNATURE.dataoff - 72`.
+/// Null for a non-signable Mach-O; the caller then probes EOF-72.
 pub fn trailerOffset(bytes: []const u8) ?u64 {
     const info = parse(bytes) orelse return null;
     if (info.codesig_dataoff < TRAILER_LEN) return null;
     return info.codesig_dataoff - TRAILER_LEN;
 }
 
-/// The size the ad-hoc signature will occupy for an image of `code_limit`
-/// bytes with the given identifier. The caller needs this to lay out
-/// `__LINKEDIT` and `LC_CODE_SIGNATURE` before the hashes are computed.
+/// Signature size for a `code_limit`-byte image with this identifier, so
+/// `__LINKEDIT` and `LC_CODE_SIGNATURE` are laid out before the hashes exist.
 fn signatureLen(code_limit: u64, identifier: []const u8) u32 {
     const n_code_slots: u32 = @intCast((code_limit + CS_PAGE - 1) / CS_PAGE);
     const ident_z_len: u32 = @intCast(identifier.len + 1);
@@ -138,15 +130,14 @@ fn signatureLen(code_limit: u64, identifier: []const u8) u32 {
     return 12 + 8 + cd_len; // SuperBlob header(12) + one BlobIndex(8) + CD
 }
 
-/// Produce the final ad-hoc signed bundle. `image` is the stub with its own
-/// signature already stripped, followed by the aligned payload area and the
-/// 72-byte trailer — i.e. everything the signature must cover; its length is
-/// the CodeDirectory's `codeLimit`. `info` is `parse(original_stub)`.
-/// Caller owns the returned bytes.
+/// Produce the final ad-hoc signed bundle. `image` is the stripped stub plus
+/// the aligned payload area and the 72-byte trailer, everything the signature
+/// covers; its length becomes the CodeDirectory `codeLimit`. `info` comes from
+/// `parse(original_stub)`. Caller owns the returned bytes.
 pub fn sign(gpa: Allocator, image: []const u8, info: MachoInfo, identifier: []const u8) Allocator.Error![]u8 {
     const code_limit: u64 = image.len;
     const sig_len = signatureLen(code_limit, identifier);
-    const sig_dataoff = code_limit; // trailer ends here → probe reads dataoff-72
+    const sig_dataoff = code_limit; // trailer ends here, so the probe reads dataoff-72
     const total: usize = @intCast(code_limit + sig_len);
 
     var out = try gpa.alloc(u8, total);
@@ -166,8 +157,8 @@ pub fn sign(gpa: Allocator, image: []const u8, info: MachoInfo, identifier: []co
 }
 
 /// Write the embedded-signature SuperBlob (one CodeDirectory) at `sig_off`,
-/// hashing `out[0..code_limit]` page by page. `out[sig_off..]` must already
-/// be zeroed and large enough.
+/// hashing `out[0..code_limit]` per page. `out[sig_off..]` must be zeroed and
+/// large enough.
 fn writeSignature(out: []u8, sig_off: u64, code_limit: u64, info: MachoInfo, identifier: []const u8) void {
     const n_code_slots: u32 = @intCast((code_limit + CS_PAGE - 1) / CS_PAGE);
     const ident_z_len: u32 = @intCast(identifier.len + 1);
@@ -219,16 +210,11 @@ fn writeSignature(out: []u8, sig_off: u64, code_limit: u64, info: MachoInfo, ide
     }
 }
 
-// ---------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------
-
-/// Build a minimal thin arm64 Mach-O with `__TEXT`, `__LINKEDIT`, and an
-/// `LC_CODE_SIGNATURE` whose signature is the trailing region — enough to
-/// exercise parse/strip/sign without a real linker.
+/// Minimal thin arm64 Mach-O with `__TEXT`, `__LINKEDIT`, and an
+/// `LC_CODE_SIGNATURE` whose signature is the trailing region.
 fn synthMacho(gpa: Allocator) ![]u8 {
-    // Layout: header(32) + 3 load commands, __TEXT [0,4096), __LINKEDIT
-    // [4096, 4096+256), signature at 4096+128 size 128.
+    // header(32) + 3 load commands, __TEXT [0,4096), __LINKEDIT [4096,4352),
+    // signature at 4224, size 128.
     const ncmds: u32 = 3;
     const seg = 72; // segment_command_64 size
     const sig_cmd = 16; // linkedit_data_command size
@@ -288,8 +274,8 @@ test "sign strips, re-signs, and places the trailer at dataoff-72" {
     defer gpa.free(stub);
     const info = parse(stub).?;
 
-    // image = stub minus its signature, then an aligned payload + 72-byte
-    // trailer (mirroring how bundle.zig lays out the overlay).
+    // Stub minus its signature, then an aligned payload and 72-byte trailer,
+    // as bundle.zig lays out the overlay.
     const core_len: usize = @intCast(info.codesig_dataoff);
     const payload_off = std.mem.alignForward(u64, core_len, 16384);
     const payload_n: usize = 5000;
@@ -304,16 +290,14 @@ test "sign strips, re-signs, and places the trailer at dataoff-72" {
     const signed = try sign(gpa, image, info, "myapp");
     defer gpa.free(signed);
 
-    // Re-parse the signed output: the LC_CODE_SIGNATURE now points past the
-    // trailer, and the trailer sits at dataoff-72.
+    // LC_CODE_SIGNATURE now points past the trailer, which sits at dataoff-72.
     const signed_info = parse(signed).?;
     try std.testing.expectEqual(@as(u64, image_len), signed_info.codesig_dataoff);
     const off = trailerOffset(signed).?;
     try std.testing.expectEqual(@as(u64, image_len - TRAILER_LEN), off);
     try std.testing.expectEqualSlices(u8, "KBND\x00KL1", signed[@intCast(off)..][0..8]);
 
-    // The SuperBlob is well-formed and the CodeDirectory hashes match the
-    // signed image page by page.
+    // The SuperBlob is well-formed and its hashes match the image page by page.
     const sb = signed[image_len..];
     try std.testing.expectEqual(CSMAGIC_EMBEDDED_SIGNATURE, std.mem.readInt(u32, sb[0..4], .big));
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, sb[8..12], .big));

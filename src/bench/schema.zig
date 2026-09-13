@@ -13,8 +13,7 @@ pub const BenchRecord = struct {
     ref_kotlinc_native_ns: ?u64 = null,
     ref_kotlinc_jvm_ns: ?u64 = null,
 
-    /// Serialize one record as a JSON object; null optionals are omitted
-    /// from the output.
+    /// Serialize one record as a JSON object, omitting null optionals.
     pub fn writeJson(self: *const BenchRecord, w: *std.Io.Writer, indent: usize) std.Io.Writer.Error!void {
         try writeIndent(w, indent);
         try w.writeAll("{\n");
@@ -23,10 +22,8 @@ pub const BenchRecord = struct {
         try writeU64Field(w, indent + 1, "median_ns", self.median_ns, true);
         try writeU64Field(w, indent + 1, "p99_ns", self.p99_ns, true);
 
-        // The trailing optional fields are emitted only when present; the
-        // last present field must not carry a comma. Iters is always last
-        // of the mandatory group, so its comma depends on whether any
-        // optional follows.
+        // Trailing optionals are emitted only when present and the last present
+        // field must not carry a comma, so `iters` commas only if one follows.
         const has_opt = self.allocs != null or self.alloc_bytes != null or
             self.ref_kotlinc_native_ns != null or self.ref_kotlinc_jvm_ns != null;
         try writeU64Field(w, indent + 1, "iters", self.iters, has_opt);
@@ -64,7 +61,7 @@ pub const BenchReport = struct {
     host: []const u8,
     records: []const BenchRecord,
 
-    /// Emit `serde_json::to_string_pretty`-compatible JSON (2-space indent).
+    /// Emit pretty JSON with a 2-space indent.
     pub fn writeJson(self: *const BenchReport, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.writeAll("{\n");
         try writeStrField(w, 1, "git_sha", self.git_sha, true);
@@ -152,9 +149,8 @@ pub const DiffRow = struct {
     level: RegressionLevel,
 };
 
-/// Diff the `median_ns` of `cur` vs. `base`. Returns one row per workload
-/// present in `cur` (missing baselines emit ratio 1.0 + Green). The caller
-/// owns the returned slice and frees it with the same allocator.
+/// Diff the `median_ns` of `cur` against `base`, one row per workload in `cur`;
+/// a missing baseline yields ratio 1.0 and Green. Caller owns the slice.
 pub fn diff(allocator: std.mem.Allocator, base: *const BenchReport, cur: *const BenchReport) std.mem.Allocator.Error![]DiffRow {
     var rows: std.ArrayList(DiffRow) = .empty;
     errdefer rows.deinit(allocator);
@@ -215,7 +211,7 @@ test "diff reports ratios against baseline" {
     try testing.expectEqual(@as(?u64, 100), rows[0].base_ns);
     try testing.expectEqual(@as(f64, 2.0), rows[0].ratio);
     try testing.expectEqual(RegressionLevel.Red, rows[0].level);
-    // Missing baseline → ratio 1.0, Green.
+    // Missing baseline: ratio 1.0, Green.
     try testing.expectEqual(@as(?u64, null), rows[1].base_ns);
     try testing.expectEqual(@as(f64, 1.0), rows[1].ratio);
     try testing.expectEqual(RegressionLevel.Green, rows[1].level);

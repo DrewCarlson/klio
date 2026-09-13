@@ -2,9 +2,8 @@
 
 const std = @import("std");
 
-/// Errors produced while encoding or decoding a pack. Modeled as data so
-/// callers can match on the variant and render the matching message; the
-/// `format` method renders the error text.
+/// Failure data callers match on, rendered to text by `format`. Each
+/// variant's doc comment is the message template `format` writes.
 pub const PackError = union(enum) {
     /// pack header is truncated or shorter than expected
     Truncated,

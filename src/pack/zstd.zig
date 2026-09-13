@@ -1,9 +1,9 @@
-//! Thin binding over the vendored zstd library. Only the entry points the
-//! pack format needs are declared; the C header is not required because the
-//! symbols are linked directly from the statically-compiled zstd sources.
+//! Thin binding over the vendored zstd library: only the entry points the
+//! pack format needs, linked straight from the statically compiled zstd
+//! sources, so no C header is required.
 //!
-//! `dst`/`uncompressed_len` capacities come from the pack directory, so
-//! the decoder never has to trust the frame's embedded content size.
+//! `dst` and `uncompressed_len` capacities come from the pack directory, so
+//! the decoder never trusts the frame's embedded content size.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -50,12 +50,12 @@ extern fn ZSTD_decompress_usingDict(
     dictSize: usize,
 ) usize;
 
-/// Errors surfaced from the zstd codec. `message` borrows zstd's static
-/// error-name table, so it stays valid for the process lifetime.
+/// Errors surfaced from the zstd codec.
 pub const ZstdError = error{ OutOfMemory, ZstdFailed };
 
-/// The most recent zstd error name. Set whenever a codec call returns
-/// `error.ZstdFailed`; callers read it to build a `PackError.Compression`.
+/// Most recent zstd error name on this thread, set whenever a codec call
+/// returns `error.ZstdFailed` and read to build a `PackError.Compression`. It
+/// borrows zstd's static error-name table, valid for the process lifetime.
 pub threadlocal var last_error: []const u8 = "unknown zstd error";
 
 fn checkError(code: usize) ZstdError!usize {
@@ -66,8 +66,7 @@ fn checkError(code: usize) ZstdError!usize {
     return code;
 }
 
-/// Compress `src` and return a freshly allocated buffer holding the zstd
-/// frame. The caller owns the result.
+/// Compress `src` into a freshly allocated zstd frame owned by the caller.
 pub fn compress(allocator: Allocator, src: []const u8, level: i32) ZstdError![]u8 {
     const bound = ZSTD_compressBound(src.len);
     const dst = try allocator.alloc(u8, bound);
@@ -82,9 +81,8 @@ pub fn compress(allocator: Allocator, src: []const u8, level: i32) ZstdError![]u
     return try allocator.realloc(dst, written);
 }
 
-/// Decompress `src` into a buffer of exactly `uncompressed_len` bytes
-/// (the size recorded in the pack directory). Fails if the frame expands
-/// to a different length.
+/// Decompress `src` into exactly `uncompressed_len` bytes, the size recorded
+/// in the pack directory. Fails when the frame expands to a different length.
 pub fn decompress(allocator: Allocator, src: []const u8, uncompressed_len: usize) ZstdError![]u8 {
     const dst = try allocator.alloc(u8, uncompressed_len);
     errdefer allocator.free(dst);
@@ -96,9 +94,9 @@ pub fn decompress(allocator: Allocator, src: []const u8, uncompressed_len: usize
     return dst;
 }
 
-/// Decompressed content size declared by a standalone zstd frame's
-/// header, or null when the frame is malformed or omits it. Used for
-/// artifacts distributed as bare frames (no directory carries the size).
+/// Content size declared by a standalone zstd frame's header; null when the
+/// frame is malformed or omits it. For artifacts shipped as bare frames, where
+/// no directory carries the size.
 pub fn frameContentSize(src: []const u8) ?usize {
     const size = ZSTD_getFrameContentSize(src.ptr, src.len);
     // -1 = unknown, -2 = error (per zstd.h contract).

@@ -1,13 +1,9 @@
-//! Stdlib codegen library.
-//!
-//! Walks the upstream Kotlin stdlib source tree and extracts every public
-//! top-level / class-member declaration into a stable schema that the
-//! generator emits as constant data for `stdlib`.
-//!
-//! The parser here is intentionally declaration-only. It does not understand
-//! Kotlin expressions or bodies, only enough lexical structure (comments,
-//! strings, annotations, modifiers, braces / parens / angle brackets) to find
-//! the next declaration header and skip past everything else.
+//! Stdlib codegen library. Walks the upstream Kotlin stdlib source tree and
+//! extracts every top-level and class-member declaration into the schema the
+//! generator emits as constant data for `stdlib`. The parser is
+//! declaration-only: it reads just enough lexical structure (comments, strings,
+//! annotations, modifiers, brackets) to find the next declaration header and
+//! skip the rest.
 
 const std = @import("std");
 

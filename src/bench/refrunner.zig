@@ -1,17 +1,15 @@
-//! Reference runners: `kotlinc-native` and JVM `kotlinc`. Both are downloaded
-//! on demand via `parity`'s install machinery and are never assumed on PATH.
-//!
-//! Compiled artifacts are cached under `target/bench-cache/` keyed by
-//! source-content hash so repeated bench passes don't recompile.
+//! Reference runners: `kotlinc-native` and JVM `kotlinc`, both downloaded on
+//! demand via `parity`'s install machinery and never assumed on PATH. Compiled
+//! artifacts are cached under `target/bench-cache/` keyed by source-content
+//! hash, so repeated bench passes do not recompile.
 
 const std = @import("std");
 const parity = @import("parity");
 
 pub const KOTLIN_JVM_VERSION: []const u8 = "2.4.0";
 
-/// Error outcomes for a reference-runner invocation. Carried as data so the
-/// caller decides how to surface it. Variants owning heap text document the
-/// owner; `deinit` frees them.
+/// Error outcome of a reference-runner invocation, carried as data so the
+/// caller decides how to surface it. `deinit` frees the heap-text variants.
 pub const RefError = union(enum) {
     Io: []const u8,
     Install: []const u8,
@@ -44,8 +42,7 @@ pub const RefError = union(enum) {
     }
 };
 
-/// `Result<Duration, RefError>` carried as data. `median_ns` is the median
-/// per-run wall time in nanoseconds.
+/// A median per-run wall time in nanoseconds, or the error that prevented it.
 pub const RefResult = union(enum) {
     ok: u64,
     err: RefError,
@@ -112,9 +109,8 @@ fn procEnvMap(allocator: std.mem.Allocator, io: std.Io) std.mem.Allocator.Error!
     return map;
 }
 
-/// Locate the requested `kotlinc` via the `parity` install machinery. The
-/// returned path is owned by the caller. The label prefixes any install
-/// error.
+/// Locate the requested `kotlinc` via the `parity` install machinery. Caller
+/// owns the returned path; `label` prefixes any install error.
 fn findKotlinc(allocator: std.mem.Allocator, kind: parity.KotlincKind, label: []const u8) std.mem.Allocator.Error!RefResultPath {
     const r = try parity.findKotlincKind(allocator, kind);
     switch (r) {
@@ -140,8 +136,6 @@ fn termOk(term: std.process.Child.Term) bool {
         else => false,
     };
 }
-
-// ---------------------- kotlinc-native ----------------------
 
 /// Time a single end-to-end run of `kotlinc-native` (compile + execute).
 /// Compilation is cached; only the execution time is measured.
@@ -203,8 +197,6 @@ pub fn timeKotlincNative(allocator: std.mem.Allocator, io: std.Io, file: []const
     std.mem.sort(u64, samples.items, {}, std.sort.asc(u64));
     return .{ .ok = samples.items[samples.items.len / 2] };
 }
-
-// ---------------------- kotlinc JVM ----------------------
 
 fn kotlincJvmFilename() []const u8 {
     return "kotlinc";

@@ -18,7 +18,7 @@ const Io = std.Io;
 pub const EmitError = error{Encode} || Allocator.Error;
 
 /// Build the symbol index from `files`, encode it, and write
-/// `out_dir/symbols.postcard`. Returns the number of unique symbols written.
+/// `out_dir/symbols.postcard`. Returns the count of unique symbols written.
 pub fn emitGenerated(allocator: Allocator, io: Io, out_dir: []const u8, files: []const FileDecls) EmitError!usize {
     const cwd = std.Io.Dir.cwd();
     cwd.createDirPath(io, out_dir) catch return error.Encode;
@@ -84,8 +84,7 @@ fn declToRecord(d: *const Decl, rel: []const u8) schema.SymbolRecord {
     };
 }
 
-/// Everything before the last `.` of `fqn`, or empty when there is no `.`.
-/// Returns a slice into `fqn`.
+/// Everything before the last `.` of `fqn`, empty if it has none; slices `fqn`.
 fn rsplitPackage(fqn: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, fqn, '.')) |idx| {
         return fqn[0..idx];

@@ -20,17 +20,15 @@
 //! ```
 //!
 //! Section payloads and the manifest use the pack module's postcard codec
-//! (`write.encode` / `read.decode`). Image sections (`base-image`,
-//! `program-image`) are stored uncompressed and 16384-aligned so the boot
-//! path can mmap them straight out of the executable file (16 KiB covers
-//! macOS arm64 pages, so one constant serves every target). Cold sections
-//! (resources, the Skia shim) compress with zstd.
+//! (`write.encode`, `read.decode`). Image sections (`base-image`,
+//! `program-image`) are stored uncompressed and SECTION_ALIGN-aligned so boot
+//! mmaps them straight out of the executable file; cold sections (resources,
+//! the Skia shim) compress with zstd.
 //!
-//! Versioning: the trailer magic carries the container revision (`KL1`);
-//! a layout change bumps it and an old stub simply fails the probe. The
-//! manifest's `klio_version` / `image_format_version` fields pin the
-//! producing binary — a stub refuses a payload from a different version,
-//! so cross-version skew is caught before anything decodes.
+//! The trailer magic's last three bytes are the container revision (`KL1`): a
+//! layout change bumps it and an old stub fails the probe. The manifest's
+//! `klio_version` and `image_format_version` pin the producing binary, so a
+//! version-skewed payload is refused before anything decodes.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -47,9 +45,9 @@ pub const MAGIC: *const [8]u8 = "KBND\x00KL1";
 /// Fixed trailer size in bytes: 8 magic + 4×8 offsets/lengths + 32 hash.
 pub const TRAILER_LEN: usize = 72;
 
-/// Alignment for the payload area and every mmap-target section, as an
-/// absolute file offset. 16 KiB covers the largest page size in the
-/// support matrix (macOS arm64).
+/// Alignment, as an absolute file offset, of the payload area and of every
+/// mmap-target section. 16 KiB covers the largest page size in the support
+/// matrix (macOS arm64).
 pub const SECTION_ALIGN: u64 = 16384;
 
 pub const HASH_LEN: usize = 32;
@@ -71,11 +69,10 @@ pub const Compression = enum(u8) {
     zstd = 1,
 };
 
-/// The fixed-size trailer.
 pub const Trailer = struct {
-    /// Absolute file offset of the payload area (SECTION_ALIGN-aligned).
+    /// Absolute file offset of the payload area, SECTION_ALIGN-aligned.
     payload_off: u64,
-    /// Length of the payload area (sections + table, no trailer).
+    /// Length of the payload area: sections plus table, trailer excluded.
     payload_len: u64,
     /// Absolute file offset of the encoded section table.
     table_off: u64,
@@ -94,8 +91,8 @@ pub const Trailer = struct {
         return out;
     }
 
-    /// Parse a trailer candidate. Null when the magic is absent — the
-    /// running executable is a plain `klio`, not a bundle.
+    /// Parse a trailer candidate. Null when the magic is absent: the running
+    /// executable is a plain `klio`, not a bundle.
     pub fn decode(bytes: *const [TRAILER_LEN]u8) ?Trailer {
         if (!std.mem.eql(u8, bytes[0..8], MAGIC)) return null;
         var hash: [HASH_LEN]u8 = undefined;
@@ -109,8 +106,8 @@ pub const Trailer = struct {
         };
     }
 
-    /// Structural sanity against the containing file's size: every region
-    /// in bounds, the table inside the payload area, alignment held.
+    /// Check against the containing file's size: every region in bounds, the
+    /// table inside the payload area, alignment held.
     pub fn consistent(self: *const Trailer, file_len: u64) bool {
         if (self.payload_off % SECTION_ALIGN != 0) return false;
         const payload_end = std.math.add(u64, self.payload_off, self.payload_len) catch return false;
@@ -121,8 +118,8 @@ pub const Trailer = struct {
     }
 };
 
-/// Directory entry for one stored section. Offsets are absolute file
-/// offsets so the boot path can mmap/slice without extra arithmetic.
+/// Directory entry for one stored section. `offset` is an absolute file
+/// offset, so boot mmaps or slices without extra arithmetic.
 pub const Section = struct {
     name: []const u8,
     offset: u64,
@@ -135,9 +132,8 @@ pub const SectionTable = struct {
     entries: []Section = &.{},
 };
 
-/// One embedded resource (`--include`): a mount path and its zstd frame
-/// inside the `resources` section. `offset` is relative to the section's
-/// stored payload start.
+/// One embedded resource (`--include`): a mount path and its zstd frame in
+/// the `resources` section, at `offset` from that section's stored start.
 pub const ResourceEntry = struct {
     mount: []const u8,
     offset: u64,
@@ -153,11 +149,9 @@ pub const PackInfo = struct {
     features: []const []const u8,
 };
 
-/// A pack host binding replayed at boot: the Kotlin FQN and the in-binary
-/// host symbol it resolves to. Function pointers never serialize; boot
-/// re-resolves `host_symbol` against the running stub's registry and
-/// errors hard when it is missing (a version-skewed stub, refused earlier
-/// by the manifest version check).
+/// A pack host binding replayed at boot: the Kotlin FQN and the host symbol
+/// it resolves to. Function pointers never serialize, so boot re-resolves
+/// `host_symbol` against the stub's registry, erroring hard when missing.
 pub const BindingPair = struct {
     fqn: []const u8,
     host_symbol: []const u8,
@@ -168,30 +162,29 @@ pub const Flavor = enum(u8) {
     ui = 1,
 };
 
-/// The manifest section. Postcard is sequential, so fields only append;
-/// a breaking change bumps the trailer magic revision instead.
+/// The manifest section. Postcard is sequential, so fields only append; a
+/// breaking change bumps the trailer magic revision instead.
 pub const BundleManifest = struct {
-    /// Version of the klio binary that produced the bundle. The stub
-    /// refuses a payload whose version differs from its own.
+    /// Version of the klio binary that produced the bundle; the stub refuses a
+    /// payload whose version differs from its own.
     klio_version: []const u8,
     /// `interp_ir.image.FORMAT_VERSION` of the embedded image sections.
     image_format_version: u32,
     flavor: Flavor,
-    /// App display name (window title default; `--name`).
+    /// App display name, the window-title default (`--name`).
     name: []const u8,
-    /// Main-function FQN when a `program-image` section boots directly;
-    /// empty when boot parses `program-src`.
+    /// Main-function FQN when a `program-image` section boots directly; empty
+    /// when boot parses `program-src`.
     entry: []const u8,
-    /// True when a program-image bake was attempted but refused, so the
-    /// bundle fell back to `program-src` (startup-only difference).
+    /// True when a program-image bake was refused and the bundle fell back to
+    /// `program-src`, a startup-cost-only difference.
     program_src_fallback: bool,
     packs: []const PackInfo,
     /// Packages to replay through `stdlib.registerKnownPackage` at boot.
     known_packages: []const []const u8,
-    /// Platform-helper FQNs replayed against the host registry (the
-    /// stdlib image's own replay list, duplicated for introspection).
+    /// Platform-helper FQNs replayed against the host registry, duplicated
+    /// from the stdlib image's replay list for introspection.
     binding_fqns: []const []const u8,
-    /// Pack host bindings replayed at boot (see `BindingPair`).
     pack_bindings: []const BindingPair,
     resources: []const ResourceEntry,
 };
@@ -206,22 +199,18 @@ pub const ProgramSources = struct {
     files: []const ProgramFile = &.{},
 };
 
-// ---------------------------------------------------------------------
-// Writer
-// ---------------------------------------------------------------------
-
 const PendingSection = struct {
     name: []const u8,
     payload: []const u8,
     compression: Compression,
-    /// Align the stored payload to SECTION_ALIGN (absolute file offset)
+    /// Align the stored payload to SECTION_ALIGN as an absolute file offset,
     /// so boot can mmap it. Implies `compression == .none`.
     mmap_target: bool,
 };
 
-/// Assembles the payload area + trailer. Sections are emitted in
-/// insertion order (the bundler adds them in a fixed order, so output is
-/// deterministic). The writer borrows names and payloads until `finish`.
+/// Assembles the payload area and trailer. Sections are emitted in insertion
+/// order, which the bundler fixes, so output is deterministic. Names and
+/// payloads are borrowed until `finish`.
 pub const Writer = struct {
     gpa: Allocator,
     sections: std.ArrayList(PendingSection) = .empty,
@@ -251,10 +240,9 @@ pub const Writer = struct {
         });
     }
 
-    /// Encode everything that follows a stub of `stub_len` bytes: the
-    /// alignment padding, the payload area (sections + table), and the
-    /// trailer. Appending the returned bytes to the stub yields the
-    /// complete bundle. Caller owns the result.
+    /// Encode everything after a stub of `stub_len` bytes: alignment padding,
+    /// the payload area (sections + table), and the trailer. Appending the
+    /// result to the stub yields the complete bundle; the caller owns it.
     pub fn finish(self: *Writer, stub_len: u64, result: *PackError) Allocator.Error!?[]u8 {
         const gpa = self.gpa;
         var out: std.ArrayList(u8) = .empty;
@@ -328,12 +316,8 @@ pub const Writer = struct {
     }
 };
 
-// ---------------------------------------------------------------------
-// Reader
-// ---------------------------------------------------------------------
-
-/// Verify the payload hash over the full bundle bytes. `bytes` must span
-/// the whole file (offsets are absolute).
+/// Verify the payload hash. `bytes` must span the whole file, since offsets
+/// are absolute.
 pub fn verifyPayload(bytes: []const u8, trailer: *const Trailer) bool {
     if (!trailer.consistent(bytes.len)) return false;
     const start: usize = @intCast(trailer.payload_off);
@@ -343,8 +327,7 @@ pub fn verifyPayload(bytes: []const u8, trailer: *const Trailer) bool {
     return std.mem.eql(u8, &hash, &trailer.payload_hash);
 }
 
-/// Decode the section table. Caller frees via the allocator (or hands in
-/// an arena).
+/// Decode the section table. Caller frees with `gpa`, or passes an arena.
 pub fn decodeTable(gpa: Allocator, bytes: []const u8, trailer: *const Trailer) ?SectionTable {
     if (!trailer.consistent(bytes.len)) return null;
     const start: usize = @intCast(trailer.table_off);
@@ -360,15 +343,14 @@ pub fn findSection(table: *const SectionTable, name: []const u8) ?Section {
     return null;
 }
 
-/// The stored (possibly compressed) bytes of a section, borrowed from the
-/// bundle bytes.
+/// Stored, possibly compressed, bytes of a section, borrowed from `bytes`.
 pub fn sectionStored(bytes: []const u8, s: Section) []const u8 {
     const start: usize = @intCast(s.offset);
     return bytes[start .. start + @as(usize, @intCast(s.stored_len))];
 }
 
-/// Materialize a section's payload: borrowed for uncompressed sections,
-/// owned (decompressed) for zstd. Null on a corrupt frame.
+/// Materialize a section's payload: borrowed when uncompressed, owned when
+/// decompressed from zstd. Null on a corrupt frame.
 pub fn sectionBytes(gpa: Allocator, bytes: []const u8, s: Section) Allocator.Error!?read.SectionBytes {
     const stored = sectionStored(bytes, s);
     switch (s.compression) {
@@ -383,8 +365,8 @@ pub fn sectionBytes(gpa: Allocator, bytes: []const u8, s: Section) Allocator.Err
     }
 }
 
-/// Decompress one resource entry out of the `resources` section's stored
-/// bytes. Caller owns the result for compressed entries.
+/// Decompress one resource entry from the `resources` section's stored bytes.
+/// Caller owns the result for compressed entries.
 pub fn resourceBytes(gpa: Allocator, resources_stored: []const u8, e: ResourceEntry) Allocator.Error!?read.SectionBytes {
     const start: usize = @intCast(e.offset);
     const end: usize = start + @as(usize, @intCast(e.stored_len));
@@ -401,10 +383,6 @@ pub fn resourceBytes(gpa: Allocator, resources_stored: []const u8, e: ResourceEn
         },
     }
 }
-
-// ---------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------
 
 test "trailer round-trips and rejects a non-bundle tail" {
     const t = Trailer{

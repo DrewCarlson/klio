@@ -1,7 +1,6 @@
-//! `klio-diagnostics-gen build` — mines kotlinc factory declarations and
-//! emits `src/diagnostics/generated/factories.zig`.
-//!
-//! Exposes a `pub fn run` taking parsed arguments, not a real `main`.
+//! `klio-diagnostics-gen build`: mines kotlinc factory declarations and emits
+//! `src/diagnostics/generated/factories.zig`. Exposes `run` over parsed
+//! arguments rather than a real `main`.
 
 const std = @import("std");
 
@@ -56,8 +55,8 @@ pub fn parseArgs(args: []const []const u8) Cmd {
     return .{ .unknown = cmd_name };
 }
 
-/// Run a parsed subcommand. `writer`/`err_writer` receive stdout/stderr text.
-/// Returns the process exit code.
+/// Run a parsed subcommand. `err_writer` takes stderr text; the result is the
+/// process exit code.
 pub fn run(
     allocator: Allocator,
     io: Io,
@@ -110,8 +109,7 @@ fn build(allocator: Allocator, io: Io, args: Cmd.Build, err_writer: *std.Io.Writ
 
 const EmitError = error{WriteFailed} || Allocator.Error;
 
-/// Render `factories` and write them to `out_file`, creating parent
-/// directories as needed.
+/// Render `factories` into `out_file`, creating parent directories as needed.
 fn emit(allocator: Allocator, io: Io, factories: []const gen.Factory, out_file: []const u8) EmitError!void {
     const cwd = std.Io.Dir.cwd();
     if (std.fs.path.dirname(out_file)) |parent| {
@@ -122,14 +120,12 @@ fn emit(allocator: Allocator, io: Io, factories: []const gen.Factory, out_file: 
     cwd.writeFile(io, .{ .sub_path = out_file, .data = text }) catch return error.WriteFailed;
 }
 
-/// Kotlin checkout root, resolved relative to the working directory the
-/// generator runs from (the workspace root).
+/// Kotlin checkout root, relative to the workspace root the generator runs in.
 fn defaultKotlinRoot(allocator: Allocator) Allocator.Error![]u8 {
     return allocator.dupe(u8, "kotlin");
 }
 
-/// Output path for the generated factories file, relative to the workspace
-/// root the generator runs from.
+/// Generated factories path, relative to that same workspace root.
 fn defaultOutFile(allocator: Allocator) Allocator.Error![]u8 {
     return allocator.dupe(u8, "src/diagnostics/generated/factories.zig");
 }
