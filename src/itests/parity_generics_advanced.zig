@@ -149,3 +149,24 @@ test "function_type_returning_function_type" {
     ;
     try assertKlio("fn_returns_fn", src, "11,25\n");
 }
+
+test "type_param_operand_compares_by_equals" {
+    const src =
+        \\
+        \\fun <T> indexedEqual(a: Array<out T>): Boolean = a[0] == a[1]
+        \\fun <T> listEqual(l: List<T>): Boolean = l[0] == l[1]
+        \\fun <T> nextEqual(i: Iterator<T>): Boolean = i.next() == i.next()
+        \\fun main() {
+        \\    val nan = arrayOf(Double.NaN, Double.NaN)
+        \\    val zeros = arrayOf(0.0, -0.0)
+        \\    println(indexedEqual(nan))
+        \\    println(indexedEqual(zeros))
+        \\    println(listEqual(listOf(Float.NaN, Float.NaN)))
+        \\    println(nextEqual(listOf(Double.NaN, Double.NaN).iterator()))
+        \\    println(Double.NaN == Double.NaN)
+        \\    println(0.0 == -0.0)
+        \\}
+        \\
+    ;
+    try assertKlio("type_param_eq", src, "true\nfalse\ntrue\ntrue\nfalse\ntrue\n");
+}

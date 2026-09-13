@@ -1745,7 +1745,10 @@ fn memberReadSelfTypeRef(b: *FuncBuilder, m: @FieldType(Expr, "Member")) Allocat
 /// The declared return type of a nullary member on a known receiver type, with the
 /// receiver's type arguments substituted in. This is what a destructured
 /// component needs, each name binding to the element's `componentN()`.
-pub fn nullaryMemberReturnTypeRef(
+/// The instantiated return of a nullary member call, keeping a return left as a
+/// bare type parameter. `nullaryMemberReturnTypeRef` drops those; callers that
+/// want to know an expression carries `T` ask here.
+pub fn nullaryMemberReturnTypeRefRaw(
     b: *FuncBuilder,
     recv: ir.TypeRef,
     name: []const u8,
@@ -1785,7 +1788,7 @@ pub fn nullaryMemberReturnTypeRef(
     };
     var dispatch_receiver = try staticDispatchReceiverTypeRef(b, target, recv, file);
     defer if (dispatch_receiver) |*ty| ty.deinit(b.allocator);
-    var out = (try b.module.instantiatedCallReturnType(
+    const out = (try b.module.instantiatedCallReturnType(
         b.allocator,
         target,
         recv,
@@ -1796,16 +1799,28 @@ pub fn nullaryMemberReturnTypeRef(
         if (trace) std.debug.print("[comp] {s}.{s} no return type\n", .{ identity, name });
         return null;
     };
+    if (trace) std.debug.print("[comp] {s}.{s} -> {s}\n", .{ identity, name, out.name });
+    return out;
+}
+
+pub fn nullaryMemberReturnTypeRef(
+    b: *FuncBuilder,
+    recv: ir.TypeRef,
+    name: []const u8,
+    file: span.FileId,
+) Allocator.Error!?ir.TypeRef {
+    var out = (try nullaryMemberReturnTypeRefRaw(b, recv, name, file)) orelse return null;
     // A return type left as the owner's own type parameter names no class.
     var head = std.mem.trimEnd(u8, out.name, "?");
     if (std.mem.findScalar(u8, head, '<')) |lt| head = head[0..lt];
     if (b.module.classIdByFqn(head) == null and
         b.module.uniqueClassIdBySimpleName(typeHead(head)) == null)
     {
-        if (trace) std.debug.print("[comp] {s}.{s} unknown head {s}\n", .{ identity, name, out.name });
+        if (runtime.envOnce("KLIO_COMP_TRACE") != null) {
+            std.debug.print("[comp] {s} unknown head {s}\n", .{ name, out.name });
+        }
         out.deinit(b.allocator);
         return null;
     }
-    if (trace) std.debug.print("[comp] {s}.{s} -> {s}\n", .{ identity, name, out.name });
     return out;
 }

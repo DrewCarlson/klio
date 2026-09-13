@@ -22,6 +22,7 @@ const isAnyTypedPath = helpers.isAnyTypedPath;
 const isGenericTypedPath = helpers.isGenericTypedPath;
 const isBoxedToAnyForm = ast_scan.isBoxedToAnyForm;
 const staticCallReturnTypeRef = static_call_type.staticCallReturnTypeRef;
+const static_type_mod = @import("static_type.zig");
 
 const expr_mod = @import("../expr.zig");
 const lowerExpr = expr_mod.lowerExpr;
@@ -220,7 +221,8 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
             isGenericTypedPath(b, lhs) or isGenericTypedPath(b, rhs) or
             isComparableCast(lhs) or isComparableCast(rhs) or
             (lhs.* == .Path and lhs.Path.segments.len == 1 and comparableTypedLocal(b, lhs.Path.segments[0].name)) or
-            (rhs.* == .Path and rhs.Path.segments.len == 1 and comparableTypedLocal(b, rhs.Path.segments[0].name))))
+            (rhs.* == .Path and rhs.Path.segments.len == 1 and comparableTypedLocal(b, rhs.Path.segments[0].name)) or
+            try typeParamTypedOperand(b, lhs) or try typeParamTypedOperand(b, rhs)))
     {
         const l = try lowerExpr(b, lhs);
         const r = try lowerExpr(b, rhs);
@@ -408,6 +410,41 @@ pub fn lowerBinary(b: *FuncBuilder, bin: anytype) Allocator.Error!Reg {
     const dst = b.allocReg();
     try b.push(.{ .BinOp = .{ .dst = dst, .op = astBinop(op), .lhs = l, .rhs = r } });
     return dst;
+}
+
+/// An operand whose static type is an in-scope type parameter. `isGenericTypedPath`
+/// sees only a bare parameter name, so this covers the reads that carry `T`
+/// without naming it: `a[i]` over an `Array<out T>`, `list[i]`, `iterator.next()`.
+/// Kotlin compares such an operand with `equals`, giving the total order where the
+/// runtime value happens to be a `Double`.
+fn typeParamTypedOperand(b: *FuncBuilder, e: *const Expr) Allocator.Error!bool {
+    if (argLitKind(e) != null) return false;
+    var ty = (try operandTypeRefKeepingTypeParams(b, e)) orelse return false;
+    defer ty.deinit(b.allocator);
+    // Declaration-site variance is mangled into the name: `Array<out T>` yields
+    // an element spelled `out#T`.
+    var name = ty.name;
+    if (std.mem.startsWith(u8, name, "out#")) name = name[4..];
+    if (std.mem.startsWith(u8, name, "in#")) name = name[3..];
+    return b.typeParamBound(name) != null;
+}
+
+/// The operand's static type, keeping a bare type parameter that the general
+/// deriver discards. `iterator.next()` over an `Iterable<T>` is `T`, which decides
+/// whether `==` compares by `equals`.
+fn operandTypeRefKeepingTypeParams(b: *FuncBuilder, e: *const Expr) Allocator.Error!?ir.TypeRef {
+    if (try static_type_mod.staticExprTypeRef(b, e)) |t| return t;
+    if (e.* != .Call or e.Call.args.len != 0) return null;
+    const callee = e.Call.callee;
+    if (callee.* != .Member) return null;
+    var recv = (try static_type_mod.staticExprTypeRef(b, callee.Member.receiver)) orelse return null;
+    defer recv.deinit(b.allocator);
+    return static_type_mod.nullaryMemberReturnTypeRefRaw(
+        b,
+        recv,
+        callee.Member.name.name,
+        e.Call.span.file,
+    );
 }
 
 fn isGenericOperand(b: *FuncBuilder, e: *const Expr) bool {
